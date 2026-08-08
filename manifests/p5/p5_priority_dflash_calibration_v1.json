@@ -1,0 +1,72 @@
+{
+  "description": "Disjoint Math500 production-SGLang calibration for Qwen3-4B DFlash-b16. Static is measured once; TTS candidates share exact 4K/16K/40K prefix checkpoints and are isolated by mode/learning-rate artifact root. This manifest selects a safe candidate only and is never used for the held-out LiveCodeBench claim.",
+  "engine_params": {
+    "benchmark_repetitions": 1,
+    "ignore_eos": true,
+    "lr": 0.0001,
+    "max_consecutive_exactness_failures": 1,
+    "max_consecutive_runtime_failures": 1,
+    "max_new_tokens": 128,
+    "max_running_requests": 1,
+    "max_total_tokens": 100000,
+    "p5_context_lengths": [
+      4096,
+      16384,
+      40000
+    ],
+    "prompt_limit": 12,
+    "request_timeout_s": 1800,
+    "warmup_prompts": 2
+  },
+  "lockfile_sha256": null,
+  "name": "p5_priority_dflash_calibration_v1",
+  "phase": "p5_priority_dflash_calibration_v1",
+  "profile": "local_1x96gb",
+  "schema_version": 1,
+  "units": [
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "none",
+      "dataset": "math500",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "static",
+      "model_pair": "qwen3_4b_dflash16",
+      "parameter_scope": "tail",
+      "phase": "p5_priority_dflash_calibration_v1",
+      "prompt_subset": "p5_ctx_4096-40000",
+      "required": true,
+      "sampling_profile": "greedy_t0",
+      "seed": 73013,
+      "stride": 4,
+      "trainable_scope": "tail_lora",
+      "transport_variant": null,
+      "unit_id": "e54cf96bce341fe40c04d2eee5531948df428c9fec471bc86f2a18670d1189e4",
+      "weight_update_mode": "lora"
+    },
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "none",
+      "dataset": "math500",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "tts",
+      "model_pair": "qwen3_4b_dflash16",
+      "parameter_scope": "tail",
+      "phase": "p5_priority_dflash_calibration_v1",
+      "prompt_subset": "p5_ctx_4096-40000",
+      "required": true,
+      "sampling_profile": "greedy_t0",
+      "seed": 73013,
+      "stride": 4,
+      "trainable_scope": "tail_lora",
+      "transport_variant": null,
+      "unit_id": "d3a4c7c6c464d644c87853689cc704417d8f1fd60277f137bb62fc8ecdf46dff",
+      "weight_update_mode": "lora"
+    }
+  ]
+}

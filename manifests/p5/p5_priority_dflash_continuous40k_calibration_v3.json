@@ -1,0 +1,116 @@
+{
+  "description": "Continuous-request DFlash tail-LoRA calibration from exact 128-token prefixes through a true prefix of 40,944 tokens. Static, TTS and L0 use identical prompts, candidate parameterization, AdamW configuration, stride and seed across five repetitions; five windows, including an exact 4K boundary, are assigned by prefix_len_before, never by final request length.",
+  "engine_params": {
+    "benchmark_repetitions": 5,
+    "continuous_warmup_new_tokens": 128,
+    "ignore_eos": true,
+    "lr": 0.0001,
+    "weight_decay": 0.01,
+    "max_consecutive_exactness_failures": 1,
+    "max_consecutive_runtime_failures": 1,
+    "max_new_tokens": 40816,
+    "max_running_requests": 1,
+    "max_total_tokens": 50000,
+    "p5_context_lengths": [
+      128
+    ],
+    "p5_continuous_prefix_windows": [
+      [
+        128,
+        4096
+      ],
+      [
+        4096,
+        10240
+      ],
+      [
+        10240,
+        20480
+      ],
+      [
+        20480,
+        30720
+      ],
+      [
+        30720,
+        40944
+      ]
+    ],
+    "prompt_limit": 2,
+    "request_timeout_s": 7200,
+    "warmup_prompts": 1
+  },
+  "lockfile_sha256": "db77e4ffac78c341557cc4e8390deceffdeacc5ec460d2426f1fd5c0f1ec4051",
+  "name": "p5_priority_dflash_continuous40k_calibration_v3",
+  "phase": "p5_priority_dflash_continuous40k_calibration_v3",
+  "profile": "local_1x96gb",
+  "schema_version": 1,
+  "units": [
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "none",
+      "dataset": "math500",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "static",
+      "model_pair": "qwen3_4b_dflash16",
+      "parameter_scope": "tail",
+      "phase": "p5_priority_dflash_continuous40k_calibration_v3",
+      "prompt_subset": "p5_ctx_128",
+      "required": true,
+      "sampling_profile": "greedy_t0",
+      "seed": 73013,
+      "stride": 1,
+      "trainable_scope": "tail_lora",
+      "transport_variant": null,
+      "unit_id": "ab988c711dc9c8e6af0173a0db6d4e2b1c71bc6898ef9715b24dc16d3984a5fd",
+      "weight_update_mode": "lora"
+    },
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "none",
+      "dataset": "math500",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "tts",
+      "model_pair": "qwen3_4b_dflash16",
+      "parameter_scope": "tail",
+      "phase": "p5_priority_dflash_continuous40k_calibration_v3",
+      "prompt_subset": "p5_ctx_128",
+      "required": true,
+      "sampling_profile": "greedy_t0",
+      "seed": 73013,
+      "stride": 1,
+      "trainable_scope": "tail_lora",
+      "transport_variant": null,
+      "unit_id": "fcdb39454cdfdf8ac64a70221f3d2db1fc55bcc68b6c7d7994916a716e0da9c4",
+      "weight_update_mode": "lora"
+    },
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "realistic_async",
+      "dataset": "math500",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "naive_async",
+      "model_pair": "qwen3_4b_dflash16",
+      "parameter_scope": "tail",
+      "phase": "p5_priority_dflash_continuous40k_calibration_v3",
+      "prompt_subset": "p5_ctx_128",
+      "required": true,
+      "sampling_profile": "greedy_t0",
+      "seed": 73013,
+      "stride": 1,
+      "trainable_scope": "tail_lora",
+      "transport_variant": null,
+      "unit_id": "5a1aaf8a5f1356a6e4e220df85ca16833b6e72731c5b89fc92fe0ea162b962ce",
+      "weight_update_mode": "lora"
+    }
+  ]
+}

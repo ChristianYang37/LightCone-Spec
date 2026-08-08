@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "name": "p5_l2_screen_livecodebench_32k_lr1e2",
+  "phase": "p5_l2_screen",
+  "description": "Paired 32K Static versus L2 Damp screen before repeated long-context evaluation",
+  "profile": "auto_gpu_preflight",
+  "lockfile_sha256": null,
+  "engine_params": {
+    "benchmark_repetitions": 1,
+    "lr": 0.01,
+    "max_new_tokens": 128,
+    "max_running_requests": 4,
+    "max_total_tokens": 100000,
+    "prompt_limit": 32,
+    "request_timeout_s": 1800,
+    "speculative_num_draft_tokens": 8,
+    "warmup_prompts": 2
+  },
+  "units": [
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "none",
+      "dataset": "livecodebench",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "static",
+      "model_pair": "qwen3_4b_dspark7",
+      "phase": "p5",
+      "prompt_subset": "p5_ctx_32768",
+      "required": true,
+      "sampling_profile": "main_t1_p1",
+      "seed": 0,
+      "stride": 4,
+      "trainable_scope": "adapter",
+      "transport_variant": null,
+      "unit_id": "fa5968fc5f596760d512f2b3d8cbdbc3391102e9bd8734113b8894550291a936"
+    },
+    {
+      "adapter_rank": 16,
+      "allow_resource_skip": false,
+      "concurrency": 1,
+      "contention_condition": "realistic_async",
+      "dataset": "livecodebench",
+      "lifecycle": "stream",
+      "logical_delay": 0,
+      "method": "lc_damp",
+      "model_pair": "qwen3_4b_dspark7",
+      "phase": "p5",
+      "prompt_subset": "p5_ctx_32768",
+      "required": true,
+      "sampling_profile": "main_t1_p1",
+      "seed": 0,
+      "stride": 4,
+      "trainable_scope": "adapter",
+      "transport_variant": null,
+      "unit_id": "f4f557bc6e2d5f4ffd5f930658a4ed9ef15aa355fbe461bfd8b3708062a7571e"
+    }
+  ]
+}
