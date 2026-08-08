@@ -42,7 +42,12 @@ done < "$PATCH_DIR/series"
     exit 1
 }
 
-git am "${patches[@]}"
+# Fresh CI and disposable runtime checkouts intentionally have no global Git
+# identity.  Preserve each mail patch's author while supplying only the local
+# committer identity required by ``git am``; do not mutate user Git config.
+git -c user.name="LightCone patch applicator" \
+    -c user.email="ChristianYang37@users.noreply.github.com" \
+    am "${patches[@]}"
 actual_tree="$(git rev-parse 'HEAD^{tree}')"
 [[ "$actual_tree" == "$EXPECTED_TREE" ]] || {
     echo "error: patched tree $actual_tree != $EXPECTED_TREE" >&2
