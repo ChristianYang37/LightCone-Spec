@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible correctness or engineering defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private prompts, model tokens, or provider details.
+  - type: input
+    id: commit
+    attributes:
+      label: LightCone-Spec commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Sanitized environment
+      description: OS, Python, GPU, driver/toolkit, SGLang upstream commit, and patched tree.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

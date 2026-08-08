@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused extension or protocol change
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Minimal proposed design
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Exactness, memory, and compatibility impact
+    validations:
+      required: true

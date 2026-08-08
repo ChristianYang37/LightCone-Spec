@@ -1,0 +1,38 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-and-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: git clone --filter=blob:none https://github.com/sgl-project/sglang.git sglang
+      - run: git -C sglang checkout --detach 3312645a307453893a00778592f105581e3d1c3d
+      - run: patches/sglang/apply.sh sglang
+      - run: pytest -q
+      - run: python -m compileall -q src scripts tests
+      - run: python scripts/quality/check_public_tree.py
+      - run: python -m build
+      - run: python -m twine check dist/*
+
+  patch-integrity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: patches/sglang/verify.sh --skip-tests
+      - run: bash -n patches/sglang/apply.sh patches/sglang/verify.sh
