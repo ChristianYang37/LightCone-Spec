@@ -1,0 +1,18 @@
+LightCone-Spec
+Copyright 2026 LightCone contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This distribution contains original LightCone-Spec code and an auditable
+patch series for SGLang. SGLang is licensed under Apache-2.0 and is not
+distributed with this repository. The patches target:
+
+  Repository: https://github.com/sgl-project/sglang.git
+  Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
+
+The patch series changes SGLang to expose proposal evidence and integrate
+versioned, cache-safe tail adaptation for supported speculative backends.
+See patches/sglang/manifest.json for the exact patch and tree identities.
+
+Models and datasets are external artifacts. They are not distributed by this
+repository and remain subject to their respective licenses and terms.

@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local source checkouts and recovery material
+sglang/
+.local-backup/
+lightcone-spec/
+tmp/
+
+# Models, datasets, telemetry, profiles, and experiment outputs
+artifacts/
+models/
+model-cache/
+datasets/
+traces/
+profiles/
+*.parquet
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+selection_summary.json
+selected_optimizer_config.json
+baselines/
+
+# Local credentials and provider state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*instance*.json
+SSH_AGENT_HANDOFF_PROMPT*.md
+
+# Local papers and generated documents
+*.pdf
