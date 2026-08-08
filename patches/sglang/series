@@ -1,0 +1,7 @@
+0001-feat-spec-add-fail-closed-adaptation-configuration.patch
+0002-feat-spec-add-versioned-tail-adaptation-runtime.patch
+0003-feat-dspark-integrate-tail-adaptation-signals.patch
+0004-feat-dflash-integrate-cache-safe-tail-updates.patch
+0005-feat-eagle-add-version-safe-proposal-adaptation.patch
+0006-feat-runtime-harden-memory-lifecycle-and-telemetry.patch
+0007-test-spec-cover-adaptation-protocols-and-disabled-pa.patch

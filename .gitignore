@@ -19,7 +19,7 @@ venv/
 *.swp
 
 # Local source checkouts and recovery material
-sglang/
+/sglang/
 .local-backup/
 lightcone-spec/
 tmp/

@@ -1,0 +1,3261 @@
+From 9164bdd1a0ccba6e14340646fad5524e8099d1ce Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 17:22:18 +0800
+Subject: [PATCH 7/7] test(spec): cover adaptation protocols and disabled paths
+
+---
+ .../unit/entrypoints/test_server_info.py      |   33 +
+ ...est_batch_result_processor_spec_grammar.py |   45 +
+ .../observability/test_metrics_lifecycle.py   |  115 ++
+ .../unit/spec/test_dflash_tail_adaptation.py  |  609 ++++++++
+ .../spec/test_eagle_adaptation_protocol.py    |  707 ++++++++++
+ .../test_eagle_draft_cuda_graph_runner.py     |   24 +
+ .../test_speculative_adaptation_preflight.py  |  395 ++++++
+ .../unit/spec/test_tail_adaptation_manager.py | 1233 +++++++++++++++++
+ 8 files changed, 3161 insertions(+)
+ create mode 100644 test/registered/unit/observability/test_metrics_lifecycle.py
+ create mode 100644 test/registered/unit/spec/test_dflash_tail_adaptation.py
+ create mode 100644 test/registered/unit/spec/test_eagle_adaptation_protocol.py
+ create mode 100644 test/registered/unit/spec/test_speculative_adaptation_preflight.py
+ create mode 100644 test/registered/unit/spec/test_tail_adaptation_manager.py
+
+diff --git a/test/registered/unit/entrypoints/test_server_info.py b/test/registered/unit/entrypoints/test_server_info.py
+index 3f348dc..b9831e7 100644
+--- a/test/registered/unit/entrypoints/test_server_info.py
++++ b/test/registered/unit/entrypoints/test_server_info.py
+@@ -321,5 +321,38 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
+         json.dumps(info)
+ 
+ 
++class TestEngineAdaptationFallbackInfo(CustomTestCase):
++    def test_runtime_only_fallback_reason_is_explicitly_surfaced(self):
++        from sglang.srt.entrypoints.engine import Engine
++
++        reason = "dflash_exact_stochastic_sampling_kernel_unavailable"
++        args = ServerArgs(model_path="dummy")
++        args.override(
++            "test.adaptation_fallback",
++            speculative_adaptation_fallback_reason=reason,
++        )
++
++        async def get_internal_state():
++            return []
++
++        engine = object.__new__(Engine)
++        engine.loop = asyncio.new_event_loop()
++        engine.tokenizer_manager = SimpleNamespace(
++            server_args=args,
++            get_internal_state=get_internal_state,
++        )
++        engine._scheduler_init_result = SimpleNamespace(
++            scheduler_infos=[{}]
++        )
++        try:
++            info = engine.get_server_info()
++        finally:
++            engine.loop.close()
++
++        self.assertEqual(
++            info["speculative_adaptation_fallback_reason"], reason
++        )
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/managers/test_batch_result_processor_spec_grammar.py b/test/registered/unit/managers/test_batch_result_processor_spec_grammar.py
+index ef5e205..8bf80e2 100644
+--- a/test/registered/unit/managers/test_batch_result_processor_spec_grammar.py
++++ b/test/registered/unit/managers/test_batch_result_processor_spec_grammar.py
+@@ -6,6 +6,7 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
+ 
+ import unittest
+ from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
+ 
+ import torch
+ 
+@@ -42,6 +43,9 @@ class _FakeSpecAlgorithm:
+     def is_dflash(self) -> bool:
+         return False
+ 
++    def is_dspark(self) -> bool:
++        return True
++
+ 
+ class _FakeForwardMode:
+     def is_decode(self) -> bool:
+@@ -133,6 +137,47 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
+         self.assertEqual(predict_tokens, [[201, 202, 203]])
+         self.assertEqual(req.kv_committed_len, 3)
+ 
++    def test_decode_reports_dspark_verify_work_from_batch(self):
++        proc = _make_processor()
++        metrics_reporter = proc.metrics_reporter
++        metrics_reporter.num_generated_tokens = 0
++        metrics_reporter.forward_ct_decode = 0
++        metrics_reporter.update_spec_metrics = MagicMock()
++        metrics_reporter.report_decode_stats = MagicMock()
++        object.__setattr__(proc, "token_to_kv_pool_allocator", MagicMock())
++        object.__setattr__(proc, "output_streamer", MagicMock())
++
++        batch = _FakeBatch([])
++        batch.return_logprob = False
++        batch.spec_verify_tier_num_tokens = 7
++        batch.batch_size = lambda: 0
++        result = SimpleNamespace(
++            copy_done=None,
++            routed_experts_output=None,
++            indexer_topk_output=None,
++            logits_output=SimpleNamespace(),
++            next_token_ids=torch.empty(0, dtype=torch.long),
++            can_run_cuda_graph=True,
++            num_correct_drafts=0,
++            num_block_accept_tokens=0,
++            num_cap_tokens=0,
++            speculative_num_draft_tokens=4,
++        )
++
++        with patch.object(
++            SchedulerBatchResultProcessor,
++            "_normalize_decode_outputs",
++            return_value=([], None),
++        ):
++            proc.process_batch_result_decode(batch, result)
++
++        metrics_reporter.report_decode_stats.assert_called_once_with(
++            True,
++            running_batch=batch,
++            num_correct_drafts=0,
++            num_verified_tokens=7,
++        )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/observability/test_metrics_lifecycle.py b/test/registered/unit/observability/test_metrics_lifecycle.py
+new file mode 100644
+index 0000000..0001135
+--- /dev/null
++++ b/test/registered/unit/observability/test_metrics_lifecycle.py
+@@ -0,0 +1,115 @@
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from prometheus_client import Counter
++
++from sglang.srt.observability.cpu_monitor import (
++    start_cpu_monitor_thread,
++    stop_cpu_monitor_thread,
++)
++from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
++from sglang.srt.utils.watchdog import SubprocessWatchdog
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++class TestMetricsLifecycle(unittest.TestCase):
++    def test_watchdog_exposes_only_owned_processes(self):
++        owned = object()
++        watchdog = SubprocessWatchdog([owned])
++        self.assertEqual(watchdog.processes, (owned,))
++
++    def test_engine_shutdown_closes_owned_process_once(self):
++        from sglang.srt.entrypoints.engine import Engine
++
++        class Process:
++            pid = 42
++
++            def __init__(self):
++                self.joins = 0
++                self.closes = 0
++
++            def join(self, timeout):
++                self.joins += 1
++
++            def is_alive(self):
++                return False
++
++            def close(self):
++                self.closes += 1
++
++        process = Process()
++        watchdog = SimpleNamespace(
++            processes=(process,), stop=lambda: None
++        )
++        engine = object.__new__(Engine)
++        engine.tokenizer_manager = SimpleNamespace(
++            _subprocess_watchdog=watchdog,
++            metrics_collector=None,
++            cpu_monitor_thread=None,
++        )
++        engine.send_to_rpc = None
++        engine._weight_cache_daemon_procs = []
++        with patch("sglang.srt.entrypoints.engine.kill_process_tree") as kill:
++            engine.shutdown()
++            engine.shutdown()
++        kill.assert_called_once_with(42, include_parent=True, wait_timeout=60)
++        self.assertEqual(process.joins, 1)
++        self.assertEqual(process.closes, 1)
++
++    def test_prometheus_directory_can_rotate_in_one_process(self):
++        script = """
++from pathlib import Path
++from prometheus_client import Counter
++from sglang.srt.utils.common import set_prometheus_multiproc_dir
++
++set_prometheus_multiproc_dir()
++first = os.environ["PROMETHEUS_MULTIPROC_DIR"]
++Counter("sglang_test_rotation_first_total", "first").inc()
++set_prometheus_multiproc_dir()
++second = os.environ["PROMETHEUS_MULTIPROC_DIR"]
++Counter("sglang_test_rotation_second_total", "second").inc()
++assert first != second
++assert not Path(first).exists()
++assert Path(second).is_dir()
++"""
++        with tempfile.TemporaryDirectory() as root:
++            env = dict(os.environ)
++            env["PROMETHEUS_MULTIPROC_DIR"] = root
++            subprocess.run(
++                [sys.executable, "-c", "import os\n" + script],
++                check=True,
++                env=env,
++            )
++
++    def test_tokenizer_collector_close_is_idempotent(self):
++        name = "sglang_test_tokenizer_lifecycle_total"
++        collector = object.__new__(TokenizerMetricsCollector)
++        collector.metric = Counter(name, "lifecycle test")
++
++        collector.close()
++        collector.close()
++        replacement = Counter(name, "lifecycle test")
++        replacement_collector = object.__new__(TokenizerMetricsCollector)
++        replacement_collector.metric = replacement
++        replacement_collector.close()
++
++    def test_cpu_monitor_is_reused_per_component(self):
++        first = start_cpu_monitor_thread("lifecycle-test", interval=3600)
++        second = start_cpu_monitor_thread("lifecycle-test", interval=3600)
++        self.assertIs(first, second)
++        stop_cpu_monitor_thread(first)
++
++        replacement = start_cpu_monitor_thread("lifecycle-test", interval=3600)
++        self.assertIsNot(first, replacement)
++        stop_cpu_monitor_thread(replacement)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/spec/test_dflash_tail_adaptation.py b/test/registered/unit/spec/test_dflash_tail_adaptation.py
+new file mode 100644
+index 0000000..8b4c5e4
+--- /dev/null
++++ b/test/registered/unit/spec/test_dflash_tail_adaptation.py
+@@ -0,0 +1,609 @@
++"""CPU contract tests for DFlash tail adaptation.
++
++The CUDA graph replay/address checks live in GPU-marked integration tests; this
++module keeps the public callback, eager/graph sampling semantics, exactness
++guards, and lifecycle forwarding testable without a model or accelerator.
++"""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++from sglang.srt.speculative.dflash_info_v2 import (
++    dflash_semantic_valid_mask,
++)
++from sglang.srt.speculative.dflash_utils import (
++    DFlashTargetDecodeRequired,
++    apply_dflash_tail_correction,
++    validate_dflash_adaptation_startup,
++    validate_dflash_exact_sampling,
++)
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
++
++_HAS_CUDA = torch.cuda.is_available()
++
++
++class _TokenTwoTail:
++    capture_proposal_signals = True
++
++    def __init__(self):
++        self.calls = []
++        self.finished = []
++
++    def correct_draft_logits(self, **kwargs):
++        self.calls.append(
++            {
++                key: value
++                for key, value in kwargs.items()
++                if key not in ("hidden_states", "raw_logits")
++            }
++        )
++        out = kwargs["raw_logits"].clone()
++        out[:, 2].add_(100.0)
++        return out
++
++    def source_adapter_versions(self, batch):
++        return tuple(range(len(batch.reqs)))
++
++    def finish_request(self, *, rid, natural_stop):
++        self.finished.append((rid, natural_stop))
++
++
++class TestDFlashTailCorrection(CustomTestCase):
++    def test_disabled_is_identity_without_callback(self):
++        raw = torch.randn(3, 5)
++        corrected = apply_dflash_tail_correction(
++            None,
++            hidden_states=torch.randn(3, 2),
++            raw_logits=raw,
++            row_start=0,
++            rows_per_request=3,
++            vocab_start=0,
++            vocab_end=5,
++            graph_capture=False,
++        )
++        self.assertIs(corrected, raw)
++
++    def test_contract_rejects_shape_device_or_dtype_changes(self):
++        hidden = torch.randn(2, 3)
++        raw = torch.randn(2, 4)
++
++        class Bad:
++            def __init__(self, fn):
++                self.fn = fn
++
++            def correct_draft_logits(self, **kwargs):
++                return self.fn(kwargs["raw_logits"])
++
++        cases = [
++            Bad(lambda value: value[:, :-1]),
++            Bad(lambda value: value.to(torch.float64)),
++            Bad(lambda value: "not-a-tensor"),
++        ]
++        for adapter in cases:
++            with self.assertRaises((TypeError, ValueError)):
++                apply_dflash_tail_correction(
++                    adapter,
++                    hidden_states=hidden,
++                    raw_logits=raw,
++                    row_start=0,
++                    rows_per_request=2,
++                    vocab_start=0,
++                    vocab_end=4,
++                    graph_capture=False,
++                )
++
++    def test_graph_sampler_applies_tail_before_argmax_and_retains_signals(self):
++        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
++
++        weight = torch.tensor(
++            [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0], [0.5, 0.5]]
++        )
++        hidden = torch.tensor([[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]])
++        tail = _TokenTwoTail()
++        sampler = _DflashDraftSampler(
++            weight=weight,
++            block_size=3,
++            num_org=4,
++            org_vocab_start=0,
++            max_bs=1,
++            tail_adaptation=tail,
++        )
++        sampler(hidden)
++
++        torch.testing.assert_close(sampler.out[:2], torch.tensor([2, 2]))
++        self.assertIsNotNone(sampler.tail_hidden)
++        self.assertIsNotNone(sampler.raw_logits)
++        self.assertIsNotNone(sampler.proposal_logits)
++        self.assertEqual(tail.calls[0]["rows_per_request"], 2)
++        self.assertTrue(tail.calls[0]["graph_capture"])
++
++    def test_graph_sampler_disabled_does_not_retain_adaptation_tensors(self):
++        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
++
++        sampler = _DflashDraftSampler(
++            weight=torch.eye(3),
++            block_size=2,
++            num_org=3,
++            org_vocab_start=0,
++            max_bs=1,
++        )
++        sampler(torch.eye(3)[:2])
++        self.assertIsNone(sampler.tail_hidden)
++        self.assertIsNone(sampler.raw_logits)
++        self.assertIsNone(sampler.proposal_logits)
++
++    def test_graph_supervision_uses_current_bs4_replay_after_bs8_capture(self):
++        """The final Python capture reference must not define replay shape.
++
++        Decode graphs are captured bs8 -> ... -> bs1.  Before this regression
++        fix, a later bs4 replay read the sampler's bs1 ``tail_hidden`` and
++        silently reshaped ``3 x H`` into ``12 x H/4`` whenever H was divisible
++        by four.  Use sentinel rows and a divisible hidden width so this test
++        catches row mixing rather than relying on ``view`` to raise.
++        """
++
++        from sglang.srt.speculative.dflash_worker_v2 import (
++            DFlashWorkerV2,
++            _DflashDraftSampler,
++        )
++
++        block_size = 4
++        hidden_size = 8
++        # Keep the native head non-trivial while ensuring the +100 tail makes
++        # token two the unambiguous winner.  The test is about replay-row
++        # ownership, not the arbitrary scale of this synthetic LM head.
++        weight = torch.arange(6 * hidden_size, dtype=torch.float32).view(
++            6, hidden_size
++        ) / 10_000.0
++        tail = _TokenTwoTail()
++        sampler = _DflashDraftSampler(
++            weight=weight,
++            block_size=block_size,
++            num_org=6,
++            org_vocab_start=0,
++            max_bs=8,
++            tail_adaptation=tail,
++        )
++        sampler(torch.randn(8 * block_size, hidden_size))
++        sampler(torch.randn(block_size, hidden_size))
++        self.assertEqual(tuple(sampler.tail_hidden.shape), (3, hidden_size))
++
++        replay_hidden = torch.arange(
++            4 * block_size * hidden_size, dtype=torch.float32
++        ).view(4 * block_size, hidden_size)
++        draft_out = SimpleNamespace(
++            can_run_graph=True,
++            logits_output=SimpleNamespace(hidden_states=replay_hidden),
++        )
++        worker = object.__new__(DFlashWorkerV2)
++        worker.block_size = block_size
++        worker._draft_sampler = sampler
++        draft_next, signals = worker._sample_dflash_draft_head(
++            draft_out=draft_out,
++            batch_size=4,
++            lm_head=SimpleNamespace(weight=weight),
++            adaptation=tail,
++            capture_tail_signals=True,
++        )
++
++        expected_hidden = replay_hidden.view(
++            4, block_size, hidden_size
++        )[:, 1:, :].reshape(12, hidden_size)
++        self.assertEqual(tuple(draft_next.shape), (4, 3))
++        self.assertIsNotNone(signals)
++        torch.testing.assert_close(signals.tail_hidden, expected_hidden)
++        self.assertEqual(tuple(signals.raw_logits.shape), (12, 6))
++        self.assertEqual(tuple(signals.proposal_logits.shape), (12, 6))
++        torch.testing.assert_close(draft_next, torch.full((4, 3), 2))
++
++    def test_graph_supervision_reuses_resolved_replay_bucket_head(self):
++        """Supervision must not launch a second full-vocabulary head matmul."""
++
++        from sglang.srt.speculative.dflash_worker_v2 import (
++            DFlashWorkerV2,
++            _DflashDraftSampler,
++        )
++
++        block_size = 3
++        hidden_size = 2
++        weight = torch.tensor(
++            [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0], [0.5, 0.5]]
++        )
++        tail = _TokenTwoTail()
++        sampler = _DflashDraftSampler(
++            weight=weight,
++            block_size=block_size,
++            num_org=4,
++            org_vocab_start=0,
++            max_bs=4,
++            tail_adaptation=tail,
++        )
++        captured_hidden = torch.arange(
++            4 * block_size * hidden_size, dtype=torch.float32
++        ).view(4 * block_size, hidden_size)
++        sampler(captured_hidden)
++        captured_call_count = len(tail.calls)
++
++        # A real replay updates the captured tensors in place.  The unit test
++        # only needs to prove bucket ownership and that no eager callback is
++        # launched; the captured sentinel values therefore remain sufficient.
++        worker = object.__new__(DFlashWorkerV2)
++        worker.block_size = block_size
++        worker._draft_sampler = sampler
++        worker.draft_model_runner = SimpleNamespace(
++            decode_cuda_graph_runner=SimpleNamespace(bs=4)
++        )
++        draft_out = SimpleNamespace(
++            can_run_graph=True,
++            logits_output=SimpleNamespace(
++                hidden_states=torch.full((2 * block_size, hidden_size), -99.0)
++            ),
++        )
++        draft_next, signals = worker._sample_dflash_draft_head(
++            draft_out=draft_out,
++            batch_size=2,
++            lm_head=SimpleNamespace(weight=weight),
++            adaptation=tail,
++            capture_tail_signals=True,
++        )
++
++        expected_hidden = captured_hidden.view(
++            4, block_size, hidden_size
++        )[:2, 1:, :].reshape(4, hidden_size)
++        self.assertEqual(len(tail.calls), captured_call_count)
++        self.assertEqual(tuple(draft_next.shape), (2, 2))
++        self.assertIsNotNone(signals)
++        torch.testing.assert_close(signals.tail_hidden, expected_hidden)
++        self.assertEqual(tuple(signals.raw_logits.shape), (4, 4))
++        self.assertEqual(tuple(signals.proposal_logits.shape), (4, 4))
++
++    def test_graph_supervision_rejects_malformed_replay_hidden(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        worker = object.__new__(DFlashWorkerV2)
++        worker.block_size = 4
++        worker._draft_sampler = SimpleNamespace(out=torch.empty(24, dtype=torch.long))
++        malformed = SimpleNamespace(
++            can_run_graph=True,
++            logits_output=SimpleNamespace(hidden_states=torch.zeros(15, 8)),
++        )
++        with self.assertRaisesRegex(RuntimeError, "replay hidden shape mismatch"):
++            worker._sample_dflash_draft_head(
++                draft_out=malformed,
++                batch_size=4,
++                lm_head=SimpleNamespace(weight=torch.zeros(6, 8)),
++                adaptation=_TokenTwoTail(),
++                capture_tail_signals=True,
++            )
++
++    def test_eager_sampler_captures_scores_and_chunk_offsets(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        fake = SimpleNamespace()
++        hidden = torch.tensor([[3.0, 0.0], [0.0, 3.0]])
++        lm_head = SimpleNamespace(
++            weight=torch.tensor(
++                [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0], [0.5, 0.5]]
++            )
++        )
++        tail = _TokenTwoTail()
++        result = DFlashWorkerV2._sample_from_vocab_parallel_head(
++            fake,
++            hidden_states=hidden,
++            lm_head=lm_head,
++            tail_adaptation=tail,
++            capture_signals=True,
++            rows_per_request=2,
++            chunk_size=1,
++        )
++
++        torch.testing.assert_close(result.token_ids, torch.tensor([2, 2]))
++        torch.testing.assert_close(result.tail_hidden, hidden)
++        self.assertEqual(result.raw_logits.shape, (2, 4))
++        self.assertEqual(result.proposal_logits.shape, (2, 4))
++        self.assertEqual(result.vocab_ranges, ((0, 4),))
++        self.assertEqual([call["row_start"] for call in tail.calls], [0, 1])
++
++
++class TestDFlashExactnessGuard(CustomTestCase):
++    def test_adapted_stochastic_requires_unit_thresholds(self):
++        with self.assertRaisesRegex(ValueError, "threshold_single=1.0"):
++            validate_dflash_exact_sampling(
++                adaptation_enabled=True,
++                is_all_greedy=False,
++                sampling_kernel_available=True,
++                threshold_single=0.9,
++                threshold_acc=1.0,
++            )
++
++    def test_missing_kernel_requests_target_decode(self):
++        with self.assertRaises(DFlashTargetDecodeRequired):
++            validate_dflash_exact_sampling(
++                adaptation_enabled=True,
++                is_all_greedy=False,
++                sampling_kernel_available=False,
++                threshold_single=1.0,
++                threshold_acc=1.0,
++            )
++
++    def test_startup_converts_missing_kernel_to_actionable_fail_closed(self):
++        with self.assertRaisesRegex(
++            RuntimeError, "scheduler-wide.*next_draft_input=None"
++        ):
++            validate_dflash_adaptation_startup(
++                sampling_kernel_available=False,
++                threshold_single=1.0,
++                threshold_acc=1.0,
++            )
++
++    def test_startup_validates_stochastic_superset(self):
++        validate_dflash_adaptation_startup(
++            sampling_kernel_available=True,
++            threshold_single=1.0,
++            threshold_acc=1.0,
++        )
++        with self.assertRaisesRegex(RuntimeError, "threshold_single=1.0"):
++            validate_dflash_adaptation_startup(
++                sampling_kernel_available=True,
++                threshold_single=0.9,
++                threshold_acc=1.0,
++            )
++
++    def test_greedy_startup_does_not_require_stochastic_kernel(self):
++        validate_dflash_adaptation_startup(
++            sampling_kernel_available=False,
++            threshold_single=1.0,
++            threshold_acc=1.0,
++            stochastic=False,
++        )
++
++    def test_native_or_greedy_path_is_unchanged(self):
++        validate_dflash_exact_sampling(
++            adaptation_enabled=False,
++            is_all_greedy=False,
++            sampling_kernel_available=False,
++            threshold_single=0.5,
++            threshold_acc=0.5,
++        )
++        validate_dflash_exact_sampling(
++            adaptation_enabled=True,
++            is_all_greedy=True,
++            sampling_kernel_available=False,
++            threshold_single=0.5,
++            threshold_acc=0.5,
++        )
++
++
++class TestDFlashTailLifecycle(CustomTestCase):
++    def _semantic_mask(
++        self,
++        *,
++        proposals=(10, 11, 12, 13),
++        correct_len=0,
++        bonus=99,
++        remaining=16,
++        stops=(),
++        ignore_eos=False,
++    ):
++        return dflash_semantic_valid_mask(
++            proposal_token_ids=torch.tensor([proposals]),
++            base_valid_mask=torch.ones((1, len(proposals)), dtype=torch.bool),
++            correct_len=torch.tensor([correct_len], dtype=torch.int32),
++            bonus=torch.tensor([bonus]),
++            remaining_output_tokens=(remaining,),
++            terminal_token_ids=(stops,),
++            ignore_eos=(ignore_eos,),
++        )
++
++    def test_semantic_mask_respects_remaining_budget_without_false_censor(self):
++        mask, censored = self._semantic_mask(remaining=1, correct_len=0)
++        torch.testing.assert_close(
++            mask, torch.tensor([[True, False, False, False]])
++        )
++        self.assertFalse(bool(censored[0]))
++
++        mask, censored = self._semantic_mask(remaining=4, correct_len=3)
++        self.assertTrue(mask.all())
++        self.assertFalse(bool(censored[0]))
++
++        _, censored = self._semantic_mask(remaining=4, correct_len=4)
++        self.assertTrue(bool(censored[0]))  # four drafts plus bonus cross budget
++
++    def test_semantic_mask_keeps_accepted_eos_and_masks_its_suffix(self):
++        mask, censored = self._semantic_mask(
++            proposals=(10, 42, 12, 13),
++            correct_len=3,
++            stops=(42,),
++        )
++        torch.testing.assert_close(
++            mask, torch.tensor([[True, True, False, False]])
++        )
++        self.assertTrue(bool(censored[0]))
++
++    def test_semantic_mask_truncates_at_terminal_bonus(self):
++        mask, censored = self._semantic_mask(
++            correct_len=2,
++            bonus=42,
++            stops=(42,),
++        )
++        torch.testing.assert_close(
++            mask, torch.tensor([[True, True, False, False]])
++        )
++        self.assertTrue(bool(censored[0]))
++
++    def test_semantic_mask_does_not_truncate_rejected_eos(self):
++        mask, censored = self._semantic_mask(
++            proposals=(10, 11, 42, 13),
++            correct_len=2,
++            stops=(42,),
++        )
++        self.assertTrue(mask.all())
++        self.assertFalse(bool(censored[0]))
++
++    def test_late_stochastic_request_never_falls_back_to_greedy(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = _TokenTwoTail()
++        worker.server_args = SimpleNamespace(
++            speculative_accept_threshold_single=1.0,
++            speculative_accept_threshold_acc=1.0,
++        )
++        sampling = SimpleNamespace(
++            is_all_greedy=False,
++            need_top_k_sampling=False,
++            need_top_p_sampling=False,
++            need_min_p_sampling=False,
++        )
++        with patch(
++            "sglang.srt.speculative.dflash_worker_v2."
++            "is_dflash_sampling_verify_available",
++            return_value=False,
++        ), self.assertRaises(DFlashTargetDecodeRequired):
++            worker._validate_phase1_sampling_support(
++                SimpleNamespace(sampling_info=sampling)
++            )
++
++    def test_stochastic_truncated_target_distribution_fails_closed(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = _TokenTwoTail()
++        for field in (
++            "need_top_k_sampling",
++            "need_top_p_sampling",
++            "need_min_p_sampling",
++        ):
++            sampling = SimpleNamespace(
++                is_all_greedy=False,
++                need_top_k_sampling=False,
++                need_top_p_sampling=False,
++                need_min_p_sampling=False,
++            )
++            setattr(sampling, field, True)
++            with self.subTest(field=field), self.assertRaisesRegex(
++                ValueError, "full vocabulary"
++            ):
++                worker._validate_phase1_sampling_support(
++                    SimpleNamespace(sampling_info=sampling)
++                )
++
++    def test_versions_and_finish_are_forwarded_without_device_sync(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        tail = _TokenTwoTail()
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = tail
++        worker._cuda_graphs_initialized = False
++        batch = SimpleNamespace(reqs=[SimpleNamespace(), SimpleNamespace()])
++
++        self.assertEqual(worker._source_adapter_versions(batch), (0, 1))
++        worker.note_request_finished(rid="r0", natural_stop=False)
++        self.assertEqual(tail.finished, [("r0", False)])
++
++    def test_static_observer_lifecycle_is_separate_from_tail_protocol(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        finished = []
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = None
++        worker._static_observer = SimpleNamespace(
++            finish_request=lambda rid: finished.append(rid)
++        )
++
++        self.assertIsNone(worker._call_tail_hook("tail_logits_offset"))
++        worker.note_request_finished(rid="r-static", natural_stop=True)
++        self.assertEqual(finished, ["r-static"])
++
++    def test_late_install_is_rejected(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = None
++        worker._cuda_graphs_initialized = True
++        with self.assertRaisesRegex(RuntimeError, "before init_cuda_graphs"):
++            worker.set_tail_adaptation(_TokenTwoTail())
++
++    def test_unsafe_adapter_install_fails_before_becoming_active(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        worker = object.__new__(DFlashWorkerV2)
++        worker._tail_adaptation = None
++        worker._cuda_graphs_initialized = False
++        worker.server_args = SimpleNamespace(
++            speculative_accept_threshold_single=1.0,
++            speculative_accept_threshold_acc=1.0,
++        )
++        with patch(
++            "sglang.srt.speculative.dflash_worker_v2."
++            "is_dflash_sampling_verify_available",
++            return_value=False,
++        ), self.assertRaisesRegex(RuntimeError, "service startup"):
++            worker.set_tail_adaptation(_TokenTwoTail())
++        self.assertIsNone(worker._tail_adaptation)
++
++
++@unittest.skipUnless(_HAS_CUDA, "CUDA graph replay requires CUDA")
++class TestDFlashTailCudaGraph(CustomTestCase):
++    def test_fixed_address_tail_publish_changes_replay_without_recapture(self):
++        from sglang.srt.speculative.dflash_worker_v2 import _DflashDraftSampler
++
++        class FixedTail:
++            def __init__(self):
++                self.delta = torch.zeros((1, 3), device="cuda")
++
++            def correct_draft_logits(self, **kwargs):
++                return kwargs["raw_logits"] + self.delta
++
++        tail = FixedTail()
++        sampler = _DflashDraftSampler(
++            weight=torch.eye(3, device="cuda"),
++            block_size=2,
++            num_org=3,
++            org_vocab_start=0,
++            max_bs=1,
++            tail_adaptation=tail,
++        )
++        hidden = torch.tensor(
++            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], device="cuda"
++        )
++        stream = torch.cuda.Stream()
++        stream.wait_stream(torch.cuda.current_stream())
++        with torch.cuda.stream(stream):
++            for _ in range(3):
++                sampler(hidden)
++        torch.cuda.current_stream().wait_stream(stream)
++
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            sampler(hidden)
++        raw_ptr = sampler.raw_logits.data_ptr()
++        proposal_ptr = sampler.proposal_logits.data_ptr()
++
++        graph.replay()
++        self.assertEqual(int(sampler.out[0]), 0)
++        replay = sampler.replay_signals(
++            graph_batch_size=1, actual_batch_size=1
++        )
++        self.assertIsNotNone(replay)
++        self.assertEqual(replay.raw_logits.data_ptr(), raw_ptr)
++        self.assertEqual(replay.proposal_logits.data_ptr(), proposal_ptr)
++        tail.delta[:, 2].fill_(100.0)
++        graph.replay()
++        self.assertEqual(int(sampler.out[0]), 2)
++        torch.testing.assert_close(
++            replay.proposal_logits,
++            replay.raw_logits + torch.tensor([[0.0, 0.0, 100.0]], device="cuda"),
++        )
++        self.assertEqual(sampler.raw_logits.data_ptr(), raw_ptr)
++        self.assertEqual(sampler.proposal_logits.data_ptr(), proposal_ptr)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/spec/test_eagle_adaptation_protocol.py b/test/registered/unit/spec/test_eagle_adaptation_protocol.py
+new file mode 100644
+index 0000000..3b4ff99
+--- /dev/null
++++ b/test/registered/unit/spec/test_eagle_adaptation_protocol.py
+@@ -0,0 +1,707 @@
++"""CPU contracts for the optional single-layer EAGLE adaptation seam."""
++
++import contextlib
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++from sglang.srt.speculative.spec_utils import speculative_semantic_valid_mask
++
++from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
++from sglang.srt.speculative.eagle_info import EagleDraftInput
++from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
++from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
++    MultiLayerEagleWorkerV2,
++)
++from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.speculative.spec_utils import resolve_request_rng_metadata
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++
++def _forward_mode(*, extend=False, idle=False):
++    return SimpleNamespace(is_extend=lambda: extend, is_idle=lambda: idle)
++
++
++def _draft_input(versions):
++    bs = len(versions)
++    return EagleDraftInput(
++        topk_p=torch.ones((bs, 1), dtype=torch.float32),
++        topk_index=torch.arange(bs, dtype=torch.int64).view(bs, 1),
++        hidden_states=torch.arange(bs * 2, dtype=torch.float32).view(bs, 2),
++        bonus_tokens=torch.arange(bs, dtype=torch.int64),
++        source_adapter_version=torch.tensor(versions, dtype=torch.int64),
++    )
++
++
++class TestRequestRngMetadata(CustomTestCase):
++    def test_complete_request_metadata_wins_over_batch_fallback(self):
++        reqs = [
++            SimpleNamespace(
++                sampling_params=SimpleNamespace(sampling_seed=11, top_k=1)
++            ),
++            SimpleNamespace(
++                sampling_params=SimpleNamespace(sampling_seed=None, top_k=8)
++            ),
++        ]
++        seeds, greedy = resolve_request_rng_metadata(
++            reqs, SimpleNamespace(is_all_greedy=False)
++        )
++        self.assertEqual(seeds, (11, None))
++        self.assertEqual(greedy, (True, False))
++
++    def test_missing_sampling_params_uses_batch_greedy_flag(self):
++        seeds, greedy = resolve_request_rng_metadata(
++            [SimpleNamespace()], SimpleNamespace(is_all_greedy=False)
++        )
++        self.assertEqual(seeds, (None,))
++        self.assertEqual(greedy, (False,))
++
++    def test_missing_top_k_preserves_seed_and_uses_batch_fallback(self):
++        req = SimpleNamespace(
++            sampling_params=SimpleNamespace(sampling_seed=23)
++        )
++        seeds, greedy = resolve_request_rng_metadata(
++            [req], SimpleNamespace(is_all_greedy=True)
++        )
++        self.assertEqual(seeds, (23,))
++        self.assertEqual(greedy, (True,))
++
++
++class _RecordingAdaptation:
++    def __init__(self, events, versions):
++        self.events = events
++        self.versions = versions
++
++    def tail_logits_offset(self, **kwargs):
++        self.events.append(("correct", kwargs["phase"], kwargs["proposal_step"]))
++        return torch.zeros_like(kwargs["logits"])
++
++    def begin_requests(self, batch):
++        self.events.append("begin")
++
++    def after_verify(self, *, batch, batch_result, source_adapter_version):
++        self.events.append("after_verify")
++        torch.testing.assert_close(source_adapter_version, self.versions)
++
++    def before_draft_extend(self, batch):
++        self.events.append("pin")
++        return self.versions
++
++    def assert_pinned(self, *, batch, source_adapter_version):
++        self.events.append("assert")
++        torch.testing.assert_close(source_adapter_version, self.versions)
++
++    def finish_request(self, *, rid, natural_stop):
++        self.events.append(("finish", rid, natural_stop))
++
++
++class TestEagleAdapterVersionState(CustomTestCase):
++    def test_filter_and_merge_preserve_versions(self):
++        info = _draft_input([3, 5, 7])
++        info.filter_batch(torch.tensor([2, 0]))
++        self.assertEqual(info.source_adapter_version.tolist(), [7, 3])
++
++        info.merge_batch(_draft_input([11, 13]))
++        self.assertEqual(info.source_adapter_version.tolist(), [7, 3, 11, 13])
++
++    def test_merge_rejects_mixed_adaptation_state(self):
++        adapted = _draft_input([1])
++        plain = _draft_input([0])
++        plain.source_adapter_version = None
++        with self.assertRaisesRegex(RuntimeError, "adapted and unadapted"):
++            adapted.merge_batch(plain)
++
++    def test_overlap_relay_stashes_and_resolves_versions(self):
++        future_map = object.__new__(FutureMap)
++        future_map.device = torch.device("cpu")
++        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
++        future_map.req_pool_size = 8
++        future_map._forward_buf_initialized = False
++        future_map.dsa_topk_indices_buf = None
++        future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
++
++        source = _draft_input([17, 19])
++        payload = RelayPayload.from_draft_input(source)
++        indices = torch.tensor([2, 6], dtype=torch.int64)
++        with patch(
++            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
++            return_value=True,
++        ):
++            future_map.stash(indices, payload)
++
++        self.assertIsNotNone(future_map.source_adapter_version_buf)
++        self.assertEqual(
++            future_map.source_adapter_version_buf[indices].tolist(), [17, 19]
++        )
++
++        unresolved = EagleDraftInput(
++            topk_p=torch.empty((2, 1)),
++            topk_index=torch.empty((2, 1), dtype=torch.int64),
++            hidden_states=torch.empty((2, 2)),
++            bonus_tokens=torch.empty((2,), dtype=torch.int64),
++            future_indices=indices,
++        )
++        batch = SimpleNamespace(spec_info=unresolved)
++
++        def gather(indices, topk_p, topk_index, bonus, hidden):
++            return (
++                topk_p[indices],
++                topk_index[indices],
++                bonus[indices],
++                None if hidden is None else hidden[indices],
++            )
++
++        with patch.object(
++            torch.Tensor, "record_stream", lambda self, stream: None
++        ), patch(
++            "sglang.srt.managers.overlap_utils.gather_spec_extras",
++            side_effect=gather,
++        ):
++            future_map._resolve_spec_extras(batch)
++        self.assertEqual(unresolved.source_adapter_version.tolist(), [17, 19])
++
++    def test_plain_relay_allocates_no_version_buffer(self):
++        future_map = object.__new__(FutureMap)
++        future_map.device = torch.device("cpu")
++        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
++        future_map.req_pool_size = 4
++        with patch(
++            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
++            return_value=False,
++        ):
++            future_map._lazy_init_forward_buf(
++                RelayPayload(
++                    bonus_tokens=torch.zeros(1, dtype=torch.int64),
++                    topk_p=torch.ones((1, 1)),
++                    topk_index=torch.zeros((1, 1), dtype=torch.int64),
++                )
++            )
++        self.assertIsNone(future_map.source_adapter_version_buf)
++
++    def test_relay_rejects_late_enable_and_wrong_dtype(self):
++        future_map = object.__new__(FutureMap)
++        future_map.device = torch.device("cpu")
++        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
++        future_map.req_pool_size = 4
++        future_map._forward_buf_initialized = False
++        future_map.dsa_topk_indices_buf = None
++        future_map.output_tokens_buf = torch.empty(4, dtype=torch.int64)
++        indices = torch.tensor([1], dtype=torch.int64)
++
++        plain = RelayPayload(
++            bonus_tokens=torch.zeros(1, dtype=torch.int64),
++            topk_p=torch.ones((1, 1)),
++            topk_index=torch.zeros((1, 1), dtype=torch.int64),
++        )
++        with patch(
++            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
++            return_value=False,
++        ):
++            future_map.stash(indices, plain)
++        late_adapted = RelayPayload(
++            bonus_tokens=torch.zeros(1, dtype=torch.int64),
++            topk_p=torch.ones((1, 1)),
++            topk_index=torch.zeros((1, 1), dtype=torch.int64),
++            source_adapter_version=torch.tensor([1], dtype=torch.int64),
++        )
++        with self.assertRaisesRegex(RuntimeError, "cannot be enabled"):
++            future_map.stash(indices, late_adapted)
++
++        adapted_map = object.__new__(FutureMap)
++        adapted_map.device = torch.device("cpu")
++        adapted_map.spec_algo = SpeculativeAlgorithm.EAGLE
++        adapted_map.req_pool_size = 4
++        adapted_map._forward_buf_initialized = False
++        adapted_map.dsa_topk_indices_buf = None
++        adapted_map.output_tokens_buf = torch.empty(4, dtype=torch.int64)
++        wrong_dtype = RelayPayload(
++            bonus_tokens=torch.zeros(1, dtype=torch.int64),
++            topk_p=torch.ones((1, 1)),
++            topk_index=torch.zeros((1, 1), dtype=torch.int64),
++            source_adapter_version=torch.tensor([1], dtype=torch.int32),
++        )
++        with patch(
++            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
++            return_value=False,
++        ), self.assertRaisesRegex(ValueError, "same-device int64"):
++            adapted_map.stash(indices, wrong_dtype)
++
++
++class TestEagleTailCorrection(CustomTestCase):
++    def _worker(self, *, rejection_sampling=True):
++        worker = object.__new__(EagleDraftWorker)
++        worker.topk = 1
++        worker.hot_token_id = None
++        worker.index_share_for_mtp_iteration = False
++        worker.seed_dsa_topk_from_draft_extend = False
++        worker.server_args = SimpleNamespace(
++            speculative_use_rejection_sampling=rejection_sampling
++        )
++        worker._tail_logits_offset_fn = None
++        return worker
++
++    def test_adds_offset_once_without_mutating_raw_logits(self):
++        worker = self._worker()
++        calls = []
++
++        def offset(**kwargs):
++            calls.append(kwargs)
++            return torch.tensor([[2.0, -1.0]])
++
++        worker._tail_logits_offset_fn = offset
++        raw = torch.tensor([[1.0, 3.0]])
++        corrected = worker._correct_proposal_logits(
++            raw,
++            hidden_states=torch.zeros((1, 2)),
++            source_adapter_version=torch.tensor([4]),
++            req_pool_indices=torch.tensor([9]),
++            phase="draft_decode",
++            proposal_step=2,
++        )
++        torch.testing.assert_close(raw, torch.tensor([[1.0, 3.0]]))
++        torch.testing.assert_close(corrected, torch.tensor([[3.0, 2.0]]))
++        self.assertEqual(len(calls), 1)
++        self.assertEqual(calls[0]["source_adapter_version"].tolist(), [4])
++
++    def test_rejects_offset_dtype_that_would_allocate_in_hot_path(self):
++        worker = self._worker()
++        worker._tail_logits_offset_fn = lambda **kwargs: torch.zeros(
++            kwargs["logits"].shape, dtype=torch.float64
++        )
++        with self.assertRaisesRegex(ValueError, "device and dtype"):
++            worker._correct_proposal_logits(
++                torch.zeros((1, 2), dtype=torch.float32),
++                hidden_states=None,
++                source_adapter_version=torch.tensor([1]),
++                req_pool_indices=torch.tensor([0]),
++                phase="draft_decode",
++                proposal_step=1,
++            )
++
++    def test_internal_step_rejection_q_comes_from_corrected_logits(self):
++        worker = self._worker(rejection_sampling=True)
++        worker.speculative_num_steps = 2
++        worker.speculative_num_draft_tokens = 3
++        worker.device = torch.device("cpu")
++        worker._topk1_parents_prealloc = torch.tensor([[-1, 0]], dtype=torch.int64)
++        worker._topk1_score_indices_prealloc = torch.tensor([[0, 1]])
++        raw = torch.tensor([[0.0, 1.0, 2.0]])
++        delta = torch.tensor([[4.0, 0.0, 0.0]])
++        worker._tail_logits_offset_fn = lambda **kwargs: delta
++        worker.draft_runner = SimpleNamespace(
++            canary_manager=None,
++            model_config=SimpleNamespace(
++                hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
++            ),
++            forward=lambda forward_batch: SimpleNamespace(
++                logits_output=SimpleNamespace(
++                    next_token_logits=raw,
++                    hidden_states=torch.zeros((1, 2)),
++                )
++            ),
++        )
++        worker.draft_attn_backend = SimpleNamespace(attn_backends=[object()])
++        initial_q = torch.tensor([[0.2, 0.3, 0.5]])
++        spec_info = EagleDraftInput(
++            topk_p=torch.ones((1, 1)),
++            topk_index=torch.zeros((1, 1), dtype=torch.int64),
++            draft_probs=initial_q,
++            hidden_states=torch.zeros((1, 2)),
++            source_adapter_version=torch.tensor([8]),
++        )
++        forward_batch = SimpleNamespace(
++            spec_info=spec_info,
++            out_cache_loc=torch.zeros(1, dtype=torch.int64),
++            batch_size=1,
++            positions=torch.zeros(1, dtype=torch.int64),
++            req_pool_indices=torch.tensor([3]),
++            sampling_info=SimpleNamespace(temperatures=torch.tensor([[2.0]])),
++            input_ids=None,
++            reuse_dsa_topk_indices=False,
++        )
++
++        def select(i, topk_p, topk_index, hidden_states, scores, topk):
++            tree = (
++                torch.ones((1, 1, 1)),
++                topk_index.reshape(1, 1),
++                torch.tensor([[-1, 0]]) if i == 0 else torch.tensor([[i]]),
++            )
++            return topk_index.flatten(), hidden_states, topk_p, tree
++
++        with patch(
++            "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
++            side_effect=select,
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.per_step_draft_out_cache_loc",
++            return_value=[torch.zeros(1, dtype=torch.int64)],
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.forward_context",
++            return_value=contextlib.nullcontext(),
++        ):
++            _, _, _, draft_probs = worker.draft_forward(forward_batch)
++
++        expected_q = torch.softmax((raw + delta) / 2.0, dim=-1)
++        torch.testing.assert_close(draft_probs[:, 0], initial_q)
++        torch.testing.assert_close(draft_probs[:, 1], expected_q)
++
++    def test_prefill_and_decode_first_proposal_use_corrected_q(self):
++        worker = self._worker(rejection_sampling=True)
++        worker.device = torch.device("cpu")
++        worker.speculative_algorithm = SimpleNamespace(is_standalone=lambda: False)
++        worker.speculative_num_draft_tokens = 3
++        worker.plan_stream = None
++        worker.plan_stream_ctx = contextlib.nullcontext()
++        worker.cuda_graph_runner_for_draft_extend = None
++        raw_prefill = torch.tensor([[0.0, 1.0, 2.0]])
++        raw_decode = torch.tensor([[9.0, 0.0, 0.0], [0.0, 1.0, 2.0], [0.0, 0.0, 9.0]])
++        delta = torch.tensor([[4.0, 0.0, 0.0]])
++        phases = []
++
++        def offset(**kwargs):
++            phases.append(kwargs["phase"])
++            return delta.expand_as(kwargs["logits"])
++
++        worker._tail_logits_offset_fn = offset
++        logits_queue = [raw_prefill, raw_decode]
++        worker.draft_runner = SimpleNamespace(
++            canary_manager=None,
++            forward=lambda forward_batch: SimpleNamespace(
++                logits_output=SimpleNamespace(
++                    next_token_logits=logits_queue.pop(0),
++                    hidden_states=(
++                        torch.zeros((1, 2))
++                        if len(logits_queue) == 1
++                        else torch.zeros((3, 2))
++                    ),
++                )
++            ),
++        )
++        temperature = torch.tensor([[2.0]])
++        sampling_info = SimpleNamespace(temperatures=temperature)
++        source_version = torch.tensor([23], dtype=torch.int64)
++
++        prefill_forward = SimpleNamespace(
++            forward_mode=_forward_mode(idle=True),
++            batch_size=1,
++            req_pool_indices=torch.tensor([2]),
++            extend_seq_lens=torch.ones(1, dtype=torch.int32),
++            spec_info=SimpleNamespace(),
++            return_logprob=False,
++        )
++        prefill_batch = SimpleNamespace(
++            forward_mode=_forward_mode(idle=True),
++            sampling_info=sampling_info,
++        )
++        with patch.object(
++            __import__(
++                "sglang.srt.speculative.eagle_worker_v2", fromlist=["ForwardBatch"]
++            ).ForwardBatch,
++            "init_new",
++            return_value=prefill_forward,
++        ):
++            prefill_next = worker._draft_extend_for_prefill(
++                prefill_batch,
++                target_hidden_states=torch.zeros((1, 2)),
++                next_token_ids=torch.tensor([5]),
++                source_adapter_version=source_version,
++            )
++        expected_prefill_q = torch.softmax((raw_prefill + delta) / 2.0, dim=-1)
++        torch.testing.assert_close(prefill_next.draft_probs, expected_prefill_q)
++        torch.testing.assert_close(prefill_next.source_adapter_version, source_version)
++
++        decode_forward = SimpleNamespace(
++            input_ids=torch.zeros(3, dtype=torch.int64),
++            req_pool_indices=torch.tensor([2]),
++            spec_info=SimpleNamespace(),
++        )
++        decode_batch = SimpleNamespace(
++            seq_lens=torch.tensor([100]),
++            sampling_info=sampling_info,
++        )
++        decode_result = SimpleNamespace(
++            logits_output=SimpleNamespace(hidden_states=torch.zeros((3, 2))),
++            accept_lens=torch.tensor([2], dtype=torch.int32),
++            next_token_ids=torch.tensor([7]),
++            next_draft_input=EagleDraftInput(bonus_tokens=torch.tensor([7])),
++        )
++        with patch(
++            "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft_extend",
++            return_value=decode_forward,
++        ):
++            worker._draft_extend_for_decode(
++                decode_batch,
++                decode_result,
++                source_adapter_version=source_version,
++            )
++        expected_decode_q = torch.softmax((raw_decode[1:2] + delta) / 2.0, dim=-1)
++        torch.testing.assert_close(
++            decode_result.next_draft_input.draft_probs, expected_decode_q
++        )
++        torch.testing.assert_close(
++            decode_result.next_draft_input.source_adapter_version, source_version
++        )
++        self.assertEqual(phases, ["prefill_draft_extend", "decode_draft_extend"])
++
++
++class TestEagleAdaptationBoundary(CustomTestCase):
++    def _outer(self, events, versions):
++        worker = object.__new__(EAGLEWorkerV2)
++        worker.topk = 1
++        worker.speculative_num_steps = 1
++        worker.speculative_num_draft_tokens = 2
++        worker.device = torch.device("cpu")
++        worker.adaptive_controller = None
++        worker.speculative_algorithm = SimpleNamespace(is_standalone=lambda: False)
++        worker.server_args = SimpleNamespace(
++            enable_multi_layer_eagle=False,
++            speculative_use_rejection_sampling=False,
++        )
++        worker._adaptation = _RecordingAdaptation(events, versions)
++        return worker
++
++    def test_decode_publishes_only_between_verify_and_draft_extend(self):
++        events = []
++        versions = torch.tensor([6], dtype=torch.int64)
++        worker = self._outer(events, versions)
++        previous = _draft_input([6])
++        verify_input = SimpleNamespace(
++            is_verify_input=lambda: True,
++            source_adapter_version=versions,
++        )
++        draft_worker = SimpleNamespace(
++            hot_token_id=None,
++            draft_runner=SimpleNamespace(tp_group=None),
++            draft_tp_context=lambda group: contextlib.nullcontext(),
++            draft=lambda batch: (events.append("draft"), verify_input)[1],
++            _draft_extend_for_decode=lambda batch, result, source_adapter_version: (
++                events.append("draft_extend"),
++                torch.testing.assert_close(source_adapter_version, versions),
++            ),
++        )
++        worker._draft_worker = draft_worker
++        result = SimpleNamespace(
++            new_seq_lens=torch.tensor([101]),
++            next_draft_input=EagleDraftInput(bonus_tokens=torch.tensor([1])),
++        )
++        worker.verify = lambda batch, grammar_barrier=None: (
++            events.append("verify"),
++            result,
++        )[1]
++        batch = SimpleNamespace(
++            forward_mode=_forward_mode(),
++            is_extend_in_batch=False,
++            spec_info=previous,
++            seq_lens=torch.tensor([100]),
++            sampling_info=SimpleNamespace(is_all_greedy=True),
++        )
++
++        with patch(
++            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
++            return_value=contextlib.nullcontext(),
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
++            return_value=contextlib.nullcontext(),
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
++            return_value=contextlib.nullcontext(),
++        ):
++            worker.forward_batch_generation(
++                batch, on_publish=lambda new_lens: events.append("relay_publish")
++            )
++
++        self.assertEqual(
++            events,
++            [
++                "assert",
++                "draft",
++                "verify",
++                "relay_publish",
++                "after_verify",
++                "pin",
++                "draft_extend",
++            ],
++        )
++
++    def test_finish_and_cancel_forward_to_protocol(self):
++        events = []
++        worker = self._outer(events, torch.tensor([0], dtype=torch.int64))
++        worker.note_request_finished(rid="natural", natural_stop=True)
++        worker.note_request_finished(rid="cancelled", natural_stop=False)
++        self.assertEqual(
++            events,
++            [
++                ("finish", "natural", True),
++                ("finish", "cancelled", False),
++            ],
++        )
++
++    def test_static_observer_never_enters_tail_or_version_protocol(self):
++        events = []
++
++        class Observer:
++            def begin_round(self, **kwargs):
++                events.append(("begin", kwargs))
++
++            def record_stage(self, name):
++                events.append(name)
++
++            def after_accept(self, **kwargs):
++                events.append(("accepted", kwargs["commit_lens"].clone()))
++
++            def commit_round(self, **kwargs):
++                events.append(("committed", kwargs["new_seq_lens"].clone()))
++
++            def finish_request(self, rid):
++                events.append(("finish", rid))
++
++        worker = self._outer([], torch.tensor([0], dtype=torch.int64))
++        worker._adaptation = None
++        worker._static_observer = Observer()
++        previous = EagleDraftInput(bonus_tokens=torch.tensor([7]))
++        verify_input = SimpleNamespace(is_verify_input=lambda: True)
++        worker._draft_worker = SimpleNamespace(
++            draft_runner=SimpleNamespace(tp_group=None),
++            draft_tp_context=lambda group: contextlib.nullcontext(),
++            draft=lambda batch: verify_input,
++            _draft_extend_for_decode=lambda batch, result, source_adapter_version: None,
++        )
++        native_tokens = torch.tensor([11, 12])
++        result = SimpleNamespace(
++            next_token_ids=native_tokens,
++            accept_lens=torch.tensor([2], dtype=torch.int32),
++            new_seq_lens=torch.tensor([102], dtype=torch.int64),
++            next_draft_input=EagleDraftInput(bonus_tokens=torch.tensor([8])),
++        )
++
++        def verify(batch, grammar_barrier=None):
++            worker._static_observer.record_stage("verify_end")
++            worker._static_observer.record_stage("accept_end")
++            return result
++
++        worker.verify = verify
++        batch = SimpleNamespace(
++            reqs=[SimpleNamespace(rid="r-static")],
++            forward_mode=_forward_mode(),
++            is_extend_in_batch=False,
++            spec_info=previous,
++            seq_lens=torch.tensor([100]),
++            # Efficient attention backends deliberately omit this mirror; the
++            # evidence-only observer must consume seq_lens asynchronously
++            # instead of forcing a per-round D2H synchronization.
++            seq_lens_cpu=None,
++            sampling_info=SimpleNamespace(is_all_greedy=True),
++        )
++        tokens_before = native_tokens.clone()
++        with patch(
++            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
++            return_value=contextlib.nullcontext(),
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
++            return_value=contextlib.nullcontext(),
++        ), patch(
++            "sglang.srt.speculative.eagle_worker_v2.spec_stage_span",
++            return_value=contextlib.nullcontext(),
++        ):
++            actual = worker.forward_batch_generation(batch)
++
++        self.assertIs(actual, result)
++        torch.testing.assert_close(actual.next_token_ids, tokens_before)
++        self.assertIsNone(actual.next_draft_input.source_adapter_version)
++        self.assertEqual(events[0][0], "begin")
++        self.assertIs(events[0][1]["prefix_lens"], batch.seq_lens)
++        self.assertEqual(events[0][1]["sampling_seeds"], (None,))
++        self.assertEqual(events[0][1]["greedy_flags"], (True,))
++        self.assertEqual(events[1:4], ["draft_end", "verify_end", "accept_end"])
++        self.assertEqual(events[4][0], "accepted")
++        self.assertEqual(events[5][0], "committed")
++
++    def test_tree_and_stochastic_hot_vocab_fail_closed(self):
++        adapter = _RecordingAdaptation([], torch.tensor([0], dtype=torch.int64))
++        worker = object.__new__(EAGLEWorkerV2)
++        worker.topk = 2
++        worker.server_args = SimpleNamespace(enable_multi_layer_eagle=False)
++        worker._adaptation = None
++        worker._draft_worker = SimpleNamespace()
++        with self.assertRaisesRegex(ValueError, "topk=1"):
++            worker.attach_adaptation(adapter)
++
++        worker = self._outer([], torch.tensor([0], dtype=torch.int64))
++        worker._draft_worker = SimpleNamespace(hot_token_id=torch.tensor([1, 2]))
++        batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
++        with self.assertRaisesRegex(ValueError, "stochastic sampling"):
++            worker._validate_adaptation_batch(batch)
++
++        multi_layer = object.__new__(MultiLayerEagleWorkerV2)
++        with self.assertRaisesRegex(ValueError, "single-layer"):
++            multi_layer.attach_adaptation(adapter)
++
++    def test_stochastic_non_rejection_path_fails_closed(self):
++        worker = self._outer([], torch.tensor([0], dtype=torch.int64))
++        worker._draft_worker = SimpleNamespace(hot_token_id=None)
++        batch = SimpleNamespace(
++            sampling_info=SimpleNamespace(is_all_greedy=False)
++        )
++        with self.assertRaisesRegex(ValueError, "full-vocabulary rejection"):
++            worker._validate_adaptation_batch(batch)
++
++        worker.server_args.speculative_use_rejection_sampling = True
++        worker._validate_adaptation_batch(batch)
++
++    def test_stochastic_truncated_target_distribution_fails_closed(self):
++        worker = self._outer([], torch.tensor([0], dtype=torch.int64))
++        worker._draft_worker = SimpleNamespace(hot_token_id=None)
++        worker.server_args.speculative_use_rejection_sampling = True
++        for field in (
++            "need_top_k_sampling",
++            "need_top_p_sampling",
++            "need_min_p_sampling",
++        ):
++            sampling = SimpleNamespace(
++                is_all_greedy=False,
++                need_top_k_sampling=False,
++                need_top_p_sampling=False,
++                need_min_p_sampling=False,
++            )
++            setattr(sampling, field, True)
++            with self.subTest(field=field), self.assertRaisesRegex(
++                ValueError, "full vocabulary"
++            ):
++                worker._validate_adaptation_batch(
++                    SimpleNamespace(sampling_info=sampling)
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
++
++def test_eagle_semantic_mask_censors_output_budget_and_accepted_stop():
++    mask, censored = speculative_semantic_valid_mask(
++        proposal_token_ids=torch.tensor([[10, 99, 11, 12]]),
++        base_valid_mask=torch.ones((1, 4), dtype=torch.bool),
++        correct_len=torch.tensor([3]),
++        bonus=torch.tensor([13]),
++        remaining_output_tokens=[4],
++        terminal_token_ids=[(99,)],
++        ignore_eos=[False],
++        backend="EAGLE",
++    )
++    assert mask.tolist() == [[True, True, False, False]]
++    assert censored.tolist() == [True]
++
++    budget_mask, budget_censored = speculative_semantic_valid_mask(
++        proposal_token_ids=torch.tensor([[10, 11, 12, 13]]),
++        base_valid_mask=torch.ones((1, 4), dtype=torch.bool),
++        correct_len=torch.tensor([3]),
++        bonus=torch.tensor([14]),
++        remaining_output_tokens=[2],
++        terminal_token_ids=[()],
++        ignore_eos=[False],
++        backend="EAGLE3",
++    )
++    assert budget_mask.tolist() == [[True, True, False, False]]
++    assert budget_censored.tolist() == [True]
+diff --git a/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py b/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py
+index 51e4e97..a87a72f 100644
+--- a/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py
++++ b/test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py
+@@ -194,6 +194,30 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
+             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
+         self.assertIsNone(forward_batch.seq_lens_sum)
+ 
++    def test_replay_copies_pinned_adapter_versions_to_static_buffer(self):
++        backend = _RecordingDraftBackend()
++        runner = self._build_runner(backend)
++        runner.buffers.source_adapter_version = torch.zeros(
++            CAPTURE_BS, dtype=torch.int64
++        )
++        forward_batch = self._build_forward_batch([4, 5], 9)
++        forward_batch.spec_info.source_adapter_version = torch.tensor(
++            [7, 11], dtype=torch.int64
++        )
++        seen = []
++
++        def replay_graph_stub(shape_key, replay_batch):
++            seen.append(runner.buffers.source_adapter_version.clone())
++            return None
++
++        runner._replay_graph = replay_graph_stub
++        runner.execute(forward_batch)
++
++        self.assertEqual(seen[0][:2].tolist(), [7, 11])
++        # Padded rows are neutral slot/version zero, never stale data from a
++        # previous replay.
++        self.assertEqual(seen[0][2:].tolist(), [0, 0])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/spec/test_speculative_adaptation_preflight.py b/test/registered/unit/spec/test_speculative_adaptation_preflight.py
+new file mode 100644
+index 0000000..5447e0f
+--- /dev/null
++++ b/test/registered/unit/spec/test_speculative_adaptation_preflight.py
+@@ -0,0 +1,395 @@
++"""Pre-model validation contracts for speculative tail adaptation."""
++
++import builtins
++import sys
++import unittest
++from types import ModuleType, SimpleNamespace
++from unittest.mock import Mock, patch
++
++from sglang.srt.arg_groups.speculative_hook import (
++    _preflight_dflash_adaptation_fallback,
++    _validate_speculative_adaptation_before_model_load,
++    handle_speculative_decoding,
++)
++from sglang.srt.managers.overlap_utils import decide_needs_cpu_seq_lens
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=2, suite="base-a-test-cpu")
++
++
++def _args(algorithm, **overrides):
++    values = {
++        "speculative_adaptation_config": "/tmp/adaptation.yaml",
++        "speculative_algorithm": algorithm,
++        "speculative_eagle_topk": 1,
++        "enable_multi_layer_eagle": False,
++        "speculative_use_rejection_sampling": True,
++        "speculative_accept_threshold_single": 1.0,
++        "speculative_accept_threshold_acc": 1.0,
++        "enable_dp_attention": False,
++        "speculative_draft_model_path": "draft",
++        "speculative_draft_model_revision": "main",
++        "speculative_num_draft_tokens": 16,
++        "speculative_adaptation_reserve_mb": 64,
++        "dspark_adaptation_config": None,
++        "dspark_adaptation_reserve_mb": 0,
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def _config(
++    *, pair_id, temperature=1.0, method="lc_gate", parameter_scope="tail"
++):
++    return SimpleNamespace(
++        method=method,
++        parameter_scope=parameter_scope,
++        model=SimpleNamespace(pair_id=pair_id),
++        sampling=SimpleNamespace(temperature=temperature),
++    )
++
++
++class TestSpeculativeAdaptationPreflight(CustomTestCase):
++    def _run(self, args, config, pairs):
++        root = ModuleType("lightcone_spec")
++        root.__path__ = []
++        config_package = ModuleType("lightcone_spec.config")
++        config_package.__path__ = []
++        loader = ModuleType("lightcone_spec.config.loader")
++        loader.load_adaptation_config = Mock(return_value=config)
++        schema = ModuleType("lightcone_spec.config.schema")
++        schema.MODEL_PAIRS = pairs
++        schema.CONTROLLER_METHODS = (
++            "lc_gate",
++            "lc_damp",
++            "lc_transport",
++            "round_discard",
++            "wall_damp",
++            "endpoint_gate",
++            "parameter_only",
++            "random_transport",
++        )
++        bridge_package = ModuleType("lightcone_spec.sglang_bridge")
++        bridge_package.__path__ = []
++        static_observer = ModuleType(
++            "lightcone_spec.sglang_bridge.static_observer"
++        )
++        static_observer.evidence_only_static_bypass = Mock(
++            return_value=(
++                config.method == "static",
++                "static" if config.method == "static" else None,
++            )
++        )
++        with patch.dict(
++            sys.modules,
++            {
++                "lightcone_spec": root,
++                "lightcone_spec.config": config_package,
++                "lightcone_spec.config.loader": loader,
++                "lightcone_spec.config.schema": schema,
++                "lightcone_spec.sglang_bridge": bridge_package,
++                "lightcone_spec.sglang_bridge.static_observer": static_observer,
++            },
++        ):
++            _validate_speculative_adaptation_before_model_load(args)
++
++    def _run_dflash_fallback(self, args, config, *, kernel_available):
++        root = ModuleType("lightcone_spec")
++        root.__path__ = []
++        config_package = ModuleType("lightcone_spec.config")
++        config_package.__path__ = []
++        loader = ModuleType("lightcone_spec.config.loader")
++        loader.load_adaptation_config = Mock(return_value=config)
++        dflash_utils = ModuleType("sglang.srt.speculative.dflash_utils")
++        dflash_utils.is_dflash_sampling_verify_available = Mock(
++            return_value=kernel_available
++        )
++        with patch.dict(
++            sys.modules,
++            {
++                "lightcone_spec": root,
++                "lightcone_spec.config": config_package,
++                "lightcone_spec.config.loader": loader,
++                "sglang.srt.speculative.dflash_utils": dflash_utils,
++            },
++        ):
++            result = _preflight_dflash_adaptation_fallback(args)
++        return result, dflash_utils.is_dflash_sampling_verify_available
++
++    def test_no_config_imports_no_adaptation_modules(self):
++        args = SimpleNamespace(speculative_adaptation_config=None)
++        original_import = builtins.__import__
++
++        def guarded_import(name, *import_args, **import_kwargs):
++            if name.startswith("lightcone_spec") or name.endswith("dflash_utils"):
++                raise AssertionError(f"unexpected adaptation import: {name}")
++            return original_import(name, *import_args, **import_kwargs)
++
++        with patch("builtins.__import__", side_effect=guarded_import):
++            _validate_speculative_adaptation_before_model_load(args)
++
++    def test_static_bypass_preserves_backend_gpu_only_seq_lens(self):
++        args = _args("DFLASH", enable_two_batch_overlap=False)
++        config = _config(pair_id="qwen_dflash", method="static")
++        gpu_only_backend = SimpleNamespace(needs_cpu_seq_lens=False)
++        with patch(
++            "lightcone_spec.config.loader.load_adaptation_config",
++            return_value=config,
++        ), patch(
++            "lightcone_spec.sglang_bridge.static_observer."
++            "evidence_only_static_bypass",
++            return_value=(True, "static"),
++        ):
++            self.assertFalse(decide_needs_cpu_seq_lens(args, [gpu_only_backend]))
++
++        with patch(
++            "lightcone_spec.config.loader.load_adaptation_config",
++            return_value=_config(pair_id="qwen_dflash", method="lc_gate"),
++        ), patch(
++            "lightcone_spec.sglang_bridge.static_observer."
++            "evidence_only_static_bypass",
++            return_value=(False, None),
++        ):
++            self.assertTrue(decide_needs_cpu_seq_lens(args, [gpu_only_backend]))
++
++    def test_static_config_still_binds_model_pair_and_backend(self):
++        self._run(
++            _args("DFLASH"),
++            _config(pair_id="qwen_dflash", method="static"),
++            {"qwen_dflash": {"speculative_algorithm": "DFLASH"}},
++        )
++        with self.assertRaisesRegex(ValueError, "requires DFLASH.*resolved EAGLE3"):
++            self._run(
++                _args("EAGLE3"),
++                _config(pair_id="qwen_dflash", method="static"),
++                {"qwen_dflash": {"speculative_algorithm": "DFLASH"}},
++            )
++
++    def test_pair_backend_mismatch_fails_closed(self):
++        with self.assertRaisesRegex(ValueError, "requires EAGLE3.*resolved DFLASH"):
++            self._run(
++                _args("DFLASH"),
++                _config(pair_id="qwen_eagle"),
++                {"qwen_eagle": {"speculative_algorithm": "EAGLE3"}},
++            )
++
++    def test_live_adaptation_rejects_tbo_and_pdmux_before_model_load(self):
++        pair = {"qwen_dflash": {"speculative_algorithm": "DFLASH"}}
++        config = _config(
++            pair_id="qwen_dflash", temperature=0.0, method="naive_async"
++        )
++        cases = (
++            ({"enable_two_batch_overlap": True}, "two-batch-overlap"),
++            ({"enable_pdmux": True}, "pdmux"),
++        )
++        for flags, message in cases:
++            with self.subTest(flags=flags), self.assertRaisesRegex(
++                ValueError, message
++            ):
++                self._run(_args("DFLASH", **flags), config, pair)
++
++    def test_static_bypass_keeps_native_tbo_and_pdmux_compatibility(self):
++        pair = {"qwen_dflash": {"speculative_algorithm": "DFLASH"}}
++        config = _config(
++            pair_id="qwen_dflash", temperature=0.0, method="static"
++        )
++        self._run(
++            _args(
++                "DFLASH",
++                enable_two_batch_overlap=True,
++                enable_pdmux=True,
++            ),
++            config,
++            pair,
++        )
++
++    def test_non_tail_scope_fails_before_pair_or_model_load(self):
++        for scope in ("all", "allowlist"):
++            with self.subTest(scope=scope), self.assertRaisesRegex(
++                ValueError, "currently certifies only parameter_scope=tail"
++            ):
++                self._run(
++                    _args("DFLASH"),
++                    _config(pair_id="qwen_dflash", parameter_scope=scope),
++                    {"qwen_dflash": {"speculative_algorithm": "DFLASH"}},
++                )
++
++    def test_unregistered_live_pair_is_replay_only(self):
++        with self.assertRaisesRegex(ValueError, "replay-only"):
++            self._run(
++                _args("EAGLE3"),
++                _config(pair_id="toy_pair"),
++                {},
++            )
++
++    def test_eagle_tree_multilayer_and_inexact_stochastic_fail_closed(self):
++        pair = {"qwen_eagle": {"speculative_algorithm": "EAGLE3"}}
++        config = _config(pair_id="qwen_eagle")
++        cases = (
++            (_args("EAGLE3", enable_dp_attention=True), "DP attention"),
++            (_args("EAGLE3", speculative_eagle_topk=2), "topk=1"),
++            (_args("EAGLE3", enable_multi_layer_eagle=True), "single-layer"),
++            (
++                _args("EAGLE3", speculative_use_rejection_sampling=False),
++                "requires --speculative-use-rejection-sampling",
++            ),
++        )
++        for args, message in cases:
++            with self.subTest(message=message), self.assertRaisesRegex(
++                ValueError, message
++            ):
++                self._run(args, config, pair)
++
++        self._run(
++            _args("EAGLE3", speculative_use_rejection_sampling=False),
++            _config(pair_id="qwen_eagle", temperature=0.0),
++            pair,
++        )
++
++    def test_dflash_stochastic_missing_kernel_falls_back_before_handler(self):
++        args = _args("DFLASH")
++        result, kernel_probe = self._run_dflash_fallback(
++            args,
++            _config(pair_id="qwen_dflash"),
++            kernel_available=False,
++        )
++        self.assertTrue(result)
++        kernel_probe.assert_called_once_with()
++        self.assertIsNone(args.speculative_algorithm)
++        self.assertIsNone(args.speculative_draft_model_path)
++        self.assertIsNone(args.speculative_adaptation_config)
++        self.assertEqual(args.speculative_adaptation_reserve_mb, 0)
++        self.assertEqual(
++            args.speculative_adaptation_fallback_reason,
++            "dflash_exact_stochastic_sampling_kernel_unavailable",
++        )
++
++    def test_dflash_missing_kernel_starts_target_only_service(self):
++        """The public startup hook must never construct the DFlash worker.
++
++        Clearing only the adaptation object would leave the scheduler on the
++        DFlash protocol and could turn a stochastic request into greedy draft
++        decoding.  The supported fallback is service-wide target decoding:
++        clear the speculative arguments before the algorithm handler runs.
++        """
++
++        args = _args("DFLASH")
++        args.decrypted_draft_config_file = None
++        args.trust_remote_code = False
++        args.speculative_draft_window_size = None
++        args.speculative_skip_dp_mlp_sync = False
++        args.speculative_adaptive = False
++        algo = SimpleNamespace(handle_server_args=Mock())
++
++        with patch(
++            "sglang.srt.arg_groups.overrides.run_post_process_pass"
++        ), patch(
++            "sglang.srt.arg_groups.speculative_hook."
++            "_resolve_speculative_algorithm_alias",
++            return_value="DFLASH",
++        ), patch(
++            "sglang.srt.speculative.spec_info.SpeculativeAlgorithm.from_string",
++            return_value=algo,
++        ), patch(
++            "lightcone_spec.config.loader.load_adaptation_config",
++            return_value=_config(pair_id="qwen_dflash"),
++        ), patch(
++            "sglang.srt.speculative.dflash_utils."
++            "is_dflash_sampling_verify_available",
++            return_value=False,
++        ):
++            handle_speculative_decoding(args)
++
++        algo.handle_server_args.assert_not_called()
++        self.assertIsNone(args.speculative_algorithm)
++        self.assertIsNone(args.speculative_draft_model_path)
++        self.assertIsNone(args.speculative_adaptation_config)
++        self.assertEqual(
++            args.speculative_adaptation_fallback_reason,
++            "dflash_exact_stochastic_sampling_kernel_unavailable",
++        )
++
++    def test_dflash_static_stochastic_missing_kernel_never_becomes_greedy(self):
++        args = _args("DFLASH")
++        result, kernel_probe = self._run_dflash_fallback(
++            args,
++            _config(pair_id="qwen_dflash", method="static"),
++            kernel_available=False,
++        )
++        self.assertTrue(result)
++        kernel_probe.assert_called_once_with()
++        self.assertIsNone(args.speculative_algorithm)
++        self.assertIsNone(args.speculative_adaptation_config)
++        self.assertEqual(
++            args.speculative_adaptation_fallback_reason,
++            "dflash_exact_stochastic_sampling_kernel_unavailable",
++        )
++
++    def test_dflash_static_stochastic_still_rejects_heuristic_thresholds(self):
++        args = _args("DFLASH", speculative_accept_threshold_acc=0.9)
++        with self.assertRaisesRegex(ValueError, "threshold_acc=1.0"):
++            self._run_dflash_fallback(
++                args,
++                _config(pair_id="qwen_dflash", method="static"),
++                kernel_available=True,
++            )
++        self.assertEqual(args.speculative_algorithm, "DFLASH")
++
++    def test_dflash_greedy_does_not_require_stochastic_kernel(self):
++        args = _args("DFLASH")
++        result, kernel_probe = self._run_dflash_fallback(
++            args,
++            _config(pair_id="qwen_dflash", temperature=0.0),
++            kernel_available=False,
++        )
++        self.assertFalse(result)
++        kernel_probe.assert_not_called()
++        self.assertEqual(args.speculative_algorithm, "DFLASH")
++        self.assertEqual(args.speculative_adaptation_config, "/tmp/adaptation.yaml")
++
++    def test_dflash_threshold_violation_fails_instead_of_falling_back(self):
++        args = _args("DFLASH", speculative_accept_threshold_single=0.9)
++        with self.assertRaisesRegex(ValueError, "threshold_single=1.0"):
++            self._run_dflash_fallback(
++                args,
++                _config(pair_id="qwen_dflash"),
++                kernel_available=False,
++            )
++        self.assertEqual(args.speculative_algorithm, "DFLASH")
++
++    def test_dflash_common_preflight_accepts_exact_thresholds(self):
++        pair = {"qwen_dflash": {"speculative_algorithm": "DFLASH"}}
++        args = _args("DFLASH")
++        config = _config(pair_id="qwen_dflash")
++        self._run(args, config, pair)
++
++    def test_dflash_zero_draft_window_fails_before_model_load(self):
++        pair = {"qwen_dflash": {"speculative_algorithm": "DFLASH"}}
++        with self.assertRaisesRegex(ValueError, "block_size >= 2"):
++            self._run(
++                _args("DFLASH", speculative_num_draft_tokens=1),
++                _config(pair_id="qwen_dflash", temperature=0.0),
++                pair,
++            )
++
++    def test_stochastic_preferred_truncation_fails_before_model_load(self):
++        pair = {"qwen_eagle": {"speculative_algorithm": "EAGLE3"}}
++        config = _config(pair_id="qwen_eagle")
++        for preferred in (
++            {"top_p": 0.9},
++            {"top_k": 40},
++            {"min_p": 0.05},
++        ):
++            with self.subTest(preferred=preferred), self.assertRaisesRegex(
++                ValueError, "full-vocabulary sampling profile"
++            ):
++                self._run(
++                    _args("EAGLE3", preferred_sampling_params=preferred),
++                    config,
++                    pair,
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/spec/test_tail_adaptation_manager.py b/test/registered/unit/spec/test_tail_adaptation_manager.py
+new file mode 100644
+index 0000000..5ed5bb0
+--- /dev/null
++++ b/test/registered/unit/spec/test_tail_adaptation_manager.py
+@@ -0,0 +1,1233 @@
++"""CPU math contracts for the shared DFlash/EAGLE tail manager.
++
++The runtime/model construction path is covered by integration tests.  These
++tests isolate the graph-visible tail math so all three parameter layouts and a
++chunk crossing request boundaries can be checked without loading a model.
++"""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++from sglang.srt.speculative.tail_adaptation import (
++    LightConeTailAdaptationManager,
++    tp_gradient_consensus,
++    validate_proposal_depth,
++)
++from sglang.srt.speculative.dspark_components.dspark_adaptation import (
++    DSparkAdaptationManager,
++    DSparkStaticTelemetryManager,
++    _resolve_worker_proposal_depth,
++)
++from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
++    _adaptation_prefix_lens,
++)
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++def test_tail_row_capacity_matches_request_and_resolved_graph_contract():
++    worker = SimpleNamespace(
++        server_args=SimpleNamespace(
++            max_running_requests=20,
++            cuda_graph_config=SimpleNamespace(
++                decode=SimpleNamespace(max_bs=20, bs=[1, 2, 4, 8, 20])
++            ),
++        )
++    )
++    assert LightConeTailAdaptationManager._row_capacity(worker, 4) == 20
++
++    worker.server_args.cuda_graph_config.decode.max_bs = 32
++    worker.server_args.cuda_graph_config.decode.bs = [1, 8, 32]
++    assert LightConeTailAdaptationManager._row_capacity(worker, 4) == 32
++
++
++class _DenseProjection:
++    def __init__(self, weight: torch.Tensor):
++        self.weight = weight
++
++    def project_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
++        return hidden.to(self.weight.dtype) @ self.weight.T
++
++    def project_hidden_range(
++        self, hidden: torch.Tensor, *, vocab_start: int, vocab_end: int
++    ) -> torch.Tensor:
++        weight = self.weight[vocab_start:vocab_end]
++        return hidden.to(weight.dtype) @ weight.T
++
++
++def _manager(mode: str, *, capacity: int = 4):
++    hidden_size, rank, vocab_size, depth = 5, 3, 7, 3
++    manager = object.__new__(LightConeTailAdaptationManager)
++    manager.shapes = SimpleNamespace(
++        mode=mode,
++        hidden_size=hidden_size,
++        rank=rank,
++        vocab_size=vocab_size,
++        draft_depth=depth,
++    )
++    if mode == "output_residual":
++        num_params = rank * 128
++        manager._slices = {"a_h": slice(0, num_params)}
++    elif mode == "tail_lora":
++        split = hidden_size * rank
++        num_params = 2 * split
++        manager._slices = {
++            "a_h": slice(0, split),
++            "b_h": slice(split, num_params),
++        }
++    else:
++        num_params = hidden_size * hidden_size
++        manager._slices = {"d_h": slice(0, num_params)}
++    manager._forward_dtype = torch.bfloat16
++    manager.adapter_rows = torch.zeros(
++        capacity, num_params, dtype=manager._forward_dtype
++    )
++    manager._r_h_forward = torch.randn(hidden_size, 128).to(
++        manager._forward_dtype
++    )
++    manager._basis_forward = torch.randn(vocab_size, rank).to(
++        manager._forward_dtype
++    )
++    manager._projection = _DenseProjection(
++        torch.randn(vocab_size, hidden_size).to(torch.bfloat16)
++    )
++    return manager
++
++
++def _dspark_manager(mode: str, *, capacity: int = 3):
++    """Build only the graph-visible DSpark tail math, without a model."""
++
++    hidden, markov, rank, vocab, depth = 5, 4, 3, 7, 3
++    manager = object.__new__(DSparkAdaptationManager)
++    confidence_width = (
++        128 + markov + 1 if mode == "output_residual" else hidden + markov + 1
++    )
++    manager.shapes = SimpleNamespace(
++        mode=mode,
++        hidden_size=hidden,
++        markov_dim=markov,
++        rank=rank,
++        vocab_size=vocab,
++        draft_depth=depth,
++        conf_feature_dim=confidence_width,
++    )
++    cursor = 0
++    slices = {}
++
++    def take(name, count):
++        nonlocal cursor
++        slices[name] = slice(cursor, cursor + count)
++        cursor += count
++
++    if mode == "output_residual":
++        take("a_h", rank * 128)
++        take("a_m", rank * markov)
++    elif mode == "tail_lora":
++        take("a_h", hidden * rank)
++        take("a_m", markov * rank)
++        take("b_h", rank * hidden)
++    else:
++        take("d_h", hidden * hidden)
++        take("d_m", markov * hidden)
++    take("a_c", depth * confidence_width)
++    manager._parameter_slices = slices
++    manager._forward_dtype = torch.bfloat16
++    manager._r_h_dev = torch.randn(hidden, 128).to(torch.bfloat16)
++    manager._basis_dev = torch.randn(vocab, rank).to(torch.bfloat16)
++    manager._tail_projection = _DenseProjection(
++        torch.randn(vocab, hidden).to(torch.bfloat16)
++    )
++    manager.adapter_rows = torch.randn(capacity, cursor).to(torch.bfloat16)
++    return manager
++
++
++class TestSharedTailMath(CustomTestCase):
++    def test_dflash_batch_signals_own_graph_backed_source_tensors(self):
++        from sglang.srt.speculative.dflash_info_v2 import (
++            DFlashAcceptResult,
++            DFlashProposalSignals,
++        )
++
++        batch_size, depth, hidden_size, vocab_size = 2, 3, 8, 6
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._dflash_accept = DFlashAcceptResult(
++            correct_len=torch.full((batch_size,), depth, dtype=torch.int32),
++            commit_lens=torch.full((batch_size,), depth + 1, dtype=torch.int32),
++            bonus=torch.zeros(batch_size, dtype=torch.long),
++        )
++        manager._dflash_request_semantics = lambda batch: (
++            [depth + 1] * batch_size,
++            [()] * batch_size,
++            [True] * batch_size,
++        )
++        manager._dflash_algorithmic_censored = None
++        manager.tp_size = 1
++        manager.shapes = SimpleNamespace(
++            vocab_size=vocab_size,
++            mode="tail_lora",
++        )
++        manager._disabled = set()
++        manager._capture_round = lambda rid: True
++        manager._forward_dtype = torch.float32
++        manager._r_h_dev = torch.arange(
++            hidden_size * 128, dtype=torch.float32
++        ).view(hidden_size, 128)
++        manager._round_of = {"r0": 4, "r1": 4}
++        manager._pinned_versions = {"r0": 0, "r1": 0}
++        launched = []
++        manager.runtime = SimpleNamespace(
++            wants_trace_signal=lambda rid: False,
++            launch_update_batch=lambda request_ids, signal: launched.append(
++                (request_ids, signal)
++            ),
++        )
++        manager.config = SimpleNamespace(update_stride=4)
++        manager._guard = lambda rid, fn: fn()
++
++        proposal = DFlashProposalSignals(
++            proposal_token_ids=torch.arange(batch_size * depth).view(
++                batch_size, depth
++            ),
++            tail_hidden=torch.arange(
++                batch_size * depth * hidden_size, dtype=torch.float32
++            ).view(batch_size, depth, hidden_size),
++            raw_logits=torch.arange(
++                batch_size * depth * vocab_size, dtype=torch.float32
++            ).view(batch_size, depth, vocab_size),
++            proposal_logits=(
++                torch.arange(
++                    batch_size * depth * vocab_size, dtype=torch.float32
++                ).view(batch_size, depth, vocab_size)
++                + 1000
++            ),
++            valid_mask=torch.ones(batch_size, depth, dtype=torch.bool),
++            prefix_lens_before=torch.tensor([4096, 16384]),
++            source_adapter_versions=torch.zeros(batch_size, dtype=torch.long),
++            vocab_ranges=((0, vocab_size),),
++        )
++        target_logits = (
++            torch.arange(
++                batch_size * (depth + 1) * vocab_size,
++                dtype=torch.float32,
++            ).view(batch_size * (depth + 1), vocab_size)
++            + 2000
++        )
++        expected = {
++            "hidden": proposal.tail_hidden.clone(),
++            "corrected": proposal.proposal_logits.float().clone(),
++            "target": target_logits.view(batch_size, depth + 1, vocab_size)[
++                :, :depth
++            ].clone(),
++            "u": proposal.tail_hidden.clone() @ manager._r_h_dev,
++        }
++
++        manager._launch_dflash_signals(
++            SimpleNamespace(
++                reqs=[SimpleNamespace(rid="r0"), SimpleNamespace(rid="r1")],
++                sampling_info=SimpleNamespace(is_all_greedy=True),
++            ),
++            target_logits,
++            proposal,
++        )
++        self.assertEqual(len(launched), 1)
++        request_ids, signal = launched[0]
++        self.assertEqual(request_ids, ("r0", "r1"))
++
++        # A following graph replay writes every source buffer in-place.  The
++        # single batched side-stream candidate must still see round one.
++        proposal.tail_hidden.fill_(-1)
++        proposal.raw_logits.fill_(-2)
++        proposal.proposal_logits.fill_(-3)
++        proposal.valid_mask.zero_()
++        target_logits.fill_(-4)
++        self.assertEqual(signal.source_rounds, (4, 4))
++        self.assertEqual(signal.source_versions, (0, 0))
++        torch.testing.assert_close(signal.tail_hidden, expected["hidden"])
++        torch.testing.assert_close(signal.u, expected["u"])
++        torch.testing.assert_close(signal.proposal_logits, expected["corrected"])
++        torch.testing.assert_close(signal.target_logits, expected["target"])
++        self.assertTrue(bool(signal.valid_mask.all()))
++
++    def test_tail_diagnostics_exposes_memory_ledger(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager.algorithm = "DFLASH"
++        manager.config = SimpleNamespace(
++            method="tts",
++            weight_update_mode="lora",
++            parameter_scope="tail",
++        )
++        manager.shapes = SimpleNamespace(mode="tail_lora")
++        manager.parameter_layout_sha256 = "layout"
++        manager._disabled = set()
++        manager._fallback_counts = {}
++        manager._telemetry_lanes = None
++        categories = {"active_staging": 1024, "runtime_headroom": 8192}
++        headroom = {
++            "reserved_total": 8192,
++            "transient_peak": 6144,
++            "supervision_fanout_within_transient": 2048,
++        }
++        manager.memory_ledger = SimpleNamespace(
++            fixed_bytes=4096,
++            transient_bytes=6144,
++            reserve_bytes=8192,
++            reserve_mb=1,
++            num_slots=4,
++            num_params=2048,
++            adapter_row_capacity=8,
++            category_bytes=lambda: categories,
++            headroom_breakdown=lambda: headroom,
++        )
++        manager.runtime = SimpleNamespace(
++            telemetry=SimpleNamespace(
++                flush=lambda: True,
++                health=lambda: {"error_count": 0, "last_error": None},
++            ),
++            requests={},
++            max_allocator_growth_bytes=512,
++        )
++
++        diagnostics = manager.diagnostics()
++
++        self.assertEqual(
++            diagnostics["memory"],
++            {
++                "fixed_bytes": 4096,
++                "transient_bytes": 6144,
++                "reserve_bytes": 8192,
++                "reserve_mb": 1,
++                "num_slots": 4,
++                "num_params": 2048,
++                "adapter_row_capacity": 8,
++                "allocator_growth_bytes": 512,
++                "categories": categories,
++                "headroom_breakdown": headroom,
++            },
++        )
++        self.assertEqual(diagnostics["memory_reserve_mb"], 1)
++
++    def test_tail_stage_timing_uses_preallocated_lane_events(self):
++        class Event:
++            def __init__(self):
++                self.records = []
++
++            def record(self, stream):
++                self.records.append(stream)
++
++        events = {name: Event() for name in ("draft_start", "draft_end")}
++        pool = SimpleNamespace(
++            acquire=lambda: 3,
++            event=lambda lane, name: events[name],
++        )
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager.device = "cuda:0"
++        manager._batch_cpu_timing = {}
++        manager._batch_timing = {}
++        manager._telemetry_lanes = pool
++        manager._batch_telemetry_lane = None
++        with patch.object(
++            torch.cuda,
++            "Event",
++            side_effect=AssertionError("hot path allocated a CUDA event"),
++        ), patch.object(torch.cuda, "current_stream", return_value="stream"):
++            manager.record_stage("draft_start")
++            manager.record_stage("draft_end")
++
++        self.assertEqual(manager._batch_telemetry_lane, 3)
++        self.assertIs(manager._batch_timing["draft_start"], events["draft_start"])
++        self.assertEqual(events["draft_start"].records, ["stream"])
++        self.assertEqual(events["draft_end"].records, ["stream"])
++
++    def test_dflash_signal_prep_timing_uses_current_batch_lane(self):
++        class Event:
++            def __init__(self):
++                self.records = []
++
++            def record(self, stream):
++                self.records.append(stream)
++
++        events = {
++            name: Event() for name in ("signal_prep_start", "signal_prep_end")
++        }
++        pool = SimpleNamespace(event=lambda lane, name: events[name])
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager.device = "cuda:0"
++        manager._batch_telemetry_lane = 7
++        manager._telemetry_lanes = pool
++        manager._batch_timing = {}
++        launched = []
++        manager._launch_dflash_signals = (
++            lambda batch, target, proposal: launched.append(
++                (batch, target, proposal)
++            )
++        )
++
++        with patch.object(
++            torch.cuda,
++            "Event",
++            side_effect=AssertionError("hot path allocated a CUDA event"),
++        ), patch.object(torch.cuda, "current_stream", return_value="main"):
++            manager.maybe_launch_updates("batch", "target", "proposal")
++
++        self.assertEqual(launched, [("batch", "target", "proposal")])
++        self.assertEqual(events["signal_prep_start"].records, ["main"])
++        self.assertEqual(events["signal_prep_end"].records, ["main"])
++        self.assertIs(
++            manager._batch_timing["signal_prep_start"],
++            events["signal_prep_start"],
++        )
++
++    def test_tail_lane_releases_after_last_round_reference(self):
++        deferred = []
++        released = []
++        pool = SimpleNamespace(release=lambda lane: released.append(lane))
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._telemetry_lanes = pool
++        manager.runtime = SimpleNamespace(
++            telemetry=SimpleNamespace(
++                defer=lambda callback, event: deferred.append((callback, event))
++            )
++        )
++        ready = object()
++        lease = {
++            "lane": 5,
++            "ready": ready,
++            "remaining": 2,
++            "release_queued": False,
++        }
++        first = {"telemetry_lane_lease": lease}
++        second = {"telemetry_lane_lease": lease}
++
++        manager._complete_round_telemetry_lane(first)
++        self.assertEqual(deferred, [])
++        manager._complete_round_telemetry_lane(second)
++        self.assertEqual(len(deferred), 1)
++        self.assertIs(deferred[0][1], ready)
++        deferred[0][0]()
++        self.assertEqual(released, [5])
++        manager._complete_round_telemetry_lane(second)
++        self.assertEqual(released, [5])
++
++    def test_dspark_static_prefix_falls_back_to_device_tensor(self):
++        device_lens = torch.tensor([4096, 8192])
++        self.assertIs(
++            _adaptation_prefix_lens(
++                SimpleNamespace(seq_lens_cpu=None, seq_lens=device_lens)
++            ),
++            device_lens,
++        )
++        host_lens = torch.tensor([1, 2])
++        self.assertIs(
++            _adaptation_prefix_lens(
++                SimpleNamespace(seq_lens_cpu=host_lens, seq_lens=device_lens)
++            ),
++            host_lens,
++        )
++
++    def test_dspark_static_is_allocation_free_protocol_delegate(self):
++        calls = []
++
++        class Observer:
++            telemetry = object()
++
++            def begin_round(self, **kwargs):
++                calls.append(("begin", kwargs))
++
++            def set_draft_tokens(self, value):
++                calls.append(("draft_tokens", value))
++
++            def record_stage(self, value):
++                calls.append(("stage", value))
++
++            def after_accept(self, **kwargs):
++                calls.append(("accept", kwargs))
++
++            def commit_round(self, **kwargs):
++                calls.append(("commit", kwargs))
++
++            def finish_request(self, rid):
++                calls.append(("finish", rid))
++
++            def diagnostics(self):
++                return {"telemetry_flushed": True}
++
++            def close(self):
++                calls.append(("close",))
++
++        observer = Observer()
++        worker = SimpleNamespace(
++            device="cuda:0",
++            gamma=7,
++            server_args=SimpleNamespace(),
++        )
++        config = SimpleNamespace(
++            method="static",
++            trace=SimpleNamespace(trace_capture_max_bytes=0),
++            runtime=SimpleNamespace(speculative_num_draft_tokens=7),
++        )
++        with patch(
++            "lightcone_spec.sglang_bridge.static_observer."
++            "build_static_speculative_observer",
++            return_value=observer,
++        ):
++            manager = DSparkStaticTelemetryManager(
++                config=config,
++                worker=worker,
++                bypass_reason="static",
++            )
++
++        batch = SimpleNamespace(
++            reqs=[
++                SimpleNamespace(
++                    rid="r0",
++                    sampling_params=SimpleNamespace(sampling_seed=0, top_k=1),
++                )
++            ]
++        )
++        device_prefix = torch.tensor([4096])
++        proposal = SimpleNamespace(
++            draft_block=SimpleNamespace(draft_tokens=torch.zeros(1, 7))
++        )
++        accept = SimpleNamespace(commit_lens=torch.tensor([4], dtype=torch.int32))
++        with patch.object(
++            torch,
++            "empty",
++            side_effect=AssertionError("wrapper allocated in round hot path"),
++        ):
++            manager.before_draft(batch, device_prefix)
++            manager.after_proposal(batch, proposal)
++            manager.after_verify(batch, None, None)
++            manager.after_accept(batch, accept, verify_lens=torch.tensor([8]))
++            manager.after_commit(batch, torch.tensor([4100]))
++            manager.poll_updates(batch)
++
++        self.assertIs(calls[0][1]["prefix_lens"], device_prefix)
++        self.assertEqual(calls[1], ("draft_tokens", 7))
++        self.assertIn(("stage", "draft_end"), calls)
++        self.assertIn(("stage", "verify_end"), calls)
++        self.assertTrue(manager.diagnostics()["candidate_generation_bypassed"])
++
++    def test_dspark_static_delegate_rejects_ordinary_l1(self):
++        worker = SimpleNamespace(device="cuda:0", server_args=SimpleNamespace())
++        config = SimpleNamespace(method="lc_gate")
++        with patch(
++            "lightcone_spec.sglang_bridge.static_observer."
++            "evidence_only_static_bypass",
++            return_value=(False, None),
++        ), self.assertRaisesRegex(ValueError, "globally constant-discard"):
++            DSparkStaticTelemetryManager(config=config, worker=worker)
++
++    def test_tp_gradient_consensus_averages_fp32_without_host_flags(self):
++        calls = []
++
++        def all_reduce(value):
++            calls.append(value.detach().clone())
++            return value * 2
++
++        with patch(
++            "sglang.srt.distributed.communication_op."
++            "tensor_model_parallel_all_reduce",
++            side_effect=all_reduce,
++        ):
++            grad, ok = tp_gradient_consensus(
++                torch.tensor([2.0, -3.0], dtype=torch.float16),
++                torch.tensor(True),
++                tp_size=2,
++            )
++
++        self.assertEqual(grad.dtype, torch.float32)
++        torch.testing.assert_close(grad, torch.tensor([2.0, -3.0]))
++        self.assertTrue(bool(ok))
++        self.assertEqual([value.numel() for value in calls], [1, 2, 2])
++
++    def test_tp_gradient_consensus_discards_when_any_rank_is_nonfinite(self):
++        call_index = 0
++
++        def all_reduce(value):
++            nonlocal call_index
++            call_index += 1
++            if call_index == 1:
++                return torch.ones_like(value)  # only one of two ranks is finite
++            return value * 2
++
++        with patch(
++            "sglang.srt.distributed.communication_op."
++            "tensor_model_parallel_all_reduce",
++            side_effect=all_reduce,
++        ):
++            grad, ok = tp_gradient_consensus(
++                torch.tensor([2.0, -3.0]),
++                torch.tensor(True),
++                tp_size=2,
++            )
++
++        torch.testing.assert_close(grad, torch.zeros(2))
++        self.assertFalse(bool(ok))
++
++    def test_backend_draft_depth_matches_native_proposal_width(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager.algorithm = "DFLASH"
++        self.assertEqual(
++            manager._resolve_draft_depth(SimpleNamespace(block_size=16)),
++            15,
++        )
++        with self.assertRaisesRegex(ValueError, "block_size >= 2"):
++            manager._resolve_draft_depth(SimpleNamespace(block_size=1))
++
++        for algorithm in ("EAGLE", "EAGLE3"):
++            with self.subTest(algorithm=algorithm):
++                manager.algorithm = algorithm
++                self.assertEqual(
++                    manager._resolve_draft_depth(
++                        SimpleNamespace(
++                            speculative_num_steps=7,
++                            speculative_num_draft_tokens=8,
++                        )
++                    ),
++                    8,
++                )
++
++    def test_worker_depth_is_validated_against_pre_kv_layout(self):
++        self.assertEqual(
++            validate_proposal_depth(
++                actual=15,
++                declared=15,
++                expected=15,
++                algorithm="DFLASH",
++                pair_id="qwen3_4b_dflash16",
++            ),
++            15,
++        )
++        with self.assertRaisesRegex(ValueError, "proposal depth mismatch"):
++            validate_proposal_depth(
++                actual=16,
++                declared=15,
++                expected=15,
++                algorithm="DFLASH",
++                pair_id="qwen3_4b_dflash16",
++            )
++        with self.assertRaisesRegex(ValueError, "proposal depth mismatch"):
++            validate_proposal_depth(
++                actual=14,
++                declared=15,
++                expected=15,
++                algorithm="DFLASH",
++                pair_id="qwen3_4b_dflash16",
++            )
++
++    def test_dspark_worker_depth_prefers_native_gamma(self):
++        self.assertEqual(
++            _resolve_worker_proposal_depth(
++                SimpleNamespace(gamma=5, verify_num_draft_tokens=99)
++            ),
++            5,
++        )
++        self.assertEqual(
++            _resolve_worker_proposal_depth(
++                SimpleNamespace(verify_num_draft_tokens=8)
++            ),
++            7,
++        )
++        with self.assertRaisesRegex(ValueError, "positive proposal depth"):
++            _resolve_worker_proposal_depth(SimpleNamespace())
++
++    def _reference(self, manager, hidden, *, row_start, depth, start, end):
++        outputs = []
++        for token_index, token_hidden in enumerate(hidden):
++            request_index = (row_start + token_index) // depth
++            row = manager.adapter_rows[request_index : request_index + 1]
++            token_hidden = token_hidden.view(1, -1)
++            if manager.shapes.mode == "output_residual":
++                outputs.append(
++                    manager._output_residual(
++                        token_hidden,
++                        row,
++                        manager._basis_forward[start:end],
++                    )
++                )
++            else:
++                delta_hidden = manager._delta_hidden(token_hidden, row)
++                outputs.append(
++                    manager._projection.project_hidden_range(
++                        delta_hidden,
++                        vocab_start=start,
++                        vocab_end=end,
++                    )
++                )
++        return torch.cat(outputs, dim=0)
++
++    def test_all_layouts_match_tokenwise_reference_across_request_boundaries(self):
++        torch.manual_seed(7)
++        hidden = torch.randn(8, 5)
++        for mode in ("output_residual", "tail_lora", "full_rank_tail"):
++            with self.subTest(mode=mode):
++                manager = _manager(mode)
++                manager.adapter_rows.normal_(mean=0.0, std=0.05)
++                before_ptr = manager.adapter_rows.data_ptr()
++                actual = manager._dflash_delta_logits(
++                    hidden,
++                    row_start=2,
++                    rows_per_request=3,
++                    vocab_start=1,
++                    vocab_end=6,
++                )
++                expected = self._reference(
++                    manager,
++                    hidden,
++                    row_start=2,
++                    depth=3,
++                    start=1,
++                    end=6,
++                )
++                torch.testing.assert_close(actual, expected)
++                self.assertEqual(manager.adapter_rows.data_ptr(), before_ptr)
++
++    def test_zero_initialization_is_identity_in_every_layout(self):
++        hidden = torch.randn(5, 5)
++        raw = torch.randn(5, 4)
++        for mode in ("output_residual", "tail_lora", "full_rank_tail"):
++            with self.subTest(mode=mode):
++                manager = _manager(mode, capacity=2)
++                raw_before = raw.clone()
++                corrected = manager.correct_draft_logits(
++                    hidden_states=hidden,
++                    raw_logits=raw,
++                    row_start=0,
++                    rows_per_request=3,
++                    vocab_start=1,
++                    vocab_end=5,
++                    graph_capture=False,
++                )
++                torch.testing.assert_close(corrected, raw)
++                torch.testing.assert_close(raw, raw_before)
++
++    def test_model_dtype_rows_preserve_native_head_add_rounding(self):
++        hidden = torch.randn(5, 5).to(torch.bfloat16)
++        raw = torch.randn(5, 4).to(torch.bfloat16)
++        for mode in ("output_residual", "tail_lora", "full_rank_tail"):
++            with self.subTest(mode=mode):
++                manager = _manager(mode, capacity=2)
++                self.assertEqual(manager.adapter_rows.dtype, torch.bfloat16)
++                manager.adapter_rows.normal_(mean=0.0, std=0.05)
++                delta = manager._dflash_delta_logits(
++                    hidden,
++                    row_start=0,
++                    rows_per_request=3,
++                    vocab_start=1,
++                    vocab_end=5,
++                )
++                corrected = manager.correct_draft_logits(
++                    hidden_states=hidden,
++                    raw_logits=raw,
++                    row_start=0,
++                    rows_per_request=3,
++                    vocab_start=1,
++                    vocab_end=5,
++                    graph_capture=False,
++                )
++                self.assertEqual(corrected.dtype, raw.dtype)
++                torch.testing.assert_close(corrected, raw + delta.to(raw.dtype))
++
++    def test_dspark_folded_and_eager_helpers_share_native_dtype_math(self):
++        """All DSpark graph/eager call sites consume these same primitives."""
++
++        torch.manual_seed(19)
++        hidden = torch.randn(2, 3, 5)
++        markov = torch.randn(2, 3, 4)
++        for mode in ("output_residual", "tail_lora", "full_rank_tail"):
++            with self.subTest(mode=mode):
++                manager = _dspark_manager(mode)
++                rows = manager.adapter_rows[:2]
++                if mode == "output_residual":
++                    projected, hidden_delta = manager._output_residual_hidden(
++                        rows, hidden
++                    )
++                    a_h = rows[:, manager._parameter_slices["a_h"]].view(
++                        2, 3, 128
++                    )
++                    expected_projected = (
++                        hidden.to(torch.bfloat16) @ manager._r_h_dev
++                    )
++                    expected_hidden = torch.matmul(
++                        torch.bmm(expected_projected, a_h.transpose(1, 2)),
++                        manager._basis_dev.T,
++                    )
++                    torch.testing.assert_close(
++                        projected, expected_projected, rtol=0, atol=0
++                    )
++                    torch.testing.assert_close(
++                        hidden_delta, expected_hidden, rtol=0, atol=0
++                    )
++
++                    markov_projected, markov_delta = (
++                        manager._output_residual_markov(rows, markov[:, 0])
++                    )
++                    a_m = rows[:, manager._parameter_slices["a_m"]].view(
++                        2, 3, 4
++                    )
++                    expected_markov = markov[:, 0].to(torch.bfloat16)
++                    expected_markov_delta = torch.matmul(
++                        torch.bmm(
++                            expected_markov.unsqueeze(1),
++                            a_m.transpose(1, 2),
++                        ).squeeze(1),
++                        manager._basis_dev.T,
++                    )
++                    torch.testing.assert_close(
++                        markov_projected, expected_markov, rtol=0, atol=0
++                    )
++                    torch.testing.assert_close(
++                        markov_delta, expected_markov_delta, rtol=0, atol=0
++                    )
++                elif mode == "tail_lora":
++                    a_h = rows[:, manager._parameter_slices["a_h"]].view(
++                        2, 5, 3
++                    )
++                    a_m = rows[:, manager._parameter_slices["a_m"]].view(
++                        2, 4, 3
++                    )
++                    b_h = rows[:, manager._parameter_slices["b_h"]].view(
++                        2, 3, 5
++                    )
++                    expected_hidden = torch.bmm(
++                        torch.bmm(hidden.to(torch.bfloat16), a_h), b_h
++                    )
++                    expected_markov_delta = torch.bmm(
++                        torch.bmm(markov.to(torch.bfloat16), a_m), b_h
++                    )
++                    torch.testing.assert_close(
++                        manager._tail_delta_hidden(rows, hidden=hidden),
++                        expected_hidden,
++                        rtol=0,
++                        atol=0,
++                    )
++                    torch.testing.assert_close(
++                        manager._tail_delta_hidden(rows, markov=markov),
++                        expected_markov_delta,
++                        rtol=0,
++                        atol=0,
++                    )
++                else:
++                    d_h = rows[:, manager._parameter_slices["d_h"]].view(
++                        2, 5, 5
++                    )
++                    d_m = rows[:, manager._parameter_slices["d_m"]].view(
++                        2, 4, 5
++                    )
++                    torch.testing.assert_close(
++                        manager._tail_delta_hidden(rows, hidden=hidden),
++                        torch.bmm(hidden.to(torch.bfloat16), d_h),
++                        rtol=0,
++                        atol=0,
++                    )
++                    torch.testing.assert_close(
++                        manager._tail_delta_hidden(rows, markov=markov),
++                        torch.bmm(markov.to(torch.bfloat16), d_m),
++                        rtol=0,
++                        atol=0,
++                    )
++
++                confidence = manager._confidence_features(hidden, markov)
++                if mode == "output_residual":
++                    expected_hidden_features = (
++                        hidden.to(torch.bfloat16) @ manager._r_h_dev
++                    )
++                    native_markov = markov.to(torch.bfloat16)
++                    expected_markov_features = native_markov * torch.rsqrt(
++                        native_markov.pow(2).mean(dim=-1, keepdim=True) + 1e-6
++                    )
++                else:
++                    expected_hidden_features = hidden.to(torch.bfloat16)
++                    expected_markov_features = markov.to(torch.bfloat16)
++                expected_confidence = torch.cat(
++                    [
++                        expected_hidden_features,
++                        expected_markov_features,
++                        torch.ones(2, 3, 1, dtype=torch.bfloat16),
++                    ],
++                    dim=-1,
++                )
++                torch.testing.assert_close(
++                    confidence, expected_confidence, rtol=0, atol=0
++                )
++
++    def test_empty_and_out_of_capacity_chunks_fail_predictably(self):
++        manager = _manager("full_rank_tail", capacity=2)
++        empty = manager._dflash_delta_logits(
++            torch.empty(0, 5),
++            row_start=0,
++            rows_per_request=3,
++            vocab_start=2,
++            vocab_end=5,
++        )
++        self.assertEqual(tuple(empty.shape), (0, 3))
++        with self.assertRaisesRegex(RuntimeError, "row buffer"):
++            manager._dflash_delta_logits(
++                torch.randn(4, 5),
++                row_start=5,
++                rows_per_request=3,
++                vocab_start=0,
++                vocab_end=7,
++            )
++
++    def test_backend_specific_verify_protocols_share_one_dispatcher(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        calls = []
++        manager.algorithm = "DFLASH"
++        manager._after_dflash_verify = lambda *args: calls.append(("dflash", args))
++        manager.after_verify("batch", "logits", "hidden")
++
++        manager.algorithm = "EAGLE3"
++        manager._after_eagle_verify = lambda **kwargs: calls.append(
++            ("eagle", kwargs)
++        )
++        manager.after_verify(
++            batch="batch",
++            batch_result="result",
++            source_adapter_version="versions",
++        )
++        self.assertEqual(calls[0][0], "dflash")
++        self.assertEqual(calls[1][0], "eagle")
++
++    def _prefix_manager(self, *, ready):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._disabled = set()
++        manager._pending_round_commits = {}
++        manager._round_of = {"r0": 4}
++        manager.shapes = SimpleNamespace(draft_depth=3)
++        manager.config = SimpleNamespace(
++            runtime=SimpleNamespace(concurrency=1)
++        )
++        manager._H = SimpleNamespace(
++            RoundCommitted=lambda **kwargs: SimpleNamespace(**kwargs),
++            UpdatePollPoint=lambda **kwargs: SimpleNamespace(**kwargs),
++            rng_substream_identity=lambda **kwargs: (
++                f"{'greedy' if kwargs['is_greedy'] else 'sample'}:"
++                f"{kwargs['sampling_seed']}:{kwargs['round_id']}:"
++                f"{kwargs['prefix_len']}"
++            ),
++        )
++        ctx = SimpleNamespace(
++            prefix_len=512,
++            request_epoch=7,
++            slot_index=0,
++        )
++        rounds = []
++        polls = []
++
++        def on_round_committed(event):
++            rounds.append(event)
++            ctx.prefix_len = event.prefix_len_after
++
++        def on_update_poll(event):
++            polls.append((event.round_id, ctx.prefix_len - 512))
++
++        manager.runtime = SimpleNamespace(
++            requests={"r0": ctx},
++            bank=SimpleNamespace(
++                slots=[SimpleNamespace(active_version=2)]
++            ),
++            on_round_committed=on_round_committed,
++            on_update_poll=on_update_poll,
++        )
++        manager._guard = lambda _rid, fn: fn()
++
++        class Event:
++            def __init__(self, value):
++                self.value = value
++
++            def query(self):
++                return self.value
++
++            def synchronize(self):
++                raise AssertionError("prefix boundary must never synchronize")
++
++        event = Event(ready)
++        manager._pending_round_commits["r0"] = [
++            {
++                "round_id": 3,
++                "version": 2,
++                "request_index": 0,
++                "new_seq_lens_cpu": torch.tensor([8192]),
++                "commit_lens_cpu": torch.tensor([4]),
++                "ready": event,
++                "timing": {"telemetry_ready": event},
++                "draft_cpu_us": 2.0,
++                "verify_cpu_us": 3.0,
++                "verify_len": 4,
++                "batch_size": 1,
++                "round_wall_us": 5.0,
++            }
++        ]
++        return manager, event, rounds, polls
++
++    def test_eagle_prefix_race_skips_poll_until_exact_copy_is_ready(self):
++        manager, event, rounds, polls = self._prefix_manager(ready=False)
++        batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
++
++        self.assertFalse(manager._finalize_pending_rounds("r0"))
++        manager._poll_ready(batch, skip_rids=frozenset({"r0"}))
++        self.assertEqual(rounds, [])
++        self.assertEqual(polls, [])
++
++        event.value = True
++        self.assertTrue(manager._finalize_pending_rounds("r0"))
++        manager._poll_ready(batch)
++        self.assertEqual(rounds[0].prefix_len_after, 8192)
++        self.assertEqual(rounds[0].rng_substream_id, "greedy:None:3:512")
++        self.assertTrue(rounds[0].prefix_feature_exact)
++        # ArrivalContext is built after the exact prefix transition, so the
++        # controller sees 8192 - 512 rather than a stale/telemetry-only value.
++        self.assertEqual(polls, [(4, 7680)])
++
++    def test_dflash_host_prefix_override_precedes_poll_without_cuda_wait(self):
++        manager, _event, rounds, polls = self._prefix_manager(ready=False)
++        batch = SimpleNamespace(reqs=[SimpleNamespace(rid="r0")])
++
++        self.assertTrue(
++            manager._finalize_pending_rounds(
++                "r0", prefix_override=516
++            )
++        )
++        manager._poll_ready(batch)
++        self.assertEqual(rounds[0].prefix_len_after, 516)
++        self.assertTrue(rounds[0].prefix_feature_exact)
++        self.assertEqual(polls, [(4, 4)])
++        # The host prefix delta is already exact at this boundary, so
++        # acceptance/count evidence must not be published as a false zero
++        # while the redundant pinned CUDA scalar is still in flight.
++        self.assertEqual(rounds[0].committed_per_verify, 4)
++        self.assertEqual(rounds[0].accepted_drafts, 3)
++        self.assertIn("telemetry_ready", rounds[0].cuda_timing_ref)
++
++    def test_finish_request_drains_all_final_rounds_before_freeing_runtime(self):
++        manager, _event, rounds, _polls = self._prefix_manager(ready=False)
++
++        class FinishEvent:
++            def __init__(self):
++                self.ready = False
++                self.syncs = 0
++
++            def query(self):
++                return self.ready
++
++            def synchronize(self):
++                self.syncs += 1
++                self.ready = True
++
++        first = FinishEvent()
++        second = FinishEvent()
++        manager._pending_round_commits["r0"] = [
++            {
++                "round_id": 3,
++                "version": 2,
++                "request_index": 0,
++                "new_seq_lens_cpu": torch.tensor([516]),
++                "commit_lens_cpu": torch.tensor([4]),
++                "ready": first,
++                "timing": {"telemetry_ready": first},
++                "draft_cpu_us": 2.0,
++                "verify_cpu_us": 3.0,
++                "verify_len": 4,
++                "batch_size": 1,
++                "round_wall_us": 5.0,
++            },
++            {
++                "round_id": 4,
++                "version": 2,
++                "request_index": 0,
++                "new_seq_lens_cpu": torch.tensor([518]),
++                "commit_lens_cpu": torch.tensor([2]),
++                "ready": second,
++                "timing": {"telemetry_ready": second},
++                "draft_cpu_us": 2.0,
++                "verify_cpu_us": 3.0,
++                "verify_len": 4,
++                "batch_size": 1,
++                "round_wall_us": 5.0,
++            },
++        ]
++        ctx = manager.runtime.requests["r0"]
++        ctx.stream_id = None
++        ctx.tenant_id_hash = "tenant"
++        manager.config.lifecycle = "request"
++        manager._H.RequestLifecycle = lambda **kwargs: SimpleNamespace(**kwargs)
++        lifecycle = []
++
++        def on_lifecycle(event):
++            self.assertEqual([round_.round_id for round_ in rounds], [3, 4])
++            lifecycle.append(event.event)
++
++        manager.runtime.on_request_lifecycle = on_lifecycle
++        manager._round_t0 = {"r0": 1.0}
++        manager._pinned_versions = {"r0": 2}
++        manager._prefix_blocked_rounds = set()
++        manager._eagle_capture = {}
++        manager._capture_decisions = {}
++        manager._adapter_signature = object()
++        manager._disabled = set()
++
++        manager.finish_request(rid="r0", natural_stop=True)
++
++        self.assertEqual([first.syncs, second.syncs], [1, 1])
++        self.assertEqual([round_.prefix_len_after for round_ in rounds], [516, 518])
++        self.assertEqual(lifecycle, ["end"])
++        self.assertNotIn("r0", manager._pending_round_commits)
++        self.assertNotIn("r0", manager._round_of)
++
++    def test_eagle_rebinds_rows_after_batch_reorder(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._ExactnessViolation = RuntimeError
++        manager._disabled = set()
++        manager._adapter_signature = ((0, 7), (1, 11))
++        manager._pinned_versions = {"r0": 7, "r1": 11}
++        manager._batch = None
++        manager.adapter_rows = torch.zeros(2, 2)
++        manager._row_slot_indices = torch.zeros(2, dtype=torch.int64)
++        manager._row_slot_indices_cpu = torch.zeros(2, dtype=torch.int64)
++        manager._row_enabled = torch.ones(2)
++        manager._row_enabled_cpu = torch.ones(2)
++        manager.runtime = SimpleNamespace(
++            requests={
++                "r0": SimpleNamespace(slot_index=0, prefix_len=0),
++                "r1": SimpleNamespace(slot_index=1, prefix_len=0),
++            },
++            bank=SimpleNamespace(
++                active=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
++                slots=[
++                    SimpleNamespace(active_version=7, active_has_effect=True),
++                    SimpleNamespace(active_version=11, active_has_effect=True),
++                ],
++            ),
++        )
++        manager._disable = lambda *args, **kwargs: self.fail(
++            f"unexpected disable: {args}"
++        )
++        batch = SimpleNamespace(
++            reqs=[
++                SimpleNamespace(rid="r1", origin_input_ids=[1, 2, 3]),
++                SimpleNamespace(rid="r0", origin_input_ids=[1, 2]),
++            ]
++        )
++
++        manager.assert_pinned(
++            batch=batch,
++            # The device tensor is graph evidence, not row ownership.  Even a
++            # corrupted canary must not trigger an uncatchable device assert or
++            # redirect one request to another request's parameters.
++            source_adapter_version=torch.tensor([999, 998], dtype=torch.int64),
++        )
++
++        torch.testing.assert_close(
++            manager.adapter_rows,
++            torch.tensor([[3.0, 4.0], [1.0, 2.0]]),
++        )
++        self.assertIs(manager._batch, batch)
++
++    def test_eagle_host_pin_mismatch_disables_before_row_rebind(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._ExactnessViolation = RuntimeError
++        manager._disabled = set()
++        manager._adapter_signature = None
++        manager._pinned_versions = {"r0": 7}
++        manager._batch = None
++        manager.adapter_rows = torch.ones(1, 2)
++        manager._row_slot_indices = torch.zeros(1, dtype=torch.int64)
++        manager._row_slot_indices_cpu = torch.zeros(1, dtype=torch.int64)
++        manager._row_enabled = torch.ones(1)
++        manager._row_enabled_cpu = torch.ones(1)
++        manager.runtime = SimpleNamespace(
++            requests={"r0": SimpleNamespace(slot_index=0, prefix_len=0)},
++            bank=SimpleNamespace(
++                active=torch.tensor([[3.0, 4.0]]),
++                slots=[
++                    SimpleNamespace(
++                        active_version=8,
++                        active_has_effect=True,
++                    )
++                ],
++            ),
++        )
++        disabled = []
++
++        def disable(rid, reason, exc):
++            disabled.append((rid, reason, str(exc)))
++            manager._disabled.add(rid)
++
++        manager._disable = disable
++        batch = SimpleNamespace(
++            reqs=[SimpleNamespace(rid="r0", origin_input_ids=[1, 2])]
++        )
++
++        manager.assert_pinned(
++            batch=batch,
++            source_adapter_version=torch.tensor([7], dtype=torch.int64),
++        )
++
++        self.assertEqual(disabled[0][:2], ("r0", "exactness"))
++        self.assertIn("changed after proposal pin", disabled[0][2])
++        torch.testing.assert_close(manager.adapter_rows, torch.zeros(1, 2))
++
++    def test_tp_trace_capture_decision_is_broadcast_once_per_round(self):
++        manager = object.__new__(LightConeTailAdaptationManager)
++        manager._round_of = {"r0": 3}
++        manager._capture_decisions = {}
++        manager.tp_rank = 1
++        manager.tp_size = 2
++        manager.config = SimpleNamespace(
++            update_stride=4,
++            trace=SimpleNamespace(trace_capture_max_bytes=1024),
++        )
++        manager.runtime = SimpleNamespace(
++            wants_trace_signal=lambda rid: self.fail(
++                "non-writer TP rank must not own replay quota"
++            )
++        )
++        group = SimpleNamespace()
++        calls = []
++
++        def broadcast(value, src):
++            calls.append((value, src))
++            return True
++
++        group.broadcast_object = broadcast
++        with patch("sglang.srt.distributed.get_tp_group", return_value=group):
++            self.assertTrue(manager._capture_round("r0"))
++            self.assertTrue(manager._capture_round("r0"))
++        self.assertEqual(calls, [(None, 0)])
++
++    def test_dspark_tp_trace_capture_decision_is_broadcast_once_per_round(self):
++        manager = object.__new__(DSparkAdaptationManager)
++        manager._round_of = {"r0": 3}
++        manager._capture_decisions = {}
++        manager.tp_rank = 1
++        manager.tp_size = 2
++        manager.config = SimpleNamespace(
++            trace=SimpleNamespace(trace_capture_max_bytes=1024),
++        )
++        manager.runtime = SimpleNamespace(
++            wants_trace_signal=lambda rid: self.fail(
++                "non-writer TP rank must not own replay quota"
++            )
++        )
++        group = SimpleNamespace()
++        calls = []
++
++        def broadcast(value, src):
++            calls.append((value, src))
++            return True
++
++        group.broadcast_object = broadcast
++        with patch("sglang.srt.distributed.get_tp_group", return_value=group):
++            self.assertTrue(manager._capture_trace_round("r0"))
++            self.assertTrue(manager._capture_trace_round("r0"))
++        self.assertEqual(calls, [(None, 0)])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+

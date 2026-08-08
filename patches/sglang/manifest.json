@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://github.com/sgl-project/sglang.git",
+    "commit": "3312645a307453893a00778592f105581e3d1c3d"
+  },
+  "expected_tree": "9e32eb1872a963cb3981710079101fe1f4f8fe0a",
+  "patches": [
+    {
+      "file": "0001-feat-spec-add-fail-closed-adaptation-configuration.patch",
+      "sha256": "c9fcb6289bdcbd64460b935532b80beb4d394d2279191ff3515a08a774b08cf5",
+      "scope": "configuration, preflight, shared proposal semantics",
+      "files": ["python/sglang/srt/arg_groups/speculative_hook.py", "python/sglang/srt/server_args.py", "python/sglang/srt/speculative/spec_utils.py"]
+    },
+    {
+      "file": "0002-feat-spec-add-versioned-tail-adaptation-runtime.patch",
+      "sha256": "23cec1994038b5a93e0f18de4fde141a196658c5549504c6fecbcdab198f6562",
+      "scope": "tail adaptation runtime",
+      "files": ["python/sglang/srt/speculative/tail_adaptation.py"]
+    },
+    {
+      "file": "0003-feat-dspark-integrate-tail-adaptation-signals.patch",
+      "sha256": "7eeb15ddaa7f5d768b2f27676adb311f69fee5a63ae6f64e45546e900e116b57",
+      "scope": "DSpark integration",
+      "files": ["python/sglang/srt/speculative/dspark_components/dspark_adaptation.py", "python/sglang/srt/speculative/dspark_components/dspark_draft.py", "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py"]
+    },
+    {
+      "file": "0004-feat-dflash-integrate-cache-safe-tail-updates.patch",
+      "sha256": "12bcbe3bea7ed004637c7c72eb7ede20be8af648e96e3724389554faa289e2d7",
+      "scope": "DFlash integration",
+      "files": ["python/sglang/srt/speculative/dflash_info_v2.py", "python/sglang/srt/speculative/dflash_utils.py", "python/sglang/srt/speculative/dflash_worker_v2.py"]
+    },
+    {
+      "file": "0005-feat-eagle-add-version-safe-proposal-adaptation.patch",
+      "sha256": "1b7cc1175db5b50ac34cc56c49cd23a96cfec6479efdf452b5cd47da15d594c0",
+      "scope": "EAGLE and EAGLE3 integration",
+      "files": ["python/sglang/srt/managers/overlap_utils.py", "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py", "python/sglang/srt/speculative/eagle_info.py", "python/sglang/srt/speculative/eagle_worker_common.py", "python/sglang/srt/speculative/eagle_worker_v2.py", "python/sglang/srt/speculative/multi_layer_eagle_worker_v2.py"]
+    },
+    {
+      "file": "0006-feat-runtime-harden-memory-lifecycle-and-telemetry.patch",
+      "sha256": "431ee67e8e1d939c85e3fe2d4f35ec3a8b1fc53c939d1761dede3e0a1f885faa",
+      "scope": "memory, lifecycle, telemetry, and load",
+      "files": ["python/sglang/srt/entrypoints/engine.py", "python/sglang/srt/managers/scheduler.py", "python/sglang/srt/managers/scheduler_components/batch_result_processor.py", "python/sglang/srt/managers/scheduler_components/metrics_reporter.py", "python/sglang/srt/managers/tokenizer_manager.py", "python/sglang/srt/managers/tp_worker.py", "python/sglang/srt/mem_cache/kv_cache_configurator.py", "python/sglang/srt/model_executor/model_runner_components/kv_pool_runtime.py", "python/sglang/srt/observability/cpu_monitor.py", "python/sglang/srt/observability/metrics_collector.py", "python/sglang/srt/utils/common.py", "python/sglang/srt/utils/watchdog.py"]
+    },
+    {
+      "file": "0007-test-spec-cover-adaptation-protocols-and-disabled-pa.patch",
+      "sha256": "8aa75ab9198b23d012afacb7a45b649feda4870fa9503d609d86ee9e5ce1789e",
+      "scope": "unit and protocol tests",
+      "files": ["test/registered/unit/entrypoints/test_server_info.py", "test/registered/unit/managers/test_batch_result_processor_spec_grammar.py", "test/registered/unit/observability/test_metrics_lifecycle.py", "test/registered/unit/spec/test_dflash_tail_adaptation.py", "test/registered/unit/spec/test_eagle_adaptation_protocol.py", "test/registered/unit/spec/test_eagle_draft_cuda_graph_runner.py", "test/registered/unit/spec/test_speculative_adaptation_preflight.py", "test/registered/unit/spec/test_tail_adaptation_manager.py"]
+    }
+  ]
+}
