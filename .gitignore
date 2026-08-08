@@ -25,12 +25,12 @@ lightcone-spec/
 tmp/
 
 # Models, datasets, telemetry, profiles, and experiment outputs
-artifacts/
-models/
-model-cache/
-datasets/
-traces/
-profiles/
+/artifacts/
+/models/
+/model-cache/
+/datasets/
+/traces/
+/profiles/
 *.parquet
 *.safetensors
 *.pt
@@ -38,7 +38,7 @@ profiles/
 *.ckpt
 selection_summary.json
 selected_optimizer_config.json
-baselines/
+/baselines/
 
 # Local credentials and provider state
 .env
