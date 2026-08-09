@@ -13,8 +13,7 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         return None
     if config.method.startswith("onlinespec_"):
         raise ValueError(
-            "OnlineSpec is an isolated external baseline, not an SGLang "
-            "adaptation mode"
+            "OnlineSpec is an isolated external baseline, not an SGLang adaptation mode"
         )
     adaptation = config.adaptation
     if adaptation is None:
@@ -22,6 +21,7 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
     return {
         "schema_version": 2,
         "method": config.method,
+        "algorithm": config.model.algorithm,
         "weight_update_mode": adaptation.weight_update_mode,
         "parameter_scope": adaptation.parameter_scope,
         "kv_history_policy": adaptation.kv_history_policy,
@@ -36,9 +36,7 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         "loss_position_decay": adaptation.loss_position_decay,
         "target_revision": config.model.target_revision,
         "drafter_revision": config.model.drafter_revision,
-        "sampling_profile_sha256": (
-            config.runtime.sampling_profile_sha256
-        ),
+        "sampling_profile_sha256": (config.runtime.sampling_profile_sha256),
         "telemetry_detail": config.runtime.telemetry_detail,
     }
 
@@ -48,7 +46,5 @@ def sglang_adaptation_sha256(config: RunConfig) -> str | None:
     payload = sglang_adaptation_payload(config)
     if payload is None:
         return None
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode()
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()

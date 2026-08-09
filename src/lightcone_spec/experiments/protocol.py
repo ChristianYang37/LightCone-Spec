@@ -34,31 +34,46 @@ class TuningCandidate:
     rank: int | None
     stride: int
     grad_clip: float = 1.0
+    beta1: float = 0.9
+    beta2: float = 0.999
+    momentum: float | None = None
+    muon_ns_steps: int | None = None
+    muon_auxiliary_learning_rate: float | None = None
+    muon_auxiliary_weight_decay: float | None = None
 
     @property
     def candidate_id(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
 
 def tuning_candidates() -> tuple[TuningCandidate, ...]:
     candidates: list[TuningCandidate] = []
     for stride in (1, 5, 10, 20, 40, 80):
-        for optimizer, weight_decay in (
-            ("adam", 0.0),
-            ("adamw", 0.0),
-            ("adamw", 0.01),
+        for optimizer, weight_decay, momentum in (
+            ("adam", 0.0, None),
+            ("adamw", 0.0, None),
+            ("adamw", 0.01, None),
+            ("sgdm", 0.0, 0.9),
+            ("nag", 0.0, 0.9),
+            ("lion", 0.01, None),
+            ("muon", 0.01, 0.95),
         ):
+            beta2 = 0.99 if optimizer == "lion" else 0.999
+            lora_learning_rates = {
+                "sgdm": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
+                "nag": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
+                "lion": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
+                "muon": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
+            }.get(optimizer, (1e-5, 3e-5, 1e-4, 3e-4, 1e-3))
+            full_learning_rates = {
+                "sgdm": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
+                "nag": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
+                "lion": (1e-8, 3e-8, 1e-7, 3e-7, 1e-6),
+                "muon": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
+            }.get(optimizer, (1e-7, 3e-7, 1e-6, 3e-6, 1e-5))
             for rank in (4, 8, 16, 32):
-                for learning_rate in (
-                    1e-5,
-                    3e-5,
-                    1e-4,
-                    3e-4,
-                    1e-3,
-                ):
+                for learning_rate in lora_learning_rates:
                     candidates.append(
                         TuningCandidate(
                             "lora",
@@ -68,15 +83,18 @@ def tuning_candidates() -> tuple[TuningCandidate, ...]:
                             weight_decay,
                             rank,
                             stride,
+                            beta2=beta2,
+                            momentum=momentum,
+                            muon_ns_steps=(5 if optimizer == "muon" else None),
+                            muon_auxiliary_learning_rate=(
+                                1e-5 if optimizer == "muon" else None
+                            ),
+                            muon_auxiliary_weight_decay=(
+                                0.01 if optimizer == "muon" else None
+                            ),
                         )
                     )
-            for learning_rate in (
-                1e-7,
-                3e-7,
-                1e-6,
-                3e-6,
-                1e-5,
-            ):
+            for learning_rate in full_learning_rates:
                 candidates.append(
                     TuningCandidate(
                         "full",
@@ -86,6 +104,15 @@ def tuning_candidates() -> tuple[TuningCandidate, ...]:
                         weight_decay,
                         None,
                         stride,
+                        beta2=beta2,
+                        momentum=momentum,
+                        muon_ns_steps=(5 if optimizer == "muon" else None),
+                        muon_auxiliary_learning_rate=(
+                            1e-5 if optimizer == "muon" else None
+                        ),
+                        muon_auxiliary_weight_decay=(
+                            0.01 if optimizer == "muon" else None
+                        ),
                     )
                 )
     identities = [candidate.candidate_id for candidate in candidates]
@@ -109,9 +136,7 @@ def successive_halving(
     if any(not math.isfinite(float(scores[key])) for key in candidate_ids):
         raise ValueError("candidate scores must be finite")
     keep = max(1, int(len(candidate_ids) * keep_fraction))
-    return tuple(
-        sorted(candidate_ids, key=lambda key: (-scores[key], key))[:keep]
-    )
+    return tuple(sorted(candidate_ids, key=lambda key: (-scores[key], key))[:keep])
 
 
 @dataclass(frozen=True)
@@ -221,6 +246,12 @@ def _candidate_fields(candidate: TuningCandidate) -> dict[str, object]:
         "rank": candidate.rank,
         "stride": candidate.stride,
         "grad_clip": candidate.grad_clip,
+        "beta1": candidate.beta1,
+        "beta2": candidate.beta2,
+        "momentum": candidate.momentum,
+        "muon_ns_steps": candidate.muon_ns_steps,
+        "muon_auxiliary_learning_rate": (candidate.muon_auxiliary_learning_rate),
+        "muon_auxiliary_weight_decay": (candidate.muon_auxiliary_weight_decay),
     }
 
 
@@ -234,6 +265,16 @@ def _adaptation_fields(adaptation: object) -> dict[str, object]:
         "rank": adaptation.rank,
         "stride": adaptation.stride,
         "grad_clip": adaptation.optimizer.grad_clip,
+        "beta1": adaptation.optimizer.beta1,
+        "beta2": adaptation.optimizer.beta2,
+        "momentum": adaptation.optimizer.momentum,
+        "muon_ns_steps": adaptation.optimizer.muon_ns_steps,
+        "muon_auxiliary_learning_rate": (
+            adaptation.optimizer.muon_auxiliary_learning_rate
+        ),
+        "muon_auxiliary_weight_decay": (
+            adaptation.optimizer.muon_auxiliary_weight_decay
+        ),
     }
 
 

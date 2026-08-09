@@ -102,9 +102,7 @@ def _region(
 ) -> tuple[int, int, float, list[float]] | None:
     if start < 0 or end <= start:
         raise ValueError("token region must be a non-empty half-open interval")
-    at_risk = tuple(
-        result for result in results if result.completion_tokens > start
-    )
+    at_risk = tuple(result for result in results if result.completion_tokens > start)
     if not at_risk:
         return None
     output_tokens = 0
@@ -152,8 +150,7 @@ def _prompt_budgets(
         for sample, count in zip(samples, counts, strict=True)
     }
     if any(
-        generation < minimum_generation_tokens
-        for _, generation in budgets.values()
+        generation < minimum_generation_tokens for _, generation in budgets.values()
     ):
         raise RuntimeError(
             "controlled prompts leave insufficient context-safe generation budget"
@@ -194,10 +191,7 @@ def _adaptation_fields(
     if (
         expected_adaptation_sha256 is None
         or len(expected_adaptation_sha256) != 64
-        or any(
-            char not in "0123456789abcdef"
-            for char in expected_adaptation_sha256
-        )
+        or any(char not in "0123456789abcdef" for char in expected_adaptation_sha256)
     ):
         raise RuntimeError("adapted run lacks an expected config identity")
     diagnostics = snapshot.adaptation
@@ -252,9 +246,7 @@ def _adaptation_fields(
     if len(layout) != 64 or any(char not in "0123456789abcdef" for char in layout):
         raise RuntimeError("adaptation parameter layout identity is invalid")
     cohort = str(diagnostics["cohort_sha256"])
-    if len(cohort) != 64 or any(
-        char not in "0123456789abcdef" for char in cohort
-    ):
+    if len(cohort) != 64 or any(char not in "0123456789abcdef" for char in cohort):
         raise RuntimeError("adaptation cohort identity is invalid")
     ledger = diagnostics["memory_ledger"]
     ledger_keys = {
@@ -263,6 +255,7 @@ def _adaptation_fields(
         "gradient_bytes",
         "first_moment_bytes",
         "second_moment_bytes",
+        "optimizer_metadata_bytes",
         "staging_bytes",
         "training_activation_bytes",
         "kv_gather_scratch_bytes",
@@ -273,9 +266,13 @@ def _adaptation_fields(
         "optimizer_bytes",
         "peak_bytes",
     }
-    if not isinstance(ledger, dict) or set(ledger) != ledger_keys or any(
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in ledger.values()
+    if (
+        not isinstance(ledger, dict)
+        or set(ledger) != ledger_keys
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in ledger.values()
+        )
     ):
         raise RuntimeError("adaptation memory ledger is incomplete")
     if (
@@ -291,6 +288,7 @@ def _adaptation_fields(
             "master_fp32_bytes",
             "first_moment_bytes",
             "second_moment_bytes",
+            "optimizer_metadata_bytes",
             "staging_bytes",
             "graph_buffer_bytes",
             "telemetry_bytes",
@@ -311,6 +309,7 @@ def _adaptation_fields(
             "master_fp32_bytes",
             "first_moment_bytes",
             "second_moment_bytes",
+            "optimizer_metadata_bytes",
         )
     )
     if (
@@ -325,14 +324,9 @@ def _adaptation_fields(
             ledger, sort_keys=True, separators=(",", ":")
         ),
         "trainable_parameters": int(diagnostics["trainable_parameters"]),
-        **{
-            f"{lane}_cuda_ms": float(timings[lane])
-            for lane in _TIMING_LANES
-        },
+        **{f"{lane}_cuda_ms": float(timings[lane]) for lane in _TIMING_LANES},
         "exposed_update_ms": float(diagnostics["exposed_update_ms"]),
-        "main_side_overlap_ratio": float(
-            diagnostics["main_side_overlap_ratio"]
-        ),
+        "main_side_overlap_ratio": float(diagnostics["main_side_overlap_ratio"]),
         **{field: int(counters[field]) for field in _SAFETY_COUNTERS},
         **{field: int(counters[field]) for field in _UPDATE_COUNTERS},
     }
@@ -421,9 +415,7 @@ def _performance_record(
             target_calls / output_tokens if run_scope_metrics else None
         ),
         batch_fill=snapshot.batch_fill if run_scope_metrics else None,
-        queue_occupancy=(
-            snapshot.queue_occupancy if run_scope_metrics else None
-        ),
+        queue_occupancy=(snapshot.queue_occupancy if run_scope_metrics else None),
         gpu_busy=None,
         sm_utilization=None,
         dram_utilization=None,
@@ -539,9 +531,7 @@ def _round_records(
             raise RuntimeError("Static cannot contain round adaptation evidence")
         return ()
     inputs = {result.request_id: result.input_tokens for result in results}
-    completions = {
-        result.request_id: result.completion_tokens for result in results
-    }
+    completions = {result.request_id: result.completion_tokens for result in results}
     if len(inputs) != len(results):
         raise RuntimeError("request identities are not unique within a run")
     histories: dict[str, list[dict[str, int]]] = {
@@ -573,7 +563,9 @@ def _round_records(
         if round_index < 1 or source_version < 0 or round_index in seen_rounds:
             raise RuntimeError("round trace identity is invalid or duplicated")
         seen_rounds.add(round_index)
-        columns = tuple(trace[name] for name in required - {"round_index", "source_version"})
+        columns = tuple(
+            trace[name] for name in required - {"round_index", "source_version"}
+        )
         if any(not isinstance(column, list) for column in columns):
             raise RuntimeError("round trace columns must be arrays")
         request_ids = trace["request_ids"]
@@ -622,10 +614,7 @@ def _round_records(
             or accepted < 0
             or accepted > verified
             or committed < 0
-            or (
-                committed != accepted + 1
-                and not (committed == 0 and accepted == 0)
-            )
+            or (committed != accepted + 1 and not (committed == 0 and accepted == 0))
         ):
             raise RuntimeError("round speculative counts are inconsistent")
         generated_before = prefix - inputs[request_id]
@@ -718,9 +707,7 @@ def _warmup(
             sampling_profile=sampling_profile,
         ),
         concurrency=concurrency,
-        adaptation_group_id=(
-            None if method == "static" else adaptation_group_id
-        ),
+        adaptation_group_id=(None if method == "static" else adaptation_group_id),
     )
 
 
@@ -786,9 +773,7 @@ def measure_controlled_slice(
                 sampling_profile=sampling_profile,
             ),
             concurrency=concurrency,
-            adaptation_group_id=(
-                None if method == "static" else adaptation_group_id
-            ),
+            adaptation_group_id=(None if method == "static" else adaptation_group_id),
         )
         if any(
             result.input_tokens != expected_input_tokens
@@ -976,9 +961,7 @@ def run_confirmation_slice(
         )
         if completed is not None:
             run_rows = pq.read_table(completed["run"]).to_pylist()
-            performance_rows = pq.read_table(
-                completed["performance"]
-            ).to_pylist()
+            performance_rows = pq.read_table(completed["performance"]).to_pylist()
             expected = {
                 "manifest_sha256": manifest_sha256,
                 "config_sha256": config_sha256,
@@ -986,8 +969,7 @@ def run_confirmation_slice(
                 "repetition_block": block,
             }
             if len(run_rows) != 1 or any(
-                run_rows[0].get(key) != value
-                for key, value in expected.items()
+                run_rows[0].get(key) != value for key, value in expected.items()
             ):
                 raise RuntimeError(f"completed run identity mismatch for {run_id}")
             if any(
@@ -1013,9 +995,7 @@ def run_confirmation_slice(
                 sampling_profile=sampling_profile,
             ),
             concurrency=concurrency,
-            adaptation_group_id=(
-                None if method == "static" else adaptation_group_id
-            ),
+            adaptation_group_id=(None if method == "static" else adaptation_group_id),
         )
         completed_ns = time.time_ns()
         if any(
@@ -1217,9 +1197,7 @@ def run_natural_replication_slice(
         completed = load_completed_evidence(output_root, run_id=run_id, rank=0)
         if completed is not None:
             run_rows = pq.read_table(completed["run"]).to_pylist()
-            performance_rows = pq.read_table(
-                completed["performance"]
-            ).to_pylist()
+            performance_rows = pq.read_table(completed["performance"]).to_pylist()
             expected = {
                 "manifest_sha256": manifest_sha256,
                 "config_sha256": config_sha256,
@@ -1256,9 +1234,7 @@ def run_natural_replication_slice(
                 sampling_profile=sampling_profile,
             ),
             concurrency=concurrency,
-            adaptation_group_id=(
-                None if method == "static" else adaptation_group_id
-            ),
+            adaptation_group_id=(None if method == "static" else adaptation_group_id),
         )
         completed_ns = time.time_ns()
         if any(

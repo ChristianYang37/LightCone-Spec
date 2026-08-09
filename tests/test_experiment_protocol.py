@@ -105,10 +105,22 @@ def test_speed_manifest_is_immutable_and_hash_bound(tmp_path) -> None:
 
 def test_tuning_grid_is_complete_and_unique() -> None:
     candidates = tuning_candidates()
-    assert len(candidates) == 450
-    assert len({candidate.candidate_id for candidate in candidates}) == 450
+    assert len(candidates) == 1050
+    assert len({candidate.candidate_id for candidate in candidates}) == 1050
+    assert {candidate.optimizer for candidate in candidates} == {
+        "adam",
+        "adamw",
+        "sgdm",
+        "nag",
+        "muon",
+        "lion",
+    }
     assert {candidate.stride for candidate in candidates} == {1, 5, 10, 20, 40, 80}
-    assert {candidate.rank for candidate in candidates if candidate.weight_update_mode == "lora"} == {
+    assert {
+        candidate.rank
+        for candidate in candidates
+        if candidate.weight_update_mode == "lora"
+    } == {
         4,
         8,
         16,
@@ -118,6 +130,16 @@ def test_tuning_grid_is_complete_and_unique() -> None:
         candidate.rank is None
         for candidate in candidates
         if candidate.weight_update_mode == "full"
+    )
+    assert all(
+        candidate.momentum is not None
+        for candidate in candidates
+        if candidate.optimizer in {"sgdm", "nag", "muon"}
+    )
+    assert all(
+        candidate.muon_ns_steps is not None
+        for candidate in candidates
+        if candidate.optimizer == "muon"
     )
     assert [tuning_stage(index) for index in range(4)] == [
         (2, 4096),
@@ -204,9 +226,7 @@ def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
     manifest_path = tmp_path / "manifest.json"
     manifest.write(manifest_path)
     candidate = tuning_candidates()[0]
-    expected_window = sample_set_sha256(
-        LongContinuationAdapter().window("tune")[:4]
-    )
+    expected_window = sample_set_sha256(LongContinuationAdapter().window("tune")[:4])
     paths = []
     for method, candidate_id, goodput in (
         ("static", None, 100.0),
@@ -273,20 +293,48 @@ def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
 def measurements(first: str, second: str) -> list[CandidateMeasurement]:
     return [
         CandidateMeasurement(
-            first, "tts", "tune", 1.04, 100, 5.0, 1.0,
-            updates_launched=1, updates_published=1,
+            first,
+            "tts",
+            "tune",
+            1.04,
+            100,
+            5.0,
+            1.0,
+            updates_launched=1,
+            updates_published=1,
         ),
         CandidateMeasurement(
-            first, "naive_async", "tune", 1.03, 100, 5.0, 1.0,
-            updates_launched=1, updates_published=1,
+            first,
+            "naive_async",
+            "tune",
+            1.03,
+            100,
+            5.0,
+            1.0,
+            updates_launched=1,
+            updates_published=1,
         ),
         CandidateMeasurement(
-            second, "tts", "tune", 1.06, 200, 7.0, 2.0,
-            updates_launched=1, updates_published=1,
+            second,
+            "tts",
+            "tune",
+            1.06,
+            200,
+            7.0,
+            2.0,
+            updates_launched=1,
+            updates_published=1,
         ),
         CandidateMeasurement(
-            second, "naive_async", "tune", 1.01, 200, 7.0, 2.0,
-            updates_launched=1, updates_published=1,
+            second,
+            "naive_async",
+            "tune",
+            1.01,
+            200,
+            7.0,
+            2.0,
+            updates_launched=1,
+            updates_published=1,
         ),
     ]
 
@@ -669,17 +717,14 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     assert len({launch.base_url for launch in launches}) == 1
     assert all(launch.exclusive_device for launch in launches)
     assert all(
-        "--speculative-adaptation-config" in launch.argv
-        for launch in launches[1:]
+        "--speculative-adaptation-config" in launch.argv for launch in launches[1:]
     )
     assert all("--disable-cuda-graph" not in launch.argv for launch in launches)
     assert all(
-        "--speculative-use-rejection-sampling" in launch.argv
-        for launch in launches
+        "--speculative-use-rejection-sampling" in launch.argv for launch in launches
     )
     assert all(
-        "--speculative-speed-study-metrics" in launch.argv
-        for launch in launches
+        "--speculative-speed-study-metrics" in launch.argv for launch in launches
     )
     assert all(
         "lightcone_spec.sglang_bridge.launch" in launch.argv

@@ -45,9 +45,7 @@ class RuntimeChoice:
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
 
@@ -154,7 +152,13 @@ def _render_choice_plan(
             name=selected.optimizer,
             learning_rate=selected.learning_rate,
             weight_decay=selected.weight_decay,
+            beta1=selected.beta1,
+            beta2=selected.beta2,
             grad_clip=selected.grad_clip,
+            momentum=selected.momentum,
+            muon_ns_steps=selected.muon_ns_steps,
+            muon_auxiliary_learning_rate=(selected.muon_auxiliary_learning_rate),
+            muon_auxiliary_weight_decay=(selected.muon_auxiliary_weight_decay),
         )
         adaptation = AdaptationConfig(
             weight_update_mode=selected.weight_update_mode,

@@ -72,8 +72,9 @@ def test_streaming_itl_uses_chunk_arrival_semantics() -> None:
         "text": "prompt",
         "sampling_params": {"max_new_tokens": 4},
     }
-    with patch("urllib.request.urlopen", return_value=response), patch(
-        "time.perf_counter", side_effect=[0.0, 0.1, 0.3, 0.31]
+    with (
+        patch("urllib.request.urlopen", return_value=response),
+        patch("time.perf_counter", side_effect=[0.0, 0.1, 0.3, 0.31]),
     ):
         result = SGLangHTTPClient("http://server").stream_generate(payload)
     assert result.input_tokens == 7
@@ -88,8 +89,9 @@ def test_stream_arrivals_share_one_process_monotonic_clock() -> None:
     response = StreamingResponse(
         [stream_line(2), stream_line(4, finish=True), b"data: [DONE]\n"]
     )
-    with patch("urllib.request.urlopen", return_value=response), patch(
-        "time.perf_counter", side_effect=[10.0, 10.1, 10.3, 10.31]
+    with (
+        patch("urllib.request.urlopen", return_value=response),
+        patch("time.perf_counter", side_effect=[10.0, 10.1, 10.3, 10.31]),
     ):
         result = SGLangHTTPClient("http://server").stream_generate(
             {"rid": "r0", "text": "x", "sampling_params": {}}
@@ -104,9 +106,11 @@ def test_streaming_rejects_missing_prompt_count() -> None:
     response = StreamingResponse(
         [f"data: {json.dumps(value)}\n".encode(), b"data: [DONE]\n"]
     )
-    with patch("urllib.request.urlopen", return_value=response), patch(
-        "time.perf_counter", side_effect=[0.0, 0.1, 0.2]
-    ), pytest.raises(RuntimeError, match="prompt token"):
+    with (
+        patch("urllib.request.urlopen", return_value=response),
+        patch("time.perf_counter", side_effect=[0.0, 0.1, 0.2]),
+        pytest.raises(RuntimeError, match="prompt token"),
+    ):
         SGLangHTTPClient("http://server").stream_generate(
             {"rid": "r0", "text": "x", "sampling_params": {}}
         )
@@ -134,9 +138,10 @@ def test_prompt_budget_uses_total_prompt_plus_generation_limit() -> None:
         type("Sample", (), {"sample_id": "a", "prompt": "a"})(),
         type("Sample", (), {"sample_id": "b", "prompt": "b"})(),
     )
-    assert _prompt_budgets(
-        Tokenizer(), samples, safe_context_limit=40960
-    ) == {"a": (100, 40860), "b": (200, 40760)}
+    assert _prompt_budgets(Tokenizer(), samples, safe_context_limit=40960) == {
+        "a": (100, 40860),
+        "b": (200, 40760),
+    }
 
 
 def snapshot_payload(*, adapted: bool = False, target_calls: int = 4) -> dict:
@@ -182,6 +187,7 @@ def adaptation_payload(*, target_calls: int = 4) -> dict:
             "gradient_bytes": 20,
             "first_moment_bytes": 20,
             "second_moment_bytes": 20,
+            "optimizer_metadata_bytes": 0,
             "staging_bytes": 10,
             "training_activation_bytes": 20,
             "kv_gather_scratch_bytes": 10,
@@ -236,9 +242,7 @@ def adaptation_payload(*, target_calls: int = 4) -> dict:
                 "committed_tokens": [4],
             }
         ],
-        "kv_segments": {
-            "r0": [{"start": 0, "end": 11, "source_version": 0}]
-        },
+        "kv_segments": {"r0": [{"start": 0, "end": 11, "source_version": 0}]},
     }
 
 
@@ -341,12 +345,8 @@ def test_confirmation_slice_order_is_manifest_seeded() -> None:
 
 
 def test_region_goodput_excludes_ttft_and_tracks_at_risk_requests() -> None:
-    first = replace(
-        result("a", 4), token_arrival_ms=(100.0, 110.0, 120.0, 130.0)
-    )
-    second = replace(
-        result("b", 2), token_arrival_ms=(200.0, 210.0)
-    )
+    first = replace(result("a", 4), token_arrival_ms=(100.0, 110.0, 120.0, 130.0))
+    second = replace(result("b", 2), token_arrival_ms=(200.0, 210.0))
     measured = _region((first, second), start=0, end=4)
     assert measured is not None
     at_risk, output_tokens, elapsed_s, intervals = measured
@@ -388,9 +388,7 @@ def test_adaptation_evidence_never_uses_missing_defaults() -> None:
     diagnostics["future_field"] = "ignored"
     del diagnostics["kv_segments"]
     with pytest.raises(RuntimeError, match="incomplete"):
-        _adaptation_fields(
-            "tts", ServerSnapshot.parse(malformed_root), "c" * 64
-        )
+        _adaptation_fields("tts", ServerSnapshot.parse(malformed_root), "c" * 64)
 
 
 def test_update_trace_required_fields_cannot_be_hidden_by_extras() -> None:
@@ -542,9 +540,7 @@ def test_completion_receipt_rejects_tampering_and_ignores_partial_attempt(
     )
     retry.write(request_record("partial"))
     retry.write(performance_record("partial"))
-    assert load_completed_evidence(
-        tmp_path, run_id="partial", rank=0
-    ) is None
+    assert load_completed_evidence(tmp_path, run_id="partial", rank=0) is None
     retry.close()
     assert load_completed_evidence(tmp_path, run_id="partial", rank=0) is not None
 
@@ -577,9 +573,7 @@ def test_evidence_writer_rejects_cross_run_and_incomplete_adaptation(
     with pytest.raises(ValueError, match="another run"):
         writer.write(request_record("other"))
 
-    adapted = EvidenceWriter(
-        tmp_path, run_id="adapted", rank=0, process_id=11
-    )
+    adapted = EvidenceWriter(tmp_path, run_id="adapted", rank=0, process_id=11)
     adapted.write(
         RunRecord(
             "adapted",

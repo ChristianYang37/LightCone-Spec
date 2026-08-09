@@ -77,6 +77,7 @@ def test_formal_adaptation_payload_is_schema_v2(method: str) -> None:
     assert payload is not None
     assert payload["schema_version"] == 2
     assert payload["method"] == method
+    assert payload["algorithm"] == "DFLASH"
     assert payload["kv_history_policy"] == "frozen"
     assert len(sglang_adaptation_sha256(config) or "") == 64
 
@@ -91,7 +92,9 @@ def test_formal_adaptation_payload_is_schema_v2(method: str) -> None:
         (("runtime", "sampling_profile_sha256"), "A" * 64),
     ],
 )
-def test_legacy_or_unlocked_identity_fails(path: tuple[str, ...], value: object) -> None:
+def test_legacy_or_unlocked_identity_fails(
+    path: tuple[str, ...], value: object
+) -> None:
     config = config_value()
     target = config
     for key in path[:-1]:
@@ -114,7 +117,9 @@ def test_legacy_or_unlocked_identity_fails(path: tuple[str, ...], value: object)
         ("full", "drafter", 8, False),
     ],
 )
-def test_update_mode_contract(mode: str, scope: str, rank: int | None, valid: bool) -> None:
+def test_update_mode_contract(
+    mode: str, scope: str, rank: int | None, valid: bool
+) -> None:
     value = config_value()
     value["adaptation"].update(
         weight_update_mode=mode, parameter_scope=scope, rank=rank
@@ -129,8 +134,7 @@ def test_update_mode_contract(mode: str, scope: str, rank: int | None, valid: bo
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("algorithm", "EAGLE3", "certified only for DFlash"),
-        ("tensor_parallel_size", 2, "requires TP=1"),
+        ("tensor_parallel_size", 2, "requires TP=DP=1"),
         ("speculative_num_draft_tokens", 8, r"draft_depth \+ 1"),
         ("canvas_tokens", 8, "canvas width"),
     ],
@@ -147,6 +151,91 @@ def test_uncertified_runtime_fails_closed(
         config["runtime"][field] = value
     with pytest.raises(ValidationError, match=message):
         RunConfig.model_validate(config)
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
+@pytest.mark.parametrize("method", ["tts", "naive_async"])
+def test_tail_adaptation_is_available_on_linear_backends(
+    algorithm: str, method: str
+) -> None:
+    value = config_value(method)
+    value["model"]["algorithm"] = algorithm
+    value["adaptation"].update(
+        weight_update_mode="residual",
+        parameter_scope="tail",
+        rank=8,
+    )
+    if algorithm in {"EAGLE", "EAGLE3"}:
+        value["runtime"]["speculative_eagle_topk"] = 1
+    config = RunConfig.model_validate(value)
+    payload = sglang_adaptation_payload(config)
+    assert payload is not None
+    assert payload["algorithm"] == algorithm
+    assert payload["method"] == method
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
+def test_static_is_native_on_every_compatibility_backend(algorithm: str) -> None:
+    value = config_value("static")
+    value["model"]["algorithm"] = algorithm
+    if algorithm in {"EAGLE", "EAGLE3"}:
+        value["runtime"]["speculative_eagle_topk"] = 1
+    config = RunConfig.model_validate(value)
+    assert sglang_adaptation_payload(config) is None
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
+def test_cross_backend_drafter_scope_fails_closed(algorithm: str) -> None:
+    value = config_value()
+    value["model"]["algorithm"] = algorithm
+    if algorithm in {"EAGLE", "EAGLE3"}:
+        value["runtime"]["speculative_eagle_topk"] = 1
+    with pytest.raises(ValidationError, match="parameter_scope=tail"):
+        RunConfig.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    ("name", "updates"),
+    [
+        ("sgdm", {"momentum": 0.9, "weight_decay": 0.01}),
+        ("nag", {"momentum": 0.9, "weight_decay": 0.01}),
+        ("lion", {"beta2": 0.99, "weight_decay": 0.01}),
+        (
+            "muon",
+            {
+                "momentum": 0.95,
+                "muon_ns_steps": 5,
+                "muon_auxiliary_learning_rate": 1e-5,
+                "muon_auxiliary_weight_decay": 0.01,
+                "weight_decay": 0.01,
+            },
+        ),
+    ],
+)
+def test_formal_methods_accept_extended_optimizers(
+    name: str, updates: dict[str, object]
+) -> None:
+    value = config_value()
+    value["adaptation"]["optimizer"].update(
+        name=name,
+        learning_rate=1e-4,
+        **updates,
+    )
+    RunConfig.model_validate(value)
+
+
+def test_optimizer_specific_fields_fail_closed() -> None:
+    value = config_value()
+    value["adaptation"]["optimizer"]["momentum"] = 0.9
+    with pytest.raises(ValidationError, match="not a parameter"):
+        RunConfig.model_validate(value)
+
+    value = config_value()
+    value["adaptation"]["optimizer"].update(
+        name="sgdm", learning_rate=1e-3, momentum=0.9, beta2=0.99
+    )
+    with pytest.raises(ValidationError, match="must stay canonical"):
+        RunConfig.model_validate(value)
 
 
 def test_dflash_canvas_requires_at_least_one_proposal_position() -> None:

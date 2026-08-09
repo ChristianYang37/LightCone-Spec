@@ -18,15 +18,24 @@ from lightcone_spec.runtime.exactness import greedy_exact, rejection_sample
 
 
 def optimizer_config(name: str, *, weight_decay: float = 0.0) -> OptimizerConfig:
-    return OptimizerConfig(
-        name=name,
-        learning_rate=0.05,
-        weight_decay=weight_decay,
-        beta1=0.9,
-        beta2=0.999,
-        epsilon=1e-8,
-        grad_clip=1.0,
-    )
+    values = {
+        "name": name,
+        "learning_rate": 0.05,
+        "weight_decay": weight_decay,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "grad_clip": 1.0,
+    }
+    if name in {"sgdm", "nag", "muon"}:
+        values["momentum"] = 0.9
+    if name == "muon":
+        values.update(
+            muon_ns_steps=5,
+            muon_auxiliary_learning_rate=0.005,
+            muon_auxiliary_weight_decay=0.01,
+        )
+    return OptimizerConfig(**values)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +65,77 @@ def test_optimizer_matches_torch_one_step(name, weight_decay, reference) -> None
     torch.testing.assert_close(ours.master[0], initial)
     ours.commit(proposal)
     torch.testing.assert_close(ours.master[0], parameter.detach())
+
+
+@pytest.mark.parametrize(("name", "nesterov"), [("sgdm", False), ("nag", True)])
+def test_momentum_optimizer_matches_torch(name: str, nesterov: bool) -> None:
+    initial = torch.tensor([1.0, -2.0])
+    gradients = (
+        torch.tensor([0.25, -0.5]),
+        torch.tensor([-0.3, 0.2]),
+    )
+    ours = GPUOptimizer((initial,), optimizer_config(name, weight_decay=0.01))
+    parameter = torch.nn.Parameter(initial.clone())
+    baseline = torch.optim.SGD(
+        (parameter,),
+        lr=0.05,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay=0.01,
+    )
+    for gradient in gradients:
+        proposal = ours.propose((gradient,))
+        ours.commit(proposal)
+        parameter.grad = gradient.clone()
+        baseline.step()
+        torch.testing.assert_close(ours.master[0], parameter.detach())
+
+
+def test_lion_matches_reference_and_uses_one_state_tensor() -> None:
+    initial = torch.tensor([1.0, -2.0])
+    gradient = torch.tensor([0.25, -0.5])
+    config = optimizer_config("lion", weight_decay=0.01)
+    ours = GPUOptimizer((initial,), config)
+    proposal = ours.propose((gradient,))
+    direction = ((1.0 - config.beta1) * gradient).sign()
+    expected = initial * (1.0 - 0.05 * 0.01) - 0.05 * direction
+    torch.testing.assert_close(proposal.parameters[0], expected)
+    torch.testing.assert_close(
+        proposal.first_moments[0], (1.0 - config.beta2) * gradient
+    )
+    assert proposal.second_moments[0].numel() == 0
+
+
+def test_muon_matches_reference_and_uses_adamw_for_non_matrices() -> None:
+    matrix = torch.tensor([[1.0, -2.0], [0.5, 3.0]])
+    vector = torch.tensor([1.0, -1.0])
+    matrix_gradient = torch.tensor([[0.25, -0.5], [0.1, 0.2]])
+    vector_gradient = torch.tensor([0.3, -0.4])
+    config = optimizer_config("muon", weight_decay=0.01)
+    ours = GPUOptimizer((matrix, vector), config)
+    proposal = ours.propose((matrix_gradient, vector_gradient))
+
+    momentum_buffer = (1.0 - 0.9) * matrix_gradient
+    nesterov = (1.0 - 0.9) * matrix_gradient + 0.9 * momentum_buffer
+    from lightcone_spec.adaptation.optimizer import zeroth_power_newton_schulz
+
+    direction = zeroth_power_newton_schulz(nesterov, steps=5, epsilon=1e-7)
+    expected_matrix = matrix * (1.0 - 0.05 * 0.01) - 0.05 * direction
+    torch.testing.assert_close(proposal.parameters[0], expected_matrix)
+
+    auxiliary = torch.nn.Parameter(vector.clone())
+    baseline = torch.optim.AdamW(
+        (auxiliary,),
+        lr=0.005,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+    )
+    auxiliary.grad = vector_gradient.clone()
+    baseline.step()
+    torch.testing.assert_close(proposal.parameters[1], auxiliary.detach())
+    assert proposal.second_moments[0].numel() == 0
+    assert proposal.second_moments[1].numel() == vector.numel()
 
 
 def test_optimizer_rejects_layout_and_step_conflicts() -> None:
@@ -102,9 +182,7 @@ def named_parameters() -> dict[str, torch.Tensor]:
 
 
 def test_full_selects_all_and_only_drafter_owned_float_parameters() -> None:
-    plan = DFlashParameterPlan.build(
-        named_parameters(), mode="full", scope="drafter"
-    )
+    plan = DFlashParameterPlan.build(named_parameters(), mode="full", scope="drafter")
     names = {entry.name for entry in plan.entries}
     assert "fc.weight" in names
     assert "layers.0.input_layernorm.weight" in names
@@ -119,9 +197,7 @@ def test_parameter_ownership_uses_exact_dotted_components() -> None:
         "layers.target_model_adapter.weight": torch.zeros(2, 2),
         "target_model.weight": torch.zeros(2, 2),
     }
-    plan = DFlashParameterPlan.build(
-        parameters, mode="full", scope="drafter"
-    )
+    plan = DFlashParameterPlan.build(parameters, mode="full", scope="drafter")
     assert {entry.name for entry in plan.entries} == {
         "draft_lm_head_adapter.weight",
         "layers.target_model_adapter.weight",

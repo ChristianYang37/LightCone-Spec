@@ -27,6 +27,13 @@ def test_package_and_schema_version_are_focused_release() -> None:
     assert __version__ == "0.2.0"
 
 
+def test_tracked_speed_manifest_matches_the_registered_protocol() -> None:
+    path = ROOT / "manifests" / "speed-study" / "static_tts_l0_v2.json"
+    manifest = SpeedStudyManifest.load(path)
+    assert manifest == SpeedStudyManifest.default()
+    assert Path(f"{path}.sha256").read_text().strip() == manifest.sha256
+
+
 def test_patch_manifest_binds_series_files_and_tree() -> None:
     manifest = json.loads((PATCH_ROOT / "manifest.json").read_text())
     assert manifest["schema_version"] == 2
