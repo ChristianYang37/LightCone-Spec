@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parents[2]
 FORBIDDEN_PREFIXES = (
     "artifacts/",
@@ -29,13 +31,37 @@ TEXT_SUFFIXES = {
     ".cfg", ".ini", ".json", ".md", ".patch", ".py", ".sh", ".toml",
     ".txt", ".yaml", ".yml",
 }
+TEXT_NAMES = {
+    ".dockerignore",
+    ".editorconfig",
+    ".gitattributes",
+    ".gitignore",
+    "Dockerfile",
+    "MANIFEST.in",
+}
+RETIRED_DESIGN = re.compile(
+    "|".join(
+        (
+            r"\bL" + r"[123]\b",
+            r"\bcontrol" + r"ler\b",
+            r"\boracle " + r"replay\b",
+            r"\bFish" + r"er\b",
+            r"\bdamp" + r"ing\b",
+            "decisions" + r"\.parquet",
+            "sync" + "_fresh",
+            "oracle" + "_current",
+        )
+    ),
+    re.IGNORECASE,
+)
 
 
 def tracked() -> list[Path]:
     output = subprocess.check_output(
-        ["git", "ls-files", "-z"], cwd=ROOT
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT,
     ).decode().split("\0")
-    return [ROOT / value for value in output if value]
+    return [ROOT / value for value in output if value and (ROOT / value).is_file()]
 
 
 def fail(message: str) -> None:
@@ -64,12 +90,14 @@ def check_text(files: list[Path]) -> None:
         ),
     }
     for path in files:
-        if path.suffix.lower() not in TEXT_SUFFIXES:
+        if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_NAMES:
             continue
         body = path.read_text(encoding="utf-8", errors="strict")
         for label, pattern in forbidden.items():
             if pattern.search(body):
                 fail(f"{label} in {path.relative_to(ROOT)}")
+        if RETIRED_DESIGN.search(body):
+            fail(f"retired adaptation design in {path.relative_to(ROOT)}")
 
 
 def check_markdown_links(files: list[Path]) -> None:
@@ -100,6 +128,9 @@ def check_readme_parity() -> None:
     zh = {path.name for path in (ROOT / "docs/zh-CN").glob("*.md")}
     if en != zh:
         fail("English and Chinese documentation file sets differ")
+    for name in sorted(en):
+        if structure(f"docs/en/{name}") != structure(f"docs/zh-CN/{name}"):
+            fail(f"English and Chinese heading structures differ: {name}")
 
 
 def check_patchset() -> None:
@@ -109,15 +140,36 @@ def check_patchset() -> None:
     entries = manifest["patches"]
     if series != [entry["file"] for entry in entries]:
         fail("patch series and manifest order differ")
-    sums = {}
-    for line in (patch_root / "SHA256SUMS").read_text().splitlines():
-        digest, file_name = line.split("\t", 1)
-        sums[file_name] = digest
     for entry in entries:
         data = (patch_root / entry["file"]).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
-        if digest != entry["sha256"] or sums.get(entry["file"]) != digest:
+        if digest != entry["sha256"]:
             fail(f"patch identity mismatch: {entry['file']}")
+    apply = (patch_root / "apply.sh").read_text()
+    if manifest["upstream"]["commit"] not in apply:
+        fail("apply script upstream identity differs from manifest")
+    if manifest["expected_tree"] not in apply:
+        fail("apply script final tree differs from manifest")
+
+
+def check_versions() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    package = (ROOT / "src/lightcone_spec/__init__.py").read_text()
+    if project["version"] != "0.2.0" or '__version__ = "0.2.0"' not in package:
+        fail("package version is not consistently 0.2.0")
+
+
+def check_manifest_sidecars() -> None:
+    for path in (ROOT / "manifests").rglob("*.json"):
+        sidecar = Path(f"{path}.sha256")
+        if not sidecar.is_file():
+            fail(f"manifest sidecar missing: {path.relative_to(ROOT)}")
+        value = json.loads(path.read_text())
+        canonical = json.dumps(
+            value, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if hashlib.sha256(canonical).hexdigest() != sidecar.read_text().strip():
+            fail(f"manifest sidecar mismatch: {path.relative_to(ROOT)}")
 
 
 def main() -> int:
@@ -127,6 +179,8 @@ def main() -> int:
     check_markdown_links(files)
     check_readme_parity()
     check_patchset()
+    check_versions()
+    check_manifest_sidecars()
     print(f"public-tree checks passed for {len(files)} tracked files")
     return 0
 
