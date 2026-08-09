@@ -16,7 +16,17 @@ D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
 
 Semantic mask \(m\) 排除越过请求边界的位置、accepted terminal token 之后的位置，以及
 依赖 rejected token 的 draft suffix。Gradient 在 cohort 内归一化，因此 batch size 不会
-暗中改变 learning rate。
+暗中改变 learning rate。对于已注册的 block-16 DFlash checkpoint，位置权重绑定其训练
+recipe：
+
+\[
+w_k=\exp\!\left(-\frac{k-1}{7}\right),
+\qquad \lambda=\exp(-1/7).
+\]
+
+DFlash 不使用均匀位置权重：早期 token 不匹配后，继续优化无法通过 prefix verification
+的 suffix 会浪费 gradient。因此该 decay 属于 run identity，而不是静默默认值或由结果
+反推的超参数。参见 [DFlash 论文](https://arxiv.org/abs/2602.06036)。
 
 ## 相同 candidate，不同发布时刻
 

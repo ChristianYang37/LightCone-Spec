@@ -18,7 +18,19 @@ D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
 The semantic mask \(m\) removes invalid request positions, tokens after an
 accepted terminal token, and draft suffixes conditioned on a rejected token.
 The gradient is normalized across the cohort, so batch size does not silently
-change the learning rate.
+change the learning rate. For the registered block-16 DFlash checkpoint, the
+weight is bound to its training recipe,
+
+\[
+w_k=\exp\!\left(-\frac{k-1}{7}\right),
+\qquad \lambda=\exp(-1/7).
+\]
+
+Uniform weighting is not used for DFlash: optimizing suffix positions after an
+early mismatch spends gradient on tokens that cannot survive prefix
+verification. The decay is therefore part of the run identity, not a silent
+default or a result-derived hyperparameter. See the
+[DFlash paper](https://arxiv.org/abs/2602.06036).
 
 ## Identical candidates, different publication
 

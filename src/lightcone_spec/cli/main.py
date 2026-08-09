@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +39,7 @@ from lightcone_spec.experiments.onlinespec import (
     verify_onlinespec_source_checkout,
 )
 from lightcone_spec.experiments.protocol import (
+    DFLASH_LOSS_POSITION_DECAY,
     TUNING_STAGES,
     assert_confirmation_slice_config,
     assert_matched_confirmation_configs,
@@ -1034,7 +1036,12 @@ def _assert_onlinespec_candidate_config(
     if (
         actual != expected
         or adaptation.optimizer.name != "sgd"
-        or adaptation.loss_position_decay != 1.0
+        or not math.isclose(
+            adaptation.loss_position_decay,
+            DFLASH_LOSS_POSITION_DECAY,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
     ):
         raise ValueError("OnlineSPEC run config does not match its tuning selection")
 

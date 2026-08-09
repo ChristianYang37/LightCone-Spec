@@ -10,6 +10,15 @@ from dataclasses import asdict, dataclass
 
 from lightcone_spec.config.schema import RunConfig
 
+# DFlash trains block-16 drafters with
+#   w_k = exp(-(k - 1) / gamma), gamma = 7.
+# The runtime loss uses ``decay ** arange(depth)``, so this is the exact base
+# that reproduces the checkpoint's position weighting.  Keep it protocol-bound
+# rather than exposing an unsupported result-derived tuning dimension.
+DFLASH_BLOCK_SIZE = 16
+DFLASH_LOSS_DECAY_GAMMA = 7.0
+DFLASH_LOSS_POSITION_DECAY = math.exp(-1.0 / DFLASH_LOSS_DECAY_GAMMA)
+
 TUNING_STAGES = (
     (2, 4096),
     (4, 8192),

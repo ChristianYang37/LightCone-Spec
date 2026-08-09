@@ -21,7 +21,11 @@ from lightcone_spec.experiments.onlinespec import (
     OnlineSpecCandidate,
     OnlineSpecSelection,
 )
-from lightcone_spec.experiments.protocol import TuningCandidate
+from lightcone_spec.experiments.protocol import (
+    DFLASH_BLOCK_SIZE,
+    DFLASH_LOSS_POSITION_DECAY,
+    TuningCandidate,
+)
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import SelectionArtifact
 from lightcone_spec.locking.models import ModelLock
@@ -254,7 +258,8 @@ def _render_choice_plan(
             optimizer=optimizer,
             rank=selected.rank,
             stride=selected.stride,
-            canvas_tokens=16,
+            canvas_tokens=DFLASH_BLOCK_SIZE,
+            loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
         )
     output = Path(output_root).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -515,7 +520,8 @@ def _onlinespec_run_config(
             ),
             rank=candidate.rank,
             stride=candidate.stride,
-            canvas_tokens=16,
+            canvas_tokens=DFLASH_BLOCK_SIZE,
+            loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
         ),
         online_spec=OnlineSpecConfig(
             projection_radius=candidate.projection_radius,

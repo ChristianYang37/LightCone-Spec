@@ -27,7 +27,10 @@ from lightcone_spec.experiments.onlinespec import (
     select_onlinespec,
     verify_onlinespec_source_checkout,
 )
-from lightcone_spec.experiments.protocol import onlinespec_blocks
+from lightcone_spec.experiments.protocol import (
+    DFLASH_LOSS_POSITION_DECAY,
+    onlinespec_blocks,
+)
 from lightcone_spec.experiments.runner import _earlier_slices
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import LossPoint, SliceMeasurement
@@ -414,6 +417,9 @@ def test_onlinespec_renderer_creates_four_sequential_servers(
         assert config.online_spec is not None
         assert config.adaptation is not None
         assert config.adaptation.optimizer.name == "sgd"
+        assert config.adaptation.loss_position_decay == pytest.approx(
+            DFLASH_LOSS_POSITION_DECAY, abs=1e-15
+        )
 
 
 def test_onlinespec_tuning_renderer_pairs_candidate_with_static(
@@ -457,6 +463,11 @@ def test_onlinespec_tuning_renderer_pairs_candidate_with_static(
     assert [launch.method for launch in launches] == ["static", candidate.method]
     assert launches[0].adaptation_config is None
     assert launches[1].adaptation_config is not None
+    config = RunConfig.model_validate_json(Path(launches[1].run_config).read_text())
+    assert config.adaptation is not None
+    assert config.adaptation.loss_position_decay == pytest.approx(
+        DFLASH_LOSS_POSITION_DECAY, abs=1e-15
+    )
 
 
 def test_onlinespec_protocol_rejects_runtime_and_loss_drift() -> None:
@@ -487,7 +498,7 @@ def test_onlinespec_protocol_rejects_runtime_and_loss_drift() -> None:
                 "rank": candidate.rank,
                 "stride": candidate.stride,
                 "canvas_tokens": 16,
-                "loss_position_decay": 1.0,
+                "loss_position_decay": DFLASH_LOSS_POSITION_DECAY,
             },
             "online_spec": {
                 "projection_radius": candidate.projection_radius,

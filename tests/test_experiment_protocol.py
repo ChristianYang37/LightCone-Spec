@@ -25,6 +25,7 @@ from lightcone_spec.experiments.evidence import (
     evidence_files_sha256,
 )
 from lightcone_spec.experiments.protocol import (
+    DFLASH_LOSS_POSITION_DECAY,
     assert_matched_confirmation_configs,
     confirmation_blocks,
     select_static_load,
@@ -752,6 +753,16 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
         "lightcone_spec.sglang_bridge.launch" in launch.argv
         and "--checkout" in launch.argv
         for launch in launches
+    )
+    adapted = [
+        RunConfig.model_validate_json(Path(launch.run_config).read_text())
+        for launch in launches[1:]
+    ]
+    assert all(
+        config.adaptation is not None
+        and config.adaptation.loss_position_decay
+        == pytest.approx(DFLASH_LOSS_POSITION_DECAY, abs=1e-15)
+        for config in adapted
     )
 
 
