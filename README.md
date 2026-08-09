@@ -2,107 +2,184 @@
 
 [简体中文](README_zh-CN.md) · [Documentation](docs/en/architecture.md) · [License](LICENSE)
 
-LightCone-Spec is a research framework for version-safe asynchronous test-time
-adaptation in speculative decoding. It separates proposal correction from the
-drafter backbone, publishes updates only at legal decode boundaries, and binds
-every controller and run to reproducible model, runtime, and data identities.
+LightCone-Spec is an evidence-first research framework for testing whether
+test-time drafter updates can make speculative decoding faster. Version 0.2.0
+has one deliberately narrow question: can paper-faithful TTS and a first-ready
+publication policy both improve decode goodput over an unchanged Static
+baseline?
 
-> Alpha software. This repository publishes implementation and evaluation
-> protocols, not performance claims or experiment results.
+> Alpha software. GPU performance is `UNMEASURED` until an immutable formal
+> run passes the registered statistical and safety gate. This repository does
+> not publish benchmark results or performance claims.
+
+## Scope
+
+The formal study contains exactly three methods:
+
+| Method | Candidate computation | Publication policy |
+|---|---|---|
+| Static | none | native SGLang speculative decoding |
+| TTS | side-CUDA-stream update every stride | synchronize and publish at the next fixed update boundary |
+| L0 (`naive_async`) | byte-for-byte equivalent update to TTS | publish at the first legal graph boundary after the ready event |
+
+TTS follows the scheduling definition in the [Test-Time Speculation
+paper](https://arxiv.org/abs/2605.09329). L0 changes only the publication time;
+it is not a different loss or optimizer.
+
+Focused online adaptation is currently certified only for Qwen3-8B + DFlash,
+with TP=DP=1. Native SGLang remains available for other backends when the
+adaptation config is omitted. Three clean-room OnlineSpec equations are kept
+under an isolated `baselines` package and never enter the default study.
+
+## Performance model
+
+The study does not assume an update is beneficial:
+
+\[
+T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
++T_{\mathrm{update}}^{\mathrm{exposed}}
++T_{\mathrm{draft}}^{\mathrm{extra}}+T_{\mathrm{barrier}}.
+\]
+
+An adapted method is faster only if fewer target calls save more time than
+training, contention, publication, and barrier overhead consume. Formal claims
+therefore require paired decode goodput, exactness counters, target-call
+counts, CUDA timing, HBM accounting, and confidence intervals together.
 
 ## Architecture
 
-The system has three deliberately separate layers:
+- `lightcone_spec` owns strict schema-v2 configuration, deterministic data
+  windows, selection, evidence records, and statistical gates.
+- `patches/sglang` is a reproducible six-patch mail series against one exact
+  upstream commit. The repository never vendors or edits SGLang in place.
+- A cohort runtime keeps optimizer state on GPU, publishes into fixed-address
+  inference tensors, and binds every candidate to epoch, slot generation, and
+  source version.
+- Headline telemetry uses asynchronous CUDA events. Synchronizing diagnostics
+  and profilers run after the measured interval or in a separate run.
 
-1. `lightcone_spec` builds candidates, controllers, immutable manifests, and
-   evidence artifacts.
-2. A pinned patch series adds backend-neutral proposal signals and a versioned
-   tail bank to a disposable SGLang checkout.
-3. Experiment runners enforce exactness, model locks, request-level splits,
-   telemetry integrity, and fail-closed scientific gates.
-
-Adaptation tensors remain GPU-resident. Active buffers keep stable addresses
-for graph replay; staging, optimizer, and candidate work run on a side stream.
-Request epoch, slot generation, and source version jointly prevent stale or ABA
-publication.
-
-## Supported backends
-
-| Backend | Supported scope | Current boundary |
-|---|---|---|
-| DSpark | residual, LoRA, full-rank tail; Markov and confidence signals | checkpoint and proposal-depth constraints are validated before model load |
-| DFlash | residual, LoRA, full-rank tail | deterministic proposals and certified rejection-sampling paths only |
-| EAGLE / EAGLE3 | residual, LoRA, full-rank tail | single-layer, `topk=1`; unsupported tree/multi-layer combinations fail closed |
-
-The unmodified SGLang path is preserved when adaptation is disabled. The
-repository does not vendor SGLang or model weights.
+See [Architecture](docs/en/architecture.md) and [Mathematical
+method](docs/en/mathematical-method.md).
 
 ## Installation
 
-For framework-only development:
+Framework-only development:
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[dev]'
-lightcone-spec --help
+pytest -q
 ```
 
-For a GPU runtime, first run the read-only preflight, then use the native
-installer. The installer creates a disposable checkout from the exact upstream
-commit and applies the verified patch series; it never edits system Python or
-CUDA and does nothing without `--execute`.
+Create a disposable patched SGLang checkout from the exact upstream pin:
 
 ```bash
-lightcone-spec doctor --output doctor.json
-python scripts/install_native.py --runtime-root ~/lightcone-spec-runtime
-python scripts/install_native.py --runtime-root ~/lightcone-spec-runtime --execute
+git clone https://github.com/sgl-project/sglang.git /path/to/sglang
+git -C /path/to/sglang checkout 3312645a307453893a00778592f105581e3d1c3d
+patches/sglang/apply.sh /path/to/sglang
+python scripts/verify_sglang_patchset.py \
+  --upstream-checkout /path/to/clean-upstream --compile-only
 ```
 
-See [installation](docs/en/installation.md) and the
-[SGLang patch workflow](docs/en/sglang-patches.md).
+See [Installation](docs/en/installation.md) for the GPU environment contract.
 
 ## Quick start
 
-Create immutable input locks before downloading or loading a model:
+Build the immutable source protocol and sampling profile:
 
 ```bash
-lightcone-spec lock --output lightcone.lock.json \
-  --pairs qwen3_4b_dflash16 --datasets livecodebench
-lightcone-spec prepare-models --lockfile lightcone.lock.json \
-  --model-cache /path/to/cache --pairs qwen3_4b_dflash16 \
-  --output model-roots.json
-lightcone-spec run-manifest --manifest manifests/smoke/smoke_gpu_qwen3_4b.json \
-  --lockfile lightcone.lock.json --model-roots model-roots.json \
-  --runtime-root /path/to/runtime --model-cache /path/to/cache
+lightcone-spec build-speed-study \
+  --output artifacts/protocol/static_tts_l0.json
 ```
 
-Real runs require explicit selection and controller artifacts where the
-manifest calls for them. Missing, mismatched, or result-derived implicit
-defaults are rejected before model loading.
+Lock model revisions before downloading:
 
-## Update modes and schedulers
+```bash
+lightcone-spec lock-models --output artifacts/locks/models.json \
+  Qwen/Qwen3-8B z-lab/Qwen3-8B-DFlash-b16
+lightcone-spec prepare-models --lockfile artifacts/locks/models.json \
+  --model-cache /path/to/model-cache \
+  --output artifacts/locks/model-roots.json
+```
 
-`--weight-update-mode` accepts exactly:
+Render one allocation-free Static endpoint per registered concurrency before
+tuning (shown for `C=48`):
 
-- `residual`: a compressed output-logit residual;
-- `lora`: a low-rank update at the proposal tail;
-- `full`: a full-rank proposal-tail update, not full-drafter fine-tuning.
+```bash
+lightcone-spec render-static-load-runtime --concurrency 48 \
+  --sglang-checkout /path/to/patched-sglang \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/load/c48
+```
 
-L0 publishes a completed candidate at the first legal boundary. L1 gates
-candidates, L2 damps their magnitude, and L3 evaluates transported candidates.
-Controller stages remain diagnostic unless their immutable evidence gates pass.
+After the independent Static load screen and tuning phase have produced a
+selection artifact, render one exclusive-device launch plan. All methods reuse
+one port and one GPU **sequentially**; never start the three server argv vectors
+at the same time:
 
-## Correctness, memory, and evidence
+```bash
+lightcone-spec render-runtime \
+  --sglang-checkout /path/to/patched-sglang \
+  --selection artifacts/selection.json \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --adaptation-group-id formal-a --adaptation-reserve-mb RESERVE_MB \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/runtime
 
-- Proposal sampling and rejection use the same corrected distribution `q`.
-- Semantic masks exclude rejected suffixes, post-stop tokens, bonus tokens past
-  the request boundary, and tokens beyond `max_new_tokens`.
-- Adaptation memory is reserved before KV-pool sizing and is not silently
-  offloaded or evicted. Admission control and KV retraction handle pressure.
-- Lightweight CUDA-event telemetry is separate from synchronized profiling.
-- Artifacts bind model revisions, parameter layout, runtime sources, data
-  windows, seeds, and upstream/patch identities.
+lightcone-spec build-confirmation-queue \
+  --manifest manifests/speed-study/static_tts_l0_v2.json \
+  --selection artifacts/selection.json \
+  --model-lock artifacts/locks/models.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --launch-plan artifacts/runtime/launch-plan.json \
+  --evidence-root artifacts/confirmation \
+  --output artifacts/confirmation/queue.json
+```
+
+For each queue job, start its `launch_argv`, wait for health, run its
+`run_argv`, then terminate that server before the next job. Finally use
+`collect-speed-study` to derive the formal table. The queue is data, not a
+shell script: orchestration must preserve the registered order and clean-server
+boundaries.
+
+`RESERVE_MB` and `MEMORY_FRACTION` are intentionally not source defaults. They
+must come from hardware preflight and the selected parameter layout.
+
+## Update modes and cache contract
+
+The public schema accepts:
+
+- `residual`: tail-only low-rank logit correction;
+- `lora`: low-rank factors for the drafter or a tail ablation, merged into
+  fixed-address inference weights at publication;
+- `full`: all DFlash-owned floating parameters for drafter scope, or a
+  full-rank tail ablation. Target embeddings, target LM head, and target model
+  remain frozen.
+
+Historical drafter KV is immutable. KV created before publication is neither
+rebuilt nor differentiated; new KV records the newly published source version.
+The actual proposal distribution remains the distribution used by exact
+speculative rejection sampling.
+
+## Evidence and safety
+
+Formal confirmation uses 32 held-out controlled prompts, eight independent
+method-order blocks, one selected load, and generated-token buckets through each
+prompt's checkpoint-safe end. The 40,960-token model limit always includes the
+tokenized prompt; the headline region begins at 16K generated tokens. Both TTS
+and L0 must independently clear the registered speed threshold with a paired
+prompt-cluster BCa interval and zero safety events.
+
+The gate cannot report `PASS` without a content-bound GPU attestation covering
+the manifest, tuning selection, patched SGLang tree, model revisions, hardware
+report, and exact Parquet inputs. A local or synthetic table remains
+`UNMEASURED`, even when its arithmetic effect is positive.
 
 ## Documentation
 
@@ -117,14 +194,18 @@ Controller stages remain diagnostic unless their immutable evidence gates pass.
 
 ## Limitations and roadmap
 
-GPU and model compatibility is intentionally narrower than SGLang itself.
-Unsupported speculative trees, parameter scopes, checkpoint context windows,
-and sampling combinations fail closed. Planned work includes broader backend
-coverage, more cache-safe trainable scopes, multi-GPU certification, and public
-evidence only after the corresponding gates are complete.
+- GPU status is currently `UNMEASURED`; no speedup is asserted.
+- Focused adaptation supports DFlash with TP=DP=1 and an unquantized draft/KV
+  path. Unsupported combinations fail before adaptation allocation.
+- Historical KV is frozen by design. Recomputing old KV would define a
+  different method and memory envelope.
+- Multi-GPU certification and additional speculative backends are future work,
+  not latent or partially enabled features.
 
-## Contributing and security
+## Contributing and license
 
-See [CONTRIBUTING.md](CONTRIBUTING.md),
-[CONTRIBUTING_zh-CN.md](CONTRIBUTING_zh-CN.md), and [SECURITY.md](SECURITY.md).
-LightCone-Spec is licensed under [Apache-2.0](LICENSE).
+Read [CONTRIBUTING.md](CONTRIBUTING.md),
+[CONTRIBUTING_zh-CN.md](CONTRIBUTING_zh-CN.md), and
+[SECURITY.md](SECURITY.md). LightCone-Spec is licensed under
+[Apache-2.0](LICENSE); external models, datasets, and SGLang retain their own
+licenses.

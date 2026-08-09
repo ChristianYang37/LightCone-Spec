@@ -2,18 +2,48 @@
 
 [English](../en/sglang-patches.md) · [首页](../../README_zh-CN.md)
 
-SGLang 是外部 Apache-2.0 依赖。LightCone-Spec 固定 upstream commit
-`3312645a307453893a00778592f105581e3d1c3d`，只在 `patches/sglang/` 发布 mail-format
-patch series。
+## 源码边界
 
-只对 exact、clean checkout 应用：
+SGLang 是外部 Apache-2.0 项目。LightCone-Spec 固定 upstream commit
+`3312645a307453893a00778592f105581e3d1c3d`，只分发 mail-format patch。仓库不包含
+SGLang 源码、submodule 或修改后的 checkout。本地 `sglang/` 目录被 ignore，永远不作为
+集成身份。
+
+## Patch 分层
+
+六个 patch 具有单向的语义依赖：
+
+1. 严格 schema、preflight 与 disabled fast path；
+2. cohort、source version、CUDA event 与发布 runtime；
+3. 可微 DFlash drafter Full/LoRA 更新路径；
+4. cache-safe tail 消融；
+5. 显存账本、lifecycle、遥测与 profiling；
+6. 聚焦的 SGLang 协议与回归测试。
+
+只支持完整 series。中间 patch 状态是 review 边界，不是可运行的产品变体。
+
+## 应用
+
+`patches/sglang/apply.sh` 只接受位于精确 upstream HEAD 的 clean checkout。它校验每个
+patch digest，使用 `git am` 应用，并核对 `manifest.json` 记录的最终 Git tree：
 
 ```bash
-git clone https://github.com/sgl-project/sglang.git /tmp/sglang
-git -C /tmp/sglang checkout --detach 3312645a307453893a00778592f105581e3d1c3d
-patches/sglang/apply.sh /tmp/sglang
+patches/sglang/apply.sh /path/to/clean-sglang
 ```
 
-`apply.sh` 验证每个 patch 的 SHA-256 与最终 Git tree。`verify.sh` 在临时 clone 中重新
-应用、编译修改的 Python surface、运行聚焦测试并检查反向 checkout 后保持 clean。
-后续 SGLang 改动必须 patch-first；不得在本仓库提交源码 checkout 或 submodule。
+Dirty state、错误 commit、被修改的 patch、mail 应用失败或最终 tree 不匹配都会立即停止。
+脚本不会通过 rebase、stash、reset 或编辑输入 checkout 来掩盖错误。
+
+## 验证与编写
+
+发布前运行一次性 verifier：
+
+```bash
+python scripts/verify_sglang_patchset.py \
+  --upstream-checkout /path/to/clean-upstream
+```
+
+新的集成改动必须 patch-first：从 pin 创建临时分支，完成单一语义 commit 和聚焦测试，
+用 `git format-patch` 导出，然后同时更新 `series`、patch SHA-256、修改文件列表、expected
+final tree、Python pin 常量、NOTICE 与文档。最后验证应用与反向卸载，并确认原始 upstream
+源码仍保持 clean。

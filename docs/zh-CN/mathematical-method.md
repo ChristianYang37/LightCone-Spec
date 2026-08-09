@@ -1,25 +1,93 @@
 # 数学方法
 
-[English](../en/mathematical-method.md) · [首页](../../README_zh-CN.md)
+[English](../en/mathematical-method.md) · [README](../../README_zh-CN.md)
 
-令 `h` 为冻结 proposal head `W` 前的最终 hidden，`m` 为可选的 DSpark Markov 特征。
-LightCone 使用三种 cache-safe tail 参数化之一：
+## 优化目标
 
-\[
-\Delta \ell=B(A_hR_h^\top h+A_m m),
-\]
+令 \(p_t\) 为 target distribution，\(q_\theta\) 为某个合法 draft 位置的 DFlash
+proposal。更新最小化带位置权重的 target-to-draft KL：
 
 \[
-\Delta h=(hA_h+mA_m)B_h,\qquad \Delta\ell=W\Delta h,
+\mathcal L(\theta)=
+\frac{\sum_{b,k}m_{b,k}\lambda^k
+D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
+{\sum_{b,k}m_{b,k}\lambda^k}.
 \]
+
+Semantic mask \(m\) 排除越过请求边界的位置、accepted terminal token 之后的位置，以及
+依赖 rejected token 的 draft suffix。Gradient 在 cohort 内归一化，因此 batch size 不会
+暗中改变 learning rate。
+
+## 相同 candidate，不同发布时刻
+
+对于 source round \(r\)，两种 adaptation 方法计算同一个 functional optimizer
+proposal \(u_r\)。发布之前，active parameter 与 moment 不会变化。
+
+设 update stride 为 \(S\)，TTS 不早于下一个固定更新边界发布：
 
 \[
-\Delta h=hD_h+mD_m,\qquad \Delta\ell=W\Delta h.
+a_{\mathrm{TTS}}=
+\max\!\left(a_{\mathrm{ready}},
+(\lfloor r/S\rfloor+1)S\right).
 \]
 
-三者对应 `residual`、`lora` 和 `full`。`full` 指 full-rank tail matrix；drafter
-backbone、target embedding 和 LM head 保持冻结，因此历史 KV 仍然有效。
+L0 在 side event ready 后的首个合法 decode 边界发布：
 
-L0 在首个合法边界发布；L1 使用二元 gate；L2 预测 `[0,1]` 内的 damping；L3 在评估
-前 transport 候选。它们处理的是 staleness 下的到达时效用，而不改变 speculative
-decoding 的 exactness 规则。生成和拒绝路径共享同一个 corrected proposal distribution。
+\[
+a_{\mathrm{L0}}=a_{\mathrm{ready}}.
+\]
+
+Candidate tensor、loss、optimizer、rank、stride、supervision 与 source version 全部
+保持一致。任何数值 candidate 差异都是实现错误，而不是方法差异。
+
+## 截断在线梯度
+
+Update round 将历史 paged KV gather 后 detach。当前 canvas K/V 通过可微 DFlash
+linear、RMSNorm、NeoX RoPE 与 non-causal SDPA 重算。Device-side reconstruction
+predicate 将重算 hidden 与真实 inference hidden 比较；不匹配时 proposal 变为 no-op，
+并关闭该 cohort 后续 adaptation。
+
+Target embedding 与 LM head 冻结。最终 target head 将可微 DFlash hidden 映射为 draft
+logits。Source-point proximal KL 的一阶导数为零，因此实现不物化无效项，也不把其系数
+作为伪 tuning 维度。
+
+## 参数化
+
+对已选择 base matrix \(W\)，LoRA 使用
+
+\[
+W'=W+BA,
+\qquad A\in\mathbb R^{r\times d_{in}},\quad
+B\in\mathbb R^{d_{out}\times r},
+\]
+
+其中 \(A\) 按锁定 seed 初始化，\(B\) 为零，两者均可训练。Inference 只看到合并后的
+固定地址 matrix。Full 为每个 DFlash 自有浮点参数保留 FP32 master。Tail LoRA/full
+计算 \(h'=h+\Delta h\)，再通过冻结 target head 投影一次；residual tail 直接对 logits
+施加低秩修正。
+
+## Exact speculative sampling
+
+Verification 记录的 proposal probability \(q\) 必须正是生成 draft token 的分布。给定
+target probability \(p\)，proposal token \(x\) 的接受概率为
+
+\[
+\alpha(x)=\min\left(1,\frac{p(x)}{q(x)}\right).
+\]
+
+拒绝时从归一化的 \((p-q)_+\) 采样 replacement。即使历史 KV 由旧 drafter version
+产生，也保持 target distribution。Greedy exactness 单独检查。
+
+## 加速条件
+
+实测 decode time 分解为
+
+\[
+T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
++T_{\mathrm{update}}^{\mathrm{exposed}}
++T_{\mathrm{draft}}^{\mathrm{extra}}+T_{\mathrm{barrier}}.
+\]
+
+Acceptance 单独提升不充分。只有配对 long-region decode goodput 提升、target calls 不与
+该提升矛盾，且 exactness、version、fallback、non-finite、OOM 与 retraction 计数均为
+零时，方法才通过工程门槛。

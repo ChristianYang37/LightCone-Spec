@@ -2,18 +2,118 @@
 
 [English](../en/cli.md) · [首页](../../README_zh-CN.md)
 
-`lightcone-spec` 提供以下工作流：
+## 命令
 
-- `doctor`：只读的 host/GPU 兼容性报告；
-- `lock`：解析可变的模型、数据集和环境输入；
-- `prepare-models` / `prepare-datasets`：物化并验证锁定输入；
-- `serve`：启动一个已验证的 adaptation server；
-- `run-manifest`：以隔离输出路径执行不可变 unit；
-- `replay`：oracle replay 与 controller 拟合；
-- `exactness`：检查 proposal/accept/reject 正确性；
-- `analyze`：生成协议表格与图；
-- `validate-artifacts`：递归验证证据。
+参数以 `lightcone-spec --help` 为准。0.2.0 提供：
 
-以 `lightcone-spec COMMAND --help` 为参数权威来源。缺少 lock、controller、selection
-artifact 或 runtime binding 时会产生可操作错误，而不是空的成功运行。队列退出码区分
-成功、科学阻塞、锁冲突和可恢复的工程失败。
+| 命令 | 用途 |
+|---|---|
+| `doctor` | 只读检查 host、Python、CUDA 与源码树 |
+| `validate-config` | 解析一份严格 schema-v2 run config |
+| `build-speed-study` | 物化不可变源协议 |
+| `lock-models` | 把模型 ID 解析为不可变 revision |
+| `prepare-models` | 下载或离线核验锁定 snapshot |
+| `list-tuning-candidates` | 物化已注册的 Full/LoRA 搜索网格 |
+| `render-static-load-runtime` | 生成一个不分配 adaptation 状态的 Static 负载端点 |
+| `render-tuning-runtime` | 为单个 candidate 渲染独占的 TTS/L0 slice |
+| `run-controlled-slice` | 测量一个 load-screen 或 tuning slice |
+| `collect-static-load-screen` | 验证 Static 负载网格并选择负载 |
+| `advance-tuning-stage` | 验证 tuning stage 并写入 survivor 集合 |
+| `select-speed-config` | 执行只读取 tuning 的 maximin 规则 |
+| `render-runtime` | 输出顺序执行的匹配 confirmation 配置与 argv |
+| `build-confirmation-queue` | 注册 24 个 clean-server confirmation job |
+| `run-confirmation` | 执行一个 method/block confirmation slice |
+| `collect-speed-study` | 从完整 receipt 派生正式表 |
+| `render-replication-runtime` | 渲染自然任务或仅 profiler 使用的 slice |
+| `run-natural-slice` | 运行一个锁定的自然 EOS 副表 slice |
+| `build-profiler-plan` | 构建隔离的 Nsight/device-monitor 计划 |
+| `attest-speed-study` | 绑定 GPU、runtime、模型、selection 和证据身份 |
+| `analyze-speed-study` | 计算已注册的配对速度门槛 |
+
+项目不提供通用 method override 或 replay 命令。正式流程刻意保持狭窄，源码 manifest
+永远不包含实测结果。
+
+## 身份链
+
+最小依赖链为：
+
+```text
+manifest + model lock + sampling profile + registered grid
+                            |
+                            v
+              load screen + staged tuning
+                            |
+                            v
+                   selection artifact
+                            |
+                            v
+       sequential launch plan + completed evidence
+                            |
+                            v
+          derived table + attestation + speed gate
+```
+
+每个 artifact 都有 sidecar 或内嵌 digest。身份不匹配是可操作错误；CLI 不会生成空的
+成功 run，也不会用默认配置替代缺失输入。`select-speed-config` 必须同时接收 terminal
+tuning artifact、完整 Static load-screen artifact、源 manifest、controlled sampling
+profile 与 model lock。生成的 selection 会绑定这些身份、完整 tuning grid 与 patched
+SGLang tree。
+
+## 负载扫描与调参
+
+两阶段都使用 controlled sampling profile。Static 负载扫描必须为每个注册 concurrency
+生成一份 `run-controlled-slice --phase static-load` measurement。
+`collect-static-load-screen` 会拒绝覆盖不全、重复、OOM、retraction 或身份不匹配的证据。
+
+每个负载点使用 `render-static-load-runtime --concurrency C`，它只生成一个原生
+Static 端点，不接受 adaptation group 或 adaptation HBM reserve，启动参数也不包含
+adaptation flag。进入下一个负载点前必须停止当前 server。所有 renderer 还必须显式提供
+`--sglang-checkout /path/to/patched-sglang`；该 checkout 必须 clean，且 Git tree 与本版本
+记录的精确 patchset tree 一致。
+
+Tuning 从 `list-tuning-candidates` 开始。先按选定 concurrency 只渲染一个 Static
+端点，并在每个 stage 中复用其不可变启动描述作为唯一 Static baseline。每个 active
+candidate/stage 使用 `render-tuning-runtime` 在同一端口只生成 TTS 与 L0 两个互斥
+slice，因此不会意外重复 Static 证据。只启动当前要测量的 slice，
+执行 `run-controlled-slice --phase tune`，关闭 server 后再继续。`advance-tuning-stage`
+强制检查注册的 prompt 数与 context 上限、Static/TTS/L0 配对覆盖、安全计数与 survivor
+身份。后续 stage 必须引用前一 stage 的 survivor artifact；confirmation 数据永不作为输入。
+
+## Confirmation 与恢复
+
+`render-runtime` 输出的三个方法描述刻意共用一个端口，并要求独占设备。
+`build-confirmation-queue` 把 manifest 中由 seed 固定的方法顺序展开为 24 个 job。对每个
+job，启动其 `launch_argv`、等待健康检查、执行 `run_argv`，然后关闭该 server，才能开始
+下一项。同时运行三个 endpoint 会改变 HBM、KV 容量、batching 与竞争，因此属于无效实验。
+
+启动 wrapper 只从已验证 checkout 导入 SGLang。服务端 diagnostics 必须报告精确
+adaptation config 的 SHA-256；method、optimizer、学习率、rank、stride 或 cohort 任一
+不匹配，都会在提交证据前使该 slice 失效。
+
+`run-confirmation` 每次只执行一个 method/block slice；它会 reset engine/cohort，默认执行
+不计时 warmup，并记录绝对 streaming arrival time。模型的 40,960-token 上限包含 tokenized
+prompt，因此每个 prompt 的生成上限独立计算。
+
+每个完整 slice 最后写入 SHA-256 绑定的 receipt。重复执行相同 job 时，只有在 manifest、
+config、method、block、prompt、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的
+中断 shard 永不进入 `speed_study.parquet`；被修改或重复的 terminal 会 fail closed。
+`--no-warmup` 只能用于诊断，不能用于正式协议。
+
+## 自然任务复现与 Profiling
+
+自然副表使用 `render-replication-runtime --phase natural` 和独立的 EOS-enabled sampling
+profile，再对每个方法和锁定 dataset revision 执行 `run-natural-slice`。它们报告 at-risk
+request，但不能影响 selection 或正式 gate。
+
+详细 profiling 使用 `--phase profile` 与 `build-profiler-plan`。计划中固定
+`headline_evidence_forbidden=true`；带同步开销的 profiler 输出不得合并进 headline 计时证据。
+
+## Attestation 与退出状态
+
+未提供 attestation 时，`analyze-speed-study` 可以计算诊断，但状态固定为 `UNMEASURED`
+且退出码为 42。提供有效的内容绑定 GPU attestation 后，只有两种 adaptation 方法都
+通过才退出零；有效的实测失败是 `BLOCKED`，同样退出 42。输入、身份、runtime 或证据
+错误属于普通非零失败，不能表述为科学结果。
+
+Artifact、模型根目录、profiler trace 和生成的 selection 应位于 ignored 输出根目录。
+不得把 secret 放入 CLI 参数；模型访问只使用临时 `HF_TOKEN` 环境变量。

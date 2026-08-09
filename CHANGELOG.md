@@ -1,24 +1,31 @@
 # Changelog
 
-All notable changes to LightCone-Spec will be documented here. The format is
-based on Keep a Changelog, and the project follows semantic versioning after a
-stable public API is declared.
+All notable changes to LightCone-Spec are documented here. The format follows
+Keep a Changelog. The project remains pre-release; a stable public API has not
+yet been declared.
 
 ## [Unreleased]
 
 ### Planned
 
-- GPU certification across supported speculative backends.
-- Broader cache-safe trainable scopes and multi-GPU validation.
+- GPU certification of the registered Qwen3-8B + DFlash speed study.
+- Multi-GPU validation and separately reviewed backend extensions.
 
-## [0.1.0] - 2026-08-08
+## [0.2.0] - 2026-08-09
 
-### Added
+### Changed
 
-- Alpha runtime, immutable experiment framework, and evidence validators.
-- Residual, LoRA, and full-rank tail parameterizations.
-- L0–L3 scheduling and controller protocol.
-- Reproducible patch-only SGLang integration for DSpark, DFlash, and EAGLE.
-- English and Chinese documentation.
+- Focused the formal runtime and experiment protocol on Static, paper-faithful
+  TTS, and first-ready L0.
+- Replaced the public configuration with strict schema-v2 identities.
+- Added DFlash drafter Full/LoRA updates, cache-safe tail ablations, frozen
+  historical KV versioning, and cohort-scoped publication.
+- Replaced the SGLang integration with a reproducible six-patch series against
+  one exact upstream commit.
+- Added deterministic disjoint data windows, tuning-only maximin selection,
+  independent confirmation timing, resumable evidence receipts, and a
+  content-bound GPU speed gate.
+- Rewrote English and Chinese documentation without experimental results or
+  performance claims.
 
-No release tag is created for this alpha source publication.
+GPU status for this source version is `UNMEASURED`. No release tag is created.

@@ -2,19 +2,54 @@
 
 [中文](../zh-CN/sglang-patches.md) · [Home](../../README.md)
 
-SGLang is an external Apache-2.0 dependency. LightCone-Spec pins upstream commit
-`3312645a307453893a00778592f105581e3d1c3d` and publishes only a mail-formatted
-patch series under `patches/sglang/`.
+## Source boundary
 
-Apply the series only to an exact, clean checkout:
+SGLang is an external Apache-2.0 project. LightCone-Spec pins upstream commit
+`3312645a307453893a00778592f105581e3d1c3d` and distributes only mail-formatted
+patches. The repository contains no SGLang source, submodule, or modified
+checkout. A local `sglang/` directory is ignored and is never an integration
+identity.
+
+## Series layers
+
+The six-patch series has one-way semantic dependencies:
+
+1. strict schema, preflight, and disabled fast path;
+2. cohort, source-version, CUDA-event, and publication runtime;
+3. differentiable DFlash drafter Full/LoRA update path;
+4. cache-safe tail ablations;
+5. memory accounting, lifecycle, telemetry, and profiling;
+6. focused SGLang protocol and regression tests.
+
+Only the complete series is supported. Intermediate patch states are review
+boundaries, not runnable product variants.
+
+## Application
+
+`patches/sglang/apply.sh` accepts only a clean checkout at the exact upstream
+HEAD. It verifies every patch digest, applies with `git am`, and checks the
+final Git tree recorded in `manifest.json`:
 
 ```bash
-git clone https://github.com/sgl-project/sglang.git /tmp/sglang
-git -C /tmp/sglang checkout --detach 3312645a307453893a00778592f105581e3d1c3d
-patches/sglang/apply.sh /tmp/sglang
+patches/sglang/apply.sh /path/to/clean-sglang
 ```
 
-`apply.sh` verifies every patch SHA-256 and the final Git tree. `verify.sh`
-repeats application in a temporary clone, compiles the changed Python surface,
-runs focused tests, and checks a clean reverse checkout. New SGLang changes must
-be authored patch-first; do not commit a source checkout or submodule here.
+Any dirty state, wrong commit, changed patch, failed mail application, or final
+tree mismatch stops immediately. The script never rebases, stashes, resets, or
+edits the supplied checkout to make a mismatch disappear.
+
+## Verification and authoring
+
+Run the disposable verifier before publishing:
+
+```bash
+python scripts/verify_sglang_patchset.py \
+  --upstream-checkout /path/to/clean-upstream
+```
+
+New integration changes are patch-first: create a temporary branch from the
+pin, make one semantic commit, add focused tests, export with `git format-patch`,
+then update `series`, patch SHA-256 values, modified-file lists, expected final
+tree, Python pin constants, NOTICE, and documentation together. Finally verify
+application and reverse removal while confirming the original upstream source
+remains clean.

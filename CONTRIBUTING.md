@@ -21,10 +21,16 @@ separate GPU-marked test and must not make CPU tests require CUDA.
 ## Design rules
 
 - Prefer the smallest reusable abstraction; avoid backend copies of lifecycle,
-  version-bank, or controller logic.
+  version-bank, optimizer, or evidence logic.
 - Fail closed before model loading when identity, exactness, or compatibility
   cannot be established.
 - Keep the disabled speculative path allocation-free and upstream-compatible.
+- Keep the formal method surface limited to Static, TTS, and L0. New research
+  ideas belong in a separately reviewed proposal, not hidden feature flags.
+- Treat TTS and L0 candidate computation as one implementation. Only their
+  publication policy may differ.
+- Preserve frozen historical drafter KV and its per-segment source versions;
+  changing that contract defines a new method.
 - Never commit model weights, datasets, telemetry, profiles, experiment
   results, credentials, provider state, or machine-specific paths.
 - Do not add a SGLang checkout or submodule. Author changes against the pinned
@@ -37,5 +43,7 @@ Use focused commits and explain the invariant being changed. Include CPU tests,
 GPU-test requirements, compatibility impact, memory-accounting impact, and
 evidence that exactness is preserved. Performance claims require an approved
 experiment protocol and are not accepted from ad hoc measurements.
+
+The full project standard is [`.codex/project-standards.md`](.codex/project-standards.md).
 
 Contributions are licensed under Apache-2.0 unless explicitly stated otherwise.
