@@ -16,5 +16,16 @@ versioned frozen-KV lifecycle, memory accounting, and evidence hooks for the
 Static/TTS/L0 study.
 See patches/sglang/manifest.json for the exact patch and tree identities.
 
+The registered OnlineSPEC comparison is a clean-room implementation of online
+learner equations described by:
+
+  Paper: https://arxiv.org/abs/2603.12617v2
+  Reference repository: https://github.com/ZinYY/OnlineSPEC
+  Audited commit: e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b
+
+The reference repository did not expose a software license at the audited
+commit. No OnlineSPEC source code or checkpoint utility is copied or
+distributed here; the reference is recorded for scientific provenance only.
+
 Models and datasets are external artifacts. They are not distributed by this
 repository and remain subject to their respective licenses and terms.

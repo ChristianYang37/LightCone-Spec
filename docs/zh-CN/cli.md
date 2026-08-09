@@ -30,6 +30,24 @@
 | `attest-speed-study` | 绑定 GPU、runtime、模型、selection 和证据身份 |
 | `analyze-speed-study` | 计算已注册的配对速度门槛 |
 
+重要但与核心 gate 隔离的 OnlineSPEC 对比拥有一组平行命令：
+
+| 命令 | 用途 |
+|---|---|
+| `build-onlinespec-study` | 物化绑定 provenance 的对比协议 |
+| `verify-onlinespec-source` | 按已注册源码审计验证外部 clean checkout |
+| `list-onlinespec-candidates` | 写出 OGD、optimistic 与 Hedge 调参网格 |
+| `render-onlinespec-tuning-runtime` | 渲染配对 Static/candidate tuning endpoint |
+| `run-onlinespec-tuning-slice` | 测量一个 learner tuning slice |
+| `advance-onlinespec-tuning-stage` | 在每个 learner 内独立减半 candidate |
+| `select-onlinespec-config` | 为每个 learner 选择一个安全 terminal candidate |
+| `render-onlinespec-runtime` | 渲染 Static 与三个互斥对比 endpoint |
+| `build-onlinespec-queue` | 注册随机化 clean-server 对比 job |
+| `run-onlinespec-confirmation` | 执行一个 method/block 对比 slice |
+| `collect-onlinespec-study` | 派生配对对比表 |
+| `attest-onlinespec-study` | 把对比证据绑定到 GPU 与源码身份 |
+| `analyze-onlinespec-study` | 生成 learner 对 Static 的诊断区间 |
+
 项目不提供通用 method override 或 replay 命令。正式流程刻意保持狭窄，源码 manifest
 永远不包含实测结果。
 
@@ -58,6 +76,27 @@ manifest + model lock + sampling profile + registered grid
 tuning artifact、完整 Static load-screen artifact、源 manifest、controlled sampling
 profile 与 model lock。生成的 selection 会绑定这些身份、完整 tuning grid 与 patched
 SGLang tree。
+
+## OnlineSPEC 流程
+
+OnlineSPEC 复用 model lock、host preflight、controlled sampling 与已选择的 Static 负载，
+但绝不复用核心 tuning 或 confirmation row。正式比较前，
+`verify-onlinespec-source` 会验证外部 checkout 的精确 commit/tree、clean
+状态、全部已注册关键文件哈希与许可证文件清单。其内容绑定 receipt 应写入 ignored artifact
+root；upstream 源码继续保留在本仓库之外。从已跟踪的
+`manifests/speed-study/onlinespec_baseline_v2.json` 开始，每个 stage 为一个 candidate
+及其唯一配对 Static reference 渲染运行时，并在 selection 前完成全部注册 stage。
+Successive halving 在每个 learner 内独立执行。
+
+Terminal selection 绑定完整 terminal-stage artifact 的 SHA-256，而不只是重新序列化的
+winner row。随后 `render-onlinespec-runtime` 输出四个共享端口与设备的描述；Static、OGD、
+optimistic 与 Hedge 必须按 manifest 的随机顺序依次执行。
+
+`analyze-onlinespec-study` 与核心分析使用相同的内容绑定 attestation 纪律。缺少
+attestation 时状态为 `UNMEASURED` 且退出码为 42；attested 证据若有任何安全失败则为
+`BLOCKED`，同样退出 42。安全的实测输出仍然只是诊断，并固定
+`core_speed_gate_affected=false`。完整公式、源码审计边界和显存账本见
+[OnlineSPEC baseline](onlinespec-baseline.md)。
 
 ## 负载扫描与调参
 

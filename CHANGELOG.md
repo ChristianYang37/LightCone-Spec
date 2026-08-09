@@ -12,6 +12,11 @@ yet been declared.
   EAGLE, and EAGLE3, with backend-specific version and proposal contracts.
 - Added selectable Adam, AdamW, SGDm, NAG, Muon, and Lion online optimizers
   with strict configuration identity and state-aware HBM accounting.
+- Added clean-room projected OGD, two-state optimistic OGD, and cumulative-loss
+  Hedge as a provenance-bound OnlineSPEC comparison, with separate tuning,
+  paired confirmation, telemetry, memory accounting, and GPU attestation.
+- Streamed OnlineSPEC expert backward passes through one reusable gradient
+  scratch while preserving the same cumulative-loss Hedge decision.
 
 ### Planned
 

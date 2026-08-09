@@ -8,7 +8,10 @@ change. `AGENTS.md` points here so there is one normative list.
 1. Apply Occam's razor. Prefer the smallest abstraction that preserves the
    invariant; reuse one lifecycle, optimizer, publication, and evidence path.
 2. The formal research surface is Static, TTS, and L0. TTS and L0 share one
-   candidate implementation and differ only in publication timing.
+   candidate implementation and differ only in publication timing. Registered
+   OnlineSPEC learners are important comparisons, but use separate tuning,
+   evidence, attestation, and analysis and can never influence the core
+   selection or gate.
 3. Fail closed before expensive allocation whenever identity, compatibility,
    exactness, memory capacity, or evidence completeness cannot be established.
 4. Static and every disabled path must preserve upstream behavior and allocate

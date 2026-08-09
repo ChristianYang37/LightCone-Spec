@@ -35,6 +35,21 @@ module. TTS and L0 create one homogeneous cohort runtime per server process:
 Only one candidate may be in flight. This makes publication and cancellation
 semantics explicit and prevents unbounded side-stream work.
 
+## OnlineSPEC comparison lifecycle
+
+The registered OnlineSPEC baselines reuse the same cohort, supervision,
+version, exactness, and fixed-address publication infrastructure, but own a
+prequential learner state. A proposal is made with the current online decision;
+verification supplies feedback; a transactional candidate is then committed at
+the next prediction boundary. OGD stores one decision, optimistic OGD stores an
+anchor and gradient hint, and Hedge stores independent decisions and cumulative
+loss for every learning-rate expert.
+
+This state is not routed through the TTS/L0 optimizer or publication policy.
+The comparison has a separate manifest, selection, evidence namespace, and
+attestation, and cannot affect the core speed gate. See [OnlineSPEC
+baseline](onlinespec-baseline.md).
+
 ## Backend contracts
 
 DFlash exposes its actual proposal hidden state and supports both drafter-scope
@@ -99,6 +114,12 @@ determines KV capacity and admission.
 Candidate scratch is derived from the actual master, allocated moments,
 functional proposal copies, and backend merge tensors; it is not a fixed
 multiple of trainable parameter count.
+
+OnlineSPEC preflight additionally counts the shared reset/projection snapshot,
+optimistic anchor/hint tensors, independent Hedge expert decisions and
+gradients, cumulative losses, and weighted-merge staging. The snapshot is
+reported with active/base state; learner-only tensors are `online_state` bytes.
+Neither category is hidden inside the KV budget.
 
 Requests share updates only when model revisions, algorithm, sampling profile,
 tenant, experiment group, parameter layout, and optimizer identity match. The

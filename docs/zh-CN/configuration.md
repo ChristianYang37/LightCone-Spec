@@ -4,9 +4,10 @@
 
 ## Schema 身份
 
-所有 run config 使用 schema version 2，并拒绝未知字段。正式方法只有 `static`、`tts`
-和 `naive_async`。三个隔离的 OnlineSpec 标识只用于外部 baseline 核验，不能替代正式
-速度实验中的方法。
+所有 run config 使用 schema version 2，并拒绝未知字段。核心方法只有 `static`、`tts`
+和 `naive_async`。已注册 OnlineSPEC 对比在独立 manifest、selection 和证据身份下加入
+`onlinespec_ogd`、`onlinespec_opt` 与 `onlinespec_ens`。它们不能替代核心速度实验中的
+方法，也不能影响其 gate。
 
 每个真实 run 都绑定不可变的 target/drafter revision、固定 SGLang commit、sampling
 profile digest、tenant 与 runtime load。旧 schema 或已删除的方法名会在模型加载前作为
@@ -60,7 +61,7 @@ kernel 时直接报错，绝不退回 greedy decoding。
 `grad_clip` 对整个 candidate parameter list 做全局裁剪。未使用 momentum 的 optimizer
 会拒绝该字段；Muon 专属字段在其他 optimizer 中也会被拒绝。Adam 未使用的 weight
 decay 与 Lion 未使用的 epsilon 变体同样不能形成伪 tuning identity。Static 不创建
-optimizer。Plain `sgd` 只保留给隔离的 OnlineSpec baseline，不是 TTS/L0 的可选项。
+optimizer。Plain `sgd` 只保留给已注册 OnlineSPEC learner，不是 TTS/L0 的可选项。
 
 HBM 账本包含 FP32 master、所有真实分配的 moment 和 device step scalar。空 moment 不
 分配：SGDm、NAG 与 Lion 不承担第二个 state tensor；Muon 只对交给辅助 AdamW 的非
@@ -81,3 +82,24 @@ Cancellation、epoch rollover、slot reuse 或 source-version conflict 都会使
 
 除 `method` 字段外，TTS 与 L0 配置必须逐项一致。修改超参数、sampling profile、load、
 模型 revision 或 runtime tree 后，必须创建新的 selection 和 evidence root。
+
+## OnlineSPEC 对比配置
+
+每个 OnlineSPEC run 都有普通 `adaptation` object，并额外要求 `online_spec` object。
+Optimizer 必须是 plain `sgd`；论文专属状态不能通过 Adam 或 momentum alias 表达。
+
+| 字段 | 合同 |
+|---|---|
+| `projection_radius` | 可选的、以初始 decision 为中心的正 Euclidean 半径 |
+| `additional_learning_rates` | 严格递增的专家学习率，仅 Hedge 使用 |
+| `hedge_learning_rate` | 正 Hedge meta rate，仅 Hedge 使用 |
+
+OGD 与 optimistic OGD 拒绝 ensemble 字段。Hedge 至少需要两个有序专家学习率，要求
+`weight_update_mode=full`，并拒绝 LoRA，因为平均 factor 不等于平均其所表示的参数。
+DFlash 为单 learner 支持 drafter Full/LoRA；DSpark 与 EAGLE/EAGLE3 只接受共享 tail
+scope，并保留各自后端限制。全部 OnlineSPEC 方法都要求 TP=DP=1、frozen historical KV、
+cohort 隔离、exact rejection sampling 和一个 in-flight update。
+
+`online_spec` 身份、专家学习率、projection radius 与 learner method 都会进入配置、
+layout、selection、显存和证据 hash。状态转移及独立注册协议见
+[OnlineSPEC baseline](onlinespec-baseline.md)。

@@ -30,6 +30,25 @@
 | `attest-speed-study` | Bind GPU, runtime, model, selection, and evidence IDs |
 | `analyze-speed-study` | Evaluate the registered paired speed gate |
 
+The important but gate-isolated OnlineSPEC comparison has a parallel command
+family:
+
+| Command | Purpose |
+|---|---|
+| `build-onlinespec-study` | Materialize the provenance-bound comparison protocol |
+| `verify-onlinespec-source` | Verify an external clean checkout against the registered source audit |
+| `list-onlinespec-candidates` | Write the OGD, optimistic, and Hedge tuning grid |
+| `render-onlinespec-tuning-runtime` | Render paired Static/candidate tuning endpoints |
+| `run-onlinespec-tuning-slice` | Measure one learner tuning slice |
+| `advance-onlinespec-tuning-stage` | Halve candidates independently per learner |
+| `select-onlinespec-config` | Select one safe terminal candidate per learner |
+| `render-onlinespec-runtime` | Render Static plus three exclusive comparison endpoints |
+| `build-onlinespec-queue` | Register randomized clean-server comparison jobs |
+| `run-onlinespec-confirmation` | Execute one method/block comparison slice |
+| `collect-onlinespec-study` | Derive the paired comparison table |
+| `attest-onlinespec-study` | Bind comparison evidence to GPU and source identities |
+| `analyze-onlinespec-study` | Produce diagnostic learner-versus-Static intervals |
+
 There is no generic method override or replay command. The formal workflow is
 intentionally narrow, and source manifests never contain a measured result.
 
@@ -59,6 +78,31 @@ configuration. `select-speed-config` requires the terminal tuning artifact,
 the complete Static load-screen artifact, source manifest, controlled sampling
 profile, and model lock. The selection binds those identities, the full tuning
 grid, and the patched SGLang tree.
+
+## OnlineSPEC workflow
+
+OnlineSPEC reuses model locking, host preflight, controlled sampling, and the
+selected Static load, but it never reuses core tuning or confirmation rows.
+Before running the comparison, `verify-onlinespec-source` checks the external
+checkout's exact commit and tree, clean status, all registered key-file hashes,
+and license-file inventory. Its receipt is content-bound and belongs in the
+ignored artifact root; the upstream source remains outside this repository.
+Start from the tracked
+`manifests/speed-study/onlinespec_baseline_v2.json`, render one candidate and
+its single paired Static reference per stage, and advance all registered stages
+before selection. Successive halving runs independently inside each learner.
+
+The terminal selection binds the SHA-256 of the complete terminal-stage
+artifact, not merely a reserialized winner row. `render-onlinespec-runtime`
+then emits four descriptions sharing one port and device; execute Static, OGD,
+optimistic, and Hedge sequentially in the manifest's randomized order.
+
+`analyze-onlinespec-study` requires the same content-bound attestation discipline
+as the core analysis. Without it, the status is `UNMEASURED` and exit code is
+42. Attested evidence with any safety failure is `BLOCKED` and also exits 42.
+A safe measured output remains diagnostic and sets
+`core_speed_gate_affected=false`. Full equations, source-audit boundaries, and
+memory accounting are documented in [OnlineSPEC baseline](onlinespec-baseline.md).
 
 ## Load screen and tuning
 

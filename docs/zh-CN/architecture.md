@@ -29,6 +29,18 @@ server process 中创建一个同质 cohort runtime：
 
 最多只有一个 in-flight candidate，从协议上限制 side-stream 工作并明确取消语义。
 
+## OnlineSPEC 对比生命周期
+
+已注册 OnlineSPEC baseline 复用同一 cohort、监督、版本、exactness 与固定地址发布基础
+设施，但保存自己的 prequential learner state。Proposal 使用当前 online decision；
+verification 给出反馈；随后 transactional candidate 在下一次 prediction boundary 提交。
+OGD 保存一个 decision；optimistic OGD 保存 anchor 与 gradient hint；Hedge 为每个学习率
+专家保存独立 decision 和累计 loss。
+
+这些状态不会经过 TTS/L0 optimizer 或发布时间策略。该对比使用独立 manifest、selection、
+证据 namespace 与 attestation，并且不能影响核心速度 gate。详见
+[OnlineSPEC baseline](onlinespec-baseline.md)。
+
 ## Backend 合同
 
 DFlash 暴露真实 proposal hidden，同时支持 drafter-scope Full/LoRA 与共享 tail
@@ -80,6 +92,11 @@ moment；SGDm/NAG/Lion 分配一个；Muon 对 matrix 分配一个，对辅助 A
 
 Candidate scratch 按真实 master、已分配 moment、functional proposal copy 与 backend
 merge tensor 计算，不再使用 trainable parameter count 的固定倍数。
+
+OnlineSPEC 预检还会计算共享 reset/projection snapshot、optimistic anchor/hint、独立
+Hedge 专家 decision 与 gradient、累计 loss 和 weighted-merge staging。Snapshot 记入
+active/base state，learner-only tensor 记为 `online_state` bytes；两类都不会被隐藏在
+KV budget 中。
 
 只有模型 revision、算法、sampling profile、tenant、实验组、参数布局和 optimizer identity
 全部相同的请求才能共享更新。Batch 对每个请求只保留最近一次合法信号，不积累跳过轮次

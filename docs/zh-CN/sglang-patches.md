@@ -14,13 +14,19 @@ SGLang 源码、submodule 或修改后的 checkout。本地 `sglang/` 目录被 
 六个 patch 具有单向的语义依赖：
 
 1. 严格的跨 backend schema、preflight 与 disabled fast path；
-2. cohort、resident optimizer、source version、CUDA event 与发布 runtime；
-3. 可微 DFlash drafter Full/LoRA 更新路径；
+2. cohort、resident optimizer 与 OnlineSPEC learner state、source version、CUDA event
+   和发布 runtime；
+3. 可微 DFlash drafter Full/LoRA 与 OnlineSPEC 更新路径；
 4. cache-safe DFlash、DSpark、EAGLE 与 EAGLE3 tail 路径；
 5. 显存账本、lifecycle、遥测与 profiling 集成；
 6. 跨 backend optimizer、proposal、exactness 与回归测试。
 
 只支持完整 series。中间 patch 状态是 review 边界，不是可运行的产品变体。
+
+OnlineSPEC 被折叠到既有语义层，而不是创建一套平行 runtime patch：patch 一负责 schema，
+patch 二负责 learner state，patch 三负责 DFlash gradient，patch 四负责跨 backend tail
+routing，patch 五负责显存与诊断，patch 六负责协议测试。这样版本、event、exactness 与
+disabled path 始终只有一份实现。
 
 ## 应用
 

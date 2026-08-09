@@ -110,6 +110,27 @@ orthogonalization, and scales the matrix step by
 parameters take an explicitly configured auxiliary AdamW step. No optimizer
 silently creates unused moment tensors or falls back to another rule.
 
+## OnlineSPEC comparison learners
+
+The separate OnlineSPEC baseline uses projected OGD rather than a core
+optimizer. Given revealed gradient $g_t$, OGD uses
+
+\[
+w_{t+1}=\Pi_K(w_t-\eta g_t).
+\]
+
+Optimistic OGD keeps an anchor \(\hat w_t\) and uses the last revealed gradient
+as its next hint. Hedge keeps independent OGD experts, evaluates each loss and
+gradient at that expert's own decision, and forms the next full-parameter
+decision with probabilities proportional to exponentiated negative cumulative
+loss. The implementation is transactional and commits only after feedback, so
+the decision that receives a gradient is exactly the decision that generated
+the proposal.
+
+These equations, projection semantics, and clean-room source boundary are
+specified in [OnlineSPEC baseline](onlinespec-baseline.md). They are comparison
+math and do not change the Static/TTS/L0 objective or speed gate.
+
 ## Exact speculative sampling
 
 The proposal probability \(q\) recorded for verification is exactly the
@@ -122,7 +143,9 @@ proposal token \(x\) is accepted with
 
 On rejection, the replacement is sampled from normalized
 \((p-q)_+\). This preserves the target distribution even though historical KV
-was produced by older drafter versions. Greedy exactness is checked separately.
+was produced by older drafter versions. The formal controlled speed profile is
+greedy so all methods follow the same token trajectory; stochastic coupled-RNG
+and distributional exactness are checked separately.
 
 ## Speed condition
 

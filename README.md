@@ -30,8 +30,12 @@ The formal speed study remains Qwen3-8B + DFlash with TP=DP=1. The patchset
 also implements the same Static/TTS/L0 publication contract for DSpark and
 single-layer, top-k-one EAGLE/EAGLE3 through cache-safe tail updates. Those
 compatibility paths are GPU-`UNMEASURED` and are not silently substituted into
-the formal DFlash gate. Three clean-room OnlineSpec equations are kept under an
-isolated `baselines` package and never enter the default study.
+the formal DFlash gate. Three clean-room OnlineSPEC learners are kept under an
+isolated `baselines` package. OnlineSPEC is an important registered comparison
+with its own tuning and paired evidence path; it never changes core selection
+or the Static/TTS/L0 speed gate. Its pinned, machine-readable
+[source audit](manifests/provenance/onlinespec_source_audit_v2.json) distinguishes
+the paper equations, the released recipes, and this project's implementation.
 
 ## Performance model
 
@@ -206,6 +210,7 @@ report, and exact Parquet inputs. A local or synthetic table remains
 - [CLI](docs/en/cli.md)
 - [SGLang patch workflow](docs/en/sglang-patches.md)
 - [Experiment protocol](docs/en/experiment-protocol.md)
+- [OnlineSPEC baseline](docs/en/onlinespec-baseline.md)
 - [Troubleshooting](docs/en/troubleshooting.md)
 
 ## Limitations and roadmap
@@ -220,6 +225,9 @@ report, and exact Parquet inputs. A local or synthetic table remains
   different method and memory envelope.
 - GPU certification outside the formal DFlash pair and multi-GPU adaptation
   are future work. Implemented compatibility does not imply measured speedup.
+- The OnlineSPEC comparison is a clean-room implementation of the published
+  online-learner equations. Its official repository exposed no software license
+  at the pinned audit commit, so no upstream source is redistributed or copied.
 
 ## Contributing and license
 

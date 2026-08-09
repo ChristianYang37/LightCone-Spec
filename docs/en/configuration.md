@@ -5,9 +5,11 @@
 ## Schema identity
 
 All run configurations use schema version 2 and reject unknown fields. There
-are three formal methods: `static`, `tts`, and `naive_async`. Three isolated
-OnlineSpec identifiers are available only for external-baseline checks; they
-are not valid substitutes in the formal speed study.
+are three core methods: `static`, `tts`, and `naive_async`. The registered
+OnlineSPEC comparison adds `onlinespec_ogd`, `onlinespec_opt`, and
+`onlinespec_ens` under a separate manifest, selection, and evidence identity.
+They are not valid substitutes in the core speed study and cannot affect its
+gate.
 
 Every real run binds immutable target and drafter revisions, the pinned SGLang
 commit, a sampling-profile digest, a tenant, and a runtime load. Old schemas or
@@ -66,8 +68,8 @@ The configuration is strict rather than accepting silently unused fields:
 `momentum` is rejected for optimizers that do not use it. Muon-only fields are
 rejected for every other optimizer. Adam's unused weight decay and Lion's
 unused epsilon variants are likewise rejected instead of forming fake tuning
-identities. Static uses no optimizer. Plain `sgd` is reserved for the isolated
-OnlineSpec baselines and is not a TTS/L0 optimizer choice.
+identities. Static uses no optimizer. Plain `sgd` is reserved for the registered
+OnlineSPEC learners and is not a TTS/L0 optimizer choice.
 
 The HBM ledger counts the FP32 master, every allocated moment, and the device
 step scalar. Empty moments are not allocated: SGDm, NAG, and Lion therefore do
@@ -93,3 +95,28 @@ ignored artifact directory and must not be committed.
 TTS and L0 configs must be byte-equivalent after removing the `method` field.
 Changing a hyperparameter, sampling profile, load, model revision, or runtime
 tree requires a new selection and evidence root.
+
+## OnlineSPEC comparison configuration
+
+Every OnlineSPEC run has the ordinary `adaptation` object plus a required
+`online_spec` object. Its optimizer must be plain `sgd`; paper-specific state
+is not expressed through an Adam or momentum alias.
+
+| Field | Contract |
+|---|---|
+| `projection_radius` | optional positive Euclidean radius around the initial decision |
+| `additional_learning_rates` | strictly increasing expert rates, Hedge only |
+| `hedge_learning_rate` | positive Hedge meta rate, Hedge only |
+
+OGD and optimistic OGD reject ensemble fields. Hedge requires at least two
+ordered expert rates, uses `weight_update_mode=full`, and rejects LoRA because
+averaging factors is not equivalent to averaging the represented parameter.
+DFlash supports drafter Full/LoRA for the single learners. DSpark and
+EAGLE/EAGLE3 accept only the shared tail scope and retain their ordinary
+backend restrictions. All OnlineSPEC methods require TP=DP=1, frozen historical
+KV, cohort isolation, exact rejection sampling, and one in-flight update.
+
+The `online_spec` identity, expert rates, projection radius, and learner method
+enter configuration, layout, selection, memory, and evidence hashes. See the
+[OnlineSPEC baseline](onlinespec-baseline.md) for the state transitions and
+separate registered protocol.

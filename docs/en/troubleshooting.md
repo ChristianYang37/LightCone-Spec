@@ -30,6 +30,10 @@
   environment; do not replace it with a greedy DFlash fallback.
 - Static must have no adaptation object. TTS and L0 must have identical
   adaptation fields and the exact selected concurrency.
+- OnlineSPEC uses its own manifest and selection. Its optimizer must be plain
+  SGD; OGD/optimistic reject expert fields, while Hedge requires ordered expert
+  rates, a meta rate, and Full parameters. Never reuse a core TTS/L0 selection
+  or confirmation shard for this comparison.
 
 ## Memory pressure
 
@@ -46,6 +50,11 @@ trainable parameters alone. Adam/AdamW have two moments, SGDm/NAG/Lion have
 one, and Muon uses one for matrices plus two for non-matrix auxiliary-AdamW
 parameters. The FP32 master, staging bank, gradient, and step metadata are
 separate categories.
+
+For OnlineSPEC, also inspect `online_state_bytes`. Optimistic anchor/hint state
+and every Hedge expert, gradient, cumulative-loss vector, and merge buffer are
+resident. A Hedge run that appears to consume only one model decision has an
+incomplete ledger and must not start.
 
 ## Interrupted confirmation
 

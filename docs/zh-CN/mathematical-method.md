@@ -99,6 +99,24 @@ m_t=\beta_2m_{t-1}+(1-\beta_2)g_t,
 执行显式配置的辅助 AdamW。任何 optimizer 都不会静默分配无用 moment，也不会退回
 另一种更新规则。
 
+## OnlineSPEC 对比 learner
+
+独立 OnlineSPEC baseline 使用 projected OGD，而不是核心 optimizer。给定已揭示 gradient
+$g_t$，OGD 为
+
+\[
+w_{t+1}=\Pi_K(w_t-\eta g_t).
+\]
+
+Optimistic OGD 保存 anchor \(\hat w_t\)，并将最近一次揭示的 gradient 作为下一轮 hint。
+Hedge 保存相互独立的 OGD 专家，在每个专家自己的 decision 上计算其 loss 与 gradient，
+再用负累计 loss 的指数权重形成下一轮 full-parameter decision。实现是 transactional 的，
+只在得到反馈后提交，因此收到 gradient 的 decision 正是生成 proposal 的 decision。
+
+完整公式、projection 语义与 clean-room 源码边界见
+[OnlineSPEC baseline](onlinespec-baseline.md)。这些是对比方法的数学，不改变
+Static/TTS/L0 objective 或速度 gate。
+
 ## Exact speculative sampling
 
 Verification 记录的 proposal probability \(q\) 必须正是生成 draft token 的分布。给定
@@ -109,7 +127,8 @@ target probability \(p\)，proposal token \(x\) 的接受概率为
 \]
 
 拒绝时从归一化的 \((p-q)_+\) 采样 replacement。即使历史 KV 由旧 drafter version
-产生，也保持 target distribution。Greedy exactness 单独检查。
+产生，也保持 target distribution。正式 controlled speed profile 使用 greedy，确保
+所有方法遵循相同 token 轨迹；stochastic coupled-RNG 与分布 exactness 单独检查。
 
 ## 加速条件
 

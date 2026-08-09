@@ -59,6 +59,16 @@ method on the same prompt, seed, sampling profile, and load. A warmup occurs
 outside the interval. Repetitions are never merged into one timer and never
 receive copied throughput values.
 
+The registered controlled profile is greedy. This makes the target-token
+trajectory identical across Static and every exact adapted method, so a paired
+timing effect cannot be caused by method-dependent random-number consumption.
+Tuning and confirmation store only a SHA-256 of each generated trajectory and
+fail closed unless every paired method has the same digest; generated text is
+not retained in the evidence tables.
+Stochastic coupled-RNG and distribution checks remain mandatory GPU tests;
+stochastic natural-task runs are robustness side tables, not the causal speed
+headline.
+
 Every complete run has a terminal receipt binding its normalized Parquet
 shards. Resume reuses only identity-matched receipts. Interrupted shards are
 not evidence, so a stopped multi-hour study can continue without duplicating
@@ -89,6 +99,26 @@ study counters and never allocates adaptation trace buffers.
 
 Detailed profiling is a separate run; headline decoding never synchronizes
 once per round. Acceptance alone is not a speed claim.
+
+## OnlineSPEC comparison protocol
+
+OnlineSPEC is registered as an important comparison with a separate manifest
+and evidence namespace. It uses the controlled tuning and confirmation windows
+but cannot consume core TTS/L0 tuning rows or confirmation outcomes. Its three
+learners are reduced independently during successive halving, then one safe
+configuration per learner is compared with a paired Static reference.
+
+Confirmation uses 32 held-out prompts, eight randomized blocks, identical
+seeds, one locked concurrency, and the same 16K-to-safe-limit region. The
+derived table reports OGD, optimistic OGD, and Hedge separately; it never
+collapses them into a best-of-baselines result. Each comparison includes paired
+BCa intervals, safety counters, update counts, HBM categories, and the
+learner-specific diagnostics defined in [OnlineSPEC
+baseline](onlinespec-baseline.md).
+
+The comparison has its own content-bound GPU attestation. Without it the result
+is `UNMEASURED`. With it, the result is still diagnostic and cannot alter the
+core formal gate or its selected configuration.
 
 ## Formal gate
 

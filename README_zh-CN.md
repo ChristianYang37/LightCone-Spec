@@ -25,8 +25,11 @@ L0 只改变发布时间，不改变 loss 或 optimizer。
 正式速度实验仍固定 Qwen3-8B + DFlash，且要求 TP=DP=1。Patchset 也通过 cache-safe
 tail update，为 DSpark 及 single-layer、top-k-one EAGLE/EAGLE3 实现相同的
 Static/TTS/L0 发布合同。这些兼容路径的 GPU 状态为 `UNMEASURED`，不会被静默替换进
-正式 DFlash gate。三个 clean-room OnlineSpec 公式隔离在 `baselines` 包中，不进入
-默认实验。
+正式 DFlash gate。三个 clean-room OnlineSPEC learner 隔离在 `baselines` 包中。
+OnlineSPEC 是拥有独立 tuning 与配对证据链的重要已注册对比，但不能改变核心配置选择或
+Static/TTS/L0 速度 gate。固定且机器可读的
+[源码审计](manifests/provenance/onlinespec_source_audit_v2.json)会区分论文公式、公开
+recipe 与本项目实现。
 
 ## 性能模型
 
@@ -185,6 +188,7 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 - [CLI](docs/zh-CN/cli.md)
 - [SGLang patch 工作流](docs/zh-CN/sglang-patches.md)
 - [实验协议](docs/zh-CN/experiment-protocol.md)
+- [OnlineSPEC baseline](docs/zh-CN/onlinespec-baseline.md)
 - [故障排查](docs/zh-CN/troubleshooting.md)
 
 ## 限制与路线图
@@ -197,6 +201,8 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 - 历史 KV 按设计冻结；重算旧 KV 会定义另一种方法和显存边界；
 - 正式 DFlash 模型对之外的 GPU 认证与多 GPU adaptation 属于未来工作；实现兼容不
   代表已经实测加速。
+- OnlineSPEC 对比是对论文在线 learner 公式的 clean-room 实现。固定审计 commit 上的
+  官方仓库没有公开软件许可，因此本项目没有重新分发或复制其上游源码。
 
 ## 贡献与许可证
 

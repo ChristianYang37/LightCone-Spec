@@ -49,6 +49,13 @@ Confirmation 包含八个 repetition block。每个 block 都在每种方法前�
 随机排列 Static/TTS/L0，并以相同 prompt、seed、sampling profile 与 load 测量。Warmup
 位于计时区间之外。不同 repetition 不会合并为一个 timer，也不会复制 throughput 数值。
 
+已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
+沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
+调参与 confirmation 仅保存每条生成轨迹的 SHA-256；任一配对方法摘要不同都会 fail
+closed，证据表不保留生成文本。Stochastic
+coupled-RNG 与分布检查仍是必需的 GPU 测试；stochastic 自然任务只作为鲁棒性副表，不是
+因果速度 headline。
+
 每个完整 run 都有绑定规范化 Parquet shard 的 terminal receipt。Resume 只复用身份匹配
 的 receipt。中断 shard 不是证据，因此长时间实验可以续跑，不会重复或静默遗漏完整 cell。
 
@@ -74,6 +81,22 @@ segments。Static 只启用聚合实验计数，绝不分配 adaptation trace bu
 
 详细 profiling 使用独立 run；headline decoding 不逐轮 synchronize。Acceptance 单独
 改善不能表述为加速。
+
+## OnlineSPEC 对比协议
+
+OnlineSPEC 作为重要对比被注册在独立 manifest 与证据 namespace 下。它使用 controlled
+tuning/confirmation window，但不能读取核心 TTS/L0 tuning row 或 confirmation 结果。
+三种 learner 在 successive halving 中各自独立缩减，随后每种 learner 选择一个安全配置，
+并与配对 Static reference 比较。
+
+Confirmation 使用 32 个 held-out prompt、八个随机 block、相同 seed、一个锁定
+concurrency，以及相同的 16K 到安全上限区域。派生表分别报告 OGD、optimistic OGD 与
+Hedge，绝不把它们折叠成 best-of-baselines 结果。每项比较都包含配对 BCa 区间、安全
+计数、update 数、HBM 分类，以及 [OnlineSPEC baseline](onlinespec-baseline.md)定义的
+learner-specific 诊断。
+
+该对比使用自己的内容绑定 GPU attestation。缺少 attestation 时结果为 `UNMEASURED`；
+即使具备 attestation，它仍然是诊断结果，不能改变核心正式 gate 或其选择配置。
 
 ## 正式门槛
 

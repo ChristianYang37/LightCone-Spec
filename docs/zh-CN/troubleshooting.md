@@ -26,6 +26,9 @@
   sampling。若 exact kernel 不可用，应修复环境，不能改成 greedy DFlash fallback；
 - Static 不能含 adaptation object。TTS 与 L0 的 adaptation 字段和选择的 concurrency
   必须完全相同。
+- OnlineSPEC 使用自己的 manifest 与 selection。其 optimizer 必须是 plain SGD；
+  OGD/optimistic 拒绝 expert 字段，Hedge 则要求有序 expert rate、meta rate 与 Full
+  parameter。绝不能为该对比复用核心 TTS/L0 selection 或 confirmation shard。
 
 ## 显存压力
 
@@ -40,6 +43,10 @@ OOM 或 retraction 是正式实验的安全事件。不得删除计数、单纯�
 Adam/AdamW 有两个 moment，SGDm/NAG/Lion 有一个；Muon 对 matrix 使用一个，对辅助
 AdamW 处理的非 matrix 参数使用两个。FP32 master、staging bank、gradient 与 step
 metadata 都是独立类别。
+
+OnlineSPEC 还要检查 `online_state_bytes`。Optimistic anchor/hint，以及每个 Hedge expert、
+gradient、累计 loss vector 与 merge buffer 都常驻显存。若 Hedge run 的账本看起来只包含
+一份 model decision，说明账本不完整，必须禁止启动。
 
 ## Confirmation 中断
 
