@@ -1,4 +1,4 @@
-From 6121642e5069c85f6da1764ecc2b99beb0444f9b Mon Sep 17 00:00:00 2001
+From a8e9b7e8c72a1c8c2a254b23da4b3d91a35d6337 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 5/6] feat(spec): add memory lifecycle and telemetry

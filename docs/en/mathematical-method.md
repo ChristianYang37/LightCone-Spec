@@ -15,21 +15,23 @@ D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
 {\sum_{b,k}m_{b,k}\lambda^k}.
 \]
 
-The semantic mask \(m\) removes invalid request positions, tokens after an
-accepted terminal token, and draft suffixes conditioned on a rejected token.
-The gradient is normalized across the cohort, so batch size does not silently
-change the learning rate. For the registered block-16 DFlash checkpoint, the
-weight is bound to its training recipe,
+The semantic mask \(m\) removes positions beyond the request limit and after a
+terminal token. It deliberately retains the sampled counterfactual suffix after
+the first rejection: target verification produced a valid teacher distribution
+for that complete canvas, exactly as in the TTS objective. The gradient is
+normalized across the cohort, so batch size does not silently change the
+learning rate. For the registered block-16 DFlash checkpoint, the weight is
+bound to its training recipe,
 
 \[
 w_k=\exp\!\left(-\frac{k-1}{7}\right),
 \qquad \lambda=\exp(-1/7).
 \]
 
-Uniform weighting is not used for DFlash: optimizing suffix positions after an
-early mismatch spends gradient on tokens that cannot survive prefix
-verification. The decay is therefore part of the run identity, not a silent
-default or a result-derived hyperparameter. See the
+Uniform weighting is not used for DFlash because an error near the front of a
+canvas prevents every later token from surviving prefix verification. The
+decay is therefore part of the run identity, not a silent default or a
+result-derived hyperparameter. See the
 [DFlash paper](https://arxiv.org/abs/2602.06036).
 
 ## Identical candidates, different publication

@@ -14,19 +14,20 @@ D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
 {\sum_{b,k}m_{b,k}\lambda^k}.
 \]
 
-Semantic mask \(m\) 排除越过请求边界的位置、accepted terminal token 之后的位置，以及
-依赖 rejected token 的 draft suffix。Gradient 在 cohort 内归一化，因此 batch size 不会
-暗中改变 learning rate。对于已注册的 block-16 DFlash checkpoint，位置权重绑定其训练
-recipe：
+Semantic mask \(m\) 排除越过请求上限的位置和 terminal token 之后的位置，但刻意保留
+首次 rejection 后由 drafter 采样的反事实 suffix：target verification 已经为完整 canvas
+给出了有效 teacher distribution，这与 TTS 目标一致。Gradient 在 cohort 内归一化，
+因此 batch size 不会暗中改变 learning rate。对于已注册的 block-16 DFlash checkpoint，
+位置权重绑定其训练 recipe：
 
 \[
 w_k=\exp\!\left(-\frac{k-1}{7}\right),
 \qquad \lambda=\exp(-1/7).
 \]
 
-DFlash 不使用均匀位置权重：早期 token 不匹配后，继续优化无法通过 prefix verification
-的 suffix 会浪费 gradient。因此该 decay 属于 run identity，而不是静默默认值或由结果
-反推的超参数。参见 [DFlash 论文](https://arxiv.org/abs/2602.06036)。
+DFlash 不使用均匀位置权重，因为靠前 token 的错误会令其后的全部 token 无法通过
+prefix verification。因此该 decay 属于 run identity，而不是静默默认值或由结果反推的
+超参数。参见 [DFlash 论文](https://arxiv.org/abs/2602.06036)。
 
 ## 相同 candidate，不同发布时刻
 

@@ -1,12 +1,12 @@
-From c48b6c79e46059d669af813fb95913b199817cd8 Mon Sep 17 00:00:00 2001
+From 6ec44d9885696c77d2784c3e182f5b237d504f00 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
 
 ---
  .../speculative/dflash_online_adaptation.py   | 1093 +++++++++++++++++
- .../srt/speculative/online_valid_mask.py      |  138 +++
- 2 files changed, 1231 insertions(+)
+ .../srt/speculative/online_valid_mask.py      |  142 +++
+ 2 files changed, 1235 insertions(+)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
 
@@ -1111,10 +1111,10 @@ index 0000000000000000000000000000000000000000..58f94979bf3dec3a82f0535d6f7ba58b
 +    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea431062ae39
+index 0000000000000000000000000000000000000000..a8762fa8cd9cb463769b85f588ae4947d1058fa7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_valid_mask.py
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,142 @@
 +"""Shared semantic proposal mask for linear speculative backends."""
 +
 +from __future__ import annotations
@@ -1150,7 +1150,14 @@ index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea43
 +    terminal_token_ids: Sequence[Sequence[int]],
 +    ignore_eos: Sequence[bool],
 +) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-+    """Return valid teachers, accepted drafts, and semantic commits."""
++    """Return full-canvas teachers, accepted drafts, and semantic commits.
++
++    Verification reveals a teacher distribution for every token in the
++    sampled canvas, including the counterfactual suffix after the first
++    rejection.  That suffix is training evidence even though it is not
++    committed to the live request.  Only a request limit or a terminal token
++    truncates the distillation canvas.
++    """
 +    if proposal_tokens.ndim != 2:
 +        raise ValueError("proposal_tokens must have shape (batch, depth)")
 +    batch, depth = proposal_tokens.shape
@@ -1166,15 +1173,12 @@ index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea43
 +    positions = torch.arange(
 +        depth, device=proposal_tokens.device, dtype=correct_len.dtype
 +    )[None, :]
-+    # The first rejected proposal has a valid target teacher distribution;
-+    # positions after it were conditioned on an invalid draft suffix.
-+    valid = positions <= correct_len[:, None]
 +    remaining = torch.tensor(
 +        remaining_output_tokens,
 +        device=proposal_tokens.device,
 +        dtype=correct_len.dtype,
 +    )
-+    valid &= positions < remaining[:, None]
++    valid = positions < remaining[:, None]
 +    # The target bonus is committed only when the accepted draft prefix and
 +    # request boundary leave room for it.
 +    committed = torch.minimum(correct_len + 1, remaining)
@@ -1187,17 +1191,17 @@ index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea43
 +            dtype=proposal_tokens.dtype,
 +        )
 +        hit = (proposal_tokens[index, :, None] == terminals).any(-1)
-+        accepted_hit = hit & (positions[0] < correct_len[index])
-+        earlier_terminal = (
++        earlier_canvas_terminal = (
 +            torch.cat(
 +                (
 +                    torch.zeros((1,), device=proposal_tokens.device, dtype=torch.bool),
-+                    accepted_hit[:-1],
++                    hit[:-1],
 +                )
 +            ).cumsum(0)
 +            > 0
 +        )
-+        valid[index] &= ~earlier_terminal
++        valid[index] &= ~earlier_canvas_terminal
++        accepted_hit = hit & (positions[0] < correct_len[index])
 +        terminal_positions = torch.where(
 +            accepted_hit,
 +            positions[0] + 1,
@@ -1216,7 +1220,7 @@ index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea43
 +    terminal_token_ids: Sequence[Sequence[int]],
 +    ignore_eos: Sequence[bool],
 +) -> torch.Tensor:
-+    """Mask rejected suffix, request boundary, and accepted terminal suffix."""
++    """Keep the sampled canvas; mask request and terminal boundaries only."""
 +    valid, _, _ = semantic_proposal_semantics(
 +        proposal_tokens=proposal_tokens,
 +        correct_len=correct_len,

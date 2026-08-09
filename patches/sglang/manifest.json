@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "b42bbaf320f7a1547a1ccfc4c597ed0d21505ec2",
+  "expected_tree": "dda0447dba10e266d767dab173a03c1b04223421",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
@@ -24,7 +24,7 @@
     },
     {
       "file": "0003-feat-dflash-add-differentiable-online-update-path.patch",
-      "sha256": "cf7028901d0e1f2bf27630aa7ee84f34a28660e2c588b904a6646aaba1d6a080",
+      "sha256": "cf466679671858d5ae8f2070d681ecf0cea48d07114c77328a67b7ca919494f6",
       "files": [
         "python/sglang/srt/speculative/dflash_online_adaptation.py",
         "python/sglang/srt/speculative/online_valid_mask.py"
@@ -32,7 +32,7 @@
     },
     {
       "file": "0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch",
-      "sha256": "5bc4229a8b94e2f5936184d657b20da145d05f9c3150dcad4f619264b0b22085",
+      "sha256": "6b556967946b0ba577d8cc6caad67da166f9c331577566121fd995e955e0fd00",
       "files": [
         "python/sglang/srt/managers/overlap_utils.py",
         "python/sglang/srt/models/deepseek_v4_dspark.py",
@@ -51,7 +51,7 @@
     },
     {
       "file": "0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch",
-      "sha256": "67787c346b9d1a6bbae34b70bb119ca549fddbeeeab2e6b3af55302e6787d7fa",
+      "sha256": "6771c520eb508560ef1b06a434c9771cfe3cbf48394727a23e0e43218a8b16ea",
       "files": [
         "python/sglang/srt/managers/scheduler.py",
         "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
@@ -62,7 +62,7 @@
     },
     {
       "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
-      "sha256": "8f843218ba6c1f57a92ef6828156f7187f2a7b1ba61612b3d27a32aa0c550d60",
+      "sha256": "f3bccff309be02e84899f43c4363da935aac4c1ba5876a61216305d5cb05bd78",
       "files": [
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]

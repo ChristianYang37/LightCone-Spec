@@ -1,4 +1,4 @@
-From 2d4f6b6bebe7138fb4dcbcdca11a91c8a74bc7b4 Mon Sep 17 00:00:00 2001
+From 3ad56507a1777b16e0d9b4f1ffbe06ca53966c1b Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
