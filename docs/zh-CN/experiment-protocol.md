@@ -29,8 +29,10 @@ Static 独立扫描 concurrency 1、2、4、8、16、32、48。只有 OOM 和 re
 且 p99 ITL 不超过 Static-c1 两倍的负载才可选。满足条件后选择 decode goodput 最高者，
 并对三种方法固定。
 
-调参在注册的 optimizer、学习率、rank、stride、weight decay 与 gradient clipping 网格
-中搜索 drafter Full/LoRA。Successive halving 只能读取 tuning 窗口。共享配置最大化
+调参对 drafter Full/LoRA 搜索 Adam、AdamW、SGDm、NAG、Muon 与 Lion，并为不同
+optimizer 使用各自的 learning-rate 范围，同时覆盖 rank、stride、weight decay 与全局
+gradient clipping。Muon 的 matrix step 与辅助 AdamW 字段绑定为一个 candidate identity，
+run 后不能拆开选择。Successive halving 只能读取 tuning 窗口。共享配置最大化
 
 \[
 \min\left(V_{\mathrm{TTS}}/V_{\mathrm{Static}},
@@ -61,6 +63,10 @@ verified draft、verification waste、target calls/output token、TTFT、ITL 分
 lane 时间、exposed update time、overlap、graph replay、batch fill、queue occupancy、
 peak HBM、KV/optimizer 显存、loss 与 trainable parameter count。Target-only estimated
 MFU 与 profiler 实测设备利用率使用不同名称。
+
+Optimizer 显存按类别记录，不从 parameter count 反推，从而区分双 moment 的
+Adam/AdamW、单 moment 的 SGDm/NAG/Lion，以及 Muon 的 matrix momentum 与非 matrix
+辅助 AdamW state。
 
 Adapted run 还为每个 verification round 保留语义记录，包括真实 `prefix_len_before`、
 有效的 verified/accepted/committed 计数、proposal source version 与 frozen-KV version

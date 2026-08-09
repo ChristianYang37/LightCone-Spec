@@ -15,8 +15,8 @@ Git tree in `patches/sglang/manifest.json`.
 
 ## Decode lifecycle
 
-Static takes the original DFlash path and imports no adaptation module. TTS and
-L0 create one homogeneous cohort runtime per server process:
+Static takes the selected backend's original path and imports no adaptation
+module. TTS and L0 create one homogeneous cohort runtime per server process:
 
 1. A verification round exposes the current teacher logits, drafter hidden
    state, semantic mask, and source version.
@@ -34,6 +34,32 @@ L0 create one homogeneous cohort runtime per server process:
 
 Only one candidate may be in flight. This makes publication and cancellation
 semantics explicit and prevents unbounded side-stream work.
+
+## Backend contracts
+
+DFlash exposes its actual proposal hidden state and supports both drafter-scope
+Full/LoRA and the shared tail parameterizations. Only update rounds enter the
+differentiable current-canvas path; ordinary proposal rounds retain graph replay
+and do not run an extra vocabulary projection.
+
+DSpark keeps two hidden identities separate. Its Markov feature is the raw
+drafter output consumed by the Markov head, while its tail feature is the exact
+post-collapse, post-final-normalization input to the frozen LM head. The tail
+correction is applied before the Markov bias. The stored adapter-free logits are
+reconstructed at the same sampled predecessor-token path, so the actual
+proposal distribution is neither corrected twice nor replaced during
+verification. Adaptation requires verify-all mode; confidence-based draft
+truncation would remove supervision rows and therefore fails closed.
+
+EAGLE and EAGLE3 pin one source adapter version from `draft_extend` through the
+following verification. The first proposal and every internal proposal step
+use the same fixed-address tail bank. Publication is blocked while any pinned
+proposal remains outstanding. The legal transition is
+`verify -> candidate -> publish boundary -> draft_extend`. Filter, merge,
+overlap futures, retraction, finish, and abort preserve or invalidate the
+version state transactionally.
+The supported online shape is deliberately narrow: single layer, fixed depth,
+top-k one, no token map, and exact full-vocabulary rejection sampling.
 
 ## Parameter layouts
 
@@ -62,10 +88,17 @@ different algorithm.
 ## Memory and concurrency
 
 Adaptation memory is allocated before KV-pool sizing. The ledger separates
-active/base state, FP32 master, gradients, first and second moments, staging,
-training activations, KV gather scratch, candidate scratch, graph buffers, and
-telemetry. Resident adaptation state is not evictable and is never silently
-offloaded or downgraded. Remaining HBM determines KV capacity and admission.
+active/base state, FP32 master, gradients, allocated optimizer moments,
+optimizer metadata, staging, training activations, KV gather scratch, candidate
+scratch, graph buffers, and telemetry. Adam/AdamW allocate two moments;
+SGDm/NAG/Lion allocate one; Muon allocates one per matrix and two for each
+non-matrix auxiliary-AdamW parameter. Resident adaptation state is not
+evictable and is never silently offloaded or downgraded. Remaining HBM
+determines KV capacity and admission.
+
+Candidate scratch is derived from the actual master, allocated moments,
+functional proposal copies, and backend merge tensors; it is not a fixed
+multiple of trainable parameter count.
 
 Requests share updates only when model revisions, algorithm, sampling profile,
 tenant, experiment group, parameter layout, and optimizer identity match. The

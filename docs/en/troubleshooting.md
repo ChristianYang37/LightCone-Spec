@@ -16,9 +16,15 @@
 
 - Regenerate the model lock when an upstream revision changes. A model-roots
   file must bind that exact lock and every selected local directory must exist.
-- DFlash adaptation rejects TP/DP greater than one, quantized draft paths,
+- All adapted backends reject TP/DP greater than one, quantized draft paths,
   block/canvas mismatch, unsupported speculative options, and insufficient
-  explicit HBM reserve.
+  explicit HBM reserve. Drafter scope is DFlash-only. DSpark additionally
+  requires verify-all; EAGLE/EAGLE3 requires a single layer, fixed depth,
+  top-k one, no token map, and exact full-vocabulary rejection sampling.
+- Optimizer-specific fields are not interchangeable. SGDm, NAG, and Muon need
+  explicit momentum; Muon also needs Newton--Schulz steps and auxiliary AdamW
+  settings. A field that is unused by the selected optimizer is a configuration
+  error, not an ignored default.
 - Formal Static/TTS/L0 endpoints require the explicit speed-study metric flag
   and exact rejection sampling. If the exact kernel is unavailable, fix that
   environment; do not replace it with a greedy DFlash fallback.
@@ -34,6 +40,12 @@ then repeat load screening because the runtime identity changed.
 
 An OOM or retraction is a safety event in the formal study. Do not remove the
 counter, increase a timeout, or drop the failed request from the denominator.
+
+If optimizer HBM is unexpected, inspect the ledger rather than estimating from
+trainable parameters alone. Adam/AdamW have two moments, SGDm/NAG/Lion have
+one, and Muon uses one for matrices plus two for non-matrix auxiliary-AdamW
+parameters. The FP32 master, staging bank, gradient, and step metadata are
+separate categories.
 
 ## Interrupted confirmation
 

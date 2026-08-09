@@ -26,10 +26,12 @@ TTS follows the scheduling definition in the [Test-Time Speculation
 paper](https://arxiv.org/abs/2605.09329). L0 changes only the publication time;
 it is not a different loss or optimizer.
 
-Focused online adaptation is currently certified only for Qwen3-8B + DFlash,
-with TP=DP=1. Native SGLang remains available for other backends when the
-adaptation config is omitted. Three clean-room OnlineSpec equations are kept
-under an isolated `baselines` package and never enter the default study.
+The formal speed study remains Qwen3-8B + DFlash with TP=DP=1. The patchset
+also implements the same Static/TTS/L0 publication contract for DSpark and
+single-layer, top-k-one EAGLE/EAGLE3 through cache-safe tail updates. Those
+compatibility paths are GPU-`UNMEASURED` and are not silently substituted into
+the formal DFlash gate. Three clean-room OnlineSpec equations are kept under an
+isolated `baselines` package and never enter the default study.
 
 ## Performance model
 
@@ -54,7 +56,8 @@ counts, CUDA timing, HBM accounting, and confidence intervals together.
   upstream commit. The repository never vendors or edits SGLang in place.
 - A cohort runtime keeps optimizer state on GPU, publishes into fixed-address
   inference tensors, and binds every candidate to epoch, slot generation, and
-  source version.
+  source version. Adam, AdamW, SGDm, NAG, Muon, and Lion share this functional
+  propose-then-commit path.
 - Headline telemetry uses asynchronous CUDA events. Synchronizing diagnostics
   and profilers run after the measured interval or in a separate run.
 
@@ -162,6 +165,19 @@ The public schema accepts:
   full-rank tail ablation. Target embeddings, target LM head, and target model
   remain frozen.
 
+DFlash supports drafter Full/LoRA and all three tail modes. DSpark and
+EAGLE/EAGLE3 deliberately support tail scope only: residual, tail LoRA, and
+full-rank tail. DSpark applies the tail to the exact post-normalization LM-head
+input before its Markov correction. EAGLE pins the proposal version from
+draft-extend through verification and cannot publish while that proposal is
+outstanding.
+
+The selectable online optimizers are `adam`, `adamw`, `sgdm`, `nag`, `muon`,
+and `lion`. Muon uses its matrix orthogonalization path for two-dimensional
+parameters and an explicitly configured auxiliary AdamW path for non-matrix
+parameters. Optimizer identity and all optimizer-specific fields are part of
+the cohort, selection, layout, and evidence hashes.
+
 Historical drafter KV is immutable. KV created before publication is neither
 rebuilt nor differentiated; new KV records the newly published source version.
 The actual proposal distribution remains the distribution used by exact
@@ -195,12 +211,15 @@ report, and exact Parquet inputs. A local or synthetic table remains
 ## Limitations and roadmap
 
 - GPU status is currently `UNMEASURED`; no speedup is asserted.
-- Focused adaptation supports DFlash with TP=DP=1 and an unquantized draft/KV
-  path. Unsupported combinations fail before adaptation allocation.
+- Adaptation requires TP=DP=1 and an unquantized draft/KV path. Drafter-scope
+  Full/LoRA is DFlash-only; DSpark requires verify-all execution, and adapted
+  EAGLE/EAGLE3 requires a single layer, fixed depth, top-k one, and exact
+  full-vocabulary rejection sampling. Unsupported combinations fail before
+  adaptation allocation.
 - Historical KV is frozen by design. Recomputing old KV would define a
   different method and memory envelope.
-- Multi-GPU certification and additional speculative backends are future work,
-  not latent or partially enabled features.
+- GPU certification outside the formal DFlash pair and multi-GPU adaptation
+  are future work. Implemented compatibility does not imply measured speedup.
 
 ## Contributing and license
 

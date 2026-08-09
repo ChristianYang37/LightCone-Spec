@@ -35,9 +35,12 @@ eligible only with zero OOM and retractions and p99 ITL no greater than twice
 Static-c1. The eligible load with highest decode goodput is fixed for all three
 methods.
 
-Tuning searches drafter Full and LoRA using the registered optimizer, learning
-rate, rank, stride, weight-decay, and clipping grid. Successive halving reads
-only the tuning window. The final shared configuration maximizes
+Tuning searches drafter Full and LoRA across Adam, AdamW, SGDm, NAG, Muon, and
+Lion with optimizer-specific learning-rate ranges, rank, stride, weight decay,
+and global gradient clipping. Muon's matrix step and auxiliary AdamW fields are
+one bound candidate identity; they cannot be selected independently after the
+run. Successive halving reads only the tuning window. The final shared
+configuration maximizes
 
 \[
 \min\left(V_{\mathrm{TTS}}/V_{\mathrm{Static}},
@@ -74,6 +77,10 @@ token, TTFT, ITL percentiles, CUDA lane times, exposed update time, overlap,
 graph replay, batch fill, queue occupancy, peak HBM, KV and optimizer memory,
 loss, and trainable parameter count. Target-only estimated MFU and profiler
 device utilization use different names.
+
+Optimizer memory is reported by category rather than inferred from parameter
+count. This distinguishes two-moment Adam/AdamW, one-moment SGDm/NAG/Lion, and
+Muon's matrix momentum plus non-matrix auxiliary AdamW state.
 
 Adapted runs also retain one semantic record per verification round, including
 the real `prefix_len_before`, valid verified/accepted/committed counts, proposal

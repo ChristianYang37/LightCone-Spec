@@ -66,6 +66,39 @@ B\in\mathbb R^{d_{out}\times r},
 计算 \(h'=h+\Delta h\)，再通过冻结 target head 投影一次；residual tail 直接对 logits
 施加低秩修正。
 
+对于 DSpark，\(h\) 特指 normalized LM-head input，Markov state 保持为另一份冻结
+feature。对于 EAGLE/EAGLE3，同一 proposal chain 中的所有 hidden 都使用钉在同一 source
+version 的 tail bank。
+
+## Optimizer 动力学
+
+每个 optimizer 都实现为 functional proposal
+\((\theta_t,s_t,g_t)\mapsto(\hat\theta_{t+1},\hat s_{t+1})\)。只有发布提交
+candidate 后，active parameter/state 才会改变。因此，即使 TTS 与 L0 的 candidate 在
+不同 decode boundary 才能发布，它们仍执行完全相同的 optimizer 算术。
+
+Adam 与 AdamW 使用 bias-corrected FP32 一阶、二阶动量；AdamW 使用 decoupled decay。
+对 coupled-decay momentum 方法，令 \(\tilde g_t=g_t+\lambda\theta_t\)，SGDm 与 NAG 为
+
+\[
+v_t=\mu v_{t-1}+\tilde g_t,\qquad
+d_t^{\mathrm{SGDm}}=v_t,\qquad
+d_t^{\mathrm{NAG}}=\tilde g_t+\mu v_t.
+\]
+
+Lion 只保留一个 moment：
+
+\[
+d_t=\operatorname{sign}(\beta_1m_{t-1}+(1-\beta_1)g_t),\qquad
+m_t=\beta_2m_{t-1}+(1-\beta_2)g_t,
+\]
+
+并使用 decoupled weight decay。Muon 对每个二维参数构造 Nesterov momentum proposal，
+执行已注册的 quintic Newton--Schulz orthogonalization，并按
+\(\sqrt{\max(1,d_{out}/d_{in})}\) 缩放 matrix step。Bias、norm 与其他非 matrix 参数
+执行显式配置的辅助 AdamW。任何 optimizer 都不会静默分配无用 moment，也不会退回
+另一种更新规则。
+
 ## Exact speculative sampling
 
 Verification 记录的 proposal probability \(q\) 必须正是生成 draft token 的分布。给定

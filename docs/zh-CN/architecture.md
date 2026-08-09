@@ -13,8 +13,8 @@ run artifact 全部位于仓库之外。
 
 ## 解码生命周期
 
-Static 使用原生 DFlash 路径，不导入 adaptation module。TTS 与 L0 在每个 server
-process 中创建一个同质 cohort runtime：
+Static 使用所选 backend 的原生路径，不导入 adaptation module。TTS 与 L0 在每个
+server process 中创建一个同质 cohort runtime：
 
 1. Verification round 暴露当前 teacher logits、drafter hidden、semantic mask 和
    source version；
@@ -28,6 +28,27 @@ process 中创建一个同质 cohort runtime：
    继续执行，并记录原因。
 
 最多只有一个 in-flight candidate，从协议上限制 side-stream 工作并明确取消语义。
+
+## Backend 合同
+
+DFlash 暴露真实 proposal hidden，同时支持 drafter-scope Full/LoRA 与共享 tail
+parameterization。只有 update round 进入可微 current-canvas path；普通 proposal round
+保留 graph replay，也不额外执行 vocabulary projection。
+
+DSpark 严格分开两种 hidden 身份：Markov feature 是 Markov head 消费的原始 drafter
+输出；tail feature 是经过 collapse 与 final normalization 后，进入冻结 LM head 的真实
+输入。Tail correction 在 Markov bias 前施加。Adapter-free logits 在相同 sampled
+predecessor-token path 下重建，因此真实 proposal distribution 不会被重复 correction，
+verification 也不会换用另一份分布。Adaptation 必须使用 verify-all；confidence-based
+draft truncation 会删除监督 row，因而 fail closed。
+
+EAGLE/EAGLE3 从 `draft_extend` 到随后的 verification 钉住同一个 source adapter
+version。首个 proposal 与每个内部 proposal step 使用同一固定地址 tail bank。任何 pinned
+proposal 尚未完成时都禁止发布。合法顺序为
+`verify -> candidate -> publish boundary -> draft_extend`。Filter、merge、overlap
+future、retraction、finish 与 abort 都以事务方式传播或失效 version state。在线支持形状
+刻意收窄为 single layer、fixed depth、top-k one、无 token map 与 exact full-vocabulary
+rejection sampling。
 
 ## 参数布局
 
@@ -51,9 +72,14 @@ Tail 消融先修正 hidden，再只执行一次 target-head projection。Residu
 ## 显存与并发
 
 Adaptation 显存在 KV-pool sizing 前分配。账本拆分 active/base、FP32 master、gradient、
-一阶与二阶动量、staging、training activation、KV gather scratch、candidate scratch、
-graph buffer 和 telemetry。Resident adaptation state 不可驱逐，也不静默 offload 或降档；
+实际分配的 optimizer moment、optimizer metadata、staging、training activation、KV
+gather scratch、candidate scratch、graph buffer 和 telemetry。Adam/AdamW 分配两个
+moment；SGDm/NAG/Lion 分配一个；Muon 对 matrix 分配一个，对辅助 AdamW 处理的每个
+非 matrix 参数分配两个。Resident adaptation state 不可驱逐，也不静默 offload 或降档；
 剩余 HBM 决定 KV capacity 与 admission。
+
+Candidate scratch 按真实 master、已分配 moment、functional proposal copy 与 backend
+merge tensor 计算，不再使用 trainable parameter count 的固定倍数。
 
 只有模型 revision、算法、sampling profile、tenant、实验组、参数布局和 optimizer identity
 全部相同的请求才能共享更新。Batch 对每个请求只保留最近一次合法信号，不积累跳过轮次

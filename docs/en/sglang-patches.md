@@ -14,12 +14,13 @@ identity.
 
 The six-patch series has one-way semantic dependencies:
 
-1. strict schema, preflight, and disabled fast path;
-2. cohort, source-version, CUDA-event, and publication runtime;
+1. strict cross-backend schema, preflight, and disabled fast path;
+2. cohort, resident optimizer, source-version, CUDA-event, and publication
+   runtime;
 3. differentiable DFlash drafter Full/LoRA update path;
-4. cache-safe tail ablations;
-5. memory accounting, lifecycle, telemetry, and profiling;
-6. focused SGLang protocol and regression tests.
+4. cache-safe DFlash, DSpark, EAGLE, and EAGLE3 tail paths;
+5. memory accounting, lifecycle, telemetry, and profiling integration;
+6. cross-backend optimizer, proposal, exactness, and regression tests.
 
 Only the complete series is supported. Intermediate patch states are review
 boundaries, not runnable product variants.

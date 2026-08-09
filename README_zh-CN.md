@@ -22,9 +22,11 @@ LightCone-Spec 是一个以证据为先的 speculative decoding 测试时 drafte
 TTS 遵循 [Test-Time Speculation 论文](https://arxiv.org/abs/2605.09329)中的调度定义。
 L0 只改变发布时间，不改变 loss 或 optimizer。
 
-目前在线 adaptation 仅认证 Qwen3-8B + DFlash，且要求 TP=DP=1。未提供 adaptation
-配置时，其他后端仍走原生 SGLang 路径。三个 clean-room OnlineSpec 公式隔离在
-`baselines` 包中，不进入默认实验。
+正式速度实验仍固定 Qwen3-8B + DFlash，且要求 TP=DP=1。Patchset 也通过 cache-safe
+tail update，为 DSpark 及 single-layer、top-k-one EAGLE/EAGLE3 实现相同的
+Static/TTS/L0 发布合同。这些兼容路径的 GPU 状态为 `UNMEASURED`，不会被静默替换进
+正式 DFlash gate。三个 clean-room OnlineSpec 公式隔离在 `baselines` 包中，不进入
+默认实验。
 
 ## 性能模型
 
@@ -47,7 +49,8 @@ T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
 - `patches/sglang` 是针对唯一 upstream commit 的六层可复现 mail patch；仓库既不
   vendoring SGLang，也不原地修改 SGLang；
 - cohort runtime 将 optimizer 状态保持在 GPU，在固定地址的 inference tensor 上发布，
-  并用 epoch、slot generation 和 source version 绑定每个 candidate；
+  并用 epoch、slot generation 和 source version 绑定每个 candidate；Adam、AdamW、
+  SGDm、NAG、Muon 与 Lion 共用这一 functional propose-then-commit 路径；
 - headline 遥测只使用异步 CUDA event；需要同步的诊断和 profiler 在计时区间之后或
   独立 run 中执行。
 
@@ -148,6 +151,15 @@ server，随后进入下一项。最后用 `collect-speed-study` 派生正式表
 - `full`：drafter scope 下更新全部 DFlash 自有浮点参数，或作为 full-rank tail 消融。
   target embedding、target LM head 与 target model 始终冻结。
 
+DFlash 支持 drafter Full/LoRA 与三种 tail mode。DSpark 和 EAGLE/EAGLE3 刻意只支持
+tail scope：residual、tail LoRA 与 full-rank tail。DSpark 在 Markov correction 之前，
+对 post-normalization 的真实 LM-head 输入施加 tail；EAGLE 从 draft-extend 到 verify
+持续钉住 proposal version，存在尚未验证的 proposal 时禁止发布。
+
+在线可选 optimizer 为 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与 `lion`。Muon 对二维
+参数使用 matrix orthogonalization，对非 matrix 参数使用显式配置的辅助 AdamW。
+Optimizer 身份及全部专属字段都进入 cohort、selection、layout 与 evidence hash。
+
 历史 drafter KV 不可变。发布前的 KV 不重建、不参与梯度；发布后新建的 KV 记录新
 source version。实际 proposal distribution 始终用于 exact speculative rejection
 sampling。
@@ -178,10 +190,13 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 ## 限制与路线图
 
 - GPU 状态目前为 `UNMEASURED`，不声明任何加速；
-- 在线 adaptation 仅支持 DFlash、TP=DP=1、未量化 drafter/KV；其他组合在分配
+- Adaptation 要求 TP=DP=1 与未量化 drafter/KV。Drafter-scope Full/LoRA 仅用于
+  DFlash；DSpark 必须使用 verify-all；EAGLE/EAGLE3 必须 single layer、fixed depth、
+  top-k one，并使用 exact full-vocabulary rejection sampling。其他组合在分配
   adaptation 显存前 fail closed；
 - 历史 KV 按设计冻结；重算旧 KV 会定义另一种方法和显存边界；
-- 多 GPU 认证及更多 speculative backend 属于未来工作，不存在隐藏或半启用实现。
+- 正式 DFlash 模型对之外的 GPU 认证与多 GPU adaptation 属于未来工作；实现兼容不
+  代表已经实测加速。
 
 ## 贡献与许可证
 

@@ -15,8 +15,13 @@
 
 - Upstream revision 改变时重新生成 model lock。Model-roots 文件必须绑定该精确 lock，
   且选择的每个本地目录都必须存在；
-- DFlash adaptation 拒绝大于一的 TP/DP、量化 drafter path、block/canvas 不匹配、
-  未支持的 speculative 选项和未显式保留足够 HBM 的配置；
+- 所有 adapted backend 都拒绝大于一的 TP/DP、量化 drafter path、block/canvas
+  不匹配、未支持的 speculative 选项和未显式保留足够 HBM 的配置。Drafter scope 仅
+  用于 DFlash；DSpark 还要求 verify-all；EAGLE/EAGLE3 要求 single layer、fixed
+  depth、top-k one、无 token map 与 exact full-vocabulary rejection sampling；
+- 不同 optimizer 的专属字段不能混用。SGDm、NAG 与 Muon 需要显式 momentum；Muon
+  还需要 Newton--Schulz steps 与辅助 AdamW 配置。所选 optimizer 不使用的字段会
+  触发配置错误，不会被静默忽略；
 - 正式 Static/TTS/L0 endpoint 必须显式启用 speed-study metric 与 exact rejection
   sampling。若 exact kernel 不可用，应修复环境，不能改成 greedy DFlash fallback；
 - Static 不能含 adaptation object。TTS 与 L0 的 adaptation 字段和选择的 concurrency
@@ -30,6 +35,11 @@ runtime 身份已经改变，随后必须重新执行负载筛选。
 
 OOM 或 retraction 是正式实验的安全事件。不得删除计数、单纯增加 timeout，或把失败请求
 从分母移除。
+
+如果 optimizer HBM 与预期不符，应检查账本，而不是只按 trainable parameter 推算。
+Adam/AdamW 有两个 moment，SGDm/NAG/Lion 有一个；Muon 对 matrix 使用一个，对辅助
+AdamW 处理的非 matrix 参数使用两个。FP32 master、staging bank、gradient 与 step
+metadata 都是独立类别。
 
 ## Confirmation 中断
 

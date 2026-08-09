@@ -6,10 +6,17 @@ yet been declared.
 
 ## [Unreleased]
 
+### Added
+
+- Added cache-safe tail implementations of Static/TTS/L0 for DSpark,
+  EAGLE, and EAGLE3, with backend-specific version and proposal contracts.
+- Added selectable Adam, AdamW, SGDm, NAG, Muon, and Lion online optimizers
+  with strict configuration identity and state-aware HBM accounting.
+
 ### Planned
 
 - GPU certification of the registered Qwen3-8B + DFlash speed study.
-- Multi-GPU validation and separately reviewed backend extensions.
+- Multi-GPU validation and GPU certification of the compatibility backends.
 
 ## [0.2.0] - 2026-08-09
 

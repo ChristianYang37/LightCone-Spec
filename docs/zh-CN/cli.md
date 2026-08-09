@@ -75,7 +75,11 @@ Tuning 从 `list-tuning-candidates` 开始。先按选定 concurrency 只渲染�
 端点，并在每个 stage 中复用其不可变启动描述作为唯一 Static baseline。每个 active
 candidate/stage 使用 `render-tuning-runtime` 在同一端口只生成 TTS 与 L0 两个互斥
 slice，因此不会意外重复 Static 证据。只启动当前要测量的 slice，
-执行 `run-controlled-slice --phase tune`，关闭 server 后再继续。`advance-tuning-stage`
+执行 `run-controlled-slice --phase tune`，关闭 server 后再继续。
+Candidate JSON 包含完整 optimizer identity：Adam/AdamW 的 beta 与 decay、SGDm/NAG
+momentum、Lion beta，或 Muon momentum、Newton--Schulz steps 与辅助 AdamW 字段。
+不得删除字段，也不得手工把两个 optimizer candidate 归一化为同一 identity。
+`advance-tuning-stage`
 强制检查注册的 prompt 数与 context 上限、Static/TTS/L0 配对覆盖、安全计数与 survivor
 身份。后续 stage 必须引用前一 stage 的 survivor artifact；confirmation 数据永不作为输入。
 

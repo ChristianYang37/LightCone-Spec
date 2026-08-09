@@ -24,14 +24,17 @@ TTS and L0 share one identical adaptation object:
 | `kv_history_policy` | exactly `frozen` |
 | `adaptation_scope` | exactly `cohort` |
 | `adaptation_group_id` | explicit, non-empty group identity |
-| `optimizer.name` | `adam` or `adamw` for TTS/L0 |
+| `optimizer.name` | `adam`, `adamw`, `sgdm`, `nag`, `muon`, or `lion` |
 | `rank` | explicit for residual/LoRA; `null` for full |
 | `stride` | positive integer |
 | `max_in_flight` | exactly one |
 
-Residual is tail-only. Drafter Full/LoRA is currently certified only for
-unquantized DFlash with TP=DP=1 and a canvas width equal to the speculative
-block size. Target embedding, target LM head, and target model remain frozen.
+Residual is tail-only. Drafter Full/LoRA is DFlash-only and requires an
+unquantized TP=DP=1 path with a canvas width equal to the speculative block
+size. DSpark and EAGLE/EAGLE3 accept only tail scope. Adapted DSpark requires
+verify-all execution. Adapted EAGLE/EAGLE3 requires one layer, fixed proposal
+depth, top-k one, no token-map remapping, and exact full-vocabulary rejection
+sampling. Target embedding, target LM head, and target model remain frozen.
 
 Static requires `adaptation: null`. This is a semantic fast-path requirement:
 no optimizer, gradient, trace, candidate, or adaptation-reserve allocation may
@@ -42,6 +45,34 @@ exact rejection sampling to all three endpoints. Without that study flag,
 native SGLang allocates no LightCone metric state. With it, DFlash, rejection
 sampling, and both acceptance thresholds equal to one are mandatory; a
 missing exact kernel is an error and never falls back to greedy decoding.
+
+## Optimizer contracts
+
+All online optimizers are functional: a side stream computes candidate
+parameters and candidate state without mutating the active optimizer. The
+candidate becomes active only when the TTS or L0 publication policy commits it.
+The configuration is strict rather than accepting silently unused fields:
+
+| Optimizer | Required fields | Decay and resident state |
+|---|---|---|
+| `adam` | learning rate, betas, epsilon | no weight decay; FP32 first and second moments |
+| `adamw` | learning rate, betas, epsilon | decoupled decay; FP32 first and second moments |
+| `sgdm` | learning rate, `momentum` | coupled weight decay; one FP32 momentum buffer |
+| `nag` | learning rate, `momentum` | PyTorch-style Nesterov with coupled weight decay; one FP32 momentum buffer |
+| `lion` | learning rate, betas | decoupled decay; one FP32 momentum buffer |
+| `muon` | learning rate, `momentum`, `muon_ns_steps`, auxiliary AdamW learning rate and decay | Muon for 2-D tensors; auxiliary AdamW and two moments for non-matrix tensors |
+
+`grad_clip` is mandatory and global across the candidate parameter list.
+`momentum` is rejected for optimizers that do not use it. Muon-only fields are
+rejected for every other optimizer. Adam's unused weight decay and Lion's
+unused epsilon variants are likewise rejected instead of forming fake tuning
+identities. Static uses no optimizer. Plain `sgd` is reserved for the isolated
+OnlineSpec baselines and is not a TTS/L0 optimizer choice.
+
+The HBM ledger counts the FP32 master, every allocated moment, and the device
+step scalar. Empty moments are not allocated: SGDm, NAG, and Lion therefore do
+not pay for a second state tensor, while Muon pays two moments only for the
+non-matrix parameters handled by auxiliary AdamW.
 
 ## Cohort identity
 

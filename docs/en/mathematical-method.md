@@ -74,6 +74,42 @@ floating parameter. Tail LoRA/full instead computes \(h'=h+\Delta h\) and
 projects \(h'\) once through the frozen target head. Residual tail mode applies
 a low-rank correction directly to logits.
 
+For DSpark, \(h\) is specifically the normalized LM-head input; the Markov
+state remains a separate frozen feature. For EAGLE/EAGLE3, every hidden in one
+proposal chain is evaluated against a tail bank pinned to one source version.
+
+## Optimizer dynamics
+
+Every optimizer is implemented as a functional proposal
+\((\theta_t,s_t,g_t)\mapsto(\hat\theta_{t+1},\hat s_{t+1})\). The active
+parameter and state pair changes only when publication commits the candidate.
+Thus TTS and L0 receive identical optimizer arithmetic even if their candidates
+become publishable at different decode boundaries.
+
+Adam and AdamW use bias-corrected FP32 first and second moments; AdamW applies
+decoupled decay. For coupled-decay momentum methods, let
+\(\tilde g_t=g_t+\lambda\theta_t\). SGDm and NAG use
+
+\[
+v_t=\mu v_{t-1}+\tilde g_t,\qquad
+d_t^{\mathrm{SGDm}}=v_t,\qquad
+d_t^{\mathrm{NAG}}=\tilde g_t+\mu v_t.
+\]
+
+Lion keeps one moment and uses
+
+\[
+d_t=\operatorname{sign}(\beta_1m_{t-1}+(1-\beta_1)g_t),\qquad
+m_t=\beta_2m_{t-1}+(1-\beta_2)g_t,
+\]
+
+with decoupled weight decay. Muon uses a Nesterov momentum proposal for every
+two-dimensional parameter, applies the registered quintic Newton--Schulz
+orthogonalization, and scales the matrix step by
+\(\sqrt{\max(1,d_{out}/d_{in})}\). Biases, norms, and other non-matrix
+parameters take an explicitly configured auxiliary AdamW step. No optimizer
+silently creates unused moment tensors or falls back to another rule.
+
 ## Exact speculative sampling
 
 The proposal probability \(q\) recorded for verification is exactly the

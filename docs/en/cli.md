@@ -80,6 +80,10 @@ single Static baseline in each stage. For each active candidate and stage,
 `render-tuning-runtime` emits only the TTS and L0 slices on one port; it cannot
 accidentally duplicate Static evidence. Launch only the slice being measured, run
 `run-controlled-slice --phase tune`, terminate the server, and continue.
+Candidate JSON includes the complete optimizer identity: Adam/AdamW betas and
+decay, SGDm/NAG momentum, Lion betas, or Muon momentum, Newton--Schulz steps,
+and auxiliary AdamW fields. Do not remove fields or hand-normalize two
+optimizer candidates into one identity.
 `advance-tuning-stage` enforces the registered prompt count and context limit,
 paired Static/TTS/L0 coverage, safety counters, and survivor identity. A later
 stage must name the prior survivor artifact; confirmation data is never an
