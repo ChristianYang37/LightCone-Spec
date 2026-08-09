@@ -1,0 +1,1356 @@
+"""GPU-ready confirmation driver with independent, attested measurements."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+
+from lightcone_spec.experiments.data import (
+    GENERATED_TOKEN_BUCKETS,
+    LongContinuationAdapter,
+    PromptSample,
+    sample_set_sha256,
+)
+from lightcone_spec.experiments.evidence import evidence_files_sha256
+from lightcone_spec.experiments.protocol import confirmation_blocks
+from lightcone_spec.experiments.sampling import SamplingProfile
+from lightcone_spec.experiments.selection import LossPoint, SliceMeasurement
+from lightcone_spec.sglang_bridge.client import (
+    GenerationResult,
+    MethodRun,
+    ServerSnapshot,
+    SGLangHTTPClient,
+    independent_method_run,
+)
+from lightcone_spec.telemetry import (
+    EvidenceWriter,
+    PerformanceRecord,
+    RequestRecord,
+    RoundRecord,
+    RunRecord,
+    UpdateRecord,
+    load_completed_evidence,
+)
+
+_FORMAL_METHODS = {"static", "tts", "naive_async"}
+_SAFETY_COUNTERS = (
+    "exactness_violations",
+    "version_mismatches",
+    "fallbacks",
+    "nonfinite_updates",
+    "oom_events",
+    "retractions",
+)
+_UPDATE_COUNTERS = ("updates_launched", "updates_published")
+_TIMING_LANES = ("training", "optimizer", "merge", "publish", "barrier")
+
+
+def _run_id(
+    manifest_sha256: str,
+    block: int,
+    prompt_id: str,
+    method: str,
+    namespace: str = "confirmation",
+) -> str:
+    if not namespace:
+        raise ValueError("run namespace must be non-empty")
+    value = f"{namespace}:{manifest_sha256}:{block}:{prompt_id}:{method}"
+    return hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def _payloads(
+    sample: PromptSample,
+    *,
+    method: str,
+    block: int,
+    concurrency: int,
+    max_new_tokens: int,
+    sampling_profile: SamplingProfile,
+) -> tuple[dict, ...]:
+    if method not in _FORMAL_METHODS:
+        raise ValueError("unknown formal method")
+    return tuple(
+        {
+            "rid": f"{sample.sample_id}-b{block}-{method}-r{replica}",
+            "text": sample.prompt,
+            "sampling_params": sampling_profile.parameters(
+                seed=sample.seed + replica,
+                max_new_tokens=max_new_tokens,
+            ),
+        }
+        for replica in range(concurrency)
+    )
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    return float(np.quantile(np.asarray(values, dtype=np.float64), quantile))
+
+
+def _region(
+    results: tuple[GenerationResult, ...],
+    *,
+    start: int,
+    end: int,
+) -> tuple[int, int, float, list[float]] | None:
+    if start < 0 or end <= start:
+        raise ValueError("token region must be a non-empty half-open interval")
+    at_risk = tuple(
+        result for result in results if result.completion_tokens > start
+    )
+    if not at_risk:
+        return None
+    output_tokens = 0
+    starts: list[float] = []
+    ends: list[float] = []
+    intervals: list[float] = []
+    for result in at_risk:
+        stop = min(result.completion_tokens, end)
+        count = stop - start
+        if count < 1:
+            continue
+        output_tokens += count
+        starts.append(result.token_arrival_ms[start])
+        ends.append(result.token_arrival_ms[stop - 1])
+        # inter_token_ms[i] is the transition from token i to token i + 1.
+        intervals.extend(result.inter_token_ms[start : stop - 1])
+    if output_tokens < 1 or not starts or not ends:
+        return None
+    elapsed_s = (max(ends) - min(starts)) / 1000.0
+    if elapsed_s <= 0:
+        raise RuntimeError(
+            "decode region has no measurable arrival interval; increase its size"
+        )
+    return len(at_risk), output_tokens, elapsed_s, intervals
+
+
+def _prompt_budgets(
+    client: SGLangHTTPClient,
+    samples: tuple[PromptSample, ...],
+    *,
+    safe_context_limit: int,
+    minimum_generation_tokens: int = 1,
+) -> dict[str, tuple[int, int]]:
+    if minimum_generation_tokens < 1:
+        raise ValueError("minimum generation budget must be positive")
+    prompts = tuple(sample.prompt for sample in samples)
+    counts, reported_limit = client.tokenize_prompts(prompts)
+    if reported_limit < safe_context_limit:
+        raise RuntimeError(
+            f"tokenizer limit {reported_limit} is below the registered safe "
+            f"limit {safe_context_limit}"
+        )
+    budgets = {
+        sample.sample_id: (count, safe_context_limit - count)
+        for sample, count in zip(samples, counts, strict=True)
+    }
+    if any(
+        generation < minimum_generation_tokens
+        for _, generation in budgets.values()
+    ):
+        raise RuntimeError(
+            "controlled prompts leave insufficient context-safe generation budget"
+        )
+    return budgets
+
+
+def _adaptation_fields(
+    method: str,
+    snapshot: ServerSnapshot,
+    expected_adaptation_sha256: str | None,
+) -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]:
+    if method == "static":
+        if expected_adaptation_sha256 is not None:
+            raise RuntimeError("Static cannot have an adaptation config identity")
+        if snapshot.adaptation is not None:
+            raise RuntimeError("Static returned adaptation diagnostics")
+        return (
+            {
+                "optimizer_bytes": 0,
+                "adaptation_memory_ledger": None,
+                "trainable_parameters": 0,
+                "training_cuda_ms": None,
+                "optimizer_cuda_ms": None,
+                "merge_cuda_ms": None,
+                "publish_cuda_ms": None,
+                "barrier_cuda_ms": None,
+                "exposed_update_ms": None,
+                "main_side_overlap_ratio": None,
+                **{field: 0 for field in _UPDATE_COUNTERS},
+                **{field: 0 for field in _SAFETY_COUNTERS},
+                "oom_events": snapshot.oom_events,
+                "retractions": snapshot.retractions,
+            },
+            (),
+            (),
+        )
+    if (
+        expected_adaptation_sha256 is None
+        or len(expected_adaptation_sha256) != 64
+        or any(
+            char not in "0123456789abcdef"
+            for char in expected_adaptation_sha256
+        )
+    ):
+        raise RuntimeError("adapted run lacks an expected config identity")
+    diagnostics = snapshot.adaptation
+    if not isinstance(diagnostics, dict) or diagnostics.get("schema_version") != 2:
+        raise RuntimeError("adapted run lacks schema-v2 diagnostics")
+    counters = diagnostics.get("counters")
+    timings = diagnostics.get("timings_ms")
+    updates = diagnostics.get("updates")
+    rounds = diagnostics.get("rounds")
+    if not isinstance(counters, dict) or not isinstance(timings, dict):
+        raise RuntimeError(  # noqa: TRY004 - malformed remote evidence
+            "adaptation counters or timings are missing"
+        )
+    if not isinstance(updates, list):
+        raise RuntimeError(  # noqa: TRY004 - malformed remote evidence
+            "adaptation update evidence is missing"
+        )
+    if not isinstance(rounds, list) or not rounds:
+        raise RuntimeError("adaptation round evidence is missing")
+    missing_counters = set(_SAFETY_COUNTERS + _UPDATE_COUNTERS) - set(counters)
+    missing_timings = set(_TIMING_LANES) - set(timings)
+    if missing_counters or missing_timings:
+        raise RuntimeError(
+            "adaptation evidence is incomplete: "
+            f"counters={sorted(missing_counters)}, "
+            f"timings={sorted(missing_timings)}"
+        )
+    if int(counters.get("target_calls", -1)) != snapshot.target_calls:
+        raise RuntimeError("scheduler and adaptation target-call counts disagree")
+    required = {
+        "adaptation_config_sha256",
+        "cohort_sha256",
+        "kv_segments",
+        "parameter_layout_sha256",
+        "optimizer_bytes",
+        "trainable_parameters",
+        "memory_ledger",
+        "resident_bytes",
+        "peak_bytes",
+        "exposed_update_ms",
+        "main_side_overlap_ratio",
+    }
+    if not required <= set(diagnostics):
+        raise RuntimeError("adaptation memory or overlap evidence is incomplete")
+    if diagnostics["adaptation_config_sha256"] != expected_adaptation_sha256:
+        raise RuntimeError("runtime adaptation config identity mismatch")
+    if not isinstance(diagnostics["kv_segments"], dict):
+        raise RuntimeError(  # noqa: TRY004 - malformed remote evidence
+            "adaptation KV-version evidence is malformed"
+        )
+    layout = str(diagnostics["parameter_layout_sha256"])
+    if len(layout) != 64 or any(char not in "0123456789abcdef" for char in layout):
+        raise RuntimeError("adaptation parameter layout identity is invalid")
+    cohort = str(diagnostics["cohort_sha256"])
+    if len(cohort) != 64 or any(
+        char not in "0123456789abcdef" for char in cohort
+    ):
+        raise RuntimeError("adaptation cohort identity is invalid")
+    ledger = diagnostics["memory_ledger"]
+    ledger_keys = {
+        "active_or_base_bytes",
+        "master_fp32_bytes",
+        "gradient_bytes",
+        "first_moment_bytes",
+        "second_moment_bytes",
+        "staging_bytes",
+        "training_activation_bytes",
+        "kv_gather_scratch_bytes",
+        "candidate_scratch_bytes",
+        "graph_buffer_bytes",
+        "telemetry_bytes",
+        "resident_bytes",
+        "optimizer_bytes",
+        "peak_bytes",
+    }
+    if not isinstance(ledger, dict) or set(ledger) != ledger_keys or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in ledger.values()
+    ):
+        raise RuntimeError("adaptation memory ledger is incomplete")
+    if (
+        ledger["resident_bytes"] != int(diagnostics["resident_bytes"])
+        or ledger["peak_bytes"] != int(diagnostics["peak_bytes"])
+        or ledger["optimizer_bytes"] != int(diagnostics["optimizer_bytes"])
+    ):
+        raise RuntimeError("adaptation memory ledger totals disagree")
+    resident_categories = sum(
+        ledger[name]
+        for name in (
+            "active_or_base_bytes",
+            "master_fp32_bytes",
+            "first_moment_bytes",
+            "second_moment_bytes",
+            "staging_bytes",
+            "graph_buffer_bytes",
+            "telemetry_bytes",
+        )
+    )
+    scratch_categories = sum(
+        ledger[name]
+        for name in (
+            "gradient_bytes",
+            "training_activation_bytes",
+            "kv_gather_scratch_bytes",
+            "candidate_scratch_bytes",
+        )
+    )
+    optimizer_categories = sum(
+        ledger[name]
+        for name in (
+            "master_fp32_bytes",
+            "first_moment_bytes",
+            "second_moment_bytes",
+        )
+    )
+    if (
+        resident_categories != ledger["resident_bytes"]
+        or resident_categories + scratch_categories != ledger["peak_bytes"]
+        or optimizer_categories != ledger["optimizer_bytes"]
+    ):
+        raise RuntimeError("adaptation memory ledger categories do not sum")
+    fields = {
+        "optimizer_bytes": int(diagnostics["optimizer_bytes"]),
+        "adaptation_memory_ledger": json.dumps(
+            ledger, sort_keys=True, separators=(",", ":")
+        ),
+        "trainable_parameters": int(diagnostics["trainable_parameters"]),
+        **{
+            f"{lane}_cuda_ms": float(timings[lane])
+            for lane in _TIMING_LANES
+        },
+        "exposed_update_ms": float(diagnostics["exposed_update_ms"]),
+        "main_side_overlap_ratio": float(
+            diagnostics["main_side_overlap_ratio"]
+        ),
+        **{field: int(counters[field]) for field in _SAFETY_COUNTERS},
+        **{field: int(counters[field]) for field in _UPDATE_COUNTERS},
+    }
+    fields["oom_events"] += snapshot.oom_events
+    fields["retractions"] = max(fields["retractions"], snapshot.retractions)
+    numeric_fields = tuple(
+        float(value)
+        for key, value in fields.items()
+        if key not in {"main_side_overlap_ratio", "adaptation_memory_ledger"}
+        and value is not None
+    )
+    if not all(math.isfinite(value) and value >= 0 for value in numeric_fields):
+        raise RuntimeError(
+            "adaptation counters and timings must be finite and non-negative"
+        )
+    overlap = float(fields["main_side_overlap_ratio"])
+    if not math.isfinite(overlap) or not 0.0 <= overlap <= 1.0:
+        raise RuntimeError("adaptation overlap ratio is outside [0, 1]")
+    if int(fields["updates_launched"]) != len(updates):
+        raise RuntimeError("update counter and trace coverage disagree")
+    published = sum(update.get("status") == "published" for update in updates)
+    if not published <= int(fields["updates_published"]) <= len(updates):
+        raise RuntimeError("published update counter and trace coverage disagree")
+    return fields, tuple(updates), tuple(rounds)
+
+
+def _performance_record(
+    *,
+    run_id: str,
+    sample: PromptSample,
+    method: str,
+    block: int,
+    concurrency: int,
+    region_name: str,
+    region_start: int,
+    region_end: int,
+    results: tuple[GenerationResult, ...],
+    snapshot: ServerSnapshot,
+    adaptation: dict,
+    run_scope_metrics: bool,
+) -> PerformanceRecord | None:
+    measured = _region(results, start=region_start, end=region_end)
+    if measured is None:
+        return None
+    at_risk, output_tokens, elapsed_s, intervals = measured
+    target_calls = snapshot.target_calls if run_scope_metrics else None
+    accepted = snapshot.accepted_drafts if run_scope_metrics else None
+    committed = snapshot.committed_tokens if run_scope_metrics else None
+    verified = snapshot.verified_drafts if run_scope_metrics else None
+    if target_calls is not None and target_calls < 1:
+        raise RuntimeError("run-scope performance requires target calls")
+    return PerformanceRecord(
+        run_id=run_id,
+        prompt_id=sample.sample_id,
+        method=method,
+        repetition_block=block,
+        region=region_name,
+        concurrency=concurrency,
+        generated_bucket_start=region_start,
+        generated_bucket_end=region_end,
+        at_risk_requests=at_risk,
+        output_tokens=output_tokens,
+        elapsed_s=elapsed_s,
+        decode_goodput_tps=len(intervals) / elapsed_s,
+        itl_p50_ms=_percentile(intervals, 0.50),
+        itl_p95_ms=_percentile(intervals, 0.95),
+        itl_p99_ms=_percentile(intervals, 0.99),
+        survival_weighted_accepted_prefix=(
+            accepted / target_calls if run_scope_metrics else None
+        ),
+        accepted_drafts_per_verify=(
+            accepted / target_calls if run_scope_metrics else None
+        ),
+        committed_tokens_per_verify=(
+            committed / target_calls if run_scope_metrics else None
+        ),
+        verified_drafts_per_verify=(
+            verified / target_calls if run_scope_metrics else None
+        ),
+        verification_waste=(
+            snapshot.verification_waste / verified
+            if run_scope_metrics and verified
+            else (0.0 if run_scope_metrics else None)
+        ),
+        target_calls_per_output_token=(
+            target_calls / output_tokens if run_scope_metrics else None
+        ),
+        batch_fill=snapshot.batch_fill if run_scope_metrics else None,
+        queue_occupancy=(
+            snapshot.queue_occupancy if run_scope_metrics else None
+        ),
+        gpu_busy=None,
+        sm_utilization=None,
+        dram_utilization=None,
+        target_estimated_mfu=None,
+        peak_hbm_bytes=snapshot.peak_hbm_bytes,
+        kv_bytes=snapshot.kv_bytes,
+        optimizer_bytes=int(adaptation["optimizer_bytes"]),
+        adaptation_memory_ledger=adaptation["adaptation_memory_ledger"],
+        trainable_parameters=int(adaptation["trainable_parameters"]),
+        training_cuda_ms=adaptation["training_cuda_ms"],
+        optimizer_cuda_ms=adaptation["optimizer_cuda_ms"],
+        merge_cuda_ms=adaptation["merge_cuda_ms"],
+        publish_cuda_ms=adaptation["publish_cuda_ms"],
+        barrier_cuda_ms=adaptation["barrier_cuda_ms"],
+        exposed_update_ms=adaptation["exposed_update_ms"],
+        main_side_overlap_ratio=adaptation["main_side_overlap_ratio"],
+        graph_replay_hit_rate=(
+            snapshot.graph_replay_hit_rate if run_scope_metrics else None
+        ),
+        updates_launched=int(adaptation["updates_launched"]),
+        updates_published=int(adaptation["updates_published"]),
+        exactness_violations=int(adaptation["exactness_violations"]),
+        version_mismatches=int(adaptation["version_mismatches"]),
+        fallbacks=int(adaptation["fallbacks"]),
+        nonfinite_updates=int(adaptation["nonfinite_updates"]),
+        oom_events=int(adaptation["oom_events"]),
+        retractions=int(adaptation["retractions"]),
+    )
+
+
+def _write_updates(
+    writer: EvidenceWriter,
+    *,
+    run_id: str,
+    diagnostics: dict | None,
+    updates: tuple[dict, ...],
+) -> None:
+    if diagnostics is None:
+        if updates:
+            raise RuntimeError("Static cannot contain update evidence")
+        return
+    cohort = str(diagnostics["cohort_sha256"])
+    layout = str(diagnostics["parameter_layout_sha256"])
+    trainable = int(diagnostics["trainable_parameters"])
+    for index, update in enumerate(updates):
+        required = {
+            "source_round",
+            "source_version",
+            "published_version",
+            "status",
+            "loss",
+        }
+        if not isinstance(update, dict) or not required <= set(update):
+            raise RuntimeError("update trace is incomplete")
+        request_ids = update.get("request_ids")
+        prefix_lens = update.get("prefix_len_before")
+        if (
+            not isinstance(request_ids, list)
+            or not request_ids
+            or any(not isinstance(value, str) or not value for value in request_ids)
+            or not isinstance(prefix_lens, list)
+            or len(prefix_lens) != len(request_ids)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+                for value in prefix_lens
+            )
+        ):
+            raise RuntimeError("update trace lacks request-level prefix lengths")
+        loss = float(update["loss"])
+        if not math.isfinite(loss) or loss < -1e-6:
+            raise RuntimeError("update trace loss must be finite and non-negative")
+        writer.write(
+            UpdateRecord(
+                run_id=run_id,
+                cohort_sha256=cohort,
+                parameter_layout_sha256=layout,
+                update_index=index,
+                request_ids=json.dumps(request_ids, separators=(",", ":")),
+                prefix_len_before=json.dumps(prefix_lens, separators=(",", ":")),
+                prefix_len_min=min(prefix_lens),
+                prefix_len_max=max(prefix_lens),
+                prefix_len_mean=sum(prefix_lens) / len(prefix_lens),
+                source_round=int(update["source_round"]),
+                source_version=int(update["source_version"]),
+                published_version=(
+                    None
+                    if update["published_version"] is None
+                    else int(update["published_version"])
+                ),
+                candidate_status=str(update["status"]),
+                loss=loss,
+                trainable_parameters=trainable,
+                training_cuda_ms=None,
+                optimizer_cuda_ms=None,
+                merge_cuda_ms=None,
+                publish_cuda_ms=None,
+                barrier_cuda_ms=None,
+                exposed_update_ms=None,
+                overlap_ratio=None,
+            )
+        )
+
+
+def _round_records(
+    *,
+    run_id: str,
+    diagnostics: dict | None,
+    results: tuple[GenerationResult, ...],
+    rounds: tuple[dict, ...],
+) -> tuple[RoundRecord, ...]:
+    if diagnostics is None:
+        if rounds:
+            raise RuntimeError("Static cannot contain round adaptation evidence")
+        return ()
+    inputs = {result.request_id: result.input_tokens for result in results}
+    completions = {
+        result.request_id: result.completion_tokens for result in results
+    }
+    if len(inputs) != len(results):
+        raise RuntimeError("request identities are not unique within a run")
+    histories: dict[str, list[dict[str, int]]] = {
+        request_id: [
+            {
+                "start": 0,
+                "end": input_tokens,
+                "source_version": 0,
+            }
+        ]
+        for request_id, input_tokens in inputs.items()
+    }
+    flat: list[tuple[int, int, str, int, int, int, int]] = []
+    seen_rounds: set[int] = set()
+    for trace in rounds:
+        required = {
+            "round_index",
+            "source_version",
+            "request_ids",
+            "prefix_len_before",
+            "verify_len",
+            "accepted_drafts",
+            "committed_tokens",
+        }
+        if not isinstance(trace, dict) or set(trace) != required:
+            raise RuntimeError("round trace fields are incomplete")
+        round_index = int(trace["round_index"])
+        source_version = int(trace["source_version"])
+        if round_index < 1 or source_version < 0 or round_index in seen_rounds:
+            raise RuntimeError("round trace identity is invalid or duplicated")
+        seen_rounds.add(round_index)
+        columns = tuple(trace[name] for name in required - {"round_index", "source_version"})
+        if any(not isinstance(column, list) for column in columns):
+            raise RuntimeError("round trace columns must be arrays")
+        request_ids = trace["request_ids"]
+        count = len(request_ids)
+        if count < 1 or any(len(column) != count for column in columns):
+            raise RuntimeError("round trace columns have inconsistent lengths")
+        for request_id, prefix, verified, accepted, committed in zip(
+            request_ids,
+            trace["prefix_len_before"],
+            trace["verify_len"],
+            trace["accepted_drafts"],
+            trace["committed_tokens"],
+            strict=True,
+        ):
+            flat.append(
+                (
+                    round_index,
+                    source_version,
+                    str(request_id),
+                    int(prefix),
+                    int(verified),
+                    int(accepted),
+                    int(committed),
+                )
+            )
+    records: list[RoundRecord] = []
+    seen_cells: set[tuple[int, str]] = set()
+    for (
+        round_index,
+        source_version,
+        request_id,
+        prefix,
+        verified,
+        accepted,
+        committed,
+    ) in sorted(flat):
+        cell = (round_index, request_id)
+        if cell in seen_cells or request_id not in histories:
+            raise RuntimeError("round trace references a duplicate or unknown request")
+        seen_cells.add(cell)
+        history = histories[request_id]
+        if prefix != history[-1]["end"]:
+            raise RuntimeError("round prefix does not continue the recorded KV history")
+        if (
+            verified < 0
+            or accepted < 0
+            or accepted > verified
+            or committed < 0
+            or (
+                committed != accepted + 1
+                and not (committed == 0 and accepted == 0)
+            )
+        ):
+            raise RuntimeError("round speculative counts are inconsistent")
+        generated_before = prefix - inputs[request_id]
+        if generated_before < 0:
+            raise RuntimeError("round prefix precedes the tokenized prompt")
+        records.append(
+            RoundRecord(
+                run_id=run_id,
+                request_id=request_id,
+                round_index=round_index,
+                generated_tokens_before=generated_before,
+                prefix_len_before=prefix,
+                verify_len=verified,
+                accepted_drafts=accepted,
+                committed_tokens=committed,
+                target_calls=1,
+                proposal_source_version=source_version,
+                kv_source_versions=json.dumps(
+                    history, sort_keys=True, separators=(",", ":")
+                ),
+            )
+        )
+        end = prefix + committed
+        if history[-1]["source_version"] == source_version:
+            history[-1] = {**history[-1], "end": end}
+        else:
+            history.append(
+                {
+                    "start": prefix,
+                    "end": end,
+                    "source_version": source_version,
+                }
+            )
+    if {record.request_id for record in records} != set(inputs):
+        raise RuntimeError("round traces do not cover every completed request")
+    for request_id, history in histories.items():
+        expected_end = inputs[request_id] + completions[request_id]
+        if history[-1]["end"] != expected_end:
+            raise RuntimeError("round commits do not reconstruct request output length")
+    runtime_segments = diagnostics["kv_segments"]
+    if set(runtime_segments) != set(inputs):
+        raise RuntimeError("KV-version evidence does not cover completed requests")
+    for request_id, expected in histories.items():
+        actual = runtime_segments[request_id]
+        if not isinstance(actual, list) or not actual:
+            raise RuntimeError("KV-version segment list is empty")
+        clipped = []
+        limit = expected[-1]["end"]
+        for segment in actual:
+            if not isinstance(segment, dict) or set(segment) != {
+                "start",
+                "end",
+                "source_version",
+            }:
+                raise RuntimeError("KV-version segment fields are malformed")
+            start = int(segment["start"])
+            end = min(int(segment["end"]), limit)
+            if start >= limit:
+                break
+            clipped.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "source_version": int(segment["source_version"]),
+                }
+            )
+        if clipped != expected:
+            raise RuntimeError("round and KV-version evidence disagree")
+    return tuple(records)
+
+
+def _warmup(
+    client: SGLangHTTPClient,
+    *,
+    method: str,
+    concurrency: int,
+    adaptation_group_id: str,
+    sampling_profile: SamplingProfile,
+) -> None:
+    sample = LongContinuationAdapter().window("load")[0]
+    independent_method_run(
+        client,
+        method=method,
+        payloads=_payloads(
+            sample,
+            method=method,
+            block=-1,
+            concurrency=concurrency,
+            max_new_tokens=64,
+            sampling_profile=sampling_profile,
+        ),
+        concurrency=concurrency,
+        adaptation_group_id=(
+            None if method == "static" else adaptation_group_id
+        ),
+    )
+
+
+def measure_controlled_slice(
+    *,
+    client: SGLangHTTPClient,
+    method: str,
+    samples: tuple[PromptSample, ...],
+    phase: str,
+    stage: int,
+    candidate_id: str | None,
+    manifest_sha256: str,
+    config_sha256: str,
+    model_lock_sha256: str,
+    adaptation_config_sha256: str | None,
+    sampling_profile: SamplingProfile,
+    context_limit: int,
+    concurrency: int,
+    adaptation_group_id: str,
+    warmup: bool = True,
+) -> SliceMeasurement:
+    """Measure one pre-confirmation slice at the highest registered batch."""
+    if method not in _FORMAL_METHODS:
+        raise ValueError("unknown formal method")
+    if phase not in {"static_load_screen", "shared_config_tuning"}:
+        raise ValueError("controlled slice has an invalid phase")
+    if not samples or concurrency < 1:
+        raise ValueError("controlled slice needs prompts and positive concurrency")
+    budgets = _prompt_budgets(
+        client,
+        samples,
+        safe_context_limit=context_limit,
+    )
+    if warmup:
+        _warmup(
+            client,
+            method=method,
+            concurrency=concurrency,
+            adaptation_group_id=adaptation_group_id,
+            sampling_profile=sampling_profile,
+        )
+    transition_count = 0
+    decode_elapsed_s = 0.0
+    intervals: list[float] = []
+    peak_hbm_bytes = 0
+    kv_bytes = 0
+    optimizer_bytes: int | None = None
+    trainable_parameters: int | None = None
+    exposed_update_ms = 0.0
+    counters = {field: 0 for field in _SAFETY_COUNTERS + _UPDATE_COUNTERS}
+    loss_points: list[LossPoint] = []
+    for sample in samples:
+        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
+        run = independent_method_run(
+            client,
+            method=method,
+            payloads=_payloads(
+                sample,
+                method=method,
+                block=stage,
+                concurrency=concurrency,
+                max_new_tokens=max_new_tokens,
+                sampling_profile=sampling_profile,
+            ),
+            concurrency=concurrency,
+            adaptation_group_id=(
+                None if method == "static" else adaptation_group_id
+            ),
+        )
+        if any(
+            result.input_tokens != expected_input_tokens
+            or result.completion_tokens != max_new_tokens
+            or result.stop_reason != "length"
+            for result in run.results
+        ):
+            raise RuntimeError("controlled slice did not reach its context limit")
+        measured = _region(run.results, start=0, end=max_new_tokens)
+        if measured is None:
+            raise RuntimeError("controlled slice produced no decode interval")
+        _, _, elapsed_s, measured_intervals = measured
+        transition_count += len(measured_intervals)
+        decode_elapsed_s += elapsed_s
+        intervals.extend(measured_intervals)
+        fields, updates, _rounds = _adaptation_fields(
+            method, run.after, adaptation_config_sha256
+        )
+        peak_hbm_bytes = max(peak_hbm_bytes, run.after.peak_hbm_bytes)
+        kv_bytes = max(kv_bytes, run.after.kv_bytes)
+        current_optimizer_bytes = int(fields["optimizer_bytes"])
+        current_trainable = int(fields["trainable_parameters"])
+        if optimizer_bytes is None:
+            optimizer_bytes = current_optimizer_bytes
+            trainable_parameters = current_trainable
+        elif (
+            optimizer_bytes != current_optimizer_bytes
+            or trainable_parameters != current_trainable
+        ):
+            raise RuntimeError("adaptation layout changed across controlled prompts")
+        exposed_update_ms += float(fields["exposed_update_ms"] or 0.0)
+        for field in counters:
+            counters[field] += int(fields[field])
+        for update in updates:
+            prefixes = update.get("prefix_len_before")
+            if not isinstance(prefixes, list) or not prefixes:
+                raise RuntimeError("update loss is not bound to real prefix lengths")
+            resolved = tuple(int(value) for value in prefixes)
+            loss_points.append(
+                LossPoint(
+                    prefix_len_min=min(resolved),
+                    prefix_len_max=max(resolved),
+                    prefix_len_mean=sum(resolved) / len(resolved),
+                    loss=float(update["loss"]),
+                )
+            )
+    if transition_count < 1 or decode_elapsed_s <= 0:
+        raise RuntimeError("controlled slice has no measurable decode work")
+    measurement = SliceMeasurement(
+        schema_version=2,
+        phase=phase,
+        stage=stage,
+        method=method,
+        candidate_id=candidate_id,
+        manifest_sha256=manifest_sha256,
+        config_sha256=config_sha256,
+        model_lock_sha256=model_lock_sha256,
+        sampling_profile_sha256=sampling_profile.sha256,
+        window_sha256=sample_set_sha256(samples),
+        prompt_count=len(samples),
+        context_limit=context_limit,
+        concurrency=concurrency,
+        decode_goodput_tps=transition_count / decode_elapsed_s,
+        itl_p99_ms=_percentile(intervals, 0.99),
+        peak_hbm_bytes=peak_hbm_bytes,
+        kv_bytes=kv_bytes,
+        optimizer_bytes=optimizer_bytes or 0,
+        trainable_parameters=trainable_parameters or 0,
+        exposed_update_ms=exposed_update_ms,
+        updates_launched=counters["updates_launched"],
+        updates_published=counters["updates_published"],
+        exactness_violations=counters["exactness_violations"],
+        version_mismatches=counters["version_mismatches"],
+        fallbacks=counters["fallbacks"],
+        nonfinite_updates=counters["nonfinite_updates"],
+        oom_events=counters["oom_events"],
+        retractions=counters["retractions"],
+        loss_points=tuple(loss_points),
+    )
+    measurement.validate()
+    return measurement
+
+
+def _earlier_slices(
+    *, method: str, block: int, schedule_seed: int
+) -> tuple[tuple[int, str], ...]:
+    jobs = tuple(
+        (entry.block, scheduled_method)
+        for entry in confirmation_blocks(schedule_seed)
+        for scheduled_method in entry.method_order
+    )
+    target = (block, method)
+    if target not in jobs:
+        raise ValueError("confirmation slice is outside the registered schedule")
+    return jobs[: jobs.index(target)]
+
+
+def _assert_prior_slices_complete(
+    output_root: str | Path,
+    *,
+    manifest_sha256: str,
+    method: str,
+    block: int,
+    schedule_seed: int,
+    samples: tuple[PromptSample, ...],
+) -> None:
+    for earlier_block, earlier_method in _earlier_slices(
+        method=method,
+        block=block,
+        schedule_seed=schedule_seed,
+    ):
+        for sample in samples:
+            run_id = _run_id(
+                manifest_sha256,
+                earlier_block,
+                sample.sample_id,
+                earlier_method,
+            )
+            if load_completed_evidence(output_root, run_id=run_id, rank=0) is None:
+                raise RuntimeError(
+                    "confirmation slices must follow the registered randomized "
+                    f"order; missing predecessor {earlier_block}/{earlier_method}"
+                )
+
+
+def run_confirmation_slice(
+    *,
+    client: SGLangHTTPClient,
+    method: str,
+    block: int,
+    manifest_sha256: str,
+    config_sha256: str,
+    adaptation_config_sha256: str | None,
+    output_root: str | Path,
+    concurrency: int,
+    safe_context_limit: int,
+    adaptation_group_id: str,
+    schedule_seed: int,
+    sampling_profile: SamplingProfile,
+    model_pair: str = "qwen3_8b_dflash16",
+    warmup: bool = True,
+) -> tuple[Path, ...]:
+    """Run one exclusive-device method slice in registered random order."""
+    if method not in _FORMAL_METHODS:
+        raise ValueError("unknown formal method")
+    if block not in range(8):
+        raise ValueError("formal confirmation block must be in [0, 8)")
+    if concurrency < 1:
+        raise ValueError("concurrency must be positive")
+    if not 32768 <= safe_context_limit <= 40960:
+        raise ValueError("formal confirmation must cover 32K to the safe limit")
+    if not adaptation_group_id:
+        raise ValueError("formal adapted runs require a cohort group")
+    samples = LongContinuationAdapter().window("confirm")
+    budgets = _prompt_budgets(
+        client,
+        samples,
+        safe_context_limit=safe_context_limit,
+        minimum_generation_tokens=32769,
+    )
+    _assert_prior_slices_complete(
+        output_root,
+        manifest_sha256=manifest_sha256,
+        method=method,
+        block=block,
+        schedule_seed=schedule_seed,
+        samples=samples,
+    )
+    if warmup:
+        _warmup(
+            client,
+            method=method,
+            concurrency=concurrency,
+            adaptation_group_id=adaptation_group_id,
+            sampling_profile=sampling_profile,
+        )
+    written: list[Path] = []
+    for sample in samples:
+        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
+        run_id = _run_id(manifest_sha256, block, sample.sample_id, method)
+        completed = load_completed_evidence(
+            output_root,
+            run_id=run_id,
+            rank=0,
+        )
+        if completed is not None:
+            run_rows = pq.read_table(completed["run"]).to_pylist()
+            performance_rows = pq.read_table(
+                completed["performance"]
+            ).to_pylist()
+            expected = {
+                "manifest_sha256": manifest_sha256,
+                "config_sha256": config_sha256,
+                "method": method,
+                "repetition_block": block,
+            }
+            if len(run_rows) != 1 or any(
+                run_rows[0].get(key) != value
+                for key, value in expected.items()
+            ):
+                raise RuntimeError(f"completed run identity mismatch for {run_id}")
+            if any(
+                row.get("prompt_id") != sample.sample_id
+                or int(row.get("concurrency", -1)) != concurrency
+                for row in performance_rows
+            ):
+                raise RuntimeError(
+                    f"completed performance identity mismatch for {run_id}"
+                )
+            written.extend(completed.values())
+            continue
+        started_ns = time.time_ns()
+        run: MethodRun = independent_method_run(
+            client,
+            method=method,
+            payloads=_payloads(
+                sample,
+                method=method,
+                block=block,
+                concurrency=concurrency,
+                max_new_tokens=max_new_tokens,
+                sampling_profile=sampling_profile,
+            ),
+            concurrency=concurrency,
+            adaptation_group_id=(
+                None if method == "static" else adaptation_group_id
+            ),
+        )
+        completed_ns = time.time_ns()
+        if any(
+            result.input_tokens != expected_input_tokens
+            or result.completion_tokens != max_new_tokens
+            or result.stop_reason != "length"
+            for result in run.results
+        ):
+            raise RuntimeError(
+                "controlled run did not reach its exact context-safe limit"
+            )
+        adaptation, updates, rounds = _adaptation_fields(
+            method, run.after, adaptation_config_sha256
+        )
+        with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+            writer.write(
+                RunRecord(
+                    run_id=run_id,
+                    manifest_sha256=manifest_sha256,
+                    config_sha256=config_sha256,
+                    method=method,
+                    model_pair=model_pair,
+                    repetition_block=block,
+                    started_ns=started_ns,
+                    completed_ns=completed_ns,
+                    status="complete",
+                )
+            )
+            for result in run.results:
+                writer.write(
+                    RequestRecord(
+                        run_id=run_id,
+                        request_id=result.request_id,
+                        prompt_id=sample.sample_id,
+                        method=method,
+                        repetition_block=block,
+                        concurrency=concurrency,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.completion_tokens,
+                        ttft_ms=result.ttft_ms,
+                        finished=result.stop_reason is not None,
+                        stop_reason=result.stop_reason,
+                    )
+                )
+            for round_record in _round_records(
+                run_id=run_id,
+                diagnostics=run.after.adaptation,
+                results=run.results,
+                rounds=rounds,
+            ):
+                writer.write(round_record)
+            for start, end in GENERATED_TOKEN_BUCKETS:
+                if start >= max_new_tokens:
+                    continue
+                row = _performance_record(
+                    run_id=run_id,
+                    sample=sample,
+                    method=method,
+                    block=block,
+                    concurrency=concurrency,
+                    region_name="generated_bucket",
+                    region_start=start,
+                    region_end=min(end, max_new_tokens),
+                    results=run.results,
+                    snapshot=run.after,
+                    adaptation=adaptation,
+                    run_scope_metrics=False,
+                )
+                if row is not None:
+                    writer.write(row)
+            full = _performance_record(
+                run_id=run_id,
+                sample=sample,
+                method=method,
+                block=block,
+                concurrency=concurrency,
+                region_name="full_trajectory",
+                region_start=0,
+                region_end=max_new_tokens,
+                results=run.results,
+                snapshot=run.after,
+                adaptation=adaptation,
+                run_scope_metrics=True,
+            )
+            if full is None:
+                raise RuntimeError("completed run has no performance row")
+            writer.write(full)
+            _write_updates(
+                writer,
+                run_id=run_id,
+                diagnostics=run.after.adaptation,
+                updates=updates,
+            )
+            paths = writer.close()
+            written.extend(paths.values())
+    return tuple(written)
+
+
+def collect_confirmation_performance(
+    *,
+    evidence_root: str | Path,
+    manifest_sha256: str,
+    config_sha256: dict[str, str],
+    concurrency: int,
+) -> tuple[tuple[Path, ...], str]:
+    """Collect exactly one completed, identity-matched shard per formal cell."""
+    if set(config_sha256) != _FORMAL_METHODS:
+        raise ValueError("collector requires one config identity per method")
+    samples = LongContinuationAdapter().window("confirm")
+    performance: list[Path] = []
+    all_evidence: list[Path] = []
+    for block in range(8):
+        for sample in samples:
+            for method in ("static", "tts", "naive_async"):
+                run_id = _run_id(manifest_sha256, block, sample.sample_id, method)
+                completed = load_completed_evidence(
+                    evidence_root,
+                    run_id=run_id,
+                    rank=0,
+                )
+                if completed is None:
+                    raise RuntimeError(f"confirmation evidence is incomplete: {run_id}")
+                run_rows = pq.read_table(completed["run"]).to_pylist()
+                rows = pq.read_table(completed["performance"]).to_pylist()
+                if len(run_rows) != 1 or any(
+                    run_rows[0].get(key) != value
+                    for key, value in {
+                        "manifest_sha256": manifest_sha256,
+                        "config_sha256": config_sha256[method],
+                        "method": method,
+                        "repetition_block": block,
+                    }.items()
+                ):
+                    raise RuntimeError(f"confirmation run identity mismatch: {run_id}")
+                if any(
+                    row.get("prompt_id") != sample.sample_id
+                    or int(row.get("concurrency", -1)) != concurrency
+                    for row in rows
+                ):
+                    raise RuntimeError(
+                        f"confirmation performance identity mismatch: {run_id}"
+                    )
+                performance.append(completed["performance"])
+                all_evidence.extend(completed.values())
+    return tuple(performance), evidence_files_sha256(all_evidence)
+
+
+def run_natural_replication_slice(
+    *,
+    client: SGLangHTTPClient,
+    method: str,
+    dataset_name: str,
+    samples: tuple[PromptSample, ...],
+    manifest_sha256: str,
+    config_sha256: str,
+    adaptation_config_sha256: str | None,
+    output_root: str | Path,
+    concurrency: int,
+    safe_context_limit: int,
+    adaptation_group_id: str,
+    sampling_profile: SamplingProfile,
+    model_pair: str = "qwen3_8b_dflash16",
+    warmup: bool = True,
+) -> tuple[Path, ...]:
+    """Run one natural-EOS side-table slice; never enters the formal gate."""
+    if method not in _FORMAL_METHODS or dataset_name not in {
+        "livecodebench",
+        "math500",
+    }:
+        raise ValueError("natural replication identity is invalid")
+    if sampling_profile.purpose != "natural" or sampling_profile.ignore_eos:
+        raise ValueError("natural replication requires its EOS-enabled profile")
+    if len(samples) != 32:
+        raise ValueError("natural side tables require exactly 32 locked prompts")
+    budgets = _prompt_budgets(
+        client,
+        samples,
+        safe_context_limit=safe_context_limit,
+    )
+    if warmup:
+        _warmup(
+            client,
+            method=method,
+            concurrency=concurrency,
+            adaptation_group_id=adaptation_group_id,
+            sampling_profile=sampling_profile,
+        )
+    written: list[Path] = []
+    namespace = f"natural-{dataset_name}"
+    for sample in samples:
+        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
+        run_id = _run_id(
+            manifest_sha256,
+            0,
+            sample.sample_id,
+            method,
+            namespace=namespace,
+        )
+        completed = load_completed_evidence(output_root, run_id=run_id, rank=0)
+        if completed is not None:
+            run_rows = pq.read_table(completed["run"]).to_pylist()
+            performance_rows = pq.read_table(
+                completed["performance"]
+            ).to_pylist()
+            expected = {
+                "manifest_sha256": manifest_sha256,
+                "config_sha256": config_sha256,
+                "method": method,
+                "repetition_block": 0,
+            }
+            if len(run_rows) != 1 or any(
+                run_rows[0].get(key) != value for key, value in expected.items()
+            ):
+                raise RuntimeError(
+                    f"completed natural run identity mismatch for {run_id}"
+                )
+            if any(
+                row.get("prompt_id") != sample.sample_id
+                or int(row.get("concurrency", -1)) != concurrency
+                or not str(row.get("region", "")).startswith("natural")
+                for row in performance_rows
+            ):
+                raise RuntimeError(
+                    f"completed natural performance mismatch for {run_id}"
+                )
+            written.extend(completed.values())
+            continue
+        started_ns = time.time_ns()
+        run = independent_method_run(
+            client,
+            method=method,
+            payloads=_payloads(
+                sample,
+                method=method,
+                block=0,
+                concurrency=concurrency,
+                max_new_tokens=max_new_tokens,
+                sampling_profile=sampling_profile,
+            ),
+            concurrency=concurrency,
+            adaptation_group_id=(
+                None if method == "static" else adaptation_group_id
+            ),
+        )
+        completed_ns = time.time_ns()
+        if any(
+            result.input_tokens != expected_input_tokens
+            or result.completion_tokens > max_new_tokens
+            or result.stop_reason is None
+            for result in run.results
+        ):
+            raise RuntimeError("natural run violated its context or terminal contract")
+        adaptation, updates, rounds = _adaptation_fields(
+            method, run.after, adaptation_config_sha256
+        )
+        with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+            writer.write(
+                RunRecord(
+                    run_id=run_id,
+                    manifest_sha256=manifest_sha256,
+                    config_sha256=config_sha256,
+                    method=method,
+                    model_pair=model_pair,
+                    repetition_block=0,
+                    started_ns=started_ns,
+                    completed_ns=completed_ns,
+                    status="complete",
+                )
+            )
+            for result in run.results:
+                writer.write(
+                    RequestRecord(
+                        run_id=run_id,
+                        request_id=result.request_id,
+                        prompt_id=sample.sample_id,
+                        method=method,
+                        repetition_block=0,
+                        concurrency=concurrency,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.completion_tokens,
+                        ttft_ms=result.ttft_ms,
+                        finished=True,
+                        stop_reason=result.stop_reason,
+                    )
+                )
+            for round_record in _round_records(
+                run_id=run_id,
+                diagnostics=run.after.adaptation,
+                results=run.results,
+                rounds=rounds,
+            ):
+                writer.write(round_record)
+            longest = max(result.completion_tokens for result in run.results)
+            for start, end in GENERATED_TOKEN_BUCKETS:
+                if start >= longest:
+                    continue
+                row = _performance_record(
+                    run_id=run_id,
+                    sample=sample,
+                    method=method,
+                    block=0,
+                    concurrency=concurrency,
+                    region_name=f"natural:{dataset_name}",
+                    region_start=start,
+                    region_end=min(end, longest),
+                    results=run.results,
+                    snapshot=run.after,
+                    adaptation=adaptation,
+                    run_scope_metrics=False,
+                )
+                if row is not None:
+                    writer.write(row)
+            full = _performance_record(
+                run_id=run_id,
+                sample=sample,
+                method=method,
+                block=0,
+                concurrency=concurrency,
+                region_name=f"natural_full:{dataset_name}",
+                region_start=0,
+                region_end=longest,
+                results=run.results,
+                snapshot=run.after,
+                adaptation=adaptation,
+                run_scope_metrics=True,
+            )
+            if full is None:
+                raise RuntimeError("natural run has no measurable decode trajectory")
+            writer.write(full)
+            _write_updates(
+                writer,
+                run_id=run_id,
+                diagnostics=run.after.adaptation,
+                updates=updates,
+            )
+            paths = writer.close()
+            written.extend(paths.values())
+    return tuple(written)

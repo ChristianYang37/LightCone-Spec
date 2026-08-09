@@ -1,226 +1,169 @@
-"""Immutable experiment manifests with unit-level resume (spec 9.2,
-13.6).
-
-A manifest is content-addressed (SHA-256 of the canonical JSON) and
-lists run units. Execution skips units whose completed run dirs already
-carry a matching unit hash, resumes partials from the last complete unit
-boundary, and never overwrites immutable artifacts.
-"""
+"""Single resumable protocol manifest for the focused speed study."""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import math
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from lightcone_spec.exit_codes import ConfigError
-from lightcone_spec.locking.hashing import canonical_json, sha256_bytes
-from lightcone_spec.orchestration.units import RunUnit
-
-MANIFEST_SCHEMA_VERSION = 1
+from lightcone_spec.experiments.data import LongContinuationAdapter
+from lightcone_spec.experiments.protocol import TUNING_STAGES, tuning_candidates
+from lightcone_spec.experiments.sampling import SamplingProfile
 
 
-def _reject_duplicate_units(units: list[RunUnit], *, context: str) -> None:
-    """Reject identities that collapse after effective canonicalization."""
-    by_id: dict[str, list[RunUnit]] = {}
-    for unit in units:
-        by_id.setdefault(unit.unit_id, []).append(unit)
-    duplicates = {
-        unit_id: group for unit_id, group in by_id.items() if len(group) > 1
-    }
-    if duplicates:
-        unit_id, group = next(iter(duplicates.items()))
-        raise ConfigError(
-            f"{context} contains duplicate identity {unit_id} after effective "
-            "canonicalization: "
-            f"{[u.key_dict() for u in group]}"
-        )
+def _tuning_grid_sha256() -> str:
+    rows = [asdict(candidate) for candidate in tuning_candidates()]
+    body = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
 
 
-@dataclass
-class ExperimentManifest:
-    name: str
-    phase: str
-    description: str
-    units: list[RunUnit]
-    engine_params: dict = field(default_factory=dict)
-    lockfile_sha256: str | None = None
-    profile: str = "local_1x80gb"
-
-    def to_dict(self) -> dict:
-        return {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "name": self.name,
-            "phase": self.phase,
-            "description": self.description,
-            "profile": self.profile,
-            "lockfile_sha256": self.lockfile_sha256,
-            "engine_params": self.engine_params,
-            "units": [u.to_manifest_dict() for u in self.units],
-        }
-
-    def content_sha256(self) -> str:
-        return sha256_bytes(canonical_json(self.to_dict()).encode("utf-8"))
-
-    def write(self, path: str | Path) -> str:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        body = canonical_json(self.to_dict())
-        digest = sha256_bytes(body.encode("utf-8"))
-        if path.is_file():
-            existing = path.read_text()
-            if sha256_bytes(existing.encode("utf-8")) != digest:
-                raise ConfigError(
-                    f"manifest {path} exists with different content; manifests "
-                    "are immutable (write a new file instead)"
-                )
-            return digest
-        path.write_text(body)
-        Path(str(path) + ".sha256").write_text(digest + "\n")
-        return digest
+@dataclass(frozen=True)
+class SpeedStudyManifest:
+    schema_version: int = 2
+    name: str = "static-tts-l0-speed-study"
+    model_pair: str = "qwen3_8b_dflash16"
+    methods: tuple[str, ...] = ("static", "tts", "naive_async")
+    phases: tuple[str, ...] = (
+        "static_load_screen",
+        "shared_config_tuning",
+        "controlled_confirmation",
+        "natural_task_replication",
+        "independent_profiler",
+    )
+    formal_context_start: int = 16384
+    safe_context_limit: int = 40960
+    context_limit_definition: str = "prompt_tokens_plus_generated_tokens"
+    concurrency_grid: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 48)
+    load_screen_context_limit: int = 4096
+    tuning_stages: tuple[tuple[int, int], ...] = TUNING_STAGES
+    generated_buckets: tuple[int, ...] = (
+        0,
+        2048,
+        4096,
+        8192,
+        16384,
+        24576,
+        32768,
+        40960,
+    )
+    confirmation_repetitions: int = 8
+    confirmation_schedule_seed: int = 20260809
+    controlled_window_hashes: dict[str, str] = field(default_factory=dict)
+    tuning_grid_sha256: str = ""
+    sampling_profile_sha256: str = ""
+    natural_side_tables: tuple[str, ...] = ("livecodebench", "math500")
+    gpu_evidence: str = "UNMEASURED"
 
     @classmethod
-    def load(cls, path: str | Path) -> "ExperimentManifest":
-        path = Path(path)
-        if not path.is_file():
-            raise ConfigError(f"manifest not found: {path}")
-        d = json.loads(path.read_text())
-        if d.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-            raise ConfigError(
-                f"manifest schema_version {d.get('schema_version')} != "
-                f"{MANIFEST_SCHEMA_VERSION}"
-            )
-        sha_path = Path(str(path) + ".sha256")
-        if sha_path.is_file():
-            expected = sha_path.read_text().strip()
-            # Historical immutable manifests sometimes included a final
-            # newline and hashed the exact file bytes.  Accept that provenance
-            # convention as well as the canonical-JSON digest; never ignore a
-            # mismatch to both representations.
-            actual_canonical = sha256_bytes(canonical_json(d).encode("utf-8"))
-            actual_source = sha256_bytes(path.read_bytes())
-            if expected not in {actual_canonical, actual_source}:
-                raise ConfigError(f"manifest hash drift: {path}")
-        try:
-            units = [RunUnit.from_dict(u) for u in d["units"]]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ConfigError(f"invalid manifest unit in {path}: {exc}") from exc
-        _reject_duplicate_units(units, context=f"manifest {path}")
+    def default(cls) -> SpeedStudyManifest:
+        adapter = LongContinuationAdapter()
+        adapter.assert_disjoint()
         return cls(
-            name=d["name"],
-            phase=d["phase"],
-            description=d["description"],
-            units=units,
-            engine_params=d.get("engine_params", {}),
-            lockfile_sha256=d.get("lockfile_sha256"),
-            profile=d.get("profile", "local_1x80gb"),
+            controlled_window_hashes={
+                name: adapter.window_sha256(name)
+                for name in ("load", "tune", "confirm")
+            },
+            tuning_grid_sha256=_tuning_grid_sha256(),
+            sampling_profile_sha256=SamplingProfile().sha256,
         )
 
-    def expected_units(self) -> list[dict]:
-        # Engine-parameter overlays (for example learning rate) intentionally
-        # do not alter a RunUnit ID.  Bind every expected-unit declaration to
-        # the effective outer manifest so two execution overlays cannot
-        # silently present an identical, unqualified coverage contract.
-        manifest_sha256 = self.content_sha256()
-        return [
-            {
-                **unit.to_manifest_dict(),
-                "expected_manifest_sha256": manifest_sha256,
-            }
-            for unit in self.units
-        ]
-
-    def with_methods(self, methods: list[str] | tuple[str, ...] | None) -> "ExperimentManifest":
-        """Return a deterministic method subset for staged experiment runs.
-
-        Filtering is an execution overlay, just like ``weight_update_mode``:
-        it never edits the source manifest, and the effective manifest hash is
-        recomputed from the retained units.  Reject misspellings and an empty
-        result before creating artifacts or loading a model.
-        """
-        if methods is None:
-            return self
-        requested = tuple(dict.fromkeys(str(method) for method in methods))
-        if not requested:
-            raise ConfigError("--methods requires at least one method")
-        available = {unit.method for unit in self.units}
-        unknown = sorted(set(requested) - available)
-        if unknown:
-            raise ConfigError(
-                f"--methods contains values absent from this manifest: {unknown}"
-            )
-        units = [unit for unit in self.units if unit.method in requested]
-        if not units:
-            raise ConfigError("--methods removed every manifest unit")
-        _reject_duplicate_units(units, context="--methods result")
-        return replace(self, units=units)
-
-    def with_lifecycles(
-        self, lifecycles: list[str] | tuple[str, ...] | None
-    ) -> "ExperimentManifest":
-        """Return a deterministic lifecycle subset execution overlay."""
-        if lifecycles is None:
-            return self
-        requested = tuple(
-            dict.fromkeys(str(lifecycle) for lifecycle in lifecycles)
-        )
-        if not requested:
-            raise ConfigError("--lifecycles requires at least one lifecycle")
-        available = {unit.lifecycle for unit in self.units}
-        unknown = sorted(set(requested) - available)
-        if unknown:
-            raise ConfigError(
-                "--lifecycles contains values absent from this manifest: "
-                f"{unknown}"
-            )
-        units = [unit for unit in self.units if unit.lifecycle in requested]
-        if not units:
-            raise ConfigError("--lifecycles removed every manifest unit")
-        _reject_duplicate_units(units, context="--lifecycles result")
-        return replace(self, units=units)
-
-    def with_learning_rate(self, learning_rate: float | None) -> "ExperimentManifest":
-        """Apply a positive finite learning-rate engine overlay in memory."""
-        if learning_rate is None:
-            return self
-        if isinstance(learning_rate, bool) or not isinstance(
-            learning_rate, (int, float)
+    def validate(self) -> None:
+        if self.schema_version != 2:
+            raise ValueError("only schema-v2 speed-study manifests are valid")
+        if self.methods != ("static", "tts", "naive_async"):
+            raise ValueError("formal methods must remain Static, TTS, and L0")
+        if self.phases != (
+            "static_load_screen",
+            "shared_config_tuning",
+            "controlled_confirmation",
+            "natural_task_replication",
+            "independent_profiler",
         ):
-            raise ConfigError("--learning-rate must be a positive finite number")
-        resolved = float(learning_rate)
-        if not math.isfinite(resolved) or resolved <= 0.0:
-            raise ConfigError("--learning-rate must be a positive finite number")
-        engine_params = dict(self.engine_params)
-        engine_params["lr"] = resolved
-        return replace(self, engine_params=engine_params)
+            raise ValueError("speed-study phase order is immutable")
+        if self.formal_context_start != 16384:
+            raise ValueError("formal speed region must begin at 16K")
+        if self.gpu_evidence != "UNMEASURED":
+            raise ValueError("source manifests cannot contain GPU claims")
+        if self.safe_context_limit != 40960:
+            raise ValueError("the pinned DFlash study stops at 40,960 tokens")
+        if self.context_limit_definition != "prompt_tokens_plus_generated_tokens":
+            raise ValueError("context limit must include the tokenized prompt")
+        if self.concurrency_grid != (1, 2, 4, 8, 16, 32, 48):
+            raise ValueError("Static load grid identity mismatch")
+        if self.load_screen_context_limit != 4096:
+            raise ValueError("Static load screen context identity mismatch")
+        if self.tuning_stages != TUNING_STAGES:
+            raise ValueError("successive-halving stage identity mismatch")
+        if self.generated_buckets != (
+            0,
+            2048,
+            4096,
+            8192,
+            16384,
+            24576,
+            32768,
+            40960,
+        ):
+            raise ValueError("generated-token bucket identity mismatch")
+        if self.confirmation_repetitions != 8:
+            raise ValueError("formal confirmation requires eight independent blocks")
+        if self.confirmation_schedule_seed != 20260809:
+            raise ValueError("confirmation schedule identity mismatch")
+        if self.natural_side_tables != ("livecodebench", "math500"):
+            raise ValueError("natural side-table identity mismatch")
+        expected_windows = LongContinuationAdapter.default_hashes()
+        if self.controlled_window_hashes != expected_windows:
+            raise ValueError("controlled dataset window identity mismatch")
+        if self.tuning_grid_sha256 != _tuning_grid_sha256():
+            raise ValueError("tuning grid identity mismatch")
+        if self.sampling_profile_sha256 != SamplingProfile().sha256:
+            raise ValueError("sampling profile identity mismatch")
 
-    def with_weight_update_mode(self, mode: str | None) -> "ExperimentManifest":
-        """Apply a CLI-only mode overlay without mutating the source manifest.
+    def to_dict(self) -> dict:
+        return asdict(self)
 
-        Static baselines are intentionally untouched.  Unit IDs and the outer
-        manifest hash are properties, so replacing the frozen units recomputes
-        both.  Converged identities are rejected before any artifact or model
-        allocation occurs.
-        """
-        if mode is None:
-            return self
-        from lightcone_spec.config.schema import (
-            canonical_tail_layout_mode,
-            canonical_weight_update_mode,
+    @property
+    def sha256(self) -> str:
+        body = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        return hashlib.sha256(body).hexdigest()
+
+    def write(self, path: str | Path) -> None:
+        self.validate()
+        output = Path(path)
+        body = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":")
+        ) + "\n"
+        if output.exists() and output.read_text(encoding="utf-8") != body:
+            raise ValueError("manifest is immutable; choose a new output path")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(body, encoding="utf-8")
+        Path(f"{output}.sha256").write_text(
+            self.sha256 + "\n", encoding="utf-8"
         )
 
-        canonical = canonical_weight_update_mode(mode)
-        units = [
-            replace(
-                unit,
-                trainable_scope=canonical_tail_layout_mode(
-                    unit.trainable_scope
-                ),
+    @classmethod
+    def load(cls, path: str | Path) -> SpeedStudyManifest:
+        source = Path(path)
+        data = json.loads(source.read_text(encoding="utf-8"))
+        for field_name in (
+            "methods",
+            "phases",
+            "concurrency_grid",
+            "generated_buckets",
+            "natural_side_tables",
+        ):
+            if field_name in data:
+                data[field_name] = tuple(data[field_name])
+        if "tuning_stages" in data:
+            data["tuning_stages"] = tuple(
+                tuple(stage) for stage in data["tuning_stages"]
             )
-            if unit.method == "static"
-            else replace(unit, trainable_scope=canonical_tail_layout_mode(canonical))
-            for unit in self.units
-        ]
-        _reject_duplicate_units(units, context="--weight-update-mode result")
-        return replace(self, units=units)
+        manifest = cls(**data)
+        manifest.validate()
+        sidecar = Path(f"{source}.sha256")
+        if not sidecar.is_file() or sidecar.read_text().strip() != manifest.sha256:
+            raise ValueError("manifest sidecar is missing or does not match")
+        return manifest

@@ -1,19 +1,5 @@
-from lightcone_spec.locking.hashing import (
-    canonical_json,
-    sha256_bytes,
-    sha256_file,
-    sha256_json,
-)
-from lightcone_spec.locking.lockfile import Lockfile, LockedFile, load_lockfile
-from lightcone_spec.locking.verify import verify_lockfile_offline
+"""Content-addressed model locks."""
 
-__all__ = [
-    "canonical_json",
-    "sha256_bytes",
-    "sha256_file",
-    "sha256_json",
-    "Lockfile",
-    "LockedFile",
-    "load_lockfile",
-    "verify_lockfile_offline",
-]
+from .models import ModelLock, prepare_models, resolve_model_lock
+
+__all__ = ["ModelLock", "prepare_models", "resolve_model_lock"]

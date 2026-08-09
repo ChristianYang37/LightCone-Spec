@@ -1,2 +1,17 @@
-"""Version-safe runtime: RNG substreams, exact sampling, version state
-machine, double buffering, canaries, and the CPU reference engine."""
+"""Runtime exactness and CUDA publication helpers."""
+
+from .dflash_canvas import (
+    CanvasReconstruction,
+    DifferentiableCanvasContract,
+    position_weighted_kl,
+)
+from .exactness import rejection_sample
+from .publication import CudaPublicationCoordinator
+
+__all__ = [
+    "CanvasReconstruction",
+    "CudaPublicationCoordinator",
+    "DifferentiableCanvasContract",
+    "position_weighted_kl",
+    "rejection_sample",
+]
