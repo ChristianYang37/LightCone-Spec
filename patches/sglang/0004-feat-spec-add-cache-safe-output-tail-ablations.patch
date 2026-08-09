@@ -1,0 +1,424 @@
+From 8b4cf4c8f65604439de0f4072036c1f474072736 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 03:34:29 +0800
+Subject: [PATCH 4/6] feat(spec): add cache-safe output-tail ablations
+
+---
+ .../srt/speculative/dflash_worker_v2.py       |  93 ++++++--
+ .../srt/speculative/online_tail_adaptation.py | 215 ++++++++++++++++++
+ 2 files changed, 286 insertions(+), 22 deletions(-)
+ create mode 100644 python/sglang/srt/speculative/online_tail_adaptation.py
+
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 6a4de5c..0f1ec12 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -86,7 +86,15 @@ class _DflashDraftSampler:
+     """
+ 
+     def __init__(
+-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
++        self,
++        *,
++        weight,
++        block_size,
++        num_org,
++        org_vocab_start,
++        max_bs,
++        tp_group=None,
++        online_tail=None,
+     ):
+         self.weight = weight
+         self.block_size = int(block_size)
+@@ -94,6 +102,7 @@ class _DflashDraftSampler:
+         self.org_vocab_start = int(org_vocab_start)
+         self.tp_group = tp_group
+         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
++        self.online_tail = online_tail
+         max_tokens = int(max_bs) * (self.block_size - 1)
+         device = weight.device
+         # Proposed draft tokens: written in-graph, read by the worker after replay.
+@@ -128,7 +137,12 @@ class _DflashDraftSampler:
+         if hs.dtype != self.weight.dtype:
+             hs = hs.to(self.weight.dtype)
+         n = hs.shape[0]
+-        logits = torch.matmul(hs, self.weight[: self.num_org].T)
++        head_weight = self.weight[: self.num_org]
++        logits = (
++            torch.matmul(hs, head_weight.T)
++            if self.online_tail is None
++            else self.online_tail.proposal_logits(hs, head_weight)
++        )
+         if self.tp_size == 1:
+             tokens = torch.argmax(logits, dim=-1).to(torch.long)
+             if self.org_vocab_start:
+@@ -287,6 +301,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+         self._out_tokens_bufs: List[torch.Tensor] = []
+         self._new_seq_lens_bufs: List[torch.Tensor] = []
+         self._online_drafter_adapter = None
++        self._online_tail_adapter = None
+         if getattr(server_args, "speculative_adaptation_config", None):
+             from sglang.srt.speculative.dflash_online_adaptation import (
+                 maybe_build_dflash_drafter_adapter,
+@@ -295,6 +310,13 @@ class DFlashWorkerV2(BaseSpecWorker):
+             self._online_drafter_adapter = (
+                 maybe_build_dflash_drafter_adapter(server_args, self)
+             )
++            from sglang.srt.speculative.online_tail_adaptation import (
++                maybe_build_online_tail_adapter,
++            )
++
++            self._online_tail_adapter = maybe_build_online_tail_adapter(
++                server_args, self
++            )
+ 
+     @property
+     def draft_worker(self):
+@@ -307,9 +329,12 @@ class DFlashWorkerV2(BaseSpecWorker):
+         adapter = self._online_drafter_adapter
+         if adapter is not None:
+             adapter.finish_request(rid)
++        tail = self._online_tail_adapter
++        if tail is not None:
++            tail.finish_request(rid)
+ 
+     def dump_info_records(self) -> Optional[dict]:
+-        adapter = self._online_drafter_adapter
++        adapter = self._online_drafter_adapter or self._online_tail_adapter
+         if adapter is None:
+             return None
+         return {"online_adaptation": adapter.diagnostics()}
+@@ -421,6 +446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+             org_vocab_start=org_vocab_start,
+             max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+             tp_group=tp_group if tp_group.world_size > 1 else None,
++            online_tail=self._online_tail_adapter,
+         )
+ 
+     def _init_fused_kv_helper(self) -> None:
+@@ -1513,8 +1539,11 @@ class DFlashWorkerV2(BaseSpecWorker):
+         bs = len(batch.seq_lens)
+         device = self.device
+         online_adapter = self._online_drafter_adapter
++        online_tail = self._online_tail_adapter
+         if online_adapter is not None:
+             online_adapter.begin_round(batch)
++        if online_tail is not None:
++            online_tail.begin_round(batch)
+ 
+         # --- 1) Draft a fixed block with the draft model.
+         target_model = self.target_worker.model_runner.model
+@@ -1664,7 +1693,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+             draft_out = self.draft_model_runner.forward(forward_batch)
+         draft_logits_output = draft_out.logits_output
+         online_draft_hidden = draft_logits_output.hidden_states
+-        if online_adapter is not None and online_draft_hidden is None:
++        if (
++            online_adapter is not None or online_tail is not None
++        ) and online_draft_hidden is None:
+             raise RuntimeError(
+                 "DFLASH online adaptation requires draft hidden states"
+             )
+@@ -1678,12 +1709,21 @@ class DFlashWorkerV2(BaseSpecWorker):
+             if draft_hidden is None:
+                 raise RuntimeError("DFLASH draft model returned no hidden states.")
+             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+-            draft_next = self._greedy_sample_from_vocab_parallel_head(
+-                hidden_states=draft_hidden[:, 1:, :].reshape(
+-                    -1, draft_hidden.shape[-1]
+-                ),
+-                lm_head=lm_head,
+-            ).view(bs, int(self.block_size) - 1)
++            sample_hidden = draft_hidden[:, 1:, :].reshape(
++                -1, draft_hidden.shape[-1]
++            )
++            if online_tail is None:
++                draft_next = self._greedy_sample_from_vocab_parallel_head(
++                    hidden_states=sample_hidden,
++                    lm_head=lm_head,
++                ).view(bs, int(self.block_size) - 1)
++            else:
++                draft_next = torch.argmax(
++                    online_tail.proposal_logits(
++                        sample_hidden, lm_head.weight
++                    ),
++                    dim=-1,
++                ).view(bs, int(self.block_size) - 1)
+ 
+         draft_tokens = self._draft_block_tokens_buf[:bs]
+         draft_tokens[:, 0].copy_(block_ids[:, 0])
+@@ -1866,7 +1906,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+             )
+         hidden = hidden.view(bs, int(self.block_size), -1)
+ 
+-        if online_adapter is not None:
++        if online_adapter is not None or online_tail is not None:
+             from sglang.srt.speculative.online_valid_mask import (
+                 semantic_valid_mask,
+             )
+@@ -1893,17 +1933,24 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 terminal_token_ids=terminal_ids,
+                 ignore_eos=ignore_eos,
+             )
+-            online_adapter.capture_verify(
+-                hidden_states=hidden,
+-                positions=positions,
+-                commit_lens=commit_lens,
+-            )
+-            online_adapter.maybe_launch(
+-                draft_hidden=online_draft_hidden,
+-                target_logits=logits_output.next_token_logits,
+-                valid_mask=valid_mask,
+-                lm_head_weight=lm_head.weight,
+-            )
++            if online_adapter is not None:
++                online_adapter.capture_verify(
++                    hidden_states=hidden,
++                    positions=positions,
++                    commit_lens=commit_lens,
++                )
++                online_adapter.maybe_launch(
++                    draft_hidden=online_draft_hidden,
++                    target_logits=logits_output.next_token_logits,
++                    valid_mask=valid_mask,
++                    lm_head_weight=lm_head.weight,
++                )
++            if online_tail is not None:
++                online_tail.maybe_launch(
++                    hidden=online_draft_hidden,
++                    target_logits=logits_output.next_token_logits,
++                    valid_mask=valid_mask,
++                )
+ 
+         self._append_target_hidden_to_draft_kv_by_loc(
+             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+@@ -1918,6 +1965,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+         if online_adapter is not None:
+             online_adapter.after_commit(batch, new_seq_lens)
++        if online_tail is not None:
++            online_tail.after_commit(batch, new_seq_lens)
+ 
+         next_draft_input = self._make_next_draft_input_decode(
+             bonus_tokens=bonus,
+diff --git a/python/sglang/srt/speculative/online_tail_adaptation.py b/python/sglang/srt/speculative/online_tail_adaptation.py
+new file mode 100644
+index 0000000..f1376a3
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_tail_adaptation.py
+@@ -0,0 +1,215 @@
++"""Cache-safe output-tail ablations for speculative proposal heads."""
++
++from __future__ import annotations
++
++import math
++
++import torch
++
++from sglang.srt.speculative.online_adaptation_config import (
++    load_online_adaptation,
++)
++from sglang.srt.speculative.online_adaptation_runtime import (
++    FixedInferenceBank,
++    OnlineCohortRuntime,
++    ResidentOptimizer,
++)
++
++
++class OnlineTailAdapter:
++    def __init__(self, server_args, worker) -> None:
++        config = load_online_adaptation(server_args)
++        if config is None or config.parameter_scope != "tail":
++            raise ValueError("tail adapter requires tail-scope configuration")
++        if int(worker.ps.tp_size) != 1:
++            raise ValueError("tail ablations currently require TP=1")
++        self.config = config
++        self.worker = worker
++        self.device = worker.device
++        target_model = worker.target_worker.model_runner.model
++        lm_head = getattr(target_model, "lm_head", None)
++        if lm_head is None or not hasattr(lm_head, "weight"):
++            raise RuntimeError("tail updates require the target LM head")
++        self.lm_head_weight = lm_head.weight.detach()
++        hidden = int(self.lm_head_weight.shape[1])
++        vocab = int(self.lm_head_weight.shape[0])
++        generator = torch.Generator(device=self.device)
++        generator.manual_seed(int(config.sampling_profile_sha256[:16], 16))
++        if config.weight_update_mode == "residual":
++            rank = int(config.rank)
++            first = torch.empty(
++                (hidden, rank), dtype=torch.float32, device=self.device
++            )
++            torch.nn.init.kaiming_uniform_(
++                first, a=math.sqrt(5), generator=generator
++            )
++            second = torch.zeros(
++                (rank, vocab), dtype=torch.float32, device=self.device
++            )
++            parameters = (first, second)
++        elif config.weight_update_mode == "lora":
++            rank = int(config.rank)
++            first = torch.empty(
++                (hidden, rank), dtype=torch.float32, device=self.device
++            )
++            torch.nn.init.kaiming_uniform_(
++                first, a=math.sqrt(5), generator=generator
++            )
++            second = torch.zeros(
++                (rank, hidden), dtype=torch.float32, device=self.device
++            )
++            parameters = (first, second)
++        else:
++            parameters = (
++                torch.zeros(
++                    (hidden, hidden),
++                    dtype=torch.float32,
++                    device=self.device,
++                ),
++            )
++        self.active = tuple(parameters)
++        self.bank = FixedInferenceBank(self.active)
++        self.optimizer = ResidentOptimizer(self.active, config.optimizer)
++        self.runtime = OnlineCohortRuntime(
++            config,
++            device=self.device,
++            reserve_bytes=int(
++                server_args.speculative_adaptation_reserve_mb
++            )
++            * 1024
++            * 1024,
++            telemetry_path=server_args.speculative_adaptation_telemetry_path,
++        )
++        resident = (
++            self.active
++            + self.bank.staging
++            + self.optimizer.master
++            + self.optimizer.first
++            + self.optimizer.second
++        )
++        scratch = (
++            int(server_args.max_running_requests)
++            * int(worker.block_size)
++            * max(hidden, vocab)
++            * 4
++        )
++        self.runtime.bind_memory(
++            resident_tensors=resident,
++            peak_scratch_bytes=scratch,
++        )
++
++    def begin_round(self, batch) -> tuple[int, ...]:
++        request_ids = tuple(request.rid for request in batch.reqs)
++        version = self.runtime.begin_round(request_ids)
++        return (version,) * len(request_ids)
++
++    def _logits(
++        self,
++        hidden: torch.Tensor,
++        parameters: tuple[torch.Tensor, ...],
++        head_weight: torch.Tensor,
++    ) -> torch.Tensor:
++        hidden_fp32 = hidden.to(torch.float32)
++        if self.config.weight_update_mode == "residual":
++            raw = hidden.to(head_weight.dtype) @ head_weight.T
++            correction = (hidden_fp32 @ parameters[0]) @ parameters[1]
++            return raw + correction.to(raw.dtype)
++        if self.config.weight_update_mode == "lora":
++            corrected = hidden_fp32 + (
++                hidden_fp32 @ parameters[0]
++            ) @ parameters[1]
++        else:
++            corrected = hidden_fp32 + hidden_fp32 @ parameters[0]
++        return corrected.to(head_weight.dtype) @ head_weight.T
++
++    def proposal_logits(
++        self, hidden: torch.Tensor, head_weight: torch.Tensor
++    ) -> torch.Tensor:
++        return self._logits(hidden, self.active, head_weight)
++
++    def maybe_launch(
++        self,
++        *,
++        hidden: torch.Tensor,
++        target_logits: torch.Tensor,
++        valid_mask: torch.Tensor,
++    ) -> None:
++        if not self.runtime.update_due():
++            return
++        block = int(self.worker.block_size)
++        batch = int(valid_mask.shape[0])
++        depth = block - 1
++        owned_hidden = hidden.detach().clone().view(batch, block, -1)[
++            :, 1:, :
++        ]
++        owned_target = target_logits.detach().clone().view(
++            batch, block, -1
++        )[:, :depth]
++        owned_mask = valid_mask.detach().clone()
++        with self.runtime.side_update(
++            (owned_hidden, owned_target, owned_mask)
++        ):
++            leaves = tuple(
++                parameter.detach().clone().requires_grad_(True)
++                for parameter in self.optimizer.master
++            )
++            draft = self._logits(
++                owned_hidden.reshape(-1, owned_hidden.shape[-1]),
++                leaves,
++                self.lm_head_weight,
++            ).view(batch, depth, -1).to(torch.float32)
++            target = owned_target.to(torch.float32)
++            probability = torch.softmax(target, dim=-1)
++            weights = self.config.loss_position_decay ** torch.arange(
++                depth, device=self.device, dtype=torch.float32
++            )
++            weights = weights[None, :] * owned_mask.to(torch.float32)
++            loss = (
++                (
++                    probability
++                    * (
++                        torch.log_softmax(target, dim=-1)
++                        - torch.log_softmax(draft, dim=-1)
++                    )
++                ).sum(-1)
++                * weights
++            ).sum() / weights.sum().clamp_min(1.0)
++            gradients = torch.autograd.grad(loss, leaves)
++            finite = torch.isfinite(loss) & torch.stack(
++                [torch.isfinite(gradient).all() for gradient in gradients]
++            ).all()
++            proposal = self.optimizer.propose(gradients)
++            staged = tuple(
++                torch.where(finite, candidate, active)
++                for candidate, active in zip(
++                    proposal.parameters, self.active, strict=True
++                )
++            )
++            self.bank.stage(staged)
++            self.runtime.submit(
++                source_round=self.runtime.round,
++                source_version=self.runtime.active_version,
++                optimizer=self.optimizer,
++                proposal=proposal,
++                inference_bank=self.bank,
++                finite=finite,
++            )
++
++    def after_commit(self, batch, new_seq_lens: torch.Tensor) -> None:
++        self.runtime.record_device_commit(
++            tuple(request.rid for request in batch.reqs), new_seq_lens
++        )
++
++    def finish_request(self, request_id: str) -> None:
++        self.runtime.finish_request(request_id)
++
++    def diagnostics(self) -> dict:
++        return self.runtime.diagnostics()
++
++
++def maybe_build_online_tail_adapter(server_args, worker):
++    config = load_online_adaptation(server_args)
++    if config is None or config.parameter_scope != "tail":
++        return None
++    return OnlineTailAdapter(server_args, worker)
++

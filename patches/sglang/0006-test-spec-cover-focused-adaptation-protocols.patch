@@ -1,0 +1,526 @@
+From f7949025602a6b01fc9cc21b27fb4524e055437d Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 09:44:57 +0800
+Subject: [PATCH 6/6] test(spec): cover focused adaptation protocols
+
+---
+ .../spec/test_online_adaptation_protocol.py   | 510 ++++++++++++++++++
+ 1 file changed, 510 insertions(+)
+ create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
+
+diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
+new file mode 100644
+index 0000000..fec8caf
+--- /dev/null
++++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
+@@ -0,0 +1,510 @@
++import hashlib
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++import torch
++from sglang.srt.speculative.online_adaptation_config import (
++    OnlineAdaptationConfig,
++    OnlineOptimizerConfig,
++    validate_online_adaptation,
++)
++from sglang.srt.speculative.online_adaptation_runtime import (
++    FixedInferenceBank,
++    RequestVersionState,
++    ResidentOptimizer,
++    estimate_full_vocab_training_scratch_bytes,
++)
++from sglang.srt.speculative.online_valid_mask import (
++    semantic_outcome_lengths,
++    semantic_valid_mask,
++)
++from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
++
++
++def _config_value(**overrides):
++    value = {
++        "schema_version": 2,
++        "method": "tts",
++        "weight_update_mode": "lora",
++        "parameter_scope": "drafter",
++        "kv_history_policy": "frozen",
++        "adaptation_scope": "cohort",
++        "adaptation_group_id": "study-a",
++        "tenant_id": "tenant-a",
++        "optimizer": {
++            "name": "adamw",
++            "learning_rate": 1e-5,
++            "weight_decay": 0.01,
++            "beta1": 0.9,
++            "beta2": 0.999,
++            "epsilon": 1e-8,
++            "grad_clip": 1.0,
++        },
++        "rank": 8,
++        "stride": 10,
++        "max_in_flight": 1,
++        "canvas_tokens": 4096,
++        "loss_position_decay": 1.0,
++        "target_revision": "b" * 40,
++        "drafter_revision": "c" * 40,
++        "sampling_profile_sha256": "a" * 64,
++        "telemetry_detail": "headline",
++    }
++    value.update(overrides)
++    return value
++
++
++def _write_config(value) -> str:
++    directory = tempfile.mkdtemp(prefix="sglang-online-adaptation-")
++    path = Path(directory) / "config.json"
++    path.write_text(json.dumps(value), encoding="utf-8")
++    return str(path)
++
++
++def _server_args(config_path=None, **overrides):
++    value = {
++        "speculative_adaptation_config": config_path,
++        "speculative_adaptation_reserve_mb": 0 if config_path is None else 1024,
++        "speculative_adaptation_telemetry_path": None,
++        "speculative_speed_study_metrics": config_path is not None,
++        "speculative_algorithm": "DFLASH",
++        "speculative_draft_model_quantization": None,
++        "kv_cache_dtype": "auto",
++        "enable_two_batch_overlap": False,
++        "enable_pdmux": False,
++        "speculative_accept_threshold_single": 1.0,
++        "speculative_accept_threshold_acc": 1.0,
++        "speculative_use_rejection_sampling": config_path is not None,
++        "tp_size": 1,
++        "dp_size": 1,
++    }
++    value.update(overrides)
++    return SimpleNamespace(**value)
++
++
++class TestOnlineAdaptationConfig(unittest.TestCase):
++    def test_strict_schema_and_normalized_modes(self):
++        value = _config_value()
++        loaded = OnlineAdaptationConfig.load(_write_config(value))
++        self.assertEqual(loaded.method, "tts")
++        self.assertEqual(loaded.weight_update_mode, "lora")
++        self.assertEqual(loaded.parameter_scope, "drafter")
++        canonical = json.dumps(
++            value, sort_keys=True, separators=(",", ":")
++        ).encode()
++        self.assertEqual(loaded.sha256, hashlib.sha256(canonical).hexdigest())
++
++    def test_unknown_method_and_legacy_schema_fail_closed(self):
++        for update in (
++            {"method": "unsupported_method_a"},
++            {"method": "unsupported_method_b"},
++            {"schema_version": 1},
++        ):
++            with self.subTest(update=update), self.assertRaises(ValueError):
++                OnlineAdaptationConfig.load(
++                    _write_config(_config_value(**update))
++                )
++
++    def test_rejects_zero_depth_canvas(self):
++        with self.assertRaisesRegex(ValueError, "at least two"):
++            OnlineAdaptationConfig.load(
++                _write_config(_config_value(canvas_tokens=1))
++            )
++
++    def test_revisions_and_optimizer_values_are_immutable_and_finite(self):
++        with self.assertRaisesRegex(ValueError, "immutable Git SHA"):
++            OnlineAdaptationConfig.load(
++                _write_config(_config_value(target_revision="main"))
++            )
++        value = _config_value()
++        value["optimizer"]["learning_rate"] = float("nan")
++        with self.assertRaisesRegex(ValueError, "finite"):
++            OnlineAdaptationConfig.load(_write_config(value))
++
++    def test_full_requires_null_rank_and_residual_is_tail_only(self):
++        with self.assertRaisesRegex(ValueError, "rank=null"):
++            OnlineAdaptationConfig.load(
++                _write_config(
++                    _config_value(weight_update_mode="full", rank=8)
++                )
++            )
++        with self.assertRaisesRegex(ValueError, "tail-only"):
++            OnlineAdaptationConfig.load(
++                _write_config(_config_value(weight_update_mode="residual"))
++            )
++
++    def test_disabled_path_forbids_reserve_and_telemetry(self):
++        validate_online_adaptation(_server_args())
++        with self.assertRaisesRegex(ValueError, "forbidden"):
++            validate_online_adaptation(
++                _server_args(speculative_adaptation_reserve_mb=1)
++            )
++        with self.assertRaisesRegex(ValueError, "forbidden"):
++            validate_online_adaptation(
++                _server_args(
++                    speculative_adaptation_telemetry_path="telemetry.json"
++                )
++            )
++
++    def test_unsupported_backend_fails_before_allocation(self):
++        path = _write_config(_config_value())
++        with self.assertRaisesRegex(ValueError, "requires DFLASH"):
++            validate_online_adaptation(
++                _server_args(path, speculative_algorithm="EAGLE3")
++            )
++
++    def test_unsupported_parallel_layout_fails_before_allocation(self):
++        path = _write_config(_config_value())
++        for field in ("tp_size", "dp_size"):
++            with self.subTest(field=field), self.assertRaisesRegex(
++                ValueError, "TP=1 and DP=1"
++            ):
++                validate_online_adaptation(
++                    _server_args(path, **{field: 2})
++                )
++
++    def test_adaptation_requires_exact_rejection_sampling(self):
++        path = _write_config(_config_value())
++        with self.assertRaisesRegex(ValueError, "exact rejection sampling"):
++            validate_online_adaptation(
++                _server_args(
++                    path, speculative_use_rejection_sampling=False
++                )
++            )
++
++    def test_adaptation_requires_explicit_speed_study_metrics(self):
++        path = _write_config(_config_value())
++        with self.assertRaisesRegex(ValueError, "speed-study-metrics"):
++            validate_online_adaptation(
++                _server_args(path, speculative_speed_study_metrics=False)
++            )
++
++    def test_native_disabled_path_does_not_enable_study_metrics(self):
++        args = _server_args()
++        validate_online_adaptation(args)
++        self.assertFalse(args.speculative_speed_study_metrics)
++
++    def test_static_study_metrics_require_exact_sampling(self):
++        validate_online_adaptation(
++            _server_args(
++                speculative_speed_study_metrics=True,
++                speculative_use_rejection_sampling=True,
++            )
++        )
++        with self.assertRaisesRegex(ValueError, "exact rejection sampling"):
++            validate_online_adaptation(
++                _server_args(speculative_speed_study_metrics=True)
++            )
++
++
++class TestSemanticValidMask(unittest.TestCase):
++    def test_rejection_terminal_and_request_boundary(self):
++        proposals = torch.tensor(
++            [[5, 9, 7, 8], [1, 2, 3, 4], [6, 7, 8, 9]]
++        )
++        mask = semantic_valid_mask(
++            proposal_tokens=proposals,
++            correct_len=torch.tensor([3, 1, 4]),
++            remaining_output_tokens=[4, 4, 2],
++            terminal_token_ids=[(9,), (), ()],
++            ignore_eos=[False, False, False],
++        )
++        torch.testing.assert_close(
++            mask,
++            torch.tensor(
++                [
++                    [True, True, False, False],
++                    [True, True, False, False],
++                    [True, True, False, False],
++                ]
++            ),
++            rtol=0,
++            atol=0,
++        )
++
++    def test_all_accepted_and_ignored_terminal_remain_valid(self):
++        mask = semantic_valid_mask(
++            proposal_tokens=torch.tensor([[2, 2, 2]]),
++            correct_len=torch.tensor([3]),
++            remaining_output_tokens=[3],
++            terminal_token_ids=[(2,)],
++            ignore_eos=[True],
++        )
++        self.assertTrue(bool(mask.all()))
++
++    def test_outcome_lengths_respect_terminal_bonus_and_request_boundary(self):
++        accepted, committed = semantic_outcome_lengths(
++            proposal_tokens=torch.tensor(
++                [[4, 9, 7, 8], [1, 2, 3, 4], [5, 6, 7, 8]]
++            ),
++            correct_len=torch.tensor([4, 3, 4]),
++            bonus_tokens=torch.tensor([6, 9, 2]),
++            remaining_output_tokens=[8, 4, 2],
++            terminal_token_ids=[(9,), (9,), ()],
++            ignore_eos=[False, False, False],
++        )
++        torch.testing.assert_close(accepted, torch.tensor([2, 3, 2]))
++        torch.testing.assert_close(committed, torch.tensor([2, 4, 2]))
++
++
++class TestFunctionalOptimizerAndBank(unittest.TestCase):
++    def test_full_vocab_training_scratch_is_conservative_and_validated(self):
++        self.assertEqual(
++            estimate_full_vocab_training_scratch_bytes(
++                batch_tokens=48 * 15, vocab_size=151936
++            ),
++            48 * 15 * 151936 * 32,
++        )
++        with self.assertRaisesRegex(ValueError, "must be positive"):
++            estimate_full_vocab_training_scratch_bytes(
++                batch_tokens=0, vocab_size=151936
++            )
++
++    def test_tts_and_first_ready_start_from_identical_candidate(self):
++        optimizer_config = OnlineOptimizerConfig(
++            "adam", 0.1, 0.0, 0.9, 0.999, 1e-8, 1.0
++        )
++        left = ResidentOptimizer((torch.tensor([1.0]),), optimizer_config)
++        right = ResidentOptimizer((torch.tensor([1.0]),), optimizer_config)
++        gradient = (torch.tensor([0.25]),)
++        left_proposal = left.propose(gradient)
++        right_proposal = right.propose(gradient)
++        torch.testing.assert_close(
++            left_proposal.parameters[0], right_proposal.parameters[0]
++        )
++
++    def test_adamw_proposal_is_immutable_until_commit(self):
++        parameter = torch.tensor([1.0, -2.0])
++        optimizer = ResidentOptimizer(
++            (parameter,),
++            OnlineOptimizerConfig(
++                "adamw", 0.1, 0.01, 0.9, 0.999, 1e-8, 1.0
++            ),
++        )
++        proposal = optimizer.propose((torch.tensor([0.25, -0.5]),))
++        torch.testing.assert_close(
++            optimizer.master[0], torch.tensor([1.0, -2.0])
++        )
++        self.assertEqual(optimizer.step, 0)
++        optimizer.commit(proposal)
++        self.assertEqual(optimizer.step, 1)
++        self.assertFalse(torch.equal(optimizer.master[0], parameter))
++
++    def test_invalid_candidate_does_not_advance_optimizer_state(self):
++        optimizer = ResidentOptimizer(
++            (torch.tensor([1.0, -2.0]),),
++            OnlineOptimizerConfig(
++                "adam", 0.1, 0.0, 0.9, 0.999, 1e-8, 1.0
++            ),
++        )
++        proposal = optimizer.propose((torch.tensor([0.25, -0.5]),))
++        before = tuple(
++            value.clone()
++            for value in optimizer.master + optimizer.first + optimizer.second
++        )
++        optimizer.commit(proposal, valid=torch.tensor(False))
++        self.assertEqual(optimizer.step, 0)
++        for actual, expected in zip(
++            optimizer.master + optimizer.first + optimizer.second,
++            before,
++            strict=True,
++        ):
++            torch.testing.assert_close(actual, expected)
++
++    def test_fixed_bank_preserves_addresses(self):
++        active = torch.zeros(4)
++        bank = FixedInferenceBank((active,))
++        address = active.data_ptr()
++        bank.stage((torch.ones(4),))
++        bank.publish()
++        self.assertEqual(active.data_ptr(), address)
++        torch.testing.assert_close(active, torch.ones(4))
++
++    def test_reset_clears_moments_without_replacing_storage(self):
++        parameter = torch.tensor([1.0, 2.0])
++        optimizer = ResidentOptimizer(
++            (parameter,),
++            OnlineOptimizerConfig(
++                "adam", 0.1, 0.0, 0.9, 0.999, 1e-8, 1.0
++            ),
++        )
++        address = optimizer.master[0].data_ptr()
++        optimizer.commit(optimizer.propose((torch.ones(2),)))
++        optimizer.reset((torch.tensor([3.0, 4.0]),))
++        self.assertEqual(optimizer.master[0].data_ptr(), address)
++        self.assertEqual(optimizer.step, 0)
++        torch.testing.assert_close(optimizer.first[0], torch.zeros(2))
++        torch.testing.assert_close(optimizer.second[0], torch.zeros(2))
++
++
++class TestFrozenKVVersionHistory(unittest.TestCase):
++    def test_publish_only_changes_future_segments(self):
++        state = RequestVersionState(version=0, slot_generation=0)
++        state.append(8, source_version=0)
++        state.version = 1
++        state.append(12, source_version=1)
++        self.assertEqual(
++            [
++                (segment.start, segment.end, segment.source_version)
++                for segment in state.segments
++            ],
++            [(0, 8, 0), (8, 12, 1)],
++        )
++        state.retract(10)
++        self.assertEqual(state.segments[-1].end, 10)
++        self.assertEqual(state.segments[-1].source_version, 1)
++
++
++class TestCancellationLifecycle(unittest.TestCase):
++    def test_abort_invalidates_pending_candidate_without_publishing(self):
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            OnlineCohortRuntime,
++        )
++
++        runtime = OnlineCohortRuntime.__new__(OnlineCohortRuntime)
++        runtime.requests = {"request-a": object()}
++        runtime.latest_device_lengths = {}
++        runtime.slot_generation = 4
++        runtime.update_traces = [SimpleNamespace(status="pending")]
++        runtime.counters = {"updates_discarded": 0}
++        runtime.pending = SimpleNamespace(trace_index=0)
++        runtime.abort_request("request-a")
++
++        self.assertEqual(runtime.slot_generation, 5)
++        self.assertIsNone(runtime.pending)
++        self.assertEqual(runtime.update_traces[0].status, "request_aborted")
++        self.assertEqual(runtime.counters["updates_discarded"], 1)
++
++    def test_dflash_abort_cleans_both_parameterizations(self):
++        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
++
++        drafter = SimpleNamespace(aborted=[])
++        drafter.abort_request = drafter.aborted.append
++        tail = SimpleNamespace(aborted=[])
++        tail.abort_request = tail.aborted.append
++        worker = DFlashWorkerV2.__new__(DFlashWorkerV2)
++        worker._online_drafter_adapter = drafter
++        worker._online_tail_adapter = tail
++
++        worker.note_request_aborted(rid="request-a")
++
++        self.assertEqual(drafter.aborted, ["request-a"])
++        self.assertEqual(tail.aborted, ["request-a"])
++
++
++class TestHistoryGather(unittest.TestCase):
++    def test_reconstruction_gate_compares_actual_logits(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _logit_reconstruction_gate,
++        )
++
++        reference = torch.tensor([[1.0, -2.0]])
++        valid, error = _logit_reconstruction_gate(
++            reference, reference + 1e-3
++        )
++        self.assertTrue(bool(valid))
++        self.assertAlmostEqual(float(error), 1e-3, places=6)
++        invalid, _ = _logit_reconstruction_gate(
++            reference, reference + 1.0
++        )
++        self.assertFalse(bool(invalid))
++
++    def test_nhd_and_hnd_layouts_match(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            DFlashDrafterAdapter,
++        )
++
++        nhd_key = torch.arange(8 * 2 * 3).view(8, 2, 3)
++        nhd_value = nhd_key + 1000
++        hnd_key = nhd_key.view(2, 4, 2, 3).permute(0, 2, 1, 3)
++        hnd_value = nhd_value.view(2, 4, 2, 3).permute(0, 2, 1, 3)
++        locations = torch.tensor([1, 6])
++
++        class Pool:
++            def __init__(self, key, value):
++                self.key = key
++                self.value = value
++
++            def get_kv_buffer(self, _layer_id):
++                return self.key, self.value
++
++        def adapter(key, value):
++            return SimpleNamespace(
++                worker=SimpleNamespace(
++                    page_size=4,
++                    draft_model_runner=SimpleNamespace(
++                        token_to_kv_pool=Pool(key, value)
++                    ),
++                )
++            )
++
++        nhd = DFlashDrafterAdapter._gather_history(
++            adapter(nhd_key, nhd_value),
++            layer_id=0,
++            locations=locations,
++        )
++        hnd = DFlashDrafterAdapter._gather_history(
++            adapter(hnd_key, hnd_value),
++            layer_id=0,
++            locations=locations,
++        )
++        torch.testing.assert_close(nhd[0], hnd[0])
++        torch.testing.assert_close(nhd[1], hnd[1])
++
++
++@unittest.skipUnless(torch.cuda.is_available(), "CUDA publication test")
++class TestCudaFixedAddress(unittest.TestCase):
++    def test_publish_does_not_replace_cuda_storage(self):
++        active = torch.zeros(16, device="cuda", dtype=torch.float16)
++        bank = FixedInferenceBank((active,))
++        address = active.data_ptr()
++        for value in (1.0, 2.0, 3.0):
++            bank.stage((torch.full_like(active, value),))
++            bank.publish()
++            self.assertEqual(active.data_ptr(), address)
++        torch.testing.assert_close(active, torch.full_like(active, 3.0))
++
++    def test_round_telemetry_stays_device_resident_until_diagnostics(self):
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            OnlineCohortRuntime,
++        )
++
++        config = OnlineAdaptationConfig.load(
++            _write_config(_config_value(stride=2, canvas_tokens=16))
++        )
++        runtime = OnlineCohortRuntime(
++            config,
++            device=torch.device("cuda"),
++            reserve_bytes=64 * 1024 * 1024,
++            telemetry_path=None,
++            max_trace_updates=10,
++            max_trace_batch=2,
++        )
++        runtime.bind_parameter_layout(
++            (("weight", torch.zeros(1, device="cuda")),),
++            projection_identity="test-head",
++        )
++        version = runtime.begin_round(
++            ("r0", "r1"), torch.tensor([100, 200], device="cuda")
++        )
++        self.assertEqual(version, 0)
++        runtime.record_round_outcome(
++            ("r0", "r1"),
++            verified_drafts=torch.tensor([15, 15], device="cuda"),
++            accepted_drafts=torch.tensor([4, 5], device="cuda"),
++            committed_tokens=torch.tensor([5, 6], device="cuda"),
++        )
++        rounds = runtime.diagnostics()["rounds"]
++        self.assertEqual(len(rounds), 1)
++        self.assertEqual(rounds[0]["prefix_len_before"], [100, 200])
++        self.assertEqual(rounds[0]["accepted_drafts"], [4, 5])
++
++
++if __name__ == "__main__":
++    unittest.main()

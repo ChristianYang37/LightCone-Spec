@@ -1,0 +1,1908 @@
+From 0e67d25d6cdd60f342b409e8f3639a9b935b46ef Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 06:04:42 +0800
+Subject: [PATCH 5/6] feat(spec): harden memory lifecycle and profiling
+
+---
+ python/sglang/srt/managers/scheduler.py       |  74 +-
+ .../batch_result_processor.py                 |  13 +-
+ .../scheduler_components/metrics_reporter.py  |  22 +
+ .../srt/mem_cache/kv_cache_configurator.py    |  26 +-
+ .../srt/speculative/base_spec_worker.py       |   4 +
+ .../speculative/dflash_online_adaptation.py   | 631 ++++++++++++------
+ .../srt/speculative/dflash_worker_v2.py       |  73 +-
+ .../speculative/online_adaptation_config.py   |  68 +-
+ .../speculative/online_adaptation_runtime.py  |  31 +
+ .../srt/speculative/online_tail_adaptation.py | 206 ++++--
+ .../srt/speculative/online_valid_mask.py      |  64 +-
+ 11 files changed, 936 insertions(+), 276 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 861c13f..375c35e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3252,6 +3252,9 @@ class Scheduler(
+             )
+ 
+             self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
++            if self.metrics_reporter.speed_study_enabled:
++                self.metrics_reporter.speed_study_retractions += len(retracted_reqs)
++                self.metrics_reporter.speed_study_oom_events += len(reqs_to_abort)
+             if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
+                 self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                     num_retracted_reqs=len(retracted_reqs),
+@@ -3572,6 +3575,17 @@ class Scheduler(
+                     can_run_cuda_graph=can_run_cuda_graph,
+                 )
+ 
++        if self.is_generation and not batch.forward_mode.is_extend():
++            record_load = getattr(
++                self.draft_worker, "record_scheduler_load", None
++            )
++            if callable(record_load):
++                record_load(
++                    running_requests=len(batch.reqs),
++                    waiting_requests=len(self.waiting_queue),
++                    graph_replay=bool(ret.can_run_cuda_graph),
++                )
++
+         self._maybe_report_active_ranks()
+ 
+         return ret
+@@ -3974,6 +3988,8 @@ class Scheduler(
+ 
+             if empty_cache:
+                 current_platform.empty_cache()
++            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
++                torch.cuda.reset_peak_memory_stats(self.device)
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
+@@ -4002,6 +4018,54 @@ class Scheduler(
+             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+         }
+         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
++        if self.metrics_reporter.speed_study_enabled:
++            speed_samples = self.metrics_reporter.speed_study_graph_total
++            target_calls = (
++                self.metrics_reporter.spec_total_num_forward_ct
++                + self.metrics_reporter.spec_num_forward_ct
++            )
++            committed_tokens = (
++                self.metrics_reporter.spec_total_num_accept_tokens
++                + self.metrics_reporter.spec_num_accept_tokens
++            )
++            accepted_drafts = max(committed_tokens - target_calls, 0)
++            verified_drafts = target_calls * max(
++                int(self.server_args.speculative_num_draft_tokens) - 1, 0
++            )
++            ret["speed_study_metrics"] = {
++                "target_calls": target_calls,
++                "accepted_drafts": accepted_drafts,
++                "committed_tokens": committed_tokens,
++                "verified_drafts": verified_drafts,
++                "verification_waste": verified_drafts - accepted_drafts,
++                "oom_events": self.metrics_reporter.speed_study_oom_events,
++                "retractions": self.metrics_reporter.speed_study_retractions,
++                "peak_hbm_bytes": int(
++                    torch.cuda.max_memory_allocated(self.device)
++                    if torch.cuda.is_available()
++                    and str(self.device).startswith("cuda")
++                    else 0
++                ),
++                "kv_bytes": int(
++                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage
++                    * (1 << 30)
++                ),
++                "batch_fill": (
++                    self.metrics_reporter.speed_study_batch_sum / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++                "queue_occupancy": (
++                    self.metrics_reporter.speed_study_queue_sum / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++                "graph_replay_hit_rate": (
++                    self.metrics_reporter.speed_study_graph_hits / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++            }
+ 
+         if self.server_args.elastic_ep_backend is not None:
+             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+@@ -4024,10 +4088,14 @@ class Scheduler(
+         if RECORD_STEP_TIME:
+             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
+ 
+-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+-            info_record = self.draft_worker.dump_info_records()
++        if not self.spec_algorithm.is_none() and self.draft_worker is not None:
++            dump_info = getattr(self.draft_worker, "dump_info_records", None)
++            info_record = dump_info() if callable(dump_info) else None
+             if info_record is not None:
+-                ret["dspark_info_record"] = info_record
++                if self.spec_algorithm.is_dspark():
++                    ret["dspark_info_record"] = info_record
++                if self.server_args.speculative_adaptation_config:
++                    ret["speculative_adaptation_info_record"] = info_record
+ 
+         # These fields are not msgpack-serializable (a config object and a bound
+         # signal handler); no reader consumes them.
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 248a929..12a4a7a 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -948,10 +948,15 @@ class SchedulerBatchResultProcessor:
+             # isinstance narrowing: create_worker may also return plain
+             # TpModelWorker-based drafts, which carry no spec-worker hooks.
+             if isinstance(self.draft_worker, BaseSpecWorker):
+-                self.draft_worker.note_request_finished(
+-                    rid=req.rid,
+-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+-                )
++                if isinstance(req.finished_reason, FINISH_ABORT):
++                    self.draft_worker.note_request_aborted(rid=req.rid)
++                else:
++                    self.draft_worker.note_request_finished(
++                        rid=req.rid,
++                        natural_stop=isinstance(
++                            req.finished_reason, FINISH_MATCHED_TOKEN
++                        ),
++                    )
+ 
+             # delete feature to save memory
+             if req.multimodal_inputs is not None and req.session is None:
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 15e1b81..1779332 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -141,6 +141,16 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        self.speed_study_enabled = bool(
++            self.scheduler.server_args.speculative_speed_study_metrics
++        )
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+         # For PD disaggregation
+         self.kv_transfer_speed_gb_s: float = 0.0
+@@ -524,6 +534,13 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+     def report_prefill_stats(
+         self,
+@@ -697,6 +714,11 @@ class SchedulerMetricsReporter:
+         num_correct_drafts: int = 0,
+     ):
+         batch = running_batch or self.scheduler.running_batch
++        if self.speed_study_enabled:
++            self.speed_study_graph_total += 1
++            self.speed_study_graph_hits += int(can_run_cuda_graph)
++            self.speed_study_batch_sum += len(batch.reqs)
++            self.speed_study_queue_sum += len(self.scheduler.waiting_queue)
+ 
+         # Every-iteration work: realtime token counting + status logger
+         if self.current_scheduler_metrics_enabled:
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index bc4cf81..d18d814 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
+                 )
+                 / 1024,
+             )
+-        rest_memory = available_gpu_memory - slack_gb
++        adaptation_reserve_bytes = int(
++            getattr(
++                self.server_args,
++                "speculative_adaptation_reserve_mb",
++                0,
++            )
++        ) * 1024 * 1024
++        adaptation_resident_bytes = int(
++            getattr(
++                self.server_args,
++                "_speculative_adaptation_resident_bytes",
++                0,
++            )
++        )
++        adaptation_headroom_bytes = max(
++            adaptation_reserve_bytes - adaptation_resident_bytes, 0
++        )
++        adaptation_headroom_gb = adaptation_headroom_bytes / (1 << 30)
++        rest_memory = (
++            available_gpu_memory - slack_gb - adaptation_headroom_gb
++        )
+         if self.mambaish_config is not None:
+             rest_memory = self._handle_max_mamba_cache(rest_memory)
+ 
+@@ -1569,7 +1589,9 @@ class KVCacheConfigurator:
+                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
+             )
+             raise ValueError(
+-                f"Loaded weights leave no GPU memory for the KV cache under "
++                f"Loaded weights and the {adaptation_headroom_gb:.3f} GiB "
++                f"unallocated adaptation headroom leave no GPU memory for the "
++                f"KV cache under "
+                 f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
+                 f"Raise --mem-fraction-static above "
+                 f"{suggested_mem_fraction_static:.3f} "
+diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+index eb21194..e887ef0 100644
+--- a/python/sglang/srt/speculative/base_spec_worker.py
++++ b/python/sglang/srt/speculative/base_spec_worker.py
+@@ -172,6 +172,10 @@ class BaseSpecWorker(ABC):
+         """
+         pass
+ 
++    def note_request_aborted(self, *, rid: str) -> None:
++        """Hook called when cancellation invalidates request-owned state."""
++        pass
++
+     def activate_step_by_batch(self, batch_size: int) -> None:
+         """Activate the optimal adaptive step for the current batch size.
+ 
+diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
+index cb13977..c55f23e 100644
+--- a/python/sglang/srt/speculative/dflash_online_adaptation.py
++++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
+@@ -5,12 +5,11 @@ from __future__ import annotations
+ import logging
+ import math
+ import re
++from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import Sequence
+ 
+ import torch
+ import torch.nn.functional as F
+-
+ from sglang.srt.speculative.online_adaptation_config import (
+     load_online_adaptation,
+ )
+@@ -18,6 +17,7 @@ from sglang.srt.speculative.online_adaptation_runtime import (
+     FixedInferenceBank,
+     OnlineCohortRuntime,
+     ResidentOptimizer,
++    estimate_full_vocab_training_scratch_bytes,
+ )
+ 
+ logger = logging.getLogger(__name__)
+@@ -25,12 +25,14 @@ logger = logging.getLogger(__name__)
+ _LINEAR = re.compile(
+     r"(?:^|\.)(?:fc|qkv_proj|o_proj|gate_up_proj|down_proj)\.weight$"
+ )
++_BORROWED = re.compile(
++    r"(?:^|\.)(?:embed_tokens|lm_head|target_model)(?:\.|$)"
++)
+ 
+ 
+ @dataclass
+-class _RequestCanvas:
+-    target_hidden: torch.Tensor
+-    positions: torch.Tensor
++class _CapturedHistory:
++    locations: torch.Tensor
+     valid_mask: torch.Tensor
+ 
+ 
+@@ -53,6 +55,24 @@ def _linear(
+     )
+ 
+ 
++def _logit_reconstruction_gate(
++    inference_logits: torch.Tensor,
++    differentiable_logits: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if inference_logits.shape != differentiable_logits.shape:
++        raise ValueError("DFlash reconstruction logit shapes differ")
++    inference = inference_logits.detach().to(torch.float32)
++    reconstructed = differentiable_logits.detach().to(torch.float32)
++    maximum = (reconstructed - inference).abs().max()
++    limit = 2e-3 + 2e-3 * inference.abs().max()
++    valid = (
++        torch.isfinite(maximum)
++        & torch.isfinite(limit)
++        & (maximum <= limit)
++    )
++    return valid, maximum
++
++
+ def _rope(
+     value: torch.Tensor,
+     positions: torch.Tensor,
+@@ -99,8 +119,61 @@ class DFlashDrafterAdapter:
+             )
+         self.config = config
+         self.worker = worker
++        if worker.draft_window_size is None:
++            raise ValueError(
++                "drafter-scope adaptation requires a bounded "
++                "--speculative-draft-window-size"
++            )
++        if int(worker.draft_window_size) != int(config.canvas_tokens):
++            raise ValueError(
++                "canvas_tokens must equal speculative_draft_window_size so "
++                "the differentiable path sees the exact inference history"
++            )
+         self.model = worker.draft_model
+         self.device = worker.device
++        if self.model.__class__.__name__ != "DFlashDraftModel":
++            raise ValueError(
++                "drafter-scope updates currently require the base "
++                "DFlashDraftModel; specialized variants fail closed"
++            )
++        rope_scaling = getattr(self.model.config, "rope_scaling", None)
++        if rope_scaling not in (None, {}):
++            raise ValueError(
++                "differentiable DFlash adaptation does not yet reconstruct "
++                "non-default RoPE scaling; start-up fails before allocation"
++            )
++        if not bool(
++            getattr(
++                self.model.config,
++                "rope_is_neox_style",
++                getattr(self.model.config, "is_neox_style", True),
++            )
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation requires NeoX-style RoPE"
++            )
++        if any(
++            layer.self_attn.sliding_window_size is not None
++            for layer in self.model.layers
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation does not yet reconstruct "
++                "sliding-window attention"
++            )
++        if any(
++            getattr(layer.self_attn.attn.attn_type, "name", None)
++            != "ENCODER_ONLY"
++            for layer in self.model.layers
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation currently requires "
++                "encoder-only canvas attention"
++            )
++        context_capacity = int(
++            server_args.context_length
++            or self.model.config.max_position_embeddings
++        )
++        max_batch = max(1, int(server_args.max_running_requests))
+         self.runtime = OnlineCohortRuntime(
+             config,
+             device=self.device,
+@@ -110,25 +183,30 @@ class DFlashDrafterAdapter:
+             * 1024
+             * 1024,
+             telemetry_path=server_args.speculative_adaptation_telemetry_path,
++            max_trace_updates=context_capacity // config.stride + 2,
++            max_trace_batch=max_batch,
+         )
+-        self.named = {
+-            name: parameter
+-            for name, parameter in self.model.named_parameters()
+-            if parameter.is_floating_point()
+-        }
++        self.named = {}
++        for raw_name, parameter in self.model.named_parameters():
++            name = raw_name.removeprefix("model.")
++            if not parameter.is_floating_point() or _BORROWED.search(name):
++                continue
++            if name in self.named:
++                raise RuntimeError(
++                    f"duplicate canonical DFlash parameter: {name}"
++                )
++            self.named[name] = parameter
+         if not self.named:
+             raise RuntimeError("DFlash drafter exposes no floating parameters")
+-        self.names = tuple(sorted(self.named))
+-        self.inference = FixedInferenceBank(
+-            tuple(self.named[name] for name in self.names)
+-        )
+-        self.base = {
+-            name: parameter.detach().to(torch.float32).clone()
+-            for name, parameter in self.named.items()
+-        }
++        all_names = tuple(sorted(self.named))
+         self.factor_names: tuple[str, ...] = ()
+         self.factor_shapes: dict[str, tuple[int, int]] = {}
+         if config.weight_update_mode == "full":
++            self.names = all_names
++            self.base: dict[str, torch.Tensor] = {}
++            self.inference = FixedInferenceBank(
++                tuple(self.named[name] for name in self.names)
++            )
+             self.optimizer = ResidentOptimizer(
+                 tuple(self.named[name] for name in self.names),
+                 config.optimizer,
+@@ -136,12 +214,20 @@ class DFlashDrafterAdapter:
+         else:
+             factor_names = [
+                 name
+-                for name in self.names
++                for name in all_names
+                 if self.named[name].ndim == 2 and _LINEAR.search(name)
+             ]
+             if not factor_names:
+                 raise RuntimeError("DFlash LoRA parameter selection is empty")
+             self.factor_names = tuple(factor_names)
++            self.names = self.factor_names
++            self.base = {
++                name: self.named[name].detach().to(torch.float32).clone()
++                for name in self.names
++            }
++            self.inference = FixedInferenceBank(
++                tuple(self.named[name] for name in self.names)
++            )
+             factors = []
+             generator = torch.Generator(device=self.device)
+             seed = int(config.sampling_profile_sha256[:16], 16)
+@@ -169,37 +255,107 @@ class DFlashDrafterAdapter:
+                 factors.extend((a, b))
+                 self.factor_shapes[name] = (len(factors) - 2, len(factors) - 1)
+             self.optimizer = ResidentOptimizer(tuple(factors), config.optimizer)
++        self.initial_trainable = tuple(
++            value.detach().clone() for value in self.optimizer.master
++        )
++        if config.weight_update_mode == "full":
++            layout = tuple(zip(self.names, self.optimizer.master, strict=True))
++        else:
++            layout_rows = []
++            for name in self.factor_names:
++                a_index, b_index = self.factor_shapes[name]
++                layout_rows.extend(
++                    (
++                        (f"{name}.lora_a", self.optimizer.master[a_index]),
++                        (f"{name}.lora_b", self.optimizer.master[b_index]),
++                    )
++                )
++            layout = tuple(layout_rows)
++        self.runtime.bind_parameter_layout(
++            layout,
++            projection_identity=f"target_lm_head:{config.target_revision}",
++        )
+         self._captured_input: torch.Tensor | None = None
+         self._captured_positions: torch.Tensor | None = None
++        self._captured_prefix_lens: torch.Tensor | None = None
+         self._captured_request_ids: tuple[str, ...] = ()
+-        self._contexts: dict[str, _RequestCanvas] = {}
+-        self._verify_hidden: torch.Tensor | None = None
+-        self._verify_positions: torch.Tensor | None = None
+-        self._commit_lens: torch.Tensor | None = None
++        self._captured_history: _CapturedHistory | None = None
+         resident = (
+             tuple(self.base.values())
+             + self.optimizer.master
+             + self.optimizer.first
+             + self.optimizer.second
+             + self.inference.staging
++            + self.runtime.telemetry_tensors
+         )
+         hidden = int(self.model.config.hidden_size)
+         layers = int(self.model.config.num_hidden_layers)
+-        scratch = (
+-            max(1, int(server_args.max_running_requests))
++        intermediate = int(self.model.config.intermediate_size)
++        target_model = worker.target_worker.model_runner.model
++        lm_head = getattr(target_model, "lm_head", None)
++        if lm_head is None or not hasattr(lm_head, "weight"):
++            raise RuntimeError("drafter updates require the target LM head")
++        vocab = int(lm_head.weight.shape[0])
++        logit_scratch = estimate_full_vocab_training_scratch_bytes(
++            batch_tokens=max_batch * (config.canvas_tokens - 1),
++            vocab_size=vocab,
++        )
++        activation_scratch = (
++            max_batch
+             * config.canvas_tokens
+-            * hidden
+-            * max(4, layers)
++            * (
++                layers * (8 * hidden + 3 * intermediate)
++                + 4 * hidden
++            )
+             * 4
++        ) + logit_scratch
++        history_capacity = config.canvas_tokens + max(
++            int(worker.page_size) - 1, 0
++        )
++        kv_gather_scratch = (
++            max_batch * history_capacity * layers * hidden * 2 * 4
++        )
++        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
++        base_bytes = sum(value.nbytes for value in self.base.values())
++        candidate_scratch = 5 * trainable_bytes + 2 * base_bytes
++        scratch = (
++            activation_scratch
++            + kv_gather_scratch
++            + trainable_bytes
++            + candidate_scratch
+         )
++        def bytes_of(tensors) -> int:
++            return sum(value.nbytes for value in tensors)
+         self.runtime.bind_memory(
+             resident_tensors=resident,
+             peak_scratch_bytes=scratch,
++            optimizer_tensors=(
++                self.optimizer.master
++                + self.optimizer.first
++                + self.optimizer.second
++            ),
++            trainable_tensors=self.optimizer.master,
++            categories={
++                "active_or_base_bytes": bytes_of(tuple(self.base.values())),
++                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                "gradient_bytes": trainable_bytes,
++                "first_moment_bytes": bytes_of(self.optimizer.first),
++                "second_moment_bytes": bytes_of(self.optimizer.second),
++                "staging_bytes": bytes_of(self.inference.staging),
++                "training_activation_bytes": activation_scratch,
++                "kv_gather_scratch_bytes": kv_gather_scratch,
++                "candidate_scratch_bytes": candidate_scratch,
++                "graph_buffer_bytes": 0,
++                "telemetry_bytes": bytes_of(self.runtime.telemetry_tensors),
++            },
++        )
++        server_args._speculative_adaptation_resident_bytes = (
++            self.runtime.resident_bytes
+         )
+ 
+     def begin_round(self, batch) -> tuple[int, ...]:
+         request_ids = tuple(request.rid for request in batch.reqs)
+-        version = self.runtime.begin_round(request_ids)
++        version = self.runtime.begin_round(request_ids, batch.seq_lens)
+         return (version,) * len(request_ids)
+ 
+     def capture_canvas(
+@@ -212,23 +368,40 @@ class DFlashDrafterAdapter:
+         if not self.runtime.update_due():
+             self._captured_input = None
+             self._captured_positions = None
++            self._captured_prefix_lens = None
++            self._captured_history = None
+             return
+         self._captured_request_ids = tuple(
+             request.rid for request in batch.reqs
+         )
+         self._captured_input = input_embeds.detach().clone()
+         self._captured_positions = positions.detach().clone()
+-
+-    def capture_verify(
+-        self,
+-        *,
+-        hidden_states: torch.Tensor,
+-        positions: torch.Tensor,
+-        commit_lens: torch.Tensor,
+-    ) -> None:
+-        self._verify_hidden = hidden_states.detach()
+-        self._verify_positions = positions.detach()
+-        self._commit_lens = commit_lens.detach()
++        prefix_lens = batch.seq_lens.to(torch.int64)
++        self._captured_prefix_lens = prefix_lens.detach().clone()
++        visible_lens = self.worker._compute_compact_draft_seq_lens(
++            prefix_lens
++        ).to(torch.int64)
++        capacity = int(self.config.canvas_tokens) + max(
++            int(self.worker.page_size) - 1, 0
++        )
++        offsets = torch.arange(
++            capacity, device=self.device, dtype=torch.int64
++        )[None, :]
++        history_positions = (
++            prefix_lens - visible_lens
++        )[:, None] + offsets
++        valid = offsets < visible_lens[:, None]
++        table = self.worker.model_runner.req_to_token_pool.req_to_token
++        safe_positions = history_positions.clamp(
++            min=0, max=int(table.shape[1]) - 1
++        )
++        locations = table[
++            batch.req_pool_indices.to(torch.int64)[:, None], safe_positions
++        ]
++        self._captured_history = _CapturedHistory(
++            locations=locations.detach().clone(),
++            valid_mask=valid.detach().clone(),
++        )
+ 
+     def _effective_parameters(
+         self, trainable: Sequence[torch.Tensor]
+@@ -250,23 +423,44 @@ class DFlashDrafterAdapter:
+         name: str,
+         fallback: torch.Tensor,
+     ) -> torch.Tensor:
+-        return values.get(name, fallback.detach().to(torch.float32))
++        return values.get(name, fallback.detach())
+ 
+-    def _project_context(
++    def _bias(
+         self,
+         values: dict[str, torch.Tensor],
+-        hidden: torch.Tensor,
+-    ) -> torch.Tensor:
+-        fc = self._parameter(values, "fc.weight", self.model.fc.weight)
+-        projected = _linear(hidden, fc, None)
+-        norm = self._parameter(
+-            values, "hidden_norm.weight", self.model.hidden_norm.weight
+-        )
+-        return _rms(
+-            projected,
+-            norm.to(projected.dtype),
+-            float(self.model.hidden_norm.variance_epsilon),
+-        )
++        name: str,
++        fallback: torch.Tensor | None,
++    ) -> torch.Tensor | None:
++        if fallback is None:
++            return None
++        return self._parameter(values, name, fallback)
++
++    def _gather_history(
++        self,
++        *,
++        layer_id: int,
++        locations: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        pool = self.worker.draft_model_runner.token_to_kv_pool
++        key_buffer, value_buffer = pool.get_kv_buffer(layer_id)
++
++        def gather(buffer: torch.Tensor) -> torch.Tensor:
++            if buffer.ndim == 3:
++                return buffer[locations]
++            if buffer.ndim == 4:
++                pages = torch.div(
++                    locations, int(self.worker.page_size), rounding_mode="floor"
++                )
++                offsets = torch.remainder(
++                    locations, int(self.worker.page_size)
++                )
++                return buffer[pages, :, offsets, :]
++            raise RuntimeError(
++                "differentiable DFlash adaptation requires NHD or HND KV "
++                f"layout, got rank {buffer.ndim}"
++            )
++
++        return gather(key_buffer).detach(), gather(value_buffer).detach()
+ 
+     def _layer_forward(
+         self,
+@@ -276,9 +470,8 @@ class DFlashDrafterAdapter:
+         hidden: torch.Tensor,
+         residual: torch.Tensor | None,
+         positions: torch.Tensor,
+-        context: torch.Tensor | None,
+-        context_positions: torch.Tensor | None,
+-        context_valid: torch.Tensor | None,
++        history_locations: torch.Tensor,
++        history_valid: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         layer = self.model.layers[layer_index]
+         prefix = f"layers.{layer_index}"
+@@ -312,7 +505,15 @@ class DFlashDrafterAdapter:
+             f"{prefix}.self_attn.qkv_proj.weight",
+             attention.qkv_proj.weight,
+         )
+-        qkv = _linear(hidden, qkv_weight, attention.qkv_proj.bias)
++        qkv = _linear(
++            hidden,
++            qkv_weight,
++            self._bias(
++                values,
++                f"{prefix}.self_attn.qkv_proj.bias",
++                attention.qkv_proj.bias,
++            ),
++        )
+         query, current_key, current_value = qkv.split(
+             [attention.q_size, attention.kv_size, attention.kv_size],
+             dim=-1,
+@@ -349,57 +550,29 @@ class DFlashDrafterAdapter:
+         )
+         query = _rope(query, positions, theta=theta)
+         current_key = _rope(current_key, positions, theta=theta)
+-        key_parts = []
+-        value_parts = []
+-        if context is not None and context.numel():
+-            context_qkv = _linear(
+-                context,
+-                qkv_weight,
+-                attention.qkv_proj.bias,
+-            )
+-            _, context_key, context_value = context_qkv.split(
+-                [attention.q_size, attention.kv_size, attention.kv_size],
+-                dim=-1,
+-            )
+-            context_key = context_key.view(
+-                -1, attention.num_kv_heads, attention.head_dim
+-            )
+-            context_value = context_value.view(
+-                -1, attention.num_kv_heads, attention.head_dim
+-            )
+-            context_key = _rms(
+-                context_key,
+-                k_norm.to(context_key.dtype),
+-                float(attention.k_norm.variance_epsilon),
+-            )
+-            context_key = _rope(
+-                context_key, context_positions, theta=theta
+-            )
+-            key_parts.append(context_key)
+-            value_parts.append(context_value)
+-        key_parts.append(current_key)
+-        value_parts.append(current_value)
+-        key = torch.cat(key_parts, dim=0)
+-        value = torch.cat(value_parts, dim=0)
++        history_key, history_value = self._gather_history(
++            layer_id=int(attention.attn.layer_id),
++            locations=history_locations,
++        )
++        key = torch.cat((history_key, current_key), dim=0)
++        value = torch.cat((history_value, current_value), dim=0)
+         repeat = attention.num_heads // attention.num_kv_heads
+         key = key.repeat_interleave(repeat, dim=1)
+         value = value.repeat_interleave(repeat, dim=1)
+         query = query.transpose(0, 1).unsqueeze(0)
+         key = key.transpose(0, 1).unsqueeze(0)
+         value = value.transpose(0, 1).unsqueeze(0)
+-        attention_mask = None
+-        if context_valid is not None:
+-            visible = torch.cat(
+-                (
+-                    context_valid,
+-                    torch.ones(
+-                        current_key.shape[0],
+-                        device=self.device,
+-                        dtype=torch.bool,
+-                    ),
+-                )
++        visible = torch.cat(
++            (
++                history_valid,
++                torch.ones(
++                    current_key.shape[0],
++                    device=self.device,
++                    dtype=torch.bool,
++                ),
+             )
+-            attention_mask = visible[None, None, None, :]
++        )
++        attention_mask = visible[None, None, None, :]
+         attended = F.scaled_dot_product_attention(
+             query,
+             key,
+@@ -418,7 +591,13 @@ class DFlashDrafterAdapter:
+             attention.o_proj.weight,
+         )
+         attention_output = _linear(
+-            attended, o_weight, attention.o_proj.bias
++            attended,
++            o_weight,
++            self._bias(
++                values,
++                f"{prefix}.self_attn.o_proj.bias",
++                attention.o_proj.bias,
++            ),
+         )
+         residual = residual + attention_output
+         post_weight = self._parameter(
+@@ -437,7 +616,13 @@ class DFlashDrafterAdapter:
+             layer.mlp.gate_up_proj.weight,
+         )
+         gate_up = _linear(
+-            mlp_input, gate_weight, layer.mlp.gate_up_proj.bias
++            mlp_input,
++            gate_weight,
++            self._bias(
++                values,
++                f"{prefix}.mlp.gate_up_proj.bias",
++                layer.mlp.gate_up_proj.bias,
++            ),
+         )
+         gate, up = gate_up.chunk(2, dim=-1)
+         activated = F.silu(gate) * up
+@@ -447,7 +632,15 @@ class DFlashDrafterAdapter:
+             layer.mlp.down_proj.weight,
+         )
+         return (
+-            _linear(activated, down_weight, layer.mlp.down_proj.bias),
++            _linear(
++                activated,
++                down_weight,
++                self._bias(
++                    values,
++                    f"{prefix}.mlp.down_proj.bias",
++                    layer.mlp.down_proj.bias,
++                ),
++            ),
+             residual,
+         )
+ 
+@@ -457,28 +650,14 @@ class DFlashDrafterAdapter:
+         input_embeds: torch.Tensor,
+         positions: torch.Tensor,
+         request_ids: tuple[str, ...],
++        history: _CapturedHistory,
+     ) -> torch.Tensor:
+         block = int(self.worker.block_size)
+         batch_size = len(request_ids)
+         inputs = input_embeds.view(batch_size, block, -1)
+         positions = positions.view(batch_size, block)
+         outputs = []
+-        for index, request_id in enumerate(request_ids):
+-            context_state = self._contexts.get(request_id)
+-            context = None
+-            context_positions = None
+-            context_valid = None
+-            if context_state is not None:
+-                target_hidden = context_state.target_hidden[
+-                    -self.config.canvas_tokens :
+-                ]
+-                context = self._project_context(values, target_hidden)
+-                context_positions = context_state.positions[
+-                    -self.config.canvas_tokens :
+-                ]
+-                context_valid = context_state.valid_mask[
+-                    -self.config.canvas_tokens :
+-                ]
++        for index, _request_id in enumerate(request_ids):
+             hidden = inputs[index]
+             residual = None
+             for layer_index in range(len(self.model.layers)):
+@@ -488,9 +667,8 @@ class DFlashDrafterAdapter:
+                     hidden=hidden,
+                     residual=residual,
+                     positions=positions[index],
+-                    context=context,
+-                    context_positions=context_positions,
+-                    context_valid=context_valid,
++                    history_locations=history.locations[index],
++                    history_valid=history.valid_mask[index],
+                 )
+             if residual is not None:
+                 hidden = hidden + residual
+@@ -516,7 +694,12 @@ class DFlashDrafterAdapter:
+     ) -> None:
+         if not self.runtime.update_due():
+             return
+-        if self._captured_input is None or self._captured_positions is None:
++        if (
++            self._captured_input is None
++            or self._captured_positions is None
++            or self._captured_prefix_lens is None
++            or self._captured_history is None
++        ):
+             self.runtime.disable("missing_current_canvas", exactness=True)
+             return
+         source_round = self.runtime.round
+@@ -530,6 +713,9 @@ class DFlashDrafterAdapter:
+             owned_draft,
+             owned_target,
+             owned_mask,
++            self._captured_history.locations,
++            self._captured_history.valid_mask,
++            self._captured_prefix_lens,
+         )
+         try:
+             with self.runtime.side_update(source_tensors):
+@@ -537,56 +723,84 @@ class DFlashDrafterAdapter:
+                     value.detach().clone().requires_grad_(True)
+                     for value in self.optimizer.master
+                 )
+-                values = self._effective_parameters(leaves)
+-                surrogate = self._surrogate_hidden(
+-                    values,
+-                    self._captured_input,
+-                    self._captured_positions,
+-                    self._captured_request_ids,
+-                )
+-                block = int(self.worker.block_size)
+-                batch_size = len(self._captured_request_ids)
+-                raw = owned_draft.view(batch_size, block, -1)
+-                differentiable = raw.detach() + surrogate - surrogate.detach()
+-                draft_logits = (
+-                    differentiable[:, 1:, :].to(lm_head_weight.dtype)
+-                    @ lm_head_weight.T
+-                ).to(torch.float32)
+-                target = owned_target.view(
+-                    batch_size, block, -1
+-                )[:, : block - 1].to(torch.float32)
+-                weights = self.config.loss_position_decay ** torch.arange(
+-                    block - 1,
+-                    device=self.device,
+-                    dtype=torch.float32,
+-                )
+-                weights = weights[None, :] * owned_mask.to(torch.float32)
+-                probability = torch.softmax(target, dim=-1)
+-                loss = (
+-                    (
+-                        probability
+-                        * (
+-                            torch.log_softmax(target, dim=-1)
+-                            - torch.log_softmax(draft_logits, dim=-1)
++                with self.runtime.timing("training"):
++                    values = self._effective_parameters(leaves)
++                    surrogate = self._surrogate_hidden(
++                        values,
++                        self._captured_input,
++                        self._captured_positions,
++                        self._captured_request_ids,
++                        self._captured_history,
++                    )
++                    block = int(self.worker.block_size)
++                    batch_size = len(self._captured_request_ids)
++                    draft_logits = (
++                        surrogate[:, 1:, :].to(lm_head_weight.dtype)
++                        @ lm_head_weight.T
++                    ).to(torch.float32)
++                    inference_logits = (
++                        owned_draft.view(batch_size, block, -1)[:, 1:, :]
++                        .to(lm_head_weight.dtype)
++                        @ lm_head_weight.T
++                    )
++                    reconstruction_ok, reconstruction_max_abs = (
++                        _logit_reconstruction_gate(
++                            inference_logits, draft_logits
++                        )
++                    )
++                    target = owned_target.view(
++                        batch_size, block, -1
++                    )[:, : block - 1].to(torch.float32)
++                    weights = self.config.loss_position_decay ** torch.arange(
++                        block - 1,
++                        device=self.device,
++                        dtype=torch.float32,
++                    )
++                    weights = weights[None, :] * owned_mask.to(torch.float32)
++                    probability = torch.softmax(target, dim=-1)
++                    loss = (
++                        (
++                            probability
++                            * (
++                                torch.log_softmax(target, dim=-1)
++                                - torch.log_softmax(draft_logits, dim=-1)
++                            )
++                        ).sum(-1)
++                        * weights
++                    ).sum() / weights.sum().clamp_min(1.0)
++                    guarded_objective = torch.where(
++                        reconstruction_ok, loss, loss * 0.0
++                    )
++                    raw_gradients = torch.autograd.grad(
++                        guarded_objective, leaves, allow_unused=True
++                    )
++                    gradients = tuple(
++                        torch.zeros_like(leaf)
++                        if gradient is None
++                        else gradient
++                        for leaf, gradient in zip(
++                            leaves, raw_gradients, strict=True
+                         )
+-                    ).sum(-1)
+-                    * weights
+-                ).sum() / weights.sum().clamp_min(1.0)
+-                gradients = torch.autograd.grad(loss, leaves)
++                    )
+                 finite = torch.isfinite(loss) & torch.stack(
+                     [torch.isfinite(gradient).all() for gradient in gradients]
+                 ).all()
+-                proposal = self.optimizer.propose(gradients)
+-                effective = self._effective_parameters(proposal.parameters)
+-                staged = tuple(
+-                    torch.where(
+-                        finite,
+-                        effective[name],
+-                        self.named[name].detach().to(torch.float32),
++                with self.runtime.timing("optimizer"):
++                    proposal = self.optimizer.propose(gradients)
++                with self.runtime.timing("merge"):
++                    effective = self._effective_parameters(
++                        proposal.parameters
+                     )
+-                    for name in self.names
+-                )
+-                self.inference.stage(staged)
++                    publish_valid = finite & reconstruction_ok
++                    staged = tuple(
++                        torch.where(
++                            publish_valid,
++                            effective[name],
++                            self.named[name].detach().to(torch.float32),
++                        )
++                        for name in self.names
++                    )
++                    self.inference.stage(staged)
+                 self.runtime.submit(
+                     source_round=source_round,
+                     source_version=source_version,
+@@ -594,41 +808,70 @@ class DFlashDrafterAdapter:
+                     proposal=proposal,
+                     inference_bank=self.inference,
+                     finite=finite,
++                    loss=loss,
++                    request_ids=self._captured_request_ids,
++                    prefix_lens=self._captured_prefix_lens,
++                    reconstruction_ok=reconstruction_ok,
++                    reconstruction_max_abs=reconstruction_max_abs,
+                 )
+         except torch.cuda.OutOfMemoryError:
+             self.runtime.counters["oom_events"] += 1
+             self.runtime.disable("adaptation_cuda_oom")
++        except Exception as error:
++            logger.exception("Disabling DFlash adaptation after update failure")
++            self.runtime.counters["fallbacks"] += 1
++            self.runtime.disable(
++                f"adaptation_update_failed:{type(error).__name__}"
++            )
+ 
+-    def after_commit(self, batch, new_seq_lens: torch.Tensor) -> None:
++    def after_commit(
++        self,
++        batch,
++        new_seq_lens: torch.Tensor,
++        *,
++        accepted_drafts: torch.Tensor,
++        verified_drafts: torch.Tensor,
++        committed_tokens: torch.Tensor,
++    ) -> None:
+         request_ids = tuple(request.rid for request in batch.reqs)
++        self.runtime.record_round_outcome(
++            request_ids,
++            verified_drafts=verified_drafts,
++            accepted_drafts=accepted_drafts,
++            committed_tokens=committed_tokens,
++        )
+         self.runtime.record_device_commit(request_ids, new_seq_lens)
+-        if (
+-            self._verify_hidden is None
+-            or self._verify_positions is None
+-            or self._commit_lens is None
+-        ):
+-            return
+-        batch_size = len(request_ids)
+-        block = int(self.worker.block_size)
+-        hidden = self._verify_hidden.view(batch_size, block, -1)
+-        positions = self._verify_positions.view(batch_size, block)
+-        commit_lens = self._commit_lens
+-        valid_positions = torch.arange(
+-            block, device=self.device, dtype=commit_lens.dtype
+-        )[None, :] < commit_lens[:, None]
+-        for index, request_id in enumerate(request_ids):
+-            self._contexts[request_id] = _RequestCanvas(
+-                hidden[index].detach(),
+-                positions[index].detach(),
+-                valid_positions[index].detach(),
+-            )
+-        self._verify_hidden = None
+-        self._verify_positions = None
+-        self._commit_lens = None
+ 
+     def finish_request(self, request_id: str) -> None:
+         self.runtime.finish_request(request_id)
+-        self._contexts.pop(request_id, None)
++
++    def abort_request(self, request_id: str) -> None:
++        self.runtime.abort_request(request_id)
++
++    def reset(self) -> None:
++        self.runtime.reset()
++        self.optimizer.reset(self.initial_trainable)
++        effective = self._effective_parameters(self.optimizer.master)
++        self.inference.stage(tuple(effective[name] for name in self.names))
++        self.inference.publish()
++        self._captured_input = None
++        self._captured_positions = None
++        self._captured_prefix_lens = None
++        self._captured_request_ids = ()
++        self._captured_history = None
++
++    def note_load(
++        self,
++        *,
++        running_requests: int,
++        waiting_requests: int,
++        graph_replay: bool,
++    ) -> None:
++        self.runtime.note_load(
++            running_requests=running_requests,
++            waiting_requests=waiting_requests,
++            graph_replay=graph_replay,
++        )
+ 
+     def diagnostics(self) -> dict:
+         return self.runtime.diagnostics()
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 0f1ec12..ccf3e59 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -333,6 +333,14 @@ class DFlashWorkerV2(BaseSpecWorker):
+         if tail is not None:
+             tail.finish_request(rid)
+ 
++    def note_request_aborted(self, *, rid: str) -> None:
++        adapter = self._online_drafter_adapter
++        if adapter is not None:
++            adapter.abort_request(rid)
++        tail = self._online_tail_adapter
++        if tail is not None:
++            tail.abort_request(rid)
++
+     def dump_info_records(self) -> Optional[dict]:
+         adapter = self._online_drafter_adapter or self._online_tail_adapter
+         if adapter is None:
+@@ -586,7 +594,24 @@ class DFlashWorkerV2(BaseSpecWorker):
+         # sliding-window path, the draft req->token view is rebuilt from committed
+         # target state before each draft forward, so there is nothing persistent
+         # to flush here.
+-        pass
++        adapter = self._online_drafter_adapter or self._online_tail_adapter
++        if adapter is not None:
++            adapter.reset()
++
++    def record_scheduler_load(
++        self,
++        *,
++        running_requests: int,
++        waiting_requests: int,
++        graph_replay: bool,
++    ) -> None:
++        adapter = self._online_drafter_adapter or self._online_tail_adapter
++        if adapter is not None:
++            adapter.note_load(
++                running_requests=running_requests,
++                waiting_requests=waiting_requests,
++                graph_replay=graph_replay,
++            )
+ 
+     def _gather_req_to_token_masked(
+         self,
+@@ -1403,6 +1428,14 @@ class DFlashWorkerV2(BaseSpecWorker):
+         if sampling_info is None or sampling_info.is_all_greedy:
+             return
+ 
++        if (
++            not is_dflash_sampling_verify_available()
++            and self.server_args.speculative_use_rejection_sampling
++        ):
++            raise RuntimeError(
++                "DFLASH exact non-greedy verification is unavailable on this "
++                "build/device; refusing to fall back to greedy decoding."
++            )
+         if (
+             not is_dflash_sampling_verify_available()
+             and not self._warned_sampling_fallback
+@@ -1908,7 +1941,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+         if online_adapter is not None or online_tail is not None:
+             from sglang.srt.speculative.online_valid_mask import (
+-                semantic_valid_mask,
++                semantic_proposal_semantics,
+             )
+ 
+             remaining = []
+@@ -1926,19 +1959,21 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 )
+                 terminal_ids.append(tuple(sorted(int(token) for token in stops)))
+                 ignore_eos.append(bool(getattr(sampling, "ignore_eos", False)))
+-            valid_mask = semantic_valid_mask(
++            (
++                valid_mask,
++                semantic_accepted,
++                semantic_committed,
++            ) = semantic_proposal_semantics(
+                 proposal_tokens=draft_tokens[:, 1:],
+                 correct_len=accept_len,
+                 remaining_output_tokens=remaining,
+                 terminal_token_ids=terminal_ids,
+                 ignore_eos=ignore_eos,
+             )
++            semantic_new_seq_lens = (
++                prefix_lens + semantic_committed.to(prefix_lens.dtype)
++            )
+             if online_adapter is not None:
+-                online_adapter.capture_verify(
+-                    hidden_states=hidden,
+-                    positions=positions,
+-                    commit_lens=commit_lens,
+-                )
+                 online_adapter.maybe_launch(
+                     draft_hidden=online_draft_hidden,
+                     target_logits=logits_output.next_token_logits,
+@@ -1950,6 +1985,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+                     hidden=online_draft_hidden,
+                     target_logits=logits_output.next_token_logits,
+                     valid_mask=valid_mask,
++                    request_ids=tuple(request.rid for request in batch.reqs),
++                    prefix_lens=batch.seq_lens,
+                 )
+ 
+         self._append_target_hidden_to_draft_kv_by_loc(
+@@ -1964,9 +2001,25 @@ class DFlashWorkerV2(BaseSpecWorker):
+         logits_output.hidden_states = None
+ 
+         if online_adapter is not None:
+-            online_adapter.after_commit(batch, new_seq_lens)
++            online_adapter.after_commit(
++                batch,
++                semantic_new_seq_lens,
++                accepted_drafts=semantic_accepted,
++                verified_drafts=torch.full_like(
++                    accept_len, int(self.block_size) - 1
++                ),
++                committed_tokens=semantic_committed,
++            )
+         if online_tail is not None:
+-            online_tail.after_commit(batch, new_seq_lens)
++            online_tail.after_commit(
++                batch,
++                semantic_new_seq_lens,
++                accepted_drafts=semantic_accepted,
++                verified_drafts=torch.full_like(
++                    accept_len, int(self.block_size) - 1
++                ),
++                committed_tokens=semantic_committed,
++            )
+ 
+         next_draft_input = self._make_next_draft_input_decode(
+             bonus_tokens=bonus,
+diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
+index 62bbece..f27db95 100644
+--- a/python/sglang/srt/speculative/online_adaptation_config.py
++++ b/python/sglang/srt/speculative/online_adaptation_config.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import math
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any
+@@ -35,6 +36,7 @@ class OnlineAdaptationConfig:
+     target_revision: str
+     drafter_revision: str
+     sampling_profile_sha256: str
++    telemetry_detail: str
+ 
+     @property
+     def sha256(self) -> str:
+@@ -64,7 +66,7 @@ class OnlineAdaptationConfig:
+         return hashlib.sha256(encoded).hexdigest()
+ 
+     @classmethod
+-    def load(cls, path: str | Path) -> "OnlineAdaptationConfig":
++    def load(cls, path: str | Path) -> OnlineAdaptationConfig:
+         source = Path(path)
+         try:
+             value = json.loads(source.read_text(encoding="utf-8"))
+@@ -73,7 +75,7 @@ class OnlineAdaptationConfig:
+                 f"cannot load speculative adaptation config {source}: {exc}"
+             ) from exc
+         if not isinstance(value, dict):
+-            raise ValueError("speculative adaptation config must be an object")
++            raise TypeError("speculative adaptation config must be an object")
+         expected = {
+             "schema_version",
+             "method",
+@@ -92,6 +94,7 @@ class OnlineAdaptationConfig:
+             "target_revision",
+             "drafter_revision",
+             "sampling_profile_sha256",
++            "telemetry_detail",
+         }
+         unknown = set(value) - expected
+         missing = expected - set(value)
+@@ -125,14 +128,17 @@ class OnlineAdaptationConfig:
+             raise ValueError("only cohort-shared parameters are supported")
+         if value["max_in_flight"] != 1:
+             raise ValueError("max_in_flight must equal one")
+-        for field in (
+-            "adaptation_group_id",
+-            "tenant_id",
+-            "target_revision",
+-            "drafter_revision",
+-        ):
++        for field in ("adaptation_group_id", "tenant_id"):
+             if not isinstance(value[field], str) or not value[field]:
+                 raise ValueError(f"{field} must be a non-empty string")
++        for field in ("target_revision", "drafter_revision"):
++            revision = value[field]
++            if (
++                not isinstance(revision, str)
++                or len(revision) != 40
++                or any(char not in "0123456789abcdef" for char in revision)
++            ):
++                raise ValueError(f"{field} must be an immutable Git SHA")
+         profile = value["sampling_profile_sha256"]
+         if (
+             not isinstance(profile, str)
+@@ -140,6 +146,9 @@ class OnlineAdaptationConfig:
+             or any(char not in "0123456789abcdef" for char in profile)
+         ):
+             raise ValueError("sampling_profile_sha256 must be lowercase SHA-256")
++        telemetry_detail = value["telemetry_detail"]
++        if telemetry_detail not in {"headline", "profile"}:
++            raise ValueError("telemetry_detail must be headline or profile")
+         stride = value["stride"]
+         canvas_tokens = value["canvas_tokens"]
+         if (
+@@ -148,9 +157,11 @@ class OnlineAdaptationConfig:
+             or stride < 1
+             or not isinstance(canvas_tokens, int)
+             or isinstance(canvas_tokens, bool)
+-            or canvas_tokens < 1
++            or canvas_tokens < 2
+         ):
+-            raise ValueError("stride and canvas_tokens must be positive integers")
++            raise ValueError(
++                "stride must be positive and canvas_tokens must be at least two"
++            )
+         decay = float(value["loss_position_decay"])
+         if not 0.0 < decay <= 1.0:
+             raise ValueError("loss_position_decay must be in (0, 1]")
+@@ -169,12 +180,13 @@ class OnlineAdaptationConfig:
+             target_revision=value["target_revision"],
+             drafter_revision=value["drafter_revision"],
+             sampling_profile_sha256=profile,
++            telemetry_detail=telemetry_detail,
+         )
+ 
+ 
+ def _parse_optimizer(value: Any) -> OnlineOptimizerConfig:
+     if not isinstance(value, dict):
+-        raise ValueError("optimizer must be an object")
++        raise TypeError("optimizer must be an object")
+     expected = {
+         "name",
+         "learning_rate",
+@@ -195,6 +207,18 @@ def _parse_optimizer(value: Any) -> OnlineOptimizerConfig:
+     beta2 = float(value["beta2"])
+     epsilon = float(value["epsilon"])
+     grad_clip = float(value["grad_clip"])
++    if not all(
++        math.isfinite(number)
++        for number in (
++            learning_rate,
++            weight_decay,
++            beta1,
++            beta2,
++            epsilon,
++            grad_clip,
++        )
++    ):
++        raise ValueError("optimizer values must be finite")
+     if learning_rate <= 0 or epsilon <= 0 or grad_clip <= 0:
+         raise ValueError("optimizer lr, epsilon, and grad_clip must be positive")
+     if not 0 < beta1 < 1 or not 0 < beta2 < 1:
+@@ -228,9 +252,12 @@ def validate_online_adaptation(server_args) -> None:
+     if reserve_mb < 0:
+         raise ValueError("speculative_adaptation_reserve_mb cannot be negative")
+     if config is None:
+-        if reserve_mb:
++        if reserve_mb or getattr(
++            server_args, "speculative_adaptation_telemetry_path", None
++        ):
+             raise ValueError(
+-                "adaptation reserve is forbidden without an adaptation config"
++                "adaptation reserve and telemetry are forbidden without an "
++                "adaptation config"
+             )
+         if not metrics_enabled:
+             return
+@@ -253,18 +280,24 @@ def validate_online_adaptation(server_args) -> None:
+             "online adaptation requires --speculative-speed-study-metrics"
+         )
+     backend = str(server_args.speculative_algorithm or "").upper()
+-    if backend not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
++    if backend != "DFLASH":
+         raise ValueError(
+-            "online adaptation requires DFLASH, DSPARK, EAGLE, or EAGLE3"
++            "the focused online adaptation patch currently requires DFLASH"
+         )
+-    if config.parameter_scope == "drafter" and backend != "DFLASH":
++    if int(getattr(server_args, "tp_size", 1)) != 1 or int(
++        getattr(server_args, "dp_size", 1)
++    ) != 1:
+         raise ValueError(
+-            "drafter-scope Full/LoRA is currently implemented for DFLASH only"
++            "focused online adaptation currently requires TP=1 and DP=1"
+         )
+     if config.parameter_scope == "drafter" and config.weight_update_mode == "residual":
+         raise ValueError("residual updates cannot target the drafter")
+     if getattr(server_args, "speculative_draft_model_quantization", None):
+         raise ValueError("online updates require an unquantized draft model")
++    if str(getattr(server_args, "kv_cache_dtype", "auto")) != "auto":
++        raise ValueError(
++            "online adaptation currently requires unquantized KV cache dtype=auto"
++        )
+     if bool(getattr(server_args, "enable_two_batch_overlap", False)):
+         raise ValueError("online adaptation does not support two-batch overlap")
+     if bool(getattr(server_args, "enable_pdmux", False)):
+@@ -283,4 +316,3 @@ def validate_online_adaptation(server_args) -> None:
+         raise ValueError(
+             "online adaptation requires an explicit pre-KV HBM reserve"
+         )
+-
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index 38c9329..7237c46 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -16,6 +16,22 @@ from sglang.srt.speculative.online_adaptation_config import (
+ )
+ 
+ 
++def estimate_full_vocab_training_scratch_bytes(
++    *, batch_tokens: int, vocab_size: int
++) -> int:
++    """Conservative peak for update-only target-to-draft KL tensors.
++
++    The budget covers model-dtype target/draft copies plus the FP32 target,
++    draft, probability, log-probability, and KL intermediates. It is an HBM
++    admission bound, not a claim that the allocator retains every tensor at
++    the same instant.
++    """
++    if batch_tokens < 1 or vocab_size < 1:
++        raise ValueError("full-vocabulary scratch dimensions must be positive")
++    bytes_per_logit = 8 * 4
++    return int(batch_tokens) * int(vocab_size) * bytes_per_logit
++
++
+ @dataclass(frozen=True)
+ class CandidateBinding:
+     cohort_epoch: int
+@@ -742,6 +758,8 @@ class OnlineCohortRuntime:
+         for request_id in selected:
+             length, version = self.latest_device_lengths.pop(request_id)
+             grouped.setdefault(version, []).append((request_id, length))
++        if not grouped:
++            return
+         main = torch.cuda.current_stream(self.device)
+         for version, rows in grouped.items():
+             identifiers = tuple(request_id for request_id, _ in rows)
+@@ -760,6 +778,17 @@ class OnlineCohortRuntime:
+             return
+         self._archive_latest_device_lengths((request_id,))
+ 
++    def abort_request(self, request_id: str) -> None:
++        if request_id not in self.requests:
++            return
++        self._archive_latest_device_lengths((request_id,))
++        self.slot_generation += 1
++        candidate = self.pending
++        if candidate is not None:
++            self.update_traces[candidate.trace_index].status = "request_aborted"
++            self.counters["updates_discarded"] += 1
++            self.pending = None
++
+     def reset(self) -> None:
+         self.side_stream.synchronize()
+         self.epoch += 1
+@@ -948,6 +977,8 @@ class OnlineCohortRuntime:
+             ):
+                 state = self.requests.get(request_id)
+                 if state is not None:
++                    if int(length) < state.prefix_length:
++                        self.counters["retractions"] += 1
+                     state.append(int(length), version)
+         self.device_commits.clear()
+         round_metric_rows = self.round_metrics[
+diff --git a/python/sglang/srt/speculative/online_tail_adaptation.py b/python/sglang/srt/speculative/online_tail_adaptation.py
+index f1376a3..bca5078 100644
+--- a/python/sglang/srt/speculative/online_tail_adaptation.py
++++ b/python/sglang/srt/speculative/online_tail_adaptation.py
+@@ -2,10 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import math
++from collections.abc import Sequence
+ 
+ import torch
+-
+ from sglang.srt.speculative.online_adaptation_config import (
+     load_online_adaptation,
+ )
+@@ -13,8 +14,11 @@ from sglang.srt.speculative.online_adaptation_runtime import (
+     FixedInferenceBank,
+     OnlineCohortRuntime,
+     ResidentOptimizer,
++    estimate_full_vocab_training_scratch_bytes,
+ )
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class OnlineTailAdapter:
+     def __init__(self, server_args, worker) -> None:
+@@ -68,8 +72,16 @@ class OnlineTailAdapter:
+                 ),
+             )
+         self.active = tuple(parameters)
++        self.initial_trainable = tuple(
++            parameter.detach().clone() for parameter in self.active
++        )
+         self.bank = FixedInferenceBank(self.active)
+         self.optimizer = ResidentOptimizer(self.active, config.optimizer)
++        context_capacity = int(
++            server_args.context_length
++            or worker.draft_model.config.max_position_embeddings
++        )
++        max_batch = max(1, int(server_args.max_running_requests))
+         self.runtime = OnlineCohortRuntime(
+             config,
+             device=self.device,
+@@ -79,6 +91,18 @@ class OnlineTailAdapter:
+             * 1024
+             * 1024,
+             telemetry_path=server_args.speculative_adaptation_telemetry_path,
++            max_trace_updates=context_capacity // config.stride + 2,
++            max_trace_batch=max_batch,
++        )
++        self.runtime.bind_parameter_layout(
++            tuple(
++                (f"tail.{index}", parameter)
++                for index, parameter in enumerate(self.optimizer.master)
++            ),
++            projection_identity=(
++                f"target_lm_head:{config.target_revision}:"
++                f"{tuple(self.lm_head_weight.shape)}:{self.lm_head_weight.dtype}"
++            ),
+         )
+         resident = (
+             self.active
+@@ -86,21 +110,50 @@ class OnlineTailAdapter:
+             + self.optimizer.master
+             + self.optimizer.first
+             + self.optimizer.second
++            + self.runtime.telemetry_tensors
+         )
+-        scratch = (
+-            int(server_args.max_running_requests)
+-            * int(worker.block_size)
+-            * max(hidden, vocab)
+-            * 4
++        batch_tokens = max_batch * (
++            int(worker.block_size) - 1
+         )
++        logits_scratch = estimate_full_vocab_training_scratch_bytes(
++            batch_tokens=batch_tokens,
++            vocab_size=vocab,
++        )
++        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
++        candidate_scratch = 5 * trainable_bytes
++        scratch = logits_scratch + trainable_bytes + candidate_scratch
++        def bytes_of(tensors) -> int:
++            return sum(value.nbytes for value in tensors)
+         self.runtime.bind_memory(
+             resident_tensors=resident,
+             peak_scratch_bytes=scratch,
++            optimizer_tensors=(
++                self.optimizer.master
++                + self.optimizer.first
++                + self.optimizer.second
++            ),
++            trainable_tensors=self.optimizer.master,
++            categories={
++                "active_or_base_bytes": bytes_of(self.active),
++                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                "gradient_bytes": trainable_bytes,
++                "first_moment_bytes": bytes_of(self.optimizer.first),
++                "second_moment_bytes": bytes_of(self.optimizer.second),
++                "staging_bytes": bytes_of(self.bank.staging),
++                "training_activation_bytes": logits_scratch,
++                "kv_gather_scratch_bytes": 0,
++                "candidate_scratch_bytes": candidate_scratch,
++                "graph_buffer_bytes": 0,
++                "telemetry_bytes": bytes_of(self.runtime.telemetry_tensors),
++            },
++        )
++        server_args._speculative_adaptation_resident_bytes = (
++            self.runtime.resident_bytes
+         )
+ 
+     def begin_round(self, batch) -> tuple[int, ...]:
+         request_ids = tuple(request.rid for request in batch.reqs)
+-        version = self.runtime.begin_round(request_ids)
++        version = self.runtime.begin_round(request_ids, batch.seq_lens)
+         return (version,) * len(request_ids)
+ 
+     def _logits(
+@@ -113,7 +166,7 @@ class OnlineTailAdapter:
+         if self.config.weight_update_mode == "residual":
+             raw = hidden.to(head_weight.dtype) @ head_weight.T
+             correction = (hidden_fp32 @ parameters[0]) @ parameters[1]
+-            return raw + correction.to(raw.dtype)
++            return raw.add_(correction.to(raw.dtype))
+         if self.config.weight_update_mode == "lora":
+             corrected = hidden_fp32 + (
+                 hidden_fp32 @ parameters[0]
+@@ -133,6 +186,35 @@ class OnlineTailAdapter:
+         hidden: torch.Tensor,
+         target_logits: torch.Tensor,
+         valid_mask: torch.Tensor,
++        request_ids: Sequence[str],
++        prefix_lens: torch.Tensor,
++    ) -> None:
++        try:
++            self._launch(
++                hidden=hidden,
++                target_logits=target_logits,
++                valid_mask=valid_mask,
++                request_ids=request_ids,
++                prefix_lens=prefix_lens,
++            )
++        except torch.cuda.OutOfMemoryError:
++            self.runtime.counters["oom_events"] += 1
++            self.runtime.disable("adaptation_cuda_oom")
++        except Exception as error:
++            logger.exception("Disabling tail adaptation after update failure")
++            self.runtime.counters["fallbacks"] += 1
++            self.runtime.disable(
++                f"adaptation_update_failed:{type(error).__name__}"
++            )
++
++    def _launch(
++        self,
++        *,
++        hidden: torch.Tensor,
++        target_logits: torch.Tensor,
++        valid_mask: torch.Tensor,
++        request_ids: Sequence[str],
++        prefix_lens: torch.Tensor,
+     ) -> None:
+         if not self.runtime.update_due():
+             return
+@@ -147,45 +229,48 @@ class OnlineTailAdapter:
+         )[:, :depth]
+         owned_mask = valid_mask.detach().clone()
+         with self.runtime.side_update(
+-            (owned_hidden, owned_target, owned_mask)
++            (owned_hidden, owned_target, owned_mask, prefix_lens)
+         ):
+             leaves = tuple(
+                 parameter.detach().clone().requires_grad_(True)
+                 for parameter in self.optimizer.master
+             )
+-            draft = self._logits(
+-                owned_hidden.reshape(-1, owned_hidden.shape[-1]),
+-                leaves,
+-                self.lm_head_weight,
+-            ).view(batch, depth, -1).to(torch.float32)
+-            target = owned_target.to(torch.float32)
+-            probability = torch.softmax(target, dim=-1)
+-            weights = self.config.loss_position_decay ** torch.arange(
+-                depth, device=self.device, dtype=torch.float32
+-            )
+-            weights = weights[None, :] * owned_mask.to(torch.float32)
+-            loss = (
+-                (
+-                    probability
+-                    * (
+-                        torch.log_softmax(target, dim=-1)
+-                        - torch.log_softmax(draft, dim=-1)
+-                    )
+-                ).sum(-1)
+-                * weights
+-            ).sum() / weights.sum().clamp_min(1.0)
+-            gradients = torch.autograd.grad(loss, leaves)
++            with self.runtime.timing("training"):
++                draft = self._logits(
++                    owned_hidden.reshape(-1, owned_hidden.shape[-1]),
++                    leaves,
++                    self.lm_head_weight,
++                ).view(batch, depth, -1).to(torch.float32)
++                target = owned_target.to(torch.float32)
++                probability = torch.softmax(target, dim=-1)
++                weights = self.config.loss_position_decay ** torch.arange(
++                    depth, device=self.device, dtype=torch.float32
++                )
++                weights = weights[None, :] * owned_mask.to(torch.float32)
++                loss = (
++                    (
++                        probability
++                        * (
++                            torch.log_softmax(target, dim=-1)
++                            - torch.log_softmax(draft, dim=-1)
++                        )
++                    ).sum(-1)
++                    * weights
++                ).sum() / weights.sum().clamp_min(1.0)
++                gradients = torch.autograd.grad(loss, leaves)
+             finite = torch.isfinite(loss) & torch.stack(
+                 [torch.isfinite(gradient).all() for gradient in gradients]
+             ).all()
+-            proposal = self.optimizer.propose(gradients)
+-            staged = tuple(
+-                torch.where(finite, candidate, active)
+-                for candidate, active in zip(
+-                    proposal.parameters, self.active, strict=True
++            with self.runtime.timing("optimizer"):
++                proposal = self.optimizer.propose(gradients)
++            with self.runtime.timing("merge"):
++                staged = tuple(
++                    torch.where(finite, candidate, active)
++                    for candidate, active in zip(
++                        proposal.parameters, self.active, strict=True
++                    )
+                 )
+-            )
+-            self.bank.stage(staged)
++                self.bank.stage(staged)
+             self.runtime.submit(
+                 source_round=self.runtime.round,
+                 source_version=self.runtime.active_version,
+@@ -193,16 +278,54 @@ class OnlineTailAdapter:
+                 proposal=proposal,
+                 inference_bank=self.bank,
+                 finite=finite,
++                loss=loss,
++                request_ids=request_ids,
++                prefix_lens=prefix_lens,
+             )
+ 
+-    def after_commit(self, batch, new_seq_lens: torch.Tensor) -> None:
+-        self.runtime.record_device_commit(
+-            tuple(request.rid for request in batch.reqs), new_seq_lens
++    def after_commit(
++        self,
++        batch,
++        new_seq_lens: torch.Tensor,
++        *,
++        accepted_drafts: torch.Tensor,
++        verified_drafts: torch.Tensor,
++        committed_tokens: torch.Tensor,
++    ) -> None:
++        request_ids = tuple(request.rid for request in batch.reqs)
++        self.runtime.record_round_outcome(
++            request_ids,
++            verified_drafts=verified_drafts,
++            accepted_drafts=accepted_drafts,
++            committed_tokens=committed_tokens,
+         )
++        self.runtime.record_device_commit(request_ids, new_seq_lens)
+ 
+     def finish_request(self, request_id: str) -> None:
+         self.runtime.finish_request(request_id)
+ 
++    def abort_request(self, request_id: str) -> None:
++        self.runtime.abort_request(request_id)
++
++    def reset(self) -> None:
++        self.runtime.reset()
++        self.optimizer.reset(self.initial_trainable)
++        self.bank.stage(self.initial_trainable)
++        self.bank.publish()
++
++    def note_load(
++        self,
++        *,
++        running_requests: int,
++        waiting_requests: int,
++        graph_replay: bool,
++    ) -> None:
++        self.runtime.note_load(
++            running_requests=running_requests,
++            waiting_requests=waiting_requests,
++            graph_replay=graph_replay,
++        )
++
+     def diagnostics(self) -> dict:
+         return self.runtime.diagnostics()
+ 
+@@ -212,4 +335,3 @@ def maybe_build_online_tail_adapter(server_args, worker):
+     if config is None or config.parameter_scope != "tail":
+         return None
+     return OnlineTailAdapter(server_args, worker)
+-
+diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
+index 89f955c..8d9ea70 100644
+--- a/python/sglang/srt/speculative/online_valid_mask.py
++++ b/python/sglang/srt/speculative/online_valid_mask.py
+@@ -7,15 +7,15 @@ from typing import Sequence
+ import torch
+ 
+ 
+-def semantic_valid_mask(
++def semantic_proposal_semantics(
+     *,
+     proposal_tokens: torch.Tensor,
+     correct_len: torch.Tensor,
+     remaining_output_tokens: Sequence[int],
+     terminal_token_ids: Sequence[Sequence[int]],
+     ignore_eos: Sequence[bool],
+-) -> torch.Tensor:
+-    """Mask rejected suffix, request boundary, and accepted terminal suffix."""
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return valid teachers, accepted drafts, and semantic commits."""
+     if proposal_tokens.ndim != 2:
+         raise ValueError("proposal_tokens must have shape (batch, depth)")
+     batch, depth = proposal_tokens.shape
+@@ -40,6 +40,9 @@ def semantic_valid_mask(
+         dtype=correct_len.dtype,
+     )
+     valid &= positions < remaining[:, None]
++    # The target bonus is committed only when the accepted draft prefix and
++    # request boundary leave room for it.
++    committed = torch.minimum(correct_len + 1, remaining)
+     for index, terminal_ids in enumerate(terminal_token_ids):
+         if ignore_eos[index] or not terminal_ids:
+             continue
+@@ -61,5 +64,60 @@ def semantic_valid_mask(
+             )
+         ).cumsum(0) > 0
+         valid[index] &= ~earlier_terminal
++        terminal_positions = torch.where(
++            accepted_hit,
++            positions[0] + 1,
++            torch.full_like(positions[0], depth + 1),
++        )
++        committed[index] = torch.minimum(
++            committed[index], terminal_positions.min()
++        )
++    accepted = torch.minimum(correct_len, committed)
++    return valid, accepted, committed
++
++
++def semantic_valid_mask(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> torch.Tensor:
++    """Mask rejected suffix, request boundary, and accepted terminal suffix."""
++    valid, _, _ = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
+     return valid
+ 
++
++def semantic_outcome_lengths(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    bonus_tokens: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return accepted drafts and committed tokens after request semantics.
++
++    A normal verification commits ``correct_len`` drafts plus one target bonus.
++    A request boundary may cut inside the accepted prefix, while an accepted
++    terminal token commits that token but neither its suffix nor the bonus.
++    """
++    batch = proposal_tokens.shape[0] if proposal_tokens.ndim == 2 else -1
++    if bonus_tokens.shape != (batch,):
++        raise ValueError("outcome lengths require one value per request")
++    _, accepted, committed = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
++    return accepted, committed

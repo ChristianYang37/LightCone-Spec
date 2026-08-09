@@ -1,0 +1,355 @@
+From 2ab26606223f9d0353bff62e875317d856452fbb Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 03:22:17 +0800
+Subject: [PATCH 1/6] feat(spec): add focused online adaptation preflight
+
+---
+ .../sglang/srt/arg_groups/speculative_hook.py |   6 +
+ python/sglang/srt/server_args.py              |  23 ++
+ .../speculative/online_adaptation_config.py   | 286 ++++++++++++++++++
+ 3 files changed, 315 insertions(+)
+ create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
+
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 427acdd..771a175 100644
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -143,6 +143,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
+     if algo is not None:
+         algo.handle_server_args(server_args)
+ 
++    from sglang.srt.speculative.online_adaptation_config import (
++        validate_online_adaptation,
++    )
++
++    validate_online_adaptation(server_args)
++
+ 
+ def _handle_dflash(server_args: ServerArgs) -> None:
+     from sglang.srt.arg_groups.overrides import resolved_view
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1182ccb..f6fb45a 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2157,6 +2157,29 @@ class ServerArgs:
+         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+         NS("spec"),
+     ] = None
++    speculative_adaptation_config: A[
++        Optional[str],
++        "Path to a LightCone schema-v2 online adaptation JSON. Omit it for the "
++        "native zero-allocation speculative path.",
++        NS("spec"),
++    ] = None
++    speculative_adaptation_reserve_mb: A[
++        int,
++        "HBM reserved before KV-pool sizing for resident adaptation state. "
++        "The runtime verifies this bound against its exact tensor ledger.",
++        NS("spec"),
++    ] = 0
++    speculative_adaptation_telemetry_path: A[
++        Optional[str],
++        "Process-unique output path for asynchronous adaptation telemetry.",
++        NS("spec"),
++    ] = None
++    speculative_speed_study_metrics: A[
++        bool,
++        "Enable the explicit Static/TTS/L0 speed-study counters. The default "
++        "native speculative path performs no LightCone metric work.",
++        NS("spec"),
++    ] = False
+ 
+     # Decoupled speculative decoding: draft and verify run as
+     # separate engines, currently connected by a ZMQ IPC mesh.
+diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
+new file mode 100644
+index 0000000..62bbece
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_adaptation_config.py
+@@ -0,0 +1,286 @@
++"""Narrow fail-closed parser for LightCone schema-v2 runtime configuration."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++
++@dataclass(frozen=True)
++class OnlineOptimizerConfig:
++    name: str
++    learning_rate: float
++    weight_decay: float
++    beta1: float
++    beta2: float
++    epsilon: float
++    grad_clip: float
++
++
++@dataclass(frozen=True)
++class OnlineAdaptationConfig:
++    method: str
++    weight_update_mode: str
++    parameter_scope: str
++    adaptation_group_id: str
++    tenant_id: str
++    optimizer: OnlineOptimizerConfig
++    rank: int | None
++    stride: int
++    canvas_tokens: int
++    loss_position_decay: float
++    target_revision: str
++    drafter_revision: str
++    sampling_profile_sha256: str
++
++    @property
++    def sha256(self) -> str:
++        payload = {
++            "schema_version": 2,
++            "method": self.method,
++            "weight_update_mode": self.weight_update_mode,
++            "parameter_scope": self.parameter_scope,
++            "kv_history_policy": "frozen",
++            "adaptation_scope": "cohort",
++            "adaptation_group_id": self.adaptation_group_id,
++            "tenant_id": self.tenant_id,
++            "optimizer": self.optimizer.__dict__,
++            "rank": self.rank,
++            "stride": self.stride,
++            "max_in_flight": 1,
++            "canvas_tokens": self.canvas_tokens,
++            "loss_position_decay": self.loss_position_decay,
++            "target_revision": self.target_revision,
++            "drafter_revision": self.drafter_revision,
++            "sampling_profile_sha256": self.sampling_profile_sha256,
++            "telemetry_detail": self.telemetry_detail,
++        }
++        encoded = json.dumps(
++            payload, sort_keys=True, separators=(",", ":")
++        ).encode()
++        return hashlib.sha256(encoded).hexdigest()
++
++    @classmethod
++    def load(cls, path: str | Path) -> "OnlineAdaptationConfig":
++        source = Path(path)
++        try:
++            value = json.loads(source.read_text(encoding="utf-8"))
++        except (OSError, json.JSONDecodeError) as exc:
++            raise ValueError(
++                f"cannot load speculative adaptation config {source}: {exc}"
++            ) from exc
++        if not isinstance(value, dict):
++            raise ValueError("speculative adaptation config must be an object")
++        expected = {
++            "schema_version",
++            "method",
++            "weight_update_mode",
++            "parameter_scope",
++            "kv_history_policy",
++            "adaptation_scope",
++            "adaptation_group_id",
++            "tenant_id",
++            "optimizer",
++            "rank",
++            "stride",
++            "max_in_flight",
++            "canvas_tokens",
++            "loss_position_decay",
++            "target_revision",
++            "drafter_revision",
++            "sampling_profile_sha256",
++        }
++        unknown = set(value) - expected
++        missing = expected - set(value)
++        if unknown or missing:
++            raise ValueError(
++                "speculative adaptation config fields mismatch: "
++                f"missing={sorted(missing)}, unknown={sorted(unknown)}"
++            )
++        if value["schema_version"] != 2:
++            raise ValueError("speculative adaptation requires schema_version=2")
++        if value["method"] not in {"tts", "naive_async"}:
++            raise ValueError("online adaptation method must be tts or naive_async")
++        if value["weight_update_mode"] not in {"residual", "lora", "full"}:
++            raise ValueError("unknown weight_update_mode")
++        if value["parameter_scope"] not in {"tail", "drafter"}:
++            raise ValueError("unknown parameter_scope")
++        if (
++            value["weight_update_mode"] == "residual"
++            and value["parameter_scope"] != "tail"
++        ):
++            raise ValueError("residual updates are tail-only")
++        rank = value["rank"]
++        if value["weight_update_mode"] == "full":
++            if rank is not None:
++                raise ValueError("full updates require rank=null")
++        elif not isinstance(rank, int) or isinstance(rank, bool) or rank < 1:
++            raise ValueError("residual and lora require a positive rank")
++        if value["kv_history_policy"] != "frozen":
++            raise ValueError("only frozen historical drafter KV is supported")
++        if value["adaptation_scope"] != "cohort":
++            raise ValueError("only cohort-shared parameters are supported")
++        if value["max_in_flight"] != 1:
++            raise ValueError("max_in_flight must equal one")
++        for field in (
++            "adaptation_group_id",
++            "tenant_id",
++            "target_revision",
++            "drafter_revision",
++        ):
++            if not isinstance(value[field], str) or not value[field]:
++                raise ValueError(f"{field} must be a non-empty string")
++        profile = value["sampling_profile_sha256"]
++        if (
++            not isinstance(profile, str)
++            or len(profile) != 64
++            or any(char not in "0123456789abcdef" for char in profile)
++        ):
++            raise ValueError("sampling_profile_sha256 must be lowercase SHA-256")
++        stride = value["stride"]
++        canvas_tokens = value["canvas_tokens"]
++        if (
++            not isinstance(stride, int)
++            or isinstance(stride, bool)
++            or stride < 1
++            or not isinstance(canvas_tokens, int)
++            or isinstance(canvas_tokens, bool)
++            or canvas_tokens < 1
++        ):
++            raise ValueError("stride and canvas_tokens must be positive integers")
++        decay = float(value["loss_position_decay"])
++        if not 0.0 < decay <= 1.0:
++            raise ValueError("loss_position_decay must be in (0, 1]")
++        optimizer = _parse_optimizer(value["optimizer"])
++        return cls(
++            method=value["method"],
++            weight_update_mode=value["weight_update_mode"],
++            parameter_scope=value["parameter_scope"],
++            adaptation_group_id=value["adaptation_group_id"],
++            tenant_id=value["tenant_id"],
++            optimizer=optimizer,
++            rank=rank,
++            stride=stride,
++            canvas_tokens=canvas_tokens,
++            loss_position_decay=decay,
++            target_revision=value["target_revision"],
++            drafter_revision=value["drafter_revision"],
++            sampling_profile_sha256=profile,
++        )
++
++
++def _parse_optimizer(value: Any) -> OnlineOptimizerConfig:
++    if not isinstance(value, dict):
++        raise ValueError("optimizer must be an object")
++    expected = {
++        "name",
++        "learning_rate",
++        "weight_decay",
++        "beta1",
++        "beta2",
++        "epsilon",
++        "grad_clip",
++    }
++    if set(value) != expected:
++        raise ValueError("optimizer fields do not match schema-v2")
++    name = value["name"]
++    if name not in {"adam", "adamw"}:
++        raise ValueError("TTS/L0 tuning supports Adam or AdamW")
++    learning_rate = float(value["learning_rate"])
++    weight_decay = float(value["weight_decay"])
++    beta1 = float(value["beta1"])
++    beta2 = float(value["beta2"])
++    epsilon = float(value["epsilon"])
++    grad_clip = float(value["grad_clip"])
++    if learning_rate <= 0 or epsilon <= 0 or grad_clip <= 0:
++        raise ValueError("optimizer lr, epsilon, and grad_clip must be positive")
++    if not 0 < beta1 < 1 or not 0 < beta2 < 1:
++        raise ValueError("optimizer betas must be in (0, 1)")
++    if weight_decay < 0 or (name != "adamw" and weight_decay != 0):
++        raise ValueError("weight decay is non-negative and AdamW-only")
++    return OnlineOptimizerConfig(
++        name,
++        learning_rate,
++        weight_decay,
++        beta1,
++        beta2,
++        epsilon,
++        grad_clip,
++    )
++
++
++def load_online_adaptation(server_args) -> OnlineAdaptationConfig | None:
++    path = getattr(server_args, "speculative_adaptation_config", None)
++    return None if not path else OnlineAdaptationConfig.load(path)
++
++
++def validate_online_adaptation(server_args) -> None:
++    config = load_online_adaptation(server_args)
++    metrics_enabled = bool(
++        getattr(server_args, "speculative_speed_study_metrics", False)
++    )
++    reserve_mb = int(
++        getattr(server_args, "speculative_adaptation_reserve_mb", 0)
++    )
++    if reserve_mb < 0:
++        raise ValueError("speculative_adaptation_reserve_mb cannot be negative")
++    if config is None:
++        if reserve_mb:
++            raise ValueError(
++                "adaptation reserve is forbidden without an adaptation config"
++            )
++        if not metrics_enabled:
++            return
++        backend = str(server_args.speculative_algorithm or "").upper()
++        if backend != "DFLASH":
++            raise ValueError("speed-study metrics currently require DFLASH")
++        if not bool(
++            getattr(server_args, "speculative_use_rejection_sampling", False)
++        ):
++            raise ValueError(
++                "speed-study metrics require exact rejection sampling"
++            )
++        if float(server_args.speculative_accept_threshold_single) != 1.0:
++            raise ValueError("speed-study metrics require accept threshold single=1")
++        if float(server_args.speculative_accept_threshold_acc) != 1.0:
++            raise ValueError("speed-study metrics require accept threshold acc=1")
++        return
++    if not metrics_enabled:
++        raise ValueError(
++            "online adaptation requires --speculative-speed-study-metrics"
++        )
++    backend = str(server_args.speculative_algorithm or "").upper()
++    if backend not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
++        raise ValueError(
++            "online adaptation requires DFLASH, DSPARK, EAGLE, or EAGLE3"
++        )
++    if config.parameter_scope == "drafter" and backend != "DFLASH":
++        raise ValueError(
++            "drafter-scope Full/LoRA is currently implemented for DFLASH only"
++        )
++    if config.parameter_scope == "drafter" and config.weight_update_mode == "residual":
++        raise ValueError("residual updates cannot target the drafter")
++    if getattr(server_args, "speculative_draft_model_quantization", None):
++        raise ValueError("online updates require an unquantized draft model")
++    if bool(getattr(server_args, "enable_two_batch_overlap", False)):
++        raise ValueError("online adaptation does not support two-batch overlap")
++    if bool(getattr(server_args, "enable_pdmux", False)):
++        raise ValueError("online adaptation does not support PD multiplexing")
++    if not bool(
++        getattr(server_args, "speculative_use_rejection_sampling", False)
++    ):
++        raise ValueError(
++            "focused online adaptation requires exact rejection sampling"
++        )
++    if float(server_args.speculative_accept_threshold_single) != 1.0:
++        raise ValueError("exact adaptation requires accept threshold single=1")
++    if float(server_args.speculative_accept_threshold_acc) != 1.0:
++        raise ValueError("exact adaptation requires accept threshold acc=1")
++    if reserve_mb <= 0:
++        raise ValueError(
++            "online adaptation requires an explicit pre-KV HBM reserve"
++        )
++

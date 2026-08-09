@@ -1,7 +1,6 @@
-0001-feat-spec-add-fail-closed-adaptation-configuration.patch
-0002-feat-spec-add-versioned-tail-adaptation-runtime.patch
-0003-feat-dspark-integrate-tail-adaptation-signals.patch
-0004-feat-dflash-integrate-cache-safe-tail-updates.patch
-0005-feat-eagle-add-version-safe-proposal-adaptation.patch
-0006-feat-runtime-harden-memory-lifecycle-and-telemetry.patch
-0007-test-spec-cover-adaptation-protocols-and-disabled-pa.patch
+0001-feat-spec-add-focused-online-adaptation-preflight.patch
+0002-feat-spec-add-cohort-version-and-event-runtime.patch
+0003-feat-dflash-add-differentiable-drafter-Full-and-LoRA.patch
+0004-feat-spec-add-cache-safe-output-tail-ablations.patch
+0005-feat-spec-harden-memory-lifecycle-and-profiling.patch
+0006-test-spec-cover-focused-adaptation-protocols.patch
