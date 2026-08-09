@@ -1,4 +1,4 @@
-From 4349f507b3282a4525bc71a1c5f68bc71c4c1d4d Mon Sep 17 00:00:00 2001
+From 84b9a4bf54ec99481c101d1e8a6499aa8c451def Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight

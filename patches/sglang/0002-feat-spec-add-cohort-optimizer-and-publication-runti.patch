@@ -1,19 +1,19 @@
-From aed3a408c8cc8192e868e8b149367a437816a04a Mon Sep 17 00:00:00 2001
+From 332261fcd28f8a1febbea9f05bee1591ab339fcc Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH 2/6] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 1950 +++++++++++++++++
- 1 file changed, 1950 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 1967 +++++++++++++++++
+ 1 file changed, 1967 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add5dc3d459
+index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b923a95498
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,1950 @@
+@@ -0,0 +1,1967 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
@@ -117,6 +117,23 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +    return master + 2 * (master + moments) + int(merge_bytes)
 +
 +
++def _clip_fp32_gradients(
++    gradients: Sequence[torch.Tensor],
++    *,
++    width: int,
++    grad_clip: float,
++    label: str,
++) -> tuple[torch.Tensor, ...]:
++    """Clip a heterogeneous layout with fused multi-tensor CUDA kernels."""
++    if len(gradients) != width:
++        raise ValueError(f"{label} gradient layout mismatch")
++    values = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
++    norms = torch._foreach_norm(values, 2.0)
++    norm = torch.stack(norms).square().sum().sqrt()
++    scale = torch.clamp(grad_clip / (norm + 1e-12), max=1.0)
++    return tuple(torch._foreach_mul(values, scale))
++
++
 +@dataclass(frozen=True)
 +class CandidateBinding:
 +    cohort_epoch: int
@@ -182,74 +199,72 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        return (self._step,)
 +
 +    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
-+        if len(gradients) != len(self.master):
-+            raise ValueError("optimizer gradient layout mismatch")
-+        gradients = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
-+        norm = (
-+            torch.stack([gradient.square().sum() for gradient in gradients])
-+            .sum()
-+            .sqrt()
++        gradients = _clip_fp32_gradients(
++            gradients,
++            width=len(self.master),
++            grad_clip=self.config.grad_clip,
++            label="optimizer",
 +        )
-+        scale = torch.clamp(self.config.grad_clip / (norm + 1e-12), max=1.0)
-+        gradients = tuple(gradient * scale for gradient in gradients)
 +        step = self._step + 1
 +        if self.config.name in {"sgdm", "nag"}:
 +            momentum = self.config.momentum
 +            if momentum is None:
 +                raise AssertionError("validated momentum optimizer is incomplete")
 +            effective = tuple(
-+                gradient + self.config.weight_decay * parameter
-+                for parameter, gradient in zip(self.master, gradients, strict=True)
++                torch._foreach_add(
++                    gradients,
++                    self.master,
++                    alpha=self.config.weight_decay,
++                )
 +            )
-+            first = tuple(
-+                momentum * moment + gradient
-+                for moment, gradient in zip(self.first, effective, strict=True)
-+            )
++            first = torch._foreach_mul(self.first, momentum)
++            torch._foreach_add_(first, effective)
 +            directions = (
-+                first
++                tuple(first)
 +                if self.config.name == "sgdm"
 +                else tuple(
-+                    gradient + momentum * moment
-+                    for gradient, moment in zip(effective, first, strict=True)
++                    torch._foreach_add(effective, first, alpha=momentum)
 +                )
 +            )
 +            parameters = tuple(
-+                parameter - self.config.learning_rate * direction
-+                for parameter, direction in zip(self.master, directions, strict=True)
++                torch._foreach_add(
++                    self.master,
++                    directions,
++                    alpha=-self.config.learning_rate,
++                )
 +            )
-+            return ParameterProposal(parameters, first, self.second, step)
++            return ParameterProposal(parameters, tuple(first), self.second, step)
 +
 +        if self.config.name == "lion":
 +            beta1 = self.config.beta1
 +            beta2 = self.config.beta2
-+            directions = tuple(
-+                (beta1 * moment + (1 - beta1) * gradient).sign()
-+                for moment, gradient in zip(self.first, gradients, strict=True)
-+            )
-+            first = tuple(
-+                beta2 * moment + (1 - beta2) * gradient
-+                for moment, gradient in zip(self.first, gradients, strict=True)
-+            )
++            directions = torch._foreach_mul(self.first, beta1)
++            torch._foreach_add_(directions, gradients, alpha=1 - beta1)
++            torch._foreach_sign_(directions)
++            first = torch._foreach_mul(self.first, beta2)
++            torch._foreach_add_(first, gradients, alpha=1 - beta2)
 +            decay = 1 - self.config.learning_rate * self.config.weight_decay
-+            parameters = tuple(
-+                parameter * decay - self.config.learning_rate * direction
-+                for parameter, direction in zip(self.master, directions, strict=True)
++            parameters = torch._foreach_mul(self.master, decay)
++            torch._foreach_add_(
++                parameters,
++                directions,
++                alpha=-self.config.learning_rate,
 +            )
-+            return ParameterProposal(parameters, first, self.second, step)
++            return ParameterProposal(
++                tuple(parameters), tuple(first), self.second, step
++            )
 +
 +        if self.config.name == "muon":
 +            return self._propose_muon(gradients, step)
 +
 +        beta1 = self.config.beta1
 +        beta2 = self.config.beta2
-+        first = tuple(
-+            beta1 * moment + (1 - beta1) * gradient
-+            for moment, gradient in zip(self.first, gradients, strict=True)
-+        )
-+        second = tuple(
-+            beta2 * moment + (1 - beta2) * gradient.square()
-+            for moment, gradient in zip(self.second, gradients, strict=True)
-+        )
++        first = torch._foreach_mul(self.first, beta1)
++        torch._foreach_add_(first, gradients, alpha=1 - beta1)
++        squared = torch._foreach_mul(gradients, gradients)
++        second = torch._foreach_mul(self.second, beta2)
++        torch._foreach_add_(second, squared, alpha=1 - beta2)
++        del squared
 +        floating_step = step.to(torch.float32)
 +        correction1 = 1 - torch.pow(
 +            torch.as_tensor(beta1, device=step.device), floating_step
@@ -257,15 +272,25 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        correction2 = 1 - torch.pow(
 +            torch.as_tensor(beta2, device=step.device), floating_step
 +        )
-+        parameters = []
-+        for parameter, moment1, moment2 in zip(self.master, first, second, strict=True):
-+            direction = (moment1 / correction1) / (
-+                (moment2 / correction2).sqrt() + self.config.epsilon
++        directions = torch._foreach_div(first, correction1)
++        denominators = torch._foreach_div(second, correction2)
++        torch._foreach_sqrt_(denominators)
++        torch._foreach_add_(denominators, self.config.epsilon)
++        torch._foreach_div_(directions, denominators)
++        if self.config.name == "adamw":
++            torch._foreach_add_(
++                directions,
++                self.master,
++                alpha=self.config.weight_decay,
 +            )
-+            if self.config.name == "adamw":
-+                direction = direction + self.config.weight_decay * parameter
-+            parameters.append(parameter - self.config.learning_rate * direction)
-+        return ParameterProposal(tuple(parameters), first, second, step)
++        parameters = torch._foreach_add(
++            self.master,
++            directions,
++            alpha=-self.config.learning_rate,
++        )
++        return ParameterProposal(
++            tuple(parameters), tuple(first), tuple(second), step
++        )
 +
 +    def _adamw_candidate(
 +        self,
@@ -361,10 +386,22 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        *,
 +        valid: torch.Tensor | None = None,
 +    ) -> None:
-+        if valid is None:
-+            valid = torch.ones((), dtype=torch.bool, device=self.master[0].device)
-+        valid = valid.reshape(()).to(device=self.master[0].device, dtype=torch.bool)
 +        with torch.no_grad():
++            if valid is None:
++                # The publication boundary has already consumed the pinned
++                # validity receipt.  A second device-wide ``where`` would read
++                # and rewrite every full-drafter state tensor solely to select
++                # the candidate that is known to be valid.
++                torch._foreach_copy_(self.master, proposal.parameters)
++                if self.first:
++                    torch._foreach_copy_(self.first, proposal.first_moments)
++                if self.second:
++                    torch._foreach_copy_(self.second, proposal.second_moments)
++                self._step.copy_(proposal.step)
++                return
++            valid = valid.reshape(()).to(
++                device=self.master[0].device, dtype=torch.bool
++            )
 +            for active, candidate in zip(self.master, proposal.parameters, strict=True):
 +                active.copy_(torch.where(valid, candidate, active))
 +            for active, candidate in zip(
@@ -519,14 +556,12 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        return torch.softmax(-rate * self.second[0], dim=0)
 +
 +    def _clip(self, gradients: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
-+        if len(gradients) != self._width:
-+            raise ValueError("OnlineSPEC gradient layout mismatch")
-+        values = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
-+        norm = (
-+            torch.stack([gradient.square().sum() for gradient in values]).sum().sqrt()
++        return _clip_fp32_gradients(
++            gradients,
++            width=self._width,
++            grad_clip=self.config.grad_clip,
++            label="OnlineSPEC",
 +        )
-+        scale = torch.clamp(self.config.grad_clip / (norm + 1e-12), max=1.0)
-+        return tuple(gradient * scale for gradient in values)
 +
 +    def _ogd(
 +        self,
@@ -660,14 +695,22 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        *,
 +        valid: torch.Tensor | None = None,
 +    ) -> None:
-+        if valid is None:
-+            valid = torch.ones((), dtype=torch.bool, device=self.master[0].device)
-+        valid = valid.reshape(()).to(device=self.master[0].device, dtype=torch.bool)
 +        if len(proposal.first_moments) != len(self.first) or len(
 +            proposal.second_moments
 +        ) != len(self.second):
 +            raise ValueError("OnlineSPEC proposal state layout mismatch")
 +        with torch.no_grad():
++            if valid is None:
++                torch._foreach_copy_(self.master, proposal.parameters)
++                if self.first:
++                    torch._foreach_copy_(self.first, proposal.first_moments)
++                if self.second:
++                    torch._foreach_copy_(self.second, proposal.second_moments)
++                self._step.copy_(proposal.step)
++                return
++            valid = valid.reshape(()).to(
++                device=self.master[0].device, dtype=torch.bool
++            )
 +            for active, candidate in zip(self.master, proposal.parameters, strict=True):
 +                active.copy_(torch.where(valid, candidate, active))
 +            for active, candidate in zip(
@@ -754,13 +797,11 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +        if len(tensors) != len(self.staging):
 +            raise ValueError("inference parameter layout mismatch")
 +        with torch.no_grad():
-+            for destination, source in zip(self.staging, tensors, strict=True):
-+                destination.copy_(source.to(destination.dtype))
++            torch._foreach_copy_(self.staging, tuple(tensors))
 +
 +    def publish(self) -> None:
 +        with torch.no_grad():
-+            for destination, source in zip(self.active, self.staging, strict=True):
-+                destination.copy_(source)
++            torch._foreach_copy_(self.active, self.staging)
 +        if tuple(tensor.data_ptr() for tensor in self.active) != self.addresses:
 +            raise RuntimeError("inference parameter address changed")
 +
@@ -1182,27 +1223,6 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +                ).sum()
 +                online_effective_experts = online_ensemble_entropy.exp()
 +                online_cumulative_losses = proposal.second_moments[0]
-+        proposal = ParameterProposal(
-+            parameters=tuple(
-+                torch.where(publish_valid, candidate, active)
-+                for candidate, active in zip(
-+                    proposal.parameters, optimizer.master, strict=True
-+                )
-+            ),
-+            first_moments=tuple(
-+                torch.where(publish_valid, candidate, active)
-+                for candidate, active in zip(
-+                    proposal.first_moments, optimizer.first, strict=True
-+                )
-+            ),
-+            second_moments=tuple(
-+                torch.where(publish_valid, candidate, active)
-+                for candidate, active in zip(
-+                    proposal.second_moments, optimizer.second, strict=True
-+                )
-+            ),
-+            step=proposal.step,
-+        )
 +        metric_row = self.trace_metrics[trace_index]
 +        metric_row[0].copy_(loss.detach().reshape(()).to(torch.float32))
 +        metric_row[1].copy_(finite.detach().to(torch.float32))
@@ -1384,10 +1404,7 @@ index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add
 +            return False
 +        with self.timing("publish"):
 +            self._archive_latest_device_lengths()
-+            candidate.optimizer.commit(
-+                candidate.optimizer_proposal,
-+                valid=candidate.finite,
-+            )
++            candidate.optimizer.commit(candidate.optimizer_proposal, valid=None)
 +            candidate.inference_bank.publish()
 +        for tensor in candidate.candidate_tensors:
 +            tensor.record_stream(main)

@@ -1,21 +1,21 @@
-From 6ec44d9885696c77d2784c3e182f5b237d504f00 Mon Sep 17 00:00:00 2001
+From abc8c9a8fc4c5c725dcfeb38c40af9f6da163fd7 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
 
 ---
- .../speculative/dflash_online_adaptation.py   | 1093 +++++++++++++++++
+ .../speculative/dflash_online_adaptation.py   | 1088 +++++++++++++++++
  .../srt/speculative/online_valid_mask.py      |  142 +++
- 2 files changed, 1235 insertions(+)
+ 2 files changed, 1230 insertions(+)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
 
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..58f94979bf3dec3a82f0535d6f7ba58ba37275b7
+index 0000000000000000000000000000000000000000..2ef4b7858c7cb5c6b837840ef770b172c6357369
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1093 @@
+@@ -0,0 +1,1088 @@
 +"""DFlash drafter-scope Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -1007,18 +1007,13 @@ index 0000000000000000000000000000000000000000..58f94979bf3dec3a82f0535d6f7ba58b
 +                        proposal = self.optimizer.propose(gradients)
 +                with self.runtime.timing("merge"):
 +                    effective = self._effective_parameters(proposal.parameters)
-+                    publish_valid = (
-+                        finite & reconstruction_ok & supervision_nonempty
++                    # Invalid candidates are rejected from the pinned receipt
++                    # before publication.  Staging their values is harmless;
++                    # selecting the active full drafter here would add another
++                    # full-model read/copy to every update.
++                    self.inference.stage(
++                        tuple(effective[name] for name in self.names)
 +                    )
-+                    staged = tuple(
-+                        torch.where(
-+                            publish_valid,
-+                            effective[name],
-+                            self.named[name].detach().to(torch.float32),
-+                        )
-+                        for name in self.names
-+                    )
-+                    self.inference.stage(staged)
 +                self.runtime.submit(
 +                    source_round=source_round,
 +                    source_version=source_version,

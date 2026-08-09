@@ -1,4 +1,4 @@
-From 3ad56507a1777b16e0d9b4f1ffbe06ca53966c1b Mon Sep 17 00:00:00 2001
+From 3624dfed5229ff9bec00c8421eb9a77c93970556 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
@@ -11,13 +11,13 @@ Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
  .../dspark_components/dspark_draft.py         | 105 ++-
  .../dspark_components/dspark_proposal.py      |  71 ++
  .../dspark_components/dspark_verify.py        |   4 +-
- .../dspark_components/dspark_worker_v2.py     | 111 ++-
+ .../dspark_components/dspark_worker_v2.py     | 111 +++-
  python/sglang/srt/speculative/eagle_info.py   |  19 +
  .../srt/speculative/eagle_worker_common.py    |   1 +
  .../sglang/srt/speculative/eagle_worker_v2.py | 215 +++++-
  .../speculative/online_eagle_adaptation.py    | 291 ++++++++
- .../srt/speculative/online_tail_adaptation.py | 631 ++++++++++++++++++
- 13 files changed, 1659 insertions(+), 83 deletions(-)
+ .../srt/speculative/online_tail_adaptation.py | 624 ++++++++++++++++++
+ 13 files changed, 1652 insertions(+), 83 deletions(-)
  create mode 100644 python/sglang/srt/speculative/dspark_components/dspark_proposal.py
  create mode 100644 python/sglang/srt/speculative/online_eagle_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_tail_adaptation.py
@@ -1889,10 +1889,10 @@ index 0000000000000000000000000000000000000000..17b515053a3377de3ba864d4e225a0df
 +)
 diff --git a/python/sglang/srt/speculative/online_tail_adaptation.py b/python/sglang/srt/speculative/online_tail_adaptation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9aef606d530804efb9d41456da3ded08844e88ef
+index 0000000000000000000000000000000000000000..a69be5aa36ca9585e32e2a29aff7b88de89fd917
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_tail_adaptation.py
-@@ -0,0 +1,631 @@
+@@ -0,0 +1,624 @@
 +"""Cache-safe output-tail ablations for speculative proposal heads."""
 +
 +from __future__ import annotations
@@ -2430,14 +2430,7 @@ index 0000000000000000000000000000000000000000..9aef606d530804efb9d41456da3ded08
 +                with self.runtime.timing("optimizer"):
 +                    proposal = self.optimizer.propose(gradients)
 +            with self.runtime.timing("merge"):
-+                publish_valid = finite & reconstruction_ok & supervision_nonempty
-+                staged = tuple(
-+                    torch.where(publish_valid, candidate, active)
-+                    for candidate, active in zip(
-+                        proposal.parameters, self.active, strict=True
-+                    )
-+                )
-+                self.bank.stage(staged)
++                self.bank.stage(proposal.parameters)
 +            self.runtime.submit(
 +                source_round=source_round,
 +                source_version=source_version,

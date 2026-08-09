@@ -1,4 +1,4 @@
-From 04b802babefee55d23168e6f4d97927c974871d1 Mon Sep 17 00:00:00 2001
+From 4d98526a37e202693d74b973840de0b092fa2bac Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 6/6] test(spec): cover cross-backend adaptation protocols
