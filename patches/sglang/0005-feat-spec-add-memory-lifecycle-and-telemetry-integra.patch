@@ -1,0 +1,258 @@
+From eb1d4ae9d77a086e189d1a44a762fb6759c282ff Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 15:36:45 +0800
+Subject: [PATCH 5/6] feat(spec): add memory lifecycle and telemetry
+ integration
+
+---
+ python/sglang/srt/managers/scheduler.py       | 74 ++++++++++++++++++-
+ .../batch_result_processor.py                 | 13 +++-
+ .../scheduler_components/metrics_reporter.py  | 22 ++++++
+ .../srt/mem_cache/kv_cache_configurator.py    | 26 ++++++-
+ .../srt/speculative/base_spec_worker.py       |  4 +
+ 5 files changed, 130 insertions(+), 9 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 861c13f..375c35e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3252,6 +3252,9 @@ class Scheduler(
+             )
+ 
+             self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
++            if self.metrics_reporter.speed_study_enabled:
++                self.metrics_reporter.speed_study_retractions += len(retracted_reqs)
++                self.metrics_reporter.speed_study_oom_events += len(reqs_to_abort)
+             if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
+                 self.metrics_reporter.metrics_collector.increment_retracted_reqs(
+                     num_retracted_reqs=len(retracted_reqs),
+@@ -3572,6 +3575,17 @@ class Scheduler(
+                     can_run_cuda_graph=can_run_cuda_graph,
+                 )
+ 
++        if self.is_generation and not batch.forward_mode.is_extend():
++            record_load = getattr(
++                self.draft_worker, "record_scheduler_load", None
++            )
++            if callable(record_load):
++                record_load(
++                    running_requests=len(batch.reqs),
++                    waiting_requests=len(self.waiting_queue),
++                    graph_replay=bool(ret.can_run_cuda_graph),
++                )
++
+         self._maybe_report_active_ranks()
+ 
+         return ret
+@@ -3974,6 +3988,8 @@ class Scheduler(
+ 
+             if empty_cache:
+                 current_platform.empty_cache()
++            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
++                torch.cuda.reset_peak_memory_stats(self.device)
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
+@@ -4002,6 +4018,54 @@ class Scheduler(
+             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
+         }
+         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
++        if self.metrics_reporter.speed_study_enabled:
++            speed_samples = self.metrics_reporter.speed_study_graph_total
++            target_calls = (
++                self.metrics_reporter.spec_total_num_forward_ct
++                + self.metrics_reporter.spec_num_forward_ct
++            )
++            committed_tokens = (
++                self.metrics_reporter.spec_total_num_accept_tokens
++                + self.metrics_reporter.spec_num_accept_tokens
++            )
++            accepted_drafts = max(committed_tokens - target_calls, 0)
++            verified_drafts = target_calls * max(
++                int(self.server_args.speculative_num_draft_tokens) - 1, 0
++            )
++            ret["speed_study_metrics"] = {
++                "target_calls": target_calls,
++                "accepted_drafts": accepted_drafts,
++                "committed_tokens": committed_tokens,
++                "verified_drafts": verified_drafts,
++                "verification_waste": verified_drafts - accepted_drafts,
++                "oom_events": self.metrics_reporter.speed_study_oom_events,
++                "retractions": self.metrics_reporter.speed_study_retractions,
++                "peak_hbm_bytes": int(
++                    torch.cuda.max_memory_allocated(self.device)
++                    if torch.cuda.is_available()
++                    and str(self.device).startswith("cuda")
++                    else 0
++                ),
++                "kv_bytes": int(
++                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage
++                    * (1 << 30)
++                ),
++                "batch_fill": (
++                    self.metrics_reporter.speed_study_batch_sum / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++                "queue_occupancy": (
++                    self.metrics_reporter.speed_study_queue_sum / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++                "graph_replay_hit_rate": (
++                    self.metrics_reporter.speed_study_graph_hits / speed_samples
++                    if speed_samples
++                    else 0.0
++                ),
++            }
+ 
+         if self.server_args.elastic_ep_backend is not None:
+             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+@@ -4024,10 +4088,14 @@ class Scheduler(
+         if RECORD_STEP_TIME:
+             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
+ 
+-        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+-            info_record = self.draft_worker.dump_info_records()
++        if not self.spec_algorithm.is_none() and self.draft_worker is not None:
++            dump_info = getattr(self.draft_worker, "dump_info_records", None)
++            info_record = dump_info() if callable(dump_info) else None
+             if info_record is not None:
+-                ret["dspark_info_record"] = info_record
++                if self.spec_algorithm.is_dspark():
++                    ret["dspark_info_record"] = info_record
++                if self.server_args.speculative_adaptation_config:
++                    ret["speculative_adaptation_info_record"] = info_record
+ 
+         # These fields are not msgpack-serializable (a config object and a bound
+         # signal handler); no reader consumes them.
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 248a929..12a4a7a 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -948,10 +948,15 @@ class SchedulerBatchResultProcessor:
+             # isinstance narrowing: create_worker may also return plain
+             # TpModelWorker-based drafts, which carry no spec-worker hooks.
+             if isinstance(self.draft_worker, BaseSpecWorker):
+-                self.draft_worker.note_request_finished(
+-                    rid=req.rid,
+-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+-                )
++                if isinstance(req.finished_reason, FINISH_ABORT):
++                    self.draft_worker.note_request_aborted(rid=req.rid)
++                else:
++                    self.draft_worker.note_request_finished(
++                        rid=req.rid,
++                        natural_stop=isinstance(
++                            req.finished_reason, FINISH_MATCHED_TOKEN
++                        ),
++                    )
+ 
+             # delete feature to save memory
+             if req.multimodal_inputs is not None and req.session is None:
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 15e1b81..1779332 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -141,6 +141,16 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        self.speed_study_enabled = bool(
++            self.scheduler.server_args.speculative_speed_study_metrics
++        )
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+         # For PD disaggregation
+         self.kv_transfer_speed_gb_s: float = 0.0
+@@ -524,6 +534,13 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+     def report_prefill_stats(
+         self,
+@@ -697,6 +714,11 @@ class SchedulerMetricsReporter:
+         num_correct_drafts: int = 0,
+     ):
+         batch = running_batch or self.scheduler.running_batch
++        if self.speed_study_enabled:
++            self.speed_study_graph_total += 1
++            self.speed_study_graph_hits += int(can_run_cuda_graph)
++            self.speed_study_batch_sum += len(batch.reqs)
++            self.speed_study_queue_sum += len(self.scheduler.waiting_queue)
+ 
+         # Every-iteration work: realtime token counting + status logger
+         if self.current_scheduler_metrics_enabled:
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index bc4cf81..d18d814 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
+                 )
+                 / 1024,
+             )
+-        rest_memory = available_gpu_memory - slack_gb
++        adaptation_reserve_bytes = int(
++            getattr(
++                self.server_args,
++                "speculative_adaptation_reserve_mb",
++                0,
++            )
++        ) * 1024 * 1024
++        adaptation_resident_bytes = int(
++            getattr(
++                self.server_args,
++                "_speculative_adaptation_resident_bytes",
++                0,
++            )
++        )
++        adaptation_headroom_bytes = max(
++            adaptation_reserve_bytes - adaptation_resident_bytes, 0
++        )
++        adaptation_headroom_gb = adaptation_headroom_bytes / (1 << 30)
++        rest_memory = (
++            available_gpu_memory - slack_gb - adaptation_headroom_gb
++        )
+         if self.mambaish_config is not None:
+             rest_memory = self._handle_max_mamba_cache(rest_memory)
+ 
+@@ -1569,7 +1589,9 @@ class KVCacheConfigurator:
+                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
+             )
+             raise ValueError(
+-                f"Loaded weights leave no GPU memory for the KV cache under "
++                f"Loaded weights and the {adaptation_headroom_gb:.3f} GiB "
++                f"unallocated adaptation headroom leave no GPU memory for the "
++                f"KV cache under "
+                 f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
+                 f"Raise --mem-fraction-static above "
+                 f"{suggested_mem_fraction_static:.3f} "
+diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+index eb21194..e887ef0 100644
+--- a/python/sglang/srt/speculative/base_spec_worker.py
++++ b/python/sglang/srt/speculative/base_spec_worker.py
+@@ -172,6 +172,10 @@ class BaseSpecWorker(ABC):
+         """
+         pass
+ 
++    def note_request_aborted(self, *, rid: str) -> None:
++        """Hook called when cancellation invalidates request-owned state."""
++        pass
++
+     def activate_step_by_batch(self, batch_size: int) -> None:
+         """Activate the optimal adaptive step for the current batch size.
+ 

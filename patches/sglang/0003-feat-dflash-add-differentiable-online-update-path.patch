@@ -1,0 +1,990 @@
+From 7a0b06d8eb9d2ff1ac2e0662501bbe859241e7e4 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 15:36:45 +0800
+Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
+
+---
+ .../speculative/dflash_online_adaptation.py   | 828 ++++++++++++++++++
+ .../srt/speculative/online_valid_mask.py      | 138 +++
+ 2 files changed, 966 insertions(+)
+ create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
+ create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
+
+diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
+new file mode 100644
+index 0000000..a1c3b93
+--- /dev/null
++++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
+@@ -0,0 +1,828 @@
++"""DFlash drafter-scope Full/LoRA updates on a bounded current canvas."""
++
++from __future__ import annotations
++
++import logging
++import math
++import re
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++import torch
++import torch.nn.functional as F
++from sglang.srt.speculative.online_adaptation_config import (
++    load_online_adaptation,
++)
++from sglang.srt.speculative.online_adaptation_runtime import (
++    FixedInferenceBank,
++    OnlineCohortRuntime,
++    ResidentOptimizer,
++    estimate_functional_optimizer_scratch_bytes,
++    estimate_full_vocab_training_scratch_bytes,
++)
++
++logger = logging.getLogger(__name__)
++
++_LINEAR = re.compile(r"(?:^|\.)(?:fc|qkv_proj|o_proj|gate_up_proj|down_proj)\.weight$")
++_BORROWED = re.compile(r"(?:^|\.)(?:embed_tokens|lm_head|target_model)(?:\.|$)")
++
++
++@dataclass
++class _CapturedHistory:
++    locations: torch.Tensor
++    valid_mask: torch.Tensor
++
++
++def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
++    variance = hidden.to(torch.float32).square().mean(-1, keepdim=True)
++    return (hidden * torch.rsqrt(variance + epsilon).to(hidden.dtype)) * weight
++
++
++def _linear(
++    hidden: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++) -> torch.Tensor:
++    return F.linear(
++        hidden,
++        weight.to(hidden.dtype),
++        None if bias is None else bias.to(hidden.dtype),
++    )
++
++
++def _logit_reconstruction_gate(
++    inference_logits: torch.Tensor,
++    differentiable_logits: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if inference_logits.shape != differentiable_logits.shape:
++        raise ValueError("DFlash reconstruction logit shapes differ")
++    inference = inference_logits.detach().to(torch.float32)
++    reconstructed = differentiable_logits.detach().to(torch.float32)
++    maximum = (reconstructed - inference).abs().max()
++    limit = 2e-3 + 2e-3 * inference.abs().max()
++    valid = torch.isfinite(maximum) & torch.isfinite(limit) & (maximum <= limit)
++    return valid, maximum
++
++
++def _rope(
++    value: torch.Tensor,
++    positions: torch.Tensor,
++    *,
++    theta: float,
++) -> torch.Tensor:
++    dimension = value.shape[-1]
++    if dimension % 2:
++        raise ValueError("RoPE head dimension must be even")
++    inverse = 1.0 / (
++        theta
++        ** (
++            torch.arange(
++                0,
++                dimension,
++                2,
++                device=value.device,
++                dtype=torch.float32,
++            )
++            / dimension
++        )
++    )
++    angles = positions.to(torch.float32)[:, None] * inverse[None, :]
++    cosine = torch.cat((angles.cos(), angles.cos()), dim=-1).to(value.dtype)
++    sine = torch.cat((angles.sin(), angles.sin()), dim=-1).to(value.dtype)
++    left, right = value.chunk(2, dim=-1)
++    rotated = torch.cat((-right, left), dim=-1)
++    return value * cosine[:, None, :] + rotated * sine[:, None, :]
++
++
++class DFlashDrafterAdapter:
++    """Update DFlash-owned parameters while target embeddings/head stay frozen."""
++
++    def __init__(self, server_args, worker) -> None:
++        config = load_online_adaptation(server_args)
++        if config is None or config.parameter_scope != "drafter":
++            raise ValueError("drafter adapter requires drafter-scope configuration")
++        if config.weight_update_mode not in {"lora", "full"}:
++            raise ValueError("drafter scope supports Full or LoRA")
++        if int(worker.ps.tp_size) != 1:
++            raise ValueError(
++                "differentiable DFlash current-canvas updates currently require "
++                "TP=1; start-up fails before adaptation allocation"
++            )
++        self.config = config
++        self.worker = worker
++        if worker.draft_window_size is None:
++            raise ValueError(
++                "drafter-scope adaptation requires a bounded "
++                "--speculative-draft-window-size"
++            )
++        if int(worker.draft_window_size) != int(config.canvas_tokens):
++            raise ValueError(
++                "canvas_tokens must equal speculative_draft_window_size so "
++                "the differentiable path sees the exact inference history"
++            )
++        self.model = worker.draft_model
++        self.device = worker.device
++        if self.model.__class__.__name__ != "DFlashDraftModel":
++            raise ValueError(
++                "drafter-scope updates currently require the base "
++                "DFlashDraftModel; specialized variants fail closed"
++            )
++        rope_scaling = getattr(self.model.config, "rope_scaling", None)
++        if rope_scaling not in (None, {}):
++            raise ValueError(
++                "differentiable DFlash adaptation does not yet reconstruct "
++                "non-default RoPE scaling; start-up fails before allocation"
++            )
++        if not bool(
++            getattr(
++                self.model.config,
++                "rope_is_neox_style",
++                getattr(self.model.config, "is_neox_style", True),
++            )
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation requires NeoX-style RoPE"
++            )
++        if any(
++            layer.self_attn.sliding_window_size is not None
++            for layer in self.model.layers
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation does not yet reconstruct "
++                "sliding-window attention"
++            )
++        if any(
++            getattr(layer.self_attn.attn.attn_type, "name", None) != "ENCODER_ONLY"
++            for layer in self.model.layers
++        ):
++            raise ValueError(
++                "differentiable DFlash adaptation currently requires "
++                "encoder-only canvas attention"
++            )
++        context_capacity = int(
++            server_args.context_length or self.model.config.max_position_embeddings
++        )
++        max_batch = max(1, int(server_args.max_running_requests))
++        self.runtime = OnlineCohortRuntime(
++            config,
++            device=self.device,
++            reserve_bytes=int(server_args.speculative_adaptation_reserve_mb)
++            * 1024
++            * 1024,
++            telemetry_path=server_args.speculative_adaptation_telemetry_path,
++            max_trace_updates=context_capacity // config.stride + 2,
++            max_trace_batch=max_batch,
++        )
++        self.named = {}
++        for raw_name, parameter in self.model.named_parameters():
++            name = raw_name.removeprefix("model.")
++            if not parameter.is_floating_point() or _BORROWED.search(name):
++                continue
++            if name in self.named:
++                raise RuntimeError(f"duplicate canonical DFlash parameter: {name}")
++            self.named[name] = parameter
++        if not self.named:
++            raise RuntimeError("DFlash drafter exposes no floating parameters")
++        all_names = tuple(sorted(self.named))
++        self.factor_names: tuple[str, ...] = ()
++        self.factor_shapes: dict[str, tuple[int, int]] = {}
++        if config.weight_update_mode == "full":
++            self.names = all_names
++            self.base: dict[str, torch.Tensor] = {}
++            self.inference = FixedInferenceBank(
++                tuple(self.named[name] for name in self.names)
++            )
++            self.optimizer = ResidentOptimizer(
++                tuple(self.named[name] for name in self.names),
++                config.optimizer,
++            )
++        else:
++            factor_names = [
++                name
++                for name in all_names
++                if self.named[name].ndim == 2 and _LINEAR.search(name)
++            ]
++            if not factor_names:
++                raise RuntimeError("DFlash LoRA parameter selection is empty")
++            self.factor_names = tuple(factor_names)
++            self.names = self.factor_names
++            self.base = {
++                name: self.named[name].detach().to(torch.float32).clone()
++                for name in self.names
++            }
++            self.inference = FixedInferenceBank(
++                tuple(self.named[name] for name in self.names)
++            )
++            factors = []
++            generator = torch.Generator(device=self.device)
++            seed = int(config.sampling_profile_sha256[:16], 16)
++            generator.manual_seed(seed)
++            for name in self.factor_names:
++                weight = self.named[name]
++                rank = int(config.rank)
++                if rank > min(weight.shape):
++                    raise ValueError(
++                        f"LoRA rank {rank} exceeds {name} shape {tuple(weight.shape)}"
++                    )
++                a = torch.empty(
++                    (rank, weight.shape[1]),
++                    dtype=torch.float32,
++                    device=self.device,
++                )
++                torch.nn.init.kaiming_uniform_(a, a=math.sqrt(5), generator=generator)
++                b = torch.zeros(
++                    (weight.shape[0], rank),
++                    dtype=torch.float32,
++                    device=self.device,
++                )
++                factors.extend((a, b))
++                self.factor_shapes[name] = (len(factors) - 2, len(factors) - 1)
++            self.optimizer = ResidentOptimizer(tuple(factors), config.optimizer)
++        self.initial_trainable = tuple(
++            value.detach().clone() for value in self.optimizer.master
++        )
++        if config.weight_update_mode == "full":
++            layout = tuple(zip(self.names, self.optimizer.master, strict=True))
++        else:
++            layout_rows = []
++            for name in self.factor_names:
++                a_index, b_index = self.factor_shapes[name]
++                layout_rows.extend(
++                    (
++                        (f"{name}.lora_a", self.optimizer.master[a_index]),
++                        (f"{name}.lora_b", self.optimizer.master[b_index]),
++                    )
++                )
++            layout = tuple(layout_rows)
++        self.runtime.bind_parameter_layout(
++            layout,
++            projection_identity=f"target_lm_head:{config.target_revision}",
++        )
++        self._captured_input: torch.Tensor | None = None
++        self._captured_positions: torch.Tensor | None = None
++        self._captured_prefix_lens: torch.Tensor | None = None
++        self._captured_request_ids: tuple[str, ...] = ()
++        self._captured_history: _CapturedHistory | None = None
++        resident = (
++            tuple(self.base.values())
++            + self.optimizer.state_tensors
++            + self.inference.staging
++            + self.runtime.telemetry_tensors
++        )
++        hidden = int(self.model.config.hidden_size)
++        layers = int(self.model.config.num_hidden_layers)
++        intermediate = int(self.model.config.intermediate_size)
++        target_model = worker.target_worker.model_runner.model
++        lm_head = getattr(target_model, "lm_head", None)
++        if lm_head is None or not hasattr(lm_head, "weight"):
++            raise RuntimeError("drafter updates require the target LM head")
++        vocab = int(lm_head.weight.shape[0])
++        logit_scratch = estimate_full_vocab_training_scratch_bytes(
++            batch_tokens=max_batch * (config.canvas_tokens - 1),
++            vocab_size=vocab,
++        )
++        activation_scratch = (
++            max_batch
++            * config.canvas_tokens
++            * (layers * (8 * hidden + 3 * intermediate) + 4 * hidden)
++            * 4
++        ) + logit_scratch
++        history_capacity = config.canvas_tokens + max(int(worker.page_size) - 1, 0)
++        kv_gather_scratch = max_batch * history_capacity * layers * hidden * 2 * 4
++        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
++        base_bytes = sum(value.nbytes for value in self.base.values())
++        merge_bytes = (
++            trainable_bytes if config.weight_update_mode == "full" else 2 * base_bytes
++        )
++        candidate_scratch = estimate_functional_optimizer_scratch_bytes(
++            self.optimizer,
++            merge_bytes=merge_bytes,
++        )
++        scratch = (
++            activation_scratch + kv_gather_scratch + trainable_bytes + candidate_scratch
++        )
++
++        def bytes_of(tensors) -> int:
++            return sum(value.nbytes for value in tensors)
++
++        self.runtime.bind_memory(
++            resident_tensors=resident,
++            peak_scratch_bytes=scratch,
++            optimizer_tensors=self.optimizer.state_tensors,
++            trainable_tensors=self.optimizer.master,
++            categories={
++                "active_or_base_bytes": bytes_of(tuple(self.base.values())),
++                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                "gradient_bytes": trainable_bytes,
++                "first_moment_bytes": bytes_of(self.optimizer.first),
++                "second_moment_bytes": bytes_of(self.optimizer.second),
++                "optimizer_metadata_bytes": bytes_of(self.optimizer.metadata_tensors),
++                "staging_bytes": bytes_of(self.inference.staging),
++                "training_activation_bytes": activation_scratch,
++                "kv_gather_scratch_bytes": kv_gather_scratch,
++                "candidate_scratch_bytes": candidate_scratch,
++                "graph_buffer_bytes": 0,
++                "telemetry_bytes": bytes_of(self.runtime.telemetry_tensors),
++            },
++        )
++        server_args._speculative_adaptation_resident_bytes = self.runtime.resident_bytes
++
++    def begin_round(self, batch) -> tuple[int, ...]:
++        request_ids = tuple(request.rid for request in batch.reqs)
++        version = self.runtime.begin_round(request_ids, batch.seq_lens)
++        return (version,) * len(request_ids)
++
++    def capture_canvas(
++        self,
++        batch,
++        *,
++        input_embeds: torch.Tensor,
++        positions: torch.Tensor,
++    ) -> None:
++        if not self.runtime.update_due():
++            self._captured_input = None
++            self._captured_positions = None
++            self._captured_prefix_lens = None
++            self._captured_history = None
++            return
++        self._captured_request_ids = tuple(request.rid for request in batch.reqs)
++        self._captured_input = input_embeds.detach().clone()
++        self._captured_positions = positions.detach().clone()
++        prefix_lens = batch.seq_lens.to(torch.int64)
++        self._captured_prefix_lens = prefix_lens.detach().clone()
++        visible_lens = self.worker._compute_compact_draft_seq_lens(prefix_lens).to(
++            torch.int64
++        )
++        capacity = int(self.config.canvas_tokens) + max(
++            int(self.worker.page_size) - 1, 0
++        )
++        offsets = torch.arange(capacity, device=self.device, dtype=torch.int64)[None, :]
++        history_positions = (prefix_lens - visible_lens)[:, None] + offsets
++        valid = offsets < visible_lens[:, None]
++        table = self.worker.model_runner.req_to_token_pool.req_to_token
++        safe_positions = history_positions.clamp(min=0, max=int(table.shape[1]) - 1)
++        locations = table[
++            batch.req_pool_indices.to(torch.int64)[:, None], safe_positions
++        ]
++        self._captured_history = _CapturedHistory(
++            locations=locations.detach().clone(),
++            valid_mask=valid.detach().clone(),
++        )
++
++    def _effective_parameters(
++        self, trainable: Sequence[torch.Tensor]
++    ) -> dict[str, torch.Tensor]:
++        if self.config.weight_update_mode == "full":
++            return dict(zip(self.names, trainable, strict=True))
++        values = dict(self.base)
++        for name in self.factor_names:
++            a_index, b_index = self.factor_shapes[name]
++            values[name] = self.base[name] + trainable[b_index] @ trainable[a_index]
++        return values
++
++    def _parameter(
++        self,
++        values: dict[str, torch.Tensor],
++        name: str,
++        fallback: torch.Tensor,
++    ) -> torch.Tensor:
++        return values.get(name, fallback.detach())
++
++    def _bias(
++        self,
++        values: dict[str, torch.Tensor],
++        name: str,
++        fallback: torch.Tensor | None,
++    ) -> torch.Tensor | None:
++        if fallback is None:
++            return None
++        return self._parameter(values, name, fallback)
++
++    def _gather_history(
++        self,
++        *,
++        layer_id: int,
++        locations: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        pool = self.worker.draft_model_runner.token_to_kv_pool
++        key_buffer, value_buffer = pool.get_kv_buffer(layer_id)
++
++        def gather(buffer: torch.Tensor) -> torch.Tensor:
++            if buffer.ndim == 3:
++                return buffer[locations]
++            if buffer.ndim == 4:
++                pages = torch.div(
++                    locations, int(self.worker.page_size), rounding_mode="floor"
++                )
++                offsets = torch.remainder(locations, int(self.worker.page_size))
++                return buffer[pages, :, offsets, :]
++            raise RuntimeError(
++                "differentiable DFlash adaptation requires NHD or HND KV "
++                f"layout, got rank {buffer.ndim}"
++            )
++
++        return gather(key_buffer).detach(), gather(value_buffer).detach()
++
++    def _layer_forward(
++        self,
++        values: dict[str, torch.Tensor],
++        *,
++        layer_index: int,
++        hidden: torch.Tensor,
++        residual: torch.Tensor | None,
++        positions: torch.Tensor,
++        history_locations: torch.Tensor,
++        history_valid: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        layer = self.model.layers[layer_index]
++        prefix = f"layers.{layer_index}"
++        if residual is None:
++            residual = hidden
++            norm_weight = self._parameter(
++                values,
++                f"{prefix}.input_layernorm.weight",
++                layer.input_layernorm.weight,
++            )
++            hidden = _rms(
++                hidden,
++                norm_weight.to(hidden.dtype),
++                float(layer.input_layernorm.variance_epsilon),
++            )
++        else:
++            residual = residual + hidden
++            norm_weight = self._parameter(
++                values,
++                f"{prefix}.input_layernorm.weight",
++                layer.input_layernorm.weight,
++            )
++            hidden = _rms(
++                residual,
++                norm_weight.to(residual.dtype),
++                float(layer.input_layernorm.variance_epsilon),
++            )
++        attention = layer.self_attn
++        qkv_weight = self._parameter(
++            values,
++            f"{prefix}.self_attn.qkv_proj.weight",
++            attention.qkv_proj.weight,
++        )
++        qkv = _linear(
++            hidden,
++            qkv_weight,
++            self._bias(
++                values,
++                f"{prefix}.self_attn.qkv_proj.bias",
++                attention.qkv_proj.bias,
++            ),
++        )
++        query, current_key, current_value = qkv.split(
++            [attention.q_size, attention.kv_size, attention.kv_size],
++            dim=-1,
++        )
++        query = query.view(-1, attention.num_heads, attention.head_dim)
++        current_key = current_key.view(-1, attention.num_kv_heads, attention.head_dim)
++        current_value = current_value.view(
++            -1, attention.num_kv_heads, attention.head_dim
++        )
++        q_norm = self._parameter(
++            values,
++            f"{prefix}.self_attn.q_norm.weight",
++            attention.q_norm.weight,
++        )
++        k_norm = self._parameter(
++            values,
++            f"{prefix}.self_attn.k_norm.weight",
++            attention.k_norm.weight,
++        )
++        query = _rms(
++            query,
++            q_norm.to(query.dtype),
++            float(attention.q_norm.variance_epsilon),
++        )
++        current_key = _rms(
++            current_key,
++            k_norm.to(current_key.dtype),
++            float(attention.k_norm.variance_epsilon),
++        )
++        theta = float(getattr(self.model.config, "rope_theta", 1_000_000.0))
++        query = _rope(query, positions, theta=theta)
++        current_key = _rope(current_key, positions, theta=theta)
++        history_key, history_value = self._gather_history(
++            layer_id=int(attention.attn.layer_id),
++            locations=history_locations,
++        )
++        key = torch.cat((history_key, current_key), dim=0)
++        value = torch.cat((history_value, current_value), dim=0)
++        repeat = attention.num_heads // attention.num_kv_heads
++        key = key.repeat_interleave(repeat, dim=1)
++        value = value.repeat_interleave(repeat, dim=1)
++        query = query.transpose(0, 1).unsqueeze(0)
++        key = key.transpose(0, 1).unsqueeze(0)
++        value = value.transpose(0, 1).unsqueeze(0)
++        visible = torch.cat(
++            (
++                history_valid,
++                torch.ones(
++                    current_key.shape[0],
++                    device=self.device,
++                    dtype=torch.bool,
++                ),
++            )
++        )
++        attention_mask = visible[None, None, None, :]
++        attended = F.scaled_dot_product_attention(
++            query,
++            key,
++            value,
++            attn_mask=attention_mask,
++            dropout_p=0.0,
++            is_causal=False,
++            scale=attention.scaling,
++        )
++        attended = attended.squeeze(0).transpose(0, 1).reshape(hidden.shape[0], -1)
++        o_weight = self._parameter(
++            values,
++            f"{prefix}.self_attn.o_proj.weight",
++            attention.o_proj.weight,
++        )
++        attention_output = _linear(
++            attended,
++            o_weight,
++            self._bias(
++                values,
++                f"{prefix}.self_attn.o_proj.bias",
++                attention.o_proj.bias,
++            ),
++        )
++        residual = residual + attention_output
++        post_weight = self._parameter(
++            values,
++            f"{prefix}.post_attention_layernorm.weight",
++            layer.post_attention_layernorm.weight,
++        )
++        mlp_input = _rms(
++            residual,
++            post_weight.to(residual.dtype),
++            float(layer.post_attention_layernorm.variance_epsilon),
++        )
++        gate_weight = self._parameter(
++            values,
++            f"{prefix}.mlp.gate_up_proj.weight",
++            layer.mlp.gate_up_proj.weight,
++        )
++        gate_up = _linear(
++            mlp_input,
++            gate_weight,
++            self._bias(
++                values,
++                f"{prefix}.mlp.gate_up_proj.bias",
++                layer.mlp.gate_up_proj.bias,
++            ),
++        )
++        gate, up = gate_up.chunk(2, dim=-1)
++        activated = F.silu(gate) * up
++        down_weight = self._parameter(
++            values,
++            f"{prefix}.mlp.down_proj.weight",
++            layer.mlp.down_proj.weight,
++        )
++        return (
++            _linear(
++                activated,
++                down_weight,
++                self._bias(
++                    values,
++                    f"{prefix}.mlp.down_proj.bias",
++                    layer.mlp.down_proj.bias,
++                ),
++            ),
++            residual,
++        )
++
++    def _surrogate_hidden(
++        self,
++        values: dict[str, torch.Tensor],
++        input_embeds: torch.Tensor,
++        positions: torch.Tensor,
++        request_ids: tuple[str, ...],
++        history: _CapturedHistory,
++    ) -> torch.Tensor:
++        block = int(self.worker.block_size)
++        batch_size = len(request_ids)
++        inputs = input_embeds.view(batch_size, block, -1)
++        positions = positions.view(batch_size, block)
++        outputs = []
++        for index, _request_id in enumerate(request_ids):
++            hidden = inputs[index]
++            residual = None
++            for layer_index in range(len(self.model.layers)):
++                hidden, residual = self._layer_forward(
++                    values,
++                    layer_index=layer_index,
++                    hidden=hidden,
++                    residual=residual,
++                    positions=positions[index],
++                    history_locations=history.locations[index],
++                    history_valid=history.valid_mask[index],
++                )
++            if residual is not None:
++                hidden = hidden + residual
++            norm = self._parameter(values, "norm.weight", self.model.norm.weight)
++            outputs.append(
++                _rms(
++                    hidden,
++                    norm.to(hidden.dtype),
++                    float(self.model.norm.variance_epsilon),
++                )
++            )
++        return torch.stack(outputs)
++
++    def maybe_launch(
++        self,
++        *,
++        draft_hidden: torch.Tensor,
++        target_logits: torch.Tensor,
++        valid_mask: torch.Tensor,
++        lm_head_weight: torch.Tensor,
++    ) -> None:
++        if not self.runtime.update_due():
++            return
++        if (
++            self._captured_input is None
++            or self._captured_positions is None
++            or self._captured_prefix_lens is None
++            or self._captured_history is None
++        ):
++            self.runtime.disable("missing_current_canvas", exactness=True)
++            return
++        source_round = self.runtime.round
++        source_version = self.runtime.active_version
++        owned_draft = draft_hidden.detach().clone()
++        owned_target = target_logits.detach().clone()
++        owned_mask = valid_mask.detach().clone()
++        source_tensors = (
++            self._captured_input,
++            self._captured_positions,
++            owned_draft,
++            owned_target,
++            owned_mask,
++            self._captured_history.locations,
++            self._captured_history.valid_mask,
++            self._captured_prefix_lens,
++        )
++        try:
++            with self.runtime.side_update(source_tensors):
++                leaves = tuple(
++                    value.detach().clone().requires_grad_(True)
++                    for value in self.optimizer.master
++                )
++                with self.runtime.timing("training"):
++                    values = self._effective_parameters(leaves)
++                    surrogate = self._surrogate_hidden(
++                        values,
++                        self._captured_input,
++                        self._captured_positions,
++                        self._captured_request_ids,
++                        self._captured_history,
++                    )
++                    block = int(self.worker.block_size)
++                    batch_size = len(self._captured_request_ids)
++                    draft_logits = (
++                        surrogate[:, 1:, :].to(lm_head_weight.dtype) @ lm_head_weight.T
++                    ).to(torch.float32)
++                    inference_logits = (
++                        owned_draft.view(batch_size, block, -1)[:, 1:, :].to(
++                            lm_head_weight.dtype
++                        )
++                        @ lm_head_weight.T
++                    )
++                    reconstruction_ok, reconstruction_max_abs = (
++                        _logit_reconstruction_gate(inference_logits, draft_logits)
++                    )
++                    target = owned_target.view(batch_size, block, -1)[
++                        :, : block - 1
++                    ].to(torch.float32)
++                    weights = self.config.loss_position_decay ** torch.arange(
++                        block - 1,
++                        device=self.device,
++                        dtype=torch.float32,
++                    )
++                    weights = weights[None, :] * owned_mask.to(torch.float32)
++                    probability = torch.softmax(target, dim=-1)
++                    loss = (
++                        (
++                            probability
++                            * (
++                                torch.log_softmax(target, dim=-1)
++                                - torch.log_softmax(draft_logits, dim=-1)
++                            )
++                        ).sum(-1)
++                        * weights
++                    ).sum() / weights.sum().clamp_min(1.0)
++                    guarded_objective = torch.where(reconstruction_ok, loss, loss * 0.0)
++                    raw_gradients = torch.autograd.grad(
++                        guarded_objective, leaves, allow_unused=True
++                    )
++                    gradients = tuple(
++                        torch.zeros_like(leaf) if gradient is None else gradient
++                        for leaf, gradient in zip(leaves, raw_gradients, strict=True)
++                    )
++                finite = (
++                    torch.isfinite(loss)
++                    & torch.stack(
++                        [torch.isfinite(gradient).all() for gradient in gradients]
++                    ).all()
++                )
++                with self.runtime.timing("optimizer"):
++                    proposal = self.optimizer.propose(gradients)
++                with self.runtime.timing("merge"):
++                    effective = self._effective_parameters(proposal.parameters)
++                    publish_valid = finite & reconstruction_ok
++                    staged = tuple(
++                        torch.where(
++                            publish_valid,
++                            effective[name],
++                            self.named[name].detach().to(torch.float32),
++                        )
++                        for name in self.names
++                    )
++                    self.inference.stage(staged)
++                self.runtime.submit(
++                    source_round=source_round,
++                    source_version=source_version,
++                    optimizer=self.optimizer,
++                    proposal=proposal,
++                    inference_bank=self.inference,
++                    finite=finite,
++                    loss=loss,
++                    request_ids=self._captured_request_ids,
++                    prefix_lens=self._captured_prefix_lens,
++                    reconstruction_ok=reconstruction_ok,
++                    reconstruction_max_abs=reconstruction_max_abs,
++                )
++        except torch.cuda.OutOfMemoryError:
++            self.runtime.counters["oom_events"] += 1
++            self.runtime.disable("adaptation_cuda_oom")
++        except Exception as error:
++            logger.exception("Disabling DFlash adaptation after update failure")
++            self.runtime.counters["fallbacks"] += 1
++            self.runtime.disable(f"adaptation_update_failed:{type(error).__name__}")
++
++    def after_commit(
++        self,
++        batch,
++        new_seq_lens: torch.Tensor,
++        *,
++        accepted_drafts: torch.Tensor,
++        verified_drafts: torch.Tensor,
++        committed_tokens: torch.Tensor,
++    ) -> None:
++        request_ids = tuple(request.rid for request in batch.reqs)
++        self.runtime.record_round_outcome(
++            request_ids,
++            verified_drafts=verified_drafts,
++            accepted_drafts=accepted_drafts,
++            committed_tokens=committed_tokens,
++        )
++        self.runtime.record_device_commit(request_ids, new_seq_lens)
++
++    def finish_request(self, request_id: str) -> None:
++        self.runtime.finish_request(request_id)
++
++    def abort_request(self, request_id: str) -> None:
++        self.runtime.abort_request(request_id)
++
++    def reset(self) -> None:
++        self.runtime.reset()
++        self.optimizer.reset(self.initial_trainable)
++        effective = self._effective_parameters(self.optimizer.master)
++        self.inference.stage(tuple(effective[name] for name in self.names))
++        self.inference.publish()
++        self._captured_input = None
++        self._captured_positions = None
++        self._captured_prefix_lens = None
++        self._captured_request_ids = ()
++        self._captured_history = None
++
++    def note_load(
++        self,
++        *,
++        running_requests: int,
++        waiting_requests: int,
++        graph_replay: bool,
++    ) -> None:
++        self.runtime.note_load(
++            running_requests=running_requests,
++            waiting_requests=waiting_requests,
++            graph_replay=graph_replay,
++        )
++
++    def diagnostics(self) -> dict:
++        return self.runtime.diagnostics()
++
++
++def maybe_build_dflash_drafter_adapter(server_args, worker):
++    config = load_online_adaptation(server_args)
++    if config is None or config.parameter_scope != "drafter":
++        return None
++    return DFlashDrafterAdapter(server_args, worker)
+diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
+new file mode 100644
+index 0000000..54be892
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_valid_mask.py
+@@ -0,0 +1,138 @@
++"""Shared semantic proposal mask for linear speculative backends."""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import torch
++
++
++def request_boundary_metadata(
++    requests: Sequence[object],
++) -> tuple[list[int], list[tuple[int, ...]], list[bool]]:
++    """Extract max-token and terminal semantics once for every backend."""
++    remaining: list[int] = []
++    terminal_ids: list[tuple[int, ...]] = []
++    ignore_eos: list[bool] = []
++    for request in requests:
++        generated = len(request.output_ids)
++        sampling = request.sampling_params
++        remaining.append(max(int(sampling.max_new_tokens) - generated, 0))
++        stops = set(getattr(request, "eos_token_ids", None) or ())
++        stops.update(getattr(sampling, "stop_token_ids", None) or ())
++        terminal_ids.append(tuple(sorted(int(token) for token in stops)))
++        ignore_eos.append(bool(getattr(sampling, "ignore_eos", False)))
++    return remaining, terminal_ids, ignore_eos
++
++
++def semantic_proposal_semantics(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return valid teachers, accepted drafts, and semantic commits."""
++    if proposal_tokens.ndim != 2:
++        raise ValueError("proposal_tokens must have shape (batch, depth)")
++    batch, depth = proposal_tokens.shape
++    if correct_len.shape != (batch,):
++        raise ValueError("correct_len must have one value per request")
++    if not (
++        len(remaining_output_tokens)
++        == len(terminal_token_ids)
++        == len(ignore_eos)
++        == batch
++    ):
++        raise ValueError("request-boundary metadata length mismatch")
++    positions = torch.arange(
++        depth, device=proposal_tokens.device, dtype=correct_len.dtype
++    )[None, :]
++    # The first rejected proposal has a valid target teacher distribution;
++    # positions after it were conditioned on an invalid draft suffix.
++    valid = positions <= correct_len[:, None]
++    remaining = torch.tensor(
++        remaining_output_tokens,
++        device=proposal_tokens.device,
++        dtype=correct_len.dtype,
++    )
++    valid &= positions < remaining[:, None]
++    # The target bonus is committed only when the accepted draft prefix and
++    # request boundary leave room for it.
++    committed = torch.minimum(correct_len + 1, remaining)
++    for index, terminal_ids in enumerate(terminal_token_ids):
++        if ignore_eos[index] or not terminal_ids:
++            continue
++        terminals = torch.tensor(
++            tuple(terminal_ids),
++            device=proposal_tokens.device,
++            dtype=proposal_tokens.dtype,
++        )
++        hit = (proposal_tokens[index, :, None] == terminals).any(-1)
++        accepted_hit = hit & (positions[0] < correct_len[index])
++        earlier_terminal = (
++            torch.cat(
++                (
++                    torch.zeros((1,), device=proposal_tokens.device, dtype=torch.bool),
++                    accepted_hit[:-1],
++                )
++            ).cumsum(0)
++            > 0
++        )
++        valid[index] &= ~earlier_terminal
++        terminal_positions = torch.where(
++            accepted_hit,
++            positions[0] + 1,
++            torch.full_like(positions[0], depth + 1),
++        )
++        committed[index] = torch.minimum(committed[index], terminal_positions.min())
++    accepted = torch.minimum(correct_len, committed)
++    return valid, accepted, committed
++
++
++def semantic_valid_mask(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> torch.Tensor:
++    """Mask rejected suffix, request boundary, and accepted terminal suffix."""
++    valid, _, _ = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
++    return valid
++
++
++def semantic_outcome_lengths(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    bonus_tokens: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return accepted drafts and committed tokens after request semantics.
++
++    A normal verification commits ``correct_len`` drafts plus one target bonus.
++    A request boundary may cut inside the accepted prefix, while an accepted
++    terminal token commits that token but neither its suffix nor the bonus.
++    """
++    batch = proposal_tokens.shape[0] if proposal_tokens.ndim == 2 else -1
++    if bonus_tokens.shape != (batch,):
++        raise ValueError("outcome lengths require one value per request")
++    _, accepted, committed = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
++    return accepted, committed

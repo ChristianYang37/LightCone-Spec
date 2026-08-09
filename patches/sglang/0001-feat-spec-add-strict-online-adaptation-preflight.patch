@@ -1,13 +1,13 @@
-From 2ab26606223f9d0353bff62e875317d856452fbb Mon Sep 17 00:00:00 2001
+From f89f18c71a0e680b7da99859787a332bdb7b81b6 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
-Date: Sun, 9 Aug 2026 03:22:17 +0800
-Subject: [PATCH 1/6] feat(spec): add focused online adaptation preflight
+Date: Sun, 9 Aug 2026 15:36:44 +0800
+Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight
 
 ---
  .../sglang/srt/arg_groups/speculative_hook.py |   6 +
- python/sglang/srt/server_args.py              |  23 ++
- .../speculative/online_adaptation_config.py   | 286 ++++++++++++++++++
- 3 files changed, 315 insertions(+)
+ python/sglang/srt/server_args.py              |  23 +
+ .../speculative/online_adaptation_config.py   | 394 ++++++++++++++++++
+ 3 files changed, 423 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
@@ -63,16 +63,18 @@ index 1182ccb..f6fb45a 100644
      # separate engines, currently connected by a ZMQ IPC mesh.
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
-index 0000000..62bbece
+index 0000000..4f02c30
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,394 @@
 +"""Narrow fail-closed parser for LightCone schema-v2 runtime configuration."""
 +
 +from __future__ import annotations
 +
 +import hashlib
 +import json
++import math
++import os
 +from dataclasses import dataclass
 +from pathlib import Path
 +from typing import Any
@@ -87,11 +89,16 @@ index 0000000..62bbece
 +    beta2: float
 +    epsilon: float
 +    grad_clip: float
++    momentum: float | None = None
++    muon_ns_steps: int | None = None
++    muon_auxiliary_learning_rate: float | None = None
++    muon_auxiliary_weight_decay: float | None = None
 +
 +
 +@dataclass(frozen=True)
 +class OnlineAdaptationConfig:
 +    method: str
++    algorithm: str
 +    weight_update_mode: str
 +    parameter_scope: str
 +    adaptation_group_id: str
@@ -104,12 +111,14 @@ index 0000000..62bbece
 +    target_revision: str
 +    drafter_revision: str
 +    sampling_profile_sha256: str
++    telemetry_detail: str
 +
 +    @property
 +    def sha256(self) -> str:
 +        payload = {
 +            "schema_version": 2,
 +            "method": self.method,
++            "algorithm": self.algorithm,
 +            "weight_update_mode": self.weight_update_mode,
 +            "parameter_scope": self.parameter_scope,
 +            "kv_history_policy": "frozen",
@@ -127,13 +136,11 @@ index 0000000..62bbece
 +            "sampling_profile_sha256": self.sampling_profile_sha256,
 +            "telemetry_detail": self.telemetry_detail,
 +        }
-+        encoded = json.dumps(
-+            payload, sort_keys=True, separators=(",", ":")
-+        ).encode()
++        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 +        return hashlib.sha256(encoded).hexdigest()
 +
 +    @classmethod
-+    def load(cls, path: str | Path) -> "OnlineAdaptationConfig":
++    def load(cls, path: str | Path) -> OnlineAdaptationConfig:
 +        source = Path(path)
 +        try:
 +            value = json.loads(source.read_text(encoding="utf-8"))
@@ -142,10 +149,11 @@ index 0000000..62bbece
 +                f"cannot load speculative adaptation config {source}: {exc}"
 +            ) from exc
 +        if not isinstance(value, dict):
-+            raise ValueError("speculative adaptation config must be an object")
++            raise TypeError("speculative adaptation config must be an object")
 +        expected = {
 +            "schema_version",
 +            "method",
++            "algorithm",
 +            "weight_update_mode",
 +            "parameter_scope",
 +            "kv_history_policy",
@@ -161,6 +169,7 @@ index 0000000..62bbece
 +            "target_revision",
 +            "drafter_revision",
 +            "sampling_profile_sha256",
++            "telemetry_detail",
 +        }
 +        unknown = set(value) - expected
 +        missing = expected - set(value)
@@ -173,6 +182,8 @@ index 0000000..62bbece
 +            raise ValueError("speculative adaptation requires schema_version=2")
 +        if value["method"] not in {"tts", "naive_async"}:
 +            raise ValueError("online adaptation method must be tts or naive_async")
++        if value["algorithm"] not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
++            raise ValueError("unknown speculative adaptation algorithm")
 +        if value["weight_update_mode"] not in {"residual", "lora", "full"}:
 +            raise ValueError("unknown weight_update_mode")
 +        if value["parameter_scope"] not in {"tail", "drafter"}:
@@ -194,14 +205,17 @@ index 0000000..62bbece
 +            raise ValueError("only cohort-shared parameters are supported")
 +        if value["max_in_flight"] != 1:
 +            raise ValueError("max_in_flight must equal one")
-+        for field in (
-+            "adaptation_group_id",
-+            "tenant_id",
-+            "target_revision",
-+            "drafter_revision",
-+        ):
++        for field in ("adaptation_group_id", "tenant_id"):
 +            if not isinstance(value[field], str) or not value[field]:
 +                raise ValueError(f"{field} must be a non-empty string")
++        for field in ("target_revision", "drafter_revision"):
++            revision = value[field]
++            if (
++                not isinstance(revision, str)
++                or len(revision) != 40
++                or any(char not in "0123456789abcdef" for char in revision)
++            ):
++                raise ValueError(f"{field} must be an immutable Git SHA")
 +        profile = value["sampling_profile_sha256"]
 +        if (
 +            not isinstance(profile, str)
@@ -209,6 +223,9 @@ index 0000000..62bbece
 +            or any(char not in "0123456789abcdef" for char in profile)
 +        ):
 +            raise ValueError("sampling_profile_sha256 must be lowercase SHA-256")
++        telemetry_detail = value["telemetry_detail"]
++        if telemetry_detail not in {"headline", "profile"}:
++            raise ValueError("telemetry_detail must be headline or profile")
 +        stride = value["stride"]
 +        canvas_tokens = value["canvas_tokens"]
 +        if (
@@ -217,15 +234,18 @@ index 0000000..62bbece
 +            or stride < 1
 +            or not isinstance(canvas_tokens, int)
 +            or isinstance(canvas_tokens, bool)
-+            or canvas_tokens < 1
++            or canvas_tokens < 2
 +        ):
-+            raise ValueError("stride and canvas_tokens must be positive integers")
++            raise ValueError(
++                "stride must be positive and canvas_tokens must be at least two"
++            )
 +        decay = float(value["loss_position_decay"])
 +        if not 0.0 < decay <= 1.0:
 +            raise ValueError("loss_position_decay must be in (0, 1]")
 +        optimizer = _parse_optimizer(value["optimizer"])
 +        return cls(
 +            method=value["method"],
++            algorithm=value["algorithm"],
 +            weight_update_mode=value["weight_update_mode"],
 +            parameter_scope=value["parameter_scope"],
 +            adaptation_group_id=value["adaptation_group_id"],
@@ -238,12 +258,13 @@ index 0000000..62bbece
 +            target_revision=value["target_revision"],
 +            drafter_revision=value["drafter_revision"],
 +            sampling_profile_sha256=profile,
++            telemetry_detail=telemetry_detail,
 +        )
 +
 +
 +def _parse_optimizer(value: Any) -> OnlineOptimizerConfig:
 +    if not isinstance(value, dict):
-+        raise ValueError("optimizer must be an object")
++        raise TypeError("optimizer must be an object")
 +    expected = {
 +        "name",
 +        "learning_rate",
@@ -252,24 +273,79 @@ index 0000000..62bbece
 +        "beta2",
 +        "epsilon",
 +        "grad_clip",
++        "momentum",
++        "muon_ns_steps",
++        "muon_auxiliary_learning_rate",
++        "muon_auxiliary_weight_decay",
 +    }
 +    if set(value) != expected:
 +        raise ValueError("optimizer fields do not match schema-v2")
 +    name = value["name"]
-+    if name not in {"adam", "adamw"}:
-+        raise ValueError("TTS/L0 tuning supports Adam or AdamW")
++    if name not in {"adam", "adamw", "sgdm", "nag", "muon", "lion"}:
++        raise ValueError("unknown TTS/L0 optimizer")
 +    learning_rate = float(value["learning_rate"])
 +    weight_decay = float(value["weight_decay"])
 +    beta1 = float(value["beta1"])
 +    beta2 = float(value["beta2"])
 +    epsilon = float(value["epsilon"])
 +    grad_clip = float(value["grad_clip"])
++    momentum_raw = value["momentum"]
++    momentum = None if momentum_raw is None else float(momentum_raw)
++    ns_steps = value["muon_ns_steps"]
++    auxiliary_lr_raw = value["muon_auxiliary_learning_rate"]
++    auxiliary_decay_raw = value["muon_auxiliary_weight_decay"]
++    auxiliary_lr = None if auxiliary_lr_raw is None else float(auxiliary_lr_raw)
++    auxiliary_decay = (
++        None if auxiliary_decay_raw is None else float(auxiliary_decay_raw)
++    )
++    if not all(
++        math.isfinite(number)
++        for number in (
++            learning_rate,
++            weight_decay,
++            beta1,
++            beta2,
++            epsilon,
++            grad_clip,
++        )
++    ):
++        raise ValueError("optimizer values must be finite")
++    if any(
++        number is not None and not math.isfinite(number)
++        for number in (momentum, auxiliary_lr, auxiliary_decay)
++    ):
++        raise ValueError("optional optimizer values must be finite")
 +    if learning_rate <= 0 or epsilon <= 0 or grad_clip <= 0:
 +        raise ValueError("optimizer lr, epsilon, and grad_clip must be positive")
 +    if not 0 < beta1 < 1 or not 0 < beta2 < 1:
 +        raise ValueError("optimizer betas must be in (0, 1)")
-+    if weight_decay < 0 or (name != "adamw" and weight_decay != 0):
-+        raise ValueError("weight decay is non-negative and AdamW-only")
++    if weight_decay < 0 or (
++        name not in {"adamw", "sgdm", "nag", "muon", "lion"} and weight_decay != 0
++    ):
++        raise ValueError("weight decay is unsupported for this optimizer")
++    momentum_names = {"sgdm", "nag", "muon"}
++    if name in momentum_names:
++        if momentum is None or not 0 < momentum < 1:
++            raise ValueError(f"{name} requires momentum in (0, 1)")
++    elif momentum is not None:
++        raise ValueError(f"momentum is not valid for optimizer={name}")
++    if name in {"sgdm", "nag"} and (beta1 != 0.9 or beta2 != 0.999 or epsilon != 1e-8):
++        raise ValueError(f"unused Adam fields must stay canonical for optimizer={name}")
++    if name == "lion" and epsilon != 1e-8:
++        raise ValueError("unused epsilon must stay canonical for optimizer=lion")
++    if name == "muon":
++        if (
++            not isinstance(ns_steps, int)
++            or isinstance(ns_steps, bool)
++            or not 1 <= ns_steps <= 20
++        ):
++            raise ValueError("Muon requires muon_ns_steps in [1, 20]")
++        if auxiliary_lr is None or auxiliary_lr <= 0:
++            raise ValueError("Muon requires positive auxiliary AdamW lr")
++        if auxiliary_decay is None or auxiliary_decay < 0:
++            raise ValueError("Muon auxiliary weight decay must be non-negative")
++    elif any(item is not None for item in (ns_steps, auxiliary_lr, auxiliary_decay)):
++        raise ValueError("Muon-only fields require optimizer=muon")
 +    return OnlineOptimizerConfig(
 +        name,
 +        learning_rate,
@@ -278,6 +354,10 @@ index 0000000..62bbece
 +        beta2,
 +        epsilon,
 +        grad_clip,
++        momentum,
++        ns_steps,
++        auxiliary_lr,
++        auxiliary_decay,
 +    )
 +
 +
@@ -291,65 +371,93 @@ index 0000000..62bbece
 +    metrics_enabled = bool(
 +        getattr(server_args, "speculative_speed_study_metrics", False)
 +    )
-+    reserve_mb = int(
-+        getattr(server_args, "speculative_adaptation_reserve_mb", 0)
-+    )
++    reserve_mb = int(getattr(server_args, "speculative_adaptation_reserve_mb", 0))
 +    if reserve_mb < 0:
 +        raise ValueError("speculative_adaptation_reserve_mb cannot be negative")
 +    if config is None:
-+        if reserve_mb:
++        if reserve_mb or getattr(
++            server_args, "speculative_adaptation_telemetry_path", None
++        ):
 +            raise ValueError(
-+                "adaptation reserve is forbidden without an adaptation config"
++                "adaptation reserve and telemetry are forbidden without an "
++                "adaptation config"
 +            )
 +        if not metrics_enabled:
 +            return
 +        backend = str(server_args.speculative_algorithm or "").upper()
-+        if backend != "DFLASH":
-+            raise ValueError("speed-study metrics currently require DFLASH")
-+        if not bool(
-+            getattr(server_args, "speculative_use_rejection_sampling", False)
-+        ):
-+            raise ValueError(
-+                "speed-study metrics require exact rejection sampling"
-+            )
++        if backend not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
++            raise ValueError("speed-study metrics require a supported backend")
++        if not bool(getattr(server_args, "speculative_use_rejection_sampling", False)):
++            raise ValueError("speed-study metrics require exact rejection sampling")
 +        if float(server_args.speculative_accept_threshold_single) != 1.0:
 +            raise ValueError("speed-study metrics require accept threshold single=1")
 +        if float(server_args.speculative_accept_threshold_acc) != 1.0:
 +            raise ValueError("speed-study metrics require accept threshold acc=1")
 +        return
 +    if not metrics_enabled:
-+        raise ValueError(
-+            "online adaptation requires --speculative-speed-study-metrics"
-+        )
++        raise ValueError("online adaptation requires --speculative-speed-study-metrics")
 +    backend = str(server_args.speculative_algorithm or "").upper()
++    if backend != config.algorithm:
++        raise ValueError(
++            "adaptation config/backend mismatch: "
++            f"config={config.algorithm}, runtime={backend}"
++        )
 +    if backend not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
-+        raise ValueError(
-+            "online adaptation requires DFLASH, DSPARK, EAGLE, or EAGLE3"
-+        )
-+    if config.parameter_scope == "drafter" and backend != "DFLASH":
-+        raise ValueError(
-+            "drafter-scope Full/LoRA is currently implemented for DFLASH only"
-+        )
++        raise ValueError("unsupported online adaptation backend")
++    if (
++        int(getattr(server_args, "tp_size", 1)) != 1
++        or int(getattr(server_args, "dp_size", 1)) != 1
++    ):
++        raise ValueError("focused online adaptation currently requires TP=1 and DP=1")
 +    if config.parameter_scope == "drafter" and config.weight_update_mode == "residual":
 +        raise ValueError("residual updates cannot target the drafter")
++    if backend != "DFLASH" and config.parameter_scope != "tail":
++        raise ValueError(
++            f"{backend} online adaptation currently supports tail scope only"
++        )
++    if backend in {"EAGLE", "EAGLE3"}:
++        if int(getattr(server_args, "speculative_eagle_topk", 0) or 0) != 1:
++            raise ValueError("adapted EAGLE/EAGLE3 requires topk=1")
++        if bool(getattr(server_args, "enable_multi_layer_eagle", False)):
++            raise ValueError("adapted EAGLE/EAGLE3 does not support multi-layer mode")
++        if bool(getattr(server_args, "speculative_adaptive", False)):
++            raise ValueError("adapted EAGLE/EAGLE3 requires a fixed draft depth")
++        if getattr(server_args, "speculative_token_map", None) is not None:
++            raise ValueError("adapted EAGLE requires a full-vocabulary proposal head")
++        steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
++        width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
++        if steps < 1 or width != steps + 1:
++            raise ValueError("adapted EAGLE/EAGLE3 requires draft_tokens=steps+1")
++    else:
++        width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
++    if config.canvas_tokens != width:
++        raise ValueError(
++            "adaptation canvas_tokens must equal speculative_num_draft_tokens"
++        )
++    if (
++        backend == "DSPARK"
++        and os.environ.get("SGLANG_RAGGED_VERIFY_MODE", "static").strip().lower()
++        != "static"
++    ):
++        raise ValueError(
++            "adapted DSpark requires SGLANG_RAGGED_VERIFY_MODE=static "
++            "so every proposal position has a target teacher"
++        )
 +    if getattr(server_args, "speculative_draft_model_quantization", None):
 +        raise ValueError("online updates require an unquantized draft model")
++    if str(getattr(server_args, "kv_cache_dtype", "auto")) != "auto":
++        raise ValueError(
++            "online adaptation currently requires unquantized KV cache dtype=auto"
++        )
 +    if bool(getattr(server_args, "enable_two_batch_overlap", False)):
 +        raise ValueError("online adaptation does not support two-batch overlap")
 +    if bool(getattr(server_args, "enable_pdmux", False)):
 +        raise ValueError("online adaptation does not support PD multiplexing")
-+    if not bool(
-+        getattr(server_args, "speculative_use_rejection_sampling", False)
-+    ):
-+        raise ValueError(
-+            "focused online adaptation requires exact rejection sampling"
-+        )
++    if not bool(getattr(server_args, "speculative_use_rejection_sampling", False)):
++        raise ValueError("focused online adaptation requires exact rejection sampling")
 +    if float(server_args.speculative_accept_threshold_single) != 1.0:
 +        raise ValueError("exact adaptation requires accept threshold single=1")
 +    if float(server_args.speculative_accept_threshold_acc) != 1.0:
 +        raise ValueError("exact adaptation requires accept threshold acc=1")
 +    if reserve_mb <= 0:
-+        raise ValueError(
-+            "online adaptation requires an explicit pre-KV HBM reserve"
-+        )
-+
++        raise ValueError("online adaptation requires an explicit pre-KV HBM reserve")

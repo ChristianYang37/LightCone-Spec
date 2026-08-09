@@ -10,9 +10,10 @@ distributed with this repository. The patches target:
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
 
-The patch series changes SGLang to add focused DFlash Full/LoRA and cache-safe
-tail adaptation, versioned frozen-KV lifecycle, memory accounting, and evidence
-hooks for the Static/TTS/L0 study.
+The patch series changes SGLang to add focused DFlash Full/LoRA, cache-safe
+DFlash/DSpark/EAGLE/EAGLE3 tail adaptation, resident optimizer choices,
+versioned frozen-KV lifecycle, memory accounting, and evidence hooks for the
+Static/TTS/L0 study.
 See patches/sglang/manifest.json for the exact patch and tree identities.
 
 Models and datasets are external artifacts. They are not distributed by this

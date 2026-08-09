@@ -4,11 +4,11 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "605337d5bceb98cb224eb84085e4e6a4c0cd932e",
+  "expected_tree": "fdc30ad9e464af3da46bdd4f11cd01c0f5b002b9",
   "patches": [
     {
-      "file": "0001-feat-spec-add-focused-online-adaptation-preflight.patch",
-      "sha256": "54ef4c4a5540e9dc5bb03baec054608fbe107527c9e459c90c2f5c6e18156616",
+      "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
+      "sha256": "2e1bd76905b4bb32a1086227732f9fe87f6bdde85c6cca8c928db33c1b76bb28",
       "files": [
         "python/sglang/srt/arg_groups/speculative_hook.py",
         "python/sglang/srt/server_args.py",
@@ -16,49 +16,53 @@
       ]
     },
     {
-      "file": "0002-feat-spec-add-cohort-version-and-event-runtime.patch",
-      "sha256": "131373bd62a0b70365d8ebf3226df10886889f3b4cf2528b01d4e97cb8520098",
+      "file": "0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch",
+      "sha256": "ad29ffdb28f655163b541e406e7478cd00b48cb0da10587639561cd4b5f9e2f5",
       "files": [
         "python/sglang/srt/speculative/online_adaptation_runtime.py"
       ]
     },
     {
-      "file": "0003-feat-dflash-add-differentiable-drafter-Full-and-LoRA.patch",
-      "sha256": "8aaaa2804b18f7819a848fe1691601643332d5e722feb35b531286f76cdafaac",
+      "file": "0003-feat-dflash-add-differentiable-online-update-path.patch",
+      "sha256": "0b87df5b85edd9cf99f28cbc73f0a49815ea84e6058c4265a43eed5e84e695ef",
       "files": [
         "python/sglang/srt/speculative/dflash_online_adaptation.py",
-        "python/sglang/srt/speculative/dflash_worker_v2.py",
         "python/sglang/srt/speculative/online_valid_mask.py"
       ]
     },
     {
-      "file": "0004-feat-spec-add-cache-safe-output-tail-ablations.patch",
-      "sha256": "d7f26418733a692cdbba393a4a6dfec641481df9f4ff1892bcc831e2943761ec",
+      "file": "0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch",
+      "sha256": "b006249ea11d0ca527a9edd62d4136e7ac32965bef9fd3bd8af008ab13f04e2e",
       "files": [
+        "python/sglang/srt/managers/overlap_utils.py",
+        "python/sglang/srt/models/deepseek_v4_dspark.py",
+        "python/sglang/srt/models/dspark.py",
         "python/sglang/srt/speculative/dflash_worker_v2.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_draft.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_proposal.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_verify.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
+        "python/sglang/srt/speculative/eagle_info.py",
+        "python/sglang/srt/speculative/eagle_worker_common.py",
+        "python/sglang/srt/speculative/eagle_worker_v2.py",
+        "python/sglang/srt/speculative/online_eagle_adaptation.py",
         "python/sglang/srt/speculative/online_tail_adaptation.py"
       ]
     },
     {
-      "file": "0005-feat-spec-harden-memory-lifecycle-and-profiling.patch",
-      "sha256": "19f5663dc23b19919016fc7e3bb22beba3c2d7047b099f7c3ded363262545072",
+      "file": "0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch",
+      "sha256": "1f9861051027a50c23e10e50ffa6d49cf85d14c5cc79e7941aac67d985669fb9",
       "files": [
         "python/sglang/srt/managers/scheduler.py",
         "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
         "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
         "python/sglang/srt/mem_cache/kv_cache_configurator.py",
-        "python/sglang/srt/speculative/base_spec_worker.py",
-        "python/sglang/srt/speculative/dflash_online_adaptation.py",
-        "python/sglang/srt/speculative/dflash_worker_v2.py",
-        "python/sglang/srt/speculative/online_adaptation_config.py",
-        "python/sglang/srt/speculative/online_adaptation_runtime.py",
-        "python/sglang/srt/speculative/online_tail_adaptation.py",
-        "python/sglang/srt/speculative/online_valid_mask.py"
+        "python/sglang/srt/speculative/base_spec_worker.py"
       ]
     },
     {
-      "file": "0006-test-spec-cover-focused-adaptation-protocols.patch",
-      "sha256": "b097dc544ea1ed2b338655ea4c79d2e38222d890d4918625319b0dbd8eb08bdb",
+      "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
+      "sha256": "291681ffacebe74f04a54a78756baf54cc61c916ae6f81da08352853ca8469be",
       "files": [
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]

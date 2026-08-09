@@ -1,25 +1,26 @@
-From 4a035e80997dcefabdd346124d4de3834303ad4c Mon Sep 17 00:00:00 2001
+From 38149a3bbd53108fd2aded3b1913fe5dcc9f47ad Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
-Date: Sun, 9 Aug 2026 03:24:11 +0800
-Subject: [PATCH 2/6] feat(spec): add cohort version and event runtime
+Date: Sun, 9 Aug 2026 15:36:44 +0800
+Subject: [PATCH 2/6] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 1065 +++++++++++++++++
- 1 file changed, 1065 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 1384 +++++++++++++++++
+ 1 file changed, 1384 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000..38c9329
+index 0000000..0dc839b
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,1384 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
 +
 +import hashlib
 +import json
++import math
 +from collections import deque
 +from collections.abc import Iterator, Sequence
 +from contextlib import contextmanager
@@ -30,6 +31,90 @@ index 0000000..38c9329
 +from sglang.srt.speculative.online_adaptation_config import (
 +    OnlineAdaptationConfig,
 +)
++
++_MUON_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
++
++
++def notify_online_adapters(
++    adapters: Sequence[object | None],
++    *,
++    action: str,
++    request_id: str,
++) -> None:
++    """Apply one request lifecycle event to every active parameterization."""
++    if action not in {"finish", "abort"}:
++        raise ValueError("unknown online-adapter lifecycle action")
++    callback_name = f"{action}_request"
++    for adapter in adapters:
++        if adapter is not None:
++            getattr(adapter, callback_name)(request_id)
++
++
++def zeroth_power_newton_schulz(
++    matrix: torch.Tensor,
++    *,
++    steps: int,
++    epsilon: float,
++) -> torch.Tensor:
++    """Orthogonalize one Muon matrix on device without a host round trip."""
++    if matrix.ndim != 2:
++        raise ValueError("Muon orthogonalization requires a matrix")
++    if not 1 <= steps <= 20:
++        raise ValueError("Muon Newton--Schulz steps must be in [1, 20]")
++    work = matrix.to(torch.bfloat16)
++    transposed = work.shape[0] > work.shape[1]
++    if transposed:
++        work = work.T
++    work = work / work.norm().clamp_min(epsilon)
++    a, b, c = _MUON_COEFFICIENTS
++    for _ in range(steps):
++        gram = work @ work.T
++        polynomial = torch.addmm(gram, gram, gram, beta=b, alpha=c)
++        work = torch.addmm(work, polynomial, work, beta=a)
++    if transposed:
++        work = work.T
++    return work.to(torch.float32)
++
++
++def estimate_full_vocab_training_scratch_bytes(
++    *, batch_tokens: int, vocab_size: int
++) -> int:
++    """Conservative peak for update-only target-to-draft KL tensors.
++
++    The budget covers model-dtype target/draft copies plus the FP32 target,
++    draft, probability, log-probability, and KL intermediates. It is an HBM
++    admission bound, not a claim that the allocator retains every tensor at
++    the same instant.
++    """
++    if batch_tokens < 1 or vocab_size < 1:
++        raise ValueError("full-vocabulary scratch dimensions must be positive")
++    bytes_per_logit = 8 * 4
++    return int(batch_tokens) * int(vocab_size) * bytes_per_logit
++
++
++def estimate_functional_optimizer_scratch_bytes(
++    optimizer,
++    *,
++    merge_bytes: int,
++) -> int:
++    """Peak candidate state outside gradients and model activations.
++
++    The functional path retains trainable leaves, an optimizer proposal, and
++    the validity-guarded proposal copied into the pending candidate. Backend
++    publication may additionally materialize merged/staged inference tensors.
++    Counting actual moment layouts keeps one-state optimizers from inheriting
++    Adam's two-state reserve while still preventing Adam under-accounting.
++    """
++
++    if merge_bytes < 0:
++        raise ValueError("optimizer merge scratch cannot be negative")
++
++    def bytes_of(tensors: Sequence[torch.Tensor]) -> int:
++        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
++
++    master = bytes_of(optimizer.master)
++    moments = bytes_of(optimizer.first) + bytes_of(optimizer.second)
++    return master + 2 * (master + moments) + int(merge_bytes)
 +
 +
 +@dataclass(frozen=True)
@@ -60,34 +145,101 @@ index 0000000..38c9329
 +            raise ValueError("optimizer parameter layout is empty")
 +        self.config = config
 +        self.master = tuple(
-+            parameter.detach().to(torch.float32).clone()
-+            for parameter in parameters
++            parameter.detach().to(torch.float32).clone() for parameter in parameters
 +        )
-+        self.first = tuple(torch.zeros_like(value) for value in self.master)
-+        self.second = tuple(torch.zeros_like(value) for value in self.master)
-+        self._step = torch.zeros(
-+            (), dtype=torch.int64, device=self.master[0].device
++        first_names = {"adam", "adamw", "sgdm", "nag", "muon", "lion"}
++        self.first = tuple(
++            (
++                torch.zeros_like(value)
++                if config.name in first_names
++                else torch.empty(0, dtype=torch.float32, device=value.device)
++            )
++            for value in self.master
 +        )
++        self.second = tuple(
++            (
++                torch.zeros_like(value)
++                if config.name in {"adam", "adamw"}
++                or (config.name == "muon" and value.ndim != 2)
++                else torch.empty(0, dtype=torch.float32, device=value.device)
++            )
++            for value in self.master
++        )
++        self._step = torch.zeros((), dtype=torch.int64, device=self.master[0].device)
 +
 +    @property
 +    def step(self) -> int:
 +        """Expose the step only to diagnostics/tests, never the hot path."""
 +        return int(self._step.item())
 +
++    @property
++    def state_tensors(self) -> tuple[torch.Tensor, ...]:
++        """All persistent optimizer tensors, including scalar metadata."""
++        return self.master + self.first + self.second + self.metadata_tensors
++
++    @property
++    def metadata_tensors(self) -> tuple[torch.Tensor, ...]:
++        return (self._step,)
++
 +    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
 +        if len(gradients) != len(self.master):
 +            raise ValueError("optimizer gradient layout mismatch")
-+        gradients = tuple(
-+            gradient.detach().to(torch.float32) for gradient in gradients
++        gradients = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
++        norm = (
++            torch.stack([gradient.square().sum() for gradient in gradients])
++            .sum()
++            .sqrt()
 +        )
-+        norm = torch.stack(
-+            [gradient.square().sum() for gradient in gradients]
-+        ).sum().sqrt()
-+        scale = torch.clamp(
-+            self.config.grad_clip / (norm + 1e-12), max=1.0
-+        )
++        scale = torch.clamp(self.config.grad_clip / (norm + 1e-12), max=1.0)
 +        gradients = tuple(gradient * scale for gradient in gradients)
 +        step = self._step + 1
++        if self.config.name in {"sgdm", "nag"}:
++            momentum = self.config.momentum
++            if momentum is None:
++                raise AssertionError("validated momentum optimizer is incomplete")
++            effective = tuple(
++                gradient + self.config.weight_decay * parameter
++                for parameter, gradient in zip(self.master, gradients, strict=True)
++            )
++            first = tuple(
++                momentum * moment + gradient
++                for moment, gradient in zip(self.first, effective, strict=True)
++            )
++            directions = (
++                first
++                if self.config.name == "sgdm"
++                else tuple(
++                    gradient + momentum * moment
++                    for gradient, moment in zip(effective, first, strict=True)
++                )
++            )
++            parameters = tuple(
++                parameter - self.config.learning_rate * direction
++                for parameter, direction in zip(self.master, directions, strict=True)
++            )
++            return ParameterProposal(parameters, first, self.second, step)
++
++        if self.config.name == "lion":
++            beta1 = self.config.beta1
++            beta2 = self.config.beta2
++            directions = tuple(
++                (beta1 * moment + (1 - beta1) * gradient).sign()
++                for moment, gradient in zip(self.first, gradients, strict=True)
++            )
++            first = tuple(
++                beta2 * moment + (1 - beta2) * gradient
++                for moment, gradient in zip(self.first, gradients, strict=True)
++            )
++            decay = 1 - self.config.learning_rate * self.config.weight_decay
++            parameters = tuple(
++                parameter * decay - self.config.learning_rate * direction
++                for parameter, direction in zip(self.master, directions, strict=True)
++            )
++            return ParameterProposal(parameters, first, self.second, step)
++
++        if self.config.name == "muon":
++            return self._propose_muon(gradients, step)
++
 +        beta1 = self.config.beta1
 +        beta2 = self.config.beta2
 +        first = tuple(
@@ -106,18 +258,102 @@ index 0000000..38c9329
 +            torch.as_tensor(beta2, device=step.device), floating_step
 +        )
 +        parameters = []
-+        for parameter, moment1, moment2 in zip(
-+            self.master, first, second, strict=True
-+        ):
++        for parameter, moment1, moment2 in zip(self.master, first, second, strict=True):
 +            direction = (moment1 / correction1) / (
 +                (moment2 / correction2).sqrt() + self.config.epsilon
 +            )
 +            if self.config.name == "adamw":
 +                direction = direction + self.config.weight_decay * parameter
-+            parameters.append(
-+                parameter - self.config.learning_rate * direction
-+            )
++            parameters.append(parameter - self.config.learning_rate * direction)
 +        return ParameterProposal(tuple(parameters), first, second, step)
++
++    def _adamw_candidate(
++        self,
++        parameter: torch.Tensor,
++        gradient: torch.Tensor,
++        first: torch.Tensor,
++        second: torch.Tensor,
++        step: torch.Tensor,
++        *,
++        learning_rate: float,
++        weight_decay: float,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        beta1 = self.config.beta1
++        beta2 = self.config.beta2
++        next_first = beta1 * first + (1 - beta1) * gradient
++        next_second = beta2 * second + (1 - beta2) * gradient.square()
++        floating_step = step.to(torch.float32)
++        correction1 = 1 - torch.pow(
++            torch.as_tensor(beta1, device=step.device), floating_step
++        )
++        correction2 = 1 - torch.pow(
++            torch.as_tensor(beta2, device=step.device), floating_step
++        )
++        direction = (next_first / correction1) / (
++            (next_second / correction2).sqrt() + self.config.epsilon
++        )
++        updated = parameter * (1 - learning_rate * weight_decay) - (
++            learning_rate * direction
++        )
++        return updated, next_first, next_second
++
++    def _propose_muon(
++        self,
++        gradients: Sequence[torch.Tensor],
++        step: torch.Tensor,
++    ) -> ParameterProposal:
++        momentum = self.config.momentum
++        ns_steps = self.config.muon_ns_steps
++        auxiliary_lr = self.config.muon_auxiliary_learning_rate
++        auxiliary_decay = self.config.muon_auxiliary_weight_decay
++        if (
++            momentum is None
++            or ns_steps is None
++            or auxiliary_lr is None
++            or auxiliary_decay is None
++        ):
++            raise AssertionError("validated Muon configuration is incomplete")
++        parameters = []
++        first = []
++        second = []
++        for parameter, gradient, old_first, old_second in zip(
++            self.master,
++            gradients,
++            self.first,
++            self.second,
++            strict=True,
++        ):
++            if parameter.ndim != 2:
++                updated, next_first, next_second = self._adamw_candidate(
++                    parameter,
++                    gradient,
++                    old_first,
++                    old_second,
++                    step,
++                    learning_rate=auxiliary_lr,
++                    weight_decay=auxiliary_decay,
++                )
++            else:
++                next_first = momentum * old_first + (1 - momentum) * gradient
++                nesterov = (1 - momentum) * gradient + momentum * next_first
++                direction = zeroth_power_newton_schulz(
++                    nesterov,
++                    steps=ns_steps,
++                    epsilon=max(self.config.epsilon, 1e-7),
++                )
++                adjusted_lr = self.config.learning_rate * math.sqrt(
++                    max(1.0, parameter.shape[0] / parameter.shape[1])
++                )
++                updated = (
++                    parameter
++                    * (1 - self.config.learning_rate * self.config.weight_decay)
++                    - adjusted_lr * direction
++                )
++                next_second = old_second
++            parameters.append(updated)
++            first.append(next_first)
++            second.append(next_second)
++        return ParameterProposal(tuple(parameters), tuple(first), tuple(second), step)
 +
 +    def commit(
 +        self,
@@ -126,16 +362,10 @@ index 0000000..38c9329
 +        valid: torch.Tensor | None = None,
 +    ) -> None:
 +        if valid is None:
-+            valid = torch.ones(
-+                (), dtype=torch.bool, device=self.master[0].device
-+            )
-+        valid = valid.reshape(()).to(
-+            device=self.master[0].device, dtype=torch.bool
-+        )
++            valid = torch.ones((), dtype=torch.bool, device=self.master[0].device)
++        valid = valid.reshape(()).to(device=self.master[0].device, dtype=torch.bool)
 +        with torch.no_grad():
-+            for active, candidate in zip(
-+                self.master, proposal.parameters, strict=True
-+            ):
++            for active, candidate in zip(self.master, proposal.parameters, strict=True):
 +                active.copy_(torch.where(valid, candidate, active))
 +            for active, candidate in zip(
 +                self.first, proposal.first_moments, strict=True
@@ -151,9 +381,7 @@ index 0000000..38c9329
 +        if len(parameters) != len(self.master):
 +            raise ValueError("optimizer reset layout mismatch")
 +        with torch.no_grad():
-+            for destination, source in zip(
-+                self.master, parameters, strict=True
-+            ):
++            for destination, source in zip(self.master, parameters, strict=True):
 +                destination.copy_(source.to(destination.dtype))
 +            for moment in self.first + self.second:
 +                moment.zero_()
@@ -174,16 +402,12 @@ index 0000000..38c9329
 +        if len(tensors) != len(self.staging):
 +            raise ValueError("inference parameter layout mismatch")
 +        with torch.no_grad():
-+            for destination, source in zip(
-+                self.staging, tensors, strict=True
-+            ):
++            for destination, source in zip(self.staging, tensors, strict=True):
 +                destination.copy_(source.to(destination.dtype))
 +
 +    def publish(self) -> None:
 +        with torch.no_grad():
-+            for destination, source in zip(
-+                self.active, self.staging, strict=True
-+            ):
++            for destination, source in zip(self.active, self.staging, strict=True):
 +                destination.copy_(source)
 +        if tuple(tensor.data_ptr() for tensor in self.active) != self.addresses:
 +            raise RuntimeError("inference parameter address changed")
@@ -198,6 +422,8 @@ index 0000000..38c9329
 +    ready_event: torch.cuda.Event | None
 +    candidate_tensors: tuple[torch.Tensor, ...]
 +    finite: torch.Tensor
++    reconstruction_ok: torch.Tensor
++    host_validity: torch.Tensor
 +    trace_index: int
 +
 +
@@ -248,14 +474,10 @@ index 0000000..38c9329
 +            return
 +        if new_length == self.prefix_length:
 +            return
-+        segment = KVVersionSegment(
-+            self.prefix_length, new_length, source_version
-+        )
++        segment = KVVersionSegment(self.prefix_length, new_length, source_version)
 +        if self.segments and self.segments[-1].source_version == source_version:
 +            previous = self.segments[-1]
-+            segment = KVVersionSegment(
-+                previous.start, new_length, source_version
-+            )
++            segment = KVVersionSegment(previous.start, new_length, source_version)
 +            self.segments[-1] = segment
 +        else:
 +            self.segments.append(segment)
@@ -303,26 +525,23 @@ index 0000000..38c9329
 +            Path(telemetry_path) if telemetry_path is not None else None
 +        )
 +        least_priority, _ = torch.cuda.get_stream_priority_range()
-+        self.side_stream = torch.cuda.Stream(
-+            device=device, priority=least_priority
-+        )
++        self.side_stream = torch.cuda.Stream(device=device, priority=least_priority)
 +        self.main_ready = torch.cuda.Event(blocking=False)
 +        self.epoch = 0
 +        self.active_version = 0
 +        self.slot_generation = 0
 +        self.round = 0
 +        self.pending: ReadyCandidate | None = None
++        self.reserved: CandidateBinding | None = None
 +        self.requests: dict[str, RequestVersionState] = {}
 +        self.device_commits: list[
 +            tuple[tuple[str, ...], torch.Tensor, int, torch.cuda.Event]
 +        ] = []
-+        self.latest_device_lengths: dict[
-+            str, tuple[torch.Tensor, int]
-+        ] = {}
++        self.latest_device_lengths: dict[str, tuple[torch.Tensor, int]] = {}
 +        self.pending_timings: deque[PendingTiming] = deque()
 +        self.update_traces: list[UpdateTrace] = []
 +        self.round_traces: list[RoundTrace] = []
-+        self.active_round_trace: RoundTrace | None = None
++        self.active_round_rows: dict[str, tuple[RoundTrace, int]] = {}
 +        self.trace_prefix_lens = torch.empty(
 +            (max_trace_updates, max_trace_batch),
 +            device=device,
@@ -333,9 +552,15 @@ index 0000000..38c9329
 +            device=device,
 +            dtype=torch.float32,
 +        )
-+        max_trace_rounds = (
-+            max(1, max_trace_updates - 2) * config.stride + 2
++        # Allocate the tiny D2H publication receipts once. Repeated pinned-host
++        # allocation in the update path can serialize the allocator and
++        # fragment the process-wide pinned pool under long-running loads.
++        self.host_validity = torch.empty(
++            (max_trace_updates, 2),
++            dtype=torch.uint8,
++            pin_memory=True,
 +        )
++        max_trace_rounds = max(1, max_trace_updates - 2) * config.stride + 2
 +        self.round_metrics = torch.empty(
 +            (max_trace_rounds, max_trace_batch, 4),
 +            device=device,
@@ -394,9 +619,7 @@ index 0000000..38c9329
 +            "parameter_layout_sha256": self.parameter_layout_sha256,
 +            "optimizer": self.config.optimizer.__dict__,
 +        }
-+        value = json.dumps(
-+            fields, sort_keys=True, separators=(",", ":")
-+        ).encode()
++        value = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 +        return hashlib.sha256(value).hexdigest()
 +
 +    def bind_parameter_layout(
@@ -418,7 +641,7 @@ index 0000000..38c9329
 +        if not rows or len({row["name"] for row in rows}) != len(rows):
 +            raise ValueError("parameter layout must be non-empty and unique")
 +        body = {
-+            "algorithm": "DFLASH",
++            "algorithm": self.config.algorithm,
 +            "weight_update_mode": self.config.weight_update_mode,
 +            "parameter_scope": self.config.parameter_scope,
 +            "rank": self.config.rank,
@@ -479,6 +702,7 @@ index 0000000..38c9329
 +        prefix_lens: torch.Tensor,
 +        reconstruction_ok: torch.Tensor | None = None,
 +        reconstruction_max_abs: torch.Tensor | None = None,
++        reservation: CandidateBinding | None = None,
 +    ) -> None:
 +        if self.pending is not None:
 +            raise RuntimeError("max_in_flight=1")
@@ -495,9 +719,7 @@ index 0000000..38c9329
 +        prefix_row.copy_(prefix_lens.detach().to(torch.int64))
 +        finite = finite.reshape(()).to(device=self.device, dtype=torch.bool)
 +        if reconstruction_ok is None:
-+            reconstruction_ok = torch.ones(
-+                (), device=self.device, dtype=torch.bool
-+            )
++            reconstruction_ok = torch.ones((), device=self.device, dtype=torch.bool)
 +        else:
 +            reconstruction_ok = reconstruction_ok.reshape(()).to(
 +                device=self.device, dtype=torch.bool
@@ -507,6 +729,23 @@ index 0000000..38c9329
 +                (), device=self.device, dtype=torch.float32
 +            )
 +        publish_valid = finite & reconstruction_ok
++        if reservation is None:
++            binding = CandidateBinding(
++                self.epoch,
++                source_version,
++                self.slot_generation,
++                source_round,
++            )
++        else:
++            if self.reserved != reservation:
++                raise RuntimeError("update reservation is stale or already consumed")
++            if (
++                source_round != reservation.source_round
++                or source_version != reservation.source_version
++                or not self._binding_fields_current(reservation)
++            ):
++                raise RuntimeError("update reservation no longer matches the cohort")
++            binding = reservation
 +        proposal = ParameterProposal(
 +            parameters=tuple(
 +                torch.where(publish_valid, candidate, active)
@@ -558,26 +797,29 @@ index 0000000..38c9329
 +        )
 +        for tensor in candidate_tensors:
 +            tensor.record_stream(self.side_stream)
++        device_validity = torch.stack((finite, reconstruction_ok)).to(torch.uint8)
++        host_validity = self.host_validity[trace_index]
++        host_validity.copy_(device_validity, non_blocking=True)
++        device_validity.record_stream(self.side_stream)
 +        # This event is the sole side->main publication dependency. Record it
 +        # after proposal, staging, and device-resident evidence writes so both
 +        # publication and later diagnostics observe one complete candidate.
 +        ready = torch.cuda.Event(blocking=False)
 +        ready.record(self.side_stream)
 +        self.pending = ReadyCandidate(
-+            binding=CandidateBinding(
-+                self.epoch,
-+                source_version,
-+                self.slot_generation,
-+                source_round,
-+            ),
++            binding=binding,
 +            optimizer=optimizer,
 +            optimizer_proposal=proposal,
 +            inference_bank=inference_bank,
 +            ready_event=ready,
 +            candidate_tensors=candidate_tensors,
 +            finite=publish_valid,
++            reconstruction_ok=reconstruction_ok,
++            host_validity=host_validity,
 +            trace_index=trace_index,
 +        )
++        if reservation is not None:
++            self.reserved = None
 +        self.counters["updates_launched"] += 1
 +
 +    def update_due(self) -> bool:
@@ -586,15 +828,43 @@ index 0000000..38c9329
 +            and self.round > 0
 +            and self.round % self.config.stride == 0
 +            and self.pending is None
++            and self.reserved is None
 +        )
 +
-+    def _binding_valid(self, candidate: ReadyCandidate) -> bool:
-+        binding = candidate.binding
++    def reserve_update(self) -> CandidateBinding | None:
++        """Reserve a due signal whose proposal is verified in a later call."""
++        if not self.update_due():
++            return None
++        binding = CandidateBinding(
++            self.epoch,
++            self.active_version,
++            self.slot_generation,
++            self.round,
++        )
++        self.reserved = binding
++        return binding
++
++    def reservation_ready(self, binding: CandidateBinding) -> bool:
++        return (
++            self.disabled_reason is None
++            and self.pending is None
++            and self.reserved == binding
++            and self._binding_fields_current(binding)
++        )
++
++    def release_reservation(self, binding: CandidateBinding) -> None:
++        if self.reserved == binding:
++            self.reserved = None
++
++    def _binding_fields_current(self, binding: CandidateBinding) -> bool:
 +        return (
 +            binding.cohort_epoch == self.epoch
 +            and binding.source_version == self.active_version
 +            and binding.slot_generation == self.slot_generation
 +        )
++
++    def _binding_valid(self, candidate: ReadyCandidate) -> bool:
++        return self._binding_fields_current(candidate.binding)
 +
 +    def boundary(self) -> bool:
 +        """Publish if policy permits; TTS alone may wait at its fixed boundary."""
@@ -604,9 +874,7 @@ index 0000000..38c9329
 +        if not self._binding_valid(candidate):
 +            self.counters["version_mismatches"] += 1
 +            self.counters["updates_discarded"] += 1
-+            self.update_traces[candidate.trace_index].status = (
-+                "version_conflict"
-+            )
++            self.update_traces[candidate.trace_index].status = "version_conflict"
 +            self.pending = None
 +            return False
 +        ready = candidate.ready_event
@@ -616,17 +884,28 @@ index 0000000..38c9329
 +            if not ready.query():
 +                return False
 +        else:
-+            next_boundary = (
-+                candidate.binding.source_round + self.config.stride
-+            )
++            next_boundary = candidate.binding.source_round + self.config.stride
 +            if self.round < next_boundary:
 +                return False
 +        main = torch.cuda.current_stream(self.device)
 +        if self.config.method == "tts":
 +            with self.timing("barrier"):
 +                main.wait_event(ready)
++                # TTS has an explicit fixed-boundary barrier. Completing the
++                # side event also makes its pinned validity receipt readable.
++                ready.synchronize()
 +        else:
 +            main.wait_event(ready)
++        finite_ok = bool(candidate.host_validity[0].item())
++        reconstruction_ok = bool(candidate.host_validity[1].item())
++        if not finite_ok or not reconstruction_ok:
++            trace = self.update_traces[candidate.trace_index]
++            self._record_invalid_candidate(
++                trace,
++                finite_ok=finite_ok,
++                reconstruction_ok=reconstruction_ok,
++            )
++            return False
 +        with self.timing("publish"):
 +            self._archive_latest_device_lengths()
 +            candidate.optimizer.commit(
@@ -648,19 +927,25 @@ index 0000000..38c9329
 +        self,
 +        request_ids: Sequence[str],
 +        prefix_lens: torch.Tensor,
++        *,
++        allow_publish: bool = True,
 +    ) -> int:
 +        request_ids = tuple(request_ids)
 +        if not request_ids:
 +            raise ValueError("round telemetry requires a non-empty request batch")
 +        if prefix_lens.ndim != 1 or prefix_lens.shape[0] != len(request_ids):
 +            raise ValueError("one prefix length is required per round request")
-+        if self.active_round_trace is not None:
-+            raise RuntimeError("previous round telemetry is incomplete")
++        repeated = set(request_ids) & self.active_round_rows.keys()
++        if repeated:
++            raise RuntimeError(
++                f"previous round telemetry is incomplete for {sorted(repeated)}"
++            )
 +        self.round += 1
 +        if len(self.pending_timings) >= 64:
 +            self._drain_ready_timings()
 +        self.counters["target_calls"] += len(request_ids)
-+        self.boundary()
++        if allow_publish:
++            self.boundary()
 +        for request_id in request_ids:
 +            state = self.requests.get(request_id)
 +            if state is None:
@@ -685,7 +970,8 @@ index 0000000..38c9329
 +            request_ids=request_ids,
 +        )
 +        self.round_traces.append(trace)
-+        self.active_round_trace = trace
++        for index, request_id in enumerate(request_ids):
++            self.active_round_rows[request_id] = (trace, index)
 +        return self.active_version
 +
 +    def record_round_outcome(
@@ -696,29 +982,37 @@ index 0000000..38c9329
 +        accepted_drafts: torch.Tensor,
 +        committed_tokens: torch.Tensor,
 +    ) -> None:
-+        trace = self.active_round_trace
 +        request_ids = tuple(request_ids)
-+        if trace is None or trace.request_ids != request_ids:
-+            raise RuntimeError("round outcome does not match the active batch")
 +        values = (verified_drafts, accepted_drafts, committed_tokens)
 +        if any(
-+            value.ndim != 1 or value.shape[0] != len(request_ids)
-+            for value in values
++            value.ndim != 1 or value.shape[0] != len(request_ids) for value in values
 +        ):
 +            raise ValueError("round outcome tensors must have one value per request")
-+        row = self.round_metrics[trace.buffer_index, : len(request_ids)]
-+        for column, value in enumerate(values, start=1):
-+            row[:, column].copy_(value.detach().to(torch.int64))
-+        self.active_round_trace = None
++        if len(request_ids) != len(set(request_ids)):
++            raise ValueError("round outcome request ids must be unique")
++        active_rows = []
++        for request_id in request_ids:
++            active = self.active_round_rows.get(request_id)
++            if active is None:
++                raise RuntimeError(
++                    f"round outcome has no active proposal for {request_id}"
++                )
++            active_rows.append(active)
++        for output_index, (request_id, active) in enumerate(
++            zip(request_ids, active_rows, strict=True)
++        ):
++            trace, trace_index = active
++            row = self.round_metrics[trace.buffer_index, trace_index]
++            for column, value in enumerate(values, start=1):
++                row[column].copy_(value[output_index].detach().to(torch.int64))
++            self.active_round_rows.pop(request_id)
 +
 +    def commit_lengths(
 +        self, request_ids: Sequence[str], new_lengths: Sequence[int]
 +    ) -> None:
 +        if len(request_ids) != len(new_lengths):
 +            raise ValueError("one committed length is required per request")
-+        for request_id, length in zip(
-+            request_ids, new_lengths, strict=True
-+        ):
++        for request_id, length in zip(request_ids, new_lengths, strict=True):
 +            state = self.requests[request_id]
 +            if int(length) < state.prefix_length:
 +                self.counters["retractions"] += 1
@@ -758,6 +1052,8 @@ index 0000000..38c9329
 +        for request_id in selected:
 +            length, version = self.latest_device_lengths.pop(request_id)
 +            grouped.setdefault(version, []).append((request_id, length))
++        if not grouped:
++            return
 +        main = torch.cuda.current_stream(self.device)
 +        for version, rows in grouped.items():
 +            identifiers = tuple(request_id for request_id, _ in rows)
@@ -765,16 +1061,28 @@ index 0000000..38c9329
 +            ready = torch.cuda.Event(blocking=False)
 +            ready.record(main)
 +            lengths.record_stream(main)
-+            self.device_commits.append(
-+                (identifiers, lengths, version, ready)
-+            )
++            self.device_commits.append((identifiers, lengths, version, ready))
 +
 +    def finish_request(self, request_id: str) -> None:
 +        # Keep compact version metadata until diagnostics are flushed. Tensor
 +        # canvas state is owned and released by the backend adapter.
 +        if request_id not in self.requests:
 +            return
++        self._discard_active_round(request_id)
 +        self._archive_latest_device_lengths((request_id,))
++
++    def abort_request(self, request_id: str) -> None:
++        if request_id not in self.requests:
++            return
++        self._discard_active_round(request_id)
++        self._archive_latest_device_lengths((request_id,))
++        self.slot_generation += 1
++        self.reserved = None
++        candidate = self.pending
++        if candidate is not None:
++            self.update_traces[candidate.trace_index].status = "request_aborted"
++            self.counters["updates_discarded"] += 1
++            self.pending = None
 +
 +    def reset(self) -> None:
 +        self.side_stream.synchronize()
@@ -783,13 +1091,14 @@ index 0000000..38c9329
 +        self.slot_generation += 1
 +        self.round = 0
 +        self.pending = None
++        self.reserved = None
 +        self.requests.clear()
 +        self.device_commits.clear()
 +        self.latest_device_lengths.clear()
 +        self.pending_timings.clear()
 +        self.update_traces.clear()
 +        self.round_traces.clear()
-+        self.active_round_trace = None
++        self.active_round_rows.clear()
 +        self.disabled_reason = None
 +        for key in self.counters:
 +            self.counters[key] = 0
@@ -801,9 +1110,18 @@ index 0000000..38c9329
 +        self.waiting_requests_sum = 0
 +        self.waiting_requests_max = 0
 +
++    def _discard_active_round(self, request_id: str) -> None:
++        active = self.active_round_rows.pop(request_id, None)
++        if active is None:
++            return
++        trace, trace_index = active
++        row = self.round_metrics[trace.buffer_index, trace_index]
++        row[1:].zero_()
++
 +    def disable(self, reason: str, *, exactness: bool = False) -> None:
 +        self.disabled_reason = reason
 +        self.pending = None
++        self.reserved = None
 +        if exactness:
 +            self.counters["exactness_violations"] += 1
 +
@@ -817,8 +1135,7 @@ index 0000000..38c9329
 +        categories: dict[str, int] | None = None,
 +    ) -> None:
 +        resident = sum(
-+            tensor.numel() * tensor.element_size()
-+            for tensor in resident_tensors
++            tensor.numel() * tensor.element_size() for tensor in resident_tensors
 +        )
 +        peak = resident + int(peak_scratch_bytes)
 +        if peak > self.reserve_bytes:
@@ -829,12 +1146,9 @@ index 0000000..38c9329
 +        self.resident_bytes = resident
 +        self.peak_bytes = peak
 +        self.optimizer_bytes = sum(
-+            tensor.numel() * tensor.element_size()
-+            for tensor in optimizer_tensors
++            tensor.numel() * tensor.element_size() for tensor in optimizer_tensors
 +        )
-+        self.trainable_parameters = sum(
-+            tensor.numel() for tensor in trainable_tensors
-+        )
++        self.trainable_parameters = sum(tensor.numel() for tensor in trainable_tensors)
 +        if categories is None:
 +            categories = {
 +                "active_or_base_bytes": resident,
@@ -842,6 +1156,7 @@ index 0000000..38c9329
 +                "gradient_bytes": 0,
 +                "first_moment_bytes": 0,
 +                "second_moment_bytes": 0,
++                "optimizer_metadata_bytes": 0,
 +                "staging_bytes": 0,
 +                "training_activation_bytes": int(peak_scratch_bytes),
 +                "kv_gather_scratch_bytes": 0,
@@ -855,6 +1170,7 @@ index 0000000..38c9329
 +            "gradient_bytes",
 +            "first_moment_bytes",
 +            "second_moment_bytes",
++            "optimizer_metadata_bytes",
 +            "staging_bytes",
 +            "training_activation_bytes",
 +            "kv_gather_scratch_bytes",
@@ -873,6 +1189,7 @@ index 0000000..38c9329
 +                "master_fp32_bytes",
 +                "first_moment_bytes",
 +                "second_moment_bytes",
++                "optimizer_metadata_bytes",
 +                "staging_bytes",
 +                "graph_buffer_bytes",
 +                "telemetry_bytes",
@@ -920,69 +1237,81 @@ index 0000000..38c9329
 +    def _drain_ready_timings(self) -> None:
 +        while self.pending_timings and self.pending_timings[0].finished.query():
 +            timing = self.pending_timings.popleft()
-+            self.timings_ms[timing.name] += timing.started.elapsed_time(
-+                timing.finished
-+            )
++            self.timings_ms[timing.name] += timing.started.elapsed_time(timing.finished)
 +
 +    def _drain_diagnostics(self) -> tuple[list[list[int]], list[list[float]]]:
 +        while self.pending_timings:
 +            timing = self.pending_timings.popleft()
 +            timing.finished.synchronize()
-+            self.timings_ms[timing.name] += timing.started.elapsed_time(
-+                timing.finished
-+            )
-+        prefix_rows = self.trace_prefix_lens[
-+            : len(self.update_traces)
-+        ].tolist()
++            self.timings_ms[timing.name] += timing.started.elapsed_time(timing.finished)
++        prefix_rows = self.trace_prefix_lens[: len(self.update_traces)].tolist()
 +        metric_rows = self.trace_metrics[: len(self.update_traces)].tolist()
 +        for trace in self.update_traces:
 +            if trace.diagnosed:
 +                continue
 +            metrics = metric_rows[trace.buffer_index]
-+            if not bool(metrics[1]):
-+                if trace.status == "published":
-+                    trace.status = "nonfinite_noop"
-+                self.counters["nonfinite_updates"] += 1
-+                self.disabled_reason = "nonfinite_update"
-+            if not bool(metrics[2]):
-+                if trace.status == "published":
-+                    trace.status = "reconstruction_mismatch_noop"
-+                self.counters["exactness_violations"] += 1
-+                self.disabled_reason = "dflash_reconstruction_mismatch"
-+            trace.diagnosed = True
++            finite_ok = bool(metrics[1])
++            reconstruction_ok = bool(metrics[2])
++            if not finite_ok or not reconstruction_ok:
++                self._record_invalid_candidate(
++                    trace,
++                    finite_ok=finite_ok,
++                    reconstruction_ok=reconstruction_ok,
++                )
++            else:
++                trace.diagnosed = True
 +        return prefix_rows, metric_rows
++
++    def _record_invalid_candidate(
++        self,
++        trace: UpdateTrace,
++        *,
++        finite_ok: bool,
++        reconstruction_ok: bool,
++    ) -> None:
++        """Account for one invalid candidate exactly once and fail closed."""
++        if trace.diagnosed:
++            return
++        trace.status = (
++            "nonfinite_update" if not finite_ok else "reconstruction_mismatch"
++        )
++        trace.diagnosed = True
++        self.counters["updates_discarded"] += 1
++        if not finite_ok:
++            self.counters["nonfinite_updates"] += 1
++            self.disabled_reason = "nonfinite_update"
++        elif not reconstruction_ok:
++            self.counters["exactness_violations"] += 1
++            self.counters["fallbacks"] += 1
++            self.disabled_reason = "logit_reconstruction_mismatch"
++        candidate = self.pending
++        if candidate is not None and candidate.trace_index == trace.buffer_index:
++            self.pending = None
 +
 +    def diagnostics(self) -> dict:
 +        trace_prefix_rows, trace_metric_rows = self._drain_diagnostics()
-+        if self.active_round_trace is not None:
++        if self.active_round_rows:
 +            raise RuntimeError("cannot diagnose an incomplete decode round")
 +        self._archive_latest_device_lengths()
 +        for request_ids, lengths, version, ready in self.device_commits:
 +            ready.synchronize()
-+            for request_id, length in zip(
-+                request_ids, lengths.tolist(), strict=True
-+            ):
++            for request_id, length in zip(request_ids, lengths.tolist(), strict=True):
 +                state = self.requests.get(request_id)
 +                if state is not None:
++                    if int(length) < state.prefix_length:
++                        self.counters["retractions"] += 1
 +                    state.append(int(length), version)
 +        self.device_commits.clear()
-+        round_metric_rows = self.round_metrics[
-+            : len(self.round_traces)
-+        ].tolist()
++        round_metric_rows = self.round_metrics[: len(self.round_traces)].tolist()
 +        graph_total = self.counters["graph_replay_total"]
 +        graph_hit_rate = (
-+            self.counters["graph_replay_hits"] / graph_total
-+            if graph_total
-+            else 0.0
++            self.counters["graph_replay_hits"] / graph_total if graph_total else 0.0
 +        )
 +        load_samples = self.load_samples
 +        side_update_ms = sum(
-+            self.timings_ms[name]
-+            for name in ("training", "optimizer", "merge")
++            self.timings_ms[name] for name in ("training", "optimizer", "merge")
 +        )
-+        exposed_update_ms = (
-+            self.timings_ms["barrier"] + self.timings_ms["publish"]
-+        )
++        exposed_update_ms = self.timings_ms["barrier"] + self.timings_ms["publish"]
 +        overlap_ratio = (
 +            max(0.0, min(1.0, 1.0 - exposed_update_ms / side_update_ms))
 +            if side_update_ms > 0
@@ -1004,15 +1333,11 @@ index 0000000..38c9329
 +            "memory_ledger": dict(self.memory_ledger),
 +            "parameter_layout_sha256": self.parameter_layout_sha256,
 +            "batch_fill": (
-+                self.running_requests_sum / load_samples
-+                if load_samples
-+                else 0.0
++                self.running_requests_sum / load_samples if load_samples else 0.0
 +            ),
 +            "max_batch_size": self.running_requests_max,
 +            "queue_occupancy": (
-+                self.waiting_requests_sum / load_samples
-+                if load_samples
-+                else 0.0
++                self.waiting_requests_sum / load_samples if load_samples else 0.0
 +            ),
 +            "max_queue_occupancy": self.waiting_requests_max,
 +            "graph_replay_hit_rate": graph_hit_rate,
@@ -1025,15 +1350,13 @@ index 0000000..38c9329
 +                    "source_round": trace.source_round,
 +                    "source_version": trace.source_version,
 +                    "request_ids": list(trace.request_ids),
-+                    "prefix_len_before": trace_prefix_rows[
-+                        trace.buffer_index
-+                    ][: trace.prefix_count],
++                    "prefix_len_before": trace_prefix_rows[trace.buffer_index][
++                        : trace.prefix_count
++                    ],
 +                    "published_version": trace.published_version,
 +                    "status": trace.status,
 +                    "loss": float(trace_metric_rows[trace.buffer_index][0]),
-+                    "reconstruction_ok": bool(
-+                        trace_metric_rows[trace.buffer_index][2]
-+                    ),
++                    "reconstruction_ok": bool(trace_metric_rows[trace.buffer_index][2]),
 +                    "reconstruction_max_abs": float(
 +                        trace_metric_rows[trace.buffer_index][3]
 +                    ),
@@ -1052,9 +1375,7 @@ index 0000000..38c9329
 +                }
 +                for trace in self.round_traces
 +                for values in (
-+                    round_metric_rows[trace.buffer_index][
-+                        : len(trace.request_ids)
-+                    ],
++                    round_metric_rows[trace.buffer_index][: len(trace.request_ids)],
 +                )
 +            ],
 +            "kv_segments": {
@@ -1074,8 +1395,6 @@ index 0000000..38c9329
 +            temporary = self.telemetry_path.with_suffix(
 +                self.telemetry_path.suffix + ".tmp"
 +            )
-+            temporary.write_text(
-+                json.dumps(payload, sort_keys=True), encoding="utf-8"
-+            )
++            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 +            temporary.replace(self.telemetry_path)
 +        return payload
