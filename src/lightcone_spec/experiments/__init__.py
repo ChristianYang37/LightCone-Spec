@@ -2,6 +2,16 @@
 
 from .data import ControlledWindow, LongContinuationAdapter
 from .evidence import GpuEvidenceAttestation, evidence_files_sha256
+from .onlinespec import (
+    OnlineSpecCandidate,
+    OnlineSpecGpuAttestation,
+    OnlineSpecManifest,
+    OnlineSpecSelection,
+    OnlineSpecTuningMeasurement,
+    compare_onlinespec,
+    onlinespec_candidates,
+    select_onlinespec,
+)
 from .protocol import (
     ConfirmationBlock,
     TuningCandidate,
@@ -22,13 +32,21 @@ __all__ = [
     "ControlledWindow",
     "GpuEvidenceAttestation",
     "LongContinuationAdapter",
+    "OnlineSpecCandidate",
+    "OnlineSpecGpuAttestation",
+    "OnlineSpecManifest",
+    "OnlineSpecSelection",
+    "OnlineSpecTuningMeasurement",
     "SamplingProfile",
     "SelectionArtifact",
     "SpeedGate",
     "TuningCandidate",
+    "compare_onlinespec",
     "confirmation_blocks",
     "evaluate_speed_gate",
     "evidence_files_sha256",
+    "onlinespec_candidates",
+    "select_onlinespec",
     "select_shared_config",
     "tuning_candidates",
 ]

@@ -1,24 +1,27 @@
-From 679750308401b7c5fb7f3738c380ac5b1e6aea2a Mon Sep 17 00:00:00 2001
+From 5e0953e6770691517ef50e54c3df9c58790f5994 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 6/6] test(spec): cover cross-backend adaptation protocols
 
 ---
- .../spec/test_online_adaptation_protocol.py   | 1048 +++++++++++++++++
- 1 file changed, 1048 insertions(+)
+ .../spec/test_online_adaptation_protocol.py   | 1723 +++++++++++++++++
+ 1 file changed, 1723 insertions(+)
  create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
 
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000..3f11dd6
+index 0000000000000000000000000000000000000000..b09586f9d490203c9de9ddbaff751e558c1d55b8
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,1048 @@
+@@ -0,0 +1,1723 @@
 +import hashlib
 +import json
++import math
 +import tempfile
 +import unittest
++from collections import deque
 +from contextlib import nullcontext
++from inspect import signature
 +from pathlib import Path
 +from types import SimpleNamespace
 +from unittest.mock import patch
@@ -31,10 +34,11 @@ index 0000000..3f11dd6
 +)
 +from sglang.srt.speculative.online_adaptation_runtime import (
 +    FixedInferenceBank,
++    OnlineSpecOptimizer,
 +    RequestVersionState,
 +    ResidentOptimizer,
-+    estimate_functional_optimizer_scratch_bytes,
 +    estimate_full_vocab_training_scratch_bytes,
++    estimate_functional_optimizer_scratch_bytes,
 +    zeroth_power_newton_schulz,
 +)
 +from sglang.srt.speculative.online_valid_mask import (
@@ -92,6 +96,29 @@ index 0000000..3f11dd6
 +    return str(path)
 +
 +
++def _online_config(method, **learner_overrides):
++    value = _config_value(
++        method=method,
++        weight_update_mode="full",
++        parameter_scope="tail",
++        rank=None,
++    )
++    value["optimizer"].update(
++        name="sgd",
++        learning_rate=0.1,
++        weight_decay=0.0,
++        grad_clip=100.0,
++    )
++    learner = {
++        "projection_radius": None,
++        "additional_learning_rates": [],
++        "hedge_learning_rate": None,
++    }
++    learner.update(learner_overrides)
++    value["online_spec"] = learner
++    return value
++
++
 +def _server_args(config_path=None, **overrides):
 +    value = {
 +        "speculative_adaptation_config": config_path,
@@ -137,6 +164,29 @@ index 0000000..3f11dd6
 +        ):
 +            with self.subTest(update=update), self.assertRaises(ValueError):
 +                OnlineAdaptationConfig.load(_write_config(_config_value(**update)))
++
++    def test_onlinespec_schema_is_explicit_and_method_bound(self):
++        for method in ("onlinespec_ogd", "onlinespec_opt"):
++            with self.subTest(method=method):
++                loaded = OnlineAdaptationConfig.load(
++                    _write_config(_online_config(method))
++                )
++                self.assertEqual(loaded.optimizer.name, "sgd")
++                self.assertIsNotNone(loaded.online_spec)
++        ensemble = _online_config(
++            "onlinespec_ens",
++            additional_learning_rates=[0.2, 0.4],
++            hedge_learning_rate=0.5,
++        )
++        loaded = OnlineAdaptationConfig.load(_write_config(ensemble))
++        self.assertEqual(loaded.online_spec.additional_learning_rates, (0.2, 0.4))
++        with self.assertRaisesRegex(ValueError, "only valid"):
++            OnlineAdaptationConfig.load(
++                _write_config(_config_value(online_spec=ensemble["online_spec"]))
++            )
++        invalid = _online_config("onlinespec_ens", hedge_learning_rate=0.5)
++        with self.assertRaisesRegex(ValueError, "multi-rate"):
++            OnlineAdaptationConfig.load(_write_config(invalid))
 +
 +    def test_rejects_zero_depth_canvas(self):
 +        with self.assertRaisesRegex(ValueError, "at least two"):
@@ -395,6 +445,44 @@ index 0000000..3f11dd6
 +                merge_bytes=-1,
 +            )
 +
++    def test_memory_ledger_does_not_double_count_projection_origin(self):
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            OnlineCohortRuntime,
++        )
++
++        runtime = OnlineCohortRuntime.__new__(OnlineCohortRuntime)
++        runtime.reserve_bytes = 1024
++        projection_origin = torch.zeros(2, dtype=torch.float32)
++        master = torch.zeros(2, dtype=torch.float32)
++        online_state = torch.zeros(2, dtype=torch.float32)
++        runtime.bind_memory(
++            resident_tensors=(projection_origin, master, online_state),
++            peak_scratch_bytes=master.nbytes,
++            trainable_tensors=(master,),
++            categories={
++                "active_or_base_bytes": projection_origin.nbytes,
++                "master_fp32_bytes": master.nbytes,
++                "gradient_bytes": master.nbytes,
++                "first_moment_bytes": 0,
++                "second_moment_bytes": 0,
++                "online_state_bytes": online_state.nbytes,
++                "optimizer_metadata_bytes": 0,
++                "staging_bytes": 0,
++                "training_activation_bytes": 0,
++                "kv_gather_scratch_bytes": 0,
++                "candidate_scratch_bytes": 0,
++                "graph_buffer_bytes": 0,
++                "telemetry_bytes": 0,
++            },
++        )
++        self.assertEqual(runtime.optimizer_bytes, master.nbytes + online_state.nbytes)
++        self.assertEqual(
++            runtime.memory_ledger["active_or_base_bytes"], projection_origin.nbytes
++        )
++        self.assertEqual(
++            runtime.memory_ledger["optimizer_bytes"], runtime.optimizer_bytes
++        )
++
 +    def test_tts_and_first_ready_start_from_identical_candidate(self):
 +        optimizer_config = OnlineOptimizerConfig(
 +            "adam", 0.1, 0.0, 0.9, 0.999, 1e-8, 1.0
@@ -407,6 +495,124 @@ index 0000000..3f11dd6
 +        torch.testing.assert_close(
 +            left_proposal.parameters[0], right_proposal.parameters[0]
 +        )
++
++    def test_onlinespec_ogd_proposal_is_transactional(self):
++        config = OnlineAdaptationConfig.load(
++            _write_config(_online_config("onlinespec_ogd", projection_radius=1.0))
++        )
++        optimizer = OnlineSpecOptimizer((torch.tensor([0.0, 0.0]),), config)
++        proposal = optimizer.propose((torch.tensor([6.0, 8.0]),))
++        torch.testing.assert_close(proposal.parameters[0], torch.tensor([-0.6, -0.8]))
++        torch.testing.assert_close(optimizer.master[0], torch.zeros(2))
++        optimizer.commit(proposal)
++        torch.testing.assert_close(optimizer.master[0], torch.tensor([-0.6, -0.8]))
++
++    def test_onlinespec_reuses_adapter_reset_snapshot_as_projection_origin(self):
++        config = OnlineAdaptationConfig.load(
++            _write_config(_online_config("onlinespec_ogd", projection_radius=1.0))
++        )
++        reset_snapshot = torch.tensor([1.0, -1.0])
++        optimizer = OnlineSpecOptimizer(
++            (reset_snapshot,),
++            config,
++            projection_origin=(reset_snapshot,),
++        )
++        self.assertEqual(optimizer.initial[0].data_ptr(), reset_snapshot.data_ptr())
++        self.assertNotIn(
++            reset_snapshot.data_ptr(),
++            {tensor.data_ptr() for tensor in optimizer.state_tensors},
++        )
++        proposal = optimizer.propose((torch.tensor([10.0, 0.0]),))
++        distance = (proposal.parameters[0] - reset_snapshot).norm()
++        self.assertLessEqual(float(distance), 1.0 + 1e-6)
++
++    def test_onlinespec_optimistic_uses_two_projected_states(self):
++        config = OnlineAdaptationConfig.load(
++            _write_config(_online_config("onlinespec_opt", projection_radius=1.0))
++        )
++        optimizer = OnlineSpecOptimizer((torch.tensor([0.0]),), config)
++        optimizer.commit(optimizer.propose((torch.tensor([20.0]),)))
++        torch.testing.assert_close(optimizer.master[0], torch.tensor([-1.0]))
++        diagnostics = optimizer.diagnostics()
++        self.assertEqual(diagnostics["algorithm"], "onlinespec_opt")
++        self.assertEqual(diagnostics["step"], 1)
++        self.assertEqual(diagnostics["hint_norm"], 20.0)
++        second = optimizer.propose((torch.tensor([-5.0]),))
++        torch.testing.assert_close(second.parameters[0], torch.tensor([0.0]))
++        # Applying the unconstrained 2g_t-g_(t-1) shortcut after projection
++        # would instead land at the positive boundary.
++        shortcut = torch.clamp(
++            optimizer.master[0] - 0.1 * (2 * torch.tensor([-5.0]) - 20.0),
++            -1.0,
++            1.0,
++        )
++        torch.testing.assert_close(shortcut, torch.tensor([1.0]))
++
++    def test_onlinespec_hedge_keeps_experts_independent(self):
++        config = OnlineAdaptationConfig.load(
++            _write_config(
++                _online_config(
++                    "onlinespec_ens",
++                    additional_learning_rates=[0.2],
++                    hedge_learning_rate=1.0,
++                )
++            )
++        )
++        optimizer = OnlineSpecOptimizer((torch.tensor([0.0]),), config)
++        proposal = optimizer.propose_ensemble(
++            torch.tensor([0.0, 2.0]),
++            ((torch.tensor([1.0]),), (torch.tensor([-1.0]),)),
++        )
++        probabilities = torch.softmax(torch.tensor([0.0, -2.0]), dim=0)
++        expected = probabilities[0] * -0.1 + probabilities[1] * 0.2
++        torch.testing.assert_close(proposal.parameters[0], expected.reshape(1))
++        torch.testing.assert_close(optimizer.experts[0][0], torch.tensor([0.0]))
++        optimizer.commit(proposal)
++        torch.testing.assert_close(optimizer.experts[0][0], torch.tensor([-0.1]))
++        torch.testing.assert_close(optimizer.experts[1][0], torch.tensor([0.2]))
++        diagnostics = optimizer.diagnostics()
++        self.assertEqual(diagnostics["learning_rates"], [0.1, 0.2])
++        self.assertEqual(diagnostics["cumulative_losses"], [0.0, 2.0])
++        self.assertAlmostEqual(sum(diagnostics["expert_probabilities"]), 1.0, places=6)
++
++    def test_onlinespec_streamed_hedge_matches_bulk_feedback(self):
++        config = OnlineAdaptationConfig.load(
++            _write_config(
++                _online_config(
++                    "onlinespec_ens",
++                    additional_learning_rates=[0.2, 0.4],
++                    hedge_learning_rate=0.7,
++                )
++            )
++        )
++        optimizer = OnlineSpecOptimizer((torch.tensor([0.5, -0.5]),), config)
++        losses = torch.tensor([0.2, 1.0, -0.1])
++        gradients = (
++            (torch.tensor([1.0, -2.0]),),
++            (torch.tensor([-0.5, 0.25]),),
++            (torch.tensor([2.0, 1.0]),),
++        )
++        bulk = optimizer.propose_ensemble(losses, gradients)
++        updated = tuple(
++            optimizer.propose_ensemble_member(index, row)
++            for index, row in enumerate(gradients)
++        )
++        streamed = optimizer.combine_ensemble(losses, updated)
++
++        for left, right in zip(
++            bulk.parameters + bulk.first_moments + bulk.second_moments,
++            streamed.parameters + streamed.first_moments + streamed.second_moments,
++            strict=True,
++        ):
++            torch.testing.assert_close(left, right)
++        torch.testing.assert_close(bulk.step, streamed.step)
++        with self.assertRaisesRegex(ValueError, "outside"):
++            optimizer.propose_ensemble_member(len(gradients), gradients[0])
++        with self.assertRaisesRegex(ValueError, "required"):
++            optimizer.combine_ensemble(losses, updated[:-1])
++        malformed = ((torch.zeros(1, 1),),) * len(updated)
++        with self.assertRaisesRegex(ValueError, "layout"):
++            optimizer.combine_ensemble(losses, malformed)
 +
 +    def test_adamw_proposal_is_immutable_until_commit(self):
 +        parameter = torch.tensor([1.0, -2.0])
@@ -552,6 +758,7 @@ index 0000000..3f11dd6
 +        runtime = OnlineCohortRuntime.__new__(OnlineCohortRuntime)
 +        runtime.counters = {
 +            "updates_discarded": 0,
++            "updates_skipped_no_supervision": 0,
 +            "nonfinite_updates": 0,
 +            "exactness_violations": 0,
 +            "fallbacks": 0,
@@ -619,6 +826,7 @@ index 0000000..3f11dd6
 +        runtime.counters = {
 +            "version_mismatches": 0,
 +            "updates_discarded": 0,
++            "updates_skipped_no_supervision": 0,
 +            "updates_published": 0,
 +            "nonfinite_updates": 0,
 +            "exactness_violations": 0,
@@ -640,7 +848,8 @@ index 0000000..3f11dd6
 +            candidate_tensors=(),
 +            finite=torch.tensor(True),
 +            reconstruction_ok=torch.tensor(True),
-+            host_validity=torch.tensor([1, 1], dtype=torch.uint8),
++            supervision_nonempty=torch.tensor(True),
++            host_validity=torch.tensor([1, 1, 1], dtype=torch.uint8),
 +            trace_index=0,
 +        )
 +        return runtime, event, optimizer, bank
@@ -683,6 +892,36 @@ index 0000000..3f11dd6
 +        self.assertEqual(event.synchronized, 1)
 +        self.assertEqual(optimizer.commits, 1)
 +        self.assertEqual(bank.publications, 1)
++
++    def test_onlinespec_preserves_predict_then_update_barrier(self):
++        runtime, event, optimizer, bank = self._runtime(
++            "onlinespec_ogd", ready=True, round_index=10
++        )
++        with patch("torch.cuda.current_stream") as current_stream:
++            self.assertFalse(runtime.boundary())
++        current_stream.assert_not_called()
++        runtime.round = 11
++        stream = SimpleNamespace(wait_event=lambda _: None)
++        with patch("torch.cuda.current_stream", return_value=stream):
++            self.assertTrue(runtime.boundary())
++        self.assertEqual(event.synchronized, 1)
++        self.assertEqual(optimizer.commits, 1)
++        self.assertEqual(bank.publications, 1)
++
++    def test_empty_supervision_discards_without_disabling_or_version_change(self):
++        runtime, _event, optimizer, bank = self._runtime(
++            "onlinespec_ogd", ready=True, round_index=11
++        )
++        runtime.pending.host_validity[2] = 0
++        stream = SimpleNamespace(wait_event=lambda _: None)
++        with patch("torch.cuda.current_stream", return_value=stream):
++            self.assertFalse(runtime.boundary())
++        self.assertEqual(runtime.active_version, 0)
++        self.assertEqual(optimizer.commits, 0)
++        self.assertEqual(bank.publications, 0)
++        self.assertIsNone(runtime.disabled_reason)
++        self.assertEqual(runtime.counters["updates_skipped_no_supervision"], 1)
++        self.assertEqual(runtime.update_traces[0].status, "no_supervision")
 +
 +
 +class TestFrozenKVVersionHistory(unittest.TestCase):
@@ -914,6 +1153,36 @@ index 0000000..3f11dd6
 +
 +
 +class TestCancellationLifecycle(unittest.TestCase):
++    def test_diagnostics_waits_for_pending_evidence_row(self):
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            OnlineCohortRuntime,
++            UpdateTrace,
++        )
++
++        event = SimpleNamespace(synchronized=0)
++
++        def synchronize():
++            event.synchronized += 1
++
++        event.synchronize = synchronize
++        runtime = OnlineCohortRuntime.__new__(OnlineCohortRuntime)
++        runtime.pending = SimpleNamespace(ready_event=event, trace_index=0)
++        runtime.pending_timings = deque()
++        runtime.trace_prefix_lens = torch.tensor([[128]], dtype=torch.int64)
++        runtime.trace_metrics = torch.full((1, 11), float("nan"))
++        runtime.trace_metrics[0, 0] = 1.25
++        runtime.trace_metrics[0, 1:3] = 1.0
++        runtime.trace_metrics[0, 10] = 1.0
++        runtime.trace_online_experts = torch.full((1, 1, 2), float("nan"))
++        runtime.update_traces = [UpdateTrace(0, 1, 0, ("request-a",), 1)]
++
++        _, metrics, experts = runtime._drain_diagnostics()
++
++        self.assertEqual(event.synchronized, 1)
++        self.assertEqual(metrics[0][0], 1.25)
++        self.assertTrue(math.isnan(experts[0][0][0]))
++        self.assertTrue(runtime.update_traces[0].diagnosed)
++
 +    def test_abort_invalidates_pending_candidate_without_publishing(self):
 +        from sglang.srt.speculative.online_adaptation_runtime import (
 +            OnlineCohortRuntime,
@@ -955,17 +1224,423 @@ index 0000000..3f11dd6
 +
 +
 +class TestHistoryGather(unittest.TestCase):
++    def test_dflash_update_reenables_grad_without_copying_master(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _loss_and_grad,
++        )
++
++        master = torch.tensor([2.0, -3.0])
++        observed = []
++
++        def objective(leaves):
++            observed.append(
++                (
++                    torch.is_grad_enabled(),
++                    leaves[0].data_ptr(),
++                    leaves[0].requires_grad,
++                )
++            )
++            return leaves[0].square().sum()
++
++        with torch.no_grad():
++            loss, gradients = _loss_and_grad((master,), objective)
++        self.assertEqual(observed, [(True, master.data_ptr(), True)])
++        self.assertFalse(master.requires_grad)
++        self.assertFalse(loss.requires_grad)
++        torch.testing.assert_close(loss, torch.tensor(13.0))
++        torch.testing.assert_close(gradients[0], torch.tensor([4.0, -6.0]))
++
++    def test_dflash_value_anchor_uses_reference_and_surrogate_gradient(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _anchor_forward_value,
++        )
++
++        source = torch.tensor([1.0, 2.0], requires_grad=True)
++        surrogate = source.square()
++        reference = torch.tensor([7.0, 11.0])
++        anchored = _anchor_forward_value(surrogate, reference)
++        self.assertTrue(torch.equal(anchored.detach(), reference))
++        anchored.sum().backward()
++        self.assertTrue(torch.equal(source.grad, 2.0 * source.detach()))
++
++    def test_sglang_disabled_sliding_window_sentinels(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _is_disabled_sliding_window,
++        )
++
++        self.assertTrue(_is_disabled_sliding_window(None))
++        self.assertTrue(_is_disabled_sliding_window(-1))
++        for active_or_invalid in (0, 1, 4096, -2, False):
++            self.assertFalse(_is_disabled_sliding_window(active_or_invalid))
++
++    def test_transformers_default_rope_metadata_is_not_scaling(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _is_default_rope_metadata,
++        )
++
++        self.assertTrue(_is_default_rope_metadata(None))
++        self.assertTrue(_is_default_rope_metadata({}))
++        self.assertTrue(
++            _is_default_rope_metadata(
++                {"rope_type": "default", "rope_theta": 1_000_000}
++            )
++        )
++        self.assertTrue(
++            _is_default_rope_metadata(
++                {
++                    "rope_type": "default",
++                    "type": "default",
++                    "rope_theta": 1_000_000,
++                }
++            )
++        )
++        self.assertFalse(
++            _is_default_rope_metadata({"rope_type": "linear", "factor": 2})
++        )
++        self.assertFalse(
++            _is_default_rope_metadata(
++                {"rope_type": "default", "rope_theta": 1_000_000, "factor": 2}
++            )
++        )
++
 +    def test_reconstruction_gate_compares_actual_logits(self):
 +        from sglang.srt.speculative.dflash_online_adaptation import (
 +            _logit_reconstruction_gate,
 +        )
 +
 +        reference = torch.tensor([[1.0, -2.0]])
-+        valid, error = _logit_reconstruction_gate(reference, reference + 1e-3)
++        valid, error, relative_rms, top1_match, mean_kl = _logit_reconstruction_gate(
++            reference, reference + 1e-3
++        )
 +        self.assertTrue(bool(valid))
 +        self.assertAlmostEqual(float(error), 1e-3, places=6)
-+        invalid, _ = _logit_reconstruction_gate(reference, reference + 1.0)
++        self.assertLess(float(relative_rms), 1e-3)
++        self.assertEqual(float(top1_match), 1.0)
++        self.assertLess(float(mean_kl), 16e-6)
++        invalid, _, _, _, _ = _logit_reconstruction_gate(
++            reference, reference + torch.tensor([[0.0, 4.0]])
++        )
 +        self.assertFalse(bool(invalid))
++
++    def test_dflash_surrogate_matches_fused_silu_single_rounding(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _silu_and_mul,
++        )
++
++        gate = torch.linspace(-8.0, 8.0, 4096, dtype=torch.bfloat16)
++        up = torch.linspace(7.0, -7.0, 4096, dtype=torch.bfloat16)
++        expected = (
++            torch.nn.functional.silu(gate.float()) * up.float()
++        ).to(torch.bfloat16)
++        actual = _silu_and_mul(gate, up)
++        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
++        legacy = torch.nn.functional.silu(gate) * up
++        self.assertFalse(torch.equal(legacy, expected))
++
++    def test_reconstruction_gate_accepts_bf16_kernel_drift_not_argmax_drift(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _logit_reconstruction_gate,
++        )
++
++        reference = torch.linspace(-12.0, 12.0, 512, dtype=torch.bfloat16).view(
++            2, 256
++        )
++        reconstructed = reference.clone()
++        reconstructed[1, 240] += torch.tensor(0.125, dtype=torch.bfloat16)
++        (
++            valid,
++            maximum,
++            relative_rms,
++            top1_match,
++            mean_kl,
++        ) = _logit_reconstruction_gate(reference, reconstructed)
++        self.assertTrue(bool(valid))
++        self.assertEqual(float(maximum), 0.125)
++        self.assertLess(float(relative_rms), torch.finfo(torch.bfloat16).eps)
++        self.assertEqual(float(top1_match), 1.0)
++        self.assertLess(
++            float(mean_kl), 16.0 * torch.finfo(torch.bfloat16).eps**2
++        )
++
++        reordered = reference.clone()
++        reordered[0, -1] = reordered[0, -2] - 1.0
++        invalid, _, _, changed_top1, _ = _logit_reconstruction_gate(
++            reference, reordered
++        )
++        self.assertFalse(bool(invalid))
++        self.assertLess(float(changed_top1), 1.0)
++
++        canvas = torch.linspace(
++            -8.0, 8.0, 15 * 64, dtype=torch.bfloat16
++        ).view(1, 15, 64)
++        near_tie = canvas.clone()
++        near_tie[0, 0, -1] = near_tie[0, 0, -2] - 0.03125
++        accepted, _, _, canvas_top1, _ = _logit_reconstruction_gate(
++            canvas, near_tie
++        )
++        self.assertTrue(bool(accepted))
++        self.assertGreaterEqual(float(canvas_top1), 14.0 / 15.0)
++
++    def test_reconstruction_gate_accounts_for_multilayer_bf16_accumulation(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            _logit_reconstruction_gate,
++        )
++
++        generator = torch.Generator().manual_seed(4)
++        reference = (
++            torch.randn((4, 4096), generator=generator) * 4.0
++        ).to(torch.bfloat16)
++        reconstructed = (
++            reference.float()
++            + torch.randn((4, 4096), generator=generator) * 0.07
++        ).to(torch.bfloat16)
++        valid, _, relative_rms, top1_match, mean_kl = _logit_reconstruction_gate(
++            reference, reconstructed
++        )
++        unit = torch.finfo(torch.bfloat16).eps
++        self.assertTrue(bool(valid))
++        self.assertGreater(float(relative_rms), 2.0 * unit)
++        self.assertLess(float(relative_rms), 2.5 * unit)
++        self.assertEqual(float(top1_match), 1.0)
++        self.assertGreater(float(mean_kl), 16.0 * unit**2)
++        self.assertLess(float(mean_kl), 32.0 * unit**2)
++
++    def test_adapter_diagnostics_extends_runtime_before_persistence(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            DFlashDrafterAdapter,
++        )
++
++        calls = []
++        adapter = DFlashDrafterAdapter.__new__(DFlashDrafterAdapter)
++        adapter.optimizer = object()
++        adapter.runtime = SimpleNamespace(
++            diagnostics=lambda **kwargs: calls.append(kwargs) or {"ok": True}
++        )
++        self.assertEqual(adapter.diagnostics(), {"ok": True})
++        self.assertEqual(calls, [{"extra": {"online_spec_state": None}}])
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            OnlineCohortRuntime,
++        )
++
++        self.assertIn(
++            "extra", signature(OnlineCohortRuntime.diagnostics).parameters
++        )
++        self.assertNotIn(
++            "extra", signature(OnlineSpecOptimizer.diagnostics).parameters
++        )
++
++    def test_dflash_rms_keeps_affine_math_in_fp32(self):
++        from sglang.srt.speculative.dflash_online_adaptation import _rms
++
++        hidden = torch.tensor(
++            [[1.125, -0.3125, 0.78125, -1.625]], dtype=torch.bfloat16
++        )
++        weight = torch.tensor(
++            [0.8125, 1.1875, 0.9375, 1.0625], dtype=torch.bfloat16
++        )
++        variance = hidden.float().square().mean(-1, keepdim=True)
++        reference = (
++            hidden.float()
++            * torch.rsqrt(variance + 1e-6)
++            * weight.float()
++        ).to(hidden.dtype)
++        self.assertTrue(torch.equal(_rms(hidden, weight, 1e-6), reference))
++
++    def test_dflash_rope_reuses_inference_cache(self):
++        from sglang.srt.speculative.dflash_online_adaptation import _rope
++
++        value = torch.tensor(
++            [[[1.0, 2.0, 3.0, 4.0]], [[-2.0, 1.0, 0.5, -0.25]]],
++            dtype=torch.bfloat16,
++        )
++        positions = torch.tensor([1, 3], dtype=torch.int64)
++        cache = torch.tensor(
++            [
++                [1.0, 1.0, 0.0, 0.0],
++                [0.5, 0.25, 0.75, -0.5],
++                [1.0, 1.0, 0.0, 0.0],
++                [-0.25, 0.5, 1.0, 0.125],
++            ],
++            dtype=torch.float32,
++        )
++        selected = cache.index_select(0, positions)
++        cosine, sine = selected.chunk(2, dim=-1)
++        left, right = value.float().chunk(2, dim=-1)
++        reference = torch.cat(
++            (
++                left * cosine[:, None] - right * sine[:, None],
++                right * cosine[:, None] + left * sine[:, None],
++            ),
++            dim=-1,
++        ).to(value.dtype)
++        actual = _rope(value, positions, cos_sin_cache=cache)
++        self.assertTrue(torch.equal(actual, reference))
++
++    def test_dflash_rope_batches_requests_without_changing_values(self):
++        from sglang.srt.speculative.dflash_online_adaptation import _rope
++
++        generator = torch.Generator().manual_seed(17)
++        value = torch.randn((3, 4, 2, 8), generator=generator).to(torch.bfloat16)
++        positions = torch.tensor(
++            [[0, 1, 2, 3], [5, 7, 11, 13], [16, 17, 18, 19]],
++            dtype=torch.int64,
++        )
++        cache = torch.randn((32, 8), generator=generator)
++        batched = _rope(value, positions, cos_sin_cache=cache)
++        per_request = torch.stack(
++            [
++                _rope(row, row_positions, cos_sin_cache=cache)
++                for row, row_positions in zip(value, positions, strict=True)
++            ]
++        )
++        self.assertTrue(torch.equal(batched, per_request))
++        with self.assertRaisesRegex(ValueError, "token dimensions"):
++            _rope(value, positions[:, :2], cos_sin_cache=cache)
++
++    def test_dflash_surrogate_runs_one_batched_forward_per_layer(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            DFlashDrafterAdapter,
++            _CapturedHistory,
++        )
++
++        adapter = DFlashDrafterAdapter.__new__(DFlashDrafterAdapter)
++        adapter.worker = SimpleNamespace(block_size=3)
++        adapter.model = SimpleNamespace(
++            layers=(object(), object(), object()),
++            norm=SimpleNamespace(
++                weight=torch.ones(4),
++                variance_epsilon=1e-6,
++            ),
++        )
++        adapter._parameter = lambda _values, _name, fallback: fallback
++        calls = []
++
++        def layer_forward(_values, **kwargs):
++            calls.append(
++                (
++                    kwargs["layer_index"],
++                    tuple(kwargs["hidden"].shape),
++                    tuple(kwargs["positions"].shape),
++                    tuple(kwargs["history_locations"].shape),
++                )
++            )
++            residual = kwargs["hidden"] if kwargs["residual"] is None else kwargs["residual"]
++            return kwargs["hidden"] + 0.125, residual
++
++        adapter._layer_forward = layer_forward
++        result = adapter._surrogate_hidden(
++            {},
++            torch.ones((6, 4)),
++            torch.arange(6),
++            ("request-a", "request-b"),
++            _CapturedHistory(
++                locations=torch.zeros((2, 5), dtype=torch.int64),
++                valid_mask=torch.ones((2, 5), dtype=torch.bool),
++            ),
++        )
++        self.assertEqual(tuple(result.shape), (2, 3, 4))
++        self.assertEqual(
++            calls,
++            [
++                (0, (2, 3, 4), (2, 3), (2, 5)),
++                (1, (2, 3, 4), (2, 3), (2, 5)),
++                (2, (2, 3, 4), (2, 3), (2, 5)),
++            ],
++        )
++
++    def test_dflash_batched_layer_matches_independent_requests(self):
++        from sglang.srt.speculative.dflash_online_adaptation import (
++            DFlashDrafterAdapter,
++        )
++
++        generator = torch.Generator().manual_seed(23)
++
++        def linear(rows, columns):
++            return SimpleNamespace(
++                weight=torch.randn((rows, columns), generator=generator),
++                bias=None,
++            )
++
++        norm = lambda width: SimpleNamespace(
++            weight=torch.rand((width,), generator=generator) + 0.5,
++            variance_epsilon=1e-6,
++        )
++        cache = torch.randn((32, 2), generator=generator)
++        attention = SimpleNamespace(
++            q_size=4,
++            kv_size=2,
++            num_heads=2,
++            num_kv_heads=1,
++            head_dim=2,
++            scaling=2**-0.5,
++            qkv_proj=linear(8, 4),
++            q_norm=norm(2),
++            k_norm=norm(2),
++            rotary_emb=SimpleNamespace(cos_sin_cache=cache),
++            attn=SimpleNamespace(layer_id=0),
++            o_proj=linear(4, 4),
++        )
++        layer = SimpleNamespace(
++            input_layernorm=norm(4),
++            self_attn=attention,
++            post_attention_layernorm=norm(4),
++            mlp=SimpleNamespace(
++                gate_up_proj=linear(8, 4),
++                down_proj=linear(4, 4),
++            ),
++        )
++        key = torch.randn((8, 1, 2), generator=generator)
++        value = torch.randn((8, 1, 2), generator=generator)
++
++        class Pool:
++            def get_kv_buffer(self, _layer_id):
++                return key, value
++
++        adapter = DFlashDrafterAdapter.__new__(DFlashDrafterAdapter)
++        adapter.device = torch.device("cpu")
++        adapter.model = SimpleNamespace(layers=(layer,))
++        adapter.worker = SimpleNamespace(
++            page_size=1,
++            draft_model_runner=SimpleNamespace(token_to_kv_pool=Pool()),
++        )
++        hidden = torch.randn((2, 3, 4), generator=generator)
++        positions = torch.tensor([[1, 2, 3], [7, 8, 9]], dtype=torch.int64)
++        locations = torch.tensor([[0, 1], [4, 6]], dtype=torch.int64)
++        valid = torch.tensor([[True, True], [False, True]])
++
++        batched_hidden, batched_residual = adapter._layer_forward(
++            {},
++            layer_index=0,
++            hidden=hidden,
++            residual=None,
++            positions=positions,
++            history_locations=locations,
++            history_valid=valid,
++        )
++        independent = [
++            adapter._layer_forward(
++                {},
++                layer_index=0,
++                hidden=hidden[index : index + 1],
++                residual=None,
++                positions=positions[index : index + 1],
++                history_locations=locations[index : index + 1],
++                history_valid=valid[index : index + 1],
++            )
++            for index in range(2)
++        ]
++        torch.testing.assert_close(
++            batched_hidden,
++            torch.cat([row[0] for row in independent]),
++            rtol=1e-5,
++            atol=1e-6,
++        )
++        torch.testing.assert_close(
++            batched_residual,
++            torch.cat([row[1] for row in independent]),
++            rtol=1e-5,
++            atol=1e-6,
++        )
 +
 +    def test_nhd_and_hnd_layouts_match(self):
 +        from sglang.srt.speculative.dflash_online_adaptation import (
@@ -1038,7 +1713,7 @@ index 0000000..3f11dd6
 +            max_trace_updates=10,
 +            max_trace_batch=2,
 +        )
-+        self.assertEqual(tuple(runtime.host_validity.shape), (10, 2))
++        self.assertEqual(tuple(runtime.host_validity.shape), (10, 3))
 +        self.assertTrue(runtime.host_validity.is_pinned())
 +        runtime.bind_parameter_layout(
 +            (("weight", torch.zeros(1, device="cuda")),),

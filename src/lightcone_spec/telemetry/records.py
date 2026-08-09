@@ -28,6 +28,7 @@ class RequestRecord:
     concurrency: int
     input_tokens: int
     output_tokens: int
+    output_sha256: str
     ttft_ms: float
     finished: bool
     stop_reason: str | None
@@ -72,6 +73,11 @@ class UpdateRecord:
     barrier_cuda_ms: float | None
     exposed_update_ms: float | None
     overlap_ratio: float | None
+    online_hint_error: float | None
+    online_ensemble_entropy: float | None
+    online_effective_experts: float | None
+    online_expert_probabilities: str | None
+    online_cumulative_losses: str | None
 
 
 @dataclass(frozen=True)

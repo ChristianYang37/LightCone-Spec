@@ -1,19 +1,19 @@
-From 38149a3bbd53108fd2aded3b1913fe5dcc9f47ad Mon Sep 17 00:00:00 2001
+From aed3a408c8cc8192e868e8b149367a437816a04a Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH 2/6] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 1384 +++++++++++++++++
- 1 file changed, 1384 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 1950 +++++++++++++++++
+ 1 file changed, 1950 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000..0dc839b
+index 0000000000000000000000000000000000000000..99ad5de5535f628029f2885151669add5dc3d459
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1950 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
@@ -388,6 +388,358 @@ index 0000000..0dc839b
 +            self._step.zero_()
 +
 +
++def _project_online_parameters(
++    parameters: Sequence[torch.Tensor],
++    origin: Sequence[torch.Tensor],
++    radius: float | None,
++) -> tuple[torch.Tensor, ...]:
++    if radius is None:
++        return tuple(parameters)
++    distance = (
++        torch.stack(
++            [
++                (parameter - base).square().sum()
++                for parameter, base in zip(parameters, origin, strict=True)
++            ]
++        )
++        .sum()
++        .sqrt()
++    )
++    scale = torch.clamp(
++        torch.as_tensor(radius, device=distance.device) / distance.clamp_min(1e-12),
++        max=1.0,
++    )
++    return tuple(
++        base + (parameter - base) * scale
++        for parameter, base in zip(parameters, origin, strict=True)
++    )
++
++
++class OnlineSpecOptimizer:
++    """Transactional OGD, two-state optimistic OGD, or Hedge experts."""
++
++    def __init__(
++        self,
++        parameters: Sequence[torch.Tensor],
++        config: OnlineAdaptationConfig,
++        *,
++        projection_origin: Sequence[torch.Tensor] | None = None,
++    ) -> None:
++        if config.online_spec is None or not config.method.startswith("onlinespec_"):
++            raise ValueError("OnlineSPEC optimizer requires an OnlineSPEC method")
++        if not parameters:
++            raise ValueError("OnlineSPEC parameter layout is empty")
++        self.config = config.optimizer
++        self.method = config.method
++        self.online_spec = config.online_spec
++        self.master = tuple(
++            parameter.detach().to(torch.float32).clone() for parameter in parameters
++        )
++        if projection_origin is None:
++            self.initial = tuple(parameter.clone() for parameter in self.master)
++        else:
++            origin = tuple(projection_origin)
++            if len(origin) != len(self.master) or any(
++                base.shape != parameter.shape
++                or base.device != parameter.device
++                or not base.is_floating_point()
++                for base, parameter in zip(origin, self.master, strict=True)
++            ):
++                raise ValueError("OnlineSPEC projection origin layout mismatch")
++            # The adapter owns this immutable reset snapshot. Reuse it as the
++            # projection origin instead of retaining a second full FP32 copy.
++            self.initial = tuple(base.detach() for base in origin)
++        width = len(self.master)
++        if self.method == "onlinespec_ogd":
++            self.first = ()
++            self.second = ()
++            self.learning_rates = (self.config.learning_rate,)
++        elif self.method == "onlinespec_opt":
++            self.first = tuple(parameter.clone() for parameter in self.master)
++            self.second = tuple(
++                torch.zeros_like(parameter) for parameter in self.master
++            )
++            self.learning_rates = (self.config.learning_rate,)
++        else:
++            self.learning_rates = (
++                self.config.learning_rate,
++                *self.online_spec.additional_learning_rates,
++            )
++            self.first = tuple(
++                parameter.clone()
++                for _ in self.learning_rates
++                for parameter in self.master
++            )
++            self.second = (
++                torch.zeros(
++                    len(self.learning_rates),
++                    dtype=torch.float32,
++                    device=self.master[0].device,
++                ),
++            )
++        self._width = width
++        self._step = torch.zeros((), dtype=torch.int64, device=self.master[0].device)
++
++    @property
++    def is_ensemble(self) -> bool:
++        return self.method == "onlinespec_ens"
++
++    @property
++    def step(self) -> int:
++        return int(self._step.item())
++
++    @property
++    def metadata_tensors(self) -> tuple[torch.Tensor, ...]:
++        return (self._step,)
++
++    @property
++    def state_tensors(self) -> tuple[torch.Tensor, ...]:
++        return self.master + self.first + self.second + self.metadata_tensors
++
++    @property
++    def online_state_tensors(self) -> tuple[torch.Tensor, ...]:
++        return self.first + self.second + self.metadata_tensors
++
++    @property
++    def experts(self) -> tuple[tuple[torch.Tensor, ...], ...]:
++        if not self.is_ensemble:
++            raise RuntimeError("only OnlineSPEC Hedge owns expert states")
++        return tuple(
++            self.first[index : index + self._width]
++            for index in range(0, len(self.first), self._width)
++        )
++
++    @property
++    def expert_probabilities(self) -> torch.Tensor | None:
++        if not self.is_ensemble:
++            return None
++        rate = self.online_spec.hedge_learning_rate
++        if rate is None:
++            raise AssertionError("validated Hedge state has no meta learning rate")
++        return torch.softmax(-rate * self.second[0], dim=0)
++
++    def _clip(self, gradients: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
++        if len(gradients) != self._width:
++            raise ValueError("OnlineSPEC gradient layout mismatch")
++        values = tuple(gradient.detach().to(torch.float32) for gradient in gradients)
++        norm = (
++            torch.stack([gradient.square().sum() for gradient in values]).sum().sqrt()
++        )
++        scale = torch.clamp(self.config.grad_clip / (norm + 1e-12), max=1.0)
++        return tuple(gradient * scale for gradient in values)
++
++    def _ogd(
++        self,
++        parameters: Sequence[torch.Tensor],
++        gradients: Sequence[torch.Tensor],
++        learning_rate: float,
++    ) -> tuple[torch.Tensor, ...]:
++        candidate = tuple(
++            parameter - learning_rate * gradient
++            for parameter, gradient in zip(
++                parameters, self._clip(gradients), strict=True
++            )
++        )
++        return _project_online_parameters(
++            candidate,
++            self.initial,
++            self.online_spec.projection_radius,
++        )
++
++    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
++        if self.is_ensemble:
++            raise RuntimeError("Hedge requires per-expert losses and gradients")
++        next_step = self._step + 1
++        if self.method == "onlinespec_ogd":
++            parameters = self._ogd(self.master, gradients, self.config.learning_rate)
++            return ParameterProposal(parameters, (), (), next_step)
++        clipped = self._clip(gradients)
++        anchor = tuple(
++            parameter - self.config.learning_rate * gradient
++            for parameter, gradient in zip(self.first, clipped, strict=True)
++        )
++        anchor = _project_online_parameters(
++            anchor,
++            self.initial,
++            self.online_spec.projection_radius,
++        )
++        decision = tuple(
++            parameter - self.config.learning_rate * hint
++            for parameter, hint in zip(anchor, clipped, strict=True)
++        )
++        decision = _project_online_parameters(
++            decision,
++            self.initial,
++            self.online_spec.projection_radius,
++        )
++        return ParameterProposal(decision, anchor, clipped, next_step)
++
++    def propose_ensemble(
++        self,
++        losses: torch.Tensor,
++        gradients: Sequence[Sequence[torch.Tensor]],
++    ) -> ParameterProposal:
++        if not self.is_ensemble:
++            raise RuntimeError("only OnlineSPEC Hedge accepts expert feedback")
++        experts = self.experts
++        if losses.shape != (len(experts),) or len(gradients) != len(experts):
++            raise ValueError("one loss and gradient tuple is required per expert")
++        updated = tuple(
++            self.propose_ensemble_member(index, member_gradients)
++            for index, member_gradients in enumerate(gradients)
++        )
++        return self.combine_ensemble(losses, updated)
++
++    def propose_ensemble_member(
++        self,
++        index: int,
++        gradients: Sequence[torch.Tensor],
++    ) -> tuple[torch.Tensor, ...]:
++        """Update one Hedge expert so backends can release its gradients early."""
++        if not self.is_ensemble:
++            raise RuntimeError("only OnlineSPEC Hedge owns expert states")
++        experts = self.experts
++        if (
++            not isinstance(index, int)
++            or isinstance(index, bool)
++            or not 0 <= index < len(experts)
++        ):
++            raise ValueError("OnlineSPEC expert index is outside the learner")
++        return self._ogd(
++            experts[index],
++            gradients,
++            self.learning_rates[index],
++        )
++
++    def combine_ensemble(
++        self,
++        losses: torch.Tensor,
++        updated: Sequence[Sequence[torch.Tensor]],
++    ) -> ParameterProposal:
++        """Form the next Hedge decision from already-updated expert states."""
++        if not self.is_ensemble:
++            raise RuntimeError("only OnlineSPEC Hedge accepts expert feedback")
++        experts = tuple(tuple(parameters) for parameters in updated)
++        if losses.shape != (len(self.learning_rates),) or len(experts) != len(
++            self.learning_rates
++        ):
++            raise ValueError("one loss and updated state is required per expert")
++        if any(
++            len(expert) != self._width
++            or any(
++                parameter.shape != reference.shape
++                or parameter.device != reference.device
++                or not parameter.is_floating_point()
++                for parameter, reference in zip(expert, self.master, strict=True)
++            )
++            for expert in experts
++        ):
++            raise ValueError("updated OnlineSPEC expert layout mismatch")
++        cumulative = self.second[0] + losses.detach().to(torch.float32)
++        hedge_rate = self.online_spec.hedge_learning_rate
++        if hedge_rate is None:
++            raise AssertionError("validated Hedge state has no meta learning rate")
++        probabilities = torch.softmax(-hedge_rate * cumulative, dim=0)
++        decision = tuple(
++            torch.stack([expert[index] for expert in experts])
++            .mul(probabilities.view((-1,) + (1,) * parameter.ndim))
++            .sum(0)
++            for index, parameter in enumerate(self.master)
++        )
++        flattened = tuple(parameter for expert in experts for parameter in expert)
++        return ParameterProposal(
++            decision,
++            flattened,
++            (cumulative,),
++            self._step + 1,
++        )
++
++    def commit(
++        self,
++        proposal: ParameterProposal,
++        *,
++        valid: torch.Tensor | None = None,
++    ) -> None:
++        if valid is None:
++            valid = torch.ones((), dtype=torch.bool, device=self.master[0].device)
++        valid = valid.reshape(()).to(device=self.master[0].device, dtype=torch.bool)
++        if len(proposal.first_moments) != len(self.first) or len(
++            proposal.second_moments
++        ) != len(self.second):
++            raise ValueError("OnlineSPEC proposal state layout mismatch")
++        with torch.no_grad():
++            for active, candidate in zip(self.master, proposal.parameters, strict=True):
++                active.copy_(torch.where(valid, candidate, active))
++            for active, candidate in zip(
++                self.first, proposal.first_moments, strict=True
++            ):
++                active.copy_(torch.where(valid, candidate, active))
++            for active, candidate in zip(
++                self.second, proposal.second_moments, strict=True
++            ):
++                active.copy_(torch.where(valid, candidate, active))
++            self._step.copy_(torch.where(valid, proposal.step, self._step))
++
++    def reset(self, parameters: Sequence[torch.Tensor]) -> None:
++        if len(parameters) != self._width:
++            raise ValueError("OnlineSPEC reset layout mismatch")
++        with torch.no_grad():
++            for destination, source, initial in zip(
++                self.master, parameters, self.initial, strict=True
++            ):
++                initial.copy_(source.to(torch.float32))
++                destination.copy_(initial)
++            if self.method == "onlinespec_opt":
++                for anchor, master in zip(self.first, self.master, strict=True):
++                    anchor.copy_(master)
++                for hint in self.second:
++                    hint.zero_()
++            elif self.is_ensemble:
++                for index, expert in enumerate(self.experts):
++                    for destination, master in zip(expert, self.master, strict=True):
++                        destination.copy_(master)
++                self.second[0].zero_()
++            self._step.zero_()
++
++    def diagnostics(self) -> dict:
++        """Synchronizing endpoint-only diagnostics; never called in decode."""
++        payload = {
++            "algorithm": self.method,
++            "step": self.step,
++            "projection_radius": self.online_spec.projection_radius,
++            "learning_rates": list(self.learning_rates),
++        }
++        if self.method == "onlinespec_opt":
++            payload["hint_norm"] = float(
++                torch.stack([value.square().sum() for value in self.second])
++                .sum()
++                .sqrt()
++                .item()
++            )
++        elif self.is_ensemble:
++            probabilities = self.expert_probabilities
++            if probabilities is None:
++                raise AssertionError("validated Hedge state has no probabilities")
++            payload["expert_probabilities"] = probabilities.tolist()
++            payload["cumulative_losses"] = self.second[0].tolist()
++        return payload
++
++
++def build_parameter_optimizer(
++    parameters: Sequence[torch.Tensor],
++    config: OnlineAdaptationConfig,
++    *,
++    projection_origin: Sequence[torch.Tensor] | None = None,
++) -> ResidentOptimizer | OnlineSpecOptimizer:
++    if config.method.startswith("onlinespec_"):
++        return OnlineSpecOptimizer(
++            parameters,
++            config,
++            projection_origin=projection_origin,
++        )
++    return ResidentOptimizer(parameters, config.optimizer)
++
++
 +class FixedInferenceBank:
 +    """Stages model-dtype values and publishes without changing storage."""
 +
@@ -416,13 +768,14 @@ index 0000000..0dc839b
 +@dataclass
 +class ReadyCandidate:
 +    binding: CandidateBinding
-+    optimizer: ResidentOptimizer
++    optimizer: ResidentOptimizer | OnlineSpecOptimizer
 +    optimizer_proposal: ParameterProposal
 +    inference_bank: FixedInferenceBank
 +    ready_event: torch.cuda.Event | None
 +    candidate_tensors: tuple[torch.Tensor, ...]
 +    finite: torch.Tensor
 +    reconstruction_ok: torch.Tensor
++    supervision_nonempty: torch.Tensor
 +    host_validity: torch.Tensor
 +    trace_index: int
 +
@@ -524,8 +877,10 @@ index 0000000..0dc839b
 +        self.telemetry_path = (
 +            Path(telemetry_path) if telemetry_path is not None else None
 +        )
-+        least_priority, _ = torch.cuda.get_stream_priority_range()
-+        self.side_stream = torch.cuda.Stream(device=device, priority=least_priority)
++        # CUDA clamps out-of-range priorities to the nearest supported value.
++        # A large positive value requests the device's lowest-priority stream
++        # without relying on a version-specific priority-range API.
++        self.side_stream = torch.cuda.Stream(device=device, priority=2**31 - 1)
 +        self.main_ready = torch.cuda.Event(blocking=False)
 +        self.epoch = 0
 +        self.active_version = 0
@@ -548,7 +903,17 @@ index 0000000..0dc839b
 +            dtype=torch.int64,
 +        )
 +        self.trace_metrics = torch.empty(
-+            (max_trace_updates, 4),
++            (max_trace_updates, 11),
++            device=device,
++            dtype=torch.float32,
++        )
++        online_members = (
++            1 + len(config.online_spec.additional_learning_rates)
++            if config.method == "onlinespec_ens" and config.online_spec is not None
++            else 1
++        )
++        self.trace_online_experts = torch.empty(
++            (max_trace_updates, online_members, 2),
 +            device=device,
 +            dtype=torch.float32,
 +        )
@@ -556,7 +921,7 @@ index 0000000..0dc839b
 +        # allocation in the update path can serialize the allocator and
 +        # fragment the process-wide pinned pool under long-running loads.
 +        self.host_validity = torch.empty(
-+            (max_trace_updates, 2),
++            (max_trace_updates, 3),
 +            dtype=torch.uint8,
 +            pin_memory=True,
 +        )
@@ -571,6 +936,7 @@ index 0000000..0dc839b
 +            "updates_launched": 0,
 +            "updates_published": 0,
 +            "updates_discarded": 0,
++            "updates_skipped_no_supervision": 0,
 +            "version_mismatches": 0,
 +            "exactness_violations": 0,
 +            "nonfinite_updates": 0,
@@ -602,13 +968,19 @@ index 0000000..0dc839b
 +
 +    @property
 +    def telemetry_tensors(self) -> tuple[torch.Tensor, ...]:
-+        return self.trace_prefix_lens, self.trace_metrics, self.round_metrics
++        return (
++            self.trace_prefix_lens,
++            self.trace_metrics,
++            self.trace_online_experts,
++            self.round_metrics,
++        )
 +
 +    @property
 +    def cohort_sha256(self) -> str:
 +        if self.parameter_layout_sha256 is None:
 +            raise RuntimeError("parameter layout must be bound before cohort use")
 +        fields = {
++            "method": self.config.method,
 +            "target_revision": self.config.target_revision,
 +            "drafter_revision": self.config.drafter_revision,
 +            "sampling_profile_sha256": self.config.sampling_profile_sha256,
@@ -618,6 +990,11 @@ index 0000000..0dc839b
 +            "parameter_scope": self.config.parameter_scope,
 +            "parameter_layout_sha256": self.parameter_layout_sha256,
 +            "optimizer": self.config.optimizer.__dict__,
++            "online_spec": (
++                None
++                if self.config.online_spec is None
++                else self.config.online_spec.__dict__
++            ),
 +        }
 +        value = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 +        return hashlib.sha256(value).hexdigest()
@@ -693,7 +1070,7 @@ index 0000000..0dc839b
 +        *,
 +        source_round: int,
 +        source_version: int,
-+        optimizer: ResidentOptimizer,
++        optimizer: ResidentOptimizer | OnlineSpecOptimizer,
 +        proposal: ParameterProposal,
 +        inference_bank: FixedInferenceBank,
 +        finite: torch.Tensor,
@@ -702,6 +1079,10 @@ index 0000000..0dc839b
 +        prefix_lens: torch.Tensor,
 +        reconstruction_ok: torch.Tensor | None = None,
 +        reconstruction_max_abs: torch.Tensor | None = None,
++        reconstruction_relative_rms: torch.Tensor | None = None,
++        reconstruction_top1_match: torch.Tensor | None = None,
++        reconstruction_mean_kl: torch.Tensor | None = None,
++        supervision_nonempty: torch.Tensor | None = None,
 +        reservation: CandidateBinding | None = None,
 +    ) -> None:
 +        if self.pending is not None:
@@ -728,7 +1109,27 @@ index 0000000..0dc839b
 +            reconstruction_max_abs = torch.zeros(
 +                (), device=self.device, dtype=torch.float32
 +            )
-+        publish_valid = finite & reconstruction_ok
++        if reconstruction_relative_rms is None:
++            reconstruction_relative_rms = torch.full(
++                (), float("nan"), device=self.device, dtype=torch.float32
++            )
++        if reconstruction_top1_match is None:
++            reconstruction_top1_match = torch.full(
++                (), float("nan"), device=self.device, dtype=torch.float32
++            )
++        if reconstruction_mean_kl is None:
++            reconstruction_mean_kl = torch.full(
++                (), float("nan"), device=self.device, dtype=torch.float32
++            )
++        if supervision_nonempty is None:
++            supervision_nonempty = torch.ones(
++                (), device=self.device, dtype=torch.bool
++            )
++        else:
++            supervision_nonempty = supervision_nonempty.reshape(()).to(
++                device=self.device, dtype=torch.bool
++            )
++        publish_valid = finite & reconstruction_ok & supervision_nonempty
 +        if reservation is None:
 +            binding = CandidateBinding(
 +                self.epoch,
@@ -746,6 +1147,41 @@ index 0000000..0dc839b
 +            ):
 +                raise RuntimeError("update reservation no longer matches the cohort")
 +            binding = reservation
++        online_hint_error = torch.full(
++            (), float("nan"), device=self.device, dtype=torch.float32
++        )
++        online_ensemble_entropy = torch.full_like(online_hint_error, float("nan"))
++        online_effective_experts = torch.full_like(online_hint_error, float("nan"))
++        online_probabilities = None
++        online_cumulative_losses = None
++        if isinstance(optimizer, OnlineSpecOptimizer):
++            if optimizer.method == "onlinespec_opt":
++                online_hint_error = (
++                    torch.stack(
++                        [
++                            (candidate - previous).to(torch.float32).square().sum()
++                            for candidate, previous in zip(
++                                proposal.second_moments,
++                                optimizer.second,
++                                strict=True,
++                            )
++                        ]
++                    )
++                    .sum()
++                    .sqrt()
++                )
++            elif optimizer.is_ensemble:
++                rate = optimizer.online_spec.hedge_learning_rate
++                if rate is None:
++                    raise AssertionError("validated Hedge state lacks its meta rate")
++                online_probabilities = torch.softmax(
++                    -rate * proposal.second_moments[0], dim=0
++                )
++                online_ensemble_entropy = -(
++                    online_probabilities * online_probabilities.clamp_min(1e-12).log()
++                ).sum()
++                online_effective_experts = online_ensemble_entropy.exp()
++                online_cumulative_losses = proposal.second_moments[0]
 +        proposal = ParameterProposal(
 +            parameters=tuple(
 +                torch.where(publish_valid, candidate, active)
@@ -772,6 +1208,18 @@ index 0000000..0dc839b
 +        metric_row[1].copy_(finite.detach().to(torch.float32))
 +        metric_row[2].copy_(reconstruction_ok.detach().to(torch.float32))
 +        metric_row[3].copy_(reconstruction_max_abs.detach().to(torch.float32))
++        metric_row[4].copy_(online_hint_error)
++        metric_row[5].copy_(online_ensemble_entropy)
++        metric_row[6].copy_(online_effective_experts)
++        metric_row[7].copy_(reconstruction_relative_rms.detach().to(torch.float32))
++        metric_row[8].copy_(reconstruction_top1_match.detach().to(torch.float32))
++        metric_row[9].copy_(reconstruction_mean_kl.detach().to(torch.float32))
++        metric_row[10].copy_(supervision_nonempty.detach().to(torch.float32))
++        online_expert_row = self.trace_online_experts[trace_index]
++        online_expert_row.fill_(float("nan"))
++        if online_probabilities is not None and online_cumulative_losses is not None:
++            online_expert_row[:, 0].copy_(online_probabilities)
++            online_expert_row[:, 1].copy_(online_cumulative_losses)
 +        self.update_traces.append(
 +            UpdateTrace(
 +                buffer_index=trace_index,
@@ -791,13 +1239,23 @@ index 0000000..0dc839b
 +                loss,
 +                reconstruction_ok,
 +                reconstruction_max_abs,
++                reconstruction_relative_rms,
++                reconstruction_top1_match,
++                reconstruction_mean_kl,
++                supervision_nonempty,
++                online_hint_error,
++                online_ensemble_entropy,
++                online_effective_experts,
 +                prefix_row,
 +                metric_row,
++                online_expert_row,
 +            )
 +        )
 +        for tensor in candidate_tensors:
 +            tensor.record_stream(self.side_stream)
-+        device_validity = torch.stack((finite, reconstruction_ok)).to(torch.uint8)
++        device_validity = torch.stack(
++            (finite, reconstruction_ok, supervision_nonempty)
++        ).to(torch.uint8)
 +        host_validity = self.host_validity[trace_index]
 +        host_validity.copy_(device_validity, non_blocking=True)
 +        device_validity.record_stream(self.side_stream)
@@ -815,6 +1273,7 @@ index 0000000..0dc839b
 +            candidate_tensors=candidate_tensors,
 +            finite=publish_valid,
 +            reconstruction_ok=reconstruction_ok,
++            supervision_nonempty=supervision_nonempty,
 +            host_validity=host_validity,
 +            trace_index=trace_index,
 +        )
@@ -856,6 +1315,14 @@ index 0000000..0dc839b
 +        if self.reserved == binding:
 +            self.reserved = None
 +
++    def skip_update_no_supervision(
++        self, reservation: CandidateBinding | None = None
++    ) -> None:
++        """Account for a due update whose request boundary has no teacher row."""
++        if reservation is not None:
++            self.release_reservation(reservation)
++        self.counters["updates_skipped_no_supervision"] += 1
++
 +    def _binding_fields_current(self, binding: CandidateBinding) -> bool:
 +        return (
 +            binding.cohort_epoch == self.epoch
@@ -867,7 +1334,7 @@ index 0000000..0dc839b
 +        return self._binding_fields_current(candidate.binding)
 +
 +    def boundary(self) -> bool:
-+        """Publish if policy permits; TTS alone may wait at its fixed boundary."""
++        """Publish at L0 readiness, OnlineSPEC next-step, or TTS stride."""
 +        candidate = self.pending
 +        if candidate is None or self.disabled_reason is not None:
 +            return False
@@ -883,12 +1350,19 @@ index 0000000..0dc839b
 +        if self.config.method == "naive_async":
 +            if not ready.query():
 +                return False
++        elif self.config.method.startswith("onlinespec_"):
++            # Prequential online learning evaluates with w_t, observes the
++            # current feedback, and must expose w_(t+1) before the next
++            # prediction. The side stream may overlap the remainder of the
++            # current round, but it cannot lag by another full stride.
++            if self.round <= candidate.binding.source_round:
++                return False
 +        else:
 +            next_boundary = candidate.binding.source_round + self.config.stride
 +            if self.round < next_boundary:
 +                return False
 +        main = torch.cuda.current_stream(self.device)
-+        if self.config.method == "tts":
++        if self.config.method != "naive_async":
 +            with self.timing("barrier"):
 +                main.wait_event(ready)
 +                # TTS has an explicit fixed-boundary barrier. Completing the
@@ -898,12 +1372,14 @@ index 0000000..0dc839b
 +            main.wait_event(ready)
 +        finite_ok = bool(candidate.host_validity[0].item())
 +        reconstruction_ok = bool(candidate.host_validity[1].item())
-+        if not finite_ok or not reconstruction_ok:
++        supervision_ok = bool(candidate.host_validity[2].item())
++        if not finite_ok or not reconstruction_ok or not supervision_ok:
 +            trace = self.update_traces[candidate.trace_index]
 +            self._record_invalid_candidate(
 +                trace,
 +                finite_ok=finite_ok,
 +                reconstruction_ok=reconstruction_ok,
++                supervision_ok=supervision_ok,
 +            )
 +            return False
 +        with self.timing("publish"):
@@ -1130,7 +1606,6 @@ index 0000000..0dc839b
 +        *,
 +        resident_tensors: Sequence[torch.Tensor],
 +        peak_scratch_bytes: int,
-+        optimizer_tensors: Sequence[torch.Tensor] = (),
 +        trainable_tensors: Sequence[torch.Tensor] = (),
 +        categories: dict[str, int] | None = None,
 +    ) -> None:
@@ -1145,9 +1620,6 @@ index 0000000..0dc839b
 +            )
 +        self.resident_bytes = resident
 +        self.peak_bytes = peak
-+        self.optimizer_bytes = sum(
-+            tensor.numel() * tensor.element_size() for tensor in optimizer_tensors
-+        )
 +        self.trainable_parameters = sum(tensor.numel() for tensor in trainable_tensors)
 +        if categories is None:
 +            categories = {
@@ -1156,6 +1628,7 @@ index 0000000..0dc839b
 +                "gradient_bytes": 0,
 +                "first_moment_bytes": 0,
 +                "second_moment_bytes": 0,
++                "online_state_bytes": 0,
 +                "optimizer_metadata_bytes": 0,
 +                "staging_bytes": 0,
 +                "training_activation_bytes": int(peak_scratch_bytes),
@@ -1170,6 +1643,7 @@ index 0000000..0dc839b
 +            "gradient_bytes",
 +            "first_moment_bytes",
 +            "second_moment_bytes",
++            "online_state_bytes",
 +            "optimizer_metadata_bytes",
 +            "staging_bytes",
 +            "training_activation_bytes",
@@ -1189,6 +1663,7 @@ index 0000000..0dc839b
 +                "master_fp32_bytes",
 +                "first_moment_bytes",
 +                "second_moment_bytes",
++                "online_state_bytes",
 +                "optimizer_metadata_bytes",
 +                "staging_bytes",
 +                "graph_buffer_bytes",
@@ -1208,6 +1683,16 @@ index 0000000..0dc839b
 +            raise ValueError("resident adaptation memory ledger does not sum")
 +        if scratch_from_categories != int(peak_scratch_bytes):
 +            raise ValueError("peak adaptation memory ledger does not sum")
++        self.optimizer_bytes = sum(
++            int(categories[name])
++            for name in (
++                "master_fp32_bytes",
++                "first_moment_bytes",
++                "second_moment_bytes",
++                "online_state_bytes",
++                "optimizer_metadata_bytes",
++            )
++        )
 +        self.memory_ledger = {
 +            **{name: int(value) for name, value in categories.items()},
 +            "resident_bytes": resident,
@@ -1239,28 +1724,44 @@ index 0000000..0dc839b
 +            timing = self.pending_timings.popleft()
 +            self.timings_ms[timing.name] += timing.started.elapsed_time(timing.finished)
 +
-+    def _drain_diagnostics(self) -> tuple[list[list[int]], list[list[float]]]:
++    def _drain_diagnostics(
++        self,
++    ) -> tuple[list[list[int]], list[list[float]], list[list[list[float]]]]:
++        # Metrics and OnlineSPEC expert rows are written after the timed
++        # training/optimizer/merge regions.  Waiting only for those timing
++        # events can therefore expose a partially written final row when a
++        # request finishes with one candidate still in flight.  The candidate
++        # ready event is the single completion fence for all evidence writes.
++        candidate = self.pending
++        if candidate is not None:
++            ready = candidate.ready_event
++            if ready is None:
++                raise RuntimeError("CUDA candidate has no ready event")
++            ready.synchronize()
 +        while self.pending_timings:
 +            timing = self.pending_timings.popleft()
 +            timing.finished.synchronize()
 +            self.timings_ms[timing.name] += timing.started.elapsed_time(timing.finished)
 +        prefix_rows = self.trace_prefix_lens[: len(self.update_traces)].tolist()
 +        metric_rows = self.trace_metrics[: len(self.update_traces)].tolist()
++        expert_rows = self.trace_online_experts[: len(self.update_traces)].tolist()
 +        for trace in self.update_traces:
 +            if trace.diagnosed:
 +                continue
 +            metrics = metric_rows[trace.buffer_index]
 +            finite_ok = bool(metrics[1])
 +            reconstruction_ok = bool(metrics[2])
-+            if not finite_ok or not reconstruction_ok:
++            supervision_ok = bool(metrics[10])
++            if not finite_ok or not reconstruction_ok or not supervision_ok:
 +                self._record_invalid_candidate(
 +                    trace,
 +                    finite_ok=finite_ok,
 +                    reconstruction_ok=reconstruction_ok,
++                    supervision_ok=supervision_ok,
 +                )
 +            else:
 +                trace.diagnosed = True
-+        return prefix_rows, metric_rows
++        return prefix_rows, metric_rows, expert_rows
 +
 +    def _record_invalid_candidate(
 +        self,
@@ -1268,16 +1769,22 @@ index 0000000..0dc839b
 +        *,
 +        finite_ok: bool,
 +        reconstruction_ok: bool,
++        supervision_ok: bool = True,
 +    ) -> None:
 +        """Account for one invalid candidate exactly once and fail closed."""
 +        if trace.diagnosed:
 +            return
-+        trace.status = (
-+            "nonfinite_update" if not finite_ok else "reconstruction_mismatch"
-+        )
++        if not supervision_ok:
++            trace.status = "no_supervision"
++        elif not finite_ok:
++            trace.status = "nonfinite_update"
++        else:
++            trace.status = "reconstruction_mismatch"
 +        trace.diagnosed = True
 +        self.counters["updates_discarded"] += 1
-+        if not finite_ok:
++        if not supervision_ok:
++            self.counters["updates_skipped_no_supervision"] += 1
++        elif not finite_ok:
 +            self.counters["nonfinite_updates"] += 1
 +            self.disabled_reason = "nonfinite_update"
 +        elif not reconstruction_ok:
@@ -1288,8 +1795,10 @@ index 0000000..0dc839b
 +        if candidate is not None and candidate.trace_index == trace.buffer_index:
 +            self.pending = None
 +
-+    def diagnostics(self) -> dict:
-+        trace_prefix_rows, trace_metric_rows = self._drain_diagnostics()
++    def diagnostics(self, *, extra: dict | None = None) -> dict:
++        trace_prefix_rows, trace_metric_rows, trace_expert_rows = (
++            self._drain_diagnostics()
++        )
 +        if self.active_round_rows:
 +            raise RuntimeError("cannot diagnose an incomplete decode round")
 +        self._archive_latest_device_lengths()
@@ -1360,6 +1869,55 @@ index 0000000..0dc839b
 +                    "reconstruction_max_abs": float(
 +                        trace_metric_rows[trace.buffer_index][3]
 +                    ),
++                    "reconstruction_relative_rms": (
++                        float(trace_metric_rows[trace.buffer_index][7])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][7])
++                        else None
++                    ),
++                    "reconstruction_top1_match": (
++                        float(trace_metric_rows[trace.buffer_index][8])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][8])
++                        else None
++                    ),
++                    "supervision_nonempty": bool(
++                        trace_metric_rows[trace.buffer_index][10]
++                    ),
++                    "reconstruction_mean_kl": (
++                        float(trace_metric_rows[trace.buffer_index][9])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][9])
++                        else None
++                    ),
++                    "online_hint_error": (
++                        float(trace_metric_rows[trace.buffer_index][4])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][4])
++                        else None
++                    ),
++                    "online_ensemble_entropy": (
++                        float(trace_metric_rows[trace.buffer_index][5])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][5])
++                        else None
++                    ),
++                    "online_effective_experts": (
++                        float(trace_metric_rows[trace.buffer_index][6])
++                        if math.isfinite(trace_metric_rows[trace.buffer_index][6])
++                        else None
++                    ),
++                    "online_expert_probabilities": (
++                        [float(row[0]) for row in trace_expert_rows[trace.buffer_index]]
++                        if all(
++                            math.isfinite(row[0])
++                            for row in trace_expert_rows[trace.buffer_index]
++                        )
++                        else None
++                    ),
++                    "online_cumulative_losses": (
++                        [float(row[1]) for row in trace_expert_rows[trace.buffer_index]]
++                        if all(
++                            math.isfinite(row[1])
++                            for row in trace_expert_rows[trace.buffer_index]
++                        )
++                        else None
++                    ),
 +                }
 +                for trace in self.update_traces
 +            ],
@@ -1390,6 +1948,14 @@ index 0000000..0dc839b
 +                for request_id, state in self.requests.items()
 +            },
 +        }
++        if extra is not None:
++            overlap = set(payload) & set(extra)
++            if overlap:
++                raise ValueError(
++                    "diagnostic extension collides with runtime fields: "
++                    + ", ".join(sorted(overlap))
++                )
++            payload.update(extra)
 +        if self.telemetry_path is not None:
 +            self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
 +            temporary = self.telemetry_path.with_suffix(

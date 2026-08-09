@@ -257,10 +257,10 @@ def test_formal_methods_reject_non_tuning_optimizers(optimizer: str) -> None:
         RunConfig.model_validate(value)
 
 
-def test_external_baseline_is_not_routed_into_sglang() -> None:
+def test_external_baseline_has_explicit_clean_room_runtime_state() -> None:
     value = config_value("onlinespec_ogd")
     value["adaptation"].update(
-        weight_update_mode="residual",
+        weight_update_mode="full",
         parameter_scope="tail",
         optimizer={
             "name": "sgd",
@@ -271,10 +271,18 @@ def test_external_baseline_is_not_routed_into_sglang() -> None:
             "epsilon": 1e-8,
             "grad_clip": 1.0,
         },
+        rank=None,
     )
+    value["online_spec"] = {
+        "projection_radius": None,
+        "additional_learning_rates": [],
+        "hedge_learning_rate": None,
+    }
     config = RunConfig.model_validate(value)
-    with pytest.raises(ValueError, match="isolated external baseline"):
-        sglang_adaptation_payload(config)
+    payload = sglang_adaptation_payload(config)
+    assert payload is not None
+    assert payload["method"] == "onlinespec_ogd"
+    assert payload["online_spec"]["projection_radius"] is None
 
 
 def test_loader_is_deterministic_and_strict(tmp_path) -> None:

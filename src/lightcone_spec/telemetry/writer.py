@@ -31,6 +31,14 @@ _TABLE = {
     UpdateRecord: "update",
     PerformanceRecord: "performance",
 }
+_EVIDENCE_METHODS = {
+    "static",
+    "tts",
+    "naive_async",
+    "onlinespec_ogd",
+    "onlinespec_opt",
+    "onlinespec_ens",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -99,7 +107,7 @@ def load_completed_evidence(
             len(run_table) != 1
             or run_table[0].get("run_id") != run_id
             or run_table[0].get("status") != "complete"
-            or method not in {"static", "tts", "naive_async"}
+            or method not in _EVIDENCE_METHODS
             or set(resolved) != expected_tables
             or not performance
             or any(row.get("run_id") != run_id for row in performance)
@@ -174,7 +182,7 @@ class EvidenceWriter:
         if (
             run.get("run_id") != self.run_id
             or run.get("status") != "complete"
-            or method not in {"static", "tts", "naive_async"}
+            or method not in _EVIDENCE_METHODS
             or populated != expected_tables
             or any(
                 row.get("method") != method

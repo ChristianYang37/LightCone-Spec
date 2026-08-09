@@ -1,21 +1,21 @@
-From 7a0b06d8eb9d2ff1ac2e0662501bbe859241e7e4 Mon Sep 17 00:00:00 2001
+From c48b6c79e46059d669af813fb95913b199817cd8 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
 
 ---
- .../speculative/dflash_online_adaptation.py   | 828 ++++++++++++++++++
- .../srt/speculative/online_valid_mask.py      | 138 +++
- 2 files changed, 966 insertions(+)
+ .../speculative/dflash_online_adaptation.py   | 1093 +++++++++++++++++
+ .../srt/speculative/online_valid_mask.py      |  138 +++
+ 2 files changed, 1231 insertions(+)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
 
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000..a1c3b93
+index 0000000000000000000000000000000000000000..58f94979bf3dec3a82f0535d6f7ba58ba37275b7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,828 @@
+@@ -0,0 +1,1093 @@
 +"""DFlash drafter-scope Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -23,7 +23,7 @@ index 0000000..a1c3b93
 +import logging
 +import math
 +import re
-+from collections.abc import Sequence
++from collections.abc import Callable, Sequence
 +from dataclasses import dataclass
 +
 +import torch
@@ -34,9 +34,10 @@ index 0000000..a1c3b93
 +from sglang.srt.speculative.online_adaptation_runtime import (
 +    FixedInferenceBank,
 +    OnlineCohortRuntime,
-+    ResidentOptimizer,
-+    estimate_functional_optimizer_scratch_bytes,
++    OnlineSpecOptimizer,
++    build_parameter_optimizer,
 +    estimate_full_vocab_training_scratch_bytes,
++    estimate_functional_optimizer_scratch_bytes,
 +)
 +
 +logger = logging.getLogger(__name__)
@@ -52,8 +53,20 @@ index 0000000..a1c3b93
 +
 +
 +def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
++    """Match SGLang RMSNorm's fp32 reduction and affine arithmetic.
++
++    Casting the reciprocal RMS to bf16 before the affine multiply introduces
++    a systematic error that is amplified by the frozen LM head.  Keep the
++    entire normalization in fp32 and cast only the final activation, matching
++    ``RMSNorm.forward_native`` and the non-residual CUDA kernel contract.
++    """
 +    variance = hidden.to(torch.float32).square().mean(-1, keepdim=True)
-+    return (hidden * torch.rsqrt(variance + epsilon).to(hidden.dtype)) * weight
++    normalized = (
++        hidden.to(torch.float32)
++        * torch.rsqrt(variance + epsilon)
++        * weight.to(torch.float32)
++    )
++    return normalized.to(hidden.dtype)
 +
 +
 +def _linear(
@@ -68,48 +81,143 @@ index 0000000..a1c3b93
 +    )
 +
 +
++def _silu_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
++    """Match the fused CUDA activation's single bf16 rounding boundary."""
++    if gate.shape != up.shape or gate.dtype != up.dtype:
++        raise ValueError("DFlash gated-MLP activation inputs do not match")
++    return (F.silu(gate.to(torch.float32)) * up.to(torch.float32)).to(gate.dtype)
++
++
 +def _logit_reconstruction_gate(
 +    inference_logits: torch.Tensor,
 +    differentiable_logits: torch.Tensor,
-+) -> tuple[torch.Tensor, torch.Tensor]:
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 +    if inference_logits.shape != differentiable_logits.shape:
 +        raise ValueError("DFlash reconstruction logit shapes differ")
 +    inference = inference_logits.detach().to(torch.float32)
 +    reconstructed = differentiable_logits.detach().to(torch.float32)
-+    maximum = (reconstructed - inference).abs().max()
-+    limit = 2e-3 + 2e-3 * inference.abs().max()
-+    valid = torch.isfinite(maximum) & torch.isfinite(limit) & (maximum <= limit)
-+    return valid, maximum
++    error = (reconstructed - inference).abs()
++    maximum = error.max()
++    # FlashInfer and differentiable SDPA evaluate the same attention equation
++    # with different reduction orders.  Bound normalized logit error and
++    # proposal-distribution KL; max error and top-1 agreement remain audit
++    # signals because isolated low-probability outliers and near-ties are not
++    # stable semantic gates over a full vocabulary.
++    numerical_unit = max(float(torch.finfo(inference_logits.dtype).eps), 1e-3)
++    denominator = inference.square().mean().sqrt().clamp_min(1e-12)
++    relative_rms = error.square().mean().sqrt() / denominator
++    top1_match = (
++        inference.argmax(dim=-1) == reconstructed.argmax(dim=-1)
++    ).to(torch.float32).mean()
++    # Top-1 agreement remains diagnostic rather than a hard gate: near-tied
++    # logits may exchange order under bf16 reduction drift even when their KL
++    # is tiny.  Exact decoding continues to use the retained inference q, not
++    # this differentiable surrogate.
++    probability = torch.softmax(inference, dim=-1)
++    mean_kl = (
++        probability
++        * (
++            torch.log_softmax(inference, dim=-1)
++            - torch.log_softmax(reconstructed, dim=-1)
++        )
++    ).sum(-1).mean()
++    # The current canvas traverses five bf16 transformer layers. A 2.5*u
++    # relative envelope plus the independent 32*u^2 distribution bound covers
++    # accumulated FlashInfer/SDPA reduction drift without allowing the KL
++    # average to hide diffuse logit corruption. The actual sampled q still
++    # comes from inference logits; the surrogate is used only for its Jacobian.
++    valid = (
++        torch.isfinite(error).all()
++        & torch.isfinite(relative_rms)
++        & torch.isfinite(mean_kl)
++        & (relative_rms <= 2.5 * numerical_unit)
++        & (mean_kl <= 32.0 * numerical_unit**2)
++    )
++    return valid, maximum, relative_rms, top1_match, mean_kl
++
++
++def _loss_and_grad(
++    parameters: Sequence[torch.Tensor],
++    objective: Callable[[tuple[torch.Tensor, ...]], torch.Tensor],
++) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
++    """Differentiate a bounded update even when inference runs under no_grad."""
++    with torch.enable_grad():
++        leaves = tuple(
++            value.detach().requires_grad_(True) for value in parameters
++        )
++        loss = objective(leaves)
++        if loss.numel() != 1 or not loss.requires_grad:
++            raise RuntimeError("DFlash update objective is not differentiable")
++        raw = torch.autograd.grad(loss, leaves, allow_unused=True)
++    gradients = tuple(
++        torch.zeros_like(leaf) if gradient is None else gradient
++        for leaf, gradient in zip(leaves, raw, strict=True)
++    )
++    return loss.detach(), gradients
++
++
++def _anchor_forward_value(
++    surrogate: torch.Tensor,
++    reference: torch.Tensor,
++) -> torch.Tensor:
++    """Use ``reference`` in the forward pass and ``surrogate`` for autograd."""
++    if surrogate.shape != reference.shape:
++        raise ValueError("value-corrected surrogate shapes differ")
++    return surrogate + (reference.detach() - surrogate).detach()
++
++
++def _is_default_rope_metadata(value: object) -> bool:
++    """Accept Transformers' normalized representation of unscaled RoPE."""
++    if value in (None, {}):
++        return True
++    if not isinstance(value, dict):
++        return False
++    return (
++        set(value) <= {"rope_type", "type", "rope_theta"}
++        and value.get("rope_type", "default") == "default"
++        and value.get("type", "default") == "default"
++    )
++
++
++def _is_disabled_sliding_window(value: object) -> bool:
++    """Recognize SGLang's only two no-window representations."""
++    return value is None or (type(value) is int and value == -1)
 +
 +
 +def _rope(
 +    value: torch.Tensor,
 +    positions: torch.Tensor,
 +    *,
-+    theta: float,
++    cos_sin_cache: torch.Tensor,
 +) -> torch.Tensor:
++    """Apply NeoX RoPE from the exact cache used by the inference kernel.
++
++    Recomputing trigonometric values on GPU does not reproduce SGLang's
++    initialization-time cache at long positions.  The discrepancy is small
++    per element but becomes visible after five draft layers and the frozen LM
++    head.  Reusing the immutable fp32 cache is both cheaper and bit-identical
++    to the JIT RoPE kernel after the final activation cast.
++    """
 +    dimension = value.shape[-1]
 +    if dimension % 2:
 +        raise ValueError("RoPE head dimension must be even")
-+    inverse = 1.0 / (
-+        theta
-+        ** (
-+            torch.arange(
-+                0,
-+                dimension,
-+                2,
-+                device=value.device,
-+                dtype=torch.float32,
-+            )
-+            / dimension
-+        )
-+    )
-+    angles = positions.to(torch.float32)[:, None] * inverse[None, :]
-+    cosine = torch.cat((angles.cos(), angles.cos()), dim=-1).to(value.dtype)
-+    sine = torch.cat((angles.sin(), angles.sin()), dim=-1).to(value.dtype)
-+    left, right = value.chunk(2, dim=-1)
-+    rotated = torch.cat((-right, left), dim=-1)
-+    return value * cosine[:, None, :] + rotated * sine[:, None, :]
++    if value.ndim != positions.ndim + 2 or value.shape[:-2] != positions.shape:
++        raise ValueError("RoPE positions do not match the token dimensions")
++    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] < dimension:
++        raise ValueError("RoPE cache does not cover the requested head dimension")
++    cached = cos_sin_cache.index_select(0, positions.reshape(-1))[:, :dimension]
++    cached = cached.reshape(*positions.shape, dimension)
++    cosine, sine = cached.to(torch.float32).chunk(2, dim=-1)
++    cosine = cosine.unsqueeze(-2)
++    sine = sine.unsqueeze(-2)
++    left, right = value.to(torch.float32).chunk(2, dim=-1)
++    return torch.cat(
++        (
++            left * cosine - right * sine,
++            right * cosine + left * sine,
++        ),
++        dim=-1,
++    ).to(value.dtype)
 +
 +
 +class DFlashDrafterAdapter:
@@ -146,7 +254,7 @@ index 0000000..a1c3b93
 +                "DFlashDraftModel; specialized variants fail closed"
 +            )
 +        rope_scaling = getattr(self.model.config, "rope_scaling", None)
-+        if rope_scaling not in (None, {}):
++        if not _is_default_rope_metadata(rope_scaling):
 +            raise ValueError(
 +                "differentiable DFlash adaptation does not yet reconstruct "
 +                "non-default RoPE scaling; start-up fails before allocation"
@@ -162,7 +270,9 @@ index 0000000..a1c3b93
 +                "differentiable DFlash adaptation requires NeoX-style RoPE"
 +            )
 +        if any(
-+            layer.self_attn.sliding_window_size is not None
++            not _is_disabled_sliding_window(
++                layer.self_attn.sliding_window_size
++            )
 +            for layer in self.model.layers
 +        ):
 +            raise ValueError(
@@ -207,12 +317,15 @@ index 0000000..a1c3b93
 +        if config.weight_update_mode == "full":
 +            self.names = all_names
 +            self.base: dict[str, torch.Tensor] = {}
-+            self.inference = FixedInferenceBank(
-+                tuple(self.named[name] for name in self.names)
++            trainable = tuple(self.named[name] for name in self.names)
++            self.initial_trainable = tuple(
++                value.detach().clone() for value in trainable
 +            )
-+            self.optimizer = ResidentOptimizer(
-+                tuple(self.named[name] for name in self.names),
-+                config.optimizer,
++            self.inference = FixedInferenceBank(trainable)
++            self.optimizer = build_parameter_optimizer(
++                trainable,
++                config,
++                projection_origin=self.initial_trainable,
 +            )
 +        else:
 +            factor_names = [
@@ -255,10 +368,15 @@ index 0000000..a1c3b93
 +                )
 +                factors.extend((a, b))
 +                self.factor_shapes[name] = (len(factors) - 2, len(factors) - 1)
-+            self.optimizer = ResidentOptimizer(tuple(factors), config.optimizer)
-+        self.initial_trainable = tuple(
-+            value.detach().clone() for value in self.optimizer.master
-+        )
++            trainable = tuple(factors)
++            self.initial_trainable = tuple(
++                value.detach().clone() for value in trainable
++            )
++            self.optimizer = build_parameter_optimizer(
++                trainable,
++                config,
++                projection_origin=self.initial_trainable,
++            )
 +        if config.weight_update_mode == "full":
 +            layout = tuple(zip(self.names, self.optimizer.master, strict=True))
 +        else:
@@ -283,6 +401,7 @@ index 0000000..a1c3b93
 +        self._captured_history: _CapturedHistory | None = None
 +        resident = (
 +            tuple(self.base.values())
++            + self.initial_trainable
 +            + self.optimizer.state_tensors
 +            + self.inference.staging
 +            + self.runtime.telemetry_tensors
@@ -299,13 +418,21 @@ index 0000000..a1c3b93
 +            batch_tokens=max_batch * (config.canvas_tokens - 1),
 +            vocab_size=vocab,
 +        )
++        history_capacity = config.canvas_tokens + max(int(worker.page_size) - 1, 0)
++        attention_workspace = (
++            max_batch
++            * layers
++            * int(self.model.config.num_attention_heads)
++            * config.canvas_tokens
++            * (history_capacity + config.canvas_tokens)
++            * 4
++        )
 +        activation_scratch = (
 +            max_batch
 +            * config.canvas_tokens
 +            * (layers * (8 * hidden + 3 * intermediate) + 4 * hidden)
 +            * 4
-+        ) + logit_scratch
-+        history_capacity = config.canvas_tokens + max(int(worker.page_size) - 1, 0)
++        ) + logit_scratch + attention_workspace
 +        kv_gather_scratch = max_batch * history_capacity * layers * hidden * 2 * 4
 +        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
 +        base_bytes = sum(value.nbytes for value in self.base.values())
@@ -326,14 +453,35 @@ index 0000000..a1c3b93
 +        self.runtime.bind_memory(
 +            resident_tensors=resident,
 +            peak_scratch_bytes=scratch,
-+            optimizer_tensors=self.optimizer.state_tensors,
-+            trainable_tensors=self.optimizer.master,
++            trainable_tensors=(
++                self.optimizer.first
++                if isinstance(self.optimizer, OnlineSpecOptimizer)
++                and self.optimizer.is_ensemble
++                else self.optimizer.master
++            ),
 +            categories={
-+                "active_or_base_bytes": bytes_of(tuple(self.base.values())),
++                "active_or_base_bytes": bytes_of(
++                    tuple(self.base.values()) + self.initial_trainable
++                ),
 +                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                # Hedge experts are differentiated sequentially. Only one
++                # expert-gradient layout is live at the scratch peak.
 +                "gradient_bytes": trainable_bytes,
-+                "first_moment_bytes": bytes_of(self.optimizer.first),
-+                "second_moment_bytes": bytes_of(self.optimizer.second),
++                "first_moment_bytes": (
++                    0
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else bytes_of(self.optimizer.first)
++                ),
++                "second_moment_bytes": (
++                    0
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else bytes_of(self.optimizer.second)
++                ),
++                "online_state_bytes": (
++                    bytes_of(self.optimizer.first + self.optimizer.second)
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else 0
++                ),
 +                "optimizer_metadata_bytes": bytes_of(self.optimizer.metadata_tensors),
 +                "staging_bytes": bytes_of(self.inference.staging),
 +                "training_activation_bytes": activation_scratch,
@@ -452,6 +600,14 @@ index 0000000..a1c3b93
 +        history_locations: torch.Tensor,
 +        history_valid: torch.Tensor,
 +    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if hidden.ndim != 3 or positions.shape != hidden.shape[:2]:
++            raise ValueError("batched DFlash canvas shapes are inconsistent")
++        if (
++            history_locations.ndim != 2
++            or history_valid.shape != history_locations.shape
++            or history_locations.shape[0] != hidden.shape[0]
++        ):
++            raise ValueError("batched DFlash history shapes are inconsistent")
 +        layer = self.model.layers[layer_index]
 +        prefix = f"layers.{layer_index}"
 +        if residual is None:
@@ -497,10 +653,14 @@ index 0000000..a1c3b93
 +            [attention.q_size, attention.kv_size, attention.kv_size],
 +            dim=-1,
 +        )
-+        query = query.view(-1, attention.num_heads, attention.head_dim)
-+        current_key = current_key.view(-1, attention.num_kv_heads, attention.head_dim)
++        query = query.view(
++            *hidden.shape[:2], attention.num_heads, attention.head_dim
++        )
++        current_key = current_key.view(
++            *hidden.shape[:2], attention.num_kv_heads, attention.head_dim
++        )
 +        current_value = current_value.view(
-+            -1, attention.num_kv_heads, attention.head_dim
++            *hidden.shape[:2], attention.num_kv_heads, attention.head_dim
 +        )
 +        q_norm = self._parameter(
 +            values,
@@ -522,32 +682,37 @@ index 0000000..a1c3b93
 +            k_norm.to(current_key.dtype),
 +            float(attention.k_norm.variance_epsilon),
 +        )
-+        theta = float(getattr(self.model.config, "rope_theta", 1_000_000.0))
-+        query = _rope(query, positions, theta=theta)
-+        current_key = _rope(current_key, positions, theta=theta)
++        rope_cache = attention.rotary_emb.cos_sin_cache
++        query = _rope(query, positions, cos_sin_cache=rope_cache)
++        current_key = _rope(
++            current_key,
++            positions,
++            cos_sin_cache=rope_cache,
++        )
 +        history_key, history_value = self._gather_history(
 +            layer_id=int(attention.attn.layer_id),
 +            locations=history_locations,
 +        )
-+        key = torch.cat((history_key, current_key), dim=0)
-+        value = torch.cat((history_value, current_value), dim=0)
++        key = torch.cat((history_key, current_key), dim=1)
++        value = torch.cat((history_value, current_value), dim=1)
 +        repeat = attention.num_heads // attention.num_kv_heads
-+        key = key.repeat_interleave(repeat, dim=1)
-+        value = value.repeat_interleave(repeat, dim=1)
-+        query = query.transpose(0, 1).unsqueeze(0)
-+        key = key.transpose(0, 1).unsqueeze(0)
-+        value = value.transpose(0, 1).unsqueeze(0)
++        key = key.repeat_interleave(repeat, dim=2)
++        value = value.repeat_interleave(repeat, dim=2)
++        query = query.transpose(1, 2)
++        key = key.transpose(1, 2)
++        value = value.transpose(1, 2)
 +        visible = torch.cat(
 +            (
 +                history_valid,
 +                torch.ones(
-+                    current_key.shape[0],
++                    hidden.shape[:2],
 +                    device=self.device,
 +                    dtype=torch.bool,
 +                ),
-+            )
++            ),
++            dim=1,
 +        )
-+        attention_mask = visible[None, None, None, :]
++        attention_mask = visible[:, None, None, :]
 +        attended = F.scaled_dot_product_attention(
 +            query,
 +            key,
@@ -557,7 +722,7 @@ index 0000000..a1c3b93
 +            is_causal=False,
 +            scale=attention.scaling,
 +        )
-+        attended = attended.squeeze(0).transpose(0, 1).reshape(hidden.shape[0], -1)
++        attended = attended.transpose(1, 2).reshape(*hidden.shape[:2], -1)
 +        o_weight = self._parameter(
 +            values,
 +            f"{prefix}.self_attn.o_proj.weight",
@@ -598,7 +763,10 @@ index 0000000..a1c3b93
 +            ),
 +        )
 +        gate, up = gate_up.chunk(2, dim=-1)
-+        activated = F.silu(gate) * up
++        # SGLang's fused SiluAndMul evaluates both operations in fp32 and casts
++        # once. Two eager bf16 operations introduce an extra rounding boundary
++        # whose error compounds across the five DFlash layers.
++        activated = _silu_and_mul(gate, up)
 +        down_weight = self._parameter(
 +            values,
 +            f"{prefix}.mlp.down_proj.weight",
@@ -627,33 +795,50 @@ index 0000000..a1c3b93
 +    ) -> torch.Tensor:
 +        block = int(self.worker.block_size)
 +        batch_size = len(request_ids)
-+        inputs = input_embeds.view(batch_size, block, -1)
++        hidden = input_embeds.view(batch_size, block, -1)
 +        positions = positions.view(batch_size, block)
-+        outputs = []
-+        for index, _request_id in enumerate(request_ids):
-+            hidden = inputs[index]
-+            residual = None
-+            for layer_index in range(len(self.model.layers)):
-+                hidden, residual = self._layer_forward(
-+                    values,
-+                    layer_index=layer_index,
-+                    hidden=hidden,
-+                    residual=residual,
-+                    positions=positions[index],
-+                    history_locations=history.locations[index],
-+                    history_valid=history.valid_mask[index],
-+                )
-+            if residual is not None:
-+                hidden = hidden + residual
-+            norm = self._parameter(values, "norm.weight", self.model.norm.weight)
-+            outputs.append(
-+                _rms(
-+                    hidden,
-+                    norm.to(hidden.dtype),
-+                    float(self.model.norm.variance_epsilon),
-+                )
++        residual = None
++        for layer_index in range(len(self.model.layers)):
++            hidden, residual = self._layer_forward(
++                values,
++                layer_index=layer_index,
++                hidden=hidden,
++                residual=residual,
++                positions=positions,
++                history_locations=history.locations,
++                history_valid=history.valid_mask,
 +            )
-+        return torch.stack(outputs)
++        if residual is not None:
++            hidden = hidden + residual
++        norm = self._parameter(values, "norm.weight", self.model.norm.weight)
++        return _rms(
++            hidden,
++            norm.to(hidden.dtype),
++            float(self.model.norm.variance_epsilon),
++        )
++
++    def _distillation_loss(
++        self,
++        draft_logits: torch.Tensor,
++        target_logits: torch.Tensor,
++        valid_mask: torch.Tensor,
++    ) -> torch.Tensor:
++        target = target_logits.to(torch.float32)
++        draft = draft_logits.to(torch.float32)
++        weights = self.config.loss_position_decay ** torch.arange(
++            draft.shape[1],
++            device=self.device,
++            dtype=torch.float32,
++        )
++        weights = weights[None, :] * valid_mask.to(torch.float32)
++        probability = torch.softmax(target, dim=-1)
++        return (
++            (
++                probability
++                * (torch.log_softmax(target, dim=-1) - torch.log_softmax(draft, dim=-1))
++            ).sum(-1)
++            * weights
++        ).sum() / weights.sum().clamp_min(1.0)
 +
 +    def maybe_launch(
 +        self,
@@ -662,8 +847,12 @@ index 0000000..a1c3b93
 +        target_logits: torch.Tensor,
 +        valid_mask: torch.Tensor,
 +        lm_head_weight: torch.Tensor,
++        has_supervision: bool = True,
 +    ) -> None:
 +        if not self.runtime.update_due():
++            return
++        if not has_supervision:
++            self.runtime.skip_update_no_supervision()
 +            return
 +        if (
 +            self._captured_input is None
@@ -678,6 +867,7 @@ index 0000000..a1c3b93
 +        owned_draft = draft_hidden.detach().clone()
 +        owned_target = target_logits.detach().clone()
 +        owned_mask = valid_mask.detach().clone()
++        supervision_nonempty = owned_mask.any()
 +        source_tensors = (
 +            self._captured_input,
 +            self._captured_positions,
@@ -690,72 +880,136 @@ index 0000000..a1c3b93
 +        )
 +        try:
 +            with self.runtime.side_update(source_tensors):
-+                leaves = tuple(
-+                    value.detach().clone().requires_grad_(True)
-+                    for value in self.optimizer.master
-+                )
 +                with self.runtime.timing("training"):
-+                    values = self._effective_parameters(leaves)
-+                    surrogate = self._surrogate_hidden(
-+                        values,
-+                        self._captured_input,
-+                        self._captured_positions,
-+                        self._captured_request_ids,
-+                        self._captured_history,
-+                    )
 +                    block = int(self.worker.block_size)
 +                    batch_size = len(self._captured_request_ids)
-+                    draft_logits = (
-+                        surrogate[:, 1:, :].to(lm_head_weight.dtype) @ lm_head_weight.T
-+                    ).to(torch.float32)
++                    target = owned_target.view(batch_size, block, -1)[:, : block - 1]
 +                    inference_logits = (
 +                        owned_draft.view(batch_size, block, -1)[:, 1:, :].to(
 +                            lm_head_weight.dtype
 +                        )
 +                        @ lm_head_weight.T
 +                    )
-+                    reconstruction_ok, reconstruction_max_abs = (
-+                        _logit_reconstruction_gate(inference_logits, draft_logits)
++                    active_values = self._effective_parameters(self.optimizer.master)
++                    active_surrogate = self._surrogate_hidden(
++                        active_values,
++                        self._captured_input,
++                        self._captured_positions,
++                        self._captured_request_ids,
++                        self._captured_history,
 +                    )
-+                    target = owned_target.view(batch_size, block, -1)[
-+                        :, : block - 1
-+                    ].to(torch.float32)
-+                    weights = self.config.loss_position_decay ** torch.arange(
-+                        block - 1,
-+                        device=self.device,
-+                        dtype=torch.float32,
++                    active_logits = (
++                        active_surrogate[:, 1:, :].to(lm_head_weight.dtype)
++                        @ lm_head_weight.T
 +                    )
-+                    weights = weights[None, :] * owned_mask.to(torch.float32)
-+                    probability = torch.softmax(target, dim=-1)
-+                    loss = (
-+                        (
-+                            probability
-+                            * (
-+                                torch.log_softmax(target, dim=-1)
-+                                - torch.log_softmax(draft_logits, dim=-1)
++                    (
++                        reconstruction_ok,
++                        reconstruction_max_abs,
++                        reconstruction_relative_rms,
++                        reconstruction_top1_match,
++                        reconstruction_mean_kl,
++                    ) = _logit_reconstruction_gate(inference_logits, active_logits)
++                    loss = self._distillation_loss(
++                        inference_logits,
++                        target,
++                        owned_mask,
++                    )
++
++                    def member_feedback(parameters):
++                        align_to_inference = parameters is self.optimizer.master
++
++                        def objective(leaves):
++                            values = self._effective_parameters(leaves)
++                            surrogate = self._surrogate_hidden(
++                                values,
++                                self._captured_input,
++                                self._captured_positions,
++                                self._captured_request_ids,
++                                self._captured_history,
 +                            )
-+                        ).sum(-1)
-+                        * weights
-+                    ).sum() / weights.sum().clamp_min(1.0)
-+                    guarded_objective = torch.where(reconstruction_ok, loss, loss * 0.0)
-+                    raw_gradients = torch.autograd.grad(
-+                        guarded_objective, leaves, allow_unused=True
-+                    )
-+                    gradients = tuple(
-+                        torch.zeros_like(leaf) if gradient is None else gradient
-+                        for leaf, gradient in zip(leaves, raw_gradients, strict=True)
-+                    )
-+                finite = (
-+                    torch.isfinite(loss)
-+                    & torch.stack(
-+                        [torch.isfinite(gradient).all() for gradient in gradients]
-+                    ).all()
-+                )
-+                with self.runtime.timing("optimizer"):
-+                    proposal = self.optimizer.propose(gradients)
++                            draft_logits = (
++                                surrogate[:, 1:, :].to(lm_head_weight.dtype)
++                                @ lm_head_weight.T
++                            )
++                            if align_to_inference:
++                                # The inference and differentiable kernels use
++                                # different reduction orders.  Anchor the
++                                # source-point value to the logits that
++                                # actually generated q while retaining the
++                                # differentiable surrogate's local Jacobian.
++                                draft_logits = _anchor_forward_value(
++                                    draft_logits,
++                                    inference_logits,
++                                )
++                            member_loss = self._distillation_loss(
++                                draft_logits,
++                                target,
++                                owned_mask,
++                            )
++                            return torch.where(
++                                reconstruction_ok,
++                                member_loss,
++                                member_loss * 0.0,
++                            )
++
++                        return _loss_and_grad(parameters, objective)
++
++                if (
++                    isinstance(self.optimizer, OnlineSpecOptimizer)
++                    and self.optimizer.is_ensemble
++                ):
++                    expert_losses = []
++                    expert_finite = []
++                    updated_experts = []
++                    for index, expert in enumerate(self.optimizer.experts):
++                        with self.runtime.timing("training"):
++                            member_loss, gradients = member_feedback(expert)
++                            expert_losses.append(member_loss.detach())
++                            expert_finite.append(
++                                torch.isfinite(member_loss.detach())
++                                & torch.stack(
++                                    [
++                                        torch.isfinite(gradient).all()
++                                        for gradient in gradients
++                                    ]
++                                ).all()
++                            )
++                        with self.runtime.timing("optimizer"):
++                            updated_experts.append(
++                                self.optimizer.propose_ensemble_member(
++                                    index,
++                                    gradients,
++                                )
++                            )
++                        # Retain the candidate state, not every expert's
++                        # full-model gradient and differentiable leaves.
++                        del member_loss, gradients
++                    stacked_losses = torch.stack(expert_losses)
++                    finite = torch.isfinite(loss) & torch.stack(expert_finite).all()
++                    with self.runtime.timing("optimizer"):
++                        proposal = self.optimizer.combine_ensemble(
++                            stacked_losses,
++                            updated_experts,
++                        )
++                else:
++                    with self.runtime.timing("training"):
++                        member_loss, gradients = member_feedback(self.optimizer.master)
++                        finite = (
++                            torch.isfinite(loss)
++                            & torch.stack(
++                                [
++                                    torch.isfinite(gradient).all()
++                                    for gradient in gradients
++                                ]
++                            ).all()
++                        )
++                    with self.runtime.timing("optimizer"):
++                        proposal = self.optimizer.propose(gradients)
 +                with self.runtime.timing("merge"):
 +                    effective = self._effective_parameters(proposal.parameters)
-+                    publish_valid = finite & reconstruction_ok
++                    publish_valid = (
++                        finite & reconstruction_ok & supervision_nonempty
++                    )
 +                    staged = tuple(
 +                        torch.where(
 +                            publish_valid,
@@ -777,6 +1031,10 @@ index 0000000..a1c3b93
 +                    prefix_lens=self._captured_prefix_lens,
 +                    reconstruction_ok=reconstruction_ok,
 +                    reconstruction_max_abs=reconstruction_max_abs,
++                    reconstruction_relative_rms=reconstruction_relative_rms,
++                    reconstruction_top1_match=reconstruction_top1_match,
++                    reconstruction_mean_kl=reconstruction_mean_kl,
++                    supervision_nonempty=supervision_nonempty,
 +                )
 +        except torch.cuda.OutOfMemoryError:
 +            self.runtime.counters["oom_events"] += 1
@@ -836,7 +1094,14 @@ index 0000000..a1c3b93
 +        )
 +
 +    def diagnostics(self) -> dict:
-+        return self.runtime.diagnostics()
++        online_spec_state = (
++            self.optimizer.diagnostics()
++            if isinstance(self.optimizer, OnlineSpecOptimizer)
++            else None
++        )
++        return self.runtime.diagnostics(
++            extra={"online_spec_state": online_spec_state}
++        )
 +
 +
 +def maybe_build_dflash_drafter_adapter(server_args, worker):
@@ -846,7 +1111,7 @@ index 0000000..a1c3b93
 +    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
 new file mode 100644
-index 0000000..54be892
+index 0000000000000000000000000000000000000000..54be892541a4f3e2f74fcdf01d18ea431062ae39
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_valid_mask.py
 @@ -0,0 +1,138 @@

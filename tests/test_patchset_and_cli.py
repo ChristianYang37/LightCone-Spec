@@ -12,6 +12,7 @@ import pytest
 from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE, __version__
 from lightcone_spec.cli.main import main
 from lightcone_spec.doctor import _command, doctor_report
+from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.orchestration import SpeedStudyManifest
 from lightcone_spec.sglang_bridge import verify_patched_checkout
 
@@ -27,11 +28,54 @@ def test_package_and_schema_version_are_focused_release() -> None:
     assert __version__ == "0.2.0"
 
 
+def test_cli_exposes_content_bound_onlinespec_source_verifier(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["verify-onlinespec-source", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "--checkout" in output
+    assert "--audit" in output
+    assert "--output" in output
+
+
 def test_tracked_speed_manifest_matches_the_registered_protocol() -> None:
     path = ROOT / "manifests" / "speed-study" / "static_tts_l0_v2.json"
     manifest = SpeedStudyManifest.load(path)
     assert manifest == SpeedStudyManifest.default()
     assert Path(f"{path}.sha256").read_text().strip() == manifest.sha256
+
+
+def test_tracked_onlinespec_manifest_matches_registered_protocol() -> None:
+    path = ROOT / "manifests" / "speed-study" / "onlinespec_baseline_v2.json"
+    manifest = OnlineSpecManifest.load(path)
+    assert manifest == OnlineSpecManifest.default()
+    assert Path(f"{path}.sha256").read_text().strip() == manifest.sha256
+
+
+def test_tracked_onlinespec_source_audit_is_content_bound() -> None:
+    from lightcone_spec.experiments.onlinespec import (
+        ONLINE_SPEC_CLAIM_SCOPE,
+        ONLINE_SPEC_COMMIT,
+        ONLINE_SPEC_SOURCE_AUDIT_SHA256,
+        ONLINE_SPEC_TREE,
+    )
+
+    path = ROOT / "manifests" / "provenance" / "onlinespec_source_audit_v2.json"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert value["schema_version"] == 2
+    assert value["commit"] == ONLINE_SPEC_COMMIT
+    assert value["tree"] == ONLINE_SPEC_TREE
+    assert value["claim_scope"] == ONLINE_SPEC_CLAIM_SCOPE
+    assert value["license_status"] == "no-license-file-present-at-audited-commit"
+    assert value["license_files"] == []
+    assert {row["name"] for row in value["instantiations"]} == {
+        "online_lr",
+        "opt_hydra",
+        "ens_eagle",
+    }
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(canonical).hexdigest() == ONLINE_SPEC_SOURCE_AUDIT_SHA256
+    assert Path(f"{path}.sha256").read_text().strip() == ONLINE_SPEC_SOURCE_AUDIT_SHA256
 
 
 def test_patch_manifest_binds_series_files_and_tree() -> None:
@@ -170,3 +214,7 @@ def test_cli_help_contains_only_focused_workflow(capsys) -> None:
     assert "build-profiler-plan" in output
     assert "select-speed-config" in output
     assert "attest-speed-study" in output
+    assert "run-onlinespec-tuning-slice" in output
+    assert "advance-onlinespec-tuning-stage" in output
+    assert "run-onlinespec-confirmation" in output
+    assert "attest-onlinespec-study" in output

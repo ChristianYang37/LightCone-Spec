@@ -156,6 +156,7 @@ def snapshot_payload(*, adapted: bool = False, target_calls: int = 4) -> dict:
             "retractions": 0,
             "peak_hbm_bytes": 100,
             "kv_bytes": 50,
+            "kv_token_capacity": 409600,
             "batch_fill": 3.0,
             "queue_occupancy": 1.0,
             "graph_replay_hit_rate": 0.9,
@@ -187,6 +188,7 @@ def adaptation_payload(*, target_calls: int = 4) -> dict:
             "gradient_bytes": 20,
             "first_moment_bytes": 20,
             "second_moment_bytes": 20,
+            "online_state_bytes": 0,
             "optimizer_metadata_bytes": 0,
             "staging_bytes": 10,
             "training_activation_bytes": 20,
@@ -261,6 +263,18 @@ def test_server_snapshot_requires_complete_consistent_metrics() -> None:
         ServerSnapshot.parse(inconsistent)
 
 
+def test_snapshot_accepts_current_sglang_internal_states_envelope() -> None:
+    state = snapshot_payload()["internal_state"]
+    snapshot = ServerSnapshot.parse({"internal_states": [state]})
+    assert snapshot.target_calls == 4
+
+
+@pytest.mark.parametrize("states", [[], [{}, {}], "not-a-list"])
+def test_snapshot_rejects_ambiguous_dp_state_aggregation(states: object) -> None:
+    with pytest.raises(RuntimeError, match="exactly one SGLang DP state"):
+        ServerSnapshot.parse({"internal_states": states})
+
+
 def result(request_id: str = "r0", tokens: int = 4) -> GenerationResult:
     return GenerationResult(
         request_id=request_id,
@@ -271,7 +285,10 @@ def result(request_id: str = "r0", tokens: int = 4) -> GenerationResult:
         token_arrival_ms=tuple(10.0 + index for index in range(tokens)),
         elapsed_s=0.02,
         stop_reason="length",
-        response={"meta_info": {"prompt_tokens": 7, "completion_tokens": tokens}},
+        response={
+            "text": "x" * tokens,
+            "meta_info": {"prompt_tokens": 7, "completion_tokens": tokens},
+        },
     )
 
 
@@ -293,7 +310,17 @@ class FakeClient:
         return rows, 1.0
 
 
-@pytest.mark.parametrize("method", ["static", "tts", "naive_async"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "static",
+        "tts",
+        "naive_async",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    ],
+)
 def test_independent_run_resets_and_collects_post_run_snapshot(method: str) -> None:
     client = FakeClient(adapted=method != "static")
     run = independent_method_run(
@@ -329,8 +356,9 @@ def test_payloads_use_native_sglang_rid_and_paired_seed() -> None:
         sampling_profile=profile,
     )
     assert all("rid" in row and "request_id" not in row for row in tts + l0)
-    assert [row["sampling_params"]["seed"] for row in tts] == [7, 8]
-    assert [row["sampling_params"]["seed"] for row in l0] == [7, 8]
+    assert [row["sampling_params"]["sampling_seed"] for row in tts] == [7, 8]
+    assert [row["sampling_params"]["sampling_seed"] for row in l0] == [7, 8]
+    assert all("seed" not in row["sampling_params"] for row in tts + l0)
 
 
 def test_confirmation_slice_order_is_manifest_seeded() -> None:
@@ -407,6 +435,43 @@ def test_update_trace_required_fields_cannot_be_hidden_by_extras() -> None:
             run_id="run-a",
             diagnostics=diagnostics,
             updates=(update,),
+        )
+
+
+def test_onlinespec_update_diagnostics_are_preserved_and_validated() -> None:
+    diagnostics = adaptation_payload()
+    update = {
+        **diagnostics["updates"][0],
+        "online_hint_error": None,
+        "online_ensemble_entropy": 0.5,
+        "online_effective_experts": 1.648721,
+        "online_expert_probabilities": [0.75, 0.25],
+        "online_cumulative_losses": [0.1, 1.2],
+    }
+
+    class Writer:
+        def __init__(self) -> None:
+            self.records = []
+
+        def write(self, record) -> None:
+            self.records.append(record)
+
+    writer = Writer()
+    _write_updates(
+        writer,
+        run_id="run-a",
+        diagnostics=diagnostics,
+        updates=(update,),
+    )
+    assert writer.records[0].online_ensemble_entropy == pytest.approx(0.5)
+    assert writer.records[0].online_expert_probabilities == "[0.75,0.25]"
+    invalid = {**update, "online_expert_probabilities": [0.8, 0.3]}
+    with pytest.raises(RuntimeError, match="ensemble evidence"):
+        _write_updates(
+            Writer(),
+            run_id="run-a",
+            diagnostics=diagnostics,
+            updates=(invalid,),
         )
 
 
@@ -495,6 +560,7 @@ def request_record(run_id: str) -> RequestRecord:
         concurrency=1,
         input_tokens=2,
         output_tokens=4,
+        output_sha256="c" * 64,
         ttft_ms=1.0,
         finished=True,
         stop_reason="length",

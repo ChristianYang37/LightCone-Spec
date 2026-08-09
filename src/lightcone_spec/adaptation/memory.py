@@ -19,6 +19,7 @@ class AdaptationMemoryLedger:
     gradients: int = 0
     first_moments: int = 0
     second_moments: int = 0
+    online_state: int = 0
     staging: int = 0
     training_activations: int = 0
     kv_gather_scratch: int = 0
@@ -37,6 +38,7 @@ class AdaptationMemoryLedger:
             + self.master_fp32
             + self.first_moments
             + self.second_moments
+            + self.online_state
             + self.staging
             + self.graph_buffers
             + self.telemetry

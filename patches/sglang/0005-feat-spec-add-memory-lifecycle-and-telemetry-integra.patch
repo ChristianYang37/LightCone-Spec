@@ -1,19 +1,19 @@
-From eb1d4ae9d77a086e189d1a44a762fb6759c282ff Mon Sep 17 00:00:00 2001
+From 6121642e5069c85f6da1764ecc2b99beb0444f9b Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 5/6] feat(spec): add memory lifecycle and telemetry
  integration
 
 ---
- python/sglang/srt/managers/scheduler.py       | 74 ++++++++++++++++++-
+ python/sglang/srt/managers/scheduler.py       | 75 ++++++++++++++++++-
  .../batch_result_processor.py                 | 13 +++-
  .../scheduler_components/metrics_reporter.py  | 22 ++++++
  .../srt/mem_cache/kv_cache_configurator.py    | 26 ++++++-
  .../srt/speculative/base_spec_worker.py       |  4 +
- 5 files changed, 130 insertions(+), 9 deletions(-)
+ 5 files changed, 131 insertions(+), 9 deletions(-)
 
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 861c13f..375c35e 100644
+index 861c13fb4e4950b324c4126206106b474685b45b..495fdf7041d903f71b3f8b4ac6fd0ff5b43c781c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -3252,6 +3252,9 @@ class Scheduler(
@@ -53,7 +53,7 @@ index 861c13f..375c35e 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4002,6 +4018,54 @@ class Scheduler(
+@@ -4002,6 +4018,55 @@ class Scheduler(
              "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
          }
          ret["effective_max_running_requests_per_dp"] = self.max_running_requests
@@ -89,6 +89,7 @@ index 861c13f..375c35e 100644
 +                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage
 +                    * (1 << 30)
 +                ),
++                "kv_token_capacity": int(self.max_total_num_tokens),
 +                "batch_fill": (
 +                    self.metrics_reporter.speed_study_batch_sum / speed_samples
 +                    if speed_samples
@@ -108,7 +109,7 @@ index 861c13f..375c35e 100644
  
          if self.server_args.elastic_ep_backend is not None:
              from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-@@ -4024,10 +4088,14 @@ class Scheduler(
+@@ -4024,10 +4089,14 @@ class Scheduler(
          if RECORD_STEP_TIME:
              ret["step_time_dict"] = self.metrics_reporter.step_time_dict
  
@@ -127,7 +128,7 @@ index 861c13f..375c35e 100644
          # These fields are not msgpack-serializable (a config object and a bound
          # signal handler); no reader consumes them.
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 248a929..12a4a7a 100644
+index 248a92939e28d0a008a66ac7be9b181aeb86b64d..12a4a7a2e9c36c5554166f4077e57d8ae22ce198 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -948,10 +948,15 @@ class SchedulerBatchResultProcessor:
@@ -151,7 +152,7 @@ index 248a929..12a4a7a 100644
              # delete feature to save memory
              if req.multimodal_inputs is not None and req.session is None:
 diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
-index 15e1b81..1779332 100644
+index 15e1b814d7381c3e945a60d08a1fc24332c3494a..1779332372ffd5bc1e4906d391a7134114597a78 100644
 --- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 +++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 @@ -141,6 +141,16 @@ class SchedulerMetricsReporter:
@@ -198,7 +199,7 @@ index 15e1b81..1779332 100644
          # Every-iteration work: realtime token counting + status logger
          if self.current_scheduler_metrics_enabled:
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index bc4cf81..d18d814 100644
+index bc4cf815457f0975ab120394c878b10675f3ad8e..d18d814f0ee25d422e4174a18e1b92b956fdfdee 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
@@ -242,7 +243,7 @@ index bc4cf81..d18d814 100644
                  f"Raise --mem-fraction-static above "
                  f"{suggested_mem_fraction_static:.3f} "
 diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
-index eb21194..e887ef0 100644
+index eb2119413b56a1454489e19f555830f59480bb73..e887ef0b9dc63bd2503d1c820e012f5856a03e0c 100644
 --- a/python/sglang/srt/speculative/base_spec_worker.py
 +++ b/python/sglang/srt/speculative/base_spec_worker.py
 @@ -172,6 +172,10 @@ class BaseSpecWorker(ABC):

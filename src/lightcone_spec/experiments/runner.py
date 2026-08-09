@@ -18,7 +18,7 @@ from lightcone_spec.experiments.data import (
     sample_set_sha256,
 )
 from lightcone_spec.experiments.evidence import evidence_files_sha256
-from lightcone_spec.experiments.protocol import confirmation_blocks
+from lightcone_spec.experiments.protocol import paired_blocks
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import LossPoint, SliceMeasurement
 from lightcone_spec.sglang_bridge.client import (
@@ -39,6 +39,13 @@ from lightcone_spec.telemetry import (
 )
 
 _FORMAL_METHODS = {"static", "tts", "naive_async"}
+_ONLINE_SPEC_METHODS = {
+    "static",
+    "onlinespec_ogd",
+    "onlinespec_opt",
+    "onlinespec_ens",
+}
+_EVIDENCE_METHODS = _FORMAL_METHODS | _ONLINE_SPEC_METHODS
 _SAFETY_COUNTERS = (
     "exactness_violations",
     "version_mismatches",
@@ -64,6 +71,18 @@ def _run_id(
     return hashlib.sha256(value.encode()).hexdigest()[:24]
 
 
+def _output_sha256(result: GenerationResult) -> str:
+    text = result.response.get("text")
+    if not isinstance(text, str):
+        raise TypeError("final SGLang response lacks generated text for exactness")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _output_set_sha256(rows: list[tuple[str, tuple[str, ...]]]) -> str:
+    body = json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(body).hexdigest()
+
+
 def _payloads(
     sample: PromptSample,
     *,
@@ -73,8 +92,8 @@ def _payloads(
     max_new_tokens: int,
     sampling_profile: SamplingProfile,
 ) -> tuple[dict, ...]:
-    if method not in _FORMAL_METHODS:
-        raise ValueError("unknown formal method")
+    if method not in _EVIDENCE_METHODS:
+        raise ValueError("unknown measured method")
     return tuple(
         {
             "rid": f"{sample.sample_id}-b{block}-{method}-r{replica}",
@@ -255,6 +274,7 @@ def _adaptation_fields(
         "gradient_bytes",
         "first_moment_bytes",
         "second_moment_bytes",
+        "online_state_bytes",
         "optimizer_metadata_bytes",
         "staging_bytes",
         "training_activation_bytes",
@@ -288,6 +308,7 @@ def _adaptation_fields(
             "master_fp32_bytes",
             "first_moment_bytes",
             "second_moment_bytes",
+            "online_state_bytes",
             "optimizer_metadata_bytes",
             "staging_bytes",
             "graph_buffer_bytes",
@@ -309,6 +330,7 @@ def _adaptation_fields(
             "master_fp32_bytes",
             "first_moment_bytes",
             "second_moment_bytes",
+            "online_state_bytes",
             "optimizer_metadata_bytes",
         )
     )
@@ -487,6 +509,36 @@ def _write_updates(
         loss = float(update["loss"])
         if not math.isfinite(loss) or loss < -1e-6:
             raise RuntimeError("update trace loss must be finite and non-negative")
+        online_scalars = {
+            name: update.get(name)
+            for name in (
+                "online_hint_error",
+                "online_ensemble_entropy",
+                "online_effective_experts",
+            )
+        }
+        if any(
+            value is not None
+            and (not math.isfinite(float(value)) or float(value) < 0)
+            for value in online_scalars.values()
+        ):
+            raise RuntimeError("OnlineSPEC update diagnostics are invalid")
+        probabilities = update.get("online_expert_probabilities")
+        cumulative_losses = update.get("online_cumulative_losses")
+        if (probabilities is None) != (cumulative_losses is None):
+            raise RuntimeError("OnlineSPEC ensemble diagnostics are incomplete")
+        if probabilities is not None and (
+            not isinstance(probabilities, list)
+            or not isinstance(cumulative_losses, list)
+            or len(probabilities) < 2
+            or len(probabilities) != len(cumulative_losses)
+            or not all(
+                math.isfinite(float(value)) and float(value) >= 0
+                for value in (*probabilities, *cumulative_losses)
+            )
+            or not math.isclose(sum(probabilities), 1.0, abs_tol=1e-5)
+        ):
+            raise RuntimeError("OnlineSPEC ensemble evidence is invalid")
         writer.write(
             UpdateRecord(
                 run_id=run_id,
@@ -515,6 +567,31 @@ def _write_updates(
                 barrier_cuda_ms=None,
                 exposed_update_ms=None,
                 overlap_ratio=None,
+                online_hint_error=(
+                    None
+                    if online_scalars["online_hint_error"] is None
+                    else float(online_scalars["online_hint_error"])
+                ),
+                online_ensemble_entropy=(
+                    None
+                    if online_scalars["online_ensemble_entropy"] is None
+                    else float(online_scalars["online_ensemble_entropy"])
+                ),
+                online_effective_experts=(
+                    None
+                    if online_scalars["online_effective_experts"] is None
+                    else float(online_scalars["online_effective_experts"])
+                ),
+                online_expert_probabilities=(
+                    None
+                    if probabilities is None
+                    else json.dumps(probabilities, separators=(",", ":"))
+                ),
+                online_cumulative_losses=(
+                    None
+                    if cumulative_losses is None
+                    else json.dumps(cumulative_losses, separators=(",", ":"))
+                ),
             )
         )
 
@@ -730,10 +807,15 @@ def measure_controlled_slice(
     warmup: bool = True,
 ) -> SliceMeasurement:
     """Measure one pre-confirmation slice at the highest registered batch."""
-    if method not in _FORMAL_METHODS:
-        raise ValueError("unknown formal method")
-    if phase not in {"static_load_screen", "shared_config_tuning"}:
+    allowed = {
+        "static_load_screen": {"static"},
+        "shared_config_tuning": _FORMAL_METHODS,
+        "onlinespec_tuning": _ONLINE_SPEC_METHODS,
+    }
+    if phase not in allowed:
         raise ValueError("controlled slice has an invalid phase")
+    if method not in allowed[phase]:
+        raise ValueError("method is outside the controlled study")
     if not samples or concurrency < 1:
         raise ValueError("controlled slice needs prompts and positive concurrency")
     budgets = _prompt_budgets(
@@ -754,11 +836,13 @@ def measure_controlled_slice(
     intervals: list[float] = []
     peak_hbm_bytes = 0
     kv_bytes = 0
+    kv_token_capacity: int | None = None
     optimizer_bytes: int | None = None
     trainable_parameters: int | None = None
     exposed_update_ms = 0.0
     counters = {field: 0 for field in _SAFETY_COUNTERS + _UPDATE_COUNTERS}
     loss_points: list[LossPoint] = []
+    output_trajectories: list[tuple[str, tuple[str, ...]]] = []
     for sample in samples:
         expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
         run = independent_method_run(
@@ -775,6 +859,10 @@ def measure_controlled_slice(
             concurrency=concurrency,
             adaptation_group_id=(None if method == "static" else adaptation_group_id),
         )
+        if run.after.kv_token_capacity < concurrency * context_limit:
+            raise RuntimeError(
+                "KV token capacity cannot sustain the registered load/context cell"
+            )
         if any(
             result.input_tokens != expected_input_tokens
             or result.completion_tokens != max_new_tokens
@@ -782,6 +870,12 @@ def measure_controlled_slice(
             for result in run.results
         ):
             raise RuntimeError("controlled slice did not reach its context limit")
+        output_trajectories.append(
+            (
+                sample.sample_id,
+                tuple(sorted(_output_sha256(result) for result in run.results)),
+            )
+        )
         measured = _region(run.results, start=0, end=max_new_tokens)
         if measured is None:
             raise RuntimeError("controlled slice produced no decode interval")
@@ -794,6 +888,10 @@ def measure_controlled_slice(
         )
         peak_hbm_bytes = max(peak_hbm_bytes, run.after.peak_hbm_bytes)
         kv_bytes = max(kv_bytes, run.after.kv_bytes)
+        if kv_token_capacity is None:
+            kv_token_capacity = run.after.kv_token_capacity
+        elif kv_token_capacity != run.after.kv_token_capacity:
+            raise RuntimeError("KV token capacity changed across controlled prompts")
         current_optimizer_bytes = int(fields["optimizer_bytes"])
         current_trainable = int(fields["trainable_parameters"])
         if optimizer_bytes is None:
@@ -833,6 +931,7 @@ def measure_controlled_slice(
         model_lock_sha256=model_lock_sha256,
         sampling_profile_sha256=sampling_profile.sha256,
         window_sha256=sample_set_sha256(samples),
+        output_set_sha256=_output_set_sha256(output_trajectories),
         prompt_count=len(samples),
         context_limit=context_limit,
         concurrency=concurrency,
@@ -840,6 +939,7 @@ def measure_controlled_slice(
         itl_p99_ms=_percentile(intervals, 0.99),
         peak_hbm_bytes=peak_hbm_bytes,
         kv_bytes=kv_bytes,
+        kv_token_capacity=kv_token_capacity or 0,
         optimizer_bytes=optimizer_bytes or 0,
         trainable_parameters=trainable_parameters or 0,
         exposed_update_ms=exposed_update_ms,
@@ -858,11 +958,15 @@ def measure_controlled_slice(
 
 
 def _earlier_slices(
-    *, method: str, block: int, schedule_seed: int
+    *,
+    method: str,
+    block: int,
+    schedule_seed: int,
+    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
 ) -> tuple[tuple[int, str], ...]:
     jobs = tuple(
         (entry.block, scheduled_method)
-        for entry in confirmation_blocks(schedule_seed)
+        for entry in paired_blocks(schedule_seed, study_methods)
         for scheduled_method in entry.method_order
     )
     target = (block, method)
@@ -879,11 +983,14 @@ def _assert_prior_slices_complete(
     block: int,
     schedule_seed: int,
     samples: tuple[PromptSample, ...],
+    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
+    namespace: str = "confirmation",
 ) -> None:
     for earlier_block, earlier_method in _earlier_slices(
         method=method,
         block=block,
         schedule_seed=schedule_seed,
+        study_methods=study_methods,
     ):
         for sample in samples:
             run_id = _run_id(
@@ -891,6 +998,7 @@ def _assert_prior_slices_complete(
                 earlier_block,
                 sample.sample_id,
                 earlier_method,
+                namespace=namespace,
             )
             if load_completed_evidence(output_root, run_id=run_id, rank=0) is None:
                 raise RuntimeError(
@@ -915,10 +1023,17 @@ def run_confirmation_slice(
     sampling_profile: SamplingProfile,
     model_pair: str = "qwen3_8b_dflash16",
     warmup: bool = True,
+    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
+    namespace: str = "confirmation",
 ) -> tuple[Path, ...]:
     """Run one exclusive-device method slice in registered random order."""
-    if method not in _FORMAL_METHODS:
-        raise ValueError("unknown formal method")
+    if frozenset(study_methods) not in {
+        frozenset(_FORMAL_METHODS),
+        frozenset(_ONLINE_SPEC_METHODS),
+    }:
+        raise ValueError("unknown paired study method set")
+    if method not in study_methods:
+        raise ValueError("method is outside the paired study")
     if block not in range(8):
         raise ValueError("formal confirmation block must be in [0, 8)")
     if concurrency < 1:
@@ -941,6 +1056,8 @@ def run_confirmation_slice(
         block=block,
         schedule_seed=schedule_seed,
         samples=samples,
+        study_methods=study_methods,
+        namespace=namespace,
     )
     if warmup:
         _warmup(
@@ -953,7 +1070,13 @@ def run_confirmation_slice(
     written: list[Path] = []
     for sample in samples:
         expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
-        run_id = _run_id(manifest_sha256, block, sample.sample_id, method)
+        run_id = _run_id(
+            manifest_sha256,
+            block,
+            sample.sample_id,
+            method,
+            namespace=namespace,
+        )
         completed = load_completed_evidence(
             output_root,
             run_id=run_id,
@@ -1035,6 +1158,7 @@ def run_confirmation_slice(
                         concurrency=concurrency,
                         input_tokens=result.input_tokens,
                         output_tokens=result.completion_tokens,
+                        output_sha256=_output_sha256(result),
                         ttft_ms=result.ttft_ms,
                         finished=result.stop_reason is not None,
                         stop_reason=result.stop_reason,
@@ -1094,23 +1218,32 @@ def run_confirmation_slice(
     return tuple(written)
 
 
-def collect_confirmation_performance(
+def _collect_paired_performance(
     *,
     evidence_root: str | Path,
     manifest_sha256: str,
     config_sha256: dict[str, str],
     concurrency: int,
+    methods: tuple[str, ...],
+    namespace: str,
 ) -> tuple[tuple[Path, ...], str]:
-    """Collect exactly one completed, identity-matched shard per formal cell."""
-    if set(config_sha256) != _FORMAL_METHODS:
+    """Collect one completed, identity-matched shard per paired study cell."""
+    if set(config_sha256) != set(methods):
         raise ValueError("collector requires one config identity per method")
     samples = LongContinuationAdapter().window("confirm")
     performance: list[Path] = []
     all_evidence: list[Path] = []
     for block in range(8):
         for sample in samples:
-            for method in ("static", "tts", "naive_async"):
-                run_id = _run_id(manifest_sha256, block, sample.sample_id, method)
+            paired_outputs: dict[str, tuple[str, ...]] = {}
+            for method in methods:
+                run_id = _run_id(
+                    manifest_sha256,
+                    block,
+                    sample.sample_id,
+                    method,
+                    namespace=namespace,
+                )
                 completed = load_completed_evidence(
                     evidence_root,
                     run_id=run_id,
@@ -1119,6 +1252,7 @@ def collect_confirmation_performance(
                 if completed is None:
                     raise RuntimeError(f"confirmation evidence is incomplete: {run_id}")
                 run_rows = pq.read_table(completed["run"]).to_pylist()
+                request_rows = pq.read_table(completed["request"]).to_pylist()
                 rows = pq.read_table(completed["performance"]).to_pylist()
                 if len(run_rows) != 1 or any(
                     run_rows[0].get(key) != value
@@ -1138,9 +1272,83 @@ def collect_confirmation_performance(
                     raise RuntimeError(
                         f"confirmation performance identity mismatch: {run_id}"
                     )
+                if len(request_rows) != concurrency or any(
+                    row.get("prompt_id") != sample.sample_id
+                    or row.get("method") != method
+                    or int(row.get("repetition_block", -1)) != block
+                    or int(row.get("concurrency", -1)) != concurrency
+                    or not isinstance(row.get("output_sha256"), str)
+                    or len(str(row["output_sha256"])) != 64
+                    for row in request_rows
+                ):
+                    raise RuntimeError(
+                        f"confirmation request identity mismatch: {run_id}"
+                    )
+                paired_outputs[method] = tuple(
+                    sorted(str(row["output_sha256"]) for row in request_rows)
+                )
                 performance.append(completed["performance"])
                 all_evidence.extend(completed.values())
+            if len(set(paired_outputs.values())) != 1:
+                raise RuntimeError(
+                    "paired greedy methods produced different output trajectories: "
+                    f"block={block}, prompt={sample.sample_id}"
+                )
     return tuple(performance), evidence_files_sha256(all_evidence)
+
+
+def collect_confirmation_performance(
+    *,
+    evidence_root: str | Path,
+    manifest_sha256: str,
+    config_sha256: dict[str, str],
+    concurrency: int,
+) -> tuple[tuple[Path, ...], str]:
+    """Collect exactly one completed, identity-matched formal shard per cell."""
+    return _collect_paired_performance(
+        evidence_root=evidence_root,
+        manifest_sha256=manifest_sha256,
+        config_sha256=config_sha256,
+        concurrency=concurrency,
+        methods=("static", "tts", "naive_async"),
+        namespace="confirmation",
+    )
+
+
+def run_onlinespec_confirmation_slice(**kwargs) -> tuple[Path, ...]:
+    """Run one clean-room OnlineSPEC comparison slice on confirmation data."""
+    return run_confirmation_slice(
+        **kwargs,
+        study_methods=(
+            "static",
+            "onlinespec_ogd",
+            "onlinespec_opt",
+            "onlinespec_ens",
+        ),
+        namespace="onlinespec_confirmation",
+    )
+
+
+def collect_onlinespec_performance(
+    *,
+    evidence_root: str | Path,
+    manifest_sha256: str,
+    config_sha256: dict[str, str],
+    concurrency: int,
+) -> tuple[tuple[Path, ...], str]:
+    return _collect_paired_performance(
+        evidence_root=evidence_root,
+        manifest_sha256=manifest_sha256,
+        config_sha256=config_sha256,
+        concurrency=concurrency,
+        methods=(
+            "static",
+            "onlinespec_ogd",
+            "onlinespec_opt",
+            "onlinespec_ens",
+        ),
+        namespace="onlinespec_confirmation",
+    )
 
 
 def run_natural_replication_slice(
@@ -1272,6 +1480,7 @@ def run_natural_replication_slice(
                         concurrency=concurrency,
                         input_tokens=result.input_tokens,
                         output_tokens=result.completion_tokens,
+                        output_sha256=_output_sha256(result),
                         ttft_ms=result.ttft_ms,
                         finished=True,
                         stop_reason=result.stop_reason,

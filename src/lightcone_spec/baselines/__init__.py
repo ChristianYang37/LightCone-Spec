@@ -1,5 +1,19 @@
-"""Isolated clean-room external baselines; never selected by default."""
+"""Registered clean-room comparisons; never selected into the core gate."""
 
-from .onlinespec import OnlineSpecEnsemble, ogd_update, optimistic_update
+from .onlinespec import (
+    OnlineSpecHedge,
+    OnlineSpecOGD,
+    OnlineSpecOptimistic,
+    OnlineSpecProposal,
+    ogd_update,
+    project_l2_ball,
+)
 
-__all__ = ["OnlineSpecEnsemble", "ogd_update", "optimistic_update"]
+__all__ = [
+    "OnlineSpecHedge",
+    "OnlineSpecOGD",
+    "OnlineSpecOptimistic",
+    "OnlineSpecProposal",
+    "ogd_update",
+    "project_l2_ball",
+]

@@ -11,6 +11,15 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
+_MEASURED_METHODS = {
+    "static",
+    "tts",
+    "naive_async",
+    "onlinespec_ogd",
+    "onlinespec_opt",
+    "onlinespec_ens",
+}
+
 
 @dataclass(frozen=True)
 class GenerationResult:
@@ -36,6 +45,7 @@ class ServerSnapshot:
     retractions: int
     peak_hbm_bytes: int
     kv_bytes: int
+    kv_token_capacity: int
     batch_fill: float
     queue_occupancy: float
     graph_replay_hit_rate: float
@@ -43,7 +53,21 @@ class ServerSnapshot:
 
     @classmethod
     def parse(cls, payload: dict) -> ServerSnapshot:
-        state = payload.get("internal_state", payload)
+        states = payload.get("internal_states")
+        if states is not None:
+            if (
+                not isinstance(states, list)
+                or len(states) != 1
+                or not isinstance(states[0], dict)
+            ):
+                raise RuntimeError(
+                    "speed-study collection requires exactly one SGLang DP state"
+                )
+            state = states[0]
+        else:
+            # Current SGLang exposes a per-DP list.  The singular envelope is
+            # retained for older patchsets and small protocol fixtures.
+            state = payload.get("internal_state", payload)
         if not isinstance(state, dict):
             raise RuntimeError(  # noqa: TRY004 - malformed remote response
                 "SGLang server state is not an object"
@@ -63,6 +87,7 @@ class ServerSnapshot:
             "retractions",
             "peak_hbm_bytes",
             "kv_bytes",
+            "kv_token_capacity",
             "batch_fill",
             "queue_occupancy",
             "graph_replay_hit_rate",
@@ -91,6 +116,7 @@ class ServerSnapshot:
             retractions=int(metrics["retractions"]),
             peak_hbm_bytes=int(metrics["peak_hbm_bytes"]),
             kv_bytes=int(metrics["kv_bytes"]),
+            kv_token_capacity=int(metrics["kv_token_capacity"]),
             batch_fill=float(metrics["batch_fill"]),
             queue_occupancy=float(metrics["queue_occupancy"]),
             graph_replay_hit_rate=float(metrics["graph_replay_hit_rate"]),
@@ -106,6 +132,7 @@ class ServerSnapshot:
             snapshot.retractions,
             snapshot.peak_hbm_bytes,
             snapshot.kv_bytes,
+            snapshot.kv_token_capacity,
         )
         if any(value < 0 for value in counts):
             raise RuntimeError("SGLang speed counters cannot be negative")
@@ -307,9 +334,9 @@ def independent_method_run(
     concurrency: int,
     adaptation_group_id: str | None,
 ) -> MethodRun:
-    """One method/repetition owns one timer and one clean cohort state."""
-    if method not in {"static", "tts", "naive_async"}:
-        raise ValueError("unknown formal method")
+    """One measured method owns one timer and one clean cohort state."""
+    if method not in _MEASURED_METHODS:
+        raise ValueError("unknown measured method")
     if method != "static" and not adaptation_group_id:
         raise ValueError("adapted methods require a cohort identity")
     client.reset_engine()

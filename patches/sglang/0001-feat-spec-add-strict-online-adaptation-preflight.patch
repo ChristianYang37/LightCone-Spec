@@ -1,4 +1,4 @@
-From f89f18c71a0e680b7da99859787a332bdb7b81b6 Mon Sep 17 00:00:00 2001
+From 4349f507b3282a4525bc71a1c5f68bc71c4c1d4d Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight
@@ -6,12 +6,12 @@ Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight
 ---
  .../sglang/srt/arg_groups/speculative_hook.py |   6 +
  python/sglang/srt/server_args.py              |  23 +
- .../speculative/online_adaptation_config.py   | 394 ++++++++++++++++++
- 3 files changed, 423 insertions(+)
+ .../speculative/online_adaptation_config.py   | 475 ++++++++++++++++++
+ 3 files changed, 504 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
-index 427acdd..771a175 100644
+index 427acdd3817f865612b79425743adfc6c89f78f2..771a175df2ff81b76cca74dbf937ea30ba576f29 100644
 --- a/python/sglang/srt/arg_groups/speculative_hook.py
 +++ b/python/sglang/srt/arg_groups/speculative_hook.py
 @@ -143,6 +143,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
@@ -28,7 +28,7 @@ index 427acdd..771a175 100644
  def _handle_dflash(server_args: ServerArgs) -> None:
      from sglang.srt.arg_groups.overrides import resolved_view
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 1182ccb..f6fb45a 100644
+index 1182ccbb23ad31ee942d1882e7b9ec1eec987267..f6fb45a2846353c9b61b3a9b20937c08ab7aaed6 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -2157,6 +2157,29 @@ class ServerArgs:
@@ -63,10 +63,10 @@ index 1182ccb..f6fb45a 100644
      # separate engines, currently connected by a ZMQ IPC mesh.
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
-index 0000000..4f02c30
+index 0000000000000000000000000000000000000000..8b02ac012bbb563a91035a2f41eb1350cecd2e1a
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,475 @@
 +"""Narrow fail-closed parser for LightCone schema-v2 runtime configuration."""
 +
 +from __future__ import annotations
@@ -96,6 +96,13 @@ index 0000000..4f02c30
 +
 +
 +@dataclass(frozen=True)
++class OnlineSpecLearnerConfig:
++    projection_radius: float | None
++    additional_learning_rates: tuple[float, ...]
++    hedge_learning_rate: float | None
++
++
++@dataclass(frozen=True)
 +class OnlineAdaptationConfig:
 +    method: str
 +    algorithm: str
@@ -112,6 +119,7 @@ index 0000000..4f02c30
 +    drafter_revision: str
 +    sampling_profile_sha256: str
 +    telemetry_detail: str
++    online_spec: OnlineSpecLearnerConfig | None = None
 +
 +    @property
 +    def sha256(self) -> str:
@@ -136,6 +144,14 @@ index 0000000..4f02c30
 +            "sampling_profile_sha256": self.sampling_profile_sha256,
 +            "telemetry_detail": self.telemetry_detail,
 +        }
++        if self.online_spec is not None:
++            payload["online_spec"] = {
++                "projection_radius": self.online_spec.projection_radius,
++                "additional_learning_rates": list(
++                    self.online_spec.additional_learning_rates
++                ),
++                "hedge_learning_rate": self.online_spec.hedge_learning_rate,
++            }
 +        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 +        return hashlib.sha256(encoded).hexdigest()
 +
@@ -171,7 +187,7 @@ index 0000000..4f02c30
 +            "sampling_profile_sha256",
 +            "telemetry_detail",
 +        }
-+        unknown = set(value) - expected
++        unknown = set(value) - expected - {"online_spec"}
 +        missing = expected - set(value)
 +        if unknown or missing:
 +            raise ValueError(
@@ -180,8 +196,14 @@ index 0000000..4f02c30
 +            )
 +        if value["schema_version"] != 2:
 +            raise ValueError("speculative adaptation requires schema_version=2")
-+        if value["method"] not in {"tts", "naive_async"}:
-+            raise ValueError("online adaptation method must be tts or naive_async")
++        if value["method"] not in {
++            "tts",
++            "naive_async",
++            "onlinespec_ogd",
++            "onlinespec_opt",
++            "onlinespec_ens",
++        }:
++            raise ValueError("unknown online adaptation method")
 +        if value["algorithm"] not in {"DFLASH", "DSPARK", "EAGLE", "EAGLE3"}:
 +            raise ValueError("unknown speculative adaptation algorithm")
 +        if value["weight_update_mode"] not in {"residual", "lora", "full"}:
@@ -242,7 +264,23 @@ index 0000000..4f02c30
 +        decay = float(value["loss_position_decay"])
 +        if not 0.0 < decay <= 1.0:
 +            raise ValueError("loss_position_decay must be in (0, 1]")
-+        optimizer = _parse_optimizer(value["optimizer"])
++        online_spec = _parse_online_spec(value.get("online_spec"), value["method"])
++        optimizer = _parse_optimizer(value["optimizer"], method=value["method"])
++        if value["method"] == "onlinespec_ens":
++            if value["weight_update_mode"] != "full":
++                raise ValueError(
++                    "OnlineSPEC Hedge combines full parameter decisions"
++                )
++            if online_spec is None:
++                raise AssertionError("validated OnlineSPEC config is missing")
++            rates = (
++                optimizer.learning_rate,
++                *online_spec.additional_learning_rates,
++            )
++            if len(rates) < 2 or tuple(sorted(rates)) != rates:
++                raise ValueError(
++                    "OnlineSPEC Hedge requires an increasing multi-rate grid"
++                )
 +        return cls(
 +            method=value["method"],
 +            algorithm=value["algorithm"],
@@ -259,10 +297,46 @@ index 0000000..4f02c30
 +            drafter_revision=value["drafter_revision"],
 +            sampling_profile_sha256=profile,
 +            telemetry_detail=telemetry_detail,
++            online_spec=online_spec,
 +        )
 +
 +
-+def _parse_optimizer(value: Any) -> OnlineOptimizerConfig:
++def _parse_online_spec(value: Any, method: str) -> OnlineSpecLearnerConfig | None:
++    baseline = method.startswith("onlinespec_")
++    if not baseline:
++        if value is not None:
++            raise ValueError("online_spec is only valid for OnlineSPEC baselines")
++        return None
++    if not isinstance(value, dict) or set(value) != {
++        "projection_radius",
++        "additional_learning_rates",
++        "hedge_learning_rate",
++    }:
++        raise ValueError("OnlineSPEC learner fields do not match schema-v2")
++    radius_raw = value["projection_radius"]
++    radius = None if radius_raw is None else float(radius_raw)
++    rates_raw = value["additional_learning_rates"]
++    if not isinstance(rates_raw, list):
++        raise TypeError("additional_learning_rates must be a list")
++    rates = tuple(float(rate) for rate in rates_raw)
++    hedge_raw = value["hedge_learning_rate"]
++    hedge = None if hedge_raw is None else float(hedge_raw)
++    if any(
++        number is not None and (not math.isfinite(number) or number <= 0)
++        for number in (radius, hedge, *rates)
++    ):
++        raise ValueError("OnlineSPEC learner values must be positive and finite")
++    if len(set(rates)) != len(rates) or tuple(sorted(rates)) != rates:
++        raise ValueError("OnlineSPEC learning rates must be unique and increasing")
++    if method == "onlinespec_ens":
++        if hedge is None:
++            raise ValueError("OnlineSPEC Hedge requires hedge_learning_rate")
++    elif rates or hedge is not None:
++        raise ValueError("ensemble fields are only valid for onlinespec_ens")
++    return OnlineSpecLearnerConfig(radius, rates, hedge)
++
++
++def _parse_optimizer(value: Any, *, method: str) -> OnlineOptimizerConfig:
 +    if not isinstance(value, dict):
 +        raise TypeError("optimizer must be an object")
 +    expected = {
@@ -281,8 +355,13 @@ index 0000000..4f02c30
 +    if set(value) != expected:
 +        raise ValueError("optimizer fields do not match schema-v2")
 +    name = value["name"]
-+    if name not in {"adam", "adamw", "sgdm", "nag", "muon", "lion"}:
-+        raise ValueError("unknown TTS/L0 optimizer")
++    allowed = (
++        {"sgd"}
++        if method.startswith("onlinespec_")
++        else {"adam", "adamw", "sgdm", "nag", "muon", "lion"}
++    )
++    if name not in allowed:
++        raise ValueError("optimizer is not valid for this online method")
 +    learning_rate = float(value["learning_rate"])
 +    weight_decay = float(value["weight_decay"])
 +    beta1 = float(value["beta1"])
@@ -329,7 +408,9 @@ index 0000000..4f02c30
 +            raise ValueError(f"{name} requires momentum in (0, 1)")
 +    elif momentum is not None:
 +        raise ValueError(f"momentum is not valid for optimizer={name}")
-+    if name in {"sgdm", "nag"} and (beta1 != 0.9 or beta2 != 0.999 or epsilon != 1e-8):
++    if name in {"sgd", "sgdm", "nag"} and (
++        beta1 != 0.9 or beta2 != 0.999 or epsilon != 1e-8
++    ):
 +        raise ValueError(f"unused Adam fields must stay canonical for optimizer={name}")
 +    if name == "lion" and epsilon != 1e-8:
 +        raise ValueError("unused epsilon must stay canonical for optimizer=lion")

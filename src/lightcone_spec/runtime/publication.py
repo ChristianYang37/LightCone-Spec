@@ -16,11 +16,13 @@ class CudaPublicationCoordinator:
         resolved = torch.device(device)
         if resolved.type != "cuda":
             raise ValueError("CUDA publication requires a CUDA device")
-        least_priority, _ = torch.cuda.get_stream_priority_range()
         self.device = resolved
+        # CUDA clamps out-of-range priorities to the nearest supported value.
+        # A large positive value requests the device's lowest-priority stream
+        # without relying on a version-specific priority-range API.
         self.side_stream = torch.cuda.Stream(
             device=resolved,
-            priority=least_priority,
+            priority=2**31 - 1,
         )
         self.main_ready = torch.cuda.Event(blocking=False)
         self.side_ready = torch.cuda.Event(blocking=False)

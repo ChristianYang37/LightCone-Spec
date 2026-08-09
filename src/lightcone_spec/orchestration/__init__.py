@@ -3,6 +3,8 @@
 from .manifest import SpeedStudyManifest
 from .runtime import (
     ServerLaunch,
+    render_onlinespec_runtime_plan,
+    render_onlinespec_tuning_runtime_plan,
     render_replication_runtime_plan,
     render_runtime_plan,
     render_static_load_runtime_plan,
@@ -12,6 +14,8 @@ from .runtime import (
 __all__ = [
     "ServerLaunch",
     "SpeedStudyManifest",
+    "render_onlinespec_runtime_plan",
+    "render_onlinespec_tuning_runtime_plan",
     "render_replication_runtime_plan",
     "render_runtime_plan",
     "render_static_load_runtime_plan",

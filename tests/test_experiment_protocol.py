@@ -84,6 +84,7 @@ def test_sampling_profiles_separate_controlled_and_natural_eos() -> None:
     natural = SamplingProfile(purpose="natural", ignore_eos=False)
     controlled.validate()
     natural.validate()
+    assert controlled.temperature == 0.0
     assert controlled.sha256 != natural.sha256
     with pytest.raises(ValueError, match="natural replication"):
         SamplingProfile(purpose="natural", ignore_eos=True).validate()
@@ -179,6 +180,7 @@ def load_screen_rows() -> list[dict]:
             "itl_p99_ms": 10.0 + concurrency,
             "oom_events": 0,
             "retractions": 0,
+            "kv_token_capacity": 48 * 40960,
         }
         for concurrency in (1, 2, 4, 8, 16, 32, 48)
     ]
@@ -187,18 +189,20 @@ def load_screen_rows() -> list[dict]:
 def test_static_load_selection_respects_latency_and_safety() -> None:
     rows = load_screen_rows()
     # c16 and above exceed twice the c1 p99 (22 ms).
-    assert select_static_load(rows) == 8
+    assert select_static_load(rows, required_context_limit=40960) == 8
     rows[-1]["oom_events"] = 1
-    assert select_static_load(rows) == 8
+    assert select_static_load(rows, required_context_limit=40960) == 8
+    rows[3]["kv_token_capacity"] = 7 * 40960
+    assert select_static_load(rows, required_context_limit=40960) == 4
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(rows[:-1])
+        select_static_load(rows[:-1], required_context_limit=40960)
     duplicated = load_screen_rows() + [load_screen_rows()[0]]
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(duplicated)
+        select_static_load(duplicated, required_context_limit=40960)
     invalid = load_screen_rows()
     invalid[0]["decode_goodput_tps"] = float("nan")
     with pytest.raises(ValueError, match="finite and positive"):
-        select_static_load(invalid)
+        select_static_load(invalid, required_context_limit=40960)
 
 
 def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None:
@@ -357,6 +361,7 @@ def slice_measurement(
         model_lock_sha256="f" * 64,
         sampling_profile_sha256="d" * 64,
         window_sha256="e" * 64,
+        output_set_sha256="1" * 64,
         prompt_count=2,
         context_limit=4096,
         concurrency=8,
@@ -364,6 +369,7 @@ def slice_measurement(
         itl_p99_ms=5.0,
         peak_hbm_bytes=100,
         kv_bytes=50,
+        kv_token_capacity=409600,
         optimizer_bytes=20 if adapted else 0,
         trainable_parameters=10 if adapted else 0,
         exposed_update_ms=1.0 if adapted else 0.0,
@@ -410,6 +416,22 @@ def test_tuning_stage_reducer_pairs_methods_and_static() -> None:
     assert survivors == (first.candidate_id,)
     assert len(reduced) == 4
     assert all(row.safe for row in reduced)
+
+
+def test_tuning_stage_rejects_a_different_greedy_output_trajectory() -> None:
+    candidate = tuning_candidates()[0]
+    static = slice_measurement("static", candidate_id=None, goodput=100.0)
+    tts = slice_measurement("tts", candidate_id=candidate.candidate_id, goodput=101.0)
+    l0 = slice_measurement(
+        "naive_async", candidate_id=candidate.candidate_id, goodput=101.0
+    )
+    with pytest.raises(ValueError, match="paired to the Static"):
+        reduce_tuning_stage(
+            [static, replace(tts, output_set_sha256="2" * 64), l0],
+            candidates={candidate.candidate_id: candidate},
+            active_candidate_ids=(candidate.candidate_id,),
+            stage=0,
+        )
 
 
 def test_tuning_stage_eliminates_unsafe_candidate_before_goodput_ranking() -> None:

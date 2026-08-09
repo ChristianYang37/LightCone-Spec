@@ -1,4 +1,4 @@
-From bb89bc3a473ee6c9eb3e9b877740b7d87f9e8191 Mon Sep 17 00:00:00 2001
+From 2d4f6b6bebe7138fb4dcbcdca11a91c8a74bc7b4 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
@@ -7,23 +7,23 @@ Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
  python/sglang/srt/managers/overlap_utils.py   |  31 +-
  .../sglang/srt/models/deepseek_v4_dspark.py   |  29 +-
  python/sglang/srt/models/dspark.py            |  15 +-
- .../srt/speculative/dflash_worker_v2.py       | 216 ++++++-
- .../dspark_components/dspark_draft.py         | 105 +++-
- .../dspark_components/dspark_proposal.py      |  71 +++
+ .../srt/speculative/dflash_worker_v2.py       | 219 +++++-
+ .../dspark_components/dspark_draft.py         | 105 ++-
+ .../dspark_components/dspark_proposal.py      |  71 ++
  .../dspark_components/dspark_verify.py        |   4 +-
- .../dspark_components/dspark_worker_v2.py     | 109 +++-
+ .../dspark_components/dspark_worker_v2.py     | 111 ++-
  python/sglang/srt/speculative/eagle_info.py   |  19 +
  .../srt/speculative/eagle_worker_common.py    |   1 +
- .../sglang/srt/speculative/eagle_worker_v2.py | 215 ++++++-
- .../speculative/online_eagle_adaptation.py    | 287 ++++++++++
- .../srt/speculative/online_tail_adaptation.py | 526 ++++++++++++++++++
- 13 files changed, 1545 insertions(+), 83 deletions(-)
+ .../sglang/srt/speculative/eagle_worker_v2.py | 215 +++++-
+ .../speculative/online_eagle_adaptation.py    | 291 ++++++++
+ .../srt/speculative/online_tail_adaptation.py | 631 ++++++++++++++++++
+ 13 files changed, 1659 insertions(+), 83 deletions(-)
  create mode 100644 python/sglang/srt/speculative/dspark_components/dspark_proposal.py
  create mode 100644 python/sglang/srt/speculative/online_eagle_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_tail_adaptation.py
 
 diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/managers/overlap_utils.py
-index 9e2f191..45d4117 100644
+index 9e2f191aa2ffa97a0e9c188059df7905915ce79f..45d4117cbbbb0c5451aa3d673d42fa801cd8e630 100644
 --- a/python/sglang/srt/managers/overlap_utils.py
 +++ b/python/sglang/srt/managers/overlap_utils.py
 @@ -120,7 +120,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
@@ -112,7 +112,7 @@ index 9e2f191..45d4117 100644
              self.dsa_topk_indices_buf is not None
              and payload.dsa_topk_indices is not None
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 2b01ec2..d6d5664 100644
+index 2b01ec2e2a0890b6741f11449693f26a82fb892a..d6d566452be40ff7dcbc61178cd91b64594481cb 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -78,7 +78,6 @@ def apply_rotary_emb(
@@ -214,7 +214,7 @@ index 2b01ec2..d6d5664 100644
          mapped_rest = rest
          mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
-index a1ca3f1..45f9076 100644
+index a1ca3f145ec932cc497cbedd8bab80f62bfca4bc..45f90763d207b112947d8ef97a551b6403dea332 100644
 --- a/python/sglang/srt/models/dspark.py
 +++ b/python/sglang/srt/models/dspark.py
 @@ -65,7 +65,6 @@ def run_markov_block(
@@ -289,7 +289,7 @@ index a1ca3f1..45f9076 100644
  
  
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
-index 0bfd3b2..a039b45 100644
+index 0bfd3b249d771651e11090d7785854ed6123e89f..1feacc440e45bd318823bd31ac6658acf37b93fa 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
 @@ -86,7 +86,15 @@ class _DflashDraftSampler:
@@ -533,7 +533,7 @@ index 0bfd3b2..a039b45 100644
  
          draft_tokens = self._draft_block_tokens_buf[:bs]
          draft_tokens[:, 0].copy_(block_ids[:, 0])
-@@ -1832,6 +1959,56 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1832,6 +1959,59 @@ class DFlashWorkerV2(BaseSpecWorker):
              )
          hidden = hidden.view(bs, int(self.block_size), -1)
  
@@ -544,6 +544,7 @@ index 0bfd3b2..a039b45 100644
 +            )
 +
 +            remaining, terminal_ids, ignore_eos = request_boundary_metadata(batch.reqs)
++            has_supervision = any(value > 0 for value in remaining)
 +            (
 +                valid_mask,
 +                semantic_accepted,
@@ -564,6 +565,7 @@ index 0bfd3b2..a039b45 100644
 +                    target_logits=logits_output.next_token_logits,
 +                    valid_mask=valid_mask,
 +                    lm_head_weight=lm_head.weight,
++                    has_supervision=has_supervision,
 +                )
 +            if online_tail is not None:
 +                if tail_update_due:
@@ -585,12 +587,13 @@ index 0bfd3b2..a039b45 100644
 +                        valid_mask=valid_mask,
 +                        request_ids=tuple(request.rid for request in batch.reqs),
 +                        prefix_lens=batch.seq_lens,
++                        has_supervision=has_supervision,
 +                    )
 +
          self._append_target_hidden_to_draft_kv_by_loc(
              target_hidden=hidden.reshape(-1, hidden.shape[-1]),
              cache_loc=verify_out_cache_loc,
-@@ -1843,6 +2020,23 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1843,6 +2023,23 @@ class DFlashWorkerV2(BaseSpecWorker):
          # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
          logits_output.hidden_states = None
  
@@ -615,7 +618,7 @@ index 0bfd3b2..a039b45 100644
              bonus_tokens=bonus,
              new_seq_lens=new_seq_lens,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-index acdbd74..440c878 100644
+index acdbd7451340a9721443f081ed97b537e759bca0..440c878124a71e219f977ba42b508b7ee7f6731b 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 @@ -21,6 +21,11 @@ from sglang.srt.runtime_context import get_parallel
@@ -846,7 +849,7 @@ index acdbd74..440c878 100644
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_proposal.py b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 new file mode 100644
-index 0000000..2a1db91
+index 0000000000000000000000000000000000000000..2a1db91c033e792385af507eab03e8b9c7ae0d03
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 @@ -0,0 +1,71 @@
@@ -922,7 +925,7 @@ index 0000000..2a1db91
 +    "compute_dspark_projection",
 +)
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-index 4d5478c..ab2114d 100644
+index 4d5478cd53c70f342cc4555ab352108c335a35aa..ab2114d90266459e2e2e4e06a222d14b24a2a9b6 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 @@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
@@ -951,7 +954,7 @@ index 4d5478c..ab2114d 100644
          self,
          *,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
-index ae778ee..c83fa5a 100644
+index ae778ee1dbffe5e6570ba456d316dfac8cdddfc9..af94ba14de42ec8d0ccda216bd39812f5e36bd77 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 @@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
@@ -1069,7 +1072,7 @@ index ae778ee..c83fa5a 100644
              )
          draft_block_ids = proposal.draft_block_ids
          draft_block = proposal.draft_block
-@@ -638,6 +696,51 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -638,6 +696,53 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              draft_tokens=draft_tokens,
          )
@@ -1080,6 +1083,7 @@ index ae778ee..c83fa5a 100644
 +            )
 +
 +            remaining, terminal_ids, ignore_eos = request_boundary_metadata(batch.reqs)
++            has_supervision = any(value > 0 for value in remaining)
 +            (
 +                valid_mask,
 +                semantic_accepted,
@@ -1110,6 +1114,7 @@ index ae778ee..c83fa5a 100644
 +                    request_ids=tuple(request.rid for request in batch.reqs),
 +                    prefix_lens=prefix_lens,
 +                    logit_scales=(proposal.draft_block.temperatures.reciprocal()),
++                    has_supervision=has_supervision,
 +                )
 +            online_tail.after_commit(
 +                batch,
@@ -1122,7 +1127,7 @@ index ae778ee..c83fa5a 100644
              if confidence is not None:
                  on_publish(accept.new_seq_lens, confidence=confidence)
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
-index 4184fe4..ba7a039 100644
+index 4184fe4657996bfba8c39d055876d1aa2bcb7f3a..ba7a0390efd8a8045db2fbbfc07d9e951b96b440 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
 +++ b/python/sglang/srt/speculative/eagle_info.py
 @@ -30,6 +30,7 @@ class EagleVerifyInput(SpecInput):
@@ -1180,7 +1185,7 @@ index 4184fe4..ba7a039 100644
  
  @dataclass
 diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
-index 880545b..8ee2ed5 100644
+index 880545b509ad6870d9d0921c9a73fd3beed4e4e4..8ee2ed59d29f7ed516546b2d7a43dacef15152a4 100644
 --- a/python/sglang/srt/speculative/eagle_worker_common.py
 +++ b/python/sglang/srt/speculative/eagle_worker_common.py
 @@ -397,6 +397,7 @@ def build_eagle_verify_input(
@@ -1192,7 +1197,7 @@ index 880545b..8ee2ed5 100644
  
  
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index ee43575..0befbb9 100644
+index ee4357578c3fe102e0f0ba4d2fa759db5ba1400e..0befbb9b6377a0e8d05b9750a7d78266d35c0f38 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
 @@ -2,7 +2,7 @@ import contextlib
@@ -1587,10 +1592,10 @@ index ee43575..0befbb9 100644
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/online_eagle_adaptation.py b/python/sglang/srt/speculative/online_eagle_adaptation.py
 new file mode 100644
-index 0000000..1153bb8
+index 0000000000000000000000000000000000000000..17b515053a3377de3ba864d4e225a0dfd1fb4e3f
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_eagle_adaptation.py
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,291 @@
 +"""Version-safe tail adaptation for single-layer EAGLE/EAGLE3 chains."""
 +
 +from __future__ import annotations
@@ -1732,6 +1737,7 @@ index 0000000..1153bb8
 +        ]
 +        correct_len = (batch_result.accept_lens - 1).clamp_min(0)
 +        remaining, terminal_ids, ignore_eos = request_boundary_metadata(batch.reqs)
++        has_supervision = any(value > 0 for value in remaining)
 +        valid, accepted, committed = semantic_proposal_semantics(
 +            proposal_tokens=proposal_tokens,
 +            correct_len=correct_len,
@@ -1746,7 +1752,9 @@ index 0000000..1153bb8
 +            if request_id in self.capture_owners
 +        ]
 +        attempted_capture = binding is not None and bool(owner_indices)
-+        should_launch = attempted_capture
++        should_launch = attempted_capture and has_supervision
++        if attempted_capture and not has_supervision:
++            self.runtime.skip_update_no_supervision(binding)
 +        if should_launch:
 +            depth = proposal_tokens.shape[1]
 +            rows = []
@@ -1801,6 +1809,7 @@ index 0000000..1153bb8
 +                    .clamp_min(1e-5)
 +                    .reciprocal(),
 +                    reservation=binding,
++                    has_supervision=has_supervision,
 +                )
 +        self.tail.after_commit(
 +            batch,
@@ -1880,10 +1889,10 @@ index 0000000..1153bb8
 +)
 diff --git a/python/sglang/srt/speculative/online_tail_adaptation.py b/python/sglang/srt/speculative/online_tail_adaptation.py
 new file mode 100644
-index 0000000..75a4fe8
+index 0000000000000000000000000000000000000000..9aef606d530804efb9d41456da3ded08844e88ef
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_tail_adaptation.py
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,631 @@
 +"""Cache-safe output-tail ablations for speculative proposal heads."""
 +
 +from __future__ import annotations
@@ -1900,9 +1909,10 @@ index 0000000..75a4fe8
 +    CandidateBinding,
 +    FixedInferenceBank,
 +    OnlineCohortRuntime,
-+    ResidentOptimizer,
-+    estimate_functional_optimizer_scratch_bytes,
++    OnlineSpecOptimizer,
++    build_parameter_optimizer,
 +    estimate_full_vocab_training_scratch_bytes,
++    estimate_functional_optimizer_scratch_bytes,
 +)
 +
 +logger = logging.getLogger(__name__)
@@ -1983,7 +1993,11 @@ index 0000000..75a4fe8
 +            parameter.detach().clone() for parameter in self.active
 +        )
 +        self.bank = FixedInferenceBank(self.active)
-+        self.optimizer = ResidentOptimizer(self.active, config.optimizer)
++        self.optimizer = build_parameter_optimizer(
++            self.active,
++            config,
++            projection_origin=self.initial_trainable,
++        )
 +        context_capacity = int(server_args.context_length or 0)
 +        if context_capacity <= 0:
 +            context_capacity = int(
@@ -2013,6 +2027,7 @@ index 0000000..75a4fe8
 +        )
 +        resident = (
 +            self.active
++            + self.initial_trainable
 +            + self.bank.staging
 +            + self.optimizer.state_tensors
 +            + self.runtime.telemetry_tensors
@@ -2035,14 +2050,32 @@ index 0000000..75a4fe8
 +        self.runtime.bind_memory(
 +            resident_tensors=resident,
 +            peak_scratch_bytes=scratch,
-+            optimizer_tensors=self.optimizer.state_tensors,
-+            trainable_tensors=self.optimizer.master,
++            trainable_tensors=(
++                self.optimizer.first
++                if isinstance(self.optimizer, OnlineSpecOptimizer)
++                and self.optimizer.is_ensemble
++                else self.optimizer.master
++            ),
 +            categories={
-+                "active_or_base_bytes": bytes_of(self.active),
++                "active_or_base_bytes": bytes_of(self.active + self.initial_trainable),
 +                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                # Ensemble members share one sequential gradient scratch.
 +                "gradient_bytes": trainable_bytes,
-+                "first_moment_bytes": bytes_of(self.optimizer.first),
-+                "second_moment_bytes": bytes_of(self.optimizer.second),
++                "first_moment_bytes": (
++                    0
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else bytes_of(self.optimizer.first)
++                ),
++                "second_moment_bytes": (
++                    0
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else bytes_of(self.optimizer.second)
++                ),
++                "online_state_bytes": (
++                    bytes_of(self.optimizer.first + self.optimizer.second)
++                    if isinstance(self.optimizer, OnlineSpecOptimizer)
++                    else 0
++                ),
 +                "optimizer_metadata_bytes": bytes_of(self.optimizer.metadata_tensors),
 +                "staging_bytes": bytes_of(self.bank.staging),
 +                "training_activation_bytes": logits_scratch,
@@ -2130,6 +2163,32 @@ index 0000000..75a4fe8
 +            raise ValueError("proposal head is narrower than raw proposal logits")
 +        return raw_logits + correction[..., : raw_logits.shape[-1]].to(raw_logits.dtype)
 +
++    def _distillation_loss(
++        self,
++        draft: torch.Tensor,
++        target: torch.Tensor,
++        valid_mask: torch.Tensor,
++        logit_scales: torch.Tensor | None,
++    ) -> torch.Tensor:
++        draft = draft.to(torch.float32)
++        target = target.to(torch.float32)
++        if logit_scales is not None:
++            scale = logit_scales.to(torch.float32)[..., None]
++            draft = draft * scale
++            target = target * scale
++        probability = torch.softmax(target, dim=-1)
++        weights = self.config.loss_position_decay ** torch.arange(
++            draft.shape[1], device=self.device, dtype=torch.float32
++        )
++        weights = weights[None, :] * valid_mask.to(torch.float32)
++        return (
++            (
++                probability
++                * (torch.log_softmax(target, dim=-1) - torch.log_softmax(draft, dim=-1))
++            ).sum(-1)
++            * weights
++        ).sum() / weights.sum().clamp_min(1.0)
++
 +    def maybe_launch(
 +        self,
 +        *,
@@ -2183,6 +2242,7 @@ index 0000000..75a4fe8
 +        prefix_lens: torch.Tensor,
 +        logit_scales: torch.Tensor | None = None,
 +        reservation: CandidateBinding | None = None,
++        has_supervision: bool = True,
 +    ) -> None:
 +        try:
 +            self._launch_aligned(
@@ -2195,6 +2255,7 @@ index 0000000..75a4fe8
 +                prefix_lens=prefix_lens,
 +                logit_scales=logit_scales,
 +                reservation=reservation,
++                has_supervision=has_supervision,
 +            )
 +        except torch.cuda.OutOfMemoryError:
 +            self.runtime.counters["oom_events"] += 1
@@ -2216,6 +2277,7 @@ index 0000000..75a4fe8
 +        prefix_lens: torch.Tensor,
 +        logit_scales: torch.Tensor | None = None,
 +        reservation: CandidateBinding | None = None,
++        has_supervision: bool = True,
 +    ) -> None:
 +        if reservation is None:
 +            if not self.runtime.update_due():
@@ -2227,6 +2289,9 @@ index 0000000..75a4fe8
 +                raise RuntimeError("tail update reservation is no longer valid")
 +            source_round = reservation.source_round
 +            source_version = reservation.source_version
++        if not has_supervision:
++            self.runtime.skip_update_no_supervision(reservation)
++            return
 +        batch = int(valid_mask.shape[0])
 +        depth = int(valid_mask.shape[1])
 +        expected = (batch, depth)
@@ -2245,6 +2310,7 @@ index 0000000..75a4fe8
 +        owned_proposal = proposal_logits.detach().clone()
 +        owned_target = target_logits.detach().clone()
 +        owned_mask = valid_mask.detach().clone()
++        supervision_nonempty = owned_mask.any()
 +        owned_scales = None if logit_scales is None else logit_scales.detach().clone()
 +        if owned_scales is not None:
 +            if owned_scales.shape == (batch,):
@@ -2266,10 +2332,6 @@ index 0000000..75a4fe8
 +                if value is not None
 +            )
 +        ):
-+            leaves = tuple(
-+                parameter.detach().clone().requires_grad_(True)
-+                for parameter in self.active
-+            )
 +            with self.runtime.timing("training"):
 +                reconstructed = self._proposal_with_parameters(
 +                    owned_hidden.reshape(-1, owned_hidden.shape[-1]),
@@ -2288,45 +2350,89 @@ index 0000000..75a4fe8
 +                    & torch.isfinite(reconstruction_limit)
 +                    & (reconstruction_error <= reconstruction_limit)
 +                )
-+                draft = self._proposal_with_parameters(
-+                    owned_hidden.reshape(-1, owned_hidden.shape[-1]),
-+                    leaves,
-+                    self.lm_head_weight,
-+                    raw_logits=owned_raw.reshape(-1, owned_raw.shape[-1]),
-+                ).view(batch, depth, -1)[..., : owned_raw.shape[-1]]
-+                draft = draft.to(torch.float32)
-+                target = owned_target.to(torch.float32)
-+                if owned_scales is not None:
-+                    scale = owned_scales.to(torch.float32)[..., None]
-+                    draft = draft * scale
-+                    target = target * scale
-+                probability = torch.softmax(target, dim=-1)
-+                weights = self.config.loss_position_decay ** torch.arange(
-+                    depth, device=self.device, dtype=torch.float32
++                loss = self._distillation_loss(
++                    owned_proposal,
++                    owned_target,
++                    owned_mask,
++                    owned_scales,
 +                )
-+                weights = weights[None, :] * owned_mask.to(torch.float32)
-+                loss = (
-+                    (
-+                        probability
-+                        * (
-+                            torch.log_softmax(target, dim=-1)
-+                            - torch.log_softmax(draft, dim=-1)
++
++                def member_feedback(parameters):
++                    leaves = tuple(
++                        parameter.detach().clone().requires_grad_(True)
++                        for parameter in parameters
++                    )
++                    member_draft = self._proposal_with_parameters(
++                        owned_hidden.reshape(-1, owned_hidden.shape[-1]),
++                        leaves,
++                        self.lm_head_weight,
++                        raw_logits=owned_raw.reshape(-1, owned_raw.shape[-1]),
++                    ).view(batch, depth, -1)[..., : owned_raw.shape[-1]]
++                    member_loss = self._distillation_loss(
++                        member_draft,
++                        owned_target,
++                        owned_mask,
++                        owned_scales,
++                    )
++                    return member_loss, torch.autograd.grad(member_loss, leaves)
++
++            if (
++                isinstance(self.optimizer, OnlineSpecOptimizer)
++                and self.optimizer.is_ensemble
++            ):
++                expert_losses = []
++                expert_finite = []
++                updated_experts = []
++                for index, expert in enumerate(self.optimizer.experts):
++                    with self.runtime.timing("training"):
++                        member_loss, gradients = member_feedback(expert)
++                        expert_losses.append(member_loss.detach())
++                        expert_finite.append(
++                            torch.isfinite(member_loss.detach())
++                            & torch.stack(
++                                [
++                                    torch.isfinite(gradient).all()
++                                    for gradient in gradients
++                                ]
++                            ).all()
 +                        )
-+                    ).sum(-1)
-+                    * weights
-+                ).sum() / weights.sum().clamp_min(1.0)
-+                gradients = torch.autograd.grad(loss, leaves)
-+            finite = (
-+                torch.isfinite(loss)
-+                & torch.stack(
-+                    [torch.isfinite(gradient).all() for gradient in gradients]
-+                ).all()
-+            )
-+            with self.runtime.timing("optimizer"):
-+                proposal = self.optimizer.propose(gradients)
++                    with self.runtime.timing("optimizer"):
++                        updated_experts.append(
++                            self.optimizer.propose_ensemble_member(
++                                index,
++                                gradients,
++                            )
++                        )
++                    # The next expert reuses the gradient scratch instead of
++                    # retaining every expert's differentiable state.
++                    del member_loss, gradients
++                stacked_losses = torch.stack(expert_losses)
++                finite = torch.isfinite(loss) & torch.stack(expert_finite).all()
++                with self.runtime.timing("optimizer"):
++                    proposal = self.optimizer.combine_ensemble(
++                        stacked_losses,
++                        updated_experts,
++                    )
++            else:
++                with self.runtime.timing("training"):
++                    source_parameters = (
++                        self.optimizer.master
++                        if isinstance(self.optimizer, OnlineSpecOptimizer)
++                        else self.active
++                    )
++                    member_loss, gradients = member_feedback(source_parameters)
++                    finite = (
++                        torch.isfinite(loss)
++                        & torch.stack(
++                            [torch.isfinite(gradient).all() for gradient in gradients]
++                        ).all()
++                    )
++                with self.runtime.timing("optimizer"):
++                    proposal = self.optimizer.propose(gradients)
 +            with self.runtime.timing("merge"):
++                publish_valid = finite & reconstruction_ok & supervision_nonempty
 +                staged = tuple(
-+                    torch.where(finite, candidate, active)
++                    torch.where(publish_valid, candidate, active)
 +                    for candidate, active in zip(
 +                        proposal.parameters, self.active, strict=True
 +                    )
@@ -2344,6 +2450,7 @@ index 0000000..75a4fe8
 +                prefix_lens=prefix_lens,
 +                reconstruction_ok=reconstruction_ok,
 +                reconstruction_max_abs=reconstruction_error,
++                supervision_nonempty=supervision_nonempty,
 +                reservation=reservation,
 +            )
 +
@@ -2391,7 +2498,14 @@ index 0000000..75a4fe8
 +        )
 +
 +    def diagnostics(self) -> dict:
-+        return self.runtime.diagnostics()
++        online_spec_state = (
++            self.optimizer.diagnostics()
++            if isinstance(self.optimizer, OnlineSpecOptimizer)
++            else None
++        )
++        return self.runtime.diagnostics(
++            extra={"online_spec_state": online_spec_state}
++        )
 +
 +
 +def maybe_build_online_tail_adapter(

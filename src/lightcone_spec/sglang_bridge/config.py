@@ -11,14 +11,10 @@ from lightcone_spec.config.schema import RunConfig
 def sglang_adaptation_payload(config: RunConfig) -> dict | None:
     if config.method == "static":
         return None
-    if config.method.startswith("onlinespec_"):
-        raise ValueError(
-            "OnlineSpec is an isolated external baseline, not an SGLang adaptation mode"
-        )
     adaptation = config.adaptation
     if adaptation is None:
         raise AssertionError("validated non-static config has no adaptation")
-    return {
+    payload = {
         "schema_version": 2,
         "method": config.method,
         "algorithm": config.model.algorithm,
@@ -39,6 +35,9 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         "sampling_profile_sha256": (config.runtime.sampling_profile_sha256),
         "telemetry_detail": config.runtime.telemetry_detail,
     }
+    if config.online_spec is not None:
+        payload["online_spec"] = config.online_spec.model_dump(mode="json")
+    return payload
 
 
 def sglang_adaptation_sha256(config: RunConfig) -> str | None:

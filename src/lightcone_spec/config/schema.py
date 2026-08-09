@@ -129,6 +129,25 @@ class AdaptationConfig(StrictModel):
         return self
 
 
+class OnlineSpecConfig(StrictModel):
+    """Algorithm state not shared with the Static/TTS/L0 hypothesis."""
+
+    projection_radius: float | None = Field(default=None, gt=0.0)
+    additional_learning_rates: tuple[float, ...] = ()
+    hedge_learning_rate: float | None = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_finite_grid(self) -> OnlineSpecConfig:
+        rates = self.additional_learning_rates
+        if any(rate <= 0 for rate in rates):
+            raise ValueError("OnlineSPEC learning rates must be positive")
+        if len(set(rates)) != len(rates) or tuple(sorted(rates)) != rates:
+            raise ValueError(
+                "OnlineSPEC additional learning rates must be unique and increasing"
+            )
+        return self
+
+
 class RuntimeConfig(StrictModel):
     sglang_commit: Literal[PINNED_SGLANG_COMMIT] = PINNED_SGLANG_COMMIT
     sampling_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -147,6 +166,7 @@ class RunConfig(StrictModel):
     model: ModelPair
     runtime: RuntimeConfig
     adaptation: AdaptationConfig | None = None
+    online_spec: OnlineSpecConfig | None = None
     tenant_id: str = Field(default="research", min_length=1, max_length=128)
 
     @model_validator(mode="after")
@@ -162,17 +182,62 @@ class RunConfig(StrictModel):
         elif self.runtime.speculative_eagle_topk is None:
             raise ValueError("EAGLE backends require speculative_eagle_topk")
         if self.method == "static":
-            if self.adaptation is not None:
+            if self.adaptation is not None or self.online_spec is not None:
                 raise ValueError("static must not allocate adaptation state")
             return self
         if self.adaptation is None:
             raise ValueError(f"method={self.method} requires adaptation configuration")
         if self.method.startswith("onlinespec_"):
+            if self.online_spec is None:
+                raise ValueError("OnlineSPEC baselines require online_spec state")
             if self.adaptation.optimizer.name != "sgd":
                 raise ValueError("OnlineSpec baselines preserve their SGD update")
-            if self.adaptation.parameter_scope != "tail":
-                raise ValueError("OnlineSpec baselines are isolated tail baselines")
+            if algorithm != "DFLASH" and self.adaptation.parameter_scope != "tail":
+                raise ValueError(
+                    f"{algorithm} OnlineSPEC currently supports parameter_scope=tail"
+                )
+            if self.method == "onlinespec_ens":
+                if self.adaptation.weight_update_mode != "full":
+                    raise ValueError(
+                        "OnlineSPEC Hedge combines full parameter decisions"
+                    )
+                rates = (
+                    self.adaptation.optimizer.learning_rate,
+                    *self.online_spec.additional_learning_rates,
+                )
+                if len(rates) < 2 or tuple(sorted(rates)) != rates:
+                    raise ValueError(
+                        "OnlineSPEC Hedge requires an increasing multi-rate grid"
+                    )
+                if self.online_spec.hedge_learning_rate is None:
+                    raise ValueError("OnlineSPEC Hedge requires hedge_learning_rate")
+            elif (
+                self.online_spec.additional_learning_rates
+                or self.online_spec.hedge_learning_rate is not None
+            ):
+                raise ValueError("ensemble fields are only valid for onlinespec_ens")
+            if (
+                self.runtime.tensor_parallel_size != 1
+                or self.runtime.data_parallel_size != 1
+            ):
+                raise ValueError("OnlineSPEC currently requires TP=DP=1")
+            if not self.runtime.use_rejection_sampling:
+                raise ValueError("OnlineSPEC requires exact rejection sampling")
+            if (
+                algorithm in {"EAGLE", "EAGLE3"}
+                and self.runtime.speculative_eagle_topk != 1
+            ):
+                raise ValueError("adapted EAGLE/EAGLE3 currently requires topk=1")
+            if (
+                self.adaptation.canvas_tokens
+                != self.runtime.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "adaptation canvas width must equal the speculative width"
+                )
             return self
+        if self.online_spec is not None:
+            raise ValueError("online_spec state is only valid for OnlineSPEC methods")
         if (
             self.runtime.tensor_parallel_size != 1
             or self.runtime.data_parallel_size != 1

@@ -142,29 +142,58 @@ def successive_halving(
 @dataclass(frozen=True)
 class ConfirmationBlock:
     block: int
-    method_order: tuple[str, str, str]
+    method_order: tuple[str, ...]
     reset_cohort_before_each: bool = True
 
 
-def confirmation_blocks(seed: int, count: int = 8) -> tuple[ConfirmationBlock, ...]:
+def paired_blocks(
+    seed: int,
+    methods: tuple[str, ...],
+    count: int = 8,
+) -> tuple[ConfirmationBlock, ...]:
     if count < 1:
         raise ValueError("at least one confirmation block is required")
+    if len(methods) < 2 or len(set(methods)) != len(methods):
+        raise ValueError("paired blocks require unique comparison methods")
     randomizer = random.Random(seed)
     blocks: list[ConfirmationBlock] = []
     for block in range(count):
-        methods = ["static", "tts", "naive_async"]
-        randomizer.shuffle(methods)
+        order = list(methods)
+        randomizer.shuffle(order)
         blocks.append(
             ConfirmationBlock(
                 block=block,
-                method_order=tuple(methods),
+                method_order=tuple(order),
             )
         )
     return tuple(blocks)
 
 
-def select_static_load(rows: list[dict]) -> int:
+def confirmation_blocks(seed: int, count: int = 8) -> tuple[ConfirmationBlock, ...]:
+    return paired_blocks(seed, ("static", "tts", "naive_async"), count)
+
+
+def onlinespec_blocks(seed: int, count: int = 8) -> tuple[ConfirmationBlock, ...]:
+    return paired_blocks(
+        seed,
+        (
+            "static",
+            "onlinespec_ogd",
+            "onlinespec_opt",
+            "onlinespec_ens",
+        ),
+        count,
+    )
+
+
+def select_static_load(
+    rows: list[dict],
+    *,
+    required_context_limit: int,
+) -> int:
     """Select maximum-goodput safe concurrency from the fixed scan."""
+    if required_context_limit < 1:
+        raise ValueError("required context limit must be positive")
     expected = {1, 2, 4, 8, 16, 32, 48}
     observed = {int(row["concurrency"]) for row in rows}
     if observed != expected or len(rows) != len(expected):
@@ -174,11 +203,12 @@ def select_static_load(rows: list[dict]) -> int:
         p99 = float(row["itl_p99_ms"])
         oom = int(row["oom_events"])
         retractions = int(row["retractions"])
+        capacity = int(row["kv_token_capacity"])
         if not math.isfinite(goodput) or goodput <= 0:
             raise ValueError("static goodput must be finite and positive")
         if not math.isfinite(p99) or p99 < 0:
             raise ValueError("static p99 ITL must be finite and non-negative")
-        if oom < 0 or retractions < 0:
+        if oom < 0 or retractions < 0 or capacity < 1:
             raise ValueError("static safety counters cannot be negative")
     c1 = next(row for row in rows if int(row["concurrency"]) == 1)
     threshold = 2.0 * float(c1["itl_p99_ms"])
@@ -187,6 +217,8 @@ def select_static_load(rows: list[dict]) -> int:
         for row in rows
         if int(row["oom_events"]) == 0
         and int(row["retractions"]) == 0
+        and int(row["kv_token_capacity"])
+        >= int(row["concurrency"]) * required_context_limit
         and float(row["itl_p99_ms"]) <= threshold
     ]
     if not eligible:

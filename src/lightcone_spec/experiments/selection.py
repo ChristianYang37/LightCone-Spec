@@ -39,6 +39,7 @@ class SliceMeasurement:
     model_lock_sha256: str
     sampling_profile_sha256: str
     window_sha256: str
+    output_set_sha256: str
     prompt_count: int
     context_limit: int
     concurrency: int
@@ -46,6 +47,7 @@ class SliceMeasurement:
     itl_p99_ms: float
     peak_hbm_bytes: int
     kv_bytes: int
+    kv_token_capacity: int
     optimizer_bytes: int
     trainable_parameters: int
     exposed_update_ms: float
@@ -62,9 +64,23 @@ class SliceMeasurement:
     def validate(self) -> None:
         if self.schema_version != 2:
             raise ValueError("slice measurement must use schema version 2")
-        if self.phase not in {"static_load_screen", "shared_config_tuning"}:
+        if self.phase not in {
+            "static_load_screen",
+            "shared_config_tuning",
+            "onlinespec_tuning",
+        }:
             raise ValueError("slice measurement phase is not selectable")
-        if self.method not in {"static", "tts", "naive_async"}:
+        allowed_methods = {
+            "static_load_screen": {"static"},
+            "shared_config_tuning": {"static", "tts", "naive_async"},
+            "onlinespec_tuning": {
+                "static",
+                "onlinespec_ogd",
+                "onlinespec_opt",
+                "onlinespec_ens",
+            },
+        }[self.phase]
+        if self.method not in allowed_methods:
             raise ValueError("slice measurement has an unknown method")
         if self.prompt_count < 1 or self.context_limit < 1 or self.concurrency < 1:
             raise ValueError("slice dimensions must be positive")
@@ -74,6 +90,7 @@ class SliceMeasurement:
             "model_lock_sha256",
             "sampling_profile_sha256",
             "window_sha256",
+            "output_set_sha256",
         ):
             value = getattr(self, name)
             if len(value) != 64 or any(
@@ -92,6 +109,7 @@ class SliceMeasurement:
         counters = (
             self.peak_hbm_bytes,
             self.kv_bytes,
+            self.kv_token_capacity,
             self.optimizer_bytes,
             self.trainable_parameters,
             self.updates_launched,
@@ -275,6 +293,7 @@ def reduce_tuning_stage(
             or row.model_lock_sha256 != static.model_lock_sha256
             or row.sampling_profile_sha256 != static.sampling_profile_sha256
             or row.window_sha256 != static.window_sha256
+            or row.output_set_sha256 != static.output_set_sha256
             or row.concurrency != static.concurrency
         ):
             raise ValueError("tuning slices are not paired to the Static baseline")

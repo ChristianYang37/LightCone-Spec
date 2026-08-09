@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
+import torch
 
 from lightcone_spec.adaptation.cohort import (
     CohortIdentity,
@@ -16,6 +19,7 @@ from lightcone_spec.methods.core import (
     policy_for,
     publication_round,
 )
+from lightcone_spec.runtime.publication import CudaPublicationCoordinator
 
 
 def candidate(**updates) -> CandidateUpdate:
@@ -215,3 +219,15 @@ def test_frozen_kv_history_versions_only_future_tokens() -> None:
 def test_empty_kv_append_rejected(count: int) -> None:
     with pytest.raises(ValueError):
         FrozenKVHistory().append(count, 0)
+
+
+def test_cuda_side_stream_uses_portable_lowest_priority_request() -> None:
+    with (
+        patch("lightcone_spec.runtime.publication.torch.cuda.Stream") as stream,
+        patch("lightcone_spec.runtime.publication.torch.cuda.Event"),
+    ):
+        CudaPublicationCoordinator("cuda")
+    stream.assert_called_once_with(
+        device=torch.device("cuda"),
+        priority=2**31 - 1,
+    )

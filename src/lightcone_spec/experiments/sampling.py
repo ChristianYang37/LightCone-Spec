@@ -14,7 +14,10 @@ from typing import Literal
 class SamplingProfile:
     schema_version: int = 2
     purpose: Literal["controlled", "natural"] = "controlled"
-    temperature: float = 1.0
+    # Formal controlled timing is greedy so every method follows the same
+    # target-token trajectory. Stochastic exactness remains a separate test and
+    # natural-task profile rather than a source of paired-timing path variance.
+    temperature: float = 0.0
     top_p: float = 1.0
     ignore_eos: bool = True
 
@@ -49,7 +52,10 @@ class SamplingProfile:
         return {
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "seed": seed,
+            # The native SGLang ``/generate`` endpoint accepts
+            # ``sampling_seed``.  ``seed`` belongs to its OpenAI-compatible
+            # endpoint and is rejected by the native SamplingParams schema.
+            "sampling_seed": seed,
             "max_new_tokens": max_new_tokens,
             "ignore_eos": self.ignore_eos,
         }
