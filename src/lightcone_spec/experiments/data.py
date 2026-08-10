@@ -188,7 +188,12 @@ def load_natural_prompts(
     from datasets import load_dataset
 
     repository, prompt_fields = specifications[dataset_name]
-    dataset = load_dataset(repository, split=split, revision=revision)
+    dataset = load_dataset(
+        repository,
+        split=split,
+        revision=revision,
+        streaming=True,
+    )
     samples: list[PromptSample] = []
     for index, row in enumerate(dataset):
         if len(samples) >= limit:

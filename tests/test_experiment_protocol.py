@@ -21,6 +21,7 @@ from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     DFLASH_SPECULATIVE_HEADROOM,
     LongContinuationAdapter,
+    load_natural_prompts,
     sample_set_sha256,
 )
 from lightcone_spec.experiments.evidence import (
@@ -91,6 +92,36 @@ def test_controlled_path_does_not_import_optional_dataset_package() -> None:
     before = sys.modules.get("datasets")
     LongContinuationAdapter().window("confirm")
     assert sys.modules.get("datasets") is before
+
+
+def test_natural_prompt_loader_streams_only_the_locked_window(monkeypatch) -> None:
+    import sys
+    import types
+
+    calls: list[tuple[str, dict]] = []
+    module = types.ModuleType("datasets")
+
+    def load_dataset(repository: str, **kwargs):
+        calls.append((repository, kwargs))
+        return ({"problem": f"problem-{index}"} for index in range(64))
+
+    module.load_dataset = load_dataset
+    monkeypatch.setitem(sys.modules, "datasets", module)
+    revision = "a" * 40
+    samples = load_natural_prompts(
+        "math500", revision=revision, split="test", limit=32
+    )
+    assert len(samples) == 32
+    assert len({sample.sample_id for sample in samples}) == 32
+    assert [sample.prompt for sample in samples] == [
+        f"problem-{index}" for index in range(32)
+    ]
+    assert calls == [
+        (
+            "HuggingFaceH4/MATH-500",
+            {"split": "test", "revision": revision, "streaming": True},
+        )
+    ]
 
 
 def test_sampling_profiles_separate_controlled_and_natural_eos() -> None:
