@@ -984,16 +984,17 @@ def _round_records(
             )
         )
         end = prefix + committed
-        if history[-1]["source_version"] == source_version:
-            history[-1] = {**history[-1], "end": end}
-        else:
-            history.append(
-                {
-                    "start": prefix,
-                    "end": end,
-                    "source_version": source_version,
-                }
-            )
+        if committed > 0:
+            if history[-1]["source_version"] == source_version:
+                history[-1] = {**history[-1], "end": end}
+            else:
+                history.append(
+                    {
+                        "start": prefix,
+                        "end": end,
+                        "source_version": source_version,
+                    }
+                )
     if {record.request_id for record in records} != set(inputs):
         raise RuntimeError("round traces do not cover every completed request")
     for request_id, history in histories.items():

@@ -762,6 +762,34 @@ def test_round_evidence_rejects_missing_bonus_before_request_boundary() -> None:
         )
 
 
+def test_round_evidence_ignores_zero_length_publication_segment() -> None:
+    diagnostics = adaptation_payload()
+    diagnostics["rounds"].append(
+        {
+            "round_index": 2,
+            "source_version": 1,
+            "request_ids": ["r0"],
+            "prefix_len_before": [11],
+            "verify_len": [15],
+            "accepted_drafts": [0],
+            "committed_tokens": [0],
+        }
+    )
+
+    records = _round_records(
+        run_id="run-final-noop",
+        diagnostics=diagnostics,
+        results=(result(tokens=4),),
+        rounds=tuple(diagnostics["rounds"]),
+    )
+
+    assert len(records) == 2
+    assert records[-1].committed_tokens == 0
+    assert json.loads(records[-1].kv_source_versions) == [
+        {"start": 0, "end": 11, "source_version": 0}
+    ]
+
+
 def test_round_evidence_binds_queued_prompt_kv_to_its_start_version() -> None:
     diagnostics = adaptation_payload()
     diagnostics["rounds"][0] = {
