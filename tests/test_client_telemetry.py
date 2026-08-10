@@ -128,6 +128,15 @@ def test_tokenize_prompts_returns_real_counts_and_limit() -> None:
     assert limit == 40960
 
 
+def test_engine_reset_waits_for_scheduler_idle() -> None:
+    response = StreamingResponse([b"Cache flushed.\n"])
+    with patch("urllib.request.urlopen", return_value=response) as opened:
+        SGLangHTTPClient("http://server").reset_engine()
+    request = opened.call_args.args[0]
+    assert request.full_url == "http://server/flush_cache?timeout=30"
+    assert request.method == "POST"
+
+
 def test_prompt_budget_uses_total_prompt_plus_generation_limit() -> None:
     class Tokenizer:
         def tokenize_prompts(self, prompts):

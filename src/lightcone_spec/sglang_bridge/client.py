@@ -171,8 +171,11 @@ class SGLangHTTPClient:
         self.timeout_s = timeout_s
 
     def reset_engine(self) -> None:
+        # SGLang performs a tiny asynchronous startup warmup after its HTTP
+        # endpoint becomes reachable.  Ask the scheduler to defer this flush
+        # until it is truly idle instead of racing that request.
         request = urllib.request.Request(
-            f"{self.base_url}/flush_cache",
+            f"{self.base_url}/flush_cache?timeout=30",
             data=b"",
             method="POST",
         )
