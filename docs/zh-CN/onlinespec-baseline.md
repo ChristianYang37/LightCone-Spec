@@ -46,9 +46,11 @@ GPU 状态为 `UNMEASURED`。本文描述协议与实现，不提供性能结果
 `pipeline_ens.py` 和 `pipeline_eagle3_ens.py` 会保留相互独立的 base learner，并根据
 累计 loss 形成下一轮 ensemble；较旧的 `pipeline_hedge.py` 变体只使用上一 chunk 的
 loss，而且每轮训练前都从当前 meta checkpoint 重置所有 learner。后者不等价于
-cumulative-loss Hedge，因此本项目不复刻它。类似地，官方 Hydra 路径实际实现的是
-momentum SGD，而论文给出的是双状态 optimistic update。LightCone-Spec 实现已发表的
-状态转移，不会把 momentum 重新命名为 optimistic online learning。
+cumulative-loss Hedge，因此本项目不复刻它。在审计 commit 上，README 示例和两个
+`eagle-ens.sh` 入口仍调用旧的 `*_hedge.py`，而不是累计版本的 `*_ens.py`。类似地，
+README 把 momentum 称为“optimism”，官方 Hydra 路径实际实现的也是 momentum SGD，
+而论文给出的是使用历史 gradient hint 的双状态 optimistic update。LightCone-Spec 实现
+已发表的状态转移，不会把 momentum 重新命名为 optimistic online learning。
 
 论文 recipe 与固定源码默认值之间还存在多处差异：附录写 Online-LR global batch 为 16，
 而 `LR/pipeline.py` 启动 12；附录称 EAGLE 使用 Adam，而 `EAGLE/train.py` 实际构造
@@ -96,6 +98,12 @@ schema、runtime、tuning、confirmation、telemetry 与安全实现。它不表
 本项目不会直接复制源码 recipe 中 optimizer 或 Hedge meta learning rate 的数值。官方的
 累计 epoch loss 与本项目归一化的逐轮 loss 尺度不同，直接复制 epsilon 并不能保持相同的
 指数权重。learner rate 与 meta rate 都只能在已注册 tuning window 上选择。
+
+由于每个 OnlineSPEC gradient 都经过 global clipping，其 learning rate 表示参数空间位移
+尺度，而不是 Adam 风格的逐坐标步长。注册的 OGD/optimistic 网格因此使用
+`1e-4, 1e-3, 1e-2, 1e-1` 和 stride `20, 40, 80, 160`；Hedge 使用从
+`1e-3` 或 `1e-2` 开始的有序三元组，stride 为 `40, 80, 160`。这些只是
+tuning-only 协议边界，不是已报告的最优配置。
 
 ## 在线 learner
 
@@ -187,10 +195,11 @@ expert 前释放当前 differentiable leaf 与 gradient。因此它保持相同�
 但不需要为每个 expert 各预留一份完整 gradient。这些 tensor 不可驱逐，也不会静默
 offload 或降档；KV pool 只能使用扣除这些开销后的剩余显存。
 
-Update telemetry 记录 learner step、source/published version、loss、gradient norm、更新与
-发布时间，以及安全处置。Optimistic 额外记录 hint error；Hedge 记录 expert probability、
-cumulative loss、ensemble entropy 与 effective expert count。Headline 收集不会每轮把这些
-值拷回 CPU；诊断在计时 hot path 外排空有界 device buffer。
+Update telemetry 记录 learner step、source/published version、loss、gradient norm、可微路径
+与推理 logits 的重建诊断、更新时间、发布时间及安全处置。Optimistic 额外记录 hint
+error；Hedge 记录逐 expert gradient norm、expert probability、cumulative loss、ensemble
+entropy 与 effective expert count。Headline 收集不会每轮把这些值拷回 CPU；诊断在计时
+hot path 外排空有界 device buffer。
 
 ## 已注册实验
 

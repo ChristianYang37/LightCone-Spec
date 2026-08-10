@@ -55,10 +55,13 @@ paper-aligned `pipeline_ens.py` and `pipeline_eagle3_ens.py` keep independent
 base learners and form the next ensemble from cumulative losses. The older
 `pipeline_hedge.py` variants instead weight only the preceding chunk loss and
 reset every learner from the current meta checkpoint before training. That is
-not cumulative-loss Hedge and is not reproduced here. Likewise, the
-Hydra-oriented source path implements momentum SGD, while the paper specifies
-the two-state optimistic update. LightCone-Spec implements the published state
-transition and does not relabel momentum as optimistic online learning.
+not cumulative-loss Hedge and is not reproduced here. At the audited commit,
+the README examples and both `eagle-ens.sh` entrypoints still invoke these
+older `*_hedge.py` variants rather than the cumulative `*_ens.py` files.
+Likewise, the README calls momentum “optimism” and the Hydra source implements
+momentum SGD, while the paper specifies the two-state historical-gradient-hint
+update. LightCone-Spec implements the published state transition and does not
+relabel momentum as optimistic online learning.
 
 Several paper recipes and pinned-source defaults also disagree. The appendix
 states a global Online-LR batch of 16 while `LR/pipeline.py` launches 12; it
@@ -115,6 +118,13 @@ from the source recipe. Its accumulated epoch loss has a different scale from
 the normalized per-round loss used here, so copying its epsilon would not
 preserve the same exponential weights. All learner and meta rates are selected
 only on the registered tuning window.
+
+Because every OnlineSPEC gradient is globally clipped, its learning rate is a
+parameter-space displacement scale rather than an Adam-style coordinate step.
+The registered OGD/optimistic grid therefore uses rates
+`1e-4, 1e-3, 1e-2, 1e-1` and strides `20, 40, 80, 160`. Hedge uses ordered
+triples starting at `1e-3` or `1e-2`, with strides `40, 80, 160`. These are
+tuning-only protocol bounds, not reported best settings.
 
 ## Online learners
 
@@ -219,11 +229,12 @@ tensors are non-evictable and are never silently offloaded or downgraded.
 KV-pool sizing uses only the remaining memory.
 
 Update telemetry records learner step, source and published versions, loss,
-gradient norm, update and publication timing, and safety dispositions.
-Optimistic runs also record hint error. Hedge records expert probabilities,
-cumulative losses, ensemble entropy, and effective expert count. Headline
-collection does not copy these values to the CPU per round; diagnostics drain
-the bounded device buffer outside the measured hot path.
+gradient norm, differentiable/inference-logit reconstruction diagnostics,
+update and publication timing, and safety dispositions. Optimistic runs also
+record hint error. Hedge records per-expert gradient norms, expert
+probabilities, cumulative losses, ensemble entropy, and effective expert
+count. Headline collection does not copy these values to the CPU per round;
+diagnostics drain the bounded device buffer outside the measured hot path.
 
 ## Registered experiment
 

@@ -62,9 +62,17 @@ class UpdateRecord:
     prefix_len_mean: float
     source_round: int
     source_version: int
+    optimizer_step: int
     published_version: int | None
     candidate_status: str
     loss: float
+    gradient_norm: float
+    reconstruction_ok: bool
+    reconstruction_max_abs: float
+    reconstruction_relative_rms: float | None
+    reconstruction_top1_match: float | None
+    reconstruction_mean_kl: float | None
+    supervision_nonempty: bool
     trainable_parameters: int
     training_cuda_ms: float | None
     optimizer_cuda_ms: float | None
@@ -78,6 +86,7 @@ class UpdateRecord:
     online_effective_experts: float | None
     online_expert_probabilities: str | None
     online_cumulative_losses: str | None
+    online_expert_gradient_norms: str | None
 
 
 @dataclass(frozen=True)

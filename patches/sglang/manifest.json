@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "6d6598eaa9502e1a757fdcbfdd3a42327c6238b6",
+  "expected_tree": "b41b45f8769d28fef14ca98218579f1089b6e72b",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
@@ -17,7 +17,7 @@
     },
     {
       "file": "0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch",
-      "sha256": "6f488425507059ca433cde2c6b7e19dffa2cfd4a438076ee5648d73861f198e0",
+      "sha256": "2a876b0e5588fd38e7bd62e5300c08e2eeb1d6b150c8f886dd5a05e7df3244e4",
       "files": [
         "python/sglang/srt/speculative/online_adaptation_runtime.py"
       ]
@@ -62,7 +62,7 @@
     },
     {
       "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
-      "sha256": "3ab1f9fc9e8cffe4d9f9f57d7abcea8cc8738bb62bcd72f26fb8adc721c49b3f",
+      "sha256": "9453b108ed0ad964aea9d9654fba7b892a69693439ffc27c8e68466acbff482d",
       "files": [
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]

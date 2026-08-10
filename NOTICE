@@ -13,7 +13,7 @@ distributed with this repository. The patches target:
 The patch series changes SGLang to add focused DFlash Full/LoRA, cache-safe
 DFlash/DSpark/EAGLE/EAGLE3 tail adaptation, resident optimizer choices,
 versioned frozen-KV lifecycle, memory accounting, and evidence hooks for the
-Static/TTS/L0 study.
+Static/TTS/L0 study and the isolated GPU-resident OnlineSPEC comparison.
 See patches/sglang/manifest.json for the exact patch and tree identities.
 
 The registered OnlineSPEC comparison is a clean-room implementation of online

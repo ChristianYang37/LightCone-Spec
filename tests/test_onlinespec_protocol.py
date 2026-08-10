@@ -94,9 +94,7 @@ def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
         "repository": "https://example.invalid/upstream",
         "commit": commit,
         "tree": tree,
-        "key_files": {
-            "pipeline.py": hashlib.sha256(source.read_bytes()).hexdigest()
-        },
+        "key_files": {"pipeline.py": hashlib.sha256(source.read_bytes()).hexdigest()},
         "license_files": [],
         "license_status": "no-license-file-present-at-audited-commit",
     }
@@ -127,8 +125,8 @@ def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
 
 def test_onlinespec_grid_is_complete_unique_and_algorithm_specific() -> None:
     candidates = onlinespec_candidates()
-    assert len(candidates) == 170
-    assert len({candidate.candidate_id for candidate in candidates}) == 170
+    assert len(candidates) == 146
+    assert len({candidate.candidate_id for candidate in candidates}) == 146
     assert {candidate.method for candidate in candidates} == set(ONLINE_SPEC_METHODS)
     assert all(
         candidate.weight_update_mode == "full"
@@ -142,6 +140,16 @@ def test_onlinespec_grid_is_complete_unique_and_algorithm_specific() -> None:
         for candidate in candidates
         if candidate.method != "onlinespec_ens"
     } == {"full", "lora"}
+    assert {
+        candidate.stride
+        for candidate in candidates
+        if candidate.method != "onlinespec_ens"
+    } == {20, 40, 80, 160}
+    assert {
+        candidate.learning_rate
+        for candidate in candidates
+        if candidate.method != "onlinespec_ens"
+    } == {1e-4, 1e-3, 1e-2, 1e-1}
 
 
 def test_onlinespec_schedule_is_paired_randomized_and_resumable() -> None:

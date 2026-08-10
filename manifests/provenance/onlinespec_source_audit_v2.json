@@ -1,1 +1,91 @@
-{"adopted":["prequential_predict_feedback_update","projected_ogd","two_state_optimistic_update","independent_experts","cumulative_loss_hedge","target_to_draft_ce_gradient"],"claim_scope":"clean-room-online-learner-equation-complete-not-official-system-reproduction","commit":"e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b","instantiations":[{"feedback":"verifier_preference_pairs","name":"online_lr","online_unit":"25_example_chunk","paths":["LR/pipeline.py","LR/dpo_train.py","LR/main.py"],"prediction":"standalone_reasoning_drafter","update":"dpo_adamw_subprocess"},{"feedback":"teacher_token_and_feature_losses","name":"opt_hydra","online_unit":"80_example_chunk","paths":["Hydra/pipeline.py","Hydra/train.py"],"prediction":"multi_head_hydra","update":"momentum_sgd_subprocess_not_paper_two_state"},{"feedback":"teacher_token_and_feature_losses","name":"ens_eagle","online_unit":"40_example_chunk","paths":["EAGLE/pipeline_ens.py","EAGLE/pipeline_eagle3_ens.py","EAGLE/train.py","EAGLE/traineagle3.py"],"prediction":"three_independent_eagle_or_eagle3_heads","update":"multi_epoch_train_then_cpu_checkpoint_merge"}],"key_files":{"EAGLE/pipeline.py":"4f52dfbd5dec8046a1b10ca8a842fed77300dc3353ada4cfd5e34ce5b7772e88","EAGLE/pipeline_eagle3_ens.py":"5ab34e2d1c4fb22d2fc1af77b54ff6cc38d7a173dcf6414a2727a77f6f01e3a8","EAGLE/pipeline_eagle3_hedge.py":"eb7fcfbf7e253bfcbdff62b1176c936a3ea5123f4c04df2949a948c94e388c71","EAGLE/pipeline_ens.py":"a86325e27cb7dc76a7dc9b849a56cc421dbb07a78d3f7d4bff5552a0e71ad825","EAGLE/pipeline_hedge.py":"e96fbc995b8fd3f59c85a6c29a65be56fd154d2bc09279c38205fab8eae7d7d3","EAGLE/train.py":"2a6b243e742465a10b56743241167a747aaa65b6bb7d33212201750040ca22e0","EAGLE/traineagle3.py":"894160abebb287a57ed28857543ffa53d6934dc6776fce68ee70fb0e0f07324f","Hydra/pipeline.py":"57cf030295e4bdecdffb77008d8a87ef4afb66fc5c1129171ef148dbbd49cd74","Hydra/train.py":"5cca973399a7bb145e4c0e79c2e7ea65f2bda6348a2c7791ec0737f8bf1953c6","LR/dpo_train.py":"a838399d5db5ff6d89ede8fc42f6e98fa9a6f94dd682b510992d5dbd5f4bee78","LR/main.py":"bd0acf8c16928628fa3f32fa81704b23e468651b54a9e97b6b44769cbbbffd6a","LR/pipeline.py":"a8bea64277e6c94b1770633ddf216f55ae5ba5dad69fd2f1a2b8b7e880cde2af","README.md":"81e6ac7716ee770788d9403ffc956b88f7893d09205afcb2c5e58a05b0117288"},"license_files":[],"license_status":"no-license-file-present-at-audited-commit","name":"onlinespec-upstream-source-audit","rejected":["hard_coded_devices","shell_model_copy","per_chunk_subprocess","cpu_checkpoint_merge","last_chunk_only_hedge_variant","momentum_labeled_as_optimism","decode_only_speed_accounting","silent_failed_update"],"repository":"https://github.com/ZinYY/OnlineSPEC","schema_version":2,"scope":"test-time-drafter-update","tree":"e037a463f16bcbb19c909d4a626c4c25a983c289"}
+{
+  "adopted": [
+    "prequential_predict_feedback_update",
+    "projected_ogd",
+    "two_state_optimistic_update",
+    "independent_experts",
+    "cumulative_loss_hedge",
+    "target_to_draft_ce_gradient"
+  ],
+  "claim_scope": "clean-room-online-learner-equation-complete-not-official-system-reproduction",
+  "commit": "e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b",
+  "instantiations": [
+    {
+      "feedback": "verifier_preference_pairs",
+      "name": "online_lr",
+      "online_unit": "25_example_chunk",
+      "paths": [
+        "LR/pipeline.py",
+        "LR/dpo_train.py",
+        "LR/main.py"
+      ],
+      "prediction": "standalone_reasoning_drafter",
+      "update": "dpo_adamw_subprocess"
+    },
+    {
+      "feedback": "teacher_token_and_feature_losses",
+      "name": "opt_hydra",
+      "online_unit": "80_example_chunk",
+      "paths": [
+        "Hydra/pipeline.py",
+        "Hydra/train.py"
+      ],
+      "prediction": "multi_head_hydra",
+      "update": "momentum_sgd_subprocess_not_paper_two_state"
+    },
+    {
+      "feedback": "teacher_token_and_feature_losses",
+      "name": "ens_eagle",
+      "online_unit": "40_example_chunk",
+      "paths": [
+        "EAGLE/pipeline_ens.py",
+        "EAGLE/pipeline_eagle3_ens.py",
+        "EAGLE/train.py",
+        "EAGLE/traineagle3.py"
+      ],
+      "prediction": "three_independent_eagle_or_eagle3_heads",
+      "update": "multi_epoch_train_then_cpu_checkpoint_merge"
+    }
+  ],
+  "key_files": {
+    "EAGLE/pipeline.py": "4f52dfbd5dec8046a1b10ca8a842fed77300dc3353ada4cfd5e34ce5b7772e88",
+    "EAGLE/pipeline_eagle3_ens.py": "5ab34e2d1c4fb22d2fc1af77b54ff6cc38d7a173dcf6414a2727a77f6f01e3a8",
+    "EAGLE/pipeline_eagle3_hedge.py": "eb7fcfbf7e253bfcbdff62b1176c936a3ea5123f4c04df2949a948c94e388c71",
+    "EAGLE/pipeline_ens.py": "a86325e27cb7dc76a7dc9b849a56cc421dbb07a78d3f7d4bff5552a0e71ad825",
+    "EAGLE/pipeline_hedge.py": "e96fbc995b8fd3f59c85a6c29a65be56fd154d2bc09279c38205fab8eae7d7d3",
+    "EAGLE/pipeline_osd.py": "9a488d76af6136e182636d5df8fd03a9ebc296380f8c3811d79b0e254d7d6388",
+    "EAGLE/script/EAGLE-3/eagle3-ens.sh": "a3a09bcf6a9ec0e8ed8e370dcce398b6d999e750d0392430594830480ade65d3",
+    "EAGLE/script/EAGLE/eagle-ens.sh": "ee85a41e085473142f6178c5c8b812ba82bbbde5531e18017865ae54e9ccfe42",
+    "EAGLE/train.py": "2a6b243e742465a10b56743241167a747aaa65b6bb7d33212201750040ca22e0",
+    "EAGLE/traineagle3.py": "894160abebb287a57ed28857543ffa53d6934dc6776fce68ee70fb0e0f07324f",
+    "Hydra/pipeline.py": "57cf030295e4bdecdffb77008d8a87ef4afb66fc5c1129171ef148dbbd49cd74",
+    "Hydra/script/run.sh": "9b7bb0fd4e365f0ae5e2a21ceb6e9600d088c903c458a3c5f0416bf7053d00b2",
+    "Hydra/train.py": "5cca973399a7bb145e4c0e79c2e7ea65f2bda6348a2c7791ec0737f8bf1953c6",
+    "LR/dpo_train.py": "a838399d5db5ff6d89ede8fc42f6e98fa9a6f94dd682b510992d5dbd5f4bee78",
+    "LR/main.py": "bd0acf8c16928628fa3f32fa81704b23e468651b54a9e97b6b44769cbbbffd6a",
+    "LR/pipeline.py": "a8bea64277e6c94b1770633ddf216f55ae5ba5dad69fd2f1a2b8b7e880cde2af",
+    "LR/script/reproduce.sh": "f1a04a6df2faf5f9b9bf3812705836bf534614f2badab9cac0022efde4bf741b",
+    "README.md": "81e6ac7716ee770788d9403ffc956b88f7893d09205afcb2c5e58a05b0117288"
+  },
+  "license_files": [],
+  "license_status": "no-license-file-present-at-audited-commit",
+  "name": "onlinespec-upstream-source-audit",
+  "observed_source_mismatches": [
+    "README_and_shell_entrypoints_invoke_last_chunk_reset_hedge_not_cumulative_ens",
+    "README_calls_momentum_optimistic_while_the_paper_uses_a_historical_gradient_hint"
+  ],
+  "rejected": [
+    "hard_coded_devices",
+    "shell_model_copy",
+    "per_chunk_subprocess",
+    "cpu_checkpoint_merge",
+    "last_chunk_only_hedge_variant",
+    "momentum_labeled_as_optimism",
+    "decode_only_speed_accounting",
+    "silent_failed_update"
+  ],
+  "repository": "https://github.com/ZinYY/OnlineSPEC",
+  "schema_version": 2,
+  "scope": "test-time-drafter-update",
+  "tree": "e037a463f16bcbb19c909d4a626c4c25a983c289"
+}

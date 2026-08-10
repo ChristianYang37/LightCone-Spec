@@ -224,13 +224,19 @@ def adaptation_payload(*, target_calls: int = 4) -> dict:
             {
                 "source_round": 10,
                 "source_version": 0,
+                "optimizer_step": 1,
                 "request_ids": ["r0"],
                 "prefix_len_before": [4096],
                 "published_version": 1,
                 "status": "published",
                 "loss": 0.5,
+                "gradient_norm": 0.25,
                 "reconstruction_ok": True,
                 "reconstruction_max_abs": 0.01,
+                "reconstruction_relative_rms": 0.001,
+                "reconstruction_top1_match": 1.0,
+                "reconstruction_mean_kl": 0.0001,
+                "supervision_nonempty": True,
             }
         ],
         "rounds": [
@@ -433,8 +439,58 @@ def test_update_trace_required_fields_cannot_be_hidden_by_extras() -> None:
         _write_updates(
             Writer(),
             run_id="run-a",
+            method="tts",
             diagnostics=diagnostics,
             updates=(update,),
+        )
+
+
+def test_update_trace_requires_method_specific_online_state() -> None:
+    diagnostics = adaptation_payload()
+    plain = diagnostics["updates"][0]
+    optimistic = {**plain, "online_hint_error": 0.2}
+
+    class Writer:
+        def __init__(self) -> None:
+            self.records = []
+
+        def write(self, record) -> None:
+            self.records.append(record)
+
+    writer = Writer()
+    _write_updates(
+        writer,
+        run_id="run-a",
+        method="onlinespec_opt",
+        diagnostics=diagnostics,
+        updates=(optimistic,),
+    )
+    assert writer.records[0].optimizer_step == 1
+    assert writer.records[0].online_hint_error == pytest.approx(0.2)
+
+    with pytest.raises(RuntimeError, match="foreign OnlineSPEC"):
+        _write_updates(
+            Writer(),
+            run_id="run-a",
+            method="onlinespec_ogd",
+            diagnostics=diagnostics,
+            updates=(optimistic,),
+        )
+    with pytest.raises(RuntimeError, match="non-empty update evidence"):
+        _write_updates(
+            Writer(),
+            run_id="run-a",
+            method="onlinespec_ogd",
+            diagnostics=diagnostics,
+            updates=(),
+        )
+    with pytest.raises(RuntimeError, match="Static"):
+        _write_updates(
+            Writer(),
+            run_id="run-a",
+            method="static",
+            diagnostics=diagnostics,
+            updates=(plain,),
         )
 
 
@@ -447,6 +503,7 @@ def test_onlinespec_update_diagnostics_are_preserved_and_validated() -> None:
         "online_effective_experts": 1.648721,
         "online_expert_probabilities": [0.75, 0.25],
         "online_cumulative_losses": [0.1, 1.2],
+        "online_expert_gradient_norms": [0.3, 0.8],
     }
 
     class Writer:
@@ -460,16 +517,20 @@ def test_onlinespec_update_diagnostics_are_preserved_and_validated() -> None:
     _write_updates(
         writer,
         run_id="run-a",
+        method="onlinespec_ens",
         diagnostics=diagnostics,
         updates=(update,),
     )
     assert writer.records[0].online_ensemble_entropy == pytest.approx(0.5)
     assert writer.records[0].online_expert_probabilities == "[0.75,0.25]"
+    assert writer.records[0].gradient_norm == pytest.approx(0.25)
+    assert writer.records[0].online_expert_gradient_norms == "[0.3,0.8]"
     invalid = {**update, "online_expert_probabilities": [0.8, 0.3]}
     with pytest.raises(RuntimeError, match="ensemble evidence"):
         _write_updates(
             Writer(),
             run_id="run-a",
+            method="onlinespec_ens",
             diagnostics=diagnostics,
             updates=(invalid,),
         )

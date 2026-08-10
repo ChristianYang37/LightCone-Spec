@@ -1,19 +1,19 @@
-From 332261fcd28f8a1febbea9f05bee1591ab339fcc Mon Sep 17 00:00:00 2001
+From 4f62da3df83212e75aed1059ab322ae1b8bf4960 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH 2/6] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 1967 +++++++++++++++++
- 1 file changed, 1967 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 2054 +++++++++++++++++
+ 1 file changed, 2054 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b923a95498
+index 0000000000000000000000000000000000000000..51ae296b23ded48f942956f261082c4132df59da
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,1967 @@
+@@ -0,0 +1,2054 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
@@ -123,7 +123,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +    width: int,
 +    grad_clip: float,
 +    label: str,
-+) -> tuple[torch.Tensor, ...]:
++) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
 +    """Clip a heterogeneous layout with fused multi-tensor CUDA kernels."""
 +    if len(gradients) != width:
 +        raise ValueError(f"{label} gradient layout mismatch")
@@ -131,7 +131,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +    norms = torch._foreach_norm(values, 2.0)
 +    norm = torch.stack(norms).square().sum().sqrt()
 +    scale = torch.clamp(grad_clip / (norm + 1e-12), max=1.0)
-+    return tuple(torch._foreach_mul(values, scale))
++    return tuple(torch._foreach_mul(values, scale)), norm
 +
 +
 +@dataclass(frozen=True)
@@ -148,6 +148,13 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +    first_moments: tuple[torch.Tensor, ...]
 +    second_moments: tuple[torch.Tensor, ...]
 +    step: torch.Tensor
++    gradient_norms: torch.Tensor
++
++
++@dataclass(frozen=True)
++class OnlineSpecMemberProposal:
++    parameters: tuple[torch.Tensor, ...]
++    gradient_norm: torch.Tensor
 +
 +
 +class ResidentOptimizer:
@@ -199,13 +206,14 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        return (self._step,)
 +
 +    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
-+        gradients = _clip_fp32_gradients(
++        gradients, gradient_norm = _clip_fp32_gradients(
 +            gradients,
 +            width=len(self.master),
 +            grad_clip=self.config.grad_clip,
 +            label="optimizer",
 +        )
 +        step = self._step + 1
++        gradient_norms = gradient_norm.reshape(1)
 +        if self.config.name in {"sgdm", "nag"}:
 +            momentum = self.config.momentum
 +            if momentum is None:
@@ -233,7 +241,9 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                    alpha=-self.config.learning_rate,
 +                )
 +            )
-+            return ParameterProposal(parameters, tuple(first), self.second, step)
++            return ParameterProposal(
++                parameters, tuple(first), self.second, step, gradient_norms
++            )
 +
 +        if self.config.name == "lion":
 +            beta1 = self.config.beta1
@@ -251,11 +261,11 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                alpha=-self.config.learning_rate,
 +            )
 +            return ParameterProposal(
-+                tuple(parameters), tuple(first), self.second, step
++                tuple(parameters), tuple(first), self.second, step, gradient_norms
 +            )
 +
 +        if self.config.name == "muon":
-+            return self._propose_muon(gradients, step)
++            return self._propose_muon(gradients, step, gradient_norms)
 +
 +        beta1 = self.config.beta1
 +        beta2 = self.config.beta2
@@ -289,7 +299,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            alpha=-self.config.learning_rate,
 +        )
 +        return ParameterProposal(
-+            tuple(parameters), tuple(first), tuple(second), step
++            tuple(parameters), tuple(first), tuple(second), step, gradient_norms
 +        )
 +
 +    def _adamw_candidate(
@@ -326,6 +336,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        self,
 +        gradients: Sequence[torch.Tensor],
 +        step: torch.Tensor,
++        gradient_norms: torch.Tensor,
 +    ) -> ParameterProposal:
 +        momentum = self.config.momentum
 +        ns_steps = self.config.muon_ns_steps
@@ -378,7 +389,9 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            parameters.append(updated)
 +            first.append(next_first)
 +            second.append(next_second)
-+        return ParameterProposal(tuple(parameters), tuple(first), tuple(second), step)
++        return ParameterProposal(
++            tuple(parameters), tuple(first), tuple(second), step, gradient_norms
++        )
 +
 +    def commit(
 +        self,
@@ -555,7 +568,9 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            raise AssertionError("validated Hedge state has no meta learning rate")
 +        return torch.softmax(-rate * self.second[0], dim=0)
 +
-+    def _clip(self, gradients: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
++    def _clip(
++        self, gradients: Sequence[torch.Tensor]
++    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
 +        return _clip_fp32_gradients(
 +            gradients,
 +            width=self._width,
@@ -568,17 +583,21 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        parameters: Sequence[torch.Tensor],
 +        gradients: Sequence[torch.Tensor],
 +        learning_rate: float,
-+    ) -> tuple[torch.Tensor, ...]:
++    ) -> OnlineSpecMemberProposal:
++        clipped, gradient_norm = self._clip(gradients)
 +        candidate = tuple(
 +            parameter - learning_rate * gradient
 +            for parameter, gradient in zip(
-+                parameters, self._clip(gradients), strict=True
++                parameters, clipped, strict=True
 +            )
 +        )
-+        return _project_online_parameters(
-+            candidate,
-+            self.initial,
-+            self.online_spec.projection_radius,
++        return OnlineSpecMemberProposal(
++            _project_online_parameters(
++                candidate,
++                self.initial,
++                self.online_spec.projection_radius,
++            ),
++            gradient_norm,
 +        )
 +
 +    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
@@ -586,9 +605,15 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            raise RuntimeError("Hedge requires per-expert losses and gradients")
 +        next_step = self._step + 1
 +        if self.method == "onlinespec_ogd":
-+            parameters = self._ogd(self.master, gradients, self.config.learning_rate)
-+            return ParameterProposal(parameters, (), (), next_step)
-+        clipped = self._clip(gradients)
++            member = self._ogd(self.master, gradients, self.config.learning_rate)
++            return ParameterProposal(
++                member.parameters,
++                (),
++                (),
++                next_step,
++                member.gradient_norm.reshape(1),
++            )
++        clipped, gradient_norm = self._clip(gradients)
 +        anchor = tuple(
 +            parameter - self.config.learning_rate * gradient
 +            for parameter, gradient in zip(self.first, clipped, strict=True)
@@ -607,7 +632,9 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            self.initial,
 +            self.online_spec.projection_radius,
 +        )
-+        return ParameterProposal(decision, anchor, clipped, next_step)
++        return ParameterProposal(
++            decision, anchor, clipped, next_step, gradient_norm.reshape(1)
++        )
 +
 +    def propose_ensemble(
 +        self,
@@ -629,7 +656,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        self,
 +        index: int,
 +        gradients: Sequence[torch.Tensor],
-+    ) -> tuple[torch.Tensor, ...]:
++    ) -> OnlineSpecMemberProposal:
 +        """Update one Hedge expert so backends can release its gradients early."""
 +        if not self.is_ensemble:
 +            raise RuntimeError("only OnlineSPEC Hedge owns expert states")
@@ -649,25 +676,31 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +    def combine_ensemble(
 +        self,
 +        losses: torch.Tensor,
-+        updated: Sequence[Sequence[torch.Tensor]],
++        updated: Sequence[OnlineSpecMemberProposal],
 +    ) -> ParameterProposal:
 +        """Form the next Hedge decision from already-updated expert states."""
 +        if not self.is_ensemble:
 +            raise RuntimeError("only OnlineSPEC Hedge accepts expert feedback")
-+        experts = tuple(tuple(parameters) for parameters in updated)
++        members = tuple(updated)
++        if any(not isinstance(member, OnlineSpecMemberProposal) for member in members):
++            raise ValueError("updated OnlineSPEC expert member is malformed")
++        experts = tuple(member.parameters for member in members)
 +        if losses.shape != (len(self.learning_rates),) or len(experts) != len(
 +            self.learning_rates
 +        ):
 +            raise ValueError("one loss and updated state is required per expert")
 +        if any(
 +            len(expert) != self._width
++            or member.gradient_norm.shape != ()
++            or member.gradient_norm.device != self.master[0].device
++            or not member.gradient_norm.is_floating_point()
 +            or any(
 +                parameter.shape != reference.shape
 +                or parameter.device != reference.device
 +                or not parameter.is_floating_point()
 +                for parameter, reference in zip(expert, self.master, strict=True)
 +            )
-+            for expert in experts
++            for member, expert in zip(members, experts, strict=True)
 +        ):
 +            raise ValueError("updated OnlineSPEC expert layout mismatch")
 +        cumulative = self.second[0] + losses.detach().to(torch.float32)
@@ -682,11 +715,15 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            for index, parameter in enumerate(self.master)
 +        )
 +        flattened = tuple(parameter for expert in experts for parameter in expert)
++        gradient_norms = torch.stack(
++            [member.gradient_norm.reshape(()) for member in members]
++        )
 +        return ParameterProposal(
 +            decision,
 +            flattened,
 +            (cumulative,),
 +            self._step + 1,
++            gradient_norms,
 +        )
 +
 +    def commit(
@@ -944,9 +981,14 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            dtype=torch.int64,
 +        )
 +        self.trace_metrics = torch.empty(
-+            (max_trace_updates, 11),
++            (max_trace_updates, 12),
 +            device=device,
 +            dtype=torch.float32,
++        )
++        self.trace_optimizer_steps = torch.empty(
++            (max_trace_updates,),
++            device=device,
++            dtype=torch.int64,
 +        )
 +        online_members = (
 +            1 + len(config.online_spec.additional_learning_rates)
@@ -954,7 +996,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            else 1
 +        )
 +        self.trace_online_experts = torch.empty(
-+            (max_trace_updates, online_members, 2),
++            (max_trace_updates, online_members, 3),
 +            device=device,
 +            dtype=torch.float32,
 +        )
@@ -1012,6 +1054,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        return (
 +            self.trace_prefix_lens,
 +            self.trace_metrics,
++            self.trace_optimizer_steps,
 +            self.trace_online_experts,
 +            self.round_metrics,
 +        )
@@ -1195,6 +1238,24 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        online_effective_experts = torch.full_like(online_hint_error, float("nan"))
 +        online_probabilities = None
 +        online_cumulative_losses = None
++        expected_gradient_norms = (
++            len(optimizer.learning_rates)
++            if isinstance(optimizer, OnlineSpecOptimizer) and optimizer.is_ensemble
++            else 1
++        )
++        gradient_norms = proposal.gradient_norms
++        if (
++            gradient_norms.shape != (expected_gradient_norms,)
++            or gradient_norms.device != self.device
++            or not gradient_norms.is_floating_point()
++        ):
++            raise ValueError("proposal gradient-norm layout mismatch")
++        # A finite elementwise gradient can still overflow its global norm.
++        # Keep this check device-resident and reject the complete candidate;
++        # publishing an apparent zero step after inf-norm clipping would hide
++        # an invalid update from both the learner and its evidence.
++        finite = finite & torch.isfinite(gradient_norms).all()
++        gradient_norm = gradient_norms.square().mean().sqrt()
 +        if isinstance(optimizer, OnlineSpecOptimizer):
 +            if optimizer.method == "onlinespec_opt":
 +                online_hint_error = (
@@ -1235,11 +1296,15 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +        metric_row[8].copy_(reconstruction_top1_match.detach().to(torch.float32))
 +        metric_row[9].copy_(reconstruction_mean_kl.detach().to(torch.float32))
 +        metric_row[10].copy_(supervision_nonempty.detach().to(torch.float32))
++        metric_row[11].copy_(gradient_norm.detach().to(torch.float32))
++        optimizer_step_row = self.trace_optimizer_steps[trace_index]
++        optimizer_step_row.copy_(proposal.step.detach().reshape(()).to(torch.int64))
 +        online_expert_row = self.trace_online_experts[trace_index]
 +        online_expert_row.fill_(float("nan"))
 +        if online_probabilities is not None and online_cumulative_losses is not None:
 +            online_expert_row[:, 0].copy_(online_probabilities)
 +            online_expert_row[:, 1].copy_(online_cumulative_losses)
++            online_expert_row[:, 2].copy_(gradient_norms)
 +        self.update_traces.append(
 +            UpdateTrace(
 +                buffer_index=trace_index,
@@ -1255,6 +1320,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            + proposal.second_moments
 +            + (
 +                proposal.step,
++                gradient_norms,
 +                publish_valid,
 +                loss,
 +                reconstruction_ok,
@@ -1268,6 +1334,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                online_effective_experts,
 +                prefix_row,
 +                metric_row,
++                optimizer_step_row,
 +                online_expert_row,
 +            )
 +        )
@@ -1743,7 +1810,9 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +
 +    def _drain_diagnostics(
 +        self,
-+    ) -> tuple[list[list[int]], list[list[float]], list[list[list[float]]]]:
++    ) -> tuple[
++        list[list[int]], list[list[float]], list[int], list[list[list[float]]]
++    ]:
 +        # Metrics and OnlineSPEC expert rows are written after the timed
 +        # training/optimizer/merge regions.  Waiting only for those timing
 +        # events can therefore expose a partially written final row when a
@@ -1761,6 +1830,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            self.timings_ms[timing.name] += timing.started.elapsed_time(timing.finished)
 +        prefix_rows = self.trace_prefix_lens[: len(self.update_traces)].tolist()
 +        metric_rows = self.trace_metrics[: len(self.update_traces)].tolist()
++        optimizer_steps = self.trace_optimizer_steps[: len(self.update_traces)].tolist()
 +        expert_rows = self.trace_online_experts[: len(self.update_traces)].tolist()
 +        for trace in self.update_traces:
 +            if trace.diagnosed:
@@ -1778,7 +1848,7 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                )
 +            else:
 +                trace.diagnosed = True
-+        return prefix_rows, metric_rows, expert_rows
++        return prefix_rows, metric_rows, optimizer_steps, expert_rows
 +
 +    def _record_invalid_candidate(
 +        self,
@@ -1813,9 +1883,12 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +            self.pending = None
 +
 +    def diagnostics(self, *, extra: dict | None = None) -> dict:
-+        trace_prefix_rows, trace_metric_rows, trace_expert_rows = (
-+            self._drain_diagnostics()
-+        )
++        (
++            trace_prefix_rows,
++            trace_metric_rows,
++            trace_optimizer_steps,
++            trace_expert_rows,
++        ) = self._drain_diagnostics()
 +        if self.active_round_rows:
 +            raise RuntimeError("cannot diagnose an incomplete decode round")
 +        self._archive_latest_device_lengths()
@@ -1879,9 +1952,15 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                    "prefix_len_before": trace_prefix_rows[trace.buffer_index][
 +                        : trace.prefix_count
 +                    ],
++                    "optimizer_step": int(
++                        trace_optimizer_steps[trace.buffer_index]
++                    ),
 +                    "published_version": trace.published_version,
 +                    "status": trace.status,
 +                    "loss": float(trace_metric_rows[trace.buffer_index][0]),
++                    "gradient_norm": float(
++                        trace_metric_rows[trace.buffer_index][11]
++                    ),
 +                    "reconstruction_ok": bool(trace_metric_rows[trace.buffer_index][2]),
 +                    "reconstruction_max_abs": float(
 +                        trace_metric_rows[trace.buffer_index][3]
@@ -1931,6 +2010,14 @@ index 0000000000000000000000000000000000000000..51e37d715f3bf7866d4628605d6551b9
 +                        [float(row[1]) for row in trace_expert_rows[trace.buffer_index]]
 +                        if all(
 +                            math.isfinite(row[1])
++                            for row in trace_expert_rows[trace.buffer_index]
++                        )
++                        else None
++                    ),
++                    "online_expert_gradient_norms": (
++                        [float(row[2]) for row in trace_expert_rows[trace.buffer_index]]
++                        if all(
++                            math.isfinite(row[2])
 +                            for row in trace_expert_rows[trace.buffer_index]
 +                        )
 +                        else None

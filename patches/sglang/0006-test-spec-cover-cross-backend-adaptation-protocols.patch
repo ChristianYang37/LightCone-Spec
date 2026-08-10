@@ -1,19 +1,19 @@
-From 4d98526a37e202693d74b973840de0b092fa2bac Mon Sep 17 00:00:00 2001
+From 902e778f59d3018533f10f65a8dc16b0def50941 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH 6/6] test(spec): cover cross-backend adaptation protocols
 
 ---
- .../spec/test_online_adaptation_protocol.py   | 1733 +++++++++++++++++
- 1 file changed, 1733 insertions(+)
+ .../spec/test_online_adaptation_protocol.py   | 1763 +++++++++++++++++
+ 1 file changed, 1763 insertions(+)
  create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
 
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be16d05f24
+index 0000000000000000000000000000000000000000..28a7317ff1815525c711249622a37ed65938f23b
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,1733 @@
+@@ -0,0 +1,1763 @@
 +import hashlib
 +import json
 +import math
@@ -34,6 +34,7 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +)
 +from sglang.srt.speculative.online_adaptation_runtime import (
 +    FixedInferenceBank,
++    OnlineSpecMemberProposal,
 +    OnlineSpecOptimizer,
 +    RequestVersionState,
 +    ResidentOptimizer,
@@ -284,6 +285,25 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +                    _server_args(path, speculative_algorithm=algorithm)
 +                )
 +
++    def test_onlinespec_tail_learners_are_available_on_every_linear_backend(self):
++        for algorithm in ("DSPARK", "EAGLE", "EAGLE3"):
++            for method in ("onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"):
++                learner = (
++                    {
++                        "additional_learning_rates": [0.2, 0.4],
++                        "hedge_learning_rate": 0.5,
++                    }
++                    if method == "onlinespec_ens"
++                    else {}
++                )
++                value = _online_config(method, **learner)
++                value["algorithm"] = algorithm
++                path = _write_config(value)
++                with self.subTest(algorithm=algorithm, method=method):
++                    validate_online_adaptation(
++                        _server_args(path, speculative_algorithm=algorithm)
++                    )
++
 +    def test_eagle_shape_contracts_fail_closed(self):
 +        path = _write_config(
 +            _config_value(
@@ -513,6 +533,7 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +        optimizer = OnlineSpecOptimizer((torch.tensor([0.0, 0.0]),), config)
 +        proposal = optimizer.propose((torch.tensor([6.0, 8.0]),))
 +        torch.testing.assert_close(proposal.parameters[0], torch.tensor([-0.6, -0.8]))
++        torch.testing.assert_close(proposal.gradient_norms, torch.tensor([10.0]))
 +        torch.testing.assert_close(optimizer.master[0], torch.zeros(2))
 +        optimizer.commit(proposal)
 +        torch.testing.assert_close(optimizer.master[0], torch.tensor([-0.6, -0.8]))
@@ -576,6 +597,7 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +        probabilities = torch.softmax(torch.tensor([0.0, -2.0]), dim=0)
 +        expected = probabilities[0] * -0.1 + probabilities[1] * 0.2
 +        torch.testing.assert_close(proposal.parameters[0], expected.reshape(1))
++        torch.testing.assert_close(proposal.gradient_norms, torch.ones(2))
 +        torch.testing.assert_close(optimizer.experts[0][0], torch.tensor([0.0]))
 +        optimizer.commit(proposal)
 +        torch.testing.assert_close(optimizer.experts[0][0], torch.tensor([-0.1]))
@@ -616,11 +638,15 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +        ):
 +            torch.testing.assert_close(left, right)
 +        torch.testing.assert_close(bulk.step, streamed.step)
++        torch.testing.assert_close(bulk.gradient_norms, streamed.gradient_norms)
 +        with self.assertRaisesRegex(ValueError, "outside"):
 +            optimizer.propose_ensemble_member(len(gradients), gradients[0])
 +        with self.assertRaisesRegex(ValueError, "required"):
 +            optimizer.combine_ensemble(losses, updated[:-1])
-+        malformed = ((torch.zeros(1, 1),),) * len(updated)
++        malformed = tuple(
++            OnlineSpecMemberProposal((torch.zeros(1, 1),), torch.tensor(1.0))
++            for _ in updated
++        )
 +        with self.assertRaisesRegex(ValueError, "layout"):
 +            optimizer.combine_ensemble(losses, malformed)
 +
@@ -1179,17 +1205,21 @@ index 0000000000000000000000000000000000000000..e99236ccbdb94e3d56c3544c40ee77be
 +        runtime.pending = SimpleNamespace(ready_event=event, trace_index=0)
 +        runtime.pending_timings = deque()
 +        runtime.trace_prefix_lens = torch.tensor([[128]], dtype=torch.int64)
-+        runtime.trace_metrics = torch.full((1, 11), float("nan"))
++        runtime.trace_metrics = torch.full((1, 12), float("nan"))
 +        runtime.trace_metrics[0, 0] = 1.25
 +        runtime.trace_metrics[0, 1:3] = 1.0
 +        runtime.trace_metrics[0, 10] = 1.0
-+        runtime.trace_online_experts = torch.full((1, 1, 2), float("nan"))
++        runtime.trace_metrics[0, 11] = 2.5
++        runtime.trace_optimizer_steps = torch.tensor([7], dtype=torch.int64)
++        runtime.trace_online_experts = torch.full((1, 1, 3), float("nan"))
 +        runtime.update_traces = [UpdateTrace(0, 1, 0, ("request-a",), 1)]
 +
-+        _, metrics, experts = runtime._drain_diagnostics()
++        _, metrics, optimizer_steps, experts = runtime._drain_diagnostics()
 +
 +        self.assertEqual(event.synchronized, 1)
 +        self.assertEqual(metrics[0][0], 1.25)
++        self.assertEqual(metrics[0][11], 2.5)
++        self.assertEqual(optimizer_steps, [7])
 +        self.assertTrue(math.isnan(experts[0][0][0]))
 +        self.assertTrue(runtime.update_traces[0].diagnosed)
 +

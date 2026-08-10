@@ -15,6 +15,7 @@ from lightcone_spec.doctor import _command, doctor_report
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.orchestration import SpeedStudyManifest
 from lightcone_spec.sglang_bridge import verify_patched_checkout
+from lightcone_spec.sglang_bridge.launch import _bind_interpreter_tools
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_ROOT = ROOT / "patches" / "sglang"
@@ -73,6 +74,16 @@ def test_tracked_onlinespec_source_audit_is_content_bound() -> None:
         "opt_hydra",
         "ens_eagle",
     }
+    assert {
+        "EAGLE/script/EAGLE/eagle-ens.sh",
+        "EAGLE/script/EAGLE-3/eagle3-ens.sh",
+        "Hydra/script/run.sh",
+        "LR/script/reproduce.sh",
+    } <= set(value["key_files"])
+    assert value["observed_source_mismatches"] == [
+        "README_and_shell_entrypoints_invoke_last_chunk_reset_hedge_not_cumulative_ens",
+        "README_calls_momentum_optimistic_while_the_paper_uses_a_historical_gradient_hint",
+    ]
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     assert hashlib.sha256(canonical).hexdigest() == ONLINE_SPEC_SOURCE_AUDIT_SHA256
     assert Path(f"{path}.sha256").read_text().strip() == ONLINE_SPEC_SOURCE_AUDIT_SHA256
@@ -102,7 +113,7 @@ def test_patch_apply_script_requires_exact_clean_upstream() -> None:
     assert PINNED_SGLANG_COMMIT in text
     assert PINNED_SGLANG_TREE in text
     assert "status --porcelain=v1" in text
-    assert "git -C \"$CHECKOUT\" am" in text
+    assert 'git -C "$CHECKOUT" am' in text
 
 
 def test_runtime_launcher_rejects_unpatched_upstream_checkout(tmp_path) -> None:
@@ -131,6 +142,27 @@ def test_runtime_launcher_rejects_unpatched_upstream_checkout(tmp_path) -> None:
         verify_patched_checkout(checkout)
 
 
+def test_runtime_launcher_exposes_tools_from_its_interpreter(
+    monkeypatch, tmp_path
+) -> None:
+    interpreter_bin = tmp_path / "runtime" / "bin"
+    interpreter_bin.mkdir(parents=True)
+    interpreter = interpreter_bin / "python"
+    interpreter.symlink_to(Path(sys.executable).resolve())
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(("/usr/bin", str(interpreter_bin), "/bin")),
+    )
+
+    _bind_interpreter_tools()
+    _bind_interpreter_tools()
+
+    entries = os.environ["PATH"].split(os.pathsep)
+    assert entries[0] == str(interpreter_bin.resolve())
+    assert entries.count(str(interpreter_bin.resolve())) == 1
+
+
 def test_doctor_records_actual_source_tree_identity(tmp_path) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -154,9 +186,12 @@ def test_doctor_records_actual_source_tree_identity(tmp_path) -> None:
     )
     source = doctor_report(checkout)["source_tree"]
     assert source["is_git_checkout"] is True
-    assert source["head"] == subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
-    ).strip()
+    assert (
+        source["head"]
+        == subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+        ).strip()
+    )
     assert source["dirty"] is False
     assert source["pinned_ancestor"] is False
     assert source["patch_commits"] is None

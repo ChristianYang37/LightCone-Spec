@@ -28,7 +28,7 @@ ONLINE_SPEC_COMMIT = "e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b"
 ONLINE_SPEC_TREE = "e037a463f16bcbb19c909d4a626c4c25a983c289"
 ONLINE_SPEC_PAPER = "https://arxiv.org/abs/2603.12617v2"
 ONLINE_SPEC_SOURCE_AUDIT_SHA256 = (
-    "475bc764f65c2387d8a30524b9b4b78594b81dfe3e62266898d23568d3b262f7"
+    "20d0843e7eff72331656cdebcd443edc94077337bac8baa6d7bb4c3d7f73db87"
 )
 ONLINE_SPEC_CLAIM_SCOPE = (
     "clean-room-online-learner-equation-complete-not-official-system-reproduction"
@@ -172,7 +172,9 @@ def verify_onlinespec_source_checkout(
         path for path in tracked if Path(path).name.casefold() in license_names
     )
     if discovered_licenses != sorted(license_files):
-        raise ValueError("OnlineSPEC license-file inventory no longer matches the audit")
+        raise ValueError(
+            "OnlineSPEC license-file inventory no longer matches the audit"
+        )
 
     return {
         "schema_version": 2,
@@ -253,8 +255,12 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
     """DFlash drafter candidates; confirmation never participates in tuning."""
     rows: list[OnlineSpecCandidate] = []
     for method in ("onlinespec_ogd", "onlinespec_opt"):
-        for stride in (1, 5, 10, 20, 40):
-            for learning_rate in (1e-7, 3e-7, 1e-6, 3e-6, 1e-5):
+        # OnlineSPEC uses globally clipped projected SGD, not Adam's
+        # coordinate-normalized step. Its rate is therefore the parameter-space
+        # displacement scale. The logarithmic grid spans the scales used by the
+        # source instantiations without selecting from confirmation evidence.
+        for stride in (20, 40, 80, 160):
+            for learning_rate in (1e-4, 1e-3, 1e-2, 1e-1):
                 rows.append(
                     OnlineSpecCandidate(
                         method,
@@ -266,7 +272,7 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                     )
                 )
             for rank in (8, 16, 32):
-                for learning_rate in (1e-5, 1e-4, 1e-3):
+                for learning_rate in (1e-4, 1e-3, 1e-2, 1e-1):
                     rows.append(
                         OnlineSpecCandidate(
                             method,
@@ -277,8 +283,8 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                             stride,
                         )
                     )
-    for stride in (1, 5, 10, 20, 40):
-        for learning_rate in (1e-7, 1e-6):
+    for stride in (40, 80, 160):
+        for learning_rate in (1e-3, 1e-2):
             for hedge_learning_rate in (0.1, 0.5, 1.0):
                 rows.append(
                     OnlineSpecCandidate(
@@ -358,7 +364,9 @@ class OnlineSpecManifest:
 
     def validate(self) -> None:
         if self != type(self).default():
-            raise ValueError("OnlineSPEC source manifest differs from the registered protocol")
+            raise ValueError(
+                "OnlineSPEC source manifest differs from the registered protocol"
+            )
 
     @property
     def sha256(self) -> str:
@@ -400,21 +408,27 @@ class OnlineSpecTuningMeasurement:
             raise ValueError("unknown OnlineSPEC tuning method")
         if len(self.candidate_id) != 64:
             raise ValueError("OnlineSPEC candidate identity must be a SHA-256")
-        if any(
-            not math.isfinite(value) or value < 0
-            for value in (
-                self.goodput_ratio_to_static,
-                self.itl_p99_ms,
-                self.exposed_update_ms,
+        if (
+            any(
+                not math.isfinite(value) or value < 0
+                for value in (
+                    self.goodput_ratio_to_static,
+                    self.itl_p99_ms,
+                    self.exposed_update_ms,
+                )
             )
-        ) or self.goodput_ratio_to_static <= 0:
+            or self.goodput_ratio_to_static <= 0
+        ):
             raise ValueError("OnlineSPEC tuning metrics are invalid")
-        if min(
-            self.peak_hbm_bytes,
-            self.updates_launched,
-            self.updates_published,
-            self.safety_violations,
-        ) < 0:
+        if (
+            min(
+                self.peak_hbm_bytes,
+                self.updates_launched,
+                self.updates_published,
+                self.safety_violations,
+            )
+            < 0
+        ):
             raise ValueError("OnlineSPEC tuning counters cannot be negative")
 
     @property
@@ -556,7 +570,10 @@ class OnlineSpecSelection:
     def validate(self) -> None:
         if self.schema_version != 2 or self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("OnlineSPEC selection runtime identity is invalid")
-        if tuple(candidate.method for candidate in self.selected) != ONLINE_SPEC_METHODS:
+        if (
+            tuple(candidate.method for candidate in self.selected)
+            != ONLINE_SPEC_METHODS
+        ):
             raise ValueError("selection requires one ordered candidate per method")
         if self.selected_concurrency not in {1, 2, 4, 8, 16, 32, 48}:
             raise ValueError("OnlineSPEC selection load is invalid")
@@ -568,7 +585,9 @@ class OnlineSpecSelection:
             self.sampling_profile_sha256,
             self.tuning_evidence_sha256,
         ):
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            if len(value) != 64 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
                 raise ValueError("selection identity must be a SHA-256")
 
     @property
@@ -681,7 +700,9 @@ class OnlineSpecGpuAttestation:
             self.performance_sha256,
             self.hardware_sha256,
         ):
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            if len(value) != 64 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
                 raise ValueError("OnlineSPEC attestation identity must be a SHA-256")
 
     @property
@@ -701,7 +722,9 @@ class OnlineSpecGpuAttestation:
         return artifact
 
 
-def compare_onlinespec(rows: list[dict], *, seed: int = 0) -> tuple[OnlineSpecComparison, ...]:
+def compare_onlinespec(
+    rows: list[dict], *, seed: int = 0
+) -> tuple[OnlineSpecComparison, ...]:
     """Paired diagnostics only; these rows never drive the core speed gate."""
     if {str(row["method"]) for row in rows} != set(ONLINE_SPEC_STUDY_METHODS):
         raise ValueError("OnlineSPEC comparison coverage has the wrong methods")
@@ -721,19 +744,23 @@ def compare_onlinespec(rows: list[dict], *, seed: int = 0) -> tuple[OnlineSpecCo
         if str(row["method"]) in grouped.setdefault(key, {}):
             raise ValueError("duplicate OnlineSPEC paired cell")
         grouped[key][str(row["method"])] = row
-    if not grouped or any(set(group) != set(ONLINE_SPEC_STUDY_METHODS) for group in grouped.values()):
+    if not grouped or any(
+        set(group) != set(ONLINE_SPEC_STUDY_METHODS) for group in grouped.values()
+    ):
         raise ValueError("OnlineSPEC paired coverage is incomplete")
     prompts = {key[0] for key in grouped}
     blocks = {key[1] for key in grouped}
     buckets = {key[2] for key in grouped}
-    if len(prompts) != 32 or blocks != set(range(8)) or buckets != {16384, 24576, 32768}:
+    if (
+        len(prompts) != 32
+        or blocks != set(range(8))
+        or buckets != {16384, 24576, 32768}
+    ):
         raise ValueError("OnlineSPEC comparison does not cover the registered matrix")
     if len(grouped) != len(prompts) * len(blocks) * len(buckets):
         raise ValueError("OnlineSPEC comparison contains missing paired cells")
     concurrencies = {
-        int(row["concurrency"])
-        for group in grouped.values()
-        for row in group.values()
+        int(row["concurrency"]) for group in grouped.values() for row in group.values()
     }
     if len(concurrencies) != 1 or next(iter(concurrencies)) < 1:
         raise ValueError("OnlineSPEC methods must share one positive load")
@@ -757,7 +784,10 @@ def compare_onlinespec(rows: list[dict], *, seed: int = 0) -> tuple[OnlineSpecCo
         for (prompt, _, _), group in grouped.items():
             baseline = float(group["static"]["decode_goodput_tps"])
             measured = float(group[method]["decode_goodput_tps"])
-            if min(baseline, measured) <= 0 or not np.isfinite([baseline, measured]).all():
+            if (
+                min(baseline, measured) <= 0
+                or not np.isfinite([baseline, measured]).all()
+            ):
                 raise ValueError("OnlineSPEC goodput must be finite and positive")
             clusters.setdefault(prompt, []).append(measured / baseline - 1.0)
             safe &= all(int(group[method][field]) == 0 for field in safety_fields)

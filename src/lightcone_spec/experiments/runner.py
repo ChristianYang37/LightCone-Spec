@@ -472,13 +472,18 @@ def _write_updates(
     writer: EvidenceWriter,
     *,
     run_id: str,
+    method: str,
     diagnostics: dict | None,
     updates: tuple[dict, ...],
 ) -> None:
-    if diagnostics is None:
-        if updates:
+    if method not in _EVIDENCE_METHODS:
+        raise RuntimeError("update trace belongs to an unknown method")
+    if method == "static":
+        if diagnostics is not None or updates:
             raise RuntimeError("Static cannot contain update evidence")
         return
+    if diagnostics is None or not updates:
+        raise RuntimeError("adapted method requires non-empty update evidence")
     cohort = str(diagnostics["cohort_sha256"])
     layout = str(diagnostics["parameter_layout_sha256"])
     trainable = int(diagnostics["trainable_parameters"])
@@ -486,9 +491,14 @@ def _write_updates(
         required = {
             "source_round",
             "source_version",
+            "optimizer_step",
             "published_version",
             "status",
             "loss",
+            "gradient_norm",
+            "reconstruction_ok",
+            "reconstruction_max_abs",
+            "supervision_nonempty",
         }
         if not isinstance(update, dict) or not required <= set(update):
             raise RuntimeError("update trace is incomplete")
@@ -509,6 +519,45 @@ def _write_updates(
         loss = float(update["loss"])
         if not math.isfinite(loss) or loss < -1e-6:
             raise RuntimeError("update trace loss must be finite and non-negative")
+        optimizer_step = update["optimizer_step"]
+        if (
+            not isinstance(optimizer_step, int)
+            or isinstance(optimizer_step, bool)
+            or optimizer_step < 1
+        ):
+            raise RuntimeError("update trace optimizer step must be positive")
+        gradient_norm = float(update["gradient_norm"])
+        if not math.isfinite(gradient_norm) or gradient_norm < 0:
+            raise RuntimeError(
+                "update trace gradient norm must be finite and non-negative"
+            )
+        reconstruction_ok = update["reconstruction_ok"]
+        supervision_nonempty = update["supervision_nonempty"]
+        if not isinstance(reconstruction_ok, bool) or not isinstance(
+            supervision_nonempty, bool
+        ):
+            raise TypeError("update reconstruction flags must be boolean")
+        reconstruction_max_abs = float(update["reconstruction_max_abs"])
+        if not math.isfinite(reconstruction_max_abs) or reconstruction_max_abs < 0:
+            raise RuntimeError(
+                "update reconstruction error must be finite and non-negative"
+            )
+        optional_reconstruction = {
+            name: update.get(name)
+            for name in (
+                "reconstruction_relative_rms",
+                "reconstruction_top1_match",
+                "reconstruction_mean_kl",
+            )
+        }
+        if any(
+            value is not None and (not math.isfinite(float(value)) or float(value) < 0)
+            for value in optional_reconstruction.values()
+        ) or (
+            optional_reconstruction["reconstruction_top1_match"] is not None
+            and float(optional_reconstruction["reconstruction_top1_match"]) > 1
+        ):
+            raise RuntimeError("update reconstruction diagnostics are invalid")
         online_scalars = {
             name: update.get(name)
             for name in (
@@ -518,27 +567,72 @@ def _write_updates(
             )
         }
         if any(
-            value is not None
-            and (not math.isfinite(float(value)) or float(value) < 0)
+            value is not None and (not math.isfinite(float(value)) or float(value) < 0)
             for value in online_scalars.values()
         ):
             raise RuntimeError("OnlineSPEC update diagnostics are invalid")
         probabilities = update.get("online_expert_probabilities")
         cumulative_losses = update.get("online_cumulative_losses")
-        if (probabilities is None) != (cumulative_losses is None):
+        expert_gradient_norms = update.get("online_expert_gradient_norms")
+        if (
+            len(
+                {
+                    probabilities is None,
+                    cumulative_losses is None,
+                    expert_gradient_norms is None,
+                }
+            )
+            != 1
+        ):
             raise RuntimeError("OnlineSPEC ensemble diagnostics are incomplete")
         if probabilities is not None and (
             not isinstance(probabilities, list)
             or not isinstance(cumulative_losses, list)
+            or not isinstance(expert_gradient_norms, list)
             or len(probabilities) < 2
             or len(probabilities) != len(cumulative_losses)
+            or len(probabilities) != len(expert_gradient_norms)
             or not all(
                 math.isfinite(float(value)) and float(value) >= 0
-                for value in (*probabilities, *cumulative_losses)
+                for value in (
+                    *probabilities,
+                    *cumulative_losses,
+                    *expert_gradient_norms,
+                )
             )
             or not math.isclose(sum(probabilities), 1.0, abs_tol=1e-5)
         ):
             raise RuntimeError("OnlineSPEC ensemble evidence is invalid")
+        online_values = (
+            *online_scalars.values(),
+            probabilities,
+            cumulative_losses,
+            expert_gradient_norms,
+        )
+        if method == "onlinespec_opt":
+            if online_scalars["online_hint_error"] is None or any(
+                value is not None
+                for value in (
+                    online_scalars["online_ensemble_entropy"],
+                    online_scalars["online_effective_experts"],
+                    probabilities,
+                    cumulative_losses,
+                    expert_gradient_norms,
+                )
+            ):
+                raise RuntimeError("optimistic OnlineSPEC diagnostics are incomplete")
+        elif method == "onlinespec_ens":
+            if (
+                online_scalars["online_hint_error"] is not None
+                or online_scalars["online_ensemble_entropy"] is None
+                or online_scalars["online_effective_experts"] is None
+                or probabilities is None
+            ):
+                raise RuntimeError("OnlineSPEC ensemble diagnostics are incomplete")
+        elif method in {"tts", "naive_async", "onlinespec_ogd"} and any(
+            value is not None for value in online_values
+        ):
+            raise RuntimeError("method emitted foreign OnlineSPEC diagnostics")
         writer.write(
             UpdateRecord(
                 run_id=run_id,
@@ -552,6 +646,7 @@ def _write_updates(
                 prefix_len_mean=sum(prefix_lens) / len(prefix_lens),
                 source_round=int(update["source_round"]),
                 source_version=int(update["source_version"]),
+                optimizer_step=optimizer_step,
                 published_version=(
                     None
                     if update["published_version"] is None
@@ -559,6 +654,25 @@ def _write_updates(
                 ),
                 candidate_status=str(update["status"]),
                 loss=loss,
+                gradient_norm=gradient_norm,
+                reconstruction_ok=reconstruction_ok,
+                reconstruction_max_abs=reconstruction_max_abs,
+                reconstruction_relative_rms=(
+                    None
+                    if optional_reconstruction["reconstruction_relative_rms"] is None
+                    else float(optional_reconstruction["reconstruction_relative_rms"])
+                ),
+                reconstruction_top1_match=(
+                    None
+                    if optional_reconstruction["reconstruction_top1_match"] is None
+                    else float(optional_reconstruction["reconstruction_top1_match"])
+                ),
+                reconstruction_mean_kl=(
+                    None
+                    if optional_reconstruction["reconstruction_mean_kl"] is None
+                    else float(optional_reconstruction["reconstruction_mean_kl"])
+                ),
+                supervision_nonempty=supervision_nonempty,
                 trainable_parameters=trainable,
                 training_cuda_ms=None,
                 optimizer_cuda_ms=None,
@@ -591,6 +705,11 @@ def _write_updates(
                     None
                     if cumulative_losses is None
                     else json.dumps(cumulative_losses, separators=(",", ":"))
+                ),
+                online_expert_gradient_norms=(
+                    None
+                    if expert_gradient_norms is None
+                    else json.dumps(expert_gradient_norms, separators=(",", ":"))
                 ),
             )
         )
@@ -1210,6 +1329,7 @@ def run_confirmation_slice(
             _write_updates(
                 writer,
                 run_id=run_id,
+                method=method,
                 diagnostics=run.after.adaptation,
                 updates=updates,
             )
@@ -1533,6 +1653,7 @@ def run_natural_replication_slice(
             _write_updates(
                 writer,
                 run_id=run_id,
+                method=method,
                 diagnostics=run.after.adaptation,
                 updates=updates,
             )
