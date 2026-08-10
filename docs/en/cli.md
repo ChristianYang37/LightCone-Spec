@@ -167,7 +167,8 @@ engine/cohort once, performs an unmeasured warmup by default, then submits all
 `max_running_requests` performs admission while the cohort remains continuous.
 It records the union of active decode intervals plus request-level absolute
 streaming arrivals. The model's 40,960-token limit includes the tokenized
-prompt; generation is capped separately for every prompt.
+prompt; each prompt is capped at the registered 40,928 safe limit so two
+block-16 KV reservations remain available.
 
 Each completed slice ends with a SHA-256-bound receipt. Re-running the same job
 skips it only after validating its manifest, config, method, block, prompt,

@@ -260,7 +260,10 @@ separate evidence identities:
    in one ordered native batch request. The formal admission limit cannot exceed
    those 32 unique prompts; SGLang's locked admission limit drains the queue
    without resetting the cohort. Run eight independently randomized blocks over the
-   16K-to-40,960 long region. The batch owns the union of its active decode
+   registered long region from 16K generated tokens to the 40,928 safe request
+   limit. The 40,960 checkpoint limit leaves two block-16 speculative KV
+   reservations outside measurement. The batch owns the union of its active
+   decode
    intervals; request-level rows are diagnostic only.
 4. Collect one diagnostic comparison per learner against the paired Static
    rows and bind the evidence to a GPU attestation.

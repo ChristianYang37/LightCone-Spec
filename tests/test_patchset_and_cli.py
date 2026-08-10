@@ -100,7 +100,7 @@ def test_patch_manifest_binds_series_files_and_tree() -> None:
         if line.strip()
     ]
     assert series == [entry["file"] for entry in manifest["patches"]]
-    assert len(series) == 6
+    assert len(series) == 7
     for entry in manifest["patches"]:
         patch = PATCH_ROOT / entry["file"]
         assert patch.is_file()

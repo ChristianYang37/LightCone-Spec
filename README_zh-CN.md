@@ -49,7 +49,7 @@ T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
 
 - `lightcone_spec` 管理严格的 schema-v2 配置、确定性数据窗口、配置选择、证据记录和
   统计门槛；
-- `patches/sglang` 是针对唯一 upstream commit 的六层可复现 mail patch；仓库既不
+- `patches/sglang` 是针对唯一 upstream commit 的七层可复现 mail patch；仓库既不
   vendoring SGLang，也不原地修改 SGLang；
 - cohort runtime 将 optimizer 状态保持在 GPU，在固定地址的 inference tensor 上发布，
   并用 epoch、slot generation 和 source version 绑定每个 candidate；Adam、AdamW、
@@ -173,8 +173,9 @@ sampling。
 batch 请求全部提交给 SGLang，并使用八个独立方法顺序 block 与一个已选择负载。锁定的 server
 admission limit 控制 active batch，队列排空前不 reset cohort；每个 method/block 只拥有其
 active decode 区间的并集。Request 诊断独立记录，避免把共享 batch 时间伪重复成 32 个
-goodput 样本。40,960 token
-模型上限包含 tokenized prompt，headline 区域从 16K generated tokens 开始。TTS 与 L0
+goodput 样本。40,960 token 模型上限包含 tokenized prompt；正式的
+prompt-plus-generated context 在 40,928 停止，为 DFlash 保留两个 block-16
+speculative KV reservation。Headline 区域从 16K generated tokens 开始。TTS 与 L0
 必须分别通过已注册的速度阈值、repetition-block 配对 BCa 区间和零安全事件要求。
 
 缺少内容绑定的 GPU attestation 时，gate 不能输出 `PASS`。Attestation 同时绑定

@@ -56,7 +56,7 @@ counts, CUDA timing, HBM accounting, and confidence intervals together.
 
 - `lightcone_spec` owns strict schema-v2 configuration, deterministic data
   windows, selection, evidence records, and statistical gates.
-- `patches/sglang` is a reproducible six-patch mail series against one exact
+- `patches/sglang` is a reproducible seven-patch mail series against one exact
   upstream commit. The repository never vendors or edits SGLang in place.
 - A cohort runtime keeps optimizer state on GPU, publishes into fixed-address
   inference tensors, and binds every candidate to epoch, slot generation, and
@@ -194,8 +194,10 @@ in one ordered native batch request per method across eight independent
 method-order blocks. The locked server admission limit controls the active batch and the
 cohort is not reset while the queue drains. Each method/block owns the union of
 its active decode intervals; request diagnostics remain separate, so shared
-batch timing is not pseudoreplicated as 32 goodput samples. The
-40,960-token model limit includes the tokenized prompt, and the headline region
+batch timing is not pseudoreplicated as 32 goodput samples. The 40,960-token
+model limit includes the tokenized prompt. Formal prompt-plus-generated context
+stops at 40,928 so DFlash retains two block-16 speculative KV reservations; the
+headline region
 begins at 16K generated tokens. TTS and L0 must each clear the registered speed
 threshold, repetition-block BCa interval, and zero safety events.
 

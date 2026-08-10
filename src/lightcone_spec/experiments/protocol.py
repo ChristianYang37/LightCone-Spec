@@ -9,7 +9,10 @@ import random
 from dataclasses import asdict, dataclass
 
 from lightcone_spec.config.schema import RunConfig
-from lightcone_spec.experiments.data import LongContinuationAdapter
+from lightcone_spec.experiments.data import (
+    DFLASH_SAFE_CONTEXT_LIMIT,
+    LongContinuationAdapter,
+)
 
 # DFlash trains block-16 drafters with
 #   w_k = exp(-(k - 1) / gamma), gamma = 7.
@@ -24,7 +27,7 @@ TUNING_STAGES = (
     (2, 4096),
     (4, 8192),
     (8, 16384),
-    (16, 40960),
+    (16, DFLASH_SAFE_CONTEXT_LIMIT),
 )
 FORMAL_CONCURRENCY_GRID = (1, 2, 4, 8, 16, 32)
 

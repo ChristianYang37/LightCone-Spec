@@ -8,6 +8,15 @@ import random
 from dataclasses import dataclass
 from typing import ClassVar
 
+# The checkpoint accepts at most 40,960 prompt-plus-generated tokens. DFlash
+# block-16 verification needs two blocks of request-to-token/KV headroom at a
+# decode boundary, so formal measurements stop before those reserved slots.
+DFLASH_MODEL_CONTEXT_LIMIT = 40960
+DFLASH_SPECULATIVE_HEADROOM = 2 * 16
+DFLASH_SAFE_CONTEXT_LIMIT = (
+    DFLASH_MODEL_CONTEXT_LIMIT - DFLASH_SPECULATIVE_HEADROOM
+)
+
 
 @dataclass(frozen=True)
 class ControlledWindow:
@@ -149,7 +158,7 @@ GENERATED_TOKEN_BUCKETS = (
     (8192, 16384),
     (16384, 24576),
     (24576, 32768),
-    (32768, 40960),
+    (32768, DFLASH_SAFE_CONTEXT_LIMIT),
 )
 
 

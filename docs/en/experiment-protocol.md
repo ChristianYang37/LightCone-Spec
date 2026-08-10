@@ -9,8 +9,11 @@ decode goodput over unchanged Static. It does not assume that acceptance gains
 pay for training or scheduling cost. GPU status remains `UNMEASURED` until the
 complete protocol produces a content-bound attestation.
 
-The primary model pair is Qwen3-8B + DFlash. The formal long region begins at
-16K generated tokens and ends at the checkpoint-safe limit, at most 40,960.
+The primary model pair is Qwen3-8B + DFlash. The checkpoint/model context limit
+is 40,960 prompt-plus-generated tokens. Formal measurement caps that context at
+40,928, leaving two block-16 speculative KV reservations at the request
+boundary. The formal long region begins at 16K generated tokens and ends at
+that safe request limit.
 TTS and L0 must share candidate computation, optimizer, update mode, parameter
 scope, rank, learning rate, stride, supervision, sampling, and load. Their only
 difference is publication policy.
@@ -32,7 +35,7 @@ They replicate behavior but do not determine the formal gate.
 
 Static independently scans concurrency 1, 2, 4, 8, 16, 32, and 48. A load is
 eligible only with zero OOM and retractions, KV capacity for
-`concurrency × 40,960`, and p99 ITL no greater than twice Static-c1. The
+`concurrency × 40,928`, and p99 ITL no greater than twice Static-c1. The
 eligible load with highest decode goodput is fixed for all three methods.
 Selection also requires no more active requests than the 32-prompt confirmation
 window can supply; the c48 screen remains a capacity diagnostic rather than an

@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
 
 
 def _sha256(path: Path) -> str:
@@ -58,7 +59,10 @@ class GpuEvidenceAttestation:
             raise ValueError("GPU evidence methods do not match the formal study")
         if self.repetitions != 8:
             raise ValueError("GPU evidence requires eight repetition blocks")
-        if self.context_start != 16384 or not 32768 <= self.context_limit <= 40960:
+        if (
+            self.context_start != 16384
+            or self.context_limit != DFLASH_SAFE_CONTEXT_LIMIT
+        ):
             raise ValueError("GPU evidence context region is outside the protocol")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("GPU evidence uses a different patched SGLang tree")

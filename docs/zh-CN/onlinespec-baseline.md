@@ -216,7 +216,8 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
    不匹配的负载会被拒绝。
 3. 每个 method/block 计时窗都把 32 个不重叠 prompt 各提交一次，并组成一个有序的原生
    batch 请求。正式 admission limit 不得超过这 32 个唯一 prompt；SGLang 锁定的 admission
-   limit 在不 reset cohort 的情况下排空队列。随后在 16K–40,960 long region
+   limit 在不 reset cohort 的情况下排空队列。随后在已注册的 16K–40,928 安全 long
+   region（40,960 checkpoint 上限之外保留两个 block-16 speculative KV reservation）
    上运行八个独立随机 block 的配对
    Static/OGD/optimistic/Hedge confirmation。Headline 值是整个 batch active decode
    区间的并集；request 级行只用于诊断。

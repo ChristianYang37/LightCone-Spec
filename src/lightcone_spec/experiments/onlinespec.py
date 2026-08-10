@@ -13,7 +13,11 @@ from pathlib import Path
 import numpy as np
 
 from lightcone_spec import PINNED_SGLANG_TREE
-from lightcone_spec.experiments.data import LongContinuationAdapter, sample_set_sha256
+from lightcone_spec.experiments.data import (
+    DFLASH_SAFE_CONTEXT_LIMIT,
+    LongContinuationAdapter,
+    sample_set_sha256,
+)
 from lightcone_spec.experiments.protocol import (
     FORMAL_CONCURRENCY_GRID,
     TUNING_STAGES,
@@ -369,7 +373,7 @@ class OnlineSpecManifest:
             headline_timing_unit="method_repetition_batch",
             inference_cluster_unit="repetition_block",
             formal_context_start=16384,
-            safe_context_limit=40960,
+            safe_context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
             gpu_evidence="UNMEASURED",
         )
 
@@ -793,8 +797,7 @@ def compare_onlinespec(
             or len(output) != 1
             or min(at_risk | output) < 1
             or starts != {16384}
-            or len(ends) != 1
-            or next(iter(ends)) <= 32768
+            or ends != {DFLASH_SAFE_CONTEXT_LIMIT}
         ):
             raise ValueError("OnlineSPEC methods do not share the paired work")
     full_rows = [

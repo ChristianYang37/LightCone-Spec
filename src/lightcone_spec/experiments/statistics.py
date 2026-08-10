@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.stats import norm
 
+from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
+
 
 def bca_mean_interval(
     cluster_values: dict[str, np.ndarray],
@@ -156,8 +158,7 @@ def _validate_coverage(
             or len(output) != 1
             or min(at_risk | output) < 1
             or starts != {16384}
-            or len(ends) != 1
-            or next(iter(ends)) <= 32768
+            or ends != {DFLASH_SAFE_CONTEXT_LIMIT}
         ):
             raise ValueError("paired methods do not share the same at-risk sample")
     full_rows = [row for row in rows if str(row.get("region")) == "full_trajectory"]

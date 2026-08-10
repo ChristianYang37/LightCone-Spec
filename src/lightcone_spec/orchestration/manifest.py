@@ -7,7 +7,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from lightcone_spec.experiments.data import LongContinuationAdapter
+from lightcone_spec.experiments.data import (
+    DFLASH_SAFE_CONTEXT_LIMIT,
+    LongContinuationAdapter,
+)
 from lightcone_spec.experiments.protocol import TUNING_STAGES, tuning_candidates
 from lightcone_spec.experiments.sampling import SamplingProfile
 
@@ -32,7 +35,7 @@ class SpeedStudyManifest:
         "independent_profiler",
     )
     formal_context_start: int = 16384
-    safe_context_limit: int = 40960
+    safe_context_limit: int = DFLASH_SAFE_CONTEXT_LIMIT
     context_limit_definition: str = "prompt_tokens_plus_generated_tokens"
     concurrency_grid: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 48)
     load_screen_context_limit: int = 4096
@@ -45,7 +48,7 @@ class SpeedStudyManifest:
         16384,
         24576,
         32768,
-        40960,
+        DFLASH_SAFE_CONTEXT_LIMIT,
     )
     confirmation_repetitions: int = 8
     confirmation_schedule_seed: int = 20260809
@@ -88,8 +91,10 @@ class SpeedStudyManifest:
             raise ValueError("formal speed region must begin at 16K")
         if self.gpu_evidence != "UNMEASURED":
             raise ValueError("source manifests cannot contain GPU claims")
-        if self.safe_context_limit != 40960:
-            raise ValueError("the pinned DFlash study stops at 40,960 tokens")
+        if self.safe_context_limit != DFLASH_SAFE_CONTEXT_LIMIT:
+            raise ValueError(
+                "the pinned DFlash study stops at the registered safe limit"
+            )
         if self.context_limit_definition != "prompt_tokens_plus_generated_tokens":
             raise ValueError("context limit must include the tokenized prompt")
         if self.concurrency_grid != (1, 2, 4, 8, 16, 32, 48):
@@ -106,7 +111,7 @@ class SpeedStudyManifest:
             16384,
             24576,
             32768,
-            40960,
+            DFLASH_SAFE_CONTEXT_LIMIT,
         ):
             raise ValueError("generated-token bucket identity mismatch")
         if self.confirmation_repetitions != 8:

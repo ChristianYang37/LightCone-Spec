@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from lightcone_spec.experiments.data import (
+    DFLASH_SAFE_CONTEXT_LIMIT,
     GENERATED_TOKEN_BUCKETS,
     LongContinuationAdapter,
     PromptSample,
@@ -1270,8 +1271,8 @@ def run_confirmation_slice(
         raise ValueError("formal confirmation block must be in [0, 8)")
     if concurrency < 1:
         raise ValueError("concurrency must be positive")
-    if not 32768 <= safe_context_limit <= 40960:
-        raise ValueError("formal confirmation must cover 32K to the safe limit")
+    if safe_context_limit != DFLASH_SAFE_CONTEXT_LIMIT:
+        raise ValueError("formal confirmation must end at the registered safe limit")
     if not adaptation_group_id:
         raise ValueError("formal adapted runs require a cohort group")
     samples = LongContinuationAdapter().window("confirm")

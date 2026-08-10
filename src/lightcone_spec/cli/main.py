@@ -17,6 +17,7 @@ from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
 from lightcone_spec.experiments.data import (
+    DFLASH_MODEL_CONTEXT_LIMIT,
     LongContinuationAdapter,
     load_natural_prompts,
     sample_set_sha256,
@@ -1006,7 +1007,7 @@ def _assert_onlinespec_candidate_config(
         or model.target != "Qwen/Qwen3-8B"
         or model.drafter != "z-lab/Qwen3-8B-DFlash-b16"
         or model.algorithm != "DFLASH"
-        or model.max_context_length != 40960
+        or model.max_context_length != DFLASH_MODEL_CONTEXT_LIMIT
         or model.draft_depth != 15
         or runtime.speculative_num_draft_tokens != 16
         or runtime.telemetry_detail != "headline"
@@ -1902,7 +1903,7 @@ def _attest(args: argparse.Namespace) -> int:
         or source_tree.get("tree") != PINNED_SGLANG_TREE
         or source_tree.get("dirty") is not False
         or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != 6
+        or source_tree.get("patch_commits") != 7
     ):
         raise ValueError(
             "GPU attestation requires doctor --path on the exact clean patched checkout"
@@ -1973,7 +1974,7 @@ def _attest_onlinespec(args: argparse.Namespace) -> int:
         or source_tree.get("tree") != PINNED_SGLANG_TREE
         or source_tree.get("dirty") is not False
         or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != 6
+        or source_tree.get("patch_commits") != 7
     ):
         raise ValueError("OnlineSPEC attestation requires the exact patched checkout")
     attestation = OnlineSpecGpuAttestation(

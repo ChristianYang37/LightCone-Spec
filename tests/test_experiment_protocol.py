@@ -17,6 +17,9 @@ from lightcone_spec.cli.main import (
 )
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.experiments.data import (
+    DFLASH_MODEL_CONTEXT_LIMIT,
+    DFLASH_SAFE_CONTEXT_LIMIT,
+    DFLASH_SPECULATIVE_HEADROOM,
     LongContinuationAdapter,
     sample_set_sha256,
 )
@@ -71,6 +74,14 @@ def test_controlled_windows_are_sized_unique_and_content_disjoint() -> None:
     ]
     assert len({sample.sample_id for sample in all_samples}) == 56
     assert len({sample.prompt for sample in all_samples}) == 56
+
+
+def test_dflash_safe_limit_reserves_two_verification_blocks() -> None:
+    assert DFLASH_SPECULATIVE_HEADROOM == 32
+    assert (
+        DFLASH_SAFE_CONTEXT_LIMIT + DFLASH_SPECULATIVE_HEADROOM
+        == DFLASH_MODEL_CONTEXT_LIMIT
+    )
 
 
 def test_controlled_path_does_not_import_optional_dataset_package() -> None:
@@ -168,7 +179,7 @@ def test_tuning_grid_is_complete_and_unique() -> None:
         (2, 4096),
         (4, 8192),
         (8, 16384),
-        (16, 40960),
+        (16, DFLASH_SAFE_CONTEXT_LIMIT),
     ]
 
 
@@ -202,7 +213,7 @@ def load_screen_rows() -> list[dict]:
             "itl_p99_ms": 10.0 + concurrency,
             "oom_events": 0,
             "retractions": 0,
-            "kv_token_capacity": 48 * 40960,
+            "kv_token_capacity": 48 * DFLASH_SAFE_CONTEXT_LIMIT,
         }
         for concurrency in (1, 2, 4, 8, 16, 32, 48)
     ]
@@ -211,25 +222,39 @@ def load_screen_rows() -> list[dict]:
 def test_static_load_selection_respects_latency_and_safety() -> None:
     rows = load_screen_rows()
     # c16 and above exceed twice the c1 p99 (22 ms).
-    assert select_static_load(rows, required_context_limit=40960) == 8
+    assert select_static_load(
+        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+    ) == 8
     rows[-1]["oom_events"] = 1
-    assert select_static_load(rows, required_context_limit=40960) == 8
-    rows[3]["kv_token_capacity"] = 7 * 40960
-    assert select_static_load(rows, required_context_limit=40960) == 4
+    assert select_static_load(
+        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+    ) == 8
+    rows[3]["kv_token_capacity"] = 7 * DFLASH_SAFE_CONTEXT_LIMIT
+    assert select_static_load(
+        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+    ) == 4
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(rows[:-1], required_context_limit=40960)
+        select_static_load(
+            rows[:-1], required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+        )
     duplicated = load_screen_rows() + [load_screen_rows()[0]]
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(duplicated, required_context_limit=40960)
+        select_static_load(
+            duplicated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+        )
     invalid = load_screen_rows()
     invalid[0]["decode_goodput_tps"] = float("nan")
     with pytest.raises(ValueError, match="finite and positive"):
-        select_static_load(invalid, required_context_limit=40960)
+        select_static_load(
+            invalid, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+        )
 
     saturated = load_screen_rows()
     for row in saturated:
         row["itl_p99_ms"] = 1.0
-    assert select_static_load(saturated, required_context_limit=40960) == 32
+    assert select_static_load(
+        saturated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
+    ) == 32
 
 
 def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None:
@@ -652,9 +677,12 @@ def performance_rows(
                     "region": "long_region",
                     "concurrency": 8,
                     "generated_bucket_start": 16384,
-                    "generated_bucket_end": 40960,
+                    "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
                     "at_risk_requests": 32,
-                    "output_tokens": 24576 * 32,
+                    "output_tokens": (
+                        DFLASH_SAFE_CONTEXT_LIMIT - 16384
+                    )
+                    * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }
@@ -668,7 +696,7 @@ def performance_rows(
                     "concurrency": 8,
                     "generated_bucket_start": 0,
                     "at_risk_requests": 32,
-                    "output_tokens": 40960 * 32,
+                    "output_tokens": DFLASH_SAFE_CONTEXT_LIMIT * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **safety,
                 }
@@ -706,6 +734,12 @@ def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
 def test_speed_gate_rejects_incomplete_coverage() -> None:
     with pytest.raises(ValueError, match="coverage|paired cells"):
         evaluate_speed_gate(performance_rows()[:-1])
+    short = performance_rows()
+    next(row for row in short if row["region"] == "long_region")[
+        "generated_bucket_end"
+    ] = 32768
+    with pytest.raises(ValueError, match="same at-risk sample"):
+        evaluate_speed_gate(short)
 
 
 def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
@@ -725,7 +759,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         methods=("static", "tts", "naive_async"),
         repetitions=8,
         context_start=16384,
-        context_limit=40960,
+        context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
     )
     path = tmp_path / "attestation.json"
     attestation.write(path)
@@ -734,6 +768,8 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
     evidence.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="does not bind"):
         loaded.verify_performance((evidence,))
+    with pytest.raises(ValueError, match="context region"):
+        replace(loaded, context_limit=32768).validate()
 
 
 def test_runtime_renderer_produces_three_matched_argv_plans(

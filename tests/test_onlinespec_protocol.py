@@ -15,6 +15,7 @@ from lightcone_spec.cli.main import (
     main,
 )
 from lightcone_spec.config import RunConfig
+from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_CLAIM_SCOPE,
     ONLINE_SPEC_COMMIT,
@@ -497,10 +498,13 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
                     "repetition_block": block,
                     "region": "long_region",
                     "generated_bucket_start": 16384,
-                    "generated_bucket_end": 40960,
+                    "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
                     "concurrency": 4,
                     "at_risk_requests": 32,
-                    "output_tokens": 24576 * 32,
+                    "output_tokens": (
+                        DFLASH_SAFE_CONTEXT_LIMIT - 16384
+                    )
+                    * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }
@@ -514,7 +518,7 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
                     "generated_bucket_start": 0,
                     "concurrency": 4,
                     "at_risk_requests": 32,
-                    "output_tokens": 40960 * 32,
+                    "output_tokens": DFLASH_SAFE_CONTEXT_LIMIT * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **safety,
                 }
@@ -532,6 +536,12 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     assert not any(row.safety_pass for row in compare_onlinespec(unsafe_rows, seed=7))
     with pytest.raises(ValueError, match="coverage"):
         compare_onlinespec(rows[:-1])
+    short = [dict(row) for row in rows]
+    next(row for row in short if row["region"] == "long_region")[
+        "generated_bucket_end"
+    ] = 32768
+    with pytest.raises(ValueError, match="paired work"):
+        compare_onlinespec(short)
 
 
 def test_onlinespec_renderer_creates_four_sequential_servers(

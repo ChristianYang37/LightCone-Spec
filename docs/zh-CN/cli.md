@@ -149,7 +149,8 @@ adaptation config 的 SHA-256；method、optimizer、学习率、rank、stride �
 执行不计时 warmup，然后将 32 个不同 prompt 以一次有序的原生 batch 请求全部提交。
 SGLang 锁定的 `max_running_requests` 负责 admission，cohort 在队列排空期间保持连续。它记录
 active decode 区间的并集以及 request 级绝对 streaming arrival time。模型的 40,960-token
-上限包含 tokenized prompt，因此每个 prompt 的生成上限独立计算。
+上限包含 tokenized prompt；每个 prompt 独立截断到已注册的 40,928 安全上限，从而保留
+两个 block-16 KV reservation。
 
 每个完整 slice 最后写入 SHA-256 绑定的 receipt。重复执行相同 job 时，只有在 manifest、
 config、method、block、batch window、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的

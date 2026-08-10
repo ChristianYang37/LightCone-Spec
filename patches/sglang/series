@@ -4,3 +4,4 @@
 0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch
 0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch
 0006-test-spec-cover-cross-backend-adaptation-protocols.patch
+0007-fix-spec-bound-request-boundary-KV-reservations.patch

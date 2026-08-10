@@ -8,8 +8,10 @@
 更高 decode goodput。实验不预设 acceptance 收益足以覆盖训练与调度成本。只有完整
 协议生成内容绑定的 attestation 后，GPU 状态才会离开 `UNMEASURED`。
 
-主模型对为 Qwen3-8B + DFlash。正式长区间从已生成 16K token 开始，到 checkpoint
-安全上限结束，且不超过 40,960。TTS 与 L0 必须共享 candidate 计算、optimizer、更新
+主模型对为 Qwen3-8B + DFlash。Checkpoint/模型的 prompt-plus-generated context 上限为
+40,960；正式测量将该 context 截断在 40,928，为请求边界保留两个 block-16
+speculative KV reservation。正式长区间从已生成 16K token 开始，到该安全请求上限
+结束。TTS 与 L0 必须共享 candidate 计算、optimizer、更新
 模式、参数范围、rank、学习率、stride、监督、sampling 与 load；唯一差别是发布策略。
 
 ## 数据隔离
@@ -26,7 +28,7 @@ Context 按每次 proposal 前真实 `prefix_len_before` 记录。生成位置 b
 ## 负载与调参
 
 Static 独立扫描 concurrency 1、2、4、8、16、32、48。只有 OOM 和 retraction 均为零，
-KV capacity 足以容纳 `concurrency × 40,960`，且 p99 ITL 不超过 Static-c1 两倍的负载
+KV capacity 足以容纳 `concurrency × 40,928`，且 p99 ITL 不超过 Static-c1 两倍的负载
 才可选。满足条件后选择 decode goodput 最高者，并对三种方法固定。选择还要求 32-prompt
 confirmation window 能提供足够的 active request；c48 screen 仍是容量诊断，不能成为只含
 32 个请求的不满载正式负载。

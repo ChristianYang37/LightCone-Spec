@@ -12,7 +12,7 @@ identity.
 
 ## Series layers
 
-The six-patch series has one-way semantic dependencies:
+The seven-patch series has one-way semantic dependencies:
 
 1. strict cross-backend schema, preflight, and disabled fast path;
 2. cohort, resident optimizer and OnlineSPEC learner state, source-version,
@@ -20,7 +20,8 @@ The six-patch series has one-way semantic dependencies:
 3. differentiable DFlash drafter Full/LoRA and OnlineSPEC update path;
 4. cache-safe DFlash, DSpark, EAGLE, and EAGLE3 tail paths;
 5. memory accounting, lifecycle, telemetry, and profiling integration;
-6. cross-backend optimizer, proposal, exactness, and regression tests.
+6. cross-backend optimizer, proposal, exactness, and regression tests;
+7. request-boundary speculative KV headroom and bounded reservation checks.
 
 Only the complete series is supported. Intermediate patch states are review
 boundaries, not runnable product variants.
@@ -28,7 +29,8 @@ boundaries, not runnable product variants.
 OnlineSPEC is folded into these existing semantic layers instead of creating a
 parallel runtime patch: schema in patch one, learner state in patch two,
 DFlash gradients in patch three, cross-backend tail routing in patch four,
-memory and diagnostics in patch five, and protocol tests in patch six. This
+memory and diagnostics in patch five, protocol tests in patch six, and strict
+request-boundary KV lifecycle checks in patch seven. This
 preserves one version, event, exactness, and disabled-path implementation.
 
 ## Application
