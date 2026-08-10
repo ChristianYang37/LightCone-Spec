@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import runpy
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +26,48 @@ def _bind_interpreter_tools() -> None:
     )
 
 
+def _command_output(executable: str, *arguments: str) -> str | None:
+    path = shutil.which(executable)
+    if path is None:
+        return None
+    result = subprocess.run(
+        (path, *arguments),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _validate_blackwell_jit_toolchain() -> None:
+    """Require the toolkit version needed to JIT kernels for SM 12.x."""
+    capabilities = _command_output(
+        "nvidia-smi",
+        "--query-gpu=compute_cap",
+        "--format=csv,noheader,nounits",
+    )
+    if capabilities is None:
+        return
+    parsed = []
+    for line in capabilities.splitlines():
+        match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", line)
+        if match is None:
+            raise RuntimeError("nvidia-smi returned an invalid compute capability")
+        parsed.append((int(match.group(1)), int(match.group(2))))
+    if not parsed or max(parsed) < (12, 0):
+        return
+    nvcc = _command_output("nvcc", "--version")
+    match = re.search(r"\brelease\s+(\d+)\.(\d+)\b", nvcc or "")
+    if match is None or (int(match.group(1)), int(match.group(2))) < (12, 9):
+        raise RuntimeError(
+            "SM 12.x requires CUDA toolkit >= 12.9 on PATH; set CUDA_HOME, "
+            "prepend $CUDA_HOME/bin to PATH, and add $CUDA_HOME/lib64 to "
+            "LD_LIBRARY_PATH before launching SGLang"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lightcone-sglang-launch")
     parser.add_argument("--checkout", required=True)
@@ -38,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     if "sglang" in sys.modules:
         raise RuntimeError("sglang was imported before checkout verification")
     _bind_interpreter_tools()
+    _validate_blackwell_jit_toolchain()
     sys.path.insert(0, python_root)
     sys.argv = ["sglang.launch_server", *server_argv]
     runpy.run_module("sglang.launch_server", run_name="__main__")
