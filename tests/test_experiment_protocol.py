@@ -24,6 +24,7 @@ from lightcone_spec.experiments.evidence import (
     GpuEvidenceAttestation,
     evidence_files_sha256,
 )
+from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
     assert_matched_confirmation_configs,
@@ -92,6 +93,26 @@ def test_sampling_profiles_separate_controlled_and_natural_eos() -> None:
     for value in (float("nan"), float("inf")):
         with pytest.raises(ValueError, match="temperature/top_p"):
             SamplingProfile(temperature=value).validate()
+
+
+def test_tracked_controlled_profile_matches_registered_manifests() -> None:
+    root = Path(__file__).resolve().parents[1]
+    profile = SamplingProfile.load(
+        root / "manifests/speed-study/sampling_profile_v2.json"
+    )
+    assert profile == SamplingProfile()
+    assert (
+        SpeedStudyManifest.load(
+            root / "manifests/speed-study/static_tts_l0_v2.json"
+        ).sampling_profile_sha256
+        == profile.sha256
+    )
+    assert (
+        OnlineSpecManifest.load(
+            root / "manifests/speed-study/onlinespec_baseline_v2.json"
+        ).sampling_profile_sha256
+        == profile.sha256
+    )
 
 
 def test_speed_manifest_is_immutable_and_hash_bound(tmp_path) -> None:
