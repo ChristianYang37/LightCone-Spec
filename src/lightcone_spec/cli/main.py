@@ -241,7 +241,7 @@ def _parser() -> argparse.ArgumentParser:
     select_online.add_argument("--manifest", required=True)
     select_online.add_argument("--model-lock", required=True)
     select_online.add_argument("--sampling-profile", required=True)
-    select_online.add_argument("--concurrency", type=int, required=True)
+    select_online.add_argument("--core-selection", required=True)
     select_online.add_argument("--output", required=True)
 
     lock = commands.add_parser("lock-models")
@@ -593,8 +593,17 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
     manifest = OnlineSpecManifest.load(args.manifest)
     lock = ModelLock.load(args.model_lock)
     sampling = SamplingProfile.load(args.sampling_profile)
+    core_selection = SelectionArtifact.load(args.core_selection)
     if sampling.sha256 != manifest.sampling_profile_sha256:
         raise ValueError("OnlineSPEC manifest uses another sampling profile")
+    if (
+        core_selection.manifest_sha256 != SpeedStudyManifest.default().sha256
+        or core_selection.model_lock_sha256 != lock.sha256
+        or core_selection.sampling_profile_sha256 != sampling.sha256
+    ):
+        raise ValueError(
+            "OnlineSPEC selection requires the registered core Static load"
+        )
     value = _load_bound_json(args.measurements)
     if (
         value.get("schema_version") != 2
@@ -607,7 +616,7 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
         or value.get("stage") != len(TUNING_STAGES) - 1
         or value.get("next_stage") is not None
         or not _is_lower_sha256(value.get("prior_stage_sha256"))
-        or value.get("concurrency") != args.concurrency
+        or value.get("concurrency") != core_selection.selected_concurrency
     ):
         raise ValueError("OnlineSPEC tuning artifact identity mismatch")
     raw_rows = value.get("measurements")
@@ -619,10 +628,11 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
     selection = select_onlinespec(
         [OnlineSpecTuningMeasurement(**row) for row in raw_rows],
         candidates=candidates,
-        selected_concurrency=args.concurrency,
+        selected_concurrency=core_selection.selected_concurrency,
         manifest_sha256=manifest.sha256,
         model_lock_sha256=lock.sha256,
         sampling_profile_sha256=sampling.sha256,
+        reference_core_selection_sha256=core_selection.sha256,
         tuning_evidence_sha256=_canonical_sha256(value),
     )
     selection.write(args.output)

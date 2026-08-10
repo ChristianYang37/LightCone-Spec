@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from unittest.mock import patch
 
 import pyarrow.parquet as pq
 import pytest
 
+from lightcone_spec.experiments.data import PromptSample
 from lightcone_spec.experiments.protocol import confirmation_blocks
 from lightcone_spec.experiments.runner import (
     _adaptation_fields,
+    _batch_prompt_id,
+    _batched_payloads,
     _earlier_slices,
+    _group_results,
     _payloads,
+    _performance_record,
     _prompt_budgets,
     _region,
     _round_records,
     _write_updates,
+    measure_controlled_slice,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.sglang_bridge.client import (
@@ -351,6 +358,40 @@ def test_independent_run_resets_and_collects_post_run_snapshot(method: str) -> N
     assert run.after.target_calls == 4
 
 
+def test_loaded_batch_submits_the_complete_queue_to_sglang() -> None:
+    class QueueClient(SGLangHTTPClient):
+        def __init__(self) -> None:
+            super().__init__("http://unused")
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+            self.barrier = threading.Barrier(4)
+
+        def stream_generate(self, payload: dict) -> GenerationResult:
+            request_id = str(payload["rid"])
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            self.barrier.wait(timeout=5)
+            with self.lock:
+                self.active -= 1
+            return result(request_id)
+
+    client = QueueClient()
+    payloads = tuple({"rid": f"r{index}"} for index in range(4))
+    rows, elapsed = client.run_loaded_batch(
+        payloads,
+        concurrency=2,
+    )
+    assert {row.request_id for row in rows} == {"r0", "r1", "r2", "r3"}
+    # The HTTP queue is admitted in one burst. The server's registered
+    # max_running_requests, not a client-side executor, controls GPU load.
+    assert client.max_active == 4
+    assert elapsed > 0
+    with pytest.raises(ValueError, match="cannot reach"):
+        client.run_loaded_batch(payloads[:1], concurrency=2)
+
+
 def test_payloads_use_native_sglang_rid_and_paired_seed() -> None:
     sample = type("Sample", (), {"sample_id": "p", "prompt": "x", "seed": 7})()
     profile = SamplingProfile()
@@ -410,6 +451,137 @@ def test_warmup_request_namespace_cannot_reuse_measured_rids() -> None:
         )
 
 
+def test_distinct_prompt_batch_only_fills_an_undersized_screen() -> None:
+    samples = (
+        PromptSample("p0", "first", 7),
+        PromptSample("p1", "second", 11),
+    )
+    budgets = {"p0": (3, 8), "p1": (4, 7)}
+    filled, assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method="static",
+        block=0,
+        concurrency=8,
+        sampling_profile=SamplingProfile(),
+        fill_concurrency=True,
+    )
+    assert len(filled) == 8
+    assert len(assignments) == 8
+    assert [row["text"] for row in filled].count("first") == 4
+    assert [row["text"] for row in filled].count("second") == 4
+    assert len({row["rid"] for row in filled}) == 8
+    assert [row["sampling_params"]["sampling_seed"] for row in filled] == [
+        7,
+        11,
+        8,
+        12,
+        9,
+        13,
+        10,
+        14,
+    ]
+
+    confirmation, confirmation_assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method="static",
+        block=0,
+        concurrency=8,
+        sampling_profile=SamplingProfile(),
+        fill_concurrency=False,
+    )
+    assert len(confirmation) == len(samples)
+    grouped = _group_results(
+        tuple(result(row["rid"]) for row in confirmation),
+        confirmation_assignments,
+    )
+    assert set(grouped) == {"p0", "p1"}
+    assert all(len(rows) == 1 for rows in grouped.values())
+    assert _batch_prompt_id(samples).startswith("batch-")
+
+
+def test_controlled_slice_executes_one_continuous_batch(monkeypatch) -> None:
+    samples = (
+        PromptSample("p0", "first", 7),
+        PromptSample("p1", "second", 11),
+    )
+
+    class Tokenizer:
+        def tokenize_prompts(self, prompts):
+            assert tuple(prompts) == ("first", "second")
+            return (2, 2), 10
+
+    calls: list[tuple[dict, ...]] = []
+
+    def run_once(_client, *, payloads, **_kwargs):
+        requests = tuple(payloads)
+        calls.append(requests)
+        rows = tuple(
+            replace(
+                result(str(payload["rid"]), 8),
+                input_tokens=2,
+                token_arrival_ms=tuple(
+                    index * 100.0 + offset for offset in range(8)
+                ),
+            )
+            for index, payload in enumerate(requests)
+        )
+        before = ServerSnapshot.parse(snapshot_payload(target_calls=0))
+        after = ServerSnapshot.parse(snapshot_payload(target_calls=len(rows)))
+        return MethodRun(rows, 1.0, before, after)
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.runner.independent_method_run", run_once
+    )
+    measurement = measure_controlled_slice(
+        client=Tokenizer(),
+        method="static",
+        samples=samples,
+        phase="static_load_screen",
+        stage=0,
+        candidate_id=None,
+        manifest_sha256="a" * 64,
+        config_sha256="b" * 64,
+        model_lock_sha256="c" * 64,
+        adaptation_config_sha256=None,
+        sampling_profile=SamplingProfile(),
+        context_limit=10,
+        concurrency=8,
+        adaptation_group_id="unused-static-group",
+        warmup=False,
+    )
+    assert len(calls) == 1
+    assert len(calls[0]) == 8
+    assert measurement.prompt_count == 2
+    assert measurement.concurrency == 8
+    assert measurement.decode_goodput_tps > 0
+
+
+def test_bucket_rows_do_not_duplicate_run_scope_counters() -> None:
+    snapshot = ServerSnapshot.parse(snapshot_payload(target_calls=4))
+    adaptation, _, _ = _adaptation_fields("static", snapshot, None)
+    row = _performance_record(
+        run_id="run-a",
+        prompt_id="batch-confirmation",
+        method="static",
+        block=0,
+        concurrency=4,
+        region_name="generated_bucket",
+        region_start=0,
+        region_end=4,
+        results=(result(),),
+        snapshot=snapshot,
+        adaptation=adaptation,
+        run_scope_metrics=False,
+    )
+    assert row is not None
+    assert row.target_calls_per_output_token is None
+    assert row.peak_hbm_bytes is None
+    assert row.updates_launched is None
+    assert row.exactness_violations is None
+
+
 def test_confirmation_slice_order_is_manifest_seeded() -> None:
     jobs = [
         (block.block, method)
@@ -429,11 +601,45 @@ def test_region_goodput_excludes_ttft_and_tracks_at_risk_requests() -> None:
     at_risk, output_tokens, elapsed_s, intervals = measured
     assert at_risk == 2
     assert output_tokens == 6
-    assert elapsed_s == pytest.approx(0.11)
+    assert elapsed_s == pytest.approx(0.04)
     assert len(intervals) == 4
     tail = _region((first, second), start=2, end=4)
     assert tail is not None
     assert tail[0] == 1
+
+
+def test_region_time_is_the_union_of_active_decode_intervals() -> None:
+    first = replace(
+        result("a", 4),
+        token_arrival_ms=(100.0, 110.0, 120.0, 130.0),
+    )
+    second = replace(
+        result("b", 4),
+        token_arrival_ms=(1000.0, 1010.0, 1020.0, 1030.0),
+    )
+    measured = _region((first, second), start=0, end=4)
+    assert measured is not None
+    assert measured[:3] == pytest.approx((2, 8, 0.06))
+    # The 870 ms gap is server queue/prefill time, not a decode interval.
+    assert measured[2] != pytest.approx(0.93)
+
+
+def test_region_union_does_not_double_count_overlapping_requests() -> None:
+    first = replace(
+        result("a", 4),
+        token_arrival_ms=(100.0, 110.0, 120.0, 130.0),
+    )
+    second = replace(
+        result("b", 4),
+        token_arrival_ms=(110.0, 120.0, 130.0, 140.0),
+    )
+    measured = _region((first, second), start=0, end=4)
+    assert measured is not None
+    assert measured[:3] == pytest.approx((2, 8, 0.04))
+
+
+def test_region_requires_a_real_decode_transition() -> None:
+    assert _region((result("one", 1),), start=0, end=1) is None
 
 
 def test_adaptation_evidence_never_uses_missing_defaults() -> None:

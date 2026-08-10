@@ -169,11 +169,13 @@ sampling。
 
 ## 证据与安全
 
-正式 confirmation 使用 32 个 held-out controlled prompts、八个独立方法顺序 block、
-一个已选择负载，并按生成 token 位置记录到每个 prompt 的 checkpoint 安全终点。40,960
-token 的模型上限始终包含 tokenized prompt；headline 区域从 16K generated tokens 开始。
-TTS 与 L0 必须分别通过已注册的速度阈值、prompt-cluster 配对
-BCa 区间和零安全事件要求。
+正式 confirmation 在每种方法中将 32 个不同的 held-out controlled prompt 以一次 start-gated
+burst 全部提交给 SGLang，并使用八个独立方法顺序 block 与一个已选择负载。锁定的 server
+admission limit 控制 active batch，队列排空前不 reset cohort；每个 method/block 只拥有其
+active decode 区间的并集。Request 诊断独立记录，避免把共享 batch 时间伪重复成 32 个
+goodput 样本。40,960 token
+模型上限包含 tokenized prompt，headline 区域从 16K generated tokens 开始。TTS 与 L0
+必须分别通过已注册的速度阈值、repetition-block 配对 BCa 区间和零安全事件要求。
 
 缺少内容绑定的 GPU attestation 时，gate 不能输出 `PASS`。Attestation 同时绑定
 manifest、tuning selection、patched SGLang tree、模型 revision、硬件报告和准确的
@@ -202,7 +204,7 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 - 正式 DFlash 模型对之外的 GPU 认证与多 GPU adaptation 属于未来工作；实现兼容不
   代表已经实测加速。
 - OnlineSPEC 对比是对论文在线 learner 公式的 clean-room 实现。固定审计 commit 上的
-  官方仓库没有公开软件许可，因此本项目没有重新分发或复制其上游源码。
+  官方仓库没有项目级许可证文件，因此本项目没有重新分发或复制其上游源码。
 
 ## 贡献与许可证
 

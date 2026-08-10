@@ -3,13 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
 from lightcone_spec import PINNED_SGLANG_TREE
-from lightcone_spec.cli.main import _assert_onlinespec_candidate_config
+from lightcone_spec.cli.main import (
+    _assert_onlinespec_candidate_config,
+    _write_json,
+    main,
+)
 from lightcone_spec.config import RunConfig
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_CLAIM_SCOPE,
@@ -29,12 +33,19 @@ from lightcone_spec.experiments.onlinespec import (
 )
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
+    TUNING_STAGES,
     onlinespec_blocks,
+    tuning_candidates,
 )
 from lightcone_spec.experiments.runner import _earlier_slices
 from lightcone_spec.experiments.sampling import SamplingProfile
-from lightcone_spec.experiments.selection import LossPoint, SliceMeasurement
+from lightcone_spec.experiments.selection import (
+    LossPoint,
+    SelectionArtifact,
+    SliceMeasurement,
+)
 from lightcone_spec.locking.models import LockedModel, ModelLock
+from lightcone_spec.orchestration.manifest import SpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
     render_onlinespec_runtime_plan,
     render_onlinespec_tuning_runtime_plan,
@@ -125,8 +136,8 @@ def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
 
 def test_onlinespec_grid_is_complete_unique_and_algorithm_specific() -> None:
     candidates = onlinespec_candidates()
-    assert len(candidates) == 146
-    assert len({candidate.candidate_id for candidate in candidates}) == 146
+    assert len(candidates) == 155
+    assert len({candidate.candidate_id for candidate in candidates}) == 155
     assert {candidate.method for candidate in candidates} == set(ONLINE_SPEC_METHODS)
     assert all(
         candidate.weight_update_mode == "full"
@@ -150,6 +161,11 @@ def test_onlinespec_grid_is_complete_unique_and_algorithm_specific() -> None:
         for candidate in candidates
         if candidate.method != "onlinespec_ens"
     } == {1e-4, 1e-3, 1e-2, 1e-1}
+    assert {
+        candidate.learning_rate
+        for candidate in candidates
+        if candidate.method == "onlinespec_ens"
+    } == {1e-4, 1e-3, 1e-2}
 
 
 def test_onlinespec_schedule_is_paired_randomized_and_resumable() -> None:
@@ -202,6 +218,7 @@ def test_onlinespec_selection_is_per_method_tuning_only_and_fail_closed() -> Non
         manifest_sha256="a" * 64,
         model_lock_sha256="b" * 64,
         sampling_profile_sha256="c" * 64,
+        reference_core_selection_sha256="e" * 64,
         tuning_evidence_sha256="d" * 64,
     )
     assert all(
@@ -221,6 +238,128 @@ def test_onlinespec_selection_is_per_method_tuning_only_and_fail_closed() -> Non
             manifest_sha256="a" * 64,
             model_lock_sha256="b" * 64,
             sampling_profile_sha256="c" * 64,
+            reference_core_selection_sha256="e" * 64,
+        )
+    with pytest.raises(ValueError, match="selection load"):
+        select_onlinespec(
+            evidence,
+            candidates=candidates,
+            selected_concurrency=48,
+            manifest_sha256="a" * 64,
+            model_lock_sha256="b" * 64,
+            sampling_profile_sha256="c" * 64,
+            reference_core_selection_sha256="e" * 64,
+        )
+
+
+def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> None:
+    manifest = OnlineSpecManifest.default()
+    manifest_path = tmp_path / "onlinespec-manifest.json"
+    manifest.write(manifest_path)
+    sampling = SamplingProfile()
+    sampling_path = tmp_path / "sampling.json"
+    sampling.write(sampling_path)
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    lock_path = tmp_path / "models.json"
+    lock.write(lock_path)
+    core_manifest = SpeedStudyManifest.default()
+    core_selection = SelectionArtifact(
+        schema_version=2,
+        candidate=tuning_candidates()[0],
+        selected_concurrency=8,
+        minimum_goodput_ratio=1.0,
+        peak_hbm_bytes=1,
+        itl_p99_ms=1.0,
+        exposed_update_ms=1.0,
+        manifest_sha256=core_manifest.sha256,
+        sampling_profile_sha256=sampling.sha256,
+        tuning_grid_sha256=core_manifest.tuning_grid_sha256,
+        load_screen_sha256="c" * 64,
+        tuning_window_sha256=core_manifest.controlled_window_hashes["tune"],
+        model_lock_sha256=lock.sha256,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        tuning_evidence_sha256="d" * 64,
+    )
+    core_selection_path = tmp_path / "core-selection.json"
+    core_selection.write(core_selection_path)
+    candidates = {
+        method: next(
+            candidate
+            for candidate in onlinespec_candidates()
+            if candidate.method == method
+        )
+        for method in ONLINE_SPEC_METHODS
+    }
+    terminal = {
+        "schema_version": 2,
+        "phase": "onlinespec_tuning",
+        "manifest_sha256": manifest.sha256,
+        "model_lock_sha256": lock.sha256,
+        "sampling_profile_sha256": sampling.sha256,
+        "window_sha256": manifest.tuning_window_sha256,
+        "tuning_grid_sha256": manifest.tuning_grid_sha256,
+        "stage": len(TUNING_STAGES) - 1,
+        "next_stage": None,
+        "prior_stage_sha256": "e" * 64,
+        "concurrency": 8,
+        "measurements": [
+            asdict(measurement(candidates[method], 1.0))
+            for method in ONLINE_SPEC_METHODS
+        ],
+    }
+    terminal_path = tmp_path / "terminal.json"
+    _write_json(terminal_path, terminal)
+    output = tmp_path / "onlinespec-selection.json"
+    assert (
+        main(
+            [
+                "select-onlinespec-config",
+                "--measurements",
+                str(terminal_path),
+                "--manifest",
+                str(manifest_path),
+                "--model-lock",
+                str(lock_path),
+                "--sampling-profile",
+                str(sampling_path),
+                "--core-selection",
+                str(core_selection_path),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    selected = OnlineSpecSelection.load(output)
+    assert selected.selected_concurrency == 8
+    assert selected.reference_core_selection_sha256 == core_selection.sha256
+
+    mismatched = replace(core_selection, selected_concurrency=4)
+    mismatched_path = tmp_path / "mismatched-core-selection.json"
+    mismatched.write(mismatched_path)
+    with pytest.raises(ValueError, match="tuning artifact identity mismatch"):
+        main(
+            [
+                "select-onlinespec-config",
+                "--measurements",
+                str(terminal_path),
+                "--manifest",
+                str(manifest_path),
+                "--model-lock",
+                str(lock_path),
+                "--sampling-profile",
+                str(sampling_path),
+                "--core-selection",
+                str(mismatched_path),
+                "--output",
+                str(tmp_path / "must-not-exist.json"),
+            ]
         )
 
 
@@ -324,30 +463,62 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
         "onlinespec_opt": 1.02,
         "onlinespec_ens": 0.99,
     }
-    for prompt in range(32):
-        for block in range(8):
+    for block in range(8):
+        for method, ratio in ratios.items():
+            safety = {
+                "updates_launched": 0 if method == "static" else 1,
+                "updates_published": 0 if method == "static" else 1,
+                "exactness_violations": 0,
+                "version_mismatches": 0,
+                "fallbacks": 0,
+                "nonfinite_updates": 0,
+                "oom_events": 0,
+                "retractions": 0,
+            }
             for bucket in (16384, 24576, 32768):
-                for method, ratio in ratios.items():
-                    rows.append(
-                        {
-                            "prompt_id": f"p{prompt}",
-                            "method": method,
-                            "repetition_block": block,
-                            "region": "generated_bucket",
-                            "generated_bucket_start": bucket,
-                            "concurrency": 4,
-                            "at_risk_requests": 4,
-                            "output_tokens": 8192,
-                            "decode_goodput_tps": 100.0 * ratio,
-                            "updates_published": 0 if method == "static" else 1,
-                            "exactness_violations": 0,
-                            "version_mismatches": 0,
-                            "fallbacks": 0,
-                            "nonfinite_updates": 0,
-                            "oom_events": 0,
-                            "retractions": 0,
-                        }
-                    )
+                rows.append(
+                    {
+                        "prompt_id": "batch-confirmation",
+                        "method": method,
+                        "repetition_block": block,
+                        "region": "generated_bucket",
+                        "generated_bucket_start": bucket,
+                        "concurrency": 4,
+                        "at_risk_requests": 32,
+                        "output_tokens": 8192 * 32,
+                        "decode_goodput_tps": 100.0 * ratio,
+                        **{key: None for key in safety},
+                    }
+                )
+            rows.append(
+                {
+                    "prompt_id": "batch-confirmation",
+                    "method": method,
+                    "repetition_block": block,
+                    "region": "long_region",
+                    "generated_bucket_start": 16384,
+                    "generated_bucket_end": 40960,
+                    "concurrency": 4,
+                    "at_risk_requests": 32,
+                    "output_tokens": 24576 * 32,
+                    "decode_goodput_tps": 100.0 * ratio,
+                    **{key: None for key in safety},
+                }
+            )
+            rows.append(
+                {
+                    "prompt_id": "batch-confirmation",
+                    "method": method,
+                    "repetition_block": block,
+                    "region": "full_trajectory",
+                    "generated_bucket_start": 0,
+                    "concurrency": 4,
+                    "at_risk_requests": 32,
+                    "output_tokens": 40960 * 32,
+                    "decode_goodput_tps": 100.0 * ratio,
+                    **safety,
+                }
+            )
     result = compare_onlinespec(rows, seed=7)
     assert [row.method for row in result] == list(ONLINE_SPEC_METHODS)
     assert result[0].mean_speedup == pytest.approx(0.01)
@@ -356,7 +527,7 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     next(
         row
         for row in unsafe_rows
-        if row["method"] == "static" and row["generated_bucket_start"] == 16384
+        if row["method"] == "static" and row["region"] == "full_trajectory"
     )["exactness_violations"] = 1
     assert not any(row.safety_pass for row in compare_onlinespec(unsafe_rows, seed=7))
     with pytest.raises(ValueError, match="coverage"):
@@ -397,6 +568,7 @@ def test_onlinespec_renderer_creates_four_sequential_servers(
         model_lock_sha256=lock.sha256,
         sampling_profile_sha256=SamplingProfile().sha256,
         tuning_evidence_sha256="d" * 64,
+        reference_core_selection_sha256="e" * 64,
         patched_sglang_tree=PINNED_SGLANG_TREE,
     )
     launches = render_onlinespec_runtime_plan(

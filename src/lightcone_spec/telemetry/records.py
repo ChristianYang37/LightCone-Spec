@@ -118,11 +118,11 @@ class PerformanceRecord:
     sm_utilization: float | None
     dram_utilization: float | None
     target_estimated_mfu: float | None
-    peak_hbm_bytes: int
-    kv_bytes: int
-    optimizer_bytes: int
+    peak_hbm_bytes: int | None
+    kv_bytes: int | None
+    optimizer_bytes: int | None
     adaptation_memory_ledger: str | None
-    trainable_parameters: int
+    trainable_parameters: int | None
     training_cuda_ms: float | None
     optimizer_cuda_ms: float | None
     merge_cuda_ms: float | None
@@ -131,11 +131,11 @@ class PerformanceRecord:
     exposed_update_ms: float | None
     main_side_overlap_ratio: float | None
     graph_replay_hit_rate: float | None
-    updates_launched: int
-    updates_published: int
-    exactness_violations: int
-    version_mismatches: int
-    fallbacks: int
-    nonfinite_updates: int
-    oom_events: int
-    retractions: int
+    updates_launched: int | None
+    updates_published: int | None
+    exactness_violations: int | None
+    version_mismatches: int | None
+    fallbacks: int | None
+    nonfinite_updates: int | None
+    oom_events: int | None
+    retractions: int | None

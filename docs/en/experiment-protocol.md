@@ -31,9 +31,12 @@ They replicate behavior but do not determine the formal gate.
 ## Load and tuning
 
 Static independently scans concurrency 1, 2, 4, 8, 16, 32, and 48. A load is
-eligible only with zero OOM and retractions and p99 ITL no greater than twice
-Static-c1. The eligible load with highest decode goodput is fixed for all three
-methods.
+eligible only with zero OOM and retractions, KV capacity for
+`concurrency × 40,960`, and p99 ITL no greater than twice Static-c1. The
+eligible load with highest decode goodput is fixed for all three methods.
+Selection also requires no more active requests than the 32-prompt confirmation
+window can supply; the c48 screen remains a capacity diagnostic rather than an
+underfilled formal load.
 
 Tuning searches drafter Full and LoRA across Adam, AdamW, SGDm, NAG, Muon, and
 Lion with optimizer-specific learning-rate ranges, rank, stride, weight decay,
@@ -54,10 +57,19 @@ the grid, tuning window, model lock, patched tree, load, and tuning evidence.
 ## Independent confirmation
 
 Confirmation has eight repetition blocks. Every block independently resets the
-cohort before each method, randomly orders Static/TTS/L0, and measures every
-method on the same prompt, seed, sampling profile, and load. A warmup occurs
-outside the interval. Repetitions are never merged into one timer and never
-receive copied throughput values.
+cohort before each method, randomly orders Static/TTS/L0, and submits all 32
+distinct prompts once in one start-gated burst. SGLang's locked admission limit
+owns continuous batching; the engine and cohort are not reset while the queue
+drains. A warmup occurs outside the interval. One method/block batch owns the
+union of its active decode intervals, excluding request queue and prefill gaps;
+repetitions are never merged and batch metrics are never copied onto prompt or
+bucket rows.
+
+Request-level ITL, TTFT, output identity, and per-request decode diagnostics are
+recorded separately. They do not masquerade as aggregate system goodput. Load
+and early tuning stages fill an undersized prompt window round-robin only until
+the registered concurrency is occupied; confirmation and natural-task runs
+never replicate prompts to manufacture load.
 
 The registered controlled profile is greedy. This makes the target-token
 trajectory identical across Static and every exact adapted method, so a paired
@@ -76,10 +88,14 @@ or silently dropping completed cells.
 
 ## Metrics and inference
 
-Headline metrics are paired decode-goodput effects for the 16K-to-limit region
-and the full trajectory. TTS and L0 are evaluated separately against Static
-using prompt-cluster BCa 95% intervals. Each must reach the registered mean
-threshold and have a confidence lower bound above zero.
+Headline metrics are paired batch decode-goodput effects for one dedicated
+`long_region` row spanning 16K-to-limit and for the full trajectory. Position
+buckets remain explanatory and are never averaged into the headline. TTS and L0 are evaluated separately against
+Static using repetition-block BCa 95% intervals. The repetition block is the
+independent timing and randomization unit; treating 32 requests that share one
+wall-clock interval as 32 independent goodput samples would be
+pseudoreplication. Each method must reach the registered mean threshold and
+have a confidence lower bound above zero.
 
 Interpretation retains survival-weighted accepted prefix, committed and
 verified drafts per verification, verification waste, target calls per output
@@ -108,9 +124,12 @@ but cannot consume core TTS/L0 tuning rows or confirmation outcomes. Its three
 learners are reduced independently during successive halving, then one safe
 configuration per learner is compared with a paired Static reference.
 
-Confirmation uses 32 held-out prompts, eight randomized blocks, identical
-seeds, one locked concurrency, and the same 16K-to-safe-limit region. The
-derived table reports OGD, optimistic OGD, and Hedge separately; it never
+Confirmation uses 32 held-out prompts submitted once per method to one SGLang
+queue, eight randomized blocks, identical seeds, one locked concurrency, and
+the same 16K-to-safe-limit region. Aggregate goodput is inferred over the eight
+independent method/block active-interval unions; prompt-level rows remain
+diagnostic.
+The derived table reports OGD, optimistic OGD, and Hedge separately; it never
 collapses them into a best-of-baselines result. Each comparison includes paired
 BCa intervals, safety counters, update counts, HBM categories, and the
 learner-specific diagnostics defined in [OnlineSPEC

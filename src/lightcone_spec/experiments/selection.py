@@ -10,6 +10,7 @@ from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments.protocol import (
+    FORMAL_CONCURRENCY_GRID,
     TUNING_STAGES,
     TuningCandidate,
     successive_halving,
@@ -379,7 +380,7 @@ class SelectionArtifact:
     def validate(self) -> None:
         if self.schema_version != 2:
             raise ValueError("selection artifact must use schema version 2")
-        if self.selected_concurrency not in {1, 2, 4, 8, 16, 32, 48}:
+        if self.selected_concurrency not in FORMAL_CONCURRENCY_GRID:
             raise ValueError("selection artifact has an invalid concurrency")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("selection artifact uses the wrong runtime tree")

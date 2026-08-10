@@ -49,6 +49,9 @@ class SpeedStudyManifest:
     )
     confirmation_repetitions: int = 8
     confirmation_schedule_seed: int = 20260809
+    request_scheduling: str = "distinct_prompt_cohort_queue"
+    headline_timing_unit: str = "method_repetition_batch"
+    inference_cluster_unit: str = "repetition_block"
     controlled_window_hashes: dict[str, str] = field(default_factory=dict)
     tuning_grid_sha256: str = ""
     sampling_profile_sha256: str = ""
@@ -110,6 +113,12 @@ class SpeedStudyManifest:
             raise ValueError("formal confirmation requires eight independent blocks")
         if self.confirmation_schedule_seed != 20260809:
             raise ValueError("confirmation schedule identity mismatch")
+        if self.request_scheduling != "distinct_prompt_cohort_queue":
+            raise ValueError("request scheduling identity mismatch")
+        if self.headline_timing_unit != "method_repetition_batch":
+            raise ValueError("headline timing identity mismatch")
+        if self.inference_cluster_unit != "repetition_block":
+            raise ValueError("inference cluster identity mismatch")
         if self.natural_side_tables != ("livecodebench", "math500"):
             raise ValueError("natural side-table identity mismatch")
         expected_windows = LongContinuationAdapter.default_hashes()

@@ -189,12 +189,15 @@ speculative rejection sampling.
 
 ## Evidence and safety
 
-Formal confirmation uses 32 held-out controlled prompts, eight independent
-method-order blocks, one selected load, and generated-token buckets through each
-prompt's checkpoint-safe end. The 40,960-token model limit always includes the
-tokenized prompt; the headline region begins at 16K generated tokens. Both TTS
-and L0 must independently clear the registered speed threshold with a paired
-prompt-cluster BCa interval and zero safety events.
+Formal confirmation submits 32 distinct held-out controlled prompts to SGLang
+in one start-gated burst per method across eight independent method-order
+blocks. The locked server admission limit controls the active batch and the
+cohort is not reset while the queue drains. Each method/block owns the union of
+its active decode intervals; request diagnostics remain separate, so shared
+batch timing is not pseudoreplicated as 32 goodput samples. The
+40,960-token model limit includes the tokenized prompt, and the headline region
+begins at 16K generated tokens. TTS and L0 must each clear the registered speed
+threshold, repetition-block BCa interval, and zero safety events.
 
 The gate cannot report `PASS` without a content-bound GPU attestation covering
 the manifest, tuning selection, patched SGLang tree, model revisions, hardware
@@ -226,8 +229,9 @@ report, and exact Parquet inputs. A local or synthetic table remains
 - GPU certification outside the formal DFlash pair and multi-GPU adaptation
   are future work. Implemented compatibility does not imply measured speedup.
 - The OnlineSPEC comparison is a clean-room implementation of the published
-  online-learner equations. Its official repository exposed no software license
-  at the pinned audit commit, so no upstream source is redistributed or copied.
+  online-learner equations. Its official repository had no project-level
+  license file at the pinned audit commit, so no upstream source is
+  redistributed or copied.
 
 ## Contributing and license
 

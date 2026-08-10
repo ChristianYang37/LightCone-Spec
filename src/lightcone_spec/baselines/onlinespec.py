@@ -1,9 +1,9 @@
 """Clean-room OnlineSPEC online learners derived from the published equations.
 
-The upstream research repository does not publish a software license. This
-module therefore implements the paper's state transitions without copying its
-source. Learners are functional: ``propose`` never mutates active state, so a
-stale or invalid CUDA candidate can be discarded atomically.
+The audited upstream commit has no project-level license file. This module
+therefore implements the paper's state transitions without copying its source.
+Learners are functional: ``propose`` never mutates active state, so a stale or
+invalid CUDA candidate can be discarded atomically.
 """
 
 from __future__ import annotations

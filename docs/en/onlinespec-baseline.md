@@ -15,9 +15,9 @@ update abstraction. It is based on the [OnlineSPEC
 paper](https://arxiv.org/abs/2603.12617v2) and records the [official repository
 at commit
 `e58f82e`](https://github.com/ZinYY/OnlineSPEC/tree/e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b).
-The audited repository did not expose a software license at that commit, so no
-source file, checkpoint utility, or training script was copied into
-LightCone-Spec.
+The audited repository had no project-level license file at that commit; some
+individual files carry their own notices. No source file, checkpoint utility,
+or training script was copied into LightCone-Spec.
 
 The machine-readable audit is
 [`manifests/provenance/onlinespec_source_audit_v2.json`](../../manifests/provenance/onlinespec_source_audit_v2.json).
@@ -123,7 +123,8 @@ Because every OnlineSPEC gradient is globally clipped, its learning rate is a
 parameter-space displacement scale rather than an Adam-style coordinate step.
 The registered OGD/optimistic grid therefore uses rates
 `1e-4, 1e-3, 1e-2, 1e-1` and strides `20, 40, 80, 160`. Hedge uses ordered
-triples starting at `1e-3` or `1e-2`, with strides `40, 80, 160`. These are
+triples starting at `1e-4`, `1e-3`, or `1e-2`, with strides `40, 80, 160`.
+These are
 tuning-only protocol bounds, not reported best settings.
 
 ## Online learners
@@ -250,11 +251,17 @@ separate evidence identities:
 1. Run successive-halving tuning on the tuning-only window. Halving occurs
    independently inside OGD, optimistic OGD, and Hedge so one learner cannot
    eliminate another.
-2. Select one safe candidate per learner. The selection binds the complete
-   terminal tuning artifact, model lock, sampling profile, manifest, load, and
-   patched SGLang tree.
-3. Run paired Static/OGD/optimistic/Hedge confirmation on 32 disjoint prompts,
-   eight independently randomized blocks, and the 16K-to-40,960 long region.
+2. Select one safe candidate per learner. The CLI requires the core
+   Static/TTS/L0 selection, inherits its selected concurrency, and recursively
+   binds its SHA-256. The OnlineSPEC selection also binds the complete terminal
+   tuning artifact, model lock, sampling profile, manifest, and patched SGLang
+   tree. A manually supplied or mismatched load is rejected.
+3. In each method/block interval, submit all 32 disjoint prompts exactly once
+   in one start-gated burst. The formal admission limit cannot exceed those 32
+   unique prompts; SGLang's locked admission limit drains the queue without
+   resetting the cohort. Run eight independently randomized blocks over the
+   16K-to-40,960 long region. The batch owns the union of its active decode
+   intervals; request-level rows are diagnostic only.
 4. Collect one diagnostic comparison per learner against the paired Static
    rows and bind the evidence to a GPU attestation.
 5. Profile in a separate run; synchronized traces cannot enter headline
@@ -300,7 +307,7 @@ lightcone-spec verify-onlinespec-source \
   --output /path/to/ignored-artifacts/onlinespec-source-verification.json
 ```
 
-The verifier fails unless the checkout is clean and its commit, tree, 13
+The verifier fails unless the checkout is clean and its commit, tree, 18
 audited file hashes, and license inventory all match. The checkout and receipt
 are audit inputs only and must not be copied, vendored, or committed into
 LightCone-Spec.

@@ -9,6 +9,7 @@ import random
 from dataclasses import asdict, dataclass
 
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.experiments.data import LongContinuationAdapter
 
 # DFlash trains block-16 drafters with
 #   w_k = exp(-(k - 1) / gamma), gamma = 7.
@@ -25,6 +26,7 @@ TUNING_STAGES = (
     (8, 16384),
     (16, 40960),
 )
+FORMAL_CONCURRENCY_GRID = (1, 2, 4, 8, 16, 32)
 
 
 def tuning_stage(stage: int) -> tuple[int, int]:
@@ -203,7 +205,7 @@ def select_static_load(
     """Select maximum-goodput safe concurrency from the fixed scan."""
     if required_context_limit < 1:
         raise ValueError("required context limit must be positive")
-    expected = {1, 2, 4, 8, 16, 32, 48}
+    expected = {*FORMAL_CONCURRENCY_GRID, 48}
     observed = {int(row["concurrency"]) for row in rows}
     if observed != expected or len(rows) != len(expected):
         raise ValueError("static load screen must cover the complete grid")
@@ -221,11 +223,13 @@ def select_static_load(
             raise ValueError("static safety counters cannot be negative")
     c1 = next(row for row in rows if int(row["concurrency"]) == 1)
     threshold = 2.0 * float(c1["itl_p99_ms"])
+    confirmation_prompts = LongContinuationAdapter.WINDOWS["confirm"].count
     eligible = [
         row
         for row in rows
         if int(row["oom_events"]) == 0
         and int(row["retractions"]) == 0
+        and int(row["concurrency"]) <= confirmation_prompts
         and int(row["kv_token_capacity"])
         >= int(row["concurrency"]) * required_context_limit
         and float(row["itl_p99_ms"]) <= threshold

@@ -309,23 +309,26 @@ class SGLangHTTPClient:
         *,
         concurrency: int,
     ) -> tuple[tuple[GenerationResult, ...], float]:
+        """Submit one complete queue; SGLang owns the locked admission limit."""
         requests = tuple(payloads)
         if concurrency < 1 or not requests:
             raise ValueError("a non-empty positive-concurrency batch is required")
+        if len(requests) < concurrency:
+            raise ValueError(
+                "the request queue cannot reach the registered concurrency"
+            )
         start_gate = threading.Event()
 
         def invoke(payload: dict) -> GenerationResult:
             start_gate.wait()
             return self.stream_generate(payload)
 
-        results: list[GenerationResult] = []
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
             futures = [executor.submit(invoke, payload) for payload in requests]
             started = time.perf_counter()
             start_gate.set()
-            for future in as_completed(futures):
-                results.append(future.result())
-            elapsed = time.perf_counter() - started
+            results = [future.result() for future in as_completed(futures)]
+        elapsed = time.perf_counter() - started
         return tuple(sorted(results, key=lambda row: row.request_id)), elapsed
 
 
@@ -337,7 +340,7 @@ def independent_method_run(
     concurrency: int,
     adaptation_group_id: str | None,
 ) -> MethodRun:
-    """One measured method owns one timer and one clean cohort state."""
+    """One measured method owns one clean cohort and registered timing unit."""
     if method not in _MEASURED_METHODS:
         raise ValueError("unknown measured method")
     if method != "static" and not adaptation_group_id:
@@ -347,7 +350,8 @@ def independent_method_run(
     if before.target_calls != 0:
         raise RuntimeError("engine reset did not clear target-call counters")
     results, elapsed_s = client.run_loaded_batch(
-        payloads, concurrency=concurrency
+        payloads,
+        concurrency=concurrency,
     )
     after = ServerSnapshot.parse(client.server_info())
     if after.target_calls < 1:

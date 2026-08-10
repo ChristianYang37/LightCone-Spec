@@ -12,8 +12,8 @@ confirmation queue、性能表、GPU attestation 与诊断分析。其结果不�
 本实现针对论文中的测试时 drafter 更新抽象进行 clean-room 重写。依据是
 [OnlineSPEC 论文](https://arxiv.org/abs/2603.12617v2)，并将官方仓库固定在 commit
 [`e58f82e`](https://github.com/ZinYY/OnlineSPEC/tree/e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b)。
-审计时该 commit 没有公开软件许可，因此 LightCone-Spec 没有复制任何源文件、checkpoint
-工具或训练脚本。
+审计时该 commit 没有项目级许可证文件，部分单独文件带有各自声明；LightCone-Spec
+没有复制任何源文件、checkpoint 工具或训练脚本。
 
 机器可读审计记录为
 [`manifests/provenance/onlinespec_source_audit_v2.json`](../../manifests/provenance/onlinespec_source_audit_v2.json)。
@@ -102,7 +102,7 @@ schema、runtime、tuning、confirmation、telemetry 与安全实现。它不表
 由于每个 OnlineSPEC gradient 都经过 global clipping，其 learning rate 表示参数空间位移
 尺度，而不是 Adam 风格的逐坐标步长。注册的 OGD/optimistic 网格因此使用
 `1e-4, 1e-3, 1e-2, 1e-1` 和 stride `20, 40, 80, 160`；Hedge 使用从
-`1e-3` 或 `1e-2` 开始的有序三元组，stride 为 `40, 80, 160`。这些只是
+`1e-4`、`1e-3` 或 `1e-2` 开始的有序三元组，stride 为 `40, 80, 160`。这些只是
 tuning-only 协议边界，不是已报告的最优配置。
 
 ## 在线 learner
@@ -210,10 +210,16 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
 
 1. 只在 tuning window 执行 successive halving。OGD、optimistic OGD 与 Hedge 各自
    独立减半，避免一个 learner 淘汰另一个 learner。
-2. 为每个 learner 选择一个安全 candidate。Selection 绑定完整 terminal tuning
-   artifact、model lock、sampling profile、manifest、负载与 patched SGLang tree。
-3. 在 32 个不重叠 prompt、八个独立随机 block 和 16K–40,960 long region 上，运行配对
-   Static/OGD/optimistic/Hedge confirmation。
+2. 为每个 learner 选择一个安全 candidate。CLI 强制接收核心 Static/TTS/L0
+   selection，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning
+   artifact、model lock、sampling profile、manifest 与 patched SGLang tree。手工指定或
+   不匹配的负载会被拒绝。
+3. 每个 method/block 计时窗都把 32 个不重叠 prompt 各提交一次，并组成一个 start-gated
+   burst。正式 admission limit 不得超过这 32 个唯一 prompt；SGLang 锁定的 admission
+   limit 在不 reset cohort 的情况下排空队列。随后在 16K–40,960 long region
+   上运行八个独立随机 block 的配对
+   Static/OGD/optimistic/Hedge confirmation。Headline 值是整个 batch active decode
+   区间的并集；request 级行只用于诊断。
 4. 对每个 learner 与配对 Static 生成一项诊断比较，并将证据绑定到 GPU attestation。
 5. Profiler 单独运行；同步 trace 不能进入 headline timing。
 
@@ -252,6 +258,6 @@ lightcone-spec verify-onlinespec-source \
   --output /path/to/ignored-artifacts/onlinespec-source-verification.json
 ```
 
-只有 checkout clean，且 commit、tree、13 个审计文件哈希和许可证清单全部匹配时，
+只有 checkout clean，且 commit、tree、18 个审计文件哈希和许可证清单全部匹配时，
 verifier 才会通过。该 checkout 与 receipt 只作为审计输入，不得复制、vendor 或提交到
 LightCone-Spec。

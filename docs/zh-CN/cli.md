@@ -89,8 +89,20 @@ root；upstream 源码继续保留在本仓库之外。从已跟踪的
 Successive halving 在每个 learner 内独立执行。
 
 Terminal selection 绑定完整 terminal-stage artifact 的 SHA-256，而不只是重新序列化的
-winner row。随后 `render-onlinespec-runtime` 输出四个共享端口与设备的描述；Static、OGD、
-optimistic 与 Hedge 必须按 manifest 的随机顺序依次执行。
+winner row。它还强制要求 `--core-selection`，继承其中选定的 Static 并发量，并绑定其
+SHA-256；OnlineSPEC 不再有独立并发覆盖。由于 confirmation 只有 32 个唯一 prompt，
+正式 selection 不可能把并发 48 写成真实负载。随后 `render-onlinespec-runtime` 输出四个
+共享端口与设备的描述；Static、OGD、optimistic 与 Hedge 必须按 manifest 的随机顺序依次执行。
+
+```bash
+lightcone-spec select-onlinespec-config \
+  --measurements artifacts/onlinespec/terminal-tuning.json \
+  --manifest manifests/speed-study/onlinespec_baseline_v2.json \
+  --model-lock artifacts/locks/models.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --core-selection artifacts/selection.json \
+  --output artifacts/onlinespec/selection.json
+```
 
 `analyze-onlinespec-study` 与核心分析使用相同的内容绑定 attestation 纪律。缺少
 attestation 时状态为 `UNMEASURED` 且退出码为 42；attested 证据若有任何安全失败则为
@@ -133,12 +145,14 @@ job，启动其 `launch_argv`、等待健康检查、执行 `run_argv`，然后�
 adaptation config 的 SHA-256；method、optimizer、学习率、rank、stride 或 cohort 任一
 不匹配，都会在提交证据前使该 slice 失效。
 
-`run-confirmation` 每次只执行一个 method/block slice；它会 reset engine/cohort，默认执行
-不计时 warmup，并记录绝对 streaming arrival time。模型的 40,960-token 上限包含 tokenized
-prompt，因此每个 prompt 的生成上限独立计算。
+`run-confirmation` 每次只执行一个 method/block slice；它只 reset 一次 engine/cohort，默认
+执行不计时 warmup，然后将 32 个不同 prompt 以一次 start-gated HTTP burst 全部提交。
+SGLang 锁定的 `max_running_requests` 负责 admission，cohort 在队列排空期间保持连续。它记录
+active decode 区间的并集以及 request 级绝对 streaming arrival time。模型的 40,960-token
+上限包含 tokenized prompt，因此每个 prompt 的生成上限独立计算。
 
 每个完整 slice 最后写入 SHA-256 绑定的 receipt。重复执行相同 job 时，只有在 manifest、
-config、method、block、prompt、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的
+config、method、block、batch window、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的
 中断 shard 永不进入 `speed_study.parquet`；被修改或重复的 terminal 会 fail closed。
 `--no-warmup` 只能用于诊断，不能用于正式协议。
 

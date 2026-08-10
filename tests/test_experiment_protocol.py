@@ -226,6 +226,11 @@ def test_static_load_selection_respects_latency_and_safety() -> None:
     with pytest.raises(ValueError, match="finite and positive"):
         select_static_load(invalid, required_context_limit=40960)
 
+    saturated = load_screen_rows()
+    for row in saturated:
+        row["itl_p99_ms"] = 1.0
+    assert select_static_load(saturated, required_context_limit=40960) == 32
+
 
 def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None:
     manifest = SpeedStudyManifest.default()
@@ -507,6 +512,8 @@ def test_shared_selection_uses_maximin_then_resource_tiebreak(tmp_path) -> None:
     path = tmp_path / "selection.json"
     artifact.write(path)
     assert SelectionArtifact.load(path) == artifact
+    with pytest.raises(ValueError, match="invalid concurrency"):
+        replace(artifact, selected_concurrency=48).validate()
 
 
 def test_selection_rejects_confirmation_or_unsafe_evidence() -> None:
@@ -608,33 +615,64 @@ def performance_rows(
 ) -> list[dict]:
     rows: list[dict] = []
     methods = {"static": 1.0, "tts": speed_tts, "naive_async": speed_l0}
-    for prompt in range(32):
-        for block in range(8):
+    for block in range(8):
+        for method, ratio in methods.items():
+            safety = {
+                "updates_launched": 0 if method == "static" else 4,
+                "updates_published": 0 if method == "static" else 3,
+                "exactness_violations": int(
+                    unsafe and method == "tts" and block == 0
+                ),
+                "version_mismatches": 0,
+                "fallbacks": 0,
+                "nonfinite_updates": 0,
+                "oom_events": 0,
+                "retractions": 0,
+            }
             for bucket in (16384, 24576, 32768):
-                for method, ratio in methods.items():
-                    rows.append(
-                        {
-                            "prompt_id": f"p{prompt}",
-                            "method": method,
-                            "repetition_block": block,
-                            "region": "generated_bucket",
-                            "concurrency": 8,
-                            "generated_bucket_start": bucket,
-                            "at_risk_requests": 8,
-                            "output_tokens": 8192 * 8,
-                            "decode_goodput_tps": 100.0 * ratio,
-                            "updates_launched": 0 if method == "static" else 4,
-                            "updates_published": 0 if method == "static" else 3,
-                            "exactness_violations": int(
-                                unsafe and method == "tts" and prompt == 0
-                            ),
-                            "version_mismatches": 0,
-                            "fallbacks": 0,
-                            "nonfinite_updates": 0,
-                            "oom_events": 0,
-                            "retractions": 0,
-                        }
-                    )
+                rows.append(
+                    {
+                        "prompt_id": "batch-confirmation",
+                        "method": method,
+                        "repetition_block": block,
+                        "region": "generated_bucket",
+                        "concurrency": 8,
+                        "generated_bucket_start": bucket,
+                        "at_risk_requests": 32,
+                        "output_tokens": 8192 * 32,
+                        "decode_goodput_tps": 100.0 * ratio,
+                        **{key: None for key in safety},
+                    }
+                )
+            rows.append(
+                {
+                    "prompt_id": "batch-confirmation",
+                    "method": method,
+                    "repetition_block": block,
+                    "region": "long_region",
+                    "concurrency": 8,
+                    "generated_bucket_start": 16384,
+                    "generated_bucket_end": 40960,
+                    "at_risk_requests": 32,
+                    "output_tokens": 24576 * 32,
+                    "decode_goodput_tps": 100.0 * ratio,
+                    **{key: None for key in safety},
+                }
+            )
+            rows.append(
+                {
+                    "prompt_id": "batch-confirmation",
+                    "method": method,
+                    "repetition_block": block,
+                    "region": "full_trajectory",
+                    "concurrency": 8,
+                    "generated_bucket_start": 0,
+                    "at_risk_requests": 32,
+                    "output_tokens": 40960 * 32,
+                    "decode_goodput_tps": 100.0 * ratio,
+                    **safety,
+                }
+            )
     return rows
 
 
@@ -666,8 +704,8 @@ def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
 
 
 def test_speed_gate_rejects_incomplete_coverage() -> None:
-    with pytest.raises(ValueError, match="32 independent"):
-        evaluate_speed_gate(performance_rows()[:-72])
+    with pytest.raises(ValueError, match="coverage|paired cells"):
+        evaluate_speed_gate(performance_rows()[:-1])
 
 
 def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:

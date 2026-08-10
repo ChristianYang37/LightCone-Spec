@@ -1,4 +1,4 @@
-"""Paired prompt-cluster inference and the formal GPU speed gate."""
+"""Paired repetition-block inference and the formal GPU speed gate."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ def bca_mean_interval(
     repetitions: int = 10_000,
     seed: int = 0,
 ) -> tuple[float, float, float]:
-    """Prompt-cluster BCa interval for the mean paired effect."""
+    """Cluster BCa interval for the mean paired effect."""
     if not 0.0 < confidence < 1.0:
         raise ValueError("confidence must be in (0, 1)")
     if len(cluster_values) < 2:
-        raise ValueError("BCa requires at least two prompt clusters")
+        raise ValueError("BCa requires at least two independent clusters")
     if repetitions < 100:
         raise ValueError("bootstrap repetitions are too small")
     clusters = [
@@ -106,23 +106,20 @@ class SpeedGate:
         )
 
 
-def _validate_coverage(rows: list[dict]) -> dict[tuple[str, int, int], dict[str, dict]]:
+def _validate_coverage(
+    rows: list[dict],
+) -> tuple[dict[int, dict[str, dict]], dict[int, dict[str, dict]]]:
     required_methods = {"static", "tts", "naive_async"}
     if {str(row["method"]) for row in rows} != required_methods:
         raise ValueError("formal gate requires exactly Static, TTS, and L0")
     filtered = [
         row
         for row in rows
-        if str(row.get("region")) == "generated_bucket"
-        and int(row["generated_bucket_start"]) >= 16384
+        if str(row.get("region")) == "long_region"
     ]
-    by_key: dict[tuple[str, int, int], dict[str, dict]] = {}
+    by_key: dict[int, dict[str, dict]] = {}
     for row in filtered:
-        key = (
-            str(row["prompt_id"]),
-            int(row["repetition_block"]),
-            int(row["generated_bucket_start"]),
-        )
+        key = int(row["repetition_block"])
         method_rows = by_key.setdefault(key, {})
         method = str(row["method"])
         if method in method_rows:
@@ -132,18 +129,16 @@ def _validate_coverage(rows: list[dict]) -> dict[tuple[str, int, int], dict[str,
         set(group) != required_methods for group in by_key.values()
     ):
         raise ValueError("paired long-region coverage is incomplete")
-    prompts = {key[0] for key in by_key}
-    blocks = {key[1] for key in by_key}
-    buckets = {key[2] for key in by_key}
-    if len(prompts) != 32:
-        raise ValueError("formal gate requires 32 independent prompt clusters")
+    prompt_batches = {
+        str(row["prompt_id"])
+        for group in by_key.values()
+        for row in group.values()
+    }
+    blocks = set(by_key)
+    if len(prompt_batches) != 1 or not next(iter(prompt_batches)).startswith("batch-"):
+        raise ValueError("formal gate requires one jointly timed confirmation batch")
     if blocks != set(range(8)):
         raise ValueError("formal gate requires eight independent blocks")
-    if buckets != {16384, 24576, 32768}:
-        raise ValueError("formal gate does not cover the complete long region")
-    expected = len(prompts) * len(blocks) * len(buckets)
-    if len(by_key) != expected:
-        raise ValueError("formal gate has duplicate or missing paired cells")
     concurrencies = {
         int(row["concurrency"])
         for group in by_key.values()
@@ -154,9 +149,38 @@ def _validate_coverage(rows: list[dict]) -> dict[tuple[str, int, int], dict[str,
     for group in by_key.values():
         at_risk = {int(row["at_risk_requests"]) for row in group.values()}
         output = {int(row["output_tokens"]) for row in group.values()}
-        if len(at_risk) != 1 or len(output) != 1 or min(at_risk | output) < 1:
+        starts = {int(row["generated_bucket_start"]) for row in group.values()}
+        ends = {int(row["generated_bucket_end"]) for row in group.values()}
+        if (
+            len(at_risk) != 1
+            or len(output) != 1
+            or min(at_risk | output) < 1
+            or starts != {16384}
+            or len(ends) != 1
+            or next(iter(ends)) <= 32768
+        ):
             raise ValueError("paired methods do not share the same at-risk sample")
-    return by_key
+    full_rows = [row for row in rows if str(row.get("region")) == "full_trajectory"]
+    full_by_block: dict[int, dict[str, dict]] = {}
+    for row in full_rows:
+        block = int(row["repetition_block"])
+        method = str(row["method"])
+        methods = full_by_block.setdefault(block, {})
+        if method in methods:
+            raise ValueError("duplicate run-scope performance row")
+        methods[method] = row
+    if set(full_by_block) != set(range(8)) or any(
+        set(methods) != required_methods for methods in full_by_block.values()
+    ):
+        raise ValueError("run-scope safety coverage is incomplete")
+    if any(
+        str(row.get("prompt_id")) not in prompt_batches
+        or int(row.get("concurrency", -1)) not in concurrencies
+        for methods in full_by_block.values()
+        for row in methods.values()
+    ):
+        raise ValueError("run-scope evidence is not bound to the timed batch")
+    return by_key, full_by_block
 
 
 def evaluate_speed_gate(
@@ -174,12 +198,12 @@ def evaluate_speed_gate(
         raise ValueError("unknown GPU evidence state")
     if (gpu_evidence == "MEASURED") != (evidence_sha256 is not None):
         raise ValueError("MEASURED evidence requires exactly one attestation")
-    by_key = _validate_coverage(rows)
+    by_key, full_by_block = _validate_coverage(rows)
     gates: dict[str, MethodSpeedGate] = {}
     for method in ("tts", "naive_async"):
         clusters: dict[str, list[float]] = {}
         safety_pass = True
-        for (prompt_id, _, _), group in by_key.items():
+        for block, group in by_key.items():
             static_goodput = float(group["static"]["decode_goodput_tps"])
             method_goodput = float(group[method]["decode_goodput_tps"])
             if (
@@ -188,9 +212,8 @@ def evaluate_speed_gate(
                 or not np.isfinite([static_goodput, method_goodput]).all()
             ):
                 raise ValueError("goodput must be finite and positive")
-            clusters.setdefault(prompt_id, []).append(
-                method_goodput / static_goodput - 1.0
-            )
+            clusters[str(block)] = [method_goodput / static_goodput - 1.0]
+        for block, group in full_by_block.items():
             for field in (
                 "exactness_violations",
                 "version_mismatches",
@@ -200,12 +223,13 @@ def evaluate_speed_gate(
                 "retractions",
             ):
                 safety_pass &= int(group[method][field]) == 0
+                safety_pass &= int(group["static"][field]) == 0
             safety_pass &= int(group[method]["updates_launched"]) > 0
             safety_pass &= int(group[method]["updates_published"]) > 0
         estimate, lower, upper = bca_mean_interval(
             {
-                prompt: np.asarray(values)
-                for prompt, values in clusters.items()
+                cluster: np.asarray(values)
+                for cluster, values in clusters.items()
             },
             seed=seed + (0 if method == "tts" else 1),
         )

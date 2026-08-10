@@ -26,8 +26,10 @@ Context 按每次 proposal 前真实 `prefix_len_before` 记录。生成位置 b
 ## 负载与调参
 
 Static 独立扫描 concurrency 1、2、4、8、16、32、48。只有 OOM 和 retraction 均为零，
-且 p99 ITL 不超过 Static-c1 两倍的负载才可选。满足条件后选择 decode goodput 最高者，
-并对三种方法固定。
+KV capacity 足以容纳 `concurrency × 40,960`，且 p99 ITL 不超过 Static-c1 两倍的负载
+才可选。满足条件后选择 decode goodput 最高者，并对三种方法固定。选择还要求 32-prompt
+confirmation window 能提供足够的 active request；c48 screen 仍是容量诊断，不能成为只含
+32 个请求的不满载正式负载。
 
 调参对 drafter Full/LoRA 搜索 Adam、AdamW、SGDm、NAG、Muon 与 Lion，并为不同
 optimizer 使用各自的 learning-rate 范围，同时覆盖 rank、stride、weight decay 与全局
@@ -46,8 +48,15 @@ patched tree、load 与 tuning evidence。
 ## 独立 Confirmation
 
 Confirmation 包含八个 repetition block。每个 block 都在每种方法前独立 reset cohort，
-随机排列 Static/TTS/L0，并以相同 prompt、seed、sampling profile 与 load 测量。Warmup
-位于计时区间之外。不同 repetition 不会合并为一个 timer，也不会复制 throughput 数值。
+随机排列 Static/TTS/L0，并将 32 个不同 prompt 以一次 start-gated burst 全部提交。
+SGLang 锁定的 admission limit 负责 continuous batching，队列排空期间不 reset
+engine/cohort。Warmup 位于计时区间之外；每个 method/block batch 只拥有 active decode
+区间的并集，排除 request queue/prefill 空档；不合并 repetition，也不把 batch 指标复制到
+prompt 或 bucket 行。
+
+Request 级 ITL、TTFT、输出 identity 与单请求 decode 诊断独立记录，不能冒充系统聚合
+goodput。Load screen 和早期 tuning stage 只有在 prompt 数少于 concurrency 时，才按完整
+窗口 round-robin 补足负载；confirmation 与自然任务绝不通过复制 prompt 制造并发。
 
 已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
 沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
@@ -61,9 +70,11 @@ coupled-RNG 与分布检查仍是必需的 GPU 测试；stochastic 自然任务�
 
 ## 指标与推断
 
-Headline 指标是 16K 至上限区域和完整轨迹的配对 decode-goodput effect。TTS 与 L0
-分别使用 prompt-cluster BCa 95% 区间对比 Static；二者都必须达到注册的平均提升门槛，
-且置信区间下界大于零。
+Headline 指标来自一条覆盖 16K 至上限的专用 `long_region` batch 记录，以及完整轨迹的
+配对 batch decode-goodput effect；位置 bucket 只用于解释，不会等权平均进 headline。TTS 与
+L0 分别使用 repetition-block BCa 95% 区间对比 Static。Repetition block 才是独立计时
+和随机化单元；把共享同一 wall-clock interval 的 32 个请求当作 32 个独立 goodput 样本
+会构成伪重复。二者都必须达到注册的平均提升门槛，且置信区间下界大于零。
 
 解释性指标保留 survival-weighted accepted prefix、每次 verification 的 committed 与
 verified draft、verification waste、target calls/output token、TTFT、ITL 分位数、各 CUDA
@@ -89,9 +100,10 @@ tuning/confirmation window，但不能读取核心 TTS/L0 tuning row 或 confirm
 三种 learner 在 successive halving 中各自独立缩减，随后每种 learner 选择一个安全配置，
 并与配对 Static reference 比较。
 
-Confirmation 使用 32 个 held-out prompt、八个随机 block、相同 seed、一个锁定
-concurrency，以及相同的 16K 到安全上限区域。派生表分别报告 OGD、optimistic OGD 与
-Hedge，绝不把它们折叠成 best-of-baselines 结果。每项比较都包含配对 BCa 区间、安全
+Confirmation 在每种方法中将 32 个 held-out prompt 各提交一次并进入同一个 SGLang queue，
+同时使用八个随机 block、相同 seed、一个锁定 concurrency，以及相同的 16K 到安全上限
+区域。聚合 goodput 只在八个独立 method/block active-interval 并集上推断，prompt 级行仅用于诊断。派生表分别报告 OGD、
+optimistic OGD 与 Hedge，绝不把它们折叠成 best-of-baselines 结果。每项比较都包含配对 BCa 区间、安全
 计数、update 数、HBM 分类，以及 [OnlineSPEC baseline](onlinespec-baseline.md)定义的
 learner-specific 诊断。
 

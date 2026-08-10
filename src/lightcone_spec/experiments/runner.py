@@ -113,6 +113,92 @@ def _payloads(
     )
 
 
+def _batch_prompt_id(samples: tuple[PromptSample, ...]) -> str:
+    """Return the evidence identity for one jointly timed prompt batch."""
+    if not samples:
+        raise ValueError("a measured prompt batch cannot be empty")
+    identifiers = tuple(sample.sample_id for sample in samples)
+    if any(not identifier for identifier in identifiers) or len(set(identifiers)) != len(
+        identifiers
+    ):
+        raise ValueError("measured prompt IDs must be non-empty and unique")
+    return f"batch-{sample_set_sha256(samples)[:24]}"
+
+
+def _batched_payloads(
+    samples: tuple[PromptSample, ...],
+    *,
+    budgets: dict[str, tuple[int, int]],
+    method: str,
+    block: int,
+    concurrency: int,
+    sampling_profile: SamplingProfile,
+    fill_concurrency: bool,
+) -> tuple[tuple[dict, ...], dict[str, tuple[PromptSample, int, int]]]:
+    """Build one queue of distinct prompts, filling only undersized screens.
+
+    Confirmation and natural-task runs submit each prompt exactly once. Load
+    and early tuning stages may contain fewer prompts than the registered
+    concurrency, so those stages repeat the complete prompt set round-robin
+    only until the selected load is full. The returned request map binds every
+    response to its prompt and context-safe budget without parsing request IDs.
+    """
+    if method not in _EVIDENCE_METHODS:
+        raise ValueError("unknown measured method")
+    if concurrency < 1:
+        raise ValueError("batch concurrency must be positive")
+    _batch_prompt_id(samples)
+    expected_ids = {sample.sample_id for sample in samples}
+    if set(budgets) != expected_ids:
+        raise ValueError("prompt budgets do not match the measured batch")
+    request_count = max(len(samples), concurrency) if fill_concurrency else len(samples)
+    payloads: list[dict] = []
+    assignments: dict[str, tuple[PromptSample, int, int]] = {}
+    for index in range(request_count):
+        sample = samples[index % len(samples)]
+        replica = index // len(samples)
+        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
+        request_id = f"{sample.sample_id}-b{block}-{method}-r{replica}"
+        if request_id in assignments:
+            raise AssertionError("batched request identities are not unique")
+        payloads.append(
+            {
+                "rid": request_id,
+                "text": sample.prompt,
+                "sampling_params": sampling_profile.parameters(
+                    seed=sample.seed + replica,
+                    max_new_tokens=max_new_tokens,
+                ),
+            }
+        )
+        assignments[request_id] = (
+            sample,
+            expected_input_tokens,
+            max_new_tokens,
+        )
+    return tuple(payloads), assignments
+
+
+def _group_results(
+    results: tuple[GenerationResult, ...],
+    assignments: dict[str, tuple[PromptSample, int, int]],
+) -> dict[str, tuple[GenerationResult, ...]]:
+    """Validate result coverage and group replicas by original prompt."""
+    if len(results) != len(assignments):
+        raise RuntimeError("measured batch result coverage is incomplete")
+    observed = {result.request_id for result in results}
+    if len(observed) != len(results) or observed != set(assignments):
+        raise RuntimeError("measured batch returned unknown or duplicate requests")
+    grouped: dict[str, list[GenerationResult]] = {}
+    for result in results:
+        sample, _, _ = assignments[result.request_id]
+        grouped.setdefault(sample.sample_id, []).append(result)
+    return {
+        prompt_id: tuple(sorted(rows, key=lambda row: row.request_id))
+        for prompt_id, rows in grouped.items()
+    }
+
+
 def _percentile(values: list[float], quantile: float) -> float:
     if not values:
         return 0.0
@@ -131,8 +217,7 @@ def _region(
     if not at_risk:
         return None
     output_tokens = 0
-    starts: list[float] = []
-    ends: list[float] = []
+    spans: list[tuple[float, float]] = []
     intervals: list[float] = []
     for result in at_risk:
         stop = min(result.completion_tokens, end)
@@ -140,13 +225,29 @@ def _region(
         if count < 1:
             continue
         output_tokens += count
-        starts.append(result.token_arrival_ms[start])
-        ends.append(result.token_arrival_ms[stop - 1])
         # inter_token_ms[i] is the transition from token i to token i + 1.
-        intervals.extend(result.inter_token_ms[start : stop - 1])
-    if output_tokens < 1 or not starts or not ends:
+        request_intervals = result.inter_token_ms[start : stop - 1]
+        intervals.extend(request_intervals)
+        if request_intervals:
+            spans.append(
+                (
+                    result.token_arrival_ms[start],
+                    result.token_arrival_ms[stop - 1],
+                )
+            )
+    if output_tokens < 1 or not spans or not intervals:
         return None
-    elapsed_s = (max(ends) - min(starts)) / 1000.0
+    spans.sort()
+    active_ms = 0.0
+    active_start, active_end = spans[0]
+    for span_start, span_end in spans[1:]:
+        if span_start > active_end:
+            active_ms += active_end - active_start
+            active_start, active_end = span_start, span_end
+        else:
+            active_end = max(active_end, span_end)
+    active_ms += active_end - active_start
+    elapsed_s = active_ms / 1000.0
     if elapsed_s <= 0:
         raise RuntimeError(
             "decode region has no measurable arrival interval; increase its size"
@@ -384,7 +485,7 @@ def _adaptation_fields(
 def _performance_record(
     *,
     run_id: str,
-    sample: PromptSample,
+    prompt_id: str,
     method: str,
     block: int,
     concurrency: int,
@@ -408,7 +509,7 @@ def _performance_record(
         raise RuntimeError("run-scope performance requires target calls")
     return PerformanceRecord(
         run_id=run_id,
-        prompt_id=sample.sample_id,
+        prompt_id=prompt_id,
         method=method,
         repetition_block=block,
         region=region_name,
@@ -448,29 +549,57 @@ def _performance_record(
         sm_utilization=None,
         dram_utilization=None,
         target_estimated_mfu=None,
-        peak_hbm_bytes=snapshot.peak_hbm_bytes,
-        kv_bytes=snapshot.kv_bytes,
-        optimizer_bytes=int(adaptation["optimizer_bytes"]),
-        adaptation_memory_ledger=adaptation["adaptation_memory_ledger"],
-        trainable_parameters=int(adaptation["trainable_parameters"]),
-        training_cuda_ms=adaptation["training_cuda_ms"],
-        optimizer_cuda_ms=adaptation["optimizer_cuda_ms"],
-        merge_cuda_ms=adaptation["merge_cuda_ms"],
-        publish_cuda_ms=adaptation["publish_cuda_ms"],
-        barrier_cuda_ms=adaptation["barrier_cuda_ms"],
-        exposed_update_ms=adaptation["exposed_update_ms"],
-        main_side_overlap_ratio=adaptation["main_side_overlap_ratio"],
+        peak_hbm_bytes=(snapshot.peak_hbm_bytes if run_scope_metrics else None),
+        kv_bytes=(snapshot.kv_bytes if run_scope_metrics else None),
+        optimizer_bytes=(
+            int(adaptation["optimizer_bytes"]) if run_scope_metrics else None
+        ),
+        adaptation_memory_ledger=(
+            adaptation["adaptation_memory_ledger"] if run_scope_metrics else None
+        ),
+        trainable_parameters=(
+            int(adaptation["trainable_parameters"]) if run_scope_metrics else None
+        ),
+        training_cuda_ms=(adaptation["training_cuda_ms"] if run_scope_metrics else None),
+        optimizer_cuda_ms=(
+            adaptation["optimizer_cuda_ms"] if run_scope_metrics else None
+        ),
+        merge_cuda_ms=(adaptation["merge_cuda_ms"] if run_scope_metrics else None),
+        publish_cuda_ms=(
+            adaptation["publish_cuda_ms"] if run_scope_metrics else None
+        ),
+        barrier_cuda_ms=(
+            adaptation["barrier_cuda_ms"] if run_scope_metrics else None
+        ),
+        exposed_update_ms=(
+            adaptation["exposed_update_ms"] if run_scope_metrics else None
+        ),
+        main_side_overlap_ratio=(
+            adaptation["main_side_overlap_ratio"] if run_scope_metrics else None
+        ),
         graph_replay_hit_rate=(
             snapshot.graph_replay_hit_rate if run_scope_metrics else None
         ),
-        updates_launched=int(adaptation["updates_launched"]),
-        updates_published=int(adaptation["updates_published"]),
-        exactness_violations=int(adaptation["exactness_violations"]),
-        version_mismatches=int(adaptation["version_mismatches"]),
-        fallbacks=int(adaptation["fallbacks"]),
-        nonfinite_updates=int(adaptation["nonfinite_updates"]),
-        oom_events=int(adaptation["oom_events"]),
-        retractions=int(adaptation["retractions"]),
+        updates_launched=(
+            int(adaptation["updates_launched"]) if run_scope_metrics else None
+        ),
+        updates_published=(
+            int(adaptation["updates_published"]) if run_scope_metrics else None
+        ),
+        exactness_violations=(
+            int(adaptation["exactness_violations"]) if run_scope_metrics else None
+        ),
+        version_mismatches=(
+            int(adaptation["version_mismatches"]) if run_scope_metrics else None
+        ),
+        fallbacks=(int(adaptation["fallbacks"]) if run_scope_metrics else None),
+        nonfinite_updates=(
+            int(adaptation["nonfinite_updates"]) if run_scope_metrics else None
+        ),
+        oom_events=(int(adaptation["oom_events"]) if run_scope_metrics else None),
+        retractions=(
+            int(adaptation["retractions"]) if run_scope_metrics else None
+        ),
     )
 
 
@@ -957,93 +1086,70 @@ def measure_controlled_slice(
             adaptation_group_id=adaptation_group_id,
             sampling_profile=sampling_profile,
         )
-    transition_count = 0
-    decode_elapsed_s = 0.0
-    intervals: list[float] = []
-    peak_hbm_bytes = 0
-    kv_bytes = 0
-    kv_token_capacity: int | None = None
-    optimizer_bytes: int | None = None
-    trainable_parameters: int | None = None
-    exposed_update_ms = 0.0
-    counters = {field: 0 for field in _SAFETY_COUNTERS + _UPDATE_COUNTERS}
-    loss_points: list[LossPoint] = []
-    output_trajectories: list[tuple[str, tuple[str, ...]]] = []
-    for sample in samples:
-        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
-        run = independent_method_run(
-            client,
-            method=method,
-            payloads=_payloads(
-                sample,
-                method=method,
-                block=stage,
-                concurrency=concurrency,
-                max_new_tokens=max_new_tokens,
-                sampling_profile=sampling_profile,
-            ),
-            concurrency=concurrency,
-            adaptation_group_id=(None if method == "static" else adaptation_group_id),
+    payloads, assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method=method,
+        block=stage,
+        concurrency=concurrency,
+        sampling_profile=sampling_profile,
+        fill_concurrency=True,
+    )
+    run = independent_method_run(
+        client,
+        method=method,
+        payloads=payloads,
+        concurrency=concurrency,
+        adaptation_group_id=(None if method == "static" else adaptation_group_id),
+    )
+    if run.after.kv_token_capacity < concurrency * context_limit:
+        raise RuntimeError(
+            "KV token capacity cannot sustain the registered load/context cell"
         )
-        if run.after.kv_token_capacity < concurrency * context_limit:
-            raise RuntimeError(
-                "KV token capacity cannot sustain the registered load/context cell"
-            )
-        if any(
+    grouped = _group_results(run.results, assignments)
+    for result in run.results:
+        _, expected_input_tokens, max_new_tokens = assignments[result.request_id]
+        if (
             result.input_tokens != expected_input_tokens
             or result.completion_tokens != max_new_tokens
             or result.stop_reason != "length"
-            for result in run.results
         ):
             raise RuntimeError("controlled slice did not reach its context limit")
-        output_trajectories.append(
-            (
-                sample.sample_id,
-                tuple(sorted(_output_sha256(result) for result in run.results)),
+    output_trajectories = [
+        (
+            sample.sample_id,
+            tuple(_output_sha256(result) for result in grouped[sample.sample_id]),
+        )
+        for sample in samples
+    ]
+    measured = _region(
+        run.results,
+        start=0,
+        end=max(
+            max_new_tokens for _, _, max_new_tokens in assignments.values()
+        ),
+    )
+    if measured is None:
+        raise RuntimeError("controlled slice produced no decode interval")
+    _, _, decode_elapsed_s, intervals = measured
+    transition_count = len(intervals)
+    fields, updates, _rounds = _adaptation_fields(
+        method, run.after, adaptation_config_sha256
+    )
+    loss_points: list[LossPoint] = []
+    for update in updates:
+        prefixes = update.get("prefix_len_before")
+        if not isinstance(prefixes, list) or not prefixes:
+            raise RuntimeError("update loss is not bound to real prefix lengths")
+        resolved = tuple(int(value) for value in prefixes)
+        loss_points.append(
+            LossPoint(
+                prefix_len_min=min(resolved),
+                prefix_len_max=max(resolved),
+                prefix_len_mean=sum(resolved) / len(resolved),
+                loss=float(update["loss"]),
             )
         )
-        measured = _region(run.results, start=0, end=max_new_tokens)
-        if measured is None:
-            raise RuntimeError("controlled slice produced no decode interval")
-        _, _, elapsed_s, measured_intervals = measured
-        transition_count += len(measured_intervals)
-        decode_elapsed_s += elapsed_s
-        intervals.extend(measured_intervals)
-        fields, updates, _rounds = _adaptation_fields(
-            method, run.after, adaptation_config_sha256
-        )
-        peak_hbm_bytes = max(peak_hbm_bytes, run.after.peak_hbm_bytes)
-        kv_bytes = max(kv_bytes, run.after.kv_bytes)
-        if kv_token_capacity is None:
-            kv_token_capacity = run.after.kv_token_capacity
-        elif kv_token_capacity != run.after.kv_token_capacity:
-            raise RuntimeError("KV token capacity changed across controlled prompts")
-        current_optimizer_bytes = int(fields["optimizer_bytes"])
-        current_trainable = int(fields["trainable_parameters"])
-        if optimizer_bytes is None:
-            optimizer_bytes = current_optimizer_bytes
-            trainable_parameters = current_trainable
-        elif (
-            optimizer_bytes != current_optimizer_bytes
-            or trainable_parameters != current_trainable
-        ):
-            raise RuntimeError("adaptation layout changed across controlled prompts")
-        exposed_update_ms += float(fields["exposed_update_ms"] or 0.0)
-        for field in counters:
-            counters[field] += int(fields[field])
-        for update in updates:
-            prefixes = update.get("prefix_len_before")
-            if not isinstance(prefixes, list) or not prefixes:
-                raise RuntimeError("update loss is not bound to real prefix lengths")
-            resolved = tuple(int(value) for value in prefixes)
-            loss_points.append(
-                LossPoint(
-                    prefix_len_min=min(resolved),
-                    prefix_len_max=max(resolved),
-                    prefix_len_mean=sum(resolved) / len(resolved),
-                    loss=float(update["loss"]),
-                )
-            )
     if transition_count < 1 or decode_elapsed_s <= 0:
         raise RuntimeError("controlled slice has no measurable decode work")
     measurement = SliceMeasurement(
@@ -1063,20 +1169,20 @@ def measure_controlled_slice(
         concurrency=concurrency,
         decode_goodput_tps=transition_count / decode_elapsed_s,
         itl_p99_ms=_percentile(intervals, 0.99),
-        peak_hbm_bytes=peak_hbm_bytes,
-        kv_bytes=kv_bytes,
-        kv_token_capacity=kv_token_capacity or 0,
-        optimizer_bytes=optimizer_bytes or 0,
-        trainable_parameters=trainable_parameters or 0,
-        exposed_update_ms=exposed_update_ms,
-        updates_launched=counters["updates_launched"],
-        updates_published=counters["updates_published"],
-        exactness_violations=counters["exactness_violations"],
-        version_mismatches=counters["version_mismatches"],
-        fallbacks=counters["fallbacks"],
-        nonfinite_updates=counters["nonfinite_updates"],
-        oom_events=counters["oom_events"],
-        retractions=counters["retractions"],
+        peak_hbm_bytes=run.after.peak_hbm_bytes,
+        kv_bytes=run.after.kv_bytes,
+        kv_token_capacity=run.after.kv_token_capacity,
+        optimizer_bytes=int(fields["optimizer_bytes"]),
+        trainable_parameters=int(fields["trainable_parameters"]),
+        exposed_update_ms=float(fields["exposed_update_ms"] or 0.0),
+        updates_launched=int(fields["updates_launched"]),
+        updates_published=int(fields["updates_published"]),
+        exactness_violations=int(fields["exactness_violations"]),
+        version_mismatches=int(fields["version_mismatches"]),
+        fallbacks=int(fields["fallbacks"]),
+        nonfinite_updates=int(fields["nonfinite_updates"]),
+        oom_events=int(fields["oom_events"]),
+        retractions=int(fields["retractions"]),
         loss_points=tuple(loss_points),
     )
     measurement.validate()
@@ -1112,25 +1218,25 @@ def _assert_prior_slices_complete(
     study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
     namespace: str = "confirmation",
 ) -> None:
+    batch_prompt_id = _batch_prompt_id(samples)
     for earlier_block, earlier_method in _earlier_slices(
         method=method,
         block=block,
         schedule_seed=schedule_seed,
         study_methods=study_methods,
     ):
-        for sample in samples:
-            run_id = _run_id(
-                manifest_sha256,
-                earlier_block,
-                sample.sample_id,
-                earlier_method,
-                namespace=namespace,
+        run_id = _run_id(
+            manifest_sha256,
+            earlier_block,
+            batch_prompt_id,
+            earlier_method,
+            namespace=namespace,
+        )
+        if load_completed_evidence(output_root, run_id=run_id, rank=0) is None:
+            raise RuntimeError(
+                "confirmation slices must follow the registered randomized "
+                f"order; missing predecessor {earlier_block}/{earlier_method}"
             )
-            if load_completed_evidence(output_root, run_id=run_id, rank=0) is None:
-                raise RuntimeError(
-                    "confirmation slices must follow the registered randomized "
-                    f"order; missing predecessor {earlier_block}/{earlier_method}"
-                )
 
 
 def run_confirmation_slice(
@@ -1193,156 +1299,232 @@ def run_confirmation_slice(
             adaptation_group_id=adaptation_group_id,
             sampling_profile=sampling_profile,
         )
-    written: list[Path] = []
-    for sample in samples:
-        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
-        run_id = _run_id(
-            manifest_sha256,
-            block,
-            sample.sample_id,
-            method,
-            namespace=namespace,
-        )
-        completed = load_completed_evidence(
-            output_root,
-            run_id=run_id,
-            rank=0,
-        )
-        if completed is not None:
-            run_rows = pq.read_table(completed["run"]).to_pylist()
-            performance_rows = pq.read_table(completed["performance"]).to_pylist()
-            expected = {
-                "manifest_sha256": manifest_sha256,
-                "config_sha256": config_sha256,
-                "method": method,
-                "repetition_block": block,
-            }
-            if len(run_rows) != 1 or any(
-                run_rows[0].get(key) != value for key, value in expected.items()
-            ):
-                raise RuntimeError(f"completed run identity mismatch for {run_id}")
-            if any(
-                row.get("prompt_id") != sample.sample_id
+    batch_prompt_id = _batch_prompt_id(samples)
+    run_id = _run_id(
+        manifest_sha256,
+        block,
+        batch_prompt_id,
+        method,
+        namespace=namespace,
+    )
+    completed = load_completed_evidence(output_root, run_id=run_id, rank=0)
+    if completed is not None:
+        run_rows = pq.read_table(completed["run"]).to_pylist()
+        request_rows = pq.read_table(completed["request"]).to_pylist()
+        performance_rows = pq.read_table(completed["performance"]).to_pylist()
+        expected = {
+            "manifest_sha256": manifest_sha256,
+            "config_sha256": config_sha256,
+            "method": method,
+            "repetition_block": block,
+        }
+        if len(run_rows) != 1 or any(
+            run_rows[0].get(key) != value for key, value in expected.items()
+        ):
+            raise RuntimeError(f"completed run identity mismatch for {run_id}")
+        expected_prompt_ids = {sample.sample_id for sample in samples}
+        if (
+            len(request_rows) != len(samples)
+            or {str(row.get("prompt_id")) for row in request_rows}
+            != expected_prompt_ids
+            or any(
+                row.get("method") != method
+                or int(row.get("repetition_block", -1)) != block
                 or int(row.get("concurrency", -1)) != concurrency
-                for row in performance_rows
-            ):
-                raise RuntimeError(
-                    f"completed performance identity mismatch for {run_id}"
-                )
-            written.extend(completed.values())
-            continue
-        started_ns = time.time_ns()
-        run: MethodRun = independent_method_run(
-            client,
-            method=method,
-            payloads=_payloads(
-                sample,
-                method=method,
-                block=block,
-                concurrency=concurrency,
-                max_new_tokens=max_new_tokens,
-                sampling_profile=sampling_profile,
-            ),
-            concurrency=concurrency,
-            adaptation_group_id=(None if method == "static" else adaptation_group_id),
-        )
-        completed_ns = time.time_ns()
-        if any(
+                for row in request_rows
+            )
+        ):
+            raise RuntimeError(f"completed request identity mismatch for {run_id}")
+        batch_rows = [
+            row
+            for row in performance_rows
+            if row.get("prompt_id") == batch_prompt_id
+        ]
+        if (
+            {str(row.get("region")) for row in batch_rows}
+            != {"generated_bucket", "long_region", "full_trajectory"}
+            or any(
+                int(row.get("concurrency", -1)) != concurrency
+                for row in batch_rows
+            )
+        ):
+            raise RuntimeError(f"completed performance identity mismatch for {run_id}")
+        return tuple(completed.values())
+
+    payloads, assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method=method,
+        block=block,
+        concurrency=concurrency,
+        sampling_profile=sampling_profile,
+        fill_concurrency=False,
+    )
+    started_ns = time.time_ns()
+    run: MethodRun = independent_method_run(
+        client,
+        method=method,
+        payloads=payloads,
+        concurrency=concurrency,
+        adaptation_group_id=(None if method == "static" else adaptation_group_id),
+    )
+    completed_ns = time.time_ns()
+    grouped = _group_results(run.results, assignments)
+    for result in run.results:
+        _, expected_input_tokens, max_new_tokens = assignments[result.request_id]
+        if (
             result.input_tokens != expected_input_tokens
             or result.completion_tokens != max_new_tokens
             or result.stop_reason != "length"
-            for result in run.results
         ):
             raise RuntimeError(
                 "controlled run did not reach its exact context-safe limit"
             )
-        adaptation, updates, rounds = _adaptation_fields(
-            method, run.after, adaptation_config_sha256
+    adaptation, updates, rounds = _adaptation_fields(
+        method, run.after, adaptation_config_sha256
+    )
+    with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+        writer.write(
+            RunRecord(
+                run_id=run_id,
+                manifest_sha256=manifest_sha256,
+                config_sha256=config_sha256,
+                method=method,
+                model_pair=model_pair,
+                repetition_block=block,
+                started_ns=started_ns,
+                completed_ns=completed_ns,
+                status="complete",
+            )
         )
-        with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+        for result in run.results:
+            sample, _, _ = assignments[result.request_id]
             writer.write(
-                RunRecord(
+                RequestRecord(
                     run_id=run_id,
-                    manifest_sha256=manifest_sha256,
-                    config_sha256=config_sha256,
+                    request_id=result.request_id,
+                    prompt_id=sample.sample_id,
                     method=method,
-                    model_pair=model_pair,
                     repetition_block=block,
-                    started_ns=started_ns,
-                    completed_ns=completed_ns,
-                    status="complete",
+                    concurrency=concurrency,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.completion_tokens,
+                    output_sha256=_output_sha256(result),
+                    ttft_ms=result.ttft_ms,
+                    finished=result.stop_reason is not None,
+                    stop_reason=result.stop_reason,
                 )
             )
-            for result in run.results:
-                writer.write(
-                    RequestRecord(
-                        run_id=run_id,
-                        request_id=result.request_id,
-                        prompt_id=sample.sample_id,
-                        method=method,
-                        repetition_block=block,
-                        concurrency=concurrency,
-                        input_tokens=result.input_tokens,
-                        output_tokens=result.completion_tokens,
-                        output_sha256=_output_sha256(result),
-                        ttft_ms=result.ttft_ms,
-                        finished=result.stop_reason is not None,
-                        stop_reason=result.stop_reason,
-                    )
-                )
-            for round_record in _round_records(
+        for round_record in _round_records(
+            run_id=run_id,
+            diagnostics=run.after.adaptation,
+            results=run.results,
+            rounds=rounds,
+        ):
+            writer.write(round_record)
+        longest = max(result.completion_tokens for result in run.results)
+        for start, end in GENERATED_TOKEN_BUCKETS:
+            if start >= longest:
+                continue
+            batch_row = _performance_record(
                 run_id=run_id,
-                diagnostics=run.after.adaptation,
+                prompt_id=batch_prompt_id,
+                method=method,
+                block=block,
+                concurrency=concurrency,
+                region_name="generated_bucket",
+                region_start=start,
+                region_end=min(end, longest),
                 results=run.results,
-                rounds=rounds,
-            ):
-                writer.write(round_record)
-            for start, end in GENERATED_TOKEN_BUCKETS:
-                if start >= max_new_tokens:
+                snapshot=run.after,
+                adaptation=adaptation,
+                run_scope_metrics=False,
+            )
+            if batch_row is not None:
+                writer.write(batch_row)
+            for sample in samples:
+                result = grouped[sample.sample_id][0]
+                if min(end, result.completion_tokens) - start < 2:
                     continue
-                row = _performance_record(
+                request_row = _performance_record(
                     run_id=run_id,
-                    sample=sample,
+                    prompt_id=sample.sample_id,
                     method=method,
                     block=block,
                     concurrency=concurrency,
-                    region_name="generated_bucket",
+                    region_name="request_generated_bucket",
                     region_start=start,
-                    region_end=min(end, max_new_tokens),
-                    results=run.results,
+                    region_end=min(end, result.completion_tokens),
+                    results=(result,),
                     snapshot=run.after,
                     adaptation=adaptation,
                     run_scope_metrics=False,
                 )
-                if row is not None:
-                    writer.write(row)
-            full = _performance_record(
+                if request_row is not None:
+                    writer.write(request_row)
+        long_region = _performance_record(
+            run_id=run_id,
+            prompt_id=batch_prompt_id,
+            method=method,
+            block=block,
+            concurrency=concurrency,
+            region_name="long_region",
+            region_start=16384,
+            region_end=longest,
+            results=run.results,
+            snapshot=run.after,
+            adaptation=adaptation,
+            run_scope_metrics=False,
+        )
+        if long_region is None:
+            raise RuntimeError("completed run has no measurable long region")
+        writer.write(long_region)
+        full = _performance_record(
+            run_id=run_id,
+            prompt_id=batch_prompt_id,
+            method=method,
+            block=block,
+            concurrency=concurrency,
+            region_name="full_trajectory",
+            region_start=0,
+            region_end=longest,
+            results=run.results,
+            snapshot=run.after,
+            adaptation=adaptation,
+            run_scope_metrics=True,
+        )
+        if full is None:
+            raise RuntimeError("completed run has no performance row")
+        writer.write(full)
+        for sample in samples:
+            result = grouped[sample.sample_id][0]
+            if result.completion_tokens < 2:
+                continue
+            request_full = _performance_record(
                 run_id=run_id,
-                sample=sample,
+                prompt_id=sample.sample_id,
                 method=method,
                 block=block,
                 concurrency=concurrency,
-                region_name="full_trajectory",
+                region_name="request_full_trajectory",
                 region_start=0,
-                region_end=max_new_tokens,
-                results=run.results,
+                region_end=result.completion_tokens,
+                results=(result,),
                 snapshot=run.after,
                 adaptation=adaptation,
-                run_scope_metrics=True,
+                run_scope_metrics=False,
             )
-            if full is None:
-                raise RuntimeError("completed run has no performance row")
-            writer.write(full)
-            _write_updates(
-                writer,
-                run_id=run_id,
-                method=method,
-                diagnostics=run.after.adaptation,
-                updates=updates,
-            )
-            paths = writer.close()
-            written.extend(paths.values())
-    return tuple(written)
+            if request_full is None:
+                raise RuntimeError("completed request has no performance trajectory")
+            writer.write(request_full)
+        _write_updates(
+            writer,
+            run_id=run_id,
+            method=method,
+            diagnostics=run.after.adaptation,
+            updates=updates,
+        )
+        return tuple(writer.close().values())
 
 
 def _collect_paired_performance(
@@ -1358,69 +1540,86 @@ def _collect_paired_performance(
     if set(config_sha256) != set(methods):
         raise ValueError("collector requires one config identity per method")
     samples = LongContinuationAdapter().window("confirm")
+    batch_prompt_id = _batch_prompt_id(samples)
+    expected_prompt_ids = {sample.sample_id for sample in samples}
     performance: list[Path] = []
     all_evidence: list[Path] = []
     for block in range(8):
-        for sample in samples:
-            paired_outputs: dict[str, tuple[str, ...]] = {}
-            for method in methods:
-                run_id = _run_id(
-                    manifest_sha256,
-                    block,
-                    sample.sample_id,
-                    method,
-                    namespace=namespace,
+        paired_outputs: dict[str, dict[str, str]] = {}
+        for method in methods:
+            run_id = _run_id(
+                manifest_sha256,
+                block,
+                batch_prompt_id,
+                method,
+                namespace=namespace,
+            )
+            completed = load_completed_evidence(
+                evidence_root,
+                run_id=run_id,
+                rank=0,
+            )
+            if completed is None:
+                raise RuntimeError(f"confirmation evidence is incomplete: {run_id}")
+            run_rows = pq.read_table(completed["run"]).to_pylist()
+            request_rows = pq.read_table(completed["request"]).to_pylist()
+            rows = pq.read_table(completed["performance"]).to_pylist()
+            if len(run_rows) != 1 or any(
+                run_rows[0].get(key) != value
+                for key, value in {
+                    "manifest_sha256": manifest_sha256,
+                    "config_sha256": config_sha256[method],
+                    "method": method,
+                    "repetition_block": block,
+                }.items()
+            ):
+                raise RuntimeError(f"confirmation run identity mismatch: {run_id}")
+            batch_rows = [
+                row for row in rows if row.get("prompt_id") == batch_prompt_id
+            ]
+            if (
+                not batch_rows
+                or {str(row.get("region")) for row in batch_rows}
+                != {"generated_bucket", "long_region", "full_trajectory"}
+                or any(
+                    int(row.get("concurrency", -1)) != concurrency
+                    for row in batch_rows
                 )
-                completed = load_completed_evidence(
-                    evidence_root,
-                    run_id=run_id,
-                    rank=0,
+            ):
+                raise RuntimeError(
+                    f"confirmation performance identity mismatch: {run_id}"
                 )
-                if completed is None:
-                    raise RuntimeError(f"confirmation evidence is incomplete: {run_id}")
-                run_rows = pq.read_table(completed["run"]).to_pylist()
-                request_rows = pq.read_table(completed["request"]).to_pylist()
-                rows = pq.read_table(completed["performance"]).to_pylist()
-                if len(run_rows) != 1 or any(
-                    run_rows[0].get(key) != value
-                    for key, value in {
-                        "manifest_sha256": manifest_sha256,
-                        "config_sha256": config_sha256[method],
-                        "method": method,
-                        "repetition_block": block,
-                    }.items()
-                ):
-                    raise RuntimeError(f"confirmation run identity mismatch: {run_id}")
-                if any(
-                    row.get("prompt_id") != sample.sample_id
-                    or int(row.get("concurrency", -1)) != concurrency
-                    for row in rows
-                ):
-                    raise RuntimeError(
-                        f"confirmation performance identity mismatch: {run_id}"
-                    )
-                if len(request_rows) != concurrency or any(
-                    row.get("prompt_id") != sample.sample_id
-                    or row.get("method") != method
+            if (
+                len(request_rows) != len(samples)
+                or {str(row.get("prompt_id")) for row in request_rows}
+                != expected_prompt_ids
+                or any(
+                    row.get("method") != method
                     or int(row.get("repetition_block", -1)) != block
                     or int(row.get("concurrency", -1)) != concurrency
                     or not isinstance(row.get("output_sha256"), str)
                     or len(str(row["output_sha256"])) != 64
                     for row in request_rows
-                ):
-                    raise RuntimeError(
-                        f"confirmation request identity mismatch: {run_id}"
-                    )
-                paired_outputs[method] = tuple(
-                    sorted(str(row["output_sha256"]) for row in request_rows)
                 )
-                performance.append(completed["performance"])
-                all_evidence.extend(completed.values())
-            if len(set(paired_outputs.values())) != 1:
+            ):
                 raise RuntimeError(
-                    "paired greedy methods produced different output trajectories: "
-                    f"block={block}, prompt={sample.sample_id}"
+                    f"confirmation request identity mismatch: {run_id}"
                 )
+            outputs = {
+                str(row["prompt_id"]): str(row["output_sha256"])
+                for row in request_rows
+            }
+            if len(outputs) != len(samples):
+                raise RuntimeError("confirmation prompt outputs are duplicated")
+            paired_outputs[method] = outputs
+            performance.append(completed["performance"])
+            all_evidence.extend(completed.values())
+        reference = paired_outputs[methods[0]]
+        if any(outputs != reference for outputs in paired_outputs.values()):
+            raise RuntimeError(
+                "paired greedy methods produced different output trajectories: "
+                f"block={block}"
+            )
     return tuple(performance), evidence_files_sha256(all_evidence)
 
 
@@ -1518,152 +1717,198 @@ def run_natural_replication_slice(
             adaptation_group_id=adaptation_group_id,
             sampling_profile=sampling_profile,
         )
-    written: list[Path] = []
     namespace = f"natural-{dataset_name}"
-    for sample in samples:
-        expected_input_tokens, max_new_tokens = budgets[sample.sample_id]
-        run_id = _run_id(
-            manifest_sha256,
-            0,
-            sample.sample_id,
-            method,
-            namespace=namespace,
-        )
-        completed = load_completed_evidence(output_root, run_id=run_id, rank=0)
-        if completed is not None:
-            run_rows = pq.read_table(completed["run"]).to_pylist()
-            performance_rows = pq.read_table(completed["performance"]).to_pylist()
-            expected = {
-                "manifest_sha256": manifest_sha256,
-                "config_sha256": config_sha256,
-                "method": method,
-                "repetition_block": 0,
-            }
-            if len(run_rows) != 1 or any(
-                run_rows[0].get(key) != value for key, value in expected.items()
-            ):
-                raise RuntimeError(
-                    f"completed natural run identity mismatch for {run_id}"
-                )
-            if any(
-                row.get("prompt_id") != sample.sample_id
-                or int(row.get("concurrency", -1)) != concurrency
-                or not str(row.get("region", "")).startswith("natural")
+    batch_prompt_id = _batch_prompt_id(samples)
+    run_id = _run_id(
+        manifest_sha256,
+        0,
+        batch_prompt_id,
+        method,
+        namespace=namespace,
+    )
+    completed = load_completed_evidence(output_root, run_id=run_id, rank=0)
+    if completed is not None:
+        run_rows = pq.read_table(completed["run"]).to_pylist()
+        request_rows = pq.read_table(completed["request"]).to_pylist()
+        performance_rows = pq.read_table(completed["performance"]).to_pylist()
+        expected = {
+            "manifest_sha256": manifest_sha256,
+            "config_sha256": config_sha256,
+            "method": method,
+            "repetition_block": 0,
+        }
+        if len(run_rows) != 1 or any(
+            run_rows[0].get(key) != value for key, value in expected.items()
+        ):
+            raise RuntimeError(f"completed natural run identity mismatch for {run_id}")
+        if (
+            len(request_rows) != len(samples)
+            or {str(row.get("prompt_id")) for row in request_rows}
+            != {sample.sample_id for sample in samples}
+            or not any(
+                row.get("prompt_id") == batch_prompt_id
+                and str(row.get("region", "")).startswith("natural")
                 for row in performance_rows
-            ):
-                raise RuntimeError(
-                    f"completed natural performance mismatch for {run_id}"
-                )
-            written.extend(completed.values())
-            continue
-        started_ns = time.time_ns()
-        run = independent_method_run(
-            client,
-            method=method,
-            payloads=_payloads(
-                sample,
-                method=method,
-                block=0,
-                concurrency=concurrency,
-                max_new_tokens=max_new_tokens,
-                sampling_profile=sampling_profile,
-            ),
-            concurrency=concurrency,
-            adaptation_group_id=(None if method == "static" else adaptation_group_id),
-        )
-        completed_ns = time.time_ns()
-        if any(
+            )
+            or any(
+                int(row.get("concurrency", -1)) != concurrency
+                for row in performance_rows
+            )
+        ):
+            raise RuntimeError(f"completed natural evidence mismatch for {run_id}")
+        return tuple(completed.values())
+
+    payloads, assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method=method,
+        block=0,
+        concurrency=concurrency,
+        sampling_profile=sampling_profile,
+        fill_concurrency=False,
+    )
+    started_ns = time.time_ns()
+    run = independent_method_run(
+        client,
+        method=method,
+        payloads=payloads,
+        concurrency=concurrency,
+        adaptation_group_id=(None if method == "static" else adaptation_group_id),
+    )
+    completed_ns = time.time_ns()
+    grouped = _group_results(run.results, assignments)
+    for result in run.results:
+        _, expected_input_tokens, max_new_tokens = assignments[result.request_id]
+        if (
             result.input_tokens != expected_input_tokens
             or result.completion_tokens > max_new_tokens
             or result.stop_reason is None
-            for result in run.results
         ):
             raise RuntimeError("natural run violated its context or terminal contract")
-        adaptation, updates, rounds = _adaptation_fields(
-            method, run.after, adaptation_config_sha256
+    adaptation, updates, rounds = _adaptation_fields(
+        method, run.after, adaptation_config_sha256
+    )
+    with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+        writer.write(
+            RunRecord(
+                run_id=run_id,
+                manifest_sha256=manifest_sha256,
+                config_sha256=config_sha256,
+                method=method,
+                model_pair=model_pair,
+                repetition_block=0,
+                started_ns=started_ns,
+                completed_ns=completed_ns,
+                status="complete",
+            )
         )
-        with EvidenceWriter(output_root, run_id=run_id, rank=0) as writer:
+        for result in run.results:
+            sample, _, _ = assignments[result.request_id]
             writer.write(
-                RunRecord(
+                RequestRecord(
                     run_id=run_id,
-                    manifest_sha256=manifest_sha256,
-                    config_sha256=config_sha256,
+                    request_id=result.request_id,
+                    prompt_id=sample.sample_id,
                     method=method,
-                    model_pair=model_pair,
                     repetition_block=0,
-                    started_ns=started_ns,
-                    completed_ns=completed_ns,
-                    status="complete",
+                    concurrency=concurrency,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.completion_tokens,
+                    output_sha256=_output_sha256(result),
+                    ttft_ms=result.ttft_ms,
+                    finished=True,
+                    stop_reason=result.stop_reason,
                 )
             )
-            for result in run.results:
-                writer.write(
-                    RequestRecord(
-                        run_id=run_id,
-                        request_id=result.request_id,
-                        prompt_id=sample.sample_id,
-                        method=method,
-                        repetition_block=0,
-                        concurrency=concurrency,
-                        input_tokens=result.input_tokens,
-                        output_tokens=result.completion_tokens,
-                        output_sha256=_output_sha256(result),
-                        ttft_ms=result.ttft_ms,
-                        finished=True,
-                        stop_reason=result.stop_reason,
-                    )
-                )
-            for round_record in _round_records(
+        for round_record in _round_records(
+            run_id=run_id,
+            diagnostics=run.after.adaptation,
+            results=run.results,
+            rounds=rounds,
+        ):
+            writer.write(round_record)
+        longest = max(result.completion_tokens for result in run.results)
+        for start, end in GENERATED_TOKEN_BUCKETS:
+            if start >= longest:
+                continue
+            batch_row = _performance_record(
                 run_id=run_id,
-                diagnostics=run.after.adaptation,
+                prompt_id=batch_prompt_id,
+                method=method,
+                block=0,
+                concurrency=concurrency,
+                region_name=f"natural:{dataset_name}",
+                region_start=start,
+                region_end=min(end, longest),
                 results=run.results,
-                rounds=rounds,
-            ):
-                writer.write(round_record)
-            longest = max(result.completion_tokens for result in run.results)
-            for start, end in GENERATED_TOKEN_BUCKETS:
-                if start >= longest:
+                snapshot=run.after,
+                adaptation=adaptation,
+                run_scope_metrics=False,
+            )
+            if batch_row is not None:
+                writer.write(batch_row)
+            for sample in samples:
+                result = grouped[sample.sample_id][0]
+                if min(end, result.completion_tokens) - start < 2:
                     continue
-                row = _performance_record(
+                request_row = _performance_record(
                     run_id=run_id,
-                    sample=sample,
+                    prompt_id=sample.sample_id,
                     method=method,
                     block=0,
                     concurrency=concurrency,
-                    region_name=f"natural:{dataset_name}",
+                    region_name=f"natural_request:{dataset_name}",
                     region_start=start,
-                    region_end=min(end, longest),
-                    results=run.results,
+                    region_end=min(end, result.completion_tokens),
+                    results=(result,),
                     snapshot=run.after,
                     adaptation=adaptation,
                     run_scope_metrics=False,
                 )
-                if row is not None:
-                    writer.write(row)
-            full = _performance_record(
+                if request_row is not None:
+                    writer.write(request_row)
+        full = _performance_record(
+            run_id=run_id,
+            prompt_id=batch_prompt_id,
+            method=method,
+            block=0,
+            concurrency=concurrency,
+            region_name=f"natural_full:{dataset_name}",
+            region_start=0,
+            region_end=longest,
+            results=run.results,
+            snapshot=run.after,
+            adaptation=adaptation,
+            run_scope_metrics=True,
+        )
+        if full is None:
+            raise RuntimeError("natural run has no measurable decode trajectory")
+        writer.write(full)
+        for sample in samples:
+            result = grouped[sample.sample_id][0]
+            if result.completion_tokens < 2:
+                continue
+            request_full = _performance_record(
                 run_id=run_id,
-                sample=sample,
+                prompt_id=sample.sample_id,
                 method=method,
                 block=0,
                 concurrency=concurrency,
-                region_name=f"natural_full:{dataset_name}",
+                region_name=f"natural_request_full:{dataset_name}",
                 region_start=0,
-                region_end=longest,
-                results=run.results,
+                region_end=result.completion_tokens,
+                results=(result,),
                 snapshot=run.after,
                 adaptation=adaptation,
-                run_scope_metrics=True,
+                run_scope_metrics=False,
             )
-            if full is None:
-                raise RuntimeError("natural run has no measurable decode trajectory")
-            writer.write(full)
-            _write_updates(
-                writer,
-                run_id=run_id,
-                method=method,
-                diagnostics=run.after.adaptation,
-                updates=updates,
-            )
-            paths = writer.close()
-            written.extend(paths.values())
-    return tuple(written)
+            if request_full is not None:
+                writer.write(request_full)
+        _write_updates(
+            writer,
+            run_id=run_id,
+            method=method,
+            diagnostics=run.after.adaptation,
+            updates=updates,
+        )
+        return tuple(writer.close().values())

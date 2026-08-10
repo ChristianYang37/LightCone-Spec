@@ -23,9 +23,10 @@ learner equations described by:
   Reference repository: https://github.com/ZinYY/OnlineSPEC
   Audited commit: e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b
 
-The reference repository did not expose a software license at the audited
-commit. No OnlineSPEC source code or checkpoint utility is copied or
-distributed here; the reference is recorded for scientific provenance only.
+The reference repository did not contain a project-level license file at the
+audited commit. Some individual files carry their own notices; no OnlineSPEC
+source code or checkpoint utility is copied or distributed here. The reference
+is recorded for scientific provenance only.
 
 Models and datasets are external artifacts. They are not distributed by this
 repository and remain subject to their respective licenses and terms.

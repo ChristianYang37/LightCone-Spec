@@ -17,6 +17,18 @@ yet been declared.
   paired confirmation, telemetry, memory accounting, and GPU attestation.
 - Streamed OnlineSPEC expert backward passes through one reusable gradient
   scratch while preserving the same cumulative-loss Hedge decision.
+- Covered the source-audited EAGLE3 learning-rate scale in the Hedge tuning
+  grid without selecting hyperparameters from confirmation evidence.
+
+### Changed
+
+- Replaced per-prompt pseudo-load timing with one start-gated distinct-prompt
+  SGLang queue, active-decode interval unions, and repetition-block inference
+  for both the core and OnlineSPEC confirmation protocols.
+- Bound OnlineSPEC source-point gradients to the exact inference proposal
+  value while retaining the differentiable surrogate Jacobian.
+- Bound OnlineSPEC selection to the core Static load selection and capped
+  formal admission at the 32 unique confirmation prompts.
 
 ### Planned
 

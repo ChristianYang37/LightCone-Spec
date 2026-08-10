@@ -15,6 +15,7 @@ import numpy as np
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments.data import LongContinuationAdapter, sample_set_sha256
 from lightcone_spec.experiments.protocol import (
+    FORMAL_CONCURRENCY_GRID,
     TUNING_STAGES,
     successive_halving,
     tuning_stage,
@@ -284,7 +285,11 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                         )
                     )
     for stride in (40, 80, 160):
-        for learning_rate in (1e-3, 1e-2):
+        # The pinned EAGLE3 ensemble recipe includes a 1e-4 base rate.  The
+        # normalized single-step loss used here is not numerically identical
+        # to that multi-epoch recipe, so retain a logarithmic tuning grid
+        # instead of copying a claimed winner, but do not omit its scale.
+        for learning_rate in (1e-4, 1e-3, 1e-2):
             for hedge_learning_rate in (0.1, 0.5, 1.0):
                 rows.append(
                     OnlineSpecCandidate(
@@ -326,6 +331,9 @@ class OnlineSpecManifest:
     confirmation_window_sha256: str
     confirmation_repetitions: int
     confirmation_schedule_seed: int
+    request_scheduling: str
+    headline_timing_unit: str
+    inference_cluster_unit: str
     formal_context_start: int
     safe_context_limit: int
     gpu_evidence: str
@@ -357,6 +365,9 @@ class OnlineSpecManifest:
             confirmation_window_sha256=sample_set_sha256(data.window("confirm")),
             confirmation_repetitions=8,
             confirmation_schedule_seed=20260810,
+            request_scheduling="distinct_prompt_cohort_queue",
+            headline_timing_unit="method_repetition_batch",
+            inference_cluster_unit="repetition_block",
             formal_context_start=16384,
             safe_context_limit=40960,
             gpu_evidence="UNMEASURED",
@@ -565,6 +576,7 @@ class OnlineSpecSelection:
     model_lock_sha256: str
     sampling_profile_sha256: str
     tuning_evidence_sha256: str
+    reference_core_selection_sha256: str
     patched_sglang_tree: str
 
     def validate(self) -> None:
@@ -575,7 +587,7 @@ class OnlineSpecSelection:
             != ONLINE_SPEC_METHODS
         ):
             raise ValueError("selection requires one ordered candidate per method")
-        if self.selected_concurrency not in {1, 2, 4, 8, 16, 32, 48}:
+        if self.selected_concurrency not in FORMAL_CONCURRENCY_GRID:
             raise ValueError("OnlineSPEC selection load is invalid")
         for candidate in self.selected:
             candidate.validate()
@@ -584,6 +596,7 @@ class OnlineSpecSelection:
             self.model_lock_sha256,
             self.sampling_profile_sha256,
             self.tuning_evidence_sha256,
+            self.reference_core_selection_sha256,
         ):
             if len(value) != 64 or any(
                 char not in "0123456789abcdef" for char in value
@@ -602,7 +615,17 @@ class OnlineSpecSelection:
     @classmethod
     def load(cls, path: str | Path) -> OnlineSpecSelection:
         value = _load_bound(path)
-        selected = tuple(OnlineSpecCandidate(**row) for row in value.pop("selected"))
+        selected = tuple(
+            OnlineSpecCandidate(
+                **{
+                    **row,
+                    "additional_learning_rates": tuple(
+                        row.get("additional_learning_rates", ())
+                    ),
+                }
+            )
+            for row in value.pop("selected")
+        )
         artifact = cls(selected=selected, **value)
         artifact.validate()
         return artifact
@@ -616,6 +639,7 @@ def select_onlinespec(
     manifest_sha256: str,
     model_lock_sha256: str,
     sampling_profile_sha256: str,
+    reference_core_selection_sha256: str,
     tuning_evidence_sha256: str | None = None,
 ) -> OnlineSpecSelection:
     rows = tuple(measurements)
@@ -658,6 +682,7 @@ def select_onlinespec(
         model_lock_sha256=model_lock_sha256,
         sampling_profile_sha256=sampling_profile_sha256,
         tuning_evidence_sha256=evidence,
+        reference_core_selection_sha256=reference_core_selection_sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
     )
     artifact.validate()
@@ -731,16 +756,11 @@ def compare_onlinespec(
     filtered = [
         row
         for row in rows
-        if row.get("region") == "generated_bucket"
-        and int(row["generated_bucket_start"]) >= 16384
+        if row.get("region") == "long_region"
     ]
-    grouped: dict[tuple[str, int, int], dict[str, dict]] = {}
+    grouped: dict[int, dict[str, dict]] = {}
     for row in filtered:
-        key = (
-            str(row["prompt_id"]),
-            int(row["repetition_block"]),
-            int(row["generated_bucket_start"]),
-        )
+        key = int(row["repetition_block"])
         if str(row["method"]) in grouped.setdefault(key, {}):
             raise ValueError("duplicate OnlineSPEC paired cell")
         grouped[key][str(row["method"])] = row
@@ -748,17 +768,16 @@ def compare_onlinespec(
         set(group) != set(ONLINE_SPEC_STUDY_METHODS) for group in grouped.values()
     ):
         raise ValueError("OnlineSPEC paired coverage is incomplete")
-    prompts = {key[0] for key in grouped}
-    blocks = {key[1] for key in grouped}
-    buckets = {key[2] for key in grouped}
+    prompt_batches = {
+        str(row["prompt_id"]) for group in grouped.values() for row in group.values()
+    }
+    blocks = set(grouped)
     if (
-        len(prompts) != 32
+        len(prompt_batches) != 1
+        or not next(iter(prompt_batches)).startswith("batch-")
         or blocks != set(range(8))
-        or buckets != {16384, 24576, 32768}
     ):
         raise ValueError("OnlineSPEC comparison does not cover the registered matrix")
-    if len(grouped) != len(prompts) * len(blocks) * len(buckets):
-        raise ValueError("OnlineSPEC comparison contains missing paired cells")
     concurrencies = {
         int(row["concurrency"]) for group in grouped.values() for row in group.values()
     }
@@ -767,8 +786,40 @@ def compare_onlinespec(
     for group in grouped.values():
         at_risk = {int(row["at_risk_requests"]) for row in group.values()}
         output = {int(row["output_tokens"]) for row in group.values()}
-        if len(at_risk) != 1 or len(output) != 1 or min(at_risk | output) < 1:
+        starts = {int(row["generated_bucket_start"]) for row in group.values()}
+        ends = {int(row["generated_bucket_end"]) for row in group.values()}
+        if (
+            len(at_risk) != 1
+            or len(output) != 1
+            or min(at_risk | output) < 1
+            or starts != {16384}
+            or len(ends) != 1
+            or next(iter(ends)) <= 32768
+        ):
             raise ValueError("OnlineSPEC methods do not share the paired work")
+    full_rows = [
+        row for row in rows if str(row.get("region")) == "full_trajectory"
+    ]
+    full_by_block: dict[int, dict[str, dict]] = {}
+    for row in full_rows:
+        block = int(row["repetition_block"])
+        method = str(row["method"])
+        methods = full_by_block.setdefault(block, {})
+        if method in methods:
+            raise ValueError("duplicate OnlineSPEC run-scope row")
+        methods[method] = row
+    if set(full_by_block) != set(range(8)) or any(
+        set(methods) != set(ONLINE_SPEC_STUDY_METHODS)
+        for methods in full_by_block.values()
+    ):
+        raise ValueError("OnlineSPEC run-scope safety coverage is incomplete")
+    if any(
+        str(row.get("prompt_id")) not in prompt_batches
+        or int(row.get("concurrency", -1)) not in concurrencies
+        for methods in full_by_block.values()
+        for row in methods.values()
+    ):
+        raise ValueError("OnlineSPEC run-scope evidence uses another batch")
     results = []
     safety_fields = (
         "exactness_violations",
@@ -781,7 +832,7 @@ def compare_onlinespec(
     for index, method in enumerate(ONLINE_SPEC_METHODS):
         clusters: dict[str, list[float]] = {}
         safe = True
-        for (prompt, _, _), group in grouped.items():
+        for block, group in grouped.items():
             baseline = float(group["static"]["decode_goodput_tps"])
             measured = float(group[method]["decode_goodput_tps"])
             if (
@@ -789,9 +840,11 @@ def compare_onlinespec(
                 or not np.isfinite([baseline, measured]).all()
             ):
                 raise ValueError("OnlineSPEC goodput must be finite and positive")
-            clusters.setdefault(prompt, []).append(measured / baseline - 1.0)
+            clusters[str(block)] = [measured / baseline - 1.0]
+        for group in full_by_block.values():
             safe &= all(int(group[method][field]) == 0 for field in safety_fields)
             safe &= all(int(group["static"][field]) == 0 for field in safety_fields)
+            safe &= int(group[method]["updates_launched"]) > 0
             safe &= int(group[method]["updates_published"]) > 0
         estimate, lower, upper = bca_mean_interval(
             {key: np.asarray(value) for key, value in clusters.items()},

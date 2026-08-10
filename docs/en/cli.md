@@ -93,9 +93,23 @@ its single paired Static reference per stage, and advance all registered stages
 before selection. Successive halving runs independently inside each learner.
 
 The terminal selection binds the SHA-256 of the complete terminal-stage
-artifact, not merely a reserialized winner row. `render-onlinespec-runtime`
-then emits four descriptions sharing one port and device; execute Static, OGD,
-optimistic, and Hedge sequentially in the manifest's randomized order.
+artifact, not merely a reserialized winner row. It also requires
+`--core-selection`, inherits that artifact's selected Static concurrency, and
+binds its SHA-256; there is no independent OnlineSPEC concurrency override.
+Because confirmation contains 32 unique prompts, a formal selection cannot
+claim concurrency 48. `render-onlinespec-runtime` then emits four descriptions
+sharing one port and device; execute Static, OGD, optimistic, and Hedge
+sequentially in the manifest's randomized order.
+
+```bash
+lightcone-spec select-onlinespec-config \
+  --measurements artifacts/onlinespec/terminal-tuning.json \
+  --manifest manifests/speed-study/onlinespec_baseline_v2.json \
+  --model-lock artifacts/locks/models.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --core-selection artifacts/selection.json \
+  --output artifacts/onlinespec/selection.json
+```
 
 `analyze-onlinespec-study` requires the same content-bound attestation discipline
 as the core analysis. Without it, the status is `UNMEASURED` and exit code is
@@ -148,13 +162,16 @@ method, optimizer, learning-rate, rank, stride, or cohort mismatch invalidates
 the slice before evidence is committed.
 
 `run-confirmation` executes exactly one method/block slice. It resets the
-engine/cohort, performs an unmeasured warmup by default, and records absolute
-streaming arrival times. The model's 40,960-token limit includes the tokenized
+engine/cohort once, performs an unmeasured warmup by default, then submits all
+32 distinct prompts once in one start-gated HTTP burst. SGLang's locked
+`max_running_requests` performs admission while the cohort remains continuous.
+It records the union of active decode intervals plus request-level absolute
+streaming arrivals. The model's 40,960-token limit includes the tokenized
 prompt; generation is capped separately for every prompt.
 
 Each completed slice ends with a SHA-256-bound receipt. Re-running the same job
 skips it only after validating its manifest, config, method, block, prompt,
-load, and every bound shard. Interrupted shards without a receipt never enter
+batch window, load, and every bound shard. Interrupted shards without a receipt never enter
 `speed_study.parquet`; a changed or duplicate terminal fails closed. Use
 `--no-warmup` only for diagnostics, not the formal protocol.
 
