@@ -13,7 +13,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
 from lightcone_spec.experiments.data import (
@@ -27,6 +27,7 @@ from lightcone_spec.experiments.evidence import (
     evidence_files_sha256,
 )
 from lightcone_spec.experiments.onlinespec import (
+    ONLINE_SPEC_METHODS,
     ONLINE_SPEC_STUDY_METHODS,
     OnlineSpecCandidate,
     OnlineSpecGpuAttestation,
@@ -37,6 +38,7 @@ from lightcone_spec.experiments.onlinespec import (
     onlinespec_candidates,
     reduce_onlinespec_tuning_stage,
     select_onlinespec,
+    select_onlinespec_heldout_anchor,
     verify_onlinespec_source_checkout,
 )
 from lightcone_spec.experiments.protocol import (
@@ -245,6 +247,15 @@ def _parser() -> argparse.ArgumentParser:
     select_online.add_argument("--sampling-profile", required=True)
     select_online.add_argument("--core-selection", required=True)
     select_online.add_argument("--output", required=True)
+
+    select_online_anchor = commands.add_parser("select-onlinespec-anchor-config")
+    select_online_anchor.add_argument("--measurements", nargs=4, required=True)
+    select_online_anchor.add_argument("--candidate-ids", nargs=3, required=True)
+    select_online_anchor.add_argument("--manifest", required=True)
+    select_online_anchor.add_argument("--model-lock", required=True)
+    select_online_anchor.add_argument("--sampling-profile", required=True)
+    select_online_anchor.add_argument("--core-selection", required=True)
+    select_online_anchor.add_argument("--output", required=True)
 
     lock = commands.add_parser("lock-models")
     lock.add_argument("--output", required=True)
@@ -702,6 +713,78 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
         sampling_profile_sha256=sampling.sha256,
         reference_core_selection_sha256=core_selection.sha256,
         tuning_evidence_sha256=_canonical_sha256(value),
+    )
+    selection.write(args.output)
+    print(selection.sha256)
+    return 0
+
+
+def _select_onlinespec_anchor(args: argparse.Namespace) -> int:
+    manifest = OnlineSpecManifest.load(args.manifest)
+    lock = ModelLock.load(args.model_lock)
+    sampling = SamplingProfile.load(args.sampling_profile)
+    core_selection = SelectionArtifact.load(args.core_selection)
+    if sampling.sha256 != manifest.sampling_profile_sha256:
+        raise ValueError("OnlineSPEC manifest uses another sampling profile")
+    if (
+        core_selection.manifest_sha256 != SpeedStudyManifest.default().sha256
+        or core_selection.model_lock_sha256 != lock.sha256
+        or core_selection.sampling_profile_sha256 != sampling.sha256
+    ):
+        raise ValueError(
+            "OnlineSPEC selection requires the registered core Static load"
+        )
+    candidate_ids = tuple(args.candidate_ids)
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("OnlineSPEC anchor candidate identities must be unique")
+    registered = {
+        candidate.candidate_id: candidate for candidate in onlinespec_candidates()
+    }
+    try:
+        candidates = {
+            candidate_id: registered[candidate_id] for candidate_id in candidate_ids
+        }
+    except KeyError as exc:
+        raise ValueError(
+            "OnlineSPEC anchor is outside the registered tuning grid"
+        ) from exc
+    if {candidate.method for candidate in candidates.values()} != set(
+        ONLINE_SPEC_METHODS
+    ):
+        raise ValueError("OnlineSPEC anchor requires one candidate per learner")
+    measurements = tuple(SliceMeasurement.load(path) for path in args.measurements)
+    expected_count, expected_context = tuning_stage(len(TUNING_STAGES) - 1)
+    expected_window = sample_set_sha256(
+        LongContinuationAdapter().window("tune")[:expected_count]
+    )
+    if any(
+        row.manifest_sha256 != manifest.sha256
+        or row.model_lock_sha256 != lock.sha256
+        or row.sampling_profile_sha256 != sampling.sha256
+        or row.window_sha256 != expected_window
+        or row.prompt_count != expected_count
+        or row.context_limit != expected_context
+        for row in measurements
+    ):
+        raise ValueError(
+            "OnlineSPEC anchor measurement identity is not terminal tuning evidence"
+        )
+    evidence = _canonical_sha256(
+        {
+            "selection_protocol": "heldout_anchor",
+            "candidate_ids": sorted(candidate_ids),
+            "measurement_sha256": sorted(row.sha256 for row in measurements),
+        }
+    )
+    selection = select_onlinespec_heldout_anchor(
+        measurements,
+        candidates=candidates,
+        selected_concurrency=core_selection.selected_concurrency,
+        manifest_sha256=manifest.sha256,
+        model_lock_sha256=lock.sha256,
+        sampling_profile_sha256=sampling.sha256,
+        reference_core_selection_sha256=core_selection.sha256,
+        tuning_evidence_sha256=evidence,
     )
     selection.write(args.output)
     print(selection.sha256)
@@ -1970,7 +2053,7 @@ def _attest(args: argparse.Namespace) -> int:
         or source_tree.get("tree") != PINNED_SGLANG_TREE
         or source_tree.get("dirty") is not False
         or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != 7
+        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
     ):
         raise ValueError(
             "GPU attestation requires doctor --path on the exact clean patched checkout"
@@ -2041,7 +2124,7 @@ def _attest_onlinespec(args: argparse.Namespace) -> int:
         or source_tree.get("tree") != PINNED_SGLANG_TREE
         or source_tree.get("dirty") is not False
         or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != 7
+        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
     ):
         raise ValueError("OnlineSPEC attestation requires the exact patched checkout")
     attestation = OnlineSpecGpuAttestation(
@@ -2155,6 +2238,10 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             "status": status,
             "attestation_sha256": attestation_sha256,
             "core_speed_gate_affected": False,
+            "selection_protocol": selection.selection_protocol,
+            "optimized_grid_claim": (
+                selection.selection_protocol == "successive_halving"
+            ),
             "comparisons": [asdict(row) for row in comparisons],
         },
     )
@@ -2215,6 +2302,8 @@ def main(argv: list[str] | None = None) -> int:
         return _select_anchor(args)
     if args.command == "select-onlinespec-config":
         return _select_onlinespec(args)
+    if args.command == "select-onlinespec-anchor-config":
+        return _select_onlinespec_anchor(args)
     if args.command == "render-runtime":
         return _render_runtime(args)
     if args.command == "render-onlinespec-runtime":

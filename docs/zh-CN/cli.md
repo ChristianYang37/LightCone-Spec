@@ -42,6 +42,7 @@
 | `run-onlinespec-tuning-slice` | 测量一个 learner tuning slice |
 | `advance-onlinespec-tuning-stage` | 在每个 learner 内独立减半 candidate |
 | `select-onlinespec-config` | 为每个 learner 选择一个安全 terminal candidate |
+| `select-onlinespec-anchor-config` | 锁定三个 terminal learner anchor，且不声称全网格最优 |
 | `render-onlinespec-runtime` | 渲染 Static 与三个互斥对比 endpoint |
 | `build-onlinespec-queue` | 注册随机化 clean-server 对比 job |
 | `run-onlinespec-confirmation` | 执行一个 method/block 对比 slice |
@@ -89,6 +90,13 @@ root；upstream 源码继续保留在本仓库之外。从已跟踪的
 及其唯一配对 Static reference 渲染运行时，并在 selection 前完成全部注册 stage。
 Successive halving 在每个 learner 内独立执行。
 
+若只做范围较窄的复现，`select-onlinespec-anchor-config` 必须同时接收各一个已注册的
+OGD、optimistic、Hedge candidate，以及包含配对 Static 在内的四个完整 terminal tuning
+slice；它仍强制绑定核心 selection 和 16-prompt/40,928-token terminal tuning window。
+产物会标记为 `heldout_anchor`，可以进入同一套独立 confirmation 与 attestation，但
+`optimized_grid_claim` 固定为 false。该入口不能读取 confirmation 证据，也不能把 pilot
+改写成正式结果。
+
 Terminal selection 绑定完整 terminal-stage artifact 的 SHA-256，而不只是重新序列化的
 winner row。它还强制要求 `--core-selection`，继承其中选定的 Static 并发量，并绑定其
 SHA-256；OnlineSPEC 不再有独立并发覆盖。由于 confirmation 只有 32 个唯一 prompt，
@@ -108,8 +116,9 @@ lightcone-spec select-onlinespec-config \
 `analyze-onlinespec-study` 与核心分析使用相同的内容绑定 attestation 纪律。缺少
 attestation 时状态为 `UNMEASURED` 且退出码为 42；attested 证据若有任何安全失败则为
 `BLOCKED`，同样退出 42。安全的实测输出仍然只是诊断，并固定
-`core_speed_gate_affected=false`。完整公式、源码审计边界和显存账本见
-[OnlineSPEC baseline](onlinespec-baseline.md)。
+`core_speed_gate_affected=false`。输出还会记录 `selection_protocol` 与
+`optimized_grid_claim`，因此 anchor 不可能被写成 exhaustive grid optimum。完整公式、
+源码审计边界和显存账本见 [OnlineSPEC baseline](onlinespec-baseline.md)。
 
 ## 负载扫描与调参
 

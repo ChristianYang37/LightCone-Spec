@@ -43,6 +43,7 @@ family:
 | `run-onlinespec-tuning-slice` | Measure one learner tuning slice |
 | `advance-onlinespec-tuning-stage` | Halve candidates independently per learner |
 | `select-onlinespec-config` | Select one safe terminal candidate per learner |
+| `select-onlinespec-anchor-config` | Lock three terminal learner anchors without claiming grid optimality |
 | `render-onlinespec-runtime` | Render Static plus three exclusive comparison endpoints |
 | `build-onlinespec-queue` | Register randomized clean-server comparison jobs |
 | `run-onlinespec-confirmation` | Execute one method/block comparison slice |
@@ -93,6 +94,14 @@ Start from the tracked
 its single paired Static reference per stage, and advance all registered stages
 before selection. Successive halving runs independently inside each learner.
 
+For a narrowly scoped reproduction, `select-onlinespec-anchor-config` accepts
+exactly one registered OGD, optimistic, and Hedge candidate plus their four
+complete terminal tuning slices (including paired Static). It still requires
+the core selection and terminal 16-prompt/40,928-token tuning window. The
+result is labeled `heldout_anchor`; it may enter the same independent
+confirmation and attestation path, but `optimized_grid_claim` remains false.
+It cannot read confirmation evidence or convert a pilot into a formal result.
+
 The terminal selection binds the SHA-256 of the complete terminal-stage
 artifact, not merely a reserialized winner row. It also requires
 `--core-selection`, inherits that artifact's selected Static concurrency, and
@@ -116,8 +125,10 @@ lightcone-spec select-onlinespec-config \
 as the core analysis. Without it, the status is `UNMEASURED` and exit code is
 42. Attested evidence with any safety failure is `BLOCKED` and also exits 42.
 A safe measured output remains diagnostic and sets
-`core_speed_gate_affected=false`. Full equations, source-audit boundaries, and
-memory accounting are documented in [OnlineSPEC baseline](onlinespec-baseline.md).
+`core_speed_gate_affected=false`. The output also records `selection_protocol`
+and `optimized_grid_claim`, so an anchor can never be reported as an exhaustive
+grid optimum. Full equations, source-audit boundaries, and memory accounting
+are documented in [OnlineSPEC baseline](onlinespec-baseline.md).
 
 ## Load screen and tuning
 

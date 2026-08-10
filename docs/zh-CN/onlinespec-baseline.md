@@ -221,6 +221,10 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
    selection，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning
    artifact、model lock、sampling profile、manifest 与 patched SGLang tree。手工指定或
    不匹配的负载会被拒绝。
+   范围较窄的复现也可以通过 `select-onlinespec-anchor-config` 为每个 learner 锁定恰好
+   一个已注册 terminal candidate。该路径必须同时接收完整 terminal tuning window 上的
+   配对 Static 和三个 learner slice，并把 artifact 标记为 `heldout_anchor`；它绝不声称
+   exhaustive grid optimum。
 3. 每个 method/block 计时窗都把 32 个不重叠 prompt 各提交一次，并组成一个有序的原生
    batch 请求。正式 admission limit 不得超过这 32 个唯一 prompt；SGLang 锁定的 admission
    limit 在不 reset cohort 的情况下排空队列。随后在已注册的 16K–40,928 安全 long
@@ -238,7 +242,8 @@ build-onlinespec-study        list-onlinespec-candidates
 verify-onlinespec-source
 render-onlinespec-tuning-runtime
 run-onlinespec-tuning-slice  advance-onlinespec-tuning-stage
-select-onlinespec-config     render-onlinespec-runtime
+select-onlinespec-config     select-onlinespec-anchor-config
+render-onlinespec-runtime
 build-onlinespec-queue       run-onlinespec-confirmation
 collect-onlinespec-study     attest-onlinespec-study
 analyze-onlinespec-study
@@ -246,7 +251,8 @@ analyze-onlinespec-study
 
 准确参数以 `lightcone-spec COMMAND --help` 为准。生成的 selection、性能数据与
 attestation 必须保存在 ignored artifact root。该比较是重要证据，但
-`analyze-onlinespec-study` 会显式输出 `core_speed_gate_affected=false`。
+`analyze-onlinespec-study` 会显式输出 `core_speed_gate_affected=false`、
+`selection_protocol` 与 `optimized_grid_claim`。
 
 ## 复现声明
 

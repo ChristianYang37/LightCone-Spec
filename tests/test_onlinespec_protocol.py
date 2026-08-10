@@ -30,6 +30,7 @@ from lightcone_spec.experiments.onlinespec import (
     onlinespec_candidates,
     reduce_onlinespec_tuning_stage,
     select_onlinespec,
+    select_onlinespec_heldout_anchor,
     verify_onlinespec_source_checkout,
 )
 from lightcone_spec.experiments.protocol import (
@@ -228,6 +229,7 @@ def test_onlinespec_selection_is_per_method_tuning_only_and_fail_closed() -> Non
         candidate == by_method[candidate.method][1] for candidate in selection.selected
     )
     assert selection.tuning_evidence_sha256 == "d" * 64
+    assert selection.selection_protocol == "successive_halving"
     unsafe = [
         replace(row, safety_violations=1)
         for row in evidence
@@ -342,6 +344,54 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
     selected = OnlineSpecSelection.load(output)
     assert selected.selected_concurrency == 8
     assert selected.reference_core_selection_sha256 == core_selection.sha256
+    assert selected.selection_protocol == "successive_halving"
+
+    anchor_rows = [tuning_slice(None, 100.0, static=True)]
+    anchor_rows.extend(
+        tuning_slice(candidates[method], 101.0) for method in ONLINE_SPEC_METHODS
+    )
+    anchor_paths = []
+    for index, row in enumerate(anchor_rows):
+        terminal_row = replace(
+            row,
+            stage=len(TUNING_STAGES) - 1,
+            manifest_sha256=manifest.sha256,
+            model_lock_sha256=lock.sha256,
+            sampling_profile_sha256=sampling.sha256,
+            window_sha256=manifest.tuning_window_sha256,
+            prompt_count=16,
+            context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+            concurrency=8,
+        )
+        path = tmp_path / f"anchor-{index}.json"
+        terminal_row.write(path)
+        anchor_paths.append(path)
+    anchor_output = tmp_path / "onlinespec-anchor-selection.json"
+    assert (
+        main(
+            [
+                "select-onlinespec-anchor-config",
+                "--measurements",
+                *(str(path) for path in anchor_paths),
+                "--candidate-ids",
+                *(candidates[method].candidate_id for method in ONLINE_SPEC_METHODS),
+                "--manifest",
+                str(manifest_path),
+                "--model-lock",
+                str(lock_path),
+                "--sampling-profile",
+                str(sampling_path),
+                "--core-selection",
+                str(core_selection_path),
+                "--output",
+                str(anchor_output),
+            ]
+        )
+        == 0
+    )
+    anchor = OnlineSpecSelection.load(anchor_output)
+    assert anchor.selection_protocol == "heldout_anchor"
+    assert tuple(row.method for row in anchor.selected) == ONLINE_SPEC_METHODS
 
     mismatched = replace(core_selection, selected_concurrency=4)
     mismatched_path = tmp_path / "mismatched-core-selection.json"
@@ -400,6 +450,53 @@ def tuning_slice(candidate, goodput, *, static=False, unsafe=False) -> SliceMeas
         retractions=0,
         loss_points=() if static else (LossPoint(1, 1, 1.0, 0.5),),
     )
+
+
+def test_onlinespec_anchor_requires_safe_terminal_paired_measurements() -> None:
+    selected = {
+        method: next(
+            candidate
+            for candidate in onlinespec_candidates()
+            if candidate.method == method
+        )
+        for method in ONLINE_SPEC_METHODS
+    }
+    candidates = {candidate.candidate_id: candidate for candidate in selected.values()}
+    rows = [tuning_slice(None, 100.0, static=True)]
+    rows.extend(tuning_slice(selected[method], 101.0) for method in ONLINE_SPEC_METHODS)
+    rows = [
+        replace(
+            row,
+            stage=len(TUNING_STAGES) - 1,
+            prompt_count=16,
+            context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        )
+        for row in rows
+    ]
+    selection = select_onlinespec_heldout_anchor(
+        rows,
+        candidates=candidates,
+        selected_concurrency=8,
+        manifest_sha256="a" * 64,
+        model_lock_sha256="d" * 64,
+        sampling_profile_sha256="e" * 64,
+        reference_core_selection_sha256="2" * 64,
+        tuning_evidence_sha256="3" * 64,
+    )
+    assert selection.selection_protocol == "heldout_anchor"
+    assert tuple(row.method for row in selection.selected) == ONLINE_SPEC_METHODS
+    unsafe = [rows[0], replace(rows[1], exactness_violations=1), *rows[2:]]
+    with pytest.raises(ValueError, match="no safe candidate|failed"):
+        select_onlinespec_heldout_anchor(
+            unsafe,
+            candidates=candidates,
+            selected_concurrency=8,
+            manifest_sha256="a" * 64,
+            model_lock_sha256="d" * 64,
+            sampling_profile_sha256="e" * 64,
+            reference_core_selection_sha256="2" * 64,
+            tuning_evidence_sha256="3" * 64,
+        )
 
 
 def test_onlinespec_tuning_halves_each_learner_without_confirmation_leakage() -> None:

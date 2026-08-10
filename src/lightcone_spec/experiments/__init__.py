@@ -11,6 +11,7 @@ from .onlinespec import (
     compare_onlinespec,
     onlinespec_candidates,
     select_onlinespec,
+    select_onlinespec_heldout_anchor,
 )
 from .protocol import (
     ConfirmationBlock,
@@ -49,6 +50,7 @@ __all__ = [
     "onlinespec_candidates",
     "select_heldout_anchor",
     "select_onlinespec",
+    "select_onlinespec_heldout_anchor",
     "select_shared_config",
     "tuning_candidates",
 ]

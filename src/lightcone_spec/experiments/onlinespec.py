@@ -586,6 +586,7 @@ class OnlineSpecSelection:
     tuning_evidence_sha256: str
     reference_core_selection_sha256: str
     patched_sglang_tree: str
+    selection_protocol: str = "successive_halving"
 
     def validate(self) -> None:
         if self.schema_version != 2 or self.patched_sglang_tree != PINNED_SGLANG_TREE:
@@ -597,6 +598,11 @@ class OnlineSpecSelection:
             raise ValueError("selection requires one ordered candidate per method")
         if self.selected_concurrency not in FORMAL_CONCURRENCY_GRID:
             raise ValueError("OnlineSPEC selection load is invalid")
+        if self.selection_protocol not in {
+            "successive_halving",
+            "heldout_anchor",
+        }:
+            raise ValueError("OnlineSPEC selection uses an unknown protocol")
         for candidate in self.selected:
             candidate.validate()
         for value in (
@@ -623,6 +629,7 @@ class OnlineSpecSelection:
     @classmethod
     def load(cls, path: str | Path) -> OnlineSpecSelection:
         value = _load_bound(path)
+        value.setdefault("selection_protocol", "successive_halving")
         selected = tuple(
             OnlineSpecCandidate(
                 **{
@@ -649,6 +656,7 @@ def select_onlinespec(
     sampling_profile_sha256: str,
     reference_core_selection_sha256: str,
     tuning_evidence_sha256: str | None = None,
+    selection_protocol: str = "successive_halving",
 ) -> OnlineSpecSelection:
     rows = tuple(measurements)
     if not rows:
@@ -692,9 +700,58 @@ def select_onlinespec(
         tuning_evidence_sha256=evidence,
         reference_core_selection_sha256=reference_core_selection_sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
+        selection_protocol=selection_protocol,
     )
     artifact.validate()
     return artifact
+
+
+def select_onlinespec_heldout_anchor(
+    measurements: Iterable[SliceMeasurement],
+    *,
+    candidates: dict[str, OnlineSpecCandidate],
+    selected_concurrency: int,
+    manifest_sha256: str,
+    model_lock_sha256: str,
+    sampling_profile_sha256: str,
+    reference_core_selection_sha256: str,
+    tuning_evidence_sha256: str,
+) -> OnlineSpecSelection:
+    """Lock one safe terminal candidate per learner without a grid-optimum claim."""
+    if (
+        len(candidates) != len(ONLINE_SPEC_METHODS)
+        or {candidate.method for candidate in candidates.values()}
+        != set(ONLINE_SPEC_METHODS)
+        or any(
+            candidate_id != candidate.candidate_id
+            for candidate_id, candidate in candidates.items()
+        )
+    ):
+        raise ValueError(
+            "OnlineSPEC anchor requires one registered candidate per learner"
+        )
+    rows = tuple(measurements)
+    if any(row.concurrency != selected_concurrency for row in rows):
+        raise ValueError("OnlineSPEC anchor load differs from the core Static load")
+    survivors, reduced = reduce_onlinespec_tuning_stage(
+        rows,
+        candidates=candidates,
+        active_candidate_ids=tuple(candidates),
+        stage=len(TUNING_STAGES) - 1,
+    )
+    if survivors != tuple(sorted(candidates)):
+        raise ValueError("an OnlineSPEC anchor failed its terminal safety gate")
+    return select_onlinespec(
+        reduced,
+        candidates=candidates,
+        selected_concurrency=selected_concurrency,
+        manifest_sha256=manifest_sha256,
+        model_lock_sha256=model_lock_sha256,
+        sampling_profile_sha256=sampling_profile_sha256,
+        reference_core_selection_sha256=reference_core_selection_sha256,
+        tuning_evidence_sha256=tuning_evidence_sha256,
+        selection_protocol="heldout_anchor",
+    )
 
 
 @dataclass(frozen=True)

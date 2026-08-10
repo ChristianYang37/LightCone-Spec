@@ -266,6 +266,11 @@ separate evidence identities:
    binds its SHA-256. The OnlineSPEC selection also binds the complete terminal
    tuning artifact, model lock, sampling profile, manifest, and patched SGLang
    tree. A manually supplied or mismatched load is rejected.
+   A reproduction may instead lock exactly one registered terminal candidate
+   per learner through `select-onlinespec-anchor-config`. That path requires
+   paired Static plus all three learner slices on the complete terminal tuning
+   window and labels the artifact `heldout_anchor`; it never claims an
+   exhaustive grid optimum.
 3. In each method/block interval, submit all 32 disjoint prompts exactly once
    in one ordered native batch request. The formal admission limit cannot exceed
    those 32 unique prompts; SGLang's locked admission limit drains the queue
@@ -287,7 +292,8 @@ build-onlinespec-study        list-onlinespec-candidates
 verify-onlinespec-source
 render-onlinespec-tuning-runtime
 run-onlinespec-tuning-slice  advance-onlinespec-tuning-stage
-select-onlinespec-config     render-onlinespec-runtime
+select-onlinespec-config     select-onlinespec-anchor-config
+render-onlinespec-runtime
 build-onlinespec-queue       run-onlinespec-confirmation
 collect-onlinespec-study     attest-onlinespec-study
 analyze-onlinespec-study
@@ -296,7 +302,8 @@ analyze-onlinespec-study
 Use `lightcone-spec COMMAND --help` for exact arguments. Generated selections,
 performance data, and attestations remain under the ignored artifact root.
 The comparison is important evidence, but `analyze-onlinespec-study` explicitly
-reports `core_speed_gate_affected=false`.
+reports `core_speed_gate_affected=false`, `selection_protocol`, and
+`optimized_grid_claim`.
 
 ## Reproduction claim
 

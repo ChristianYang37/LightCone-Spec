@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE, __version__
+from lightcone_spec import (
+    PINNED_SGLANG_COMMIT,
+    PINNED_SGLANG_PATCH_COUNT,
+    PINNED_SGLANG_TREE,
+    __version__,
+)
 from lightcone_spec.cli.main import main
 from lightcone_spec.doctor import _command, doctor_report
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
@@ -100,7 +105,7 @@ def test_patch_manifest_binds_series_files_and_tree() -> None:
         if line.strip()
     ]
     assert series == [entry["file"] for entry in manifest["patches"]]
-    assert len(series) == 8
+    assert len(series) == PINNED_SGLANG_PATCH_COUNT
     for entry in manifest["patches"]:
         patch = PATCH_ROOT / entry["file"]
         assert patch.is_file()
@@ -252,5 +257,6 @@ def test_cli_help_contains_only_focused_workflow(capsys) -> None:
     assert "attest-speed-study" in output
     assert "run-onlinespec-tuning-slice" in output
     assert "advance-onlinespec-tuning-stage" in output
+    assert "select-onlinespec-anchor-config" in output
     assert "run-onlinespec-confirmation" in output
     assert "attest-onlinespec-study" in output
