@@ -1561,7 +1561,7 @@ def _collect_paired_performance(
     performance: list[Path] = []
     all_evidence: list[Path] = []
     for block in range(8):
-        paired_outputs: dict[str, dict[str, str]] = {}
+        paired_outputs: dict[str, dict[str, tuple[int, int, str]]] = {}
         for method in methods:
             run_id = _run_id(
                 manifest_sha256,
@@ -1613,8 +1613,15 @@ def _collect_paired_performance(
                     row.get("method") != method
                     or int(row.get("repetition_block", -1)) != block
                     or int(row.get("concurrency", -1)) != concurrency
+                    or int(row.get("input_tokens", 0)) < 1
+                    or int(row.get("output_tokens", 0)) < 1
+                    or int(row.get("input_tokens", 0))
+                    + int(row.get("output_tokens", 0))
+                    != DFLASH_SAFE_CONTEXT_LIMIT
                     or not isinstance(row.get("output_sha256"), str)
                     or len(str(row["output_sha256"])) != 64
+                    or row.get("finished") is not True
+                    or row.get("stop_reason") != "length"
                     for row in request_rows
                 )
             ):
@@ -1622,11 +1629,48 @@ def _collect_paired_performance(
                     f"confirmation request identity mismatch: {run_id}"
                 )
             outputs = {
-                str(row["prompt_id"]): str(row["output_sha256"])
+                str(row["prompt_id"]): (
+                    int(row["input_tokens"]),
+                    int(row["output_tokens"]),
+                    str(row["output_sha256"]),
+                )
                 for row in request_rows
             }
             if len(outputs) != len(samples):
                 raise RuntimeError("confirmation prompt outputs are duplicated")
+            completion_lengths = tuple(value[1] for value in outputs.values())
+            expected_end = max(completion_lengths)
+            expected_long_at_risk = sum(
+                completion > 16384 for completion in completion_lengths
+            )
+            expected_long_output = sum(
+                max(completion - 16384, 0) for completion in completion_lengths
+            )
+            long_rows = [
+                row for row in batch_rows if row.get("region") == "long_region"
+            ]
+            full_rows = [
+                row for row in batch_rows if row.get("region") == "full_trajectory"
+            ]
+            if (
+                len(long_rows) != 1
+                or int(long_rows[0].get("generated_bucket_start", -1)) != 16384
+                or int(long_rows[0].get("generated_bucket_end", -1)) != expected_end
+                or int(long_rows[0].get("at_risk_requests", -1))
+                != expected_long_at_risk
+                or int(long_rows[0].get("output_tokens", -1))
+                != expected_long_output
+                or len(full_rows) != 1
+                or int(full_rows[0].get("generated_bucket_start", -1)) != 0
+                or int(full_rows[0].get("generated_bucket_end", -1))
+                != expected_end
+                or int(full_rows[0].get("at_risk_requests", -1)) != len(samples)
+                or int(full_rows[0].get("output_tokens", -1))
+                != sum(completion_lengths)
+            ):
+                raise RuntimeError(
+                    f"confirmation performance/request work mismatch: {run_id}"
+                )
             paired_outputs[method] = outputs
             performance.append(completed["performance"])
             all_evidence.extend(completed.values())

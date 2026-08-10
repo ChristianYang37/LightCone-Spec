@@ -164,6 +164,18 @@ def _validate_coverage(
     }
     if len(concurrencies) != 1 or next(iter(concurrencies)) < 1:
         raise ValueError("formal methods must share one positive load")
+    long_ends = {
+        int(row["generated_bucket_end"])
+        for group in by_key.values()
+        for row in group.values()
+    }
+    if (
+        len(long_ends) != 1
+        or not 16384 < next(iter(long_ends)) < DFLASH_SAFE_CONTEXT_LIMIT
+    ):
+        raise ValueError(
+            "long-region bounds must be shared generated-token positions"
+        )
     for group in by_key.values():
         at_risk = {int(row["at_risk_requests"]) for row in group.values()}
         output = {int(row["output_tokens"]) for row in group.values()}
@@ -174,7 +186,7 @@ def _validate_coverage(
             or len(output) != 1
             or min(at_risk | output) < 1
             or starts != {16384}
-            or ends != {DFLASH_SAFE_CONTEXT_LIMIT}
+            or ends != long_ends
         ):
             raise ValueError("paired methods do not share the same at-risk sample")
     full_rows = [row for row in rows if str(row.get("region")) == "full_trajectory"]

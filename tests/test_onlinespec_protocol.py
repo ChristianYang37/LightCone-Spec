@@ -557,6 +557,7 @@ def test_onlinespec_tuning_halves_each_learner_without_confirmation_leakage() ->
 
 def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     rows = []
+    generated_limit = DFLASH_SAFE_CONTEXT_LIMIT - 49
     ratios = {
         "static": 1.0,
         "onlinespec_ogd": 1.01,
@@ -597,10 +598,10 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
                     "repetition_block": block,
                     "region": "long_region",
                     "generated_bucket_start": 16384,
-                    "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
+                    "generated_bucket_end": generated_limit,
                     "concurrency": 4,
                     "at_risk_requests": 32,
-                    "output_tokens": (DFLASH_SAFE_CONTEXT_LIMIT - 16384) * 32,
+                    "output_tokens": (generated_limit - 16384) * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }
@@ -623,6 +624,17 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     assert [row.method for row in result] == list(ONLINE_SPEC_METHODS)
     assert result[0].mean_speedup == pytest.approx(0.01)
     assert result[2].mean_speedup == pytest.approx(-0.01)
+    invalid_bounds = [
+        {
+            **row,
+            "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
+        }
+        if row["region"] == "long_region"
+        else row
+        for row in rows
+    ]
+    with pytest.raises(ValueError, match="generated-token positions"):
+        compare_onlinespec(invalid_bounds, seed=7)
     assert [row.acceleration_pass for row in result] == [False, True, False]
     assert [row.passed for row in result] == [False, True, False]
     unsafe_rows = [dict(row) for row in rows]
@@ -640,7 +652,7 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     next(row for row in short if row["region"] == "long_region")[
         "generated_bucket_end"
     ] = 32768
-    with pytest.raises(ValueError, match="paired work"):
+    with pytest.raises(ValueError, match="bounds|paired work"):
         compare_onlinespec(short)
 
 

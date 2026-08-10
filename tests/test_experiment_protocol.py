@@ -734,6 +734,7 @@ def performance_rows(
     *, speed_tts: float = 1.05, speed_l0: float = 1.06, unsafe: bool = False
 ) -> list[dict]:
     rows: list[dict] = []
+    generated_limit = DFLASH_SAFE_CONTEXT_LIMIT - 49
     methods = {"static": 1.0, "tts": speed_tts, "naive_async": speed_l0}
     for block in range(8):
         for method, ratio in methods.items():
@@ -770,9 +771,9 @@ def performance_rows(
                     "region": "long_region",
                     "concurrency": 8,
                     "generated_bucket_start": 16384,
-                    "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
+                    "generated_bucket_end": generated_limit,
                     "at_risk_requests": 32,
-                    "output_tokens": (DFLASH_SAFE_CONTEXT_LIMIT - 16384) * 32,
+                    "output_tokens": (generated_limit - 16384) * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }
@@ -801,6 +802,22 @@ def test_speed_gate_never_claims_unattested_gpu_success() -> None:
     assert gate.tts.acceleration_pass
     assert gate.naive_async.acceleration_pass
     assert gate.l0_vs_tts.no_worse_pass
+
+
+def test_speed_gate_distinguishes_generated_position_from_total_context() -> None:
+    rows = performance_rows()
+    assert evaluate_speed_gate(rows, seed=1).tts.acceleration_pass
+    invalid = [
+        {
+            **row,
+            "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
+        }
+        if row["region"] == "long_region"
+        else row
+        for row in rows
+    ]
+    with pytest.raises(ValueError, match="generated-token positions"):
+        evaluate_speed_gate(invalid, seed=1)
 
 
 def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
@@ -846,6 +863,8 @@ def test_speed_gate_requires_l0_to_be_noninferior_to_tts() -> None:
     assert tied.l0_vs_tts.ci_lower == pytest.approx(0.0)
     assert tied.l0_vs_tts.passed
     assert tied.status == "PASS"
+
+
 def test_speed_gate_rejects_incomplete_coverage() -> None:
     with pytest.raises(ValueError, match="coverage|paired cells"):
         evaluate_speed_gate(performance_rows()[:-1])
@@ -853,7 +872,7 @@ def test_speed_gate_rejects_incomplete_coverage() -> None:
     next(row for row in short if row["region"] == "long_region")[
         "generated_bucket_end"
     ] = 32768
-    with pytest.raises(ValueError, match="same at-risk sample"):
+    with pytest.raises(ValueError, match="bounds|same at-risk sample"):
         evaluate_speed_gate(short)
 
 
