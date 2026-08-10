@@ -57,6 +57,11 @@ after exactness and stability checks. Ties prefer lower peak HBM, then lower
 p99 ITL, then lower exposed update time. The immutable selection artifact binds
 the grid, tuning window, model lock, patched tree, load, and tuning evidence.
 
+For a narrowly scoped reproduction, a registered-grid anchor may instead be
+locked from a complete terminal tuning triplet. That artifact is explicitly
+labeled `heldout_anchor`: it uses the same independent confirmation and GPU
+gate, but makes no claim that the anchor is the grid optimum.
+
 ## Independent confirmation
 
 Confirmation has eight repetition blocks. Every block independently resets the

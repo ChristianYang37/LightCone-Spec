@@ -22,6 +22,7 @@ from .sampling import SamplingProfile
 from .selection import (
     CandidateMeasurement,
     SelectionArtifact,
+    select_heldout_anchor,
     select_shared_config,
 )
 from .statistics import SpeedGate, evaluate_speed_gate
@@ -46,6 +47,7 @@ __all__ = [
     "evaluate_speed_gate",
     "evidence_files_sha256",
     "onlinespec_candidates",
+    "select_heldout_anchor",
     "select_onlinespec",
     "select_shared_config",
     "tuning_candidates",

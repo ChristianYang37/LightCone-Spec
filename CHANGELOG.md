@@ -22,6 +22,8 @@ yet been declared.
   and is never silently downgraded.
 - Covered the source-audited EAGLE3 learning-rate scale in the Hedge tuning
   grid without selecting hyperparameters from confirmation evidence.
+- Added a held-out anchor confirmation path that can reproduce a locked
+  registered configuration without claiming exhaustive grid optimality.
 
 ### Changed
 

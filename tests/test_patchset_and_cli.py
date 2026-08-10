@@ -248,6 +248,7 @@ def test_cli_help_contains_only_focused_workflow(capsys) -> None:
     assert "run-natural-slice" in output
     assert "build-profiler-plan" in output
     assert "select-speed-config" in output
+    assert "select-anchor-config" in output
     assert "attest-speed-study" in output
     assert "run-onlinespec-tuning-slice" in output
     assert "advance-onlinespec-tuning-stage" in output

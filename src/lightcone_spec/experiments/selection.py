@@ -160,9 +160,7 @@ class SliceMeasurement:
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def write(self, path: str | Path) -> None:
@@ -238,15 +236,19 @@ class CandidateMeasurement:
 
     @property
     def safe(self) -> bool:
-        return self.updates_launched > 0 and self.updates_published > 0 and all(
-            int(getattr(self, name)) == 0
-            for name in (
-                "exactness_violations",
-                "version_mismatches",
-                "fallbacks",
-                "nonfinite_updates",
-                "oom_events",
-                "retractions",
+        return (
+            self.updates_launched > 0
+            and self.updates_published > 0
+            and all(
+                int(getattr(self, name)) == 0
+                for name in (
+                    "exactness_violations",
+                    "version_mismatches",
+                    "fallbacks",
+                    "nonfinite_updates",
+                    "oom_events",
+                    "retractions",
+                )
             )
         )
 
@@ -299,8 +301,7 @@ def reduce_tuning_stage(
         ):
             raise ValueError("tuning slices are not paired to the Static baseline")
     if set(grouped) != set(active_candidate_ids) or any(
-        set(methods) != {"tts", "naive_async"}
-        for methods in grouped.values()
+        set(methods) != {"tts", "naive_async"} for methods in grouped.values()
     ):
         raise ValueError("tuning stage coverage is incomplete")
     rows: list[CandidateMeasurement] = []
@@ -365,6 +366,7 @@ class SelectionArtifact:
     model_lock_sha256: str
     patched_sglang_tree: str
     tuning_evidence_sha256: str
+    selection_protocol: str = "successive_halving"
 
     @property
     def candidate_id(self) -> str:
@@ -372,9 +374,7 @@ class SelectionArtifact:
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def validate(self) -> None:
@@ -384,6 +384,11 @@ class SelectionArtifact:
             raise ValueError("selection artifact has an invalid concurrency")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("selection artifact uses the wrong runtime tree")
+        if self.selection_protocol not in {
+            "successive_halving",
+            "heldout_anchor",
+        }:
+            raise ValueError("selection artifact uses an unknown protocol")
         for name in (
             "minimum_goodput_ratio",
             "itl_p99_ms",
@@ -423,6 +428,7 @@ class SelectionArtifact:
     def load(cls, path: str | Path) -> SelectionArtifact:
         source = Path(path)
         value = json.loads(source.read_text(encoding="utf-8"))
+        value.setdefault("selection_protocol", "successive_halving")
         candidate = TuningCandidate(**value.pop("candidate"))
         artifact = cls(candidate=candidate, **value)
         artifact.validate()
@@ -444,6 +450,7 @@ def select_shared_config(
     tuning_window_sha256: str,
     model_lock_sha256: str,
     tuning_evidence_sha256: str | None = None,
+    selection_protocol: str = "successive_halving",
 ) -> SelectionArtifact:
     if not measurements:
         raise ValueError("selection requires tuning measurements")
@@ -480,14 +487,10 @@ def select_shared_config(
     winner = grouped[winner_id]
     canonical_rows = [
         asdict(row)
-        for row in sorted(
-            measurements, key=lambda row: (row.candidate_id, row.method)
-        )
+        for row in sorted(measurements, key=lambda row: (row.candidate_id, row.method))
     ]
     rows_hash = hashlib.sha256(
-        json.dumps(
-            canonical_rows, sort_keys=True, separators=(",", ":")
-        ).encode()
+        json.dumps(canonical_rows, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     evidence_hash = tuning_evidence_sha256 or rows_hash
     artifact = SelectionArtifact(
@@ -499,9 +502,7 @@ def select_shared_config(
         ),
         peak_hbm_bytes=max(row.peak_hbm_bytes for row in winner.values()),
         itl_p99_ms=max(row.itl_p99_ms for row in winner.values()),
-        exposed_update_ms=max(
-            row.exposed_update_ms for row in winner.values()
-        ),
+        exposed_update_ms=max(row.exposed_update_ms for row in winner.values()),
         manifest_sha256=manifest_sha256,
         sampling_profile_sha256=sampling_profile_sha256,
         tuning_grid_sha256=tuning_grid_sha256,
@@ -510,6 +511,55 @@ def select_shared_config(
         model_lock_sha256=model_lock_sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
         tuning_evidence_sha256=evidence_hash,
+        selection_protocol=selection_protocol,
     )
     artifact.validate()
     return artifact
+
+
+def select_heldout_anchor(
+    measurements: list[SliceMeasurement],
+    *,
+    candidate: TuningCandidate,
+    selected_concurrency: int,
+    manifest_sha256: str,
+    sampling_profile_sha256: str,
+    tuning_grid_sha256: str,
+    load_screen_sha256: str,
+    tuning_window_sha256: str,
+    model_lock_sha256: str,
+    tuning_evidence_sha256: str,
+) -> SelectionArtifact:
+    """Lock one tuning-window anchor without claiming grid optimality.
+
+    This path exists for a faithful held-out reproduction: the anchor may be
+    chosen from diagnostic tuning evidence, but it must be re-measured on the
+    complete terminal tuning slice before any confirmation prompt is touched.
+    It deliberately shares the same safety, pairing, and confirmation runtime
+    as the exhaustive successive-halving path.
+    """
+    survivors, rows = reduce_tuning_stage(
+        measurements,
+        candidates={candidate.candidate_id: candidate},
+        active_candidate_ids=(candidate.candidate_id,),
+        stage=len(TUNING_STAGES) - 1,
+    )
+    if survivors != (candidate.candidate_id,):
+        raise ValueError("held-out anchor did not survive its tuning safety gate")
+    if any(
+        measurement.concurrency != selected_concurrency for measurement in measurements
+    ):
+        raise ValueError("held-out anchor load differs from the Static load screen")
+    return select_shared_config(
+        list(rows),
+        candidates={candidate.candidate_id: candidate},
+        selected_concurrency=selected_concurrency,
+        manifest_sha256=manifest_sha256,
+        sampling_profile_sha256=sampling_profile_sha256,
+        tuning_grid_sha256=tuning_grid_sha256,
+        load_screen_sha256=load_screen_sha256,
+        tuning_window_sha256=tuning_window_sha256,
+        model_lock_sha256=model_lock_sha256,
+        tuning_evidence_sha256=tuning_evidence_sha256,
+        selection_protocol="heldout_anchor",
+    )

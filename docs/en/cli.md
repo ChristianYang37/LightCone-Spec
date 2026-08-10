@@ -20,6 +20,7 @@
 | `collect-static-load-screen` | Validate the Static load grid and select the load |
 | `advance-tuning-stage` | Validate a tuning stage and write its survivor set |
 | `select-speed-config` | Apply the tuning-only maximin rule |
+| `select-anchor-config` | Lock one terminal tuning anchor for held-out reproduction |
 | `render-runtime` | Emit matched sequential confirmation configs and argv |
 | `build-confirmation-queue` | Register the 24 clean-server confirmation jobs |
 | `run-confirmation` | Execute one method/block confirmation slice |
@@ -146,6 +147,14 @@ optimizer candidates into one identity.
 paired Static/TTS/L0 coverage, safety counters, and survivor identity. A later
 stage must name the prior survivor artifact; confirmation data is never an
 input.
+
+`select-anchor-config` is the narrower reproduction path. It requires a
+complete terminal tuning-window Static/TTS/L0 triplet, the full Static load
+screen, and an anchor that already belongs to the registered grid. Its
+selection artifact is labeled `heldout_anchor`; it can establish the held-out
+speed of that locked configuration but never claims grid optimality. It cannot
+consume confirmation evidence or bypass any confirmation, attestation, or
+safety gate.
 
 ## Confirmation and resume
 

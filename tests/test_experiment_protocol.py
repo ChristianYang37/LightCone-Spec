@@ -44,6 +44,7 @@ from lightcone_spec.experiments.selection import (
     SelectionArtifact,
     SliceMeasurement,
     reduce_tuning_stage,
+    select_heldout_anchor,
     select_shared_config,
 )
 from lightcone_spec.experiments.statistics import (
@@ -222,39 +223,34 @@ def load_screen_rows() -> list[dict]:
 def test_static_load_selection_respects_latency_and_safety() -> None:
     rows = load_screen_rows()
     # c16 and above exceed twice the c1 p99 (22 ms).
-    assert select_static_load(
-        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-    ) == 8
+    assert (
+        select_static_load(rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT) == 8
+    )
     rows[-1]["oom_events"] = 1
-    assert select_static_load(
-        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-    ) == 8
+    assert (
+        select_static_load(rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT) == 8
+    )
     rows[3]["kv_token_capacity"] = 7 * DFLASH_SAFE_CONTEXT_LIMIT
-    assert select_static_load(
-        rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-    ) == 4
+    assert (
+        select_static_load(rows, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT) == 4
+    )
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(
-            rows[:-1], required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-        )
+        select_static_load(rows[:-1], required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT)
     duplicated = load_screen_rows() + [load_screen_rows()[0]]
     with pytest.raises(ValueError, match="complete grid"):
-        select_static_load(
-            duplicated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-        )
+        select_static_load(duplicated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT)
     invalid = load_screen_rows()
     invalid[0]["decode_goodput_tps"] = float("nan")
     with pytest.raises(ValueError, match="finite and positive"):
-        select_static_load(
-            invalid, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-        )
+        select_static_load(invalid, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT)
 
     saturated = load_screen_rows()
     for row in saturated:
         row["itl_p99_ms"] = 1.0
-    assert select_static_load(
-        saturated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT
-    ) == 32
+    assert (
+        select_static_load(saturated, required_context_limit=DFLASH_SAFE_CONTEXT_LIMIT)
+        == 32
+    )
 
 
 def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None:
@@ -541,6 +537,74 @@ def test_shared_selection_uses_maximin_then_resource_tiebreak(tmp_path) -> None:
         replace(artifact, selected_concurrency=48).validate()
 
 
+def test_heldout_anchor_uses_terminal_tuning_only_without_grid_claim() -> None:
+    candidate = tuning_candidates()[0]
+    prompt_count, context_limit = tuning_stage(3)
+    window = sample_set_sha256(LongContinuationAdapter().window("tune")[:prompt_count])
+    rows = []
+    for method, candidate_id, goodput in (
+        ("static", None, 100.0),
+        ("tts", candidate.candidate_id, 110.0),
+        ("naive_async", candidate.candidate_id, 112.0),
+    ):
+        rows.append(
+            replace(
+                slice_measurement(
+                    method,
+                    candidate_id=candidate_id,
+                    goodput=goodput,
+                ),
+                stage=3,
+                prompt_count=prompt_count,
+                context_limit=context_limit,
+                window_sha256=window,
+            )
+        )
+    artifact = select_heldout_anchor(
+        rows,
+        candidate=candidate,
+        selected_concurrency=8,
+        manifest_sha256="a" * 64,
+        sampling_profile_sha256="d" * 64,
+        tuning_grid_sha256="c" * 64,
+        load_screen_sha256="e" * 64,
+        tuning_window_sha256=LongContinuationAdapter().window_sha256("tune"),
+        model_lock_sha256="f" * 64,
+        tuning_evidence_sha256="9" * 64,
+    )
+    assert artifact.candidate_id == candidate.candidate_id
+    assert artifact.selection_protocol == "heldout_anchor"
+    assert artifact.minimum_goodput_ratio == pytest.approx(1.1)
+
+    with pytest.raises(ValueError, match="coverage is incomplete"):
+        select_heldout_anchor(
+            rows[:-1],
+            candidate=candidate,
+            selected_concurrency=8,
+            manifest_sha256="a" * 64,
+            sampling_profile_sha256="d" * 64,
+            tuning_grid_sha256="c" * 64,
+            load_screen_sha256="e" * 64,
+            tuning_window_sha256=window,
+            model_lock_sha256="f" * 64,
+            tuning_evidence_sha256="9" * 64,
+        )
+
+    with pytest.raises(ValueError, match="Static load screen"):
+        select_heldout_anchor(
+            rows,
+            candidate=candidate,
+            selected_concurrency=4,
+            manifest_sha256="a" * 64,
+            sampling_profile_sha256="d" * 64,
+            tuning_grid_sha256="c" * 64,
+            load_screen_sha256="e" * 64,
+            tuning_window_sha256=window,
+            model_lock_sha256="f" * 64,
+            tuning_evidence_sha256="9" * 64,
+        )
+
+
 def test_selection_rejects_confirmation_or_unsafe_evidence() -> None:
     candidate = tuning_candidates()[0]
     rows = [
@@ -645,9 +709,7 @@ def performance_rows(
             safety = {
                 "updates_launched": 0 if method == "static" else 4,
                 "updates_published": 0 if method == "static" else 3,
-                "exactness_violations": int(
-                    unsafe and method == "tts" and block == 0
-                ),
+                "exactness_violations": int(unsafe and method == "tts" and block == 0),
                 "version_mismatches": 0,
                 "fallbacks": 0,
                 "nonfinite_updates": 0,
@@ -679,10 +741,7 @@ def performance_rows(
                     "generated_bucket_start": 16384,
                     "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
                     "at_risk_requests": 32,
-                    "output_tokens": (
-                        DFLASH_SAFE_CONTEXT_LIMIT - 16384
-                    )
-                    * 32,
+                    "output_tokens": (DFLASH_SAFE_CONTEXT_LIMIT - 16384) * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }

@@ -64,6 +64,7 @@ from lightcone_spec.experiments.selection import (
     SelectionArtifact,
     SliceMeasurement,
     reduce_tuning_stage,
+    select_heldout_anchor,
     select_shared_config,
 )
 from lightcone_spec.experiments.statistics import evaluate_speed_gate
@@ -262,6 +263,15 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--model-lock", required=True)
     select.add_argument("--sampling-profile", required=True)
     select.add_argument("--output", required=True)
+
+    select_anchor = commands.add_parser("select-anchor-config")
+    select_anchor.add_argument("--measurements", nargs=3, required=True)
+    select_anchor.add_argument("--candidate-id", required=True)
+    select_anchor.add_argument("--static-load-screen", required=True)
+    select_anchor.add_argument("--manifest", required=True)
+    select_anchor.add_argument("--model-lock", required=True)
+    select_anchor.add_argument("--sampling-profile", required=True)
+    select_anchor.add_argument("--output", required=True)
 
     render = commands.add_parser("render-runtime")
     render.add_argument("--selection", required=True)
@@ -584,6 +594,63 @@ def _select(args: argparse.Namespace) -> int:
         tuning_window_sha256=LongContinuationAdapter().window_sha256("tune"),
         model_lock_sha256=lock.sha256,
         tuning_evidence_sha256=_canonical_sha256(tuning_artifact),
+    )
+    artifact.write(args.output)
+    print(artifact.sha256)
+    return 0
+
+
+def _select_anchor(args: argparse.Namespace) -> int:
+    manifest = SpeedStudyManifest.load(args.manifest)
+    sampling = SamplingProfile.load(args.sampling_profile)
+    if sampling.sha256 != manifest.sampling_profile_sha256:
+        raise ValueError("sampling profile belongs to a different manifest")
+    lock = ModelLock.load(args.model_lock)
+    load_artifact = _load_bound_json(args.static_load_screen)
+    load_rows = _static_load_rows(load_artifact, manifest=manifest)
+    selected_concurrency = select_static_load(
+        load_rows,
+        required_context_limit=manifest.safe_context_limit,
+    )
+    if load_artifact.get("model_lock_sha256") != lock.sha256:
+        raise ValueError("Static load screen belongs to a different model lock")
+    grid = {candidate.candidate_id: candidate for candidate in tuning_candidates()}
+    candidate = grid.get(args.candidate_id)
+    if candidate is None:
+        raise ValueError("anchor candidate is outside the registered tuning grid")
+    measurements = [SliceMeasurement.load(path) for path in args.measurements]
+    expected_count, expected_context = tuning_stage(len(TUNING_STAGES) - 1)
+    expected_window = sample_set_sha256(
+        LongContinuationAdapter().window("tune")[:expected_count]
+    )
+    if any(
+        row.manifest_sha256 != manifest.sha256
+        or row.model_lock_sha256 != lock.sha256
+        or row.sampling_profile_sha256 != sampling.sha256
+        or row.window_sha256 != expected_window
+        or row.prompt_count != expected_count
+        or row.context_limit != expected_context
+        for row in measurements
+    ):
+        raise ValueError("anchor measurement identity is not terminal tuning evidence")
+    evidence = _canonical_sha256(
+        {
+            "selection_protocol": "heldout_anchor",
+            "candidate_id": candidate.candidate_id,
+            "measurement_sha256": sorted(row.sha256 for row in measurements),
+        }
+    )
+    artifact = select_heldout_anchor(
+        measurements,
+        candidate=candidate,
+        selected_concurrency=selected_concurrency,
+        manifest_sha256=manifest.sha256,
+        sampling_profile_sha256=sampling.sha256,
+        tuning_grid_sha256=manifest.tuning_grid_sha256,
+        load_screen_sha256=_canonical_sha256(load_artifact),
+        tuning_window_sha256=manifest.controlled_window_hashes["tune"],
+        model_lock_sha256=lock.sha256,
+        tuning_evidence_sha256=evidence,
     )
     artifact.write(args.output)
     print(artifact.sha256)
@@ -2031,7 +2098,16 @@ def _analyze(args: argparse.Namespace) -> int:
         gpu_evidence=evidence_state,
         evidence_sha256=evidence_sha256,
     )
-    _write_json(args.output, asdict(gate))
+    _write_json(
+        args.output,
+        {
+            **asdict(gate),
+            "selection_protocol": selection.selection_protocol,
+            "optimized_grid_claim": (
+                selection.selection_protocol == "successive_halving"
+            ),
+        },
+    )
     return 0 if gate.passed else 42
 
 
@@ -2135,6 +2211,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "select-speed-config":
         return _select(args)
+    if args.command == "select-anchor-config":
+        return _select_anchor(args)
     if args.command == "select-onlinespec-config":
         return _select_onlinespec(args)
     if args.command == "render-runtime":

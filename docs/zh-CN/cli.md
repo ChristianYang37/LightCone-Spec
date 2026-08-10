@@ -20,6 +20,7 @@
 | `collect-static-load-screen` | 验证 Static 负载网格并选择负载 |
 | `advance-tuning-stage` | 验证 tuning stage 并写入 survivor 集合 |
 | `select-speed-config` | 执行只读取 tuning 的 maximin 规则 |
+| `select-anchor-config` | 锁定一个 terminal tuning anchor，用于 held-out 复现 |
 | `render-runtime` | 输出顺序执行的匹配 confirmation 配置与 argv |
 | `build-confirmation-queue` | 注册 24 个 clean-server confirmation job |
 | `run-confirmation` | 执行一个 method/block confirmation slice |
@@ -133,6 +134,12 @@ momentum、Lion beta，或 Muon momentum、Newton--Schulz steps 与辅助 AdamW 
 `advance-tuning-stage`
 强制检查注册的 prompt 数与 context 上限、Static/TTS/L0 配对覆盖、安全计数与 survivor
 身份。后续 stage 必须引用前一 stage 的 survivor artifact；confirmation 数据永不作为输入。
+
+`select-anchor-config` 是更窄的复现入口。它要求完整的 terminal tuning-window
+Static/TTS/L0 三元组、完整 Static load screen，并且 anchor 必须属于已注册 grid。生成的
+selection 会标记为 `heldout_anchor`：它可以验证这个锁定配置在 held-out 数据上的速度，
+但绝不声称它是全网格最优配置。该入口不能读取 confirmation 证据，也不能绕过任何
+confirmation、attestation 或安全门槛。
 
 ## Confirmation 与恢复
 

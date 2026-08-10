@@ -47,6 +47,10 @@ V_{\mathrm{L0}}/V_{\mathrm{Static}}\right),
 exposed update time。不可变 selection artifact 绑定 grid、tuning window、model lock、
 patched tree、load 与 tuning evidence。
 
+若目标是范围更窄的复现，也可以从完整 terminal tuning 三元组中锁定一个属于注册 grid
+的 anchor。该 artifact 会显式标记为 `heldout_anchor`：它仍使用相同的独立 confirmation
+与 GPU gate，但绝不声称该 anchor 是全网格最优解。
+
 ## 独立 Confirmation
 
 Confirmation 包含八个 repetition block。每个 block 都在每种方法前独立 reset cohort，
