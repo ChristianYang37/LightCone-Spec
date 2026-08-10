@@ -1,19 +1,19 @@
-From 2eb959834a03cfbc0d98be443ae0bbda2da51d03 Mon Sep 17 00:00:00 2001
+From cd9bd2d17aa37a40d813446e2b867e00e2c933ba Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
 Subject: [PATCH] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 2062 +++++++++++++++++
- 1 file changed, 2062 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 2090 +++++++++++++++++
+ 1 file changed, 2090 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000..7c639d0
+index 0000000..a9d3e01
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2062 @@
+@@ -0,0 +1,2090 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
@@ -22,7 +22,7 @@ index 0000000..7c639d0
 +import json
 +import math
 +from collections import deque
-+from collections.abc import Iterator, Sequence
++from collections.abc import Callable, Iterator, Sequence
 +from contextlib import contextmanager
 +from dataclasses import dataclass, field
 +from pathlib import Path
@@ -140,6 +140,34 @@ index 0000000..7c639d0
 +    norm = torch.stack(norms).square().sum().sqrt()
 +    scale = torch.clamp(grad_clip / (norm + 1e-12), max=1.0)
 +    return tuple(torch._foreach_mul(values, scale)), norm
++
++
++def anchor_forward_value(
++    surrogate: torch.Tensor,
++    reference: torch.Tensor,
++) -> torch.Tensor:
++    """Use an inference value with the differentiable surrogate's Jacobian."""
++    if surrogate.shape != reference.shape:
++        raise ValueError("value-corrected surrogate shapes differ")
++    return surrogate + (reference.detach() - surrogate).detach()
++
++
++def loss_and_grad(
++    parameters: Sequence[torch.Tensor],
++    objective: Callable[[tuple[torch.Tensor, ...]], torch.Tensor],
++) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
++    """Differentiate a functional candidate without copying its parameters."""
++    with torch.enable_grad():
++        leaves = tuple(value.detach().requires_grad_(True) for value in parameters)
++        loss = objective(leaves)
++        if loss.numel() != 1 or not loss.requires_grad:
++            raise RuntimeError("online update objective is not differentiable")
++        raw = torch.autograd.grad(loss, leaves, allow_unused=True)
++    gradients = tuple(
++        torch.zeros_like(leaf) if gradient is None else gradient
++        for leaf, gradient in zip(leaves, raw, strict=True)
++    )
++    return loss.detach(), gradients
 +
 +
 +@dataclass(frozen=True)

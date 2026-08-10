@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "cf7d88811ba81cdc6872ee48889cc521d73a2214",
+  "expected_tree": "bc874284904a37f120b8f6e2f259ccd8adc8aa7a",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
@@ -17,14 +17,14 @@
     },
     {
       "file": "0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch",
-      "sha256": "ff9eb72a01ec0427b136af486995cb0ed690d746d5879565bf729ac2123e9a0d",
+      "sha256": "4d7a585218a83464386aa2791b13cdb88c62f69f15961de18abbc63e4868a4e7",
       "files": [
         "python/sglang/srt/speculative/online_adaptation_runtime.py"
       ]
     },
     {
       "file": "0003-feat-dflash-add-differentiable-online-update-path.patch",
-      "sha256": "d40b429521e07440b58f59369602d2cd839b2262af0f74bb1b92954a0c2f8dec",
+      "sha256": "57b588a38d1e7d86280e1cdd2ad8d51f60cde12440b4dabc8255f838cac941d6",
       "files": [
         "python/sglang/srt/speculative/dflash_online_adaptation.py",
         "python/sglang/srt/speculative/online_valid_mask.py"
@@ -32,7 +32,7 @@
     },
     {
       "file": "0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch",
-      "sha256": "32e773dacd0fab728ecc131725023b58d4cff0d5ac2a99e2008c55a134de8668",
+      "sha256": "37e6b9e1ab5b5414cb443f4693ec35c02eaeb36a3ff5a9d54729e7e2a0e57d15",
       "files": [
         "python/sglang/srt/managers/overlap_utils.py",
         "python/sglang/srt/models/deepseek_v4_dspark.py",
@@ -62,7 +62,7 @@
     },
     {
       "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
-      "sha256": "9d1f7b2882fd6fe12d2a8734bf9bd3382ddc34b5c2573225306e1aa53593792e",
+      "sha256": "b2be593cb918893f3b7de8fd2f1af95748f688e4e8e01c5d46998b76e3bfe557",
       "files": [
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]

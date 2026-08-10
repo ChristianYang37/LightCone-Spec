@@ -1,4 +1,4 @@
-From 22b487c5079526665bcf816a1b4c7d6fa68a211b Mon Sep 17 00:00:00 2001
+From 0781b8717f21903321c0498ee691a7c2d11e5c99 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH] test(spec): cover cross-backend adaptation protocols
@@ -10,7 +10,7 @@ Subject: [PATCH] test(spec): cover cross-backend adaptation protocols
 
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000..8f7355d
+index 0000000..20d3be1
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
 @@ -0,0 +1,1781 @@
@@ -1283,8 +1283,8 @@ index 0000000..8f7355d
 +
 +class TestHistoryGather(unittest.TestCase):
 +    def test_dflash_update_reenables_grad_without_copying_master(self):
-+        from sglang.srt.speculative.dflash_online_adaptation import (
-+            _loss_and_grad,
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            loss_and_grad,
 +        )
 +
 +        master = torch.tensor([2.0, -3.0])
@@ -1301,7 +1301,7 @@ index 0000000..8f7355d
 +            return leaves[0].square().sum()
 +
 +        with torch.no_grad():
-+            loss, gradients = _loss_and_grad((master,), objective)
++            loss, gradients = loss_and_grad((master,), objective)
 +        self.assertEqual(observed, [(True, master.data_ptr(), True)])
 +        self.assertFalse(master.requires_grad)
 +        self.assertFalse(loss.requires_grad)
@@ -1309,14 +1309,14 @@ index 0000000..8f7355d
 +        torch.testing.assert_close(gradients[0], torch.tensor([4.0, -6.0]))
 +
 +    def test_dflash_value_anchor_uses_reference_and_surrogate_gradient(self):
-+        from sglang.srt.speculative.dflash_online_adaptation import (
-+            _anchor_forward_value,
++        from sglang.srt.speculative.online_adaptation_runtime import (
++            anchor_forward_value,
 +        )
 +
 +        source = torch.tensor([1.0, 2.0], requires_grad=True)
 +        surrogate = source.square()
 +        reference = torch.tensor([7.0, 11.0])
-+        anchored = _anchor_forward_value(surrogate, reference)
++        anchored = anchor_forward_value(surrogate, reference)
 +        self.assertTrue(torch.equal(anchored.detach(), reference))
 +        anchored.sum().backward()
 +        self.assertTrue(torch.equal(source.grad, 2.0 * source.detach()))

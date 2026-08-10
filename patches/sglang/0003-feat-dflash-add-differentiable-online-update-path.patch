@@ -1,21 +1,21 @@
-From ae89aee79c81e035243fe4f963872c958395dc1c Mon Sep 17 00:00:00 2001
+From 86519e825865c651879440b55e9f98f759bea497 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
 Subject: [PATCH] feat(dflash): add differentiable online update path
 
 ---
- .../speculative/dflash_online_adaptation.py   | 1088 +++++++++++++++++
+ .../speculative/dflash_online_adaptation.py   | 1061 +++++++++++++++++
  .../srt/speculative/online_valid_mask.py      |  142 +++
- 2 files changed, 1230 insertions(+)
+ 2 files changed, 1203 insertions(+)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
 
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000..2ef4b78
+index 0000000..fceeeb8
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1088 @@
+@@ -0,0 +1,1061 @@
 +"""DFlash drafter-scope Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -23,7 +23,7 @@ index 0000000..2ef4b78
 +import logging
 +import math
 +import re
-+from collections.abc import Callable, Sequence
++from collections.abc import Sequence
 +from dataclasses import dataclass
 +
 +import torch
@@ -35,9 +35,11 @@ index 0000000..2ef4b78
 +    FixedInferenceBank,
 +    OnlineCohortRuntime,
 +    OnlineSpecOptimizer,
++    anchor_forward_value,
 +    build_parameter_optimizer,
 +    estimate_full_vocab_training_scratch_bytes,
 +    estimate_functional_optimizer_scratch_bytes,
++    loss_and_grad,
 +)
 +
 +logger = logging.getLogger(__name__)
@@ -134,36 +136,6 @@ index 0000000..2ef4b78
 +        & (mean_kl <= 32.0 * numerical_unit**2)
 +    )
 +    return valid, maximum, relative_rms, top1_match, mean_kl
-+
-+
-+def _loss_and_grad(
-+    parameters: Sequence[torch.Tensor],
-+    objective: Callable[[tuple[torch.Tensor, ...]], torch.Tensor],
-+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-+    """Differentiate a bounded update even when inference runs under no_grad."""
-+    with torch.enable_grad():
-+        leaves = tuple(
-+            value.detach().requires_grad_(True) for value in parameters
-+        )
-+        loss = objective(leaves)
-+        if loss.numel() != 1 or not loss.requires_grad:
-+            raise RuntimeError("DFlash update objective is not differentiable")
-+        raw = torch.autograd.grad(loss, leaves, allow_unused=True)
-+    gradients = tuple(
-+        torch.zeros_like(leaf) if gradient is None else gradient
-+        for leaf, gradient in zip(leaves, raw, strict=True)
-+    )
-+    return loss.detach(), gradients
-+
-+
-+def _anchor_forward_value(
-+    surrogate: torch.Tensor,
-+    reference: torch.Tensor,
-+) -> torch.Tensor:
-+    """Use ``reference`` in the forward pass and ``surrogate`` for autograd."""
-+    if surrogate.shape != reference.shape:
-+        raise ValueError("value-corrected surrogate shapes differ")
-+    return surrogate + (reference.detach() - surrogate).detach()
 +
 +
 +def _is_default_rope_metadata(value: object) -> bool:
@@ -937,7 +909,7 @@ index 0000000..2ef4b78
 +                                # source-point value to the logits that
 +                                # actually generated q while retaining the
 +                                # differentiable surrogate's local Jacobian.
-+                                draft_logits = _anchor_forward_value(
++                                draft_logits = anchor_forward_value(
 +                                    draft_logits,
 +                                    inference_logits,
 +                                )
@@ -952,7 +924,7 @@ index 0000000..2ef4b78
 +                                member_loss * 0.0,
 +                            )
 +
-+                        return _loss_and_grad(parameters, objective)
++                        return loss_and_grad(parameters, objective)
 +
 +                if (
 +                    isinstance(self.optimizer, OnlineSpecOptimizer)
@@ -996,6 +968,7 @@ index 0000000..2ef4b78
 +                        member_loss, gradients = member_feedback(self.optimizer.master)
 +                        finite = (
 +                            torch.isfinite(loss)
++                            & torch.isfinite(member_loss)
 +                            & torch.stack(
 +                                [
 +                                    torch.isfinite(gradient).all()
