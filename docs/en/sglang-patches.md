@@ -12,7 +12,7 @@ identity.
 
 ## Series layers
 
-The nine-patch series has one-way semantic dependencies:
+The ten-patch series has one-way semantic dependencies:
 
 1. strict cross-backend schema, preflight, and disabled fast path;
 2. cohort, resident optimizer and OnlineSPEC learner state, source-version,
@@ -25,7 +25,8 @@ The nine-patch series has one-way semantic dependencies:
 8. the memory-bounded LoRA-coordinate OnlineSPEC Hedge decision class and its
    protocol regression test; and
 9. device-resident request budgets derived from committed prefixes under
-   overlap scheduling.
+   overlap scheduling; and
+10. logical-prefix continuity across final overlap and publication rounds.
 
 Only the complete series is supported. Intermediate patch states are review
 boundaries, not runnable product variants.
@@ -35,9 +36,9 @@ parallel runtime patch: schema in patch one, learner state in patch two,
 DFlash gradients in patch three, cross-backend tail routing in patch four,
 memory and diagnostics in patch five, protocol tests in patch six, strict
 request-boundary KV lifecycle checks in patch seven, and the optional
-low-memory Hedge decision class in patch eight, and committed-prefix request
-budgets in patch nine. This preserves one version, event, exactness, and
-disabled-path implementation.
+low-memory Hedge decision class in patch eight, committed-prefix request
+budgets in patch nine, and logical-prefix continuity in patch ten. This
+preserves one version, event, exactness, and disabled-path implementation.
 
 ## Application
 

@@ -7,3 +7,4 @@
 0007-fix-spec-bound-request-boundary-KV-reservations.patch
 0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch
 0009-fix-spec-derive-request-budgets-from-committed-prefi.patch
+0010-fix-spec-preserve-logical-prefixes-across-overlap-ro.patch

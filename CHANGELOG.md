@@ -49,7 +49,7 @@ yet been declared.
 - Replaced the public configuration with strict schema-v2 identities.
 - Added DFlash drafter Full/LoRA updates, cache-safe tail ablations, frozen
   historical KV versioning, and cohort-scoped publication.
-- Replaced the SGLang integration with a reproducible nine-patch series against
+- Replaced the SGLang integration with a reproducible ten-patch series against
   one exact upstream commit.
 - Added deterministic disjoint data windows, tuning-only maximin selection,
   independent confirmation timing, resumable evidence receipts, and a

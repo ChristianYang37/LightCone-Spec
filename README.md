@@ -56,7 +56,7 @@ counts, CUDA timing, HBM accounting, and confidence intervals together.
 
 - `lightcone_spec` owns strict schema-v2 configuration, deterministic data
   windows, selection, evidence records, and statistical gates.
-- `patches/sglang` is a reproducible nine-patch mail series against one exact
+- `patches/sglang` is a reproducible ten-patch mail series against one exact
   upstream commit. The repository never vendors or edits SGLang in place.
 - A cohort runtime keeps optimizer state on GPU, publishes into fixed-address
   inference tensors, and binds every candidate to epoch, slot generation, and

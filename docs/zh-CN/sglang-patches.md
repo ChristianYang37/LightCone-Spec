@@ -11,7 +11,7 @@ SGLang 源码、submodule 或修改后的 checkout。本地 `sglang/` 目录被 
 
 ## Patch 分层
 
-九个 patch 具有单向的语义依赖：
+十个 patch 具有单向的语义依赖：
 
 1. 严格的跨 backend schema、preflight 与 disabled fast path；
 2. cohort、resident optimizer 与 OnlineSPEC learner state、source version、CUDA event
@@ -22,15 +22,16 @@ SGLang 源码、submodule 或修改后的 checkout。本地 `sglang/` 目录被 
 6. 跨 backend optimizer、proposal、exactness 与回归测试；
 7. 请求边界的 speculative KV headroom 与有界 reservation 校验；
 8. 显存受限的 LoRA 坐标 OnlineSPEC Hedge 决策类及其协议回归测试；
-9. overlap scheduling 下由已提交 prefix 在设备端推导请求剩余预算。
+9. overlap scheduling 下由已提交 prefix 在设备端推导请求剩余预算；
+10. 最终 overlap 与发布轮之间的逻辑 prefix 连续性。
 
 只支持完整 series。中间 patch 状态是 review 边界，不是可运行的产品变体。
 
 OnlineSPEC 被折叠到既有语义层，而不是创建一套平行 runtime patch：patch 一负责 schema，
 patch 二负责 learner state，patch 三负责 DFlash gradient，patch 四负责跨 backend tail
 routing，patch 五负责显存与诊断，patch 六负责协议测试，patch 七负责严格的请求边界 KV
-lifecycle，patch 八负责可选的低显存 Hedge 决策类，patch 九负责已提交 prefix 的请求预算。
-这样版本、event、exactness 与 disabled path 始终只有一份实现。
+lifecycle，patch 八负责可选的低显存 Hedge 决策类，patch 九负责已提交 prefix 的请求预算，
+patch 十负责逻辑 prefix 连续性。这样版本、event、exactness 与 disabled path 始终只有一份实现。
 
 ## 应用
 
