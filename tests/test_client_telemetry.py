@@ -367,6 +367,40 @@ def test_payloads_use_native_sglang_rid_and_paired_seed() -> None:
     assert all("seed" not in row["sampling_params"] for row in tts + l0)
 
 
+def test_warmup_request_namespace_cannot_reuse_measured_rids() -> None:
+    sample = type("Sample", (), {"sample_id": "p", "prompt": "x", "seed": 7})()
+    measured = _payloads(
+        sample,
+        method="static",
+        block=-1,
+        concurrency=2,
+        max_new_tokens=8,
+        sampling_profile=SamplingProfile(),
+    )
+    warmup = _payloads(
+        sample,
+        method="static",
+        block=-1,
+        concurrency=2,
+        max_new_tokens=8,
+        sampling_profile=SamplingProfile(),
+        request_namespace="warmup",
+    )
+    assert {row["rid"] for row in measured}.isdisjoint(
+        row["rid"] for row in warmup
+    )
+    with pytest.raises(ValueError, match="namespace"):
+        _payloads(
+            sample,
+            method="static",
+            block=-1,
+            concurrency=1,
+            max_new_tokens=8,
+            sampling_profile=SamplingProfile(),
+            request_namespace="",
+        )
+
+
 def test_confirmation_slice_order_is_manifest_seeded() -> None:
     jobs = [
         (block.block, method)

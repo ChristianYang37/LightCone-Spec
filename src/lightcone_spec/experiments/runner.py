@@ -91,12 +91,18 @@ def _payloads(
     concurrency: int,
     max_new_tokens: int,
     sampling_profile: SamplingProfile,
+    request_namespace: str | None = None,
 ) -> tuple[dict, ...]:
     if method not in _EVIDENCE_METHODS:
         raise ValueError("unknown measured method")
+    if request_namespace is not None and not request_namespace:
+        raise ValueError("request namespace must be non-empty when provided")
+    namespace = f"-{request_namespace}" if request_namespace is not None else ""
     return tuple(
         {
-            "rid": f"{sample.sample_id}-b{block}-{method}-r{replica}",
+            "rid": (
+                f"{sample.sample_id}{namespace}-b{block}-{method}-r{replica}"
+            ),
             "text": sample.prompt,
             "sampling_params": sampling_profile.parameters(
                 seed=sample.seed + replica,
@@ -901,6 +907,7 @@ def _warmup(
             concurrency=concurrency,
             max_new_tokens=64,
             sampling_profile=sampling_profile,
+            request_namespace="warmup",
         ),
         concurrency=concurrency,
         adaptation_group_id=(None if method == "static" else adaptation_group_id),
