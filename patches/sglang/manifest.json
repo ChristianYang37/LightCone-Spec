@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "e6b4f17068328ba05b9097eb9bd3436537fe60b6",
+  "expected_tree": "d9a5d1216622dd3a8a71cf376f91972188416a64",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
@@ -81,6 +81,17 @@
       "sha256": "bd2df150a81039d3b5d9a5fed80949a0261188d6162735da06fa8f210297a02f",
       "files": [
         "python/sglang/srt/speculative/online_adaptation_config.py",
+        "test/registered/unit/spec/test_online_adaptation_protocol.py"
+      ]
+    },
+    {
+      "file": "0009-fix-spec-derive-request-budgets-from-committed-prefi.patch",
+      "sha256": "8d0dcfc7d9ed6dd53fe9c74e2802348f6ff5bfad752c6472ba13ca7b005279e2",
+      "files": [
+        "python/sglang/srt/speculative/dflash_worker_v2.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
+        "python/sglang/srt/speculative/online_eagle_adaptation.py",
+        "python/sglang/srt/speculative/online_valid_mask.py",
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]
     }

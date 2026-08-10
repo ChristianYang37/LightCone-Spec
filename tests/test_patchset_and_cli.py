@@ -147,6 +147,36 @@ def test_runtime_launcher_rejects_unpatched_upstream_checkout(tmp_path) -> None:
         verify_patched_checkout(checkout)
 
 
+def test_runtime_launcher_uses_registered_patch_count(monkeypatch, tmp_path) -> None:
+    import lightcone_spec.sglang_bridge.checkout as checkout_module
+
+    checkout = tmp_path / "patched"
+    package = checkout / "python" / "sglang"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+
+    def fake_git(_checkout: Path, *arguments: str) -> str:
+        if arguments == ("rev-parse", "HEAD^{tree}"):
+            return PINNED_SGLANG_TREE
+        if arguments == ("status", "--porcelain=v1", "--untracked-files=all"):
+            return ""
+        if arguments == (
+            "rev-list",
+            "--count",
+            f"{PINNED_SGLANG_COMMIT}..HEAD",
+        ):
+            return str(PINNED_SGLANG_PATCH_COUNT)
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(checkout_module, "_git", fake_git)
+    monkeypatch.setattr(
+        checkout_module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    assert checkout_module.verify_patched_checkout(checkout) == checkout.resolve()
+
+
 def test_runtime_launcher_exposes_tools_from_its_interpreter(
     monkeypatch, tmp_path
 ) -> None:

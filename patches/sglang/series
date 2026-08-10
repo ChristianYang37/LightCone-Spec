@@ -6,3 +6,4 @@
 0006-test-spec-cover-cross-backend-adaptation-protocols.patch
 0007-fix-spec-bound-request-boundary-KV-reservations.patch
 0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch
+0009-fix-spec-derive-request-budgets-from-committed-prefi.patch

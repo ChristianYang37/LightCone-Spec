@@ -5,7 +5,11 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
+from lightcone_spec import (
+    PINNED_SGLANG_COMMIT,
+    PINNED_SGLANG_PATCH_COUNT,
+    PINNED_SGLANG_TREE,
+)
 
 
 def _git(checkout: Path, *arguments: str) -> str:
@@ -24,7 +28,7 @@ def _git(checkout: Path, *arguments: str) -> str:
 
 
 def verify_patched_checkout(path: str | Path) -> Path:
-    """Return an exact, clean eight-patch checkout or fail before launch."""
+    """Return an exact, clean nine-patch checkout or fail before launch."""
     checkout = Path(path).resolve()
     if not (checkout / "python" / "sglang" / "__init__.py").is_file():
         raise ValueError("SGLang checkout lacks python/sglang/__init__.py")
@@ -52,6 +56,6 @@ def verify_patched_checkout(path: str | Path) -> Path:
     if completed.returncode != 0:
         raise ValueError("patched SGLang history does not descend from the pin")
     count = int(_git(checkout, "rev-list", "--count", f"{PINNED_SGLANG_COMMIT}..HEAD"))
-    if count != 8:
-        raise ValueError("patched SGLang checkout must contain the eight-patch series")
+    if count != PINNED_SGLANG_PATCH_COUNT:
+        raise ValueError("patched SGLang checkout must contain the nine-patch series")
     return checkout
