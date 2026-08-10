@@ -6,12 +6,15 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from test_schema import config_value
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import (
     _advance_tuning,
+    _concat_evidence_tables,
     _static_load_rows,
     _write_json,
 )
@@ -728,6 +731,64 @@ def test_bca_interval_is_finite_and_ordered() -> None:
     )
     assert lower <= estimate <= upper
     assert np.isfinite([estimate, lower, upper]).all()
+
+
+def test_evidence_concat_promotes_only_all_null_inferred_columns(
+    tmp_path: Path,
+) -> None:
+    static = tmp_path / "static.parquet"
+    adapted = tmp_path / "adapted.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "method": ["static"],
+                "adaptation_memory_ledger": pa.array([None], type=pa.null()),
+                "training_cuda_ms": pa.array([None], type=pa.null()),
+            }
+        ),
+        static,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "method": ["tts"],
+                "adaptation_memory_ledger": ["{}"],
+                "training_cuda_ms": [1.25],
+            }
+        ),
+        adapted,
+    )
+
+    table = _concat_evidence_tables((static, adapted))
+
+    assert table.schema.field("adaptation_memory_ledger").type == pa.string()
+    assert table.schema.field("training_cuda_ms").type == pa.float64()
+    assert table.to_pylist() == [
+        {
+            "method": "static",
+            "adaptation_memory_ledger": None,
+            "training_cuda_ms": None,
+        },
+        {
+            "method": "tts",
+            "adaptation_memory_ledger": "{}",
+            "training_cuda_ms": 1.25,
+        },
+    ]
+
+    incompatible = tmp_path / "incompatible.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "method": ["tts"],
+                "adaptation_memory_ledger": [1],
+                "training_cuda_ms": [1.25],
+            }
+        ),
+        incompatible,
+    )
+    with pytest.raises(ValueError, match="incompatible types"):
+        _concat_evidence_tables((adapted, incompatible))
 
 
 def performance_rows(

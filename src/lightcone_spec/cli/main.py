@@ -1405,6 +1405,28 @@ def _confirmation_configs(args: argparse.Namespace) -> dict:
     }
 
 
+def _concat_evidence_tables(paths: tuple[Path, ...]) -> pa.Table:
+    """Concatenate evidence while promoting only all-null inferred columns."""
+    tables = [pq.read_table(path) for path in paths]
+    if not tables:
+        raise ValueError("evidence table set cannot be empty")
+    column_names = tables[0].column_names
+    if any(table.column_names != column_names for table in tables[1:]):
+        raise ValueError("evidence tables have different columns")
+    for index, name in enumerate(column_names):
+        concrete_types: list[pa.DataType] = []
+        for table in tables:
+            data_type = table.schema.field(index).type
+            if not pa.types.is_null(data_type) and data_type not in concrete_types:
+                concrete_types.append(data_type)
+        if len(concrete_types) > 1:
+            rendered = ", ".join(str(value) for value in concrete_types)
+            raise ValueError(
+                f"evidence column {name!r} has incompatible types: {rendered}"
+            )
+    return pa.concat_tables(tables, promote_options="default")
+
+
 def _collect_speed_study(args: argparse.Namespace) -> int:
     manifest = SpeedStudyManifest.load(args.manifest)
     selection = SelectionArtifact.load(args.selection)
@@ -1435,7 +1457,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
         },
         concurrency=selection.selected_concurrency,
     )
-    table = pa.concat_tables([pq.read_table(path) for path in performance])
+    table = _concat_evidence_tables(performance)
     table = table.replace_schema_metadata(
         _formal_table_metadata(
             manifest=manifest,
@@ -1497,7 +1519,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         config_sha256=config_hashes,
         concurrency=selection.selected_concurrency,
     )
-    table = pa.concat_tables([pq.read_table(path) for path in performance])
+    table = _concat_evidence_tables(performance)
     metadata = {
         b"lightcone_schema_version": b"2",
         b"lightcone_study": b"onlinespec-clean-room-baseline",
