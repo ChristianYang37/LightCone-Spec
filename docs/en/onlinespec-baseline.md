@@ -280,8 +280,11 @@ separate evidence identities:
    reservations outside measurement. The batch owns the union of its active
    decode
    intervals; request-level rows are diagnostic only.
-4. Collect one diagnostic comparison per learner against the paired Static
-   rows and bind the evidence to a GPU attestation.
+4. Collect one comparison per learner against the paired Static rows and bind
+   the evidence to a GPU attestation. Each learner reports whether its mean
+   speedup reaches 3% and its paired BCa 95% lower bound is above zero. The
+   OnlineSPEC reproduction passes only when every method is safe and at least
+   one registered learner clears that acceleration threshold.
 5. Profile in a separate run; synchronized traces cannot enter headline
    timing.
 
@@ -302,8 +305,8 @@ analyze-onlinespec-study
 Use `lightcone-spec COMMAND --help` for exact arguments. Generated selections,
 performance data, and attestations remain under the ignored artifact root.
 The comparison is important evidence, but `analyze-onlinespec-study` explicitly
-reports `core_speed_gate_affected=false`, `selection_protocol`, and
-`optimized_grid_claim`.
+reports `core_speed_gate_affected=false`, per-learner acceleration decisions,
+`selection_protocol`, and `optimized_grid_claim`.
 
 ## Reproduction claim
 

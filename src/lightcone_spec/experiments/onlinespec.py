@@ -761,6 +761,11 @@ class OnlineSpecComparison:
     ci_lower: float
     ci_upper: float
     safety_pass: bool
+    acceleration_pass: bool
+
+    @property
+    def passed(self) -> bool:
+        return self.safety_pass and self.acceleration_pass
 
 
 @dataclass(frozen=True)
@@ -813,9 +818,11 @@ class OnlineSpecGpuAttestation:
 
 
 def compare_onlinespec(
-    rows: list[dict], *, seed: int = 0
+    rows: list[dict], *, minimum_speedup: float = 0.03, seed: int = 0
 ) -> tuple[OnlineSpecComparison, ...]:
     """Paired diagnostics only; these rows never drive the core speed gate."""
+    if minimum_speedup < 0:
+        raise ValueError("minimum speedup cannot be negative")
     if {str(row["method"]) for row in rows} != set(ONLINE_SPEC_STUDY_METHODS):
         raise ValueError("OnlineSPEC comparison coverage has the wrong methods")
     filtered = [row for row in rows if row.get("region") == "long_region"]
@@ -908,5 +915,14 @@ def compare_onlinespec(
             {key: np.asarray(value) for key, value in clusters.items()},
             seed=seed + index,
         )
-        results.append(OnlineSpecComparison(method, estimate, lower, upper, safe))
+        results.append(
+            OnlineSpecComparison(
+                method=method,
+                mean_speedup=estimate,
+                ci_lower=lower,
+                ci_upper=upper,
+                safety_pass=safe,
+                acceleration_pass=estimate >= minimum_speedup and lower > 0.0,
+            )
+        )
     return tuple(results)

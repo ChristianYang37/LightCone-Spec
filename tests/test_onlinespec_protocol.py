@@ -560,7 +560,7 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     ratios = {
         "static": 1.0,
         "onlinespec_ogd": 1.01,
-        "onlinespec_opt": 1.02,
+        "onlinespec_opt": 1.04,
         "onlinespec_ens": 0.99,
     }
     for block in range(8):
@@ -623,6 +623,8 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
     assert [row.method for row in result] == list(ONLINE_SPEC_METHODS)
     assert result[0].mean_speedup == pytest.approx(0.01)
     assert result[2].mean_speedup == pytest.approx(-0.01)
+    assert [row.acceleration_pass for row in result] == [False, True, False]
+    assert [row.passed for row in result] == [False, True, False]
     unsafe_rows = [dict(row) for row in rows]
     next(
         row
@@ -630,6 +632,8 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
         if row["method"] == "static" and row["region"] == "full_trajectory"
     )["exactness_violations"] = 1
     assert not any(row.safety_pass for row in compare_onlinespec(unsafe_rows, seed=7))
+    with pytest.raises(ValueError, match="minimum speedup"):
+        compare_onlinespec(rows, minimum_speedup=-0.01)
     with pytest.raises(ValueError, match="coverage"):
         compare_onlinespec(rows[:-1])
     short = [dict(row) for row in rows]

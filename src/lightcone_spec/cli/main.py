@@ -2220,14 +2220,14 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
         evidence = "MEASURED"
         attestation_sha256 = attestation.sha256
     comparisons = compare_onlinespec(table.to_pylist(), seed=args.bootstrap_seed)
+    safety_pass = all(comparison.safety_pass for comparison in comparisons)
+    acceleration_pass = any(
+        comparison.acceleration_pass for comparison in comparisons
+    )
     status = (
         "UNMEASURED"
         if evidence == "UNMEASURED"
-        else (
-            "MEASURED"
-            if all(comparison.safety_pass for comparison in comparisons)
-            else "BLOCKED"
-        )
+        else "PASS" if safety_pass and acceleration_pass else "BLOCKED"
     )
     _write_json(
         args.output,
@@ -2238,6 +2238,13 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             "status": status,
             "attestation_sha256": attestation_sha256,
             "core_speed_gate_affected": False,
+            "safety_pass": safety_pass,
+            "at_least_one_acceleration_pass": acceleration_pass,
+            "passing_methods": [
+                comparison.method
+                for comparison in comparisons
+                if comparison.passed
+            ],
             "selection_protocol": selection.selection_protocol,
             "optimized_grid_claim": (
                 selection.selection_protocol == "successive_halving"
@@ -2245,7 +2252,7 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             "comparisons": [asdict(row) for row in comparisons],
         },
     )
-    return 0 if status == "MEASURED" else 42
+    return 0 if status == "PASS" else 42
 
 
 def main(argv: list[str] | None = None) -> int:
