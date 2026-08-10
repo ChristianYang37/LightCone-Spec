@@ -365,7 +365,7 @@ class OnlineSpecManifest:
             confirmation_window_sha256=sample_set_sha256(data.window("confirm")),
             confirmation_repetitions=8,
             confirmation_schedule_seed=20260810,
-            request_scheduling="distinct_prompt_cohort_queue",
+            request_scheduling="ordered_native_batch_cohort_queue",
             headline_timing_unit="method_repetition_batch",
             inference_cluster_unit="repetition_block",
             formal_context_start=16384,

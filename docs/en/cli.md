@@ -163,7 +163,7 @@ the slice before evidence is committed.
 
 `run-confirmation` executes exactly one method/block slice. It resets the
 engine/cohort once, performs an unmeasured warmup by default, then submits all
-32 distinct prompts once in one start-gated HTTP burst. SGLang's locked
+32 distinct prompts once in one ordered native batch request. SGLang's locked
 `max_running_requests` performs admission while the cohort remains continuous.
 It records the union of active decode intervals plus request-level absolute
 streaming arrivals. The model's 40,960-token limit includes the tokenized

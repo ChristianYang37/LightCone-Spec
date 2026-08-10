@@ -48,8 +48,9 @@ patched tree、load 与 tuning evidence。
 ## 独立 Confirmation
 
 Confirmation 包含八个 repetition block。每个 block 都在每种方法前独立 reset cohort，
-随机排列 Static/TTS/L0，并将 32 个不同 prompt 以一次 start-gated burst 全部提交。
-SGLang 锁定的 admission limit 负责 continuous batching，队列排空期间不 reset
+随机排列 Static/TTS/L0，并将 32 个不同 prompt 通过一次有序的原生 batch 请求全部提交。
+这会消除 host thread 的到达竞态而不限制 GPU；SGLang 锁定的 admission limit 负责
+continuous batching，队列排空期间不 reset
 engine/cohort。Warmup 位于计时区间之外；每个 method/block batch 只拥有 active decode
 区间的并集，排除 request queue/prefill 空档；不合并 repetition，也不把 batch 指标复制到
 prompt 或 bucket 行。

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -70,6 +69,22 @@ def stream_line(completion: int, *, finish: bool = False) -> bytes:
     return f"data: {json.dumps(value)}\n".encode()
 
 
+def batch_stream_line(
+    index: int, request_id: str, completion: int, *, finish: bool = False
+) -> bytes:
+    value = {
+        "index": index,
+        "text": request_id * completion,
+        "meta_info": {
+            "id": request_id,
+            "prompt_tokens": 7 + index,
+            "completion_tokens": completion,
+            "finish_reason": {"type": "length"} if finish else None,
+        },
+    }
+    return f"data: {json.dumps(value)}\n".encode()
+
+
 def test_streaming_itl_uses_chunk_arrival_semantics() -> None:
     response = StreamingResponse(
         [stream_line(2), stream_line(4, finish=True), b"data: [DONE]\n"]
@@ -106,6 +121,46 @@ def test_stream_arrivals_share_one_process_monotonic_clock() -> None:
     assert result.token_arrival_ms == pytest.approx(
         (10100.0, 10100.0, 10300.0, 10300.0)
     )
+
+
+def test_native_batch_stream_preserves_order_and_per_request_itl() -> None:
+    response = StreamingResponse(
+        [
+            batch_stream_line(1, "r1", 1),
+            batch_stream_line(0, "r0", 2),
+            batch_stream_line(1, "r1", 3, finish=True),
+            batch_stream_line(0, "r0", 4, finish=True),
+            b"data: [DONE]\n",
+        ]
+    )
+    payloads = (
+        {"rid": "r0", "text": "zero", "sampling_params": {"temperature": 0}},
+        {"rid": "r1", "text": "one", "sampling_params": {"temperature": 0}},
+    )
+    with (
+        patch("urllib.request.urlopen", return_value=response) as opened,
+        patch(
+            "time.perf_counter",
+            side_effect=[10.0, 10.1, 10.2, 10.3, 10.4, 10.5],
+        ),
+    ):
+        rows, elapsed = SGLangHTTPClient(
+            "http://server"
+        ).stream_generate_batch(payloads)
+    assert [row.request_id for row in rows] == ["r0", "r1"]
+    assert rows[0].input_tokens == 7
+    assert rows[0].inter_token_ms == pytest.approx((0.0, 200.0, 0.0))
+    assert rows[1].input_tokens == 8
+    assert rows[1].inter_token_ms == pytest.approx((200.0, 0.0))
+    assert elapsed == pytest.approx(0.5)
+    request = opened.call_args.args[0]
+    body = json.loads(request.data)
+    assert body == {
+        "rid": ["r0", "r1"],
+        "text": ["zero", "one"],
+        "sampling_params": [{"temperature": 0}, {"temperature": 0}],
+        "stream": True,
+    }
 
 
 def test_streaming_rejects_missing_prompt_count() -> None:
@@ -362,32 +417,29 @@ def test_loaded_batch_submits_the_complete_queue_to_sglang() -> None:
     class QueueClient(SGLangHTTPClient):
         def __init__(self) -> None:
             super().__init__("http://unused")
-            self.lock = threading.Lock()
-            self.active = 0
-            self.max_active = 0
-            self.barrier = threading.Barrier(4)
+            self.received = ()
 
-        def stream_generate(self, payload: dict) -> GenerationResult:
-            request_id = str(payload["rid"])
-            with self.lock:
-                self.active += 1
-                self.max_active = max(self.max_active, self.active)
-            self.barrier.wait(timeout=5)
-            with self.lock:
-                self.active -= 1
-            return result(request_id)
+        def stream_generate_batch(self, payloads):
+            self.received = tuple(payloads)
+            return (
+                tuple(result(str(payload["rid"])) for payload in self.received),
+                1.0,
+            )
 
     client = QueueClient()
-    payloads = tuple({"rid": f"r{index}"} for index in range(4))
+    payloads = tuple(
+        {"rid": f"r{index}", "text": "x", "sampling_params": {}}
+        for index in range(4)
+    )
     rows, elapsed = client.run_loaded_batch(
         payloads,
         concurrency=2,
     )
     assert {row.request_id for row in rows} == {"r0", "r1", "r2", "r3"}
-    # The HTTP queue is admitted in one burst. The server's registered
+    # One ordered native request admits the full queue. SGLang's registered
     # max_running_requests, not a client-side executor, controls GPU load.
-    assert client.max_active == 4
-    assert elapsed > 0
+    assert client.received == payloads
+    assert elapsed == 1.0
     with pytest.raises(ValueError, match="cannot reach"):
         client.run_loaded_batch(payloads[:1], concurrency=2)
 

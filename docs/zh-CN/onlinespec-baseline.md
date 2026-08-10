@@ -214,8 +214,8 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
    selection，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning
    artifact、model lock、sampling profile、manifest 与 patched SGLang tree。手工指定或
    不匹配的负载会被拒绝。
-3. 每个 method/block 计时窗都把 32 个不重叠 prompt 各提交一次，并组成一个 start-gated
-   burst。正式 admission limit 不得超过这 32 个唯一 prompt；SGLang 锁定的 admission
+3. 每个 method/block 计时窗都把 32 个不重叠 prompt 各提交一次，并组成一个有序的原生
+   batch 请求。正式 admission limit 不得超过这 32 个唯一 prompt；SGLang 锁定的 admission
    limit 在不 reset cohort 的情况下排空队列。随后在 16K–40,960 long region
    上运行八个独立随机 block 的配对
    Static/OGD/optimistic/Hedge confirmation。Headline 值是整个 batch active decode

@@ -58,9 +58,10 @@ the grid, tuning window, model lock, patched tree, load, and tuning evidence.
 
 Confirmation has eight repetition blocks. Every block independently resets the
 cohort before each method, randomly orders Static/TTS/L0, and submits all 32
-distinct prompts once in one start-gated burst. SGLang's locked admission limit
-owns continuous batching; the engine and cohort are not reset while the queue
-drains. A warmup occurs outside the interval. One method/block batch owns the
+distinct prompts once in one ordered native batch request. This removes
+host-thread arrival races without throttling the GPU: SGLang's locked admission
+limit owns continuous batching, and the engine and cohort are not reset while
+the queue drains. A warmup occurs outside the interval. One method/block batch owns the
 union of its active decode intervals, excluding request queue and prefill gaps;
 repetitions are never merged and batch metrics are never copied onto prompt or
 bucket rows.

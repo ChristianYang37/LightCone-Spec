@@ -22,9 +22,9 @@ yet been declared.
 
 ### Changed
 
-- Replaced per-prompt pseudo-load timing with one start-gated distinct-prompt
-  SGLang queue, active-decode interval unions, and repetition-block inference
-  for both the core and OnlineSPEC confirmation protocols.
+- Replaced per-prompt pseudo-load timing and host-thread admission races with
+  one ordered native SGLang batch queue, active-decode interval unions, and
+  repetition-block inference for both the core and OnlineSPEC protocols.
 - Bound OnlineSPEC source-point gradients to the exact inference proposal
   value while retaining the differentiable surrogate Jacobian.
 - Bound OnlineSPEC selection to the core Static load selection and capped

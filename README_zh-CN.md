@@ -169,8 +169,8 @@ sampling。
 
 ## 证据与安全
 
-正式 confirmation 在每种方法中将 32 个不同的 held-out controlled prompt 以一次 start-gated
-burst 全部提交给 SGLang，并使用八个独立方法顺序 block 与一个已选择负载。锁定的 server
+正式 confirmation 在每种方法中将 32 个不同的 held-out controlled prompt 以一次有序的原生
+batch 请求全部提交给 SGLang，并使用八个独立方法顺序 block 与一个已选择负载。锁定的 server
 admission limit 控制 active batch，队列排空前不 reset cohort；每个 method/block 只拥有其
 active decode 区间的并集。Request 诊断独立记录，避免把共享 batch 时间伪重复成 32 个
 goodput 样本。40,960 token

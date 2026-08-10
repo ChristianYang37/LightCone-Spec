@@ -257,9 +257,9 @@ separate evidence identities:
    tuning artifact, model lock, sampling profile, manifest, and patched SGLang
    tree. A manually supplied or mismatched load is rejected.
 3. In each method/block interval, submit all 32 disjoint prompts exactly once
-   in one start-gated burst. The formal admission limit cannot exceed those 32
-   unique prompts; SGLang's locked admission limit drains the queue without
-   resetting the cohort. Run eight independently randomized blocks over the
+   in one ordered native batch request. The formal admission limit cannot exceed
+   those 32 unique prompts; SGLang's locked admission limit drains the queue
+   without resetting the cohort. Run eight independently randomized blocks over the
    16K-to-40,960 long region. The batch owns the union of its active decode
    intervals; request-level rows are diagnostic only.
 4. Collect one diagnostic comparison per learner against the paired Static

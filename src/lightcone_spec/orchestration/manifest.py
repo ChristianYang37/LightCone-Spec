@@ -49,7 +49,7 @@ class SpeedStudyManifest:
     )
     confirmation_repetitions: int = 8
     confirmation_schedule_seed: int = 20260809
-    request_scheduling: str = "distinct_prompt_cohort_queue"
+    request_scheduling: str = "ordered_native_batch_cohort_queue"
     headline_timing_unit: str = "method_repetition_batch"
     inference_cluster_unit: str = "repetition_block"
     controlled_window_hashes: dict[str, str] = field(default_factory=dict)
@@ -113,7 +113,7 @@ class SpeedStudyManifest:
             raise ValueError("formal confirmation requires eight independent blocks")
         if self.confirmation_schedule_seed != 20260809:
             raise ValueError("confirmation schedule identity mismatch")
-        if self.request_scheduling != "distinct_prompt_cohort_queue":
+        if self.request_scheduling != "ordered_native_batch_cohort_queue":
             raise ValueError("request scheduling identity mismatch")
         if self.headline_timing_unit != "method_repetition_batch":
             raise ValueError("headline timing identity mismatch")

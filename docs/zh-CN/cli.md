@@ -146,7 +146,7 @@ adaptation config 的 SHA-256；method、optimizer、学习率、rank、stride �
 不匹配，都会在提交证据前使该 slice 失效。
 
 `run-confirmation` 每次只执行一个 method/block slice；它只 reset 一次 engine/cohort，默认
-执行不计时 warmup，然后将 32 个不同 prompt 以一次 start-gated HTTP burst 全部提交。
+执行不计时 warmup，然后将 32 个不同 prompt 以一次有序的原生 batch 请求全部提交。
 SGLang 锁定的 `max_running_requests` 负责 admission，cohort 在队列排空期间保持连续。它记录
 active decode 区间的并集以及 request 级绝对 streaming arrival time。模型的 40,960-token
 上限包含 tokenized prompt，因此每个 prompt 的生成上限独立计算。

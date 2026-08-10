@@ -190,8 +190,8 @@ speculative rejection sampling.
 ## Evidence and safety
 
 Formal confirmation submits 32 distinct held-out controlled prompts to SGLang
-in one start-gated burst per method across eight independent method-order
-blocks. The locked server admission limit controls the active batch and the
+in one ordered native batch request per method across eight independent
+method-order blocks. The locked server admission limit controls the active batch and the
 cohort is not reset while the queue drains. Each method/block owns the union of
 its active decode intervals; request diagnostics remain separate, so shared
 batch timing is not pseudoreplicated as 32 goodput samples. The

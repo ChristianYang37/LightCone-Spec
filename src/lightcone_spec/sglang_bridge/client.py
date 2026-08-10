@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-import threading
 import time
 import urllib.request
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 _MEASURED_METHODS = {
@@ -165,6 +163,109 @@ class MethodRun:
     after: ServerSnapshot
 
 
+def _consume_generation_stream(
+    response,
+    *,
+    request_ids: tuple[str, ...],
+    started: float,
+    require_batch_identity: bool,
+) -> tuple[GenerationResult, ...]:
+    """Decode one SSE connection into request-local arrival timelines."""
+    count = len(request_ids)
+    previous_arrivals: list[float | None] = [None] * count
+    previous_tokens = [0] * count
+    ttft_ms: list[float | None] = [None] * count
+    intervals: list[list[float]] = [[] for _ in request_ids]
+    arrivals: list[list[float]] = [[] for _ in request_ids]
+    finals: list[dict | None] = [None] * count
+    finished_at: list[float | None] = [None] * count
+    for raw_line in response:
+        line = raw_line.decode("utf-8").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        chunk = json.loads(data)
+        meta = chunk.get("meta_info")
+        if not isinstance(meta, dict):
+            raise TypeError("stream response metadata is malformed")
+        if require_batch_identity:
+            index = chunk.get("index")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not 0 <= index < count
+                or meta.get("id") != request_ids[index]
+            ):
+                raise RuntimeError("batch stream response identity is malformed")
+        else:
+            if count != 1 or meta.get("id", request_ids[0]) != request_ids[0]:
+                raise RuntimeError("single stream response identity is malformed")
+            index = 0
+        arrived = time.perf_counter()
+        completion_tokens = int(meta.get("completion_tokens", previous_tokens[index]))
+        new_tokens = completion_tokens - previous_tokens[index]
+        if new_tokens < 0:
+            raise RuntimeError("stream completion token count regressed")
+        if new_tokens:
+            arrivals[index].extend([arrived * 1000.0] * new_tokens)
+            previous = previous_arrivals[index]
+            if previous is None:
+                ttft_ms[index] = (arrived - started) * 1000.0
+                intervals[index].extend([0.0] * max(0, new_tokens - 1))
+            else:
+                intervals[index].append((arrived - previous) * 1000.0)
+                intervals[index].extend([0.0] * max(0, new_tokens - 1))
+            previous_arrivals[index] = arrived
+            previous_tokens[index] = completion_tokens
+        finals[index] = chunk
+        if meta.get("finish_reason") is not None:
+            finished_at[index] = arrived
+
+    results: list[GenerationResult] = []
+    for index, request_id in enumerate(request_ids):
+        final = finals[index]
+        first_token_ms = ttft_ms[index]
+        finish = finished_at[index]
+        if (
+            final is None
+            or previous_tokens[index] < 1
+            or first_token_ms is None
+            or finish is None
+        ):
+            raise RuntimeError("stream result coverage is incomplete")
+        if len(intervals[index]) != previous_tokens[index] - 1:
+            raise RuntimeError("ITL sample count does not match completion tokens")
+        meta = final.get("meta_info")
+        if not isinstance(meta, dict) or "prompt_tokens" not in meta:
+            raise RuntimeError("final stream chunk lacks prompt token telemetry")
+        input_tokens = int(meta["prompt_tokens"])
+        if input_tokens < 1:
+            raise RuntimeError("prompt token count must be positive")
+        finish_reason = meta.get("finish_reason")
+        if isinstance(finish_reason, dict):
+            stop_reason = str(finish_reason.get("type") or "unknown")
+        elif finish_reason is None:
+            stop_reason = None
+        else:
+            stop_reason = str(finish_reason)
+        results.append(
+            GenerationResult(
+                request_id=request_id,
+                input_tokens=input_tokens,
+                completion_tokens=previous_tokens[index],
+                ttft_ms=first_token_ms,
+                inter_token_ms=tuple(intervals[index]),
+                token_arrival_ms=tuple(arrivals[index]),
+                elapsed_s=finish - started,
+                stop_reason=stop_reason,
+                response=final,
+            )
+        )
+    return tuple(results)
+
+
 class SGLangHTTPClient:
     def __init__(self, base_url: str, timeout_s: float = 3600.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -237,71 +338,66 @@ class SGLangHTTPClient:
             method="POST",
         )
         started = time.perf_counter()
-        previous_arrival: float | None = None
-        previous_tokens = 0
-        ttft_ms: float | None = None
-        intervals: list[float] = []
-        arrivals: list[float] = []
-        final: dict = {}
         with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-            for raw_line in response:
-                line = raw_line.decode("utf-8").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                chunk = json.loads(data)
-                arrived = time.perf_counter()
-                meta = chunk.get("meta_info", {})
-                completion_tokens = int(
-                    meta.get("completion_tokens", previous_tokens)
-                )
-                new_tokens = completion_tokens - previous_tokens
-                if new_tokens < 0:
-                    raise RuntimeError("stream completion token count regressed")
-                if new_tokens:
-                    arrivals.extend(
-                        [arrived * 1000.0] * new_tokens
-                    )
-                    if previous_arrival is None:
-                        ttft_ms = (arrived - started) * 1000.0
-                        intervals.extend([0.0] * max(0, new_tokens - 1))
-                    else:
-                        intervals.append((arrived - previous_arrival) * 1000.0)
-                        intervals.extend([0.0] * max(0, new_tokens - 1))
-                    previous_arrival = arrived
-                    previous_tokens = completion_tokens
-                final = chunk
-        elapsed = time.perf_counter() - started
-        if previous_tokens < 1 or ttft_ms is None:
-            raise RuntimeError("stream produced no completion tokens")
-        if len(intervals) != previous_tokens - 1:
-            raise RuntimeError("ITL sample count does not match completion tokens")
-        meta = final.get("meta_info")
-        if not isinstance(meta, dict) or "prompt_tokens" not in meta:
-            raise RuntimeError("final stream chunk lacks prompt token telemetry")
-        input_tokens = int(meta["prompt_tokens"])
-        if input_tokens < 1:
-            raise RuntimeError("prompt token count must be positive")
-        finish_reason = meta.get("finish_reason")
-        if isinstance(finish_reason, dict):
-            stop_reason = str(finish_reason.get("type") or "unknown")
-        elif finish_reason is None:
-            stop_reason = None
-        else:
-            stop_reason = str(finish_reason)
-        return GenerationResult(
-            request_id=request_id,
-            input_tokens=input_tokens,
-            completion_tokens=previous_tokens,
-            ttft_ms=ttft_ms,
-            inter_token_ms=tuple(intervals),
-            token_arrival_ms=tuple(arrivals),
-            elapsed_s=elapsed,
-            stop_reason=stop_reason,
-            response=final,
+            results = _consume_generation_stream(
+                response,
+                request_ids=(request_id,),
+                started=started,
+                require_batch_identity=False,
+            )
+        return results[0]
+
+    def stream_generate_batch(
+        self, payloads: Iterable[dict]
+    ) -> tuple[tuple[GenerationResult, ...], float]:
+        """Submit one ordered native batch and retain per-request stream timing.
+
+        One HTTP batch gives SGLang a deterministic admission order while its
+        own ``max_running_requests`` remains the sole concurrency limiter.
+        This avoids host-thread races changing long greedy trajectories and
+        also removes one client connection/thread per queued request.
+        """
+        requests = tuple(payloads)
+        if not requests:
+            raise ValueError("a non-empty batch is required")
+        allowed = {"rid", "text", "sampling_params"}
+        if any(set(payload) != allowed for payload in requests):
+            raise ValueError("formal batch payload fields are not canonical")
+        request_ids = tuple(str(payload["rid"]) for payload in requests)
+        if any(not request_id for request_id in request_ids) or len(
+            set(request_ids)
+        ) != len(request_ids):
+            raise ValueError("batch request IDs must be non-empty and unique")
+        if any(
+            not isinstance(payload["text"], str)
+            or not payload["text"]
+            or not isinstance(payload["sampling_params"], dict)
+            for payload in requests
+        ):
+            raise ValueError("batch prompts and sampling parameters are malformed")
+
+        body = {
+            "rid": list(request_ids),
+            "text": [payload["text"] for payload in requests],
+            "sampling_params": [payload["sampling_params"] for payload in requests],
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/generate",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
+        started = time.perf_counter()
+        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            results = _consume_generation_stream(
+                response,
+                request_ids=request_ids,
+                started=started,
+                require_batch_identity=True,
+            )
+        ended = time.perf_counter()
+        return results, ended - started
 
     def run_loaded_batch(
         self,
@@ -317,18 +413,11 @@ class SGLangHTTPClient:
             raise ValueError(
                 "the request queue cannot reach the registered concurrency"
             )
-        start_gate = threading.Event()
-
-        def invoke(payload: dict) -> GenerationResult:
-            start_gate.wait()
-            return self.stream_generate(payload)
-
-        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
-            futures = [executor.submit(invoke, payload) for payload in requests]
-            started = time.perf_counter()
-            start_gate.set()
-            results = [future.result() for future in as_completed(futures)]
-        elapsed = time.perf_counter() - started
+        results, elapsed = self.stream_generate_batch(requests)
+        if {result.request_id for result in results} != {
+            str(payload["rid"]) for payload in requests
+        }:
+            raise RuntimeError("native batch response coverage is incomplete")
         return tuple(sorted(results, key=lambda row: row.request_id)), elapsed
 
 
