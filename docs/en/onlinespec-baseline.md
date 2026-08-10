@@ -45,7 +45,7 @@ not a performance result.
 | Ensemble of learners with different learning rates | Retained as independent learners with cumulative-loss Hedge |
 | Target-to-draft KL/CE supervision | Retained with the same semantic mask and frozen target used by the core runtime |
 | Per-chunk subprocess training and disk checkpoints | Replaced by GPU-resident transactional candidates and fixed-address publication |
-| CPU checkpoint averaging for ensemble inference | Replaced by a device-resident weighted full-parameter decision |
+| CPU checkpoint averaging for ensemble inference | Replaced by a device-resident weighted decision in one explicitly bound parameter class |
 | Hard-coded devices and dataset paths | Replaced by immutable schema, model locks, and rendered launch plans |
 | Skip a failed or OOM update and continue the experiment | Rejected; safety failures are recorded and invalidate the affected evidence |
 | Unaccounted synchronization and training time | Replaced by asynchronous CUDA timing, exposed-update accounting, and an independent profiler |
@@ -82,7 +82,7 @@ test-time-update boundary audited at the pinned commit.
 |---|---|---|---|---|
 | Online-LR | A standalone reasoning draft LM used by Lookahead Reasoning | Verifier-derived chosen/rejected responses; DPO with AdamW, β=(0.9, 0.95), learning rate 5e-7, DPO β=0.1, and three epochs. The launcher uses global batch 12 and micro batch 2. | 25-example chunks; a DeepSpeed subprocess rewrites a model directory. | The reasoning-level preference pipeline is documented but not relabelled as token-level OGD. It requires a separate judge, data, and memory protocol and is outside this registered baseline. |
 | Opt-Hydra | A multi-head Hydra draft head | Feature reconstruction plus teacher/token losses. The released “optimistic” path uses SGD momentum 0.9, learning rate 0.1, and three epochs, rather than the paper's two-state transition. | 80-example chunks; trainer checkpoints and optimizer state are loaded from disk between chunks. | Implements the published two-state optimistic learner on the supported drafter parameters. Momentum is not treated as mathematical optimism. |
-| Ens-EAGLE / EAGLE3 | Three independent EAGLE or EAGLE3 draft heads | Each learner is trained at a different rate. Registered scripts use EAGLE rates 3e-5/6e-5/1.2e-4 for five epochs and EAGLE3 rates 1e-4/2e-4/4e-4 for two epochs; source variants disagree about cumulative versus last-chunk weighting. | 40-example chunks; checkpoints are loaded and merged on CPU before evaluation. | Keeps independent projected-OGD experts and cumulative-loss Hedge, but performs the update and full-parameter merge on device. Expert backward passes are streamed sequentially so only one expert-gradient scratch is live. |
+| Ens-EAGLE / EAGLE3 | Three independent EAGLE or EAGLE3 draft heads | Each learner is trained at a different rate. Registered scripts use EAGLE rates 3e-5/6e-5/1.2e-4 for five epochs and EAGLE3 rates 1e-4/2e-4/4e-4 for two epochs; source variants disagree about cumulative versus last-chunk weighting. | 40-example chunks; checkpoints are loaded and merged on CPU before evaluation. | Keeps independent projected-OGD experts and cumulative-loss Hedge, but performs the update and same-class weighted decision on device. Expert backward passes are streamed sequentially so only one expert-gradient scratch is live. |
 
 “Complete” therefore has a precise meaning here: all three published online
 learner transitions used for a common speculative-decoding comparison—OGD,
@@ -107,7 +107,7 @@ benchmark values.
 | EAGLE objective | Cross entropy is the theoretical loss | Feature SmoothL1 plus token-distribution loss, with AdamW and multiple epochs | Target-to-draft KL/CE on the exact semantic mask so all backends share one feedback contract |
 | Gradient clipping | Bounded-gradient assumption | EAGLE source uses value clipping; recipes vary by backend | Per-expert global-norm clipping, configured and evidence-bound |
 | Parameter publication | Abstract next-round decision | Subprocess training and checkpoint replacement | Functional candidate followed by fixed-address atomic publication |
-| Ensemble merge | Weighted parameter decision | CPU checkpoint load, average, and save | Device-resident weighted full-parameter decision; no disk or CPU merge |
+| Ensemble merge | Weighted parameter decision | CPU checkpoint load, average, and save | Device-resident weighted decision in the registered Full or LoRA coordinate class; no disk or CPU merge |
 | Historical KV | Not specified | No explicit version contract for pre-update KV | Frozen, detached, versioned history; only future KV uses a published version |
 | Exact sampling | Target/draft likelihood-ratio verification | Most released evaluations use greedy decoding | The actual proposal distribution is retained for exact rejection sampling |
 | Failure handling | Not specified | Some training paths skip invalid samples, NaNs, or OOM batches | Fail closed for the affected cohort and invalidate unsafe evidence |
@@ -166,8 +166,13 @@ p_{t+1,i}=\frac{\exp(-\gamma L_{t+1,i})}
 w_{t+1}=\sum_i p_{t+1,i}w_{t+1,i}.
 \]
 
-Gradients are never reused across experts. Factor averaging is not equivalent
-to parameter averaging, so Hedge is restricted to `weight_update_mode=full`.
+Gradients are never reused across experts. With `weight_update_mode=full`,
+\(w\) is the dense drafter parameter vector and the decision matches weighted
+parameter averaging. With `weight_update_mode=lora`, \(w=(A,B)\) is instead the
+registered factor-coordinate vector at a common rank. That lower-memory
+decision class applies the same Hedge transition, but it is not numerically
+equivalent to averaging dense updates (BA); manifests, layouts, and evidence
+therefore keep the two classes distinct.
 
 Target-to-draft cross entropy and
 \(D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})\) differ by the
@@ -209,7 +214,8 @@ KV segment.
 - DSpark and EAGLE/EAGLE3 use the cache-safe tail path and their existing
   backend restrictions. They do not pretend to provide drafter-wide gradients.
 - OGD and optimistic OGD support Full and LoRA in the registered DFlash grid.
-- Hedge supports Full only and uses at least two ordered expert learning rates.
+- Hedge supports distinct Full and LoRA decision classes and uses at least two
+  ordered expert learning rates. Every LoRA expert has the same registered rank.
 - TP and DP must both equal one. Unsupported, quantized, or incompatible graph
   paths fail before OnlineSPEC state allocation.
 
@@ -228,6 +234,10 @@ leaves and gradient are released before the next expert. This preserves the
 same Hedge decision without reserving one full gradient copy per expert. These
 tensors are non-evictable and are never silently offloaded or downgraded.
 KV-pool sizing uses only the remaining memory.
+Full Hedge can legitimately fail this preflight when resident experts and the
+requested long-context KV capacity do not fit simultaneously. LoRA Hedge keeps
+expert learner state in factor coordinates and is the registered single-GPU
+alternative; it is never presented as a successful Full run.
 
 Update telemetry records learner step, source and published versions, loss,
 gradient norm, differentiable/inference-logit reconstruction diagnostics,

@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "9d5ede0634d680f567680898fa302e8e1c630ce2",
+  "expected_tree": "e6b4f17068328ba05b9097eb9bd3436537fe60b6",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
@@ -73,6 +73,14 @@
       "files": [
         "python/sglang/srt/mem_cache/allocation_sizing.py",
         "python/sglang/srt/speculative/dflash_info_v2.py",
+        "test/registered/unit/spec/test_online_adaptation_protocol.py"
+      ]
+    },
+    {
+      "file": "0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch",
+      "sha256": "bd2df150a81039d3b5d9a5fed80949a0261188d6162735da06fa8f210297a02f",
+      "files": [
+        "python/sglang/srt/speculative/online_adaptation_config.py",
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]
     }

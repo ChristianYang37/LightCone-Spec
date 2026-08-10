@@ -219,14 +219,16 @@ def test_online_baselines_are_routed_to_sglang(method: str, extra: dict) -> None
     assert payload["online_spec"] == value["online_spec"]
 
 
-def test_hedge_rejects_factor_averaging_and_incomplete_grid() -> None:
+def test_hedge_supports_lora_decisions_and_rejects_incomplete_grid() -> None:
     value = baseline_config("onlinespec_ens")
     value["adaptation"].update(weight_update_mode="lora", rank=8)
     value["online_spec"].update(
         additional_learning_rates=[0.03], hedge_learning_rate=0.5
     )
-    with pytest.raises(ValidationError, match="full parameter decisions"):
-        RunConfig.model_validate(value)
+    config = RunConfig.model_validate(value)
+    assert config.adaptation is not None
+    assert config.adaptation.weight_update_mode == "lora"
+    assert config.adaptation.rank == 8
 
     value = baseline_config("onlinespec_ens")
     with pytest.raises(ValidationError, match="multi-rate"):

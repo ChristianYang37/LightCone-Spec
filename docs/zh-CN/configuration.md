@@ -94,9 +94,11 @@ Optimizer 必须是 plain `sgd`；论文专属状态不能通过 Adam 或 moment
 | `additional_learning_rates` | 严格递增的专家学习率，仅 Hedge 使用 |
 | `hedge_learning_rate` | 正 Hedge meta rate，仅 Hedge 使用 |
 
-OGD 与 optimistic OGD 拒绝 ensemble 字段。Hedge 至少需要两个有序专家学习率，要求
-`weight_update_mode=full`，并拒绝 LoRA，因为平均 factor 不等于平均其所表示的参数。
-DFlash 为单 learner 支持 drafter Full/LoRA；DSpark 与 EAGLE/EAGLE3 只接受共享 tail
+OGD 与 optimistic OGD 拒绝 ensemble 字段。Hedge 至少需要两个有序专家学习率。
+DFlash 显式区分两种 Hedge decision class：`full` 对稠密 drafter parameter decision
+加权，`lora` 则在相同 rank 下对已注册 factor coordinate 加权。LoRA Hedge 是显存受限的
+decision class，不会被改写成稠密参数平均。DFlash 为三种 learner 都支持 drafter
+Full/LoRA；DSpark 与 EAGLE/EAGLE3 只接受共享 tail
 scope，并保留各自后端限制。全部 OnlineSPEC 方法都要求 TP=DP=1、frozen historical KV、
 cohort 隔离、exact rejection sampling 和一个 in-flight update。
 

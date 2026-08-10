@@ -17,6 +17,9 @@ yet been declared.
   paired confirmation, telemetry, memory accounting, and GPU attestation.
 - Streamed OnlineSPEC expert backward passes through one reusable gradient
   scratch while preserving the same cumulative-loss Hedge decision.
+- Added a separately identified LoRA-coordinate Hedge decision class for
+  memory-bounded OnlineSPEC comparisons; dense Full Hedge remains available
+  and is never silently downgraded.
 - Covered the source-audited EAGLE3 learning-rate scale in the Hedge tuning
   grid without selecting hyperparameters from confirmation evidence.
 
@@ -44,7 +47,7 @@ yet been declared.
 - Replaced the public configuration with strict schema-v2 identities.
 - Added DFlash drafter Full/LoRA updates, cache-safe tail ablations, frozen
   historical KV versioning, and cohort-scoped publication.
-- Replaced the SGLang integration with a reproducible seven-patch series against
+- Replaced the SGLang integration with a reproducible eight-patch series against
   one exact upstream commit.
 - Added deterministic disjoint data windows, tuning-only maximin selection,
   independent confirmation timing, resumable evidence receipts, and a

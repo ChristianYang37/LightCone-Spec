@@ -121,8 +121,10 @@ w_{t+1}=\Pi_K(w_t-\eta g_t).
 
 Optimistic OGD 保存 anchor \(\hat w_t\)，并将最近一次揭示的 gradient 作为下一轮 hint。
 Hedge 保存相互独立的 OGD 专家，在每个专家自己的 decision 上计算其 loss 与 gradient，
-再用负累计 loss 的指数权重形成下一轮 full-parameter decision。实现是 transactional 的，
-只在得到反馈后提交，因此收到 gradient 的 decision 正是生成 proposal 的 decision。
+再用负累计 loss 的指数权重在一种已注册 coordinate class 内形成下一轮 decision。Full
+使用稠密参数；LoRA 使用固定 rank 的 factor-coordinate decision，并单独报告。实现是
+transactional 的，只在得到反馈后提交，因此收到 gradient 的 decision 正是生成
+proposal 的 decision。
 
 完整公式、projection 语义与 clean-room 源码边界见
 [OnlineSPEC baseline](onlinespec-baseline.md)。这些是对比方法的数学，不改变

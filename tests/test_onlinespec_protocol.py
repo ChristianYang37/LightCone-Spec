@@ -137,16 +137,18 @@ def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
 
 def test_onlinespec_grid_is_complete_unique_and_algorithm_specific() -> None:
     candidates = onlinespec_candidates()
-    assert len(candidates) == 155
-    assert len({candidate.candidate_id for candidate in candidates}) == 155
+    assert len(candidates) == 236
+    assert len({candidate.candidate_id for candidate in candidates}) == 236
     assert {candidate.method for candidate in candidates} == set(ONLINE_SPEC_METHODS)
-    assert all(
-        candidate.weight_update_mode == "full"
-        and candidate.rank is None
-        and len(candidate.additional_learning_rates) == 2
-        for candidate in candidates
-        if candidate.method == "onlinespec_ens"
-    )
+    ensemble = [
+        candidate for candidate in candidates if candidate.method == "onlinespec_ens"
+    ]
+    assert {candidate.weight_update_mode for candidate in ensemble} == {
+        "full",
+        "lora",
+    }
+    assert {candidate.rank for candidate in ensemble} == {None, 8, 16, 32}
+    assert all(len(candidate.additional_learning_rates) == 2 for candidate in ensemble)
     assert {
         candidate.weight_update_mode
         for candidate in candidates
@@ -501,10 +503,7 @@ def test_onlinespec_comparison_is_diagnostic_and_strictly_paired() -> None:
                     "generated_bucket_end": DFLASH_SAFE_CONTEXT_LIMIT,
                     "concurrency": 4,
                     "at_risk_requests": 32,
-                    "output_tokens": (
-                        DFLASH_SAFE_CONTEXT_LIMIT - 16384
-                    )
-                    * 32,
+                    "output_tokens": (DFLASH_SAFE_CONTEXT_LIMIT - 16384) * 32,
                     "decode_goodput_tps": 100.0 * ratio,
                     **{key: None for key in safety},
                 }

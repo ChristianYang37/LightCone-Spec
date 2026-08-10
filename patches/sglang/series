@@ -5,3 +5,4 @@
 0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch
 0006-test-spec-cover-cross-backend-adaptation-protocols.patch
 0007-fix-spec-bound-request-boundary-KV-reservations.patch
+0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch

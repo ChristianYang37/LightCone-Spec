@@ -197,10 +197,6 @@ class RunConfig(StrictModel):
                     f"{algorithm} OnlineSPEC currently supports parameter_scope=tail"
                 )
             if self.method == "onlinespec_ens":
-                if self.adaptation.weight_update_mode != "full":
-                    raise ValueError(
-                        "OnlineSPEC Hedge combines full parameter decisions"
-                    )
                 rates = (
                     self.adaptation.optimizer.learning_rate,
                     *self.online_spec.additional_learning_rates,

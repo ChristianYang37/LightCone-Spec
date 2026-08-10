@@ -237,8 +237,6 @@ class OnlineSpecCandidate:
         if tuple(sorted(rates)) != rates or len(set(rates)) != len(rates):
             raise ValueError("expert learning rates must be unique and increasing")
         if self.method == "onlinespec_ens":
-            if self.weight_update_mode != "full":
-                raise ValueError("Hedge combines full parameter decisions")
             if (
                 not rates
                 or rates[0] <= self.learning_rate
@@ -293,23 +291,29 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
         # normalized single-step loss used here is not numerically identical
         # to that multi-epoch recipe, so retain a logarithmic tuning grid
         # instead of copying a claimed winner, but do not omit its scale.
-        for learning_rate in (1e-4, 1e-3, 1e-2):
-            for hedge_learning_rate in (0.1, 0.5, 1.0):
-                rows.append(
-                    OnlineSpecCandidate(
-                        "onlinespec_ens",
-                        "full",
-                        "drafter",
-                        learning_rate,
-                        None,
-                        stride,
-                        additional_learning_rates=(
-                            learning_rate * 3,
-                            learning_rate * 10,
-                        ),
-                        hedge_learning_rate=hedge_learning_rate,
+        for weight_update_mode, rank in (
+            ("full", None),
+            ("lora", 8),
+            ("lora", 16),
+            ("lora", 32),
+        ):
+            for learning_rate in (1e-4, 1e-3, 1e-2):
+                for hedge_learning_rate in (0.1, 0.5, 1.0):
+                    rows.append(
+                        OnlineSpecCandidate(
+                            "onlinespec_ens",
+                            weight_update_mode,
+                            "drafter",
+                            learning_rate,
+                            rank,
+                            stride,
+                            additional_learning_rates=(
+                                learning_rate * 3,
+                                learning_rate * 10,
+                            ),
+                            hedge_learning_rate=hedge_learning_rate,
+                        )
                     )
-                )
     identities = [row.candidate_id for row in rows]
     if len(identities) != len(set(identities)):
         raise AssertionError("OnlineSPEC tuning grid contains duplicate candidates")
@@ -757,11 +761,7 @@ def compare_onlinespec(
     """Paired diagnostics only; these rows never drive the core speed gate."""
     if {str(row["method"]) for row in rows} != set(ONLINE_SPEC_STUDY_METHODS):
         raise ValueError("OnlineSPEC comparison coverage has the wrong methods")
-    filtered = [
-        row
-        for row in rows
-        if row.get("region") == "long_region"
-    ]
+    filtered = [row for row in rows if row.get("region") == "long_region"]
     grouped: dict[int, dict[str, dict]] = {}
     for row in filtered:
         key = int(row["repetition_block"])
@@ -800,9 +800,7 @@ def compare_onlinespec(
             or ends != {DFLASH_SAFE_CONTEXT_LIMIT}
         ):
             raise ValueError("OnlineSPEC methods do not share the paired work")
-    full_rows = [
-        row for row in rows if str(row.get("region")) == "full_trajectory"
-    ]
+    full_rows = [row for row in rows if str(row.get("region")) == "full_trajectory"]
     full_by_block: dict[int, dict[str, dict]] = {}
     for row in full_rows:
         block = int(row["repetition_block"])

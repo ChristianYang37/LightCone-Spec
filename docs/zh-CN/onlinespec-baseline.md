@@ -37,7 +37,7 @@ GPU 状态为 `UNMEASURED`。本文描述协议与实现，不提供性能结果
 | 不同学习率 learner 的 ensemble | 保留为相互独立 learner 与 cumulative-loss Hedge |
 | target-to-draft KL/CE 监督 | 复用核心运行时的 semantic mask 与 frozen target |
 | 每个 chunk 启动子进程并写磁盘 checkpoint | 改为 GPU-resident transactional candidate 与固定地址发布 |
-| 在 CPU 合并 checkpoint 用于 ensemble inference | 改为设备驻留的 full-parameter 加权 decision |
+| 在 CPU 合并 checkpoint 用于 ensemble inference | 改为在一种显式绑定 parameter class 中形成设备驻留加权 decision |
 | 硬编码 device 与数据路径 | 改为不可变 schema、model lock 与渲染的 launch plan |
 | 更新失败或 OOM 后跳过并继续实验 | 拒绝；安全失败会被记录并使对应证据失效 |
 | 未计入的同步与训练时间 | 改为异步 CUDA 计时、exposed-update 账本与独立 profiler |
@@ -67,7 +67,7 @@ LightCone-Spec 只在注册的 tuning window 上选择归一化 loss 对应的 l
 |---|---|---|---|---|
 | Online-LR | Lookahead Reasoning 使用的独立 reasoning draft LM | 从 verifier 生成 chosen/rejected response；DPO 使用 AdamW、β=(0.9, 0.95)、学习率 5e-7、DPO β=0.1 和 3 个 epoch。launcher 使用 global batch 12、micro batch 2。 | 每 25 个样本为一个 chunk；DeepSpeed 子进程重写模型目录。 | 记录 reasoning-level preference pipeline，但不把它重命名为 token-level OGD。它需要独立 judge、数据与显存协议，不属于本注册 baseline。 |
 | Opt-Hydra | 多头 Hydra draft head | feature reconstruction 加 teacher/token loss。发布源码中的“optimistic”路径实际使用 momentum 0.9、学习率 0.1、3 个 epoch 的 SGD，而不是论文双状态转移。 | 每 80 个样本为一个 chunk；跨 chunk 从磁盘加载 trainer checkpoint 与 optimizer state。 | 在受支持 drafter 参数上实现论文双状态 optimistic learner；不把 momentum 当成数学意义上的 optimism。 |
-| Ens-EAGLE / EAGLE3 | 三个相互独立的 EAGLE 或 EAGLE3 draft head | 不同学习率分别训练。注册脚本中 EAGLE 为 3e-5/6e-5/1.2e-4、5 个 epoch，EAGLE3 为 1e-4/2e-4/4e-4、2 个 epoch；不同源码变体对累计 loss 与仅上一 chunk loss 的处理并不一致。 | 每 40 个样本为一个 chunk；评估前在 CPU 加载并合并 checkpoint。 | 保留相互独立的 projected-OGD expert 与 cumulative-loss Hedge，但在设备上更新和形成 full-parameter decision。expert backward 逐个流式执行，因此同时只保留一份 expert gradient scratch。 |
+| Ens-EAGLE / EAGLE3 | 三个相互独立的 EAGLE 或 EAGLE3 draft head | 不同学习率分别训练。注册脚本中 EAGLE 为 3e-5/6e-5/1.2e-4、5 个 epoch，EAGLE3 为 1e-4/2e-4/4e-4、2 个 epoch；不同源码变体对累计 loss 与仅上一 chunk loss 的处理并不一致。 | 每 40 个样本为一个 chunk；评估前在 CPU 加载并合并 checkpoint。 | 保留相互独立的 projected-OGD expert 与 cumulative-loss Hedge，但在设备上更新并形成同一 decision class 内的加权 decision。expert backward 逐个流式执行，因此同时只保留一份 expert gradient scratch。 |
 
 因此，本项目中“完整实现”具有精确定义：用于同一 speculative-decoding 对比的三种已发表
 online learner 转移——OGD、双状态 optimistic OGD 与 cumulative-loss Hedge——均具有完整
@@ -89,7 +89,7 @@ schema、runtime、tuning、confirmation、telemetry 与安全实现。它不表
 | EAGLE objective | 理论损失为 cross entropy | feature SmoothL1 加 token-distribution loss，配合 AdamW 与多 epoch | 对 exact semantic mask 计算 target-to-draft KL/CE，使各后端共享同一反馈合同 |
 | Gradient clipping | 有界 gradient 假设 | EAGLE 源码使用 value clipping，各后端 recipe 不一致 | 每个 expert 独立做 global-norm clipping，配置与证据绑定 |
 | 参数发布 | 抽象的下一轮 decision | 子进程训练并替换 checkpoint | functional candidate，在固定显存地址原子发布 |
-| Ensemble merge | 参数 decision 的加权组合 | CPU 加载、平均、保存 checkpoint | GPU 上形成 full-parameter 加权 decision；不经过磁盘或 CPU merge |
+| Ensemble merge | 参数 decision 的加权组合 | CPU 加载、平均、保存 checkpoint | GPU 上在注册的 Full 或 LoRA coordinate class 内形成加权 decision；不经过磁盘或 CPU merge |
 | 历史 KV | 未定义 | 没有为更新前 KV 给出显式版本合同 | 历史 KV frozen、detach 且带版本；只有未来 KV 使用新发布版本 |
 | Exact sampling | 按 target/draft likelihood ratio 验证 | 已发布实验大多使用 greedy decoding | 保留实际 proposal distribution，用于 exact rejection sampling |
 | 失败处理 | 未定义 | 部分训练路径会跳过坏样本、NaN 或 OOM batch | 对受影响 cohort fail closed，并使不安全证据失效 |
@@ -141,8 +141,11 @@ p_{t+1,i}=\frac{\exp(-\gamma L_{t+1,i})}
 w_{t+1}=\sum_i p_{t+1,i}w_{t+1,i}.
 \]
 
-专家之间绝不复用 gradient。Factor averaging 不等价于 parameter averaging，因此
-Hedge 只允许 `weight_update_mode=full`。
+专家之间绝不复用 gradient。使用 `weight_update_mode=full` 时，$w$ 是稠密 drafter
+parameter vector，decision 对应加权 parameter averaging；使用
+`weight_update_mode=lora` 时，$w=(A,B)$ 是相同 rank 下已注册的 factor-coordinate
+vector。后者在更低显存的 decision class 上执行相同 Hedge 转移，但它不等价于对稠密
+update $BA$ 求平均，因此 manifest、layout 与 evidence 会严格区分两种 class。
 
 Target-to-draft cross entropy 与
 \(D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})\) 只相差不依赖
@@ -178,7 +181,8 @@ barrier，也不能在产生监督的 proposal 尚未结束时发布。
 - DSpark 与 EAGLE/EAGLE3 使用 cache-safe tail 路径及其既有后端限制，不伪装提供
   drafter-wide gradient。
 - OGD 与 optimistic OGD 在已注册 DFlash 网格中支持 Full 与 LoRA。
-- Hedge 只支持 Full，并至少使用两个有序专家学习率。
+- Hedge 支持显式区分的 Full 与 LoRA decision class，并至少使用两个有序专家学习率；
+  所有 LoRA expert 使用相同的注册 rank。
 - TP 与 DP 都必须为一；不支持、量化或 graph 不兼容的路径会在分配 OnlineSPEC 状态
   前 fail closed。
 
@@ -194,6 +198,9 @@ telemetry。Hedge expert 逐个计算梯度：保留已更新的 expert candidat
 expert 前释放当前 differentiable leaf 与 gradient。因此它保持相同的 Hedge decision，
 但不需要为每个 expert 各预留一份完整 gradient。这些 tensor 不可驱逐，也不会静默
 offload 或降档；KV pool 只能使用扣除这些开销后的剩余显存。
+当常驻 expert 与所需 long-context KV 无法同时容纳时，Full Hedge 可以合法地在该预检
+失败。LoRA Hedge 把 learner state 保存在 factor coordinate 中，是已注册的单卡替代；
+它绝不会被包装成一次成功的 Full 运行。
 
 Update telemetry 记录 learner step、source/published version、loss、gradient norm、可微路径
 与推理 logits 的重建诊断、更新时间、发布时间及安全处置。Optimistic 额外记录 hint

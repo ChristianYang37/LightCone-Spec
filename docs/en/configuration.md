@@ -109,9 +109,11 @@ is not expressed through an Adam or momentum alias.
 | `hedge_learning_rate` | positive Hedge meta rate, Hedge only |
 
 OGD and optimistic OGD reject ensemble fields. Hedge requires at least two
-ordered expert rates, uses `weight_update_mode=full`, and rejects LoRA because
-averaging factors is not equivalent to averaging the represented parameter.
-DFlash supports drafter Full/LoRA for the single learners. DSpark and
+ordered expert rates. DFlash supports two explicitly distinct Hedge decision
+classes: `full` averages dense drafter-parameter decisions, while `lora`
+averages the registered factor coordinates at a common rank. LoRA Hedge is a
+memory-bounded decision class and is not relabeled as dense parameter
+averaging. DFlash supports drafter Full/LoRA for all three learners. DSpark and
 EAGLE/EAGLE3 accept only the shared tail scope and retain their ordinary
 backend restrictions. All OnlineSPEC methods require TP=DP=1, frozen historical
 KV, cohort isolation, exact rejection sampling, and one in-flight update.

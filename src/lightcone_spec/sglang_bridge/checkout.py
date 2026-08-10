@@ -24,7 +24,7 @@ def _git(checkout: Path, *arguments: str) -> str:
 
 
 def verify_patched_checkout(path: str | Path) -> Path:
-    """Return an exact, clean seven-patch checkout or fail before launch."""
+    """Return an exact, clean eight-patch checkout or fail before launch."""
     checkout = Path(path).resolve()
     if not (checkout / "python" / "sglang" / "__init__.py").is_file():
         raise ValueError("SGLang checkout lacks python/sglang/__init__.py")
@@ -51,9 +51,7 @@ def verify_patched_checkout(path: str | Path) -> Path:
     )
     if completed.returncode != 0:
         raise ValueError("patched SGLang history does not descend from the pin")
-    count = int(
-        _git(checkout, "rev-list", "--count", f"{PINNED_SGLANG_COMMIT}..HEAD")
-    )
-    if count != 7:
-        raise ValueError("patched SGLang checkout must contain the seven-patch series")
+    count = int(_git(checkout, "rev-list", "--count", f"{PINNED_SGLANG_COMMIT}..HEAD"))
+    if count != 8:
+        raise ValueError("patched SGLang checkout must contain the eight-patch series")
     return checkout

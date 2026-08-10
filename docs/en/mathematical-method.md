@@ -135,9 +135,11 @@ w_{t+1}=\Pi_K(w_t-\eta g_t).
 
 Optimistic OGD keeps an anchor \(\hat w_t\) and uses the last revealed gradient
 as its next hint. Hedge keeps independent OGD experts, evaluates each loss and
-gradient at that expert's own decision, and forms the next full-parameter
-decision with probabilities proportional to exponentiated negative cumulative
-loss. The implementation is transactional and commits only after feedback, so
+gradient at that expert's own decision, and forms the next decision in one
+registered coordinate class with probabilities proportional to exponentiated
+negative cumulative loss. Full uses dense parameters; LoRA uses a fixed-rank
+factor-coordinate decision and is reported separately. The implementation is
+transactional and commits only after feedback, so
 the decision that receives a gradient is exactly the decision that generated
 the proposal.
 
