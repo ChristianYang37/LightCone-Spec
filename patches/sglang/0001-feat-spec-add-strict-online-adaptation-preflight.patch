@@ -1,7 +1,7 @@
-From 84b9a4bf54ec99481c101d1e8a6499aa8c451def Mon Sep 17 00:00:00 2001
+From 1858b24992a4b912fbb374c775fbe49a8508d922 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
-Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight
+Subject: [PATCH] feat(spec): add strict online adaptation preflight
 
 ---
  .../sglang/srt/arg_groups/speculative_hook.py |   6 +
@@ -11,7 +11,7 @@ Subject: [PATCH 1/6] feat(spec): add strict online adaptation preflight
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
 
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
-index 427acdd3817f865612b79425743adfc6c89f78f2..771a175df2ff81b76cca74dbf937ea30ba576f29 100644
+index 427acdd..771a175 100644
 --- a/python/sglang/srt/arg_groups/speculative_hook.py
 +++ b/python/sglang/srt/arg_groups/speculative_hook.py
 @@ -143,6 +143,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
@@ -28,7 +28,7 @@ index 427acdd3817f865612b79425743adfc6c89f78f2..771a175df2ff81b76cca74dbf937ea30
  def _handle_dflash(server_args: ServerArgs) -> None:
      from sglang.srt.arg_groups.overrides import resolved_view
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index 1182ccbb23ad31ee942d1882e7b9ec1eec987267..f6fb45a2846353c9b61b3a9b20937c08ab7aaed6 100644
+index 1182ccb..f6fb45a 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -2157,6 +2157,29 @@ class ServerArgs:
@@ -63,7 +63,7 @@ index 1182ccbb23ad31ee942d1882e7b9ec1eec987267..f6fb45a2846353c9b61b3a9b20937c08
      # separate engines, currently connected by a ZMQ IPC mesh.
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b02ac012bbb563a91035a2f41eb1350cecd2e1a
+index 0000000..8b02ac0
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
 @@ -0,0 +1,475 @@
@@ -542,3 +542,6 @@ index 0000000000000000000000000000000000000000..8b02ac012bbb563a91035a2f41eb1350
 +        raise ValueError("exact adaptation requires accept threshold acc=1")
 +    if reserve_mb <= 0:
 +        raise ValueError("online adaptation requires an explicit pre-KV HBM reserve")
+-- 
+2.55.0
+

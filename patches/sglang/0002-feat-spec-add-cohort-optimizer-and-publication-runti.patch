@@ -1,19 +1,19 @@
-From 4f62da3df83212e75aed1059ab322ae1b8bf4960 Mon Sep 17 00:00:00 2001
+From 2eb959834a03cfbc0d98be443ae0bbda2da51d03 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:44 +0800
-Subject: [PATCH 2/6] feat(spec): add cohort optimizer and publication runtime
+Subject: [PATCH] feat(spec): add cohort optimizer and publication runtime
 
 ---
- .../speculative/online_adaptation_runtime.py  | 2054 +++++++++++++++++
- 1 file changed, 2054 insertions(+)
+ .../speculative/online_adaptation_runtime.py  | 2062 +++++++++++++++++
+ 1 file changed, 2062 insertions(+)
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
 
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..51ae296b23ded48f942956f261082c4132df59da
+index 0000000..7c639d0
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2054 @@
+@@ -0,0 +1,2062 @@
 +"""Cohort-shared CUDA runtime for TTS and first-ready publication."""
 +
 +from __future__ import annotations
@@ -33,6 +33,14 @@ index 0000000000000000000000000000000000000000..51ae296b23ded48f942956f261082c41
 +)
 +
 +_MUON_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
++
++
++def _canonical_runtime_device(device: torch.device) -> torch.device:
++    """Resolve an index-less CUDA device to this worker's current device."""
++    resolved = torch.device(device)
++    if resolved.type == "cuda" and resolved.index is None:
++        return torch.device("cuda", torch.cuda.current_device())
++    return resolved
 +
 +
 +def notify_online_adapters(
@@ -946,7 +954,7 @@ index 0000000000000000000000000000000000000000..51ae296b23ded48f942956f261082c41
 +        max_trace_batch: int,
 +    ) -> None:
 +        self.config = config
-+        self.device = device
++        self.device = _canonical_runtime_device(device)
 +        self.reserve_bytes = int(reserve_bytes)
 +        if self.reserve_bytes <= 0:
 +            raise ValueError("adaptation reserve must be positive")
@@ -2068,3 +2076,6 @@ index 0000000000000000000000000000000000000000..51ae296b23ded48f942956f261082c41
 +            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 +            temporary.replace(self.telemetry_path)
 +        return payload
+-- 
+2.55.0
+

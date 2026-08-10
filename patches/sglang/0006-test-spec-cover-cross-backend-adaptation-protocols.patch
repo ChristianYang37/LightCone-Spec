@@ -1,19 +1,19 @@
-From 902e778f59d3018533f10f65a8dc16b0def50941 Mon Sep 17 00:00:00 2001
+From 22b487c5079526665bcf816a1b4c7d6fa68a211b Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
-Subject: [PATCH 6/6] test(spec): cover cross-backend adaptation protocols
+Subject: [PATCH] test(spec): cover cross-backend adaptation protocols
 
 ---
- .../spec/test_online_adaptation_protocol.py   | 1763 +++++++++++++++++
- 1 file changed, 1763 insertions(+)
+ .../spec/test_online_adaptation_protocol.py   | 1781 +++++++++++++++++
+ 1 file changed, 1781 insertions(+)
  create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
 
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..28a7317ff1815525c711249622a37ed65938f23b
+index 0000000..8f7355d
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,1763 @@
+@@ -0,0 +1,1781 @@
 +import hashlib
 +import json
 +import math
@@ -38,6 +38,7 @@ index 0000000000000000000000000000000000000000..28a7317ff1815525c711249622a37ed6
 +    OnlineSpecOptimizer,
 +    RequestVersionState,
 +    ResidentOptimizer,
++    _canonical_runtime_device,
 +    estimate_full_vocab_training_scratch_bytes,
 +    estimate_functional_optimizer_scratch_bytes,
 +    zeroth_power_newton_schulz,
@@ -50,6 +51,23 @@ index 0000000000000000000000000000000000000000..28a7317ff1815525c711249622a37ed6
 +
 +register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 +register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
++
++
++class TestRuntimeDeviceCanonicalization(unittest.TestCase):
++    def test_indexless_cuda_device_uses_worker_current_device(self):
++        with patch.object(torch.cuda, "current_device", return_value=3):
++            self.assertEqual(
++                _canonical_runtime_device(torch.device("cuda")),
++                torch.device("cuda:3"),
++            )
++        self.assertEqual(
++            _canonical_runtime_device(torch.device("cuda:2")),
++            torch.device("cuda:2"),
++        )
++        self.assertEqual(
++            _canonical_runtime_device(torch.device("cpu")),
++            torch.device("cpu"),
++        )
 +
 +
 +def _config_value(**overrides):
@@ -1777,3 +1795,6 @@ index 0000000000000000000000000000000000000000..28a7317ff1815525c711249622a37ed6
 +
 +if __name__ == "__main__":
 +    unittest.main()
+-- 
+2.55.0
+

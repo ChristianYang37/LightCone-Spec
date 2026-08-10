@@ -4,11 +4,11 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "b41b45f8769d28fef14ca98218579f1089b6e72b",
+  "expected_tree": "cf7d88811ba81cdc6872ee48889cc521d73a2214",
   "patches": [
     {
       "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
-      "sha256": "65834eb8fd07038b98e47a2978d6f184b0e72b33b4a7c29734615c6d9df421bb",
+      "sha256": "04b3528070b45a6b55002bdd211ddc198705d91240406ab3242888ce2e60c5a0",
       "files": [
         "python/sglang/srt/arg_groups/speculative_hook.py",
         "python/sglang/srt/server_args.py",
@@ -17,14 +17,14 @@
     },
     {
       "file": "0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch",
-      "sha256": "2a876b0e5588fd38e7bd62e5300c08e2eeb1d6b150c8f886dd5a05e7df3244e4",
+      "sha256": "ff9eb72a01ec0427b136af486995cb0ed690d746d5879565bf729ac2123e9a0d",
       "files": [
         "python/sglang/srt/speculative/online_adaptation_runtime.py"
       ]
     },
     {
       "file": "0003-feat-dflash-add-differentiable-online-update-path.patch",
-      "sha256": "bf65e0999a59afdfb8825ff5f57ddf3e50f5be927ff472b067135e145261ba15",
+      "sha256": "d40b429521e07440b58f59369602d2cd839b2262af0f74bb1b92954a0c2f8dec",
       "files": [
         "python/sglang/srt/speculative/dflash_online_adaptation.py",
         "python/sglang/srt/speculative/online_valid_mask.py"
@@ -32,7 +32,7 @@
     },
     {
       "file": "0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch",
-      "sha256": "3c526ef8392a8c6ccc88098fdd25621bd9efa7505c7f55b7a3d3d40333057f61",
+      "sha256": "32e773dacd0fab728ecc131725023b58d4cff0d5ac2a99e2008c55a134de8668",
       "files": [
         "python/sglang/srt/managers/overlap_utils.py",
         "python/sglang/srt/models/deepseek_v4_dspark.py",
@@ -51,7 +51,7 @@
     },
     {
       "file": "0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch",
-      "sha256": "69e6a5847258362f4f8a7af00ee03e9929d7c96d2fb37f69073cc9762e78bfd7",
+      "sha256": "86f96ad7cf34098345b145ad818ed3ba8d35512fbb533c2f860cb108bd1cca5c",
       "files": [
         "python/sglang/srt/managers/scheduler.py",
         "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
@@ -62,7 +62,7 @@
     },
     {
       "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
-      "sha256": "9453b108ed0ad964aea9d9654fba7b892a69693439ffc27c8e68466acbff482d",
+      "sha256": "9d1f7b2882fd6fe12d2a8734bf9bd3382ddc34b5c2573225306e1aa53593792e",
       "files": [
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]

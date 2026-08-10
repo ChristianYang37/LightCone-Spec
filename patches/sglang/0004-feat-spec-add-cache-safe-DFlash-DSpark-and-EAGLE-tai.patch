@@ -1,7 +1,7 @@
-From 3624dfed5229ff9bec00c8421eb9a77c93970556 Mon Sep 17 00:00:00 2001
+From 684887d8d28f4e9e42cd7ec54e59199519376d53 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
-Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
+Subject: [PATCH] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
 
 ---
  python/sglang/srt/managers/overlap_utils.py   |  31 +-
@@ -23,7 +23,7 @@ Subject: [PATCH 4/6] feat(spec): add cache-safe DFlash DSpark and EAGLE tails
  create mode 100644 python/sglang/srt/speculative/online_tail_adaptation.py
 
 diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/managers/overlap_utils.py
-index 9e2f191aa2ffa97a0e9c188059df7905915ce79f..45d4117cbbbb0c5451aa3d673d42fa801cd8e630 100644
+index 9e2f191..45d4117 100644
 --- a/python/sglang/srt/managers/overlap_utils.py
 +++ b/python/sglang/srt/managers/overlap_utils.py
 @@ -120,7 +120,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
@@ -112,7 +112,7 @@ index 9e2f191aa2ffa97a0e9c188059df7905915ce79f..45d4117cbbbb0c5451aa3d673d42fa80
              self.dsa_topk_indices_buf is not None
              and payload.dsa_topk_indices is not None
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 2b01ec2e2a0890b6741f11449693f26a82fb892a..d6d566452be40ff7dcbc61178cd91b64594481cb 100644
+index 2b01ec2..d6d5664 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -78,7 +78,6 @@ def apply_rotary_emb(
@@ -214,7 +214,7 @@ index 2b01ec2e2a0890b6741f11449693f26a82fb892a..d6d566452be40ff7dcbc61178cd91b64
          mapped_rest = rest
          mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
-index a1ca3f145ec932cc497cbedd8bab80f62bfca4bc..45f90763d207b112947d8ef97a551b6403dea332 100644
+index a1ca3f1..45f9076 100644
 --- a/python/sglang/srt/models/dspark.py
 +++ b/python/sglang/srt/models/dspark.py
 @@ -65,7 +65,6 @@ def run_markov_block(
@@ -289,7 +289,7 @@ index a1ca3f145ec932cc497cbedd8bab80f62bfca4bc..45f90763d207b112947d8ef97a551b64
  
  
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
-index 0bfd3b249d771651e11090d7785854ed6123e89f..1feacc440e45bd318823bd31ac6658acf37b93fa 100644
+index 0bfd3b2..1feacc4 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
 @@ -86,7 +86,15 @@ class _DflashDraftSampler:
@@ -618,7 +618,7 @@ index 0bfd3b249d771651e11090d7785854ed6123e89f..1feacc440e45bd318823bd31ac6658ac
              bonus_tokens=bonus,
              new_seq_lens=new_seq_lens,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-index acdbd7451340a9721443f081ed97b537e759bca0..440c878124a71e219f977ba42b508b7ee7f6731b 100644
+index acdbd74..440c878 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 @@ -21,6 +21,11 @@ from sglang.srt.runtime_context import get_parallel
@@ -849,7 +849,7 @@ index acdbd7451340a9721443f081ed97b537e759bca0..440c878124a71e219f977ba42b508b7e
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_proposal.py b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2a1db91c033e792385af507eab03e8b9c7ae0d03
+index 0000000..2a1db91
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 @@ -0,0 +1,71 @@
@@ -925,7 +925,7 @@ index 0000000000000000000000000000000000000000..2a1db91c033e792385af507eab03e8b9
 +    "compute_dspark_projection",
 +)
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-index 4d5478cd53c70f342cc4555ab352108c335a35aa..ab2114d90266459e2e2e4e06a222d14b24a2a9b6 100644
+index 4d5478c..ab2114d 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 @@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
@@ -954,7 +954,7 @@ index 4d5478cd53c70f342cc4555ab352108c335a35aa..ab2114d90266459e2e2e4e06a222d14b
          self,
          *,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
-index ae778ee1dbffe5e6570ba456d316dfac8cdddfc9..af94ba14de42ec8d0ccda216bd39812f5e36bd77 100644
+index ae778ee..af94ba1 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 @@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
@@ -1127,7 +1127,7 @@ index ae778ee1dbffe5e6570ba456d316dfac8cdddfc9..af94ba14de42ec8d0ccda216bd39812f
              if confidence is not None:
                  on_publish(accept.new_seq_lens, confidence=confidence)
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
-index 4184fe4657996bfba8c39d055876d1aa2bcb7f3a..ba7a0390efd8a8045db2fbbfc07d9e951b96b440 100644
+index 4184fe4..ba7a039 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
 +++ b/python/sglang/srt/speculative/eagle_info.py
 @@ -30,6 +30,7 @@ class EagleVerifyInput(SpecInput):
@@ -1185,7 +1185,7 @@ index 4184fe4657996bfba8c39d055876d1aa2bcb7f3a..ba7a0390efd8a8045db2fbbfc07d9e95
  
  @dataclass
 diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
-index 880545b509ad6870d9d0921c9a73fd3beed4e4e4..8ee2ed59d29f7ed516546b2d7a43dacef15152a4 100644
+index 880545b..8ee2ed5 100644
 --- a/python/sglang/srt/speculative/eagle_worker_common.py
 +++ b/python/sglang/srt/speculative/eagle_worker_common.py
 @@ -397,6 +397,7 @@ def build_eagle_verify_input(
@@ -1197,7 +1197,7 @@ index 880545b509ad6870d9d0921c9a73fd3beed4e4e4..8ee2ed59d29f7ed516546b2d7a43dace
  
  
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index ee4357578c3fe102e0f0ba4d2fa759db5ba1400e..0befbb9b6377a0e8d05b9750a7d78266d35c0f38 100644
+index ee43575..0befbb9 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
 @@ -2,7 +2,7 @@ import contextlib
@@ -1592,7 +1592,7 @@ index ee4357578c3fe102e0f0ba4d2fa759db5ba1400e..0befbb9b6377a0e8d05b9750a7d78266
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/online_eagle_adaptation.py b/python/sglang/srt/speculative/online_eagle_adaptation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..17b515053a3377de3ba864d4e225a0dfd1fb4e3f
+index 0000000..17b5150
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_eagle_adaptation.py
 @@ -0,0 +1,291 @@
@@ -1889,7 +1889,7 @@ index 0000000000000000000000000000000000000000..17b515053a3377de3ba864d4e225a0df
 +)
 diff --git a/python/sglang/srt/speculative/online_tail_adaptation.py b/python/sglang/srt/speculative/online_tail_adaptation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a69be5aa36ca9585e32e2a29aff7b88de89fd917
+index 0000000..a69be5a
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_tail_adaptation.py
 @@ -0,0 +1,624 @@
@@ -2517,3 +2517,6 @@ index 0000000000000000000000000000000000000000..a69be5aa36ca9585e32e2a29aff7b88d
 +        algorithm=algorithm,
 +        proposal_depth=proposal_depth,
 +    )
+-- 
+2.55.0
+

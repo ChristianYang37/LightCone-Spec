@@ -1,7 +1,7 @@
-From abc8c9a8fc4c5c725dcfeb38c40af9f6da163fd7 Mon Sep 17 00:00:00 2001
+From ae89aee79c81e035243fe4f963872c958395dc1c Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
-Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
+Subject: [PATCH] feat(dflash): add differentiable online update path
 
 ---
  .../speculative/dflash_online_adaptation.py   | 1088 +++++++++++++++++
@@ -12,7 +12,7 @@ Subject: [PATCH 3/6] feat(dflash): add differentiable online update path
 
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..2ef4b7858c7cb5c6b837840ef770b172c6357369
+index 0000000..2ef4b78
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
 @@ -0,0 +1,1088 @@
@@ -1106,7 +1106,7 @@ index 0000000000000000000000000000000000000000..2ef4b7858c7cb5c6b837840ef770b172
 +    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a8762fa8cd9cb463769b85f588ae4947d1058fa7
+index 0000000..a8762fa
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_valid_mask.py
 @@ -0,0 +1,142 @@
@@ -1252,3 +1252,6 @@ index 0000000000000000000000000000000000000000..a8762fa8cd9cb463769b85f588ae4947
 +        ignore_eos=ignore_eos,
 +    )
 +    return accepted, committed
+-- 
+2.55.0
+

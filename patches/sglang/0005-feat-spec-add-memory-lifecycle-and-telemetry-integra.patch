@@ -1,8 +1,7 @@
-From 6c8e5cfc528ba3d0066d0882074bf7d0cf00b8cc Mon Sep 17 00:00:00 2001
+From 229f4e550b008f23b1e09926d0d43f06a5a4203f Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Sun, 9 Aug 2026 15:36:45 +0800
-Subject: [PATCH 5/6] feat(spec): add memory lifecycle and telemetry
- integration
+Subject: [PATCH] feat(spec): add memory lifecycle and telemetry integration
 
 ---
  python/sglang/srt/managers/scheduler.py       | 75 ++++++++++++++++++-
@@ -13,7 +12,7 @@ Subject: [PATCH 5/6] feat(spec): add memory lifecycle and telemetry
  5 files changed, 131 insertions(+), 9 deletions(-)
 
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 861c13fb4e4950b324c4126206106b474685b45b..495fdf7041d903f71b3f8b4ac6fd0ff5b43c781c 100644
+index 861c13f..495fdf7 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -3252,6 +3252,9 @@ class Scheduler(
@@ -128,7 +127,7 @@ index 861c13fb4e4950b324c4126206106b474685b45b..495fdf7041d903f71b3f8b4ac6fd0ff5
          # These fields are not msgpack-serializable (a config object and a bound
          # signal handler); no reader consumes them.
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 248a92939e28d0a008a66ac7be9b181aeb86b64d..12a4a7a2e9c36c5554166f4077e57d8ae22ce198 100644
+index 248a929..12a4a7a 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -948,10 +948,15 @@ class SchedulerBatchResultProcessor:
@@ -152,7 +151,7 @@ index 248a92939e28d0a008a66ac7be9b181aeb86b64d..12a4a7a2e9c36c5554166f4077e57d8a
              # delete feature to save memory
              if req.multimodal_inputs is not None and req.session is None:
 diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
-index 15e1b814d7381c3e945a60d08a1fc24332c3494a..1779332372ffd5bc1e4906d391a7134114597a78 100644
+index 15e1b81..1779332 100644
 --- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 +++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 @@ -141,6 +141,16 @@ class SchedulerMetricsReporter:
@@ -199,7 +198,7 @@ index 15e1b814d7381c3e945a60d08a1fc24332c3494a..1779332372ffd5bc1e4906d391a71341
          # Every-iteration work: realtime token counting + status logger
          if self.current_scheduler_metrics_enabled:
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
-index bc4cf815457f0975ab120394c878b10675f3ad8e..d18d814f0ee25d422e4174a18e1b92b956fdfdee 100644
+index bc4cf81..d18d814 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
@@ -243,7 +242,7 @@ index bc4cf815457f0975ab120394c878b10675f3ad8e..d18d814f0ee25d422e4174a18e1b92b9
                  f"Raise --mem-fraction-static above "
                  f"{suggested_mem_fraction_static:.3f} "
 diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
-index eb2119413b56a1454489e19f555830f59480bb73..e887ef0b9dc63bd2503d1c820e012f5856a03e0c 100644
+index eb21194..e887ef0 100644
 --- a/python/sglang/srt/speculative/base_spec_worker.py
 +++ b/python/sglang/srt/speculative/base_spec_worker.py
 @@ -172,6 +172,10 @@ class BaseSpecWorker(ABC):
@@ -257,3 +256,6 @@ index eb2119413b56a1454489e19f555830f59480bb73..e887ef0b9dc63bd2503d1c820e012f58
      def activate_step_by_batch(self, batch_size: int) -> None:
          """Activate the optimal adaptive step for the current batch size.
  
+-- 
+2.55.0
+
