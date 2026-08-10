@@ -866,16 +866,7 @@ def _round_records(
     completions = {result.request_id: result.completion_tokens for result in results}
     if len(inputs) != len(results):
         raise RuntimeError("request identities are not unique within a run")
-    histories: dict[str, list[dict[str, int]]] = {
-        request_id: [
-            {
-                "start": 0,
-                "end": input_tokens,
-                "source_version": 0,
-            }
-        ]
-        for request_id, input_tokens in inputs.items()
-    }
+    histories: dict[str, list[dict[str, int]]] = {}
     flat: list[tuple[int, int, str, int, int, int, int]] = []
     seen_rounds: set[int] = set()
     for trace in rounds:
@@ -935,18 +926,41 @@ def _round_records(
         committed,
     ) in sorted(flat):
         cell = (round_index, request_id)
-        if cell in seen_cells or request_id not in histories:
+        if cell in seen_cells or request_id not in inputs:
             raise RuntimeError("round trace references a duplicate or unknown request")
         seen_cells.add(cell)
-        history = histories[request_id]
-        if prefix != history[-1]["end"]:
+        history = histories.get(request_id)
+        if history is None:
+            if prefix != inputs[request_id]:
+                raise RuntimeError(
+                    "first round prefix does not match the tokenized prompt"
+                )
+            history = [
+                {
+                    "start": 0,
+                    "end": prefix,
+                    "source_version": source_version,
+                }
+            ]
+            histories[request_id] = history
+        elif prefix != history[-1]["end"]:
             raise RuntimeError("round prefix does not continue the recorded KV history")
+        request_end = inputs[request_id] + completions[request_id]
+        closes_request_without_bonus = (
+            committed == accepted
+            and committed > 0
+            and prefix + committed == request_end
+        )
         if (
             verified < 0
             or accepted < 0
             or accepted > verified
             or committed < 0
-            or (committed != accepted + 1 and not (committed == 0 and accepted == 0))
+            or (
+                committed != accepted + 1
+                and not closes_request_without_bonus
+                and not (committed == 0 and accepted == 0)
+            )
         ):
             raise RuntimeError("round speculative counts are inconsistent")
         generated_before = prefix - inputs[request_id]

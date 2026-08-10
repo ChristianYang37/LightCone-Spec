@@ -726,6 +726,62 @@ def test_adaptation_evidence_never_uses_missing_defaults() -> None:
         _adaptation_fields("tts", ServerSnapshot.parse(malformed_root), "c" * 64)
 
 
+def test_round_evidence_allows_final_request_boundary_without_bonus() -> None:
+    diagnostics = adaptation_payload()
+    diagnostics["rounds"][0] = {
+        **diagnostics["rounds"][0],
+        "verify_len": [15],
+        "accepted_drafts": [4],
+        "committed_tokens": [4],
+    }
+    records = _round_records(
+        run_id="run-boundary",
+        diagnostics=diagnostics,
+        results=(result(tokens=4),),
+        rounds=tuple(diagnostics["rounds"]),
+    )
+    assert len(records) == 1
+    assert records[0].accepted_drafts == 4
+    assert records[0].committed_tokens == 4
+
+
+def test_round_evidence_rejects_missing_bonus_before_request_boundary() -> None:
+    diagnostics = adaptation_payload()
+    diagnostics["rounds"][0] = {
+        **diagnostics["rounds"][0],
+        "verify_len": [15],
+        "accepted_drafts": [4],
+        "committed_tokens": [4],
+    }
+    with pytest.raises(RuntimeError, match="speculative counts"):
+        _round_records(
+            run_id="run-not-boundary",
+            diagnostics=diagnostics,
+            results=(result(tokens=5),),
+            rounds=tuple(diagnostics["rounds"]),
+        )
+
+
+def test_round_evidence_binds_queued_prompt_kv_to_its_start_version() -> None:
+    diagnostics = adaptation_payload()
+    diagnostics["rounds"][0] = {
+        **diagnostics["rounds"][0],
+        "source_version": 7,
+    }
+    diagnostics["kv_segments"]["r0"] = [
+        {"start": 0, "end": 11, "source_version": 7}
+    ]
+    records = _round_records(
+        run_id="run-queued",
+        diagnostics=diagnostics,
+        results=(result(tokens=4),),
+        rounds=tuple(diagnostics["rounds"]),
+    )
+    assert json.loads(records[0].kv_source_versions) == [
+        {"start": 0, "end": 7, "source_version": 7}
+    ]
+
+
 def test_update_trace_required_fields_cannot_be_hidden_by_extras() -> None:
     diagnostics = adaptation_payload()
     update = dict(diagnostics["updates"][0])
