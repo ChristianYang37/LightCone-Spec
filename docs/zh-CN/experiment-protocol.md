@@ -81,7 +81,9 @@ Headline 指标来自一条覆盖 16K 至上限的专用 `long_region` batch 记
 配对 batch decode-goodput effect；位置 bucket 只用于解释，不会等权平均进 headline。TTS 与
 L0 分别使用 repetition-block BCa 95% 区间对比 Static。Repetition block 才是独立计时
 和随机化单元；把共享同一 wall-clock interval 的 32 个请求当作 32 个独立 goodput 样本
-会构成伪重复。二者都必须达到注册的平均提升门槛，且置信区间下界大于零。
+会构成伪重复。二者都必须达到注册的平均提升门槛，且置信区间下界大于零。另一个配对区间
+直接比较 L0 与 TTS：固定零 margin 合同要求 L0 的平均相对 goodput 及 BCa 下界均不小于零，
+不能仅因为二者分别超过 Static 就判定通过。
 
 解释性指标保留 survival-weighted accepted prefix、每次 verification 的 committed 与
 verified draft、verification waste、target calls/output token、TTFT、ITL 分位数、各 CUDA

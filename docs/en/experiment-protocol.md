@@ -104,7 +104,10 @@ Static using repetition-block BCa 95% intervals. The repetition block is the
 independent timing and randomization unit; treating 32 requests that share one
 wall-clock interval as 32 independent goodput samples would be
 pseudoreplication. Each method must reach the registered mean threshold and
-have a confidence lower bound above zero.
+have a confidence lower bound above zero. A third paired interval compares L0
+directly with TTS. The fixed zero-margin contract requires L0's mean relative
+goodput and its BCa lower bound to be non-negative; a run cannot pass merely
+because both methods separately beat Static.
 
 Interpretation retains survival-weighted accepted prefix, committed and
 verified drafts per verification, verification waste, target calls per output

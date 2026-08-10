@@ -91,10 +91,25 @@ class MethodSpeedGate:
 
 
 @dataclass(frozen=True)
+class PairwiseSpeedGate:
+    numerator_method: str
+    denominator_method: str
+    mean_speedup: float
+    ci_lower: float
+    ci_upper: float
+    no_worse_pass: bool
+
+    @property
+    def passed(self) -> bool:
+        return self.no_worse_pass
+
+
+@dataclass(frozen=True)
 class SpeedGate:
     status: str
     tts: MethodSpeedGate
     naive_async: MethodSpeedGate
+    l0_vs_tts: PairwiseSpeedGate
     gpu_evidence: str
     evidence_sha256: str | None
 
@@ -105,6 +120,7 @@ class SpeedGate:
             and self.evidence_sha256 is not None
             and self.tts.passed
             and self.naive_async.passed
+            and self.l0_vs_tts.passed
         )
 
 
@@ -242,7 +258,31 @@ def evaluate_speed_gate(
             safety_pass=safety_pass,
             acceleration_pass=estimate >= minimum_speedup and lower > 0.0,
         )
-    statistical_pass = all(gate.passed for gate in gates.values())
+    l0_vs_tts_clusters = {
+        str(block): np.asarray(
+            [
+                float(group["naive_async"]["decode_goodput_tps"])
+                / float(group["tts"]["decode_goodput_tps"])
+                - 1.0
+            ]
+        )
+        for block, group in by_key.items()
+    }
+    l0_estimate, l0_lower, l0_upper = bca_mean_interval(
+        l0_vs_tts_clusters,
+        seed=seed + 2,
+    )
+    l0_vs_tts = PairwiseSpeedGate(
+        numerator_method="naive_async",
+        denominator_method="tts",
+        mean_speedup=l0_estimate,
+        ci_lower=l0_lower,
+        ci_upper=l0_upper,
+        no_worse_pass=l0_estimate >= 0.0 and l0_lower >= 0.0,
+    )
+    statistical_pass = (
+        all(gate.passed for gate in gates.values()) and l0_vs_tts.passed
+    )
     if gpu_evidence == "UNMEASURED":
         status = "UNMEASURED"
     elif statistical_pass:
@@ -253,6 +293,7 @@ def evaluate_speed_gate(
         status=status,
         tts=gates["tts"],
         naive_async=gates["naive_async"],
+        l0_vs_tts=l0_vs_tts,
         gpu_evidence=gpu_evidence,
         evidence_sha256=evidence_sha256,
     )

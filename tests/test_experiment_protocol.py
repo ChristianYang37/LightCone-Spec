@@ -700,7 +700,7 @@ def test_bca_interval_is_finite_and_ordered() -> None:
 
 
 def performance_rows(
-    *, speed_tts: float = 1.05, speed_l0: float = 1.04, unsafe: bool = False
+    *, speed_tts: float = 1.05, speed_l0: float = 1.06, unsafe: bool = False
 ) -> list[dict]:
     rows: list[dict] = []
     methods = {"static": 1.0, "tts": speed_tts, "naive_async": speed_l0}
@@ -769,6 +769,7 @@ def test_speed_gate_never_claims_unattested_gpu_success() -> None:
     assert not gate.passed
     assert gate.tts.acceleration_pass
     assert gate.naive_async.acceleration_pass
+    assert gate.l0_vs_tts.no_worse_pass
 
 
 def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
@@ -780,6 +781,7 @@ def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
     )
     assert gate.status == "PASS"
     assert gate.passed
+    assert gate.l0_vs_tts.passed
     unsafe = evaluate_speed_gate(
         performance_rows(unsafe=True),
         seed=1,
@@ -790,6 +792,29 @@ def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
     assert not unsafe.passed
 
 
+def test_speed_gate_requires_l0_to_be_noninferior_to_tts() -> None:
+    inferior = evaluate_speed_gate(
+        performance_rows(speed_tts=1.08, speed_l0=1.05),
+        seed=1,
+        gpu_evidence="MEASURED",
+        evidence_sha256="e" * 64,
+    )
+    assert inferior.tts.passed
+    assert inferior.naive_async.passed
+    assert not inferior.l0_vs_tts.passed
+    assert inferior.status == "BLOCKED"
+    assert not inferior.passed
+
+    tied = evaluate_speed_gate(
+        performance_rows(speed_tts=1.05, speed_l0=1.05),
+        seed=1,
+        gpu_evidence="MEASURED",
+        evidence_sha256="e" * 64,
+    )
+    assert tied.l0_vs_tts.mean_speedup == pytest.approx(0.0)
+    assert tied.l0_vs_tts.ci_lower == pytest.approx(0.0)
+    assert tied.l0_vs_tts.passed
+    assert tied.status == "PASS"
 def test_speed_gate_rejects_incomplete_coverage() -> None:
     with pytest.raises(ValueError, match="coverage|paired cells"):
         evaluate_speed_gate(performance_rows()[:-1])

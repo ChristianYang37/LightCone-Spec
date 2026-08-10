@@ -26,7 +26,7 @@ from .selection import (
     select_heldout_anchor,
     select_shared_config,
 )
-from .statistics import SpeedGate, evaluate_speed_gate
+from .statistics import PairwiseSpeedGate, SpeedGate, evaluate_speed_gate
 
 __all__ = [
     "CandidateMeasurement",
@@ -39,6 +39,7 @@ __all__ = [
     "OnlineSpecManifest",
     "OnlineSpecSelection",
     "OnlineSpecTuningMeasurement",
+    "PairwiseSpeedGate",
     "SamplingProfile",
     "SelectionArtifact",
     "SpeedGate",
