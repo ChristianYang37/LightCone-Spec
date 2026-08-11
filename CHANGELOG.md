@@ -34,6 +34,9 @@ yet been declared.
   value while retaining the differentiable surrogate Jacobian.
 - Bound OnlineSPEC selection to the core Static load selection and capped
   formal admission at the 32 unique confirmation prompts.
+- Separated OnlineSPEC tuning from the core study's short-context stages and
+  bound its 16K/24K/32K/40,928 long-trajectory schedule into the manifest
+  identity, preventing premature elimination by 4K/8K measurements.
 
 ### Planned
 
