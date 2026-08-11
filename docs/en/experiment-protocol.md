@@ -80,9 +80,14 @@ and early tuning stages fill an undersized prompt window round-robin only until
 the registered concurrency is occupied; confirmation and natural-task runs
 never replicate prompts to manufacture load.
 
-The registered controlled profile is greedy. This makes the target-token
-trajectory identical across Static and every exact adapted method, so a paired
-timing effect cannot be caused by method-dependent random-number consumption.
+The registered controlled profile is greedy. A separate immutable execution
+policy also fixes the server seed and model context and disables radix caching
+and CUDA graphs on both endpoint roles. The target-only reference uses the
+registered non-overlap role, while all timed speculative methods retain one
+matched overlap role. Complete token-ID equality against that reference—not
+the scheduler choice itself—establishes the common target trajectory, so a
+paired timing effect cannot be caused by method-dependent random-number
+consumption.
 Tuning and confirmation store only a format-tagged SHA-256 of each complete
 output-token-ID trajectory and fail closed unless every paired method has the
 same digest. A decoded-text digest is explicitly insufficient. Formal collection

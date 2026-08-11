@@ -345,6 +345,7 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": lock.sha256,
         "sampling_profile_sha256": sampling.sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.tuning_window_sha256,
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "stage": len(ONLINE_SPEC_TUNING_STAGES) - 1,

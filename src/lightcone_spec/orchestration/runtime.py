@@ -7,6 +7,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.config.schema import (
@@ -17,6 +18,7 @@ from lightcone_spec.config.schema import (
     RunConfig,
     RuntimeConfig,
 )
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.onlinespec import (
     OnlineSpecCandidate,
     OnlineSpecSelection,
@@ -71,6 +73,45 @@ def _immutable_json(path: Path, value: object) -> None:
     if sidecar.exists() and sidecar.read_text(encoding="utf-8").strip() != digest:
         raise ValueError(f"runtime sidecar does not match {path}")
     sidecar.write_text(digest + "\n", encoding="utf-8")
+
+
+def _execution_argv(
+    runtime: RuntimeConfig, *, role: Literal["target_reference", "speculative"]
+) -> list[str]:
+    """Render the server controls attested by every formal runtime."""
+    policy = ControlledExecutionPolicy(
+        context_length=runtime.context_length,
+        random_seed=runtime.random_seed,
+        disable_radix_cache=runtime.disable_radix_cache,
+        disable_cuda_graph=runtime.disable_cuda_graph,
+        target_reference_disable_overlap_schedule=(
+            runtime.target_reference_disable_overlap_schedule
+        ),
+        speculative_disable_overlap_schedule=(
+            runtime.speculative_disable_overlap_schedule
+        ),
+        enable_deterministic_inference=runtime.enable_deterministic_inference,
+        incremental_streaming_output=runtime.incremental_streaming_output,
+    )
+    if runtime.execution_policy_sha256 != policy.sha256:
+        raise ValueError("runtime execution-policy identity mismatch")
+    argv = [
+        "--context-length",
+        str(policy.context_length),
+        "--random-seed",
+        str(policy.random_seed),
+    ]
+    if policy.disable_radix_cache:
+        argv.append("--disable-radix-cache")
+    if policy.disable_cuda_graph:
+        argv.append("--disable-cuda-graph")
+    if policy.overlap_disabled(role=role):
+        argv.append("--disable-overlap-schedule")
+    if policy.enable_deterministic_inference:
+        argv.append("--enable-deterministic-inference")
+    if policy.incremental_streaming_output:
+        argv.append("--incremental-streaming-output")
+    return argv
 
 
 def _render_server(
@@ -133,6 +174,7 @@ def _render_server(
         "--port",
         str(port),
     ]
+    argv.extend(_execution_argv(config.runtime, role="speculative"))
     if adaptation_path is not None and telemetry_path is not None:
         argv.extend(
             (
@@ -305,6 +347,7 @@ def _render_choice_plan(
             "selection_sha256": choice.selection_sha256,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],
@@ -344,6 +387,100 @@ def render_static_load_runtime_plan(
         host=host,
         first_port=first_port,
     )
+
+
+def render_target_runtime_plan(
+    *,
+    output_root: str | Path,
+    concurrency: int,
+    model_lock: ModelLock,
+    model_roots: dict,
+    sampling_profile: SamplingProfile,
+    sglang_checkout: str | Path,
+    mem_fraction_static: float,
+    host: str = "127.0.0.1",
+    first_port: int = 30000,
+) -> tuple[ServerLaunch, ...]:
+    """Render the target-only endpoint used by token-exactness gates."""
+    model_lock.validate()
+    sampling_profile.validate()
+    if sampling_profile.purpose != "controlled":
+        raise ValueError("target reference requires controlled greedy sampling")
+    if concurrency < 1:
+        raise ValueError("target reference concurrency must be positive")
+    if not 0.0 < mem_fraction_static < 1.0:
+        raise ValueError("mem_fraction_static must be in (0, 1)")
+    if not 1 <= first_port <= 65535:
+        raise ValueError("first_port must be a valid TCP port")
+    verified_checkout = verify_patched_checkout(sglang_checkout)
+    model, roots = _locked_dflash_pair(model_lock, model_roots)
+    runtime = RuntimeConfig(
+        sampling_profile_sha256=sampling_profile.sha256,
+        tensor_parallel_size=1,
+        speculative_num_draft_tokens=16,
+        max_running_requests=concurrency,
+        telemetry_detail="headline",
+    )
+    output = Path(output_root).resolve()
+    method = "target_only"
+    method_root = output / method
+    config_path = method_root / "run-config.json"
+    _immutable_json(
+        config_path,
+        {
+            "schema_version": 2,
+            "purpose": "greedy_target_reference",
+            "target_model": model.target,
+            "target_revision": model.target_revision,
+            "runtime": runtime.model_dump(mode="json"),
+            "mem_fraction_static": mem_fraction_static,
+        },
+    )
+    argv = [
+        sys.executable,
+        "-m",
+        "lightcone_spec.sglang_bridge.launch",
+        "--checkout",
+        str(verified_checkout),
+        "--",
+        "--model-path",
+        str(Path(roots[model.target]).resolve()),
+        "--max-running-requests",
+        str(concurrency),
+        "--mem-fraction-static",
+        str(mem_fraction_static),
+        "--tp-size",
+        "1",
+        "--host",
+        host,
+        "--port",
+        str(first_port),
+    ]
+    argv.extend(_execution_argv(runtime, role="target_reference"))
+    launch = ServerLaunch(
+        method=method,
+        base_url=f"http://{host}:{first_port}",
+        exclusive_device=True,
+        run_config=str(config_path),
+        adaptation_config=None,
+        telemetry_path=None,
+        argv=tuple(argv),
+    )
+    _immutable_json(
+        output / "launch-plan.json",
+        {
+            "schema_version": 2,
+            "execution_mode": "sequential_exclusive_device",
+            "phase": "greedy_target_reference",
+            "model_lock_sha256": model_lock.sha256,
+            "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
+            "patched_sglang_tree": PINNED_SGLANG_TREE,
+            "sglang_checkout": str(verified_checkout),
+            "servers": [asdict(launch)],
+        },
+    )
+    return (launch,)
 
 
 def render_runtime_plan(
@@ -608,6 +745,7 @@ def render_onlinespec_tuning_runtime_plan(
             "candidate_id": candidate.candidate_id,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],
@@ -698,6 +836,7 @@ def render_onlinespec_runtime_plan(
             "selection_sha256": selection.sha256,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],

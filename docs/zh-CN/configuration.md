@@ -10,8 +10,12 @@
 方法，也不能影响其 gate。
 
 每个真实 run 都绑定不可变的 target/drafter revision、固定 SGLang commit、sampling
-profile digest、tenant 与 runtime load。旧 schema 或已删除的方法名会在模型加载前作为
-未知输入拒绝。
+profile digest、execution-policy digest、tenant 与 runtime load。注册策略固定 40,960
+context 与 server seed 1，关闭 radix cache 与 CUDA graph、关闭 deterministic-inference
+mode，并要求 non-incremental output。其 target-reference 角色关闭 overlap schedule；
+speculative 角色保留 overlap。Target-only 与 speculative launcher 共享同一策略身份，但分别
+渲染对应角色。这是协议身份，不表示该策略已被证明吞吐最优。旧 schema 或已删除的
+方法名会在模型加载前作为未知输入拒绝。
 
 ## Adaptation 配置
 
@@ -80,8 +84,9 @@ Cancellation、epoch rollover、slot reuse 或 source-version conflict 都会使
 源码不设置默认值。生成的 runtime 文件和绝对模型路径应位于 ignored artifact 目录，
 不得提交。
 
-除 `method` 字段外，TTS 与 L0 配置必须逐项一致。修改超参数、sampling profile、load、
-模型 revision 或 runtime tree 后，必须创建新的 selection 和 evidence root。
+除 `method` 字段外，TTS 与 L0 配置必须逐项一致。修改超参数、sampling profile、execution
+policy、load、模型 revision 或 runtime tree 后，必须创建新的 selection 与 evidence root。
+独立 diagnostic/profiler 可以探索更快的 graph/cache 策略，但不能混入正式 exactness gate。
 
 ## OnlineSPEC 对比配置
 

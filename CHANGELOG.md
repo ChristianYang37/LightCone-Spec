@@ -26,6 +26,9 @@ yet been declared.
   registered configuration without claiming exhaustive grid optimality.
 - Added a target-only greedy reference artifact required by both formal
   collectors, attestations, and analyzers.
+- Added a role-bound, content-addressed execution policy and a target-only
+  runtime renderer so context, seed, cache, graph, scheduler, and streaming
+  controls are attested before token-exactness evidence is accepted.
 
 ### Changed
 

@@ -12,8 +12,15 @@ They are not valid substitutes in the core speed study and cannot affect its
 gate.
 
 Every real run binds immutable target and drafter revisions, the pinned SGLang
-commit, a sampling-profile digest, a tenant, and a runtime load. Old schemas or
-retired method names fail as unknown input before model loading.
+commit, a sampling-profile digest, an execution-policy digest, a tenant, and a
+runtime load. The registered policy fixes context length 40,960 and server seed
+1, disables radix caching and CUDA graphs, keeps deterministic-inference mode
+disabled, and requires non-incremental output. Its target-reference role
+disables overlap scheduling; its speculative role retains overlap scheduling.
+Target-only and speculative launchers therefore share one policy identity but
+render their registered role. These are protocol identities, not claims that
+the policy is throughput-optimal. Old
+schemas or retired method names fail as unknown input before model loading.
 
 ## Adaptation configuration
 
@@ -93,8 +100,10 @@ default. Generated runtime files and absolute model roots belong under the
 ignored artifact directory and must not be committed.
 
 TTS and L0 configs must be byte-equivalent after removing the `method` field.
-Changing a hyperparameter, sampling profile, load, model revision, or runtime
-tree requires a new selection and evidence root.
+Changing a hyperparameter, sampling profile, execution policy, load, model
+revision, or runtime tree requires a new selection and evidence root. A separate
+diagnostic or profiler run may explore faster graph/cache policies, but it
+cannot be mixed into the formal exactness gate.
 
 ## OnlineSPEC comparison configuration
 

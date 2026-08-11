@@ -20,6 +20,7 @@ from lightcone_spec.cli.main import (
     _write_json,
 )
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_MODEL_CONTEXT_LIMIT,
     DFLASH_SAFE_CONTEXT_LIMIT,
@@ -44,6 +45,7 @@ from lightcone_spec.experiments.protocol import (
     tuning_candidates,
     tuning_stage,
 )
+from lightcone_spec.experiments.runner import _collect_paired_performance
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import (
     CandidateMeasurement,
@@ -63,6 +65,7 @@ from lightcone_spec.orchestration import SpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
     render_runtime_plan,
     render_static_load_runtime_plan,
+    render_target_runtime_plan,
     render_tuning_runtime_plan,
 )
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
@@ -91,6 +94,39 @@ def test_dflash_safe_limit_reserves_two_verification_blocks() -> None:
         DFLASH_SAFE_CONTEXT_LIMIT + DFLASH_SPECULATIVE_HEADROOM
         == DFLASH_MODEL_CONTEXT_LIMIT
     )
+
+
+def test_controlled_execution_policy_is_immutable_and_attested(tmp_path) -> None:
+    policy = ControlledExecutionPolicy()
+    path = tmp_path / "execution.json"
+    policy.write(path)
+    assert ControlledExecutionPolicy.load(path) == policy
+    assert policy.context_length == DFLASH_MODEL_CONTEXT_LIMIT
+    target_reported = policy.server_info_fields(role="target_reference")
+    speculative_reported = policy.server_info_fields(role="speculative")
+    assert target_reported["disable_overlap_schedule"] is True
+    assert speculative_reported["disable_overlap_schedule"] is False
+    policy.validate_server_info(target_reported, role="target_reference")
+    policy.validate_server_info(speculative_reported, role="speculative")
+    with pytest.raises(ValueError, match="disable_cuda_graph"):
+        policy.validate_server_info(
+            {**target_reported, "disable_cuda_graph": False},
+            role="target_reference",
+        )
+    with pytest.raises(ValueError, match="disable_overlap_schedule"):
+        policy.validate_server_info(
+            speculative_reported, role="target_reference"
+        )
+    with pytest.raises(ValueError, match="exactness requires"):
+        replace(policy, disable_cuda_graph=False).validate()
+    with pytest.raises(ValueError, match="target reference"):
+        replace(
+            policy, target_reference_disable_overlap_schedule=False
+        ).validate()
+    with pytest.raises(ValueError, match="retain overlap"):
+        replace(policy, speculative_disable_overlap_schedule=True).validate()
+    with pytest.raises(ValueError, match="seed"):
+        replace(policy, random_seed=True).validate()
 
 
 def test_controlled_path_does_not_import_optional_dataset_package() -> None:
@@ -299,6 +335,7 @@ def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": "a" * 64,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["load"],
         "rows": load_screen_rows(),
     }
@@ -346,6 +383,7 @@ def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": "f" * 64,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["tune"],
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "concurrency": 8,
@@ -951,6 +989,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         target_model_id="Qwen/Qwen3-8B",
         target_revision="c" * 40,
         sampling_profile_sha256="1" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="2" * 64,
         runtime_config_sha256="3" * 64,
         hardware_sha256="e" * 64,
@@ -1011,6 +1050,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         target_model_id="Qwen/Qwen3-8B",
         target_revision="b" * 40,
         sampling_profile_sha256="c" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="d" * 64,
         runtime_config_sha256="e" * 64,
         hardware_sha256="f" * 64,
@@ -1035,6 +1075,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         model_lock_sha256="a" * 64,
         target_revision="b" * 40,
         sampling_profile_sha256="c" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="d" * 64,
         concurrency=8,
     )
@@ -1043,16 +1084,50 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
             model_lock_sha256="a" * 64,
             target_revision="b" * 40,
             sampling_profile_sha256="c" * 64,
+            execution_policy_sha256=ControlledExecutionPolicy().sha256,
             window_sha256="d" * 64,
             concurrency=4,
         )
     with pytest.raises(ValueError, match="output hash format"):
         replace(reference, output_hash_format="decoded-text-sha256").validate()
+    with pytest.raises(ValueError, match="unregistered execution policy"):
+        replace(reference, execution_policy_sha256="0" * 64).validate()
     value = json.loads(path.read_text())
     value["outputs"][0]["unexpected"] = True
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="output fields"):
         GreedyTargetReference.load(path)
+
+
+def test_formal_collector_binds_execution_policy_before_reading_evidence(
+    tmp_path,
+) -> None:
+    class ReferenceProbe:
+        def __init__(self) -> None:
+            self.keywords: dict[str, object] | None = None
+
+        def verify_study(self, **keywords: object) -> None:
+            self.keywords = keywords
+            raise RuntimeError("stop after identity verification")
+
+    reference = ReferenceProbe()
+    policy_sha256 = ControlledExecutionPolicy().sha256
+    with pytest.raises(RuntimeError, match="stop after identity verification"):
+        _collect_paired_performance(
+            evidence_root=tmp_path,
+            manifest_sha256="a" * 64,
+            config_sha256={"static": "b" * 64},
+            concurrency=8,
+            methods=("static",),
+            namespace="collector-contract",
+            target_reference=reference,  # type: ignore[arg-type]
+            model_lock_sha256="c" * 64,
+            sampling_profile_sha256="d" * 64,
+            execution_policy_sha256=policy_sha256,
+            target_revision="e" * 40,
+        )
+    assert reference.keywords is not None
+    assert reference.keywords["execution_policy_sha256"] == policy_sha256
 
 
 def test_target_reference_requires_exact_patched_gpu_doctor(tmp_path) -> None:
@@ -1140,7 +1215,14 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     assert all(
         "--speculative-adaptation-config" in launch.argv for launch in launches[1:]
     )
-    assert all("--disable-cuda-graph" not in launch.argv for launch in launches)
+    assert all("--disable-cuda-graph" in launch.argv for launch in launches)
+    assert all("--disable-radix-cache" in launch.argv for launch in launches)
+    assert all("--disable-overlap-schedule" not in launch.argv for launch in launches)
+    assert all(
+        launch.argv[launch.argv.index("--context-length") + 1] == "40960"
+        and launch.argv[launch.argv.index("--random-seed") + 1] == "1"
+        for launch in launches
+    )
     assert all(
         "--speculative-use-rejection-sampling" in launch.argv for launch in launches
     )
@@ -1212,6 +1294,54 @@ def test_static_load_renderer_has_no_adaptation_identity_or_allocation(
     assert config.method == "static"
     assert config.adaptation is None
     assert config.runtime.max_running_requests == 48
+    assert config.runtime.execution_policy_sha256 == ControlledExecutionPolicy().sha256
+
+
+def test_target_renderer_uses_safe_reference_role_and_no_speculative_state(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "lightcone_spec.orchestration.runtime.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    target = tmp_path / "target"
+    drafter = tmp_path / "drafter"
+    target.mkdir()
+    drafter.mkdir()
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    launch = render_target_runtime_plan(
+        output_root=tmp_path / "target-runtime",
+        concurrency=8,
+        model_lock=lock,
+        model_roots={
+            "schema_version": 2,
+            "lock_sha256": lock.sha256,
+            "roots": {
+                "Qwen/Qwen3-8B": str(target),
+                "z-lab/Qwen3-8B-DFlash-b16": str(drafter),
+            },
+        },
+        sampling_profile=SamplingProfile(),
+        sglang_checkout=tmp_path / "patched-sglang",
+        mem_fraction_static=0.7,
+    )[0]
+    assert launch.method == "target_only"
+    assert launch.adaptation_config is None
+    assert launch.telemetry_path is None
+    assert not any("speculative" in arg for arg in launch.argv)
+    assert "--disable-radix-cache" in launch.argv
+    assert "--disable-cuda-graph" in launch.argv
+    assert "--disable-overlap-schedule" in launch.argv
+    assert launch.argv[launch.argv.index("--context-length") + 1] == "40960"
+    assert launch.argv[launch.argv.index("--random-seed") + 1] == "1"
+    plan = json.loads((tmp_path / "target-runtime" / "launch-plan.json").read_text())
+    assert plan["execution_policy_sha256"] == ControlledExecutionPolicy().sha256
 
 
 def test_tuning_renderer_cannot_duplicate_static_baseline(

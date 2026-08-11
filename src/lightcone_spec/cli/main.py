@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_MODEL_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -82,6 +83,7 @@ from lightcone_spec.orchestration import (
     render_replication_runtime_plan,
     render_runtime_plan,
     render_static_load_runtime_plan,
+    render_target_runtime_plan,
     render_tuning_runtime_plan,
 )
 from lightcone_spec.sglang_bridge import (
@@ -152,6 +154,7 @@ def _static_load_rows(
         "phase": "static_load_screen",
         "manifest_sha256": manifest.sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["load"],
     }
     if any(
@@ -184,6 +187,9 @@ def _formal_table_metadata(
         b"lightcone_sampling_profile_sha256": (
             manifest.sampling_profile_sha256.encode()
         ),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
+        ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_sha256).encode(),
         b"lightcone_source_evidence_sha256": source_evidence_sha256.encode(),
@@ -208,6 +214,9 @@ def _load_formal_table(
         b"lightcone_model_lock_sha256": model_lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": (
             manifest.sampling_profile_sha256.encode()
+        ),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
         ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
@@ -342,6 +351,17 @@ def _parser() -> argparse.ArgumentParser:
     render_static.add_argument("--output-root", required=True)
     render_static.add_argument("--host", default="127.0.0.1")
     render_static.add_argument("--first-port", type=int, default=30000)
+
+    render_target = commands.add_parser("render-target-runtime")
+    render_target.add_argument("--concurrency", type=int, required=True)
+    render_target.add_argument("--model-lock", required=True)
+    render_target.add_argument("--model-roots", required=True)
+    render_target.add_argument("--sglang-checkout", required=True)
+    render_target.add_argument("--sampling-profile", required=True)
+    render_target.add_argument("--mem-fraction-static", type=float, required=True)
+    render_target.add_argument("--output-root", required=True)
+    render_target.add_argument("--host", default="127.0.0.1")
+    render_target.add_argument("--first-port", type=int, default=30000)
 
     render_tuning = commands.add_parser("render-tuning-runtime")
     render_tuning.add_argument("--candidate-id", required=True)
@@ -607,6 +627,8 @@ def _select(args: argparse.Namespace) -> int:
         raise ValueError("selection inputs belong to a different model lock")
     if (
         tuning_artifact.get("sampling_profile_sha256") != sampling.sha256
+        or tuning_artifact.get("execution_policy_sha256")
+        != manifest.execution_policy_sha256
         or tuning_artifact.get("window_sha256")
         != manifest.controlled_window_hashes["tune"]
         or tuning_artifact.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
@@ -713,6 +735,7 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
         or value.get("manifest_sha256") != manifest.sha256
         or value.get("model_lock_sha256") != lock.sha256
         or value.get("sampling_profile_sha256") != sampling.sha256
+        or value.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or value.get("window_sha256") != manifest.tuning_window_sha256
         or value.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
         or value.get("stage") != len(ONLINE_SPEC_TUNING_STAGES) - 1
@@ -963,6 +986,7 @@ def _collect_static_load(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": next(iter(model_locks)),
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": expected_window,
         "rows": rows,
     }
@@ -993,6 +1017,7 @@ def _advance_tuning(args: argparse.Namespace) -> int:
             or prior.get("stage") != args.stage - 1
             or not isinstance(prior.get("survivors"), list)
             or prior.get("sampling_profile_sha256") != manifest.sampling_profile_sha256
+            or prior.get("execution_policy_sha256") != manifest.execution_policy_sha256
             or prior.get("window_sha256") != manifest.controlled_window_hashes["tune"]
             or prior.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
             or (args.stage == 1 and prior.get("prior_stage_sha256") is not None)
@@ -1041,6 +1066,7 @@ def _advance_tuning(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": model_lock_sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["tune"],
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "concurrency": concurrency,
@@ -1143,6 +1169,7 @@ def _load_target_reference(
         model_lock_sha256=model_lock.sha256,
         target_revision=target_revision,
         sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256=LongContinuationAdapter().window_sha256("confirm"),
         concurrency=concurrency,
     )
@@ -1369,6 +1396,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
             or prior.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
             or prior.get("window_sha256") != manifest.tuning_window_sha256
             or prior.get("sampling_profile_sha256") != manifest.sampling_profile_sha256
+            or prior.get("execution_policy_sha256") != manifest.execution_policy_sha256
             or prior.get("stage") != args.stage - 1
             or prior.get("next_stage") != args.stage
             or not isinstance(prior.get("survivors"), list)
@@ -1419,6 +1447,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": model_lock_sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "window_sha256": manifest.tuning_window_sha256,
         "measurement_window_sha256": expected_window,
@@ -1537,6 +1566,8 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
     for config in configs.values():
         if config.runtime.sampling_profile_sha256 != manifest.sampling_profile_sha256:
             raise ValueError("run config does not match the manifest sampling profile")
+        if config.runtime.execution_policy_sha256 != manifest.execution_policy_sha256:
+            raise ValueError("run config does not match the execution policy")
         locked = {model.model_id: model.revision for model in model_lock.models}
         if (
             locked.get(config.model.target) != config.model.target_revision
@@ -1569,6 +1600,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
         target_reference=target_reference,
         model_lock_sha256=model_lock.sha256,
         sampling_profile_sha256=manifest.sampling_profile_sha256,
+        execution_policy_sha256=manifest.execution_policy_sha256,
         target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
@@ -1620,6 +1652,8 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
     for method, config in configs.items():
         if config.runtime.sampling_profile_sha256 != selection.sampling_profile_sha256:
             raise ValueError("OnlineSPEC config sampling identity mismatch")
+        if config.runtime.execution_policy_sha256 != manifest.execution_policy_sha256:
+            raise ValueError("OnlineSPEC config execution-policy identity mismatch")
         if (
             locked.get(config.model.target) != config.model.target_revision
             or locked.get(config.model.drafter) != config.model.drafter_revision
@@ -1648,6 +1682,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         target_reference=target_reference,
         model_lock_sha256=lock.sha256,
         sampling_profile_sha256=selection.sampling_profile_sha256,
+        execution_policy_sha256=manifest.execution_policy_sha256,
         target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
@@ -1658,6 +1693,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": selection.sampling_profile_sha256.encode(),
+        b"lightcone_execution_policy_sha256": manifest.execution_policy_sha256.encode(),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_hashes).encode(),
         b"lightcone_source_evidence_sha256": evidence_sha256.encode(),
@@ -1780,6 +1816,33 @@ def _render_static_load_runtime(args: argparse.Namespace) -> int:
         or "--speculative-adaptation-config" in launches[0].argv
     ):
         raise AssertionError("Static load renderer allocated an adaptation path")
+    print(Path(args.output_root).resolve() / "launch-plan.json")
+    return 0
+
+
+def _render_target_runtime(args: argparse.Namespace) -> int:
+    model_lock = ModelLock.load(args.model_lock)
+    roots = _load_bound_json(args.model_roots)
+    sampling = SamplingProfile.load(args.sampling_profile)
+    launches = render_target_runtime_plan(
+        output_root=args.output_root,
+        concurrency=args.concurrency,
+        model_lock=model_lock,
+        model_roots=roots,
+        sampling_profile=sampling,
+        sglang_checkout=args.sglang_checkout,
+        mem_fraction_static=args.mem_fraction_static,
+        host=args.host,
+        first_port=args.first_port,
+    )
+    if (
+        len(launches) != 1
+        or launches[0].method != "target_only"
+        or launches[0].adaptation_config is not None
+        or launches[0].telemetry_path is not None
+        or any("speculative" in arg for arg in launches[0].argv)
+    ):
+        raise AssertionError("target renderer enabled speculative study state")
     print(Path(args.output_root).resolve() / "launch-plan.json")
     return 0
 
@@ -1910,6 +1973,7 @@ def _build_profiler_plan(args: argparse.Namespace) -> int:
         or source.get("phase") != "independent_profiler"
         or source.get("execution_mode") != "sequential_exclusive_device"
         or source.get("patched_sglang_tree") != PINNED_SGLANG_TREE
+        or source.get("execution_policy_sha256") != ControlledExecutionPolicy().sha256
     ):
         raise ValueError("profiler requires an independent-profiler launch plan")
     verify_patched_checkout(str(source.get("sglang_checkout", "")))
@@ -1970,6 +2034,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         or plan.get("selection_sha256") != selection.sha256
         or plan.get("model_lock_sha256") != model_lock.sha256
         or plan.get("sampling_profile_sha256") != sampling.sha256
+        or plan.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or plan.get("patched_sglang_tree") != PINNED_SGLANG_TREE
     ):
         raise ValueError("launch plan identity does not match the speed study")
@@ -2061,6 +2126,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         "selection_sha256": selection.sha256,
         "model_lock_sha256": model_lock.sha256,
         "sampling_profile_sha256": sampling.sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "patched_sglang_tree": PINNED_SGLANG_TREE,
         "launch_plan_sha256": _canonical_sha256(plan),
         "schedule_seed": manifest.confirmation_schedule_seed,
@@ -2084,6 +2150,7 @@ def _build_onlinespec_queue(args: argparse.Namespace) -> int:
         or plan.get("selection_sha256") != selection.sha256
         or plan.get("model_lock_sha256") != lock.sha256
         or plan.get("sampling_profile_sha256") != sampling.sha256
+        or plan.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or plan.get("patched_sglang_tree") != PINNED_SGLANG_TREE
     ):
         raise ValueError("OnlineSPEC launch plan identity mismatch")
@@ -2168,6 +2235,7 @@ def _build_onlinespec_queue(args: argparse.Namespace) -> int:
         "selection_sha256": selection.sha256,
         "model_lock_sha256": lock.sha256,
         "sampling_profile_sha256": sampling.sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "patched_sglang_tree": PINNED_SGLANG_TREE,
         "launch_plan_sha256": _canonical_sha256(plan),
         "schedule_seed": manifest.confirmation_schedule_seed,
@@ -2248,6 +2316,7 @@ def _onlinespec_table(
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": selection.sampling_profile_sha256.encode(),
+        b"lightcone_execution_policy_sha256": manifest.execution_policy_sha256.encode(),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
@@ -2489,6 +2558,8 @@ def main(argv: list[str] | None = None) -> int:
         return _render_onlinespec_tuning_runtime(args)
     if args.command == "render-static-load-runtime":
         return _render_static_load_runtime(args)
+    if args.command == "render-target-runtime":
+        return _render_target_runtime(args)
     if args.command == "render-tuning-runtime":
         return _render_tuning_runtime(args)
     if args.command == "render-replication-runtime":

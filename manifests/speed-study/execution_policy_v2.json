@@ -1,0 +1,1 @@
+{"context_length":40960,"disable_cuda_graph":true,"disable_radix_cache":true,"enable_deterministic_inference":false,"incremental_streaming_output":false,"random_seed":1,"schema_version":2,"speculative_disable_overlap_schedule":false,"target_reference_disable_overlap_schedule":true}

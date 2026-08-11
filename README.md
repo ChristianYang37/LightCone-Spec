@@ -93,7 +93,8 @@ See [Installation](docs/en/installation.md) for the GPU environment contract.
 
 ## Quick start
 
-Build the immutable source protocol and sampling profile:
+Build the immutable source protocol. Formal launches also bind the checked-in
+sampling profile and role-bound execution policy:
 
 ```bash
 lightcone-spec build-speed-study \
@@ -151,11 +152,29 @@ lightcone-spec build-confirmation-queue \
 
 For each queue job, start its `launch_argv`, wait for health, run its
 `run_argv`, then terminate that server before the next job. Finally use
-`run-target-reference` once against a separate locked target-only server at the
-same load, then pass that artifact to `collect-speed-study` to derive the formal
-table. Agreement among speculative methods is insufficient: every method/block
-must match the target-only greedy token-ID hashes. Decoded text alone is not an
-exactness witness because distinct token sequences can decode to the same text.
+render the target-only launch plan, run `run-target-reference` once against that
+separate server at the same load, then pass the artifact to
+`collect-speed-study`:
+
+```bash
+lightcone-spec render-target-runtime --concurrency SELECTED_CONCURRENCY \
+  --sglang-checkout /path/to/patched-sglang \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/target-runtime
+```
+
+The registered policy fixes the model context and server seed and disables
+radix caching and CUDA graphs on both endpoint roles. The target-only reference
+also disables overlap scheduling, while measured DFlash endpoints retain the
+native overlap path; both assignments are part of one content identity.
+Changing any of those controls creates a different, non-formal runtime
+identity. Agreement among speculative methods is insufficient: every
+method/block must match the target-only greedy token-ID hashes. Decoded text
+alone is not an exactness witness because distinct token sequences can decode
+to the same text.
 The queue is data, not a
 shell script: orchestration must preserve the registered order and clean-server
 boundaries.

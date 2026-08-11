@@ -65,8 +65,11 @@ Request 级 ITL、TTFT、输出 identity 与单请求 decode 诊断独立记录�
 goodput。Load screen 和早期 tuning stage 只有在 prompt 数少于 concurrency 时，才按完整
 窗口 round-robin 补足负载；confirmation 与自然任务绝不通过复制 prompt 制造并发。
 
-已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
-沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
+已注册的 controlled profile 使用 greedy。独立的不可变 execution policy 还会在
+target-only 与 speculative 两类端点固定 server seed 与模型 context，并关闭 radix cache
+与 CUDA graph。Target-only reference 使用已注册的 non-overlap 角色；所有计时的 speculative
+方法使用同一个匹配的 overlap 角色。共同 target 轨迹由完整 token-ID 与 reference 相等来证明，
+而不是由 scheduler 选择来假定，因此配对计时效应不会来自方法相关的随机数消耗。
 调参与 confirmation 仅保存带格式标识的完整 output-token-ID 轨迹 SHA-256；解码文本
 摘要被明确视为不足。正式 collect 还必须从锁定的
 target snapshot 以相同 load 与安全 context 上限捕获一份 32-prompt target-only greedy

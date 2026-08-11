@@ -273,7 +273,16 @@ def snapshot_payload(*, adapted: bool = False, target_calls: int = 4) -> dict:
         state["speculative_adaptation_info_record"] = {
             "online_adaptation": adaptation_payload(target_calls=target_calls)
         }
-    return {"incremental_streaming_output": False, "internal_state": state}
+    return {
+        "context_length": 40960,
+        "random_seed": 1,
+        "disable_radix_cache": True,
+        "disable_cuda_graph": True,
+        "disable_overlap_schedule": False,
+        "enable_deterministic_inference": False,
+        "incremental_streaming_output": False,
+        "internal_state": state,
+    }
 
 
 def adaptation_payload(*, target_calls: int = 4) -> dict:
@@ -555,7 +564,9 @@ class TargetReferenceClient:
             "sampling_backend": "flashinfer",
             "schedule_policy": "lpm",
             "mem_fraction_static": 0.95,
-            "disable_cuda_graph": False,
+            "disable_radix_cache": True,
+            "disable_cuda_graph": True,
+            "disable_overlap_schedule": True,
             "enable_deterministic_inference": False,
             "random_seed": 1,
             "incremental_streaming_output": False,
@@ -645,6 +656,28 @@ def test_target_runtime_identity_rejects_study_allocations() -> None:
     assert len(identity) == 64
     client.info["internal_states"][0]["speed_study_metrics"] = {}
     with pytest.raises(RuntimeError, match="allocated speculative study state"):
+        _target_runtime_identity(
+            client.server_info(), target_revision="a" * 40, concurrency=8
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context_length", None),
+        ("random_seed", 2),
+        ("disable_radix_cache", False),
+        ("disable_cuda_graph", False),
+        ("disable_overlap_schedule", False),
+        ("enable_deterministic_inference", True),
+        ("incremental_streaming_output", True),
+    ],
+)
+def test_target_runtime_identity_requires_registered_execution_policy(
+    field: str, value: object
+) -> None:
+    client = TargetReferenceClient(server_updates={field: value})
+    with pytest.raises(RuntimeError, match="controlled execution policy"):
         _target_runtime_identity(
             client.server_info(), target_revision="a" * 40, concurrency=8
         )

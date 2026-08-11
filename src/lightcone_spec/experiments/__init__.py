@@ -1,5 +1,7 @@
 """Static/TTS/L0 speed-study protocol."""
 
+from lightcone_spec.execution import ControlledExecutionPolicy
+
 from .data import ControlledWindow, LongContinuationAdapter
 from .evidence import (
     GpuEvidenceAttestation,
@@ -39,6 +41,7 @@ __all__ = [
     "ONLINE_SPEC_TUNING_STAGES",
     "CandidateMeasurement",
     "ConfirmationBlock",
+    "ControlledExecutionPolicy",
     "ControlledWindow",
     "GpuEvidenceAttestation",
     "GreedyTargetReference",

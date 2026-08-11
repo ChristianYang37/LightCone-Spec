@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lightcone_spec import PINNED_SGLANG_COMMIT
+from lightcone_spec.execution import ControlledExecutionPolicy
 
 CoreMethod = Literal["static", "tts", "naive_async"]
 BaselineMethod = Literal["onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"]
@@ -151,6 +152,18 @@ class OnlineSpecConfig(StrictModel):
 class RuntimeConfig(StrictModel):
     sglang_commit: Literal[PINNED_SGLANG_COMMIT] = PINNED_SGLANG_COMMIT
     sampling_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_policy_sha256: str = Field(
+        default=ControlledExecutionPolicy().sha256,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    context_length: Literal[40960] = 40960
+    random_seed: Literal[1] = 1
+    disable_radix_cache: Literal[True] = True
+    disable_cuda_graph: Literal[True] = True
+    target_reference_disable_overlap_schedule: Literal[True] = True
+    speculative_disable_overlap_schedule: Literal[False] = False
+    enable_deterministic_inference: Literal[False] = False
+    incremental_streaming_output: Literal[False] = False
     tensor_parallel_size: int = Field(default=1, ge=1)
     data_parallel_size: int = Field(default=1, ge=1)
     speculative_num_draft_tokens: int = Field(default=16, ge=2)
@@ -158,6 +171,26 @@ class RuntimeConfig(StrictModel):
     use_rejection_sampling: bool = True
     max_running_requests: int = Field(default=1, ge=1)
     telemetry_detail: Literal["headline", "profile"] = "headline"
+
+    @model_validator(mode="after")
+    def validate_execution_policy(self) -> RuntimeConfig:
+        policy = ControlledExecutionPolicy(
+            context_length=self.context_length,
+            random_seed=self.random_seed,
+            disable_radix_cache=self.disable_radix_cache,
+            disable_cuda_graph=self.disable_cuda_graph,
+            target_reference_disable_overlap_schedule=(
+                self.target_reference_disable_overlap_schedule
+            ),
+            speculative_disable_overlap_schedule=(
+                self.speculative_disable_overlap_schedule
+            ),
+            enable_deterministic_inference=self.enable_deterministic_inference,
+            incremental_streaming_output=self.incremental_streaming_output,
+        )
+        if self.execution_policy_sha256 != policy.sha256:
+            raise ValueError("runtime execution-policy identity mismatch")
+        return self
 
 
 class RunConfig(StrictModel):

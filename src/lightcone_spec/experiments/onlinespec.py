@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -353,6 +354,7 @@ class OnlineSpecManifest:
     tuning_grid_sha256: str
     tuning_stages: tuple[tuple[int, int], ...]
     sampling_profile_sha256: str
+    execution_policy_sha256: str
     tuning_window_sha256: str
     confirmation_window_sha256: str
     confirmation_repetitions: int
@@ -388,6 +390,7 @@ class OnlineSpecManifest:
             ),
             tuning_stages=ONLINE_SPEC_TUNING_STAGES,
             sampling_profile_sha256=SamplingProfile().sha256,
+            execution_policy_sha256=ControlledExecutionPolicy().sha256,
             tuning_window_sha256=sample_set_sha256(data.window("tune")),
             confirmation_window_sha256=sample_set_sha256(data.window("confirm")),
             confirmation_repetitions=8,

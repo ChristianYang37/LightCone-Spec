@@ -12,6 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     GENERATED_TOKEN_BUCKETS,
@@ -1092,10 +1093,13 @@ def _target_runtime_identity(
     ):
         raise RuntimeError("target reference requires exactly one SGLang DP state")
     state = states[0]
-    if server_info.get("incremental_streaming_output") is not False:
+    policy = ControlledExecutionPolicy()
+    try:
+        policy.validate_server_info(server_info, role="target_reference")
+    except (TypeError, ValueError) as exc:
         raise RuntimeError(
-            "target reference requires complete non-incremental output IDs"
-        )
+            "target reference requires the registered controlled execution policy"
+        ) from exc
     disabled_fields = (
         "speculative_algorithm",
         "speculative_draft_model_path",
@@ -1139,13 +1143,7 @@ def _target_runtime_identity(
         or effective_load != concurrency
     ):
         raise RuntimeError("target reference server has a different effective load")
-    context_length = server_info.get("context_length")
-    if (
-        isinstance(context_length, bool)
-        or not isinstance(context_length, int)
-        or context_length < DFLASH_SAFE_CONTEXT_LIMIT
-    ):
-        raise RuntimeError("target reference server cannot reach the safe context limit")
+    context_length = server_info["context_length"]
     model_path = server_info.get("model_path")
     if (
         not isinstance(model_path, str)
@@ -1160,6 +1158,7 @@ def _target_runtime_identity(
         "version": version,
         "target_revision": target_revision,
         "context_length": context_length,
+        "execution_policy_sha256": policy.sha256,
         "max_running_requests": concurrency,
         "effective_max_running_requests_per_dp": effective_load,
         "tp_size": 1,
@@ -1170,12 +1169,7 @@ def _target_runtime_identity(
         "sampling_backend": server_info.get("sampling_backend"),
         "schedule_policy": server_info.get("schedule_policy"),
         "mem_fraction_static": server_info.get("mem_fraction_static"),
-        "disable_cuda_graph": server_info.get("disable_cuda_graph"),
-        "enable_deterministic_inference": server_info.get(
-            "enable_deterministic_inference"
-        ),
-        "random_seed": server_info.get("random_seed"),
-        "incremental_streaming_output": False,
+        **policy.server_info_fields(role="target_reference"),
     }
     body = json.dumps(runtime, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(body.encode()).hexdigest()
@@ -1279,6 +1273,7 @@ def run_greedy_target_reference(
         target_model_id="Qwen/Qwen3-8B",
         target_revision=target_revision,
         sampling_profile_sha256=sampling_profile.sha256,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256=sample_set_sha256(samples),
         runtime_config_sha256=before_identity,
         hardware_sha256=hardware_sha256,
@@ -1815,6 +1810,7 @@ def _collect_paired_performance(
     target_reference: GreedyTargetReference,
     model_lock_sha256: str,
     sampling_profile_sha256: str,
+    execution_policy_sha256: str,
     target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     """Collect one completed, identity-matched shard per paired study cell."""
@@ -1825,6 +1821,7 @@ def _collect_paired_performance(
         model_lock_sha256=model_lock_sha256,
         target_revision=target_revision,
         sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=execution_policy_sha256,
         window_sha256=sample_set_sha256(samples),
         concurrency=concurrency,
     )
@@ -1972,6 +1969,7 @@ def collect_confirmation_performance(
     target_reference: GreedyTargetReference,
     model_lock_sha256: str,
     sampling_profile_sha256: str,
+    execution_policy_sha256: str,
     target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     """Collect exactly one completed, identity-matched formal shard per cell."""
@@ -1985,6 +1983,7 @@ def collect_confirmation_performance(
         target_reference=target_reference,
         model_lock_sha256=model_lock_sha256,
         sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=execution_policy_sha256,
         target_revision=target_revision,
     )
 
@@ -2012,6 +2011,7 @@ def collect_onlinespec_performance(
     target_reference: GreedyTargetReference,
     model_lock_sha256: str,
     sampling_profile_sha256: str,
+    execution_policy_sha256: str,
     target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     return _collect_paired_performance(
@@ -2029,6 +2029,7 @@ def collect_onlinespec_performance(
         target_reference=target_reference,
         model_lock_sha256=model_lock_sha256,
         sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=execution_policy_sha256,
         target_revision=target_revision,
     )
 

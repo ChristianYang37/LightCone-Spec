@@ -84,7 +84,7 @@ GPU 环境合同见[安装](docs/zh-CN/installation.md)。
 
 ## 快速开始
 
-先生成不可变源协议与 sampling profile：
+先生成不可变源协议。正式启动还会绑定仓库中的 sampling profile 与分角色执行策略：
 
 ```bash
 lightcone-spec build-speed-study \
@@ -139,11 +139,26 @@ lightcone-spec build-confirmation-queue \
 ```
 
 对每个 queue job：启动它的 `launch_argv`，等待健康检查，通过后执行 `run_argv`，再关闭
-server，随后进入下一项。之后以相同 load 单独启动锁定的 target-only server，执行一次
-`run-target-reference`，并把该 artifact 传给 `collect-speed-study` 派生正式表。方法彼此一致
+server，随后进入下一项。之后先生成相同 load 的 target-only 启动计划，再单独执行一次
+`run-target-reference`，并把该 artifact 传给 `collect-speed-study` 派生正式表：
+
+```bash
+lightcone-spec render-target-runtime --concurrency SELECTED_CONCURRENCY \
+  --sglang-checkout /path/to/patched-sglang \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/target-runtime
+```
+
+注册策略固定模型 context 与 server seed，并在 target 与 DFlash 两类端点关闭 radix cache
+与 CUDA graph。Target-only reference 额外关闭 overlap schedule，正式计时的 DFlash 端点保留
+原生 overlap；两个角色的赋值共同进入同一内容身份。修改任一控制项都会形成不同的非正式
+runtime identity。方法彼此一致
 并不充分：每种方法的每个 block 都必须匹配 target-only greedy token-ID 摘要。仅比较
-解码文本不能证明 exactness，因为不同 token 序列可能解码成相同文本。Queue 是数据而不是 shell
-脚本；调度器必须保留注册顺序与 clean-server 边界。
+解码文本不能证明 exactness，因为不同 token 序列可能解码成相同文本。Queue 是数据而不是
+shell 脚本；调度器必须保留注册顺序与 clean-server 边界。
 
 `RESERVE_MB` 与 `MEMORY_FRACTION` 不设源码默认值；它们必须来自硬件预检和已选择的
 参数布局。

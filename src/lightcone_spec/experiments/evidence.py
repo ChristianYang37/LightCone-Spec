@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
@@ -77,6 +78,7 @@ class GreedyTargetReference:
     target_model_id: str
     target_revision: str
     sampling_profile_sha256: str
+    execution_policy_sha256: str
     window_sha256: str
     runtime_config_sha256: str
     hardware_sha256: str
@@ -98,12 +100,15 @@ class GreedyTargetReference:
         for value in (
             self.model_lock_sha256,
             self.sampling_profile_sha256,
+            self.execution_policy_sha256,
             self.window_sha256,
             self.runtime_config_sha256,
             self.hardware_sha256,
         ):
             if not _is_sha256(value):
                 raise ValueError("target-reference identities must be SHA-256 values")
+        if self.execution_policy_sha256 != ControlledExecutionPolicy().sha256:
+            raise ValueError("target reference uses an unregistered execution policy")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("target reference uses another SGLang runtime tree")
         if self.output_hash_format != OUTPUT_HASH_FORMAT:
@@ -131,6 +136,7 @@ class GreedyTargetReference:
         model_lock_sha256: str,
         target_revision: str,
         sampling_profile_sha256: str,
+        execution_policy_sha256: str,
         window_sha256: str,
         concurrency: int,
     ) -> None:
@@ -140,6 +146,7 @@ class GreedyTargetReference:
             "model_lock_sha256": model_lock_sha256,
             "target_revision": target_revision,
             "sampling_profile_sha256": sampling_profile_sha256,
+            "execution_policy_sha256": execution_policy_sha256,
             "window_sha256": window_sha256,
             "concurrency": concurrency,
         }
@@ -175,6 +182,7 @@ class GreedyTargetReference:
             "target_model_id",
             "target_revision",
             "sampling_profile_sha256",
+            "execution_policy_sha256",
             "window_sha256",
             "runtime_config_sha256",
             "hardware_sha256",

@@ -22,6 +22,7 @@
 | `select-speed-config` | 执行只读取 tuning 的 maximin 规则 |
 | `select-anchor-config` | 锁定一个 terminal tuning anchor，用于 held-out 复现 |
 | `render-runtime` | 输出顺序执行的匹配 confirmation 配置与 argv |
+| `render-target-runtime` | 输出已注册的 target-only exactness 端点 |
 | `build-confirmation-queue` | 注册 24 个 clean-server confirmation job |
 | `run-confirmation` | 执行一个 method/block confirmation slice |
 | `run-target-reference` | 捕获锁定的 target-only greedy 轨迹 |
@@ -169,11 +170,23 @@ active decode 区间的并集以及 request 级绝对 streaming arrival time。�
 上限包含 tokenized prompt；每个 prompt 独立截断到已注册的 40,928 安全上限，从而保留
 两个 block-16 KV reservation。
 
-Collect 前必须从同一个已验证 patched checkout 单独启动 target-only server：使用锁定的
+Collect 前必须从同一个已验证 patched checkout 生成并单独启动 target-only server。Renderer
+会固定已注册的 context、server seed、radix cache、CUDA graph、deterministic-inference
+与 streaming 控制，并应用 target-reference 的 overlap 设置；speculative renderer 会应用
+另行注册的高吞吐 overlap 设置。它使用锁定的
 Qwen3-8B snapshot 与选定 concurrency，TP=DP=1，并且不带 draft model、speculative
 algorithm、adaptation config、study metrics 或 adaptation reserve。随后只捕获一次反事实轨迹：
 
 ```bash
+lightcone-spec render-target-runtime \
+  --concurrency SELECTED_CONCURRENCY \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --sglang-checkout /path/to/patched-sglang \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/target-runtime
+
 lightcone-spec doctor --path /path/to/patched-sglang > artifacts/doctor.json
 lightcone-spec run-target-reference \
   --model-lock artifacts/locks/models.json \
@@ -183,10 +196,12 @@ lightcone-spec run-target-reference \
   --output artifacts/target-reference.json
 ```
 
-该命令会验证 `/server_info`，执行相同 warmup 与 32-prompt 原生 batch，并且只保存每个
-prompt 的 token 数，以及完整 output-token-ID 数组带格式标识的 SHA-256；它不会用解码
-文本摘要代替。`collect-speed-study`、`collect-onlinespec-study`、
-两条 attestation 命令和两条 analyzer 命令都强制要求 `--target-reference`。每个 block
+执行 capture 前先启动 `artifacts/target-runtime/launch-plan.json` 中唯一的 argv。
+`run-target-reference` 会逐项校验 `/server_info` 中的注册执行策略，执行相同 warmup 与
+32-prompt 原生 batch，并且只保存每个 prompt 的 token 数，以及完整 output-token-ID 数组
+带格式标识的 SHA-256；它不会用解码文本摘要代替。`collect-speed-study`、
+`collect-onlinespec-study`、两条 attestation 和两条 analyzer 命令都强制要求
+`--target-reference`。每个 block
 中的每种方法都必须逐 prompt 与它完全一致；speculative 方法彼此一致不能替代 target
 exactness 证明。派生 Parquet metadata 与 GPU attestation 都会绑定 reference digest。
 

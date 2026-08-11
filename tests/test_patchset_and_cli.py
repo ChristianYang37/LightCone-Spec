@@ -320,6 +320,7 @@ def test_cli_help_contains_only_focused_workflow(capsys) -> None:
     assert "collect-speed-study" in output
     assert "run-controlled-slice" in output
     assert "render-static-load-runtime" in output
+    assert "render-target-runtime" in output
     assert "advance-tuning-stage" in output
     assert "run-natural-slice" in output
     assert "build-profiler-plan" in output

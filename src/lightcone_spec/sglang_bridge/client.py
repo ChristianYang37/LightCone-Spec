@@ -9,6 +9,8 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from lightcone_spec.execution import ControlledExecutionPolicy
+
 _MEASURED_METHODS = {
     "static",
     "tts",
@@ -436,10 +438,15 @@ class SGLangHTTPClient:
 
 
 def _require_complete_output_stream(server_info: dict) -> None:
-    if server_info.get("incremental_streaming_output") is not False:
-        raise RuntimeError(
-            "formal evidence requires non-incremental streaming with complete output IDs"
+    try:
+        ControlledExecutionPolicy().validate_server_info(
+            server_info, role="speculative"
         )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "formal evidence requires the registered controlled execution policy "
+            "and non-incremental streaming"
+        ) from exc
 
 
 def independent_method_run(

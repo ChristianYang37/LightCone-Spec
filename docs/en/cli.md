@@ -22,6 +22,7 @@
 | `select-speed-config` | Apply the tuning-only maximin rule |
 | `select-anchor-config` | Lock one terminal tuning anchor for held-out reproduction |
 | `render-runtime` | Emit matched sequential confirmation configs and argv |
+| `render-target-runtime` | Emit the registered target-only exactness endpoint |
 | `build-confirmation-queue` | Register the 24 clean-server confirmation jobs |
 | `run-confirmation` | Execute one method/block confirmation slice |
 | `run-target-reference` | Capture the locked target-only greedy trajectory |
@@ -191,12 +192,24 @@ streaming arrivals. The model's 40,960-token limit includes the tokenized
 prompt; each prompt is capped at the registered 40,928 safe limit so two
 block-16 KV reservations remain available.
 
-Before collection, start a separate target-only server from the same verified
-patched checkout with the locked Qwen3-8B snapshot, the selected concurrency,
-TP=DP=1, and no draft model, speculative algorithm, adaptation config, study
-metrics, or adaptation reserve. Then capture the counterfactual once:
+Before collection, render and start a separate target-only server from the same
+verified patched checkout. The renderer fixes the registered context, server
+seed, radix-cache, CUDA-graph, deterministic-inference, and streaming controls.
+It applies the target-reference overlap setting; speculative renderers apply
+the separately registered high-throughput overlap setting. It uses the locked
+Qwen3-8B snapshot, selected concurrency, TP=DP=1, and no draft model,
+speculative algorithm, adaptation config, study metrics, or adaptation reserve:
 
 ```bash
+lightcone-spec render-target-runtime \
+  --concurrency SELECTED_CONCURRENCY \
+  --model-lock artifacts/locks/models.json \
+  --model-roots artifacts/locks/model-roots.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --sglang-checkout /path/to/patched-sglang \
+  --mem-fraction-static MEMORY_FRACTION \
+  --output-root artifacts/target-runtime
+
 lightcone-spec doctor --path /path/to/patched-sglang > artifacts/doctor.json
 lightcone-spec run-target-reference \
   --model-lock artifacts/locks/models.json \
@@ -206,7 +219,9 @@ lightcone-spec run-target-reference \
   --output artifacts/target-reference.json
 ```
 
-The command validates `/server_info`, performs the same warmup and 32-prompt
+Start the sole argv from `artifacts/target-runtime/launch-plan.json` before the
+capture command. The command validates every registered execution-policy field
+in `/server_info`, performs the same warmup and 32-prompt
 native batch, and stores only per-prompt token counts plus format-tagged
 SHA-256 values of the complete output-token-ID arrays. It never substitutes a
 decoded-text digest.
