@@ -49,7 +49,7 @@ T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
 
 - `lightcone_spec` 管理严格的 schema-v2 配置、确定性数据窗口、配置选择、证据记录和
   统计门槛；
-- `patches/sglang` 是针对唯一 upstream commit 的七层可复现 mail patch；仓库既不
+- `patches/sglang` 是针对唯一 upstream commit 的十个可复现 mail patch；仓库既不
   vendoring SGLang，也不原地修改 SGLang；
 - cohort runtime 将 optimizer 状态保持在 GPU，在固定地址的 inference tensor 上发布，
   并用 epoch、slot generation 和 source version 绑定每个 candidate；Adam、AdamW、
