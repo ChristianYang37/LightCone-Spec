@@ -1,27 +1,25 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lightcone-spec"
-version = "0.2.0"
+version = "0.3.0"
 description = "Evidence-first Static, TTS, and L0 speculative decoding research."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "LightCone contributors" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
-    "torch>=2.1",
+    "torch==2.11.0",
     "pydantic>=2.5",
     "pyyaml>=6.0",
     "pyarrow>=14.0",
@@ -30,12 +28,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["datasets>=2.16"]
+gpu = [
+    "datasets>=2.16",
+    "flashinfer-python[cu13]==0.6.15.post1; sys_platform == 'linux'",
+]
 dev = [
     "build>=1.2",
     "pytest>=7.4",
     "ruff>=0.8",
     "twine>=5.1",
+    "pip-audit>=2.9",
 ]
 
 [project.urls]
@@ -60,5 +62,5 @@ markers = [
 addopts = "-m 'not gpu and not system and not integration'"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 88
