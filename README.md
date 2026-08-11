@@ -8,9 +8,10 @@ has one deliberately narrow question: can paper-faithful TTS and a first-ready
 publication policy both improve decode goodput over an unchanged Static
 baseline?
 
-> Alpha software. GPU performance is `UNMEASURED` until an immutable formal
-> run passes the registered statistical and safety gate. This repository does
-> not publish benchmark results or performance claims.
+> Alpha software. The preliminary GPU snapshot below is a controlled
+> mechanism check, not a formal paper-reproduction claim. Formal GPU status
+> remains `UNMEASURED` until an immutable run passes the registered
+> statistical, target-exactness, and safety gate.
 
 ## Scope
 
@@ -36,6 +37,9 @@ with its own tuning and paired evidence path; it never changes core selection
 or the Static/TTS/L0 speed gate. Its pinned, machine-readable
 [source audit](manifests/provenance/onlinespec_source_audit_v2.json) distinguishes
 the paper equations, the released recipes, and this project's implementation.
+The official paper's Qwen3-8B result uses a Qwen3-0.6B Lookahead Reasoning
+drafter; applying the clean-room learners to DFlash is a separate
+cross-architecture comparison, not a reproduction of that system result.
 
 ## Performance model
 
@@ -51,6 +55,35 @@ An adapted method is faster only if fewer target calls save more time than
 training, contention, publication, and barrier overhead consume. Formal claims
 therefore require paired decode goodput, exactness counters, target-call
 counts, CUDA timing, HBM accounting, and confidence intervals together.
+
+## Preliminary controlled GPU snapshot
+
+The following snapshot tests the mechanism on one RTX PRO 6000 Blackwell
+(96 GB) with Qwen3-8B + DFlash-b16, concurrency 8, greedy decoding, and a
+40,928-token safe context limit. Each method processed the same 16 deterministic
+long-continuation prompts (654,042 generated tokens per method). CUDA Graph and
+Radix Cache were disabled by the registered exactness-safe policy. TTS and L0
+used the same drafter LoRA rank 8, Adam learning rate `1e-3`, and update stride
+80; only publication timing differed.
+
+| Method | Decode goodput | vs. Static | p99 ITL | Peak HBM |
+|---|---:|---:|---:|---:|
+| Static DFlash | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
+| TTS | 2,497.9 tok/s | 1.86x | 45.94 ms | 90.52 GiB |
+| L0 | **2,519.5 tok/s** | **1.88x** | 46.21 ms | 90.53 GiB |
+
+L0 was 0.86% faster than TTS in this snapshot. Complete token-ID trajectories
+were identical across all three methods, and exactness-violation, version-
+mismatch, fallback, non-finite-update, OOM, and retraction counters were zero.
+The reproducibility identity is `LightCone-Spec@0db2ff4`, patched SGLang tree
+`e795ecc`, execution-policy SHA `231ca579`, and tuning-window SHA `132019ee`.
+
+These are single-block tuning-window measurements (`n=1` timing block), not
+BCa confidence intervals or natural-task results. The repetitive controlled
+prompts intentionally make within-request adaptation observable; they do not
+establish the paper's LiveCodeBench, mathematics, or OnlineSPEC claims. Legacy
+repeated timings that hashed decoded text instead of complete token IDs are
+deliberately excluded from this table.
 
 ## Architecture
 
@@ -244,7 +277,9 @@ report, and exact Parquet inputs. A local or synthetic table remains
 
 ## Limitations and roadmap
 
-- GPU status is currently `UNMEASURED`; no speedup is asserted.
+- Formal GPU status remains `UNMEASURED`; the published table is explicitly a
+  single-block controlled snapshot rather than an attested paper-reproduction
+  result.
 - Adaptation requires TP=DP=1 and an unquantized draft/KV path. Drafter-scope
   Full/LoRA is DFlash-only; DSpark requires verify-all execution, and adapted
   EAGLE/EAGLE3 requires a single layer, fixed depth, top-k one, and exact

@@ -6,8 +6,9 @@ LightCone-Spec 是一个以证据为先的 speculative decoding 测试时 drafte
 0.2.0 只回答一个刻意收窄的问题：严格按论文实现的 TTS，以及在更新就绪后立即发布的
 策略，能否都比不更新的 Static baseline 获得更高的 decode goodput？
 
-> 当前为 Alpha 软件。在不可变的正式 GPU 实验通过统计与安全门槛前，GPU 状态始终为
-> `UNMEASURED`。本仓库不发布 benchmark 数值或性能结论。
+> 当前为 Alpha 软件。下方初步 GPU snapshot 只是受控机制检查，不是正式论文复现结论。
+> 在不可变实验通过统计、target exactness 与安全门槛前，正式 GPU 状态仍为
+> `UNMEASURED`。
 
 ## 研究范围
 
@@ -30,6 +31,8 @@ OnlineSPEC 是拥有独立 tuning 与配对证据链的重要已注册对比，�
 Static/TTS/L0 速度 gate。固定且机器可读的
 [源码审计](manifests/provenance/onlinespec_source_audit_v2.json)会区分论文公式、公开
 recipe 与本项目实现。
+OnlineSPEC 原论文在 Qwen3-8B 上使用 Qwen3-0.6B Lookahead Reasoning drafter；把
+clean-room learner 应用于 DFlash 是独立的跨架构对比，不能写成对该系统结果的复现。
 
 ## 性能模型
 
@@ -44,6 +47,31 @@ T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
 只有减少 target calls 所节省的时间超过训练、资源竞争、发布与 barrier 开销，方法才会
 更快。因此正式结论必须同时包含配对 decode goodput、exactness 计数、target-call
 计数、CUDA 时间、HBM 账本和置信区间。
+
+## 初步受控 GPU snapshot
+
+下表是在一张 RTX PRO 6000 Blackwell（96 GB）上进行的机制检查：Qwen3-8B +
+DFlash-b16、并发 8、greedy decoding、40,928-token 安全 context 上限。每种方法处理
+相同的 16 条确定性 long-continuation prompt（每种方法生成 654,042 tokens）。注册的
+exactness-safe policy 关闭 CUDA Graph 与 Radix Cache。TTS 与 L0 均使用 drafter LoRA
+rank 8、Adam 学习率 `1e-3`、update stride 80，二者只在发布时间上不同。
+
+| 方法 | Decode goodput | 相对 Static | p99 ITL | Peak HBM |
+|---|---:|---:|---:|---:|
+| Static DFlash | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
+| TTS | 2,497.9 tok/s | 1.86x | 45.94 ms | 90.52 GiB |
+| L0 | **2,519.5 tok/s** | **1.88x** | 46.21 ms | 90.53 GiB |
+
+本次 snapshot 中 L0 比 TTS 快 0.86%。三种方法的完整 token-ID 轨迹完全一致；
+exactness violation、version mismatch、fallback、non-finite update、OOM 与 retraction
+计数均为零。
+复现身份为 `LightCone-Spec@0db2ff4`、patched SGLang tree `e795ecc`、
+execution-policy SHA `231ca579` 与 tuning-window SHA `132019ee`。
+
+这些数据来自单个 tuning-window timing block（`n=1`），没有 BCa 置信区间，也不是自然
+任务结果。重复型受控 prompt 用于让单请求内 adaptation 机制充分显现，不能据此声称复现了
+论文的 LiveCodeBench、数学任务或 OnlineSPEC 结果。旧重复实验只对 decoded text 做
+hash，未保存完整 token IDs，因此刻意不纳入本表。
 
 ## 架构
 
@@ -214,7 +242,8 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 
 ## 限制与路线图
 
-- GPU 状态目前为 `UNMEASURED`，不声明任何加速；
+- 正式 GPU 状态仍为 `UNMEASURED`；上表明确是单 block 受控 snapshot，不是经过
+  attestation 的论文复现结果；
 - Adaptation 要求 TP=DP=1 与未量化 drafter/KV。Drafter-scope Full/LoRA 仅用于
   DFlash；DSpark 必须使用 verify-all；EAGLE/EAGLE3 必须 single layer、fixed depth、
   top-k one，并使用 exact full-vocabulary rejection sampling。其他组合在分配
