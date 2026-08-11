@@ -10,6 +10,7 @@ from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
 
 def _sha256(path: Path) -> str:
@@ -82,6 +83,7 @@ class GreedyTargetReference:
     patched_sglang_tree: str
     concurrency: int
     context_limit: int
+    output_hash_format: str
     outputs: tuple[TargetOutput, ...]
 
     def validate(self) -> None:
@@ -104,6 +106,8 @@ class GreedyTargetReference:
                 raise ValueError("target-reference identities must be SHA-256 values")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("target reference uses another SGLang runtime tree")
+        if self.output_hash_format != OUTPUT_HASH_FORMAT:
+            raise ValueError("target reference uses an unknown output hash format")
         if (
             isinstance(self.concurrency, bool)
             or not isinstance(self.concurrency, int)
@@ -177,6 +181,7 @@ class GreedyTargetReference:
             "patched_sglang_tree",
             "concurrency",
             "context_limit",
+            "output_hash_format",
             "outputs",
         }
         if set(value) != expected or not isinstance(value["outputs"], list):

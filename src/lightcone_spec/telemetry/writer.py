@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .records import (
+    OUTPUT_HASH_FORMAT,
     PerformanceRecord,
     RequestRecord,
     RoundRecord,
@@ -120,6 +121,10 @@ def load_completed_evidence(
                 for table in ("request", "performance")
                 for row in table_rows[table]
             )
+            or any(
+                row.get("output_hash_format") != OUTPUT_HASH_FORMAT
+                for row in table_rows["request"]
+            )
         ):
             raise RuntimeError(f"receipt binds invalid run evidence {receipt}")
         completed.append(resolved)
@@ -188,6 +193,10 @@ class EvidenceWriter:
                 row.get("method") != method
                 for table in ("request", "performance")
                 for row in self._rows[table]
+            )
+            or any(
+                row.get("output_hash_format") != OUTPUT_HASH_FORMAT
+                for row in self._rows["request"]
             )
         ):
             raise RuntimeError(

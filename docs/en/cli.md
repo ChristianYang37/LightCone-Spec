@@ -207,7 +207,9 @@ lightcone-spec run-target-reference \
 ```
 
 The command validates `/server_info`, performs the same warmup and 32-prompt
-native batch, and stores only per-prompt token counts and output SHA-256 values.
+native batch, and stores only per-prompt token counts plus format-tagged
+SHA-256 values of the complete output-token-ID arrays. It never substitutes a
+decoded-text digest.
 `collect-speed-study`, `collect-onlinespec-study`, both attestation commands,
 and both analyzers require `--target-reference`. Every method in every block
 must match it exactly; agreement among speculative methods alone is not an

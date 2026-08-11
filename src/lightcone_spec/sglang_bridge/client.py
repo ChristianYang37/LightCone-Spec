@@ -237,6 +237,20 @@ def _consume_generation_stream(
             raise RuntimeError("stream result coverage is incomplete")
         if len(intervals[index]) != previous_tokens[index] - 1:
             raise RuntimeError("ITL sample count does not match completion tokens")
+        output_ids = final.get("output_ids")
+        if (
+            not isinstance(output_ids, list)
+            or len(output_ids) != previous_tokens[index]
+            or any(
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                for token_id in output_ids
+            )
+        ):
+            raise RuntimeError(
+                "final stream chunk lacks the complete output-token trajectory"
+            )
         meta = final.get("meta_info")
         if not isinstance(meta, dict) or "prompt_tokens" not in meta:
             raise RuntimeError("final stream chunk lacks prompt token telemetry")
@@ -421,6 +435,13 @@ class SGLangHTTPClient:
         return tuple(sorted(results, key=lambda row: row.request_id)), elapsed
 
 
+def _require_complete_output_stream(server_info: dict) -> None:
+    if server_info.get("incremental_streaming_output") is not False:
+        raise RuntimeError(
+            "formal evidence requires non-incremental streaming with complete output IDs"
+        )
+
+
 def independent_method_run(
     client: SGLangHTTPClient,
     *,
@@ -435,14 +456,18 @@ def independent_method_run(
     if method != "static" and not adaptation_group_id:
         raise ValueError("adapted methods require a cohort identity")
     client.reset_engine()
-    before = ServerSnapshot.parse(client.server_info())
+    before_info = client.server_info()
+    _require_complete_output_stream(before_info)
+    before = ServerSnapshot.parse(before_info)
     if before.target_calls != 0:
         raise RuntimeError("engine reset did not clear target-call counters")
     results, elapsed_s = client.run_loaded_batch(
         payloads,
         concurrency=concurrency,
     )
-    after = ServerSnapshot.parse(client.server_info())
+    after_info = client.server_info()
+    _require_complete_output_stream(after_info)
+    after = ServerSnapshot.parse(after_info)
     if after.target_calls < 1:
         raise RuntimeError("completed run reported no target calls")
     if method == "static" and after.adaptation is not None:

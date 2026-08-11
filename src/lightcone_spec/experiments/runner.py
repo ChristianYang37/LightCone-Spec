@@ -43,6 +43,7 @@ from lightcone_spec.telemetry import (
     UpdateRecord,
     load_completed_evidence,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
 _FORMAL_METHODS = {"static", "tts", "naive_async"}
 _ONLINE_SPEC_METHODS = {
@@ -78,10 +79,22 @@ def _run_id(
 
 
 def _output_sha256(result: GenerationResult) -> str:
-    text = result.response.get("text")
-    if not isinstance(text, str):
-        raise TypeError("final SGLang response lacks generated text for exactness")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    output_ids = result.response.get("output_ids")
+    if (
+        not isinstance(output_ids, list)
+        or len(output_ids) != result.completion_tokens
+        or any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            for token_id in output_ids
+        )
+    ):
+        raise TypeError(
+            "final SGLang response lacks the complete output-token trajectory"
+        )
+    body = json.dumps(output_ids, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
 
 
 def _output_set_sha256(rows: list[tuple[str, tuple[str, ...]]]) -> str:
@@ -1079,6 +1092,10 @@ def _target_runtime_identity(
     ):
         raise RuntimeError("target reference requires exactly one SGLang DP state")
     state = states[0]
+    if server_info.get("incremental_streaming_output") is not False:
+        raise RuntimeError(
+            "target reference requires complete non-incremental output IDs"
+        )
     disabled_fields = (
         "speculative_algorithm",
         "speculative_draft_model_path",
@@ -1158,6 +1175,7 @@ def _target_runtime_identity(
             "enable_deterministic_inference"
         ),
         "random_seed": server_info.get("random_seed"),
+        "incremental_streaming_output": False,
     }
     body = json.dumps(runtime, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(body.encode()).hexdigest()
@@ -1267,6 +1285,7 @@ def run_greedy_target_reference(
         patched_sglang_tree=PINNED_SGLANG_TREE,
         concurrency=concurrency,
         context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         outputs=tuple(sorted(outputs, key=lambda row: row.prompt_id)),
     )
     artifact.validate()
@@ -1639,6 +1658,7 @@ def run_confirmation_slice(
                     concurrency=concurrency,
                     input_tokens=result.input_tokens,
                     output_tokens=result.completion_tokens,
+                    output_hash_format=OUTPUT_HASH_FORMAT,
                     output_sha256=_output_sha256(result),
                     ttft_ms=result.ttft_ms,
                     finished=result.stop_reason is not None,
@@ -1878,6 +1898,7 @@ def _collect_paired_performance(
                     or int(row.get("input_tokens", 0))
                     + int(row.get("output_tokens", 0))
                     != DFLASH_SAFE_CONTEXT_LIMIT
+                    or row.get("output_hash_format") != OUTPUT_HASH_FORMAT
                     or not isinstance(row.get("output_sha256"), str)
                     or len(str(row["output_sha256"])) != 64
                     or row.get("finished") is not True
@@ -2149,6 +2170,7 @@ def run_natural_replication_slice(
                     concurrency=concurrency,
                     input_tokens=result.input_tokens,
                     output_tokens=result.completion_tokens,
+                    output_hash_format=OUTPUT_HASH_FORMAT,
                     output_sha256=_output_sha256(result),
                     ttft_ms=result.ttft_ms,
                     finished=True,

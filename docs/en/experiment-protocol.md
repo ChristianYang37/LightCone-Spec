@@ -83,13 +83,15 @@ never replicate prompts to manufacture load.
 The registered controlled profile is greedy. This makes the target-token
 trajectory identical across Static and every exact adapted method, so a paired
 timing effect cannot be caused by method-dependent random-number consumption.
-Tuning and confirmation store only a SHA-256 of each generated trajectory and
-fail closed unless every paired method has the same digest. Formal collection
+Tuning and confirmation store only a format-tagged SHA-256 of each complete
+output-token-ID trajectory and fail closed unless every paired method has the
+same digest. A decoded-text digest is explicitly insufficient. Formal collection
 additionally requires one 32-prompt target-only greedy reference captured from
 the locked target snapshot at the same load and safe context limit. Every
 method/block digest must match that reference; cross-method agreement by itself
 is insufficient. The reference, derived table, and attestation bind the same
-reference SHA-256, and generated text is not retained in evidence artifacts.
+reference SHA-256, and neither generated text nor raw token IDs are retained in
+evidence artifacts.
 Stochastic coupled-RNG and distribution checks remain mandatory GPU tests;
 stochastic natural-task runs are robustness side tables, not the causal speed
 headline.

@@ -212,7 +212,8 @@ hot path 外排空有界 device buffer。
 
 跟踪的协议是 `manifests/speed-study/onlinespec_baseline_v2.json`。它与核心实验使用相同
 的 controlled greedy sampling 语义和 DFlash 模型对。Greedy confirmation 让各 learner
-遵循相同 target-token 轨迹；任何计时比较前都会验证配对输出摘要，且不保留原始生成文本。
+遵循相同 target-token 轨迹；任何计时比较前都会验证带格式标识的完整 token-ID 输出摘要，
+且不保留原始生成文本或 token ID。解码文本摘要不能作为 exactness 证据。
 Stochastic exactness 单独验证。协议仍保持独立证据身份：
 
 1. 只在 tuning window 执行 successive halving。资源阶段固定为

@@ -67,11 +67,12 @@ goodput。Load screen 和早期 tuning stage 只有在 prompt 数少于 concurre
 
 已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
 沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
-调参与 confirmation 仅保存每条生成轨迹的 SHA-256。正式 collect 还必须从锁定的
+调参与 confirmation 仅保存带格式标识的完整 output-token-ID 轨迹 SHA-256；解码文本
+摘要被明确视为不足。正式 collect 还必须从锁定的
 target snapshot 以相同 load 与安全 context 上限捕获一份 32-prompt target-only greedy
 reference；每种方法的每个 block 都必须逐 prompt 与它一致，方法彼此一致本身不充分。
 Reference、派生表和 attestation 会绑定同一个 reference SHA-256，证据 artifact 不保留
-生成文本。Stochastic
+生成文本或原始 token ID。Stochastic
 coupled-RNG 与分布检查仍是必需的 GPU 测试；stochastic 自然任务只作为鲁棒性副表，不是
 因果速度 headline。
 

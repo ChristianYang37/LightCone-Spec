@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+OUTPUT_HASH_FORMAT = "sglang-output-token-ids-json-v1"
+
 
 @dataclass(frozen=True)
 class RunRecord:
@@ -28,6 +30,7 @@ class RequestRecord:
     concurrency: int
     input_tokens: int
     output_tokens: int
+    output_hash_format: str
     output_sha256: str
     ttft_ms: float
     finished: bool

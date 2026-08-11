@@ -253,8 +253,10 @@ The tracked protocol is
 `manifests/speed-study/onlinespec_baseline_v2.json`. It uses the same controlled
 greedy sampling semantics and DFlash model pair as the core study. Greedy
 confirmation keeps the target-token trajectory identical across learners;
-paired output digests are verified before any timing comparison, while raw
-generated text is not retained. Stochastic exactness is verified separately.
+format-tagged complete token-ID digests are verified before any timing
+comparison, while raw generated text and token IDs are not retained. Decoded
+text alone is not accepted as exactness evidence. Stochastic exactness is
+verified separately.
 The protocol preserves
 separate evidence identities:
 

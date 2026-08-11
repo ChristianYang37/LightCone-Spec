@@ -41,6 +41,8 @@ yet been declared.
   identity, preventing premature elimination by 4K/8K measurements.
 - Made cross-method output agreement insufficient for exactness: every formal
   method/block must also match the locked target-only trajectory.
+- Replaced decoded-text output digests with format-tagged hashes of complete
+  output-token-ID trajectories so formal exactness cannot alias two tokenizations.
 
 ### Planned
 

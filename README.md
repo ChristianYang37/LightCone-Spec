@@ -154,7 +154,9 @@ For each queue job, start its `launch_argv`, wait for health, run its
 `run-target-reference` once against a separate locked target-only server at the
 same load, then pass that artifact to `collect-speed-study` to derive the formal
 table. Agreement among speculative methods is insufficient: every method/block
-must match the target-only greedy output hashes. The queue is data, not a
+must match the target-only greedy token-ID hashes. Decoded text alone is not an
+exactness witness because distinct token sequences can decode to the same text.
+The queue is data, not a
 shell script: orchestration must preserve the registered order and clean-server
 boundaries.
 

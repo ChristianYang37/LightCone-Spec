@@ -21,6 +21,7 @@ from lightcone_spec.experiments.runner import (
     _batched_payloads,
     _earlier_slices,
     _group_results,
+    _output_sha256,
     _payloads,
     _performance_record,
     _prompt_budgets,
@@ -68,6 +69,7 @@ class StreamingResponse:
 def stream_line(completion: int, *, finish: bool = False) -> bytes:
     value = {
         "text": "tokens",
+        "output_ids": list(range(completion)),
         "meta_info": {
             "prompt_tokens": 7,
             "completion_tokens": completion,
@@ -83,6 +85,7 @@ def batch_stream_line(
     value = {
         "index": index,
         "text": request_id * completion,
+        "output_ids": list(range(completion)),
         "meta_info": {
             "id": request_id,
             "prompt_tokens": 7 + index,
@@ -172,7 +175,10 @@ def test_native_batch_stream_preserves_order_and_per_request_itl() -> None:
 
 
 def test_streaming_rejects_missing_prompt_count() -> None:
-    value = {"meta_info": {"completion_tokens": 1, "finish_reason": {"type": "length"}}}
+    value = {
+        "output_ids": [0],
+        "meta_info": {"completion_tokens": 1, "finish_reason": {"type": "length"}},
+    }
     response = StreamingResponse(
         [f"data: {json.dumps(value)}\n".encode(), b"data: [DONE]\n"]
     )
@@ -180,6 +186,28 @@ def test_streaming_rejects_missing_prompt_count() -> None:
         patch("urllib.request.urlopen", return_value=response),
         patch("time.perf_counter", side_effect=[0.0, 0.1, 0.2]),
         pytest.raises(RuntimeError, match="prompt token"),
+    ):
+        SGLangHTTPClient("http://server").stream_generate(
+            {"rid": "r0", "text": "x", "sampling_params": {}}
+        )
+
+
+def test_streaming_rejects_missing_complete_output_token_ids() -> None:
+    value = {
+        "text": "x",
+        "meta_info": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "finish_reason": {"type": "length"},
+        },
+    }
+    response = StreamingResponse(
+        [f"data: {json.dumps(value)}\n".encode(), b"data: [DONE]\n"]
+    )
+    with (
+        patch("urllib.request.urlopen", return_value=response),
+        patch("time.perf_counter", side_effect=[0.0, 0.1, 0.2]),
+        pytest.raises(RuntimeError, match="output-token trajectory"),
     ):
         SGLangHTTPClient("http://server").stream_generate(
             {"rid": "r0", "text": "x", "sampling_params": {}}
@@ -245,7 +273,7 @@ def snapshot_payload(*, adapted: bool = False, target_calls: int = 4) -> dict:
         state["speculative_adaptation_info_record"] = {
             "online_adaptation": adaptation_payload(target_calls=target_calls)
         }
-    return {"internal_state": state}
+    return {"incremental_streaming_output": False, "internal_state": state}
 
 
 def adaptation_payload(*, target_calls: int = 4) -> dict:
@@ -372,9 +400,19 @@ def result(request_id: str = "r0", tokens: int = 4) -> GenerationResult:
         stop_reason="length",
         response={
             "text": "x" * tokens,
+            "output_ids": list(range(tokens)),
             "meta_info": {"prompt_tokens": 7, "completion_tokens": tokens},
         },
     )
+
+
+def test_output_hash_binds_token_ids_not_only_decoded_text() -> None:
+    first = result(tokens=2)
+    second = replace(
+        first,
+        response={"text": first.response["text"], "output_ids": [10, 11]},
+    )
+    assert _output_sha256(first) != _output_sha256(second)
 
 
 class FakeClient:
@@ -419,6 +457,24 @@ def test_independent_run_resets_and_collects_post_run_snapshot(method: str) -> N
     assert client.reset_count == 1
     assert run.before.target_calls == 0
     assert run.after.target_calls == 4
+
+
+def test_independent_run_requires_complete_nonincremental_output_ids() -> None:
+    class IncrementalClient(FakeClient):
+        def server_info(self) -> dict:
+            return {
+                **super().server_info(),
+                "incremental_streaming_output": True,
+            }
+
+    with pytest.raises(RuntimeError, match="non-incremental streaming"):
+        independent_method_run(
+            IncrementalClient(adapted=False),
+            method="static",
+            payloads=({"rid": "r0"},),
+            concurrency=1,
+            adaptation_group_id=None,
+        )
 
 
 def test_loaded_batch_submits_the_complete_queue_to_sglang() -> None:
@@ -502,6 +558,7 @@ class TargetReferenceClient:
             "disable_cuda_graph": False,
             "enable_deterministic_inference": False,
             "random_seed": 1,
+            "incremental_streaming_output": False,
             "internal_states": [
                 {
                     "effective_max_running_requests_per_dp": 8,
@@ -538,7 +595,10 @@ class TargetReferenceClient:
                     token_arrival_ms=(),
                     elapsed_s=float(completion),
                     stop_reason="length",
-                    response={"text": f"target:{request_id}"},
+                    response={
+                        "text": f"target:{request_id}",
+                        "output_ids": [0] * completion,
+                    },
                 )
             )
         return tuple(rows), 1.0
@@ -1149,6 +1209,7 @@ def request_record(run_id: str) -> RequestRecord:
         concurrency=1,
         input_tokens=2,
         output_tokens=4,
+        output_hash_format="sglang-output-token-ids-json-v1",
         output_sha256="c" * 64,
         ttft_ms=1.0,
         finished=True,

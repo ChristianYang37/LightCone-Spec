@@ -65,6 +65,7 @@ from lightcone_spec.orchestration.runtime import (
     render_static_load_runtime_plan,
     render_tuning_runtime_plan,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
 
 def test_controlled_windows_are_sized_unique_and_content_disjoint() -> None:
@@ -956,6 +957,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         patched_sglang_tree=PINNED_SGLANG_TREE,
         concurrency=8,
         context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         outputs=tuple(
             TargetOutput(
                 prompt_id=f"prompt-{index:02d}",
@@ -1015,6 +1017,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         patched_sglang_tree=PINNED_SGLANG_TREE,
         concurrency=8,
         context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         outputs=tuple(
             TargetOutput(
                 prompt_id=f"prompt-{index:02d}",
@@ -1043,6 +1046,8 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
             window_sha256="d" * 64,
             concurrency=4,
         )
+    with pytest.raises(ValueError, match="output hash format"):
+        replace(reference, output_hash_format="decoded-text-sha256").validate()
     value = json.loads(path.read_text())
     value["outputs"][0]["unexpected"] = True
     path.write_text(json.dumps(value))

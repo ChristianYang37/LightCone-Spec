@@ -141,7 +141,8 @@ lightcone-spec build-confirmation-queue \
 对每个 queue job：启动它的 `launch_argv`，等待健康检查，通过后执行 `run_argv`，再关闭
 server，随后进入下一项。之后以相同 load 单独启动锁定的 target-only server，执行一次
 `run-target-reference`，并把该 artifact 传给 `collect-speed-study` 派生正式表。方法彼此一致
-并不充分：每种方法的每个 block 都必须匹配 target-only greedy 输出摘要。Queue 是数据而不是 shell
+并不充分：每种方法的每个 block 都必须匹配 target-only greedy token-ID 摘要。仅比较
+解码文本不能证明 exactness，因为不同 token 序列可能解码成相同文本。Queue 是数据而不是 shell
 脚本；调度器必须保留注册顺序与 clean-server 边界。
 
 `RESERVE_MB` 与 `MEMORY_FRACTION` 不设源码默认值；它们必须来自硬件预检和已选择的

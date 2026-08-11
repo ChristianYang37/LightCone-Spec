@@ -184,7 +184,8 @@ lightcone-spec run-target-reference \
 ```
 
 该命令会验证 `/server_info`，执行相同 warmup 与 32-prompt 原生 batch，并且只保存每个
-prompt 的 token 数与输出 SHA-256。`collect-speed-study`、`collect-onlinespec-study`、
+prompt 的 token 数，以及完整 output-token-ID 数组带格式标识的 SHA-256；它不会用解码
+文本摘要代替。`collect-speed-study`、`collect-onlinespec-study`、
 两条 attestation 命令和两条 analyzer 命令都强制要求 `--target-reference`。每个 block
 中的每种方法都必须逐 prompt 与它完全一致；speculative 方法彼此一致不能替代 target
 exactness 证明。派生 Parquet metadata 与 GPU attestation 都会绑定 reference digest。
