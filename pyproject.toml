@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+    "cryptography>=45,<51",
     "numpy>=1.24",
     "scipy>=1.10",
     "torch==2.11.0",

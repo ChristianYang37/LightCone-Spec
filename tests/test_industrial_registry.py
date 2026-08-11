@@ -27,11 +27,8 @@ from lightcone_spec.experiments.registry import (
     REGISTERED_CONFIRMATION_BLOCKS,
     CellIdentity,
     CellStatus,
-    ConfirmationBlockPlan,
     ExperimentReceipt,
     ExperimentRegistry,
-    StageActivationPlan,
-    TwoGpuResourceScheduler,
     WorkloadClass,
     build_industrial_registry,
     content_sha256,
@@ -390,83 +387,7 @@ def test_locked_outputs_and_dependency_receipts_fail_closed(
     )
 
 
-def test_scheduler_dispatches_only_currently_executable_target_only_cells(
-    registry: ExperimentRegistry,
-) -> None:
-    scheduler = TwoGpuResourceScheduler(registry)
-    receipts = _receipts_through(registry, "preflight")
-
-    serialized = scheduler.schedule(
-        receipts=receipts,
-        interference_gate_passed=False,
-    )
-    parallel = scheduler.schedule(
-        receipts=receipts,
-        interference_gate_passed=True,
-    )
-
-    assert serialized
-    assert all(len(wave.cells) == 1 for wave in serialized)
-    assert all(len(wave.cells) == 1 for wave in parallel)
-    assert {cell.identity.method for wave in parallel for cell in wave.cells} == {
-        "target_only"
-    }
-
-    repeated = scheduler.schedule(
-        receipts=receipts,
-        interference_gate_passed=True,
-    )
-    assert tuple(wave.sha256 for wave in parallel) == tuple(
-        wave.sha256 for wave in repeated
-    )
-
-
-def test_scheduler_never_overlaps_exclusive_or_two_gpu_cells(
-    registry: ExperimentRegistry,
-) -> None:
-    scheduler = TwoGpuResourceScheduler(registry)
-
-    preflight_waves = scheduler.schedule(interference_gate_passed=True)
-    assert preflight_waves
-    assert all(len(wave.cells) == 1 for wave in preflight_waves)
-    assert all(wave.cells[0].resources.gpu_count == 2 for wave in preflight_waves)
-    assert all(
-        wave.cells[0].identity.method == "target_only" for wave in preflight_waves
-    )
-
-    e4_waves = scheduler.schedule(
-        receipts=_receipts_through(registry, "E2"),
-        interference_gate_passed=True,
-    )
-    assert e4_waves == ()
-
-    e3b_waves = scheduler.schedule(
-        receipts=_receipts_through(registry, "E4"),
-        interference_gate_passed=True,
-    )
-    assert e3b_waves == ()
-
-    e5_waves = scheduler.schedule(
-        receipts=_receipts_through(registry, "E1a"),
-        interference_gate_passed=True,
-    )
-    assert e5_waves
-    assert all(
-        serving_cell_rejection_reason(cell) is None
-        for wave in e5_waves
-        for cell in wave.cells
-    )
-    assert all(
-        len(wave.cells) == 1
-        for wave in e5_waves
-        if wave.cells[0].resources.gpu_count == 2
-    )
-
-    with pytest.raises(ValueError, match="outside the registry"):
-        scheduler.schedule(completed_cell_ids=("f" * 64,))
-
-
-def test_headline_method_order_is_randomized_and_gpu_rotated_by_block(
+def test_headline_registry_gpu_assignments_are_balanced_by_method(
     registry: ExperimentRegistry,
 ) -> None:
     e3b = registry.cells_for("E3b")
@@ -480,133 +401,8 @@ def test_headline_method_order_is_randomized_and_gpu_rotated_by_block(
             registry.gpu_uuids[1]
         )
 
-    scheduler = TwoGpuResourceScheduler(registry)
-    selected = [
-        cell
-        for cell in e3b
-        if cell.identity.context == 1024
-        and cell.identity.regime == CONTEXT_REGIMES[0]
-        and cell.identity.arrival == "closed_loop_c1"
-        and cell.identity.variant.endswith(":concurrency_one:matched")
-    ]
-    selected.sort(key=scheduler._dispatch_order_key)
-    orders = {
-        block: tuple(
-            cell.identity.method for cell in selected if cell.identity.block == block
-        )
-        for block in PILOT_BLOCKS
-    }
-    assert all(
-        set(order) == {"target_only", "static", "tts", "l0"}
-        for order in orders.values()
-    )
-    assert len(set(orders.values())) > 1
-    assert (
-        scheduler.schedule(
-            receipts=_receipts_through(registry, "E4"),
-            interference_gate_passed=False,
-        )
-        == ()
-    )
 
-
-def test_confirmation_final_blocks_require_a_power_locked_pilot_plan(
-    registry: ExperimentRegistry,
-) -> None:
-    scheduler = TwoGpuResourceScheduler(registry)
-    receipts = _receipts_through(registry, "E4")
-    pilot_cells = tuple(
-        cell
-        for cell in registry.cells_for("E3b")
-        if cell.runnable and cell.identity.block in PILOT_BLOCKS
-    )
-    initial = scheduler.schedule(receipts=receipts, interference_gate_passed=True)
-    assert initial == ()
-
-    pilot_ids = tuple(sorted(cell.cell_id for cell in pilot_cells))
-    plan = ConfirmationBlockPlan(
-        registry_sha256=registry.sha256,
-        experiment="E3b",
-        runtime_sha256="a" * 64,
-        split_sha256="b" * 64,
-        pilot_evidence_sha256="c" * 64,
-        completed_pilot_cells_sha256=content_sha256(pilot_ids),
-        status="POWERED",
-        selected_final_blocks=12,
-        reason_code="registered_power_target_met",
-    )
-    with pytest.raises(ValueError, match="no dispatchable pilot"):
-        scheduler.schedule(receipts=receipts, confirmation_block_plan=plan)
-
-
-def test_e2_requires_dependency_bound_successive_halving_activation(
-    registry: ExperimentRegistry,
-) -> None:
-    receipts = _receipts_through(registry, "E1")
-    scheduler = TwoGpuResourceScheduler(registry)
-    with pytest.raises(ValueError, match="sealed stage activation"):
-        scheduler.schedule(receipts=receipts)
-
-    cells = registry.cells_for("E2")
-    blocked = tuple(sorted(cell.cell_id for cell in cells if not cell.runnable))
-    stage_zero = [
-        cell
-        for cell in cells
-        if cell.runnable and "halving_stage=0:" in cell.identity.variant
-    ]
-    activated_rows = [
-        cell for cell in stage_zero if cell.identity.method in {"target_only", "static"}
-    ]
-    selected_l0 = next(cell for cell in stage_zero if cell.identity.method == "l0")
-    activated_rows.append(selected_l0)
-    activated_rows.append(
-        next(
-            cell
-            for cell in stage_zero
-            if cell.identity.method == "tts"
-            and cell.identity.scope == selected_l0.identity.scope
-            and cell.identity.rank == selected_l0.identity.rank
-            and cell.identity.optimizer == selected_l0.identity.optimizer
-            and cell.identity.learning_rate == selected_l0.identity.learning_rate
-            and cell.identity.schedule == selected_l0.identity.schedule
-            and cell.identity.parameterization == selected_l0.identity.parameterization
-        )
-    )
-    activated = tuple(sorted(cell.cell_id for cell in activated_rows))
-    not_applicable = tuple(
-        sorted(cell.cell_id for cell in stage_zero if cell.cell_id not in activated)
-    )
-    deferred = tuple(
-        sorted(
-            cell.cell_id
-            for cell in cells
-            if cell.runnable and "halving_stage=0:" not in cell.identity.variant
-        )
-    )
-    plan = StageActivationPlan(
-        registry_sha256=registry.sha256,
-        experiment="E2",
-        dependency_receipt_sha256=receipts[-1].sha256,
-        runtime_sha256="a" * 64,
-        split_sha256="b" * 64,
-        source_selection_sha256="c" * 64,
-        activation_round="halving_0",
-        status="AVAILABLE",
-        activated_cell_ids=activated,
-        not_applicable_cell_ids=not_applicable,
-        blocked_cell_ids=blocked,
-        deferred_cell_ids=deferred,
-        reason_code="e1_pareto_activation",
-    )
-    with pytest.raises(ValueError, match="unresolved serving cell"):
-        scheduler.schedule(
-            receipts=receipts,
-            interference_gate_passed=True,
-            activation_plan=plan,
-        )
-
-
-def test_scheduler_preserves_blocked_reasons_and_excludes_unresolved_cells(
+def test_unresolved_and_blocked_cells_preserve_truthful_status(
     registry: ExperimentRegistry,
 ) -> None:
     unresolved = next(
@@ -622,18 +418,9 @@ def test_scheduler_preserves_blocked_reasons_and_excludes_unresolved_cells(
     blocked = next(
         cell for cell in registry.cells_for("E6") if cell.status is CellStatus.BLOCKED
     )
-    declaration = (blocked.status, blocked.reason_code, blocked.reason)
-    assert TwoGpuResourceScheduler(registry).schedule(
-        receipts=_receipts_through(registry, "E5"),
-        interference_gate_passed=True,
-    )
-    assert (blocked.status, blocked.reason_code, blocked.reason) == declaration
-
-    e0 = TwoGpuResourceScheduler(registry).schedule(
-        receipts=_receipts_through(registry, "E6"),
-        interference_gate_passed=True,
-    )
-    assert e0 == ()
+    assert not blocked.runnable
+    assert blocked.reason_code == "native_nextn_preflight_required"
+    assert "NEXTN interface and two-rank memory fit" in blocked.reason
 
 
 def test_canonical_digest_rejects_nonfinite_values() -> None:

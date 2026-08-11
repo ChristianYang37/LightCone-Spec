@@ -40,11 +40,20 @@ TP1/DP1 DFlash native-layer Full/LoRA adaptation 与 fixed-address、device-pred
 publication。这是底层 patched-server surface，不是端到端 industrial executor support。
 它也让官方 SGLang serving benchmark 对 cumulative/incremental streaming 与 non-streaming
 response 暴露 server 原样返回的有序 `output_ids`。这些 ID 不会通过重新 tokenize 生成文本来
-重建；缺失、不连续或改写的 trajectory 会无法通过 claim-grade exactness gate。
-Patch 尚未实现 executor 所需的内容绑定 terminal provider hook
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`。因此 executor 目前只会
-端到端运行 Target-only，并在 server launch 前阻止 Static/TTS/L0。下列 execution contract
-也尚未实现，因此会在 model loading 前拒绝：
+重建；缺失、不连续或改写的 trajectory 会无法通过 claim-grade exactness gate。Benchmark
+client 现在还接受由 caller 拥有的 async HTTP session，submit 与 abort 共用它，因此一个
+server session 可以复用已注册 connection pool，而无需复制 official request parser。
+
+Patch 已实现 content-bound
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
+begin/reset/finalize endpoint。当前准确 identity 为 patch SHA-256
+`c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08` 和 final tree
+`2810ac94ed225aa78b4256ded56e78890a4a590f`；manifest 仍是 authority。Lifecycle 绑定
+run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
+terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
+row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
+executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0。下列 execution
+contract 也尚未实现，因此会在 model loading 前拒绝：
 
 - DSpark、EAGLE、EAGLE3 与 NEXTN adaptation；
 - 全部 TP2 或 DP2 run；
@@ -52,8 +61,9 @@ Patch 尚未实现 executor 所需的内容绑定 terminal provider hook
 - DSpark composite-head training 与 NEXTN training interface。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
-底层 DFlash implementation 也必须先把准确 terminal hook 绑定到固定 tree，才能升级为可声明
-evidence。本 release 不报告 CUDA graph、multi-GPU、速度、容量或任何其他 GPU 结果。
+底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的
+allowlist out-of-band signer 时，仍不能升级为可声明 evidence。本 release 不报告 CUDA
+graph、multi-GPU、速度、容量或任何其他 GPU 结果。
 
 ## 应用
 
@@ -78,7 +88,9 @@ python scripts/verify_sglang_patchset.py \
 
 Verifier 必须在 disposable clone 应用完整 series，确认 expected tree 与 modified-file
 inventory，编译 changed Python，运行指定 focused test，reverse series，并证明调用者的
-upstream checkout 仍然 clean。
+upstream checkout 仍然 clean。聚焦 adaptation-protocol test 通过 stub package 只加载已
+patch 的 config、runtime 和 parameter-plan module；因此 patch-integrity CI 不依赖 SGLang
+顶层初始化所需的无关 optional serving package。
 
 新的 integration work 必须 patch-first：从 pin 临时建 branch，完成带测试的 focused semantic
 commit，通过 `git format-patch` 导出，并原子更新 series order、patch digest、modified file、
@@ -89,10 +101,11 @@ checkout。
 
 最终 schema-v3 patch 已通过仓库完整 apply/compile/focused-test/reverse verifier。这是
 patch-integrity 结果，不是 GPU validation。CPU package test 或旧 patched-tree receipt
-不足以证明 GPU 能力。TP1/DP1 DFlash 只在 executor boundary 以下实现；由于没有 provider
-实现准确 native terminal hook，Static/TTS/L0 industrial cell 会在任何 mutation 前
-`BLOCKED`，而不是可运行 `UNMEASURED` work。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与
-全部 TP2/DP2 cell 保持 `BLOCKED`。Target-only 是唯一端到端 executor path。
+不足以证明 GPU 能力。TP1/DP1 DFlash 与严格 native terminal lifecycle 已实现，但 release
+trust policy 未配置 signer；因此 Static/TTS/L0 industrial cell 会在任何 mutation 前
+`BLOCKED`，而不是可运行 `UNMEASURED` work。Test signer、provider object attribute 或
+caller-supplied verifier 都不能解锁该 policy。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与
+全部 TP2/DP2 cell 保持 `BLOCKED`。Target-only 是唯一 release-executable path。
 
 历史 v2 evidence 仅可用于 regression comparison。它不含新的 Target-only、backend-plan、
 topology、registry、trace、statistics 或 telemetry identity，不能通过改标签升级。

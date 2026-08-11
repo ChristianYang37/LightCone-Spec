@@ -1,15 +1,18 @@
-From 8186d0216b209d9a02a68968cf4487c30b27694a Mon Sep 17 00:00:00 2001
+From 4ccebb951495717615a110e7c949950484ba2f10 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Tue, 11 Aug 2026 11:42:47 +0800
 Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
 
 ---
- python/sglang/benchmark/serving.py            |   53 +
+ python/sglang/benchmark/serving.py            |  188 +-
  .../sglang/srt/arg_groups/speculative_hook.py |    6 +
+ python/sglang/srt/entrypoints/http_server.py  |   84 +-
+ python/sglang/srt/managers/io_struct.py       |   11 +
  python/sglang/srt/managers/overlap_utils.py   |   31 +-
- python/sglang/srt/managers/scheduler.py       |   75 +-
- .../batch_result_processor.py                 |   13 +-
+ python/sglang/srt/managers/scheduler.py       |  662 +++++-
+ .../batch_result_processor.py                 |   21 +-
  .../scheduler_components/metrics_reporter.py  |   22 +
+ .../srt/managers/tokenizer_control_mixin.py   |   89 +-
  .../sglang/srt/mem_cache/allocation_sizing.py |   38 +-
  .../srt/mem_cache/kv_cache_configurator.py    |   26 +-
  .../sglang/srt/models/deepseek_v4_dspark.py   |   29 +-
@@ -17,8 +20,8 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  python/sglang/srt/server_args.py              |   23 +
  .../srt/speculative/base_spec_worker.py       |    4 +
  .../sglang/srt/speculative/dflash_info_v2.py  |   13 +-
- .../speculative/dflash_online_adaptation.py   | 1058 +++++++++
- .../srt/speculative/dflash_worker_v2.py       |  135 +-
+ .../speculative/dflash_online_adaptation.py   | 1129 +++++++++
+ .../srt/speculative/dflash_worker_v2.py       |  169 +-
  .../dspark_components/dspark_draft.py         |   59 +-
  .../dspark_components/dspark_proposal.py      |   45 +
  .../dspark_components/dspark_verify.py        |    4 +-
@@ -26,27 +29,74 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  python/sglang/srt/speculative/eagle_info.py   |   19 +
  .../srt/speculative/eagle_worker_common.py    |    1 +
  .../sglang/srt/speculative/eagle_worker_v2.py |   86 +-
- .../speculative/online_adaptation_config.py   |  706 ++++++
- .../speculative/online_adaptation_runtime.py  | 2092 +++++++++++++++++
+ .../speculative/online_adaptation_config.py   |  710 ++++++
+ .../speculative/online_adaptation_runtime.py  | 2094 +++++++++++++++++
  .../srt/speculative/online_parameter_plan.py  |  195 ++
  .../srt/speculative/online_valid_mask.py      |  176 ++
- .../test_serving_output_token_ids.py          |  254 ++
- .../spec/test_online_adaptation_protocol.py   |  536 +++++
- 28 files changed, 5623 insertions(+), 95 deletions(-)
+ .../terminal_speculative_evidence.py          | 1108 +++++++++
+ .../test_serving_output_token_ids.py          |  401 ++++
+ .../spec/test_online_adaptation_protocol.py   |  575 +++++
+ .../test_terminal_speculative_evidence.py     |  560 +++++
+ 33 files changed, 8412 insertions(+), 185 deletions(-)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/dspark_components/dspark_proposal.py
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
  create mode 100644 python/sglang/srt/speculative/online_parameter_plan.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
+ create mode 100644 python/sglang/srt/speculative/terminal_speculative_evidence.py
  create mode 100644 test/registered/unit/benchmark/test_serving_output_token_ids.py
  create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
+ create mode 100644 test/registered/unit/spec/test_terminal_speculative_evidence.py
 
 diff --git a/python/sglang/benchmark/serving.py b/python/sglang/benchmark/serving.py
-index 4bd5e5f..38b1f7b 100644
+index 4bd5e5f..f8742d8 100644
 --- a/python/sglang/benchmark/serving.py
 +++ b/python/sglang/benchmark/serving.py
-@@ -97,6 +97,7 @@ class RequestFuncInput:
+@@ -67,19 +67,39 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
+     return value.lower() in ("true", "1")
+ 
+ 
+-def _create_bench_client_session():
++def _create_bench_client_session(*, total_timeout_s: float = 6 * 60 * 60):
+     # When the pressure is big, the read buffer could be full before aio thread read
+     # the content. We increase the read_bufsize from 64K to 10M.
+     # Define constants for timeout and buffer size for clarity and maintainability
+-    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+     BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+ 
+-    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
++    if not math.isfinite(total_timeout_s) or total_timeout_s <= 0:
++        raise ValueError("bench client timeout must be finite and positive")
++    aiohttp_timeout = aiohttp.ClientTimeout(total=total_timeout_s)
+     return aiohttp.ClientSession(
+         timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+     )
+ 
+ 
++async def open_bench_client_session(
++    *, total_timeout_s: float = 6 * 60 * 60
++) -> aiohttp.ClientSession:
++    """Open one caller-owned pool for a bounded execution/session."""
++
++    return _create_bench_client_session(total_timeout_s=total_timeout_s)
++
++
++async def close_bench_client_session(
++    client_session: aiohttp.ClientSession,
++) -> None:
++    """Close exactly the caller-owned pool returned by ``open``."""
++
++    if client_session is None:
++        raise ValueError("bench client session is required")
++    if not client_session.closed:
++        await client_session.close()
++
++
+ @dataclass
+ class RequestFuncInput:
+     prompt: Union[str, List[str], List[Dict[str, str]]]
+@@ -97,6 +117,7 @@ class RequestFuncInput:
  @dataclass
  class RequestFuncOutput:
      generated_text: str = ""
@@ -54,7 +104,7 @@ index 4bd5e5f..38b1f7b 100644
      success: bool = False
      latency: float = 0.0
      ttft: float = 0.0  # Time to first token
-@@ -120,6 +121,45 @@ class RequestFuncOutput:
+@@ -120,6 +141,39 @@ class RequestFuncOutput:
          return output
  
  
@@ -66,20 +116,14 @@ index 4bd5e5f..38b1f7b 100644
 +    """Merge exact SGLang output IDs across cumulative or delta streams."""
 +    if not isinstance(response_output_ids, list):
 +        raise TypeError("SGLang output_ids must be a list")
-+    if not isinstance(completion_tokens, int) or isinstance(
-+        completion_tokens, bool
-+    ):
++    if not isinstance(completion_tokens, int) or isinstance(completion_tokens, bool):
 +        raise TypeError("SGLang completion_tokens must be an integer")
 +    if completion_tokens < 0:
 +        raise ValueError("SGLang completion_tokens must be non-negative")
 +
 +    token_ids: List[int] = []
 +    for token_id in response_output_ids:
-+        if (
-+            not isinstance(token_id, int)
-+            or isinstance(token_id, bool)
-+            or token_id < 0
-+        ):
++        if not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0:
 +            raise ValueError("SGLang output_ids must contain non-negative integers")
 +        token_ids.append(token_id)
 +
@@ -100,7 +144,57 @@ index 4bd5e5f..38b1f7b 100644
  def get_auth_headers() -> Dict[str, str]:
      openai_api_key = os.environ.get("OPENAI_API_KEY")
      if openai_api_key:
-@@ -694,6 +734,7 @@ async def async_request_sglang_generate(
+@@ -259,9 +313,9 @@ async def async_request_openai_completions(
+     pbar: Optional[tqdm] = None,
+ ) -> RequestFuncOutput:
+     api_url = request_func_input.api_url
+-    assert api_url.endswith(
+-        "completions"
+-    ), "OpenAI Completions API URL must end with 'completions'."
++    assert api_url.endswith("completions"), (
++        "OpenAI Completions API URL must end with 'completions'."
++    )
+ 
+     prompt = request_func_input.prompt
+ 
+@@ -390,9 +444,9 @@ async def async_request_openai_chat_completions(
+                            latency, TTFT, ITL, and success status.
+     """
+     api_url = request_func_input.api_url
+-    assert api_url.endswith(
+-        "chat/completions"
+-    ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
++    assert api_url.endswith("chat/completions"), (
++        "OpenAI Chat Completions API URL must end with 'chat/completions'."
++    )
+ 
+     # TODO put it to other functions when `pbar` logic is refactored
+     if getattr(args, "print_requests", False):
+@@ -656,11 +710,22 @@ async def async_request_truss(
+ async def async_request_sglang_generate(
+     request_func_input: RequestFuncInput,
+     pbar: Optional[tqdm] = None,
++    *,
++    client_session: Optional[aiohttp.ClientSession] = None,
++    timeout_s: Optional[float] = None,
+ ) -> RequestFuncOutput:
+     api_url = request_func_input.api_url
+     prompt = request_func_input.prompt
+ 
+-    async with _create_bench_client_session() as session:
++    if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
++        raise ValueError("SGLang request timeout must be finite and positive")
++    owns_client_session = client_session is None
++    session = (
++        _create_bench_client_session() if client_session is None else client_session
++    )
++    if getattr(session, "closed", False):
++        raise RuntimeError("SGLang request received a closed client session")
++    try:
+         sampling_params = {
+             "temperature": args.temperature,
+             "max_new_tokens": request_func_input.output_len,
+@@ -694,6 +759,7 @@ async def async_request_sglang_generate(
          output = RequestFuncOutput.init_new(request_func_input)
  
          generated_text = ""
@@ -108,7 +202,21 @@ index 4bd5e5f..38b1f7b 100644
          output_len = request_func_input.output_len
          ttft = 0.0
          st = time.perf_counter()
-@@ -718,6 +759,17 @@ async def async_request_sglang_generate(
+@@ -701,9 +767,10 @@ async def async_request_sglang_generate(
+         most_recent_timestamp = st
+         last_output_len = 0
+         try:
+-            async with session.post(
+-                url=api_url, json=payload, headers=headers
+-            ) as response:
++            request_options = {"url": api_url, "json": payload, "headers": headers}
++            if timeout_s is not None:
++                request_options["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
++            async with session.post(**request_options) as response:
+                 if response.status == 200:
+                     async for chunk_bytes in response.content:
+                         chunk_bytes = chunk_bytes.strip()
+@@ -718,6 +785,15 @@ async def async_request_sglang_generate(
                              data = json.loads(chunk)
  
                              _meta_info = data.get("meta_info") or {}
@@ -116,17 +224,15 @@ index 4bd5e5f..38b1f7b 100644
 +                            if completion_tokens is not None:
 +                                output_len = completion_tokens
 +                            if "output_ids" in data:
-+                                generated_token_ids = (
-+                                    _merge_sglang_generated_token_ids(
-+                                        generated_token_ids,
-+                                        data["output_ids"],
-+                                        completion_tokens,
-+                                    )
++                                generated_token_ids = _merge_sglang_generated_token_ids(
++                                    generated_token_ids,
++                                    data["output_ids"],
++                                    completion_tokens,
 +                                )
                              if _meta_info.get("spec_accept_length") is not None:
                                  output.spec_accept_length = _meta_info[
                                      "spec_accept_length"
-@@ -756,6 +808,7 @@ async def async_request_sglang_generate(
+@@ -756,6 +832,7 @@ async def async_request_sglang_generate(
                                  last_output_len = output_len
  
                      output.generated_text = generated_text
@@ -134,6 +240,147 @@ index 4bd5e5f..38b1f7b 100644
                      output.success = True
                      output.latency = latency
                      output.output_len = output_len
+@@ -769,12 +846,57 @@ async def async_request_sglang_generate(
+             exc_info = sys.exc_info()
+             output.error = "".join(traceback.format_exception(*exc_info))
+             print(f"{output.error=}")
++    finally:
++        if owns_client_session:
++            await session.close()
+ 
+     if pbar:
+         pbar.update(1)
+     return output
+ 
+ 
++async def async_request_sglang_abort(
++    request_id: str,
++    base_url: str,
++    *,
++    client_session: Optional[aiohttp.ClientSession] = None,
++    timeout_s: Optional[float] = None,
++) -> None:
++    """Abort through the same caller-owned pool used by generate requests."""
++
++    if not isinstance(request_id, str) or not request_id or "\n" in request_id:
++        raise ValueError("SGLang abort requires a non-empty request ID")
++    if not isinstance(base_url, str) or not base_url.startswith(
++        ("http://", "https://")
++    ):
++        raise ValueError("SGLang abort requires an HTTP(S) base URL")
++    if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
++        raise ValueError("SGLang abort timeout must be finite and positive")
++    owns_client_session = client_session is None
++    session = (
++        _create_bench_client_session() if client_session is None else client_session
++    )
++    if getattr(session, "closed", False):
++        raise RuntimeError("SGLang abort received a closed client session")
++    try:
++        options = {
++            "url": base_url.rstrip("/") + "/abort_request",
++            "json": {"rid": request_id, "abort_all": False},
++            "headers": get_request_headers(),
++        }
++        if timeout_s is not None:
++            options["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
++        async with session.post(**options) as response:
++            if int(response.status) != 200:
++                detail = (response.reason or "") + ": " + (await response.text())
++                raise RuntimeError(
++                    f"SGLang did not acknowledge request abort: {detail}"
++                )
++    finally:
++        if owns_client_session:
++            await session.close()
++
++
+ async def async_request_openai_embeddings(
+     request_func_input: RequestFuncInput,
+     pbar: Optional[tqdm] = None,
+@@ -1274,9 +1396,9 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
+ 
+ 
+ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
+-    assert (
+-        backend in MULTI_TURN_BACKENDS
+-    ), f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
++    assert backend in MULTI_TURN_BACKENDS, (
++        f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
++    )
+ 
+     async def f(
+         request_func_input: RequestFuncInput,
+@@ -1503,9 +1625,9 @@ async def benchmark(
+                 lora_name = lora_names[lora_idx]
+                 lora_idx = (lora_idx + 1) % len(lora_names)
+             else:
+-                assert (
+-                    lora_request_distribution == "skewed"
+-                ), f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
++                assert lora_request_distribution == "skewed", (
++                    f"Unexpected lora_request_distribution: {lora_request_distribution}. Expected 'skewed'."
++                )
+ 
+                 lora_name = np.random.choice(lora_names, p=lora_probs)
+         else:
+@@ -1969,9 +2091,9 @@ def run_benchmark(args_: argparse.Namespace):
+         extra_request_body["bootstrap_room"] = 0
+ 
+     if args.tokenize_prompt:
+-        assert (
+-            args.backend == "sglang"
+-        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
++        assert args.backend == "sglang", (
++            "`--tokenize-prompt` only compatible with `--backend sglang` currently"
++        )
+ 
+     # Set url
+     if args.port is None:
+@@ -2048,18 +2170,18 @@ def run_benchmark(args_: argparse.Namespace):
+ 
+     if args.dataset_name in ["image", "mmmu"]:
+         args.apply_chat_template = True
+-        assert (
+-            not args.tokenize_prompt
+-        ), "`--tokenize-prompt` not compatible with image dataset"
++        assert not args.tokenize_prompt, (
++            "`--tokenize-prompt` not compatible with image dataset"
++        )
+ 
+     if args.lora_request_distribution in ["distinct", "skewed"]:
+-        assert (
+-            args.lora_name is not None and len(args.lora_name) > 1
+-        ), "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
++        assert args.lora_name is not None and len(args.lora_name) > 1, (
++            "More than 1 LoRA adapter must be specified via --lora-name to use 'distinct' or 'skewed' request distribution."
++        )
+ 
+-    assert (
+-        args.lora_zipf_alpha > 1
+-    ), f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
++    assert args.lora_zipf_alpha > 1, (
++        f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
++    )
+ 
+     print(f"{args}\n")
+ 
+@@ -2330,13 +2452,13 @@ def cli_main():
+         "--image-format",
+         type=str,
+         default="jpeg",
+-        help=("Format of images for image dataset. " "Supports jpeg and png."),
++        help=("Format of images for image dataset. Supports jpeg and png."),
+     )
+     parser.add_argument(
+         "--image-content",
+         type=str,
+         default="random",
+-        help=("Content for images for image dataset. " "Supports random and blank."),
++        help=("Content for images for image dataset. Supports random and blank."),
+     )
+     parser.add_argument(
+         "--request-rate",
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
 index 427acdd..771a175 100644
 --- a/python/sglang/srt/arg_groups/speculative_hook.py
@@ -151,6 +398,165 @@ index 427acdd..771a175 100644
  
  def _handle_dflash(server_args: ServerArgs) -> None:
      from sglang.srt.arg_groups.overrides import resolved_view
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 2a843f1..729f85c 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -137,6 +137,7 @@ from sglang.srt.managers.io_struct import (
+     SeparateReasoningReqInput,
+     SetInternalStateReq,
+     SlowDownReqInput,
++    TerminalSpeculativeEvidenceReq,
+     UnloadLoRAAdapterReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -163,6 +164,13 @@ from sglang.srt.observability.trace import (
+ from sglang.srt.parser.reasoning_parser import ReasoningParser
+ from sglang.srt.parser.template_manager import TemplateManager
+ from sglang.srt.server_args import PortArgs, ServerArgs
++from sglang.srt.speculative.online_adaptation_config import load_online_adaptation
++from sglang.srt.speculative.terminal_speculative_evidence import (
++    NATIVE_TERMINAL_EVIDENCE_FIELDS,
++    NATIVE_TERMINAL_EVIDENCE_HOOK,
++    SUPPORTED_TERMINAL_METHODS,
++    terminal_attestation_signer_provider_configured,
++)
+ from sglang.srt.utils import (
+     add_prometheus_middleware,
+     add_prometheus_track_response_middleware,
+@@ -226,9 +234,9 @@ async def init_multi_tokenizer() -> ServerArgs:
+     port_args: PortArgs
+ 
+     # API key authentication is not supported in multi-tokenizer mode
+-    assert (
+-        server_args.api_key is None
+-    ), "API key is not supported in multi-tokenizer mode"
++    assert server_args.api_key is None, (
++        "API key is not supported in multi-tokenizer mode"
++    )
+ 
+     # Create a new ipc name for the current process
+     port_args.tokenizer_ipc_name = (
+@@ -752,9 +760,9 @@ async def get_server_info():
+ async def server_info():
+     """Get the server information."""
+     # Returns internal states per DP.
+-    internal_states: List[Dict[Any, Any]] = (
+-        await _global_state.tokenizer_manager.get_internal_state()
+-    )
++    internal_states: List[
++        Dict[Any, Any]
++    ] = await _global_state.tokenizer_manager.get_internal_state()
+ 
+     server_args = _global_state.tokenizer_manager.server_args
+ 
+@@ -773,6 +781,58 @@ async def server_info():
+     )
+ 
+ 
++@app.get("/v1/lightcone-spec/terminal-evidence/capability")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def terminal_speculative_evidence_capability(request: Request):
++    server_args = _global_state.tokenizer_manager.server_args
++    adaptation = load_online_adaptation(server_args)
++    backend = str(server_args.speculative_algorithm or "").upper()
++    active_method = (
++        "target_only"
++        if backend in {"", "NONE"}
++        else ("static" if adaptation is None else adaptation.method)
++    )
++    method_evidence_supported = not (active_method == "static" and backend != "DFLASH")
++    topology_supported = (
++        int(server_args.tp_size) == 1
++        and int(server_args.dp_size) == 1
++        and int(server_args.pp_size) == 1
++    )
++    return {
++        "schema_version": 1,
++        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++        "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
++        "supported_methods": sorted(SUPPORTED_TERMINAL_METHODS),
++        "enabled": bool(server_args.speculative_speed_study_metrics)
++        and topology_supported
++        and active_method in SUPPORTED_TERMINAL_METHODS
++        and method_evidence_supported,
++        "active_method": active_method,
++        "method_evidence_supported": method_evidence_supported,
++        "topology_supported": topology_supported,
++        "trusted_attester_configured": (
++            terminal_attestation_signer_provider_configured()
++        ),
++    }
++
++
++@app.post("/v1/lightcone-spec/terminal-evidence")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def terminal_speculative_evidence(
++    obj: Annotated[TerminalSpeculativeEvidenceReq, Body()], request: Request
++):
++    responses = await _global_state.tokenizer_manager.terminal_speculative_evidence(obj)
++    if len(responses) != 1:
++        raise HTTPException(
++            status_code=409,
++            detail="terminal evidence requires exactly one TP1/DP1 scheduler",
++        )
++    response = responses[0]
++    if not response.success:
++        raise HTTPException(status_code=409, detail=response.message)
++    return msgspec_to_builtins(response.payload)
++
++
+ @app.get("/get_load")
+ async def get_load():
+     """Get load metrics (deprecated - use /v1/loads instead).
+@@ -1456,9 +1516,12 @@ async def check_weights(
+ ):
+     if obj is None:
+         obj = CheckWeightsReqInput()
+-    success, message, ranks, per_engine_checksum = (
+-        await _global_state.tokenizer_manager.check_weights(obj, request)
+-    )
++    (
++        success,
++        message,
++        ranks,
++        per_engine_checksum,
++    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
+     body = {"success": success, "message": message}
+     if ranks is not None:
+         body["ranks"] = ranks
+@@ -2286,8 +2349,7 @@ def _wait_and_warmup(
+     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
+     if skip_elastic_joiner_warmup:
+         logger.debug(
+-            "[Elastic EP] Skipping server warmup for elastic joiner "
+-            "(ep_join_mode=%s)",
++            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
+             server_args.ep_join_mode,
+         )
+ 
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 3248614..a72eebe 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1868,6 +1868,17 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
+     internal_state: Dict[str, Any]
+ 
+ 
++class TerminalSpeculativeEvidenceReq(BaseReq, kw_only=True):
++    action: Literal["begin", "reset", "finalize"]
++    payload: Dict[str, Any]
++
++
++class TerminalSpeculativeEvidenceReqOutput(BaseReq, kw_only=True):
++    success: bool
++    message: str
++    payload: Dict[str, Any]
++
++
+ class SetInternalStateReq(BaseReq, kw_only=True):
+     # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
+     server_args: Dict[str, Union[int, float]]
 diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/managers/overlap_utils.py
 index 9e2f191..45d4117 100644
 --- a/python/sglang/srt/managers/overlap_utils.py
@@ -241,10 +647,680 @@ index 9e2f191..45d4117 100644
              self.dsa_topk_indices_buf is not None
              and payload.dsa_topk_indices is not None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 861c13f..495fdf7 100644
+index 861c13f..e4878bf 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -3252,6 +3252,9 @@ class Scheduler(
+@@ -15,8 +15,10 @@
+ 
+ import dataclasses
+ import faulthandler
++import hashlib
+ import logging
+ import os
++import random
+ import signal
+ import sys
+ import time
+@@ -31,6 +33,7 @@ from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
+ 
+ suppress_noisy_warnings()
+ 
++import numpy as np
+ import psutil  # isort: skip
+ import setproctitle
+ import torch
+@@ -141,6 +144,8 @@ from sglang.srt.managers.io_struct import (
+     ShutdownReq,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    TerminalSpeculativeEvidenceReq,
++    TerminalSpeculativeEvidenceReqOutput,
+     TokenizedEmbeddingReqInput,
+     TokenizedGenerateReqInput,
+     UnloadLoRAAdapterReqInput,
+@@ -254,6 +259,13 @@ from sglang.srt.session.session_controller import SessionController
+ from sglang.srt.speculative.dflash_utils import validate_dflash_request
+ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.speculative.terminal_speculative_evidence import (
++    NATIVE_TERMINAL_EVIDENCE_HOOK,
++    SUPPORTED_TERMINAL_METHODS,
++    TerminalSpeculativeEvidenceLifecycle,
++    content_sha256 as terminal_content_sha256,
++    resolve_terminal_attestation_signer,
++)
+ from sglang.srt.utils import (
+     DynamicGradMode,
+     configure_gc_logger,
+@@ -358,6 +370,7 @@ class Scheduler(
+         dp_rank: Optional[int],
+     ):
+         self.is_initializing = True
++        self.server_process_started_ns = time.time_ns()
+         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+         self.forward_ct: int = 0
+         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+@@ -559,6 +572,7 @@ class Scheduler(
+         self.init_diffusion_llm()
+ 
+         self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
++        self.init_terminal_speculative_evidence()
+ 
+         # Init schedule policy and new token estimation
+         self.init_schedule_policy()
+@@ -1095,6 +1109,547 @@ class Scheduler(
+             metrics_collector=self.metrics_collector,
+         )
+ 
++    def init_terminal_speculative_evidence(self) -> None:
++        """Install the strict evidence reducer only for an explicit study run."""
++
++        self._terminal_completion_generation = 0
++        self.terminal_speculative_evidence = None
++        if not self.server_args.speculative_speed_study_metrics:
++            return
++        if self.ps.tp_size != 1 or self.ps.dp_size != 1 or self.ps.pp_size != 1:
++            return
++        adapter = self._terminal_adapter()
++        if self.spec_algorithm.is_none():
++            method = "target_only"
++        elif adapter is None:
++            method = "static"
++        else:
++            method = adapter.config.method
++        # Existing OnlineSPEC study modes remain runnable, but cannot advertise
++        # this stricter publication hook until their evidence contract exists.
++        if method not in SUPPORTED_TERMINAL_METHODS:
++            return
++        if (
++            method == "static"
++            and str(self.server_args.speculative_algorithm or "").upper() != "DFLASH"
++        ):
++            return
++        self.terminal_speculative_evidence = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=os.getpid(),
++            server_process_started_ns=self.server_process_started_ns,
++            method=method,
++            signer=resolve_terminal_attestation_signer(),
++        )
++
++    def _terminal_adapter(self):
++        if self.draft_worker is None:
++            return None
++        return getattr(self.draft_worker, "_online_drafter_adapter", None)
++
++    def _record_terminal_request(self, req: Req) -> None:
++        lifecycle = self.terminal_speculative_evidence
++        if lifecycle is None or lifecycle.phase not in {"WARMUP", "SCORED"}:
++            return
++        reason = type(req.finished_reason).__name__
++        status = (
++            "aborted" if isinstance(req.finished_reason, FINISH_ABORT) else "completed"
++        )
++        lifecycle.note_request_terminal(
++            request_id=req.rid,
++            input_token_ids=tuple(int(token) for token in req.origin_input_ids),
++            output_token_ids=tuple(int(token) for token in req.output_ids_through_stop),
++            terminal_status=status,
++            terminal_reason=reason,
++        )
++
++    def _terminal_state_snapshot(self) -> dict[str, object]:
++        self._terminal_completion_generation += 1
++        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
++            event = torch.cuda.Event(blocking=False)
++            event.record(torch.cuda.current_stream(self.device))
++            event.synchronize()
++            event_complete = bool(event.query())
++            current_hbm = int(torch.cuda.memory_allocated(self.device))
++            reserved_hbm = int(torch.cuda.memory_reserved(self.device))
++            peak_hbm = int(torch.cuda.max_memory_allocated(self.device))
++            cuda_rng = torch.cuda.get_rng_state(self.device).cpu().numpy().tobytes()
++        else:
++            event_complete = True
++            current_hbm = reserved_hbm = peak_hbm = 0
++            cuda_rng = b""
++        python_rng = random.getstate()
++        numpy_rng = np.random.get_state()
++        rng_state_sha256 = terminal_content_sha256(
++            {
++                "python": [python_rng[0], list(python_rng[1]), python_rng[2]],
++                "numpy": [
++                    numpy_rng[0],
++                    numpy_rng[1].tolist(),
++                    int(numpy_rng[2]),
++                    int(numpy_rng[3]),
++                    float(numpy_rng[4]),
++                ],
++                "torch_cpu_sha256": hashlib.sha256(
++                    torch.get_rng_state().cpu().numpy().tobytes()
++                ).hexdigest(),
++                "torch_cuda_sha256": hashlib.sha256(cuda_rng).hexdigest(),
++            }
++        )
++
++        running_batches = [
++            batch
++            for batch in (
++                getattr(self, "running_batch", None),
++                getattr(self, "last_batch", None),
++            )
++            if batch is not None
++        ]
++        active_ids = {
++            req.rid
++            for batch in running_batches
++            for req in batch.reqs
++            if not req.finished()
++        }
++        if self.chunked_req is not None and not self.chunked_req.finished():
++            active_ids.add(self.chunked_req.rid)
++        queued_requests = len(self.waiting_queue)
++        kv_capacity = int(self.max_total_num_tokens)
++        kv_available = int(self.token_to_kv_pool_allocator.available_size())
++        request_pool_capacity = max(
++            0, int(getattr(self.req_to_token_pool, "_alloc_size", 1)) - 1
++        )
++        request_pool_active = max(
++            0,
++            request_pool_capacity
++            - len(getattr(self.req_to_token_pool, "free_slots", ())),
++        )
++        adapter = self._terminal_adapter()
++        if adapter is None:
++            adapter_state = {
++                "schema_version": 1,
++                "kind": "no_adaptation_state",
++                "active_version": 0,
++                "cohort_epoch": 0,
++                "optimizer_generation": 0,
++            }
++            adapter_version = adapter_epoch = optimizer_generation = (
++                telemetry_generation
++            ) = 0
++            adapter_reset_verified = True
++        else:
++            adapter_state = adapter.reset_receipt_state()
++            adapter_version = int(adapter.runtime.active_version)
++            adapter_epoch = int(adapter.runtime.epoch)
++            optimizer_generation = int(adapter.optimizer.step)
++            telemetry_generation = int(adapter.runtime.epoch)
++            adapter_reset_verified = all(
++                bool(adapter_state[field])
++                for field in (
++                    "master_reset",
++                    "optimizer_reset",
++                    "inference_reset",
++                    "runtime_reset",
++                    "captured_state_empty",
++                )
++            )
++        kv_state = {
++            "schema_version": 1,
++            "capacity": kv_capacity,
++            "available": kv_available,
++            "request_pool_active_slots": request_pool_active,
++            "tree_cache_type": type(self.tree_cache).__name__,
++        }
++        return {
++            "schema_version": 1,
++            "scheduler_idle": bool(self.is_fully_idle()),
++            "active_requests": len(active_ids),
++            "queued_requests": queued_requests,
++            "request_pool_active_slots": request_pool_active,
++            "allocator_current_hbm_bytes": current_hbm,
++            "allocator_reserved_hbm_bytes": reserved_hbm,
++            "allocator_peak_hbm_bytes": peak_hbm,
++            "kv_token_capacity": kv_capacity,
++            "kv_available_tokens": kv_available,
++            "kv_state_sha256": terminal_content_sha256(kv_state),
++            "rng_state_sha256": rng_state_sha256,
++            "adapter_state_sha256": terminal_content_sha256(adapter_state),
++            "adapter_reset_verified": adapter_reset_verified,
++            "adapter_active_version": adapter_version,
++            "adapter_epoch": adapter_epoch,
++            "optimizer_generation": optimizer_generation,
++            "telemetry_generation": telemetry_generation,
++            "completion_event_generation": self._terminal_completion_generation,
++            "completion_event_complete": event_complete,
++        }
++
++    def _reset_terminal_server_state(self, *, run_nonce_sha256: str) -> None:
++        if not self.is_fully_idle():
++            raise RuntimeError("terminal reset requires a drained scheduler")
++        if not self.flush_cache(empty_cache=False):
++            raise RuntimeError("terminal reset could not flush native state")
++        seed = int(run_nonce_sha256[:8], 16)
++        set_random_seed(seed)
++        self.forward_ct = 0
++        self.total_prefill_uncached_tokens = 0
++        self.total_prefill_busy_us = 0
++        self.decode_moment_totals = [0.0] * 6
++        self._prev_decode_launch_ts = None
++        self.metrics_reporter.reset_metrics()
++        if torch.cuda.is_available() and str(self.device).startswith("cuda"):
++            torch.cuda.reset_peak_memory_stats(self.device)
++
++    def _terminal_native_diagnostics(self) -> dict[str, object]:
++        adapter = self._terminal_adapter()
++        return {} if adapter is None else adapter.diagnostics()
++
++    def _terminal_performance_counters(
++        self, diagnostics: dict[str, object]
++    ) -> dict[str, object]:
++        reporter = self.metrics_reporter
++        # The reporter periodically rolls interval counters into the lifetime
++        # totals.  Read both halves at this terminal boundary so a logging tick
++        # cannot drop the final partial interval.
++        spec_calls = int(
++            reporter.spec_total_num_forward_ct + reporter.spec_num_forward_ct
++        )
++        committed = int(
++            reporter.spec_total_num_accept_tokens + reporter.spec_num_accept_tokens
++        )
++        accepted = max(committed - spec_calls, 0)
++        verified = spec_calls * max(
++            int(self.server_args.speculative_num_draft_tokens) - 1, 0
++        )
++        samples = int(getattr(reporter, "speed_study_graph_total", 0))
++        request_rows = (
++            self.terminal_speculative_evidence.request_rows
++            if self.terminal_speculative_evidence is not None
++            else {}
++        )
++        output_tokens = sum(int(row["output_tokens"]) for row in request_rows.values())
++        method = (
++            self.terminal_speculative_evidence.method
++            if self.terminal_speculative_evidence is not None
++            else "target_only"
++        )
++        target_calls = spec_calls if method != "target_only" else output_tokens
++        counters = diagnostics.get("counters", {})
++        timings = diagnostics.get("timings_ms", {})
++        if not isinstance(counters, dict) or not isinstance(timings, dict):
++            raise RuntimeError("native adaptation diagnostics are malformed")
++        allocation_free = method in {"target_only", "static"}
++        static_safety = None
++        if method == "static":
++            provider = getattr(
++                self.draft_worker, "terminal_static_safety_counters", None
++            )
++            if provider is None:
++                raise RuntimeError("native Static safety counters are unavailable")
++            static_safety = provider()
++            if not isinstance(static_safety, dict) or set(static_safety) != {
++                "schema_version",
++                "backend",
++                "exactness_violations",
++                "version_mismatches",
++                "fallbacks",
++                "nonfinite_updates",
++            }:
++                raise RuntimeError("native Static safety counters are incomplete")
++            if (
++                static_safety["schema_version"] != 1
++                or static_safety["backend"] != "DFLASH"
++            ):
++                raise RuntimeError("native Static safety counter identity mismatch")
++            for field in (
++                "exactness_violations",
++                "version_mismatches",
++                "fallbacks",
++                "nonfinite_updates",
++            ):
++                value = static_safety[field]
++                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
++                    raise RuntimeError("native Static safety counter is malformed")
++        return {
++            "target_calls": target_calls,
++            "accepted_drafts": accepted if method != "target_only" else None,
++            "committed_tokens": committed if method != "target_only" else None,
++            "verified_drafts": verified if method != "target_only" else None,
++            "survival_weighted_accepted_prefix": None,
++            "accepted_drafts_per_verify": (
++                accepted / spec_calls if spec_calls else None
++            ),
++            "committed_tokens_per_verify": (
++                committed / spec_calls if spec_calls else None
++            ),
++            "verified_drafts_per_verify": (
++                verified / spec_calls if spec_calls else None
++            ),
++            "verification_waste": (
++                verified - accepted if method != "target_only" else None
++            ),
++            "target_calls_per_output_token": (
++                target_calls / output_tokens if output_tokens else None
++            ),
++            "batch_fill": (
++                int(getattr(reporter, "speed_study_batch_sum", 0)) / samples
++                if samples
++                else None
++            ),
++            "queue_occupancy": (
++                int(getattr(reporter, "speed_study_queue_sum", 0)) / samples
++                if samples
++                else None
++            ),
++            "gpu_busy": None,
++            "sm_utilization": None,
++            "dram_utilization": None,
++            "target_estimated_mfu": None,
++            "peak_hbm_bytes": int(
++                diagnostics.get(
++                    "peak_hbm_bytes",
++                    torch.cuda.max_memory_allocated(self.device)
++                    if torch.cuda.is_available() and str(self.device).startswith("cuda")
++                    else 0,
++                )
++            ),
++            "kv_bytes": int(
++                self.token_to_kv_pool_allocator.get_kvcache().mem_usage * (1 << 30)
++            ),
++            "kv_token_capacity": int(self.max_total_num_tokens),
++            "optimizer_bytes": (
++                0 if allocation_free else diagnostics.get("optimizer_bytes")
++            ),
++            "adaptation_memory_ledger": (
++                None if allocation_free else diagnostics.get("memory_ledger")
++            ),
++            "trainable_parameters": (
++                0 if allocation_free else diagnostics.get("trainable_parameters")
++            ),
++            "training_cuda_ms": (None if allocation_free else timings.get("training")),
++            "optimizer_cuda_ms": (
++                None if allocation_free else timings.get("optimizer")
++            ),
++            "merge_cuda_ms": None if allocation_free else timings.get("merge"),
++            "publish_cuda_ms": None if allocation_free else timings.get("publish"),
++            "barrier_cuda_ms": None if allocation_free else timings.get("barrier"),
++            "exposed_update_ms": (
++                None if allocation_free else diagnostics.get("exposed_update_ms")
++            ),
++            "main_side_overlap_ratio": (
++                None if allocation_free else diagnostics.get("main_side_overlap_ratio")
++            ),
++            "graph_replay_hit_rate": (
++                int(getattr(reporter, "speed_study_graph_hits", 0)) / samples
++                if samples
++                else None
++            ),
++            "updates_launched": (
++                0 if allocation_free else counters.get("updates_launched")
++            ),
++            "updates_published": (
++                0 if allocation_free else counters.get("updates_published")
++            ),
++            "exactness_violations": (
++                None
++                if method == "target_only"
++                else int(
++                    static_safety["exactness_violations"]
++                    if method == "static"
++                    else counters["exactness_violations"]
++                )
++            ),
++            "version_mismatches": (
++                None
++                if method == "target_only"
++                else int(
++                    static_safety["version_mismatches"]
++                    if method == "static"
++                    else counters["version_mismatches"]
++                )
++            ),
++            "fallbacks": (
++                None
++                if method == "target_only"
++                else int(
++                    static_safety["fallbacks"]
++                    if method == "static"
++                    else counters["fallbacks"]
++                )
++            ),
++            "nonfinite_updates": (
++                None
++                if method == "target_only"
++                else int(
++                    static_safety["nonfinite_updates"]
++                    if method == "static"
++                    else counters["nonfinite_updates"]
++                )
++            ),
++            "oom_events": int(
++                counters.get(
++                    "oom_events", getattr(reporter, "speed_study_oom_events", 0)
++                )
++            ),
++            "retractions": int(
++                counters.get(
++                    "retractions", getattr(reporter, "speed_study_retractions", 0)
++                )
++            ),
++            "communicator_failures": 0,
++            "collective_type": "none_tp1",
++            "collective_bytes": 0,
++            "collective_duration_ms": 0.0,
++            "collective_exposed_wait_ms": 0.0,
++            "collective_overlap_ratio": None,
++        }
++
++    def _terminal_round_rows(
++        self, diagnostics: dict[str, object]
++    ) -> list[dict[str, object]]:
++        raw_rows = diagnostics.get("rounds", [])
++        kv_segments = diagnostics.get("kv_segments", {})
++        if not isinstance(raw_rows, list) or not isinstance(kv_segments, dict):
++            raise RuntimeError("native round diagnostics are malformed")
++        rows = []
++        for raw in raw_rows:
++            if not isinstance(raw, dict):
++                raise RuntimeError("native round diagnostic row is malformed")
++            request_ids = raw.get("request_ids")
++            fields = (
++                raw.get("prefix_len_before"),
++                raw.get("verify_len"),
++                raw.get("accepted_drafts"),
++                raw.get("committed_tokens"),
++            )
++            if not isinstance(request_ids, list) or any(
++                not isinstance(field, list) or len(field) != len(request_ids)
++                for field in fields
++            ):
++                raise RuntimeError("native round diagnostic coverage is malformed")
++            for index, request_id in enumerate(request_ids):
++                history = kv_segments.get(request_id, [])
++                row = {
++                    "request_id": request_id,
++                    "round_index": raw.get("round_index"),
++                    "proposal_source_version": raw.get("source_version"),
++                    "prefix_len_before": fields[0][index],
++                    "verify_len": fields[1][index],
++                    "accepted_drafts": fields[2][index],
++                    "committed_tokens": fields[3][index],
++                    "target_calls": 1,
++                    "historical_kv_source_versions": history,
++                }
++                row["round_sha256"] = terminal_content_sha256(row)
++                rows.append(row)
++        return rows
++
++    def _terminal_update_rows(
++        self, diagnostics: dict[str, object]
++    ) -> list[dict[str, object]]:
++        raw_rows = diagnostics.get("updates", [])
++        if not isinstance(raw_rows, list):
++            raise RuntimeError("native update diagnostics are malformed")
++        rows = []
++        for index, raw in enumerate(raw_rows):
++            if not isinstance(raw, dict):
++                raise RuntimeError("native update diagnostic row is malformed")
++            row = {
++                "update_index": index,
++                "cohort_sha256": diagnostics.get("cohort_sha256"),
++                "cohort_epoch": diagnostics.get("cohort_epoch", 0),
++                "parameter_layout_sha256": diagnostics.get("parameter_layout_sha256"),
++                **raw,
++            }
++            row["update_sha256"] = terminal_content_sha256(row)
++            rows.append(row)
++        return rows
++
++    def handle_terminal_speculative_evidence(
++        self, recv_req: TerminalSpeculativeEvidenceReq
++    ) -> TerminalSpeculativeEvidenceReqOutput:
++        lifecycle = self.terminal_speculative_evidence
++        if lifecycle is None:
++            return TerminalSpeculativeEvidenceReqOutput(
++                success=False,
++                message="native terminal evidence is disabled or topology-unsupported",
++                payload={},
++            )
++        try:
++            payload = recv_req.payload
++            if recv_req.action == "begin":
++                # Drain any prior diagnostics before resetting their storage.
++                self._terminal_native_diagnostics()
++                prior_state = self._terminal_state_snapshot()
++                identity_nonce = payload.get("run_nonce_sha256")
++                if not isinstance(identity_nonce, str):
++                    raise ValueError("terminal begin lacks a run nonce")
++                self._reset_terminal_server_state(run_nonce_sha256=identity_nonce)
++                reset_state = self._terminal_state_snapshot()
++                result = lifecycle.begin(
++                    payload, prior_state=prior_state, reset_state=reset_state
++                )
++            elif recv_req.action == "reset":
++                if set(payload) != {"hook", "run_id", "begin_sha256"}:
++                    raise ValueError("terminal reset payload fields are incomplete")
++                if (
++                    payload["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK
++                    or lifecycle.identity is None
++                    or payload["run_id"] != lifecycle.identity.run_id
++                ):
++                    raise ValueError("terminal reset identity mismatch")
++                diagnostics = self._terminal_native_diagnostics()
++                performance = self._terminal_performance_counters(diagnostics)
++                warmup_state = self._terminal_state_snapshot()
++                self._reset_terminal_server_state(
++                    run_nonce_sha256=lifecycle.identity.run_nonce_sha256
++                )
++                reset_state = self._terminal_state_snapshot()
++                result = lifecycle.reset(
++                    begin_sha256=payload["begin_sha256"],
++                    discarded_native_sha256=terminal_content_sha256(diagnostics),
++                    warmup_performance_counters=performance,
++                    warmup_state=warmup_state,
++                    reset_state=reset_state,
++                )
++            elif recv_req.action == "finalize":
++                if set(payload) != {
++                    "hook",
++                    "run_id",
++                    "reset_sha256",
++                    "client_terminal_rows",
++                }:
++                    raise ValueError("terminal finalize payload fields are incomplete")
++                if (
++                    payload["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK
++                    or lifecycle.identity is None
++                    or payload["run_id"] != lifecycle.identity.run_id
++                ):
++                    raise ValueError("terminal finalize identity mismatch")
++                diagnostics = self._terminal_native_diagnostics()
++                result = lifecycle.finalize(
++                    reset_sha256=payload["reset_sha256"],
++                    round_rows=self._terminal_round_rows(diagnostics),
++                    update_rows=self._terminal_update_rows(diagnostics),
++                    performance_counters=self._terminal_performance_counters(
++                        diagnostics
++                    ),
++                    historical_kv_source_versions=diagnostics.get("kv_segments", {}),
++                    client_terminal_rows=payload["client_terminal_rows"],
++                    final_state=self._terminal_state_snapshot(),
++                )
++            else:
++                raise ValueError("terminal evidence action is unsupported")
++            return TerminalSpeculativeEvidenceReqOutput(
++                success=True, message="", payload=result
++            )
++        except Exception as error:
++            lifecycle.fail_closed()
++            logger.exception("Native terminal evidence transition failed closed")
++            return TerminalSpeculativeEvidenceReqOutput(
++                success=False,
++                message=f"{type(error).__name__}: {error}",
++                payload={},
++            )
++
+     def init_schedule_policy(self):
+         # Init schedule policy and new token estimation
+         self.policy = SchedulePolicy(
+@@ -1463,6 +2018,10 @@ class Scheduler(
+                 (ShutdownReq, self.handle_shutdown),
+                 (GetInternalStateReq, self.get_internal_state),
+                 (SetInternalStateReq, self.set_internal_state),
++                (
++                    TerminalSpeculativeEvidenceReq,
++                    self.handle_terminal_speculative_evidence,
++                ),
+                 (RpcReqInput, self.handle_rpc_request),
+                 (ExpertDistributionReq, self.expert_distribution_handle),
+                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+@@ -1915,13 +2474,23 @@ class Scheduler(
+             get_waiting_queue=lambda: self.waiting_queue,
+             get_stats=lambda: self.metrics_reporter.stats,
+             get_chunked_req=lambda: self.chunked_req,
+-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
+-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
++            get_disagg_prefill_bootstrap_queue=lambda: (
++                self.disagg_prefill_bootstrap_queue
++            ),
++            get_disagg_prefill_inflight_queue=lambda: (
++                self.disagg_prefill_inflight_queue
++            ),
+             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
+-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
++            get_spec_total_num_accept_tokens=lambda: (
++                self.metrics_reporter.spec_total_num_accept_tokens
++            ),
++            get_spec_total_num_forward_ct=lambda: (
++                self.metrics_reporter.spec_total_num_forward_ct
++            ),
++            get_total_prefill_uncached_tokens=lambda: (
++                self.total_prefill_uncached_tokens
++            ),
+             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+             get_decode_moment_totals=lambda: self.decode_moment_totals,
+         )
+@@ -1960,6 +2529,11 @@ class Scheduler(
+             ),
+             output_streamer=self.output_streamer,
+             abort_request=self.abort_request,
++            terminal_request_recorder=(
++                self._record_terminal_request
++                if self.terminal_speculative_evidence is not None
++                else None
++            ),
+         )
+ 
+     def init_req_max_new_tokens(self, req):
+@@ -3046,9 +3620,8 @@ class Scheduler(
+                     running_batch.batch_is_full = True
+ 
+             if running_batch.batch_is_full:
+-                if (
+-                    not self.enable_priority_preemption
+-                    or not adder.preempt_to_schedule(req, self.server_args)
++                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
++                    req, self.server_args
+                 ):
+                     break
+ 
+@@ -3252,6 +3825,9 @@ class Scheduler(
              )
  
              self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
@@ -254,14 +1330,12 @@ index 861c13f..495fdf7 100644
              if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
                  self.metrics_reporter.metrics_collector.increment_retracted_reqs(
                      num_retracted_reqs=len(retracted_reqs),
-@@ -3572,6 +3575,17 @@ class Scheduler(
+@@ -3572,6 +4148,15 @@ class Scheduler(
                      can_run_cuda_graph=can_run_cuda_graph,
                  )
  
 +        if self.is_generation and not batch.forward_mode.is_extend():
-+            record_load = getattr(
-+                self.draft_worker, "record_scheduler_load", None
-+            )
++            record_load = getattr(self.draft_worker, "record_scheduler_load", None)
 +            if callable(record_load):
 +                record_load(
 +                    running_requests=len(batch.reqs),
@@ -272,7 +1346,7 @@ index 861c13f..495fdf7 100644
          self._maybe_report_active_ranks()
  
          return ret
-@@ -3974,6 +3988,8 @@ class Scheduler(
+@@ -3974,6 +4559,8 @@ class Scheduler(
  
              if empty_cache:
                  current_platform.empty_cache()
@@ -281,7 +1355,7 @@ index 861c13f..495fdf7 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4002,6 +4018,55 @@ class Scheduler(
+@@ -4002,6 +4589,53 @@ class Scheduler(
              "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
          }
          ret["effective_max_running_requests_per_dp"] = self.max_running_requests
@@ -309,13 +1383,11 @@ index 861c13f..495fdf7 100644
 +                "retractions": self.metrics_reporter.speed_study_retractions,
 +                "peak_hbm_bytes": int(
 +                    torch.cuda.max_memory_allocated(self.device)
-+                    if torch.cuda.is_available()
-+                    and str(self.device).startswith("cuda")
++                    if torch.cuda.is_available() and str(self.device).startswith("cuda")
 +                    else 0
 +                ),
 +                "kv_bytes": int(
-+                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage
-+                    * (1 << 30)
++                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage * (1 << 30)
 +                ),
 +                "kv_token_capacity": int(self.max_total_num_tokens),
 +                "batch_fill": (
@@ -337,7 +1409,7 @@ index 861c13f..495fdf7 100644
  
          if self.server_args.elastic_ep_backend is not None:
              from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-@@ -4024,10 +4089,14 @@ class Scheduler(
+@@ -4024,10 +4658,14 @@ class Scheduler(
          if RECORD_STEP_TIME:
              ret["step_time_dict"] = self.metrics_reporter.step_time_dict
  
@@ -355,11 +1427,40 @@ index 861c13f..495fdf7 100644
  
          # These fields are not msgpack-serializable (a config object and a bound
          # signal handler); no reader consumes them.
+@@ -4162,6 +4800,8 @@ class Scheduler(
+             # This only works for requests that have not started anything.
+             # We still need to send something back to TokenizerManager to clean up the state.
+             req = self.waiting_queue.pop(i)
++            req.finished_reason = FINISH_ABORT()
++            self._record_terminal_request(req)
+             if self.enable_hicache_storage:
+                 # to release prefetch events associated with the request
+                 self.tree_cache.release_aborted_request(req.rid)
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 248a929..12a4a7a 100644
+index 248a929..8eafd9a 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-@@ -948,10 +948,15 @@ class SchedulerBatchResultProcessor:
+@@ -81,6 +81,11 @@ class SchedulerBatchResultProcessor:
+     logprob_result_processor: SchedulerLogprobResultProcessor
+     output_streamer: SchedulerOutputStreamer
+     abort_request: Callable
++    terminal_request_recorder: Optional[Callable[[Req], None]]
++
++    def _record_terminal_request(self, req: Req) -> None:
++        if self.terminal_request_recorder is not None:
++            self.terminal_request_recorder(req)
+ 
+     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+         assert self.disaggregation_mode == DisaggregationMode.DECODE
+@@ -237,6 +242,7 @@ class SchedulerBatchResultProcessor:
+ 
+                     req.update_finish_state()
+                     if req.finished():
++                        self._record_terminal_request(req)
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
+                         release_kv_cache(req, self.tree_cache)
+@@ -948,10 +954,17 @@ class SchedulerBatchResultProcessor:
              # isinstance narrowing: create_worker may also return plain
              # TpModelWorker-based drafts, which carry no spec-worker hooks.
              if isinstance(self.draft_worker, BaseSpecWorker):
@@ -376,6 +1477,8 @@ index 248a929..12a4a7a 100644
 +                            req.finished_reason, FINISH_MATCHED_TOKEN
 +                        ),
 +                    )
++
++            self._record_terminal_request(req)
  
              # delete feature to save memory
              if req.multimodal_inputs is not None and req.session is None:
@@ -426,6 +1529,207 @@ index 15e1b81..1779332 100644
  
          # Every-iteration work: realtime token counting + status logger
          if self.current_scheduler_metrics_enabled:
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index b4fa41e..37433ad 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -64,6 +64,8 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReqOutput,
+     SlowDownReqInput,
+     SlowDownReqOutput,
++    TerminalSpeculativeEvidenceReq,
++    TerminalSpeculativeEvidenceReqOutput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightsFromDistributedReqInput,
+@@ -115,6 +117,7 @@ _COMMUNICATOR_SPECS = [
+     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
+     ("profile", ProfileReqOutput),
+     ("get_internal_state", GetInternalStateReqOutput),
++    ("terminal_speculative_evidence", TerminalSpeculativeEvidenceReqOutput),
+     ("set_internal_state", SetInternalStateReqOutput),
+     ("expert_distribution", ExpertDistributionReqOutput),
+     ("update_lora_adapter", LoRAUpdateOutput),
+@@ -395,9 +398,9 @@ class TokenizerControlMixin:
+         request: Optional[fastapi.Request] = None,
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+-        assert (
+-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
++        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
++            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
++        )
+ 
+         results = await self.init_weights_update_group_communicator(obj)
+         return FanOutCommunicator.merge_results(results)
+@@ -408,9 +411,9 @@ class TokenizerControlMixin:
+         request: Optional[fastapi.Request] = None,
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+-        assert (
+-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
++        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
++            "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
++        )
+ 
+         results = await self.destroy_weights_update_group_communicator(obj)
+         return FanOutCommunicator.merge_results(results)
+@@ -421,9 +424,9 @@ class TokenizerControlMixin:
+         request: Optional[fastapi.Request] = None,
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+-        assert (
+-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
++        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
++            "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
++        )
+ 
+         if obj.abort_all_requests:
+             self.abort_request(abort_all=True)
+@@ -452,9 +455,9 @@ class TokenizerControlMixin:
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+         # TODO: support DP
+-        assert (
+-            self.server_args.dp_size == 1
+-        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
++        assert self.server_args.dp_size == 1, (
++            "dp_size must be 1 for init_weights_send_group_for_remote_instance"
++        )
+         result = (
+             await self.init_weights_send_group_for_remote_instance_communicator(obj)
+         )[0]
+@@ -467,9 +470,9 @@ class TokenizerControlMixin:
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+         # TODO: support DP
+-        assert (
+-            self.server_args.dp_size == 1
+-        ), "dp_size must be 1 for send_weights_to_remote_instance"
++        assert self.server_args.dp_size == 1, (
++            "dp_size must be 1 for send_weights_to_remote_instance"
++        )
+         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
+         return result.success, result.message
+ 
+@@ -479,9 +482,9 @@ class TokenizerControlMixin:
+         request: Optional[fastapi.Request] = None,
+     ) -> Tuple[bool, str]:
+         self.auto_create_handle_loop()
+-        assert (
+-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
++        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
++            "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
++        )
+ 
+         if obj.abort_all_requests:
+             self.abort_request(abort_all=True)
+@@ -517,7 +520,9 @@ class TokenizerControlMixin:
+             # For now, we only support single data parallel instance
+             assert (
+                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
++            ), (
++                "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
++            )
+             logger.info("Starting IPC weight update")
+ 
+             async with self.is_pause_cond:
+@@ -545,9 +550,9 @@ class TokenizerControlMixin:
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+     ) -> UnloadLoRAAdapterReqOutput:
+-        assert (
+-            self.lora_update_lock.locked()
+-        ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
++        assert self.lora_update_lock.locked(), (
++            "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
++        )
+ 
+         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
+         # from being started.
+@@ -576,9 +581,9 @@ class TokenizerControlMixin:
+ 
+             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+             # with dp_size > 1.
+-            assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++            assert self.server_args.dp_size == 1, (
++                "dp_size must be 1 for dynamic lora loading"
++            )
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -654,7 +659,9 @@ class TokenizerControlMixin:
+ 
+             assert (
+                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            ), (
++                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            )
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -726,15 +733,15 @@ class TokenizerControlMixin:
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                 )
+ 
+-            assert (
+-                obj.lora_name is not None
+-            ), "lora_name must be provided to unload LoRA adapter"
++            assert obj.lora_name is not None, (
++                "lora_name must be provided to unload LoRA adapter"
++            )
+ 
+             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+             # with dp_size > 1.
+-            assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++            assert self.server_args.dp_size == 1, (
++                "dp_size must be 1 for dynamic lora loading"
++            )
+             logger.info(
+                 "Start unload Lora adapter. Lora name=%s",
+                 obj.lora_name,
+@@ -807,19 +814,25 @@ class TokenizerControlMixin:
+     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
+         self.auto_create_handle_loop()
+         req = GetInternalStateReq()
+-        responses: List[GetInternalStateReqOutput] = (
+-            await self.get_internal_state_communicator(req)
+-        )
++        responses: List[
++            GetInternalStateReqOutput
++        ] = await self.get_internal_state_communicator(req)
+         # Many DP ranks
+         return [res.internal_state for res in responses]
+ 
++    async def terminal_speculative_evidence(
++        self: TokenizerManager, obj: TerminalSpeculativeEvidenceReq
++    ) -> List[TerminalSpeculativeEvidenceReqOutput]:
++        self.auto_create_handle_loop()
++        return await self.terminal_speculative_evidence_communicator(obj)
++
+     async def set_internal_state(
+         self: TokenizerManager, obj: SetInternalStateReq
+     ) -> List[bool]:
+         self.auto_create_handle_loop()
+-        responses: List[SetInternalStateReqOutput] = (
+-            await self.set_internal_state_communicator(obj)
+-        )
++        responses: List[
++            SetInternalStateReqOutput
++        ] = await self.set_internal_state_communicator(obj)
+         return [res.updated for res in responses]
+ 
+     async def dumper_control(
 diff --git a/python/sglang/srt/mem_cache/allocation_sizing.py b/python/sglang/srt/mem_cache/allocation_sizing.py
 index 10d08d6..bd0e7c2 100644
 --- a/python/sglang/srt/mem_cache/allocation_sizing.py
@@ -791,10 +2095,10 @@ index 72162ba..ec8a267 100644
              batch_seq_lens_cpu_t[i] = committed_len
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000..19123f4
+index 0000000..fc16e21
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1058 @@
+@@ -0,0 +1,1129 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -887,20 +2191,26 @@ index 0000000..19123f4
 +    denominator = inference.square().mean().sqrt().clamp_min(1e-12)
 +    relative_rms = error.square().mean().sqrt() / denominator
 +    top1_match = (
-+        inference.argmax(dim=-1) == reconstructed.argmax(dim=-1)
-+    ).to(torch.float32).mean()
++        (inference.argmax(dim=-1) == reconstructed.argmax(dim=-1))
++        .to(torch.float32)
++        .mean()
++    )
 +    # Top-1 agreement remains diagnostic rather than a hard gate: near-tied
 +    # logits may exchange order under bf16 reduction drift even when their KL
 +    # is tiny.  Exact decoding continues to use the retained inference q, not
 +    # this differentiable surrogate.
 +    probability = torch.softmax(inference, dim=-1)
 +    mean_kl = (
-+        probability
-+        * (
-+            torch.log_softmax(inference, dim=-1)
-+            - torch.log_softmax(reconstructed, dim=-1)
++        (
++            probability
++            * (
++                torch.log_softmax(inference, dim=-1)
++                - torch.log_softmax(reconstructed, dim=-1)
++            )
 +        )
-+    ).sum(-1).mean()
++        .sum(-1)
++        .mean()
++    )
 +    # The current canvas traverses five bf16 transformer layers. A 2.5*u
 +    # relative envelope plus the independent 32*u^2 distribution bound covers
 +    # accumulated FlashInfer/SDPA reduction drift without allowing the KL
@@ -987,8 +2297,7 @@ index 0000000..19123f4
 +        self.worker = worker
 +        if worker.draft_window_size is None:
 +            raise ValueError(
-+                "DFlash adaptation requires a bounded "
-+                "--speculative-draft-window-size"
++                "DFlash adaptation requires a bounded --speculative-draft-window-size"
 +            )
 +        if int(worker.draft_window_size) != int(config.canvas_tokens):
 +            raise ValueError(
@@ -1019,9 +2328,7 @@ index 0000000..19123f4
 +                "differentiable DFlash adaptation requires NeoX-style RoPE"
 +            )
 +        if any(
-+            not _is_disabled_sliding_window(
-+                layer.self_attn.sliding_window_size
-+            )
++            not _is_disabled_sliding_window(layer.self_attn.sliding_window_size)
 +            for layer in self.model.layers
 +        ):
 +            raise ValueError(
@@ -1175,11 +2482,15 @@ index 0000000..19123f4
 +            * 4
 +        )
 +        activation_scratch = (
-+            max_batch
-+            * config.canvas_tokens
-+            * (layers * (8 * hidden + 3 * intermediate) + 4 * hidden)
-+            * 4
-+        ) + logit_scratch + attention_workspace
++            (
++                max_batch
++                * config.canvas_tokens
++                * (layers * (8 * hidden + 3 * intermediate) + 4 * hidden)
++                * 4
++            )
++            + logit_scratch
++            + attention_workspace
++        )
 +        kv_gather_scratch = max_batch * history_capacity * layers * hidden * 2 * 4
 +        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
 +        base_bytes = sum(value.nbytes for value in self.base.values())
@@ -1403,9 +2714,7 @@ index 0000000..19123f4
 +            [attention.q_size, attention.kv_size, attention.kv_size],
 +            dim=-1,
 +        )
-+        query = query.view(
-+            *hidden.shape[:2], attention.num_heads, attention.head_dim
-+        )
++        query = query.view(*hidden.shape[:2], attention.num_heads, attention.head_dim)
 +        current_key = current_key.view(
 +            *hidden.shape[:2], attention.num_kv_heads, attention.head_dim
 +        )
@@ -1760,9 +3069,7 @@ index 0000000..19123f4
 +                    effective = self._effective_parameters(proposal.parameters)
 +                    # Staging is branch-free. Device-resident validity selects
 +                    # the staged or active values at the legal boundary.
-+                    self.inference.stage(
-+                        tuple(effective[name] for name in self.names)
-+                    )
++                    self.inference.stage(tuple(effective[name] for name in self.names))
 +                self.runtime.submit(
 +                    source_round=source_round,
 +                    source_version=source_version,
@@ -1824,6 +3131,76 @@ index 0000000..19123f4
 +        self._captured_request_ids = ()
 +        self._captured_history = None
 +
++    def reset_receipt_state(self) -> dict:
++        """Return endpoint-only predicates proving the adapted state is clean.
++
++        The reset receipt binds these predicates to the parameter-layout and
++        configuration digests.  CUDA equality checks synchronize only at the
++        explicit control boundary; they are never reachable from decode.
++        """
++
++        master_reset = all(
++            torch.equal(master, initial.to(master.dtype))
++            for master, initial in zip(
++                self.optimizer.master, self.initial_trainable, strict=True
++            )
++        )
++        effective = self._effective_parameters(self.optimizer.master)
++        expected_inference = tuple(effective[name] for name in self.names)
++        inference_reset = all(
++            torch.equal(active, expected.to(active.dtype))
++            and torch.equal(staging, expected.to(staging.dtype))
++            for active, staging, expected in zip(
++                self.inference.active,
++                self.inference.staging,
++                expected_inference,
++                strict=True,
++            )
++        )
++        if isinstance(self.optimizer, OnlineSpecOptimizer):
++            optimizer_reset = self.optimizer.step == 0 and master_reset
++        else:
++            optimizer_reset = (
++                self.optimizer.step == 0
++                and master_reset
++                and all(
++                    tensor.numel() == 0 or bool(torch.count_nonzero(tensor) == 0)
++                    for tensor in self.optimizer.first + self.optimizer.second
++                )
++            )
++        captured_state_empty = (
++            self._captured_input is None
++            and self._captured_positions is None
++            and self._captured_prefix_lens is None
++            and not self._captured_request_ids
++            and self._captured_history is None
++        )
++        runtime_reset = (
++            self.runtime.active_version == 0
++            and self.runtime.round == 0
++            and self.runtime.pending is None
++            and self.runtime.reserved is None
++            and not self.runtime.requests
++            and not self.runtime.device_commits
++            and not self.runtime.latest_device_lengths
++            and not self.runtime.update_traces
++            and not self.runtime.round_traces
++            and not self.runtime.active_round_rows
++        )
++        return {
++            "schema_version": 1,
++            "adaptation_config_sha256": self.config.sha256,
++            "parameter_layout_sha256": self.runtime.parameter_layout_sha256,
++            "cohort_epoch": self.runtime.epoch,
++            "active_version": self.runtime.active_version,
++            "optimizer_generation": self.optimizer.step,
++            "master_reset": master_reset,
++            "optimizer_reset": optimizer_reset,
++            "inference_reset": inference_reset,
++            "runtime_reset": runtime_reset,
++            "captured_state_empty": captured_state_empty,
++        }
++
 +    def note_load(
 +        self,
 +        *,
@@ -1843,9 +3220,7 @@ index 0000000..19123f4
 +            if isinstance(self.optimizer, OnlineSpecOptimizer)
 +            else None
 +        )
-+        return self.runtime.diagnostics(
-+            extra={"online_spec_state": online_spec_state}
-+        )
++        return self.runtime.diagnostics(extra={"online_spec_state": online_spec_state})
 +
 +
 +def maybe_build_dflash_drafter_adapter(server_args, worker):
@@ -1854,7 +3229,7 @@ index 0000000..19123f4
 +        return None
 +    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
-index 0bfd3b2..2791393 100644
+index 0bfd3b2..7749adb 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
 @@ -86,7 +86,14 @@ class _DflashDraftSampler:
@@ -1883,7 +3258,20 @@ index 0bfd3b2..2791393 100644
          if self.tp_size == 1:
              tokens = torch.argmax(logits, dim=-1).to(torch.long)
              if self.org_vocab_start:
-@@ -286,6 +294,15 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -183,6 +191,12 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+         self._warned_sampling_fallback = False
+         self._logged_first_verify = False
++        self._terminal_static_safety = {
++            "exactness_violations": 0,
++            "version_mismatches": 0,
++            "fallbacks": 0,
++            "nonfinite_updates": 0,
++        }
+ 
+         bundle = build_draft_tp_worker(
+             server_args=server_args,
+@@ -286,6 +300,15 @@ class DFlashWorkerV2(BaseSpecWorker):
          self._bonus_id_bufs: List[torch.Tensor] = []
          self._out_tokens_bufs: List[torch.Tensor] = []
          self._new_seq_lens_bufs: List[torch.Tensor] = []
@@ -1899,7 +3287,7 @@ index 0bfd3b2..2791393 100644
  
      @property
      def draft_worker(self):
-@@ -294,6 +311,30 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -294,6 +317,30 @@ class DFlashWorkerV2(BaseSpecWorker):
          # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
          return self._draft_worker
  
@@ -1930,7 +3318,7 @@ index 0bfd3b2..2791393 100644
      @property
      def spec_v2_attn_backends(self) -> tuple:
          # Every attn backend a spec_v2 forward touches; consumed by
-@@ -540,7 +581,24 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -540,7 +587,45 @@ class DFlashWorkerV2(BaseSpecWorker):
          # sliding-window path, the draft req->token view is rebuilt from committed
          # target state before each draft forward, so there is nothing persistent
          # to flush here.
@@ -1938,6 +3326,27 @@ index 0bfd3b2..2791393 100644
 +        adapter = self._online_drafter_adapter
 +        if adapter is not None:
 +            adapter.reset()
++        for field in self._terminal_static_safety:
++            self._terminal_static_safety[field] = 0
++
++    def terminal_static_safety_counters(self) -> dict:
++        """Return run-scoped native safety counters for Static DFlash.
++
++        Version mismatch and nonfinite-update events are structurally absent
++        because Static owns neither parameter versions nor update candidates.
++        Exact-verification unavailability is fatal and is counted before the
++        exception; any permitted sampling fallback is counted at its branch.
++        """
++
++        if self._online_drafter_adapter is not None:
++            raise RuntimeError(
++                "Static safety counters require adaptation to be disabled"
++            )
++        return {
++            "schema_version": 1,
++            "backend": "DFLASH",
++            **self._terminal_static_safety,
++        }
 +
 +    def record_scheduler_load(
 +        self,
@@ -1956,7 +3365,7 @@ index 0bfd3b2..2791393 100644
  
      def _gather_req_to_token_masked(
          self,
-@@ -1333,7 +1391,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1333,7 +1418,9 @@ class DFlashWorkerV2(BaseSpecWorker):
          ]
          self._accept_bonus_buffer_cap = new_cap
  
@@ -1967,22 +3376,29 @@ index 0bfd3b2..2791393 100644
          torch.Tensor,
          torch.Tensor,
          torch.Tensor,
-@@ -1357,6 +1417,14 @@ class DFlashWorkerV2(BaseSpecWorker):
-         if sampling_info is None or sampling_info.is_all_greedy:
-             return
+@@ -1359,6 +1446,21 @@ class DFlashWorkerV2(BaseSpecWorker):
  
-+        if (
-+            not is_dflash_sampling_verify_available()
+         if (
+             not is_dflash_sampling_verify_available()
 +            and self.server_args.speculative_use_rejection_sampling
 +        ):
++            self._terminal_static_safety["exactness_violations"] += 1
 +            raise RuntimeError(
 +                "DFLASH exact non-greedy verification is unavailable on this "
 +                "build/device; refusing to fall back to greedy decoding."
 +            )
-         if (
-             not is_dflash_sampling_verify_available()
++        if (
++            not is_dflash_sampling_verify_available()
++            and not self.server_args.speculative_use_rejection_sampling
++        ):
++            self._terminal_static_safety["fallbacks"] += 1
++        if (
++            not is_dflash_sampling_verify_available()
++            and not self.server_args.speculative_use_rejection_sampling
              and not self._warned_sampling_fallback
-@@ -1492,6 +1560,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+             and self.ps.tp_rank == 0
+         ):
+@@ -1492,6 +1594,9 @@ class DFlashWorkerV2(BaseSpecWorker):
  
          bs = len(batch.seq_lens)
          device = self.device
@@ -1992,7 +3408,7 @@ index 0bfd3b2..2791393 100644
  
          # --- 1) Draft a fixed block with the draft model.
          target_model = self.target_worker.model_runner.model
-@@ -1576,6 +1647,12 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1576,6 +1681,12 @@ class DFlashWorkerV2(BaseSpecWorker):
  
          positions = positions_2d.reshape(-1)
          verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -2005,7 +3421,7 @@ index 0bfd3b2..2791393 100644
  
          seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
          if self.use_compact_draft_cache:
-@@ -1634,6 +1711,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1634,6 +1745,9 @@ class DFlashWorkerV2(BaseSpecWorker):
          with torch.inference_mode():
              draft_out = self.draft_model_runner.forward(forward_batch)
          draft_logits_output = draft_out.logits_output
@@ -2015,7 +3431,7 @@ index 0bfd3b2..2791393 100644
  
          if self._draft_sampler is not None and draft_out.can_run_graph:
              draft_next = self._draft_sampler.out[
-@@ -1644,10 +1724,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1644,10 +1758,9 @@ class DFlashWorkerV2(BaseSpecWorker):
              if draft_hidden is None:
                  raise RuntimeError("DFLASH draft model returned no hidden states.")
              draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
@@ -2028,7 +3444,7 @@ index 0bfd3b2..2791393 100644
                  lm_head=lm_head,
              ).view(bs, int(self.block_size) - 1)
  
-@@ -1832,6 +1911,40 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1832,6 +1945,40 @@ class DFlashWorkerV2(BaseSpecWorker):
              )
          hidden = hidden.view(bs, int(self.block_size), -1)
  
@@ -2069,7 +3485,7 @@ index 0bfd3b2..2791393 100644
          self._append_target_hidden_to_draft_kv_by_loc(
              target_hidden=hidden.reshape(-1, hidden.shape[-1]),
              cache_loc=verify_out_cache_loc,
-@@ -1843,6 +1956,14 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1843,6 +1990,14 @@ class DFlashWorkerV2(BaseSpecWorker):
          # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
          logits_output.hidden_states = None
  
@@ -2612,10 +4028,10 @@ index ee43575..25624f2 100644
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
-index 0000000..8d8be33
+index 0000000..c1cb5a1
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,706 @@
+@@ -0,0 +1,710 @@
 +"""Strict schema-v3 boundary for LightCone speculative adaptation."""
 +
 +from __future__ import annotations
@@ -3274,6 +4690,10 @@ index 0000000..8d8be33
 +        if not metrics_enabled:
 +            return
 +        backend = str(server_args.speculative_algorithm or "").upper()
++        # Target-only uses the same aggregate terminal boundary without
++        # speculative allocation or exact-rejection controls.
++        if not backend:
++            return
 +        if backend not in BACKEND_ADAPTATION_CAPABILITIES:
 +            raise ValueError("speed-study metrics require a supported backend")
 +        if not bool(getattr(server_args, "speculative_use_rejection_sampling", False)):
@@ -3324,10 +4744,10 @@ index 0000000..8d8be33
 +        raise ValueError("online adaptation requires an explicit pre-KV HBM reserve")
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000..2c45bca
+index 0000000..ee7ff09
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2092 @@
+@@ -0,0 +1,2094 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -5278,6 +6698,8 @@ index 0000000..2c45bca
 +            "enabled": self.disabled_reason is None,
 +            "disabled_reason": self.disabled_reason,
 +            "cohort_sha256": self.cohort_sha256,
++            "cohort_epoch": self.epoch,
++            "slot_generation": self.slot_generation,
 +            "active_version": self.active_version,
 +            "round": self.round,
 +            "resident_bytes": self.resident_bytes,
@@ -5803,12 +7225,1126 @@ index 0000000..91fca3a
 +        ignore_eos=ignore_eos,
 +    )
 +    return accepted, committed
+diff --git a/python/sglang/srt/speculative/terminal_speculative_evidence.py b/python/sglang/srt/speculative/terminal_speculative_evidence.py
+new file mode 100644
+index 0000000..7698f3d
+--- /dev/null
++++ b/python/sglang/srt/speculative/terminal_speculative_evidence.py
+@@ -0,0 +1,1108 @@
++"""Content-bound terminal evidence for one LightCone serving trace.
++
++This module is deliberately independent of the HTTP and scheduler transports.
++The scheduler owns one lifecycle instance and supplies state snapshots only at
++idle, synchronizing control-plane boundaries.  No method may turn a partial
++or caller-authored envelope into terminal evidence.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import re
++from collections.abc import Callable, Mapping, Sequence
++from dataclasses import dataclass
++from typing import Protocol
++
++NATIVE_TERMINAL_EVIDENCE_HOOK = (
++    "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
++)
++NATIVE_TERMINAL_EVIDENCE_FIELDS = (
++    "schema_version",
++    "hook",
++    "run_id",
++    "run_nonce_sha256",
++    "execution_plan_sha256",
++    "rank_config_sha256",
++    "server_process_id",
++    "server_process_started_ns",
++    "attempt_id",
++    "session_id",
++    "session_epoch",
++    "previous_run_id",
++    "challenge_nonce_sha256",
++    "method",
++    "expected_request_ids",
++    "reset_receipt_sha256",
++    "request_round_rows",
++    "update_rows",
++    "performance_counters",
++    "historical_kv_source_versions",
++    "final_state",
++    "completion_marker",
++    "terminal_sha256",
++    "attestation",
++)
++SUPPORTED_TERMINAL_METHODS = frozenset({"target_only", "static", "tts", "l0"})
++
++_PERFORMANCE_KEYS = {
++    "target_calls",
++    "accepted_drafts",
++    "committed_tokens",
++    "verified_drafts",
++    "survival_weighted_accepted_prefix",
++    "accepted_drafts_per_verify",
++    "committed_tokens_per_verify",
++    "verified_drafts_per_verify",
++    "verification_waste",
++    "target_calls_per_output_token",
++    "batch_fill",
++    "queue_occupancy",
++    "gpu_busy",
++    "sm_utilization",
++    "dram_utilization",
++    "target_estimated_mfu",
++    "peak_hbm_bytes",
++    "kv_bytes",
++    "kv_token_capacity",
++    "optimizer_bytes",
++    "adaptation_memory_ledger",
++    "trainable_parameters",
++    "training_cuda_ms",
++    "optimizer_cuda_ms",
++    "merge_cuda_ms",
++    "publish_cuda_ms",
++    "barrier_cuda_ms",
++    "exposed_update_ms",
++    "main_side_overlap_ratio",
++    "graph_replay_hit_rate",
++    "updates_launched",
++    "updates_published",
++    "exactness_violations",
++    "version_mismatches",
++    "fallbacks",
++    "nonfinite_updates",
++    "oom_events",
++    "retractions",
++    "communicator_failures",
++    "collective_type",
++    "collective_bytes",
++    "collective_duration_ms",
++    "collective_exposed_wait_ms",
++    "collective_overlap_ratio",
++}
++_PERFORMANCE_COUNT_KEYS = {
++    "target_calls",
++    "peak_hbm_bytes",
++    "kv_bytes",
++    "kv_token_capacity",
++    "oom_events",
++    "retractions",
++    "communicator_failures",
++    "collective_bytes",
++}
++_ALLOCATION_FREE_ZERO_KEYS = {
++    "optimizer_bytes",
++    "trainable_parameters",
++    "updates_launched",
++    "updates_published",
++}
++_ALLOCATION_FREE_NULL_KEYS = {
++    "adaptation_memory_ledger",
++    "training_cuda_ms",
++    "optimizer_cuda_ms",
++    "merge_cuda_ms",
++    "publish_cuda_ms",
++    "barrier_cuda_ms",
++    "exposed_update_ms",
++    "main_side_overlap_ratio",
++}
++_SAFETY_COUNTER_KEYS = {
++    "exactness_violations",
++    "version_mismatches",
++    "fallbacks",
++    "nonfinite_updates",
++}
++
++_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
++_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}")
++_BEGIN_KEYS = {
++    "schema_version",
++    "hook",
++    "run_id",
++    "run_nonce_sha256",
++    "execution_plan_sha256",
++    "rank_config_sha256",
++    "attempt_id",
++    "session_id",
++    "session_epoch",
++    "previous_run_id",
++    "challenge_nonce_sha256",
++    "method",
++    "warmup_request_ids",
++    "scored_request_ids",
++}
++_CLIENT_TERMINAL_KEYS = {
++    "schema_version",
++    "hook",
++    "run_id",
++    "run_nonce_sha256",
++    "execution_plan_sha256",
++    "rank_config_sha256",
++    "request_id",
++    "terminal_status",
++    "terminal_reason",
++    "client_terminal_sha256",
++}
++_CLIENT_TERMINAL_STATUSES = frozenset({"rejected", "cancelled", "timed_out"})
++_STATE_KEYS = {
++    "schema_version",
++    "scheduler_idle",
++    "active_requests",
++    "queued_requests",
++    "request_pool_active_slots",
++    "allocator_current_hbm_bytes",
++    "allocator_reserved_hbm_bytes",
++    "allocator_peak_hbm_bytes",
++    "kv_token_capacity",
++    "kv_available_tokens",
++    "kv_state_sha256",
++    "rng_state_sha256",
++    "adapter_state_sha256",
++    "adapter_reset_verified",
++    "adapter_active_version",
++    "adapter_epoch",
++    "optimizer_generation",
++    "telemetry_generation",
++    "completion_event_generation",
++    "completion_event_complete",
++}
++
++
++def canonical_json_bytes(value: object) -> bytes:
++    """Serialize strict JSON for every digest and signature boundary."""
++
++    return json.dumps(
++        value,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=False,
++        allow_nan=False,
++    ).encode("utf-8")
++
++
++def content_sha256(value: object) -> str:
++    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
++
++
++def _require_sha256(value: object, field: str) -> str:
++    if not isinstance(value, str) or _LOWER_SHA256.fullmatch(value) is None:
++        raise ValueError(f"{field} must be a lowercase SHA-256")
++    return value
++
++
++def _require_id(value: object, field: str, *, nullable: bool = False) -> str | None:
++    if value is None and nullable:
++        return None
++    if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
++        raise ValueError(f"{field} must be a safe non-empty identity")
++    return value
++
++
++def _require_int(value: object, field: str, *, minimum: int = 0) -> int:
++    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
++        raise ValueError(f"{field} must be an integer at least {minimum}")
++    return value
++
++
++def _request_ids(value: object, field: str) -> tuple[str, ...]:
++    if not isinstance(value, list):
++        raise ValueError(f"{field} must be a JSON list")
++    rows = tuple(_require_id(item, field) for item in value)
++    if len(rows) != len(set(rows)):
++        raise ValueError(f"{field} contains duplicate request IDs")
++    return rows  # type: ignore[return-value]
++
++
++def _validate_finite_json(value: object, field: str = "payload") -> None:
++    if value is None or isinstance(value, (str, bool, int)):
++        return
++    if isinstance(value, float):
++        if not math.isfinite(value):
++            raise ValueError(f"{field} contains a non-finite number")
++        return
++    if isinstance(value, list):
++        for index, item in enumerate(value):
++            _validate_finite_json(item, f"{field}[{index}]")
++        return
++    if isinstance(value, dict):
++        if any(not isinstance(key, str) for key in value):
++            raise ValueError(f"{field} contains a non-string JSON key")
++        for key, item in value.items():
++            _validate_finite_json(item, f"{field}.{key}")
++        return
++    raise ValueError(f"{field} is not strict JSON")
++
++
++def validate_performance_counters(value: object, *, method: str) -> dict[str, object]:
++    if not isinstance(value, dict) or set(value) != _PERFORMANCE_KEYS:
++        raise ValueError("terminal performance counter fields are incomplete")
++    _validate_finite_json(value, "performance_counters")
++    for field in _PERFORMANCE_COUNT_KEYS:
++        _require_int(value[field], field)
++    for field in ("updates_launched", "updates_published"):
++        if value[field] is not None:
++            _require_int(value[field], field)
++    if value["collective_type"] != "none_tp1":
++        raise RuntimeError("terminal evidence is not bound to the supported TP1 path")
++    for field in ("collective_duration_ms", "collective_exposed_wait_ms"):
++        if not isinstance(value[field], (int, float)) or isinstance(value[field], bool):
++            raise ValueError(f"{field} must be a finite number")
++    if value["collective_overlap_ratio"] is not None:
++        raise RuntimeError("TP1 terminal evidence cannot report collective overlap")
++    if method in {"target_only", "static"}:
++        if any(value[field] != 0 for field in _ALLOCATION_FREE_ZERO_KEYS):
++            raise RuntimeError(
++                "allocation-free evidence reports native adaptation state"
++            )
++        if any(value[field] is not None for field in _ALLOCATION_FREE_NULL_KEYS):
++            raise RuntimeError(
++                "allocation-free evidence reports detailed update timing"
++            )
++    if method == "target_only":
++        for field in (
++            "accepted_drafts",
++            "committed_tokens",
++            "verified_drafts",
++            "accepted_drafts_per_verify",
++            "committed_tokens_per_verify",
++            "verified_drafts_per_verify",
++            "verification_waste",
++        ):
++            if value[field] is not None:
++                raise RuntimeError("Target-only evidence reports speculative counters")
++        if any(value[field] is not None for field in _SAFETY_COUNTER_KEYS):
++            raise RuntimeError(
++                "Target-only evidence reports adaptation safety counters"
++            )
++    else:
++        for field in _SAFETY_COUNTER_KEYS:
++            _require_int(value[field], field)
++    if method in {"tts", "l0"}:
++        if value["updates_launched"] is None or value["updates_published"] is None:
++            raise RuntimeError("adapted evidence lacks update counters")
++        if value["optimizer_bytes"] is None or value["trainable_parameters"] is None:
++            raise RuntimeError("adapted evidence lacks resident allocation counters")
++    return dict(value)
++
++
++def validate_state_snapshot(value: object, *, clean: bool) -> dict[str, object]:
++    if not isinstance(value, dict) or set(value) != _STATE_KEYS:
++        raise ValueError("terminal state snapshot fields are incomplete")
++    _validate_finite_json(value, "state")
++    if value["schema_version"] != 1:
++        raise ValueError("terminal state snapshot schema is unsupported")
++    for field in (
++        "active_requests",
++        "queued_requests",
++        "request_pool_active_slots",
++        "allocator_current_hbm_bytes",
++        "allocator_reserved_hbm_bytes",
++        "allocator_peak_hbm_bytes",
++        "kv_token_capacity",
++        "kv_available_tokens",
++        "adapter_active_version",
++        "adapter_epoch",
++        "optimizer_generation",
++        "telemetry_generation",
++        "completion_event_generation",
++    ):
++        _require_int(value[field], field)
++    for field in ("kv_state_sha256", "rng_state_sha256"):
++        _require_sha256(value[field], field)
++    adapter_digest = value["adapter_state_sha256"]
++    if adapter_digest is not None:
++        _require_sha256(adapter_digest, "adapter_state_sha256")
++    if (
++        not isinstance(value["scheduler_idle"], bool)
++        or not isinstance(value["adapter_reset_verified"], bool)
++        or not isinstance(value["completion_event_complete"], bool)
++    ):
++        raise ValueError("terminal state booleans are malformed")
++    if value["allocator_peak_hbm_bytes"] < value["allocator_current_hbm_bytes"]:
++        raise ValueError("allocator peak is smaller than current allocation")
++    if value["kv_available_tokens"] > value["kv_token_capacity"]:
++        raise ValueError("KV availability exceeds its capacity")
++    if clean and (
++        not value["scheduler_idle"]
++        or value["active_requests"] != 0
++        or value["queued_requests"] != 0
++        or value["request_pool_active_slots"] != 0
++        or value["kv_available_tokens"] != value["kv_token_capacity"]
++        or value["adapter_active_version"] != 0
++        or value["optimizer_generation"] != 0
++        or not value["adapter_reset_verified"]
++        or not value["completion_event_complete"]
++    ):
++        raise RuntimeError("terminal reset did not establish a clean server state")
++    return dict(value)
++
++
++@dataclass(frozen=True)
++class TerminalRunIdentity:
++    run_id: str
++    run_nonce_sha256: str
++    execution_plan_sha256: str
++    rank_config_sha256: str
++    attempt_id: str
++    session_id: str
++    session_epoch: int
++    previous_run_id: str | None
++    challenge_nonce_sha256: str
++    method: str
++    warmup_request_ids: tuple[str, ...]
++    scored_request_ids: tuple[str, ...]
++
++    @classmethod
++    def from_begin_payload(cls, value: object) -> "TerminalRunIdentity":
++        if not isinstance(value, dict) or set(value) != _BEGIN_KEYS:
++            raise ValueError("terminal begin payload fields are incomplete")
++        if value["schema_version"] != 1:
++            raise ValueError("terminal begin schema is unsupported")
++        if value["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK:
++            raise ValueError("terminal begin hook identity mismatch")
++        method = value["method"]
++        if method not in SUPPORTED_TERMINAL_METHODS:
++            raise ValueError("terminal evidence method is unsupported")
++        warmup = _request_ids(value["warmup_request_ids"], "warmup_request_ids")
++        scored = _request_ids(value["scored_request_ids"], "scored_request_ids")
++        if not scored:
++            raise ValueError("terminal evidence requires scored request IDs")
++        if set(warmup) & set(scored):
++            raise ValueError("warmup and scored request IDs must be disjoint")
++        return cls(
++            run_id=_require_id(value["run_id"], "run_id"),  # type: ignore[arg-type]
++            run_nonce_sha256=_require_sha256(
++                value["run_nonce_sha256"], "run_nonce_sha256"
++            ),
++            execution_plan_sha256=_require_sha256(
++                value["execution_plan_sha256"], "execution_plan_sha256"
++            ),
++            rank_config_sha256=_require_sha256(
++                value["rank_config_sha256"], "rank_config_sha256"
++            ),
++            attempt_id=_require_id(value["attempt_id"], "attempt_id"),  # type: ignore[arg-type]
++            session_id=_require_id(value["session_id"], "session_id"),  # type: ignore[arg-type]
++            session_epoch=_require_int(
++                value["session_epoch"], "session_epoch", minimum=1
++            ),
++            previous_run_id=_require_id(
++                value["previous_run_id"], "previous_run_id", nullable=True
++            ),
++            challenge_nonce_sha256=_require_sha256(
++                value["challenge_nonce_sha256"], "challenge_nonce_sha256"
++            ),
++            method=method,
++            warmup_request_ids=warmup,
++            scored_request_ids=scored,
++        )
++
++    def fields(self) -> dict[str, object]:
++        return {
++            "run_id": self.run_id,
++            "run_nonce_sha256": self.run_nonce_sha256,
++            "execution_plan_sha256": self.execution_plan_sha256,
++            "rank_config_sha256": self.rank_config_sha256,
++            "attempt_id": self.attempt_id,
++            "session_id": self.session_id,
++            "session_epoch": self.session_epoch,
++            "previous_run_id": self.previous_run_id,
++            "challenge_nonce_sha256": self.challenge_nonce_sha256,
++            "method": self.method,
++        }
++
++
++class TerminalAttestationSigner(Protocol):
++    """Out-of-band signer interface; implementations retain their private key."""
++
++    attester_id: str
++    trust_domain: str
++
++    def sign(self, message: bytes) -> bytes: ...
++
++
++SignatureVerifier = Callable[[bytes, bytes], bool]
++AttestationSignerProvider = Callable[[], TerminalAttestationSigner | None]
++_ATTESTATION_SIGNER_PROVIDER: AttestationSignerProvider | None = None
++
++
++def register_terminal_attestation_signer_provider(
++    provider: AttestationSignerProvider,
++) -> None:
++    """Register a process-local signer provider from trusted plugin code.
++
++    The provider, signer, and private key are never accepted over HTTP and are
++    never serialized into evidence.  SGLang loads plugins before constructing
++    the scheduler, so a deployment-owned hardware plugin can install this hook.
++    """
++
++    global _ATTESTATION_SIGNER_PROVIDER
++    if not callable(provider):
++        raise TypeError("terminal attestation signer provider must be callable")
++    if _ATTESTATION_SIGNER_PROVIDER is not None:
++        raise RuntimeError("terminal attestation signer provider is already registered")
++    _ATTESTATION_SIGNER_PROVIDER = provider
++
++
++def terminal_attestation_signer_provider_configured() -> bool:
++    return _ATTESTATION_SIGNER_PROVIDER is not None
++
++
++def resolve_terminal_attestation_signer() -> TerminalAttestationSigner | None:
++    provider = _ATTESTATION_SIGNER_PROVIDER
++    if provider is None:
++        return None
++    signer = provider()
++    if signer is None:
++        return None
++    _require_id(signer.attester_id, "attester_id")
++    if signer.trust_domain not in {"hardware", "test"} or not callable(signer.sign):
++        raise ValueError("terminal attestation signer metadata is unsupported")
++    return signer
++
++
++def _attestation_message(envelope: Mapping[str, object]) -> dict[str, object]:
++    return {
++        "schema_version": 1,
++        "kind": "lightcone_terminal_attestation_challenge",
++        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++        "challenge_nonce_sha256": envelope["challenge_nonce_sha256"],
++        "terminal_sha256": envelope["terminal_sha256"],
++        "run_id": envelope["run_id"],
++        "run_nonce_sha256": envelope["run_nonce_sha256"],
++        "server_process_id": envelope["server_process_id"],
++        "server_process_started_ns": envelope["server_process_started_ns"],
++        "session_id": envelope["session_id"],
++        "session_epoch": envelope["session_epoch"],
++        "attempt_id": envelope["attempt_id"],
++    }
++
++
++def build_terminal_attestation(
++    envelope: Mapping[str, object], signer: TerminalAttestationSigner | None
++) -> dict[str, object]:
++    message = _attestation_message(envelope)
++    message_sha256 = content_sha256(message)
++    if signer is None:
++        return {
++            "schema_version": 1,
++            "status": "UNAVAILABLE",
++            "challenge_nonce_sha256": envelope["challenge_nonce_sha256"],
++            "message_sha256": message_sha256,
++            "attester_id": None,
++            "trust_domain": None,
++            "signature_hex": None,
++        }
++    attester_id = _require_id(signer.attester_id, "attester_id")
++    if signer.trust_domain not in {"hardware", "test"}:
++        raise ValueError("attestation trust domain is unsupported")
++    signature = signer.sign(canonical_json_bytes(message))
++    if not isinstance(signature, bytes) or not signature:
++        raise ValueError("attestation signer returned an empty signature")
++    return {
++        "schema_version": 1,
++        "status": "SIGNED",
++        "challenge_nonce_sha256": envelope["challenge_nonce_sha256"],
++        "message_sha256": message_sha256,
++        "attester_id": attester_id,
++        "trust_domain": signer.trust_domain,
++        "signature_hex": signature.hex(),
++    }
++
++
++def verify_terminal_attestation(
++    envelope: Mapping[str, object],
++    *,
++    trusted_hardware_verifiers: Mapping[str, SignatureVerifier],
++) -> None:
++    """Release verifier: test identities are rejected before signature use."""
++
++    if not isinstance(envelope, dict):
++        raise ValueError("terminal envelope must be a JSON object")
++    terminal_sha256 = envelope.get("terminal_sha256")
++    _require_sha256(terminal_sha256, "terminal_sha256")
++    unsigned = dict(envelope)
++    unsigned.pop("terminal_sha256", None)
++    unsigned.pop("attestation", None)
++    if content_sha256(unsigned) != terminal_sha256:
++        raise ValueError("terminal evidence content digest mismatch")
++    attestation = envelope.get("attestation")
++    if not isinstance(attestation, dict) or attestation.get("status") != "SIGNED":
++        raise ValueError("terminal evidence has no signed attestation")
++    attester_id = _require_id(attestation.get("attester_id"), "attester_id")
++    if (
++        attestation.get("trust_domain") != "hardware"
++        or attester_id is None
++        or attester_id.lower().startswith(("test", "fixture", "cpu"))
++    ):
++        raise ValueError("release verification rejects non-hardware test attesters")
++    if attestation.get("challenge_nonce_sha256") != envelope.get(
++        "challenge_nonce_sha256"
++    ):
++        raise ValueError("attestation challenge nonce mismatch")
++    message = _attestation_message(envelope)
++    if attestation.get("message_sha256") != content_sha256(message):
++        raise ValueError("attestation message digest mismatch")
++    signature_hex = attestation.get("signature_hex")
++    if not isinstance(signature_hex, str):
++        raise ValueError("attestation signature is missing")
++    try:
++        signature = bytes.fromhex(signature_hex)
++    except ValueError as error:
++        raise ValueError("attestation signature is not hexadecimal") from error
++    verifier = trusted_hardware_verifiers.get(attester_id)
++    if verifier is None or not verifier(canonical_json_bytes(message), signature):
++        raise ValueError("terminal attestation signature verification failed")
++
++
++class TerminalSpeculativeEvidenceLifecycle:
++    """Strict begin -> warmup -> reset -> scored -> finalize state machine."""
++
++    def __init__(
++        self,
++        *,
++        server_process_id: int,
++        server_process_started_ns: int,
++        method: str,
++        signer: TerminalAttestationSigner | None = None,
++    ) -> None:
++        self.server_process_id = _require_int(
++            server_process_id, "server_process_id", minimum=1
++        )
++        self.server_process_started_ns = _require_int(
++            server_process_started_ns, "server_process_started_ns", minimum=1
++        )
++        if method not in SUPPORTED_TERMINAL_METHODS:
++            raise ValueError("terminal evidence method is unsupported")
++        self.method = method
++        self.signer = signer
++        self.phase = "IDLE"
++        self.identity: TerminalRunIdentity | None = None
++        self.begin_receipt: dict[str, object] | None = None
++        self.reset_receipt: dict[str, object] | None = None
++        self.request_rows: dict[str, dict[str, object]] = {}
++        self.last_finalized_run_id: str | None = None
++        self.next_session_epoch = 1
++        self.reset_generation = 0
++
++    def _failed(self, error: Exception) -> None:
++        self.phase = "FAILED"
++        raise error
++
++    def fail_closed(self) -> None:
++        """Poison this process-local lifecycle after a transport-side violation."""
++
++        self.phase = "FAILED"
++
++    def begin(
++        self,
++        payload: object,
++        *,
++        prior_state: object,
++        reset_state: object,
++    ) -> dict[str, object]:
++        try:
++            if self.phase not in {"IDLE", "FINALIZED"}:
++                raise RuntimeError("terminal begin is not legal in the current phase")
++            identity = TerminalRunIdentity.from_begin_payload(payload)
++            if identity.method != self.method:
++                raise ValueError("terminal begin method differs from the server")
++            if identity.session_epoch != self.next_session_epoch:
++                raise ValueError("terminal session epoch is stale or skipped")
++            if identity.previous_run_id != self.last_finalized_run_id:
++                raise ValueError("terminal begin previous trace identity mismatch")
++            prior = validate_state_snapshot(prior_state, clean=False)
++            reset = validate_state_snapshot(reset_state, clean=True)
++            self.reset_generation += 1
++            receipt = {
++                "schema_version": 1,
++                "kind": "lightcone_terminal_begin_receipt",
++                "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++                **identity.fields(),
++                "server_process_id": self.server_process_id,
++                "server_process_started_ns": self.server_process_started_ns,
++                "reset_generation": self.reset_generation,
++                "prior_state_sha256": content_sha256(prior),
++                "reset_state_sha256": content_sha256(reset),
++                "warmup_request_ids_sha256": content_sha256(
++                    list(identity.warmup_request_ids)
++                ),
++                "scored_request_ids_sha256": content_sha256(
++                    list(identity.scored_request_ids)
++                ),
++            }
++            receipt["begin_sha256"] = content_sha256(receipt)
++            self.identity = identity
++            self.begin_receipt = receipt
++            self.reset_receipt = None
++            self.request_rows = {}
++            self.phase = "WARMUP"
++            return dict(receipt)
++        except Exception as error:
++            self._failed(error)
++
++    def note_request_terminal(
++        self,
++        *,
++        request_id: str,
++        input_token_ids: Sequence[int],
++        output_token_ids: Sequence[int],
++        terminal_status: str,
++        terminal_reason: str,
++    ) -> None:
++        try:
++            if self.identity is None or self.phase not in {"WARMUP", "SCORED"}:
++                raise RuntimeError("request terminal row is outside an active trace")
++            request_id = _require_id(request_id, "request_id")  # type: ignore[assignment]
++            expected = (
++                self.identity.warmup_request_ids
++                if self.phase == "WARMUP"
++                else self.identity.scored_request_ids
++            )
++            if request_id not in expected:
++                raise ValueError("terminal request is foreign to the active trace")
++            if request_id in self.request_rows:
++                raise RuntimeError("terminal request identity was recorded twice")
++            if terminal_status not in {"completed", "aborted"}:
++                raise ValueError("terminal request status is unsupported")
++            terminal_reason = _require_id(terminal_reason, "terminal_reason")  # type: ignore[assignment]
++            inputs = list(input_token_ids)
++            outputs = list(output_token_ids)
++            if any(
++                not isinstance(token, int) or isinstance(token, bool) or token < 0
++                for token in (*inputs, *outputs)
++            ):
++                raise ValueError("terminal token IDs must be non-negative integers")
++            row = {
++                "request_id": request_id,
++                "terminal_source": "server",
++                "input_tokens": len(inputs),
++                "input_token_ids_sha256": content_sha256(inputs),
++                "output_tokens": len(outputs),
++                "ordered_output_token_ids": outputs,
++                "output_token_ids_sha256": content_sha256(outputs),
++                "terminal_status": terminal_status,
++                "terminal_reason": terminal_reason,
++            }
++            row["request_sha256"] = content_sha256(row)
++            self.request_rows[request_id] = row
++        except Exception as error:
++            self._failed(error)
++
++    def _client_terminal_rows(self, value: object) -> dict[str, dict[str, object]]:
++        if self.identity is None or not isinstance(value, list):
++            raise ValueError("client terminal reconciliation must be a JSON list")
++        expected = set(self.identity.scored_request_ids)
++        reconciled: dict[str, dict[str, object]] = {}
++        identity_fields = {
++            "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++            "run_id": self.identity.run_id,
++            "run_nonce_sha256": self.identity.run_nonce_sha256,
++            "execution_plan_sha256": self.identity.execution_plan_sha256,
++            "rank_config_sha256": self.identity.rank_config_sha256,
++        }
++        for raw in value:
++            if not isinstance(raw, dict) or set(raw) != _CLIENT_TERMINAL_KEYS:
++                raise ValueError("client terminal reconciliation fields are incomplete")
++            if raw["schema_version"] != 1 or any(
++                raw[field] != expected_value
++                for field, expected_value in identity_fields.items()
++            ):
++                raise ValueError("client terminal reconciliation identity mismatch")
++            request_id = _require_id(raw["request_id"], "client.request_id")
++            if request_id not in expected:
++                raise ValueError("client terminal reconciliation has a foreign request")
++            if request_id in self.request_rows:
++                raise RuntimeError(
++                    "client terminal reconciliation cannot override a "
++                    "server terminal row"
++                )
++            if request_id in reconciled:
++                raise RuntimeError("client terminal reconciliation is duplicated")
++            status = raw["terminal_status"]
++            if status not in _CLIENT_TERMINAL_STATUSES:
++                raise ValueError("client terminal reconciliation status is unsupported")
++            _require_id(raw["terminal_reason"], "client.terminal_reason")
++            digest = _require_sha256(
++                raw["client_terminal_sha256"], "client_terminal_sha256"
++            )
++            unsigned = dict(raw)
++            unsigned.pop("client_terminal_sha256")
++            if content_sha256(unsigned) != digest:
++                raise ValueError("client terminal reconciliation digest mismatch")
++            row = {
++                **raw,
++                "terminal_source": "client_reconciliation",
++                "output_tokens": 0,
++            }
++            row["request_sha256"] = content_sha256(row)
++            reconciled[request_id] = row
++        return reconciled
++
++    def _ordered_request_rows(
++        self,
++        expected: Sequence[str],
++        *,
++        client_terminal_rows: object | None = None,
++    ) -> list[dict[str, object]]:
++        reconciled = (
++            {}
++            if client_terminal_rows is None
++            else self._client_terminal_rows(client_terminal_rows)
++        )
++        observed = {**self.request_rows, **reconciled}
++        missing = set(expected) - set(observed)
++        foreign = set(observed) - set(expected)
++        if missing or foreign:
++            raise RuntimeError(
++                "terminal request coverage mismatch: "
++                f"missing={sorted(missing)}, foreign={sorted(foreign)}"
++            )
++        return [dict(observed[request_id]) for request_id in expected]
++
++    def _validate_terminal_detail(
++        self,
++        *,
++        request_rows: Sequence[Mapping[str, object]],
++        round_rows: list[object],
++        update_rows: list[object],
++        historical_kv_source_versions: object,
++        performance_counters: dict[str, object],
++    ) -> None:
++        if self.identity is None:
++            raise RuntimeError("terminal detail has no active identity")
++        expected = set(self.identity.scored_request_ids)
++        if self.method in {"target_only", "static"}:
++            if round_rows or update_rows or historical_kv_source_versions != {}:
++                raise RuntimeError(
++                    "allocation-free terminal evidence contains detailed traces"
++                )
++            return
++
++        if not round_rows or not update_rows:
++            raise RuntimeError(
++                "adapted terminal evidence requires round and update rows"
++            )
++        if not isinstance(historical_kv_source_versions, dict):
++            raise ValueError("historical KV evidence must be a JSON object")
++
++        completed = {
++            row["request_id"]
++            for row in request_rows
++            if row["terminal_status"] == "completed"
++        }
++        covered_round_requests: set[str] = set()
++        round_identities: set[tuple[str, int]] = set()
++        for raw in round_rows:
++            if not isinstance(raw, dict):
++                raise ValueError("terminal round row is malformed")
++            required = {
++                "request_id",
++                "round_index",
++                "proposal_source_version",
++                "prefix_len_before",
++                "verify_len",
++                "accepted_drafts",
++                "committed_tokens",
++                "target_calls",
++                "historical_kv_source_versions",
++                "round_sha256",
++            }
++            if set(raw) != required:
++                raise ValueError("terminal round row fields are incomplete")
++            request_id = _require_id(raw["request_id"], "round.request_id")
++            if request_id not in expected:
++                raise RuntimeError("terminal round row has a foreign request")
++            round_index = _require_int(raw["round_index"], "round.round_index")
++            identity = (request_id, round_index)
++            if identity in round_identities:
++                raise RuntimeError("terminal round identity is duplicated")
++            round_identities.add(identity)
++            covered_round_requests.add(request_id)
++            for field in (
++                "proposal_source_version",
++                "prefix_len_before",
++                "verify_len",
++                "accepted_drafts",
++                "committed_tokens",
++                "target_calls",
++            ):
++                _require_int(raw[field], f"round.{field}")
++            if raw["target_calls"] != 1:
++                raise RuntimeError("terminal round target-call accounting is malformed")
++            if raw["accepted_drafts"] > raw["verify_len"]:
++                raise RuntimeError(
++                    "terminal round accepts more drafts than it verifies"
++                )
++            if not isinstance(raw["historical_kv_source_versions"], list):
++                raise ValueError("terminal round historical KV rows are malformed")
++            if raw["historical_kv_source_versions"] != (
++                historical_kv_source_versions.get(request_id)
++            ):
++                raise RuntimeError(
++                    "terminal round historical KV evidence disagrees with "
++                    "the terminal map"
++                )
++            digest = _require_sha256(raw["round_sha256"], "round_sha256")
++            unsigned = dict(raw)
++            unsigned.pop("round_sha256")
++            if content_sha256(unsigned) != digest:
++                raise ValueError("terminal round content digest mismatch")
++        if not completed.issubset(covered_round_requests):
++            raise RuntimeError("completed adapted requests lack round evidence")
++        aggregate_fields = {
++            "target_calls": "target_calls",
++            "accepted_drafts": "accepted_drafts",
++            "committed_tokens": "committed_tokens",
++            "verified_drafts": "verify_len",
++        }
++        for performance_field, round_field in aggregate_fields.items():
++            if performance_counters[performance_field] != sum(
++                int(row[round_field]) for row in round_rows
++            ):
++                raise RuntimeError(
++                    "adapted aggregate counters disagree with terminal round rows"
++                )
++        if set(historical_kv_source_versions) != covered_round_requests:
++            raise RuntimeError("historical KV request coverage is incomplete")
++
++        for request_id, raw_segments in historical_kv_source_versions.items():
++            if not isinstance(raw_segments, list):
++                raise ValueError("historical KV segments are malformed")
++            previous_end = 0
++            for segment in raw_segments:
++                if not isinstance(segment, dict) or set(segment) != {
++                    "start",
++                    "end",
++                    "source_version",
++                }:
++                    raise ValueError("historical KV segment fields are incomplete")
++                start = _require_int(segment["start"], f"kv.{request_id}.start")
++                end = _require_int(segment["end"], f"kv.{request_id}.end")
++                _require_int(
++                    segment["source_version"], f"kv.{request_id}.source_version"
++                )
++                if start != previous_end or end <= start:
++                    raise RuntimeError("historical KV segments are not contiguous")
++                previous_end = end
++
++        update_request_coverage: set[str] = set()
++        for expected_index, raw in enumerate(update_rows):
++            if not isinstance(raw, dict):
++                raise ValueError("terminal update row is malformed")
++            required = {
++                "update_index",
++                "cohort_sha256",
++                "cohort_epoch",
++                "parameter_layout_sha256",
++                "source_round",
++                "source_version",
++                "request_ids",
++                "prefix_len_before",
++                "optimizer_step",
++                "published_version",
++                "status",
++                "loss",
++                "gradient_norm",
++                "reconstruction_ok",
++                "reconstruction_max_abs",
++                "reconstruction_relative_rms",
++                "reconstruction_top1_match",
++                "supervision_nonempty",
++                "reconstruction_mean_kl",
++                "online_hint_error",
++                "online_ensemble_entropy",
++                "online_effective_experts",
++                "online_expert_probabilities",
++                "online_cumulative_losses",
++                "online_expert_gradient_norms",
++                "update_sha256",
++            }
++            if set(raw) != required:
++                raise ValueError("terminal update row fields are incomplete")
++            if raw["update_index"] != expected_index:
++                raise RuntimeError("terminal update indexes are not contiguous")
++            _require_sha256(raw["cohort_sha256"], "update.cohort_sha256")
++            _require_sha256(
++                raw["parameter_layout_sha256"], "update.parameter_layout_sha256"
++            )
++            for field in (
++                "cohort_epoch",
++                "source_round",
++                "source_version",
++                "optimizer_step",
++            ):
++                _require_int(raw[field], f"update.{field}")
++            request_ids = _request_ids(raw["request_ids"], "update.request_ids")
++            if not request_ids or not set(request_ids).issubset(expected):
++                raise RuntimeError(
++                    "terminal update request coverage is foreign or empty"
++                )
++            update_request_coverage.update(request_ids)
++            if not isinstance(raw["prefix_len_before"], list) or len(
++                raw["prefix_len_before"]
++            ) != len(request_ids):
++                raise ValueError("terminal update prefix coverage is malformed")
++            for prefix in raw["prefix_len_before"]:
++                _require_int(prefix, "update.prefix_len_before")
++            published = raw["published_version"]
++            if published is not None:
++                _require_int(published, "update.published_version")
++            digest = _require_sha256(raw["update_sha256"], "update_sha256")
++            unsigned = dict(raw)
++            unsigned.pop("update_sha256")
++            if content_sha256(unsigned) != digest:
++                raise ValueError("terminal update content digest mismatch")
++        if not update_request_coverage.issubset(covered_round_requests):
++            raise RuntimeError("terminal update rows lack matching round evidence")
++        if performance_counters["updates_launched"] != len(update_rows):
++            raise RuntimeError("terminal update counter disagrees with native rows")
++        if performance_counters["updates_published"] != sum(
++            raw["status"] == "published" for raw in update_rows
++        ):
++            raise RuntimeError(
++                "terminal publication counter disagrees with native rows"
++            )
++
++    def reset(
++        self,
++        *,
++        begin_sha256: str,
++        discarded_native_sha256: str,
++        warmup_performance_counters: object,
++        warmup_state: object,
++        reset_state: object,
++    ) -> dict[str, object]:
++        try:
++            if self.phase != "WARMUP" or self.identity is None:
++                raise RuntimeError("terminal reset is not legal in the current phase")
++            if self.begin_receipt is None or begin_sha256 != self.begin_receipt.get(
++                "begin_sha256"
++            ):
++                raise ValueError("terminal reset begin receipt mismatch")
++            _require_sha256(discarded_native_sha256, "discarded_native_sha256")
++            warmup_performance_counters = validate_performance_counters(
++                warmup_performance_counters, method=self.method
++            )
++            warmup = validate_state_snapshot(warmup_state, clean=False)
++            reset = validate_state_snapshot(reset_state, clean=True)
++            warmup_rows = self._ordered_request_rows(self.identity.warmup_request_ids)
++            self.reset_generation += 1
++            receipt = {
++                "schema_version": 1,
++                "kind": "lightcone_terminal_reset_receipt",
++                "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++                **self.identity.fields(),
++                "server_process_id": self.server_process_id,
++                "server_process_started_ns": self.server_process_started_ns,
++                "begin_sha256": begin_sha256,
++                "reset_generation": self.reset_generation,
++                "prior_trace_run_id": self.identity.previous_run_id,
++                "next_trace_run_id": self.identity.run_id,
++                "warmup_request_rows_sha256": content_sha256(warmup_rows),
++                "warmup_performance_sha256": content_sha256(
++                    warmup_performance_counters
++                ),
++                "discarded_native_sha256": discarded_native_sha256,
++                "warmup_state_sha256": content_sha256(warmup),
++                "reset_state_sha256": content_sha256(reset),
++                "expected_scored_request_ids_sha256": content_sha256(
++                    list(self.identity.scored_request_ids)
++                ),
++                "completion_event_generation": reset["completion_event_generation"],
++            }
++            receipt["reset_sha256"] = content_sha256(receipt)
++            self.reset_receipt = receipt
++            self.request_rows = {}
++            self.phase = "SCORED"
++            return dict(receipt)
++        except Exception as error:
++            self._failed(error)
++
++    def finalize(
++        self,
++        *,
++        reset_sha256: str,
++        round_rows: object,
++        update_rows: object,
++        performance_counters: object,
++        historical_kv_source_versions: object,
++        client_terminal_rows: object,
++        final_state: object,
++    ) -> dict[str, object]:
++        try:
++            if self.phase != "SCORED" or self.identity is None:
++                raise RuntimeError(
++                    "terminal finalize is not legal in the current phase"
++                )
++            if self.reset_receipt is None or reset_sha256 != self.reset_receipt.get(
++                "reset_sha256"
++            ):
++                raise ValueError("terminal finalize reset receipt mismatch")
++            if not isinstance(round_rows, list) or not isinstance(update_rows, list):
++                raise ValueError("terminal round/update evidence must be JSON lists")
++            _validate_finite_json(round_rows, "round_rows")
++            _validate_finite_json(update_rows, "update_rows")
++            performance_counters = validate_performance_counters(
++                performance_counters, method=self.method
++            )
++            _validate_finite_json(
++                historical_kv_source_versions, "historical_kv_source_versions"
++            )
++            final = validate_state_snapshot(final_state, clean=False)
++            if (
++                not final["scheduler_idle"]
++                or final["active_requests"] != 0
++                or final["queued_requests"] != 0
++            ):
++                raise RuntimeError("terminal finalize requires a drained scheduler")
++            request_rows = self._ordered_request_rows(
++                self.identity.scored_request_ids,
++                client_terminal_rows=client_terminal_rows,
++            )
++            self._validate_terminal_detail(
++                request_rows=request_rows,
++                round_rows=round_rows,
++                update_rows=update_rows,
++                historical_kv_source_versions=historical_kv_source_versions,
++                performance_counters=performance_counters,
++            )
++            terminal = {
++                "schema_version": 1,
++                "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++                **self.identity.fields(),
++                "server_process_id": self.server_process_id,
++                "server_process_started_ns": self.server_process_started_ns,
++                "expected_request_ids": list(self.identity.scored_request_ids),
++                "reset_receipt_sha256": reset_sha256,
++                "request_round_rows": {
++                    "requests": request_rows,
++                    "rounds": round_rows,
++                },
++                "update_rows": update_rows,
++                "performance_counters": performance_counters,
++                "historical_kv_source_versions": historical_kv_source_versions,
++                "final_state": final,
++                "completion_marker": "TERMINAL_COMPLETE",
++            }
++            terminal["terminal_sha256"] = content_sha256(terminal)
++            terminal["attestation"] = build_terminal_attestation(terminal, self.signer)
++            self.phase = "FINALIZED"
++            self.last_finalized_run_id = self.identity.run_id
++            self.next_session_epoch += 1
++            self.request_rows = {}
++            return terminal
++        except Exception as error:
++            self._failed(error)
 diff --git a/test/registered/unit/benchmark/test_serving_output_token_ids.py b/test/registered/unit/benchmark/test_serving_output_token_ids.py
 new file mode 100644
-index 0000000..21706cd
+index 0000000..f333274
 --- /dev/null
 +++ b/test/registered/unit/benchmark/test_serving_output_token_ids.py
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,401 @@
 +from __future__ import annotations
 +
 +import ast
@@ -5821,7 +8357,6 @@ index 0000000..21706cd
 +from pathlib import Path
 +from types import SimpleNamespace
 +from typing import Any, List, Optional
-+
 +
 +SERVING_PATH = (
 +    Path(__file__).resolve().parents[4] / "python/sglang/benchmark/serving.py"
@@ -5885,6 +8420,9 @@ index 0000000..21706cd
 +class _Session:
 +    def __init__(self, chunks: list[bytes]):
 +        self.chunks = chunks
++        self.closed = False
++        self.close_calls = 0
++        self.posts = []
 +
 +    async def __aenter__(self):
 +        return self
@@ -5893,7 +8431,12 @@ index 0000000..21706cd
 +        return False
 +
 +    def post(self, **kwargs):
++        self.posts.append(kwargs)
 +        return _ResponseContext(self.chunks)
++
++    async def close(self):
++        self.close_calls += 1
++        self.closed = True
 +
 +
 +class _Output:
@@ -5915,7 +8458,12 @@ index 0000000..21706cd
 +        )
 +
 +
-+def _run_request(payloads: list[dict], *, disable_stream: bool):
++def _run_request(
++    payloads: list[dict],
++    *,
++    disable_stream: bool,
++    client_session: _Session | None = None,
++):
 +    merge = _load_merge_function()
 +    request_node = _function("async_request_sglang_generate")
 +    assert isinstance(request_node, ast.AsyncFunctionDef)
@@ -5931,6 +8479,10 @@ index 0000000..21706cd
 +        "_ROUTING_KEY_HEADER": "X-SMG-Routing-Key",
 +        "_create_bench_client_session": lambda: _Session(chunks),
 +        "_merge_sglang_generated_token_ids": merge,
++        "aiohttp": SimpleNamespace(
++            ClientSession=object,
++            ClientTimeout=lambda **kwargs: kwargs,
++        ),
 +        "args": SimpleNamespace(
 +            temperature=0.0,
 +            disable_ignore_eos=False,
@@ -5944,6 +8496,7 @@ index 0000000..21706cd
 +        ),
 +        "get_request_headers": lambda: {},
 +        "json": json,
++        "math": __import__("math"),
 +        "remove_prefix": lambda value, prefix: (
 +            value[len(prefix) :] if value.startswith(prefix) else value
 +        ),
@@ -5964,7 +8517,9 @@ index 0000000..21706cd
 +        image_data=None,
 +        routing_key=None,
 +    )
-+    return asyncio.run(namespace[request_node.name](request))
++    return asyncio.run(
++        namespace[request_node.name](request, client_session=client_session)
++    )
 +
 +
 +class ServingOutputTokenIdsTests(unittest.TestCase):
@@ -5983,7 +8538,16 @@ index 0000000..21706cd
 +
 +        request_source = ast.unparse(_function("async_request_sglang_generate"))
 +        self.assertIn("data['output_ids']", request_source)
-+        self.assertIn("output.generated_token_ids = generated_token_ids", request_source)
++        self.assertIn(
++            "output.generated_token_ids = generated_token_ids", request_source
++        )
++        self.assertIn("client_session", request_source)
++        generate = _function("async_request_sglang_generate")
++        self.assertEqual(
++            [argument.arg for argument in generate.args.kwonlyargs],
++            ["client_session", "timeout_s"],
++        )
++        self.assertTrue(all(value is not None for value in generate.args.kw_defaults))
 +
 +    def test_cumulative_and_incremental_output_ids_are_exact(self):
 +        merge = _load_merge_function()
@@ -6060,42 +8624,200 @@ index 0000000..21706cd
 +                with self.assertRaises((TypeError, ValueError)):
 +                    merge(accumulated, output_ids, count)
 +
++    def test_caller_owned_session_is_reused_without_implicit_close(self):
++        session = _Session(
++            [
++                json.dumps(
++                    {
++                        "text": "A",
++                        "output_ids": [11],
++                        "meta_info": {"completion_tokens": 1},
++                    }
++                ).encode()
++            ]
++        )
++        first = _run_request([], disable_stream=True, client_session=session)
++        second = _run_request([], disable_stream=True, client_session=session)
++        self.assertTrue(first.success and second.success)
++        self.assertEqual(len(session.posts), 2)
++        self.assertEqual(session.close_calls, 0)
++
++    def test_abort_accepts_the_same_caller_owned_session(self):
++        node = _function("async_request_sglang_abort")
++        assert isinstance(node, ast.AsyncFunctionDef)
++        namespace = {
++            "Optional": Optional,
++            "aiohttp": SimpleNamespace(
++                ClientSession=object,
++                ClientTimeout=lambda **kwargs: kwargs,
++            ),
++            "math": __import__("math"),
++            "get_request_headers": lambda: {},
++            "_create_bench_client_session": lambda: self.fail(
++                "abort unexpectedly created a second session"
++            ),
++        }
++        module = ast.Module(body=[node], type_ignores=[])
++        exec(compile(module, SERVING_PATH, "exec"), namespace)
++        session = _Session([])
++        asyncio.run(
++            namespace[node.name](
++                "request-1",
++                "http://127.0.0.1:30000",
++                client_session=session,
++                timeout_s=1.0,
++            )
++        )
++        self.assertEqual(len(session.posts), 1)
++        self.assertTrue(session.posts[0]["url"].endswith("/abort_request"))
++        self.assertEqual(session.close_calls, 0)
++
++    def test_default_generate_session_keeps_upstream_create_close_lifecycle(self):
++        create_calls: list[_Session] = []
++        node = _function("async_request_sglang_generate")
++        assert isinstance(node, ast.AsyncFunctionDef)
++        chunks = [
++            json.dumps(
++                {
++                    "text": "A",
++                    "output_ids": [11],
++                    "meta_info": {"completion_tokens": 1},
++                }
++            ).encode()
++        ]
++
++        def create_session():
++            session = _Session(chunks)
++            create_calls.append(session)
++            return session
++
++        merge = _load_merge_function()
++        namespace = {
++            "List": List,
++            "Optional": Optional,
++            "RequestFuncInput": object,
++            "RequestFuncOutput": _Output,
++            "_ROUTING_KEY_HEADER": "X-SMG-Routing-Key",
++            "_create_bench_client_session": create_session,
++            "_merge_sglang_generated_token_ids": merge,
++            "aiohttp": SimpleNamespace(
++                ClientSession=object,
++                ClientTimeout=lambda **kwargs: kwargs,
++            ),
++            "args": SimpleNamespace(
++                temperature=0.0,
++                disable_ignore_eos=False,
++                top_p=1.0,
++                disable_stream=True,
++                return_logprob=False,
++                return_routed_experts=False,
++                logprob_start_len=-1,
++                top_logprobs_num=0,
++                token_ids_logprob=None,
++            ),
++            "get_request_headers": lambda: {},
++            "json": json,
++            "math": __import__("math"),
++            "remove_prefix": lambda value, prefix: value,
++            "sys": sys,
++            "time": time,
++            "tqdm": object,
++            "traceback": traceback,
++        }
++        exec(
++            compile(ast.Module(body=[node], type_ignores=[]), SERVING_PATH, "exec"),
++            namespace,
++        )
++        request = SimpleNamespace(
++            prompt=[1],
++            api_url="http://127.0.0.1:30000/generate",
++            prompt_len=1,
++            output_len=1,
++            lora_name="",
++            extra_request_body={},
++            image_data=None,
++            routing_key=None,
++        )
++        output = asyncio.run(namespace[node.name](request))
++        self.assertTrue(output.success, output.error)
++        self.assertEqual(len(create_calls), 1)
++        self.assertEqual(create_calls[0].close_calls, 1)
++
 +
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000..ec1a5ed
+index 0000000..4c50e25
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,536 @@
+@@ -0,0 +1,575 @@
 +from __future__ import annotations
 +
 +import hashlib
++import importlib.util
 +import inspect
 +import json
++import sys
 +import tempfile
 +import time
 +import unittest
 +from pathlib import Path
-+from types import SimpleNamespace
++from types import ModuleType, SimpleNamespace
 +
 +import torch
-+from sglang.srt.speculative.online_adaptation_config import (
-+    BACKEND_ADAPTATION_CAPABILITIES,
-+    OnlineAdaptationConfig,
-+    validate_online_adaptation,
++
++PYTHON_ROOT = Path(__file__).resolve().parents[4] / "python"
++SPECULATIVE_ROOT = PYTHON_ROOT / "sglang/srt/speculative"
++
++
++def _stub_package(name: str, path: Path) -> ModuleType:
++    package = ModuleType(name)
++    package.__package__ = name
++    package.__path__ = [str(path)]
++    sys.modules[name] = package
++    return package
++
++
++def _load_module(name: str, path: Path) -> ModuleType:
++    spec = importlib.util.spec_from_file_location(name, path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++# These focused tests exercise the complete config, parameter-plan, and runtime
++# modules without importing sglang.__init__ or unrelated serving dependencies.
++SGLANG_PACKAGE = _stub_package("sglang", PYTHON_ROOT / "sglang")
++SRT_PACKAGE = _stub_package("sglang.srt", PYTHON_ROOT / "sglang/srt")
++SPECULATIVE_PACKAGE = _stub_package("sglang.srt.speculative", SPECULATIVE_ROOT)
++SGLANG_PACKAGE.srt = SRT_PACKAGE
++SRT_PACKAGE.speculative = SPECULATIVE_PACKAGE
++
++CONFIG_MODULE = _load_module(
++    "sglang.srt.speculative.online_adaptation_config",
++    SPECULATIVE_ROOT / "online_adaptation_config.py",
 +)
-+from sglang.srt.speculative.online_adaptation_runtime import (
-+    CandidateBinding,
-+    FixedInferenceBank,
-+    OnlineCohortRuntime,
-+    ReadyCandidate,
-+    UpdateTrace,
++RUNTIME_MODULE = _load_module(
++    "sglang.srt.speculative.online_adaptation_runtime",
++    SPECULATIVE_ROOT / "online_adaptation_runtime.py",
 +)
-+from sglang.srt.speculative.online_parameter_plan import (
-+    build_native_parameter_plan,
++PARAMETER_PLAN_MODULE = _load_module(
++    "sglang.srt.speculative.online_parameter_plan",
++    SPECULATIVE_ROOT / "online_parameter_plan.py",
 +)
++
++BACKEND_ADAPTATION_CAPABILITIES = CONFIG_MODULE.BACKEND_ADAPTATION_CAPABILITIES
++OnlineAdaptationConfig = CONFIG_MODULE.OnlineAdaptationConfig
++validate_online_adaptation = CONFIG_MODULE.validate_online_adaptation
++CandidateBinding = RUNTIME_MODULE.CandidateBinding
++FixedInferenceBank = RUNTIME_MODULE.FixedInferenceBank
++OnlineCohortRuntime = RUNTIME_MODULE.OnlineCohortRuntime
++ReadyCandidate = RUNTIME_MODULE.ReadyCandidate
++UpdateTrace = RUNTIME_MODULE.UpdateTrace
++build_native_parameter_plan = PARAMETER_PLAN_MODULE.build_native_parameter_plan
 +
 +
 +def _optimizer() -> dict:
@@ -6601,6 +9323,572 @@ index 0000000..ec1a5ed
 +        self.assertIsNone(runtime.pending)
 +        self.assertEqual(runtime.active_version, 7)
 +        self.assertEqual(optimizer.step, 11)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/spec/test_terminal_speculative_evidence.py b/test/registered/unit/spec/test_terminal_speculative_evidence.py
+new file mode 100644
+index 0000000..59aad36
+--- /dev/null
++++ b/test/registered/unit/spec/test_terminal_speculative_evidence.py
+@@ -0,0 +1,560 @@
++from __future__ import annotations
++
++import hashlib
++import hmac
++import importlib.util
++import sys
++import unittest
++from pathlib import Path
++
++MODULE_PATH = (
++    Path(__file__).resolve().parents[4]
++    / "python/sglang/srt/speculative/terminal_speculative_evidence.py"
++)
++SPEC = importlib.util.spec_from_file_location(
++    "terminal_speculative_evidence", MODULE_PATH
++)
++assert SPEC is not None and SPEC.loader is not None
++MODULE = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++NATIVE_TERMINAL_EVIDENCE_HOOK = MODULE.NATIVE_TERMINAL_EVIDENCE_HOOK
++TerminalSpeculativeEvidenceLifecycle = MODULE.TerminalSpeculativeEvidenceLifecycle
++content_sha256 = MODULE.content_sha256
++verify_terminal_attestation = MODULE.verify_terminal_attestation
++
++
++def _state(
++    generation: int,
++    *,
++    clean: bool = True,
++    adapter_version: int = 0,
++    optimizer_generation: int = 0,
++) -> dict:
++    capacity = 4096
++    available = capacity if clean else 4000
++    return {
++        "schema_version": 1,
++        "scheduler_idle": True,
++        "active_requests": 0,
++        "queued_requests": 0,
++        "request_pool_active_slots": 0,
++        "allocator_current_hbm_bytes": 1024,
++        "allocator_reserved_hbm_bytes": 2048,
++        "allocator_peak_hbm_bytes": 3072,
++        "kv_token_capacity": capacity,
++        "kv_available_tokens": available,
++        "kv_state_sha256": content_sha256([capacity, available]),
++        "rng_state_sha256": content_sha256(["rng", generation]),
++        "adapter_state_sha256": content_sha256(["adapter", generation]),
++        "adapter_reset_verified": clean,
++        "adapter_active_version": adapter_version,
++        "adapter_epoch": generation,
++        "optimizer_generation": optimizer_generation,
++        "telemetry_generation": generation,
++        "completion_event_generation": generation,
++        "completion_event_complete": True,
++    }
++
++
++def _begin_payload(
++    *,
++    method: str,
++    epoch: int = 1,
++    previous: str | None = None,
++    run_id: str = "run-1",
++) -> dict:
++    return {
++        "schema_version": 1,
++        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++        "run_id": run_id,
++        "run_nonce_sha256": "1" * 64,
++        "execution_plan_sha256": "2" * 64,
++        "rank_config_sha256": "3" * 64,
++        "attempt_id": f"attempt-{epoch}",
++        "session_id": "session-1",
++        "session_epoch": epoch,
++        "previous_run_id": previous,
++        "challenge_nonce_sha256": "4" * 64,
++        "method": method,
++        "warmup_request_ids": [f"warmup-{epoch}"],
++        "scored_request_ids": [f"score-{epoch}-a", f"score-{epoch}-b"],
++    }
++
++
++def _record(lifecycle, request_id: str, output: tuple[int, ...] = (7, 8)):
++    lifecycle.note_request_terminal(
++        request_id=request_id,
++        input_token_ids=(1, 2, 3),
++        output_token_ids=output,
++        terminal_status="completed",
++        terminal_reason="FINISH_LENGTH",
++    )
++
++
++def _performance(method: str, *, updates: int = 0) -> dict:
++    adapted = method in {"tts", "l0"}
++    target_only = method == "target_only"
++    return {
++        "target_calls": 2 if adapted else 3,
++        "accepted_drafts": None if target_only else (2 if adapted else 1),
++        "committed_tokens": None if target_only else (4 if adapted else 2),
++        "verified_drafts": None if target_only else 4,
++        "survival_weighted_accepted_prefix": None,
++        "accepted_drafts_per_verify": None
++        if target_only
++        else (1.0 if adapted else 0.5),
++        "committed_tokens_per_verify": None
++        if target_only
++        else (2.0 if adapted else 1.0),
++        "verified_drafts_per_verify": None if target_only else 2.0,
++        "verification_waste": None if target_only else (2 if adapted else 3),
++        "target_calls_per_output_token": 0.5 if adapted else 0.75,
++        "batch_fill": 1.0,
++        "queue_occupancy": 0.0,
++        "gpu_busy": None,
++        "sm_utilization": None,
++        "dram_utilization": None,
++        "target_estimated_mfu": None,
++        "peak_hbm_bytes": 3072,
++        "kv_bytes": 4096,
++        "kv_token_capacity": 4096,
++        "optimizer_bytes": 128 if adapted else 0,
++        "adaptation_memory_ledger": {"optimizer": 128} if adapted else None,
++        "trainable_parameters": 16 if adapted else 0,
++        "training_cuda_ms": 1.0 if adapted else None,
++        "optimizer_cuda_ms": 1.0 if adapted else None,
++        "merge_cuda_ms": 1.0 if adapted else None,
++        "publish_cuda_ms": 1.0 if adapted else None,
++        "barrier_cuda_ms": 0.0 if adapted else None,
++        "exposed_update_ms": 1.0 if adapted else None,
++        "main_side_overlap_ratio": 0.5 if adapted else None,
++        "graph_replay_hit_rate": 1.0,
++        "updates_launched": updates if adapted else 0,
++        "updates_published": updates if adapted else 0,
++        "exactness_violations": None if target_only else 0,
++        "version_mismatches": None if target_only else 0,
++        "fallbacks": None if target_only else 0,
++        "nonfinite_updates": None if target_only else 0,
++        "oom_events": 0,
++        "retractions": 0,
++        "communicator_failures": 0,
++        "collective_type": "none_tp1",
++        "collective_bytes": 0,
++        "collective_duration_ms": 0.0,
++        "collective_exposed_wait_ms": 0.0,
++        "collective_overlap_ratio": None,
++    }
++
++
++def _client_terminal(payload: dict, request_id: str, status: str) -> dict:
++    row = {
++        "schema_version": 1,
++        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
++        "run_id": payload["run_id"],
++        "run_nonce_sha256": payload["run_nonce_sha256"],
++        "execution_plan_sha256": payload["execution_plan_sha256"],
++        "rank_config_sha256": payload["rank_config_sha256"],
++        "request_id": request_id,
++        "terminal_status": status,
++        "terminal_reason": f"pre_submit_{status}",
++    }
++    row["client_terminal_sha256"] = content_sha256(row)
++    return row
++
++
++def _start_scored(lifecycle, payload: dict) -> tuple[dict, dict]:
++    begin = lifecycle.begin(
++        payload,
++        prior_state=_state(1, clean=False),
++        reset_state=_state(2),
++    )
++    _record(lifecycle, payload["warmup_request_ids"][0], (5,))
++    reset = lifecycle.reset(
++        begin_sha256=begin["begin_sha256"],
++        discarded_native_sha256=content_sha256({"warmup": "excluded"}),
++        warmup_performance_counters=_performance(payload["method"]),
++        warmup_state=_state(3, clean=False),
++        reset_state=_state(4),
++    )
++    return begin, reset
++
++
++class TerminalLifecycleTests(unittest.TestCase):
++    def test_target_only_uses_structural_null_speculative_safety_counters(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="target_only",
++        )
++        payload = _begin_payload(method="target_only")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=[],
++            update_rows=[],
++            performance_counters=_performance("target_only"),
++            historical_kv_source_versions={},
++            client_terminal_rows=[],
++            final_state=_state(5, clean=False),
++        )
++        performance = terminal["performance_counters"]
++        self.assertIsNone(performance["accepted_drafts"])
++        self.assertIsNone(performance["exactness_violations"])
++
++    def test_static_has_exact_requests_and_zero_detailed_trace(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=[],
++            update_rows=[],
++            performance_counters=_performance("static"),
++            historical_kv_source_versions={},
++            client_terminal_rows=[],
++            final_state=_state(5, clean=False),
++        )
++        self.assertEqual(terminal["hook"], NATIVE_TERMINAL_EVIDENCE_HOOK)
++        self.assertEqual(terminal["request_round_rows"]["rounds"], [])
++        self.assertEqual(terminal["update_rows"], [])
++        self.assertEqual(
++            [row["request_id"] for row in terminal["request_round_rows"]["requests"]],
++            payload["scored_request_ids"],
++        )
++        unsigned = dict(terminal)
++        unsigned.pop("terminal_sha256")
++        unsigned.pop("attestation")
++        self.assertEqual(terminal["terminal_sha256"], content_sha256(unsigned))
++        self.assertEqual(terminal["attestation"]["status"], "UNAVAILABLE")
++        self.assertNotIn("warmup-1", str(terminal["request_round_rows"]))
++        self.assertEqual(terminal["execution_plan_sha256"], "2" * 64)
++        self.assertEqual(terminal["rank_config_sha256"], "3" * 64)
++        self.assertEqual(terminal["completion_marker"], "TERMINAL_COMPLETE")
++
++    def test_tts_binds_round_update_kv_and_reset_receipt(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="tts",
++        )
++        payload = _begin_payload(method="tts")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        round_rows = []
++        for request_id in payload["scored_request_ids"]:
++            row = {
++                "request_id": request_id,
++                "round_index": 1,
++                "proposal_source_version": 0,
++                "prefix_len_before": 3,
++                "verify_len": 2,
++                "accepted_drafts": 1,
++                "committed_tokens": 2,
++                "target_calls": 1,
++                "historical_kv_source_versions": [
++                    {"start": 0, "end": 4, "source_version": 0}
++                ],
++            }
++            row["round_sha256"] = content_sha256(row)
++            round_rows.append(row)
++        update = {
++            "update_index": 0,
++            "cohort_sha256": "5" * 64,
++            "cohort_epoch": 1,
++            "parameter_layout_sha256": "6" * 64,
++            "source_round": 1,
++            "source_version": 0,
++            "request_ids": list(payload["scored_request_ids"]),
++            "prefix_len_before": [3, 3],
++            "optimizer_step": 1,
++            "published_version": 1,
++            "status": "published",
++            "loss": 0.25,
++            "gradient_norm": 0.5,
++            "reconstruction_ok": True,
++            "reconstruction_max_abs": 0.0,
++            "reconstruction_relative_rms": 0.0,
++            "reconstruction_top1_match": 1.0,
++            "supervision_nonempty": True,
++            "reconstruction_mean_kl": 0.0,
++            "online_hint_error": None,
++            "online_ensemble_entropy": None,
++            "online_effective_experts": None,
++            "online_expert_probabilities": None,
++            "online_cumulative_losses": None,
++            "online_expert_gradient_norms": None,
++        }
++        update["update_sha256"] = content_sha256(update)
++        update_rows = [update]
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=round_rows,
++            update_rows=update_rows,
++            performance_counters=_performance("tts", updates=1),
++            historical_kv_source_versions={
++                request_id: [{"start": 0, "end": 4, "source_version": 0}]
++                for request_id in payload["scored_request_ids"]
++            },
++            client_terminal_rows=[],
++            final_state=_state(
++                5, clean=False, adapter_version=1, optimizer_generation=1
++            ),
++        )
++        self.assertEqual(terminal["reset_receipt_sha256"], reset["reset_sha256"])
++        self.assertEqual(terminal["request_round_rows"]["rounds"], round_rows)
++        self.assertEqual(terminal["update_rows"], update_rows)
++
++    def test_corrupt_adapted_row_digest_fails_closed(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="tts",
++        )
++        payload = _begin_payload(method="tts")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        row = {
++            "request_id": payload["scored_request_ids"][0],
++            "round_index": 1,
++            "proposal_source_version": 0,
++            "prefix_len_before": 3,
++            "verify_len": 2,
++            "accepted_drafts": 1,
++            "committed_tokens": 2,
++            "target_calls": 1,
++            "historical_kv_source_versions": [],
++            "round_sha256": "f" * 64,
++        }
++        with self.assertRaisesRegex(ValueError, "round content digest mismatch"):
++            lifecycle.finalize(
++                reset_sha256=reset["reset_sha256"],
++                round_rows=[row],
++                update_rows=[{}],
++                performance_counters=_performance("tts", updates=1),
++                historical_kv_source_versions={
++                    request_id: [] for request_id in payload["scored_request_ids"]
++                },
++                client_terminal_rows=[],
++                final_state=_state(5, clean=False),
++            )
++        self.assertEqual(lifecycle.phase, "FAILED")
++
++    def test_finalize_reconciles_only_non_submitted_terminal_requests(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        _, reset = _start_scored(lifecycle, payload)
++        _record(lifecycle, payload["scored_request_ids"][0])
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=[],
++            update_rows=[],
++            performance_counters=_performance("static"),
++            historical_kv_source_versions={},
++            client_terminal_rows=[
++                _client_terminal(payload, payload["scored_request_ids"][1], "timed_out")
++            ],
++            final_state=_state(5, clean=False),
++        )
++        rows = terminal["request_round_rows"]["requests"]
++        self.assertEqual(
++            [row["terminal_source"] for row in rows],
++            ["server", "client_reconciliation"],
++        )
++        self.assertEqual(rows[1]["terminal_status"], "timed_out")
++        self.assertEqual(rows[1]["output_tokens"], 0)
++        self.assertNotIn("ordered_output_token_ids", rows[1])
++
++    def test_client_reconciliation_cannot_override_server_or_duplicate(self):
++        for duplicate_kind in ("server", "client"):
++            with self.subTest(duplicate_kind=duplicate_kind):
++                lifecycle = TerminalSpeculativeEvidenceLifecycle(
++                    server_process_id=123,
++                    server_process_started_ns=456,
++                    method="static",
++                )
++                payload = _begin_payload(method="static")
++                _, reset = _start_scored(lifecycle, payload)
++                _record(lifecycle, payload["scored_request_ids"][0])
++                client = _client_terminal(
++                    payload, payload["scored_request_ids"][0], "cancelled"
++                )
++                if duplicate_kind == "client":
++                    client = _client_terminal(
++                        payload, payload["scored_request_ids"][1], "rejected"
++                    )
++                    client_rows = [client, dict(client)]
++                    error = "duplicated"
++                else:
++                    client_rows = [client]
++                    error = "cannot override"
++                with self.assertRaisesRegex(RuntimeError, error):
++                    lifecycle.finalize(
++                        reset_sha256=reset["reset_sha256"],
++                        round_rows=[],
++                        update_rows=[],
++                        performance_counters=_performance("static"),
++                        historical_kv_source_versions={},
++                        client_terminal_rows=client_rows,
++                        final_state=_state(5, clean=False),
++                    )
++                self.assertEqual(lifecycle.phase, "FAILED")
++
++    def test_client_reconciliation_rejects_any_output_token_field(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        _, reset = _start_scored(lifecycle, payload)
++        _record(lifecycle, payload["scored_request_ids"][0])
++        client = _client_terminal(payload, payload["scored_request_ids"][1], "rejected")
++        client["ordered_output_token_ids"] = []
++        with self.assertRaisesRegex(ValueError, "fields are incomplete"):
++            lifecycle.finalize(
++                reset_sha256=reset["reset_sha256"],
++                round_rows=[],
++                update_rows=[],
++                performance_counters=_performance("static"),
++                historical_kv_source_versions={},
++                client_terminal_rows=[client],
++                final_state=_state(5, clean=False),
++            )
++        self.assertEqual(lifecycle.phase, "FAILED")
++
++    def test_static_missing_native_safety_counter_cannot_finalize(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        counters = _performance("static")
++        counters["fallbacks"] = None
++        with self.assertRaisesRegex(ValueError, "fallbacks must be an integer"):
++            lifecycle.finalize(
++                reset_sha256=reset["reset_sha256"],
++                round_rows=[],
++                update_rows=[],
++                performance_counters=counters,
++                historical_kv_source_versions={},
++                client_terminal_rows=[],
++                final_state=_state(5, clean=False),
++            )
++        self.assertEqual(lifecycle.phase, "FAILED")
++
++    def test_missing_request_and_stale_epoch_fail_closed(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        begin = lifecycle.begin(
++            payload, prior_state=_state(1, clean=False), reset_state=_state(2)
++        )
++        with self.assertRaisesRegex(RuntimeError, "coverage mismatch"):
++            lifecycle.reset(
++                begin_sha256=begin["begin_sha256"],
++                discarded_native_sha256=content_sha256({}),
++                warmup_performance_counters=_performance("static"),
++                warmup_state=_state(3, clean=False),
++                reset_state=_state(4),
++            )
++        self.assertEqual(lifecycle.phase, "FAILED")
++
++    def test_duplicate_terminal_request_fails_the_process_lifecycle(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++        )
++        payload = _begin_payload(method="static")
++        lifecycle.begin(
++            payload, prior_state=_state(1, clean=False), reset_state=_state(2)
++        )
++        request_id = payload["warmup_request_ids"][0]
++        _record(lifecycle, request_id)
++        with self.assertRaisesRegex(RuntimeError, "recorded twice"):
++            _record(lifecycle, request_id)
++        self.assertEqual(lifecycle.phase, "FAILED")
++
++
++class _TestSigner:
++    attester_id = "test-fixture-key-v1"
++    trust_domain = "test"
++    key = b"not-a-release-private-key"
++
++    def sign(self, message: bytes) -> bytes:
++        return hmac.new(self.key, message, hashlib.sha256).digest()
++
++
++class TerminalAttestationTests(unittest.TestCase):
++    def test_release_verifier_categorically_rejects_test_key(self):
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="static",
++            signer=_TestSigner(),
++        )
++        payload = _begin_payload(method="static")
++        _, reset = _start_scored(lifecycle, payload)
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=[],
++            update_rows=[],
++            performance_counters=_performance("static"),
++            historical_kv_source_versions={},
++            client_terminal_rows=[],
++            final_state=_state(5, clean=False),
++        )
++        with self.assertRaisesRegex(ValueError, "rejects non-hardware test"):
++            verify_terminal_attestation(
++                terminal,
++                trusted_hardware_verifiers={
++                    _TestSigner.attester_id: lambda message, signature: (
++                        hmac.compare_digest(
++                            signature,
++                            hmac.new(_TestSigner.key, message, hashlib.sha256).digest(),
++                        )
++                    )
++                },
++            )
++        cpu_fixture = dict(terminal)
++        cpu_fixture["attestation"] = {
++            **terminal["attestation"],
++            "attester_id": "cpu-fixture-v1",
++            "trust_domain": "hardware",
++        }
++        with self.assertRaisesRegex(ValueError, "rejects non-hardware test"):
++            verify_terminal_attestation(
++                cpu_fixture,
++                trusted_hardware_verifiers={
++                    "cpu-fixture-v1": lambda message, signature: True
++                },
++            )
 +
 +
 +if __name__ == "__main__":

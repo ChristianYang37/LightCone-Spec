@@ -27,9 +27,10 @@ LightCone-Spec 实现的是能够在同一 speculative-decoding 反馈与 exactn
 
 GPU 状态为 `UNMEASURED`。本文描述隔离的 source-level/CPU protocol 与目标实现，不提供
 性能结果，也不表示当前 industrial executor support。与其他 speculative method 一样，
-OnlineSPEC industrial run 将需要尚未实现的
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` provider；目前只有
-Target-only 可在该 executor 中端到端执行。
+OnlineSPEC industrial run 需要自行注册并接入已经实现的
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，还需要 allowlist
+内的 trusted hardware signer。二者都不是 release capability；目前只有 Target-only 可在该
+executor 中端到端执行。
 
 ## 源码审计
 
@@ -268,8 +269,9 @@ analyze-onlinespec-study
 
 准确参数以 `lightcone-spec COMMAND --help` 为准。生成的 selection、性能数据与
 attestation 必须保存在 ignored artifact root。这些隔离 command 会运行已注册 source
-protocol，但不会绕过 industrial executor 的 native-terminal-evidence blocker，也不能建立
-schema-v3 GPU 结果。`analyze-onlinespec-study` 会显式输出
+protocol，但不会绕过 industrial executor 的 release execution 与 trusted-attestation gate，
+也不能建立 schema-v3 GPU 结果。
+`analyze-onlinespec-study` 会显式输出
 `core_speed_gate_affected=false`、逐 learner 诊断判定、`selection_protocol` 与
 `optimized_grid_claim`。
 
@@ -278,8 +280,8 @@ schema-v3 GPU 结果。`analyze-onlinespec-study` 会显式输出
 LightCone-Spec 声明的是 OnlineSPEC 在线 drafter learner 论文公式的 clean-room 源码实现与
 CPU/runtime 目标 contract。它不声明当前端到端 industrial execution、GPU 结果、与官方脚本
 逐字节一致或重新分发其代码，也不把 Online-LR 的 reasoning DPO 流程当作 token-level
-draft-model adaptation。未来 executable extension 必须提供准确 native terminal provider，
-并另行定义 objective、数据、显存合同与已注册比较协议。
+draft-model adaptation。未来 executable extension 必须准确接入 native terminal lifecycle，
+配置 trusted signer，并另行定义 objective、数据、显存合同与已注册比较协议。
 
 若要重复源码审计，应把官方仓库克隆到本项目之外，并 detached 到已记录 commit：
 

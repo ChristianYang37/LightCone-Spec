@@ -1,5 +1,13 @@
 """Runtime exactness and CUDA publication helpers."""
 
+from .attestation import (
+    NO_TRUSTED_ATTESTERS,
+    AttestationChallenge,
+    SignedAttestation,
+    TrustedAttesterPolicy,
+    attestation_message,
+    verify_attestation_signature,
+)
 from .backend import (
     BackendContract,
     BackendPayload,
@@ -13,6 +21,14 @@ from .backend import (
     Reconstruction,
     dspark_composite_loss,
     dspark_conditional_survival_target,
+)
+from .compile_cache import (
+    CompileCacheCorruptionError,
+    CompileCacheFile,
+    CompileCacheKey,
+    CompileCacheOverlay,
+    CompileCacheReceipt,
+    ImmutableCompileCache,
 )
 from .dflash_canvas import (
     CanvasReconstruction,
@@ -43,12 +59,19 @@ from .exactness import rejection_sample
 from .publication import CudaPublicationCoordinator
 
 __all__ = [
+    "NO_TRUSTED_ATTESTERS",
     "AllRankPublicationCoordinator",
+    "AttestationChallenge",
     "BackendContract",
     "BackendPayload",
     "BackendRegistry",
     "CanvasReconstruction",
     "CohortRouteIdentity",
+    "CompileCacheCorruptionError",
+    "CompileCacheFile",
+    "CompileCacheKey",
+    "CompileCacheOverlay",
+    "CompileCacheReceipt",
     "CudaPublicationCoordinator",
     "DFlashBackendContract",
     "DSparkBackendContract",
@@ -56,6 +79,7 @@ __all__ = [
     "EagleBackendContract",
     "FunctionalBackendContract",
     "GlooPublicationTransport",
+    "ImmutableCompileCache",
     "InferenceParameterOwnership",
     "NextNBackendContract",
     "ParameterOwnership",
@@ -70,12 +94,16 @@ __all__ = [
     "RankTopologyReceipt",
     "Reconstruction",
     "ReplicaLocalRouter",
+    "SignedAttestation",
     "TopologyIdentity",
     "TopologyReceiptSet",
+    "TrustedAttesterPolicy",
     "UpdateIdentity",
+    "attestation_message",
     "dspark_composite_loss",
     "dspark_conditional_survival_target",
     "position_weighted_kl",
     "rejection_sample",
     "validate_decision_receipts",
+    "verify_attestation_signature",
 ]

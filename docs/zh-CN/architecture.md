@@ -9,21 +9,24 @@ LightCone-Spec 分离 Python 协议、面向一次性 SGLang checkout 的 semant
 完整 patch series 与 expected final Git tree。工作区 checkout 永远不是隐式依赖。
 
 CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。当前端到端
-industrial executor 只支持 TP1/DP1 Target-only。除非固定 tree 提供
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，否则它会在 server launch
-前阻止全部 speculative plan；本 release 没有实现该 provider。实证 Stage B 还因缺少
-provider credential 与已注册硬件而 `BLOCKED`。历史 v2 evidence 仅可用于
-regression/debugging，不能支撑新结论。
+industrial executor 只支持 TP1/DP1 Target-only。固定 patch 现已实现准确的
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+begin/reset/finalize hook，host 会验证其内容，而不信任 provider attribute。但本 release
+没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0 仍在任何 mutation 前
+fail closed。实证 Stage B 还会因 immutable model/data/trace 输入、provider access、已注册
+硬件与 interference evidence，以及 trusted signer 尚不可用而 `BLOCKED`。历史 v2
+evidence 仅可用于 regression/debugging，不能支撑新结论。
 
 ## 统一 Decode 与 Candidate 生命周期
 
 Target-only 关闭 speculation，是 industrial executor 当前唯一可完成的 path。Static 是
-零 adaptation 分配的原生 speculative 目标 path，但在 terminal evidence hook 可用前会被
-executor preflight 阻止。两者的 schema contract 都不导入 adaptation state，也不分配
+零 adaptation 分配的原生 speculative 目标 path，但 release preflight 会在 trusted
+terminal attestation 可用前阻止它。两者的 schema contract 都不导入 adaptation state，也不分配
 optimizer、gradient、candidate 或 adaptation trace。
 
 目标 TTS/L0 contract 共用一个 candidate 生命周期；固定 patch 只为 TP1/DP1 DFlash 实现
-底层路径，但缺少 terminal evidence provider 时不构成端到端 executor 支持：
+底层路径与 native terminal lifecycle；没有 trusted signer 时仍不构成 release-executable
+support：
 
 1. Verification 为实际被采样的 proposal 生成一个 `ProposalEvidence` envelope；
 2. Cohort 只保留每个请求最新的合法 supervision row，并把 batch 绑定到 cohort、epoch、
@@ -143,28 +146,68 @@ timed out、cancelled 或 unfinished。
 Evidence schema 可以表示每个 process/rank 的 run、request、round、update 与 performance
 record，并通过有界 queue 写入。
 Durable index 拒绝重复 primary identity。周期或容量触发的 flush 会创建 fsynced Parquet WAL
-segment 与 checkpoint；backpressure 与任何显式 drop 都有计数。端到端 executor 当前只
-封存 Target-only evidence。Static 必须保持 round/update 详细 trace 零分配；在准确 native
-terminal hook 绑定 request/performance row 与汇总 speculative safety counter 前仍保持
-blocked。
+segment 与 checkpoint；backpressure 与任何显式 drop 都有计数。Native terminal lifecycle
+把 capability、begin、reset 与 finalize receipt 绑定到同一个 process/session/run/nonce/plan/
+rank identity 及准确 ordered token ID。Static 保持 round/update 详细 trace 零分配，只生成
+所需汇总 speculative safety/accounting；TTS/L0 还绑定 request、round、update、KV version、
+publication、performance 与 safety row。signer 不可用时，release verifier 仍在 mutation 前
+阻止这三种方法。
 
-成功 close 时，WAL segment 先通过 coverage 检查，再组装为 process-unique Parquet shard；
-随后才发布 exclusive terminal receipt，绑定 schema、row-group coverage、counter、file size、
-schema digest 与 SHA-256。中断或 aborted WAL 保持可审计，但不能进入分析。Completed
-receipt 不可覆盖，也不能与竞争 attempt 合并。
+仓库为未来相邻且兼容的 trace 定义了 immutable session key 及 reset/finalize receipt 数据
+契约；完整 key 包含 source/capability、RunConfig、model/drafter revision、method/backend、
+topology 与 physical GPU UUID、memory/graph/telemetry 配置、compile-cache identity 和 port。
+但当前 release **不会执行或声明** shared server session：尚无 release-owned trusted boundary
+实现、session receipt 的 durable terminal binding，以及从 launch 到 terminate 的连续
+whole-inventory 计费。因此所有 shared-session mutation 入口都会在 launch、network、reset
+及 evidence-root 创建之前以
+`shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable` 失败。
+当前唯一可声明的 Target-only 路径仍是 single-trace execution。
+
+成功 close 时，WAL segment 先通过 coverage 检查，再组装为 process-unique Parquet shard
+与 durable prepared receipt。executor 随后完成 native terminal lifecycle，并发布与 prepared
+receipt 精确字节绑定的强制 budget observation；两者都存在后，才发布一个不同的
+exclusive terminal envelope。该 envelope 保留 prepared receipt 的 schema、row-group
+coverage、counter、file size、schema digest 与 SHA-256，并额外绑定 prepared receipt 的
+raw digest/size，以及 budget observation 的 semantic digest、raw receipt/sidecar digest、
+size 与安全路径。如果在 observation 与 terminal 发布之间崩溃，可从已验证的 prepared
+receipt 构造最终 envelope 而不重跑；只有 prepared receipt 而没有 observation 时不得形成
+claim。中断或 aborted WAL 保持可审计，但不能进入分析。Completed receipt 不可覆盖，也
+不能与竞争 attempt 合并。
 
 ## Industrial Registry 边界
 
 不可变 registry 声明顺序
 `preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0`。
-每个 cell 绑定 axis、seed、status/reason、GPU UUID、port、cache/evidence root 与 workload
-隔离。Stage receipt 在下游 unblinding 前绑定准确 dependency output、runtime、split 与
-selection state。
+每个 cell 绑定 axis、seed、status/reason、两个 logical rank slot、port、cache/evidence root
+与 workload 隔离。Physical UUID 永远不是 registry identity：content-bound inventory 与
+确定性 frozen assignment 会在 launch 前绑定 UUID、rank layout、topology、port、完整的
+per-cell `ExperimentBudget` 以及 whole-instance billing。
 
-纯 two-GPU planner 会串行任何双 GPU 或 exclusive workload。只有单独的 interference
-receipt 说明并行合格后，它才会配对互不相交的单 GPU cell。Registry 与 planner 不分配
-device state，也不产生结果结论。它们的目标 declaration 不会绕过 executor preflight；
-本 release 中全部 speculative 与 TP2/DP2 cell 都保持 `BLOCKED`。
+单一 same-host `GpuPoolScheduler` 是唯一 scheduler。它接受任意 inventory，并对 1、2、4、
+8、16 GPU 有明确 regression coverage；gang placement 是 atomic 且 topology-aware，所有
+headline wave 都在执行前冻结。并发上限由准确 `InterferenceEnvelope` 决定，而不是由空闲
+device 数量决定。Resource、port、cache writer 与 evidence root 不能重叠，receipt-only
+resume 也绝不从目录存在推断完成。
+
+Reducer-owned activation artifact 只 materialize E1 的一个 130-cell slice 与 E2 每个
+successive-halving round，并为每个未激活 template 记录 immutable disposition。Confirmation
+planning 以 family 为局部单位：恰好四个 excluded pilot 会在 confirmation 可见前选择
+`POWERED` 的 12--20-block final prefix，或选择 `UNDERPOWERED`。合法 Target-only 复用必须
+使用 byte-equivalent、content-bound evidence alias；analysis 会保留其 dependence unit，
+不会把 alias 当作独立样本。Self-described non-singleton alias 会保持 blocked，直至
+execution evidence 重新计算其 equivalence。
+
+每个 launch cell 都绑定准确 budget，覆盖 startup、compile、excluded warm-up、scored
+arrival、deadline、drain、reset、evidence close、special-job duration、retry、token、p99
+status 与 GPU accounting。强制 observation receipt 会记录所有 observed component、measured
+GPU time 与 whole-instance billed GPU time；缺失 component 不能视为零。Immutable
+compile-cache base 使用每个 process 的 private overlay，official serving client 复用一个
+caller-owned HTTP pool，evidence writer 批量写 durable WAL row group，同时保留 terminal
+fsync 与 coverage check。
+
+Registry 与 pool planning 都不分配 device state，也不产生实证结论。其 target declaration
+不会绕过 release preflight：Static/TTS/L0 因 trusted signer 保持 `BLOCKED`；全部 TP2/DP2
+和不受支持的 adaptive backend 仍受各自 implementation gate 阻止。
 
 本 release 不声明 speculative industrial execution、multi-rank execution、multi-node
 execution、Kubernetes scheduling、elastic membership、remote evidence storage 或

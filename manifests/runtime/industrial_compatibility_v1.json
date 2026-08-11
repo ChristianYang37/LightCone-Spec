@@ -62,15 +62,15 @@
       },
       {
         "mode": "static_speculative",
-        "reason_code": "release_native_terminal_evidence_unavailable"
+        "reason_code": "release_trusted_terminal_attester_unavailable"
       },
       {
         "mode": "tts",
-        "reason_code": "release_native_terminal_evidence_unavailable"
+        "reason_code": "release_trusted_terminal_attester_unavailable"
       },
       {
         "mode": "l0",
-        "reason_code": "release_native_terminal_evidence_unavailable"
+        "reason_code": "release_trusted_terminal_attester_unavailable"
       },
       {
         "mode": "adaptive_dspark",
@@ -124,11 +124,11 @@
   "schema_version": 1,
   "sglang": {
     "expected_patch_count": 1,
-    "expected_tree": "ac3393f7c1b12e801d2c5551a07257b082c66977",
+    "expected_tree": "2810ac94ed225aa78b4256ded56e78890a4a590f",
     "patches": [
       {
         "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
-        "sha256": "bdb65a88518df71d33a52118acb5a858892648942b287e74345056ae9c8a6573"
+        "sha256": "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08"
       }
     ],
     "repository": "https://github.com/sgl-project/sglang.git",

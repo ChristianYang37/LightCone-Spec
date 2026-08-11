@@ -43,7 +43,12 @@ class RunRecord:
     expected_update_rows: int | None = None
     expected_performance_rows: int | None = None
     workload_contract: str | None = None
+    experiment_budget_sha256: str | None = None
     preflight_attestation_sha256: str | None = None
+    session_plan_sha256: str | None = None
+    session_open_receipt_sha256: str | None = None
+    reset_receipt_sha256: str | None = None
+    session_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -56,8 +61,11 @@ class RequestRecord:
     concurrency: int
     input_tokens: int
     output_tokens: int
-    output_hash_format: str
-    output_sha256: str
+    # An interrupted, nonclaimable attempt may have observed neither ordered
+    # IDs nor a trustworthy output digest.  Those fields stay null in its WAL;
+    # every completed schema-v3 contract requires the canonical values.
+    output_hash_format: str | None
+    output_sha256: str | None
     ttft_ms: float | None
     finished: bool
     stop_reason: str | None
@@ -268,3 +276,18 @@ class PerformanceRecord:
     communicator_failures: int | None = None
     evidence_backpressure_events: int | None = None
     evidence_dropped_rows: int | None = None
+    http_connections_created: int | None = None
+    http_reused_requests: int | None = None
+    compile_cache_hits: int | None = None
+    compile_cache_misses: int | None = None
+    jit_duration_ms: float | None = None
+    graph_capture_ms: float | None = None
+    graph_replay_count: int | None = None
+    writer_flush_count: int | None = None
+    writer_fsync_ms: float | None = None
+    reset_duration_ms: float | None = None
+    cold_start_ms: float | None = None
+    reused_session_startup_savings_ms: float | None = None
+    estimated_gpu_seconds: float | None = None
+    measured_gpu_seconds: float | None = None
+    gpu_seconds_delta: float | None = None

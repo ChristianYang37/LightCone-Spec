@@ -615,9 +615,7 @@ def test_target_reference_requires_target_only_server_and_full_coverage() -> Non
     )
     assert artifact.patched_sglang_tree == PINNED_SGLANG_TREE
     assert artifact.status == "UNMEASURED"
-    assert artifact.window_sha256 == LongContinuationAdapter().window_sha256(
-        "confirm"
-    )
+    assert artifact.window_sha256 == LongContinuationAdapter().window_sha256("confirm")
     assert len(artifact.outputs) == 32
     assert all(
         row.input_tokens + row.output_tokens == DFLASH_SAFE_CONTEXT_LIMIT
@@ -625,7 +623,9 @@ def test_target_reference_requires_target_only_server_and_full_coverage() -> Non
     )
     assert client.reset_count == 2
 
-    speculative = TargetReferenceClient(server_updates={"speculative_algorithm": "DFLASH"})
+    speculative = TargetReferenceClient(
+        server_updates={"speculative_algorithm": "DFLASH"}
+    )
     with pytest.raises(RuntimeError, match="unexpectedly enables speculation"):
         run_greedy_target_reference(
             client=speculative,
@@ -655,7 +655,7 @@ def test_paired_methods_cannot_substitute_for_target_exactness() -> None:
     paired = {
         "static": speculative,
         "tts": dict(speculative),
-        "naive_async": dict(speculative),
+        "l0": dict(speculative),
     }
     with pytest.raises(RuntimeError, match="target-only reference"):
         _assert_paired_target_outputs(

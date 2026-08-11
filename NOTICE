@@ -9,6 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
+  Semantic patch SHA-256: c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08
+  Expected final tree: 2810ac94ed225aa78b4256ded56e78890a4a590f
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -17,10 +19,13 @@ versioned frozen-KV lifecycle, event-fenced fixed-address publication,
 memory accounting, and lower-level adaptation/evidence fields for the
 Static/TTS/L0 target study and isolated OnlineSPEC comparison. It also carries
 the server-provided ordered output token IDs through SGLang's official serving
-benchmark adapter without retokenizing generated text. The patch does not
-provide the industrial executor's content-bound terminal speculative-evidence
-hook, so only
-Target-only is currently end-to-end executable there. DSpark, EAGLE/EAGLE3,
+benchmark adapter without retokenizing generated text, supports a caller-owned
+HTTP session, and implements the content-bound begin/reset/finalize terminal
+evidence hook for the limited TP1/DP1 DFlash surface. Its focused protocol test
+loads only the patched modules and does not import unrelated SGLang optional
+dependencies. The hook has no bundled
+trusted hardware signer. The release verifier therefore keeps Static/TTS/L0
+non-claimable and only Target-only release-supported. DSpark, EAGLE/EAGLE3,
 NEXTN, and all TP2/DP2 execution fail before model loading.
 See patches/sglang/manifest.json for the exact patch and tree identities.
 

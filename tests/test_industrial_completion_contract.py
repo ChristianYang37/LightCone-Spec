@@ -3,21 +3,43 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 
 from lightcone_spec import PINNED_SGLANG_TREE
-from lightcone_spec.cli.main import _completed_industrial_cells, main
+from lightcone_spec.cli.main import (
+    _completed_industrial_cells,
+    _industrial_completion_activation_contract,
+    main,
+)
 from lightcone_spec.experiments.evidence import evidence_files_sha256
+from lightcone_spec.experiments.gpu_pool import (
+    GpuAvailability,
+    GpuDevice,
+    GpuInventory,
+    GpuTopologyGroup,
+)
+from lightcone_spec.experiments.planning import (
+    ZERO_COUNT,
+    ZERO_MILLISECONDS,
+    BudgetJobKind,
+    BudgetObservationReceipt,
+    ExpectedMaximumCount,
+    ExperimentBudget,
+    P99AnchorStatus,
+    ScenarioMilliseconds,
+)
+from lightcone_spec.experiments.planning_artifacts import experiment_budget_to_dict
 from lightcone_spec.experiments.registry import (
     CellStatus,
     ExperimentCell,
     ExperimentRegistry,
     build_industrial_registry,
 )
+from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.telemetry import (
     OUTPUT_HASH_FORMAT,
     EvidenceWriter,
@@ -45,16 +67,219 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _topology(cell: ExperimentCell) -> tuple[int, int, int, str]:
+def _inventory(*, gpu_count: int = 2) -> GpuInventory:
+    devices = tuple(
+        GpuDevice(
+            uuid=f"GPU-physical-{index}",
+            host_id="fixture-host",
+            model="A100",
+            memory_bytes=80_000_000_000,
+            compute_capability=(8, 0),
+            pci_bus_id=f"0000:{index + 1:02x}:00.0",
+            pci_root="root-0",
+            numa_node=0,
+            interconnects=("nvlink",),
+            peer_access_class="nvlink",
+            clock_policy="locked",
+            power_limit_watts=300.0,
+            thermal_limit_celsius=85.0,
+            availability=GpuAvailability.READY,
+            reserved_processes=(),
+            allowed_topology_groups=("fixture-nvlink-group",),
+        )
+        for index in range(gpu_count)
+    )
+    return GpuInventory(
+        schema_version=1,
+        devices=devices,
+        topology_groups=(
+            GpuTopologyGroup(
+                group_id="fixture-nvlink-group",
+                host_id="fixture-host",
+                gpu_uuids=tuple(device.uuid for device in devices),
+                fabric="nvlink",
+                bandwidth_class="high",
+            ),
+        ),
+        source_receipt_sha256=_sha({"inventory": "fixture", "count": gpu_count}),
+    )
+
+
+def _budget(cell: ExperimentCell) -> ExperimentBudget:
+    compile_time = (
+        ScenarioMilliseconds(1, 1, 1)
+        if cell.resources.workload_class.value == "compile"
+        else ZERO_MILLISECONDS
+    )
+    scored_time = (
+        ZERO_MILLISECONDS
+        if cell.identity.experiment == "preflight"
+        else ScenarioMilliseconds(1, 1, 1)
+    )
+    wall = compile_time + scored_time
+    gpu_time = wall.scale(cell.resources.gpu_count)
+    return ExperimentBudget(
+        schema_version=1,
+        cell_id=cell.cell_id,
+        experiment=cell.identity.experiment,
+        method=cell.identity.method,
+        workload_class=cell.resources.workload_class,
+        job_kind=(
+            BudgetJobKind.COMPILE
+            if cell.resources.workload_class.value == "compile"
+            else BudgetJobKind.STANDARD
+        ),
+        startup_model_load=ZERO_MILLISECONDS,
+        compile_jit_graph_prewarm=compile_time,
+        excluded_warmup=ZERO_MILLISECONDS,
+        excluded_warmup_requests=ZERO_COUNT,
+        scored_arrival=scored_time,
+        request_deadline=scored_time,
+        drain=ZERO_MILLISECONDS,
+        reset_finalization=ZERO_MILLISECONDS,
+        evidence_flush_shutdown=ZERO_MILLISECONDS,
+        output_tokens=(
+            ExpectedMaximumCount(0, 0)
+            if cell.identity.experiment == "preflight"
+            else ExpectedMaximumCount(1, 1)
+        ),
+        minimum_completed_requests=(
+            0 if cell.identity.experiment == "preflight" else 1
+        ),
+        p99_anchor_status=P99AnchorStatus.NOT_REQUIRED,
+        soak=ZERO_MILLISECONDS,
+        failure_injection=ZERO_MILLISECONDS,
+        retry=ZERO_MILLISECONDS,
+        retry_allowance=0,
+        profiler=ZERO_MILLISECONDS,
+        download_compile_reservation=ZERO_MILLISECONDS,
+        gpu_count=cell.resources.gpu_count,
+        topology=cell.identity.topology,
+        reserved_gpu_ms=gpu_time,
+        measured_gpu_ms=None,
+        fixed_instance_billed_gpu_ms=wall.scale(2),
+    )
+
+
+def _physical_assignment(
+    cell: ExperimentCell,
+    *,
+    cell_index: int,
+    budget: ExperimentBudget,
+) -> IndustrialPhysicalAssignment:
+    inventory = _inventory()
+    gpu_uuids = tuple(
+        inventory.devices[rank].uuid for rank in range(cell.resources.gpu_count)
+    )
     tensor_parallel_size = 2 if cell.identity.topology == "tp2_dp1" else 1
-    data_parallel_size = 2 if cell.identity.topology == "two_replica_tp1_dp2" else 1
-    world_size = len(cell.resources.gpu_uuids)
+    data_parallel_size = cell.resources.gpu_count // tensor_parallel_size
+    rank_groups = tuple(
+        gpu_uuids[replica * tensor_parallel_size : (replica + 1) * tensor_parallel_size]
+        for replica in range(data_parallel_size)
+    )
+    return IndustrialPhysicalAssignment(
+        inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        dispatch_plan_sha256=_sha({"dispatch": cell.cell_id}),
+        experiment_budget_sha256=budget.sha256,
+        assignment_sha256=_sha({"assignment": cell.cell_id}),
+        work_item_sha256=_sha({"work-item": cell.cell_id}),
+        gpu_uuids=gpu_uuids,
+        rank_groups=rank_groups,
+        ports=tuple(30_000 + cell_index * 10 + index for index in range(3)),
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        fixed_instance_gpu_count=2,
+        host_id="fixture-host",
+        topology_group_ids=tuple(
+            (() if tensor_parallel_size == 1 else ("fixture-nvlink-group",))
+            for _ in range(data_parallel_size)
+        ),
+    )
+
+
+def _write_budget_observation(
+    root: Path,
+    *,
+    run_id: str,
+    budget: ExperimentBudget,
+    terminal_receipt_sha256: str,
+    fixed_instance_gpu_count: int,
+) -> tuple[Path, str]:
+    component_names = (
+        "startup_model_load",
+        "compile_jit_graph_prewarm",
+        "excluded_warmup",
+        "scored_arrival",
+        "drain",
+        "reset_finalization",
+        "evidence_flush_shutdown",
+        "soak",
+        "failure_injection",
+        "retry",
+        "profiler",
+        "download_compile_reservation",
+    )
+    observed = tuple(
+        (name, getattr(budget, name).registered) for name in component_names
+    )
+    observed_wall_ms = sum(value for _, value in observed)
+    observation = BudgetObservationReceipt(
+        schema_version=1,
+        budget=budget,
+        observed_component_ms=observed,
+        measured_gpu_ms=observed_wall_ms * budget.gpu_count,
+        fixed_instance_billed_gpu_ms=(observed_wall_ms * fixed_instance_gpu_count),
+        terminal_evidence_sha256=terminal_receipt_sha256,
+    )
+    artifact = {
+        "schema_version": 1,
+        "artifact_kind": "industrial_budget_observation_receipt_v1",
+        "experiment_budget_sha256": budget.sha256,
+        "budget_observation_sha256": observation.sha256,
+        "budget": asdict(budget),
+        "observed_component_ms": [list(row) for row in observed],
+        "measured_gpu_ms": observation.measured_gpu_ms,
+        "fixed_instance_billed_gpu_ms": observation.fixed_instance_billed_gpu_ms,
+        "terminal_evidence_sha256": terminal_receipt_sha256,
+        "observed_wall_ms": observation.observed_wall_ms,
+        "registered_wall_delta_ms": observation.registered_wall_delta_ms,
+        "registered_gpu_delta_ms": observation.registered_gpu_delta_ms,
+        "registered_billed_delta_ms": observation.registered_billed_delta_ms,
+        "gpu_measurement_semantics": ("exclusive_reserved_gang_wall_ms_x_gpu_count"),
+        "fixed_instance_billing_semantics": "whole_inventory_wall_clock_v1",
+    }
+    directory = root / f"{run_id}.rank0.budget-observation"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "observation.json"
+    path.write_text(json.dumps(artifact, sort_keys=True) + "\n", encoding="utf-8")
+    Path(f"{path}.sha256").write_text(observation.sha256 + "\n", encoding="utf-8")
+    return path, observation.sha256
+
+
+def _topology(
+    cell: ExperimentCell,
+    assignment: IndustrialPhysicalAssignment,
+    topology_receipt_sha256: str,
+) -> tuple[int, int, int, str]:
+    tensor_parallel_size = assignment.tensor_parallel_size
+    data_parallel_size = assignment.data_parallel_size
+    world_size = len(assignment.gpu_uuids)
     digest = _sha(
         {
             "schema_version": 1,
             "cell_id": cell.cell_id,
             "topology": cell.identity.topology,
-            "gpu_uuids": list(cell.resources.gpu_uuids),
+            "topology_receipt_sha256": topology_receipt_sha256,
+            "physical_assignment_sha256": assignment.assignment_sha256,
+            "physical_binding_sha256": assignment.sha256,
+            "physical_host_id": assignment.host_id,
+            "physical_gpu_uuids": list(assignment.gpu_uuids),
+            "physical_rank_groups": [list(group) for group in assignment.rank_groups],
+            "physical_ports": list(assignment.ports),
+            "topology_group_ids": [
+                list(group) for group in assignment.topology_group_ids
+            ],
             "tensor_parallel_size": tensor_parallel_size,
             "data_parallel_size": data_parallel_size,
             "world_size": world_size,
@@ -63,7 +288,13 @@ def _topology(cell: ExperimentCell) -> tuple[int, int, int, str]:
     return tensor_parallel_size, data_parallel_size, world_size, digest
 
 
-def _locked_cell(cell: ExperimentCell) -> dict[str, object]:
+def _locked_cell(
+    cell: ExperimentCell,
+    *,
+    assignment: IndustrialPhysicalAssignment,
+    budget: ExperimentBudget,
+    topology_receipt_sha256: str,
+) -> dict[str, object]:
     request_ids = [f"request-{cell.cell_id[:16]}"]
     method = cell.identity.method
     workload_contract = (
@@ -93,11 +324,19 @@ def _locked_cell(cell: ExperimentCell) -> dict[str, object]:
         "model_lock_sha256": _sha({"kind": "model_lock", "cell_id": cell.cell_id}),
         "patched_sglang_tree": PINNED_SGLANG_TREE,
         "workload_contract": workload_contract,
+        "physical_assignment": assignment.to_dict(),
+        "physical_binding_sha256": assignment.sha256,
+        "topology_receipt_sha256": topology_receipt_sha256,
+        "experiment_budget_sha256": budget.sha256,
+        "experiment_budget": experiment_budget_to_dict(budget),
+        "execution_plan_sha256": _sha({"execution-plan": cell.cell_id}),
+        "execution_split_sha256": _sha({"execution-split": cell.cell_id}),
+        "rank_config_sha256s": None,
     }
     if cell.identity.experiment != "preflight":
         contract["rank_config_sha256s"] = [
             _sha({"kind": "rank_config", "cell_id": cell.cell_id, "rank": rank})
-            for rank in range(len(cell.resources.gpu_uuids))
+            for rank in range(len(assignment.gpu_uuids))
         ]
     return contract
 
@@ -206,6 +445,11 @@ def _request(
     ttft_ms: float | None = 1.0,
     finished: bool = True,
 ) -> RequestRecord:
+    token_ids = [int(output_sha256[:8], 16)] if finished else []
+    serialized_token_ids = json.dumps(token_ids, separators=(",", ":"))
+    canonical_output_sha256 = hashlib.sha256(
+        serialized_token_ids.encode("utf-8")
+    ).hexdigest()
     return RequestRecord(
         run_id=run_id,
         request_id=request_id,
@@ -216,10 +460,12 @@ def _request(
         input_tokens=1,
         output_tokens=1 if finished else 0,
         output_hash_format=OUTPUT_HASH_FORMAT,
-        output_sha256=output_sha256,
+        output_sha256=canonical_output_sha256,
         ttft_ms=ttft_ms,
         finished=finished,
         stop_reason="length" if finished else "cancelled_before_first_token",
+        output_token_ids=serialized_token_ids,
+        output_token_ids_sha256=canonical_output_sha256,
         outcome_status="completed" if finished else "cancelled",
         admitted_ns=1,
         completed_ns=2,
@@ -250,9 +496,9 @@ def _build_registry(tmp_path: Path) -> tuple[Path, ExperimentRegistry]:
         main(
             [
                 "build-industrial-registry",
-                "--gpu-uuid",
-                "GPU-industrial-a",
-                "GPU-industrial-b",
+                "--logical-gpu-slot",
+                "logical-test-slot-a",
+                "logical-test-slot-b",
                 "--cache-root",
                 cache_root,
                 "--evidence-root",
@@ -264,7 +510,7 @@ def _build_registry(tmp_path: Path) -> tuple[Path, ExperimentRegistry]:
         == 0
     )
     registry = build_industrial_registry(
-        gpu_uuids=("GPU-industrial-a", "GPU-industrial-b"),
+        gpu_uuids=("logical-test-slot-a", "logical-test-slot-b"),
         cache_root=cache_root,
         evidence_root=evidence_root,
     )
@@ -277,15 +523,57 @@ def _preflight_bundle(
     invalid_attestation: bool = False,
     mismatched_rank_output: bool = False,
     reused_nonce: bool = False,
+    not_applicable_task: str | None = None,
 ) -> dict[str, object]:
     registry_path, registry = _build_registry(tmp_path)
+    inventory = _inventory()
+    inventory_path = tmp_path / "gpu-inventory.json"
+    _write_bound(inventory_path, inventory.to_dict())
+    if not_applicable_task is not None:
+        source = next(
+            cell
+            for cell in registry.cells_for("preflight")
+            if cell.identity.task == not_applicable_task
+        )
+        replacement = source.with_status(
+            CellStatus.NOT_APPLICABLE,
+            reason_code="fixture_not_applicable",
+            reason="The focused completion fixture marks this cell N/A.",
+        )
+        registry = replace(
+            registry,
+            cells=tuple(
+                replacement if cell.cell_id == source.cell_id else cell
+                for cell in registry.cells
+            ),
+        )
     runtime = {"schema_version": 1, "kind": "industrial_runtime_test"}
     runtime_path = tmp_path / "runtime.json"
     _write_bound(runtime_path, runtime)
     runtime_sha256 = _sha(runtime)
 
     cells = tuple(cell for cell in registry.cells_for("preflight") if cell.runnable)
-    contracts = {cell.cell_id: _locked_cell(cell) for cell in cells}
+    budgets = {cell.cell_id: _budget(cell) for cell in cells}
+    assignments = {
+        cell.cell_id: _physical_assignment(
+            cell,
+            cell_index=index,
+            budget=budgets[cell.cell_id],
+        )
+        for index, cell in enumerate(cells)
+    }
+    topology_receipts = {
+        cell.cell_id: _sha({"topology-receipts": cell.cell_id}) for cell in cells
+    }
+    contracts = {
+        cell.cell_id: _locked_cell(
+            cell,
+            assignment=assignments[cell.cell_id],
+            budget=budgets[cell.cell_id],
+            topology_receipt_sha256=topology_receipts[cell.cell_id],
+        )
+        for cell in cells
+    }
     split = {
         "schema_version": 1,
         "kind": "industrial_locked_split",
@@ -296,10 +584,24 @@ def _preflight_bundle(
     split_path = tmp_path / "split.json"
     _write_bound(split_path, split)
     split_sha256 = _sha(split)
+    _, activation_dispositions, activation_binding = (
+        _industrial_completion_activation_contract(
+            registry,
+            experiment="preflight",
+            runtime_sha256=runtime_sha256,
+            split_sha256=split_sha256,
+            direct_dependency_receipt_sha256=None,
+            activation_artifact=None,
+            family_activations=(),
+            family_power_reductions=(),
+        )
+    )
 
     rows: list[dict[str, object]] = []
     for cell_index, cell in enumerate(cells):
         contract = contracts[cell.cell_id]
+        assignment = assignments[cell.cell_id]
+        budget = budgets[cell.cell_id]
         request_id = str(contract["request_ids"][0])
         run_id = f"preflight-{cell.cell_id[:16]}"
         run_nonce_sha256 = _sha(
@@ -308,8 +610,12 @@ def _preflight_bundle(
                 "cell_id": None if reused_nonce else cell.cell_id,
             }
         )
-        tp_size, dp_size, world_size, topology_sha256 = _topology(cell)
-        for rank, gpu_uuid in enumerate(cell.resources.gpu_uuids):
+        tp_size, dp_size, world_size, topology_sha256 = _topology(
+            cell,
+            assignment,
+            topology_receipts[cell.cell_id],
+        )
+        for rank, gpu_uuid in enumerate(assignment.gpu_uuids):
             root = Path(cell.resources.evidence_root)
             root.mkdir(parents=True, exist_ok=True)
             source = root / f"{run_id}.rank{rank}.source.json"
@@ -364,8 +670,8 @@ def _preflight_bundle(
                     completed_ns=2,
                     status="complete",
                     industrial_cell_id=cell.cell_id,
-                    runtime_sha256=runtime_sha256,
-                    split_sha256=split_sha256,
+                    runtime_sha256=str(contract["execution_plan_sha256"]),
+                    split_sha256=str(contract["execution_split_sha256"]),
                     corpus_sha256=str(contract["corpus_sha256"]),
                     arrival_trace_sha256=str(contract["arrival_trace_sha256"]),
                     request_ids_sha256=str(contract["request_ids_sha256"]),
@@ -385,6 +691,7 @@ def _preflight_bundle(
                         contract["expected_performance_rows"]
                     ),
                     workload_contract=str(contract["workload_contract"]),
+                    experiment_budget_sha256=budget.sha256,
                     preflight_attestation_sha256=attestation_sha256,
                 )
             )
@@ -416,20 +723,37 @@ def _preflight_bundle(
                     "rank": rank,
                     "evidence_sha256": evidence_files_sha256(evidence.values()),
                     "terminal_receipt_sha256": _file_sha256(receipt_path),
+                    "physical_gpu_uuid": gpu_uuid,
+                    "physical_binding_sha256": assignment.sha256,
+                    "experiment_budget_sha256": budget.sha256,
+                    "budget_observation_status": "NOT_APPLICABLE",
+                    "budget_observation_reason_code": (
+                        "preflight_or_non_serving_execution"
+                    ),
+                    "budget_observation_path": None,
+                    "budget_observation_sha256": None,
                     "preflight_attestation_path": str(attestation_path),
                     "preflight_attestation_sha256": attestation_sha256,
                     "status": "MEASURED",
                 }
             )
+    rows.extend(
+        activation_dispositions[cell.cell_id]
+        for cell in registry.cells_for("preflight")
+        if not cell.runnable
+    )
 
     completed = {
-        "schema_version": 2,
+        "schema_version": 4,
         "kind": "industrial_completed_cells",
         "registry_sha256": registry.sha256,
         "experiment": "preflight",
         "runtime_sha256": runtime_sha256,
         "split_sha256": split_sha256,
         "split_contract": split,
+        "activation_binding": activation_binding,
+        "inventory_sha256": inventory.sha256,
+        "inventory_source_receipt_sha256": inventory.source_receipt_sha256,
         "rows": rows,
     }
     completed_path = tmp_path / "completed.json"
@@ -439,6 +763,8 @@ def _preflight_bundle(
     return {
         "registry": registry,
         "registry_path": registry_path,
+        "inventory": inventory,
+        "inventory_path": inventory_path,
         "runtime": runtime,
         "runtime_path": runtime_path,
         "split": split,
@@ -449,14 +775,209 @@ def _preflight_bundle(
     }
 
 
+def _serving_bundle(tmp_path: Path) -> dict[str, object]:
+    registry = build_industrial_registry(
+        gpu_uuids=("logical-serving-slot-a", "logical-serving-slot-b"),
+        cache_root=str(tmp_path / "serving-cache"),
+        evidence_root=str(tmp_path / "serving-evidence"),
+    )
+    inventory = _inventory()
+    stage = "E1a"
+    direct_dependency_sha256 = _sha({"dependency": "E3b"})
+    runtime_sha256 = _sha({"runtime": stage})
+    cells = tuple(cell for cell in registry.cells_for(stage) if cell.runnable)
+    budgets = {cell.cell_id: _budget(cell) for cell in cells}
+    assignments = {
+        cell.cell_id: _physical_assignment(
+            cell,
+            cell_index=index,
+            budget=budgets[cell.cell_id],
+        )
+        for index, cell in enumerate(cells)
+    }
+    topology_receipts = {
+        cell.cell_id: _sha({"topology-receipts": cell.cell_id}) for cell in cells
+    }
+    contracts = {
+        cell.cell_id: _locked_cell(
+            cell,
+            assignment=assignments[cell.cell_id],
+            budget=budgets[cell.cell_id],
+            topology_receipt_sha256=topology_receipts[cell.cell_id],
+        )
+        for cell in cells
+    }
+    split = {
+        "schema_version": 1,
+        "kind": "industrial_locked_split",
+        "registry_sha256": registry.sha256,
+        "experiment": stage,
+        "cells": [contracts[cell.cell_id] for cell in cells],
+    }
+    split_sha256 = _sha(split)
+    _, dispositions, activation_binding = _industrial_completion_activation_contract(
+        registry,
+        experiment=stage,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        direct_dependency_receipt_sha256=direct_dependency_sha256,
+        activation_artifact=None,
+        family_activations=(),
+        family_power_reductions=(),
+    )
+    rows: list[dict[str, object]] = []
+    for cell_index, cell in enumerate(cells):
+        contract = contracts[cell.cell_id]
+        assignment = assignments[cell.cell_id]
+        budget = budgets[cell.cell_id]
+        run_id = f"serving-{cell.cell_id[:16]}"
+        request_id = str(contract["request_ids"][0])
+        _, _, world_size, topology_sha256 = _topology(
+            cell,
+            assignment,
+            topology_receipts[cell.cell_id],
+        )
+        assert world_size == 1
+        root = Path(cell.resources.evidence_root)
+        writer = EvidenceWriter(
+            root,
+            run_id=run_id,
+            rank=0,
+            process_id=cell_index + 100,
+            checkpoint_interval_s=None,
+        )
+        writer.write(
+            RunRecord(
+                run_id=run_id,
+                manifest_sha256=registry.sha256,
+                config_sha256=cell.cell_id,
+                method=cell.identity.method,
+                model_pair=cell.identity.model,
+                repetition_block=cell.identity.block,
+                started_ns=1,
+                completed_ns=2,
+                status="complete",
+                industrial_cell_id=cell.cell_id,
+                rank_config_sha256=str(contract["rank_config_sha256s"][0]),
+                runtime_sha256=str(contract["execution_plan_sha256"]),
+                split_sha256=str(contract["execution_split_sha256"]),
+                corpus_sha256=str(contract["corpus_sha256"]),
+                arrival_trace_sha256=str(contract["arrival_trace_sha256"]),
+                request_ids_sha256=str(contract["request_ids_sha256"]),
+                sampling_profile_sha256=str(contract["sampling_profile_sha256"]),
+                model_lock_sha256=str(contract["model_lock_sha256"]),
+                patched_sglang_tree=PINNED_SGLANG_TREE,
+                run_nonce_sha256=_sha({"nonce": cell.cell_id}),
+                topology_sha256=topology_sha256,
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+                world_size=1,
+                rank=0,
+                expected_request_rows=1,
+                expected_round_rows=0,
+                expected_update_rows=0,
+                expected_performance_rows=1,
+                workload_contract=str(contract["workload_contract"]),
+                experiment_budget_sha256=budget.sha256,
+                preflight_attestation_sha256=None,
+            )
+        )
+        writer.write(
+            _request(
+                run_id,
+                cell,
+                request_id,
+                _sha({"output": request_id}),
+            )
+        )
+        writer.write(_performance(run_id, cell))
+        evidence, prepared_path = writer.prepare_close()
+        prepared_sha256 = _file_sha256(prepared_path)
+        observation_path, observation_sha256 = _write_budget_observation(
+            root,
+            run_id=run_id,
+            budget=budget,
+            terminal_receipt_sha256=prepared_sha256,
+            fixed_instance_gpu_count=assignment.fixed_instance_gpu_count,
+        )
+
+        def validate_post_binding(
+            path: Path = observation_path,
+            sha256: str = observation_sha256,
+        ) -> None:
+            assert path.is_file() and not path.is_symlink()
+            assert Path(f"{path}.sha256").read_text(encoding="utf-8") == (sha256 + "\n")
+
+        assert (
+            writer.publish_close(validate_post_binding=validate_post_binding)
+            == evidence
+        )
+        terminal_path = root / f"{run_id}.rank0.complete.json"
+        terminal_sha256 = _file_sha256(terminal_path)
+        terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+        assert terminal["prepared_receipt_sha256"] == prepared_sha256
+        rows.append(
+            {
+                "cell_id": cell.cell_id,
+                "evidence_root": str(root),
+                "run_id": run_id,
+                "rank": 0,
+                "evidence_sha256": evidence_files_sha256(evidence.values()),
+                "terminal_receipt_sha256": terminal_sha256,
+                "physical_gpu_uuid": assignment.gpu_uuids[0],
+                "physical_binding_sha256": assignment.sha256,
+                "experiment_budget_sha256": budget.sha256,
+                "budget_observation_status": "OBSERVED",
+                "budget_observation_reason_code": None,
+                "budget_observation_path": str(observation_path),
+                "budget_observation_sha256": observation_sha256,
+                "preflight_attestation_path": None,
+                "preflight_attestation_sha256": None,
+                "status": "MEASURED",
+            }
+        )
+    rows.extend(
+        dispositions[cell.cell_id]
+        for cell in registry.cells_for(stage)
+        if not cell.runnable
+    )
+    completed = {
+        "schema_version": 4,
+        "kind": "industrial_completed_cells",
+        "registry_sha256": registry.sha256,
+        "experiment": stage,
+        "runtime_sha256": runtime_sha256,
+        "split_sha256": split_sha256,
+        "split_contract": split,
+        "activation_binding": activation_binding,
+        "inventory_sha256": inventory.sha256,
+        "inventory_source_receipt_sha256": inventory.source_receipt_sha256,
+        "rows": rows,
+    }
+    completed_path = tmp_path / "serving-completed.json"
+    _write_bound(completed_path, completed)
+    return {
+        "registry": registry,
+        "inventory": inventory,
+        "stage": stage,
+        "runtime_sha256": runtime_sha256,
+        "split": split,
+        "direct_dependency_sha256": direct_dependency_sha256,
+        "completed": completed,
+        "completed_path": completed_path,
+    }
+
+
 def _validate_bundle(
     bundle: dict[str, object], path: Path
 ) -> tuple[tuple[str, ...], str]:
     registry = bundle["registry"]
     runtime = bundle["runtime"]
     split = bundle["split"]
+    inventory = bundle["inventory"]
     assert isinstance(registry, ExperimentRegistry)
     assert isinstance(split, dict)
+    assert isinstance(inventory, GpuInventory)
     completed, digest = _completed_industrial_cells(
         str(path),
         registry,
@@ -465,6 +986,31 @@ def _validate_bundle(
         split_sha256=_sha(split),
         split_contract=split,
         require_industrial_contract=True,
+        inventory=inventory,
+    )
+    assert digest is not None
+    return completed, digest
+
+
+def _validate_serving_bundle(
+    bundle: dict[str, object], path: Path
+) -> tuple[tuple[str, ...], str]:
+    registry = bundle["registry"]
+    split = bundle["split"]
+    inventory = bundle["inventory"]
+    assert isinstance(registry, ExperimentRegistry)
+    assert isinstance(split, dict)
+    assert isinstance(inventory, GpuInventory)
+    completed, digest = _completed_industrial_cells(
+        str(path),
+        registry,
+        experiment=str(bundle["stage"]),
+        runtime_sha256=str(bundle["runtime_sha256"]),
+        split_sha256=_sha(split),
+        split_contract=split,
+        require_industrial_contract=True,
+        direct_dependency_receipt_sha256=str(bundle["direct_dependency_sha256"]),
+        inventory=inventory,
     )
     assert digest is not None
     return completed, digest
@@ -497,6 +1043,8 @@ def test_preflight_stage_cannot_seal_without_trusted_attester(tmp_path: Path) ->
                 str(bundle["split_path"]),
                 "--completed-cells",
                 str(completed_path),
+                "--inventory",
+                str(bundle["inventory_path"]),
                 "--locked-output",
                 f"runtime_envelope={bundle['locked_output']}",
                 "--output",
@@ -528,8 +1076,208 @@ def test_preflight_stage_cannot_seal_without_trusted_attester(tmp_path: Path) ->
     missing_rank["rows"].pop()
     missing_rank_path = tmp_path / "missing-rank-completed.json"
     _write_bound(missing_rank_path, missing_rank)
-    with pytest.raises(ValueError, match="one measured outcome per claimed GPU"):
+    with pytest.raises(ValueError, match="one measured outcome per physical rank"):
         _validate_bundle(bundle, missing_rank_path)
+
+
+def test_formal_completion_rejects_forged_activation_physical_and_budget_bindings(
+    tmp_path: Path,
+) -> None:
+    bundle = _preflight_bundle(tmp_path)
+    registry = bundle["registry"]
+    assert isinstance(registry, ExperimentRegistry)
+
+    cases: list[tuple[str, dict[str, object], str]] = []
+
+    forged_activation = copy.deepcopy(bundle["completed"])
+    forged_activation["activation_binding"]["dispositions_sha256"] = "0" * 64
+    cases.append(
+        (
+            "forged-activation",
+            forged_activation,
+            "activation binding is missing or forged",
+        )
+    )
+
+    logical_gpu = copy.deepcopy(bundle["completed"])
+    measured = next(row for row in logical_gpu["rows"] if row["status"] == "MEASURED")
+    measured["physical_gpu_uuid"] = registry.gpu_uuids[0]
+    cases.append(
+        (
+            "logical-gpu-substitution",
+            logical_gpu,
+            "differs from its physical assignment",
+        )
+    )
+
+    forged_binding = copy.deepcopy(bundle["completed"])
+    measured = next(
+        row for row in forged_binding["rows"] if row["status"] == "MEASURED"
+    )
+    measured["physical_binding_sha256"] = "1" * 64
+    cases.append(
+        (
+            "forged-physical-digest",
+            forged_binding,
+            "differs from its physical assignment",
+        )
+    )
+
+    bad_billing = copy.deepcopy(bundle["completed"])
+    split = bad_billing["split_contract"]
+    split["cells"][0]["physical_assignment"]["fixed_instance_billing_semantics"] = (
+        "reserved_gang_only"
+    )
+    bad_billing["split_sha256"] = _sha(split)
+    cases.append(
+        (
+            "forged-billing-semantics",
+            bad_billing,
+            "billing semantics mismatch",
+        )
+    )
+
+    forged_budget = copy.deepcopy(bundle["completed"])
+    split = forged_budget["split_contract"]
+    split["cells"][0]["experiment_budget"]["artifact_sha256"] = "2" * 64
+    forged_budget["split_sha256"] = _sha(split)
+    cases.append(
+        (
+            "forged-budget",
+            forged_budget,
+            "forged ExperimentBudget",
+        )
+    )
+
+    imputed_observation = copy.deepcopy(bundle["completed"])
+    measured = next(
+        row for row in imputed_observation["rows"] if row["status"] == "MEASURED"
+    )
+    measured["budget_observation_status"] = "OBSERVED"
+    measured["budget_observation_reason_code"] = None
+    cases.append(
+        (
+            "preflight-zero-imputation",
+            imputed_observation,
+            "non-serving budget observation disposition is not exact",
+        )
+    )
+
+    unknown_field = copy.deepcopy(bundle["completed"])
+    measured = next(row for row in unknown_field["rows"] if row["status"] == "MEASURED")
+    measured["caller_claimed_gpu"] = "GPU-forged"
+    cases.append(
+        (
+            "unknown-row-field",
+            unknown_field,
+            "completed-rank fields differ from schema",
+        )
+    )
+
+    for name, artifact, message in cases:
+        path = tmp_path / f"{name}.json"
+        _write_bound(path, artifact)
+        validation_bundle = (
+            {**bundle, "split": artifact["split_contract"]}
+            if name
+            in {
+                "forged-billing-semantics",
+                "forged-budget",
+            }
+            else bundle
+        )
+        with pytest.raises(ValueError, match=message):
+            _validate_bundle(validation_bundle, path)
+
+
+def test_serving_completion_requires_exact_observed_budget_receipt(
+    tmp_path: Path,
+) -> None:
+    bundle = _serving_bundle(tmp_path)
+    completed_path = bundle["completed_path"]
+    assert isinstance(completed_path, Path)
+    completed, _ = _validate_serving_bundle(bundle, completed_path)
+    registry = bundle["registry"]
+    assert isinstance(registry, ExperimentRegistry)
+    assert set(completed) == {
+        cell.cell_id for cell in registry.cells_for("E1a") if cell.runnable
+    }
+
+    missing = copy.deepcopy(bundle["completed"])
+    measured = next(row for row in missing["rows"] if row["status"] == "MEASURED")
+    measured["budget_observation_path"] = None
+    measured["budget_observation_sha256"] = None
+    missing_path = tmp_path / "missing-serving-observation.json"
+    _write_bound(missing_path, missing)
+    with pytest.raises(ValueError, match="exact budget observation"):
+        _validate_serving_bundle(bundle, missing_path)
+
+    observed_row = next(
+        row for row in bundle["completed"]["rows"] if row["status"] == "MEASURED"
+    )
+    observation_path = Path(str(observed_row["budget_observation_path"]))
+    observation = json.loads(observation_path.read_text(encoding="utf-8"))
+    observation["fixed_instance_billed_gpu_ms"] -= 1
+    observation_path.write_text(
+        json.dumps(observation, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="accounting is inconsistent"):
+        _validate_serving_bundle(bundle, completed_path)
+
+
+def test_two_gpu_inventory_rejects_coordinated_one_gpu_underbilling(
+    tmp_path: Path,
+) -> None:
+    bundle = _serving_bundle(tmp_path)
+    registry = bundle["registry"]
+    assert isinstance(registry, ExperimentRegistry)
+    tampered = copy.deepcopy(bundle["completed"])
+    split = tampered["split_contract"]
+    contract = split["cells"][0]
+    cell = next(row for row in registry.cells if row.cell_id == contract["cell_id"])
+    one_gpu_inventory = _inventory(gpu_count=1)
+    registered_budget = _budget(cell)
+    one_gpu_budget = replace(
+        registered_budget,
+        fixed_instance_billed_gpu_ms=registered_budget.wall_time.scale(1),
+    )
+    assignment = contract["physical_assignment"]
+    assignment["inventory_sha256"] = one_gpu_inventory.sha256
+    assignment["inventory_source_receipt_sha256"] = (
+        one_gpu_inventory.source_receipt_sha256
+    )
+    assignment["fixed_instance_gpu_count"] = 1
+    assignment["experiment_budget_sha256"] = one_gpu_budget.sha256
+    contract["physical_binding_sha256"] = _sha(assignment)
+    contract["experiment_budget_sha256"] = one_gpu_budget.sha256
+    contract["experiment_budget"] = experiment_budget_to_dict(one_gpu_budget)
+    measured = next(
+        row
+        for row in tampered["rows"]
+        if row.get("cell_id") == cell.cell_id and row.get("status") == "MEASURED"
+    )
+    measured["physical_binding_sha256"] = contract["physical_binding_sha256"]
+    measured["experiment_budget_sha256"] = one_gpu_budget.sha256
+    evidence_root = Path(str(measured["evidence_root"]))
+    terminal = json.loads(
+        (evidence_root / f"{measured['run_id']}.rank0.complete.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    observation_path, observation_sha256 = _write_budget_observation(
+        evidence_root,
+        run_id=str(measured["run_id"]),
+        budget=one_gpu_budget,
+        terminal_receipt_sha256=str(terminal["prepared_receipt_sha256"]),
+        fixed_instance_gpu_count=1,
+    )
+    measured["budget_observation_path"] = str(observation_path)
+    measured["budget_observation_sha256"] = observation_sha256
+    tampered["split_sha256"] = _sha(split)
+    path = tmp_path / "coordinated-one-gpu-underbill.json"
+    _write_bound(path, tampered)
+    with pytest.raises(ValueError, match="differs from the bound GPU inventory"):
+        _validate_serving_bundle({**bundle, "split": split}, path)
 
 
 @pytest.mark.parametrize(
@@ -560,107 +1308,40 @@ def test_preflight_rejects_task_or_rank_contract_tamper(
 def test_blocked_and_not_applicable_outcomes_are_explicit_and_exact(
     tmp_path: Path,
 ) -> None:
-    registry = build_industrial_registry(
-        gpu_uuids=("GPU-outcome-a", "GPU-outcome-b"),
-        cache_root=str(tmp_path / "cache"),
-        evidence_root=str(tmp_path / "evidence"),
+    bundle = _preflight_bundle(
+        tmp_path,
+        not_applicable_task="simultaneous_single_gpu_interference",
     )
-    blocked = next(
-        cell for cell in registry.cells_for("E1a") if cell.status is CellStatus.BLOCKED
-    )
-    not_applicable = blocked.with_status(
-        CellStatus.NOT_APPLICABLE,
-        reason_code="test_not_applicable",
-        reason="The dedicated contract test marks this declaration not applicable.",
-    )
-    registry = replace(
-        registry,
-        cells=tuple(
-            not_applicable if cell.cell_id == blocked.cell_id else cell
-            for cell in registry.cells
-        ),
-    )
-    stage_cells = registry.cells_for("E1a")
-    contracts = [_locked_cell(cell) for cell in stage_cells if cell.runnable]
-    split = {
-        "schema_version": 1,
-        "kind": "industrial_locked_split",
-        "registry_sha256": registry.sha256,
-        "experiment": "E1a",
-        "cells": contracts,
+    completed_path = bundle["completed_path"]
+    assert isinstance(completed_path, Path)
+    completed, _ = _validate_bundle(bundle, completed_path)
+    registry = bundle["registry"]
+    assert isinstance(registry, ExperimentRegistry)
+    assert set(completed) == {
+        cell.cell_id for cell in registry.cells_for("preflight") if cell.runnable
     }
-    runtime_sha256 = _sha({"kind": "runtime", "stage": "E1a"})
 
-    exact_outcomes = [
-        {
-            "cell_id": cell.cell_id,
-            "status": cell.status.value,
-            "reason_code": cell.reason_code,
-            "reason": cell.reason,
-        }
-        for cell in stage_cells
-        if not cell.runnable
-    ]
-    measured_placeholders = [
-        {"cell_id": cell.cell_id, "status": "MEASURED"}
-        for cell in stage_cells
-        if cell.runnable
-    ]
-    bad_na = next(
-        row
-        for row in exact_outcomes
-        if row["status"] == CellStatus.NOT_APPLICABLE.value
-    )
-    bad_na = {**bad_na, "reason_code": "edited_reason"}
-    rows = [bad_na, *measured_placeholders]
-    rows.extend(
-        row for row in exact_outcomes if row["cell_id"] != not_applicable.cell_id
-    )
-    invalid_na = {
-        "schema_version": 2,
-        "kind": "industrial_completed_cells",
-        "registry_sha256": registry.sha256,
-        "experiment": "E1a",
-        "runtime_sha256": runtime_sha256,
-        "split_sha256": _sha(split),
-        "split_contract": split,
-        "rows": rows,
-    }
-    invalid_na_path = tmp_path / "invalid-na.json"
-    _write_bound(invalid_na_path, invalid_na)
-    with pytest.raises(ValueError, match="BLOCKED/N/A"):
-        _completed_industrial_cells(
-            str(invalid_na_path),
-            registry,
-            experiment="E1a",
-            runtime_sha256=runtime_sha256,
-            split_sha256=_sha(split),
-            split_contract=split,
-            require_industrial_contract=True,
-        )
+    forged = copy.deepcopy(bundle["completed"])
+    disposition = next(row for row in forged["rows"] if row.get("status") == "N/A")
+    disposition["reason_code"] = "edited_after_materialization"
+    forged_path = tmp_path / "forged-disposition.json"
+    _write_bound(forged_path, forged)
+    with pytest.raises(ValueError, match="exact immutable disposition"):
+        _validate_bundle(bundle, forged_path)
 
-    omitted = next(
-        row for row in exact_outcomes if row["status"] == CellStatus.BLOCKED.value
-    )
-    missing_blocked = {
-        **invalid_na,
-        "rows": [
-            *measured_placeholders,
-            *(row for row in exact_outcomes if row["cell_id"] != omitted["cell_id"]),
-        ],
-    }
-    missing_blocked_path = tmp_path / "missing-blocked.json"
-    _write_bound(missing_blocked_path, missing_blocked)
+    missing = copy.deepcopy(bundle["completed"])
+    missing["rows"] = [row for row in missing["rows"] if row.get("status") != "N/A"]
+    missing_path = tmp_path / "missing-disposition.json"
+    _write_bound(missing_path, missing)
     with pytest.raises(ValueError, match="do not cover every declared stage cell"):
-        _completed_industrial_cells(
-            str(missing_blocked_path),
-            registry,
-            experiment="E1a",
-            runtime_sha256=runtime_sha256,
-            split_sha256=_sha(split),
-            split_contract=split,
-            require_industrial_contract=True,
-        )
+        _validate_bundle(bundle, missing_path)
+
+    extra = copy.deepcopy(bundle["completed"])
+    extra["rows"].append(dict(disposition))
+    extra_path = tmp_path / "extra-disposition.json"
+    _write_bound(extra_path, extra)
+    with pytest.raises(ValueError, match="exact immutable disposition"):
+        _validate_bundle(bundle, extra_path)
 
 
 def test_pre_token_latency_fields_persist_null_without_imputation(

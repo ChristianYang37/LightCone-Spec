@@ -15,6 +15,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
@@ -28,6 +29,11 @@ from urllib.request import Request, urlopen
 import pyarrow.parquet as pq
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments.gpu_pool import (
+    GpuDispatchExecutionContext,
+    GpuDispatchPlan,
+    validate_dispatch_plan_for_execution,
+)
 from lightcone_spec.experiments.load import (
     LoadAccounting,
     ProductionLoadPlan,
@@ -37,6 +43,12 @@ from lightcone_spec.experiments.load import (
     TokenChunkTiming,
     account_scored_requests,
     evaluate_token_timing,
+)
+from lightcone_spec.experiments.planning import (
+    BudgetJobKind,
+    BudgetObservationReceipt,
+    ExperimentBudget,
+    P99AnchorStatus,
 )
 from lightcone_spec.experiments.registry import (
     CellStatus,
@@ -50,13 +62,31 @@ from lightcone_spec.experiments.serving import (
     BenchServingResult,
     BenchServingTransport,
     BoundServingRequest,
+    PinnedBenchServingTransport,
     official_bench_argv,
 )
-from lightcone_spec.orchestration.industrial import IndustrialRuntimePlan
+from lightcone_spec.orchestration.industrial import (
+    IndustrialPhysicalAssignment,
+    IndustrialRuntimePlan,
+)
+from lightcone_spec.orchestration.native_terminal import (
+    NATIVE_TERMINAL_EVIDENCE_FIELDS,
+    NATIVE_TERMINAL_EVIDENCE_HOOK,
+    NativeTerminalProvider,
+    NativeTerminalRunBinding,
+    TerminalRequestExpectation,
+    ValidatedNativeTerminalEvidence,
+)
 from lightcone_spec.orchestration.runtime import (
     ServerLaunch,
     _immutable_json,
     _render_server,
+)
+from lightcone_spec.orchestration.session import (
+    SHARED_SESSION_UNAVAILABLE_REASON,
+    SessionExecutionBinding,
+    SessionExecutionLifecycle,
+    SharedSessionUnavailableError,
 )
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
@@ -68,25 +98,53 @@ from lightcone_spec.telemetry.records import (
     RunRecord,
     UpdateRecord,
 )
-from lightcone_spec.telemetry.writer import EvidenceWriter, load_completed_evidence
+from lightcone_spec.telemetry.writer import (
+    EvidenceWriter,
+    load_completed_evidence,
+    publish_prepared_evidence_completion,
+)
 
-NATIVE_TERMINAL_EVIDENCE_HOOK = (
-    "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
-)
-NATIVE_TERMINAL_EVIDENCE_FIELDS = (
-    "run_id",
-    "run_nonce_sha256",
-    "execution_plan_sha256",
-    "rank_config_sha256",
-    "server_process_id",
-    "attempt_id",
-    "request_round_rows",
-    "update_rows",
-    "performance_counters",
-    "terminal_sha256",
-)
 MISSING_NATIVE_EVIDENCE_REASON = "missing_content_bound_native_speculative_evidence"
+TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON = (
+    "trusted_native_terminal_attester_unavailable"
+)
 MAX_IN_MEMORY_REQUEST_EXECUTIONS = 100_000
+
+_BUDGET_OBSERVATION_COMPONENTS = (
+    "startup_model_load",
+    "compile_jit_graph_prewarm",
+    "excluded_warmup",
+    "scored_arrival",
+    "drain",
+    "reset_finalization",
+    "evidence_flush_shutdown",
+    "soak",
+    "failure_injection",
+    "retry",
+    "profiler",
+    "download_compile_reservation",
+)
+_STRUCTURALLY_ABSENT_SERVING_COMPONENTS = (
+    "compile_jit_graph_prewarm",
+    "download_compile_reservation",
+)
+_SCORING_COMPONENT_BY_JOB = {
+    BudgetJobKind.STANDARD: "scored_arrival",
+    BudgetJobKind.SHORT: "scored_arrival",
+    BudgetJobKind.P99_ANCHOR: "scored_arrival",
+    BudgetJobKind.SOAK: "soak",
+    BudgetJobKind.FAILURE: "failure_injection",
+    BudgetJobKind.PROFILER: "profiler",
+}
+_SCORING_COMPONENTS = (
+    "scored_arrival",
+    "soak",
+    "failure_injection",
+    "profiler",
+)
+_BUDGET_OBSERVATION_KIND = "industrial_budget_observation_receipt_v1"
+_RESERVED_GANG_MEASUREMENT = "exclusive_reserved_gang_wall_ms_x_gpu_count"
+_WHOLE_INSTANCE_BILLING = "whole_inventory_wall_clock_v1"
 
 type EvidenceItem = (
     PerformanceRecord | RequestRecord | RoundRecord | RunRecord | UpdateRecord
@@ -96,7 +154,22 @@ type EvidenceItem = (
 class _AsyncEvidenceSink:
     """Bounded single-writer bridge from the event loop to durable WAL."""
 
-    def __init__(self, writer: EvidenceWriter, *, max_queued_rows: int = 1024) -> None:
+    def __init__(
+        self,
+        writer: EvidenceWriter,
+        *,
+        max_queued_rows: int = 1024,
+        max_batch_rows: int | None = None,
+    ) -> None:
+        if max_batch_rows is None:
+            max_batch_rows = min(128, max_queued_rows)
+        if (
+            isinstance(max_batch_rows, bool)
+            or not isinstance(max_batch_rows, int)
+            or max_batch_rows < 1
+            or max_batch_rows > max_queued_rows
+        ):
+            raise ValueError("evidence batch rows must lie within the queue bound")
         self._writer = writer
         self._queue: asyncio.Queue[EvidenceItem | object] = asyncio.Queue(
             maxsize=max_queued_rows
@@ -105,19 +178,26 @@ class _AsyncEvidenceSink:
         self._error: BaseException | None = None
         self._closed = False
         self._backpressure_events = 0
+        self._max_batch_rows = max_batch_rows
         self._overflow_lock = asyncio.Lock()
         self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
         while True:
-            item = await self._queue.get()
+            batch = [await self._queue.get()]
+            while len(batch) < self._max_batch_rows:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            terminal = self._stop in batch
+            if terminal and batch[-1] is not self._stop:
+                self._error = RuntimeError("evidence stop marker was not terminal")
+            records = tuple(item for item in batch if item is not self._stop)
             try:
-                if item is self._stop:
-                    return
-                flush_after = self._queue.empty()
-                if not await asyncio.to_thread(
-                    self._write_one, item, flush_after=flush_after
-                ):
+                if self._error is not None:
+                    raise self._error
+                if records and not await asyncio.to_thread(self._write_batch, records):
                     raise RuntimeError("bounded evidence writer dropped a row")
             except BaseException as error:  # noqa: BLE001 - background boundary
                 self._error = error
@@ -126,7 +206,13 @@ class _AsyncEvidenceSink:
                     self._queue.task_done()
                 return
             finally:
-                self._queue.task_done()
+                for _ in batch:
+                    self._queue.task_done()
+            if terminal:
+                return
+
+    def _write_batch(self, records: tuple[EvidenceItem, ...]) -> bool:
+        return all(self._write_one(record, flush_after=False) for record in records)
 
     def _write_one(self, record: EvidenceItem, *, flush_after: bool) -> bool:
         written = self._writer.write(record)
@@ -166,6 +252,8 @@ class _AsyncEvidenceSink:
     async def flush(self) -> None:
         await self._queue.join()
         self._raise_error()
+        await asyncio.to_thread(self._writer.flush)
+        self._raise_error()
 
     async def close(self) -> None:
         if self._closed:
@@ -189,6 +277,351 @@ def _file_sha256(path: Path) -> str:
 def _is_sha256(value: str) -> bool:
     return len(value) == 64 and all(
         character in "0123456789abcdef" for character in value
+    )
+
+
+def _elapsed_milliseconds(start_ns: int, end_ns: int) -> int:
+    """Quantize one internally observed monotonic interval without undercounting."""
+
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (start_ns, end_ns)
+    ):
+        raise RuntimeError("monotonic budget boundaries must be integer nanoseconds")
+    if end_ns < start_ns:
+        raise RuntimeError("monotonic budget boundary moved backwards")
+    elapsed_ns = end_ns - start_ns
+    return (elapsed_ns + 999_999) // 1_000_000
+
+
+def _scenario_is_explicit_zero(value: object) -> bool:
+    """Require zero in every planning scenario, not only the registered row."""
+
+    return all(
+        not isinstance(component, bool)
+        and isinstance(component, int)
+        and component == 0
+        for component in (
+            getattr(value, "optimistic", None),
+            getattr(value, "registered", None),
+            getattr(value, "quota_envelope", None),
+        )
+    )
+
+
+def _initial_budget_observations(plan: IndustrialExecutionPlan) -> dict[str, int]:
+    """Bind inactive phases and this first attempt's explicit zero retry."""
+
+    observations: dict[str, int] = {}
+    active_scoring = _SCORING_COMPONENT_BY_JOB.get(plan.budget.job_kind)
+    if active_scoring is None:
+        raise ValueError("compile/download budgets cannot enter the serving executor")
+    for name in _STRUCTURALLY_ABSENT_SERVING_COMPONENTS:
+        if not _scenario_is_explicit_zero(getattr(plan.budget, name)):
+            raise ValueError(
+                f"serving executor cannot observe registered budget component {name}"
+            )
+        observations[name] = 0
+    for name in _SCORING_COMPONENTS:
+        if name == active_scoring:
+            continue
+        if not _scenario_is_explicit_zero(getattr(plan.budget, name)):
+            raise ValueError(
+                f"inactive {name} budget must be registered explicitly as zero"
+            )
+        observations[name] = 0
+    # Retry is a multi-attempt quota envelope.  This executor is one immutable
+    # first attempt; scheduler-level aggregation must add a separately bound
+    # prior-attempt observation before a retry can be claimed.
+    observations["retry"] = 0
+    return observations
+
+
+def _budget_observation_artifact(
+    observation: BudgetObservationReceipt,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "artifact_kind": _BUDGET_OBSERVATION_KIND,
+        "experiment_budget_sha256": observation.budget.sha256,
+        "budget_observation_sha256": observation.sha256,
+        "budget": asdict(observation.budget),
+        "observed_component_ms": [
+            [name, value] for name, value in observation.observed_component_ms
+        ],
+        "measured_gpu_ms": observation.measured_gpu_ms,
+        "fixed_instance_billed_gpu_ms": observation.fixed_instance_billed_gpu_ms,
+        "terminal_evidence_sha256": observation.terminal_evidence_sha256,
+        "observed_wall_ms": observation.observed_wall_ms,
+        "registered_wall_delta_ms": observation.registered_wall_delta_ms,
+        "registered_gpu_delta_ms": observation.registered_gpu_delta_ms,
+        "registered_billed_delta_ms": observation.registered_billed_delta_ms,
+        "gpu_measurement_semantics": _RESERVED_GANG_MEASUREMENT,
+        "fixed_instance_billing_semantics": _WHOLE_INSTANCE_BILLING,
+    }
+
+
+def _budget_observation_directory(root: Path, run_id: str) -> Path:
+    return root / f"{run_id}.rank0.budget-observation"
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_budget_observation(
+    *,
+    root: Path,
+    run_id: str,
+    observation: BudgetObservationReceipt,
+) -> tuple[Path, Path]:
+    """Atomically publish one JSON receipt and semantic-digest sidecar directory."""
+
+    final = _budget_observation_directory(root, run_id)
+    if os.path.lexists(final):
+        raise RuntimeError(f"budget observation already exists for run {run_id}")
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{run_id}.budget-observation.", dir=root)
+    )
+    receipt = temporary / "observation.json"
+    sidecar = temporary / "observation.json.sha256"
+    body = (
+        json.dumps(
+            _budget_observation_artifact(observation),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    with receipt.open("x", encoding="utf-8") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with sidecar.open("x", encoding="utf-8") as handle:
+        handle.write(observation.sha256 + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(temporary)
+    if os.path.lexists(final):
+        raise RuntimeError(f"budget observation already exists for run {run_id}")
+    os.rename(temporary, final)
+    _fsync_directory(root)
+    return final / receipt.name, final / sidecar.name
+
+
+def _load_budget_observation(
+    *,
+    root: Path,
+    run_id: str,
+    plan: IndustrialExecutionPlan,
+    terminal_receipt: Path,
+) -> tuple[BudgetObservationReceipt, Path, Path]:
+    directory = _budget_observation_directory(root, run_id)
+    receipt_path = directory / "observation.json"
+    sidecar_path = directory / "observation.json.sha256"
+    if (
+        terminal_receipt.is_symlink()
+        or not terminal_receipt.is_file()
+        or directory.is_symlink()
+        or not directory.is_dir()
+        or receipt_path.is_symlink()
+        or not receipt_path.is_file()
+        or sidecar_path.is_symlink()
+        or not sidecar_path.is_file()
+    ):
+        raise RuntimeError("completed industrial evidence lacks a budget observation")
+    try:
+        terminal_value = json.loads(terminal_receipt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("industrial terminal evidence is not valid JSON") from error
+    if type(terminal_value) is not dict:
+        raise RuntimeError("industrial terminal evidence is malformed")
+    prepared_binding = terminal_value.get("prepared_receipt_sha256")
+    post_binding_fields = {
+        "prepared_receipt_name",
+        "prepared_receipt_sha256",
+        "prepared_receipt_size",
+        "budget_observation",
+    }
+    present_post_bindings = post_binding_fields.intersection(terminal_value)
+    is_prepared_receipt = terminal_receipt.name == f"{run_id}.rank0.prepared.json"
+    is_canonical_receipt = terminal_receipt.name == f"{run_id}.rank0.complete.json"
+    if (
+        not (is_prepared_receipt or is_canonical_receipt)
+        or (is_prepared_receipt and present_post_bindings)
+        or (is_canonical_receipt and present_post_bindings != post_binding_fields)
+        or (
+            is_canonical_receipt
+            and (type(prepared_binding) is not str or not _is_sha256(prepared_binding))
+        )
+    ):
+        raise RuntimeError("industrial terminal evidence has an invalid post-binding")
+    observed_evidence_sha256 = (
+        prepared_binding
+        if present_post_bindings == post_binding_fields
+        else _file_sha256(terminal_receipt)
+    )
+    try:
+        artifact = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("budget observation is not valid JSON") from error
+    expected_fields = {
+        "schema_version",
+        "artifact_kind",
+        "experiment_budget_sha256",
+        "budget_observation_sha256",
+        "budget",
+        "observed_component_ms",
+        "measured_gpu_ms",
+        "fixed_instance_billed_gpu_ms",
+        "terminal_evidence_sha256",
+        "observed_wall_ms",
+        "registered_wall_delta_ms",
+        "registered_gpu_delta_ms",
+        "registered_billed_delta_ms",
+        "gpu_measurement_semantics",
+        "fixed_instance_billing_semantics",
+    }
+    if type(artifact) is not dict or set(artifact) != expected_fields:
+        raise RuntimeError("budget observation fields differ from the exact contract")
+    if (
+        type(artifact["schema_version"]) is not int
+        or artifact["schema_version"] != 1
+        or type(artifact["artifact_kind"]) is not str
+        or artifact["artifact_kind"] != _BUDGET_OBSERVATION_KIND
+        or type(artifact["gpu_measurement_semantics"]) is not str
+        or artifact["gpu_measurement_semantics"] != _RESERVED_GANG_MEASUREMENT
+        or type(artifact["fixed_instance_billing_semantics"]) is not str
+        or artifact["fixed_instance_billing_semantics"] != _WHOLE_INSTANCE_BILLING
+        or type(artifact["experiment_budget_sha256"]) is not str
+        or type(artifact["budget_observation_sha256"]) is not str
+        or type(artifact["terminal_evidence_sha256"]) is not str
+    ):
+        raise RuntimeError("budget observation identity fields are malformed")
+    observed_rows = artifact["observed_component_ms"]
+    if type(observed_rows) is not list or any(
+        type(row) is not list
+        or len(row) != 2
+        or type(row[0]) is not str
+        or type(row[1]) is not int
+        for row in observed_rows
+    ):
+        raise RuntimeError("budget observation component rows are malformed")
+    if type(artifact["budget"]) is not dict or artifact["budget"] != asdict(
+        plan.budget
+    ):
+        raise RuntimeError("budget observation belongs to another ExperimentBudget")
+    integer_fields = (
+        "measured_gpu_ms",
+        "fixed_instance_billed_gpu_ms",
+        "observed_wall_ms",
+        "registered_wall_delta_ms",
+        "registered_gpu_delta_ms",
+        "registered_billed_delta_ms",
+    )
+    if any(type(artifact[name]) is not int for name in integer_fields):
+        raise RuntimeError(
+            "budget observation accounting must use integral milliseconds"
+        )
+    try:
+        observation = BudgetObservationReceipt(
+            schema_version=artifact["schema_version"],
+            budget=plan.budget,
+            observed_component_ms=tuple(
+                (str(row[0]), int(row[1])) for row in observed_rows
+            ),
+            measured_gpu_ms=artifact["measured_gpu_ms"],
+            fixed_instance_billed_gpu_ms=artifact["fixed_instance_billed_gpu_ms"],
+            terminal_evidence_sha256=artifact["terminal_evidence_sha256"],
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "budget observation violates its planning contract"
+        ) from error
+    expected = _budget_observation_artifact(observation)
+    if artifact != expected:
+        raise RuntimeError("budget observation deltas or identities are inconsistent")
+    if (
+        observation.measured_gpu_ms
+        != observation.observed_wall_ms * plan.budget.gpu_count
+        or observation.fixed_instance_billed_gpu_ms
+        != (
+            observation.observed_wall_ms
+            * plan.runtime_plan.physical_fixed_instance_gpu_count
+        )
+    ):
+        raise RuntimeError(
+            "budget observation violates its declared GPU accounting semantics"
+        )
+    try:
+        sidecar_body = sidecar_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise RuntimeError("budget observation sidecar is unreadable") from error
+    if (
+        sidecar_body != observation.sha256 + "\n"
+        or observation.budget.sha256 != plan.budget.sha256
+        or observation.terminal_evidence_sha256 != observed_evidence_sha256
+    ):
+        raise RuntimeError("budget observation content binding is invalid")
+    return observation, receipt_path, sidecar_path
+
+
+def _recover_prepared_completion(
+    *,
+    root: Path,
+    run_id: str,
+    run_nonce_sha256: str,
+    plan: IndustrialExecutionPlan,
+) -> dict[str, Path] | None:
+    """Promote a prepared receipt only after its observation is durable."""
+
+    prepared = root / f"{run_id}.rank0.prepared.json"
+    observation_directory = _budget_observation_directory(root, run_id)
+    prepared_exists = os.path.lexists(prepared)
+    observation_exists = os.path.lexists(observation_directory)
+    if not prepared_exists and not observation_exists:
+        return None
+    if not prepared_exists or not observation_exists:
+        raise RuntimeError(
+            "industrial completion preparation is incomplete and non-resumable"
+        )
+    observation, _, _ = _load_budget_observation(
+        root=root,
+        run_id=run_id,
+        plan=plan,
+        terminal_receipt=prepared,
+    )
+
+    def validate_prepared(completed: dict[str, Path]) -> None:
+        _validate_resume(
+            completed=completed,
+            run_id=run_id,
+            plan=plan,
+            run_nonce_sha256=run_nonce_sha256,
+        )
+
+    def validate_post_binding() -> None:
+        recovered, _, _ = _load_budget_observation(
+            root=root,
+            run_id=run_id,
+            plan=plan,
+            terminal_receipt=prepared,
+        )
+        if recovered != observation:
+            raise RuntimeError("budget observation changed during recovery")
+
+    return publish_prepared_evidence_completion(
+        root,
+        run_id=run_id,
+        rank=0,
+        expected_receipt_sha256=observation.terminal_evidence_sha256,
+        validate=validate_prepared,
+        validate_post_binding=validate_post_binding,
     )
 
 
@@ -408,7 +841,8 @@ def _validate_cell_load_contract(
         for request in corpus.requests
     )
     context = identity.context
-    assert context is not None
+    if context is None:
+        raise ValueError("registered serving cell lacks a context identity")
     if identity.regime == "long_input_short_output" and any(
         input_tokens < math.ceil(0.75 * context)
         or output_tokens > math.floor(0.25 * context)
@@ -496,11 +930,112 @@ def _request_routes(
     )
 
 
+def _validate_runtime_dispatch_authority(
+    *,
+    runtime_plan: IndustrialRuntimePlan,
+    dispatch_plan: GpuDispatchPlan,
+    dispatch_context: GpuDispatchExecutionContext,
+    budget: ExperimentBudget,
+) -> None:
+    """Replay the scheduler and compare the complete launch-time binding."""
+
+    if not isinstance(dispatch_plan, GpuDispatchPlan):
+        raise TypeError("execution dispatch_plan must be a GpuDispatchPlan")
+    if not isinstance(dispatch_context, GpuDispatchExecutionContext):
+        raise TypeError(
+            "execution dispatch_context must be a GpuDispatchExecutionContext"
+        )
+    validate_dispatch_plan_for_execution(
+        dispatch_plan,
+        execution_context=dispatch_context,
+    )
+    registry = dispatch_context.registry
+    inventory = dispatch_context.inventory
+    if (
+        runtime_plan.registry_sha256 != registry.sha256
+        or dispatch_plan.registry_sha256 != registry.sha256
+        or dispatch_plan.inventory_sha256 != inventory.sha256
+    ):
+        raise ValueError(
+            "launch dispatch authority belongs to another registry or pool"
+        )
+    canonical_cells = tuple(
+        cell for cell in registry.cells if cell.cell_id == runtime_plan.cell_id
+    )
+    if canonical_cells != (runtime_plan.cell,) or (
+        runtime_plan.cell_declaration_sha256 != runtime_plan.cell.sha256
+    ):
+        raise ValueError("launch runtime cell differs from the canonical registry cell")
+    if dispatch_context.budgets_by_cell_id.get(runtime_plan.cell_id) != budget:
+        raise ValueError("launch budget differs from the scheduler authority")
+    assignments = tuple(
+        assignment
+        for wave in dispatch_plan.waves
+        for assignment in wave.assignments
+        if assignment.work_item.item_id == runtime_plan.cell_id
+    )
+    if len(assignments) != 1:
+        raise ValueError("launch cell lacks one exact scheduler-issued assignment")
+    assignment = assignments[0]
+    physical = runtime_plan.physical_assignment
+    if physical is None:
+        raise ValueError("launch runtime lacks a physical scheduler assignment")
+    claim = assignment.work_item.claim
+    devices = tuple(inventory.device(uuid) for uuid in assignment.gpu_uuids)
+    host_ids = {device.host_id for device in devices}
+    if len(host_ids) != 1:
+        raise ValueError("scheduler-issued launch assignment crosses hosts")
+    host_id = next(iter(host_ids))
+    topology_group_ids: list[tuple[str, ...]] = []
+    for rank_group in assignment.rank_groups:
+        if claim.gang_shape.tensor_parallel_size == 1:
+            topology_group_ids.append(())
+            continue
+        rank_set = set(rank_group)
+        eligible = tuple(
+            group.group_id
+            for group in inventory.topology_groups
+            if group.host_id == host_id
+            and rank_set <= set(group.gpu_uuids)
+            and (
+                not claim.allowed_topology_groups
+                or group.group_id in claim.allowed_topology_groups
+            )
+            and (not claim.allowed_fabrics or group.fabric in claim.allowed_fabrics)
+        )
+        if not eligible:
+            raise ValueError("scheduler-issued launch TP gang lacks topology authority")
+        topology_group_ids.append(eligible)
+    expected = IndustrialPhysicalAssignment(
+        inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        dispatch_plan_sha256=dispatch_plan.sha256,
+        experiment_budget_sha256=budget.sha256,
+        assignment_sha256=assignment.sha256,
+        work_item_sha256=assignment.work_item.sha256,
+        gpu_uuids=assignment.gpu_uuids,
+        rank_groups=assignment.rank_groups,
+        ports=assignment.ports,
+        tensor_parallel_size=claim.gang_shape.tensor_parallel_size,
+        data_parallel_size=claim.gang_shape.data_parallel_size,
+        fixed_instance_gpu_count=len(inventory.devices),
+        host_id=host_id,
+        topology_group_ids=tuple(topology_group_ids),
+    )
+    if physical != expected:
+        raise ValueError(
+            "launch physical assignment differs from the exact scheduler replay"
+        )
+
+
 @dataclass(frozen=True)
 class IndustrialExecutionPlan:
     """Immutable local plan for exactly one rank and one serving cell."""
 
     runtime_plan: IndustrialRuntimePlan
+    dispatch_plan: GpuDispatchPlan
+    dispatch_context: GpuDispatchExecutionContext
+    budget: ExperimentBudget
     load_plan: ProductionLoadPlan
     server_launch: ServerLaunch
     dependency_receipt_sha256s: tuple[str, ...]
@@ -518,6 +1053,16 @@ class IndustrialExecutionPlan:
     abort_grace_s: float = 30.0
 
     def validate(self) -> None:
+        _validate_runtime_dispatch_authority(
+            runtime_plan=self.runtime_plan,
+            dispatch_plan=self.dispatch_plan,
+            dispatch_context=self.dispatch_context,
+            budget=self.budget,
+        )
+        if not self.runtime_plan.physical_dispatch_ready:
+            raise ValueError(
+                "logical runtime plan cannot be launched; a physical assignment is required"
+            )
         cell = self.runtime_plan.cell
         if not cell.runnable or cell.status is not CellStatus.UNMEASURED:
             raise ValueError("execution plan requires one runnable UNMEASURED cell")
@@ -531,6 +1076,90 @@ class IndustrialExecutionPlan:
                 "the current strict RunConfig exposes only one-rank serving execution"
             )
         self.load_plan.validate()
+        budget = self.budget
+        if (
+            not isinstance(budget, ExperimentBudget)
+            or budget.cell_id != cell.cell_id
+            or budget.experiment != cell.identity.experiment
+            or budget.method != cell.identity.method
+            or budget.workload_class is not cell.resources.workload_class
+            or budget.gpu_count != cell.resources.gpu_count
+            or budget.topology != cell.identity.topology
+            or budget.measured_gpu_ms is not None
+        ):
+            raise ValueError("ExperimentBudget differs from the execution cell")
+        physical_assignment = self.runtime_plan.physical_assignment
+        if (
+            physical_assignment is None
+            or physical_assignment.experiment_budget_sha256 != budget.sha256
+        ):
+            raise ValueError(
+                "ExperimentBudget differs from the physical dispatch-plan binding"
+            )
+        expected_fixed_instance_bill = budget.wall_time.scale(
+            self.runtime_plan.physical_fixed_instance_gpu_count
+        )
+        if budget.fixed_instance_billed_gpu_ms != expected_fixed_instance_bill:
+            raise ValueError(
+                "ExperimentBudget fixed-instance billing differs from the physical "
+                "inventory"
+            )
+        scoring_component = _SCORING_COMPONENT_BY_JOB.get(budget.job_kind)
+        if scoring_component is None:
+            raise ValueError("compile/download budgets cannot enter serving execution")
+        if (budget.job_kind is BudgetJobKind.PROFILER) != (
+            budget.workload_class is WorkloadClass.PROFILE
+        ):
+            raise ValueError("profiler budget and PROFILE isolation must match exactly")
+        window = self.load_plan.window
+        expected_window_ms = {
+            "excluded warm-up": (
+                budget.excluded_warmup.registered,
+                window.warmup_duration_us,
+            ),
+            "active scored clock": (
+                getattr(budget, scoring_component).registered,
+                window.arrival_duration_us,
+            ),
+            "request deadline": (
+                budget.request_deadline.registered,
+                window.request_deadline_us,
+            ),
+            "drain": (budget.drain.registered, window.drain_duration_us),
+        }
+        if any(
+            registered_ms * 1000 != observed_us
+            for registered_ms, observed_us in expected_window_ms.values()
+        ):
+            raise ValueError("ExperimentBudget differs from the fixed load window")
+        inactive_scoring = set(_SCORING_COMPONENTS) - {scoring_component}
+        if any(
+            not _scenario_is_explicit_zero(getattr(budget, name))
+            for name in inactive_scoring
+        ):
+            raise ValueError(
+                "non-job scored duration components must be registered as zero"
+            )
+        if budget.job_kind is BudgetJobKind.FAILURE:
+            raise ValueError(
+                "failure-injection execution is BLOCKED without an internal fault actuator"
+            )
+        if budget.excluded_warmup_requests.maximum != len(self.warmup_requests):
+            raise ValueError("ExperimentBudget differs from the warm-up request pool")
+        maximum_output_tokens = sum(
+            request.requested_output_tokens for request in self.scored_requests
+        )
+        if budget.output_tokens.maximum != maximum_output_tokens:
+            raise ValueError("ExperimentBudget differs from the scored token pool")
+        if budget.minimum_completed_requests > len(self.scored_requests):
+            raise ValueError(
+                "ExperimentBudget completion floor exceeds its request pool"
+            )
+        if (
+            budget.p99_anchor_status is P99AnchorStatus.LOCKED
+            and budget.minimum_completed_requests < 10_000
+        ):
+            raise ValueError("a locked p99 anchor requires at least 10,000 completions")
         config = self.runtime_plan.rank_configs[0]
         if config.runtime.max_running_requests != cell.identity.concurrency:
             raise ValueError("execution concurrency differs from the registry cell")
@@ -628,6 +1257,11 @@ class IndustrialExecutionPlan:
         return {
             "schema_version": 1,
             "runtime_plan_sha256": self.runtime_plan.sha256,
+            "dispatch_plan_sha256": self.dispatch_plan.sha256,
+            "dispatch_context_sha256": self.dispatch_context.sha256,
+            "dispatch_plan": self.dispatch_plan.to_dict(),
+            "dispatch_authority": self.dispatch_context.authority_dict(),
+            "experiment_budget_sha256": self.budget.sha256,
             "rank_config_sha256": self.rank_config_sha256,
             "topology_sha256": self.topology_sha256,
             "topology_receipt_sha256": self.runtime_plan.topology_receipt_sha256,
@@ -690,16 +1324,30 @@ class IndustrialExecutionPlan:
 
     @property
     def topology_sha256(self) -> str:
-        """Canonical cell topology identity consumed by industrial reduction."""
+        """Canonical assigned topology identity consumed by execution/reduction."""
 
         config = self.runtime_plan.rank_configs[0]
         cell = self.runtime_plan.cell
+        assignment = self.runtime_plan.physical_assignment
+        if assignment is None:
+            raise ValueError("topology identity requires a physical assignment")
         return content_sha256(
             {
                 "schema_version": 1,
                 "cell_id": cell.cell_id,
                 "topology": cell.identity.topology,
-                "gpu_uuids": list(cell.resources.gpu_uuids),
+                "topology_receipt_sha256": (self.runtime_plan.topology_receipt_sha256),
+                "physical_assignment_sha256": assignment.assignment_sha256,
+                "physical_binding_sha256": assignment.sha256,
+                "physical_host_id": assignment.host_id,
+                "physical_gpu_uuids": list(self.runtime_plan.physical_gpu_uuids),
+                "physical_rank_groups": [
+                    list(group) for group in self.runtime_plan.physical_rank_groups
+                ],
+                "physical_ports": list(self.runtime_plan.physical_ports),
+                "topology_group_ids": [
+                    list(group_ids) for group_ids in assignment.topology_group_ids
+                ],
                 "tensor_parallel_size": config.runtime.tensor_parallel_size,
                 "data_parallel_size": config.runtime.data_parallel_size,
                 "world_size": len(self.runtime_plan.rank_configs),
@@ -711,14 +1359,26 @@ def _validate_server_launch(
     runtime_plan: IndustrialRuntimePlan,
     launch: ServerLaunch,
 ) -> None:
+    if not runtime_plan.physical_dispatch_ready:
+        raise ValueError("logical runtime plan cannot validate a server launch")
     config = runtime_plan.rank_configs[0]
+    physical_gpu_uuids = runtime_plan.physical_gpu_uuids
+    physical_rank_groups = runtime_plan.physical_rank_groups
+    physical_ports = runtime_plan.physical_ports
+    if (
+        tuple(config.runtime.device_identity for config in runtime_plan.rank_configs)
+        != physical_gpu_uuids
+    ):
+        raise ValueError("server RunConfigs do not bind the physical GPU rank order")
+    if physical_rank_groups != (physical_gpu_uuids,):
+        raise ValueError("released one-rank server requires one physical rank group")
     if launch.method != config.method or not launch.exclusive_device:
         raise ValueError("server launch method/isolation differs from the runtime plan")
     parsed = urlsplit(launch.base_url)
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "localhost"}
-        or parsed.port != runtime_plan.cell.resources.ports[0]
+        or parsed.port != physical_ports[0]
         or parsed.path not in {"", "/"}
     ):
         raise ValueError("industrial server launch must use its reserved loopback port")
@@ -815,8 +1475,10 @@ def _validate_server_launch(
         raise ValueError("speculative server argv differs from the RunConfig")
     adaptation_argv = remainder[13:]
     if not adapted:
-        if adaptation_argv:
-            raise ValueError("Static argv cannot enable adaptation")
+        if adaptation_argv != ("--speculative-speed-study-metrics",):
+            raise ValueError(
+                "Static argv requires only the native terminal-evidence hook"
+            )
         return
     if not adaptation_argv or adaptation_argv[0] != "--speculative-speed-study-metrics":
         raise ValueError("adapted server argv lacks native speed-study evidence")
@@ -850,6 +1512,9 @@ def _validate_server_launch(
 def build_industrial_execution_plan(
     *,
     runtime_plan: IndustrialRuntimePlan,
+    dispatch_plan: GpuDispatchPlan,
+    dispatch_context: GpuDispatchExecutionContext,
+    budget: ExperimentBudget,
     load_plan: ProductionLoadPlan,
     server_launch: ServerLaunch,
     dependency_receipts: tuple[ExperimentReceipt, ...],
@@ -879,6 +1544,9 @@ def build_industrial_execution_plan(
     route_id = runtime_plan.rank_configs[0].runtime.router_identity
     plan = IndustrialExecutionPlan(
         runtime_plan=runtime_plan,
+        dispatch_plan=dispatch_plan,
+        dispatch_context=dispatch_context,
+        budget=budget,
         load_plan=load_plan,
         server_launch=server_launch,
         dependency_receipt_sha256s=receipt_sha256s,
@@ -909,6 +1577,9 @@ def render_industrial_execution_plan(
     *,
     output_root: str | Path,
     runtime_plan: IndustrialRuntimePlan,
+    dispatch_plan: GpuDispatchPlan,
+    dispatch_context: GpuDispatchExecutionContext,
+    budget: ExperimentBudget,
     load_plan: ProductionLoadPlan,
     dependency_receipts: tuple[ExperimentReceipt, ...],
     dependency_artifacts: tuple[ArtifactBinding, ...],
@@ -925,6 +1596,10 @@ def render_industrial_execution_plan(
 
     if len(runtime_plan.rank_configs) != 1:
         raise ValueError("server rendering supports the released one-rank topology")
+    if not runtime_plan.physical_dispatch_ready:
+        raise ValueError(
+            "logical runtime plan cannot render a server; physical assignment required"
+        )
     config = runtime_plan.rank_configs[0]
     target_id = config.model.target
     drafter_id = config.model.drafter
@@ -955,10 +1630,18 @@ def render_industrial_execution_plan(
         adaptation_reserve_mb=adaptation_reserve_mb,
         mem_fraction_static=mem_fraction_static,
         host=host,
-        port=runtime_plan.cell.resources.ports[0],
+        port=runtime_plan.physical_ports[0],
     )
+    if config.method == "static":
+        launch = replace(
+            launch,
+            argv=(*launch.argv, "--speculative-speed-study-metrics"),
+        )
     plan = build_industrial_execution_plan(
         runtime_plan=runtime_plan,
+        dispatch_plan=dispatch_plan,
+        dispatch_context=dispatch_context,
+        budget=budget,
         load_plan=load_plan,
         server_launch=launch,
         dependency_receipts=dependency_receipts,
@@ -1147,10 +1830,15 @@ class NativeEvidencePreflight:
             if self.reason_code is not None or self.missing_hook is not None:
                 raise ValueError("READY native evidence preflight cannot be blocked")
         elif self.status == "BLOCKED":
-            if (
-                self.reason_code != MISSING_NATIVE_EVIDENCE_REASON
-                or self.missing_hook != NATIVE_TERMINAL_EVIDENCE_HOOK
-            ):
+            missing_hook = (
+                self.reason_code == MISSING_NATIVE_EVIDENCE_REASON
+                and self.missing_hook == NATIVE_TERMINAL_EVIDENCE_HOOK
+            )
+            unavailable_trust = (
+                self.reason_code == TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
+                and self.missing_hook is None
+            )
+            if not (missing_hook or unavailable_trust):
                 raise ValueError("BLOCKED native evidence preflight is ambiguous")
         else:
             raise ValueError("native evidence preflight status is invalid")
@@ -1166,43 +1854,61 @@ class NativeEvidenceUnavailableError(RuntimeError):
         if preflight.status != "BLOCKED":
             raise ValueError("only a BLOCKED preflight can be unavailable")
         self.preflight = preflight
-        fields = ",".join(preflight.required_fields)
-        super().__init__(
-            f"{preflight.reason_code}: missing hook {preflight.missing_hook}; "
-            f"required fields={fields}"
-        )
+        if preflight.missing_hook is None:
+            super().__init__(str(preflight.reason_code))
+        else:
+            fields = ",".join(preflight.required_fields)
+            super().__init__(
+                f"{preflight.reason_code}: missing hook {preflight.missing_hook}; "
+                f"required fields={fields}"
+            )
 
 
-class NativeEvidenceProvider(Protocol):
-    native_evidence_hook: str
-    patched_sglang_tree: str
-    supported_methods: frozenset[str]
+# Compatibility spelling for callers while the implementation is now one
+# concrete, wire-validating begin/reset/finalize provider rather than a
+# caller-authored ``collect`` protocol.
+NativeEvidenceProvider = NativeTerminalProvider
 
-    async def collect(
-        self,
-        *,
-        run_id: str,
-        plan: IndustrialExecutionPlan,
-        requests: tuple[RequestExecution, ...],
-        accounting: LoadAccounting,
-    ) -> NativeEvidenceBatch: ...
+
+def _is_exact_native_terminal_provider(value: object) -> bool:
+    if type(value) is not NativeTerminalProvider:
+        return False
+    instance_fields = vars(value)
+    return not any(
+        name in instance_fields for name in ("capability", "begin", "reset", "finalize")
+    )
 
 
 def native_evidence_preflight(
     plan: IndustrialExecutionPlan,
-    provider: NativeEvidenceProvider | None,
+    provider: NativeTerminalProvider | None,
 ) -> NativeEvidencePreflight:
-    """Block speculative execution unless an exact pinned native hook exists."""
+    """Structurally gate the sole wire provider before process mutation.
+
+    Target-only may omit the hook or use the concrete wire provider.  The
+    released speculative path is blocked before mutation until an immutable
+    release-owned attester policy exists; caller callables and object
+    attributes never establish that trust root.
+    """
 
     method = plan.runtime_plan.rank_configs[0].method
-    # The current patch exposes no trusted terminal provider.  Caller-authored
-    # attributes cannot promote an adapted run to READY; a future concrete
-    # provider must replace this gate and validate the full terminal envelope.
-    ready = method == "target_only"
+    if method != "target_only":
+        # The current release has no content-bound TrustedAttesterPolicy or
+        # allowlisted public-key identity.  A caller-supplied verifier callable
+        # can therefore never unlock a speculative claim, regardless of the
+        # provider object's concrete type or live server capability response.
+        status = "BLOCKED"
+        reason_code = TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
+        missing_hook = None
+    else:
+        ready = provider is None or _is_exact_native_terminal_provider(provider)
+        status = "READY" if ready else "BLOCKED"
+        reason_code = None if ready else MISSING_NATIVE_EVIDENCE_REASON
+        missing_hook = None if ready else NATIVE_TERMINAL_EVIDENCE_HOOK
     value = NativeEvidencePreflight(
-        status="READY" if ready else "BLOCKED",
-        reason_code=None if ready else MISSING_NATIVE_EVIDENCE_REASON,
-        missing_hook=None if ready else NATIVE_TERMINAL_EVIDENCE_HOOK,
+        status=status,
+        reason_code=reason_code,
+        missing_hook=missing_hook,
         required_fields=NATIVE_TERMINAL_EVIDENCE_FIELDS,
     )
     value.validate()
@@ -1330,10 +2036,15 @@ class ExecutionClock:
 class IndustrialExecutionResult:
     run_id: str
     execution_plan_sha256: str
+    experiment_budget_sha256: str
     rank_config_sha256: str
     topology_sha256: str
     resumed: bool
     terminal_receipt: str
+    terminal_receipt_sha256: str
+    budget_observation: str
+    budget_observation_sidecar: str
+    budget_observation_sha256: str
     evidence_files: tuple[str, ...]
     accounting: LoadAccounting | None
 
@@ -1352,6 +2063,159 @@ def industrial_run_id(plan: IndustrialExecutionPlan, run_nonce_sha256: str) -> s
             }
         )[:48]
     )
+
+
+def _preflight_industrial_session_trace_evidence(
+    plan: IndustrialExecutionPlan,
+    *,
+    output_root: str | Path,
+    run_nonce_sha256: str,
+) -> None:
+    """Reject any pre-existing trace state before a shared server is launched.
+
+    Shared sessions deliberately do not resume an earlier logical trace: the
+    native process boundary and its startup/reset accounting would otherwise
+    differ from the evidence already on disk.  This check is read-only and is
+    called for every planned trace before ``open_server_session`` performs any
+    process or network mutation.
+    """
+
+    plan.validate()
+    run_id = industrial_run_id(plan, run_nonce_sha256)
+    requested_root = Path(output_root)
+    root = requested_root.resolve()
+    registered_root = Path(plan.runtime_plan.cell.resources.evidence_root).resolve()
+    if root != registered_root:
+        raise ValueError("output_root differs from the registry evidence reservation")
+    if os.path.lexists(requested_root) and requested_root.is_symlink():
+        raise RuntimeError("shared-session evidence root cannot be a symlink")
+    if not root.exists():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("shared-session evidence root is not a regular directory")
+    public_prefix = f"{run_id}.rank0."
+    private_prefix = f".{run_id}."
+    try:
+        preexisting = any(
+            entry.name.startswith(public_prefix)
+            or entry.name.startswith(private_prefix)
+            for entry in root.iterdir()
+        )
+    except OSError as error:
+        raise RuntimeError("shared-session evidence root is unreadable") from error
+    if preexisting:
+        raise RuntimeError(
+            "shared-session execution cannot resume preexisting trace evidence"
+        )
+
+
+def _native_terminal_binding(
+    *,
+    plan: IndustrialExecutionPlan,
+    run_id: str,
+    run_nonce_sha256: str,
+    session_binding: SessionExecutionBinding | None,
+) -> NativeTerminalRunBinding:
+    if session_binding is None:
+        session_id = content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "standalone_native_terminal_session",
+                "execution_plan_sha256": plan.sha256,
+                "run_nonce_sha256": run_nonce_sha256,
+            }
+        )
+        session_epoch = 1
+        previous_run_id = None
+    else:
+        session_id = session_binding.native_session_id
+        session_epoch = session_binding.native_trace_epoch
+        previous_run_id = session_binding.native_previous_run_id
+    binding = NativeTerminalRunBinding(
+        run_id=run_id,
+        run_nonce_sha256=run_nonce_sha256,
+        execution_plan_sha256=plan.sha256,
+        rank_config_sha256=plan.rank_config_sha256,
+        attempt_id=f"{run_id}.attempt.{os.urandom(8).hex()}",
+        session_id=session_id,
+        session_epoch=session_epoch,
+        previous_run_id=previous_run_id,
+        challenge_nonce_sha256=hashlib.sha256(os.urandom(32)).hexdigest(),
+        method=plan.runtime_plan.rank_configs[0].method,
+        warmup_request_ids=tuple(
+            request.request_id for request in plan.warmup_requests
+        ),
+        scored_request_ids=tuple(
+            request.request_id for request in plan.scored_requests
+        ),
+    )
+    binding.validate()
+    return binding
+
+
+def _terminal_request_expectation(
+    execution: RequestExecution,
+) -> TerminalRequestExpectation:
+    outcome = execution.outcome
+    result = execution.result
+    submitted = outcome.admitted_at_us is not None
+    if submitted:
+        if outcome.status == "completed":
+            if (
+                result is None
+                or result.output_tokens != execution.request.requested_output_tokens
+            ):
+                raise RuntimeError(
+                    "submitted completion lacks an exact FINISH_LENGTH terminal"
+                )
+            terminal_status = "completed"
+            terminal_reason = "FINISH_LENGTH"
+        elif outcome.status in {"cancelled", "timed_out"}:
+            if result is None:
+                raise RuntimeError("aborted native request lacks its terminal result")
+            terminal_status = "aborted"
+            terminal_reason = "FINISH_ABORT"
+        else:
+            raise RuntimeError(
+                "submitted request lacks a reconciliable terminal outcome"
+            )
+        output_token_ids: tuple[int, ...] | None = result.generated_token_ids
+    else:
+        if outcome.status not in {"rejected", "cancelled", "timed_out"}:
+            raise RuntimeError("non-submitted request lacks a client terminal outcome")
+        terminal_status = outcome.status
+        terminal_reason = outcome.code
+        output_token_ids = None
+    expectation = TerminalRequestExpectation(
+        request_id=execution.request.request_id,
+        input_token_ids=execution.request.input_token_ids,
+        output_token_ids=output_token_ids,
+        terminal_status=terminal_status,
+        terminal_reason=terminal_reason,
+        submitted_to_server=submitted,
+    )
+    expectation.validate()
+    return expectation
+
+
+def _bind_native_terminal_transport(
+    *,
+    provider: NativeTerminalProvider,
+    transport: BenchServingTransport,
+    base_url: str,
+) -> PinnedBenchServingTransport:
+    """Prove native admin and serving requests share one official live pool."""
+
+    if not _is_exact_native_terminal_provider(provider):
+        raise TypeError("native evidence requires the concrete pinned wire provider")
+    if not isinstance(transport, PinnedBenchServingTransport):
+        raise TypeError("native evidence requires the pinned official bench transport")
+    # NativeTerminalProvider intentionally keeps the admin boundary private;
+    # identity comparison is used only to prove pool sharing, never capability.
+    if provider._transport is not transport:
+        raise ValueError("native admin and serving traffic use different HTTP pools")
+    transport.bind_native_admin_base_url(base_url)
+    return transport
 
 
 async def _sleep_until(
@@ -1768,12 +2632,11 @@ def _request_record(
     )
     result = execution.result
     output_tokens = result.output_tokens if result is not None else 0
-    output = result.generated_text if result is not None else ""
     token_ids = (
         result.generated_token_ids
         if result is not None
         else ()
-        if execution.outcome.status in {"rejected", "cancelled"}
+        if execution.outcome.status in {"rejected", "cancelled", "timed_out"}
         else None
     )
     token_ids_body = (
@@ -1782,8 +2645,9 @@ def _request_record(
     output_sha256 = (
         hashlib.sha256(token_ids_body.encode("utf-8")).hexdigest()
         if token_ids_body is not None
-        else hashlib.sha256(output.encode("utf-8")).hexdigest()
+        else None
     )
+    output_hash_format = OUTPUT_HASH_FORMAT if output_sha256 is not None else None
     timestamps = _timing_timestamps(execution, score_started_ns=score_started_ns)
     return RequestRecord(
         run_id=run_id,
@@ -1794,7 +2658,7 @@ def _request_record(
         concurrency=concurrency,
         input_tokens=len(execution.request.input_token_ids),
         output_tokens=output_tokens,
-        output_hash_format=OUTPUT_HASH_FORMAT,
+        output_hash_format=output_hash_format,
         output_sha256=output_sha256,
         ttft_ms=(timing.ttft_us / 1000 if timing.ttft_us is not None else None),
         finished=outcome.status == "completed",
@@ -1871,6 +2735,7 @@ def _performance_record(
     accounting: LoadAccounting,
     native: NativeEvidenceBatch,
     writer: EvidenceWriter,
+    transport_metrics: Mapping[str, int] | None = None,
     asynchronous_backpressure_events: int = 0,
 ) -> PerformanceRecord:
     if accounting.elapsed_us <= 0:
@@ -1898,6 +2763,7 @@ def _performance_record(
     identity = plan.runtime_plan.cell.identity
     allocation_free = identity.method in {"target_only", "static"}
     structurally_non_speculative = identity.method == "target_only"
+    transport_metrics = {} if transport_metrics is None else transport_metrics
     base = PerformanceRecord(
         run_id=run_id,
         prompt_id=plan.load_plan.scored.hashes.corpus_sha256,
@@ -1961,6 +2827,10 @@ def _performance_record(
             writer.backpressure_events + asynchronous_backpressure_events
         ),
         evidence_dropped_rows=writer.dropped_rows,
+        writer_flush_count=int(writer.counters["flushes"]),
+        writer_fsync_ms=writer.fsync_time_ns / 1_000_000,
+        http_connections_created=transport_metrics.get("connections_created"),
+        http_reused_requests=transport_metrics.get("reused_requests"),
     )
     return replace(base, **dict(native.performance_overrides))
 
@@ -1979,6 +2849,7 @@ def _validate_resume(
     run_id: str,
     plan: IndustrialExecutionPlan,
     run_nonce_sha256: str,
+    session_binding: SessionExecutionBinding | None = None,
 ) -> None:
     run_rows = pq.read_table(completed["run"]).to_pylist()
     request_rows = pq.read_table(completed["request"]).to_pylist()
@@ -2008,7 +2879,22 @@ def _validate_resume(
         "expected_request_rows": len(request_rows),
         "expected_performance_rows": 1,
         "workload_contract": _workload_contract(config.method),
+        "experiment_budget_sha256": plan.budget.sha256,
         "status": "complete",
+        "session_plan_sha256": (
+            None if session_binding is None else session_binding.session_plan_sha256
+        ),
+        "session_open_receipt_sha256": (
+            None
+            if session_binding is None
+            else session_binding.session_open_receipt_sha256
+        ),
+        "reset_receipt_sha256": (
+            None if session_binding is None else session_binding.reset_receipt_sha256
+        ),
+        "session_epoch": (
+            None if session_binding is None else session_binding.session_epoch
+        ),
     }
     if len(run_rows) != 1 or any(
         run_rows[0].get(key) != value for key, value in expected.items()
@@ -2134,20 +3020,35 @@ async def execute_industrial_plan(
     *,
     output_root: str | Path,
     run_nonce_sha256: str,
-    launch_server: ServerLauncher,
+    launch_server: ServerLauncher | None,
     transport: BenchServingTransport,
-    native_evidence: NativeEvidenceProvider | None = None,
+    native_evidence: NativeTerminalProvider | None = None,
     clock: ExecutionClock | None = None,
+    existing_handle: ServerHandle | None = None,
+    transport_already_open: bool = False,
+    keep_session_open: bool = False,
+    session_lifecycle: SessionExecutionLifecycle | None = None,
 ) -> IndustrialExecutionResult:
     """Execute one plan; no process or network action occurs without injection."""
 
+    if (
+        existing_handle is not None
+        or transport_already_open
+        or keep_session_open
+        or session_lifecycle is not None
+    ):
+        raise SharedSessionUnavailableError(SHARED_SESSION_UNAVAILABLE_REASON)
     plan.validate()
+    observed_component_ms = _initial_budget_observations(plan)
+    if launch_server is None:
+        raise ValueError("standalone execution requires a server launcher")
     method = plan.runtime_plan.rank_configs[0].method
-    if method == "target_only" and native_evidence is not None:
-        raise ValueError("Target-only cannot inject native speculative evidence")
     evidence_preflight = native_evidence_preflight(plan, native_evidence)
     if evidence_preflight.status == "BLOCKED":
         raise NativeEvidenceUnavailableError(evidence_preflight)
+    session_binding: SessionExecutionBinding | None = None
+    session_startup_interval_ns: tuple[int, int] | None = None
+    session_prepare_observed_ms = 0
     if clock is None:
         clock = ExecutionClock()
     run_id = industrial_run_id(plan, run_nonce_sha256)
@@ -2158,32 +3059,122 @@ async def execute_industrial_plan(
     root.mkdir(parents=True, exist_ok=True)
     completed = load_completed_evidence(root, run_id=run_id, rank=0)
     terminal_receipt = root / f"{run_id}.rank0.complete.json"
+    if completed is None:
+        completed = _recover_prepared_completion(
+            root=root,
+            run_id=run_id,
+            run_nonce_sha256=run_nonce_sha256,
+            plan=plan,
+        )
     if completed is not None:
+        if session_lifecycle is not None:
+            raise RuntimeError(
+                "shared-session execution cannot resume preexisting trace evidence"
+            )
         _validate_resume(
             completed=completed,
             run_id=run_id,
             plan=plan,
             run_nonce_sha256=run_nonce_sha256,
+            session_binding=session_binding,
+        )
+        observation, observation_path, observation_sidecar = _load_budget_observation(
+            root=root,
+            run_id=run_id,
+            plan=plan,
+            terminal_receipt=terminal_receipt,
         )
         return IndustrialExecutionResult(
             run_id=run_id,
             execution_plan_sha256=plan.sha256,
+            experiment_budget_sha256=plan.budget.sha256,
             rank_config_sha256=plan.rank_config_sha256,
             topology_sha256=plan.topology_sha256,
             resumed=True,
             terminal_receipt=str(terminal_receipt),
-            evidence_files=tuple(str(path) for path in completed.values()),
+            terminal_receipt_sha256=_file_sha256(terminal_receipt),
+            budget_observation=str(observation_path),
+            budget_observation_sidecar=str(observation_sidecar),
+            budget_observation_sha256=observation.sha256,
+            evidence_files=tuple(
+                str(path)
+                for path in (
+                    *completed.values(),
+                    observation_path,
+                    observation_sidecar,
+                )
+            ),
             accounting=None,
+        )
+
+    if session_lifecycle is not None:
+        session_startup_interval_ns = session_lifecycle.claim_startup_interval_ns(
+            execution_plan_sha256=plan.sha256,
+        )
+        session_prepare_started_ns = time.perf_counter_ns()
+        session_binding = await session_lifecycle.prepare_trace(
+            execution_plan_sha256=plan.sha256,
+        )
+        session_prepare_completed_ns = time.perf_counter_ns()
+        session_binding.validate()
+        if session_binding.execution_plan_sha256 != plan.sha256:
+            raise ValueError("session lifecycle prepared another execution plan")
+        session_prepare_observed_ms = _elapsed_milliseconds(
+            session_prepare_started_ns,
+            session_prepare_completed_ns,
         )
 
     writer = EvidenceWriter(root, run_id=run_id, rank=0)
     sink = _AsyncEvidenceSink(writer)
-    handle: ServerHandle | None = None
+    handle: ServerHandle | None = existing_handle
+    transport_open = transport_already_open
+    owns_handle = existing_handle is None
+    native_binding: NativeTerminalRunBinding | None = None
     try:
-        handle = await launch_server(plan.server_launch)
-        await handle.wait_ready(plan.startup_timeout_s)
+        startup_started_ns = time.perf_counter_ns()
+        if handle is None:
+            if launch_server is None:
+                raise RuntimeError("validated standalone execution lost its launcher")
+            handle = await launch_server(plan.server_launch)
+            await handle.wait_ready(plan.startup_timeout_s)
+        if not transport_open:
+            await transport.open(
+                request_timeout_s=(
+                    plan.load_plan.window.request_deadline_us / 1_000_000
+                ),
+                abort_timeout_s=plan.abort_grace_s,
+            )
+            transport_open = True
+        if native_evidence is not None:
+            _bind_native_terminal_transport(
+                provider=native_evidence,
+                transport=transport,
+                base_url=plan.server_launch.base_url,
+            )
+            capability = await native_evidence.capability(expected_method=method)
+            if method != "target_only" and not capability.trusted_attester_configured:
+                raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+            native_binding = _native_terminal_binding(
+                plan=plan,
+                run_id=run_id,
+                run_nonce_sha256=run_nonce_sha256,
+                session_binding=session_binding,
+            )
+            await native_evidence.begin(native_binding)
+        startup_completed_ns = time.perf_counter_ns()
+        observed_session_startup_ms = (
+            0
+            if session_startup_interval_ns is None
+            else _elapsed_milliseconds(*session_startup_interval_ns)
+        )
+        observed_component_ms["startup_model_load"] = (
+            _elapsed_milliseconds(startup_started_ns, startup_completed_ns)
+            + observed_session_startup_ms
+        )
         config = plan.runtime_plan.rank_configs[0]
         concurrency = config.runtime.max_running_requests
+        warmup_started_ns = startup_completed_ns
+        warmup: tuple[RequestExecution, ...] = ()
         if plan.warmup_requests:
             warmup_end = plan.load_plan.window.warmup_duration_us
             warmup = await _execute_corpus(
@@ -2201,6 +3192,25 @@ async def execute_industrial_plan(
             )
             if any(row.outcome.status != "completed" for row in warmup):
                 raise RuntimeError("excluded warm-up did not complete exactly")
+        warmup_requests_completed_ns = time.perf_counter_ns()
+        if native_evidence is not None:
+            await native_evidence.reset(
+                warmup_requests=tuple(
+                    _terminal_request_expectation(row) for row in warmup
+                )
+            )
+        native_reset_completed_ns = time.perf_counter_ns()
+        observed_component_ms["excluded_warmup"] = (
+            _elapsed_milliseconds(warmup_started_ns, warmup_requests_completed_ns)
+            if plan.warmup_requests
+            else 0
+        )
+        pre_score_native_reset_ms = _elapsed_milliseconds(
+            warmup_requests_completed_ns,
+            native_reset_completed_ns,
+        )
+        score_started_observation_ns = native_reset_completed_ns
+        score_schedule_origin_ns = clock.monotonic_ns()
         score_started_ns = clock.wall_ns()
 
         async def record_terminal(execution: RequestExecution) -> None:
@@ -2215,38 +3225,64 @@ async def execute_industrial_plan(
                 )
             )
 
-        if plan.load_plan.scored.source_kind == "closed_loop":
-            requests = await _execute_closed_loop_corpus(
-                plan.scored_requests,
-                concurrency=concurrency,
-                arrival_duration_us=plan.load_plan.window.arrival_duration_us,
-                request_deadline_us=plan.load_plan.window.request_deadline_us,
-                scored_global_end_us=plan.load_plan.window.scored_global_end_us,
-                transport=transport,
-                base_url=plan.server_launch.base_url,
-                served_model=config.model.target,
-                abort_grace_s=plan.abort_grace_s,
+        async def observe_arrival_boundary() -> int:
+            await _sleep_until(
+                plan.load_plan.window.arrival_duration_us,
+                origin_ns=score_schedule_origin_ns,
                 clock=clock,
-                on_terminal=record_terminal,
             )
-        else:
-            requests = await _execute_corpus(
-                plan.scored_requests,
-                deadline_for=lambda request: plan.load_plan.window.request_timeout_us(
-                    next(
-                        value
-                        for value in plan.load_plan.scored.requests
-                        if value.request_id == request.request_id
-                    )
-                ),
-                concurrency=concurrency,
-                transport=transport,
-                base_url=plan.server_launch.base_url,
-                served_model=config.model.target,
-                abort_grace_s=plan.abort_grace_s,
-                clock=clock,
-                on_terminal=record_terminal,
-            )
+            return time.perf_counter_ns()
+
+        arrival_boundary_task = asyncio.create_task(observe_arrival_boundary())
+        try:
+            if plan.load_plan.scored.source_kind == "closed_loop":
+                requests = await _execute_closed_loop_corpus(
+                    plan.scored_requests,
+                    concurrency=concurrency,
+                    arrival_duration_us=plan.load_plan.window.arrival_duration_us,
+                    request_deadline_us=plan.load_plan.window.request_deadline_us,
+                    scored_global_end_us=plan.load_plan.window.scored_global_end_us,
+                    transport=transport,
+                    base_url=plan.server_launch.base_url,
+                    served_model=config.model.target,
+                    abort_grace_s=plan.abort_grace_s,
+                    clock=clock,
+                    on_terminal=record_terminal,
+                )
+            else:
+                requests = await _execute_corpus(
+                    plan.scored_requests,
+                    deadline_for=lambda request: (
+                        plan.load_plan.window.request_timeout_us(
+                            next(
+                                value
+                                for value in plan.load_plan.scored.requests
+                                if value.request_id == request.request_id
+                            )
+                        )
+                    ),
+                    concurrency=concurrency,
+                    transport=transport,
+                    base_url=plan.server_launch.base_url,
+                    served_model=config.model.target,
+                    abort_grace_s=plan.abort_grace_s,
+                    clock=clock,
+                    on_terminal=record_terminal,
+                )
+            arrival_boundary_ns = await arrival_boundary_task
+        except BaseException:
+            arrival_boundary_task.cancel()
+            await asyncio.gather(arrival_boundary_task, return_exceptions=True)
+            raise
+        score_completed_monotonic_ns = time.perf_counter_ns()
+        scoring_component = _SCORING_COMPONENT_BY_JOB[plan.budget.job_kind]
+        observed_component_ms[scoring_component] = _elapsed_milliseconds(
+            score_started_observation_ns, arrival_boundary_ns
+        )
+        observed_component_ms["drain"] = _elapsed_milliseconds(
+            arrival_boundary_ns, score_completed_monotonic_ns
+        )
+        finalization_started_ns = score_completed_monotonic_ns
         accounting = account_scored_requests(
             plan.load_plan,
             tuple(row.outcome for row in requests),
@@ -2258,12 +3294,18 @@ async def execute_industrial_plan(
                 )
             native = NativeEvidenceBatch()
         else:
-            native = await native_evidence.collect(
-                run_id=run_id,
-                plan=plan,
-                requests=requests,
-                accounting=accounting,
+            if native_binding is None:
+                raise RuntimeError("native terminal binding was not established")
+            terminal = await native_evidence.finalize(
+                requests=tuple(_terminal_request_expectation(row) for row in requests)
             )
+            if not isinstance(terminal, ValidatedNativeTerminalEvidence):
+                raise TypeError("native provider returned an untyped terminal envelope")
+            if terminal.binding != native_binding:
+                raise RuntimeError("native terminal envelope changed its run binding")
+            if config.method != "target_only" and not terminal.trusted_attestation:
+                raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+            native = terminal.to_native_evidence_batch()
         native.validate(run_id=run_id, method=config.method)
         completed_request_ids = {
             row.request.request_id
@@ -2274,6 +3316,13 @@ async def execute_industrial_plan(
             row.request_id for row in native.rounds
         }:
             raise RuntimeError("native round evidence misses a completed request")
+        finalization_completed_ns = time.perf_counter_ns()
+        observed_component_ms["reset_finalization"] = (
+            _elapsed_milliseconds(finalization_started_ns, finalization_completed_ns)
+            + pre_score_native_reset_ms
+            + session_prepare_observed_ms
+        )
+        evidence_started_ns = finalization_completed_ns
         await sink.flush()
         completed_ns = clock.wall_ns()
         for row in native.rounds:
@@ -2288,6 +3337,7 @@ async def execute_industrial_plan(
                 accounting=accounting,
                 native=native,
                 writer=writer,
+                transport_metrics=transport.metrics(),
                 asynchronous_backpressure_events=sink.backpressure_events,
             )
         )
@@ -2323,30 +3373,138 @@ async def execute_industrial_plan(
                 expected_update_rows=len(native.updates),
                 expected_performance_rows=1,
                 workload_contract=_workload_contract(config.method),
+                experiment_budget_sha256=plan.budget.sha256,
                 preflight_attestation_sha256=None,
+                session_plan_sha256=(
+                    None
+                    if session_binding is None
+                    else session_binding.session_plan_sha256
+                ),
+                session_open_receipt_sha256=(
+                    None
+                    if session_binding is None
+                    else session_binding.session_open_receipt_sha256
+                ),
+                reset_receipt_sha256=(
+                    None
+                    if session_binding is None
+                    else session_binding.reset_receipt_sha256
+                ),
+                session_epoch=(
+                    None if session_binding is None else session_binding.session_epoch
+                ),
             )
         )
-        await handle.terminate(plan.shutdown_timeout_s)
-        handle = None
+        if not keep_session_open:
+            await transport.close()
+            transport_open = False
+            if owns_handle:
+                await handle.terminate(plan.shutdown_timeout_s)
+                handle = None
         await sink.close()
         if accounting.unfinished:
             writer.abort(reason="scored requests contain unfinished outcomes")
             raise RuntimeError(
                 "scored requests contain unfinished outcomes; evidence is nonclaimable"
             )
-        written = writer.close()
+        written, prepared_receipt = writer.prepare_close()
+        prepared_receipt_sha256 = _file_sha256(prepared_receipt)
+        if session_lifecycle is not None:
+            await session_lifecycle.complete_trace(
+                execution_plan_sha256=plan.sha256,
+                terminal_receipt_sha256=prepared_receipt_sha256,
+                run_id=run_id,
+            )
+        evidence_completed_ns = time.perf_counter_ns()
+        observed_component_ms["evidence_flush_shutdown"] = _elapsed_milliseconds(
+            evidence_started_ns, evidence_completed_ns
+        )
+        if set(observed_component_ms) != set(_BUDGET_OBSERVATION_COMPONENTS):
+            missing = sorted(
+                set(_BUDGET_OBSERVATION_COMPONENTS) - set(observed_component_ms)
+            )
+            raise RuntimeError(
+                "cannot publish a partial BudgetObservationReceipt; "
+                f"unobserved components={missing}"
+            )
+        observed_rows = tuple(
+            (name, observed_component_ms[name])
+            for name in _BUDGET_OBSERVATION_COMPONENTS
+        )
+        observed_wall_ms = sum(value for _, value in observed_rows)
+        measured_reserved_gang_ms = observed_wall_ms * plan.budget.gpu_count
+        fixed_instance_billed_gpu_ms = (
+            observed_wall_ms * plan.runtime_plan.physical_fixed_instance_gpu_count
+        )
+        observation = BudgetObservationReceipt(
+            schema_version=1,
+            budget=plan.budget,
+            observed_component_ms=observed_rows,
+            measured_gpu_ms=measured_reserved_gang_ms,
+            fixed_instance_billed_gpu_ms=fixed_instance_billed_gpu_ms,
+            terminal_evidence_sha256=prepared_receipt_sha256,
+        )
+        observation_path, observation_sidecar = _publish_budget_observation(
+            root=root,
+            run_id=run_id,
+            observation=observation,
+        )
+
+        def validate_post_binding() -> None:
+            persisted, persisted_path, persisted_sidecar = _load_budget_observation(
+                root=root,
+                run_id=run_id,
+                plan=plan,
+                terminal_receipt=prepared_receipt,
+            )
+            if (
+                persisted != observation
+                or persisted_path != observation_path
+                or persisted_sidecar != observation_sidecar
+            ):
+                raise RuntimeError(
+                    "budget observation changed before terminal publication"
+                )
+
+        writer.publish_close(validate_post_binding=validate_post_binding)
+        terminal_receipt_sha256 = _file_sha256(terminal_receipt)
+        terminal_value = json.loads(terminal_receipt.read_text(encoding="utf-8"))
+        if (
+            type(terminal_value) is not dict
+            or terminal_value.get("prepared_receipt_sha256") != prepared_receipt_sha256
+        ):
+            raise RuntimeError(
+                "published terminal receipt does not bind prepared evidence"
+            )
         return IndustrialExecutionResult(
             run_id=run_id,
             execution_plan_sha256=plan.sha256,
+            experiment_budget_sha256=plan.budget.sha256,
             rank_config_sha256=plan.rank_config_sha256,
             topology_sha256=plan.topology_sha256,
             resumed=False,
             terminal_receipt=str(terminal_receipt),
-            evidence_files=tuple(str(path) for path in written.values()),
+            terminal_receipt_sha256=terminal_receipt_sha256,
+            budget_observation=str(observation_path),
+            budget_observation_sidecar=str(observation_sidecar),
+            budget_observation_sha256=observation.sha256,
+            evidence_files=tuple(
+                str(path)
+                for path in (
+                    *written.values(),
+                    observation_path,
+                    observation_sidecar,
+                )
+            ),
             accounting=accounting,
         )
     except BaseException as error:
-        if handle is not None:
+        if transport_open and not keep_session_open:
+            try:
+                await transport.close()
+            except (OSError, RuntimeError, TimeoutError):
+                pass
+        if handle is not None and owns_handle and not keep_session_open:
             try:
                 await handle.terminate(plan.shutdown_timeout_s)
             except (OSError, RuntimeError, TimeoutError) as shutdown_error:

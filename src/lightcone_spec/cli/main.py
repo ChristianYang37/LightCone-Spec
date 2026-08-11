@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import os
-import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import NoReturn
@@ -33,10 +32,21 @@ from lightcone_spec.experiments.evidence import (
     GreedyTargetReference,
     evidence_files_sha256,
 )
+from lightcone_spec.experiments.gpu_pool import (
+    GpuDispatchPlan,
+    GpuDispatchPlanningContext,
+    GpuInventory,
+    InterferenceEnvelope,
+)
 from lightcone_spec.experiments.industrial_analysis import (
+    _DISABLED_SESSION_RUN_FIELDS,
     BoundArtifact,
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
+    _validate_allocation_free_performance,
+    _validate_disabled_session_run_fields,
+    reduce_confirmation_family_power,
+    reduce_e2_stage_from_raw,
     reduce_industrial_schema_v3,
 )
 from lightcone_spec.experiments.onlinespec import (
@@ -56,6 +66,40 @@ from lightcone_spec.experiments.onlinespec import (
     select_onlinespec_heldout_anchor,
     verify_onlinespec_source_checkout,
 )
+from lightcone_spec.experiments.planning import (
+    BudgetInventoryIdentity,
+    BudgetObservationReceipt,
+    ConfirmationFamilyPowerReductionArtifact,
+    DispositionStatus,
+    EvidenceDependenceMap,
+    FamilyActivationArtifact,
+    build_evidence_dependence_map,
+    estimate_industrial_budget,
+    materialize_confirmation_pilots,
+    materialize_confirmation_prefix,
+    materialize_e2_final_recipe,
+    reduce_e1_activation,
+    reduce_e2_activation,
+)
+from lightcone_spec.experiments.planning_artifacts import (
+    confirmation_family_identity_from_dict,
+    confirmation_family_power_reduction_artifact_to_dict,
+    e1_pareto_artifact_from_dict,
+    e2_final_recipe_artifact_from_dict,
+    e2_stage_reduction_artifact_to_dict,
+    evidence_alias_receipt_from_dict,
+    evidence_alias_receipt_to_dict,
+    evidence_dependence_map_from_dict,
+    evidence_dependence_map_to_dict,
+    experiment_budget_from_dict,
+    experiment_budget_sequence_from_dict,
+    family_activation_artifact_from_dict,
+    family_activation_artifact_to_dict,
+    industrial_budget_report_to_dict,
+    reducer_activation_artifact_from_dict,
+    reducer_activation_artifact_to_dict,
+    sealed_e3a_selection_from_dict,
+)
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
     TUNING_STAGES,
@@ -68,12 +112,9 @@ from lightcone_spec.experiments.protocol import (
     tuning_stage,
 )
 from lightcone_spec.experiments.registry import (
-    ConfirmationBlockPlan,
     ExperimentReceipt,
     ExperimentRegistry,
     LockedOutput,
-    StageActivationPlan,
-    TwoGpuResourceScheduler,
     build_industrial_registry,
 )
 from lightcone_spec.experiments.runner import (
@@ -96,9 +137,7 @@ from lightcone_spec.experiments.selection import (
 )
 from lightcone_spec.experiments.statistics import (
     HardwareEnvelope,
-    PairedBcaContrast,
     evaluate_speed_gate,
-    paired_bca_contrast,
 )
 from lightcone_spec.locking import ModelLock, prepare_models, resolve_model_lock
 from lightcone_spec.orchestration import (
@@ -111,6 +150,7 @@ from lightcone_spec.orchestration import (
     render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
+from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.sglang_bridge import (
     SGLangHTTPClient,
     sglang_adaptation_sha256,
@@ -144,6 +184,40 @@ def _is_lower_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _validate_request_output_identity(row: dict[str, object]) -> None:
+    if row.get("output_hash_format") != OUTPUT_HASH_FORMAT:
+        raise ValueError("industrial request has a wrong output hash format")
+    serialized = row.get("output_token_ids")
+    if not isinstance(serialized, str):
+        raise TypeError("industrial request lacks ordered output token IDs")
+    try:
+        token_ids = json.loads(serialized)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("industrial request has malformed output token IDs") from exc
+    if (
+        not isinstance(token_ids, list)
+        or any(
+            not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0
+            for token_id in token_ids
+        )
+        or json.dumps(token_ids, separators=(",", ":")) != serialized
+    ):
+        raise ValueError("industrial request has non-canonical output token IDs")
+    output_tokens = row.get("output_tokens")
+    if (
+        not isinstance(output_tokens, int)
+        or isinstance(output_tokens, bool)
+        or len(token_ids) != output_tokens
+    ):
+        raise ValueError("industrial request token IDs do not cover its output")
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    if (
+        row.get("output_token_ids_sha256") != digest
+        or row.get("output_sha256") != digest
+    ):
+        raise ValueError("industrial request token-ID digest is inconsistent")
 
 
 def _file_sha256(path: str | Path) -> str:
@@ -187,7 +261,7 @@ def _load_bound_run_config(path: str | Path) -> RunConfig:
 
 
 _INDUSTRIAL_REGISTRY_GENERATOR = (
-    "lightcone_spec.experiments.registry.build_industrial_registry:v1"
+    "lightcone_spec.experiments.registry.build_industrial_registry:v2"
 )
 # No hardware-rooted/provider signing identity is registered in this source
 # release.  Self-authored JSON plus hashes proves content consistency, not GPU
@@ -208,10 +282,10 @@ def _industrial_registry_artifact(
     seed: int,
 ) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generator": _INDUSTRIAL_REGISTRY_GENERATOR,
         "parameters": {
-            "gpu_uuids": list(registry.gpu_uuids),
+            "logical_gpu_slots": list(registry.gpu_uuids),
             "base_port": base_port,
             "cache_root": cache_root,
             "evidence_root": evidence_root,
@@ -226,27 +300,60 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
     value = _load_bound_json(path)
     if not isinstance(value, dict):
         raise TypeError("industrial registry artifact must be an object")
+    if set(value) != {
+        "schema_version",
+        "generator",
+        "parameters",
+        "registry_sha256",
+        "registry",
+    }:
+        raise ValueError("industrial registry artifact fields do not match schema")
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version") != 2
         or value.get("generator") != _INDUSTRIAL_REGISTRY_GENERATOR
     ):
         raise ValueError("industrial registry generator identity mismatch")
     parameters = value.get("parameters")
     if not isinstance(parameters, dict):
         raise TypeError("industrial registry parameters are missing")
-    gpu_uuids = parameters.get("gpu_uuids")
+    expected_parameters = {
+        "logical_gpu_slots",
+        "base_port",
+        "cache_root",
+        "evidence_root",
+        "seed",
+    }
+    if set(parameters) != expected_parameters:
+        raise ValueError("industrial registry parameter fields do not match schema")
+    logical_gpu_slots = parameters.get("logical_gpu_slots")
     if (
-        not isinstance(gpu_uuids, list)
-        or len(gpu_uuids) != 2
-        or not all(isinstance(item, str) and item for item in gpu_uuids)
+        not isinstance(logical_gpu_slots, list)
+        or len(logical_gpu_slots) != 2
+        or len(set(logical_gpu_slots)) != 2
+        or not all(
+            isinstance(item, str)
+            and item.strip()
+            and "\n" not in item
+            and "\r" not in item
+            for item in logical_gpu_slots
+        )
     ):
-        raise ValueError("industrial registry requires two explicit GPU UUIDs")
+        raise ValueError("industrial registry requires two logical rank slots")
+    if (
+        type(parameters["base_port"]) is not int
+        or type(parameters["seed"]) is not int
+        or type(parameters["cache_root"]) is not str
+        or not parameters["cache_root"]
+        or type(parameters["evidence_root"]) is not str
+        or not parameters["evidence_root"]
+    ):
+        raise TypeError("industrial registry parameter types do not match schema")
     registry = build_industrial_registry(
-        gpu_uuids=(gpu_uuids[0], gpu_uuids[1]),
-        base_port=int(parameters.get("base_port", 0)),
-        cache_root=str(parameters.get("cache_root", "")),
-        evidence_root=str(parameters.get("evidence_root", "")),
-        seed=int(parameters.get("seed", -1)),
+        gpu_uuids=(logical_gpu_slots[0], logical_gpu_slots[1]),
+        base_port=parameters["base_port"],
+        cache_root=parameters["cache_root"],
+        evidence_root=parameters["evidence_root"],
+        seed=parameters["seed"],
     )
     if value.get("registry_sha256") != registry.sha256:
         raise ValueError("industrial registry content digest mismatch")
@@ -257,31 +364,69 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
     return registry
 
 
+def _load_gpu_inventory(path: str | Path) -> GpuInventory:
+    value = _load_bound_json(path)
+    inventory = GpuInventory.from_dict(value)
+    if inventory.sha256 != _canonical_sha256(inventory.to_dict()):
+        raise ValueError("GPU inventory canonical identity mismatch")
+    return inventory
+
+
+def _load_interference_envelope(path: str | Path) -> InterferenceEnvelope:
+    value = _load_bound_json(path)
+    envelope = InterferenceEnvelope.from_dict(value)
+    if envelope.sha256 != _canonical_sha256(envelope.to_dict()):
+        raise ValueError("interference envelope canonical identity mismatch")
+    return envelope
+
+
+def _load_experiment_budgets(path: str | Path):
+    value = _load_bound_json(path)
+    budgets = experiment_budget_sequence_from_dict(value)
+    if not budgets:
+        raise ValueError("experiment budget artifact cannot be empty")
+    return budgets
+
+
 def _industrial_receipt_from_value(value: object) -> ExperimentReceipt:
     if not isinstance(value, dict):
         raise TypeError("industrial dependency receipt must be an object")
+    expected = {
+        "experiment",
+        "registry_sha256",
+        "runtime_sha256",
+        "split_sha256",
+        "completed_cells_sha256",
+        "dependency_receipts",
+        "outputs",
+        "selection_state",
+    }
+    if set(value) != expected:
+        raise ValueError("industrial dependency receipt fields do not match schema")
 
     def locked_rows(name: str) -> tuple[LockedOutput, ...]:
         rows = value.get(name)
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise TypeError(f"industrial receipt {name} must be a list")
+        if any(set(row) != {"name", "content_sha256"} for row in rows):
+            raise ValueError(f"industrial receipt {name} row fields differ")
         return tuple(
             LockedOutput(
-                name=str(row.get("name", "")),
-                content_sha256=str(row.get("content_sha256", "")),
+                name=row["name"],
+                content_sha256=row["content_sha256"],
             )
             for row in rows
         )
 
     return ExperimentReceipt(
-        experiment=str(value.get("experiment", "")),
-        registry_sha256=str(value.get("registry_sha256", "")),
-        runtime_sha256=str(value.get("runtime_sha256", "")),
-        split_sha256=str(value.get("split_sha256", "")),
-        completed_cells_sha256=str(value.get("completed_cells_sha256", "")),
+        experiment=value["experiment"],
+        registry_sha256=value["registry_sha256"],
+        runtime_sha256=value["runtime_sha256"],
+        split_sha256=value["split_sha256"],
+        completed_cells_sha256=value["completed_cells_sha256"],
         dependency_receipts=locked_rows("dependency_receipts"),
         outputs=locked_rows("outputs"),
-        selection_state=str(value.get("selection_state", "")),
+        selection_state=value["selection_state"],
     )
 
 
@@ -293,62 +438,572 @@ def _load_industrial_receipts(paths: list[str]) -> tuple[ExperimentReceipt, ...]
     )
 
 
-def _load_stage_activation_plan(path: str | None) -> StageActivationPlan | None:
+def _load_stage_activation_plan(path: str | None):
     if path is None:
         return None
     value = _load_bound_json(path)
-    expected = {
-        "registry_sha256",
-        "experiment",
-        "dependency_receipt_sha256",
-        "runtime_sha256",
-        "split_sha256",
-        "source_selection_sha256",
-        "activation_round",
-        "status",
-        "activated_cell_ids",
-        "not_applicable_cell_ids",
-        "blocked_cell_ids",
-        "deferred_cell_ids",
-        "reason_code",
-    }
-    if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError("stage activation plan fields do not match schema")
-    return StageActivationPlan(
-        registry_sha256=value["registry_sha256"],
-        experiment=value["experiment"],
-        dependency_receipt_sha256=value["dependency_receipt_sha256"],
-        runtime_sha256=value["runtime_sha256"],
-        split_sha256=value["split_sha256"],
-        source_selection_sha256=value["source_selection_sha256"],
-        activation_round=value["activation_round"],
-        status=value["status"],
-        activated_cell_ids=tuple(value["activated_cell_ids"]),
-        not_applicable_cell_ids=tuple(value["not_applicable_cell_ids"]),
-        blocked_cell_ids=tuple(value["blocked_cell_ids"]),
-        deferred_cell_ids=tuple(value["deferred_cell_ids"]),
-        reason_code=value["reason_code"],
+    if (
+        isinstance(value, dict)
+        and value.get("kind") == "industrial_e2_activation_manifest"
+    ):
+        registry, receipt, pareto, stage_index, prior = _load_e2_activation_manifest(
+            path
+        )
+        return reduce_e2_activation(
+            registry,
+            e1_receipt=receipt,
+            pareto=pareto,
+            stage_index=stage_index,
+            prior_reduction=prior,
+        )
+    artifact = reducer_activation_artifact_from_dict(value)
+    if artifact.plan.experiment == "E2":
+        raise ValueError("E2 consumers require a bound raw activation manifest")
+    return artifact
+
+
+def _load_family_activations(paths: list[str]):
+    artifacts = tuple(
+        family_activation_artifact_from_dict(_load_bound_json(path)) for path in paths
     )
+    if len({artifact.sha256 for artifact in artifacts}) != len(artifacts):
+        raise ValueError("duplicate confirmation family activation artifact")
+    return artifacts
 
 
-def _load_confirmation_block_plan(path: str | None) -> ConfirmationBlockPlan | None:
-    if path is None:
-        return None
-    value = _load_bound_json(path)
+def _load_family_power_reductions(paths: list[str]):
+    reductions = tuple(
+        reduce_confirmation_family_power(
+            registry=registry,
+            pilot_activation=pilot,
+            blocks=blocks,
+            hardware_envelope=envelope,
+            inventory=inventory,
+            confirmation_data_visible=False,
+        )
+        for registry, pilot, inventory, envelope, blocks in (
+            _load_family_power_manifest(path) for path in paths
+        )
+    )
+    if len({reduction.sha256 for reduction in reductions}) != len(reductions):
+        raise ValueError("duplicate confirmation family power artifact")
+    return reductions
+
+
+def _validate_family_artifact_bundle(
+    registry: ExperimentRegistry,
+    *,
+    activations,
+    power_reductions,
+) -> tuple[str, ...]:
+    """Validate full pilot/final lineage and return the current selected round."""
+
+    by_round = {}
+    for artifact in activations:
+        family = artifact.family
+        if family.registry_sha256 != registry.sha256:
+            raise ValueError("confirmation activation belongs to another registry")
+        key = (family.sha256, artifact.activation_round)
+        if key in by_round:
+            raise ValueError("duplicate confirmation family activation round")
+        by_round[key] = artifact
+    by_family_power = {}
+    for reduction in power_reductions:
+        if reduction.family.registry_sha256 != registry.sha256:
+            raise ValueError("confirmation power reduction belongs to another registry")
+        if reduction.family.sha256 in by_family_power:
+            raise ValueError("duplicate confirmation family power reduction")
+        by_family_power[reduction.family.sha256] = reduction
+
+    pilots = {
+        family_sha256: artifact
+        for (family_sha256, round_name), artifact in by_round.items()
+        if round_name == "excluded_pilots"
+    }
+    finals = {
+        family_sha256: artifact
+        for (family_sha256, round_name), artifact in by_round.items()
+        if round_name == "final_prefix"
+    }
+    if set(finals) - pilots.keys():
+        raise ValueError("family final prefix lacks its pilot activation")
+    if set(finals) != set(by_family_power):
+        raise ValueError(
+            "family power reductions must exactly cover final-prefix activations"
+        )
+
+    selected: list[str] = []
+    for family_sha256, pilot in sorted(pilots.items()):
+        expected_pilot = materialize_confirmation_pilots(registry, pilot.family)
+        if pilot != expected_pilot:
+            raise ValueError("family pilot activation is not reducer-generated")
+        final = finals.get(family_sha256)
+        if final is None:
+            selected.extend(pilot.activated_cell_ids)
+            continue
+        reduction = by_family_power[family_sha256]
+        expected_final = materialize_confirmation_prefix(
+            registry,
+            family=pilot.family,
+            reduction=reduction,
+            pilot_activation=pilot,
+        )
+        if final != expected_final:
+            raise ValueError("family final activation is not reducer-generated")
+        selected.extend(final.activated_cell_ids)
+    if len(selected) != len(set(selected)):
+        raise ValueError("confirmation families select overlapping cells")
+    return tuple(sorted(selected))
+
+
+_BUDGET_OBSERVATION_COMPONENTS = (
+    "startup_model_load",
+    "compile_jit_graph_prewarm",
+    "excluded_warmup",
+    "scored_arrival",
+    "drain",
+    "reset_finalization",
+    "evidence_flush_shutdown",
+    "soak",
+    "failure_injection",
+    "retry",
+    "profiler",
+    "download_compile_reservation",
+)
+_BUDGET_OBSERVATION_KIND = "industrial_budget_observation_receipt_v1"
+_RESERVED_GANG_MEASUREMENT = "exclusive_reserved_gang_wall_ms_x_gpu_count"
+_WHOLE_INSTANCE_BILLING = "whole_inventory_wall_clock_v1"
+
+
+def _industrial_physical_assignment_from_dict(
+    value: object,
+) -> IndustrialPhysicalAssignment:
     expected = {
-        "registry_sha256",
-        "experiment",
-        "runtime_sha256",
-        "split_sha256",
-        "pilot_evidence_sha256",
-        "completed_pilot_cells_sha256",
-        "status",
-        "selected_final_blocks",
-        "reason_code",
+        "schema_version",
+        "kind",
+        "inventory_sha256",
+        "inventory_source_receipt_sha256",
+        "dispatch_plan_sha256",
+        "experiment_budget_sha256",
+        "assignment_sha256",
+        "work_item_sha256",
+        "gpu_uuids",
+        "rank_groups",
+        "ports",
+        "gang_shape",
+        "fixed_instance_gpu_count",
+        "fixed_instance_billing_semantics",
+        "host_id",
+        "topology_group_ids",
     }
     if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError("confirmation block plan fields do not match schema")
-    return ConfirmationBlockPlan(**value)
+        raise ValueError("physical assignment receipt fields differ from schema")
+    if value.get("schema_version") != 1 or value.get("kind") != (
+        "industrial_physical_assignment"
+    ):
+        raise ValueError("physical assignment receipt identity mismatch")
+    if value.get("fixed_instance_billing_semantics") != _WHOLE_INSTANCE_BILLING:
+        raise ValueError("physical assignment billing semantics mismatch")
+    gang = value.get("gang_shape")
+    if not isinstance(gang, dict) or set(gang) != {
+        "tensor_parallel_size",
+        "data_parallel_size",
+    }:
+        raise ValueError("physical assignment gang shape is incomplete")
+    gpu_uuids = value.get("gpu_uuids")
+    rank_groups = value.get("rank_groups")
+    ports = value.get("ports")
+    topology_group_ids = value.get("topology_group_ids")
+    if (
+        not isinstance(gpu_uuids, list)
+        or not isinstance(rank_groups, list)
+        or not all(isinstance(group, list) for group in rank_groups)
+        or not isinstance(ports, list)
+        or not isinstance(topology_group_ids, list)
+        or not all(isinstance(group, list) for group in topology_group_ids)
+    ):
+        raise TypeError("physical assignment receipt arrays are malformed")
+    try:
+        assignment = IndustrialPhysicalAssignment(
+            inventory_sha256=value["inventory_sha256"],
+            inventory_source_receipt_sha256=value["inventory_source_receipt_sha256"],
+            dispatch_plan_sha256=value["dispatch_plan_sha256"],
+            experiment_budget_sha256=value["experiment_budget_sha256"],
+            assignment_sha256=value["assignment_sha256"],
+            work_item_sha256=value["work_item_sha256"],
+            gpu_uuids=tuple(gpu_uuids),
+            rank_groups=tuple(tuple(group) for group in rank_groups),
+            ports=tuple(ports),
+            tensor_parallel_size=gang["tensor_parallel_size"],
+            data_parallel_size=gang["data_parallel_size"],
+            fixed_instance_gpu_count=value["fixed_instance_gpu_count"],
+            host_id=value["host_id"],
+            topology_group_ids=tuple(tuple(group) for group in topology_group_ids),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("physical assignment receipt is invalid") from error
+    if assignment.to_dict() != value:
+        raise ValueError("physical assignment receipt is not canonical")
+    return assignment
+
+
+def _validate_assignment_inventory_authority(
+    assignment: IndustrialPhysicalAssignment,
+    inventory: GpuInventory,
+) -> None:
+    """Recompute assignment host, UUID, topology, and billing authority."""
+
+    if len(inventory.host_ids) != 1:
+        raise ValueError("formal completion requires one whole-instance GPU host")
+    host_id = inventory.host_ids[0]
+    if (
+        assignment.inventory_sha256 != inventory.sha256
+        or assignment.inventory_source_receipt_sha256 != inventory.source_receipt_sha256
+        or assignment.fixed_instance_gpu_count != len(inventory.devices)
+        or assignment.host_id != host_id
+    ):
+        raise ValueError("physical assignment differs from the bound GPU inventory")
+    devices = {device.uuid: device for device in inventory.devices}
+    if any(uuid not in devices for uuid in assignment.gpu_uuids) or any(
+        devices[uuid].host_id != host_id for uuid in assignment.gpu_uuids
+    ):
+        raise ValueError("physical assignment names a foreign GPU or host")
+    groups = {group.group_id: group for group in inventory.topology_groups}
+    for rank_group, group_ids in zip(
+        assignment.rank_groups,
+        assignment.topology_group_ids,
+        strict=True,
+    ):
+        if assignment.tensor_parallel_size == 1:
+            if group_ids:
+                raise ValueError("TP1 assignment cannot claim topology groups")
+            continue
+        rank_set = set(rank_group)
+        if any(
+            group_id not in groups
+            or groups[group_id].host_id != host_id
+            or not rank_set <= set(groups[group_id].gpu_uuids)
+            or any(
+                group_id not in devices[uuid].allowed_topology_groups
+                for uuid in rank_group
+            )
+            for group_id in group_ids
+        ):
+            raise ValueError("physical TP assignment lacks bound topology authority")
+
+
+def _industrial_completion_activation_contract(
+    registry: ExperimentRegistry,
+    *,
+    experiment: str,
+    runtime_sha256: str,
+    split_sha256: str,
+    direct_dependency_receipt_sha256: str | None,
+    activation_artifact,
+    family_activations,
+    family_power_reductions,
+    require_stage_sealable: bool = False,
+) -> tuple[tuple[str, ...], dict[str, dict[str, str]], dict[str, object]]:
+    """Return the exact materialized set and immutable stage dispositions."""
+
+    stage_cells = {cell.cell_id: cell for cell in registry.cells_for(experiment)}
+    family_rows = tuple(family_activations)
+    power_rows = tuple(family_power_reductions)
+    dispositions: dict[str, dict[str, str]] = {}
+    requires_dependency = bool(registry.definition(experiment).dependencies)
+    if requires_dependency and not _is_lower_sha256(direct_dependency_receipt_sha256):
+        raise ValueError("stage completion lacks its direct dependency receipt")
+    if not requires_dependency and direct_dependency_receipt_sha256 is not None:
+        raise ValueError("root stage cannot claim a dependency receipt")
+
+    if experiment in {"E1", "E2"}:
+        if activation_artifact is None:
+            raise ValueError(f"{experiment} completion requires an activation artifact")
+        if family_rows or power_rows:
+            raise ValueError("family artifacts do not belong to this stage")
+        plan = activation_artifact.plan
+        if (
+            plan.registry_sha256 != registry.sha256
+            or plan.experiment != experiment
+            or plan.runtime_sha256 != runtime_sha256
+            or plan.split_sha256 != split_sha256
+        ):
+            raise ValueError("stage activation runtime/split identity mismatch")
+        if plan.dependency_receipt_sha256 != direct_dependency_receipt_sha256:
+            raise ValueError("stage activation dependency lineage mismatch")
+        activation_round = plan.activation_round
+        if experiment == "E1" and activation_round != "e3a_locked_reference":
+            raise ValueError("E1 completion requires its locked reference activation")
+        if experiment == "E2" and activation_round not in {
+            "halving_0",
+            "halving_1",
+            "halving_2",
+            "halving_3",
+        }:
+            raise ValueError("E2 completion has an unknown halving activation")
+        if (
+            require_stage_sealable
+            and experiment == "E2"
+            and activation_round != "halving_3"
+        ):
+            raise ValueError("E2 cannot seal before the final halving activation")
+        disposition_rows = activation_artifact.dispositions
+    elif experiment in {"E3b", "E5"}:
+        if activation_artifact is not None:
+            raise ValueError(
+                "stage activation artifact does not belong to confirmation"
+            )
+        if not family_rows:
+            raise ValueError(
+                "confirmation completion requires family activation artifacts"
+            )
+        _validate_family_artifact_bundle(
+            registry,
+            activations=family_rows,
+            power_reductions=power_rows,
+        )
+        by_round = {
+            (artifact.family.sha256, artifact.activation_round): artifact
+            for artifact in family_rows
+        }
+        family_ids = {artifact.family.sha256 for artifact in family_rows}
+        final_family_ids = {
+            family_sha256
+            for family_sha256, round_name in by_round
+            if round_name == "final_prefix"
+        }
+        if require_stage_sealable and final_family_ids != family_ids:
+            raise ValueError(
+                "confirmation stage cannot seal from pilot-only activations"
+            )
+        activation_round = (
+            "final_prefix"
+            if final_family_ids == family_ids
+            else "excluded_pilots"
+            if not final_family_ids
+            else "family_incremental"
+        )
+        current = []
+        for family_sha256 in sorted(family_ids):
+            final = by_round.get((family_sha256, "final_prefix"))
+            pilot = by_round.get((family_sha256, "excluded_pilots"))
+            artifact = final if final is not None else pilot
+            if artifact is None:  # pragma: no cover - family_ids construction
+                raise RuntimeError("confirmation family lost its validated activation")
+            if (
+                artifact.family.experiment != experiment
+                or artifact.family.runtime_sha256 != runtime_sha256
+                or artifact.family.split_sha256 != split_sha256
+            ):
+                raise ValueError("family activation runtime/split identity mismatch")
+            current.extend(artifact.dispositions)
+        disposition_rows = tuple(current)
+    else:
+        if activation_artifact is not None or family_rows or power_rows:
+            raise ValueError("activation artifacts do not belong to this stage")
+        disposition_rows = tuple(
+            {
+                "cell_id": cell.cell_id,
+                "status": (
+                    DispositionStatus.ACTIVATED
+                    if cell.runnable
+                    else DispositionStatus(cell.status.value)
+                ),
+                "reason_code": (
+                    "registry_materialized" if cell.runnable else cell.reason_code
+                ),
+            }
+            for cell in stage_cells.values()
+        )
+        activation_round = "registry_materialized"
+
+    for row in disposition_rows:
+        if isinstance(row, dict):
+            cell_id = row["cell_id"]
+            status = row["status"]
+            reason_code = row["reason_code"]
+        else:
+            cell_id = row.cell_id
+            status = row.status
+            reason_code = row.reason_code
+        if cell_id not in stage_cells or cell_id in dispositions:
+            raise ValueError("activation has an unknown or duplicate disposition")
+        if not isinstance(status, DispositionStatus):
+            raise TypeError("activation disposition status is not canonical")
+        cell = stage_cells[cell_id]
+        if status is DispositionStatus.ACTIVATED and not cell.runnable:
+            raise ValueError("activation promotes a registry-blocked cell")
+        if not cell.runnable:
+            expected_status = DispositionStatus(cell.status.value)
+            if status is not expected_status or reason_code != cell.reason_code:
+                raise ValueError("activation changes an immutable registry disposition")
+        dispositions[cell_id] = {
+            "cell_id": cell_id,
+            "status": status.value,
+            "reason_code": reason_code,
+        }
+    if set(dispositions) != set(stage_cells):
+        raise ValueError("activation must disposition every stage template exactly")
+    activated = tuple(
+        sorted(
+            cell_id
+            for cell_id, row in dispositions.items()
+            if row["status"] == DispositionStatus.ACTIVATED.value
+        )
+    )
+    encoded_dispositions = [dispositions[cell_id] for cell_id in sorted(dispositions)]
+    binding = {
+        "schema_version": 1,
+        "kind": "industrial_stage_activation_binding",
+        "stage_activation_sha256": (
+            None if activation_artifact is None else activation_artifact.sha256
+        ),
+        "family_activation_sha256s": sorted(
+            artifact.sha256 for artifact in family_rows
+        ),
+        "family_power_reduction_sha256s": sorted(
+            reduction.sha256 for reduction in power_rows
+        ),
+        "direct_dependency_receipt_sha256": direct_dependency_receipt_sha256,
+        "activation_round": activation_round,
+        "dispositions_sha256": _canonical_sha256(encoded_dispositions),
+    }
+    return activated, dispositions, binding
+
+
+def _validate_budget_observation_receipt(
+    path: object,
+    *,
+    expected_sha256: object,
+    experiment_budget_sha256: str,
+    prepared_receipt_sha256: object,
+    cell,
+    evidence_root: Path,
+    fixed_instance_gpu_count: int,
+) -> None:
+    if not _is_lower_sha256(prepared_receipt_sha256):
+        raise ValueError("serving completion lacks its prepared receipt binding")
+    if not isinstance(path, str) or not path:
+        raise ValueError("serving completion lacks a budget observation path")
+    source = Path(path)
+    sidecar = Path(f"{source}.sha256")
+    resolved_root = evidence_root.resolve()
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or sidecar.is_symlink()
+        or not sidecar.is_file()
+        or resolved_root not in source.resolve().parents
+    ):
+        raise ValueError("budget observation must be bound inside the evidence root")
+    if (
+        not _is_lower_sha256(expected_sha256)
+        or sidecar.read_text(encoding="utf-8") != f"{expected_sha256}\n"
+    ):
+        raise ValueError("budget observation semantic sidecar mismatch")
+    try:
+        artifact = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("budget observation is not valid JSON") from error
+    expected_fields = {
+        "schema_version",
+        "artifact_kind",
+        "experiment_budget_sha256",
+        "budget_observation_sha256",
+        "budget",
+        "observed_component_ms",
+        "measured_gpu_ms",
+        "fixed_instance_billed_gpu_ms",
+        "terminal_evidence_sha256",
+        "observed_wall_ms",
+        "registered_wall_delta_ms",
+        "registered_gpu_delta_ms",
+        "registered_billed_delta_ms",
+        "gpu_measurement_semantics",
+        "fixed_instance_billing_semantics",
+    }
+    if not isinstance(artifact, dict) or set(artifact) != expected_fields:
+        raise ValueError("budget observation fields differ from schema")
+    budget_value = artifact.get("budget")
+    if not isinstance(budget_value, dict):
+        raise TypeError("budget observation lacks an ExperimentBudget")
+    try:
+        budget = experiment_budget_from_dict(
+            {
+                "artifact_kind": "experiment_budget",
+                "artifact_sha256": experiment_budget_sha256,
+                **budget_value,
+            }
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("budget observation contains a forged budget") from error
+    if (
+        budget.sha256 != experiment_budget_sha256
+        or budget.cell_id != cell.cell_id
+        or budget.experiment != cell.identity.experiment
+        or budget.method != cell.identity.method
+        or budget.workload_class is not cell.resources.workload_class
+        or budget.gpu_count != cell.resources.gpu_count
+        or budget.topology != cell.identity.topology
+        or budget.measured_gpu_ms is not None
+    ):
+        raise ValueError("budget observation belongs to another registry cell")
+    rows = artifact.get("observed_component_ms")
+    if (
+        not isinstance(rows, list)
+        or tuple(row[0] for row in rows if isinstance(row, list) and len(row) == 2)
+        != _BUDGET_OBSERVATION_COMPONENTS
+        or any(
+            not isinstance(row, list)
+            or len(row) != 2
+            or not isinstance(row[0], str)
+            or not isinstance(row[1], int)
+            or isinstance(row[1], bool)
+            or row[1] < 0
+            for row in rows
+        )
+    ):
+        raise ValueError("budget observation component coverage is invalid")
+    try:
+        observation = BudgetObservationReceipt(
+            schema_version=artifact["schema_version"],
+            budget=budget,
+            observed_component_ms=tuple((row[0], row[1]) for row in rows),
+            measured_gpu_ms=artifact["measured_gpu_ms"],
+            fixed_instance_billed_gpu_ms=artifact["fixed_instance_billed_gpu_ms"],
+            terminal_evidence_sha256=artifact["terminal_evidence_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("budget observation violates its accounting schema") from error
+    expected_artifact = {
+        "schema_version": 1,
+        "artifact_kind": _BUDGET_OBSERVATION_KIND,
+        "experiment_budget_sha256": budget.sha256,
+        "budget_observation_sha256": observation.sha256,
+        "budget": asdict(budget),
+        "observed_component_ms": [
+            list(row) for row in observation.observed_component_ms
+        ],
+        "measured_gpu_ms": observation.measured_gpu_ms,
+        "fixed_instance_billed_gpu_ms": observation.fixed_instance_billed_gpu_ms,
+        "terminal_evidence_sha256": observation.terminal_evidence_sha256,
+        "observed_wall_ms": observation.observed_wall_ms,
+        "registered_wall_delta_ms": observation.registered_wall_delta_ms,
+        "registered_gpu_delta_ms": observation.registered_gpu_delta_ms,
+        "registered_billed_delta_ms": observation.registered_billed_delta_ms,
+        "gpu_measurement_semantics": _RESERVED_GANG_MEASUREMENT,
+        "fixed_instance_billing_semantics": _WHOLE_INSTANCE_BILLING,
+    }
+    if (
+        artifact != expected_artifact
+        or expected_sha256 != observation.sha256
+        or observation.terminal_evidence_sha256 != prepared_receipt_sha256
+        or observation.measured_gpu_ms
+        != observation.observed_wall_ms * budget.gpu_count
+        or observation.fixed_instance_billed_gpu_ms
+        != observation.observed_wall_ms * fixed_instance_gpu_count
+    ):
+        raise ValueError("budget observation content binding is invalid")
 
 
 def _analysis_manifest_path(
@@ -435,13 +1090,330 @@ def _analysis_hardware_envelope(value: object) -> HardwareEnvelope:
     )
 
 
+def _analysis_blocks(
+    manifest_path: Path,
+    value: object,
+) -> tuple[IndustrialBlockEvidence, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("industrial analysis manifest requires block evidence")
+    blocks: list[IndustrialBlockEvidence] = []
+    for raw_block in value:
+        if not isinstance(raw_block, dict) or set(raw_block) != {
+            "block",
+            "qualification_lock",
+            "cells",
+        }:
+            raise ValueError("industrial analysis block fields do not match schema")
+        block = raw_block.get("block")
+        raw_cells = raw_block.get("cells")
+        if (
+            not isinstance(block, int)
+            or isinstance(block, bool)
+            or not isinstance(raw_cells, list)
+            or not raw_cells
+        ):
+            raise ValueError("industrial analysis block identity is invalid")
+        cells: list[IndustrialCellEvidence] = []
+        for raw_cell in raw_cells:
+            if not isinstance(raw_cell, dict) or set(raw_cell) != {
+                "cell_id",
+                "terminal_receipts",
+                "hardware_receipt",
+                "budget_observation",
+            }:
+                raise ValueError("industrial analysis cell fields do not match schema")
+            terminal = raw_cell.get("terminal_receipts")
+            if not isinstance(terminal, list) or not terminal:
+                raise ValueError("industrial analysis cell requires rank receipts")
+            cells.append(
+                IndustrialCellEvidence(
+                    cell_id=raw_cell.get("cell_id"),
+                    terminal_receipts=tuple(
+                        _analysis_file_binding(
+                            manifest_path,
+                            receipt,
+                            label="terminal receipt",
+                        )
+                        for receipt in terminal
+                    ),
+                    hardware_receipt=_analysis_file_binding(
+                        manifest_path,
+                        raw_cell.get("hardware_receipt"),
+                        label="hardware receipt",
+                    ),
+                    budget_observation=_analysis_file_binding(
+                        manifest_path,
+                        raw_cell.get("budget_observation"),
+                        label="budget observation",
+                    ),
+                )
+            )
+        blocks.append(
+            IndustrialBlockEvidence(
+                block=block,
+                cells=tuple(cells),
+                qualification_lock=_analysis_file_binding(
+                    manifest_path,
+                    raw_block.get("qualification_lock"),
+                    label="qualification lock",
+                ),
+            )
+        )
+    return tuple(blocks)
+
+
+def _analysis_cells(
+    manifest_path: Path,
+    value: object,
+) -> tuple[IndustrialCellEvidence, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("E2 raw manifest requires cell evidence")
+    cells: list[IndustrialCellEvidence] = []
+    for raw_cell in value:
+        if not isinstance(raw_cell, dict) or set(raw_cell) != {
+            "cell_id",
+            "terminal_receipts",
+            "hardware_receipt",
+            "budget_observation",
+        }:
+            raise ValueError("E2 raw cell fields do not match schema")
+        terminal = raw_cell.get("terminal_receipts")
+        if not isinstance(terminal, list) or not terminal:
+            raise ValueError("E2 raw cell requires terminal rank receipts")
+        cells.append(
+            IndustrialCellEvidence(
+                cell_id=raw_cell.get("cell_id"),
+                terminal_receipts=tuple(
+                    _analysis_file_binding(
+                        manifest_path,
+                        receipt,
+                        label="E2 terminal receipt",
+                    )
+                    for receipt in terminal
+                ),
+                hardware_receipt=_analysis_file_binding(
+                    manifest_path,
+                    raw_cell.get("hardware_receipt"),
+                    label="E2 hardware receipt",
+                ),
+                budget_observation=_analysis_file_binding(
+                    manifest_path,
+                    raw_cell.get("budget_observation"),
+                    label="E2 budget observation",
+                ),
+            )
+        )
+    return tuple(cells)
+
+
+def _load_e2_stage_manifest(
+    path: str | Path,
+    *,
+    _seen: frozenset[Path] = frozenset(),
+):
+    manifest_path = Path(path).resolve()
+    if manifest_path in _seen:
+        raise ValueError("E2 prior-stage manifests contain a cycle")
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "e1_receipt",
+        "pareto",
+        "stage_index",
+        "prior_stage_manifest",
+        "gpu_inventory",
+        "hardware_envelope",
+        "cells",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("E2 raw stage manifest fields do not match schema")
+    stage_index = value.get("stage_index")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != "industrial_e2_stage_reduction_manifest"
+        or not isinstance(stage_index, int)
+        or isinstance(stage_index, bool)
+    ):
+        raise ValueError("E2 raw stage manifest identity is invalid")
+    registry_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("registry_artifact"),
+        label="E2 registry artifact",
+    )
+    receipt_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("e1_receipt"),
+        label="E1 receipt",
+    )
+    pareto_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("pareto"),
+        label="E1 Pareto artifact",
+    )
+    registry = _load_industrial_registry(registry_path)
+    inventory_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("gpu_inventory"),
+        label="E2 GPU inventory",
+    )
+    inventory = _load_gpu_inventory(inventory_path)
+    receipt = _single_industrial_receipt(receipt_path, experiment="E1")
+    pareto = e1_pareto_artifact_from_dict(_load_bound_json(pareto_path))
+    prior_value = value.get("prior_stage_manifest")
+    if stage_index == 0:
+        if prior_value is not None:
+            raise ValueError("E2 stage zero cannot name prior raw evidence")
+        prior = None
+    else:
+        prior_path = _analysis_bound_json_path(
+            manifest_path,
+            prior_value,
+            label="prior E2 raw stage manifest",
+        )
+        prior = _load_e2_stage_manifest(
+            prior_path,
+            _seen=_seen | {manifest_path},
+        )
+        if prior.stage_index != stage_index - 1:
+            raise ValueError("E2 prior raw stage is not the immediate predecessor")
+    return reduce_e2_stage_from_raw(
+        registry=registry,
+        e1_receipt=receipt,
+        pareto=pareto,
+        stage_index=stage_index,
+        cells=_analysis_cells(manifest_path, value.get("cells")),
+        hardware_envelope=_analysis_hardware_envelope(value.get("hardware_envelope")),
+        inventory=inventory,
+        prior_stage_reduction=prior,
+        confirmation_data_visible=False,
+    )
+
+
+def _load_e2_activation_manifest(path: str | Path):
+    manifest_path = Path(path)
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "e1_receipt",
+        "pareto",
+        "stage_index",
+        "prior_stage_manifest",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("E2 activation manifest fields do not match schema")
+    stage_index = value.get("stage_index")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "industrial_e2_activation_manifest"
+        or not isinstance(stage_index, int)
+        or isinstance(stage_index, bool)
+    ):
+        raise ValueError("E2 activation manifest identity is invalid")
+    registry_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("registry_artifact"),
+        label="E2 registry artifact",
+    )
+    receipt_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("e1_receipt"),
+        label="E1 receipt",
+    )
+    pareto_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("pareto"),
+        label="E1 Pareto artifact",
+    )
+    registry = _load_industrial_registry(registry_path)
+    receipt = _single_industrial_receipt(receipt_path, experiment="E1")
+    pareto = e1_pareto_artifact_from_dict(_load_bound_json(pareto_path))
+    prior_value = value.get("prior_stage_manifest")
+    if stage_index == 0:
+        if prior_value is not None:
+            raise ValueError("E2 stage zero cannot name prior raw evidence")
+        prior = None
+    else:
+        prior_path = _analysis_bound_json_path(
+            manifest_path,
+            prior_value,
+            label="prior E2 raw stage manifest",
+        )
+        prior = _load_e2_stage_manifest(prior_path)
+        if prior.stage_index != stage_index - 1:
+            raise ValueError("E2 prior raw stage is not the immediate predecessor")
+    return registry, receipt, pareto, stage_index, prior
+
+
+def _load_family_power_manifest(
+    path: str | Path,
+) -> tuple[
+    ExperimentRegistry,
+    FamilyActivationArtifact,
+    GpuInventory,
+    HardwareEnvelope,
+    tuple[IndustrialBlockEvidence, ...],
+]:
+    manifest_path = Path(path)
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "pilot_activation",
+        "gpu_inventory",
+        "hardware_envelope",
+        "blocks",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("family power manifest fields do not match schema")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != "industrial_family_power_manifest"
+    ):
+        raise ValueError("family power manifest identity mismatch")
+    registry_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("registry_artifact"),
+        label="registry artifact",
+    )
+    pilot_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("pilot_activation"),
+        label="pilot activation",
+    )
+    registry = _load_industrial_registry(registry_path)
+    pilot = family_activation_artifact_from_dict(_load_bound_json(pilot_path))
+    inventory_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("gpu_inventory"),
+        label="family GPU inventory",
+    )
+    inventory = _load_gpu_inventory(inventory_path)
+    envelope = _analysis_hardware_envelope(value.get("hardware_envelope"))
+    return (
+        registry,
+        pilot,
+        inventory,
+        envelope,
+        _analysis_blocks(manifest_path, value["blocks"]),
+    )
+
+
 def _load_industrial_analysis_manifest(
     path: str | Path,
 ) -> tuple[
     ExperimentRegistry,
-    ConfirmationBlockPlan,
+    FamilyActivationArtifact,
+    FamilyActivationArtifact,
+    ConfirmationFamilyPowerReductionArtifact,
+    GpuInventory,
     HardwareEnvelope,
     tuple[IndustrialBlockEvidence, ...],
+    EvidenceDependenceMap | None,
     BoundArtifact | None,
     BoundArtifact | None,
     int,
@@ -461,7 +1433,11 @@ def _load_industrial_analysis_manifest(
         "schema_version",
         "kind",
         "registry_artifact",
-        "confirmation_plan",
+        "pilot_activation",
+        "final_activation",
+        "confirmation_power_manifest",
+        "gpu_inventory",
+        "evidence_dependence_map",
         "gpu_attestation",
         "doctor_report",
         "hardware_envelope",
@@ -471,7 +1447,7 @@ def _load_industrial_analysis_manifest(
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("industrial analysis manifest fields do not match schema")
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version") != 2
         or value.get("kind") != "industrial_analysis_manifest"
     ):
         raise ValueError("industrial analysis manifest identity mismatch")
@@ -481,15 +1457,41 @@ def _load_industrial_analysis_manifest(
         value.get("registry_artifact"),
         label="registry artifact",
     )
-    plan_path = _analysis_bound_json_path(
+    pilot_path = _analysis_bound_json_path(
         manifest_path,
-        value.get("confirmation_plan"),
-        label="confirmation plan",
+        value.get("pilot_activation"),
+        label="pilot activation",
+    )
+    final_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("final_activation"),
+        label="final activation",
+    )
+    power_manifest_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("confirmation_power_manifest"),
+        label="confirmation family power manifest",
     )
     registry = _load_industrial_registry(registry_path)
-    plan = _load_confirmation_block_plan(str(plan_path))
-    if plan is None:
-        raise AssertionError("required confirmation plan unexpectedly resolved to None")
+    pilot = family_activation_artifact_from_dict(_load_bound_json(pilot_path))
+    final = family_activation_artifact_from_dict(_load_bound_json(final_path))
+    inventory_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("gpu_inventory"),
+        label="analysis GPU inventory",
+    )
+    inventory = _load_gpu_inventory(inventory_path)
+    raw_dependence = value.get("evidence_dependence_map")
+    dependence = None
+    if raw_dependence is not None:
+        dependence_path = _analysis_bound_json_path(
+            manifest_path,
+            raw_dependence,
+            label="evidence dependence map",
+        )
+        dependence = evidence_dependence_map_from_dict(
+            _load_bound_json(dependence_path)
+        )
     raw_attestation = value.get("gpu_attestation")
     raw_doctor = value.get("doctor_report")
     if (raw_attestation is None) != (raw_doctor is None):
@@ -515,6 +1517,26 @@ def _load_industrial_analysis_manifest(
         )
     )
     envelope = _analysis_hardware_envelope(value.get("hardware_envelope"))
+    power_registry, power_pilot, power_inventory, power_envelope, power_blocks = (
+        _load_family_power_manifest(power_manifest_path)
+    )
+    if (
+        power_registry.sha256 != registry.sha256
+        or power_pilot != pilot
+        or power_inventory != inventory
+        or power_envelope != envelope
+    ):
+        raise ValueError(
+            "analysis family-power manifest differs from registry/pilot/hardware"
+        )
+    plan = reduce_confirmation_family_power(
+        registry=power_registry,
+        pilot_activation=power_pilot,
+        blocks=power_blocks,
+        hardware_envelope=power_envelope,
+        inventory=power_inventory,
+        confirmation_data_visible=False,
+    )
 
     bootstrap = value.get("bootstrap")
     if not isinstance(bootstrap, dict) or set(bootstrap) != {
@@ -533,71 +1555,16 @@ def _load_industrial_analysis_manifest(
     ):
         raise ValueError("industrial analysis bootstrap values are invalid")
 
-    raw_blocks = value.get("blocks")
-    if not isinstance(raw_blocks, list) or not raw_blocks:
-        raise ValueError("industrial analysis manifest requires block evidence")
-    blocks: list[IndustrialBlockEvidence] = []
-    for raw_block in raw_blocks:
-        if not isinstance(raw_block, dict) or set(raw_block) != {
-            "block",
-            "qualification_lock",
-            "cells",
-        }:
-            raise ValueError("industrial analysis block fields do not match schema")
-        block = raw_block.get("block")
-        raw_cells = raw_block.get("cells")
-        if (
-            not isinstance(block, int)
-            or isinstance(block, bool)
-            or not isinstance(raw_cells, list)
-            or not raw_cells
-        ):
-            raise ValueError("industrial analysis block identity is invalid")
-        cells: list[IndustrialCellEvidence] = []
-        for raw_cell in raw_cells:
-            if not isinstance(raw_cell, dict) or set(raw_cell) != {
-                "cell_id",
-                "terminal_receipts",
-                "hardware_receipt",
-            }:
-                raise ValueError("industrial analysis cell fields do not match schema")
-            terminal = raw_cell.get("terminal_receipts")
-            if not isinstance(terminal, list) or not terminal:
-                raise ValueError("industrial analysis cell requires rank receipts")
-            cells.append(
-                IndustrialCellEvidence(
-                    cell_id=raw_cell.get("cell_id"),
-                    terminal_receipts=tuple(
-                        _analysis_file_binding(
-                            manifest_path,
-                            receipt,
-                            label="terminal receipt",
-                        )
-                        for receipt in terminal
-                    ),
-                    hardware_receipt=_analysis_file_binding(
-                        manifest_path,
-                        raw_cell.get("hardware_receipt"),
-                        label="hardware receipt",
-                    ),
-                )
-            )
-        blocks.append(
-            IndustrialBlockEvidence(
-                block=block,
-                cells=tuple(cells),
-                qualification_lock=_analysis_file_binding(
-                    manifest_path,
-                    raw_block.get("qualification_lock"),
-                    label="qualification lock",
-                ),
-            )
-        )
+    blocks = _analysis_blocks(manifest_path, value.get("blocks"))
     return (
         registry,
+        pilot,
+        final,
         plan,
+        inventory,
         envelope,
-        tuple(blocks),
+        blocks,
+        dependence,
         gpu_attestation,
         doctor_report,
         repetitions,
@@ -606,12 +1573,19 @@ def _load_industrial_analysis_manifest(
 
 
 def _parse_locked_outputs(values: list[str]) -> dict[str, str]:
+    return {
+        name: _artifact_sha256(path)
+        for name, path in _parse_locked_output_paths(values).items()
+    }
+
+
+def _parse_locked_output_paths(values: list[str]) -> dict[str, str]:
     outputs: dict[str, str] = {}
     for value in values:
         name, separator, path = value.partition("=")
         if not separator or not name or not path or name in outputs:
             raise ValueError("locked outputs must be unique NAME=PATH values")
-        outputs[name] = _artifact_sha256(path)
+        outputs[name] = path
     return outputs
 
 
@@ -724,7 +1698,16 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--output", required=True)
 
     build_industrial = commands.add_parser("build-industrial-registry")
-    build_industrial.add_argument("--gpu-uuid", nargs=2, required=True)
+    build_industrial.add_argument(
+        "--logical-gpu-slot",
+        nargs=2,
+        default=("logical-rank-slot-0", "logical-rank-slot-1"),
+        metavar=("SLOT_0", "SLOT_1"),
+        help=(
+            "two stable logical rank slots; physical GPU UUIDs come only from "
+            "the inventory and frozen dispatch assignment"
+        ),
+    )
     build_industrial.add_argument("--base-port", type=int, default=24000)
     build_industrial.add_argument("--cache-root", default="runtime-cache/industrial")
     build_industrial.add_argument("--evidence-root", default="artifacts/industrial")
@@ -737,18 +1720,72 @@ def _parser() -> argparse.ArgumentParser:
     seal_industrial.add_argument("--runtime-artifact", required=True)
     seal_industrial.add_argument("--split-artifact", required=True)
     seal_industrial.add_argument("--completed-cells", required=True)
+    seal_industrial.add_argument("--inventory", required=True)
+    seal_industrial.add_argument("--e2-final-stage-manifest")
+    seal_industrial.add_argument("--activation-plan")
+    seal_industrial.add_argument("--family-activation", action="append", default=[])
+    seal_industrial.add_argument("--family-power-plan", action="append", default=[])
     seal_industrial.add_argument("--dependency-receipt", action="append", default=[])
     seal_industrial.add_argument("--locked-output", action="append", required=True)
     seal_industrial.add_argument("--output", required=True)
 
     plan_industrial = commands.add_parser("plan-industrial-dispatch")
     plan_industrial.add_argument("--registry", required=True)
+    plan_industrial.add_argument("--inventory", required=True)
+    plan_industrial.add_argument("--interference-envelope", required=True)
+    plan_industrial.add_argument("--budget-plan", required=True)
     plan_industrial.add_argument("--receipt", action="append", default=[])
     plan_industrial.add_argument("--completed-cells")
-    plan_industrial.add_argument("--interference-receipt")
+    plan_industrial.add_argument("--completed-e2-stage-manifest")
     plan_industrial.add_argument("--activation-plan")
-    plan_industrial.add_argument("--confirmation-block-plan")
+    plan_industrial.add_argument("--family-activation", action="append", default=[])
+    plan_industrial.add_argument("--family-power-plan", action="append", default=[])
     plan_industrial.add_argument("--output", required=True)
+
+    estimate_budget = commands.add_parser("estimate-industrial-budget")
+    estimate_budget.add_argument("--registry", required=True)
+    estimate_budget.add_argument("--activation-plan", action="append", default=[])
+    estimate_budget.add_argument("--family-activation", action="append", default=[])
+    estimate_budget.add_argument("--family-power-plan", action="append", default=[])
+    estimate_budget.add_argument("--inventory", required=True)
+    estimate_budget.add_argument("--budgets", required=True)
+    estimate_budget.add_argument("--output", required=True)
+
+    reduce_e1 = commands.add_parser("reduce-e1-activation")
+    reduce_e1.add_argument("--registry", required=True)
+    reduce_e1.add_argument("--e3a-receipt", required=True)
+    reduce_e1.add_argument("--selection", required=True)
+    reduce_e1.add_argument("--output", required=True)
+
+    reduce_e2 = commands.add_parser("reduce-e2-activation")
+    reduce_e2.add_argument("--manifest", required=True)
+    reduce_e2.add_argument("--output", required=True)
+
+    halve_e2 = commands.add_parser("reduce-e2-successive-halving")
+    halve_e2.add_argument("--manifest", required=True)
+    halve_e2.add_argument("--output", required=True)
+
+    family_pilots = commands.add_parser("materialize-confirmation-pilots")
+    family_pilots.add_argument("--registry", required=True)
+    family_pilots.add_argument("--family", required=True)
+    family_pilots.add_argument("--output", required=True)
+
+    family_power = commands.add_parser("reduce-confirmation-family-power")
+    family_power.add_argument("--manifest", required=True)
+    family_power.add_argument("--output", required=True)
+
+    family_prefix = commands.add_parser("materialize-confirmation-prefix")
+    family_prefix.add_argument("--power-manifest", required=True)
+    family_prefix.add_argument("--output", required=True)
+
+    validate_alias = commands.add_parser("validate-evidence-alias")
+    validate_alias.add_argument("--alias", required=True)
+    validate_alias.add_argument("--output", required=True)
+
+    dependence = commands.add_parser("build-evidence-dependence-map")
+    dependence.add_argument("--direct-map", required=True)
+    dependence.add_argument("--alias", action="append", default=[])
+    dependence.add_argument("--output", required=True)
 
     analyze_industrial = commands.add_parser("analyze-industrial")
     analyze_industrial.add_argument("--manifest", required=True)
@@ -2154,9 +3191,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         concurrency=selection.selected_concurrency,
     )
     target_revision = next(
-        model.revision
-        for model in lock.models
-        if model.model_id == "Qwen/Qwen3-8B"
+        model.revision for model in lock.models if model.model_id == "Qwen/Qwen3-8B"
     )
     performance, evidence_sha256 = collect_onlinespec_performance(
         evidence_root=args.evidence_root,
@@ -3047,9 +4082,7 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
     lock = ModelLock.load(args.model_lock)
     _assert_onlinespec_study(manifest, selection, lock)
     if args.attestation and _TRUSTED_HARDWARE_ATTESTER_ID is None:
-        raise _trusted_attester_unavailable(
-            "legacy OnlineSPEC analysis attestation"
-        )
+        raise _trusted_attester_unavailable("legacy OnlineSPEC analysis attestation")
     target_reference = _load_target_reference(
         args.target_reference,
         model_lock=lock,
@@ -3113,8 +4146,21 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
 
 
 def _build_industrial_registry(args: argparse.Namespace) -> int:
+    logical_slots = tuple(args.logical_gpu_slot)
+    if (
+        len(logical_slots) != 2
+        or len(set(logical_slots)) != 2
+        or any(
+            not isinstance(slot, str)
+            or not slot.strip()
+            or "\n" in slot
+            or "\r" in slot
+            for slot in logical_slots
+        )
+    ):
+        raise ValueError("logical GPU rank slots must be two unique names")
     registry = build_industrial_registry(
-        gpu_uuids=(args.gpu_uuid[0], args.gpu_uuid[1]),
+        gpu_uuids=(logical_slots[0], logical_slots[1]),
         base_port=args.base_port,
         cache_root=args.cache_root,
         evidence_root=args.evidence_root,
@@ -3130,6 +4176,71 @@ def _build_industrial_registry(args: argparse.Namespace) -> int:
     _write_json(args.output, artifact)
     print(registry.sha256)
     return 0
+
+
+def _validate_e2_final_seal_authority(
+    *,
+    registry: ExperimentRegistry,
+    reduction,
+    inventory: GpuInventory,
+    runtime_sha256: str,
+    split_sha256: str,
+    direct_dependency_receipt_sha256: str | None,
+    completed_cell_ids: tuple[str, ...],
+    completed_cells_path: str,
+    locked_output_paths: dict[str, str],
+) -> None:
+    """Require the exact raw halving_3 candidate artifact before E2 sealing."""
+
+    evidence = reduction.stage_evidence
+    completed_value = _load_bound_json(completed_cells_path)
+    if not isinstance(completed_value, dict) or not isinstance(
+        completed_value.get("rows"), list
+    ):
+        raise TypeError("E2 completed-cell authority is malformed")
+    measured_rows = tuple(
+        row
+        for row in completed_value["rows"]
+        if isinstance(row, dict) and row.get("status") == "MEASURED"
+    )
+    terminal_receipts = tuple(
+        sorted(str(row.get("terminal_receipt_sha256")) for row in measured_rows)
+    )
+    budget_observations = tuple(
+        sorted(
+            {
+                str(row["budget_observation_sha256"])
+                for row in measured_rows
+                if row.get("budget_observation_sha256") is not None
+            }
+        )
+    )
+    if (
+        reduction.registry_sha256 != registry.sha256
+        or reduction.stage_index != 3
+        or reduction.runtime_sha256 != runtime_sha256
+        or reduction.split_sha256 != split_sha256
+        or evidence.inventory_sha256 != inventory.sha256
+        or evidence.inventory_source_receipt_sha256 != inventory.source_receipt_sha256
+        or evidence.fixed_instance_gpu_count != len(inventory.devices)
+        or evidence.inventory_host_id
+        != (inventory.host_ids[0] if len(inventory.host_ids) == 1 else None)
+        or reduction.activation.plan.dependency_receipt_sha256
+        != direct_dependency_receipt_sha256
+        or tuple(sorted(completed_cell_ids))
+        != reduction.survivor_receipt.completed_stage_cell_ids
+        or terminal_receipts != evidence.terminal_receipt_sha256s
+        or budget_observations != evidence.budget_observation_sha256s
+    ):
+        raise ValueError("E2 final-stage authority differs from the sealing inputs")
+    if set(locked_output_paths) != {"dflash_recipe"}:
+        raise ValueError("E2 seal requires exactly one dflash_recipe=PATH output")
+    expected = materialize_e2_final_recipe(registry, reduction)
+    actual = e2_final_recipe_artifact_from_dict(
+        _load_bound_json(locked_output_paths["dflash_recipe"])
+    )
+    if actual != expected:
+        raise ValueError("dflash_recipe is not the raw halving_3 final candidate")
 
 
 def _seal_industrial_stage(args: argparse.Namespace) -> int:
@@ -3150,10 +4261,21 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
         print(_canonical_sha256(artifact))
         return 42
     dependencies = _load_industrial_receipts(args.dependency_receipt)
+    inventory = _load_gpu_inventory(args.inventory)
+    activation_artifact = _load_stage_activation_plan(args.activation_plan)
+    family_activations = _load_family_activations(args.family_activation)
+    family_power_reductions = _load_family_power_reductions(args.family_power_plan)
+    dependency_by_experiment = registry.validate_receipts(dependencies)
+    definition = registry.definition(args.experiment)
+    direct_dependency_sha256 = (
+        None
+        if not definition.dependencies
+        else dependency_by_experiment[definition.dependencies[-1]].sha256
+    )
     runtime_sha256 = _artifact_sha256(args.runtime_artifact)
     split_contract = _load_bound_json(args.split_artifact)
     split_sha256 = _canonical_sha256(split_contract)
-    completed, completed_sha256 = _completed_industrial_cells(
+    completed_cell_ids, completed_sha256 = _completed_industrial_cells(
         args.completed_cells,
         registry,
         experiment=args.experiment,
@@ -3161,22 +4283,35 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
         split_sha256=split_sha256,
         split_contract=split_contract,
         require_industrial_contract=True,
+        direct_dependency_receipt_sha256=direct_dependency_sha256,
+        activation_artifact=activation_artifact,
+        family_activations=family_activations,
+        family_power_reductions=family_power_reductions,
+        require_stage_sealable=True,
+        inventory=inventory,
     )
     if completed_sha256 is None:
         raise ValueError("stage sealing requires content-bound completed-cell evidence")
-    expected = {
-        cell.cell_id for cell in registry.cells_for(args.experiment) if cell.runnable
-    }
-    if set(completed) != expected:
-        missing = len(expected - set(completed))
-        extra = len(set(completed) - expected)
-        raise ValueError(
-            "stage completion must cover every runnable cell exactly "
-            f"(missing={missing}, extra={extra})"
+    locked_output_paths = _parse_locked_output_paths(args.locked_output)
+    if args.experiment == "E2":
+        if args.e2_final_stage_manifest is None:
+            raise ValueError("E2 seal requires --e2-final-stage-manifest")
+        _validate_e2_final_seal_authority(
+            registry=registry,
+            reduction=_load_e2_stage_manifest(args.e2_final_stage_manifest),
+            inventory=inventory,
+            runtime_sha256=runtime_sha256,
+            split_sha256=split_sha256,
+            direct_dependency_receipt_sha256=direct_dependency_sha256,
+            completed_cell_ids=completed_cell_ids,
+            completed_cells_path=args.completed_cells,
+            locked_output_paths=locked_output_paths,
         )
+    elif args.e2_final_stage_manifest is not None:
+        raise ValueError("E2 final-stage authority cannot seal another experiment")
     receipt = registry.make_receipt(
         args.experiment,
-        _parse_locked_outputs(args.locked_output),
+        {name: _artifact_sha256(path) for name, path in locked_output_paths.items()},
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         completed_cells_sha256=completed_sha256,
@@ -3196,6 +4331,12 @@ def _completed_industrial_cells(
     split_sha256: str | None = None,
     split_contract: object | None = None,
     require_industrial_contract: bool = False,
+    direct_dependency_receipt_sha256: str | None = None,
+    activation_artifact=None,
+    family_activations=(),
+    family_power_reductions=(),
+    require_stage_sealable: bool = False,
+    inventory: GpuInventory | None = None,
 ) -> tuple[tuple[str, ...], str | None]:
     if path is None:
         return (), None
@@ -3206,20 +4347,26 @@ def _completed_industrial_cells(
     if (
         not isinstance(schema_version, int)
         or isinstance(schema_version, bool)
-        or schema_version not in {1, 2}
+        or schema_version not in {1, 2, 3, 4}
         or value.get("kind") != "industrial_completed_cells"
         or value.get("registry_sha256") != registry.sha256
     ):
         raise ValueError("completed-cell artifact identity mismatch")
-    strict = schema_version == 2
-    if require_industrial_contract and not strict:
+    strict = schema_version in {2, 3, 4}
+    formal = schema_version == 4
+    if require_industrial_contract and not formal:
         raise ValueError(
-            "stage sealing requires a schema-version-2 per-rank industrial contract"
+            "stage sealing requires a schema-version-4 inventory-bound contract"
         )
+    if formal and inventory is None:
+        raise ValueError("formal completion requires a bound GPU inventory")
 
     known = {cell.cell_id: cell for cell in registry.cells}
     contract_by_cell: dict[str, dict] = {}
     stage: str | None = None
+    activated: tuple[str, ...] = ()
+    dispositions: dict[str, dict[str, str]] = {}
+    activation_binding: dict[str, object] | None = None
     if strict:
         stage = value.get("experiment")
         embedded_split = value.get("split_contract")
@@ -3241,6 +4388,45 @@ def _completed_industrial_cells(
             raise ValueError("completed cells bind another locked split")
         if split_contract is not None and embedded_split != split_contract:
             raise ValueError("embedded locked split differs from the sealing artifact")
+        if formal:
+            expected_completion_fields = {
+                "schema_version",
+                "kind",
+                "registry_sha256",
+                "experiment",
+                "runtime_sha256",
+                "split_sha256",
+                "split_contract",
+                "activation_binding",
+                "inventory_sha256",
+                "inventory_source_receipt_sha256",
+                "rows",
+            }
+            if set(value) != expected_completion_fields:
+                raise ValueError("formal completion fields differ from schema")
+            if inventory is None:  # pragma: no cover - guarded above
+                raise RuntimeError("formal completion lost its GPU inventory")
+            if (
+                value.get("inventory_sha256") != inventory.sha256
+                or value.get("inventory_source_receipt_sha256")
+                != inventory.source_receipt_sha256
+            ):
+                raise ValueError("formal completion binds another GPU inventory")
+            activated, dispositions, activation_binding = (
+                _industrial_completion_activation_contract(
+                    registry,
+                    experiment=stage,
+                    runtime_sha256=value["runtime_sha256"],
+                    split_sha256=value["split_sha256"],
+                    direct_dependency_receipt_sha256=(direct_dependency_receipt_sha256),
+                    activation_artifact=activation_artifact,
+                    family_activations=family_activations,
+                    family_power_reductions=family_power_reductions,
+                    require_stage_sealable=require_stage_sealable,
+                )
+            )
+            if value.get("activation_binding") != activation_binding:
+                raise ValueError("completion activation binding is missing or forged")
         if (
             not isinstance(embedded_split.get("schema_version"), int)
             or isinstance(embedded_split.get("schema_version"), bool)
@@ -3250,6 +4436,14 @@ def _completed_industrial_cells(
             or embedded_split.get("experiment") != stage
         ):
             raise ValueError("industrial locked-split identity mismatch")
+        if formal and set(embedded_split) != {
+            "schema_version",
+            "kind",
+            "registry_sha256",
+            "experiment",
+            "cells",
+        }:
+            raise ValueError("formal locked-split fields differ from schema")
         split_cells = embedded_split.get("cells")
         if not isinstance(split_cells, list) or not all(
             isinstance(row, dict) for row in split_cells
@@ -3258,11 +4452,98 @@ def _completed_industrial_cells(
         runnable = {
             cell.cell_id: cell for cell in registry.cells_for(stage) if cell.runnable
         }
+        materialized = (
+            {cell_id: runnable[cell_id] for cell_id in activated}
+            if formal
+            else runnable
+        )
         for contract in split_cells:
             cell_id = contract.get("cell_id")
-            if cell_id not in runnable or cell_id in contract_by_cell:
+            if cell_id not in materialized or cell_id in contract_by_cell:
                 raise ValueError("locked split contains an unknown or duplicate cell")
-            cell = runnable[str(cell_id)]
+            cell = materialized[str(cell_id)]
+            if formal:
+                expected_contract_fields = {
+                    "cell_id",
+                    "request_ids",
+                    "expected_request_rows",
+                    "expected_round_rows",
+                    "expected_update_rows",
+                    "expected_performance_rows",
+                    "request_ids_sha256",
+                    "corpus_sha256",
+                    "arrival_trace_sha256",
+                    "sampling_profile_sha256",
+                    "model_lock_sha256",
+                    "patched_sglang_tree",
+                    "workload_contract",
+                    "rank_config_sha256s",
+                    "physical_assignment",
+                    "physical_binding_sha256",
+                    "topology_receipt_sha256",
+                    "experiment_budget_sha256",
+                    "experiment_budget",
+                    "execution_plan_sha256",
+                    "execution_split_sha256",
+                }
+                if set(contract) != expected_contract_fields:
+                    raise ValueError("locked split cell fields differ from schema")
+                assignment = _industrial_physical_assignment_from_dict(
+                    contract.get("physical_assignment")
+                )
+                if inventory is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("formal completion lost its GPU inventory")
+                _validate_assignment_inventory_authority(assignment, inventory)
+                try:
+                    experiment_budget = experiment_budget_from_dict(
+                        contract.get("experiment_budget")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "locked split contains a forged ExperimentBudget"
+                    ) from error
+                if (
+                    contract.get("physical_binding_sha256") != assignment.sha256
+                    or contract.get("experiment_budget_sha256")
+                    != assignment.experiment_budget_sha256
+                    or contract.get("experiment_budget_sha256")
+                    != experiment_budget.sha256
+                    or not _is_lower_sha256(contract.get("topology_receipt_sha256"))
+                    or not _is_lower_sha256(contract.get("execution_plan_sha256"))
+                    or not _is_lower_sha256(contract.get("execution_split_sha256"))
+                ):
+                    raise ValueError(
+                        "locked split physical assignment/budget binding is invalid"
+                    )
+                if (
+                    experiment_budget.cell_id != cell.cell_id
+                    or experiment_budget.experiment != cell.identity.experiment
+                    or experiment_budget.method != cell.identity.method
+                    or experiment_budget.workload_class
+                    is not cell.resources.workload_class
+                    or experiment_budget.gpu_count != cell.resources.gpu_count
+                    or experiment_budget.topology != cell.identity.topology
+                    or experiment_budget.measured_gpu_ms is not None
+                    or experiment_budget.fixed_instance_billed_gpu_ms
+                    != experiment_budget.wall_time.scale(len(inventory.devices))
+                ):
+                    raise ValueError(
+                        "locked ExperimentBudget differs from its registry cell"
+                    )
+                expected_topology = {
+                    "tp1_dp1": (1, 1),
+                    "tp2_dp1": (2, 1),
+                    "two_replica_tp1_dp2": (1, 2),
+                    "two_gpu_host": (1, 2),
+                    "two_independent_tp1": (1, 2),
+                }.get(cell.identity.topology)
+                if expected_topology is None or expected_topology != (
+                    assignment.tensor_parallel_size,
+                    assignment.data_parallel_size,
+                ):
+                    raise ValueError(
+                        "physical assignment disagrees with registry topology"
+                    )
             request_ids = contract.get("request_ids")
             expected_request_rows = contract.get("expected_request_rows")
             if (
@@ -3293,7 +4574,12 @@ def _completed_industrial_cells(
                     )
             elif (
                 not isinstance(rank_config_sha256s, list)
-                or len(rank_config_sha256s) != len(cell.resources.gpu_uuids)
+                or len(rank_config_sha256s)
+                != (
+                    len(assignment.gpu_uuids)
+                    if formal
+                    else len(cell.resources.gpu_uuids)
+                )
                 or not all(_is_lower_sha256(item) for item in rank_config_sha256s)
             ):
                 raise ValueError(
@@ -3340,14 +4626,15 @@ def _completed_industrial_cells(
                     "locked split table coverage disagrees with the method"
                 )
             contract_by_cell[str(cell_id)] = contract
-        if set(contract_by_cell) != set(runnable):
-            raise ValueError("locked split does not cover every runnable stage cell")
+        if set(contract_by_cell) != set(materialized):
+            raise ValueError("locked split does not cover every activated stage cell")
 
     rows = value.get("rows")
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise TypeError("completed-cell rows are missing")
     if strict:
-        assert stage is not None
+        if stage is None:
+            raise RuntimeError("strict completion lost its stage identity")
         stage_ids = {cell.cell_id for cell in registry.cells_for(stage)}
         if any(row.get("cell_id") not in stage_ids for row in rows):
             raise ValueError("completed-cell rows cross an industrial stage boundary")
@@ -3360,22 +4647,40 @@ def _completed_industrial_cells(
             )
         for cell_id, cell_rows in grouped.items():
             cell = known[cell_id]
+            if formal and cell_id not in set(activated):
+                if cell_rows != [dispositions[cell_id]]:
+                    raise ValueError(
+                        "non-activated cells require one exact immutable disposition"
+                    )
+                continue
             if cell.runnable:
-                if len(cell_rows) != len(cell.resources.gpu_uuids) or any(
+                expected_world_size = (
+                    len(
+                        _industrial_physical_assignment_from_dict(
+                            contract_by_cell[cell_id]["physical_assignment"]
+                        ).gpu_uuids
+                    )
+                    if formal
+                    else len(cell.resources.gpu_uuids)
+                )
+                if len(cell_rows) != expected_world_size or any(
                     row.get("status") != "MEASURED" for row in cell_rows
                 ):
                     raise ValueError(
-                        "runnable cells require one measured outcome per claimed GPU"
+                        "activated cells require one measured outcome per physical rank"
                     )
                 continue
-            if cell_rows != [
-                {
+            expected_disposition = (
+                dispositions[cell_id]
+                if formal
+                else {
                     "cell_id": cell_id,
                     "status": cell.status.value,
                     "reason_code": cell.reason_code,
                     "reason": cell.reason,
                 }
-            ]:
+            )
+            if cell_rows != [expected_disposition]:
                 raise ValueError(
                     "BLOCKED/N/A cells require one exact immutable outcome row"
                 )
@@ -3383,15 +4688,53 @@ def _completed_industrial_cells(
     completed: list[str] = []
     rank_coverage: dict[str, set[int]] = {}
     consensus: dict[str, dict[str, object]] = {}
+    budget_consensus: dict[str, tuple[object, object, object]] = {}
     nonce_owner: dict[str, str] = {}
     run_owner: dict[str, str] = {}
     for row in rows:
         cell_id = row.get("cell_id")
-        if strict and cell_id in known and not known[str(cell_id)].runnable:
+        if (
+            strict
+            and cell_id in known
+            and (
+                not known[str(cell_id)].runnable
+                or (formal and cell_id not in set(activated))
+            )
+        ):
             continue
         evidence_root = row.get("evidence_root")
         run_id = row.get("run_id")
         rank = row.get("rank")
+        assignment = None
+        row_cell = known.get(str(cell_id))
+        physical_world_size = (
+            0 if row_cell is None else len(row_cell.resources.gpu_uuids)
+        )
+        if formal and cell_id in contract_by_cell:
+            formal_row_fields = {
+                "cell_id",
+                "evidence_root",
+                "run_id",
+                "rank",
+                "evidence_sha256",
+                "terminal_receipt_sha256",
+                "physical_gpu_uuid",
+                "physical_binding_sha256",
+                "experiment_budget_sha256",
+                "budget_observation_status",
+                "budget_observation_reason_code",
+                "budget_observation_path",
+                "budget_observation_sha256",
+                "preflight_attestation_path",
+                "preflight_attestation_sha256",
+                "status",
+            }
+            if set(row) != formal_row_fields:
+                raise ValueError("formal completed-rank fields differ from schema")
+            assignment = _industrial_physical_assignment_from_dict(
+                contract_by_cell[str(cell_id)]["physical_assignment"]
+            )
+            physical_world_size = len(assignment.gpu_uuids)
         if (
             not _is_lower_sha256(cell_id)
             or cell_id not in known
@@ -3402,7 +4745,7 @@ def _completed_industrial_cells(
             or not isinstance(rank, int)
             or isinstance(rank, bool)
             or rank < 0
-            or rank >= len(known[str(cell_id)].resources.gpu_uuids)
+            or rank >= physical_world_size
             or not _is_lower_sha256(row.get("evidence_sha256"))
             or not _is_lower_sha256(row.get("terminal_receipt_sha256"))
             or row.get("status") != "MEASURED"
@@ -3411,6 +4754,21 @@ def _completed_industrial_cells(
                 "completed cells require known identities and durable measured evidence"
             )
         cell = known[str(cell_id)]
+        if formal:
+            if assignment is None:
+                raise RuntimeError("formal completion lost its physical assignment")
+            contract = contract_by_cell[str(cell_id)]
+            if (
+                row.get("physical_binding_sha256") != assignment.sha256
+                or row.get("physical_gpu_uuid") != assignment.gpu_uuids[rank]
+                or row.get("experiment_budget_sha256")
+                != assignment.experiment_budget_sha256
+                or row.get("experiment_budget_sha256")
+                != contract["experiment_budget_sha256"]
+            ):
+                raise ValueError(
+                    "completed rank differs from its physical assignment/budget"
+                )
         owner = run_owner.setdefault(run_id, str(cell_id))
         if strict and owner != cell_id:
             raise ValueError("industrial run identity is reused across registry cells")
@@ -3425,6 +4783,12 @@ def _completed_industrial_cells(
         receipt_path = root / f"{run_id}.rank{rank}.complete.json"
         if _file_sha256(receipt_path) != row["terminal_receipt_sha256"]:
             raise ValueError("completed-cell terminal receipt digest mismatch")
+        try:
+            terminal_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("completed-cell terminal receipt is invalid") from error
+        if not isinstance(terminal_receipt, dict):
+            raise TypeError("completed-cell terminal receipt is malformed")
         if evidence_files_sha256(evidence.values()) != row["evidence_sha256"]:
             raise ValueError("completed-cell evidence digest mismatch")
         run_columns = ["manifest_sha256", "config_sha256", "status"]
@@ -3455,9 +4819,15 @@ def _completed_industrial_cells(
                     "expected_update_rows",
                     "expected_performance_rows",
                     "workload_contract",
+                    "experiment_budget_sha256",
                     "preflight_attestation_sha256",
+                    *_DISABLED_SESSION_RUN_FIELDS,
                 )
             )
+            run_schema_names = pq.ParquetFile(evidence["run"]).schema_arrow.names
+            for field in run_schema_names:
+                if field.startswith("session_") and field not in run_columns:
+                    run_columns.append(field)
         run = pq.read_table(evidence["run"], columns=run_columns).to_pylist()
         if len(run) != 1:
             raise ValueError("completed evidence must contain exactly one run identity")
@@ -3474,22 +4844,52 @@ def _completed_industrial_cells(
         contract: dict | None = None
         topology_sha256: str | None = None
         if strict:
+            _validate_disabled_session_run_fields(run_row)
             contract = contract_by_cell[str(cell_id)]
             topology = cell.identity.topology
-            tensor_parallel_size = 2 if topology == "tp2_dp1" else 1
-            data_parallel_size = 2 if topology == "two_replica_tp1_dp2" else 1
-            world_size = len(cell.resources.gpu_uuids)
-            topology_sha256 = _canonical_sha256(
-                {
-                    "schema_version": 1,
-                    "cell_id": cell_id,
-                    "topology": topology,
-                    "gpu_uuids": list(cell.resources.gpu_uuids),
-                    "tensor_parallel_size": tensor_parallel_size,
-                    "data_parallel_size": data_parallel_size,
-                    "world_size": world_size,
-                }
-            )
+            if formal:
+                if assignment is None:
+                    raise RuntimeError("formal completion lost its physical assignment")
+                tensor_parallel_size = assignment.tensor_parallel_size
+                data_parallel_size = assignment.data_parallel_size
+                world_size = len(assignment.gpu_uuids)
+                topology_sha256 = _canonical_sha256(
+                    {
+                        "schema_version": 1,
+                        "cell_id": cell_id,
+                        "topology": topology,
+                        "topology_receipt_sha256": contract["topology_receipt_sha256"],
+                        "physical_assignment_sha256": (assignment.assignment_sha256),
+                        "physical_binding_sha256": assignment.sha256,
+                        "physical_host_id": assignment.host_id,
+                        "physical_gpu_uuids": list(assignment.gpu_uuids),
+                        "physical_rank_groups": [
+                            list(group) for group in assignment.rank_groups
+                        ],
+                        "physical_ports": list(assignment.ports),
+                        "topology_group_ids": [
+                            list(group) for group in assignment.topology_group_ids
+                        ],
+                        "tensor_parallel_size": tensor_parallel_size,
+                        "data_parallel_size": data_parallel_size,
+                        "world_size": world_size,
+                    }
+                )
+            else:
+                tensor_parallel_size = 2 if topology == "tp2_dp1" else 1
+                data_parallel_size = 2 if topology == "two_replica_tp1_dp2" else 1
+                world_size = len(cell.resources.gpu_uuids)
+                topology_sha256 = _canonical_sha256(
+                    {
+                        "schema_version": 1,
+                        "cell_id": cell_id,
+                        "topology": topology,
+                        "gpu_uuids": list(cell.resources.gpu_uuids),
+                        "tensor_parallel_size": tensor_parallel_size,
+                        "data_parallel_size": data_parallel_size,
+                        "world_size": world_size,
+                    }
+                )
             expected_run = {
                 "method": cell.identity.method,
                 "model_pair": cell.identity.model,
@@ -3500,8 +4900,16 @@ def _completed_industrial_cells(
                     if stage == "preflight"
                     else contract["rank_config_sha256s"][rank]
                 ),
-                "runtime_sha256": value["runtime_sha256"],
-                "split_sha256": value["split_sha256"],
+                "runtime_sha256": (
+                    contract["execution_plan_sha256"]
+                    if formal
+                    else value["runtime_sha256"]
+                ),
+                "split_sha256": (
+                    contract["execution_split_sha256"]
+                    if formal
+                    else value["split_sha256"]
+                ),
                 "corpus_sha256": contract["corpus_sha256"],
                 "arrival_trace_sha256": contract["arrival_trace_sha256"],
                 "request_ids_sha256": contract["request_ids_sha256"],
@@ -3517,6 +4925,9 @@ def _completed_industrial_cells(
                 "expected_update_rows": contract["expected_update_rows"],
                 "expected_performance_rows": contract["expected_performance_rows"],
                 "workload_contract": contract["workload_contract"],
+                "experiment_budget_sha256": (
+                    contract["experiment_budget_sha256"] if formal else None
+                ),
             }
             closed_loop = str(cell.identity.arrival).startswith("closed_loop")
             if not closed_loop:
@@ -3600,7 +5011,12 @@ def _completed_industrial_cells(
                     or not isinstance(attestation.get("rank"), int)
                     or isinstance(attestation.get("rank"), bool)
                     or attestation.get("rank") != rank
-                    or attestation.get("gpu_uuid") != cell.resources.gpu_uuids[rank]
+                    or attestation.get("gpu_uuid")
+                    != (
+                        assignment.gpu_uuids[rank]
+                        if formal and assignment is not None
+                        else cell.resources.gpu_uuids[rank]
+                    )
                     or not isinstance(checks, dict)
                     or set(checks) != required_checks
                     or any(result != "PASS" for result in checks.values())
@@ -3636,17 +5052,82 @@ def _completed_industrial_cells(
                     "non-preflight completion carries a preflight attestation"
                 )
 
+            if formal:
+                if assignment is None:
+                    raise RuntimeError("formal completion lost its physical assignment")
+                non_serving = stage == "preflight" or (
+                    cell.resources.workload_class.value in {"compile", "download"}
+                )
+                budget_status = row.get("budget_observation_status")
+                budget_reason = row.get("budget_observation_reason_code")
+                budget_path = row.get("budget_observation_path")
+                budget_sha256 = row.get("budget_observation_sha256")
+                if non_serving:
+                    if (
+                        budget_status != "NOT_APPLICABLE"
+                        or budget_reason != "preflight_or_non_serving_execution"
+                        or budget_path is not None
+                        or budget_sha256 is not None
+                    ):
+                        raise ValueError(
+                            "non-serving budget observation disposition is not exact"
+                        )
+                else:
+                    expected_budget_status = (
+                        "OBSERVED" if rank == 0 else "BOUND_TO_RANK0"
+                    )
+                    expected_budget_reason = (
+                        None if rank == 0 else "gang_observation_published_by_rank0"
+                    )
+                    if (
+                        budget_status != expected_budget_status
+                        or budget_reason != expected_budget_reason
+                        or not isinstance(budget_path, str)
+                        or not _is_lower_sha256(budget_sha256)
+                    ):
+                        raise ValueError(
+                            "serving completion lacks its exact budget observation"
+                        )
+                    budget_identity = (
+                        budget_path,
+                        budget_sha256,
+                        row["experiment_budget_sha256"],
+                    )
+                    previous_budget = budget_consensus.setdefault(
+                        str(cell_id), budget_identity
+                    )
+                    if previous_budget != budget_identity:
+                        raise ValueError(
+                            "cell ranks disagree on one budget observation"
+                        )
+                    if rank == 0:
+                        _validate_budget_observation_receipt(
+                            budget_path,
+                            expected_sha256=budget_sha256,
+                            experiment_budget_sha256=row["experiment_budget_sha256"],
+                            prepared_receipt_sha256=terminal_receipt.get(
+                                "prepared_receipt_sha256"
+                            ),
+                            cell=cell,
+                            evidence_root=root,
+                            fixed_instance_gpu_count=(len(inventory.devices)),
+                        )
+
         performance = pq.read_table(
             evidence["performance"],
             columns=[
                 "region",
                 "method",
                 "optimizer_bytes",
+                "adaptation_memory_ledger",
                 "trainable_parameters",
                 "training_cuda_ms",
                 "optimizer_cuda_ms",
                 "merge_cuda_ms",
                 "publish_cuda_ms",
+                "barrier_cuda_ms",
+                "exposed_update_ms",
+                "main_side_overlap_ratio",
                 "updates_launched",
                 "updates_published",
                 "exactness_violations",
@@ -3703,24 +5184,10 @@ def _completed_industrial_cells(
         ):
             raise ValueError("industrial completion lacks backpressure accounting")
         if cell.identity.method in {"target_only", "static"}:
-            if any(
-                row["optimizer_bytes"] != 0
-                or row["trainable_parameters"] != 0
-                or row["updates_launched"] != 0
-                or row["updates_published"] != 0
-                or any(
-                    row[field] is not None
-                    for field in (
-                        "training_cuda_ms",
-                        "optimizer_cuda_ms",
-                        "merge_cuda_ms",
-                        "publish_cuda_ms",
-                    )
-                )
-                for row in performance
-            ):
-                raise ValueError(
-                    "Target-only/Static completion allocated adaptation work"
+            for performance_row in performance:
+                _validate_allocation_free_performance(
+                    performance_row,
+                    method=cell.identity.method,
                 )
         elif cell.identity.task != "failure_injection" and any(
             not isinstance(row["updates_launched"], int)
@@ -3739,7 +5206,10 @@ def _completed_industrial_cells(
                 "finished",
                 "outcome_status",
                 "output_hash_format",
+                "output_tokens",
                 "output_sha256",
+                "output_token_ids",
+                "output_token_ids_sha256",
                 "arrival_ns",
                 "admitted_ns",
                 "completed_ns",
@@ -3757,18 +5227,18 @@ def _completed_industrial_cells(
             or row["repetition_block"] != cell.identity.block
             or row["outcome_status"] not in allowed_outcomes
             or row["finished"] is not (row["outcome_status"] == "completed")
-            or row["output_hash_format"] != OUTPUT_HASH_FORMAT
             or (row["completed_ns"] is None and row["outcome_status"] != "unfinished")
             or (
                 row["completed_ns"] is not None
                 and row["outcome_status"] == "unfinished"
             )
-            or not _is_lower_sha256(row["output_sha256"])
             for row in requests
         ):
             raise ValueError(
                 "industrial completion has incomplete terminal-outcome evidence"
             )
+        for request_row in requests:
+            _validate_request_output_identity(request_row)
         request_outputs = {
             request["request_id"]: request["output_sha256"] for request in requests
         }
@@ -3777,7 +5247,8 @@ def _completed_industrial_cells(
                 "industrial request evidence contains duplicate identities"
             )
         if strict:
-            assert contract is not None
+            if contract is None:
+                raise RuntimeError("strict completion lost its split contract")
             closed_loop = str(cell.identity.arrival).startswith("closed_loop")
             if closed_loop:
                 concurrency = cell.identity.concurrency
@@ -3916,6 +5387,12 @@ def _completed_industrial_cells(
                 "run_id": run_id,
                 "run_nonce_sha256": run_row["run_nonce_sha256"],
                 "topology_sha256": topology_sha256,
+                "physical_binding_sha256": (
+                    None if not formal else row["physical_binding_sha256"]
+                ),
+                "experiment_budget_sha256": (
+                    None if not formal else row["experiment_budget_sha256"]
+                ),
                 "runtime_sha256": run_row["runtime_sha256"],
                 "split_sha256": run_row["split_sha256"],
                 "request_ids_sha256": run_row["request_ids_sha256"],
@@ -3926,382 +5403,347 @@ def _completed_industrial_cells(
                 raise ValueError("cell ranks do not agree on one run/output identity")
         completed.append(str(cell_id))
     for cell_id, ranks in rank_coverage.items():
-        expected_ranks = set(range(len(known[cell_id].resources.gpu_uuids)))
+        expected_ranks = set(
+            range(
+                len(
+                    _industrial_physical_assignment_from_dict(
+                        contract_by_cell[cell_id]["physical_assignment"]
+                    ).gpu_uuids
+                )
+                if formal
+                else len(known[cell_id].resources.gpu_uuids)
+            )
+        )
         if ranks != expected_ranks:
             raise ValueError("completed cell lacks exact per-rank evidence coverage")
     unique = tuple(dict.fromkeys(completed))
     return unique, _canonical_sha256(value)
 
 
-def _interference_gate_passed(
-    path: str | None, registry: ExperimentRegistry
-) -> tuple[bool, str | None]:
-    if path is None:
-        return False, None
-    value = _load_bound_json(path)
-    if not isinstance(value, dict):
-        raise TypeError("interference receipt must be an object")
-    source_files = value.get("source_evidence_files")
-    if (
-        value.get("schema_version") != 1
-        or value.get("kind") != "two_gpu_interference_gate"
-        or value.get("status") != "PASS"
-        or value.get("registry_sha256") != registry.sha256
-        or value.get("gpu_uuids") != list(registry.gpu_uuids)
-        or not _is_lower_sha256(value.get("source_evidence_sha256"))
-        or not isinstance(source_files, list)
-        or not source_files
-        or not all(isinstance(path, str) and path for path in source_files)
-    ):
-        raise ValueError(
-            "parallel dispatch requires a matching PASS interference receipt"
-        )
-    if evidence_files_sha256(source_files) != value["source_evidence_sha256"]:
-        raise ValueError("interference receipt does not bind its source evidence")
-    contrasts = _recompute_interference_contrasts(source_files, registry)
-    for contrast in contrasts:
-        if (
-            abs(contrast.mean_relative_gain) > 0.01
-            or contrast.ci_lower_relative_gain > 0.0
-            or contrast.ci_upper_relative_gain < 0.0
-        ):
-            raise ValueError(
-                "parallel dispatch requires <=1% throughput/ITL differences "
-                "with 95% intervals containing zero"
-            )
-    expected_metrics = {
-        contrast.name: {
-            "mean_relative_difference": contrast.mean_relative_gain,
-            "ci95_relative_difference": [
-                contrast.ci_lower_relative_gain,
-                contrast.ci_upper_relative_gain,
-            ],
-            "paired_blocks": list(contrast.block_ids),
-        }
-        for contrast in contrasts
-    }
-    if value.get("metrics") != expected_metrics:
-        raise ValueError(
-            "interference summary does not match recomputed paired evidence"
-        )
-    return True, _canonical_sha256(value)
+def _single_industrial_receipt(
+    path: str | Path, *, experiment: str
+) -> ExperimentReceipt:
+    (receipt,) = _load_industrial_receipts([str(path)])
+    if receipt.experiment != experiment:
+        raise ValueError(f"expected a sealed {experiment} receipt")
+    return receipt
 
 
-def _recompute_interference_contrasts(
-    source_files: list[str],
-    registry: ExperimentRegistry,
-) -> tuple[PairedBcaContrast, PairedBcaContrast]:
-    """Recompute interference contrasts from durable schema-v3 request rows."""
-    throughput: dict[str, tuple[float, float]] = {}
-    itl: dict[str, tuple[float, float]] = {}
-    used_receipts: set[str] = set()
-    interference_cells = [
-        cell
-        for cell in registry.cells_for("preflight")
-        if cell.identity.task == "simultaneous_single_gpu_interference"
-    ]
-    if len(interference_cells) != 1:
-        raise ValueError("registry lacks one interference calibration cell")
-    interference_cell = interference_cells[0]
+def _write_planning_artifact(
+    output: str | Path,
+    *,
+    artifact,
+    encode,
+) -> int:
+    value = encode(artifact)
+    _write_json(output, value)
+    print(artifact.sha256)
+    return 0
 
-    def percentile(values: list[float], quantile: float) -> float:
-        if not values:
-            raise ValueError("interference calibration lacks exact token intervals")
-        ordered = sorted(values)
-        position = quantile * (len(ordered) - 1)
-        lower = math.floor(position)
-        upper = math.ceil(position)
-        fraction = position - lower
-        return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
-    def condition_metrics(
-        condition: object,
-        *,
-        block_id: str,
-        condition_name: str,
-    ) -> tuple[float, float]:
-        if not isinstance(condition, dict) or set(condition) != {"terminal_receipts"}:
-            raise ValueError(
-                "interference conditions must contain only terminal receipts"
-            )
-        bindings = condition["terminal_receipts"]
-        if not isinstance(bindings, list) or len(bindings) != len(registry.gpu_uuids):
-            raise ValueError(
-                "interference conditions require exact per-GPU receipt coverage"
-            )
-        observed_ranks: set[int] = set()
-        observed_gpus: set[str] = set()
-        run_ids: set[str] = set()
-        per_rank_throughput: list[float] = []
-        intervals: list[float] = []
-        for binding in bindings:
-            if not isinstance(binding, dict) or set(binding) != {
-                "path",
-                "sha256",
-                "gpu_uuid",
-            }:
-                raise ValueError("interference terminal binding schema is ambiguous")
-            raw_path = binding["path"]
-            raw_sha256 = binding["sha256"]
-            gpu_uuid = binding["gpu_uuid"]
-            if (
-                not isinstance(raw_path, str)
-                or not raw_path
-                or not _is_lower_sha256(raw_sha256)
-                or not isinstance(gpu_uuid, str)
-                or gpu_uuid not in registry.gpu_uuids
-            ):
-                raise ValueError("interference terminal binding identity is invalid")
-            receipt_path = Path(raw_path)
-            if (
-                not receipt_path.is_file()
-                or receipt_path.is_symlink()
-                or receipt_path.resolve().parent
-                != Path(interference_cell.resources.evidence_root).resolve()
-                or _file_sha256(receipt_path) != raw_sha256
-                or raw_sha256 in used_receipts
-            ):
-                raise ValueError(
-                    "interference terminal receipt is missing, reused, or changed"
-                )
-            try:
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    "interference terminal receipt is invalid JSON"
-                ) from error
-            if not isinstance(receipt, dict) or receipt.get("schema_version") != 3:
-                raise ValueError("interference calibration requires schema-v3 receipts")
-            run_id = receipt.get("run_id")
-            rank = receipt.get("rank")
-            if (
-                not isinstance(run_id, str)
-                or not run_id
-                or not isinstance(rank, int)
-                or isinstance(rank, bool)
-                or rank < 0
-                or rank >= len(registry.gpu_uuids)
-                or gpu_uuid != registry.gpu_uuids[rank]
-                or receipt_path.name != f"{run_id}.rank{rank}.complete.json"
-            ):
-                raise ValueError("interference receipt rank/GPU identity mismatch")
-            evidence = load_completed_evidence(
-                receipt_path.parent,
-                run_id=run_id,
-                rank=rank,
-            )
-            if evidence is None:
-                raise ValueError("interference receipt has no durable evidence")
-            run_rows = pq.read_table(evidence["run"]).to_pylist()
-            request_rows = pq.read_table(evidence["request"]).to_pylist()
-            if len(run_rows) != 1 or not request_rows:
-                raise ValueError("interference receipt has incomplete raw tables")
-            run = run_rows[0]
-            block_match = re.fullmatch(r"block-([0-9]+)", block_id)
-            if (
-                block_match is None
-                or run.get("run_id") != run_id
-                or run.get("manifest_sha256") != registry.sha256
-                or run.get("config_sha256") != interference_cell.cell_id
-                or run.get("method") != "static"
-                or run.get("repetition_block") != int(block_match.group(1))
-                or run.get("status") != "complete"
-            ):
-                raise ValueError("interference run differs from the calibration cell")
-            arrivals: list[int] = []
-            completions: list[int] = []
-            output_tokens = 0
-            for request in request_rows:
-                arrival_ns = request.get("arrival_ns")
-                completed_ns = request.get("completed_ns")
-                tokens = request.get("output_tokens")
-                try:
-                    request_intervals = json.loads(request.get("inter_token_ms"))
-                except (TypeError, json.JSONDecodeError) as error:
-                    raise ValueError(
-                        "interference request lacks exact token intervals"
-                    ) from error
-                if (
-                    request.get("run_id") != run_id
-                    or request.get("method") != "static"
-                    or request.get("repetition_block") != int(block_match.group(1))
-                    or request.get("outcome_status") != "completed"
-                    or request.get("finished") is not True
-                    or request.get("output_hash_format") != OUTPUT_HASH_FORMAT
-                    or not isinstance(arrival_ns, int)
-                    or isinstance(arrival_ns, bool)
-                    or not isinstance(completed_ns, int)
-                    or isinstance(completed_ns, bool)
-                    or completed_ns <= arrival_ns
-                    or not isinstance(tokens, int)
-                    or isinstance(tokens, bool)
-                    or tokens < 2
-                    or request.get("token_timing_coverage") != 1.0
-                    or request.get("coalesced_intervals") != 0
-                    or not isinstance(request_intervals, list)
-                    or len(request_intervals) != tokens - 1
-                    or any(
-                        not isinstance(item, (int, float))
-                        or isinstance(item, bool)
-                        or not math.isfinite(float(item))
-                        or float(item) < 0.0
-                        for item in request_intervals
-                    )
-                ):
-                    raise ValueError(
-                        "interference request timing/outcome evidence is incomplete"
-                    )
-                arrivals.append(arrival_ns)
-                completions.append(completed_ns)
-                output_tokens += tokens
-                intervals.extend(float(item) for item in request_intervals)
-            elapsed_s = (max(completions) - min(arrivals)) / 1_000_000_000
-            if elapsed_s <= 0.0:
-                raise ValueError("interference calibration duration is not positive")
-            observed_ranks.add(rank)
-            observed_gpus.add(gpu_uuid)
-            run_ids.add(run_id)
-            per_rank_throughput.append(output_tokens / elapsed_s)
-            used_receipts.add(str(raw_sha256))
-        if observed_ranks != set(
-            range(len(registry.gpu_uuids))
-        ) or observed_gpus != set(registry.gpu_uuids):
-            raise ValueError("interference condition lacks exact rank/GPU coverage")
-        if len(run_ids) != 1:
-            raise ValueError(
-                f"{condition_name} interference ranks do not share one run identity"
-            )
-        return sum(per_rank_throughput), percentile(intervals, 0.99)
-
-    for source_path in source_files:
-        source = _load_bound_json(source_path)
-        if not isinstance(source, dict):
-            raise TypeError("interference calibration source must be an object")
-        if set(source) != {
-            "schema_version",
-            "kind",
-            "registry_sha256",
-            "gpu_uuids",
-            "paired_blocks",
-        } or (
-            source.get("schema_version") != 2
-            or source.get("kind") != "two_gpu_interference_calibration"
-            or source.get("registry_sha256") != registry.sha256
-            or source.get("gpu_uuids") != list(registry.gpu_uuids)
-        ):
-            raise ValueError("interference calibration identity mismatch")
-        blocks = source.get("paired_blocks")
-        if not isinstance(blocks, list) or not blocks:
-            raise ValueError("interference calibration has no paired blocks")
-        for block in blocks:
-            if not isinstance(block, dict):
-                raise TypeError("interference paired block must be an object")
-            block_id = block.get("block_id")
-            isolated = block.get("isolated")
-            simultaneous = block.get("simultaneous")
-            if (
-                not isinstance(block_id, str)
-                or not block_id
-                or block_id in throughput
-                or not isinstance(isolated, dict)
-                or not isinstance(simultaneous, dict)
-                or set(block) != {"block_id", "isolated", "simultaneous"}
-            ):
-                raise ValueError("interference paired block identity is invalid")
-            isolated_metrics = condition_metrics(
-                isolated,
-                block_id=block_id,
-                condition_name="isolated",
-            )
-            simultaneous_metrics = condition_metrics(
-                simultaneous,
-                block_id=block_id,
-                condition_name="simultaneous",
-            )
-            throughput[block_id] = (simultaneous_metrics[0], isolated_metrics[0])
-            itl[block_id] = (simultaneous_metrics[1], isolated_metrics[1])
-    if len(throughput) < 4:
-        raise ValueError(
-            "interference calibration requires at least four paired blocks"
-        )
-    return (
-        paired_bca_contrast("throughput", throughput, seed=1701),
-        paired_bca_contrast("itl", itl, seed=1702),
+def _reduce_e1_activation(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    receipt = _single_industrial_receipt(args.e3a_receipt, experiment="E3a")
+    selection = sealed_e3a_selection_from_dict(_load_bound_json(args.selection))
+    artifact = reduce_e1_activation(
+        registry,
+        e3a_receipt=receipt,
+        selection=selection,
     )
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=reducer_activation_artifact_to_dict,
+    )
+
+
+def _reduce_e2_activation(args: argparse.Namespace) -> int:
+    registry, receipt, pareto, stage_index, prior = _load_e2_activation_manifest(
+        args.manifest
+    )
+    artifact = reduce_e2_activation(
+        registry,
+        e1_receipt=receipt,
+        pareto=pareto,
+        stage_index=stage_index,
+        prior_reduction=prior,
+    )
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=reducer_activation_artifact_to_dict,
+    )
+
+
+def _reduce_e2_halving(args: argparse.Namespace) -> int:
+    artifact = _load_e2_stage_manifest(args.manifest)
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=e2_stage_reduction_artifact_to_dict,
+    )
+
+
+def _materialize_confirmation_pilots(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    family = confirmation_family_identity_from_dict(_load_bound_json(args.family))
+    artifact = materialize_confirmation_pilots(registry, family)
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=family_activation_artifact_to_dict,
+    )
+
+
+def _reduce_confirmation_family_power(args: argparse.Namespace) -> int:
+    registry, pilot, inventory, envelope, blocks = _load_family_power_manifest(
+        args.manifest
+    )
+    plan = reduce_confirmation_family_power(
+        registry=registry,
+        pilot_activation=pilot,
+        blocks=blocks,
+        hardware_envelope=envelope,
+        inventory=inventory,
+        confirmation_data_visible=False,
+    )
+    return _write_planning_artifact(
+        args.output,
+        artifact=plan,
+        encode=confirmation_family_power_reduction_artifact_to_dict,
+    )
+
+
+def _materialize_confirmation_final_prefix(args: argparse.Namespace) -> int:
+    registry, pilot, inventory, envelope, blocks = _load_family_power_manifest(
+        args.power_manifest
+    )
+    reduction = reduce_confirmation_family_power(
+        registry=registry,
+        pilot_activation=pilot,
+        blocks=blocks,
+        hardware_envelope=envelope,
+        inventory=inventory,
+        confirmation_data_visible=False,
+    )
+    artifact = materialize_confirmation_prefix(
+        registry,
+        family=pilot.family,
+        reduction=reduction,
+        pilot_activation=pilot,
+    )
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=family_activation_artifact_to_dict,
+    )
+
+
+def _validate_evidence_alias(args: argparse.Namespace) -> int:
+    artifact = evidence_alias_receipt_from_dict(_load_bound_json(args.alias))
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=evidence_alias_receipt_to_dict,
+    )
+
+
+def _build_evidence_dependence_map(args: argparse.Namespace) -> int:
+    direct_map = evidence_dependence_map_from_dict(_load_bound_json(args.direct_map))
+    direct_cell_ids: list[str] = []
+    for unit in direct_map.units:
+        if unit.member_cell_ids != (unit.source_cell_id,) or unit.unit_sha256 != (
+            _canonical_sha256({"direct_observation_cell_id": unit.source_cell_id})
+        ):
+            raise ValueError(
+                "direct dependence-map input must contain singleton observations"
+            )
+        direct_cell_ids.append(unit.source_cell_id)
+    aliases = tuple(
+        evidence_alias_receipt_from_dict(_load_bound_json(path)) for path in args.alias
+    )
+    if len({alias.sha256 for alias in aliases}) != len(aliases):
+        raise ValueError("duplicate evidence alias artifact")
+    artifact = build_evidence_dependence_map(
+        direct_observation_cell_ids=tuple(direct_cell_ids),
+        aliases=aliases,
+    )
+    return _write_planning_artifact(
+        args.output,
+        artifact=artifact,
+        encode=evidence_dependence_map_to_dict,
+    )
+
+
+def _estimate_industrial_budget(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    inventory = _load_gpu_inventory(args.inventory)
+    budgets = _load_experiment_budgets(args.budgets)
+    activations = tuple(
+        artifact
+        for path in args.activation_plan
+        if (artifact := _load_stage_activation_plan(path)) is not None
+    )
+    if len({artifact.sha256 for artifact in activations}) != len(activations):
+        raise ValueError("duplicate reducer activation artifact")
+    family_activations = _load_family_activations(args.family_activation)
+    family_power_reductions = _load_family_power_reductions(args.family_power_plan)
+    confirmation_cell_ids = _validate_family_artifact_bundle(
+        registry,
+        activations=family_activations,
+        power_reductions=family_power_reductions,
+    )
+    if not activations and not family_activations:
+        raise ValueError(
+            "budget estimation requires a reducer-generated activation artifact"
+        )
+    if any(
+        artifact.plan.registry_sha256 != registry.sha256 for artifact in activations
+    ):
+        raise ValueError("budget activation belongs to another registry")
+    reducer_cell_ids = tuple(
+        cell_id
+        for artifact in activations
+        for cell_id in artifact.plan.activated_cell_ids
+    )
+    activated_cell_ids = reducer_cell_ids + confirmation_cell_ids
+    if len(activated_cell_ids) != len(set(activated_cell_ids)):
+        raise ValueError("budget activation artifacts select overlapping cells")
+    activated_cell_ids = tuple(sorted(activated_cell_ids))
+    activation_sha256 = _canonical_sha256(
+        {
+            "reducer_activation_sha256s": sorted(
+                artifact.sha256 for artifact in activations
+            ),
+            "family_activation_sha256s": sorted(
+                artifact.sha256 for artifact in family_activations
+            ),
+            "family_power_reduction_sha256s": sorted(
+                reduction.sha256 for reduction in family_power_reductions
+            ),
+        }
+    )
+    budget_inventory = BudgetInventoryIdentity(
+        schema_version=1,
+        host_sha256=_canonical_sha256(list(inventory.host_ids)),
+        gpu_uuids=tuple(device.uuid for device in inventory.devices),
+        topology_sha256=_canonical_sha256(
+            [group.to_dict() for group in inventory.topology_groups]
+        ),
+    )
+    report = estimate_industrial_budget(
+        registry,
+        activated_cell_ids=activated_cell_ids,
+        activation_sha256=activation_sha256,
+        budgets=budgets,
+        inventory=budget_inventory,
+    )
+    artifact = industrial_budget_report_to_dict(report)
+    _write_json(args.output, artifact)
+    print(report.sha256)
+    return 0
 
 
 def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
+    inventory = _load_gpu_inventory(args.inventory)
+    envelope = _load_interference_envelope(args.interference_envelope)
+    budgets = _load_experiment_budgets(args.budget_plan)
     receipts = _load_industrial_receipts(args.receipt)
-    completed, completed_sha256 = _completed_industrial_cells(
+    activation_artifact = _load_stage_activation_plan(args.activation_plan)
+    completed_activation_artifact = activation_artifact
+    family_activations = _load_family_activations(args.family_activation)
+    family_power_reductions = _load_family_power_reductions(args.family_power_plan)
+    completed_family_activations = tuple(
+        artifact
+        for artifact in family_activations
+        if artifact.activation_round == "excluded_pilots"
+    )
+    ready_experiment = registry.ready_experiment(receipts)
+    completed_e2_requested = args.completed_e2_stage_manifest is not None
+    if ready_experiment == "E2" and args.completed_cells is not None:
+        if not completed_e2_requested:
+            raise ValueError(
+                "E2 completed-cell evidence requires its raw completed-stage manifest"
+            )
+        completed_reduction = _load_e2_stage_manifest(args.completed_e2_stage_manifest)
+        if (
+            completed_reduction.registry_sha256 != registry.sha256
+            or activation_artifact is None
+            or activation_artifact.plan.activation_round
+            != f"halving_{completed_reduction.stage_index + 1}"
+            or activation_artifact.plan.source_selection_sha256
+            != completed_reduction.sha256
+        ):
+            raise ValueError(
+                "E2 completed-stage authority is not the immediate predecessor of "
+                "the next activation"
+            )
+        completed_activation_artifact = completed_reduction.activation
+    elif completed_e2_requested:
+        raise ValueError(
+            "completed E2 stage authority requires E2 completed-cell evidence"
+        )
+    direct_dependency_sha256 = None
+    if ready_experiment is not None:
+        definition = registry.definition(ready_experiment)
+        if definition.dependencies:
+            dependency_name = definition.dependencies[-1]
+            matching = tuple(
+                receipt for receipt in receipts if receipt.experiment == dependency_name
+            )
+            if len(matching) != 1:
+                raise ValueError(
+                    "dispatch requires one exact direct dependency receipt"
+                )
+            direct_dependency_sha256 = matching[0].sha256
+    completed, _ = _completed_industrial_cells(
         args.completed_cells,
         registry,
+        experiment=ready_experiment,
+        require_industrial_contract=args.completed_cells is not None,
+        direct_dependency_receipt_sha256=direct_dependency_sha256,
+        activation_artifact=completed_activation_artifact,
+        family_activations=completed_family_activations,
+        family_power_reductions=(),
+        inventory=inventory,
     )
-    interference_passed, interference_sha256 = _interference_gate_passed(
-        args.interference_receipt, registry
-    )
-    activation_plan = _load_stage_activation_plan(args.activation_plan)
-    confirmation_block_plan = _load_confirmation_block_plan(
-        args.confirmation_block_plan
-    )
-    scheduler = TwoGpuResourceScheduler(registry)
-    waves = scheduler.schedule(
+    planning_context = GpuDispatchPlanningContext(
+        registry=registry,
+        inventory=inventory,
+        interference_envelope=envelope,
+        budgets=tuple(sorted(budgets, key=lambda budget: budget.cell_id)),
         receipts=receipts,
-        completed_cell_ids=completed,
-        interference_gate_passed=interference_passed,
-        activation_plan=activation_plan,
-        confirmation_block_plan=confirmation_block_plan,
+        completed_cell_ids=tuple(sorted(completed)),
+        activation_artifact=activation_artifact,
+        family_activations=family_activations,
+        family_power_reductions=family_power_reductions,
     )
-    experiment = registry.ready_experiment(receipts)
-    artifact = {
-        "schema_version": 1,
-        "kind": "industrial_dispatch_plan",
-        "registry_sha256": registry.sha256,
-        "experiment": experiment,
-        "dependency_receipt_sha256s": [receipt.sha256 for receipt in receipts],
-        "completed_cells_sha256": completed_sha256,
-        "interference_gate": "PASS" if interference_passed else "NOT_PASSED",
-        "interference_receipt_sha256": interference_sha256,
-        "activation_plan_sha256": (
-            activation_plan.sha256 if activation_plan is not None else None
-        ),
-        "confirmation_block_plan_sha256": (
-            confirmation_block_plan.sha256
-            if confirmation_block_plan is not None
-            else None
-        ),
-        "waves": [
-            {
-                "ordinal": ordinal,
-                "wave_sha256": wave.sha256,
-                "cells": [
-                    {
-                        "cell_id": cell.cell_id,
-                        "status": cell.status.value,
-                        "reason_code": cell.reason_code,
-                        "gpu_uuids": list(cell.resources.gpu_uuids),
-                        "ports": list(cell.resources.ports),
-                        "cache_root": cell.resources.cache_root,
-                        "evidence_root": cell.resources.evidence_root,
-                        "workload_class": cell.resources.workload_class.value,
-                    }
-                    for cell in wave.cells
-                ],
-            }
-            for ordinal, wave in enumerate(waves)
-        ],
-    }
+    plan = planning_context.issue_plan()
+    artifact = plan.to_dict()
     _write_json(args.output, artifact)
-    print(_canonical_sha256(artifact))
+    if (
+        GpuDispatchPlan.from_dict(
+            artifact,
+            planning_context=planning_context,
+        )
+        != plan
+    ):
+        raise RuntimeError("written GPU dispatch plan changed identity")
+    print(plan.sha256)
     return 0
 
 
 def _analyze_industrial(args: argparse.Namespace) -> int:
     (
         registry,
+        pilot,
+        final,
         plan,
+        inventory,
         envelope,
         blocks,
+        dependence,
         gpu_attestation,
         doctor_report,
         repetitions,
@@ -4309,9 +5751,13 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
     ) = _load_industrial_analysis_manifest(args.manifest)
     reduction = reduce_industrial_schema_v3(
         registry=registry,
-        confirmation_plan=plan,
+        pilot_activation=pilot,
+        final_activation=final,
+        confirmation_reduction=plan,
         blocks=blocks,
         hardware_envelope=envelope,
+        inventory=inventory,
+        evidence_dependence_map=dependence,
         gpu_attestation=gpu_attestation,
         doctor_report=doctor_report,
         bootstrap_repetitions=repetitions,
@@ -4351,6 +5797,24 @@ def main(argv: list[str] | None = None) -> int:
         return _seal_industrial_stage(args)
     if args.command == "plan-industrial-dispatch":
         return _plan_industrial_dispatch(args)
+    if args.command == "estimate-industrial-budget":
+        return _estimate_industrial_budget(args)
+    if args.command == "reduce-e1-activation":
+        return _reduce_e1_activation(args)
+    if args.command == "reduce-e2-activation":
+        return _reduce_e2_activation(args)
+    if args.command == "reduce-e2-successive-halving":
+        return _reduce_e2_halving(args)
+    if args.command == "materialize-confirmation-pilots":
+        return _materialize_confirmation_pilots(args)
+    if args.command == "reduce-confirmation-family-power":
+        return _reduce_confirmation_family_power(args)
+    if args.command == "materialize-confirmation-prefix":
+        return _materialize_confirmation_final_prefix(args)
+    if args.command == "validate-evidence-alias":
+        return _validate_evidence_alias(args)
+    if args.command == "build-evidence-dependence-map":
+        return _build_evidence_dependence_map(args)
     if args.command == "analyze-industrial":
         return _analyze_industrial(args)
     if args.command == "build-onlinespec-study":

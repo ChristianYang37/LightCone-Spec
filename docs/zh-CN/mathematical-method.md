@@ -5,9 +5,10 @@
 ## 目标与 Semantic Row
 
 下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。
-Industrial executor 当前只完成 TP1/DP1 Target-only；Static/TTS/L0 需要尚未实现的
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook。固定 patch 只为
-TP1/DP1 DFlash 包含底层 adaptive implementation，并且目前没有任何新 GPU 结果。
+Industrial executor 当前只完成 TP1/DP1 Target-only。固定 patch 已包含 native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，但底层 adaptive
+implementation 仍只支持 TP1/DP1 DFlash，且没有配置 trusted hardware signer。因此
+Static/TTS/L0 会在 mutation 前 blocked，并且目前没有任何新 GPU 结果。
 
 令 target distribution 为 (p)，重建 proposal 为 (q_\theta)，semantic mask 为 (m)，
 可选 position weight 为 (w_k)。公共 proposal objective 是 target-to-draft cross entropy

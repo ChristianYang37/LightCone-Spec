@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
 import sqlite3
+import stat
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Literal, Self, get_args, get_type_hints
@@ -59,6 +62,55 @@ _INDUSTRIAL_WORKLOAD_CONTRACTS = {
     "industrial_preflight_target_only",
     "industrial_preflight_static",
 }
+_BUDGET_OBSERVED_WORKLOAD_CONTRACTS = {
+    "industrial_target_only",
+    "industrial_static",
+    "industrial_adapted",
+}
+_BUDGET_OBSERVATION_KIND = "industrial_budget_observation_receipt_v1"
+_BUDGET_OBSERVATION_COMPONENTS = (
+    "startup_model_load",
+    "compile_jit_graph_prewarm",
+    "excluded_warmup",
+    "scored_arrival",
+    "drain",
+    "reset_finalization",
+    "evidence_flush_shutdown",
+    "soak",
+    "failure_injection",
+    "retry",
+    "profiler",
+    "download_compile_reservation",
+)
+_BUDGET_OBSERVATION_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "experiment_budget_sha256",
+    "budget_observation_sha256",
+    "budget",
+    "observed_component_ms",
+    "measured_gpu_ms",
+    "fixed_instance_billed_gpu_ms",
+    "terminal_evidence_sha256",
+    "observed_wall_ms",
+    "registered_wall_delta_ms",
+    "registered_gpu_delta_ms",
+    "registered_billed_delta_ms",
+    "gpu_measurement_semantics",
+    "fixed_instance_billing_semantics",
+}
+_BUDGET_OBSERVATION_BINDING_FIELDS = {
+    "directory",
+    "receipt_name",
+    "receipt_sha256",
+    "receipt_size",
+    "sidecar_name",
+    "sidecar_sha256",
+    "sidecar_size",
+    "budget_observation_sha256",
+}
+_RESERVED_GANG_MEASUREMENT = "exclusive_reserved_gang_wall_ms_x_gpu_count"
+_WHOLE_INSTANCE_BILLING = "whole_inventory_wall_clock_v1"
 _INDUSTRIAL_HASH_FIELDS = (
     "industrial_cell_id",
     "runtime_sha256",
@@ -79,6 +131,53 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_content_sha256(value: object) -> str:
+    body = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+
+def _validate_output_token_identity(row: dict[str, object]) -> None:
+    """Require one canonical, complete ordered-token identity."""
+
+    if row.get("output_hash_format") != OUTPUT_HASH_FORMAT:
+        raise RuntimeError("request evidence has a wrong output hash format")
+    serialized = row.get("output_token_ids")
+    if not isinstance(serialized, str):
+        raise TypeError("request evidence lacks ordered output token IDs")
+    try:
+        token_ids = json.loads(serialized)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("request evidence has malformed output token IDs") from exc
+    if (
+        not isinstance(token_ids, list)
+        or any(
+            not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0
+            for token_id in token_ids
+        )
+        or json.dumps(token_ids, separators=(",", ":")) != serialized
+    ):
+        raise RuntimeError("request evidence has non-canonical output token IDs")
+    output_tokens = row.get("output_tokens")
+    if (
+        not isinstance(output_tokens, int)
+        or isinstance(output_tokens, bool)
+        or output_tokens != len(token_ids)
+    ):
+        raise RuntimeError("request evidence token IDs do not cover its output")
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    if (
+        row.get("output_token_ids_sha256") != digest
+        or row.get("output_sha256") != digest
+    ):
+        raise RuntimeError("request evidence token-ID digest is inconsistent")
 
 
 def _fsync_file(path: Path) -> None:
@@ -108,22 +207,42 @@ def _atomic_json(path: Path, value: object) -> None:
 def _publish_receipt_exclusive(path: Path, value: object) -> None:
     """Publish one canonical terminal receipt without an overwrite race."""
     temporary = path.with_name(f"{path.name}.candidate.{uuid.uuid4().hex}")
+    lock_path = path.with_name(f".{path.name}.publish.lock")
     body = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
     with temporary.open("x", encoding="utf-8") as handle:
         handle.write(body)
         handle.flush()
         os.fsync(handle.fileno())
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        os.link(temporary, path)
-    except FileExistsError as exc:
-        temporary.unlink()
-        raise RuntimeError(
-            f"completed evidence already exists for run {value['run_id']}"
-        ) from exc
-    _fsync_directory(path.parent)
-    # The candidate is deliberately retained. Removing it after the canonical
-    # receipt would make receipt publication no longer the final filesystem
-    # mutation, and it remains outside every completion glob.
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"invalid receipt publication lock {lock_path}") from exc
+    published = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError(f"invalid receipt publication lock {lock_path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if os.path.lexists(path):
+            raise RuntimeError(
+                f"completed evidence already exists for run {value['run_id']}"
+            )
+        # The persistent cooperative lock makes this rename no-replace among
+        # every writer in this package.  Unlike the former link publication,
+        # rename leaves no second writable name for the canonical inode.
+        os.rename(temporary, path)
+        published = True
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        if not published:
+            temporary.unlink(missing_ok=True)
 
 
 def _arrow_type(annotation: object) -> pa.DataType:
@@ -200,7 +319,12 @@ def _validate_row(table: str, row: dict[str, object]) -> None:
             row.get("expected_round_rows"),
             row.get("expected_update_rows"),
             row.get("expected_performance_rows"),
+            row.get("experiment_budget_sha256"),
             row.get("preflight_attestation_sha256"),
+            row.get("session_plan_sha256"),
+            row.get("session_open_receipt_sha256"),
+            row.get("reset_receipt_sha256"),
+            row.get("session_epoch"),
         )
         if contract is None:
             if any(value is not None for value in industrial_values):
@@ -284,6 +408,30 @@ def _validate_row(table: str, row: dict[str, object]) -> None:
                 raise ValueError("preflight runs require a bound attestation")
         elif attestation is not None:
             raise ValueError("only preflight runs may bind a preflight attestation")
+        budget_sha256 = row.get("experiment_budget_sha256")
+        if budget_sha256 is not None and (
+            not isinstance(budget_sha256, str)
+            or _LOWER_SHA256.fullmatch(budget_sha256) is None
+        ):
+            raise ValueError("run.experiment_budget_sha256 must be a lowercase SHA-256")
+        session_values = (
+            row.get("session_plan_sha256"),
+            row.get("session_open_receipt_sha256"),
+            row.get("reset_receipt_sha256"),
+            row.get("session_epoch"),
+        )
+        if any(value is not None for value in session_values):
+            if any(value is None for value in session_values):
+                raise ValueError("industrial session identity must be complete")
+            if any(
+                not isinstance(value, str) or _LOWER_SHA256.fullmatch(value) is None
+                for value in session_values[:3]
+            ) or (
+                not isinstance(session_values[3], int)
+                or isinstance(session_values[3], bool)
+                or session_values[3] < 0
+            ):
+                raise ValueError("industrial session identity is invalid")
         expected = _expected_tables(str(row["method"]), str(contract))
         if ("round" in expected) != (counters["expected_round_rows"] > 0):
             raise ValueError(
@@ -361,6 +509,8 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"invalid completion receipt {path}") from exc
+    if not isinstance(value, dict):
+        raise TypeError(f"invalid completion receipt {path}")
     schema_version = value.get("schema_version")
     if (
         schema_version not in {2, 3}
@@ -416,15 +566,25 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
     run_columns = ["method"]
     if "workload_contract" in run_parquet.schema_arrow.names:
         run_columns.append("workload_contract")
+    if "experiment_budget_sha256" in run_parquet.schema_arrow.names:
+        run_columns.append("experiment_budget_sha256")
     run_rows = run_parquet.iter_batches(batch_size=1, columns=run_columns)
     try:
         run_batch = next(run_rows)
         method = run_batch.column(0)[0].as_py()
-        workload_contract = (
-            run_batch.column(1)[0].as_py() if len(run_columns) == 2 else None
-        )
+        run_values = run_batch.to_pydict()
+        workload_contract = run_values.get("workload_contract", [None])[0]
+        experiment_budget_sha256 = run_values.get("experiment_budget_sha256", [None])[0]
     except (StopIteration, KeyError, pa.ArrowException) as exc:
         raise RuntimeError(f"receipt binds invalid run evidence {path}") from exc
+    if schema_version == 2 and (
+        workload_contract in _INDUSTRIAL_WORKLOAD_CONTRACTS
+        or experiment_budget_sha256 is not None
+        or "experiment_budget_sha256" in value
+    ):
+        raise RuntimeError(
+            f"schema-v2 receipt cannot wrap schema-v3 industrial evidence {path}"
+        )
     expected = (
         _expected_tables(method, workload_contract)
         if method in _EVIDENCE_METHODS
@@ -433,6 +593,19 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
     if set(resolved) != expected:
         raise RuntimeError(f"receipt binds invalid run evidence {path}")
     if schema_version == 3:
+        if experiment_budget_sha256 is not None:
+            if (
+                not isinstance(experiment_budget_sha256, str)
+                or _LOWER_SHA256.fullmatch(experiment_budget_sha256) is None
+                or value.get("experiment_budget_sha256") != experiment_budget_sha256
+            ):
+                raise RuntimeError(
+                    f"completion receipt has a wrong experiment budget {path}"
+                )
+        elif "experiment_budget_sha256" in value:
+            raise RuntimeError(
+                f"completion receipt has an unbound experiment budget {path}"
+            )
         coverage = value.get("coverage")
         counters = value.get("counters")
         checkpoint = value.get("checkpoint")
@@ -472,18 +645,308 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
         _read_identity_columns(shard, table=table, run_id=run_id, method=method)
     if schema_version == 3:
         try:
-            formats = pq.read_table(
-                resolved["request"], columns=["output_hash_format"]
-            ).column("output_hash_format")
+            run_contracts = pq.read_table(
+                resolved["run"], columns=["workload_contract"]
+            ).column("workload_contract")
         except (KeyError, pa.ArrowException) as exc:
             raise RuntimeError(
-                f"completed request evidence lacks its output hash format {path}"
+                f"completed run evidence lacks its workload contract {path}"
             ) from exc
-        if len(formats) == 0 or any(
-            value.as_py() != OUTPUT_HASH_FORMAT for value in formats
+        workload_contracts = [value.as_py() for value in run_contracts]
+        if len(workload_contracts) != 1:
+            raise RuntimeError(f"completed run evidence has invalid coverage {path}")
+        columns = ["output_hash_format"]
+        industrial = workload_contracts[0] in _INDUSTRIAL_WORKLOAD_CONTRACTS
+        if industrial:
+            columns.extend(
+                [
+                    "output_tokens",
+                    "output_sha256",
+                    "output_token_ids",
+                    "output_token_ids_sha256",
+                ]
+            )
+        try:
+            request_rows = pq.read_table(
+                resolved["request"], columns=columns
+            ).to_pylist()
+        except (KeyError, pa.ArrowException) as exc:
+            raise RuntimeError(
+                f"completed request evidence lacks its output identity {path}"
+            ) from exc
+        if not request_rows:
+            raise RuntimeError(f"completed request evidence is empty {path}")
+        if industrial:
+            for row in request_rows:
+                _validate_output_token_identity(row)
+        elif any(
+            row["output_hash_format"] != OUTPUT_HASH_FORMAT for row in request_rows
         ):
-            raise RuntimeError(f"completed request evidence has a wrong hash format {path}")
+            raise RuntimeError(
+                f"completed request evidence has a wrong hash format {path}"
+            )
     return resolved
+
+
+def _run_completion_binding(
+    resolved: dict[str, Path],
+) -> tuple[str | None, str | None]:
+    try:
+        rows = pq.read_table(
+            resolved["run"],
+            columns=["workload_contract", "experiment_budget_sha256"],
+        ).to_pylist()
+    except (KeyError, pa.ArrowException) as exc:
+        raise RuntimeError("completed evidence lacks its completion binding") from exc
+    if len(rows) != 1:
+        raise RuntimeError("completed evidence has invalid run coverage")
+    workload_contract = rows[0]["workload_contract"]
+    experiment_budget_sha256 = rows[0]["experiment_budget_sha256"]
+    if workload_contract is not None and not isinstance(workload_contract, str):
+        raise TypeError("completed evidence has a malformed workload contract")
+    if experiment_budget_sha256 is not None and not isinstance(
+        experiment_budget_sha256, str
+    ):
+        raise TypeError("completed evidence has a malformed ExperimentBudget binding")
+    return workload_contract, experiment_budget_sha256
+
+
+def _registered_budget_milliseconds(budget: dict[str, object], name: str) -> int:
+    scenario = budget.get(name)
+    if type(scenario) is not dict or type(scenario.get("registered")) is not int:
+        raise RuntimeError("budget observation contains a malformed registered budget")
+    registered = scenario["registered"]
+    if registered < 0:
+        raise RuntimeError("budget observation contains a negative registered budget")
+    return registered
+
+
+def _validate_budget_observation_binding(
+    root: Path,
+    *,
+    run_id: str,
+    rank: int,
+    experiment_budget_sha256: str,
+    terminal_evidence_sha256: str,
+) -> dict[str, object]:
+    """Validate the concrete observation that makes industrial completion legal."""
+
+    if _LOWER_SHA256.fullmatch(experiment_budget_sha256) is None:
+        raise RuntimeError("industrial evidence lacks its ExperimentBudget binding")
+    directory = root / f"{run_id}.rank{rank}.budget-observation"
+    receipt = directory / "observation.json"
+    sidecar = directory / "observation.json.sha256"
+    if (
+        directory.is_symlink()
+        or not directory.is_dir()
+        or receipt.is_symlink()
+        or not receipt.is_file()
+        or sidecar.is_symlink()
+        or not sidecar.is_file()
+    ):
+        raise RuntimeError("industrial evidence requires a durable budget observation")
+    try:
+        receipt_body = receipt.read_bytes()
+        sidecar_body = sidecar.read_bytes()
+        artifact = json.loads(receipt_body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("industrial budget observation is not durable JSON") from exc
+    if type(artifact) is not dict or set(artifact) != _BUDGET_OBSERVATION_FIELDS:
+        raise RuntimeError("industrial budget observation has the wrong schema")
+    identity_fields = (
+        "experiment_budget_sha256",
+        "budget_observation_sha256",
+        "terminal_evidence_sha256",
+    )
+    if (
+        type(artifact["schema_version"]) is not int
+        or artifact["schema_version"] != 1
+        or artifact["artifact_kind"] != _BUDGET_OBSERVATION_KIND
+        or artifact["gpu_measurement_semantics"] != _RESERVED_GANG_MEASUREMENT
+        or artifact["fixed_instance_billing_semantics"] != _WHOLE_INSTANCE_BILLING
+        or any(
+            type(artifact[name]) is not str
+            or _LOWER_SHA256.fullmatch(artifact[name]) is None
+            for name in identity_fields
+        )
+    ):
+        raise RuntimeError("industrial budget observation has malformed identities")
+    if (
+        artifact["experiment_budget_sha256"] != experiment_budget_sha256
+        or artifact["terminal_evidence_sha256"] != terminal_evidence_sha256
+    ):
+        raise RuntimeError(
+            "industrial budget observation has the wrong content binding"
+        )
+    budget = artifact["budget"]
+    try:
+        budget_sha256 = (
+            _canonical_content_sha256(budget) if type(budget) is dict else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "industrial budget observation has a foreign budget"
+        ) from exc
+    if budget_sha256 != experiment_budget_sha256:
+        raise RuntimeError("industrial budget observation has a foreign budget")
+    observed_rows = artifact["observed_component_ms"]
+    if (
+        type(observed_rows) is not list
+        or tuple(row[0] for row in observed_rows if type(row) is list and len(row) == 2)
+        != _BUDGET_OBSERVATION_COMPONENTS
+        or any(
+            type(row) is not list
+            or len(row) != 2
+            or type(row[0]) is not str
+            or type(row[1]) is not int
+            or row[1] < 0
+            for row in observed_rows
+        )
+    ):
+        raise RuntimeError("industrial budget observation has malformed components")
+    integer_fields = (
+        "measured_gpu_ms",
+        "fixed_instance_billed_gpu_ms",
+        "observed_wall_ms",
+        "registered_wall_delta_ms",
+        "registered_gpu_delta_ms",
+        "registered_billed_delta_ms",
+    )
+    if any(type(artifact[name]) is not int for name in integer_fields):
+        raise RuntimeError("industrial budget observation has malformed accounting")
+    gpu_count = budget.get("gpu_count")
+    if type(gpu_count) is not int or gpu_count < 1:
+        raise RuntimeError("industrial budget observation has a malformed GPU count")
+    if budget.get("measured_gpu_ms") is not None:
+        raise RuntimeError("industrial observation does not bind a pre-run budget")
+    observed_wall_ms = sum(row[1] for row in observed_rows)
+    registered_wall_ms = sum(
+        _registered_budget_milliseconds(budget, name)
+        for name in _BUDGET_OBSERVATION_COMPONENTS
+    )
+    registered_billed_ms = _registered_budget_milliseconds(
+        budget, "fixed_instance_billed_gpu_ms"
+    )
+    measured_gpu_ms = artifact["measured_gpu_ms"]
+    fixed_instance_billed_gpu_ms = artifact["fixed_instance_billed_gpu_ms"]
+    if registered_wall_ms <= 0 or registered_billed_ms % registered_wall_ms != 0:
+        raise RuntimeError(
+            "industrial budget does not identify its fixed-instance billing size"
+        )
+    fixed_instance_gpu_count = registered_billed_ms // registered_wall_ms
+    if (
+        measured_gpu_ms < 0
+        or fixed_instance_billed_gpu_ms < measured_gpu_ms
+        or fixed_instance_gpu_count < gpu_count
+        or measured_gpu_ms != observed_wall_ms * gpu_count
+        or fixed_instance_billed_gpu_ms != observed_wall_ms * fixed_instance_gpu_count
+        or artifact["observed_wall_ms"] != observed_wall_ms
+        or artifact["registered_wall_delta_ms"] != observed_wall_ms - registered_wall_ms
+        or artifact["registered_gpu_delta_ms"]
+        != measured_gpu_ms - (registered_wall_ms * gpu_count)
+        or artifact["registered_billed_delta_ms"]
+        != fixed_instance_billed_gpu_ms - registered_billed_ms
+    ):
+        raise RuntimeError("industrial budget observation accounting is inconsistent")
+    semantic_receipt = {
+        "schema_version": artifact["schema_version"],
+        "budget": budget,
+        "observed_component_ms": observed_rows,
+        "measured_gpu_ms": measured_gpu_ms,
+        "fixed_instance_billed_gpu_ms": fixed_instance_billed_gpu_ms,
+        "terminal_evidence_sha256": artifact["terminal_evidence_sha256"],
+    }
+    try:
+        semantic_sha256 = _canonical_content_sha256(semantic_receipt)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "industrial budget observation content is non-canonical"
+        ) from exc
+    if artifact[
+        "budget_observation_sha256"
+    ] != semantic_sha256 or sidecar_body != f"{semantic_sha256}\n".encode("ascii"):
+        raise RuntimeError("budget observation content binding is invalid")
+    return {
+        "directory": directory.name,
+        "receipt_name": receipt.name,
+        "receipt_sha256": hashlib.sha256(receipt_body).hexdigest(),
+        "receipt_size": len(receipt_body),
+        "sidecar_name": sidecar.name,
+        "sidecar_sha256": hashlib.sha256(sidecar_body).hexdigest(),
+        "sidecar_size": len(sidecar_body),
+        "budget_observation_sha256": semantic_sha256,
+    }
+
+
+def _validate_industrial_terminal_binding(
+    root: Path,
+    *,
+    run_id: str,
+    rank: int,
+    terminal_receipt: dict[str, object],
+    resolved: dict[str, Path],
+    experiment_budget_sha256: str,
+) -> None:
+    prepared_name = terminal_receipt.get("prepared_receipt_name")
+    prepared_sha256 = terminal_receipt.get("prepared_receipt_sha256")
+    prepared_size = terminal_receipt.get("prepared_receipt_size")
+    observation_binding = terminal_receipt.get("budget_observation")
+    expected_prepared_name = f"{run_id}.rank{rank}.prepared.json"
+    if (
+        prepared_name != expected_prepared_name
+        or type(prepared_sha256) is not str
+        or _LOWER_SHA256.fullmatch(prepared_sha256) is None
+        or type(prepared_size) is not int
+        or prepared_size < 1
+        or type(observation_binding) is not dict
+        or set(observation_binding) != _BUDGET_OBSERVATION_BINDING_FIELDS
+    ):
+        raise RuntimeError("industrial terminal receipt lacks its exact post-binding")
+    prepared = root / prepared_name
+    if (
+        prepared.is_symlink()
+        or not prepared.is_file()
+        or prepared.stat().st_size != prepared_size
+        or _sha256(prepared) != prepared_sha256
+    ):
+        raise RuntimeError("industrial terminal receipt does not bind its preparation")
+    try:
+        prepared_body = prepared.read_bytes()
+        prepared_receipt = json.loads(prepared_body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("industrial prepared receipt is invalid") from exc
+    if (
+        type(prepared_receipt) is not dict
+        or (
+            json.dumps(prepared_receipt, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        != prepared_body
+    ):
+        raise RuntimeError("industrial prepared receipt is not canonical")
+    prepared_resolved = _load_receipt(prepared, run_id=run_id, rank=rank)
+    if prepared_resolved != resolved or _sha256(prepared) != prepared_sha256:
+        raise RuntimeError("industrial preparation differs from terminal evidence")
+    terminal_base = dict(terminal_receipt)
+    for name in (
+        "prepared_receipt_name",
+        "prepared_receipt_sha256",
+        "prepared_receipt_size",
+        "budget_observation",
+    ):
+        terminal_base.pop(name, None)
+    if terminal_base != prepared_receipt:
+        raise RuntimeError("industrial terminal envelope changed prepared evidence")
+    expected_observation = _validate_budget_observation_binding(
+        root,
+        run_id=run_id,
+        rank=rank,
+        experiment_budget_sha256=experiment_budget_sha256,
+        terminal_evidence_sha256=prepared_sha256,
+    )
+    if observation_binding != expected_observation:
+        raise RuntimeError("industrial terminal receipt does not bind its observation")
+    if _sha256(prepared) != prepared_sha256:
+        raise RuntimeError("industrial preparation changed during terminal validation")
 
 
 def load_completed_evidence(
@@ -506,12 +969,152 @@ def load_completed_evidence(
     canonical = directory / f"{run_id}.rank{rank}.complete.json"
     receipts = [canonical] if os.path.lexists(canonical) else []
     receipts.extend(sorted(directory.glob(f"{run_id}.rank{rank}.pid*.complete.json")))
-    completed = [
-        _load_receipt(receipt, run_id=run_id, rank=rank) for receipt in receipts
-    ]
+    completed: list[dict[str, Path]] = []
+    for receipt in receipts:
+        receipt_body = receipt.read_bytes()
+        receipt_sha256 = hashlib.sha256(receipt_body).hexdigest()
+        resolved = _load_receipt(receipt, run_id=run_id, rank=rank)
+        receipt_value = json.loads(receipt_body.decode("utf-8"))
+        if _sha256(receipt) != receipt_sha256:
+            raise RuntimeError("completion receipt changed during validation")
+        if receipt_value["schema_version"] == 3:
+            if (
+                json.dumps(receipt_value, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8") != receipt_body:
+                raise RuntimeError("schema-v3 completion receipt is not canonical")
+            workload_contract, experiment_budget_sha256 = _run_completion_binding(
+                resolved
+            )
+        else:
+            workload_contract = experiment_budget_sha256 = None
+        if workload_contract in _BUDGET_OBSERVED_WORKLOAD_CONTRACTS:
+            if not isinstance(experiment_budget_sha256, str):
+                raise RuntimeError(
+                    "industrial evidence lacks its ExperimentBudget binding"
+                )
+            _validate_industrial_terminal_binding(
+                directory,
+                run_id=run_id,
+                rank=rank,
+                terminal_receipt=receipt_value,
+                resolved=resolved,
+                experiment_budget_sha256=experiment_budget_sha256,
+            )
+        if _sha256(receipt) != receipt_sha256:
+            raise RuntimeError(
+                "completion receipt changed during post-binding validation"
+            )
+        completed.append(resolved)
     if len(completed) > 1:
         raise RuntimeError(f"multiple completed attempts exist for run {run_id}")
     return completed[0] if completed else None
+
+
+def publish_prepared_evidence_completion(
+    root: str | Path,
+    *,
+    run_id: str,
+    rank: int,
+    expected_receipt_sha256: str | None = None,
+    validate: Callable[[dict[str, Path]], None] | None = None,
+    validate_post_binding: Callable[[], None] | None = None,
+) -> dict[str, Path]:
+    """Publish a final envelope over prepared evidence and its post-binding."""
+
+    if not _SAFE_COMPONENT.fullmatch(run_id):
+        raise ValueError("run_id must be a safe non-empty path component")
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+        raise ValueError("rank must be a non-negative integer")
+    if expected_receipt_sha256 is not None and (
+        not isinstance(expected_receipt_sha256, str)
+        or _LOWER_SHA256.fullmatch(expected_receipt_sha256) is None
+    ):
+        raise ValueError("expected receipt must be a lowercase SHA-256")
+    directory = Path(root)
+    prepared = directory / f"{run_id}.rank{rank}.prepared.json"
+    canonical = directory / f"{run_id}.rank{rank}.complete.json"
+    if os.path.lexists(canonical):
+        raise RuntimeError(f"completed evidence already exists for run {run_id}")
+    if prepared.is_symlink() or not prepared.is_file():
+        raise RuntimeError(f"invalid prepared receipt {prepared}")
+    try:
+        prepared_body = prepared.read_bytes()
+        receipt = json.loads(prepared_body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid prepared receipt {prepared}") from exc
+    canonical_body = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    prepared_sha256 = hashlib.sha256(prepared_body).hexdigest()
+    if canonical_body != prepared_body:
+        raise RuntimeError("prepared evidence receipt is not canonical")
+    if (
+        expected_receipt_sha256 is not None
+        and prepared_sha256 != expected_receipt_sha256
+    ):
+        raise RuntimeError("prepared evidence receipt has the wrong content binding")
+    resolved = _load_receipt(prepared, run_id=run_id, rank=rank)
+    if _sha256(prepared) != prepared_sha256:
+        raise RuntimeError("prepared evidence receipt changed during validation")
+    if validate is not None:
+        validate(dict(resolved))
+    workload_contract, experiment_budget_sha256 = _run_completion_binding(resolved)
+    requires_post_binding = workload_contract in _BUDGET_OBSERVED_WORKLOAD_CONTRACTS
+    observation_binding: dict[str, object] | None = None
+    if requires_post_binding:
+        if not isinstance(experiment_budget_sha256, str):
+            raise RuntimeError("industrial evidence lacks its ExperimentBudget binding")
+        observation_binding = _validate_budget_observation_binding(
+            directory,
+            run_id=run_id,
+            rank=rank,
+            experiment_budget_sha256=experiment_budget_sha256,
+            terminal_evidence_sha256=prepared_sha256,
+        )
+    if validate_post_binding is not None:
+        validate_post_binding()
+    if requires_post_binding and observation_binding != (
+        _validate_budget_observation_binding(
+            directory,
+            run_id=run_id,
+            rank=rank,
+            experiment_budget_sha256=experiment_budget_sha256,
+            terminal_evidence_sha256=prepared_sha256,
+        )
+    ):
+        raise RuntimeError("industrial budget observation changed before publication")
+    if _sha256(prepared) != prepared_sha256:
+        raise RuntimeError("prepared evidence receipt changed before publication")
+    terminal_receipt = dict(receipt)
+    if requires_post_binding:
+        terminal_receipt.update(
+            {
+                "prepared_receipt_name": prepared.name,
+                "prepared_receipt_sha256": prepared_sha256,
+                "prepared_receipt_size": len(prepared_body),
+                "budget_observation": observation_binding,
+            }
+        )
+    terminal_body = (
+        json.dumps(terminal_receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    terminal_sha256 = hashlib.sha256(terminal_body).hexdigest()
+    _publish_receipt_exclusive(canonical, terminal_receipt)
+    if _sha256(canonical) != terminal_sha256:
+        raise RuntimeError("published completion differs from its terminal envelope")
+    loaded = _load_receipt(canonical, run_id=run_id, rank=rank)
+    if loaded != resolved:
+        raise RuntimeError("published completion changed prepared evidence bindings")
+    if requires_post_binding:
+        _validate_industrial_terminal_binding(
+            directory,
+            run_id=run_id,
+            rank=rank,
+            terminal_receipt=terminal_receipt,
+            resolved=loaded,
+            experiment_budget_sha256=experiment_budget_sha256,
+        )
+    return loaded
 
 
 class EvidenceWriter:
@@ -595,12 +1198,15 @@ class EvidenceWriter:
         self._request_hash_formats: set[str] = set()
         self._run_record: dict[str, object] | None = None
         self._flushes = 0
+        self._fsync_time_ns = 0
         self._backpressure_events = 0
         self._backpressured_rows = 0
         self._dropped_rows = 0
         self._max_observed_queued_rows = 0
         self._last_checkpoint = time.monotonic()
         self._closed = False
+        self._prepared_receipt: dict[str, object] | None = None
+        self._prepared_files: dict[str, Path] | None = None
         self._state = "open"
         self._checkpoint_path = self.root / f"{self.prefix}.checkpoint.json"
         self._index_path = self.root / f"{self.prefix}.index.sqlite3"
@@ -629,6 +1235,10 @@ class EvidenceWriter:
     def backpressure_events(self) -> int:
         return self._backpressure_events
 
+    @property
+    def fsync_time_ns(self) -> int:
+        return self._fsync_time_ns
+
     def register_external_backpressure_events(self, count: int) -> None:
         """Bind fail-closed producer-queue saturation to the durable attempt."""
 
@@ -648,6 +1258,7 @@ class EvidenceWriter:
             "dropped_rows": self._dropped_rows,
             "dropped_by_table": dict(self._dropped_by_table),
             "flushes": self._flushes,
+            "fsync_time_ns": self._fsync_time_ns,
             "max_observed_queued_rows": self._max_observed_queued_rows,
         }
 
@@ -696,7 +1307,9 @@ class EvidenceWriter:
         }
 
     def _write_checkpoint(self) -> None:
+        started = time.perf_counter_ns()
         _atomic_json(self._checkpoint_path, self._checkpoint_value())
+        self._fsync_time_ns += time.perf_counter_ns() - started
         self._last_checkpoint = time.monotonic()
 
     def _wal_path(self, table: str) -> Path:
@@ -710,9 +1323,11 @@ class EvidenceWriter:
         temporary = output.with_name(f"{output.name}.tmp.{uuid.uuid4().hex}")
         evidence = pa.Table.from_pylist(rows, schema=_SCHEMAS[table])
         pq.write_table(evidence, temporary, row_group_size=len(rows))
+        started = time.perf_counter_ns()
         _fsync_file(temporary)
         os.replace(temporary, output)
         _fsync_directory(self.root)
+        self._fsync_time_ns += time.perf_counter_ns() - started
 
     def write(self, record: EvidenceRecord) -> bool:
         """Queue one row, returning ``False`` only for explicit drop policy."""
@@ -829,6 +1444,24 @@ class EvidenceWriter:
                 raise RuntimeError(
                     "industrial run rank differs from its evidence writer"
                 )
+            if workload_contract in _INDUSTRIAL_WORKLOAD_CONTRACTS:
+                segments = sorted(
+                    self.root.glob(f"{self.prefix}.request.wal.*.parquet")
+                )
+                if len(segments) != self._row_groups["request"]:
+                    raise RuntimeError("industrial request WAL coverage changed")
+                for segment in segments:
+                    for row in pq.read_table(
+                        segment,
+                        columns=[
+                            "output_tokens",
+                            "output_hash_format",
+                            "output_sha256",
+                            "output_token_ids",
+                            "output_token_ids_sha256",
+                        ],
+                    ).to_pylist():
+                        _validate_output_token_identity(row)
         return method, expected
 
     def _build_final_table(self, table: str) -> Path:
@@ -856,9 +1489,18 @@ class EvidenceWriter:
         _fsync_directory(self.root)
         return output
 
-    def close(self) -> dict[str, Path]:
-        if self._closed:
-            raise RuntimeError("evidence writer already closed")
+    def prepare_close(self) -> tuple[dict[str, Path], Path]:
+        """Durably prepare all completion bytes without publishing completion.
+
+        The prepared receipt lets a caller finish dependent terminal work and
+        publish a post-bound observation before the canonical completion
+        receipt becomes visible.  This removes the completed-without-
+        observation crash window while keeping the receipt as the final claim
+        mutation.
+        """
+
+        if self._closed or self._prepared_receipt is not None:
+            raise RuntimeError("evidence writer is already closed or prepared")
         self.flush()
         _, expected = self._validate_completion()
         if (
@@ -903,18 +1545,66 @@ class EvidenceWriter:
                 for table, path in sorted(written.items())
             },
         }
+        experiment_budget_sha256 = self._run_record.get("experiment_budget_sha256")
+        if experiment_budget_sha256 is not None:
+            receipt["experiment_budget_sha256"] = experiment_budget_sha256
+        prepared_path = self.root / f"{self.run_id}.rank{self.rank}.prepared.json"
+        if os.path.lexists(prepared_path):
+            raise RuntimeError(
+                f"prepared evidence already exists for run {self.run_id}"
+            )
+        _publish_receipt_exclusive(prepared_path, receipt)
         self._index.commit()
         self._index.close()
-        receipt_path = self.root / f"{self.run_id}.rank{self.rank}.complete.json"
-        _publish_receipt_exclusive(receipt_path, receipt)
+        self._prepared_receipt = receipt
+        self._prepared_files = written
+        self._state = "prepared"
+        return dict(written), prepared_path
+
+    def publish_close(
+        self,
+        *,
+        validate_post_binding: Callable[[], None] | None = None,
+    ) -> dict[str, Path]:
+        """Publish a prepared receipt as the final completion mutation."""
+
+        if self._closed:
+            raise RuntimeError("evidence writer already closed")
+        if self._prepared_receipt is None or self._prepared_files is None:
+            raise RuntimeError("evidence writer has not prepared completion")
+        body = (
+            json.dumps(
+                self._prepared_receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        def validate_prepared(resolved: dict[str, Path]) -> None:
+            if resolved != self._prepared_files:
+                raise RuntimeError("prepared evidence changed before completion")
+
+        published = publish_prepared_evidence_completion(
+            self.root,
+            run_id=self.run_id,
+            rank=self.rank,
+            expected_receipt_sha256=hashlib.sha256(body).hexdigest(),
+            validate=validate_prepared,
+            validate_post_binding=validate_post_binding,
+        )
         self._state = "complete"
         self._closed = True
-        return written
+        return published
+
+    def close(self) -> dict[str, Path]:
+        self.prepare_close()
+        return self.publish_close()
 
     def abort(self, reason: str | None = None) -> None:
         """Durably retain an inspectable attempt without completing it."""
-        if self._closed:
-            raise RuntimeError("evidence writer is closed")
+        if self._closed or self._prepared_receipt is not None:
+            raise RuntimeError("evidence writer is closed or prepared")
         self.flush()
         self._state = "aborted"
         aborted = {

@@ -35,9 +35,10 @@ exactness contract: OGD, optimistic OGD, and Hedge over OGD experts.
 GPU status is `UNMEASURED`. This page describes an isolated source-level/CPU
 protocol and target implementation, not a performance result or current
 industrial executor support. Like every speculative method, an OnlineSPEC
-industrial run would require the missing
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` provider;
-only Target-only is end-to-end executable there today.
+industrial run would require its own registered integration with the now
+implemented `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+lifecycle and an allowlisted trusted hardware signer. Neither is a release
+capability; only Target-only is end-to-end executable there today.
 
 ## Source audit
 
@@ -325,8 +326,8 @@ other is not sufficient if they disagree with target-only greedy decoding.
 Use `lightcone-spec COMMAND --help` for exact arguments. Generated selections,
 performance data, and attestations remain under the ignored artifact root.
 These isolated commands exercise the registered source protocol but do not
-bypass the industrial executor's native-terminal-evidence blocker or establish
-a schema-v3 GPU result. `analyze-onlinespec-study` reports
+bypass the industrial executor's release execution and trusted-attestation
+gates or establish a schema-v3 GPU result. `analyze-onlinespec-study` reports
 `core_speed_gate_affected=false`, per-learner diagnostic decisions,
 `selection_protocol`, and `optimized_grid_claim`.
 
@@ -338,8 +339,8 @@ not claim current end-to-end industrial execution, a GPU result, byte-for-byte
 reproduction of the official scripts, or redistribution of their code. It also
 does not treat Online-LR's reasoning DPO pipeline as token-level draft-model
 adaptation. Any future executable extension requires the exact native terminal
-provider plus its own objective, data, memory contract, and registered
-comparison.
+lifecycle integration, a trusted signer, and its own objective, data, memory
+contract, and registered comparison.
 
 For a repeatable source audit, clone the official repository outside this
 project and detach at the recorded commit:

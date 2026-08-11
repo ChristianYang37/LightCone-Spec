@@ -12,25 +12,27 @@ implicit dependency.
 
 CPU tests validate contracts, not GPU speed. Every new GPU cell is
 `UNMEASURED`. The current end-to-end industrial executor supports only
-TP1/DP1 Target-only. It blocks every speculative plan before server launch
-unless the pinned tree provides
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`; no such
-provider is implemented in this release. Empirical Stage B is also `BLOCKED`
-until provider credentials and registered hardware are available. Historical
-v2 evidence is usable for regression and debugging only and cannot support a
-new claim.
+TP1/DP1 Target-only. The pinned patch now implements the exact
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+begin/reset/finalize hook, and the host validates its content rather than
+trusting provider attributes. The release contains no allowlisted, out-of-band
+hardware signer, however, so Static/TTS/L0 still fail closed before mutation.
+Empirical Stage B is also `BLOCKED` until immutable model/data/trace inputs,
+provider access, registered hardware and interference evidence, and the trusted
+signer are available. Historical v2 evidence is usable for regression and
+debugging only and cannot support a new claim.
 
 ## One decode and candidate lifecycle
 
 Target-only disables speculation and is the only path the industrial executor
 can currently complete. Static is an allocation-free native speculative target
-path, but executor preflight blocks it pending the terminal evidence hook.
+path, but release preflight blocks it pending trusted terminal attestation.
 Neither method's schema contract imports adaptation state or allocates
 optimizer, gradient, candidate, or adaptation trace storage.
 
 The target TTS/L0 contract shares one candidate lifecycle; the lower-level
-pinned patch implements this only for TP1/DP1 DFlash, and it is not end-to-end
-executor support without the terminal evidence provider:
+pinned patch and native terminal lifecycle implement this only for TP1/DP1
+DFlash. That is still not release-executable without the trusted signer:
 
 1. Verification emits one `ProposalEvidence` envelope for the exact proposal
    that was sampled.
@@ -184,32 +186,83 @@ and performance records through a bounded queue. Duplicate primary identities
 are rejected by a durable index. Periodic or capacity-triggered flushes create
 fsynced Parquet WAL segments and a checkpoint; backpressure and any explicit
 drop are counted.
-The end-to-end executor currently seals only Target-only evidence. Static must
-retain zero round/update detailed-trace allocation and remains blocked until an
-exact native terminal hook binds request/performance rows and aggregate
-speculative safety counters.
+The native terminal lifecycle binds capability, begin, reset, and finalize
+receipts to one process/session/run/nonce/plan/rank identity and exact ordered
+token IDs. Static retains zero round/update detailed-trace allocation and emits
+only the required aggregate speculative safety/accounting. TTS/L0 additionally
+bind request, round, update, KV-version, publication, performance, and safety
+rows. The release verifier still blocks all three methods before mutation when
+the signer is unavailable.
+
+The repository defines immutable session-key and reset/finalize receipt data
+contracts for future compatible adjacent traces. The complete key includes
+source/capability, run configuration, model/drafter revisions, method/backend,
+topology and physical GPU UUIDs, memory/graph/telemetry configuration,
+compile-cache identity, and ports. This release does **not** execute or claim a
+shared server session: it has no release-owned trusted boundary implementation,
+durable terminal binding for the session receipts, or continuous
+whole-inventory accounting from launch through termination. Every shared-session
+mutation entry point therefore fails before launch, network access, reset, or
+evidence-root creation with
+`shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable`.
+Single-trace execution remains the only claimable Target-only path.
 
 On successful close, WAL segments are coverage-checked and assembled into
-process-unique Parquet shards. Only then is an exclusive terminal receipt
-published with schema, row-group coverage, counters, file sizes, schema digests,
-and SHA-256 values. Interrupted or aborted WALs remain inspectable but are
-excluded from analysis. A completed receipt is never overwritten or combined
-with a competing attempt.
+process-unique Parquet shards and a durable prepared receipt. The executor then
+finishes the native terminal lifecycle and publishes the mandatory budget
+observation bound to that prepared receipt's exact bytes. Only after both exist
+does it publish a distinct exclusive terminal envelope. That final envelope
+retains the prepared schema, row-group coverage, counters, file sizes, schema
+digests, and SHA-256 values, and additionally binds the prepared receipt's raw
+digest and size plus the budget observation's semantic digest, raw receipt and
+sidecar digests, sizes, and safe paths. A crash between observation and terminal
+publication can construct the final envelope from the validated prepared
+receipt without re-execution; a prepared receipt without its observation is
+nonclaimable. Interrupted or aborted WALs remain inspectable but are excluded
+from analysis. A completed receipt is never overwritten or combined with a
+competing attempt.
 
 ## Industrial registry boundary
 
 The immutable registry declares the order
 `preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0`.
-Every cell binds axes, seed, status/reason, GPU UUIDs, ports, cache and evidence
-roots, and workload isolation. Stage receipts bind exact dependency outputs,
-runtime, split, and selection state before downstream unblinding.
+Every cell binds axes, seed, status/reason, two logical rank slots, ports,
+cache/evidence roots, and workload isolation. Physical UUIDs are never registry
+identity: a content-bound inventory and deterministic frozen assignment bind
+UUIDs, rank layout, topology, ports, the complete per-cell `ExperimentBudget`,
+and whole-instance billing before launch.
 
-The pure two-GPU planner serializes any two-GPU or exclusive workload. It may
-pair disjoint single-GPU cells only after a separate interference receipt says
-that concurrency is eligible. The registry and planner allocate no device
-state and make no result claim. Their target declarations do not override the
-executor preflight: all speculative and all TP2/DP2 cells remain `BLOCKED` in
-this release.
+One same-host `GpuPoolScheduler` is the sole scheduler. It accepts arbitrary
+inventories and has explicit regression coverage for 1, 2, 4, 8, and 16 GPUs;
+gang placement is atomic and topology-aware, and each headline wave is frozen
+before execution. Concurrent work is bounded by an exact
+`InterferenceEnvelope`, not by the number of idle devices. Resources, ports,
+cache writers, and evidence roots cannot overlap, and receipt-only resume never
+infers completion from a directory.
+
+Reducer-owned activation artifacts materialize the one 130-cell E1 slice and
+each E2 successive-halving round, with an immutable disposition for every
+nonactivated template. Confirmation planning is family-local: exactly four
+excluded pilots select `POWERED` with a 12--20-block final prefix or
+`UNDERPOWERED` before confirmation is visible. Legal Target-only reuse requires
+a byte-equivalent, content-bound evidence alias, and analysis carries its
+dependence unit rather than counting the alias as an independent sample. A
+self-described non-singleton alias remains blocked until execution evidence
+recomputes the equivalence.
+
+Every launched cell binds an exact budget for startup, compile, excluded
+warm-up, scored arrivals, deadlines, drain, reset, evidence close, special-job
+durations, retries, tokens, p99 status, and GPU accounting. A mandatory
+observation receipt records every observed component plus measured and
+whole-instance billed GPU time; missing components are not zero. Immutable
+compile-cache bases use private per-process overlays, the official serving
+client reuses one caller-owned HTTP pool, and evidence writes batch durable WAL
+row groups without weakening terminal fsync and coverage checks.
+
+Registry and pool planning make no device-state or empirical claim. Their
+target declarations do not override release preflight: Static/TTS/L0 remain
+`BLOCKED` on the trusted signer; all TP2/DP2 and unsupported adaptive backends
+remain `BLOCKED` on their separate implementation gates.
 
 This release claims no speculative industrial execution, multi-rank execution,
 multi-node execution, Kubernetes scheduling, elastic membership, remote

@@ -13,11 +13,13 @@ All new GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
 establish target protocol and coordinator contracts, not a fully runnable
 speculative surface or a benchmark result. The industrial executor currently
 runs only TP1/DP1 Target-only. Static/TTS/L0 are `BLOCKED` before mutation
-pending `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`,
-which the pinned integration does not implement. Stage B is also blocked on
-provider credentials and registered hardware. Historical v2 evidence is
-regression/debugging material only and is excluded from schema-v3 selection,
-power sizing, confirmation, and claims.
+because the pinned native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+begin/reset/finalize hook has no configured trusted hardware signer. Stage B is
+also blocked on immutable model/data/trace locks, provider credentials,
+registered hardware, GPU smoke, and the exact interference envelope.
+Historical v2 evidence is regression/debugging material only and is excluded
+from schema-v3 selection, power sizing, confirmation, and claims.
 
 ## Immutable dependency DAG
 
@@ -30,8 +32,11 @@ preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 Each target definition names dependencies, locked outputs, and scientific
 axes. Each cell then binds its complete identity: experiment/model/backend/
 task/method, parameterization and native scope, optimizer and schedule,
-context/regime/width/arrival/SLO, cohort/topology, seed/block, GPU UUIDs, ports,
-cache and evidence roots, workload class, and truthful status/reason.
+context/regime/width/arrival/SLO, cohort/topology, seed/block, two logical rank
+slots, logical port/cache/evidence claims, workload class, and truthful
+status/reason. A separate frozen physical assignment binds inventory UUIDs,
+rank layout, concrete ports, topology, exact per-cell budget, and whole-instance
+billing; changing hosts does not rewrite the scientific registry.
 
 A stage could dispatch only after exact dependency receipts validate and the
 cell passes executable-release preflight. A receipt binds registry, runtime,
@@ -44,7 +49,7 @@ fails closed.
 
 | Stage | Purpose | Output locked before downstream use |
 |---|---|---|
-| Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, two-GPU interference | runtime envelope |
+| Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, inventory/topology, audit-only session-reset schema, cache/HTTP/writer, and interference calibration | runtime envelope |
 | E3a | Target-only/Static context, regime, concurrency, and draft-width capacity | reference load, matched width, crossover and drift witness |
 | E1 | DFlash layer scope and Full/LoRA geometry at AdamW/SGDm anchors | safe Pareto set and common load |
 | E2 | optimizer, log learning-rate grid, schedule, and successive halving | one DFlash recipe |
@@ -70,11 +75,17 @@ backbone parameterizations and additionally train native W1, W2, and scalar
 acceptance/confidence state as Full. Fixed verification budget is a tuning
 control; the transferred candidate must also survive the native scheduler.
 
-These are registered scientific grids, not current executor support. The
-pinned patch rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation, nonconstant
-schedules, and all multi-rank execution. Even its lower-level TP1/DP1 DFlash
-path cannot produce claimable industrial evidence until the native terminal
-provider is implemented.
+These are registered scientific envelopes, not instructions to execute every
+template and not current release support. E1 activation consumes the sealed
+E3a selection and materializes exactly one 130-cell width/load slice; every
+other E1 template receives an immutable disposition. E2 materializes only one
+successive-halving round at a time, preserves matched TTS/L0 pairs and family
+floors, and derives the next round only from the prior sealed survivor receipt.
+Confirmation materialization is family-local: four excluded pilots are reduced
+before confirmation is visible, then only a sealed 12--20-block final prefix is
+activated. The pinned patch still rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation,
+nonconstant schedules, and all multi-rank execution. Its TP1/DP1 DFlash path
+cannot produce a claim without the out-of-band trusted signer.
 
 ## Data, contexts, and traces
 
@@ -114,17 +125,31 @@ accounted exactly once as rejected, completed, timed out, cancelled, or
 unfinished. Unfinished work remains in the denominator through its registered
 timeout boundary. Missing rows are not filled with zero.
 
-## Two-GPU staging
+## GPU-pool staging
 
-The registry requires two explicit GPU UUIDs. Before concurrent work, preflight
-records clocks, temperature, power state, background processes, driver/runtime
-identity, topology receipts, per-rank HBM, and an interference receipt. Without
-that receipt, the deterministic scheduler runs every single-GPU cell serially.
+The registry uses two logical rank slots; physical devices come only from a
+content-bound `GpuInventory` and frozen assignment. The sole deterministic
+same-host scheduler supports arbitrary inventory size, with explicit tests for
+1, 2, 4, 8, and 16 GPUs. It allocates a k-GPU TP/DP shape atomically on one
+valid topology group, rejects partial gangs and cross-host placement, rotates
+independent blocks over eligible UUIDs, and prevents overlap in GPU, port,
+cache writer, evidence root, and exclusive resources.
 
-Two-GPU, headline, profiler, download, and compile cells are exclusive. After a
-passing interference gate, only two single-GPU cells with disjoint UUIDs,
-ports, cache roots, and evidence roots may share a dispatch wave. A queue is
-data, not an instruction to launch every argv simultaneously.
+Before concurrent work, preflight records clocks, temperature, power state,
+background processes, driver/runtime identity, topology, per-rank HBM, and an
+exact `InterferenceEnvelope`. The envelope is keyed by hardware, workload,
+co-run signature and count, gang shape, thermal/power/load state, and host
+contention. If only two-way concurrency was calibrated on an eight-GPU host,
+the frozen headline waves remain two-way. Runtime completion never creates
+result-dependent co-tenancy. Profiler, download, and compile work is
+exclusive-host and cannot contend with headline timing.
+
+Each dispatch plan binds the exact `ExperimentBudget` digest for every
+assignment. Wall time, requested-gang compute GPU time, reserved GPU time, and
+fixed-instance billed GPU time remain separate; a two-GPU gang consumes twice
+its wall time, while whole-instance billing charges the entire frozen inventory
+for the observed wall interval. A queue is data, not an instruction to launch
+every assignment simultaneously.
 
 TP2 and sticky-replica DP2 are target coordinator contracts. A future release
 would require a verified patched-runtime capability receipt and all-rank
@@ -132,8 +157,9 @@ prepare/decide/apply/receipt evidence for one publication identity. The current
 `RunConfig` rejects every TP2/DP2 cell before model loading; the CPU `gloo`
 harness is only a state-machine test and cannot enable those cells.
 
-No stage claims multi-node, more than two ranks, Kubernetes scheduling, elastic
-membership, or automatic failover.
+No stage claims multi-node, an executable TP2/DP2 path, Kubernetes scheduling,
+elastic membership, or automatic failover. Larger inventory support means more
+independent TP1/DP1 work, not release support for larger rank groups.
 
 ## Production metrics and safety
 
@@ -158,11 +184,15 @@ headline evidence forbidden.
 
 ## Power and statistical inference
 
-Exactly four paired pilot blocks estimate the log-effect variance for
-L0--Static and L0--TTS. Pilot IDs are permanently excluded from confirmation.
-With family alpha 0.05, the first Holm threshold, a 3% minimum relative effect,
-and 80% target power fixed in advance, the power grid selects the smallest
-common final-block count from 12 through 20 that powers both contrasts. If no
+For every exact `ConfirmationFamilyIdentity`, exactly four paired pilot blocks
+estimate the log-effect variance for L0--Static and L0--TTS. The identity binds
+experiment/model/backend/task, context/regime/load/arrival, width panel,
+topology, cohort and method family, runtime/split/trace/sampling, and hardware
+envelope. One family's pilots cannot power another. Pilot IDs are permanently
+excluded from confirmation. With family alpha 0.05, the first Holm threshold,
+a 3% minimum relative effect, and 80% target power fixed in advance, the reducer
+selects the smallest common final-block prefix from 12 through 20 that powers
+both contrasts. It seals that prefix before confirmation is visible; if no
 count qualifies, status is `UNDERPOWERED` and confirmation cannot start.
 
 Final goodput effects are paired log ratios with 95% BCa intervals over
@@ -178,23 +208,50 @@ dependence. Both use fixed 95% intervals and registered seeds/repetition counts.
 Requests sharing one service interval are not treated as independent system
 replicates.
 
+A legal evidence alias shares one byte-equivalent Target-only observation; it
+does not copy rows. The alias validates model/runtime/tree, sampling/seed,
+corpus/trace, limits, hardware/topology/ranks, method/server configuration,
+schema, output-token trajectory, and timing contract. Static is not
+automatically aliasable and TTS/L0 are never aliases. The dependence map makes
+all aliased consumers one resampling/covariance unit. The current formal
+reducer fails closed on a non-singleton unit unless execution plans and terminal
+evidence recompute the equivalence; a structurally valid self-described alias
+is not claim evidence.
+
 Power, clocks, temperature, throttling reasons, and background processes are
 locked as a per-block hardware envelope. Missing or out-of-range observations
 invalidate the block rather than becoming covariates chosen after the fact.
 
 ## Evidence, resume, and claims
 
-Evidence is written incrementally to bounded, fsynced Parquet WAL segments.
-Only complete table coverage with zero disallowed drops can be assembled into
-final shards and receive an exclusive content-bound receipt. Interrupted and
-aborted attempts remain inspectable, but their rows are excluded. Resume skips
-only a single receipt whose full identity and file digests validate; competing
-completed attempts are an error.
+Evidence is written incrementally through a bounded single-writer queue to
+batched Parquet WAL row groups. Registered row/time checkpoints and terminal
+boundaries retain WAL fsync, directory sync, uniqueness, negative-row
+durability, and zero-drop coverage; temporarily emptying the queue is not an
+implicit fsync boundary. Interrupted and aborted attempts remain inspectable,
+but their rows are excluded. Resume skips only a single receipt whose full
+identity and file digests validate; competing completed attempts are an error.
 
-This end-to-end evidence path currently closes only Target-only runs. Every
-speculative method requires the exact pinned native terminal hook to bind its
-request/round/update/performance rows; absence of that hook is a pre-mutation
-`BLOCKED` outcome, not permission to synthesize or omit evidence.
+The immutable session-key and reset/finalize receipt schemas describe the
+evidence a future compatible method/block server reuse path would need. Live
+shared-session execution is unavailable in this release: no release-owned
+trusted boundary can prove drain/reset/finalize, the session receipts are not
+durably bound into a terminal envelope, and whole-inventory accounting does not
+yet cover the continuous launch-to-termination interval. All reuse mutation
+entry points therefore fail before launch or evidence creation. Within the
+supported single-trace path, submit and abort share one caller-owned official
+HTTP pool, with timeouts bound to the request deadline and abort grace.
+Immutable compile-cache bases remain content-addressed and verified, each
+process gets a private writable overlay, and CUDA Graphs never cross a process
+or GPU. Fault-injection cells always use a fresh process in this release.
+
+The native hook now binds capability, begin, reset, finalize, exact terminal
+request coverage and ordered token IDs, plus Static aggregate safety or TTS/L0
+request/round/update/KV/performance evidence. Provider object attributes are not
+trust evidence. Every successful serving run must additionally publish a
+terminal-bound `BudgetObservationReceipt` covering all registered phases,
+measured gang GPU time, whole-instance billed time, and exact deltas. Missing
+components remain missing or explicit N/A, never zero.
 
 An empirical gate additionally requires an attestation binding the registry or
 manifest, selections and stage receipts, exact runtime/capability and patched
@@ -206,4 +263,5 @@ protocol code, not performance claims or result artifacts, and this release
 contains no GPU results.
 No trusted hardware-attester identity is configured in this release. Therefore
 content-consistent caller-authored attestation files cannot promote either the
-industrial or legacy analyzers to `MEASURED`.
+industrial or legacy analyzers to `MEASURED`, and Static/TTS/L0 stay blocked
+before mutation despite the implemented hook.

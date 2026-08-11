@@ -6,11 +6,12 @@
 
 The equations below specify the registered target method. They do not imply
 that every backend or topology is executable in this release. The industrial
-executor currently completes only TP1/DP1 Target-only; Static/TTS/L0 require
-the missing
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook. The
-pinned patch contains a lower-level adaptive implementation only for TP1/DP1
-DFlash, and no new GPU result is available.
+executor currently completes only TP1/DP1 Target-only. The pinned patch now
+contains the native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle and
+a lower-level adaptive implementation only for TP1/DP1 DFlash, but no trusted
+hardware signer is configured. Static/TTS/L0 remain blocked before mutation,
+and no new GPU result is available.
 
 For target distribution (p), reconstructed proposal (q_\theta), semantic
 mask (m), and optional position weight (w_k), the common proposal objective

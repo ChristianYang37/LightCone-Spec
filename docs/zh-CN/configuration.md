@@ -16,10 +16,9 @@ draft depth 加一。未知 schema 与已退役 adaptation 字段会在加载模
 
 这些名称包含目标 protocol vocabulary，不承诺每个合法 scientific declaration 都可执行。
 当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0 会在任何
-mutation 前因缺少
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 而被阻止；固定 patch 没有
-提供该 provider。底层 adaptive patch path 仅限 TP1/DP1 DFlash、constant schedule、零
-extra logical delay 与 `update_round` teacher row。
+mutation 前被阻止，因为固定 native begin/reset/finalize hook 没有配置 trusted hardware
+signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash、constant
+schedule、零 extra logical delay 与 `update_round` teacher row。
 
 ## 方法与 Disabled Path 合同
 
@@ -28,7 +27,7 @@ Target-only 启动无 speculation 的 target path；Static 描述原生 speculat
 二者都不能分配 optimizer、gradient、master、candidate 或 cohort-adaptation state。当前
 只有 Target-only 可端到端执行。Static 必须保持 round/update 详细 trace 零分配，同时仍需
 content-bound request、performance 与汇总 speculative safety evidence，所以无法通过
-industrial executor preflight。
+trusted-signer release preflight。
 
 移除 method 字段后，TTS 与 L0 的 model、runtime、adaptation、sampling 与 load 身份必须
 逐字节相同。二者使用一个 candidate 实现，只能在发布时间上不同。必须使用准确
@@ -125,11 +124,24 @@ Production TP2/DP2 工作会保持 `BLOCKED`，直到新的固定 runtime 实现
 Prefill/decode disaggregation 与 two-batch overlap 仍关闭。Multi-node 和超过两个 rank 的
 配置会验证失败；不存在 Kubernetes、elastic 或 automatic-failover 设置。
 
+Runtime topology 与 pool capacity 是不同 identity。Scientific registry 使用两个稳定
+logical rank slot；严格 `GpuInventory` 可以包含任意数量 device。唯一 scheduler 对
+1/2/4/8/16 GPU 有明确 regression coverage，并在 `IndustrialPhysicalAssignment` 中冻结
+physical UUID、rank layout、port、topology 与 whole-instance size。这不会启用 TP2/DP2：
+release `RunConfig` validation 仍只接受 TP1/DP1。
+
 ## HBM 与 Cohort 策略
 
 Runtime renderer 从 preflight 接收显式 adaptation reserve 与 model/KV memory fraction；
 不存在通用源码默认值。Admission 在计入 model、KV、optimizer、candidate、activation、
 graph、telemetry 与 safety margin 后，由 headroom 最小的 rank 决定。
+
+每个 materialized cell 还需要 immutable `ExperimentBudget`；short、p99-anchor、soak、
+failure、profiler、compile 与 download job 不共享 hidden duration。Startup/load、compile/
+prewarm、excluded warm-up 与 request pool、scored arrival、deadline、drain、reset/finalization、
+evidence close、retry、token、minimum completion、topology、reserved GPU time 与
+whole-instance billed time 都是显式值。Execution copy 保持 `measured_gpu_ms=null`；独立且与
+terminal 绑定的 observation 记录所有 phase 与准确 delta。Missing、N/A 与零互不等价。
 
 固定 cohort slab 按 tenant 与 replica 设置 quota。可选 cold offload 必须显式配置，且只
 适用于 inactive cohort。Memory pressure 不会静默改变 Full/LoRA、precision、optimizer 或
@@ -139,8 +151,8 @@ scope；任何改变都需要新 config、load screen、selection 与 evidence r
 
 隔离的 OnlineSPEC protocol 要求额外 `online_spec` object，其 optimizer 必须为 plain
 SGD；其 declaration 在独立注册的 tuning protocol 中保持 TP1/DP1。这个单独的
-schema/runtime surface 不会提供 industrial executor 缺少的 native terminal evidence
-provider，也不会让 industrial speculative cell 变得可运行。
+schema/runtime surface 不会提供 release-trusted hardware signer，也不会让 industrial
+speculative cell 变得可运行。
 
 | 字段 | 合同 |
 |---|---|

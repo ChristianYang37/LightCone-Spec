@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -30,6 +31,116 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    for node in tree.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
+            return node
+    raise SystemExit(f"patched SGLang contract is missing callable: {name}")
+
+
+def _verify_native_terminal_contract(checkout: Path, changed_python: list[str]) -> None:
+    hook = "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
+    terminal = (
+        checkout / "python/sglang/srt/speculative/terminal_speculative_evidence.py"
+    ).read_text(encoding="utf-8")
+    required_terminal_symbols = (
+        "class TerminalSpeculativeEvidenceLifecycle",
+        "def begin(",
+        "def reset(",
+        "def finalize(",
+        "def fail_closed(",
+        "def register_terminal_attestation_signer_provider(",
+        "def verify_terminal_attestation(",
+        'frozenset({"rejected", "cancelled", "timed_out"})',
+        "client_terminal_rows: object",
+        '"completion_marker": "TERMINAL_COMPLETE"',
+        (
+            "SUPPORTED_TERMINAL_METHODS = "
+            'frozenset({"target_only", "static", "tts", "l0"})'
+        ),
+        'attester_id.lower().startswith(("test", "fixture", "cpu"))',
+    )
+    if hook not in terminal or any(
+        symbol not in terminal for symbol in required_terminal_symbols
+    ):
+        raise SystemExit("native terminal evidence lifecycle contract is incomplete")
+
+    static_worker = (
+        checkout / "python/sglang/srt/speculative/dflash_worker_v2.py"
+    ).read_text(encoding="utf-8")
+    required_static_symbols = (
+        "def terminal_static_safety_counters(",
+        'self._terminal_static_safety["exactness_violations"] += 1',
+        'self._terminal_static_safety["fallbacks"] += 1',
+    )
+    if any(symbol not in static_worker for symbol in required_static_symbols):
+        raise SystemExit("native Static safety instrumentation is incomplete")
+
+    scheduler_source = (checkout / "python/sglang/srt/managers/scheduler.py").read_text(
+        encoding="utf-8"
+    )
+    if (
+        '"client_terminal_rows"' not in scheduler_source
+        or "native Static safety counters are unavailable" not in scheduler_source
+    ):
+        raise SystemExit("terminal scheduler reconciliation contract is incomplete")
+
+    server_source = (
+        checkout / "python/sglang/srt/entrypoints/http_server.py"
+    ).read_text(encoding="utf-8")
+    for endpoint in (
+        '"/v1/lightcone-spec/terminal-evidence/capability"',
+        '"/v1/lightcone-spec/terminal-evidence"',
+    ):
+        if endpoint not in server_source:
+            raise SystemExit("native terminal evidence endpoint is missing")
+
+    serving_path = checkout / "python/sglang/benchmark/serving.py"
+    serving_tree = ast.parse(serving_path.read_text(encoding="utf-8"))
+    signatures = {
+        "async_request_sglang_generate": (
+            ["request_func_input", "pbar"],
+            ["client_session", "timeout_s"],
+        ),
+        "async_request_sglang_abort": (
+            ["request_id", "base_url"],
+            ["client_session", "timeout_s"],
+        ),
+    }
+    for name, (positional, keyword_only) in signatures.items():
+        function = _function(serving_tree, name)
+        if not isinstance(function, ast.AsyncFunctionDef):
+            raise SystemExit(f"official SGLang callable is not async: {name}")
+        if [argument.arg for argument in function.args.args] != positional:
+            raise SystemExit(f"official SGLang positional signature changed: {name}")
+        if [argument.arg for argument in function.args.kwonlyargs] != keyword_only:
+            raise SystemExit(
+                f"official SGLang client_session signature changed: {name}"
+            )
+        if any(
+            not isinstance(default, ast.Constant) or default.value is not None
+            for default in function.args.kw_defaults
+        ):
+            raise SystemExit(
+                f"official SGLang optional session defaults changed: {name}"
+            )
+    for name in ("open_bench_client_session", "close_bench_client_session"):
+        if not isinstance(_function(serving_tree, name), ast.AsyncFunctionDef):
+            raise SystemExit(f"official SGLang session lifecycle is not async: {name}")
+
+    for relative in changed_python:
+        if relative.startswith("test/"):
+            continue
+        source = (checkout / relative).read_text(encoding="utf-8", errors="ignore")
+        if "-----BEGIN " + "PRIVATE KEY-----" in source:
+            raise SystemExit(
+                f"patched runtime contains private-key material: {relative}"
+            )
 
 
 def main() -> int:
@@ -114,6 +225,7 @@ def main() -> int:
             env=env,
             check=True,
         )
+        _verify_native_terminal_contract(checkout, changed_python)
         if not args.compile_only:
             subprocess.run(
                 [
@@ -123,6 +235,7 @@ def main() -> int:
                     "-q",
                     "test/registered/unit/benchmark/test_serving_output_token_ids.py",
                     "test/registered/unit/spec/test_online_adaptation_protocol.py",
+                    "test/registered/unit/spec/test_terminal_speculative_evidence.py",
                 ],
                 cwd=checkout,
                 env=env,

@@ -11,9 +11,10 @@ speed or capacity.
 > Alpha software. Every new GPU outcome is `UNMEASURED`. The industrial
 > executor currently runs only Target-only end to end. Static, TTS, L0, and
 > every other speculative method are `BLOCKED` before process or network
-> mutation because the pinned SGLang integration does not provide
-> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`. Empirical
-> Stage B is also `BLOCKED` on provider credentials and registered hardware.
+> mutation because no trusted hardware signer is provisioned for the pinned
+> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook.
+> Empirical Stage B is also `BLOCKED` on provider credentials, resolved
+> model/data/trace locks, and registered hardware.
 > Historical v2 artifacts are regression/debugging evidence only; they are not
 > evidence for the schema-v3 protocol or a new performance claim.
 
@@ -34,7 +35,7 @@ timing. Target-only and Static allocate no adaptation, optimizer, candidate, or
 adaptation telemetry state.
 
 The target industrial registry covers DFlash and DSpark first, followed by
-production load, two-GPU topology, native NEXTN preflight, and breadth
+production load, multi-GPU topology, native NEXTN preflight, and breadth
 templates. EAGLE and EAGLE3 remain target backend contracts with narrow
 compatibility guards; registration is not executable release support.
 OnlineSPEC remains an important comparison with separate tuning, evidence,
@@ -42,9 +43,10 @@ attestation, and analysis; it cannot select or alter the core gate.
 
 The current pinned SGLang patch contains a lower-level adaptive path only for
 TP1/DP1 DFlash with a constant optimizer schedule and zero extra logical
-delay. It does not expose the content-bound terminal evidence provider required
-by the industrial executor, so that path is not end-to-end runnable or
-claimable there. Static/TTS/L0 fail executor preflight before mutation.
+delay. It now exposes the exact begin/reset/finalize terminal-evidence hook and
+the host adapter validates its content, but the repository ships no trusted
+hardware signer. Static/TTS/L0 therefore remain non-claimable and fail release
+preflight before mutation.
 DSpark/EAGLE/EAGLE3/NEXTN adaptation, all TP2/DP2 execution, nonconstant
 schedules, and positive extra delay also fail closed; their registry cells are
 `BLOCKED` until a new patch and provider identity implement them.
@@ -82,12 +84,25 @@ The declarative dependency order is:
 preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 ```
 
-Every cell binds scientific axes, seed, GPU UUIDs, ports, cache/evidence roots,
-resource isolation, and a truthful initial status. A stage receipt seals the
-runtime and split digests, exact dependency receipts, and locked outputs before
-the next stage can be dispatched. The two-GPU scheduler serializes exclusive
-headline/profile/download/compile work and permits independent single-GPU work
-to overlap only after an interference gate passes.
+Every cell binds scientific axes, seed, logical rank slots, ports,
+cache/evidence roots, resource isolation, and a truthful initial status. A
+stage receipt seals the runtime and split digests, exact dependency receipts,
+activated/disposition artifacts, and locked outputs before the next stage can
+be dispatched. One deterministic same-host GPU-pool scheduler maps those
+logical declarations onto content-bound physical UUIDs for 1, 2, 4, 8, 16, or
+more GPUs. It serializes exclusive headline/profile/download/compile work and
+permits independent work to overlap only under an exact registered
+interference-envelope rule.
+
+Reducer-owned E1 activation materializes one 130-cell width/load slice from
+the 2,730-cell envelope. E2 materializes only the current quarter-retention
+successive-halving round. Family-specific four-pilot evidence fixes either a
+12--20 final prefix or `UNDERPOWERED` before confirmation. Per-cell budgets,
+physical assignments, terminal evidence, and observed-versus-registered
+GPU-time receipts are all content-bound. Shared-session key/reset/finalize
+schemas are audit-only in this release; every live reuse entry point is blocked
+before mutation because no trusted durable boundary and continuous accounting
+authority ships.
 
 The target schema and CPU coordinator vocabulary define one-node TP2 and
 sticky-replica DP2 identities, inference-sharded TP state, replica-local DP
@@ -153,17 +168,22 @@ The current schema-v3 SGLang series must pass clean-pin, patch-digest,
 expected-tree, compile/test, and reverse-removal verification before any GPU
 run is evidence-eligible. Documentation does not substitute for that gate.
 
-Build the two-GPU industrial registry with real immutable device identities:
+Build the registry with logical rank slots; physical identities enter only
+through a separately locked inventory and dispatch assignment:
 
 ```bash
 lightcone-spec build-industrial-registry \
-  --gpu-uuid GPU-UUID-0 GPU-UUID-1 \
+  --logical-gpu-slot logical-rank-slot-0 logical-rank-slot-1 \
   --cache-root runtime-cache/industrial \
   --evidence-root artifacts/industrial \
   --output artifacts/industrial/registry.json
 
 lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
+  --interference-envelope artifacts/industrial/interference.json \
+  --budget-plan artifacts/industrial/budgets.json \
+  --activation-plan artifacts/industrial/activation.json \
   --output artifacts/industrial/dispatch.json
 ```
 
@@ -222,9 +242,9 @@ cannot substitute for the absent trusted attester.
 
 ## Limitations
 
-- All new GPU outcomes are `UNMEASURED`. Stage B is `BLOCKED` on the missing
-  native terminal speculative-evidence provider, provider credentials, and
-  registered hardware.
+- All new GPU outcomes are `UNMEASURED`. The native terminal hook is present,
+  but Stage B is `BLOCKED` on the absent trusted hardware signer, provider
+  credentials, resolved model/data/trace locks, and registered hardware.
 - The current end-to-end industrial execution surface is Target-only at
   TP1/DP1. TP2/DP2 appear only in target registry/coordinator contracts and are
   rejected by this release. There is no multi-node, Kubernetes,
@@ -232,8 +252,8 @@ cannot substitute for the absent trusted attester.
 - The CPU `gloo` contract is not GPU/NCCL evidence. A topology configuration is
   only target vocabulary; this release rejects TP2/DP2 regardless of any
   caller-supplied capability receipt.
-- Static/TTS/L0 remain `BLOCKED` until the exact native terminal evidence hook
-  is implemented and bound to the pinned tree. DSpark/EAGLE/EAGLE3/NEXTN
+- Static/TTS/L0 remain `BLOCKED` until an out-of-band trusted signer is bound to
+  the exact native terminal hook and pinned tree. DSpark/EAGLE/EAGLE3/NEXTN
   adaptive cells and all TP2/DP2 cells are also `BLOCKED`; they are never
   implicit successes.
 - ChronoBelief tuning cells stay `BLOCKED` until an authoritative update

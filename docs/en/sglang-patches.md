@@ -50,13 +50,22 @@ It also makes the official SGLang serving benchmark expose the server-provided,
 ordered `output_ids` for both cumulative/incremental streaming and non-streaming
 responses. Those IDs are never reconstructed by retokenizing generated text;
 missing, discontinuous, or rewritten trajectories fail the claim-grade
-exactness gate.
-The patch does not implement the executor's required content-bound terminal
-provider hook,
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`. Therefore
-the executor runs only Target-only end to end and blocks Static/TTS/L0 before
-server launch. It also rejects the following before model loading because their
-execution contracts are not implemented:
+exactness gate. The benchmark client now also accepts a caller-owned async HTTP
+session used by submit and abort, so one server session can reuse a registered
+connection pool without duplicating the official request parser.
+
+The patch implements the content-bound
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
+and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
+`c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08`
+and final tree `2810ac94ed225aa78b4256ded56e78890a4a590f`; the manifest remains the
+authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
+lineage, expected request IDs, exact ordered token IDs, terminal coverage,
+Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
+It exposes a signer plugin boundary but bundles no trusted hardware key or
+release signer. The executor therefore still runs only Target-only end to end
+and blocks Static/TTS/L0 before mutation. It also rejects the following before
+model loading because their execution contracts are not implemented:
 
 - DSpark, EAGLE, EAGLE3, and NEXTN adaptation;
 - every TP2 or DP2 run;
@@ -64,10 +73,11 @@ execution contracts are not implemented:
 - DSpark composite-head training and NEXTN training interfaces.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
-`UNMEASURED` runnable work. The lower-level DFlash implementation cannot be
-promoted to claimable evidence without the exact terminal hook bound to the
-pinned tree. No CUDA graph, multi-GPU, speed, capacity, or other GPU result is
-reported by this release.
+`UNMEASURED` runnable work. The lower-level DFlash implementation and valid
+terminal envelope cannot be promoted to claimable evidence without an
+allowlisted out-of-band signer bound to the pinned tree and challenge. No CUDA
+graph, multi-GPU, speed, capacity, or other GPU result is reported by this
+release.
 
 ## Application
 
@@ -95,7 +105,10 @@ python scripts/verify_sglang_patchset.py \
 The verifier must apply the full series in a disposable clone, confirm the
 expected tree and modified-file inventory, compile changed Python, run the
 requested focused tests, reverse the series, and prove the caller's upstream
-checkout stayed clean.
+checkout stayed clean. The focused adaptation-protocol test loads only the
+patched config, runtime, and parameter-plan modules through a stub package;
+patch-integrity CI therefore does not depend on SGLang's unrelated optional
+top-level serving packages.
 
 New integration work is patch-first: branch temporarily from the pin, make a
 focused semantic commit with tests, export through `git format-patch`, and
@@ -108,11 +121,13 @@ commit a patched checkout.
 The final schema-v3 patch has passed the repository's complete
 apply/compile/focused-test/reverse verifier. That is a patch-integrity result,
 not GPU validation. A CPU package test or an older patched-tree receipt is
-insufficient. TP1/DP1 DFlash is implemented only below the executor boundary;
-because no provider implements the exact native terminal hook, Static/TTS/L0
-industrial cells are `BLOCKED` before mutation rather than runnable
-`UNMEASURED` work. DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2
-cell remain `BLOCKED`. Target-only is the only end-to-end executor path.
+insufficient. TP1/DP1 DFlash and its strict native terminal lifecycle are
+implemented, but the release trust policy has no configured signer;
+Static/TTS/L0 industrial cells are therefore `BLOCKED` before mutation rather
+than runnable `UNMEASURED` work. A test signer, provider object attribute, or
+caller-supplied verifier cannot unlock that policy.
+DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2 cell remain
+`BLOCKED`. Target-only is the only release-executable path.
 
 Historical v2 evidence remains useful for regression comparison only. It does
 not carry the new Target-only, backend-plan, topology, registry, trace,

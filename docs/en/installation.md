@@ -54,13 +54,22 @@ gate installs the pinned dependencies and runs the focused patched-tree tests.
 Record a fresh verifier output and final-tree receipt before GPU work. This
 result does not constitute GPU validation.
 
-## GPU and two-rank contract
+## GPU inventory and rank contract
 
 Run `lightcone-spec doctor --project-root /path/to/lightcone-spec
 --sglang-root /path/to/patched-sglang` before loading a model. Capture driver,
 toolkit, PyTorch/CUDA runtime, compiler, GPU UUIDs, clocks, temperature, power
-state, storage, background processes, and patched tree. Do not replace system
-Python/CUDA, use `sudo`, or reuse an unidentified environment.
+state, storage, background processes, and patched tree. Materialize a
+content-bound `GpuInventory` with PCI/NUMA/interconnect and allowed topology
+groups before planning. Do not replace system Python/CUDA, use `sudo`, or reuse
+an unidentified environment.
+
+The pool scheduler accepts arbitrary same-host inventory size, with 1/2/4/8/16
+GPU regression coverage. The scientific registry still carries two logical
+rank slots; a frozen assignment resolves them to physical UUIDs for each cell.
+This inventory scaling supports more independent jobs and topology-aware gangs,
+not an executable larger-rank method. The tracked compatibility manifest
+continues to describe its exact reference host separately.
 
 The target registry and CPU coordinator describe one-node TP2 and sticky DP2
 identities, but the current release accepts only TP1/DP1 and rejects every
@@ -80,18 +89,18 @@ by silently changing Full to LoRA, precision, scope, optimizer, or context.
 The repository deliberately has no one-command cloud installer. Provider
 images, drivers, mounts, and firewall behavior are external state. Before
 creating an instance, obtain credentials through the provider's secure channel,
-confirm the requested two GPUs and storage are available, and record a
+confirm the requested inventory and storage are available, and record a
 sanitized provisioning receipt. Never place provider secrets, temporary URLs,
 instance addresses, or access tokens in commands, manifests, evidence, handoff
 documents, or Git.
 
-At present, empirical Stage B is `BLOCKED` because the pinned integration lacks
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`, and because
-provider credentials and registered hardware are unavailable. The industrial
-executor can run only TP1/DP1 Target-only end to end; Static/TTS/L0 fail
-preflight before mutation. Hardware access alone will not unblock speculative
-work. A new pinned patch/provider must first supply the exact content-bound
-terminal hook; DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
+At present, empirical Stage B is `BLOCKED` because no trusted hardware signer,
+provider credentials, immutable model/data/trace locks, or registered hardware
+and interference envelope are available. The pinned integration already
+implements the exact native begin/reset/finalize hook, but the industrial
+executor can release-run only TP1/DP1 Target-only; Static/TTS/L0 fail preflight
+before mutation. Hardware access or a test signer alone does not unblock
+speculative work. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
 additional implementations and remain blocked.
 
 ## Model and data preparation
@@ -119,6 +128,15 @@ Parquet shards, receipts, profiles, selections, attestations, and handoff files
 under ignored external roots. Each rank/process gets a unique evidence prefix.
 Interrupted WALs are retained for audit but cannot enter analysis without an
 exclusive terminal receipt.
+
+Build compile caches as verified content-addressed immutable bases and give
+each process a private writable overlay. Do not share a writable cache or move
+a captured CUDA Graph between processes or devices. The immutable session-key
+and boundary-receipt schemas are audit-only in this release: shared-session
+execution is blocked before mutation until a release-owned trusted boundary,
+durable session receipt binding, and continuous whole-inventory accounting are
+available. The official caller-owned HTTP pool is reused only within one
+single-trace server execution.
 
 Do not commit model/data payloads, experimental results, selected
 hyperparameters derived from results, machine paths, credentials, or provider

@@ -11,9 +11,11 @@ candidate，只在发布时间上不同。
 所有新 GPU 结果都是 `UNMEASURED`。代码、CPU 测试与 registry 建立目标 protocol 与
 coordinator contract，不是完整可运行 speculative surface 或 benchmark 结果。Industrial
 executor 当前只运行 TP1/DP1 Target-only。Static/TTS/L0 会在任何 mutation 前因缺少
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 而 `BLOCKED`；固定
-integration 没有实现该 hook。Stage B 还因缺少 provider credential 与已注册硬件而 blocked。
-历史 v2 evidence 只用于 regression/debugging，不得进入 schema-v3 selection、power sizing、
+trusted hardware signer 而 `BLOCKED`；固定 native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+begin/reset/finalize hook 已经实现。Stage B 还因 immutable model/data/trace lock、provider
+credential、已注册硬件、GPU smoke 与准确 interference envelope 尚不可用而 blocked。历史
+v2 evidence 只用于 regression/debugging，不得进入 schema-v3 selection、power sizing、
 confirmation 或结论。
 
 ## 不可变 Dependency DAG
@@ -26,8 +28,10 @@ preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 
 每个目标 definition 命名 dependency、locked output 与科学 axis。每个 cell 再绑定完整身份：
 experiment/model/backend/task/method、parameterization/native scope、optimizer/schedule、
-context/regime/width/arrival/SLO、cohort/topology、seed/block、GPU UUID、port、cache/evidence
-root、workload class 及真实 status/reason。
+context/regime/width/arrival/SLO、cohort/topology、seed/block、两个 logical rank slot、logical
+port/cache/evidence claim、workload class 及真实 status/reason。独立 frozen physical
+assignment 会绑定 inventory UUID、rank layout、concrete port、topology、准确 per-cell budget
+与 whole-instance billing；更换 host 不会重写 scientific registry。
 
 只有准确 dependency receipt 验证通过且 cell 通过 executable-release preflight 后，stage
 才可能 dispatch。Receipt 绑定 registry、
@@ -39,7 +43,7 @@ fail closed。
 
 | Stage | 目的 | 下游使用前锁定的输出 |
 |---|---|---|
-| Preflight | source/runtime/model/data identity、exactness、HBM、telemetry、双 GPU interference | runtime envelope |
+| Preflight | source/runtime/model/data identity、exactness、HBM、telemetry、inventory/topology、仅审计用 session-reset schema、cache/HTTP/writer 与 interference calibration | runtime envelope |
 | E3a | Target-only/Static context、regime、concurrency 与 draft-width capacity | reference load、matched width、crossover 与 drift witness |
 | E1 | DFlash layer scope 与 Full/LoRA geometry，使用 AdamW/SGDm anchor | safe Pareto set 与 common load |
 | E2 | optimizer、log learning-rate grid、schedule 与 successive halving | 一个 DFlash recipe |
@@ -62,10 +66,14 @@ hybrid cell 将 `last1/last3/last5` 与相同八种 backbone parameterization �
 W1、W2 与 scalar acceptance/confidence state 作为 Full 训练。Fixed verification budget
 只用于 tuning control；转移后的 candidate 还必须通过 native scheduler。
 
-这些是已注册 scientific grid，不是当前 executor support。固定 patch 会拒绝
-DSpark/EAGLE/EAGLE3/NEXTN adaptation、非 constant schedule 与全部 multi-rank execution。
-即使其底层 TP1/DP1 DFlash path，也必须先实现 native terminal provider 才能生成可声明的
-industrial evidence。
+这些是已注册 scientific envelope，不是执行每个 template 的指令，也不是当前 release
+support。E1 activation 消费 sealed E3a selection，只 materialize 一个 130-cell width/load
+slice，并为其他 E1 template 记录 immutable disposition。E2 每次只 materialize 一个
+successive-halving round，保留 matched TTS/L0 pair 与 family floor，且下一 round 只能从 prior
+sealed survivor receipt 派生。Confirmation materialization 以 family 为局部单位：四个
+excluded pilot 会在 confirmation 可见前归约，随后只激活 sealed 12--20-block final prefix。
+固定 patch 仍会拒绝 DSpark/EAGLE/EAGLE3/NEXTN adaptation、非 constant schedule 与全部
+multi-rank execution；其 TP1/DP1 DFlash path 没有 out-of-band trusted signer 时不能产生结论。
 
 ## 数据、Context 与 Trace
 
@@ -97,23 +105,34 @@ BurstGPT-shaped trace 绝不标成真实 dataset。
 顺序。每个实际 offered request 恰好记为 rejected、completed、timed out、cancelled 或
 unfinished；unfinished 工作按注册 timeout boundary 留在 denominator。缺失 row 不补零。
 
-## 双 GPU Staging
+## GPU Pool Staging
 
-Registry 要求两个显式 GPU UUID。并行工作前，preflight 记录 clock、temperature、power
-state、background process、driver/runtime identity、topology receipt、per-rank HBM 与
-interference receipt。缺少该 receipt 时，确定性 scheduler 会串行全部单 GPU cell。
+Registry 使用两个 logical rank slot；physical device 只来自 content-bound `GpuInventory`
+与 frozen assignment。唯一 deterministic same-host scheduler 支持任意 inventory size，并对
+1、2、4、8、16 GPU 有明确测试。它会在一个合法 topology group 上 atomic 分配 k-GPU
+TP/DP shape，拒绝 partial gang 与 cross-host placement，在 eligible UUID 之间轮换 independent
+block，并阻止 GPU、port、cache writer、evidence root 与 exclusive resource 重叠。
 
-双 GPU、headline、profiler、download 与 compile cell 都是 exclusive。只有 interference
-gate 通过后，GPU UUID、port、cache root 与 evidence root 都不相交的两个单 GPU cell 才能
-共享 dispatch wave。Queue 是数据，不是同时启动全部 argv 的指令。
+并行工作前，preflight 记录 clock、temperature、power state、background process、driver/
+runtime identity、topology、per-rank HBM 与准确 `InterferenceEnvelope`。Envelope 按 hardware、
+workload、co-run signature/count、gang shape、thermal/power/load state 与 host contention
+索引。如果八 GPU host 只校准过 two-way concurrency，frozen headline wave 仍最多 two-way；
+runtime completion 不能创造 result-dependent co-tenancy。Profiler、download 与 compile
+工作是 exclusive-host，不能与 headline timing 竞争。
+
+每个 dispatch plan 为每个 assignment 绑定准确 `ExperimentBudget` digest。Wall time、requested
+gang compute GPU time、reserved GPU time 与 fixed-instance billed GPU time 必须分开；two-GPU
+gang 消耗两倍 wall time，而 whole-instance billing 对 observed wall interval 计费整个 frozen
+inventory。Queue 是数据，不是同时启动全部 assignment 的指令。
 
 TP2 与 sticky-replica DP2 是目标 coordinator contract。未来 release 将要求 verified
 patched-runtime capability receipt，并由全部 rank 为同一 publication identity 提供
 prepare/decide/apply/receipt evidence。当前 `RunConfig` 会在 model loading 前拒绝全部
 TP2/DP2 cell；CPU `gloo` harness 只是状态机测试，不能启用这些 cell。
 
-任何 stage 都不声明 multi-node、超过两个 rank、Kubernetes scheduling、elastic membership
-或 automatic failover。
+任何 stage 都不声明 multi-node、可执行 TP2/DP2 path、Kubernetes scheduling、elastic
+membership 或 automatic failover。较大 inventory 只表示更多 independent TP1/DP1 work，
+不表示 release 支持较大的 rank group。
 
 ## Production 指标与安全
 
@@ -135,11 +154,14 @@ evidence。
 
 ## Power 与统计推断
 
-恰好四个 paired pilot block 只用于估计 L0--Static 与 L0--TTS 的 log-effect variance；
-pilot ID 永久排除在 confirmation 外。Family alpha 0.05、第一 Holm threshold、3% 最小相对
-效应与 80% target power 全部预先固定。Power grid 从 12 至 20 选择能同时满足两个 contrast
-的最小 common final-block count；若没有合格数量，状态为 `UNDERPOWERED`，confirmation
-不能开始。
+每个准确 `ConfirmationFamilyIdentity` 都使用恰好四个 paired pilot block，只估计
+L0--Static 与 L0--TTS 的 log-effect variance。该 identity 绑定 experiment/model/backend/task、
+context/regime/load/arrival、width panel、topology、cohort/method family、runtime/split/trace/
+sampling 与 hardware envelope；一个 family 的 pilot 不能为另一个 family 计算 power。Pilot
+ID 永久排除在 confirmation 外。Family alpha 0.05、第一 Holm threshold、3% 最小相对效应与
+80% target power 全部预先固定。Reducer 从 12 至 20 选择能同时满足两个 contrast 的最小
+common final-block prefix，并在 confirmation 可见前封存；若没有合格数量，状态为
+`UNDERPOWERED`，confirmation 不能开始。
 
 最终 goodput effect 是 paired log ratio，并在独立 repetition block 上计算 95% BCa 区间。
 Primary family 恰好包含 L0--Static 与 L0--TTS，使用 Holm family-wise adjustment。
@@ -151,19 +173,40 @@ Long-context request-level summary 使用 hierarchical bootstrap：先重采样�
 保留 block 内 tail dependence。二者均使用固定 95% 区间与已注册 seed/repetition count。
 共享一个 service interval 的 request 不能视为独立 system replicate。
 
+合法 evidence alias 共享一个 byte-equivalent Target-only observation，而不是复制 row。
+Alias 验证 model/runtime/tree、sampling/seed、corpus/trace、limit、hardware/topology/rank、
+method/server configuration、schema、output-token trajectory 与 timing contract。Static 不会
+自动 alias；TTS/L0 永远不能 alias。Dependence map 会让所有 aliased consumer 在 resampling/
+covariance 中共用一个 unit。当前 formal reducer 会对 non-singleton unit fail closed，除非
+execution plan 与 terminal evidence 重新计算该 equivalence；structurally valid 的
+self-described alias 不是 claim evidence。
+
 Power、clock、temperature、throttling reason 与 background process 作为 per-block hardware
 envelope 锁定。缺失或越界观测会使 block 无效，不能在事后选择为 covariate。
 
 ## 证据、恢复与结论
 
-Evidence 逐步写入有界、fsynced Parquet WAL segment。只有 table coverage 完整且没有不允许
-的 drop，才能组装 final shard 并获得 exclusive content-bound receipt。中断和 aborted
+Evidence 通过有界 single-writer queue 增量写入 batched Parquet WAL row group。已注册 row/
+time checkpoint 与 terminal boundary 保留 WAL fsync、directory sync、uniqueness、negative-row
+durability 与 zero-drop coverage；queue 暂时清空不是隐式 fsync boundary。中断和 aborted
 attempt 保持可审计，但其 row 被排除。Resume 只跳过一个完整身份及 file digest 都验证通过
 的 receipt；出现竞争 completed attempt 属于错误。
 
-该端到端 evidence path 当前只会关闭 Target-only run。所有 speculative method 都需要准确
-固定 native terminal hook 来绑定 request/round/update/performance row；缺少 hook 是 mutation
-前的 `BLOCKED` outcome，不代表可以合成或省略 evidence。
+Immutable session key 与 reset/finalize receipt schema 描述未来 compatible method/block
+server reuse 路径所需的 evidence。当前 release 不提供 live shared-session execution：没有
+release-owned trusted boundary 可证明 drain/reset/finalize，session receipt 尚未 durable 绑定
+进 terminal envelope，whole-inventory accounting 也未覆盖连续的 launch-to-terminate 区间。
+因此所有 reuse mutation 入口都会在 launch 或 evidence 创建前失败。支持的 single-trace
+路径中，submit/abort 共用一个 caller-owned official HTTP pool，timeout 绑定 registered
+request deadline 与 abort grace。Immutable compile-cache base 仍按内容寻址并验证，每个
+process 都有 private writable overlay，CUDA Graph 绝不跨 process 或 GPU。当前 release 的
+fault-injection cell 始终使用 fresh process。
+
+Native hook 现会绑定 capability、begin、reset、finalize、准确 terminal request coverage 与
+ordered token ID，以及 Static aggregate safety 或 TTS/L0 request/round/update/KV/performance
+evidence。Provider object attribute 不是 trust evidence。每个成功 serving run 还必须发布与
+terminal 绑定的 `BudgetObservationReceipt`，覆盖所有注册 phase、measured gang GPU time、
+whole-instance billed time 与准确 delta。缺失 component 保持 missing 或显式 N/A，绝不能为零。
 
 Empirical gate 还要求 attestation 绑定 registry/manifest、selection/stage receipt、准确
 runtime/capability 与 patched tree、model/tokenizer/data/trace identity、Target-only
@@ -171,4 +214,5 @@ reference、hardware/power report 及每个 final Parquet digest。缺少它时�
 状态仍为 `UNMEASURED`；有效 attested evidence 未通过注册标准时为 `BLOCKED`。仓库只包含
 协议代码，不包含性能结论或 result artifact；本 release 也不包含任何 GPU 结果。
 本 release 未配置 trusted hardware-attester identity，因此内容自洽但由 caller 编写的
-attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`。
+attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`；即使 hook 已实现，
+Static/TTS/L0 仍在 mutation 前保持 blocked。

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -352,6 +355,198 @@ def test_receipt_is_published_after_final_tables_and_rejects_tamper_and_duplicat
     paths["performance"].write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match="does not bind"):
         load_completed_evidence(tmp_path, run_id="terminal", rank=0)
+
+
+def test_receipt_publication_leaves_no_writable_hardlink_alias(tmp_path) -> None:
+    writer = EvidenceWriter(tmp_path, run_id="single-inode", rank=0)
+    writer.write(run_record("single-inode", "static"))
+    writer.write(request_record("single-inode", "static"))
+    writer.write(performance_record("single-inode", "static"))
+    writer.close()
+
+    prepared = tmp_path / "single-inode.rank0.prepared.json"
+    canonical = tmp_path / "single-inode.rank0.complete.json"
+    assert prepared.stat().st_nlink == 1
+    assert canonical.stat().st_nlink == 1
+    assert not tuple(tmp_path.glob("*.candidate.*"))
+
+
+def test_receipt_publication_rejects_a_symlinked_lock(tmp_path) -> None:
+    target = tmp_path / "locked.rank0.complete.json"
+    lock = tmp_path / f".{target.name}.publish.lock"
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_text("do not follow\n", encoding="utf-8")
+    lock.symlink_to(unrelated.name)
+
+    with pytest.raises(RuntimeError, match="invalid receipt publication lock"):
+        writer_module._publish_receipt_exclusive(
+            target,
+            {"schema_version": 3, "run_id": "locked", "rank": 0},
+        )
+    assert not target.exists()
+    assert unrelated.read_text(encoding="utf-8") == "do not follow\n"
+    assert not tuple(tmp_path.glob("*.candidate.*"))
+
+
+def test_receipt_publication_race_has_one_unaliased_winner(tmp_path) -> None:
+    target = tmp_path / "race.rank0.complete.json"
+
+    def publish(index: int) -> str:
+        try:
+            writer_module._publish_receipt_exclusive(
+                target,
+                {
+                    "schema_version": 3,
+                    "run_id": "race",
+                    "rank": 0,
+                    "publisher": index,
+                },
+            )
+        except RuntimeError:
+            return "blocked"
+        return "published"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = tuple(pool.map(publish, range(8)))
+    assert outcomes.count("published") == 1
+    assert outcomes.count("blocked") == 7
+    assert target.stat().st_nlink == 1
+    assert not tuple(tmp_path.glob("*.candidate.*"))
+
+
+def test_prepare_and_publish_close_preserve_generic_writer_contract(tmp_path) -> None:
+    writer = EvidenceWriter(tmp_path, run_id="prepared", rank=0)
+    writer.write(run_record("prepared", "static"))
+    writer.write(request_record("prepared", "static"))
+    writer.write(performance_record("prepared", "static"))
+
+    prepared_files, prepared_receipt = writer.prepare_close()
+    canonical = tmp_path / "prepared.rank0.complete.json"
+    assert prepared_receipt.is_file() and not prepared_receipt.is_symlink()
+    prepared_body = prepared_receipt.read_bytes()
+    assert not canonical.exists()
+    assert load_completed_evidence(tmp_path, run_id="prepared", rank=0) is None
+
+    published_files = writer.publish_close()
+    assert published_files == prepared_files
+    assert (tmp_path / "prepared.rank0.complete.json").read_bytes() == prepared_body
+    assert (
+        load_completed_evidence(tmp_path, run_id="prepared", rank=0) == published_files
+    )
+
+
+def test_schema_v2_receipt_remains_readable_without_schema_v3_bindings(
+    tmp_path,
+) -> None:
+    run_id = "legacy-v2"
+    tables = {
+        "run": pa.table(
+            {"run_id": [run_id], "method": ["static"], "status": ["complete"]}
+        ),
+        "request": pa.table({"run_id": [run_id], "method": ["static"]}),
+        "performance": pa.table({"run_id": [run_id], "method": ["static"]}),
+    }
+    files: dict[str, dict[str, object]] = {}
+    for table, data in tables.items():
+        path = tmp_path / f"{run_id}.rank0.pid1.{table}.parquet"
+        pq.write_table(data, path)
+        files[table] = {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    receipt = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "rank": 0,
+        "files": files,
+    }
+    (tmp_path / f"{run_id}.rank0.complete.json").write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_completed_evidence(tmp_path, run_id=run_id, rank=0)
+    assert loaded is not None and set(loaded) == {"run", "request", "performance"}
+
+
+def test_schema_v2_receipt_cannot_downgrade_industrial_shards(tmp_path) -> None:
+    run_id = "industrial-v2-downgrade"
+    tables = {
+        "run": pa.table(
+            {
+                "run_id": [run_id],
+                "method": ["target_only"],
+                "status": ["complete"],
+                "workload_contract": ["industrial_target_only"],
+                "experiment_budget_sha256": ["a" * 64],
+            }
+        ),
+        "request": pa.table(
+            {
+                "run_id": [run_id],
+                "method": ["target_only"],
+                "output_hash_format": [OUTPUT_HASH_FORMAT],
+                "output_tokens": [1],
+                "output_sha256": ["b" * 64],
+                "output_token_ids": ["[1]"],
+                "output_token_ids_sha256": ["b" * 64],
+            }
+        ),
+        "performance": pa.table({"run_id": [run_id], "method": ["target_only"]}),
+    }
+    files: dict[str, dict[str, object]] = {}
+    for table, data in tables.items():
+        path = tmp_path / f"{run_id}.rank0.pid1.{table}.parquet"
+        pq.write_table(data, path)
+        files[table] = {
+            "name": path.name,
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    receipt = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "rank": 0,
+        "files": files,
+    }
+    (tmp_path / f"{run_id}.rank0.complete.json").write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="schema-v2 receipt cannot wrap schema-v3 industrial evidence",
+    ):
+        load_completed_evidence(tmp_path, run_id=run_id, rank=0)
+
+
+@pytest.mark.parametrize("tamper", ["shard", "prepared_symlink"])
+def test_publish_close_revalidates_prepared_evidence_before_completion(
+    tmp_path,
+    tamper: str,
+) -> None:
+    run_id = f"publish-tamper-{tamper}"
+    writer = EvidenceWriter(tmp_path, run_id=run_id, rank=0)
+    writer.write(run_record(run_id, "static"))
+    writer.write(request_record(run_id, "static"))
+    writer.write(performance_record(run_id, "static"))
+    prepared_files, prepared_receipt = writer.prepare_close()
+
+    if tamper == "shard":
+        prepared_files["performance"].write_bytes(b"tampered")
+        message = "does not bind"
+    else:
+        target = prepared_receipt.with_suffix(".real.json")
+        prepared_receipt.rename(target)
+        prepared_receipt.symlink_to(target.name)
+        message = "invalid prepared receipt"
+
+    with pytest.raises(RuntimeError, match=message):
+        writer.publish_close()
+    assert not (tmp_path / f"{run_id}.rank0.complete.json").exists()
+    assert load_completed_evidence(tmp_path, run_id=run_id, rank=0) is None
 
 
 def test_duplicate_row_and_duplicate_terminal_receipt_fail_closed(tmp_path) -> None:

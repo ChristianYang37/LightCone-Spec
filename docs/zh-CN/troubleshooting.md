@@ -19,9 +19,10 @@
   退役 adaptation 字段属于错误；
 - Target-only 要求关闭 speculation 且无 adaptation；Static 启用 speculation 但无
   adaptation；移除 method 字段后，TTS/L0 的 adaptation 必须逐字节相同；
-- 对 industrial executor 而言，当前只有 TP1/DP1 Target-only 为 READY。缺少
-  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 时，Static/TTS/L0 会在
-  server launch 前失败；这是预期的 fail-closed release boundary；
+- 对 industrial executor 而言，当前只有 TP1/DP1 Target-only 为 READY。固定 tree 已实现
+  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，但没有配置
+  release-trusted hardware signer，因此 Static/TTS/L0 会在 mutation 前失败；这是预期的
+  fail-closed release boundary；
 - Adaptation 是 `last1`、`last3`、`last5` 或 `all` 上的 Full/LoRA。LoRA 要求注册 rank 与
   `alpha/r=1`。借用 target parameter、量化或不属于 backend 的 coordinate 不能训练；
 - DSpark layer-only 与 `*_native_heads` hybrid 字段是目标 contract；当前 adaptive schema
@@ -32,7 +33,7 @@
 - Optimizer 专属字段严格校验：SGDm/NAG/Muon 要求 momentum；Muon 还要求 Newton--Schulz
   与 auxiliary AdamW value。未使用字段不会被忽略。
 
-## 双 Rank 被拒绝或 Collective 失败
+## Distributed Rank 被拒绝或 Collective 失败
 
 - 当前 `RunConfig` 会在 model loading 前拒绝全部 TP2/DP2 value；caller 自己填写
   `patched_two_gpu_v1` digest 也不能启用 multi-rank 工作；
@@ -63,9 +64,11 @@ receipt 就复用 slab 属于 stale-state bug。
 
 ## Telemetry Backpressure 或中断
 
-Evidence writer 有 queued-row 上限。`backpressure` 策略会 flush fsynced Parquet WAL segment；
-显式 `drop` 会增加 drop counter，且 attempt 不能满足 complete evidence。提高 bound 会改变
-runtime identity，必须在 measurement 前决定。
+Evidence writer 有 queued-row 上限，并把 queue drain 批量写入 Parquet WAL row group。已
+注册 row/time checkpoint 与 terminal boundary 执行 durable fsync；queue 暂时清空不是
+fsync 请求。`backpressure` 下 producer 等待；显式 `drop` 下 triggering negative row 仍
+保持 durable，drop counter 增加，且 attempt 不能满足 complete evidence。提高 bound 会
+改变 runtime identity，必须在 measurement 前决定。
 
 Durable index 拒绝重复 request/round/update/performance key。Checkpoint、WAL row-group
 coverage、final shard schema/digest 与 completion-receipt counter 必须一致。不要 rename、
@@ -79,20 +82,31 @@ combine、truncate 或手工编辑 segment。
 
 - 通过 CLI 加载 generated registry；generator、parameter、embedded declaration 或 SHA-256
   不匹配表示内容被编辑；
+- Registry 接受两个 logical rank slot，绝不接受 physical device argument。向 pool planner
+  提供 strict content-bound inventory、准确 per-cell budget sequence 与 interference
+  envelope；physical UUID 只出现在 frozen assignment；
 - 只提供 ready stage 声明的准确 receipt。Locked-output name 必须匹配 definition，并使用
   lowercase SHA-256；
-- Completed-cell artifact 中每个 cell 都需要 measured evidence 与 terminal-receipt digest。
-  目录存在不表示完成；
-- 缺少 matching `PASS` interference receipt 时，单 GPU 工作保持串行；exclusive/双 GPU
-  工作始终串行。不能因为 JSON 中列出多个 wave 或 endpoint 就同时全部启动。
+- E1/E2 completion 需要准确 reducer activation，并为每个 template 提供 disposition。
+  Confirmation completion 需要 family-local pilot/final activation 及准确 power plan。Forged
+  或 cross-round survivor 是错误，不是 runnable work；
+- Completed serving row 需要 terminal receipt、physical assignment、`ExperimentBudget` 与
+  terminal-bound `BudgetObservationReceipt`。所有 observed phase component 及 measured/billed
+  GPU-time closure 必须一致；目录存在不表示完成；
+- Concurrency 由准确 matching `InterferenceEnvelope` 限制。更多 idle GPU 不会授权未经校准
+  co-run class。Gang job 必须 atomic；profiler/download/compile 为 exclusive-host。不能仅因
+  assignment 出现在同一个 plan 就并发启动全部工作；
+- Resume 只接受完整 assignment/wave/schedule receipt。一个 failed sibling 不会抹去 durable
+  successful receipt，但也不能被重标为 success。
 
 ## 意外的 `UNMEASURED`、`BLOCKED` 或 `UNDERPOWERED`
 
 `UNMEASURED` 表示不存在合格 content-bound GPU evidence/attestation。正向 diagnostics、
 CPU mock、历史 v2 result 或 acceptance change 都不能改变它。当前新 GPU phase 保持
-`UNMEASURED`；Stage B 因缺少 native terminal speculative-evidence provider、provider
-credential 与已注册硬件而 `BLOCKED`。Static/TTS/L0、全部 DSpark/EAGLE/EAGLE3/NEXTN
-adaptive cell 与全部 TP2/DP2 cell 都 blocked；只有 TP1/DP1 Target-only 可端到端执行。
+`UNMEASURED`；Stage B 因缺少 trusted hardware signer、provider credential、immutable
+model/data/trace lock、已注册硬件、GPU smoke 与 interference evidence 而 `BLOCKED`。
+Static/TTS/L0、全部 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与全部 TP2/DP2 cell 都
+blocked；只有 TP1/DP1 Target-only 可端到端执行。
 
 `BLOCKED` 也是 registered cell prerequisite 或 attested criterion 失败时的正确结果。
 `UNDERPOWERED` 表示四个 excluded pilot block 无法按注册 power 选择 12--20 个 final block，

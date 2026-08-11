@@ -8,9 +8,10 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 
 > 当前为 Alpha 软件。全部新 GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
 > Target-only 可以端到端运行。Static、TTS、L0 及其他所有 speculative method 会在任何
-> process 或 network mutation 前 `BLOCKED`，因为固定 SGLang integration 尚未提供
-> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`。实证 Stage B 还因缺少
-> provider credential 与已注册硬件而 `BLOCKED`。历史 v2 artifact 仅可用于
+> process 或 network mutation 前 `BLOCKED`，因为固定
+> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook 尚未配置可信
+> hardware signer。实证 Stage B 还因缺少 provider credential、已解析 model/data/trace lock
+> 与已注册硬件而 `BLOCKED`。历史 v2 artifact 仅可用于
 > regression/debugging；它们不能证明 schema-v3 协议或任何新性能结论。
 
 ## 研究范围
@@ -28,15 +29,16 @@ TTS 与 L0 共用完全相同的 evidence、trainable plan、loss、optimizer ca
 reconstruction 路径；唯一实验差异是发布时间。Target-only 与 Static 不分配任何
 adaptation、optimizer、candidate 或 adaptation telemetry 状态。
 
-目标 industrial registry 先覆盖 DFlash 与 DSpark，再进入 production load、双 GPU
+目标 industrial registry 先覆盖 DFlash 与 DSpark，再进入 production load、多 GPU
 topology、原生 NEXTN preflight 与 breadth template。EAGLE/EAGLE3 仍是带严格兼容性
 guard 的目标 backend contract；注册并不表示当前 release 可以执行。OnlineSPEC 是重要
 对比，但使用独立 tuning、证据、attestation 与分析，不能选择或改变核心 gate。
 
 当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层 adaptive path，且 optimizer schedule
-为 constant、extra logical delay 为零。它没有暴露 industrial executor 所需的内容绑定
-terminal evidence provider，因此该路径还不能端到端执行或支持结论。Static/TTS/L0 会在
-executor preflight、任何 mutation 之前失败。DSpark/EAGLE/EAGLE3/NEXTN adaptation、所有
+为 constant、extra logical delay 为零。它已实现准确 begin/reset/finalize terminal-evidence
+hook，host adapter 也会验证其内容，但仓库不携带可信 hardware signer。Static/TTS/L0 因此
+仍不可用于结论，并在 release preflight、任何 mutation 之前失败。DSpark/EAGLE/EAGLE3/
+NEXTN adaptation、所有
 TP2/DP2 execution、非 constant schedule 与正 extra delay 同样 fail closed；在新的 patch
 与 provider identity 实现这些能力前，对应 registry cell 保持 `BLOCKED`。
 
@@ -68,10 +70,19 @@ rejection distribution 属于采样数学，不是 adaptation mode 或配置 ali
 preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 ```
 
-每个 cell 都绑定科学轴、seed、GPU UUID、port、cache/evidence root、资源隔离与真实初始
-状态。Stage receipt 在下游运行前封存 runtime/split digest、准确 dependency receipt 与
-locked output。双 GPU scheduler 会串行执行独占的 headline/profile/download/compile
-工作；只有 interference gate 通过后，互相独立的单 GPU 工作才可并行。
+每个 cell 都绑定科学轴、seed、逻辑 rank slot、port、cache/evidence root、资源隔离与真实
+初始状态。Stage receipt 在下游运行前封存 runtime/split digest、准确 dependency receipt、
+activation/disposition artifact 与 locked output。唯一的确定性同主机 GPU-pool scheduler
+会把逻辑声明映射到内容绑定的物理 UUID，并支持 1、2、4、8、16 或更多 GPU。它会串行
+独占 headline/profile/download/compile 工作；只有准确注册的 interference-envelope rule
+允许时，互相独立的工作才可并行。
+
+Reducer-owned E1 activation 会从 2,730-cell envelope 只物化一个 130-cell width/load slice；
+E2 只物化当前 quarter-retention successive-halving round。每个 family 的四个 pilot 会在
+confirmation 前锁定 12--20 final prefix 或 `UNDERPOWERED`。Per-cell budget、物理 assignment、
+terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容绑定。Shared-session
+key/reset/finalize schema 在当前 release 仅供审计；由于没有 trusted durable boundary 与连续
+计费 authority，所有 live reuse 入口都会在 mutation 前被阻止。
 
 目标 schema 与 CPU coordinator vocabulary 定义单节点 TP2、sticky-replica DP2 identity、
 inference-sharded TP state、replica-local DP cohort，以及 all-rank prepare/decision/
@@ -128,17 +139,22 @@ python scripts/verify_sglang_patchset.py \
 当前 schema-v3 SGLang series 在任何 GPU run 成为合格证据前，必须通过 clean-pin、
 patch-digest、expected-tree、compile/test 与 reverse-removal gate。文档不能替代该 gate。
 
-用真实不可变 device 身份生成双 GPU industrial registry：
+先用逻辑 rank slot 生成 registry；物理 device 身份只来自另行锁定的 inventory 与 dispatch
+assignment：
 
 ```bash
 lightcone-spec build-industrial-registry \
-  --gpu-uuid GPU-UUID-0 GPU-UUID-1 \
+  --logical-gpu-slot logical-rank-slot-0 logical-rank-slot-1 \
   --cache-root runtime-cache/industrial \
   --evidence-root artifacts/industrial \
   --output artifacts/industrial/registry.json
 
 lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
+  --interference-envelope artifacts/industrial/interference.json \
+  --budget-plan artifacts/industrial/budgets.json \
+  --activation-plan artifacts/industrial/activation.json \
   --output artifacts/industrial/dispatch.json
 ```
 
@@ -189,16 +205,17 @@ Static/TTS/L0 变得可执行，也不能替代缺失的 trusted attester。
 
 ## 限制
 
-- 全部新 GPU 结果均为 `UNMEASURED`；Stage B 因缺少 native terminal speculative-
-  evidence provider、provider credential 与已注册硬件而保持 `BLOCKED`；
+- 全部新 GPU 结果均为 `UNMEASURED`；native terminal hook 已存在，但 Stage B 因缺少可信
+  hardware signer、provider credential、已解析 model/data/trace lock 与已注册硬件而保持
+  `BLOCKED`；
 - 当前端到端 industrial execution surface 只有 TP1/DP1 Target-only。TP2/DP2 仅存在于
   目标 registry/coordinator contract，本 release 会拒绝它们。不声明 multi-node、
   Kubernetes、elastic cluster、remote object store 或自动 failover；
 - CPU `gloo` 合同不是 GPU/NCCL 证据。Topology config 只是目标 vocabulary；无论 caller
   是否提供 patched-runtime capability receipt，本
   release 都会拒绝 TP2/DP2；
-- Static/TTS/L0 在准确 native terminal evidence hook 实现并绑定固定 tree 前保持
-  `BLOCKED`。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与所有 TP2/DP2 cell 同样
+- Static/TTS/L0 在 out-of-band 可信 signer 绑定准确 native terminal hook 与固定 tree 前
+  保持 `BLOCKED`。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与所有 TP2/DP2 cell 同样
   `BLOCKED`，绝不能暗示成功；
 - ChronoBelief tuning cell 在 authoritative update equation 与 source identity 注册前保持
   `BLOCKED`，不会使用替代 optimizer；

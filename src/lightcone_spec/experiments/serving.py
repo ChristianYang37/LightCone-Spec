@@ -13,14 +13,17 @@ it never turns the upstream distributed values into token timestamps.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import json
 import math
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from lightcone_spec.experiments.load import (
     FrozenSamplingParameters,
@@ -143,7 +146,7 @@ class BenchServingResult:
     stop_reason: str | None
     error_code: str | None
     chunks: tuple[TokenChunkTiming, ...]
-    generated_token_ids: tuple[int, ...] | None
+    generated_token_ids: tuple[int, ...]
     ttft_us: int | None = None
 
     def validate(self, request: BoundServingRequest) -> None:
@@ -171,8 +174,9 @@ class BenchServingResult:
                 )
         elif not self.error_code:
             raise ValueError("failed bench results require a stable error code")
-        if self.generated_token_ids is not None and (
-            len(self.generated_token_ids) != self.output_tokens
+        if (
+            not isinstance(self.generated_token_ids, tuple)
+            or len(self.generated_token_ids) != self.output_tokens
             or any(
                 not isinstance(token_id, int)
                 or isinstance(token_id, bool)
@@ -197,6 +201,13 @@ class BenchServingResult:
 class BenchServingTransport(Protocol):
     """Network boundary injected into the industrial executor."""
 
+    async def open(
+        self,
+        *,
+        request_timeout_s: float,
+        abort_timeout_s: float,
+    ) -> None: ...
+
     async def submit(
         self,
         request: BoundServingRequest,
@@ -211,6 +222,10 @@ class BenchServingTransport(Protocol):
         *,
         base_url: str,
     ) -> None: ...
+
+    async def close(self) -> None: ...
+
+    def metrics(self) -> dict[str, int]: ...
 
 
 _OfficialRequest = Callable[..., Awaitable[Any]]
@@ -236,6 +251,13 @@ class PinnedBenchServingTransport:
         self._set_global_args = set_global_args
         self._session_factory = session_factory
         self._headers_factory = headers_factory
+        self._session_context: Any | None = None
+        self._session: Any | None = None
+        self._request_timeout_s: float | None = None
+        self._abort_timeout_s: float | None = None
+        self._native_admin_base_url: str | None = None
+        self._connections_created = 0
+        self._submitted_requests = 0
         self.module_identity = module_identity
         self._set_global_args(
             SimpleNamespace(
@@ -251,6 +273,154 @@ class PinnedBenchServingTransport:
                 top_p=1.0,
             )
         )
+
+    async def open(
+        self,
+        *,
+        request_timeout_s: float,
+        abort_timeout_s: float,
+    ) -> None:
+        if self._session is not None or self._session_context is not None:
+            raise RuntimeError("official bench transport is already open")
+        if self._session_factory is None:
+            raise RuntimeError("official bench session factory is unavailable")
+        for name, value in (
+            ("request timeout", request_timeout_s),
+            ("abort timeout", abort_timeout_s),
+        ):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        context = self._session_factory()
+        session = await context.__aenter__()
+        self._session_context = context
+        self._session = session
+        self._request_timeout_s = request_timeout_s
+        self._abort_timeout_s = abort_timeout_s
+        self._connections_created += 1
+
+    async def close(self) -> None:
+        if self._session is None or self._session_context is None:
+            raise RuntimeError("official bench transport is not open")
+        context = self._session_context
+        self._session = None
+        self._session_context = None
+        self._request_timeout_s = None
+        self._abort_timeout_s = None
+        self._native_admin_base_url = None
+        await context.__aexit__(None, None, None)
+
+    def bind_native_admin_base_url(self, base_url: str) -> None:
+        """Bind the native admin endpoints to this pool's serving process.
+
+        The binding is intentionally established only after :meth:`open` and
+        cannot be changed while the pool is live.  Native capability and
+        terminal-evidence traffic therefore uses the same authenticated
+        session, connection pool, and server origin as submit/abort traffic.
+        """
+
+        if self._session is None or self._request_timeout_s is None:
+            raise RuntimeError(
+                "official bench transport must be open before admin bind"
+            )
+        if not isinstance(base_url, str):
+            raise TypeError("native admin base_url must be an HTTP(S) URL")
+        parsed = urlsplit(base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("native admin base_url must identify one server origin")
+        normalized = f"{parsed.scheme}://{parsed.netloc}"
+        if (
+            self._native_admin_base_url is not None
+            and self._native_admin_base_url != normalized
+        ):
+            raise RuntimeError("native admin origin changed inside one open pool")
+        self._native_admin_base_url = normalized
+
+    def _native_admin_url(self, path: str) -> str:
+        if (
+            self._session is None
+            or self._request_timeout_s is None
+            or self._native_admin_base_url is None
+        ):
+            raise RuntimeError("native admin transport is not bound to an open pool")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or path.startswith("//")
+            or "?" in path
+            or "#" in path
+        ):
+            raise ValueError("native admin path must be one absolute path")
+        return self._native_admin_base_url + path
+
+    async def _read_admin_response(self, response: Any) -> object:
+        if int(response.status) != 200:
+            raise RuntimeError(
+                f"SGLang native admin endpoint returned HTTP {int(response.status)}"
+            )
+        try:
+            value = await response.json(content_type=None)
+        except AttributeError:
+            try:
+                value = json.loads(await response.text())
+            except (json.JSONDecodeError, TypeError) as error:
+                raise ValueError("SGLang native admin response is not JSON") from error
+        return value
+
+    async def get_json(self, path: str, /) -> object:
+        """GET one native admin document through the official bench pool."""
+
+        url = self._native_admin_url(path)
+        session = self._session
+        timeout_s = self._request_timeout_s
+        if session is None or timeout_s is None:
+            raise RuntimeError("native admin transport is not bound to an open pool")
+        async with asyncio.timeout(timeout_s):
+            async with session.get(
+                url=url,
+                headers=(self._headers_factory() if self._headers_factory else {}),
+            ) as response:
+                return await self._read_admin_response(response)
+
+    async def post_json(
+        self,
+        path: str,
+        body: Mapping[str, object],
+        /,
+    ) -> object:
+        """POST one native lifecycle action through the official bench pool."""
+
+        if not isinstance(body, Mapping):
+            raise TypeError("native admin body must be a mapping")
+        url = self._native_admin_url(path)
+        session = self._session
+        timeout_s = self._request_timeout_s
+        if session is None or timeout_s is None:
+            raise RuntimeError("native admin transport is not bound to an open pool")
+        async with asyncio.timeout(timeout_s):
+            async with session.post(
+                url=url,
+                json=dict(body),
+                headers=(self._headers_factory() if self._headers_factory else {}),
+            ) as response:
+                return await self._read_admin_response(response)
+
+    def metrics(self) -> dict[str, int]:
+        return {
+            "connections_created": self._connections_created,
+            "submitted_requests": self._submitted_requests,
+            "reused_requests": max(
+                0, self._submitted_requests - self._connections_created
+            ),
+        }
 
     @classmethod
     def from_checkout(cls, checkout: str | Path) -> PinnedBenchServingTransport:
@@ -294,6 +464,8 @@ class PinnedBenchServingTransport:
         served_model: str,
     ) -> BenchServingResult:
         request.validate()
+        if self._session is None or self._request_timeout_s is None:
+            raise RuntimeError("official bench transport must be opened before submit")
         if not base_url.startswith(("http://", "https://")):
             raise ValueError("bench base_url must be an HTTP(S) URL")
         if not served_model:
@@ -318,7 +490,13 @@ class PinnedBenchServingTransport:
             timestamp=request.arrival_us / 1000.0,
             routing_key=request.route_id,
         )
-        raw = await self._request_callable(request_func_input=value, pbar=None)
+        async with asyncio.timeout(self._request_timeout_s):
+            raw = await self._request_callable(
+                request_func_input=value,
+                pbar=None,
+                client_session=self._session,
+            )
+        self._submitted_requests += 1
         latency = float(raw.latency)
         if not math.isfinite(latency) or latency < 0:
             raise RuntimeError("official bench result has invalid latency")
@@ -344,6 +522,15 @@ class PinnedBenchServingTransport:
             else ()
         )
         success = bool(raw.success)
+        raw_token_ids = getattr(raw, "generated_token_ids", None)
+        if raw_token_ids is None:
+            raise RuntimeError(
+                "official bench result lacks exact ordered generated token IDs"
+            )
+        if not isinstance(raw_token_ids, (list, tuple)):
+            raise TypeError(
+                "official bench result has malformed ordered generated token IDs"
+            )
         result = BenchServingResult(
             request_id=request.request_id,
             success=success,
@@ -357,11 +544,7 @@ class PinnedBenchServingTransport:
             ),
             error_code=None if success else "bench_request_failed",
             chunks=chunks,
-            generated_token_ids=(
-                tuple(int(token_id) for token_id in raw.generated_token_ids)
-                if getattr(raw, "generated_token_ids", None) is not None
-                else None
-            ),
+            generated_token_ids=tuple(raw_token_ids),
             ttft_us=ttft_us if output_tokens > 0 else None,
         )
         result.validate(request)
@@ -372,18 +555,16 @@ class PinnedBenchServingTransport:
 
         if not request_id or not base_url.startswith(("http://", "https://")):
             raise ValueError("abort requires a request ID and HTTP(S) base URL")
-        if self._session_factory is None:
-            raise RuntimeError("official bench session factory is unavailable")
-        async with (
-            self._session_factory() as session,
-            session.post(
+        if self._session is None or self._abort_timeout_s is None:
+            raise RuntimeError("official bench transport must be opened before abort")
+        async with asyncio.timeout(self._abort_timeout_s):
+            async with self._session.post(
                 url=base_url.rstrip("/") + "/abort_request",
                 json={"rid": request_id, "abort_all": False},
                 headers=(self._headers_factory() if self._headers_factory else {}),
-            ) as response,
-        ):
-            if int(response.status) != 200:
-                raise RuntimeError("SGLang did not acknowledge request abort")
+            ) as response:
+                if int(response.status) != 200:
+                    raise RuntimeError("SGLang did not acknowledge request abort")
 
 
 def official_bench_argv(

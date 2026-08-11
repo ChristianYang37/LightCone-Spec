@@ -6,7 +6,45 @@ yet been declared.
 
 ## [Unreleased]
 
-No unreleased entries.
+### Added
+
+- Added strict per-cell experiment budgets, observed-versus-registered budget
+  receipts, reducer-owned E1/E2 activation and successive halving, family-level
+  pilot/power/final-prefix artifacts, and content-bound Target-only evidence
+  aliases with explicit dependence units.
+- Added one deterministic same-host GPU-pool scheduler for 1, 2, 4, 8, 16, and
+  larger inventories, including topology-aware gangs, immutable interference
+  envelopes, frozen waves, exact physical assignments, billed-GPU accounting,
+  partial-sibling failure receipts, and receipt-only resume.
+- Added audit-only clean server-session key/reset/finalize data contracts,
+  content-addressed immutable compile caches with private process overlays,
+  one single-trace official serving HTTP pool, and bounded batched evidence
+  writes. Live shared-session mutation remains blocked until a release-owned
+  trusted durable boundary and continuous whole-inventory accounting exist.
+- Added the native
+  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+  begin/reset/finalize hook and a strict host validator. Static retains zero
+  detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
+  evidence on the supported TP1/DP1 DFlash boundary.
+
+### Changed
+
+- Replaced registry physical-device placeholders with logical rank slots;
+  physical GPU UUIDs, ranks, ports, topology, dispatch-plan identity, and exact
+  budget identity now enter only through a frozen pool assignment.
+- Restricted release-supported publication methods to Target-only. The native
+  terminal hook has no bundled trusted hardware signer, so content-valid
+  Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
+- Made the SGLang adaptation-protocol patch test hermetic by loading only its
+  config, runtime, and parameter-plan modules. The resulting patch identity is
+  `c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08`
+  with final tree `2810ac94ed225aa78b4256ded56e78890a4a590f`.
+
+### Evidence status
+
+- No formal GPU timing or new empirical result was produced. All new outcomes
+  remain `UNMEASURED`; hardware execution is blocked pending a trusted signer,
+  resolved model/data/trace locks, and the registered GPU/interference gates.
 
 ## [0.3.0] - 2026-08-11
 

@@ -22,9 +22,10 @@
   speculation on but no adaptation. TTS/L0 require byte-equivalent adaptation
   after removing the method field.
 - For the industrial executor, only TP1/DP1 Target-only is currently READY.
-  Static/TTS/L0 fail before server launch when
-  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` is absent;
-  this is the expected fail-closed release boundary.
+  The pinned tree implements
+  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`, but
+  Static/TTS/L0 fail before mutation because no release-trusted hardware signer
+  is configured. This is the expected fail-closed boundary.
 - Adaptation is Full or LoRA over `last1`, `last3`, `last5`, or `all`. LoRA
   requires a registered rank and `alpha/r=1`. Borrowed target parameters and
   quantized/unowned coordinates cannot become trainable.
@@ -38,7 +39,7 @@
   also requires Newton--Schulz and auxiliary AdamW values. Unused fields are
   not ignored.
 
-## Two-rank refusal or collective failure
+## Distributed-rank refusal or collective failure
 
 - The current `RunConfig` rejects every TP2/DP2 value before model loading. A
   caller-authored `patched_two_gpu_v1` digest cannot enable multi-rank work.
@@ -74,10 +75,13 @@ receipt is a stale-state bug.
 
 ## Telemetry backpressure or interruption
 
-The evidence writer has a bounded queued-row count. Under `backpressure` it
-flushes fsynced Parquet WAL segments; under explicit `drop` it increments drop
-counters and the attempt cannot satisfy complete evidence. Increasing a bound
-changes runtime identity and must be decided before measurement.
+The evidence writer has a bounded queued-row count and batches queue drains into
+Parquet WAL row groups. Registered row/time checkpoints and terminal boundaries
+perform the durable fsync; a temporarily empty queue is not an fsync request.
+Under `backpressure` the producer waits; under explicit `drop` the triggering
+negative row remains durable, drop counters increment, and the attempt cannot
+satisfy complete evidence. Increasing a bound changes runtime identity and must
+be decided before measurement.
 
 Duplicate request/round/update/performance keys are rejected by the durable
 index. Checkpoint, WAL row-group coverage, final shard schema/digest, and
@@ -93,21 +97,36 @@ for one run/rank, is not valid evidence.
 
 - Load the generated registry through the CLI; a generator, parameter, embedded
   declaration, or SHA-256 mismatch means it was edited.
+- The registry takes two logical rank slots, never physical device arguments.
+  Supply a strict content-bound inventory, exact per-cell budget sequence, and
+  interference envelope to the pool planner; physical UUIDs appear only in the
+  frozen assignment.
 - Supply exactly the receipts declared by the ready stage. Locked-output names
   must match the definition and use lowercase SHA-256 values.
-- A completed-cell artifact needs measured evidence and terminal-receipt digests
-  for every listed cell. Directory presence is not completion.
-- Without a matching `PASS` interference receipt, single-GPU work remains
-  serial. Exclusive/two-GPU work is always serial. Never launch every wave or
-  endpoint concurrently because they happen to appear in one JSON file.
+- E1/E2 completion requires the exact reducer activation and a disposition for
+  every template. Confirmation completion requires family-local pilot/final
+  activation and its exact power plan. A forged or cross-round survivor is an
+  error, not runnable work.
+- A completed serving row needs a terminal receipt, physical assignment,
+  `ExperimentBudget`, and terminal-bound `BudgetObservationReceipt`. All
+  observed phase components and measured/billed GPU-time closure must agree;
+  directory presence is not completion.
+- Concurrency is capped by the exact matching `InterferenceEnvelope`. More idle
+  GPUs do not authorize a co-run class that was not calibrated. Gang jobs are
+  atomic; profiler/download/compile work is exclusive-host. Never launch every
+  assignment merely because it appears in one plan.
+- Resume accepts only complete assignment/wave/schedule receipts. A failed
+  sibling does not erase durable successful receipts, but it also cannot be
+  relabelled as success.
 
 ## Unexpected `UNMEASURED`, `BLOCKED`, or `UNDERPOWERED`
 
 `UNMEASURED` means no eligible content-bound GPU evidence/attestation exists.
 Positive diagnostics, CPU mocks, historical v2 results, or acceptance changes
 do not alter it. The current new GPU phase remains `UNMEASURED` and Stage B is
-`BLOCKED` on the missing native terminal speculative-evidence provider,
-provider credentials, and registered hardware. Static/TTS/L0, all
+`BLOCKED` on the missing trusted hardware signer, provider credentials,
+immutable model/data/trace locks, registered hardware, GPU smoke, and
+interference evidence. Static/TTS/L0, all
 DSpark/EAGLE/EAGLE3/NEXTN adaptive cells, and all TP2/DP2 cells are blocked;
 only TP1/DP1 Target-only is end-to-end executable.
 

@@ -19,11 +19,10 @@ one. Unknown schemas and retired adaptation fields fail before model loading.
 These names include target protocol vocabulary, not a promise that every valid
 scientific declaration is executable. The current end-to-end industrial
 executor accepts only TP1/DP1 Target-only. Static/TTS/L0 are blocked before
-mutation pending
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`; the pinned
-patch does not provide that provider. The lower-level adaptive patch path is
-limited to TP1/DP1 DFlash, constant schedule, zero extra logical delay, and
-`update_round` teacher rows.
+mutation because the pinned native begin/reset/finalize hook has no configured
+trusted hardware signer. The lower-level adaptive patch path and terminal
+schema are limited to TP1/DP1 DFlash, constant schedule, zero extra logical
+delay, and `update_round` teacher rows.
 
 ## Method and disabled-path contract
 
@@ -33,7 +32,8 @@ Static describes native speculative decoding. Neither may allocate optimizer,
 gradient, master, candidate, or cohort-adaptation state. Only Target-only is
 currently end-to-end executable. Static requires content-bound request,
 performance, and aggregate speculative safety evidence, while preserving zero
-round/update detailed-trace allocation; it therefore fails executor preflight.
+round/update detailed-trace allocation; it therefore fails the trusted-signer
+release preflight.
 
 TTS and L0 require byte-equivalent model, runtime, adaptation, sampling, and
 load identities after removing the method field. They use one candidate
@@ -146,12 +146,28 @@ Prefill/decode disaggregation and two-batch overlap remain disabled. Multi-node
 and more-than-two-rank configurations fail validation; there is no Kubernetes,
 elastic, or automatic-failover setting.
 
+Runtime topology and pool capacity are separate identities. The scientific
+registry uses two stable logical rank slots. A strict `GpuInventory` may contain
+any number of devices; the sole scheduler has explicit 1/2/4/8/16-GPU
+regression coverage and freezes physical UUIDs, rank layout, ports, topology,
+and whole-instance size in an `IndustrialPhysicalAssignment`. This does not
+enable TP2/DP2: release `RunConfig` validation remains TP1/DP1-only.
+
 ## HBM and cohort policy
 
 Runtime rendering takes explicit adaptation reserve and model/KV memory
 fractions from preflight; there is no universal source default. Admission uses
 the least-headroom rank after charging all model, KV, optimizer, candidate,
 activation, graph, telemetry, and safety-margin categories.
+
+Every materialized cell also requires an immutable `ExperimentBudget`; short,
+p99-anchor, soak, failure, profiler, compile, and download jobs do not share a
+hidden duration. Startup/load, compile/prewarm, excluded warm-up and request
+pool, scored arrivals, deadline, drain, reset/finalization, evidence close,
+retry, tokens, minimum completions, topology, reserved GPU time, and
+whole-instance billed time are explicit. The execution copy keeps
+`measured_gpu_ms=null`; a separate terminal-bound observation records every
+phase and exact deltas. Missing and N/A are distinct from zero.
 
 Fixed cohort slabs are quota-bound per tenant and replica. Optional cold
 offload must be configured explicitly and applies only to inactive cohorts.
@@ -164,8 +180,8 @@ evidence root.
 The isolated OnlineSPEC protocol adds a required `online_spec` object. Its
 optimizer must be plain SGD, and its declarations remain TP1/DP1 under a
 separately registered tuning protocol. This separate schema/runtime surface
-does not supply the industrial executor's missing native terminal evidence
-provider and does not make an industrial speculative cell runnable.
+does not supply a release-trusted hardware signer and does not make an
+industrial speculative cell runnable.
 
 | Field | Contract |
 |---|---|

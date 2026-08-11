@@ -33,10 +33,10 @@ _FAIL_CLOSED_MODE_GATES = (
     ("dp2", "release_topology_executor_unsupported"),
     (
         "static_speculative",
-        "release_native_terminal_evidence_unavailable",
+        "release_trusted_terminal_attester_unavailable",
     ),
-    ("tts", "release_native_terminal_evidence_unavailable"),
-    ("l0", "release_native_terminal_evidence_unavailable"),
+    ("tts", "release_trusted_terminal_attester_unavailable"),
+    ("l0", "release_trusted_terminal_attester_unavailable"),
     ("adaptive_dspark", "release_adaptive_backend_unsupported"),
     ("adaptive_eagle", "release_adaptive_backend_unsupported"),
     ("adaptive_eagle3", "release_adaptive_backend_unsupported"),

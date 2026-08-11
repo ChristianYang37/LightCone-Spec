@@ -11,10 +11,19 @@ authority. The schema-v3 and industrial commands are:
 |---|---|
 | `doctor` | Read-only host, Python, CUDA, and source identity report |
 | `validate-config` | Validate one strict schema-v3 run config and sidecar |
-| `build-industrial-registry` | Bind two GPU UUIDs and materialize the immutable experiment DAG |
-| `plan-industrial-dispatch` | Validate receipts and emit deterministic one/two-GPU waves |
-| `seal-industrial-stage` | Bind a completed stage's runtime, split, dependencies, and locked outputs |
-| `analyze-industrial` | Validate schema-v3 terminal evidence and write a bound E3b/E5 analysis manifest |
+| `build-industrial-registry` | Bind two stable logical rank slots and materialize the immutable experiment DAG |
+| `reduce-e1-activation` | Derive the single 130-cell E1 slice from sealed E3a evidence |
+| `reduce-e2-activation` | Materialize one E2 round from the E1 Pareto artifact or prior survivors |
+| `reduce-e2-successive-halving` | Reduce exact E2 stage evidence into a sealed survivor receipt |
+| `materialize-confirmation-pilots` | Activate exactly four excluded pilots for one confirmation family |
+| `reduce-confirmation-family-power` | Reduce one family's exact four pilot blocks into a sealed power plan |
+| `materialize-confirmation-prefix` | Activate only a powered family's sealed 12--20-block final prefix |
+| `validate-evidence-alias` | Strictly load and rewrite one content-bound evidence alias receipt |
+| `build-evidence-dependence-map` | Preserve shared-observation dependence from legal aliases |
+| `estimate-industrial-budget` | Reduce exact per-cell budgets for one inventory and activation bundle |
+| `plan-industrial-dispatch` | Freeze deterministic topology-aware GPU-pool waves and physical assignments |
+| `seal-industrial-stage` | Bind activated completion, dispositions, budgets, runtime, split, dependencies, and locked outputs |
+| `analyze-industrial` | Validate schema-v3 terminal, budget, family-power, and hardware evidence |
 | `build-speed-study` | Materialize the smaller core source protocol |
 | `lock-models` | Resolve model IDs to immutable revisions |
 | `prepare-models` | Download or offline-verify locked snapshots |
@@ -62,11 +71,12 @@ directory into completed evidence.
 
 ## Industrial registry workflow
 
-Use immutable device UUIDs, not CUDA ordinals:
+The registry contains scientific identities and two logical rank slots, not
+host-specific GPU UUIDs:
 
 ```bash
 lightcone-spec build-industrial-registry \
-  --gpu-uuid GPU-UUID-0 GPU-UUID-1 \
+  --logical-gpu-slot logical-rank-slot-0 logical-rank-slot-1 \
   --base-port 24000 \
   --cache-root runtime-cache/industrial \
   --evidence-root artifacts/industrial \
@@ -76,30 +86,93 @@ lightcone-spec build-industrial-registry \
 
 The output embeds its generator identity, input parameters, complete
 declarations, and registry SHA-256. Loading regenerates the registry and
-compares the exact content, so hand-edited cells are rejected.
+compares exact content, so hand-edited cells are rejected. A separate
+content-bound inventory supplies physical UUIDs, model/memory/capability,
+PCI/NUMA/interconnect topology, availability, and topology groups.
 
-Before any receipt exists, the planner emits only `preflight` waves and keeps
-single-GPU work serial because the interference gate has not passed:
+Planning is fail-closed: it requires an inventory, an exact per-cell budget
+sequence, and an interference envelope. It also requires reducer-generated
+stage or family activation for template stages; a hand-authored cell list is
+not accepted.
 
 ```bash
 lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
+  --interference-envelope artifacts/industrial/interference-envelope.json \
+  --budget-plan artifacts/industrial/budgets.json \
   --output artifacts/industrial/preflight-dispatch.json
 ```
 
-After a stage's registered outputs are durable, seal them. Every
-`--locked-output` is `NAME=LOWERCASE_SHA256`; dependencies are receipt files,
-not copied hash strings:
+The frozen plan binds the exact inventory and interference envelope, every
+cell's budget digest, physical UUID/rank/port/topology assignment, wave
+membership, and scheduler identity. The scheduler accepts arbitrary same-host
+inventories; 1/2/4/8/16-GPU cases are regression-tested. A wave never exceeds
+the calibrated co-run class, so eight idle GPUs do not imply eight-way headline
+execution. Structural loading of an envelope does not prove its calibration;
+formal timing still requires raw isolated/co-run evidence and trusted hardware
+binding. There is currently no `execute-dispatch-wave` CLI command; the
+structured library executor requires a first-party, content-bound launch
+adapter and does not infer launch configuration from planner JSON.
+
+Estimate the same activated set before dispatch. Every budget field is
+explicit; the report separates wall, compute, reserved, and whole-instance
+billed GPU time in optimistic, registered, and quota-envelope scenarios:
+
+```bash
+lightcone-spec estimate-industrial-budget \
+  --registry artifacts/industrial/registry.json \
+  --activation-plan artifacts/industrial/activation.json \
+  --inventory artifacts/industrial/inventory.json \
+  --budgets artifacts/industrial/budgets.json \
+  --output artifacts/industrial/budget-report.json
+```
+
+After a stage's activated cells and dispositions are durable, seal them.
+`--inventory PATH` is the authority for the physical GPU identities and
+topology used by the completed evidence. Every repeated `--locked-output` has
+the single syntax `NAME=PATH`: names must be unique, and `PATH` must identify a
+content-bound artifact. A SHA-256 literal is not a substitute for that artifact.
+Runtime and split are also bound files, and dependencies are receipt files
+rather than copied hash strings:
 
 ```bash
 lightcone-spec seal-industrial-stage \
   --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
   --experiment preflight \
-  --runtime-sha256 RUNTIME_SHA256 \
-  --split-sha256 SPLIT_SHA256 \
-  --locked-output runtime_envelope=OUTPUT_SHA256 \
+  --runtime-artifact artifacts/industrial/runtime.json \
+  --split-artifact artifacts/industrial/preflight-split.json \
+  --completed-cells artifacts/industrial/completed-cells.json \
+  --locked-output runtime_envelope=artifacts/industrial/runtime-envelope.json \
   --output artifacts/industrial/receipts/preflight.json
 ```
+
+Sealing E2 adds one mandatory authority, `--e2-final-stage-manifest PATH`. It
+must be the raw `halving_3` manifest; the command reruns the first-party raw
+reducer and requires a `FINAL_RECIPE` result. The `dflash_recipe=PATH` artifact
+must then bind exactly that final candidate, registry, runtime, split, and final
+stage reduction. A digest in place of `PATH`, a caller-authored summary, or a
+recipe for a different candidate is rejected:
+
+```bash
+lightcone-spec seal-industrial-stage \
+  --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
+  --experiment E2 \
+  --runtime-artifact artifacts/industrial/runtime.json \
+  --split-artifact artifacts/industrial/e2-split.json \
+  --completed-cells artifacts/industrial/e2-completed-cells.json \
+  --e2-final-stage-manifest artifacts/industrial/e2-halving_3-manifest.json \
+  --dependency-receipt artifacts/industrial/receipts/E1.json \
+  --locked-output dflash_recipe=artifacts/industrial/e2-dflash-recipe.json \
+  --output artifacts/industrial/receipts/E2.json
+```
+
+These checks define the claim-bearing path once a trusted hardware attester is
+registered. In the current release, sealing still returns `BLOCKED` before it
+can issue a receipt; this raw-authority contract does not make final execution
+or a performance claim reachable.
 
 For a downstream stage, repeat `--dependency-receipt` for its exact declared
 dependencies. Then pass all completed receipts to the planner:
@@ -107,43 +180,45 @@ dependencies. Then pass all completed receipts to the planner:
 ```bash
 lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/inventory.json \
+  --interference-envelope artifacts/industrial/interference-envelope.json \
+  --budget-plan artifacts/industrial/budgets.json \
   --receipt artifacts/industrial/receipts/preflight.json \
   --completed-cells artifacts/industrial/completed-cells.json \
-  --interference-receipt artifacts/industrial/interference.json \
+  --activation-plan artifacts/industrial/activation.json \
   --output artifacts/industrial/next-dispatch.json
 ```
 
-The optional completed-cell artifact must bind each cell to measured evidence
-and a terminal receipt. The optional interference artifact must be a matching
-`PASS` for the same registry and GPU UUIDs. Without it, cells remain serial.
-Exclusive work is never paired, even after it passes.
+Formal completed-cell rows bind the frozen physical assignment, exact budget,
+terminal receipt, mandatory `BudgetObservationReceipt`, and three-way budget/
+terminal digest closure. Missing phase timing, compile/download N/A reasoning,
+or GPU accounting is not replaced with zero. Resume accepts only a complete
+receipt and never directory presence.
 
 The dispatch plan is target-protocol data, not proof that a cell is executable.
-The library industrial executor validates provider state before launch and
-currently runs only TP1/DP1 Target-only end to end. It blocks every speculative
-cell before process/network mutation unless an injected provider implements
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` for the exact
-pinned tree. No such provider ships in this release. The CLI does not silently
-launch servers or provision hardware.
+The pinned tree implements the exact native terminal begin/reset/finalize hook,
+but no trusted hardware signer is configured. Release preflight therefore runs
+only TP1/DP1 Target-only and blocks Static/TTS/L0 before process, filesystem,
+root, or network mutation. The CLI does not silently provision hardware.
 
 ## Identity and topology flow
 
 The minimum industrial identity chain is:
 
 ```text
-source + patch tree + model/data locks + two-GPU capability
+source + patched tree + model/data/trace locks
                          |
                          v
-              immutable registry + traces
+          registry logical slots + activation reducers
                          |
                          v
-           dependency receipts + dispatch waves
+ inventory + interference + budgets -> frozen physical waves
                          |
                          v
-              terminal evidence receipts
+       terminal + reset + budget-observation receipts
                          |
                          v
-        derived statistics + GPU attestation + gate
+ family power + dependence-aware statistics + trusted attestation
 ```
 
 TP2 and sticky DP2 fields are target registry/CPU-coordinator vocabulary. The
@@ -161,13 +236,37 @@ Target-only and Static render without an adaptation object or reserve. TTS and
 L0 target declarations share a Full/LoRA candidate from registered native
 layer scopes. Rendering is pure planning: in the current release only
 Target-only may proceed through industrial execution. Static/TTS/L0 fail the
-native terminal-evidence preflight before an endpoint starts.
+trusted-terminal-attester preflight before an endpoint starts.
 
-Load screening and tuning use only their registered data windows. A later
-halving stage must bind the prior survivor artifact. `select-speed-config`
-requires complete safe coverage; `select-anchor-config` is a narrower
-reproduction route and records that it did not optimize the grid. Confirmation
-data cannot enter either selection.
+The industrial E1/E2 commands are reducer-owned. E1 consumes sealed E3a output
+and activates exactly one width/load slice. E2 materializes stage zero and then
+requires the prior sealed survivor receipt for each successive-halving round,
+while preserving matched TTS/L0 pairs and family floors. Confirmation planning
+activates four excluded pilots per exact family, seals `POWERED` with 12--20
+final blocks or `UNDERPOWERED`, and materializes only the sealed prefix before
+confirmation data is visible.
+
+Family power is never accepted as a bare score or hand-authored count:
+
+```bash
+lightcone-spec reduce-confirmation-family-power \
+  --manifest artifacts/industrial/family-power-manifest.json \
+  --output artifacts/industrial/family-power-plan.json
+```
+
+The exact `industrial_family_power_manifest` binds the registry artifact,
+pilot activation, hardware envelope, and four pilot blocks. Every pilot cell
+supplies terminal receipts, a hardware receipt, and a budget observation. The
+reducer keeps confirmation hidden and rejects missing, extra, cross-family, or
+unsafe evidence.
+
+`validate-evidence-alias` does not create scientific equivalence from labels;
+it accepts only a fully content-bound byte-equivalent receipt. The dependence
+map makes shared controls one observation for covariance/bootstrap purposes.
+Static is backend-specific and TTS/L0 are never aliases. This release's formal
+reducer rejects a non-singleton dependence unit unless the alias is recomputed
+from execution plans and terminal evidence; a self-described alias can validate
+structurally but cannot enter a claim.
 
 Every completed slice ends with content-bound evidence. A resume skips it only
 after manifest/config/method/block/data/trace and every shard digest validate.
@@ -196,15 +295,15 @@ exits zero only for a complete registered pass. Valid evidence that misses a
 criterion is `BLOCKED` and also exits 42. Identity, schema, I/O, receipt, or
 runtime errors are ordinary nonzero failures, not scientific outcomes.
 The current release has no trusted hardware-attester identity, so a supplied
-legacy attestation is rejected and `analyze-industrial` remains
-`UNRESOLVED`/`UNMEASURED` with exit 42 even for self-consistent JSON.
+legacy attestation is rejected and `analyze-industrial` cannot emit `MEASURED`;
+it exits 42 even for otherwise self-consistent diagnostic JSON.
 
 The industrial registry may declare target cells as `UNMEASURED`, but that
-declarative status is not executable readiness. Executor preflight resolves
-Static/TTS/L0 to `BLOCKED` when the exact native terminal hook is absent; all
-TP2/DP2 and DSpark/EAGLE/EAGLE3/NEXTN adaptive cells are likewise blocked by
-the current schema/patch. Historical v2 artifacts are regression-only and
-cannot be supplied as schema-v3 stage receipts.
+declarative status is not executable readiness. The native hook is present;
+executor preflight resolves Static/TTS/L0 to `BLOCKED` because the trusted
+signer is absent. All TP2/DP2 and DSpark/EAGLE/EAGLE3/NEXTN adaptive cells are
+likewise blocked by separate current release gates. Historical v2 artifacts
+are regression-only and cannot be supplied as schema-v3 stage receipts.
 
 ### Target-output reference diagnostic
 

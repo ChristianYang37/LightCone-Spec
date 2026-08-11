@@ -4,18 +4,21 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "ac3393f7c1b12e801d2c5551a07257b082c66977",
+  "expected_tree": "2810ac94ed225aa78b4256ded56e78890a4a590f",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
-      "sha256": "bdb65a88518df71d33a52118acb5a858892648942b287e74345056ae9c8a6573",
+      "sha256": "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08",
       "files": [
         "python/sglang/benchmark/serving.py",
         "python/sglang/srt/arg_groups/speculative_hook.py",
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/managers/io_struct.py",
         "python/sglang/srt/managers/overlap_utils.py",
         "python/sglang/srt/managers/scheduler.py",
         "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
         "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
+        "python/sglang/srt/managers/tokenizer_control_mixin.py",
         "python/sglang/srt/mem_cache/allocation_sizing.py",
         "python/sglang/srt/mem_cache/kv_cache_configurator.py",
         "python/sglang/srt/models/deepseek_v4_dspark.py",
@@ -36,8 +39,10 @@
         "python/sglang/srt/speculative/online_adaptation_runtime.py",
         "python/sglang/srt/speculative/online_parameter_plan.py",
         "python/sglang/srt/speculative/online_valid_mask.py",
+        "python/sglang/srt/speculative/terminal_speculative_evidence.py",
         "test/registered/unit/benchmark/test_serving_output_token_ids.py",
-        "test/registered/unit/spec/test_online_adaptation_protocol.py"
+        "test/registered/unit/spec/test_online_adaptation_protocol.py",
+        "test/registered/unit/spec/test_terminal_speculative_evidence.py"
       ]
     }
   ]
