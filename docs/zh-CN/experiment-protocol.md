@@ -106,8 +106,9 @@ segments。Static 只启用聚合实验计数，绝不分配 adaptation trace bu
 
 OnlineSPEC 作为重要对比被注册在独立 manifest 与证据 namespace 下。它使用 controlled
 tuning/confirmation window，但不能读取核心 TTS/L0 tuning row 或 confirmation 结果。
-三种 learner 在 successive halving 中各自独立缩减，随后每种 learner 选择一个安全配置，
-并与配对 Static reference 比较。
+三种 learner 在 successive halving 中各自独立缩减。OnlineSPEC 使用写入 manifest identity
+的长轨迹阶段：2/16K、4/24K、8/32K 和 16/40,928（prompt 数/context），不复用核心实验
+4K/8K 的早期阶段；随后每种 learner 选择一个安全配置，并与配对 Static reference 比较。
 
 Confirmation 在每种方法中将 32 个 held-out prompt 各提交一次并进入同一个 SGLang queue，
 同时使用八个随机 block、相同 seed、一个锁定 concurrency，以及相同的 16K 到安全上限

@@ -29,6 +29,7 @@ from lightcone_spec.experiments.evidence import (
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_METHODS,
     ONLINE_SPEC_STUDY_METHODS,
+    ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecCandidate,
     OnlineSpecGpuAttestation,
     OnlineSpecManifest,
@@ -36,6 +37,7 @@ from lightcone_spec.experiments.onlinespec import (
     OnlineSpecTuningMeasurement,
     compare_onlinespec,
     onlinespec_candidates,
+    onlinespec_tuning_stage,
     reduce_onlinespec_tuning_stage,
     select_onlinespec,
     select_onlinespec_heldout_anchor,
@@ -692,7 +694,7 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
         or value.get("sampling_profile_sha256") != sampling.sha256
         or value.get("window_sha256") != manifest.tuning_window_sha256
         or value.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
-        or value.get("stage") != len(TUNING_STAGES) - 1
+        or value.get("stage") != len(ONLINE_SPEC_TUNING_STAGES) - 1
         or value.get("next_stage") is not None
         or not _is_lower_sha256(value.get("prior_stage_sha256"))
         or value.get("concurrency") != core_selection.selected_concurrency
@@ -753,7 +755,9 @@ def _select_onlinespec_anchor(args: argparse.Namespace) -> int:
     ):
         raise ValueError("OnlineSPEC anchor requires one candidate per learner")
     measurements = tuple(SliceMeasurement.load(path) for path in args.measurements)
-    expected_count, expected_context = tuning_stage(len(TUNING_STAGES) - 1)
+    expected_count, expected_context = onlinespec_tuning_stage(
+        len(ONLINE_SPEC_TUNING_STAGES) - 1
+    )
     expected_window = sample_set_sha256(
         LongContinuationAdapter().window("tune")[:expected_count]
     )
@@ -1233,7 +1237,7 @@ def _run_onlinespec_tuning_slice(args: argparse.Namespace) -> int:
         raise ValueError("OnlineSPEC tuning uses another sampling profile")
     config = _load_bound_run_config(args.config)
     _assert_locked_config(config, model_lock=lock, sampling_profile=sampling)
-    prompt_count, context_limit = tuning_stage(args.stage)
+    prompt_count, context_limit = onlinespec_tuning_stage(args.stage)
     samples = LongContinuationAdapter().window("tune")[:prompt_count]
     candidate = None
     if args.method == "static":
@@ -1281,7 +1285,7 @@ def _run_onlinespec_tuning_slice(args: argparse.Namespace) -> int:
 
 def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
     manifest = OnlineSpecManifest.load(args.manifest)
-    tuning_stage(args.stage)
+    onlinespec_tuning_stage(args.stage)
     grid = {candidate.candidate_id: candidate for candidate in onlinespec_candidates()}
     prior = None
     if args.stage == 0:
@@ -1321,7 +1325,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
         or prior.get("concurrency") != concurrency
     ):
         raise ValueError("OnlineSPEC tuning changed its model lock or load")
-    prompt_count, _ = tuning_stage(args.stage)
+    prompt_count, _ = onlinespec_tuning_stage(args.stage)
     expected_window = sample_set_sha256(
         LongContinuationAdapter().window("tune")[:prompt_count]
     )
@@ -1338,7 +1342,11 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
         active_candidate_ids=active,
         stage=args.stage,
     )
-    next_stage = args.stage + 1 if args.stage + 1 < len(TUNING_STAGES) else None
+    next_stage = (
+        args.stage + 1
+        if args.stage + 1 < len(ONLINE_SPEC_TUNING_STAGES)
+        else None
+    )
     artifact = {
         "schema_version": 2,
         "phase": "onlinespec_tuning",

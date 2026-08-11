@@ -258,9 +258,13 @@ generated text is not retained. Stochastic exactness is verified separately.
 The protocol preserves
 separate evidence identities:
 
-1. Run successive-halving tuning on the tuning-only window. Halving occurs
-   independently inside OGD, optimistic OGD, and Hedge so one learner cannot
-   eliminate another.
+1. Run successive-halving tuning on the tuning-only window. Its resource
+   schedule is `(2 prompts, 16K)`, `(4, 24K)`, `(8, 32K)`, and
+   `(16, 40,928)`. Starting at the registered 16K headline boundary prevents
+   short-context performance from eliminating a learner that needs a longer
+   online trajectory to become useful. The complete schedule is part of the
+   manifest identity. Halving occurs independently inside OGD, optimistic OGD,
+   and Hedge so one learner cannot eliminate another.
 2. Select one safe candidate per learner. The CLI requires the core
    Static/TTS/L0 selection, inherits its selected concurrency, and recursively
    binds its SHA-256. The OnlineSPEC selection also binds the complete terminal

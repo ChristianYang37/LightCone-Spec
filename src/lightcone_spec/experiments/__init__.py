@@ -3,6 +3,7 @@
 from .data import ControlledWindow, LongContinuationAdapter
 from .evidence import GpuEvidenceAttestation, evidence_files_sha256
 from .onlinespec import (
+    ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecCandidate,
     OnlineSpecGpuAttestation,
     OnlineSpecManifest,
@@ -10,6 +11,7 @@ from .onlinespec import (
     OnlineSpecTuningMeasurement,
     compare_onlinespec,
     onlinespec_candidates,
+    onlinespec_tuning_stage,
     select_onlinespec,
     select_onlinespec_heldout_anchor,
 )
@@ -29,6 +31,7 @@ from .selection import (
 from .statistics import PairwiseSpeedGate, SpeedGate, evaluate_speed_gate
 
 __all__ = [
+    "ONLINE_SPEC_TUNING_STAGES",
     "CandidateMeasurement",
     "ConfirmationBlock",
     "ControlledWindow",
@@ -49,6 +52,7 @@ __all__ = [
     "evaluate_speed_gate",
     "evidence_files_sha256",
     "onlinespec_candidates",
+    "onlinespec_tuning_stage",
     "select_heldout_anchor",
     "select_onlinespec",
     "select_onlinespec_heldout_anchor",

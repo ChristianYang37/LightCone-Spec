@@ -215,7 +215,10 @@ hot path 外排空有界 device buffer。
 遵循相同 target-token 轨迹；任何计时比较前都会验证配对输出摘要，且不保留原始生成文本。
 Stochastic exactness 单独验证。协议仍保持独立证据身份：
 
-1. 只在 tuning window 执行 successive halving。OGD、optimistic OGD 与 Hedge 各自
+1. 只在 tuning window 执行 successive halving。资源阶段固定为
+   `(2 个 prompt, 16K)`、`(4, 24K)`、`(8, 32K)` 与 `(16, 40,928)`；从已注册的
+   16K headline 边界开始，避免短上下文性能提前淘汰需要更长在线轨迹才产生收益的
+   learner。完整阶段表属于 manifest identity。OGD、optimistic OGD 与 Hedge 各自
    独立减半，避免一个 learner 淘汰另一个 learner。
 2. 为每个 learner 选择一个安全 candidate。CLI 强制接收核心 Static/TTS/L0
    selection，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning

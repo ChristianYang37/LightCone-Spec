@@ -23,11 +23,13 @@ from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_SOURCE_AUDIT_SHA256,
     ONLINE_SPEC_STUDY_METHODS,
     ONLINE_SPEC_TREE,
+    ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecManifest,
     OnlineSpecSelection,
     OnlineSpecTuningMeasurement,
     compare_onlinespec,
     onlinespec_candidates,
+    onlinespec_tuning_stage,
     reduce_onlinespec_tuning_stage,
     select_onlinespec,
     select_onlinespec_heldout_anchor,
@@ -35,7 +37,6 @@ from lightcone_spec.experiments.onlinespec import (
 )
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
-    TUNING_STAGES,
     onlinespec_blocks,
     tuning_candidates,
 )
@@ -62,11 +63,26 @@ def test_onlinespec_manifest_pins_clean_room_provenance(tmp_path) -> None:
     assert manifest.claim_scope == ONLINE_SPEC_CLAIM_SCOPE
     assert manifest.source_audit_sha256 == ONLINE_SPEC_SOURCE_AUDIT_SHA256
     assert manifest.methods == ONLINE_SPEC_STUDY_METHODS
+    assert manifest.tuning_stages == ONLINE_SPEC_TUNING_STAGES
+    assert tuple(map(onlinespec_tuning_stage, range(4))) == (
+        (2, 16384),
+        (4, 24576),
+        (8, 32768),
+        (16, DFLASH_SAFE_CONTEXT_LIMIT),
+    )
     path = tmp_path / "onlinespec.json"
     manifest.write(path)
     assert OnlineSpecManifest.load(path) == manifest
     with pytest.raises(ValueError, match="registered protocol"):
         replace(manifest, official_commit="f" * 40).validate()
+    with pytest.raises(ValueError, match="registered protocol"):
+        replace(
+            manifest,
+            tuning_stages=((2, 4096), *ONLINE_SPEC_TUNING_STAGES[1:]),
+        ).validate()
+    for invalid_stage in (-1, len(ONLINE_SPEC_TUNING_STAGES)):
+        with pytest.raises(ValueError, match="OnlineSPEC tuning stage"):
+            onlinespec_tuning_stage(invalid_stage)
 
 
 def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
@@ -309,7 +325,7 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
         "sampling_profile_sha256": sampling.sha256,
         "window_sha256": manifest.tuning_window_sha256,
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
-        "stage": len(TUNING_STAGES) - 1,
+        "stage": len(ONLINE_SPEC_TUNING_STAGES) - 1,
         "next_stage": None,
         "prior_stage_sha256": "e" * 64,
         "concurrency": 8,
@@ -354,7 +370,7 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
     for index, row in enumerate(anchor_rows):
         terminal_row = replace(
             row,
-            stage=len(TUNING_STAGES) - 1,
+            stage=len(ONLINE_SPEC_TUNING_STAGES) - 1,
             manifest_sha256=manifest.sha256,
             model_lock_sha256=lock.sha256,
             sampling_profile_sha256=sampling.sha256,
@@ -430,7 +446,7 @@ def tuning_slice(candidate, goodput, *, static=False, unsafe=False) -> SliceMeas
         window_sha256="f" * 64,
         output_set_sha256="1" * 64,
         prompt_count=2,
-        context_limit=4096,
+        context_limit=ONLINE_SPEC_TUNING_STAGES[0][1],
         concurrency=8,
         decode_goodput_tps=goodput,
         itl_p99_ms=2.0,
@@ -467,7 +483,7 @@ def test_onlinespec_anchor_requires_safe_terminal_paired_measurements() -> None:
     rows = [
         replace(
             row,
-            stage=len(TUNING_STAGES) - 1,
+            stage=len(ONLINE_SPEC_TUNING_STAGES) - 1,
             prompt_count=16,
             context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
         )
@@ -535,6 +551,13 @@ def test_onlinespec_tuning_halves_each_learner_without_confirmation_leakage() ->
     with pytest.raises(ValueError, match="another OnlineSPEC stage"):
         reduce_onlinespec_tuning_stage(
             [replace(slices[0], stage=1), *slices[1:]],
+            candidates=grid,
+            active_candidate_ids=tuple(grid),
+            stage=0,
+        )
+    with pytest.raises(ValueError, match="another OnlineSPEC stage"):
+        reduce_onlinespec_tuning_stage(
+            [replace(slices[0], context_limit=4096), *slices[1:]],
             candidates=grid,
             active_candidate_ids=tuple(grid),
             stage=0,

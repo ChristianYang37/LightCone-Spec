@@ -20,9 +20,7 @@ from lightcone_spec.experiments.data import (
 )
 from lightcone_spec.experiments.protocol import (
     FORMAL_CONCURRENCY_GRID,
-    TUNING_STAGES,
     successive_halving,
-    tuning_stage,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import SliceMeasurement
@@ -44,6 +42,25 @@ ONLINE_SPEC_METHODS = (
     "onlinespec_ens",
 )
 ONLINE_SPEC_STUDY_METHODS = ("static", *ONLINE_SPEC_METHODS)
+# OnlineSPEC candidates can be intentionally weak near the origin and become
+# useful only after enough online feedback has accumulated.  Its resource axis
+# therefore starts at the headline region instead of borrowing the core
+# Static/TTS/L0 4K/8K stages.  Prompt count still grows by successive halving,
+# while every survivor is measured on an increasingly long tuning trajectory
+# that remains disjoint from confirmation.  The complete schedule is also
+# embedded in the manifest below.
+ONLINE_SPEC_TUNING_STAGES = (
+    (2, 16384),
+    (4, 24576),
+    (8, 32768),
+    (16, DFLASH_SAFE_CONTEXT_LIMIT),
+)
+
+
+def onlinespec_tuning_stage(stage: int) -> tuple[int, int]:
+    if stage not in range(len(ONLINE_SPEC_TUNING_STAGES)):
+        raise ValueError("OnlineSPEC tuning stage must be in [0, 4)")
+    return ONLINE_SPEC_TUNING_STAGES[stage]
 
 
 def _git_output(checkout: Path, *args: str) -> str:
@@ -334,6 +351,7 @@ class OnlineSpecManifest:
     claim_scope: str
     source_audit_sha256: str
     tuning_grid_sha256: str
+    tuning_stages: tuple[tuple[int, int], ...]
     sampling_profile_sha256: str
     tuning_window_sha256: str
     confirmation_window_sha256: str
@@ -368,6 +386,7 @@ class OnlineSpecManifest:
             tuning_grid_sha256=_sha256_value(
                 [asdict(candidate) for candidate in onlinespec_candidates()]
             ),
+            tuning_stages=ONLINE_SPEC_TUNING_STAGES,
             sampling_profile_sha256=SamplingProfile().sha256,
             tuning_window_sha256=sample_set_sha256(data.window("tune")),
             confirmation_window_sha256=sample_set_sha256(data.window("confirm")),
@@ -404,6 +423,10 @@ class OnlineSpecManifest:
                 **value,
                 "methods": tuple(value["methods"]),
                 "phases": tuple(value["phases"]),
+                "tuning_stages": tuple(
+                    tuple(int(item) for item in stage)
+                    for stage in value["tuning_stages"]
+                ),
             }
         )
         artifact.validate()
@@ -467,7 +490,7 @@ def reduce_onlinespec_tuning_stage(
     stage: int,
 ) -> tuple[tuple[str, ...], tuple[OnlineSpecTuningMeasurement, ...]]:
     """Validate one paired stage and halve candidates within each learner."""
-    prompt_count, context_limit = tuning_stage(stage)
+    prompt_count, context_limit = onlinespec_tuning_stage(stage)
     active = tuple(active_candidate_ids)
     if not active or len(active) != len(set(active)):
         raise ValueError("active OnlineSPEC candidates must be unique")
@@ -567,7 +590,7 @@ def reduce_onlinespec_tuning_stage(
         safe_ids = tuple(safe_by_method[method])
         survivors.extend(
             safe_ids
-            if stage == len(TUNING_STAGES) - 1
+            if stage == len(ONLINE_SPEC_TUNING_STAGES) - 1
             else successive_halving(safe_ids, scores)
         )
     return tuple(sorted(survivors)), tuple(
@@ -737,7 +760,7 @@ def select_onlinespec_heldout_anchor(
         rows,
         candidates=candidates,
         active_candidate_ids=tuple(candidates),
-        stage=len(TUNING_STAGES) - 1,
+        stage=len(ONLINE_SPEC_TUNING_STAGES) - 1,
     )
     if survivors != tuple(sorted(candidates)):
         raise ValueError("an OnlineSPEC anchor failed its terminal safety gate")

@@ -133,8 +133,11 @@ once per round. Acceptance alone is not a speed claim.
 OnlineSPEC is registered as an important comparison with a separate manifest
 and evidence namespace. It uses the controlled tuning and confirmation windows
 but cannot consume core TTS/L0 tuning rows or confirmation outcomes. Its three
-learners are reduced independently during successive halving, then one safe
-configuration per learner is compared with a paired Static reference.
+learners are reduced independently during successive halving. OnlineSPEC owns
+a manifest-bound long-trajectory schedule of 2/16K, 4/24K, 8/32K, and
+16/40,928 prompt/context pairs; it does not reuse the core study's 4K/8K early
+stages. One safe configuration per learner is then compared with a paired
+Static reference.
 
 Confirmation uses 32 held-out prompts submitted once per method to one SGLang
 queue, eight randomized blocks, identical seeds, one locked concurrency, and
