@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .records import (
+    OUTPUT_HASH_FORMAT,
     PerformanceRecord,
     RequestRecord,
     RoundRecord,
@@ -469,6 +470,19 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
                 raise RuntimeError(f"receipt has inconsistent coverage for {table}")
     for table, shard in resolved.items():
         _read_identity_columns(shard, table=table, run_id=run_id, method=method)
+    if schema_version == 3:
+        try:
+            formats = pq.read_table(
+                resolved["request"], columns=["output_hash_format"]
+            ).column("output_hash_format")
+        except (KeyError, pa.ArrowException) as exc:
+            raise RuntimeError(
+                f"completed request evidence lacks its output hash format {path}"
+            ) from exc
+        if len(formats) == 0 or any(
+            value.as_py() != OUTPUT_HASH_FORMAT for value in formats
+        ):
+            raise RuntimeError(f"completed request evidence has a wrong hash format {path}")
     return resolved
 
 
@@ -578,6 +592,7 @@ class EvidenceWriter:
         self._methods_by_table = {
             table: set() for table in ("run", "request", "performance")
         }
+        self._request_hash_formats: set[str] = set()
         self._run_record: dict[str, object] | None = None
         self._flushes = 0
         self._backpressure_events = 0
@@ -736,6 +751,8 @@ class EvidenceWriter:
         )
         if table in self._methods_by_table:
             self._methods_by_table[table].add(str(row["method"]))
+        if table == "request":
+            self._request_hash_formats.add(str(row["output_hash_format"]))
         if table == "run":
             self._run_record = row
         if self._queued_rows >= self.row_group_rows:
@@ -789,6 +806,7 @@ class EvidenceWriter:
             or self._methods_by_table["run"] != {method}
             or self._methods_by_table["request"] != {method}
             or self._methods_by_table["performance"] != {method}
+            or self._request_hash_formats != {OUTPUT_HASH_FORMAT}
         ):
             raise RuntimeError(
                 "evidence tables do not satisfy the method completion contract"

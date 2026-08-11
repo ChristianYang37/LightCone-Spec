@@ -8,6 +8,7 @@ import pytest
 
 import lightcone_spec.telemetry.writer as writer_module
 from lightcone_spec.telemetry import (
+    OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
     RequestRecord,
@@ -47,6 +48,7 @@ def request_record(
         concurrency=1,
         input_tokens=2,
         output_tokens=4,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         output_sha256="c" * 64,
         ttft_ms=1.0,
         finished=True,

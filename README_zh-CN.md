@@ -169,6 +169,12 @@ Parquet 输入时，gate 才可能返回 `PASS`。本地 mock、历史 v2 eviden
 `UNMEASURED`。本 release 故意未配置 trusted hardware attester；caller-authored
 doctor/attestation JSON 会被拒绝，任何 analyzer 都不能产生新的 `MEASURED` GPU outcome。
 
+对于 exactness 诊断，`run-target-reference` 可以捕获一份锁定的 Target-only greedy
+reference；每个 prompt 的 output 是完整有序 token-ID 轨迹带格式标识的 hash。Legacy
+collector 要求每种 method 的每个 block 都匹配该 reference；解码文本一致或仅 speculative
+method 彼此一致都不充分。该 reference 只能增强 `UNMEASURED` 诊断：它不会让
+Static/TTS/L0 变得可执行，也不能替代缺失的 trusted attester。
+
 ## 文档
 
 - [架构](docs/zh-CN/architecture.md)

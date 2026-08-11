@@ -56,7 +56,7 @@ from lightcone_spec.runtime.distributed import (
     TopologyIdentity,
     TopologyReceiptSet,
 )
-from lightcone_spec.telemetry.records import RequestRecord
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT, RequestRecord
 from lightcone_spec.telemetry.writer import EvidenceWriter, load_completed_evidence
 
 
@@ -654,6 +654,7 @@ def test_async_evidence_saturation_persists_triggering_terminal_row(
             concurrency=1,
             input_tokens=1,
             output_tokens=1,
+            output_hash_format=OUTPUT_HASH_FORMAT,
             output_sha256=digest,
             ttft_ms=1.0,
             finished=True,

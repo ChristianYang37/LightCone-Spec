@@ -39,6 +39,7 @@ from lightcone_spec.experiments.registry import (
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
 from lightcone_spec.telemetry import (
+    OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
     RequestRecord,
@@ -455,6 +456,7 @@ def _build_evidence(
                     concurrency=1,
                     input_tokens=128,
                     output_tokens=100,
+                    output_hash_format=OUTPUT_HASH_FORMAT,
                     output_sha256=output_token_ids_sha256,
                     ttft_ms=1.0,
                     finished=True,

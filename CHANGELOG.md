@@ -72,6 +72,13 @@ No unreleased entries.
 - Kept the clean-room OnlineSPEC comparison isolated under its own tuning,
   evidence, attestation, and analysis identities; it cannot alter the core
   selection or gate.
+- Required a target-only greedy reference artifact in both formal
+  diagnostic collectors and analyzers; it cannot mint `MEASURED` evidence in
+  this release.
+- Made cross-method output agreement insufficient for exactness: every formal
+  method/block must also match the locked target-only trajectory.
+- Replaced decoded-text output digests with format-tagged hashes of complete
+  output-token-ID trajectories so formal exactness cannot alias two tokenizations.
 
 ### Evidence status
 

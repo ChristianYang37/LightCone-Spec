@@ -19,6 +19,7 @@ from lightcone_spec.experiments.registry import (
     build_industrial_registry,
 )
 from lightcone_spec.telemetry import (
+    OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
     RequestRecord,
@@ -214,6 +215,7 @@ def _request(
         concurrency=1,
         input_tokens=1,
         output_tokens=1 if finished else 0,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         output_sha256=output_sha256,
         ttft_ms=ttft_ms,
         finished=finished,

@@ -30,6 +30,7 @@ authority. The schema-v3 and industrial commands are:
 | `render-runtime` | Emit matched sequential core configs and launch argv |
 | `build-confirmation-queue` | Materialize clean-server confirmation jobs |
 | `run-confirmation` | Execute one method/block confirmation slice |
+| `run-target-reference` | Capture a locked Target-only greedy token-ID trajectory diagnostic |
 | `collect-speed-study` | Derive a table from completed receipt-bound evidence |
 | `render-replication-runtime` | Render natural-task or profiler-only slices |
 | `run-natural-slice` | Run one locked natural-task slice |
@@ -204,6 +205,17 @@ Static/TTS/L0 to `BLOCKED` when the exact native terminal hook is absent; all
 TP2/DP2 and DSpark/EAGLE/EAGLE3/NEXTN adaptive cells are likewise blocked by
 the current schema/patch. Historical v2 artifacts are regression-only and
 cannot be supplied as schema-v3 stage receipts.
+
+### Target-output reference diagnostic
+
+Against a separate locked Target-only server, `run-target-reference` records
+per-prompt token counts and format-tagged SHA-256 values of complete ordered
+output-token-ID arrays. It never substitutes a decoded-text digest. Legacy
+collectors require `--target-reference` and reject a method/block unless its
+trajectory matches the reference; agreement among speculative methods alone is
+not an exactness proof. In this release the result remains an `UNMEASURED`
+diagnostic because Static/TTS/L0 execution and trusted hardware attestation are
+both blocked.
 
 ## Credentials and output roots
 

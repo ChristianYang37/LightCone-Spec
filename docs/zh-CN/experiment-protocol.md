@@ -79,6 +79,13 @@ long-input/short-output、short-input/long-generation、multi-turn shared-prefix
 DFlash draft width 为 4、8、16。E3b 分别报告 matched-width 与 deployment-optimal-width
 panel；看到 confirmation 后再改变 width 属于禁止行为。
 
+Controlled profile 使用 greedy。Exactness 诊断会给每条完整、有序 output-token-ID 轨迹
+加显式格式标识后计算 hash；decoded text 不能作为 exactness witness。Legacy formal
+collection 还会绑定一份在相同 load 与安全 context 上限捕获的 32-prompt Target-only greedy
+reference，并要求每种 method 的每个 block 都与之匹配；仅 cross-method agreement 不充分。
+该 reference 在当前 release 中仍只是 `UNMEASURED` 诊断，不能绕过 speculative execution
+或 attestation blocker。
+
 Production trace 分离 content identity 与 arrival identity。Open-loop Poisson、immediate
 burst、BurstGPT-shaped 与 soak trace 绑定准确 arrival offset。Closed-loop run 改为绑定最大
 request pool、population 与每个 client 的顺序；每次实际 offer 必须晚于该 client 上一次
@@ -159,9 +166,9 @@ attempt 保持可审计，但其 row 被排除。Resume 只跳过一个完整身
 前的 `BLOCKED` outcome，不代表可以合成或省略 evidence。
 
 Empirical gate 还要求 attestation 绑定 registry/manifest、selection/stage receipt、准确
-runtime/capability 与 patched tree、model/tokenizer/data/trace identity、hardware/power
-report 及每个 final Parquet digest。缺少它时，即使本地算术为正，状态仍为 `UNMEASURED`；
-有效 attested evidence 未通过注册标准时为 `BLOCKED`。仓库只包含协议代码，不包含性能
-结论或 result artifact；本 release 也不包含任何 GPU 结果。
+runtime/capability 与 patched tree、model/tokenizer/data/trace identity、Target-only
+reference、hardware/power report 及每个 final Parquet digest。缺少它时，即使本地算术为正，
+状态仍为 `UNMEASURED`；有效 attested evidence 未通过注册标准时为 `BLOCKED`。仓库只包含
+协议代码，不包含性能结论或 result artifact；本 release 也不包含任何 GPU 结果。
 本 release 未配置 trusted hardware-attester identity，因此内容自洽但由 caller 编写的
 attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`。

@@ -30,6 +30,7 @@ industrial 命令包括：
 | `render-runtime` | 生成 matched sequential 核心 config 与 launch argv |
 | `build-confirmation-queue` | 生成 clean-server confirmation job |
 | `run-confirmation` | 执行一个 method/block confirmation slice |
+| `run-target-reference` | 捕获锁定的 Target-only greedy token-ID 轨迹诊断 |
 | `collect-speed-study` | 从 completed receipt-bound evidence 派生 table |
 | `render-replication-runtime` | 渲染 natural-task 或 profiler-only slice |
 | `run-natural-slice` | 运行一个 locked natural-task slice |
@@ -189,6 +190,15 @@ executable readiness。准确 native terminal hook 缺失时，executor prefligh
 Static/TTS/L0 解析为 `BLOCKED`；当前 schema/patch 同样阻止全部 TP2/DP2 与
 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell。历史 v2 artifact 仅用于 regression，不能作为
 schema-v3 stage receipt。
+
+### Target-output Reference 诊断
+
+针对一个单独锁定的 Target-only server，`run-target-reference` 记录每个 prompt 的 token
+数量，以及完整有序 output-token-ID 数组带格式标识的 SHA-256；它绝不会用 decoded-text
+digest 替代。Legacy collector 要求 `--target-reference`，任何 method/block 的轨迹不匹配
+reference 都会被拒绝；仅 speculative method 彼此一致不能证明 exactness。在本 release
+中，该结果仍只是 `UNMEASURED` 诊断，因为 Static/TTS/L0 execution 与 trusted hardware
+attestation 都处于 blocked 状态。
 
 ## Credential 与 Output Root
 

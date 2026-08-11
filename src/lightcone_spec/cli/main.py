@@ -30,6 +30,7 @@ from lightcone_spec.experiments.data import (
 )
 from lightcone_spec.experiments.evidence import (
     GpuEvidenceAttestation,
+    GreedyTargetReference,
     evidence_files_sha256,
 )
 from lightcone_spec.experiments.industrial_analysis import (
@@ -80,6 +81,7 @@ from lightcone_spec.experiments.runner import (
     collect_onlinespec_performance,
     measure_controlled_slice,
     run_confirmation_slice,
+    run_greedy_target_reference,
     run_natural_replication_slice,
     run_onlinespec_confirmation_slice,
 )
@@ -114,7 +116,7 @@ from lightcone_spec.sglang_bridge import (
     sglang_adaptation_sha256,
     verify_patched_checkout,
 )
-from lightcone_spec.telemetry import load_completed_evidence
+from lightcone_spec.telemetry import OUTPUT_HASH_FORMAT, load_completed_evidence
 
 
 def _write_json(path: str | Path, value: object) -> None:
@@ -647,6 +649,7 @@ def _formal_table_metadata(
     model_lock: ModelLock,
     config_sha256: dict[str, str],
     source_evidence_sha256: str,
+    target_reference_sha256: str,
 ) -> dict[bytes, bytes]:
     return {
         b"lightcone_schema_version": b"2",
@@ -659,6 +662,7 @@ def _formal_table_metadata(
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_sha256).encode(),
         b"lightcone_source_evidence_sha256": source_evidence_sha256.encode(),
+        b"lightcone_target_reference_sha256": target_reference_sha256.encode(),
     }
 
 
@@ -668,6 +672,7 @@ def _load_formal_table(
     manifest: SpeedStudyManifest,
     selection: SelectionArtifact,
     model_lock: ModelLock,
+    target_reference: GreedyTargetReference,
 ) -> pa.Table:
     table = pq.read_table(path)
     metadata = table.schema.metadata or {}
@@ -680,6 +685,7 @@ def _load_formal_table(
             manifest.sampling_profile_sha256.encode()
         ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
+        b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
     if any(metadata.get(key) != value for key, value in expected.items()):
         raise ValueError("formal speed table identity metadata mismatch")
@@ -995,6 +1001,15 @@ def _parser() -> argparse.ArgumentParser:
     run_online.add_argument("--output-root", required=True)
     run_online.add_argument("--no-warmup", action="store_true")
 
+    target_reference = commands.add_parser("run-target-reference")
+    target_reference.add_argument("--model-lock", required=True)
+    target_reference.add_argument("--sampling-profile", required=True)
+    target_reference.add_argument("--url", required=True)
+    target_reference.add_argument("--concurrency", type=int, required=True)
+    target_reference.add_argument("--doctor-json", required=True)
+    target_reference.add_argument("--output", required=True)
+    target_reference.add_argument("--no-warmup", action="store_true")
+
     collect = commands.add_parser("collect-speed-study")
     collect.add_argument("--manifest", required=True)
     collect.add_argument("--selection", required=True)
@@ -1003,6 +1018,7 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--tts-config", required=True)
     collect.add_argument("--l0-config", required=True)
     collect.add_argument("--evidence-root", required=True)
+    collect.add_argument("--target-reference", required=True)
     collect.add_argument("--output", required=True)
 
     collect_online = commands.add_parser("collect-onlinespec-study")
@@ -1014,6 +1030,7 @@ def _parser() -> argparse.ArgumentParser:
     collect_online.add_argument("--opt-config", required=True)
     collect_online.add_argument("--ens-config", required=True)
     collect_online.add_argument("--evidence-root", required=True)
+    collect_online.add_argument("--target-reference", required=True)
     collect_online.add_argument("--output", required=True)
 
     queue = commands.add_parser("build-confirmation-queue")
@@ -1039,6 +1056,7 @@ def _parser() -> argparse.ArgumentParser:
     attest.add_argument("--selection", required=True)
     attest.add_argument("--model-lock", required=True)
     attest.add_argument("--performance", required=True)
+    attest.add_argument("--target-reference", required=True)
     attest.add_argument("--doctor-json", required=True)
     attest.add_argument("--output", required=True)
 
@@ -1047,6 +1065,7 @@ def _parser() -> argparse.ArgumentParser:
     attest_online.add_argument("--selection", required=True)
     attest_online.add_argument("--model-lock", required=True)
     attest_online.add_argument("--performance", required=True)
+    attest_online.add_argument("--target-reference", required=True)
     attest_online.add_argument("--doctor-json", required=True)
     attest_online.add_argument("--output", required=True)
 
@@ -1055,6 +1074,7 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--manifest", required=True)
     analyze.add_argument("--selection", required=True)
     analyze.add_argument("--model-lock", required=True)
+    analyze.add_argument("--target-reference", required=True)
     analyze.add_argument("--attestation")
     analyze.add_argument("--output", required=True)
     analyze.add_argument("--bootstrap-seed", type=int, default=0)
@@ -1064,6 +1084,7 @@ def _parser() -> argparse.ArgumentParser:
     analyze_online.add_argument("--manifest", required=True)
     analyze_online.add_argument("--selection", required=True)
     analyze_online.add_argument("--model-lock", required=True)
+    analyze_online.add_argument("--target-reference", required=True)
     analyze_online.add_argument("--attestation")
     analyze_online.add_argument("--output", required=True)
     analyze_online.add_argument("--bootstrap-seed", type=int, default=0)
@@ -1626,6 +1647,51 @@ def _assert_locked_config(
         raise ValueError("run config does not match the immutable model lock")
 
 
+def _load_target_reference(
+    path: str | Path,
+    *,
+    model_lock: ModelLock,
+    sampling_profile_sha256: str,
+    concurrency: int,
+) -> GreedyTargetReference:
+    revisions = {model.model_id: model.revision for model in model_lock.models}
+    target_revision = revisions.get("Qwen/Qwen3-8B")
+    if target_revision is None:
+        raise ValueError("model lock lacks the formal Qwen3-8B target")
+    reference = GreedyTargetReference.load(path)
+    reference.verify_study(
+        model_lock_sha256=model_lock.sha256,
+        target_revision=target_revision,
+        sampling_profile_sha256=sampling_profile_sha256,
+        window_sha256=LongContinuationAdapter().window_sha256("confirm"),
+        concurrency=concurrency,
+    )
+    return reference
+
+
+def _load_patched_gpu_doctor(path: str | Path, *, purpose: str) -> dict:
+    hardware = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(hardware, dict):
+        raise TypeError(f"{purpose} doctor evidence is not an object")
+    commands = hardware.get("commands")
+    if not isinstance(commands, dict):
+        raise TypeError(f"{purpose} doctor commands are malformed")
+    nvidia = commands.get("nvidia_smi")
+    source_tree = hardware.get("source_tree")
+    if not isinstance(nvidia, str) or not nvidia.strip():
+        raise ValueError(f"{purpose} requires a successful nvidia-smi report")
+    if (
+        not isinstance(source_tree, dict)
+        or source_tree.get("is_git_checkout") is not True
+        or source_tree.get("tree") != PINNED_SGLANG_TREE
+        or source_tree.get("dirty") is not False
+        or source_tree.get("pinned_ancestor") is not True
+        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
+    ):
+        raise ValueError(f"{purpose} requires the exact clean patched checkout")
+    return hardware
+
+
 def _run_confirmation(args: argparse.Namespace) -> int:
     manifest, selection, model_lock, sampling_profile = _confirmation_inputs(args)
     config = _load_bound_run_config(args.config)
@@ -1923,6 +1989,31 @@ def _run_onlinespec_confirmation(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_target_reference(args: argparse.Namespace) -> int:
+    lock = ModelLock.load(args.model_lock)
+    sampling = SamplingProfile.load(args.sampling_profile)
+    hardware = _load_patched_gpu_doctor(
+        args.doctor_json,
+        purpose="target reference",
+    )
+    revisions = {model.model_id: model.revision for model in lock.models}
+    target_revision = revisions.get("Qwen/Qwen3-8B")
+    if target_revision is None:
+        raise ValueError("model lock lacks the formal Qwen3-8B target")
+    artifact = run_greedy_target_reference(
+        client=SGLangHTTPClient(args.url),
+        model_lock_sha256=lock.sha256,
+        target_revision=target_revision,
+        hardware_sha256=_canonical_sha256(hardware),
+        concurrency=args.concurrency,
+        sampling_profile=sampling,
+        warmup=not args.no_warmup,
+    )
+    artifact.write(args.output)
+    print(artifact.sha256)
+    return 0
+
+
 def _confirmation_configs(args: argparse.Namespace) -> dict:
     return {
         "static": _load_bound_run_config(args.static_config),
@@ -1975,6 +2066,17 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
         selected_candidate=selection.candidate,
         selected_concurrency=selection.selected_concurrency,
     )
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=model_lock,
+        sampling_profile_sha256=manifest.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
+    target_revision = next(
+        model.revision
+        for model in model_lock.models
+        if model.model_id == "Qwen/Qwen3-8B"
+    )
     performance, source_evidence_sha256 = collect_confirmation_performance(
         evidence_root=args.evidence_root,
         manifest_sha256=manifest.sha256,
@@ -1982,6 +2084,10 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
             method: run_config_sha256(config) for method, config in configs.items()
         },
         concurrency=selection.selected_concurrency,
+        target_reference=target_reference,
+        model_lock_sha256=model_lock.sha256,
+        sampling_profile_sha256=manifest.sampling_profile_sha256,
+        target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
     table = table.replace_schema_metadata(
@@ -1993,6 +2099,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
                 method: run_config_sha256(config) for method, config in configs.items()
             },
             source_evidence_sha256=source_evidence_sha256,
+            target_reference_sha256=target_reference.sha256,
         )
     )
     output = Path(args.output)
@@ -2002,6 +2109,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
             manifest=manifest,
             selection=selection,
             model_lock=model_lock,
+            target_reference=target_reference,
         )
         if existing.schema.metadata == table.schema.metadata and existing.equals(table):
             print(output)
@@ -2039,11 +2147,26 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
     config_hashes = {
         method: run_config_sha256(config) for method, config in configs.items()
     }
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=lock,
+        sampling_profile_sha256=selection.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
+    target_revision = next(
+        model.revision
+        for model in lock.models
+        if model.model_id == "Qwen/Qwen3-8B"
+    )
     performance, evidence_sha256 = collect_onlinespec_performance(
         evidence_root=args.evidence_root,
         manifest_sha256=manifest.sha256,
         config_sha256=config_hashes,
         concurrency=selection.selected_concurrency,
+        target_reference=target_reference,
+        model_lock_sha256=lock.sha256,
+        sampling_profile_sha256=selection.sampling_profile_sha256,
+        target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
     metadata = {
@@ -2056,6 +2179,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_hashes).encode(),
         b"lightcone_source_evidence_sha256": evidence_sha256.encode(),
+        b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
     table = table.replace_schema_metadata(metadata)
     output = Path(args.output)
@@ -2745,18 +2869,27 @@ def _attest(args: argparse.Namespace) -> int:
     drafter_revision = revisions.get("z-lab/Qwen3-8B-DFlash-b16")
     if target_revision is None or drafter_revision is None:
         raise ValueError("model lock lacks the formal Qwen3-8B/DFlash pair")
-    _load_formal_table(
-        args.performance,
-        manifest=manifest,
-        selection=selection,
-        model_lock=model_lock,
-    )
     hardware = _validate_attestation_doctor(
         json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
         label="GPU",
     )
     if _TRUSTED_HARDWARE_ATTESTER_ID is None:
         raise _trusted_attester_unavailable("legacy GPU attestation")
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=model_lock,
+        sampling_profile_sha256=manifest.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
+    _load_formal_table(
+        args.performance,
+        manifest=manifest,
+        selection=selection,
+        model_lock=model_lock,
+        target_reference=target_reference,
+    )
+    if target_reference.hardware_sha256 != _canonical_sha256(hardware):
+        raise ValueError("target reference belongs to a different GPU report")
     attestation = GpuEvidenceAttestation(
         schema_version=2,
         status="MEASURED",
@@ -2764,6 +2897,7 @@ def _attest(args: argparse.Namespace) -> int:
         selection_sha256=selection.sha256,
         model_lock_sha256=model_lock.sha256,
         performance_sha256=evidence_files_sha256((args.performance,)),
+        target_reference_sha256=target_reference.sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
         target_revision=target_revision,
         drafter_revision=drafter_revision,
@@ -2784,6 +2918,7 @@ def _onlinespec_table(
     manifest: OnlineSpecManifest,
     selection: OnlineSpecSelection,
     lock: ModelLock,
+    target_reference: GreedyTargetReference,
 ) -> pa.Table:
     table = pq.read_table(path)
     metadata = table.schema.metadata or {}
@@ -2795,6 +2930,7 @@ def _onlinespec_table(
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": selection.sampling_profile_sha256.encode(),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
+        b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
     if any(metadata.get(key) != value for key, value in expected.items()):
         raise ValueError("OnlineSPEC table identity metadata mismatch")
@@ -2806,18 +2942,27 @@ def _attest_onlinespec(args: argparse.Namespace) -> int:
     selection = OnlineSpecSelection.load(args.selection)
     lock = ModelLock.load(args.model_lock)
     _assert_onlinespec_study(manifest, selection, lock)
-    _onlinespec_table(
-        args.performance,
-        manifest=manifest,
-        selection=selection,
-        lock=lock,
-    )
     hardware = _validate_attestation_doctor(
         json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
         label="OnlineSPEC GPU",
     )
     if _TRUSTED_HARDWARE_ATTESTER_ID is None:
         raise _trusted_attester_unavailable("legacy OnlineSPEC GPU attestation")
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=lock,
+        sampling_profile_sha256=selection.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
+    _onlinespec_table(
+        args.performance,
+        manifest=manifest,
+        selection=selection,
+        lock=lock,
+        target_reference=target_reference,
+    )
+    if target_reference.hardware_sha256 != _canonical_sha256(hardware):
+        raise ValueError("target reference belongs to a different GPU report")
     attestation = OnlineSpecGpuAttestation(
         schema_version=2,
         status="MEASURED",
@@ -2825,6 +2970,7 @@ def _attest_onlinespec(args: argparse.Namespace) -> int:
         selection_sha256=selection.sha256,
         model_lock_sha256=lock.sha256,
         performance_sha256=evidence_files_sha256((args.performance,)),
+        target_reference_sha256=target_reference.sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
         hardware_sha256=_canonical_sha256(hardware),
         methods=manifest.methods,
@@ -2842,19 +2988,27 @@ def _analyze(args: argparse.Namespace) -> int:
     model_lock = ModelLock.load(args.model_lock)
     if selection.model_lock_sha256 != model_lock.sha256:
         raise ValueError("selection artifact belongs to a different model lock")
+    if args.attestation and _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        raise _trusted_attester_unavailable("legacy analysis attestation")
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=model_lock,
+        sampling_profile_sha256=manifest.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
     table = _load_formal_table(
         args.performance,
         manifest=manifest,
         selection=selection,
         model_lock=model_lock,
+        target_reference=target_reference,
     )
     evidence_state = "UNMEASURED"
     evidence_sha256 = None
     if args.attestation:
-        if _TRUSTED_HARDWARE_ATTESTER_ID is None:
-            raise _trusted_attester_unavailable("legacy analysis attestation")
         attestation = GpuEvidenceAttestation.load(args.attestation)
         attestation.verify_performance((args.performance,))
+        attestation.verify_target_reference(target_reference)
         if attestation.manifest_sha256 != manifest.sha256:
             raise ValueError("attestation manifest identity mismatch")
         if attestation.selection_sha256 != selection.sha256:
@@ -2892,19 +3046,26 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
     selection = OnlineSpecSelection.load(args.selection)
     lock = ModelLock.load(args.model_lock)
     _assert_onlinespec_study(manifest, selection, lock)
+    if args.attestation and _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        raise _trusted_attester_unavailable(
+            "legacy OnlineSPEC analysis attestation"
+        )
+    target_reference = _load_target_reference(
+        args.target_reference,
+        model_lock=lock,
+        sampling_profile_sha256=selection.sampling_profile_sha256,
+        concurrency=selection.selected_concurrency,
+    )
     table = _onlinespec_table(
         args.performance,
         manifest=manifest,
         selection=selection,
         lock=lock,
+        target_reference=target_reference,
     )
     evidence = "UNMEASURED"
     attestation_sha256 = None
     if args.attestation:
-        if _TRUSTED_HARDWARE_ATTESTER_ID is None:
-            raise _trusted_attester_unavailable(
-                "legacy OnlineSPEC analysis attestation"
-            )
         attestation = OnlineSpecGpuAttestation.load(args.attestation)
         if (
             attestation.manifest_sha256 != manifest.sha256
@@ -2912,6 +3073,7 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             or attestation.model_lock_sha256 != lock.sha256
             or attestation.performance_sha256
             != evidence_files_sha256((args.performance,))
+            or attestation.target_reference_sha256 != target_reference.sha256
         ):
             raise ValueError("OnlineSPEC attestation does not bind this table")
         evidence = "MEASURED"
@@ -3576,6 +3738,7 @@ def _completed_industrial_cells(
                 "repetition_block",
                 "finished",
                 "outcome_status",
+                "output_hash_format",
                 "output_sha256",
                 "arrival_ns",
                 "admitted_ns",
@@ -3594,6 +3757,7 @@ def _completed_industrial_cells(
             or row["repetition_block"] != cell.identity.block
             or row["outcome_status"] not in allowed_outcomes
             or row["finished"] is not (row["outcome_status"] == "completed")
+            or row["output_hash_format"] != OUTPUT_HASH_FORMAT
             or (row["completed_ns"] is None and row["outcome_status"] != "unfinished")
             or (
                 row["completed_ns"] is not None
@@ -3963,6 +4127,7 @@ def _recompute_interference_contrasts(
                     or request.get("repetition_block") != int(block_match.group(1))
                     or request.get("outcome_status") != "completed"
                     or request.get("finished") is not True
+                    or request.get("output_hash_format") != OUTPUT_HASH_FORMAT
                     or not isinstance(arrival_ns, int)
                     or isinstance(arrival_ns, bool)
                     or not isinstance(completed_ns, int)
@@ -4264,6 +4429,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_confirmation(args)
     if args.command == "run-onlinespec-confirmation":
         return _run_onlinespec_confirmation(args)
+    if args.command == "run-target-reference":
+        return _run_target_reference(args)
     if args.command == "collect-speed-study":
         return _collect_speed_study(args)
     if args.command == "collect-onlinespec-study":

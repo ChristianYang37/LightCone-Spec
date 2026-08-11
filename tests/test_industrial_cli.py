@@ -9,6 +9,7 @@ import pytest
 from lightcone_spec.cli.main import main
 from lightcone_spec.experiments.evidence import evidence_files_sha256
 from lightcone_spec.telemetry import (
+    OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
     RequestRecord,
@@ -141,6 +142,7 @@ def _completed_stage(
                 concurrency=1,
                 input_tokens=1,
                 output_tokens=1,
+                output_hash_format=OUTPUT_HASH_FORMAT,
                 output_sha256="d" * 64,
                 ttft_ms=1.0,
                 finished=True,
@@ -246,6 +248,7 @@ def _interference_condition(
                 concurrency=1,
                 input_tokens=8,
                 output_tokens=100,
+                output_hash_format=OUTPUT_HASH_FORMAT,
                 output_sha256=_sha(
                     {"condition": condition, "block": block, "rank": rank}
                 ),

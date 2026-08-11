@@ -11,10 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 from test_schema import config_value
 
-from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import (
     _advance_tuning,
     _concat_evidence_tables,
+    _load_patched_gpu_doctor,
     _static_load_rows,
     _write_json,
 )
@@ -29,6 +30,8 @@ from lightcone_spec.experiments.data import (
 )
 from lightcone_spec.experiments.evidence import (
     GpuEvidenceAttestation,
+    GreedyTargetReference,
+    TargetOutput,
     evidence_files_sha256,
 )
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
@@ -63,6 +66,7 @@ from lightcone_spec.orchestration.runtime import (
     render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
 
 def test_controlled_windows_are_sized_unique_and_content_disjoint() -> None:
@@ -936,6 +940,32 @@ def test_speed_gate_rejects_incomplete_coverage() -> None:
 def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
     evidence = tmp_path / "performance.parquet"
     evidence.write_bytes(b"parquet-evidence")
+    target_reference = GreedyTargetReference(
+        schema_version=2,
+        status="UNMEASURED",
+        model_lock_sha256="f" * 64,
+        target_model_id="Qwen/Qwen3-8B",
+        target_revision="c" * 40,
+        sampling_profile_sha256="1" * 64,
+        window_sha256="2" * 64,
+        runtime_config_sha256="3" * 64,
+        hardware_sha256="e" * 64,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        concurrency=8,
+        context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
+        outputs=tuple(
+            TargetOutput(
+                prompt_id=f"prompt-{index:02d}",
+                input_tokens=128,
+                output_tokens=DFLASH_SAFE_CONTEXT_LIMIT - 128,
+                output_sha256=f"{index:064x}",
+            )
+            for index in range(32)
+        ),
+    )
+    target_path = tmp_path / "target-reference.json"
+    target_reference.write(target_path)
     attestation = GpuEvidenceAttestation(
         schema_version=2,
         status="MEASURED",
@@ -943,6 +973,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         selection_sha256="b" * 64,
         model_lock_sha256="f" * 64,
         performance_sha256=evidence_files_sha256((evidence,)),
+        target_reference_sha256=target_reference.sha256,
         patched_sglang_tree=PINNED_SGLANG_TREE,
         target_revision="c" * 40,
         drafter_revision="d" * 40,
@@ -956,11 +987,90 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
     attestation.write(path)
     loaded = GpuEvidenceAttestation.load(path)
     loaded.verify_performance((evidence,))
+    loaded.verify_target_reference(GreedyTargetReference.load(target_path))
     evidence.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="does not bind"):
         loaded.verify_performance((evidence,))
     with pytest.raises(ValueError, match="context region"):
         replace(loaded, context_limit=32768).validate()
+    with pytest.raises(ValueError, match="target reference"):
+        loaded.verify_target_reference(
+            replace(target_reference, runtime_config_sha256="4" * 64)
+        )
+
+
+def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
+    reference = GreedyTargetReference(
+        schema_version=2,
+        status="UNMEASURED",
+        model_lock_sha256="a" * 64,
+        target_model_id="Qwen/Qwen3-8B",
+        target_revision="b" * 40,
+        sampling_profile_sha256="c" * 64,
+        window_sha256="d" * 64,
+        runtime_config_sha256="e" * 64,
+        hardware_sha256="f" * 64,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        concurrency=8,
+        context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
+        outputs=tuple(
+            TargetOutput(
+                prompt_id=f"prompt-{index:02d}",
+                input_tokens=64,
+                output_tokens=DFLASH_SAFE_CONTEXT_LIMIT - 64,
+                output_sha256=f"{index:064x}",
+            )
+            for index in range(32)
+        ),
+    )
+    path = tmp_path / "reference.json"
+    reference.write(path)
+    loaded = GreedyTargetReference.load(path)
+    loaded.verify_study(
+        model_lock_sha256="a" * 64,
+        target_revision="b" * 40,
+        sampling_profile_sha256="c" * 64,
+        window_sha256="d" * 64,
+        concurrency=8,
+    )
+    with pytest.raises(ValueError, match="different formal study"):
+        loaded.verify_study(
+            model_lock_sha256="a" * 64,
+            target_revision="b" * 40,
+            sampling_profile_sha256="c" * 64,
+            window_sha256="d" * 64,
+            concurrency=4,
+        )
+    with pytest.raises(ValueError, match="output hash format"):
+        replace(reference, output_hash_format="decoded-text-sha256").validate()
+    with pytest.raises(ValueError, match="UNMEASURED"):
+        replace(reference, status="MEASURED").validate()
+    value = json.loads(path.read_text())
+    value["outputs"][0]["unexpected"] = True
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="output fields"):
+        GreedyTargetReference.load(path)
+
+
+def test_target_reference_requires_exact_patched_gpu_doctor(tmp_path) -> None:
+    report = {
+        "commands": {"nvidia_smi": "GPU, 98304 MiB, driver"},
+        "source_tree": {
+            "is_git_checkout": True,
+            "tree": PINNED_SGLANG_TREE,
+            "dirty": False,
+            "pinned_ancestor": True,
+            "patch_commits": PINNED_SGLANG_PATCH_COUNT,
+        },
+    }
+    path = tmp_path / "doctor.json"
+    path.write_text(json.dumps(report))
+    assert _load_patched_gpu_doctor(path, purpose="target reference") == report
+    report["source_tree"]["dirty"] = True
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="exact clean patched checkout"):
+        _load_patched_gpu_doctor(path, purpose="target reference")
 
 
 def test_runtime_renderer_produces_three_matched_argv_plans(

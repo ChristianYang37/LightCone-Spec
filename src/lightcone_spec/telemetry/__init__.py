@@ -1,6 +1,7 @@
 """Typed experiment evidence records."""
 
 from .records import (
+    OUTPUT_HASH_FORMAT,
     PerformanceRecord,
     RequestRecord,
     RoundRecord,
@@ -10,6 +11,7 @@ from .records import (
 from .writer import EvidenceWriter, load_completed_evidence
 
 __all__ = [
+    "OUTPUT_HASH_FORMAT",
     "EvidenceWriter",
     "PerformanceRecord",
     "RequestRecord",

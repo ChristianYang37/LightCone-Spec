@@ -90,6 +90,15 @@ shared-prefix regimes. DFlash draft widths are 4, 8, and 16. E3b reports a
 matched-width panel and a deployment-optimal-width panel separately; changing
 width after seeing confirmation is forbidden.
 
+The controlled profile is greedy. Exactness diagnostics hash each complete,
+ordered output-token-ID trajectory with an explicit format tag; decoded text
+is not an exactness witness. Legacy formal collection also binds a locked
+32-prompt Target-only greedy reference captured at the same load and safe
+context limit, and every method/block must match it. Cross-method agreement by
+itself is insufficient. This reference remains an `UNMEASURED` diagnostic in
+the current release and cannot bypass speculative execution or attestation
+blocks.
+
 Production traces separate content identity from arrival identity. Open-loop
 Poisson, immediate-burst, BurstGPT-shaped, and soak traces bind exact arrival
 offsets. Closed-loop runs instead bind a maximum request pool, population, and
@@ -189,11 +198,12 @@ request/round/update/performance rows; absence of that hook is a pre-mutation
 
 An empirical gate additionally requires an attestation binding the registry or
 manifest, selections and stage receipts, exact runtime/capability and patched
-tree, model/tokenizer/data/trace identities, hardware and power report, and
-every final Parquet digest. Without it, status is `UNMEASURED` even when local
-arithmetic is positive. Valid attested evidence that fails a registered
-criterion is `BLOCKED`. The repository contains protocol code, not performance
-claims or result artifacts, and this release contains no GPU results.
+tree, model/tokenizer/data/trace identities, the Target-only reference,
+hardware and power report, and every final Parquet digest. Without it, status
+is `UNMEASURED` even when local arithmetic is positive. Valid attested evidence
+that fails a registered criterion is `BLOCKED`. The repository contains
+protocol code, not performance claims or result artifacts, and this release
+contains no GPU results.
 No trusted hardware-attester identity is configured in this release. Therefore
 content-consistent caller-authored attestation files cannot promote either the
 industrial or legacy analyzers to `MEASURED`.

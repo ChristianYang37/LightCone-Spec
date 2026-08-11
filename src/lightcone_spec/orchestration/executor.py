@@ -61,6 +61,7 @@ from lightcone_spec.orchestration.runtime import (
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 from lightcone_spec.telemetry.records import (
+    OUTPUT_HASH_FORMAT,
     PerformanceRecord,
     RequestRecord,
     RoundRecord,
@@ -1793,6 +1794,7 @@ def _request_record(
         concurrency=concurrency,
         input_tokens=len(execution.request.input_token_ids),
         output_tokens=output_tokens,
+        output_hash_format=OUTPUT_HASH_FORMAT,
         output_sha256=output_sha256,
         ttft_ms=(timing.ttft_us / 1000 if timing.ttft_us is not None else None),
         finished=outcome.status == "completed",

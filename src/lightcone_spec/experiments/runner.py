@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
+from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     GENERATED_TOKEN_BUCKETS,
@@ -18,7 +19,11 @@ from lightcone_spec.experiments.data import (
     PromptSample,
     sample_set_sha256,
 )
-from lightcone_spec.experiments.evidence import evidence_files_sha256
+from lightcone_spec.experiments.evidence import (
+    GreedyTargetReference,
+    TargetOutput,
+    evidence_files_sha256,
+)
 from lightcone_spec.experiments.protocol import paired_blocks
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import LossPoint, SliceMeasurement
@@ -38,6 +43,7 @@ from lightcone_spec.telemetry import (
     UpdateRecord,
     load_completed_evidence,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
 _FORMAL_METHODS = {"static", "tts", "l0"}
 _ONLINE_SPEC_METHODS = {
@@ -73,10 +79,22 @@ def _run_id(
 
 
 def _output_sha256(result: GenerationResult) -> str:
-    text = result.response.get("text")
-    if not isinstance(text, str):
-        raise TypeError("final SGLang response lacks generated text for exactness")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    output_ids = result.response.get("output_ids")
+    if (
+        not isinstance(output_ids, list)
+        or len(output_ids) != result.completion_tokens
+        or any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            for token_id in output_ids
+        )
+    ):
+        raise TypeError(
+            "final SGLang response lacks the complete output-token trajectory"
+        )
+    body = json.dumps(output_ids, separators=(",", ":")).encode()
+    return hashlib.sha256(body).hexdigest()
 
 
 def _output_set_sha256(rows: list[tuple[str, tuple[str, ...]]]) -> str:
@@ -1053,6 +1071,221 @@ def _warmup(
     )
 
 
+def _target_runtime_identity(
+    server_info: dict,
+    *,
+    target_revision: str,
+    concurrency: int,
+) -> str:
+    """Validate and hash the stable identity of a target-only server."""
+    states = server_info.get("internal_states")
+    if (
+        not isinstance(states, list)
+        or len(states) != 1
+        or not isinstance(states[0], dict)
+    ):
+        raise RuntimeError("target reference requires exactly one SGLang DP state")
+    state = states[0]
+    if server_info.get("incremental_streaming_output") is not False:
+        raise RuntimeError(
+            "target reference requires complete non-incremental output IDs"
+        )
+    disabled_fields = (
+        "speculative_algorithm",
+        "speculative_draft_model_path",
+        "speculative_adaptation_config",
+        "speculative_adaptation_telemetry_path",
+    )
+    if any(
+        scope.get(name) not in (None, "")
+        for scope in (server_info, state)
+        for name in disabled_fields
+    ):
+        raise RuntimeError("target reference server unexpectedly enables speculation")
+    reserve = server_info.get("speculative_adaptation_reserve_mb", 0)
+    state_reserve = state.get("speculative_adaptation_reserve_mb", 0)
+    if (
+        bool(server_info.get("speculative_speed_study_metrics", False))
+        or bool(state.get("speculative_speed_study_metrics", False))
+        or isinstance(reserve, bool)
+        or not isinstance(reserve, int)
+        or reserve != 0
+        or isinstance(state_reserve, bool)
+        or not isinstance(state_reserve, int)
+        or state_reserve != 0
+        or state.get("speculative_adaptation_info_record") is not None
+        or state.get("speed_study_metrics") is not None
+    ):
+        raise RuntimeError("target reference server allocated speculative study state")
+    integer_identity = {
+        "tp_size": 1,
+        "dp_size": 1,
+        "max_running_requests": concurrency,
+    }
+    for name, expected in integer_identity.items():
+        value = server_info.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+            raise RuntimeError(f"target reference server has invalid {name}")
+    effective_load = state.get("effective_max_running_requests_per_dp")
+    if (
+        isinstance(effective_load, bool)
+        or not isinstance(effective_load, int)
+        or effective_load != concurrency
+    ):
+        raise RuntimeError("target reference server has a different effective load")
+    context_length = server_info.get("context_length")
+    if (
+        isinstance(context_length, bool)
+        or not isinstance(context_length, int)
+        or context_length < DFLASH_SAFE_CONTEXT_LIMIT
+    ):
+        raise RuntimeError("target reference server cannot reach the safe context limit")
+    model_path = server_info.get("model_path")
+    if (
+        not isinstance(model_path, str)
+        or not model_path
+        or Path(model_path).name != target_revision
+    ):
+        raise RuntimeError("target reference server does not use the locked snapshot")
+    version = server_info.get("version")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError("target reference server lacks an SGLang version")
+    runtime = {
+        "version": version,
+        "target_revision": target_revision,
+        "context_length": context_length,
+        "max_running_requests": concurrency,
+        "effective_max_running_requests_per_dp": effective_load,
+        "tp_size": 1,
+        "dp_size": 1,
+        "dtype": server_info.get("dtype"),
+        "kv_cache_dtype": server_info.get("kv_cache_dtype"),
+        "attention_backend": server_info.get("attention_backend"),
+        "sampling_backend": server_info.get("sampling_backend"),
+        "schedule_policy": server_info.get("schedule_policy"),
+        "mem_fraction_static": server_info.get("mem_fraction_static"),
+        "disable_cuda_graph": server_info.get("disable_cuda_graph"),
+        "enable_deterministic_inference": server_info.get(
+            "enable_deterministic_inference"
+        ),
+        "random_seed": server_info.get("random_seed"),
+        "incremental_streaming_output": False,
+    }
+    body = json.dumps(runtime, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def run_greedy_target_reference(
+    *,
+    client: SGLangHTTPClient,
+    model_lock_sha256: str,
+    target_revision: str,
+    hardware_sha256: str,
+    concurrency: int,
+    sampling_profile: SamplingProfile,
+    warmup: bool = True,
+) -> GreedyTargetReference:
+    """Capture the target-only greedy trajectory required by formal gates."""
+    sampling_profile.validate()
+    if (
+        sampling_profile.purpose != "controlled"
+        or sampling_profile.temperature != 0.0
+        or not sampling_profile.ignore_eos
+    ):
+        raise ValueError("target reference requires controlled greedy sampling")
+    if concurrency < 1:
+        raise ValueError("target reference concurrency must be positive")
+    if not isinstance(hardware_sha256, str) or len(hardware_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in hardware_sha256
+    ):
+        raise ValueError("target reference requires a hardware SHA-256")
+    before_identity = _target_runtime_identity(
+        client.server_info(),
+        target_revision=target_revision,
+        concurrency=concurrency,
+    )
+    if warmup:
+        sample = LongContinuationAdapter().window("load")[0]
+        client.reset_engine()
+        client.run_loaded_batch(
+            _payloads(
+                sample,
+                method="static",
+                block=-1,
+                concurrency=concurrency,
+                max_new_tokens=64,
+                sampling_profile=sampling_profile,
+                request_namespace="target-reference-warmup",
+            ),
+            concurrency=concurrency,
+        )
+    samples = LongContinuationAdapter().window("confirm")
+    budgets = _prompt_budgets(
+        client,
+        samples,
+        safe_context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        minimum_generation_tokens=32769,
+    )
+    payloads, assignments = _batched_payloads(
+        samples,
+        budgets=budgets,
+        method="static",
+        block=0,
+        concurrency=concurrency,
+        sampling_profile=sampling_profile,
+        fill_concurrency=False,
+    )
+    client.reset_engine()
+    results, _ = client.run_loaded_batch(payloads, concurrency=concurrency)
+    grouped = _group_results(results, assignments)
+    outputs: list[TargetOutput] = []
+    for sample in samples:
+        rows = grouped.get(sample.sample_id, ())
+        if len(rows) != 1:
+            raise RuntimeError("target reference did not return one result per prompt")
+        result = rows[0]
+        _, expected_input, expected_output = assignments[result.request_id]
+        if (
+            result.input_tokens != expected_input
+            or result.completion_tokens != expected_output
+            or result.stop_reason != "length"
+        ):
+            raise RuntimeError("target reference did not reproduce formal work")
+        outputs.append(
+            TargetOutput(
+                prompt_id=sample.sample_id,
+                input_tokens=result.input_tokens,
+                output_tokens=result.completion_tokens,
+                output_sha256=_output_sha256(result),
+            )
+        )
+    after_identity = _target_runtime_identity(
+        client.server_info(),
+        target_revision=target_revision,
+        concurrency=concurrency,
+    )
+    if after_identity != before_identity:
+        raise RuntimeError("target reference runtime identity changed during capture")
+    artifact = GreedyTargetReference(
+        schema_version=2,
+        status="UNMEASURED",
+        model_lock_sha256=model_lock_sha256,
+        target_model_id="Qwen/Qwen3-8B",
+        target_revision=target_revision,
+        sampling_profile_sha256=sampling_profile.sha256,
+        window_sha256=sample_set_sha256(samples),
+        runtime_config_sha256=before_identity,
+        hardware_sha256=hardware_sha256,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        concurrency=concurrency,
+        context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
+        output_hash_format=OUTPUT_HASH_FORMAT,
+        outputs=tuple(sorted(outputs, key=lambda row: row.prompt_id)),
+    )
+    artifact.validate()
+    return artifact
+
+
 def measure_controlled_slice(
     *,
     client: SGLangHTTPClient,
@@ -1412,6 +1645,7 @@ def run_confirmation_slice(
                     concurrency=concurrency,
                     input_tokens=result.input_tokens,
                     output_tokens=result.completion_tokens,
+                    output_hash_format=OUTPUT_HASH_FORMAT,
                     output_sha256=_output_sha256(result),
                     ttft_ms=result.ttft_ms,
                     finished=result.stop_reason is not None,
@@ -1530,6 +1764,33 @@ def run_confirmation_slice(
         return tuple(writer.close().values())
 
 
+def _assert_paired_target_outputs(
+    paired_outputs: dict[str, dict[str, tuple[int, int, str]]],
+    target_outputs: dict[str, tuple[int, int, str]],
+    *,
+    block: int,
+) -> None:
+    if not paired_outputs:
+        raise RuntimeError("paired greedy output set is empty")
+    reference = next(iter(paired_outputs.values()))
+    if any(outputs != reference for outputs in paired_outputs.values()):
+        raise RuntimeError(
+            "paired greedy methods produced different output trajectories: "
+            f"block={block}"
+        )
+    if reference != target_outputs:
+        prompt_ids = set(reference) | set(target_outputs)
+        mismatches = sorted(
+            prompt_id
+            for prompt_id in prompt_ids
+            if reference.get(prompt_id) != target_outputs.get(prompt_id)
+        )
+        raise RuntimeError(
+            "paired greedy methods diverge from the target-only reference: "
+            f"block={block}, prompts={','.join(mismatches)}"
+        )
+
+
 def _collect_paired_performance(
     *,
     evidence_root: str | Path,
@@ -1538,11 +1799,30 @@ def _collect_paired_performance(
     concurrency: int,
     methods: tuple[str, ...],
     namespace: str,
+    target_reference: GreedyTargetReference,
+    model_lock_sha256: str,
+    sampling_profile_sha256: str,
+    target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     """Collect one completed, identity-matched shard per paired study cell."""
     if set(config_sha256) != set(methods):
         raise ValueError("collector requires one config identity per method")
     samples = LongContinuationAdapter().window("confirm")
+    target_reference.verify_study(
+        model_lock_sha256=model_lock_sha256,
+        target_revision=target_revision,
+        sampling_profile_sha256=sampling_profile_sha256,
+        window_sha256=sample_set_sha256(samples),
+        concurrency=concurrency,
+    )
+    target_outputs = {
+        row.prompt_id: (
+            row.input_tokens,
+            row.output_tokens,
+            row.output_sha256,
+        )
+        for row in target_reference.outputs
+    }
     batch_prompt_id = _batch_prompt_id(samples)
     expected_prompt_ids = {sample.sample_id for sample in samples}
     performance: list[Path] = []
@@ -1604,6 +1884,7 @@ def _collect_paired_performance(
                     or int(row.get("input_tokens", 0))
                     + int(row.get("output_tokens", 0))
                     != DFLASH_SAFE_CONTEXT_LIMIT
+                    or row.get("output_hash_format") != OUTPUT_HASH_FORMAT
                     or not isinstance(row.get("output_sha256"), str)
                     or len(str(row["output_sha256"])) != 64
                     or row.get("finished") is not True
@@ -1655,12 +1936,11 @@ def _collect_paired_performance(
             paired_outputs[method] = outputs
             performance.append(completed["performance"])
             all_evidence.extend(completed.values())
-        reference = paired_outputs[methods[0]]
-        if any(outputs != reference for outputs in paired_outputs.values()):
-            raise RuntimeError(
-                "paired greedy methods produced different output trajectories: "
-                f"block={block}"
-            )
+        _assert_paired_target_outputs(
+            paired_outputs,
+            target_outputs,
+            block=block,
+        )
     return tuple(performance), evidence_files_sha256(all_evidence)
 
 
@@ -1670,6 +1950,10 @@ def collect_confirmation_performance(
     manifest_sha256: str,
     config_sha256: dict[str, str],
     concurrency: int,
+    target_reference: GreedyTargetReference,
+    model_lock_sha256: str,
+    sampling_profile_sha256: str,
+    target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     """Collect exactly one completed, identity-matched formal shard per cell."""
     return _collect_paired_performance(
@@ -1679,6 +1963,10 @@ def collect_confirmation_performance(
         concurrency=concurrency,
         methods=("static", "tts", "l0"),
         namespace="confirmation",
+        target_reference=target_reference,
+        model_lock_sha256=model_lock_sha256,
+        sampling_profile_sha256=sampling_profile_sha256,
+        target_revision=target_revision,
     )
 
 
@@ -1702,6 +1990,10 @@ def collect_onlinespec_performance(
     manifest_sha256: str,
     config_sha256: dict[str, str],
     concurrency: int,
+    target_reference: GreedyTargetReference,
+    model_lock_sha256: str,
+    sampling_profile_sha256: str,
+    target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
     return _collect_paired_performance(
         evidence_root=evidence_root,
@@ -1715,6 +2007,10 @@ def collect_onlinespec_performance(
             "onlinespec_ens",
         ),
         namespace="onlinespec_confirmation",
+        target_reference=target_reference,
+        model_lock_sha256=model_lock_sha256,
+        sampling_profile_sha256=sampling_profile_sha256,
+        target_revision=target_revision,
     )
 
 
@@ -1855,6 +2151,7 @@ def run_natural_replication_slice(
                     concurrency=concurrency,
                     input_tokens=result.input_tokens,
                     output_tokens=result.completion_tokens,
+                    output_hash_format=OUTPUT_HASH_FORMAT,
                     output_sha256=_output_sha256(result),
                     ttft_ms=result.ttft_ms,
                     finished=True,

@@ -200,6 +200,14 @@ Local mocks, historical v2 evidence, or positive arithmetic remain
 attester: caller-authored doctor/attestation JSON is rejected, and no analyzer
 can emit a new `MEASURED` GPU outcome.
 
+For exactness diagnostics, `run-target-reference` can capture a locked
+Target-only greedy reference whose per-prompt outputs are format-tagged hashes
+of complete ordered token-ID trajectories. Legacy collectors require every
+method/block to match that reference; decoded-text agreement or agreement only
+among speculative methods is insufficient. The reference strengthens an
+`UNMEASURED` diagnostic only: it does not make Static/TTS/L0 executable and
+cannot substitute for the absent trusted attester.
+
 ## Documentation
 
 - [Architecture](docs/en/architecture.md)

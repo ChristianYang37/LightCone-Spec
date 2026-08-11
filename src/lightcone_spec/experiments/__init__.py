@@ -1,7 +1,12 @@
 """Static/TTS/L0 speed-study protocol."""
 
 from .data import ControlledWindow, LongContinuationAdapter
-from .evidence import GpuEvidenceAttestation, evidence_files_sha256
+from .evidence import (
+    GpuEvidenceAttestation,
+    GreedyTargetReference,
+    TargetOutput,
+    evidence_files_sha256,
+)
 from .industrial_analysis import (
     BoundArtifact,
     IndustrialBlockEvidence,
@@ -194,6 +199,7 @@ __all__ = [
     "ExternalWorkloadShape",
     "FrozenSamplingParameters",
     "GpuEvidenceAttestation",
+    "GreedyTargetReference",
     "HardwareBlockObservation",
     "HardwareBlockValidity",
     "HardwareEnvelope",
@@ -231,6 +237,7 @@ __all__ = [
     "SloRequest",
     "SpeedGate",
     "StageActivationPlan",
+    "TargetOutput",
     "TimingCoverage",
     "TokenChunkTiming",
     "TuningCandidate",

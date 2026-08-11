@@ -58,6 +58,7 @@ from lightcone_spec.experiments.statistics import (
     time_block_bootstrap,
     validate_hardware_block,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 from lightcone_spec.telemetry.writer import load_completed_evidence
 
 type BootstrapStatistic = Callable[[np.ndarray], float | np.ndarray]
@@ -518,6 +519,8 @@ def _parse_string_list(value: object, *, label: str) -> tuple[str, ...]:
 
 
 def _parse_output_token_ids(row: Mapping[str, Any]) -> tuple[int, ...]:
+    if row.get("output_hash_format") != OUTPUT_HASH_FORMAT:
+        raise ValueError("request uses an unknown output token hash format")
     value = row.get("output_token_ids")
     digest = row.get("output_token_ids_sha256")
     if not isinstance(value, str) or not _is_sha256(digest):
