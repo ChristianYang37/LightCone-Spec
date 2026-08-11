@@ -84,8 +84,12 @@ The registered controlled profile is greedy. This makes the target-token
 trajectory identical across Static and every exact adapted method, so a paired
 timing effect cannot be caused by method-dependent random-number consumption.
 Tuning and confirmation store only a SHA-256 of each generated trajectory and
-fail closed unless every paired method has the same digest; generated text is
-not retained in the evidence tables.
+fail closed unless every paired method has the same digest. Formal collection
+additionally requires one 32-prompt target-only greedy reference captured from
+the locked target snapshot at the same load and safe context limit. Every
+method/block digest must match that reference; cross-method agreement by itself
+is insufficient. The reference, derived table, and attestation bind the same
+reference SHA-256, and generated text is not retained in evidence artifacts.
 Stochastic coupled-RNG and distribution checks remain mandatory GPU tests;
 stochastic natural-task runs are robustness side tables, not the causal speed
 headline.
@@ -162,7 +166,8 @@ Exactness violations, version mismatches, fallbacks, non-finite updates, OOM,
 and retractions must all be zero; adapted runs must launch and publish updates.
 
 The gate returns `PASS` only with an attestation binding the manifest,
-selection, exact evidence bytes, model revisions, patched SGLang tree, and GPU
-hardware report. An unattested calculation is always `UNMEASURED`; a measured
+selection, exact evidence bytes, target-only reference, model revisions,
+patched SGLang tree, and GPU hardware report. An unattested calculation is
+always `UNMEASURED`; a measured
 run that misses any criterion is `BLOCKED`. This repository contains protocol
 code, not result artifacts or performance claims.

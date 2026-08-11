@@ -24,6 +24,7 @@
 | `render-runtime` | 输出顺序执行的匹配 confirmation 配置与 argv |
 | `build-confirmation-queue` | 注册 24 个 clean-server confirmation job |
 | `run-confirmation` | 执行一个 method/block confirmation slice |
+| `run-target-reference` | 捕获锁定的 target-only greedy 轨迹 |
 | `collect-speed-study` | 从完整 receipt 派生正式表 |
 | `render-replication-runtime` | 渲染自然任务或仅 profiler 使用的 slice |
 | `run-natural-slice` | 运行一个锁定的自然 EOS 副表 slice |
@@ -67,10 +68,10 @@ manifest + model lock + sampling profile + registered grid
                    selection artifact
                             |
                             v
-       sequential launch plan + completed evidence
+ target-only reference + sequential launch plan + completed evidence
                             |
                             v
-          derived table + attestation + speed gate
+       target-bound table + attestation + speed gate
 ```
 
 每个 artifact 都有 sidecar 或内嵌 digest。身份不匹配是可操作错误；CLI 不会生成空的
@@ -167,6 +168,26 @@ SGLang 锁定的 `max_running_requests` 负责 admission，cohort 在队列排�
 active decode 区间的并集以及 request 级绝对 streaming arrival time。模型的 40,960-token
 上限包含 tokenized prompt；每个 prompt 独立截断到已注册的 40,928 安全上限，从而保留
 两个 block-16 KV reservation。
+
+Collect 前必须从同一个已验证 patched checkout 单独启动 target-only server：使用锁定的
+Qwen3-8B snapshot 与选定 concurrency，TP=DP=1，并且不带 draft model、speculative
+algorithm、adaptation config、study metrics 或 adaptation reserve。随后只捕获一次反事实轨迹：
+
+```bash
+lightcone-spec doctor --path /path/to/patched-sglang > artifacts/doctor.json
+lightcone-spec run-target-reference \
+  --model-lock artifacts/locks/models.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --url http://127.0.0.1:30000 --concurrency SELECTED_CONCURRENCY \
+  --doctor-json artifacts/doctor.json \
+  --output artifacts/target-reference.json
+```
+
+该命令会验证 `/server_info`，执行相同 warmup 与 32-prompt 原生 batch，并且只保存每个
+prompt 的 token 数与输出 SHA-256。`collect-speed-study`、`collect-onlinespec-study`、
+两条 attestation 命令和两条 analyzer 命令都强制要求 `--target-reference`。每个 block
+中的每种方法都必须逐 prompt 与它完全一致；speculative 方法彼此一致不能替代 target
+exactness 证明。派生 Parquet metadata 与 GPU attestation 都会绑定 reference digest。
 
 每个完整 slice 最后写入 SHA-256 绑定的 receipt。重复执行相同 job 时，只有在 manifest、
 config、method、block、batch window、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的

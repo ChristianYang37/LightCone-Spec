@@ -24,6 +24,8 @@ yet been declared.
   grid without selecting hyperparameters from confirmation evidence.
 - Added a held-out anchor confirmation path that can reproduce a locked
   registered configuration without claiming exhaustive grid optimality.
+- Added a target-only greedy reference artifact required by both formal
+  collectors, attestations, and analyzers.
 
 ### Changed
 
@@ -37,6 +39,8 @@ yet been declared.
 - Separated OnlineSPEC tuning from the core study's short-context stages and
   bound its 16K/24K/32K/40,928 long-trajectory schedule into the manifest
   identity, preventing premature elimination by 4K/8K measurements.
+- Made cross-method output agreement insufficient for exactness: every formal
+  method/block must also match the locked target-only trajectory.
 
 ### Planned
 

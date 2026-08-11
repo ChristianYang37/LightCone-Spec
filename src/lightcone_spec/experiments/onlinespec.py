@@ -799,6 +799,7 @@ class OnlineSpecGpuAttestation:
     selection_sha256: str
     model_lock_sha256: str
     performance_sha256: str
+    target_reference_sha256: str
     patched_sglang_tree: str
     hardware_sha256: str
     methods: tuple[str, ...]
@@ -816,6 +817,7 @@ class OnlineSpecGpuAttestation:
             self.selection_sha256,
             self.model_lock_sha256,
             self.performance_sha256,
+            self.target_reference_sha256,
             self.hardware_sha256,
         ):
             if len(value) != 64 or any(

@@ -24,6 +24,7 @@
 | `render-runtime` | Emit matched sequential confirmation configs and argv |
 | `build-confirmation-queue` | Register the 24 clean-server confirmation jobs |
 | `run-confirmation` | Execute one method/block confirmation slice |
+| `run-target-reference` | Capture the locked target-only greedy trajectory |
 | `collect-speed-study` | Derive the formal table from completed receipts |
 | `render-replication-runtime` | Render natural-task or profiler-only slices |
 | `run-natural-slice` | Run one locked natural-EOS side-table slice |
@@ -68,10 +69,10 @@ manifest + model lock + sampling profile + registered grid
                    selection artifact
                             |
                             v
-       sequential launch plan + completed evidence
+ target-only reference + sequential launch plan + completed evidence
                             |
                             v
-          derived table + attestation + speed gate
+       target-bound table + attestation + speed gate
 ```
 
 Each artifact has a sidecar or embedded digest. A mismatch is an actionable
@@ -189,6 +190,29 @@ It records the union of active decode intervals plus request-level absolute
 streaming arrivals. The model's 40,960-token limit includes the tokenized
 prompt; each prompt is capped at the registered 40,928 safe limit so two
 block-16 KV reservations remain available.
+
+Before collection, start a separate target-only server from the same verified
+patched checkout with the locked Qwen3-8B snapshot, the selected concurrency,
+TP=DP=1, and no draft model, speculative algorithm, adaptation config, study
+metrics, or adaptation reserve. Then capture the counterfactual once:
+
+```bash
+lightcone-spec doctor --path /path/to/patched-sglang > artifacts/doctor.json
+lightcone-spec run-target-reference \
+  --model-lock artifacts/locks/models.json \
+  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
+  --url http://127.0.0.1:30000 --concurrency SELECTED_CONCURRENCY \
+  --doctor-json artifacts/doctor.json \
+  --output artifacts/target-reference.json
+```
+
+The command validates `/server_info`, performs the same warmup and 32-prompt
+native batch, and stores only per-prompt token counts and output SHA-256 values.
+`collect-speed-study`, `collect-onlinespec-study`, both attestation commands,
+and both analyzers require `--target-reference`. Every method in every block
+must match it exactly; agreement among speculative methods alone is not an
+exactness proof. The derived Parquet metadata and GPU attestation both bind the
+reference digest.
 
 Each completed slice ends with a SHA-256-bound receipt. Re-running the same job
 skips it only after validating its manifest, config, method, block, prompt,

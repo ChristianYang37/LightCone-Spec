@@ -24,6 +24,7 @@ from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_STUDY_METHODS,
     ONLINE_SPEC_TREE,
     ONLINE_SPEC_TUNING_STAGES,
+    OnlineSpecGpuAttestation,
     OnlineSpecManifest,
     OnlineSpecSelection,
     OnlineSpecTuningMeasurement,
@@ -83,6 +84,27 @@ def test_onlinespec_manifest_pins_clean_room_provenance(tmp_path) -> None:
     for invalid_stage in (-1, len(ONLINE_SPEC_TUNING_STAGES)):
         with pytest.raises(ValueError, match="OnlineSPEC tuning stage"):
             onlinespec_tuning_stage(invalid_stage)
+
+
+def test_onlinespec_attestation_binds_target_reference(tmp_path) -> None:
+    artifact = OnlineSpecGpuAttestation(
+        schema_version=2,
+        status="MEASURED",
+        manifest_sha256="a" * 64,
+        selection_sha256="b" * 64,
+        model_lock_sha256="c" * 64,
+        performance_sha256="d" * 64,
+        target_reference_sha256="e" * 64,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        hardware_sha256="f" * 64,
+        methods=ONLINE_SPEC_STUDY_METHODS,
+        repetitions=8,
+    )
+    path = tmp_path / "attestation.json"
+    artifact.write(path)
+    assert OnlineSpecGpuAttestation.load(path) == artifact
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(artifact, target_reference_sha256="invalid").validate()
 
 
 def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(

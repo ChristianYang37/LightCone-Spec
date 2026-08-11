@@ -235,7 +235,9 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
    上运行八个独立随机 block 的配对
    Static/OGD/optimistic/Hedge confirmation。Headline 值是整个 batch active decode
    区间的并集；request 级行只用于诊断。
-4. 对每个 learner 与配对 Static 生成一项比较，并将证据绑定到 GPU attestation。每个
+4. 先要求每种方法的每个 block 输出摘要与核心实验使用的同一份锁定 target-only greedy
+   reference 完全一致；随后对每个 learner 与配对 Static 生成一项比较，并把派生表、
+   target reference 与证据共同绑定到 GPU attestation。每个
    learner 都会报告平均提升是否达到 3%，且配对 BCa 95% 下界是否大于零。只有全部方法
    安全、并且至少一个已注册 learner 通过该加速门槛，OnlineSPEC 复现才会判定通过。
 5. Profiler 单独运行；同步 trace 不能进入 headline timing。
@@ -253,6 +255,10 @@ build-onlinespec-queue       run-onlinespec-confirmation
 collect-onlinespec-study     attest-onlinespec-study
 analyze-onlinespec-study
 ```
+
+`collect-onlinespec-study`、attestation 与 analysis 都强制接收同一份
+`--target-reference` artifact。四种 speculative 方法彼此一致但偏离 target-only greedy
+解码时，仍然不能通过 exactness 门槛。
 
 准确参数以 `lightcone-spec COMMAND --help` 为准。生成的 selection、性能数据与
 attestation 必须保存在 ignored artifact root。该比较是重要证据，但

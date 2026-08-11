@@ -1,7 +1,12 @@
 """Static/TTS/L0 speed-study protocol."""
 
 from .data import ControlledWindow, LongContinuationAdapter
-from .evidence import GpuEvidenceAttestation, evidence_files_sha256
+from .evidence import (
+    GpuEvidenceAttestation,
+    GreedyTargetReference,
+    TargetOutput,
+    evidence_files_sha256,
+)
 from .onlinespec import (
     ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecCandidate,
@@ -36,6 +41,7 @@ __all__ = [
     "ConfirmationBlock",
     "ControlledWindow",
     "GpuEvidenceAttestation",
+    "GreedyTargetReference",
     "LongContinuationAdapter",
     "OnlineSpecCandidate",
     "OnlineSpecGpuAttestation",
@@ -46,6 +52,7 @@ __all__ = [
     "SamplingProfile",
     "SelectionArtifact",
     "SpeedGate",
+    "TargetOutput",
     "TuningCandidate",
     "compare_onlinespec",
     "confirmation_blocks",

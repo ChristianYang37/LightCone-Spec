@@ -67,8 +67,11 @@ goodput。Load screen 和早期 tuning stage 只有在 prompt 数少于 concurre
 
 已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
 沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
-调参与 confirmation 仅保存每条生成轨迹的 SHA-256；任一配对方法摘要不同都会 fail
-closed，证据表不保留生成文本。Stochastic
+调参与 confirmation 仅保存每条生成轨迹的 SHA-256。正式 collect 还必须从锁定的
+target snapshot 以相同 load 与安全 context 上限捕获一份 32-prompt target-only greedy
+reference；每种方法的每个 block 都必须逐 prompt 与它一致，方法彼此一致本身不充分。
+Reference、派生表和 attestation 会绑定同一个 reference SHA-256，证据 artifact 不保留
+生成文本。Stochastic
 coupled-RNG 与分布检查仍是必需的 GPU 测试；stochastic 自然任务只作为鲁棒性副表，不是
 因果速度 headline。
 
@@ -126,7 +129,8 @@ learner-specific 诊断。
 BCa 95% 下界大于零。Exactness violation、version mismatch、fallback、non-finite update、
 OOM 与 retraction 必须全部为零；adapted run 必须实际 launch 并 publish update。
 
-只有 attestation 同时绑定 manifest、selection、精确 evidence bytes、模型 revision、
-patched SGLang tree 与 GPU 硬件报告时，gate 才可能返回 `PASS`。未 attested 的计算始终
+只有 attestation 同时绑定 manifest、selection、精确 evidence bytes、target-only
+reference、模型 revision、patched SGLang tree 与 GPU 硬件报告时，gate 才可能返回
+`PASS`。未 attested 的计算始终
 是 `UNMEASURED`；实测但未满足任一条件时是 `BLOCKED`。本仓库只包含协议代码，不包含
 结果 artifact 或性能宣传。

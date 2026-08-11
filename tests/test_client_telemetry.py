@@ -7,10 +7,16 @@ from unittest.mock import patch
 import pyarrow.parquet as pq
 import pytest
 
-from lightcone_spec.experiments.data import PromptSample
+from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments.data import (
+    DFLASH_SAFE_CONTEXT_LIMIT,
+    LongContinuationAdapter,
+    PromptSample,
+)
 from lightcone_spec.experiments.protocol import confirmation_blocks
 from lightcone_spec.experiments.runner import (
     _adaptation_fields,
+    _assert_paired_target_outputs,
     _batch_prompt_id,
     _batched_payloads,
     _earlier_slices,
@@ -20,8 +26,10 @@ from lightcone_spec.experiments.runner import (
     _prompt_budgets,
     _region,
     _round_records,
+    _target_runtime_identity,
     _write_updates,
     measure_controlled_slice,
+    run_greedy_target_reference,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.sglang_bridge.client import (
@@ -467,6 +475,141 @@ def test_payloads_use_native_sglang_rid_and_paired_seed() -> None:
     assert [row["sampling_params"]["sampling_seed"] for row in tts] == [7, 8]
     assert [row["sampling_params"]["sampling_seed"] for row in l0] == [7, 8]
     assert all("seed" not in row["sampling_params"] for row in tts + l0)
+
+
+class TargetReferenceClient:
+    def __init__(self, *, server_updates: dict | None = None) -> None:
+        revision = "a" * 40
+        self.info = {
+            "version": "0.5.5",
+            "model_path": f"/models/snapshots/{revision}",
+            "context_length": 40960,
+            "max_running_requests": 8,
+            "tp_size": 1,
+            "dp_size": 1,
+            "speculative_algorithm": None,
+            "speculative_draft_model_path": None,
+            "speculative_adaptation_config": None,
+            "speculative_adaptation_telemetry_path": None,
+            "speculative_adaptation_reserve_mb": 0,
+            "speculative_speed_study_metrics": False,
+            "dtype": "bfloat16",
+            "kv_cache_dtype": "auto",
+            "attention_backend": "flashinfer",
+            "sampling_backend": "flashinfer",
+            "schedule_policy": "lpm",
+            "mem_fraction_static": 0.95,
+            "disable_cuda_graph": False,
+            "enable_deterministic_inference": False,
+            "random_seed": 1,
+            "internal_states": [
+                {
+                    "effective_max_running_requests_per_dp": 8,
+                    "speculative_adaptation_info_record": None,
+                }
+            ],
+        }
+        self.info.update(server_updates or {})
+        self.reset_count = 0
+
+    def server_info(self) -> dict:
+        return self.info
+
+    def reset_engine(self) -> None:
+        self.reset_count += 1
+
+    def tokenize_prompts(self, prompts) -> tuple[tuple[int, ...], int]:
+        values = tuple(prompts)
+        return (128,) * len(values), 40960
+
+    def run_loaded_batch(self, payloads, *, concurrency: int):
+        assert concurrency == 8
+        rows = []
+        for payload in payloads:
+            request_id = str(payload["rid"])
+            completion = int(payload["sampling_params"]["max_new_tokens"])
+            rows.append(
+                GenerationResult(
+                    request_id=request_id,
+                    input_tokens=128,
+                    completion_tokens=completion,
+                    ttft_ms=1.0,
+                    inter_token_ms=(),
+                    token_arrival_ms=(),
+                    elapsed_s=float(completion),
+                    stop_reason="length",
+                    response={"text": f"target:{request_id}"},
+                )
+            )
+        return tuple(rows), 1.0
+
+
+def test_target_reference_requires_target_only_server_and_full_coverage() -> None:
+    client = TargetReferenceClient()
+    artifact = run_greedy_target_reference(
+        client=client,
+        model_lock_sha256="b" * 64,
+        target_revision="a" * 40,
+        hardware_sha256="c" * 64,
+        concurrency=8,
+        sampling_profile=SamplingProfile(),
+    )
+    assert artifact.patched_sglang_tree == PINNED_SGLANG_TREE
+    assert artifact.window_sha256 == LongContinuationAdapter().window_sha256(
+        "confirm"
+    )
+    assert len(artifact.outputs) == 32
+    assert all(
+        row.input_tokens + row.output_tokens == DFLASH_SAFE_CONTEXT_LIMIT
+        for row in artifact.outputs
+    )
+    assert client.reset_count == 2
+
+    speculative = TargetReferenceClient(server_updates={"speculative_algorithm": "DFLASH"})
+    with pytest.raises(RuntimeError, match="unexpectedly enables speculation"):
+        run_greedy_target_reference(
+            client=speculative,
+            model_lock_sha256="b" * 64,
+            target_revision="a" * 40,
+            hardware_sha256="c" * 64,
+            concurrency=8,
+            sampling_profile=SamplingProfile(),
+        )
+
+
+def test_target_runtime_identity_rejects_study_allocations() -> None:
+    client = TargetReferenceClient()
+    identity = _target_runtime_identity(
+        client.server_info(), target_revision="a" * 40, concurrency=8
+    )
+    assert len(identity) == 64
+    client.info["internal_states"][0]["speed_study_metrics"] = {}
+    with pytest.raises(RuntimeError, match="allocated speculative study state"):
+        _target_runtime_identity(
+            client.server_info(), target_revision="a" * 40, concurrency=8
+        )
+
+
+def test_paired_methods_cannot_substitute_for_target_exactness() -> None:
+    speculative = {"prompt": (128, 40800, "a" * 64)}
+    paired = {
+        "static": speculative,
+        "tts": dict(speculative),
+        "naive_async": dict(speculative),
+    }
+    with pytest.raises(RuntimeError, match="target-only reference"):
+        _assert_paired_target_outputs(
+            paired,
+            {"prompt": (128, 40800, "b" * 64)},
+            block=0,
+        )
+    _assert_paired_target_outputs(paired, speculative, block=0)
+    with pytest.raises(RuntimeError, match="different output trajectories"):
+        _assert_paired_target_outputs(
+            {**paired, "tts": {"prompt": (128, 40800, "c" * 64)}},
+            speculative,
+            block=0,
+        )
 
 
 def test_warmup_request_namespace_cannot_reuse_measured_rids() -> None:

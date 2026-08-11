@@ -284,8 +284,10 @@ separate evidence identities:
    reservations outside measurement. The batch owns the union of its active
    decode
    intervals; request-level rows are diagnostic only.
-4. Collect one comparison per learner against the paired Static rows and bind
-   the evidence to a GPU attestation. Each learner reports whether its mean
+4. Require every method/block output digest to match the same locked
+   target-only greedy reference used by the core study. Then collect one
+   comparison per learner against the paired Static rows and bind the table,
+   target reference, and evidence to a GPU attestation. Each learner reports whether its mean
    speedup reaches 3% and its paired BCa 95% lower bound is above zero. The
    OnlineSPEC reproduction passes only when every method is safe and at least
    one registered learner clears that acceleration threshold.
@@ -305,6 +307,10 @@ build-onlinespec-queue       run-onlinespec-confirmation
 collect-onlinespec-study     attest-onlinespec-study
 analyze-onlinespec-study
 ```
+
+`collect-onlinespec-study`, attestation, and analysis all require the same
+`--target-reference` artifact. Four speculative methods agreeing with each
+other is not sufficient if they disagree with target-only greedy decoding.
 
 Use `lightcone-spec COMMAND --help` for exact arguments. Generated selections,
 performance data, and attestations remain under the ignored artifact root.
