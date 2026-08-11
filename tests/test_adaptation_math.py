@@ -5,7 +5,12 @@ import torch
 
 from lightcone_spec.adaptation.memory import AdaptationMemoryLedger, tensor_bytes
 from lightcone_spec.adaptation.optimizer import FixedAddressBank, GPUOptimizer
-from lightcone_spec.adaptation.parameters import DFlashParameterPlan, LoRAFactors
+from lightcone_spec.adaptation.parameters import (
+    DFlashParameterPlan,
+    DSparkParameterPlan,
+    LoRAFactors,
+    NativeLayerParameterPlan,
+)
 from lightcone_spec.config.schema import OptimizerConfig
 from lightcone_spec.runtime.dflash_canvas import (
     CanvasReconstruction,
@@ -155,6 +160,55 @@ def test_optimizer_rejects_layout_and_step_conflicts() -> None:
         finite.propose((torch.tensor([1.0, float("inf")]),))
 
 
+def test_schedules_advance_only_on_published_updates() -> None:
+    inverse = GPUOptimizer(
+        (torch.ones(1),),
+        OptimizerConfig(
+            name="sgd",
+            learning_rate=0.1,
+            schedule="inverse_sqrt_published_update",
+        ),
+    )
+    first = inverse.propose((torch.ones(1),))
+    repeated = inverse.propose((torch.ones(1),))
+    assert first.step == repeated.step == 1
+    torch.testing.assert_close(first.parameters[0], repeated.parameters[0])
+    inverse.commit(first)
+    second = inverse.propose((torch.ones(1),))
+    torch.testing.assert_close(
+        second.parameters[0],
+        torch.tensor([0.9 - 0.1 / (2**0.5)]),
+    )
+
+    cosine = GPUOptimizer(
+        (torch.ones(1),),
+        OptimizerConfig(
+            name="sgd",
+            learning_rate=0.1,
+            schedule="cosine_to_zero",
+            schedule_total_published_updates=2,
+        ),
+    )
+    cosine.commit(cosine.propose((torch.ones(1),)))
+    final = cosine.propose((torch.ones(1),))
+    torch.testing.assert_close(final.parameters[0], torch.tensor([0.9]))
+
+
+def test_cosine_schedule_requires_exact_horizon() -> None:
+    with pytest.raises(ValueError, match="published-update horizon"):
+        OptimizerConfig(
+            name="sgd",
+            learning_rate=0.1,
+            schedule="cosine_to_zero",
+        )
+    with pytest.raises(ValueError, match="published-update horizon"):
+        OptimizerConfig(
+            name="sgd",
+            learning_rate=0.1,
+            schedule_total_published_updates=2,
+        )
+
+
 def test_fixed_bank_preserves_storage_and_validates_layout() -> None:
     active = torch.zeros(4, dtype=torch.float16)
     bank = FixedAddressBank((active,))
@@ -182,35 +236,34 @@ def named_parameters() -> dict[str, torch.Tensor]:
 
 
 def test_full_selects_all_and_only_drafter_owned_float_parameters() -> None:
-    plan = DFlashParameterPlan.build(named_parameters(), mode="full", scope="drafter")
+    plan = DFlashParameterPlan.build(named_parameters(), mode="full", scope="all")
     names = {entry.name for entry in plan.entries}
-    assert "fc.weight" in names
     assert "layers.0.input_layernorm.weight" in names
-    assert "norm.weight" in names
+    assert "fc.weight" not in names
+    assert "norm.weight" not in names
     assert "lm_head.weight" not in names
     assert not any(name.startswith("target_model") for name in names)
 
 
 def test_parameter_ownership_uses_exact_dotted_components() -> None:
     parameters = {
-        "draft_lm_head_adapter.weight": torch.zeros(2, 2),
-        "layers.target_model_adapter.weight": torch.zeros(2, 2),
-        "target_model.weight": torch.zeros(2, 2),
+        "layers.0.draft_lm_head_adapter.weight": torch.zeros(2, 2),
+        "layers.0.target_model_adapter.weight": torch.zeros(2, 2),
+        "layers.0.target_model.weight": torch.zeros(2, 2),
     }
-    plan = DFlashParameterPlan.build(parameters, mode="full", scope="drafter")
+    plan = DFlashParameterPlan.build(parameters, mode="full", scope="all")
     assert {entry.name for entry in plan.entries} == {
-        "draft_lm_head_adapter.weight",
-        "layers.target_model_adapter.weight",
+        "layers.0.draft_lm_head_adapter.weight",
+        "layers.0.target_model_adapter.weight",
     }
 
 
 def test_lora_selects_actual_dflash_linear_matrices() -> None:
     plan = DFlashParameterPlan.build(
-        named_parameters(), mode="lora", scope="drafter", rank=2
+        named_parameters(), mode="lora", scope="all", rank=2
     )
     names = {entry.name for entry in plan.entries}
     assert names == {
-        "fc.weight",
         "layers.0.self_attn.qkv_proj.weight",
         "layers.0.self_attn.o_proj.weight",
         "layers.0.mlp.gate_up_proj.weight",
@@ -221,16 +274,50 @@ def test_lora_selects_actual_dflash_linear_matrices() -> None:
     )
 
 
-def test_tail_selection_requires_explicit_allowlist() -> None:
-    with pytest.raises(ValueError, match="allowlist"):
-        DFlashParameterPlan.build(named_parameters(), mode="full", scope="tail")
-    plan = DFlashParameterPlan.build(
-        named_parameters(),
-        mode="full",
-        scope="tail",
-        tail_names=("norm.weight",),
+def test_dspark_native_hybrid_uses_lora_layers_and_full_replicated_heads() -> None:
+    parameters: dict[str, torch.Tensor] = {}
+    for layer in range(5):
+        parameters[f"layers.{layer}.self_attn.q_proj.weight"] = torch.zeros(4, 4)
+        parameters[f"layers.{layer}.norm.weight"] = torch.ones(4)
+    parameters.update(
+        {
+            "markov.w1.weight": torch.zeros(4, 4),
+            "markov.w2.weight": torch.zeros(4, 4),
+            "acceptance.projection": torch.zeros(1),
+        }
     )
-    assert [entry.name for entry in plan.entries] == ["norm.weight"]
+    plan = DSparkParameterPlan.build(
+        parameters,
+        mode="lora",
+        scope="last3_native_heads",
+        rank=4,
+        w1_name="markov.w1.weight",
+        w2_name="markov.w2.weight",
+        acceptance_name="acceptance.projection",
+    )
+    entries = {entry.name: entry for entry in plan.entries}
+    assert entries["layers.2.self_attn.q_proj.weight"].parameterization == "lora"
+    assert "layers.1.self_attn.q_proj.weight" not in entries
+    for name in ("markov.w1.weight", "markov.w2.weight", "acceptance.projection"):
+        assert entries[name].parameterization == "full"
+        assert entries[name].ownership == "replicated"
+    assert len(plan.sha256) == 64
+    assert plan.predict_memory("adamw").peak_bytes > 0
+
+
+@pytest.mark.parametrize("backend", ["EAGLE", "EAGLE3", "NEXTN"])
+def test_other_native_backends_have_digest_bound_layer_plans(backend: str) -> None:
+    plan = NativeLayerParameterPlan.build(
+        named_parameters(),
+        backend=backend,
+        mode="lora",
+        scope="last1",
+        rank=2,
+    )
+    assert plan.backend == backend
+    assert plan.rank == plan.lora_alpha == 2
+    assert {entry.parameterization for entry in plan.entries} == {"lora"}
+    assert len(plan.sha256) == 64
 
 
 def test_lora_zero_initialization_preserves_base_and_is_seeded() -> None:
@@ -242,6 +329,20 @@ def test_lora_zero_initialization_preserves_base_and_is_seeded() -> None:
     torch.testing.assert_close(first.merged(base), base.float())
     first.b[0, 0] = 1.0
     assert not torch.equal(first.merged(base), base.float())
+
+
+def test_lora_memory_charges_full_fixed_banks_and_merge_temporaries() -> None:
+    plan = DFlashParameterPlan.build(
+        {"layers.0.self_attn.q_proj.weight": torch.zeros(4, 4)},
+        mode="lora",
+        scope="last1",
+        rank=2,
+    )
+    prediction = plan.predict_memory("adamw")
+    assert prediction.active_merged == 4 * 4 * 4
+    assert prediction.staging == prediction.active_merged
+    assert prediction.merge_scratch == 3 * 4 * 4 * 4
+    assert prediction.peak_bytes > prediction.resident_bytes
 
 
 def test_memory_ledger_reserves_adaptation_before_kv() -> None:

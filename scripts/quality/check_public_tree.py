@@ -8,9 +8,8 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FORBIDDEN_PREFIXES = (
@@ -155,8 +154,8 @@ def check_patchset() -> None:
 def check_versions() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     package = (ROOT / "src/lightcone_spec/__init__.py").read_text()
-    if project["version"] != "0.2.0" or '__version__ = "0.2.0"' not in package:
-        fail("package version is not consistently 0.2.0")
+    if project["version"] != "0.3.0" or '__version__ = "0.3.0"' not in package:
+        fail("package version is not consistently 0.3.0")
 
 
 def check_manifest_sidecars() -> None:

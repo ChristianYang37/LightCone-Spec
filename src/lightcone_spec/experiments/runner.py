@@ -39,7 +39,7 @@ from lightcone_spec.telemetry import (
     load_completed_evidence,
 )
 
-_FORMAL_METHODS = {"static", "tts", "naive_async"}
+_FORMAL_METHODS = {"static", "tts", "l0"}
 _ONLINE_SPEC_METHODS = {
     "static",
     "onlinespec_ogd",
@@ -101,9 +101,7 @@ def _payloads(
     namespace = f"-{request_namespace}" if request_namespace is not None else ""
     return tuple(
         {
-            "rid": (
-                f"{sample.sample_id}{namespace}-b{block}-{method}-r{replica}"
-            ),
+            "rid": (f"{sample.sample_id}{namespace}-b{block}-{method}-r{replica}"),
             "text": sample.prompt,
             "sampling_params": sampling_profile.parameters(
                 seed=sample.seed + replica,
@@ -119,9 +117,9 @@ def _batch_prompt_id(samples: tuple[PromptSample, ...]) -> str:
     if not samples:
         raise ValueError("a measured prompt batch cannot be empty")
     identifiers = tuple(sample.sample_id for sample in samples)
-    if any(not identifier for identifier in identifiers) or len(set(identifiers)) != len(
-        identifiers
-    ):
+    if any(not identifier for identifier in identifiers) or len(
+        set(identifiers)
+    ) != len(identifiers):
         raise ValueError("measured prompt IDs must be non-empty and unique")
     return f"batch-{sample_set_sha256(samples)[:24]}"
 
@@ -478,7 +476,7 @@ def _adaptation_fields(
     if int(fields["updates_launched"]) != len(updates):
         raise RuntimeError("update counter and trace coverage disagree")
     published = sum(update.get("status") == "published" for update in updates)
-    if not published <= int(fields["updates_published"]) <= len(updates):
+    if published != int(fields["updates_published"]):
         raise RuntimeError("published update counter and trace coverage disagree")
     return fields, tuple(updates), tuple(rounds)
 
@@ -561,17 +559,15 @@ def _performance_record(
         trainable_parameters=(
             int(adaptation["trainable_parameters"]) if run_scope_metrics else None
         ),
-        training_cuda_ms=(adaptation["training_cuda_ms"] if run_scope_metrics else None),
+        training_cuda_ms=(
+            adaptation["training_cuda_ms"] if run_scope_metrics else None
+        ),
         optimizer_cuda_ms=(
             adaptation["optimizer_cuda_ms"] if run_scope_metrics else None
         ),
         merge_cuda_ms=(adaptation["merge_cuda_ms"] if run_scope_metrics else None),
-        publish_cuda_ms=(
-            adaptation["publish_cuda_ms"] if run_scope_metrics else None
-        ),
-        barrier_cuda_ms=(
-            adaptation["barrier_cuda_ms"] if run_scope_metrics else None
-        ),
+        publish_cuda_ms=(adaptation["publish_cuda_ms"] if run_scope_metrics else None),
+        barrier_cuda_ms=(adaptation["barrier_cuda_ms"] if run_scope_metrics else None),
         exposed_update_ms=(
             adaptation["exposed_update_ms"] if run_scope_metrics else None
         ),
@@ -598,9 +594,7 @@ def _performance_record(
             int(adaptation["nonfinite_updates"]) if run_scope_metrics else None
         ),
         oom_events=(int(adaptation["oom_events"]) if run_scope_metrics else None),
-        retractions=(
-            int(adaptation["retractions"]) if run_scope_metrics else None
-        ),
+        retractions=(int(adaptation["retractions"]) if run_scope_metrics else None),
     )
 
 
@@ -765,7 +759,7 @@ def _write_updates(
                 or probabilities is None
             ):
                 raise RuntimeError("OnlineSPEC ensemble diagnostics are incomplete")
-        elif method in {"tts", "naive_async", "onlinespec_ogd"} and any(
+        elif method in {"tts", "l0", "onlinespec_ogd"} and any(
             value is not None for value in online_values
         ):
             raise RuntimeError("method emitted foreign OnlineSPEC diagnostics")
@@ -1141,9 +1135,7 @@ def measure_controlled_slice(
     measured = _region(
         run.results,
         start=0,
-        end=max(
-            max_new_tokens for _, _, max_new_tokens in assignments.values()
-        ),
+        end=max(max_new_tokens for _, _, max_new_tokens in assignments.values()),
     )
     if measured is None:
         raise RuntimeError("controlled slice produced no decode interval")
@@ -1210,7 +1202,7 @@ def _earlier_slices(
     method: str,
     block: int,
     schedule_seed: int,
-    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
+    study_methods: tuple[str, ...] = ("static", "tts", "l0"),
 ) -> tuple[tuple[int, str], ...]:
     jobs = tuple(
         (entry.block, scheduled_method)
@@ -1231,7 +1223,7 @@ def _assert_prior_slices_complete(
     block: int,
     schedule_seed: int,
     samples: tuple[PromptSample, ...],
-    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
+    study_methods: tuple[str, ...] = ("static", "tts", "l0"),
     namespace: str = "confirmation",
 ) -> None:
     batch_prompt_id = _batch_prompt_id(samples)
@@ -1271,7 +1263,7 @@ def run_confirmation_slice(
     sampling_profile: SamplingProfile,
     model_pair: str = "qwen3_8b_dflash16",
     warmup: bool = True,
-    study_methods: tuple[str, ...] = ("static", "tts", "naive_async"),
+    study_methods: tuple[str, ...] = ("static", "tts", "l0"),
     namespace: str = "confirmation",
 ) -> tuple[Path, ...]:
     """Run one exclusive-device method slice in registered random order."""
@@ -1352,18 +1344,13 @@ def run_confirmation_slice(
         ):
             raise RuntimeError(f"completed request identity mismatch for {run_id}")
         batch_rows = [
-            row
-            for row in performance_rows
-            if row.get("prompt_id") == batch_prompt_id
+            row for row in performance_rows if row.get("prompt_id") == batch_prompt_id
         ]
-        if (
-            {str(row.get("region")) for row in batch_rows}
-            != {"generated_bucket", "long_region", "full_trajectory"}
-            or any(
-                int(row.get("concurrency", -1)) != concurrency
-                for row in batch_rows
-            )
-        ):
+        if {str(row.get("region")) for row in batch_rows} != {
+            "generated_bucket",
+            "long_region",
+            "full_trajectory",
+        } or any(int(row.get("concurrency", -1)) != concurrency for row in batch_rows):
             raise RuntimeError(f"completed performance identity mismatch for {run_id}")
         return tuple(completed.values())
 
@@ -1598,8 +1585,7 @@ def _collect_paired_performance(
                 or {str(row.get("region")) for row in batch_rows}
                 != {"generated_bucket", "long_region", "full_trajectory"}
                 or any(
-                    int(row.get("concurrency", -1)) != concurrency
-                    for row in batch_rows
+                    int(row.get("concurrency", -1)) != concurrency for row in batch_rows
                 )
             ):
                 raise RuntimeError(
@@ -1625,9 +1611,7 @@ def _collect_paired_performance(
                     for row in request_rows
                 )
             ):
-                raise RuntimeError(
-                    f"confirmation request identity mismatch: {run_id}"
-                )
+                raise RuntimeError(f"confirmation request identity mismatch: {run_id}")
             outputs = {
                 str(row["prompt_id"]): (
                     int(row["input_tokens"]),
@@ -1658,15 +1642,12 @@ def _collect_paired_performance(
                 or int(long_rows[0].get("generated_bucket_end", -1)) != expected_end
                 or int(long_rows[0].get("at_risk_requests", -1))
                 != expected_long_at_risk
-                or int(long_rows[0].get("output_tokens", -1))
-                != expected_long_output
+                or int(long_rows[0].get("output_tokens", -1)) != expected_long_output
                 or len(full_rows) != 1
                 or int(full_rows[0].get("generated_bucket_start", -1)) != 0
-                or int(full_rows[0].get("generated_bucket_end", -1))
-                != expected_end
+                or int(full_rows[0].get("generated_bucket_end", -1)) != expected_end
                 or int(full_rows[0].get("at_risk_requests", -1)) != len(samples)
-                or int(full_rows[0].get("output_tokens", -1))
-                != sum(completion_lengths)
+                or int(full_rows[0].get("output_tokens", -1)) != sum(completion_lengths)
             ):
                 raise RuntimeError(
                     f"confirmation performance/request work mismatch: {run_id}"
@@ -1696,7 +1677,7 @@ def collect_confirmation_performance(
         manifest_sha256=manifest_sha256,
         config_sha256=config_sha256,
         concurrency=concurrency,
-        methods=("static", "tts", "naive_async"),
+        methods=("static", "tts", "l0"),
         namespace="confirmation",
     )
 

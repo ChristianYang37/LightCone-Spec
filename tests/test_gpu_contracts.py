@@ -16,26 +16,50 @@ def require_cuda() -> None:
         pytest.skip("CUDA is unavailable")
 
 
-def test_cuda_publication_preserves_addresses_without_recapture() -> None:
+def test_cuda_graph_replay_observes_fixed_address_publication_without_recapture() -> (
+    None
+):
     require_cuda()
     active = torch.zeros(32, device="cuda", dtype=torch.float16)
+    static_input = torch.arange(32, device="cuda", dtype=torch.float16)
+    candidate = torch.ones_like(active)
+    captured_output = torch.empty_like(active)
     bank = FixedAddressBank((active,))
     coordinator = CudaPublicationCoordinator("cuda")
     assert not coordinator.ready()
     with pytest.raises(RuntimeError, match="no completed"):
         coordinator.publish_boundary(publish=bank.publish, tensors=(active,))
-    address = active.data_ptr()
+    parameter_address = active.data_ptr()
+    output_address = captured_output.data_ptr()
+
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        captured_output.copy_(static_input * active + 1)
+    torch.cuda.current_stream().wait_stream(warmup)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_output.copy_(static_input * active + 1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, torch.ones_like(captured_output))
+
     with coordinator.update_window((active,)):
         with (
             pytest.raises(RuntimeError, match="max_in_flight"),
             coordinator.update_window((active,)),
         ):
             pass
-        bank.stage((torch.ones_like(active),))
+        bank.stage((candidate,))
     coordinator.publish_boundary(publish=bank.publish, tensors=(active,))
+    graph.replay()
     torch.cuda.synchronize()
-    assert active.data_ptr() == address
-    torch.testing.assert_close(active, torch.ones_like(active))
+    assert active.data_ptr() == parameter_address
+    assert captured_output.data_ptr() == output_address
+    torch.testing.assert_close(active, candidate)
+    torch.testing.assert_close(captured_output, static_input + 1)
 
 
 def test_differentiable_logits_have_finite_gpu_gradient() -> None:
@@ -65,17 +89,25 @@ def test_stochastic_rejection_distribution_matches_target() -> None:
         generator=generator,
     )
     observed = torch.bincount(sampled, minlength=3).float() / count
-    torch.testing.assert_close(
-        observed, target[0], atol=0.01, rtol=0.0
-    )
+    torch.testing.assert_close(observed, target[0], atol=0.01, rtol=0.0)
 
 
 def test_high_batch_fixed_bank_allocator_stability() -> None:
     require_cuda()
     active = torch.zeros((48, 16, 256), device="cuda", dtype=torch.float16)
+    candidate = torch.empty_like(active)
     bank = FixedAddressBank((active,))
     address = active.data_ptr()
+    bank.stage((candidate,))
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
     for value in range(20):
-        bank.stage((torch.full_like(active, float(value)),))
+        candidate.fill_(float(value))
+        bank.stage((candidate,))
         bank.publish()
+    torch.cuda.synchronize()
     assert active.data_ptr() == address
+    assert torch.cuda.memory_allocated() == allocated
+    assert torch.cuda.memory_reserved() == reserved
+    torch.testing.assert_close(active, candidate)

@@ -1,0 +1,141 @@
+{
+  "cuda": {
+    "container_image": "nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04",
+    "torch_build": "13.0",
+    "toolkit_release": "13.0"
+  },
+  "disk": {
+    "minimum_free_bytes": 100000000000,
+    "minimum_total_bytes": 200000000000
+  },
+  "gpu": {
+    "accepted_topology_links": [
+      "NODE",
+      "PHB",
+      "PIX",
+      "PXB",
+      "SYS"
+    ],
+    "compute_capability": "12.0",
+    "count": 2,
+    "minimum_memory_mib": 96000,
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "nominal_memory_gib": 96
+  },
+  "host": {
+    "compiler_required": true,
+    "ninja_required": true,
+    "operating_system": "Linux",
+    "python_minor": "3.12"
+  },
+  "name": "lightcone-industrial-runtime-compatibility",
+  "network": {
+    "artifact_dns_any_of": [
+      "huggingface.co",
+      "modelscope.cn"
+    ],
+    "package_index_dns": "pypi.tuna.tsinghua.edu.cn"
+  },
+  "packages": {
+    "flashinfer_python": {
+      "cuda_extra": "cu13",
+      "cuda_marker_distribution": "nvidia-cutlass-dsl-libs-cu13",
+      "distribution": "flashinfer-python",
+      "version": "0.6.15.post1"
+    },
+    "torch": "2.11.0",
+    "triton": "3.6.0"
+  },
+  "release_capabilities": {
+    "blocked": [
+      {
+        "mode": "multi_node",
+        "reason_code": "release_multi_node_unsupported"
+      },
+      {
+        "mode": "tp2",
+        "reason_code": "release_topology_executor_unsupported"
+      },
+      {
+        "mode": "dp2",
+        "reason_code": "release_topology_executor_unsupported"
+      },
+      {
+        "mode": "static_speculative",
+        "reason_code": "release_native_terminal_evidence_unavailable"
+      },
+      {
+        "mode": "tts",
+        "reason_code": "release_native_terminal_evidence_unavailable"
+      },
+      {
+        "mode": "l0",
+        "reason_code": "release_native_terminal_evidence_unavailable"
+      },
+      {
+        "mode": "adaptive_dspark",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_eagle",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_eagle3",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_nextn",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_dflash_dspark",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_nonconstant_schedule",
+        "reason_code": "release_schedule_unsupported"
+      },
+      {
+        "mode": "adaptive_positive_extra_delay_ms",
+        "reason_code": "release_delay_mode_unsupported"
+      },
+      {
+        "mode": "quota_shadow",
+        "reason_code": "release_quota_shadow_unsupported"
+      }
+    ],
+    "supported": {
+      "data_parallel_sizes": [
+        1
+      ],
+      "node_counts": [
+        1
+      ],
+      "publication_methods": [
+        "target_only"
+      ],
+      "tensor_parallel_sizes": [
+        1
+      ]
+    }
+  },
+  "release_version": "0.3.0",
+  "schema_version": 1,
+  "sglang": {
+    "expected_patch_count": 1,
+    "expected_tree": "ac3393f7c1b12e801d2c5551a07257b082c66977",
+    "patches": [
+      {
+        "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
+        "sha256": "bdb65a88518df71d33a52118acb5a858892648942b287e74345056ae9c8a6573"
+      }
+    ],
+    "repository": "https://github.com/sgl-project/sglang.git",
+    "upstream_commit": "3312645a307453893a00778592f105581e3d1c3d"
+  },
+  "system": {
+    "minimum_driver": "580.65.06",
+    "single_node_only": true
+  }
+}

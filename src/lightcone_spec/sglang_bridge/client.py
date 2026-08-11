@@ -12,7 +12,7 @@ from dataclasses import dataclass
 _MEASURED_METHODS = {
     "static",
     "tts",
-    "naive_async",
+    "l0",
     "onlinespec_ogd",
     "onlinespec_opt",
     "onlinespec_ens",

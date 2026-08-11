@@ -8,6 +8,7 @@ import math
 import random
 from dataclasses import asdict, dataclass
 
+from lightcone_spec.adaptation.parameters import LAYER_SCOPES, LORA_RANKS
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
@@ -47,6 +48,9 @@ class TuningCandidate:
     weight_decay: float
     rank: int | None
     stride: int
+    lora_alpha: int | None = None
+    schedule: str = "constant"
+    schedule_total_published_updates: int | None = None
     grad_clip: float = 1.0
     beta1: float = 0.9
     beta2: float = 0.999
@@ -62,71 +66,37 @@ class TuningCandidate:
 
 
 def tuning_candidates() -> tuple[TuningCandidate, ...]:
+    """Registered E1 screen: four scopes, seven ranks, and two anchors."""
     candidates: list[TuningCandidate] = []
-    for stride in (1, 5, 10, 20, 40, 80):
-        for optimizer, weight_decay, momentum in (
-            ("adam", 0.0, None),
-            ("adamw", 0.0, None),
-            ("adamw", 0.01, None),
-            ("sgdm", 0.0, 0.9),
-            ("nag", 0.0, 0.9),
-            ("lion", 0.01, None),
-            ("muon", 0.01, 0.95),
+    for scope in LAYER_SCOPES:
+        for optimizer, learning_rate, weight_decay, momentum in (
+            ("adamw", 1e-4, 0.01, None),
+            ("sgdm", 1e-3, 0.0, 0.9),
         ):
-            beta2 = 0.99 if optimizer == "lion" else 0.999
-            lora_learning_rates = {
-                "sgdm": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
-                "nag": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
-                "lion": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
-                "muon": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
-            }.get(optimizer, (1e-5, 3e-5, 1e-4, 3e-4, 1e-3))
-            full_learning_rates = {
-                "sgdm": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
-                "nag": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
-                "lion": (1e-8, 3e-8, 1e-7, 3e-7, 1e-6),
-                "muon": (1e-6, 3e-6, 1e-5, 3e-5, 1e-4),
-            }.get(optimizer, (1e-7, 3e-7, 1e-6, 3e-6, 1e-5))
-            for rank in (4, 8, 16, 32):
-                for learning_rate in lora_learning_rates:
-                    candidates.append(
-                        TuningCandidate(
-                            "lora",
-                            "drafter",
-                            optimizer,
-                            learning_rate,
-                            weight_decay,
-                            rank,
-                            stride,
-                            beta2=beta2,
-                            momentum=momentum,
-                            muon_ns_steps=(5 if optimizer == "muon" else None),
-                            muon_auxiliary_learning_rate=(
-                                1e-5 if optimizer == "muon" else None
-                            ),
-                            muon_auxiliary_weight_decay=(
-                                0.01 if optimizer == "muon" else None
-                            ),
-                        )
-                    )
-            for learning_rate in full_learning_rates:
+            candidates.append(
+                TuningCandidate(
+                    "full",
+                    scope,
+                    optimizer,
+                    learning_rate / 10,
+                    weight_decay,
+                    None,
+                    10,
+                    momentum=momentum,
+                )
+            )
+            for rank in LORA_RANKS:
                 candidates.append(
                     TuningCandidate(
-                        "full",
-                        "drafter",
+                        "lora",
+                        scope,
                         optimizer,
                         learning_rate,
                         weight_decay,
-                        None,
-                        stride,
-                        beta2=beta2,
+                        rank,
+                        10,
+                        lora_alpha=rank,
                         momentum=momentum,
-                        muon_ns_steps=(5 if optimizer == "muon" else None),
-                        muon_auxiliary_learning_rate=(
-                            1e-5 if optimizer == "muon" else None
-                        ),
-                        muon_auxiliary_weight_decay=(
-                            0.01 if optimizer == "muon" else None
-                        ),
                     )
                 )
     identities = [candidate.candidate_id for candidate in candidates]
@@ -184,7 +154,7 @@ def paired_blocks(
 
 
 def confirmation_blocks(seed: int, count: int = 8) -> tuple[ConfirmationBlock, ...]:
-    return paired_blocks(seed, ("static", "tts", "naive_async"), count)
+    return paired_blocks(seed, ("static", "tts", "l0"), count)
 
 
 def onlinespec_blocks(seed: int, count: int = 8) -> tuple[ConfirmationBlock, ...]:
@@ -256,7 +226,7 @@ def assert_matched_confirmation_configs(
     selected_concurrency: int,
 ) -> None:
     """Ensure TTS/L0 differ only in publication policy and match selection."""
-    if set(configs) != {"static", "tts", "naive_async"}:
+    if set(configs) != {"static", "tts", "l0"}:
         raise ValueError("confirmation requires exactly three method configs")
     for method, config in configs.items():
         assert_confirmation_slice_config(
@@ -275,7 +245,7 @@ def assert_matched_confirmation_configs(
         if runtime != expected_runtime:
             raise ValueError("formal methods must use one runtime configuration")
     tts = configs["tts"].adaptation
-    asynchronous = configs["naive_async"].adaptation
+    asynchronous = configs["l0"].adaptation
     if tts is None or asynchronous is None or tts != asynchronous:
         raise ValueError("TTS and L0 must use an identical adaptation config")
     selected = _candidate_fields(selected_candidate)
@@ -292,6 +262,11 @@ def _candidate_fields(candidate: TuningCandidate) -> dict[str, object]:
         "learning_rate": candidate.learning_rate,
         "weight_decay": candidate.weight_decay,
         "rank": candidate.rank,
+        "lora_alpha": candidate.lora_alpha,
+        "schedule": candidate.schedule,
+        "schedule_total_published_updates": (
+            candidate.schedule_total_published_updates
+        ),
         "stride": candidate.stride,
         "grad_clip": candidate.grad_clip,
         "beta1": candidate.beta1,
@@ -311,6 +286,11 @@ def _adaptation_fields(adaptation: object) -> dict[str, object]:
         "learning_rate": adaptation.optimizer.learning_rate,
         "weight_decay": adaptation.optimizer.weight_decay,
         "rank": adaptation.rank,
+        "lora_alpha": adaptation.lora_alpha,
+        "schedule": adaptation.optimizer.schedule,
+        "schedule_total_published_updates": (
+            adaptation.optimizer.schedule_total_published_updates
+        ),
         "stride": adaptation.stride,
         "grad_clip": adaptation.optimizer.grad_clip,
         "beta1": adaptation.optimizer.beta1,
@@ -334,7 +314,7 @@ def assert_confirmation_slice_config(
     selected_concurrency: int,
 ) -> None:
     """Validate one exclusive-device slice before launching a measurement."""
-    if method not in {"static", "tts", "naive_async"}:
+    if method not in {"static", "tts", "l0"}:
         raise ValueError("unknown formal confirmation method")
     if config.method != method:
         raise ValueError("method config is bound to the wrong endpoint")

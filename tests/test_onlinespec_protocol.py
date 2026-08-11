@@ -799,7 +799,7 @@ def test_onlinespec_protocol_rejects_runtime_and_loss_drift() -> None:
     candidate = onlinespec_candidates()[0]
     base = RunConfig.model_validate(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "method": candidate.method,
             "model": {
                 "target_revision": "a" * 40,
@@ -821,6 +821,7 @@ def test_onlinespec_protocol_rejects_runtime_and_loss_drift() -> None:
                     "grad_clip": candidate.grad_clip,
                 },
                 "rank": candidate.rank,
+                "lora_alpha": candidate.rank,
                 "stride": candidate.stride,
                 "canvas_tokens": 16,
                 "loss_position_decay": DFLASH_LOSS_POSITION_DECAY,

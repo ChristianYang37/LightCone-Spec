@@ -92,7 +92,7 @@ def _render_server(
     _immutable_json(config_path, config.model_dump(mode="json"))
     adaptation_path = None
     telemetry_path = None
-    if method != "static":
+    if method not in {"target_only", "static"}:
         adaptation_path = method_root / "adaptation-config.json"
         payload = sglang_adaptation_payload(config)
         if payload is None:
@@ -108,31 +108,37 @@ def _render_server(
         "--",
         "--model-path",
         str(Path(roots[target_id]).resolve()),
-        "--speculative-algorithm",
-        "DFLASH",
-        "--speculative-draft-model-path",
-        str(Path(roots[drafter_id]).resolve()),
-        "--speculative-num-draft-tokens",
-        "16",
-        "--speculative-draft-window-size",
-        "16",
-        "--speculative-accept-threshold-single",
-        "1.0",
-        "--speculative-accept-threshold-acc",
-        "1.0",
-        "--speculative-use-rejection-sampling",
-        "--speculative-speed-study-metrics",
         "--max-running-requests",
         str(config.runtime.max_running_requests),
         "--mem-fraction-static",
         str(mem_fraction_static),
         "--tp-size",
-        "1",
+        str(config.runtime.tensor_parallel_size),
         "--host",
         host,
         "--port",
         str(port),
     ]
+    if method != "target_only":
+        argv.extend(
+            (
+                "--speculative-algorithm",
+                config.model.algorithm,
+                "--speculative-draft-model-path",
+                str(Path(roots[drafter_id]).resolve()),
+                "--speculative-num-draft-tokens",
+                str(config.runtime.speculative_num_draft_tokens),
+                "--speculative-draft-window-size",
+                str(config.runtime.speculative_num_draft_tokens),
+                "--speculative-accept-threshold-single",
+                "1.0",
+                "--speculative-accept-threshold-acc",
+                "1.0",
+                "--speculative-use-rejection-sampling",
+            )
+        )
+    if adaptation_path is not None:
+        argv.append("--speculative-speed-study-metrics")
     if adaptation_path is not None and telemetry_path is not None:
         argv.extend(
             (
@@ -246,6 +252,10 @@ def _render_choice_plan(
             beta1=selected.beta1,
             beta2=selected.beta2,
             grad_clip=selected.grad_clip,
+            schedule=selected.schedule,
+            schedule_total_published_updates=(
+                selected.schedule_total_published_updates
+            ),
             momentum=selected.momentum,
             muon_ns_steps=selected.muon_ns_steps,
             muon_auxiliary_learning_rate=(selected.muon_auxiliary_learning_rate),
@@ -257,6 +267,7 @@ def _render_choice_plan(
             adaptation_group_id=str(adaptation_group_id),
             optimizer=optimizer,
             rank=selected.rank,
+            lora_alpha=selected.lora_alpha,
             stride=selected.stride,
             canvas_tokens=DFLASH_BLOCK_SIZE,
             loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
@@ -268,9 +279,9 @@ def _render_choice_plan(
         ("static",)
         if static_only
         else (
-            ("static", "tts", "naive_async")
+            ("static", "tts", "l0")
             if include_static
-            else ("tts", "naive_async")
+            else ("tts", "l0")
         )
     )
     for method in methods:
@@ -344,6 +355,82 @@ def render_static_load_runtime_plan(
         host=host,
         first_port=first_port,
     )
+
+
+def render_target_only_runtime_plan(
+    *,
+    output_root: str | Path,
+    concurrency: int,
+    model_lock: ModelLock,
+    model_roots: dict,
+    sampling_profile: SamplingProfile,
+    sglang_checkout: str | Path,
+    mem_fraction_static: float,
+    host: str = "127.0.0.1",
+    first_port: int = 30000,
+) -> tuple[ServerLaunch, ...]:
+    """Render upstream autoregressive serving without resolving a drafter root."""
+    model_lock.validate()
+    sampling_profile.validate()
+    verified_checkout = verify_patched_checkout(sglang_checkout)
+    if model_roots.get("schema_version") != 2:
+        raise ValueError("model roots must use schema version 2")
+    if model_roots.get("lock_sha256") != model_lock.sha256:
+        raise ValueError("model roots belong to a different model lock")
+    roots = model_roots.get("roots")
+    if not isinstance(roots, dict):
+        raise TypeError("model roots mapping is missing")
+    target_id = "Qwen/Qwen3-8B"
+    drafter_id = "z-lab/Qwen3-8B-DFlash-b16"
+    revisions = {model.model_id: model.revision for model in model_lock.models}
+    if target_id not in revisions or drafter_id not in revisions:
+        raise ValueError("model lock lacks the comparison pair identity")
+    target_root = roots.get(target_id)
+    if not isinstance(target_root, str) or not Path(target_root).is_dir():
+        raise ValueError("verified local target root is missing")
+    model = ModelPair(
+        target=target_id,
+        drafter=drafter_id,
+        target_revision=revisions[target_id],
+        drafter_revision=revisions[drafter_id],
+    )
+    config = RunConfig(
+        method="target_only",
+        model=model,
+        runtime=RuntimeConfig(
+            sampling_profile_sha256=sampling_profile.sha256,
+            speculation_enabled=False,
+            max_running_requests=concurrency,
+        ),
+    )
+    output = Path(output_root).resolve()
+    launch = _render_server(
+        output=output,
+        method="target_only",
+        config=config,
+        verified_checkout=verified_checkout,
+        roots=roots,
+        target_id=target_id,
+        drafter_id=drafter_id,
+        adaptation_reserve_mb=0,
+        mem_fraction_static=mem_fraction_static,
+        host=host,
+        port=first_port,
+    )
+    _immutable_json(
+        output / "launch-plan.json",
+        {
+            "schema_version": 3,
+            "execution_mode": "single_exclusive_device",
+            "phase": "target_only_baseline",
+            "model_lock_sha256": model_lock.sha256,
+            "sampling_profile_sha256": sampling_profile.sha256,
+            "patched_sglang_tree": PINNED_SGLANG_TREE,
+            "sglang_checkout": str(verified_checkout),
+            "servers": [asdict(launch)],
+        },
+    )
+    return (launch,)
 
 
 def render_runtime_plan(
@@ -519,6 +606,9 @@ def _onlinespec_run_config(
                 grad_clip=candidate.grad_clip,
             ),
             rank=candidate.rank,
+            lora_alpha=(
+                candidate.rank if candidate.weight_update_mode == "lora" else None
+            ),
             stride=candidate.stride,
             canvas_tokens=DFLASH_BLOCK_SIZE,
             loss_position_decay=DFLASH_LOSS_POSITION_DECAY,

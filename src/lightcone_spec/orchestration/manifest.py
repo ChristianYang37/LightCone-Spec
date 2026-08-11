@@ -26,7 +26,7 @@ class SpeedStudyManifest:
     schema_version: int = 2
     name: str = "static-tts-l0-speed-study"
     model_pair: str = "qwen3_8b_dflash16"
-    methods: tuple[str, ...] = ("static", "tts", "naive_async")
+    methods: tuple[str, ...] = ("static", "tts", "l0")
     phases: tuple[str, ...] = (
         "static_load_screen",
         "shared_config_tuning",
@@ -77,7 +77,7 @@ class SpeedStudyManifest:
     def validate(self) -> None:
         if self.schema_version != 2:
             raise ValueError("only schema-v2 speed-study manifests are valid")
-        if self.methods != ("static", "tts", "naive_async"):
+        if self.methods != ("static", "tts", "l0"):
             raise ValueError("formal methods must remain Static, TTS, and L0")
         if self.phases != (
             "static_load_screen",

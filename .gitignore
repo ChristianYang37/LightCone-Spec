@@ -39,6 +39,7 @@ tmp/
 selection_summary.json
 selected_optimizer_config.json
 /baselines/
+RESULTS_HANDOFF.md
 
 # Local credentials and provider state
 .env

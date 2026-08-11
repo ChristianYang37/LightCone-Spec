@@ -2,64 +2,106 @@
 
 [English](../en/troubleshooting.md) · [首页](../../README_zh-CN.md)
 
-## Patch 或 runtime 身份失败
+## Patch 或 Runtime 身份失败
 
-- 核对完整 upstream commit、detached clean 状态、patch digest 和
-  `patches/sglang/manifest.json` 中的 expected tree；
-- 开始负载筛选或调参后不得编辑 runtime。源码、包、模型、sampling 或启动参数发生
-  drift 都需要新的 selection 和 evidence root；
-- 测试不得隐式引用工作区 `sglang/`；必须显式传入 clean upstream 或一次性 patched
-  checkout。
+- 核对准确 detached upstream commit、clean status、series order、逐 patch digest、
+  modified-file inventory 与 `patches/sglang/manifest.json` 中 expected final tree；
+- 运行完整 disposable apply/compile/test/reverse verifier。CPU package test 成功不能验证
+  pending SGLang migration；
+- Run 不得隐式引用 workspace checkout。显式传入 verified disposable checkout，并绑定其
+  tree receipt；
+- Source、package、model、sampling、trace、topology 或 launch argument 的任何 drift 都
+  要求新 runtime identity 与下游 evidence root。
 
-## 模型或配置被拒绝
+## 配置或 Backend 被拒绝
 
-- Upstream revision 改变时重新生成 model lock。Model-roots 文件必须绑定该精确 lock，
-  且选择的每个本地目录都必须存在；
-- 所有 adapted backend 都拒绝大于一的 TP/DP、量化 drafter path、block/canvas
-  不匹配、未支持的 speculative 选项和未显式保留足够 HBM 的配置。Drafter scope 仅
-  用于 DFlash；DSpark 还要求 verify-all；EAGLE/EAGLE3 要求 single layer、fixed
-  depth、top-k one、无 token map 与 exact full-vocabulary rejection sampling；
-- 不同 optimizer 的专属字段不能混用。SGDm、NAG 与 Muon 需要显式 momentum；Muon
-  还需要 Newton--Schulz steps 与辅助 AdamW 配置。所选 optimizer 不使用的字段会
-  触发配置错误，不会被静默忽略；
-- 正式 Static/TTS/L0 endpoint 必须显式启用 speed-study metric 与 exact rejection
-  sampling。若 exact kernel 不可用，应修复环境，不能改成 greedy DFlash fallback；
-- Static 不能含 adaptation object。TTS 与 L0 的 adaptation 字段和选择的 concurrency
-  必须完全相同。
-- OnlineSPEC 使用自己的 manifest 与 selection。其 optimizer 必须是 plain SGD；
-  OGD/optimistic 拒绝 expert 字段，Hedge 则要求有序 expert rate、meta rate 与 Full
-  parameter。绝不能为该对比复用核心 TTS/L0 selection 或 confirmation shard。
+- Schema v3 使用 canonical `target_only`、`static`、`tts`、`l0`。未知 method name 与已
+  退役 adaptation 字段属于错误；
+- Target-only 要求关闭 speculation 且无 adaptation；Static 启用 speculation 但无
+  adaptation；移除 method 字段后，TTS/L0 的 adaptation 必须逐字节相同；
+- 对 industrial executor 而言，当前只有 TP1/DP1 Target-only 为 READY。缺少
+  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 时，Static/TTS/L0 会在
+  server launch 前失败；这是预期的 fail-closed release boundary；
+- Adaptation 是 `last1`、`last3`、`last5` 或 `all` 上的 Full/LoRA。LoRA 要求注册 rank 与
+  `alpha/r=1`。借用 target parameter、量化或不属于 backend 的 coordinate 不能训练；
+- DSpark layer-only 与 `*_native_heads` hybrid 字段是目标 contract；当前 adaptive schema
+  会在 model loading 前拒绝 DSpark。未来实现必须解析真实 W1/W2/confidence state，不得使用
+  placeholder Markov feature 或推断 predecessor；
+- EAGLE/EAGLE3 与 NEXTN validator/hook 是目标 contract，不是当前实现。它们的 adaptive
+  config 会在 model loading 前被拒绝；
+- Optimizer 专属字段严格校验：SGDm/NAG/Muon 要求 momentum；Muon 还要求 Newton--Schulz
+  与 auxiliary AdamW value。未使用字段不会被忽略。
+
+## 双 Rank 被拒绝或 Collective 失败
+
+- 当前 `RunConfig` 会在 model loading 前拒绝全部 TP2/DP2 value；caller 自己填写
+  `patched_two_gpu_v1` digest 也不能启用 multi-rank 工作；
+- 单节点/双 rank identity、sticky DP routing 与 all-rank receipt 字段只是 CPU coordinator
+  目标 contract。它们描述未来固定实现必须证明的内容，不是当前 SGLang support；
+- 缺 prepare vote、foreign topology receipt、generation mismatch、non-finite candidate、
+  unsafe boundary 或不完整 post-copy receipt 会让全部 rank abort update。Transport/split-
+  decision failure 还会关闭 admission，直至显式 same-topology restart；
+- CPU `gloo` harness 必须使用 live gloo process group。它刻意拒绝 NCCL，不能当作 GPU
+  capability evidence；
+- Multi-node、超过两个 rank、Kubernetes、elastic membership 与 automatic failover 不受
+  支持，也不存在隐藏 flag。
 
 ## 显存压力
 
-Adaptation state 在 KV pool 之前计算。它常驻 GPU、不可驱逐、不自动 offload，也不会
-静默从 Full 改成 LoRA 或 tail。应降低 admission、context 或显式选择的参数布局；由于
-runtime 身份已经改变，随后必须重新执行负载筛选。
+检查 per-category、per-rank HBM ledger。Admission 由 headroom 最小 rank 决定，且先计入
+model/KV、FP32 master、gradient、真实 moment、candidate/staging、activation、graph、
+telemetry 与 safety margin。只按 trainable parameter count 估计是不完整的。
 
-OOM 或 retraction 是正式实验的安全事件。不得删除计数、单纯增加 timeout，或把失败请求
-从分母移除。
+Pressure handling 保留 active correctness state，只允许驱逐 native inactive prefix，随后
+取消 pending adaptation，并 queue 或拒绝新工作。可选 inactive-cohort offload 必须显式，
+且排在最后。不要通过改变 Full/LoRA、rank、scope、optimizer、precision、context 或
+admission 隐藏 OOM；每次改变都要求新 config 与 load screen。
 
-如果 optimizer HBM 与预期不符，应检查账本，而不是只按 trainable parameter 推算。
-Adam/AdamW 有两个 moment，SGDm/NAG/Lion 有一个；Muon 对 matrix 使用一个，对辅助
-AdamW 处理的非 matrix 参数使用两个。FP32 master、staging bank、gradient 与 step
-metadata 都是独立类别。
+Slab exhausted 时检查 tenant quota、active reference、replica identity、generation counter
+与可选 cold-offload timer。只有 inactive cohort 可回收。没有 matching reclamation/transfer
+receipt 就复用 slab 属于 stale-state bug。
 
-OnlineSPEC 还要检查 `online_state_bytes`。Optimistic anchor/hint，以及每个 Hedge expert、
-gradient、累计 loss vector 与 merge buffer 都常驻显存。若 Hedge run 的账本看起来只包含
-一份 model decision，说明账本不完整，必须禁止启动。
+## Telemetry Backpressure 或中断
 
-## Confirmation 中断
+Evidence writer 有 queued-row 上限。`backpressure` 策略会 flush fsynced Parquet WAL segment；
+显式 `drop` 会增加 drop counter，且 attempt 不能满足 complete evidence。提高 bound 会改变
+runtime identity，必须在 measurement 前决定。
 
-对同一不可变 root 重跑完全相同的 `run-confirmation` 命令。已完成的 hash-bound receipt
-会先验证再跳过。缺少 terminal receipt 的 Parquet shard 属于中断 attempt，不会进入
-统计。如果 receipt 损坏、重复或绑定另一身份，保留目录用于审计并创建新的 evidence
-root，不要手工编辑。
+Durable index 拒绝重复 request/round/update/performance key。Checkpoint、WAL row-group
+coverage、final shard schema/digest 与 completion-receipt counter 必须一致。不要 rename、
+combine、truncate 或手工编辑 segment。
 
-## 意外的 `UNMEASURED` 或 `BLOCKED`
+中断后保留 WAL/checkpoint/aborted marker 供审计，并从相同 immutable cell resume。只跳过
+一个有效 exclusive terminal receipt。没有 receipt 的 final Parquet file，或同一 run/rank
+存在多个 completed attempt，都不是有效证据。
 
-`UNMEASURED` 表示没有提供有效 GPU attestation，即使诊断算术为正也不例外。
-`BLOCKED` 表示存在 attested GPU evidence，但至少一个注册的速度、区间、安全、覆盖或
-发布条件失败。两者都是合法结果，不得重新命名为成功。
+## Registry 或 Dispatch 被拒绝
 
-报告 bug 时请提供脱敏命令、包与平台版本、精确 upstream/patched tree ID 和最小复现
-配置。不得公开 token、密码、私有 prompt、实例地址或机器专用模型路径。
+- 通过 CLI 加载 generated registry；generator、parameter、embedded declaration 或 SHA-256
+  不匹配表示内容被编辑；
+- 只提供 ready stage 声明的准确 receipt。Locked-output name 必须匹配 definition，并使用
+  lowercase SHA-256；
+- Completed-cell artifact 中每个 cell 都需要 measured evidence 与 terminal-receipt digest。
+  目录存在不表示完成；
+- 缺少 matching `PASS` interference receipt 时，单 GPU 工作保持串行；exclusive/双 GPU
+  工作始终串行。不能因为 JSON 中列出多个 wave 或 endpoint 就同时全部启动。
+
+## 意外的 `UNMEASURED`、`BLOCKED` 或 `UNDERPOWERED`
+
+`UNMEASURED` 表示不存在合格 content-bound GPU evidence/attestation。正向 diagnostics、
+CPU mock、历史 v2 result 或 acceptance change 都不能改变它。当前新 GPU phase 保持
+`UNMEASURED`；Stage B 因缺少 native terminal speculative-evidence provider、provider
+credential 与已注册硬件而 `BLOCKED`。Static/TTS/L0、全部 DSpark/EAGLE/EAGLE3/NEXTN
+adaptive cell 与全部 TP2/DP2 cell 都 blocked；只有 TP1/DP1 Target-only 可端到端执行。
+
+`BLOCKED` 也是 registered cell prerequisite 或 attested criterion 失败时的正确结果。
+`UNDERPOWERED` 表示四个 excluded pilot block 无法按注册 power 选择 12--20 个 final block，
+因此 confirmation 不能开始。`UNRESOLVED` p99 表示 completion 少于 10,000。不得重命名、
+省略、impute 或优化掉这些状态。
+
+## 安全与 Bug Report
+
+报告脱敏 command、package/platform version、准确 upstream/patched tree ID、registry/cell/
+trace digest、topology receipt 与最小可复现 schema-v3 config。不得公开 token、password、
+provider key、temporary URL、private prompt、instance address、model path 或 raw provider
+state。

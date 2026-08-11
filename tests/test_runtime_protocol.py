@@ -48,9 +48,32 @@ def test_publication_policy(policy: MethodPolicy, expected: int | None) -> None:
 
 
 def test_tts_waits_only_when_ready_precedes_next_boundary() -> None:
-    assert publication_round(
-        MethodPolicy.FIXED_BARRIER, candidate(ready_round=27), 10
-    ) == 27
+    assert (
+        publication_round(MethodPolicy.FIXED_BARRIER, candidate(ready_round=27), 10)
+        == 27
+    )
+
+
+def test_extra_logical_delay_is_explicit_in_boundary_math() -> None:
+    value = candidate()
+    assert (
+        publication_round(
+            MethodPolicy.FIRST_READY_BOUNDARY,
+            value,
+            10,
+            extra_logical_delay=3,
+        )
+        == 15
+    )
+    assert (
+        publication_round(
+            MethodPolicy.FIXED_BARRIER,
+            value,
+            10,
+            extra_logical_delay=12,
+        )
+        == 24
+    )
 
 
 @pytest.mark.parametrize("stride", [0, -1])
@@ -65,7 +88,7 @@ def test_candidate_equivalence_is_exact() -> None:
         assert_candidate_equivalence(candidate(), candidate(ready_round=13))
 
 
-@pytest.mark.parametrize("method", ["static", "tts", "naive_async"])
+@pytest.mark.parametrize("method", ["static", "tts", "l0"])
 def test_policy_lookup(method: str) -> None:
     assert policy_for(method).value == method
 
@@ -137,9 +160,7 @@ def test_cross_cohort_signal_rejected() -> None:
 
 def test_runtime_rejects_stale_signal_and_candidate_conflicts() -> None:
     runtime = CohortRuntime(identity())
-    assert not runtime.offer_signal(
-        signal(runtime.identity.sha256, "r0", 0, version=1)
-    )
+    assert not runtime.offer_signal(signal(runtime.identity.sha256, "r0", 0, version=1))
     update = runtime.begin_candidate(payload=(1,), source_round=10, ready_round=12)
     assert runtime.can_publish(
         update,
@@ -158,8 +179,39 @@ def test_runtime_rejects_stale_signal_and_candidate_conflicts() -> None:
         policy=MethodPolicy.FIRST_READY_BOUNDARY,
         current_round=12,
         stride=10,
+        extra_logical_delay=1,
+    ) == (False, "waiting_extra_logical_delay")
+    assert runtime.can_publish(
+        update,
+        policy=MethodPolicy.FIRST_READY_BOUNDARY,
+        current_round=13,
+        stride=10,
+        extra_logical_delay=1,
     ) == (True, "ready")
-    assert runtime.commit(update) == 1
+    assert (
+        runtime.commit(
+            update,
+            policy=MethodPolicy.FIRST_READY_BOUNDARY,
+            current_round=13,
+            stride=10,
+            extra_logical_delay=1,
+        )
+        == 1
+    )
+
+
+def test_commit_cannot_bypass_publication_authority() -> None:
+    runtime = CohortRuntime(identity())
+    update = runtime.begin_candidate(payload=(1,), source_round=10, ready_round=12)
+    with pytest.raises(RuntimeError, match="side_stream_not_ready"):
+        runtime.commit(
+            update,
+            policy=MethodPolicy.FIRST_READY_BOUNDARY,
+            current_round=11,
+            stride=10,
+        )
+    assert runtime.active_version == 0
+    assert runtime.in_flight is update
 
 
 def test_max_in_flight_cancel_and_aba_protection() -> None:

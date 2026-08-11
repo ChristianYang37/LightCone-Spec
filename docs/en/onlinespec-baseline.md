@@ -32,8 +32,12 @@ drafter baseline. LightCone-Spec implements the three online-learning rules
 that can be compared under the same speculative-decoding feedback and
 exactness contract: OGD, optimistic OGD, and Hedge over OGD experts.
 
-GPU status is `UNMEASURED`. This page describes protocol and implementation,
-not a performance result.
+GPU status is `UNMEASURED`. This page describes an isolated source-level/CPU
+protocol and target implementation, not a performance result or current
+industrial executor support. Like every speculative method, an OnlineSPEC
+industrial run would require the missing
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` provider;
+only Target-only is end-to-end executable there today.
 
 ## Source audit
 
@@ -84,10 +88,11 @@ test-time-update boundary audited at the pinned commit.
 | Opt-Hydra | A multi-head Hydra draft head | Feature reconstruction plus teacher/token losses. The released “optimistic” path uses SGD momentum 0.9, learning rate 0.1, and three epochs, rather than the paper's two-state transition. | 80-example chunks; trainer checkpoints and optimizer state are loaded from disk between chunks. | Implements the published two-state optimistic learner on the supported drafter parameters. Momentum is not treated as mathematical optimism. |
 | Ens-EAGLE / EAGLE3 | Three independent EAGLE or EAGLE3 draft heads | Each learner is trained at a different rate. Registered scripts use EAGLE rates 3e-5/6e-5/1.2e-4 for five epochs and EAGLE3 rates 1e-4/2e-4/4e-4 for two epochs; source variants disagree about cumulative versus last-chunk weighting. | 40-example chunks; checkpoints are loaded and merged on CPU before evaluation. | Keeps independent projected-OGD experts and cumulative-loss Hedge, but performs the update and same-class weighted decision on device. Expert backward passes are streamed sequentially so only one expert-gradient scratch is live. |
 
-“Complete” therefore has a precise meaning here: all three published online
+“Complete” therefore has a precise, non-industrial meaning here: all three published online
 learner transitions used for a common speculative-decoding comparison—OGD,
 two-state optimistic OGD, and cumulative-loss Hedge—have complete schema,
-runtime, tuning, confirmation, telemetry, and safety implementations. It does
+CPU/runtime contract, tuning, confirmation, telemetry, and safety source
+implementations. It does
 not mean that Online-LR, Hydra, and EAGLE have been made architecture-identical,
 because doing so would change the model pair, supervision, and systems budget
 rather than isolate the online learner.
@@ -131,7 +136,7 @@ tuning-only protocol bounds, not reported best settings.
 
 Let $K$ be the permitted parameter set, Π its Euclidean projection, $w_t$ the
 decision used for proposal round $t$, and $g_t=\nabla\ell_t(w_t)$ the loss
-gradient revealed by verification. In the executable contract, each learner
+gradient revealed by verification. In the target learner contract, each learner
 independently applies the configured global-norm clip to $g_t$ before the
 transition below.
 
@@ -207,12 +212,15 @@ KV segment.
 
 ## Backend and parameter support
 
-- DFlash supports drafter-scope `full` and `lora`, plus the shared tail
-  ablations. Only update rounds run the differentiable current-canvas path;
-  the whole homogeneous cohort is reconstructed as one batched SDPA/MLP graph,
-  not as a Python loop over requests.
-- DSpark and EAGLE/EAGLE3 use the cache-safe tail path and their existing
-  backend restrictions. They do not pretend to provide drafter-wide gradients.
+- The tracked comparison uses DFlash `full` and `lora` over the registered
+  `last1`, `last3`, `last5`, or `all` native layer scopes. Only update rounds
+  run the differentiable current-canvas path; the homogeneous cohort is
+  reconstructed as one batched SDPA/MLP graph, not as a Python loop over
+  requests.
+- The common schema-v3 evidence envelope declares DSpark, EAGLE/EAGLE3, and
+  NEXTN validator contracts, but the current patch does not implement those
+  adaptive hooks. They remain `BLOCKED`; the tracked OnlineSPEC manifest cannot
+  infer a cross-backend result from target CPU contracts.
 - OGD and optimistic OGD support Full and LoRA in the registered DFlash grid.
 - Hedge supports distinct Full and LoRA decision classes and uses at least two
   ordered expert learning rates. Every LoRA expert has the same registered rank.
@@ -308,19 +316,22 @@ analyze-onlinespec-study
 
 Use `lightcone-spec COMMAND --help` for exact arguments. Generated selections,
 performance data, and attestations remain under the ignored artifact root.
-The comparison is important evidence, but `analyze-onlinespec-study` explicitly
-reports `core_speed_gate_affected=false`, per-learner acceleration decisions,
+These isolated commands exercise the registered source protocol but do not
+bypass the industrial executor's native-terminal-evidence blocker or establish
+a schema-v3 GPU result. `analyze-onlinespec-study` reports
+`core_speed_gate_affected=false`, per-learner diagnostic decisions,
 `selection_protocol`, and `optimized_grid_claim`.
 
 ## Reproduction claim
 
-LightCone-Spec claims a clean-room, paper-equation implementation of the
-OnlineSPEC online drafter learners under one industrial speculative-decoding
-runtime. It does not claim byte-for-byte reproduction of the official scripts,
-does not redistribute their code, and does not treat Online-LR's reasoning DPO
-pipeline as if it were token-level draft-model adaptation. Any future extension
-of that pipeline requires its own objective, data, memory contract, and
-registered comparison.
+LightCone-Spec claims a clean-room, paper-equation source implementation and
+CPU/runtime target contract for the OnlineSPEC online drafter learners. It does
+not claim current end-to-end industrial execution, a GPU result, byte-for-byte
+reproduction of the official scripts, or redistribution of their code. It also
+does not treat Online-LR's reasoning DPO pipeline as token-level draft-model
+adaptation. Any future executable extension requires the exact native terminal
+provider plus its own objective, data, memory contract, and registered
+comparison.
 
 For a repeatable source audit, clone the official repository outside this
 project and detach at the recorded commit:

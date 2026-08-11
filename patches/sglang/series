@@ -1,10 +1,1 @@
-0001-feat-spec-add-strict-online-adaptation-preflight.patch
-0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch
-0003-feat-dflash-add-differentiable-online-update-path.patch
-0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch
-0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch
-0006-test-spec-cover-cross-backend-adaptation-protocols.patch
-0007-fix-spec-bound-request-boundary-KV-reservations.patch
-0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch
-0009-fix-spec-derive-request-budgets-from-committed-prefi.patch
-0010-fix-spec-preserve-logical-prefixes-across-overlap-ro.patch
+0001-feat-spec-add-schema-v3-native-online-adaptation.patch

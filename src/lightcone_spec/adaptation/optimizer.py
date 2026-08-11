@@ -5,11 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
-from lightcone_spec.config.schema import OptimizerConfig
+if TYPE_CHECKING:
+    from lightcone_spec.config.schema import OptimizerConfig
 
 _MUON_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 
@@ -46,6 +48,7 @@ class OptimizerProposal:
     first_moments: tuple[Tensor, ...]
     second_moments: tuple[Tensor, ...]
     step: int
+    numerical_predicate: Tensor
 
 
 class GPUOptimizer:
@@ -83,6 +86,52 @@ class GPUOptimizer:
         )
         self.step_number = 0
 
+    def scheduled_learning_rate(self, base_learning_rate: float, step: int) -> float:
+        """Evaluate the registered schedule on the next published update index."""
+
+        if step < 1:
+            raise ValueError("published update step must be positive")
+        if self.config.schedule == "constant":
+            scale = 1.0
+        elif self.config.schedule == "inverse_sqrt_published_update":
+            scale = 1.0 / math.sqrt(step)
+        else:
+            horizon = self.config.schedule_total_published_updates
+            if horizon is None:
+                raise AssertionError("validated cosine schedule has no horizon")
+            if step > horizon:
+                raise ValueError("published update exceeds the cosine schedule horizon")
+            scale = 0.5 * (1.0 + math.cos(math.pi * (step - 1) / (horizon - 1)))
+        return base_learning_rate * scale
+
+    @staticmethod
+    def _proposal(
+        parameters: tuple[Tensor, ...],
+        first_moments: tuple[Tensor, ...],
+        second_moments: tuple[Tensor, ...],
+        step: int,
+        gradients: tuple[Tensor, ...],
+    ) -> OptimizerProposal:
+        numerical = torch.stack(
+            tuple(
+                torch.isfinite(tensor).all()
+                for tensor in (
+                    *gradients,
+                    *parameters,
+                    *first_moments,
+                    *second_moments,
+                )
+                if tensor.numel() > 0
+            )
+        ).all()
+        return OptimizerProposal(
+            parameters,
+            first_moments,
+            second_moments,
+            step,
+            numerical,
+        )
+
     def _adamw_update(
         self,
         parameter: Tensor,
@@ -101,9 +150,10 @@ class GPUOptimizer:
         direction = (next_first / (1.0 - beta1**step)) / (
             (next_second / (1.0 - beta2**step)).sqrt() + self.config.epsilon
         )
-        learning_rate = (
+        base_learning_rate = (
             self.config.learning_rate if learning_rate is None else learning_rate
         )
+        learning_rate = self.scheduled_learning_rate(base_learning_rate, step)
         weight_decay = (
             self.config.weight_decay if weight_decay is None else weight_decay
         )
@@ -121,7 +171,10 @@ class GPUOptimizer:
         ):
             raise ValueError("gradient layout does not match optimizer state")
         grads = tuple(g.detach().to(dtype=torch.float32) for g in gradients)
-        if any(not bool(torch.isfinite(gradient).all()) for gradient in grads):
+        gradient_predicate = torch.stack(
+            tuple(torch.isfinite(gradient).all() for gradient in grads)
+        ).all()
+        if grads[0].device.type == "cpu" and not bool(gradient_predicate):
             raise ValueError("optimizer gradients must be finite")
         total_norm = (
             torch.stack(tuple(gradient.square().sum() for gradient in grads))
@@ -134,17 +187,22 @@ class GPUOptimizer:
         )
         grads = tuple(gradient * clip for gradient in grads)
         step = self.step_number + 1
+        learning_rate = self.scheduled_learning_rate(
+            self.config.learning_rate,
+            step,
+        )
 
         if self.config.name == "sgd":
             parameters = tuple(
-                parameter - self.config.learning_rate * gradient
+                parameter - learning_rate * gradient
                 for parameter, gradient in zip(self.master, grads, strict=True)
             )
-            return OptimizerProposal(
+            return self._proposal(
                 parameters,
                 self.first_moments,
                 self.second_moments,
                 step,
+                grads,
             )
 
         if self.config.name in {"sgdm", "nag"}:
@@ -168,10 +226,12 @@ class GPUOptimizer:
                 )
             )
             parameters = tuple(
-                parameter - self.config.learning_rate * direction
+                parameter - learning_rate * direction
                 for parameter, direction in zip(self.master, directions, strict=True)
             )
-            return OptimizerProposal(parameters, first, self.second_moments, step)
+            return self._proposal(
+                parameters, first, self.second_moments, step, grads
+            )
 
         if self.config.name == "lion":
             beta1 = self.config.beta1
@@ -184,12 +244,14 @@ class GPUOptimizer:
                 beta2 * moment + (1.0 - beta2) * gradient
                 for moment, gradient in zip(self.first_moments, grads, strict=True)
             )
-            decay = 1.0 - (self.config.learning_rate * self.config.weight_decay)
+            decay = 1.0 - (learning_rate * self.config.weight_decay)
             parameters = tuple(
-                parameter * decay - self.config.learning_rate * direction
+                parameter * decay - learning_rate * direction
                 for parameter, direction in zip(self.master, directions, strict=True)
             )
-            return OptimizerProposal(parameters, first, self.second_moments, step)
+            return self._proposal(
+                parameters, first, self.second_moments, step, grads
+            )
 
         if self.config.name == "muon":
             momentum = self.config.momentum
@@ -228,20 +290,20 @@ class GPUOptimizer:
                         steps=ns_steps,
                         epsilon=max(self.config.epsilon, 1e-7),
                     )
-                    adjusted_lr = self.config.learning_rate * math.sqrt(
+                    adjusted_lr = learning_rate * math.sqrt(
                         max(1.0, parameter.shape[0] / parameter.shape[1])
                     )
                     updated = (
                         parameter
-                        * (1.0 - self.config.learning_rate * self.config.weight_decay)
+                        * (1.0 - learning_rate * self.config.weight_decay)
                         - adjusted_lr * direction
                     )
                     next_second = old_second
                 parameters.append(updated)
                 first.append(next_first)
                 second.append(next_second)
-            return OptimizerProposal(
-                tuple(parameters), tuple(first), tuple(second), step
+            return self._proposal(
+                tuple(parameters), tuple(first), tuple(second), step, grads
             )
 
         beta1 = self.config.beta1
@@ -263,12 +325,27 @@ class GPUOptimizer:
             )
             if self.config.name == "adamw":
                 direction = direction + self.config.weight_decay * parameter
-            parameters.append(parameter - self.config.learning_rate * direction)
-        return OptimizerProposal(tuple(parameters), first, second, step)
+            parameters.append(parameter - learning_rate * direction)
+        return self._proposal(tuple(parameters), first, second, step, grads)
 
-    def commit(self, proposal: OptimizerProposal) -> None:
+    def commit(
+        self,
+        proposal: OptimizerProposal,
+        *,
+        numerical_receipt: bool | None = None,
+    ) -> None:
         if proposal.step != self.step_number + 1:
             raise ValueError("optimizer proposal step conflict")
+        if proposal.numerical_predicate.device.type == "cpu":
+            valid = bool(proposal.numerical_predicate)
+        elif numerical_receipt is None:
+            raise RuntimeError(
+                "CUDA commit requires an event-complete numerical receipt"
+            )
+        else:
+            valid = numerical_receipt
+        if not valid:
+            raise ValueError("optimizer proposal is non-finite")
         with torch.no_grad():
             for active, candidate in zip(self.master, proposal.parameters, strict=True):
                 active.copy_(candidate)

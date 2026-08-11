@@ -1,20 +1,71 @@
 """GPU-resident cohort adaptation primitives."""
 
 from .cohort import CohortIdentity, CohortRuntime, SupervisionSignal
+from .governor import (
+    BoundedCohortStateManager,
+    CohortAdmission,
+    CohortAdmissionReason,
+    CohortOffloadMode,
+    CohortReclamationReceipt,
+    CohortStateKey,
+    CohortStateSnapshot,
+    CohortTransferReceipt,
+    HBMAdmission,
+    HBMAdmissionReason,
+    HBMAdmissionRequest,
+    HBMGovernor,
+    HBMLedger,
+    MemoryPressureAction,
+    MemoryPressureStep,
+    RankHeadroom,
+    RankMemoryState,
+)
 from .kv_history import FrozenKVHistory, KVSegment
 from .memory import AdaptationMemoryLedger
 from .optimizer import FixedAddressBank, GPUOptimizer
-from .parameters import DFlashParameterPlan, LoRAFactors
+from .parameters import (
+    DSPARK_HYBRID_SCOPES,
+    LAYER_SCOPES,
+    LORA_RANKS,
+    DFlashParameterPlan,
+    DSparkParameterPlan,
+    LoRAFactors,
+    NativeLayerParameterPlan,
+    TrainablePlan,
+)
 
 __all__ = [
+    "DSPARK_HYBRID_SCOPES",
+    "LAYER_SCOPES",
+    "LORA_RANKS",
     "AdaptationMemoryLedger",
+    "BoundedCohortStateManager",
+    "CohortAdmission",
+    "CohortAdmissionReason",
     "CohortIdentity",
+    "CohortOffloadMode",
+    "CohortReclamationReceipt",
     "CohortRuntime",
+    "CohortStateKey",
+    "CohortStateSnapshot",
+    "CohortTransferReceipt",
     "DFlashParameterPlan",
+    "DSparkParameterPlan",
     "FixedAddressBank",
     "FrozenKVHistory",
     "GPUOptimizer",
+    "HBMAdmission",
+    "HBMAdmissionReason",
+    "HBMAdmissionRequest",
+    "HBMGovernor",
+    "HBMLedger",
     "KVSegment",
     "LoRAFactors",
+    "MemoryPressureAction",
+    "MemoryPressureStep",
+    "NativeLayerParameterPlan",
+    "RankHeadroom",
+    "RankMemoryState",
     "SupervisionSignal",
+    "TrainablePlan",
 ]

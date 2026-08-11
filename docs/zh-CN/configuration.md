@@ -4,104 +4,152 @@
 
 ## Schema 身份
 
-所有 run config 使用 schema version 2，并拒绝未知字段。核心方法只有 `static`、`tts`
-和 `naive_async`。已注册 OnlineSPEC 对比在独立 manifest、selection 和证据身份下加入
-`onlinespec_ogd`、`onlinespec_opt` 与 `onlinespec_ens`。它们不能替代核心速度实验中的
-方法，也不能影响其 gate。
+Run config 使用 schema version 3，验证后不可变，并拒绝未知字段。核心方法为
+`target_only`、`static`、`tts` 与 `l0`。隔离的 OnlineSPEC 对比另有
+`onlinespec_ogd`、`onlinespec_opt` 与 `onlinespec_ens`；它使用独立 selection 与证据
+身份，不能替换核心方法。
 
-每个真实 run 都绑定不可变的 target/drafter revision、固定 SGLang commit、sampling
-profile digest、tenant 与 runtime load。旧 schema 或已删除的方法名会在模型加载前作为
-未知输入拒绝。
+每个 run 绑定准确 target/drafter revision、backend algorithm、context/draft depth、固定
+SGLang commit、sampling-profile SHA-256、tenant 与 runtime topology。Target-only 要求
+`speculation_enabled=false`；其他方法必须启用 speculation，且 verification width 等于
+draft depth 加一。未知 schema 与已退役 adaptation 字段会在加载模型前失败。
 
-## Adaptation 配置
+这些名称包含目标 protocol vocabulary，不承诺每个合法 scientific declaration 都可执行。
+当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0 会在任何
+mutation 前因缺少
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 而被阻止；固定 patch 没有
+提供该 provider。底层 adaptive patch path 仅限 TP1/DP1 DFlash、constant schedule、零
+extra logical delay 与 `update_round` teacher row。
 
-TTS 与 L0 共享完全相同的 adaptation object：
+## 方法与 Disabled Path 合同
 
-| 字段 | 允许的合同 |
+Target-only 与 Static schema config 都要求 `adaptation: null` 和 `online_spec: null`。
+Target-only 启动无 speculation 的 target path；Static 描述原生 speculative decoding。
+二者都不能分配 optimizer、gradient、master、candidate 或 cohort-adaptation state。当前
+只有 Target-only 可端到端执行。Static 必须保持 round/update 详细 trace 零分配，同时仍需
+content-bound request、performance 与汇总 speculative safety evidence，所以无法通过
+industrial executor preflight。
+
+移除 method 字段后，TTS 与 L0 的 model、runtime、adaptation、sampling 与 load 身份必须
+逐字节相同。二者使用一个 candidate 实现，只能在发布时间上不同。必须使用准确
+full-vocabulary rejection sampling；注册 kernel 不存在时必须报错，不能静默退回 greedy。
+
+## Adaptation 对象
+
+| 字段 | Schema-v3 合同 |
 |---|---|
-| `weight_update_mode` | `residual`、`lora` 或 `full` |
-| `parameter_scope` | `tail` 或 `drafter` |
-| `kv_history_policy` | 只能是 `frozen` |
-| `adaptation_scope` | 只能是 `cohort` |
-| `adaptation_group_id` | 显式、非空的实验组身份 |
-| `optimizer.name` | `adam`、`adamw`、`sgdm`、`nag`、`muon` 或 `lion` |
-| `rank` | residual/LoRA 必须显式给出；full 为 `null` |
+| `weight_update_mode` | `full` 或 `lora` |
+| `parameter_scope` | `last1`、`last3`、`last5`、`all`；DSpark 另允许三个 `*_native_heads` scope |
+| `kv_history_policy` | 只能为 `frozen` |
+| `adaptation_scope` | 只能为 `cohort` |
+| `adaptation_group_id` | 显式非空 cohort 身份 |
+| `rank`、`lora_alpha` | Full 时均为 `null`；LoRA 时为相同注册 rank，使 `alpha/r=1` |
+| `lora_matrix_policy` | 只能为 `registered_matrices_v1` |
+| `native_head_policy` | layer-only 为 `frozen`；DSpark hybrid 为 `full` |
 | `stride` | 正整数 |
 | `max_in_flight` | 只能为一 |
+| `canvas_tokens` | 等于 speculative verification width |
+| `teacher_row_policy` | `update_round` 或已注册 `quota_shadow` |
 
-Residual 仅允许 tail。Drafter Full/LoRA 仅用于 DFlash，要求未量化、TP=DP=1，且 canvas
-宽度等于 speculative block size。DSpark 和 EAGLE/EAGLE3 只接受 tail scope。Adapted
-DSpark 必须使用 verify-all；adapted EAGLE/EAGLE3 必须 one layer、fixed proposal
-depth、top-k one、无 token-map remapping，并使用 exact full-vocabulary rejection
-sampling。Target embedding、target LM head 与 target model 始终冻结。
+LoRA rank 恰为 1、2、4、8、16、32、64。LoRA plan 只选择已注册二维 native matrix，初始
+functional delta 为零。Full 选择命名 native layer scope 中全部合格浮点参数。借用的 target
+embedding、target LM head 与 target model 始终冻结。量化或不属于 backend 的可训练
+coordinate 会在 preflight 失败。
 
-Static 必须使用 `adaptation: null`。这是 fast path 的语义要求：不得创建 optimizer、
-gradient、trace、candidate 或 adaptation-reserve allocation。
+Trainable-plan digest 覆盖 selected/frozen parameter、shape、dtype、parameterization、LoRA
+rank/alpha 以及 sharded/replicated ownership。改变任一值都会产生新的 config、memory plan、
+selection 与证据身份。
 
-正式 launcher 会为三个 endpoint 显式加入 `--speculative-speed-study-metrics` 和 exact
-rejection sampling。没有该实验开关时，原生 SGLang 不分配 LightCone 指标状态；启用后则
-必须使用 DFlash、rejection sampling，并将两个 acceptance threshold 设为一。缺少 exact
-kernel 时直接报错，绝不退回 greedy decoding。
+## Backend 专属字段
+
+本节描述目标 contract。当前可执行 schema 的 adaptive config 必须使用 DFlash；DSpark、
+EAGLE、EAGLE3 与 NEXTN 会在 model loading 前被拒绝。DFlash 的目标 contract 使用 native
+differentiable-canvas evidence。EAGLE/EAGLE3 adaptation 将要求
+`speculative_eagle_topk=1`，并钉住一个 proposal source version。NEXTN 将要求单独 preflight
+的 native interface digest；registry E6 还以双 rank memory-fit receipt 为目标。这些
+prerequisite 不会让 cell 在当前 schema 中变得可执行。
+
+DSpark layer-only scope 冻结 W1、W2 与 acceptance/confidence state。Hybrid scope
+`last1_native_heads`、`last3_native_heads`、`last5_native_heads` 选择命名 backbone scope，
+同时把 W1、W2 与 scalar native acceptance/confidence parameter 作为 Full replicated state
+训练。Hybrid 要求非空 `confidence_loss_weight`；layer-only plan 则拒绝该字段。
+
+只有 `fixed_verification_budget` 存在时，`verification_mode` 才能是 `fixed_budget`；否则为
+`native_scheduler`。Fixed-budget phase 是 tuning control，confirmation 使用 native
+scheduler。Proposal cross-entropy 与 proper confidence loss 使用真实 native Markov
+feature 和实际 sampled predecessor，配置不能用重建 placeholder feature 替代。
+
+E1a registry 恰有 56 个 adaptive configuration：四种 layer-only scope 与三种 hybrid
+scope，各自交叉 Full 加七个 LoRA rank。
 
 ## Optimizer 合同
 
-所有在线 optimizer 都是 functional 的：side stream 在不修改 active optimizer 的
-前提下生成 candidate parameter 与 candidate state，只有 TTS 或 L0 的发布策略提交后
-才成为 active state。配置严格拒绝没有实际作用的字段：
+目标 TTS/L0 optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与 `lion`。它们生成
+functional parameter/state proposal，只有 commit 时才修改 active state。Plain `sgd` 只
+用于 OnlineSPEC。
 
-| Optimizer | 必需字段 | Decay 与 resident state |
+| Optimizer | 必需身份 | 常驻 moment 规则 |
 |---|---|---|
-| `adam` | learning rate、betas、epsilon | 不支持 weight decay；FP32 一阶与二阶动量 |
-| `adamw` | learning rate、betas、epsilon | decoupled decay；FP32 一阶与二阶动量 |
-| `sgdm` | learning rate、`momentum` | coupled weight decay；一个 FP32 momentum buffer |
-| `nag` | learning rate、`momentum` | PyTorch-style Nesterov 与 coupled weight decay；一个 FP32 momentum buffer |
-| `lion` | learning rate、betas | decoupled decay；一个 FP32 momentum buffer |
-| `muon` | learning rate、`momentum`、`muon_ns_steps`、辅助 AdamW learning rate 与 decay | 二维 tensor 使用 Muon；非 matrix tensor 使用辅助 AdamW 与两个 moment |
+| Adam | learning rate、beta、epsilon | FP32 一阶与二阶 moment；无 decay |
+| AdamW | learning rate、beta、epsilon、decay | FP32 一阶与二阶 moment；decoupled decay |
+| SGDm | learning rate、momentum、可选 decay | 一个 FP32 momentum；coupled decay |
+| NAG | learning rate、momentum、可选 decay | 一个 FP32 momentum；coupled decay |
+| Lion | learning rate、beta、可选 decay | 一个 FP32 moment；decoupled decay |
+| Muon | learning rate、momentum、Newton--Schulz step、辅助 AdamW 字段 | matrix momentum，加 non-matrix 的两个辅助 moment |
 
-`grad_clip` 对整个 candidate parameter list 做全局裁剪。未使用 momentum 的 optimizer
-会拒绝该字段；Muon 专属字段在其他 optimizer 中也会被拒绝。Adam 未使用的 weight
-decay 与 Lion 未使用的 epsilon 变体同样不能形成伪 tuning identity。Static 不创建
-optimizer。Plain `sgd` 只保留给已注册 OnlineSPEC learner，不是 TTS/L0 的可选项。
+全局 `grad_clip` 必须为正并进入证据身份；未使用 optimizer 字段会被拒绝。目标 schedule
+vocabulary 包含 `constant`、`inverse_sqrt_published_update` 与 `cosine_to_zero`，按已发布
+update 数而不是 attempted work 前进。当前 adaptive `RunConfig` 只接受 `constant`；另外两种
+schedule 保持已注册但不可执行。Optimizer 与 schedule identity 进入 cohort、plan、
+selection 与 evidence digest。
 
-HBM 账本包含 FP32 master、所有真实分配的 moment 和 device step scalar。空 moment 不
-分配：SGDm、NAG 与 Lion 不承担第二个 state tensor；Muon 只对交给辅助 AdamW 的非
-matrix 参数保留两个 moment。
+## Runtime Topology
 
-## Cohort 身份
+目标 registry/coordinator vocabulary 描述一台 node、最多两个 rank：
 
-只有 target/drafter revision、算法、sampling profile、tenant、实验组、参数布局与
-optimizer 配置全部相同的请求才能共享更新。每个活跃请求只贡献最近一次合法监督。
-Cancellation、epoch rollover、slot reuse 或 source-version conflict 都会使 candidate 失效。
+| Shape | 必需字段 |
+|---|---|
+| TP1/DP1 | `distributed_runtime_capability=single_rank`，无 capability receipt |
+| TP2/DP1 | `patched_two_gpu_v1`、capability receipt、不同 rank/device identity |
+| TP1/DP2 | 相同 capability receipt，另需显式 sticky `router_identity` |
 
-## Runtime 渲染
+Rank 字段必须位于 TP/DP 维度内。Device、rendezvous、router、clock、process-group backend
+与 capability receipt 都属于目标 runtime identity。当前 release 只接受 TP1/DP1，并会在
+model loading 前拒绝全部 TP2/DP2 `RunConfig`；caller 自己填写 receipt 也不能启用。
 
-`render-runtime` 消费锁定的 selection artifact，输出三份匹配的 run config 和仅含 argv
-的启动计划。Adaptation reserve 与 Static KV memory fraction 必须由硬件预检显式提供，
-源码不设置默认值。生成的 runtime 文件和绝对模型路径应位于 ignored artifact 目录，
-不得提交。
+`process_group_backend=gloo` 只适用于 CPU collective 合同，不能认证 NCCL/CUDA 行为，
+也不能充当 GPU capability receipt。CPU contract 只保留未来 receipt vocabulary。
+Production TP2/DP2 工作会保持 `BLOCKED`，直到新的固定 runtime 实现并发出 GPU receipt
+与 all-rank publication evidence。
 
-除 `method` 字段外，TTS 与 L0 配置必须逐项一致。修改超参数、sampling profile、load、
-模型 revision 或 runtime tree 后，必须创建新的 selection 和 evidence root。
+Prefill/decode disaggregation 与 two-batch overlap 仍关闭。Multi-node 和超过两个 rank 的
+配置会验证失败；不存在 Kubernetes、elastic 或 automatic-failover 设置。
 
-## OnlineSPEC 对比配置
+## HBM 与 Cohort 策略
 
-每个 OnlineSPEC run 都有普通 `adaptation` object，并额外要求 `online_spec` object。
-Optimizer 必须是 plain `sgd`；论文专属状态不能通过 Adam 或 momentum alias 表达。
+Runtime renderer 从 preflight 接收显式 adaptation reserve 与 model/KV memory fraction；
+不存在通用源码默认值。Admission 在计入 model、KV、optimizer、candidate、activation、
+graph、telemetry 与 safety margin 后，由 headroom 最小的 rank 决定。
+
+固定 cohort slab 按 tenant 与 replica 设置 quota。可选 cold offload 必须显式配置，且只
+适用于 inactive cohort。Memory pressure 不会静默改变 Full/LoRA、precision、optimizer 或
+scope；任何改变都需要新 config、load screen、selection 与 evidence root。
+
+## OnlineSPEC 对比
+
+隔离的 OnlineSPEC protocol 要求额外 `online_spec` object，其 optimizer 必须为 plain
+SGD；其 declaration 在独立注册的 tuning protocol 中保持 TP1/DP1。这个单独的
+schema/runtime surface 不会提供 industrial executor 缺少的 native terminal evidence
+provider，也不会让 industrial speculative cell 变得可运行。
 
 | 字段 | 合同 |
 |---|---|
-| `projection_radius` | 可选的、以初始 decision 为中心的正 Euclidean 半径 |
-| `additional_learning_rates` | 严格递增的专家学习率，仅 Hedge 使用 |
-| `hedge_learning_rate` | 正 Hedge meta rate，仅 Hedge 使用 |
+| `projection_radius` | 可选正 Euclidean radius |
+| `additional_learning_rates` | 唯一递增 expert rate，仅 ensemble |
+| `hedge_learning_rate` | 正 meta rate，仅 ensemble |
 
-OGD 与 optimistic OGD 拒绝 ensemble 字段。Hedge 至少需要两个有序专家学习率。
-DFlash 显式区分两种 Hedge decision class：`full` 对稠密 drafter parameter decision
-加权，`lora` 则在相同 rank 下对已注册 factor coordinate 加权。LoRA Hedge 是显存受限的
-decision class，不会被改写成稠密参数平均。DFlash 为三种 learner 都支持 drafter
-Full/LoRA；DSpark 与 EAGLE/EAGLE3 只接受共享 tail
-scope，并保留各自后端限制。全部 OnlineSPEC 方法都要求 TP=DP=1、frozen historical KV、
-cohort 隔离、exact rejection sampling 和一个 in-flight update。
-
-`online_spec` 身份、专家学习率、projection radius 与 learner method 都会进入配置、
-layout、selection、显存和证据 hash。状态转移及独立注册协议见
-[OnlineSPEC baseline](onlinespec-baseline.md)。
+OGD 与 optimistic OGD 拒绝 ensemble 字段。Ensemble 至少需要两个有序 expert rate。Full
+与 LoRA 是不同 decision-coordinate class；对 LoRA factor 求平均不能改称对 dense update
+求平均。OnlineSPEC 使用相同已注册 native layer scope、frozen historical KV、准确 proposal
+distribution、cohort isolation 与单 candidate 上限，但其 manifest、selection、evidence 与
+attestation 永不进入核心 gate。

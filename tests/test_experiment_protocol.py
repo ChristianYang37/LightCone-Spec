@@ -60,6 +60,7 @@ from lightcone_spec.orchestration import SpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
     render_runtime_plan,
     render_static_load_runtime_plan,
+    render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
 
@@ -111,9 +112,7 @@ def test_natural_prompt_loader_streams_only_the_locked_window(monkeypatch) -> No
     module.load_dataset = load_dataset
     monkeypatch.setitem(sys.modules, "datasets", module)
     revision = "a" * 40
-    samples = load_natural_prompts(
-        "math500", revision=revision, split="test", limit=32
-    )
+    samples = load_natural_prompts("math500", revision=revision, split="test", limit=32)
     assert len(samples) == 32
     assert len({sample.sample_id for sample in samples}) == 32
     assert [sample.prompt for sample in samples] == [
@@ -174,31 +173,38 @@ def test_speed_manifest_is_immutable_and_hash_bound(tmp_path) -> None:
 
 def test_tuning_grid_is_complete_and_unique() -> None:
     candidates = tuning_candidates()
-    assert len(candidates) == 1050
-    assert len({candidate.candidate_id for candidate in candidates}) == 1050
-    assert {candidate.optimizer for candidate in candidates} == {
-        "adam",
-        "adamw",
-        "sgdm",
-        "nag",
-        "muon",
-        "lion",
+    assert len(candidates) == 64
+    assert len({candidate.candidate_id for candidate in candidates}) == 64
+    assert {candidate.optimizer for candidate in candidates} == {"adamw", "sgdm"}
+    assert {candidate.parameter_scope for candidate in candidates} == {
+        "last1",
+        "last3",
+        "last5",
+        "all",
     }
-    assert {candidate.stride for candidate in candidates} == {1, 5, 10, 20, 40, 80}
+    assert {candidate.stride for candidate in candidates} == {10}
     assert {
         candidate.rank
         for candidate in candidates
         if candidate.weight_update_mode == "lora"
     } == {
+        1,
+        2,
         4,
         8,
         16,
         32,
+        64,
     }
     assert all(
         candidate.rank is None
         for candidate in candidates
         if candidate.weight_update_mode == "full"
+    )
+    assert all(
+        candidate.lora_alpha == candidate.rank
+        for candidate in candidates
+        if candidate.weight_update_mode == "lora"
     )
     assert all(
         candidate.momentum is not None
@@ -233,7 +239,7 @@ def test_confirmation_schedule_has_independent_randomized_blocks() -> None:
     assert len(blocks) == 8
     assert blocks == confirmation_blocks(123)
     assert all(
-        set(block.method_order) == {"static", "tts", "naive_async"}
+        set(block.method_order) == {"static", "tts", "l0"}
         and block.reset_cohort_before_each
         for block in blocks
     )
@@ -317,7 +323,7 @@ def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
     for method, candidate_id, goodput in (
         ("static", None, 100.0),
         ("tts", candidate.candidate_id, 102.0),
-        ("naive_async", candidate.candidate_id, 101.0),
+        ("l0", candidate.candidate_id, 101.0),
     ):
         row = replace(
             slice_measurement(
@@ -391,7 +397,7 @@ def measurements(first: str, second: str) -> list[CandidateMeasurement]:
         ),
         CandidateMeasurement(
             first,
-            "naive_async",
+            "l0",
             "tune",
             1.03,
             100,
@@ -413,7 +419,7 @@ def measurements(first: str, second: str) -> list[CandidateMeasurement]:
         ),
         CandidateMeasurement(
             second,
-            "naive_async",
+            "l0",
             "tune",
             1.01,
             200,
@@ -480,7 +486,7 @@ def test_tuning_stage_reducer_pairs_methods_and_static() -> None:
                     "tts", candidate_id=candidate.candidate_id, goodput=tts
                 ),
                 slice_measurement(
-                    "naive_async",
+                    "l0",
                     candidate_id=candidate.candidate_id,
                     goodput=l0,
                 ),
@@ -504,9 +510,7 @@ def test_tuning_stage_rejects_a_different_greedy_output_trajectory() -> None:
     candidate = tuning_candidates()[0]
     static = slice_measurement("static", candidate_id=None, goodput=100.0)
     tts = slice_measurement("tts", candidate_id=candidate.candidate_id, goodput=101.0)
-    l0 = slice_measurement(
-        "naive_async", candidate_id=candidate.candidate_id, goodput=101.0
-    )
+    l0 = slice_measurement("l0", candidate_id=candidate.candidate_id, goodput=101.0)
     with pytest.raises(ValueError, match="paired to the Static"):
         reduce_tuning_stage(
             [static, replace(tts, output_set_sha256="2" * 64), l0],
@@ -519,7 +523,7 @@ def test_tuning_stage_rejects_a_different_greedy_output_trajectory() -> None:
 def test_tuning_stage_eliminates_unsafe_candidate_before_goodput_ranking() -> None:
     safe, unsafe = tuning_candidates()[:2]
     rows = [slice_measurement("static", candidate_id=None, goodput=100.0)]
-    for method in ("tts", "naive_async"):
+    for method in ("tts", "l0"):
         rows.append(
             slice_measurement(
                 method,
@@ -579,7 +583,7 @@ def test_heldout_anchor_uses_terminal_tuning_only_without_grid_claim() -> None:
     for method, candidate_id, goodput in (
         ("static", None, 100.0),
         ("tts", candidate.candidate_id, 110.0),
-        ("naive_async", candidate.candidate_id, 112.0),
+        ("l0", candidate.candidate_id, 112.0),
     ):
         rows.append(
             replace(
@@ -695,12 +699,13 @@ def test_matched_confirmation_configs_bind_selected_candidate() -> None:
     selected = tuning_candidates()[0]
     static = RunConfig.model_validate(config_value("static"))
     adapted = {}
-    for method in ("tts", "naive_async"):
+    for method in ("tts", "l0"):
         value = config_value(method)
         value["adaptation"].update(
             weight_update_mode=selected.weight_update_mode,
             parameter_scope=selected.parameter_scope,
             rank=selected.rank,
+            lora_alpha=selected.lora_alpha,
             stride=selected.stride,
         )
         value["adaptation"]["optimizer"].update(
@@ -708,15 +713,16 @@ def test_matched_confirmation_configs_bind_selected_candidate() -> None:
             learning_rate=selected.learning_rate,
             weight_decay=selected.weight_decay,
             grad_clip=selected.grad_clip,
+            schedule=selected.schedule,
         )
         adapted[method] = RunConfig.model_validate(value)
     configs = {"static": static, **adapted}
     assert_matched_confirmation_configs(
         configs, selected_candidate=selected, selected_concurrency=8
     )
-    changed = config_value("naive_async")
+    changed = config_value("l0")
     changed["adaptation"]["stride"] = selected.stride + 1
-    configs["naive_async"] = RunConfig.model_validate(changed)
+    configs["l0"] = RunConfig.model_validate(changed)
     with pytest.raises(ValueError):
         assert_matched_confirmation_configs(
             configs, selected_candidate=selected, selected_concurrency=8
@@ -796,7 +802,7 @@ def performance_rows(
 ) -> list[dict]:
     rows: list[dict] = []
     generated_limit = DFLASH_SAFE_CONTEXT_LIMIT - 49
-    methods = {"static": 1.0, "tts": speed_tts, "naive_async": speed_l0}
+    methods = {"static": 1.0, "tts": speed_tts, "l0": speed_l0}
     for block in range(8):
         for method, ratio in methods.items():
             safety = {
@@ -861,7 +867,7 @@ def test_speed_gate_never_claims_unattested_gpu_success() -> None:
     assert gate.status == "UNMEASURED"
     assert not gate.passed
     assert gate.tts.acceleration_pass
-    assert gate.naive_async.acceleration_pass
+    assert gate.l0.acceleration_pass
     assert gate.l0_vs_tts.no_worse_pass
 
 
@@ -881,23 +887,16 @@ def test_speed_gate_distinguishes_generated_position_from_total_context() -> Non
         evaluate_speed_gate(invalid, seed=1)
 
 
-def test_measured_speed_gate_requires_both_methods_and_safety() -> None:
-    gate = evaluate_speed_gate(
-        performance_rows(),
-        seed=1,
-        gpu_evidence="MEASURED",
-        evidence_sha256="e" * 64,
-    )
-    assert gate.status == "PASS"
-    assert gate.passed
-    assert gate.l0_vs_tts.passed
-    unsafe = evaluate_speed_gate(
-        performance_rows(unsafe=True),
-        seed=1,
-        gpu_evidence="MEASURED",
-        evidence_sha256="e" * 64,
-    )
-    assert unsafe.status == "BLOCKED"
+def test_measured_speed_gate_rejects_caller_authored_attestation_state() -> None:
+    with pytest.raises(ValueError, match="trusted hardware attestation"):
+        evaluate_speed_gate(
+            performance_rows(),
+            seed=1,
+            gpu_evidence="MEASURED",
+            evidence_sha256="e" * 64,
+        )
+    unsafe = evaluate_speed_gate(performance_rows(unsafe=True), seed=1)
+    assert unsafe.status == "UNMEASURED"
     assert not unsafe.passed
 
 
@@ -905,25 +904,22 @@ def test_speed_gate_requires_l0_to_be_noninferior_to_tts() -> None:
     inferior = evaluate_speed_gate(
         performance_rows(speed_tts=1.08, speed_l0=1.05),
         seed=1,
-        gpu_evidence="MEASURED",
-        evidence_sha256="e" * 64,
     )
     assert inferior.tts.passed
-    assert inferior.naive_async.passed
+    assert inferior.l0.passed
     assert not inferior.l0_vs_tts.passed
-    assert inferior.status == "BLOCKED"
+    assert inferior.status == "UNMEASURED"
     assert not inferior.passed
 
     tied = evaluate_speed_gate(
         performance_rows(speed_tts=1.05, speed_l0=1.05),
         seed=1,
-        gpu_evidence="MEASURED",
-        evidence_sha256="e" * 64,
     )
     assert tied.l0_vs_tts.mean_speedup == pytest.approx(0.0)
     assert tied.l0_vs_tts.ci_lower == pytest.approx(0.0)
     assert tied.l0_vs_tts.passed
-    assert tied.status == "PASS"
+    assert tied.status == "UNMEASURED"
+    assert not tied.passed
 
 
 def test_speed_gate_rejects_incomplete_coverage() -> None:
@@ -951,7 +947,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         target_revision="c" * 40,
         drafter_revision="d" * 40,
         hardware_sha256="e" * 64,
-        methods=("static", "tts", "naive_async"),
+        methods=("static", "tts", "l0"),
         repetitions=8,
         context_start=16384,
         context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
@@ -1024,7 +1020,7 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     assert [launch.method for launch in launches] == [
         "static",
         "tts",
-        "naive_async",
+        "l0",
     ]
     assert launches[0].adaptation_config is None
     assert len({launch.base_url for launch in launches}) == 1
@@ -1036,8 +1032,9 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     assert all(
         "--speculative-use-rejection-sampling" in launch.argv for launch in launches
     )
+    assert "--speculative-speed-study-metrics" not in launches[0].argv
     assert all(
-        "--speculative-speed-study-metrics" in launch.argv for launch in launches
+        "--speculative-speed-study-metrics" in launch.argv for launch in launches[1:]
     )
     assert all(
         "lightcone_spec.sglang_bridge.launch" in launch.argv
@@ -1097,13 +1094,51 @@ def test_static_load_renderer_has_no_adaptation_identity_or_allocation(
     assert launch.telemetry_path is None
     assert "--speculative-adaptation-config" not in launch.argv
     assert "--speculative-use-rejection-sampling" in launch.argv
-    assert "--speculative-speed-study-metrics" in launch.argv
+    assert "--speculative-speed-study-metrics" not in launch.argv
     config = RunConfig.model_validate_json(
         (tmp_path / "static-c48" / "static" / "run-config.json").read_text()
     )
     assert config.method == "static"
     assert config.adaptation is None
     assert config.runtime.max_running_requests == 48
+
+
+def test_target_only_renderer_never_resolves_or_launches_a_drafter(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "lightcone_spec.orchestration.runtime.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    launches = render_target_only_runtime_plan(
+        output_root=tmp_path / "target-only",
+        concurrency=8,
+        model_lock=lock,
+        model_roots={
+            "schema_version": 2,
+            "lock_sha256": lock.sha256,
+            "roots": {"Qwen/Qwen3-8B": str(target)},
+        },
+        sampling_profile=SamplingProfile(),
+        sglang_checkout=tmp_path / "patched-sglang",
+        mem_fraction_static=0.7,
+    )
+    launch = launches[0]
+    assert launch.method == "target_only"
+    assert launch.adaptation_config is None
+    assert launch.telemetry_path is None
+    assert not any("draft" in argument for argument in launch.argv)
+    assert not any("speculative" in argument for argument in launch.argv)
+    assert not any("adaptation" in argument for argument in launch.argv)
 
 
 def test_tuning_renderer_cannot_duplicate_static_baseline(
@@ -1143,5 +1178,5 @@ def test_tuning_renderer_cannot_duplicate_static_baseline(
         adaptation_reserve_mb=1024,
         mem_fraction_static=0.7,
     )
-    assert [launch.method for launch in launches] == ["tts", "naive_async"]
+    assert [launch.method for launch in launches] == ["tts", "l0"]
     assert not (tmp_path / "tuning" / "static").exists()

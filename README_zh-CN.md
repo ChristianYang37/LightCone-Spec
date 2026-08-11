@@ -2,64 +2,108 @@
 
 [English](README.md) · [中文文档](docs/zh-CN/architecture.md) · [许可证](LICENSE)
 
-LightCone-Spec 是一个以证据为先的 speculative decoding 测试时 drafter 更新研究框架。
-0.2.0 只回答一个刻意收窄的问题：严格按论文实现的 TTS，以及在更新就绪后立即发布的
-策略，能否都比不更新的 Static baseline 获得更高的 decode goodput？
+LightCone-Spec 是一个以证据为先的 speculative decoding 在线 drafter adaptation
+研究框架。它严格区分 runtime 工程与实证结论：CPU 合同可以验证身份、持久性和
+fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明速度或容量。
 
-> 当前为 Alpha 软件。在不可变的正式 GPU 实验通过统计与安全门槛前，GPU 状态始终为
-> `UNMEASURED`。本仓库不发布 benchmark 数值或性能结论。
+> 当前为 Alpha 软件。全部新 GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
+> Target-only 可以端到端运行。Static、TTS、L0 及其他所有 speculative method 会在任何
+> process 或 network mutation 前 `BLOCKED`，因为固定 SGLang integration 尚未提供
+> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`。实证 Stage B 还因缺少
+> provider credential 与已注册硬件而 `BLOCKED`。历史 v2 artifact 仅可用于
+> regression/debugging；它们不能证明 schema-v3 协议或任何新性能结论。
 
 ## 研究范围
 
-正式实验只包含三种方法：
+核心对比包含四种方法：
 
-| 方法 | Candidate 计算 | 发布策略 |
-|---|---|---|
-| Static | 无 | 原生 SGLang speculative decoding |
-| TTS | 每个 stride 在 side CUDA stream 更新 | 在下一个固定更新边界前同步并发布 |
-| L0（`naive_async`） | 与 TTS 逐项相同的更新 | ready event 完成后的首个合法 graph 边界发布 |
+| 方法 | Speculation | 在线 candidate | 发布 |
+|---|---:|---:|---|
+| Target-only（`target_only`） | 否 | 无 | 原生 target decoding |
+| Static（`static`） | 是 | 无 | 原生 speculative decoding |
+| TTS（`tts`） | 是 | side-stream update | 下一个固定更新边界 |
+| L0（`l0`） | 是 | 与 TTS 逐字节相同 | ready 后首个合法边界 |
 
-TTS 遵循 [Test-Time Speculation 论文](https://arxiv.org/abs/2605.09329)中的调度定义。
-L0 只改变发布时间，不改变 loss 或 optimizer。
+TTS 与 L0 共用完全相同的 evidence、trainable plan、loss、optimizer candidate 与
+reconstruction 路径；唯一实验差异是发布时间。Target-only 与 Static 不分配任何
+adaptation、optimizer、candidate 或 adaptation telemetry 状态。
 
-正式速度实验仍固定 Qwen3-8B + DFlash，且要求 TP=DP=1。Patchset 也通过 cache-safe
-tail update，为 DSpark 及 single-layer、top-k-one EAGLE/EAGLE3 实现相同的
-Static/TTS/L0 发布合同。这些兼容路径的 GPU 状态为 `UNMEASURED`，不会被静默替换进
-正式 DFlash gate。三个 clean-room OnlineSPEC learner 隔离在 `baselines` 包中。
-OnlineSPEC 是拥有独立 tuning 与配对证据链的重要已注册对比，但不能改变核心配置选择或
-Static/TTS/L0 速度 gate。固定且机器可读的
-[源码审计](manifests/provenance/onlinespec_source_audit_v2.json)会区分论文公式、公开
-recipe 与本项目实现。
+目标 industrial registry 先覆盖 DFlash 与 DSpark，再进入 production load、双 GPU
+topology、原生 NEXTN preflight 与 breadth template。EAGLE/EAGLE3 仍是带严格兼容性
+guard 的目标 backend contract；注册并不表示当前 release 可以执行。OnlineSPEC 是重要
+对比，但使用独立 tuning、证据、attestation 与分析，不能选择或改变核心 gate。
 
-## 性能模型
+当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层 adaptive path，且 optimizer schedule
+为 constant、extra logical delay 为零。它没有暴露 industrial executor 所需的内容绑定
+terminal evidence provider，因此该路径还不能端到端执行或支持结论。Static/TTS/L0 会在
+executor preflight、任何 mutation 之前失败。DSpark/EAGLE/EAGLE3/NEXTN adaptation、所有
+TP2/DP2 execution、非 constant schedule 与正 extra delay 同样 fail closed；在新的 patch
+与 provider identity 实现这些能力前，对应 registry cell 保持 `BLOCKED`。
 
-实验不会预设更新一定有益：
+## Runtime 合同
 
-\[
-T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
-+T_{\mathrm{update}}^{\mathrm{exposed}}
-+T_{\mathrm{draft}}^{\mathrm{extra}}+T_{\mathrm{barrier}}.
-\]
+- Schema v3 在模型分配前拒绝未知或已退役字段；
+- 公共 backend envelope 绑定 adapter-free logits、采样时使用的准确 proposal
+  distribution、semantic mask、target teacher row、真实 sampled predecessor、cohort
+  身份、source version 与 backend-native payload；
+- 目标 backend contract 要求 validator 在不重复施加 adapter 的前提下重建可微 proposal。
+  只有固定 patch 的底层 TP1/DP1 DFlash path 实现该 adaptive surface；DSpark、
+  EAGLE/EAGLE3 与 NEXTN 仍是不可执行 contract；
+- Adaptation 只有 `full` 与 `lora`。Layer scope 为 `last1`、`last3`、`last5`、`all`；
+  LoRA rank 为 1、2、4、8、16、32、64，且 `alpha/r=1`；
+- DSpark 另注册三种 hybrid scope：最后 1、3 或 5 层 backbone，加原生 W1、W2 与
+  acceptance/confidence 参数。E1a 恰有 56 个 adaptive configuration：32 个 layer-only，
+  24 个 hybrid；
+- 历史 drafter KV 冻结并带版本。发布 candidate 只影响未来 KV；重建旧 KV 或对其求导
+  会定义另一种方法。
 
-只有减少 target calls 所节省的时间超过训练、资源竞争、发布与 barrier 开销，方法才会
-更快。因此正式结论必须同时包含配对 decode goodput、exactness 计数、target-call
-计数、CUDA 时间、HBM 账本和置信区间。
+Rejection sampler 在 proposal token 被拒绝后仍从归一化 \((p-q)_+\) 采样。这个正部
+rejection distribution 属于采样数学，不是 adaptation mode 或配置 alias。
 
-## 架构
+## 工业级执行
 
-- `lightcone_spec` 管理严格的 schema-v2 配置、确定性数据窗口、配置选择、证据记录和
-  统计门槛；
-- `patches/sglang` 是针对唯一 upstream commit 的七层可复现 mail patch；仓库既不
-  vendoring SGLang，也不原地修改 SGLang；
-- cohort runtime 将 optimizer 状态保持在 GPU，在固定地址的 inference tensor 上发布，
-  并用 epoch、slot generation 和 source version 绑定每个 candidate；Adam、AdamW、
-  SGDm、NAG、Muon 与 Lion 共用这一 functional propose-then-commit 路径；
-- headline 遥测只使用异步 CUDA event；需要同步的诊断和 profiler 在计时区间之后或
-  独立 run 中执行。
+声明式依赖顺序为：
 
-详见[架构](docs/zh-CN/architecture.md)与[数学方法](docs/zh-CN/mathematical-method.md)。
+```text
+preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+```
 
-## 安装
+每个 cell 都绑定科学轴、seed、GPU UUID、port、cache/evidence root、资源隔离与真实初始
+状态。Stage receipt 在下游运行前封存 runtime/split digest、准确 dependency receipt 与
+locked output。双 GPU scheduler 会串行执行独占的 headline/profile/download/compile
+工作；只有 interference gate 通过后，互相独立的单 GPU 工作才可并行。
+
+目标 schema 与 CPU coordinator vocabulary 定义单节点 TP2、sticky-replica DP2 identity、
+inference-sharded TP state、replica-local DP cohort，以及 all-rank prepare/decision/
+application/receipt transition；这些定义不会让 topology 变得可执行。当前 `RunConfig` 与
+固定 SGLang patch 会在 model loading 前拒绝全部 TP2/DP2 run，也不能签发
+`patched_two_gpu_v1` capability receipt。
+
+真实 CPU `gloo` harness 只验证 collective state-machine 行为。它不能 attest NCCL、CUDA
+stream、graph boundary、device copy、throughput 或双 GPU 正确性。
+
+## 显存、Trace 与证据
+
+HBM admission 由最不可行 rank 决定。账本分别计费 model/KV、FP32 master、gradient、
+实际 optimizer moment、candidate/staging、activation、graph buffer 与 telemetry。显存压力
+处理首先保留不可变与活跃 correctness 状态，只允许驱逐原生 inactive prefix，随后取消
+pending adaptation，并 queue 或拒绝新工作；绝不静默把 Full 改成 LoRA。
+
+Cohort state 使用固定大小 slab、tenant quota、replica 身份、generation counter 与确定性
+回收。可选 cold offload 必须显式启用、计时，并且只适用于 inactive cohort；它不是自动
+OOM 逃生路径。
+
+Open-loop production trace 不可变且与 method 无关。Closed-loop run 绑定同一个不可变最大
+request pool 与每个 client 的顺序；由于更快的方法会更早 replenishment，实际 offer time 与
+连续 client prefix 必须逐项记录。固定 arrival window 结束前耗尽 pool 的 run 不可用于结论。
+Synthetic Poisson 与 immediate burst 必须标为 synthetic；BurstGPT 命名需要绑定外部身份。
+
+Evidence 先进入有界内存 queue，再写入 durable、process-unique 的 Parquet WAL segment。
+Flush/checkpoint 状态、重复身份、backpressure 与任何显式 drop 都有计数。只有 coverage 与
+文件系统 durability 检查通过后才发布最终 Parquet shard，随后以不可覆盖方式发布内容绑定
+completion receipt。中断 WAL 保持可审计，但没有 receipt 就不能进入分析。
+
+## 安装与快速开始
 
 仅开发框架：
 
@@ -70,117 +114,60 @@ python -m pip install -e '.[dev]'
 pytest -q
 ```
 
-从固定 upstream 创建一次性 patched SGLang checkout：
+在准确 pin 上创建一次性 SGLang checkout：
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git /path/to/sglang
-git -C /path/to/sglang checkout 3312645a307453893a00778592f105581e3d1c3d
+git -C /path/to/sglang checkout --detach \
+  3312645a307453893a00778592f105581e3d1c3d
 patches/sglang/apply.sh /path/to/sglang
 python scripts/verify_sglang_patchset.py \
   --upstream-checkout /path/to/clean-upstream --compile-only
 ```
 
-GPU 环境合同见[安装](docs/zh-CN/installation.md)。
+当前 schema-v3 SGLang series 在任何 GPU run 成为合格证据前，必须通过 clean-pin、
+patch-digest、expected-tree、compile/test 与 reverse-removal gate。文档不能替代该 gate。
 
-## 快速开始
-
-先生成不可变源协议与 sampling profile：
-
-```bash
-lightcone-spec build-speed-study \
-  --output artifacts/protocol/static_tts_l0.json
-```
-
-下载前锁定模型 revision：
+用真实不可变 device 身份生成双 GPU industrial registry：
 
 ```bash
-lightcone-spec lock-models --output artifacts/locks/models.json \
-  Qwen/Qwen3-8B z-lab/Qwen3-8B-DFlash-b16
-lightcone-spec prepare-models --lockfile artifacts/locks/models.json \
-  --model-cache /path/to/model-cache \
-  --output artifacts/locks/model-roots.json
+lightcone-spec build-industrial-registry \
+  --gpu-uuid GPU-UUID-0 GPU-UUID-1 \
+  --cache-root runtime-cache/industrial \
+  --evidence-root artifacts/industrial \
+  --output artifacts/industrial/registry.json
+
+lightcone-spec plan-industrial-dispatch \
+  --registry artifacts/industrial/registry.json \
+  --output artifacts/industrial/dispatch.json
 ```
 
-Tuning 前为每个已注册 concurrency 生成一个零 adaptation 分配的 Static 端点
-（下面以 `C=48` 为例）：
+该命令只生成目标 declaration，不会绕过 executor 的 native-evidence preflight，也不会让
+speculative 或 multi-rank cell 变得可运行。
 
-```bash
-lightcone-spec render-static-load-runtime --concurrency 48 \
-  --sglang-checkout /path/to/patched-sglang \
-  --model-lock artifacts/locks/models.json \
-  --model-roots artifacts/locks/model-roots.json \
-  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
-  --mem-fraction-static MEMORY_FRACTION \
-  --output-root artifacts/load/c48
-```
+完成一个 stage 后，封存其内容绑定 output，再把 receipt 传回 planner。准确参数以
+`lightcone-spec COMMAND --help` 为准；CLI 不会把 registry 隐式当作 shell script 执行。
+Model lock、证据、trace、credential、provider state 与 selection 必须放在忽略的外部 root，
+不得提交。
 
-独立 Static 负载扫描和 tuning 生成 selection artifact 后，渲染独占 GPU 的启动计划。
-三种方法复用同一个端口和同一张 GPU，必须**顺序执行**，不得同时启动三个 server argv：
+## 统计与结论
 
-```bash
-lightcone-spec render-runtime \
-  --sglang-checkout /path/to/patched-sglang \
-  --selection artifacts/selection.json \
-  --model-lock artifacts/locks/models.json \
-  --model-roots artifacts/locks/model-roots.json \
-  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
-  --adaptation-group-id formal-a --adaptation-reserve-mb RESERVE_MB \
-  --mem-fraction-static MEMORY_FRACTION \
-  --output-root artifacts/runtime
+四个被排除的 pilot block 仅用于估计方差。Power plan 会在下游 unblinding 前把 final
+block 数固定在 12--20；若两个 contrast 都无法对 3% 最小效应达到 80% power，则记录
+`UNDERPOWERED`。Primary L0--Static 与 L0--TTS hypothesis 使用 Holm family-wise
+correction；secondary breadth family 使用 Benjamini--Hochberg FDR。长上下文/request 数据
+使用 block 后 request 的 hierarchical bootstrap；production trace 使用 time-block
+bootstrap。P99 latency 只有达到注册的最小完成数才合格。
 
-lightcone-spec build-confirmation-queue \
-  --manifest manifests/speed-study/static_tts_l0_v2.json \
-  --selection artifacts/selection.json \
-  --model-lock artifacts/locks/models.json \
-  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
-  --launch-plan artifacts/runtime/launch-plan.json \
-  --evidence-root artifacts/confirmation \
-  --output artifacts/confirmation/queue.json
-```
+每个 system point 都同时报告 throughput/goodput、TTFT/ITL、completion/error accounting、
+target work、update/publication timing、HBM、每个 output token 的能耗，以及锁定的
+power/clock/thermal envelope。缺失值不能替换为零。
 
-对每个 queue job：启动它的 `launch_argv`，等待健康检查，通过后执行 `run_argv`，再关闭
-server，随后进入下一项。最后用 `collect-speed-study` 派生正式表。Queue 是数据而不是 shell
-脚本；调度器必须保留注册顺序与 clean-server 边界。
-
-`RESERVE_MB` 与 `MEMORY_FRACTION` 不设源码默认值；它们必须来自硬件预检和已选择的
-参数布局。
-
-## 更新模式与缓存合同
-
-公共 schema 接受：
-
-- `residual`：仅用于 tail 的低秩 logit correction；
-- `lora`：用于 drafter 或 tail 消融的低秩因子，在发布时合并到固定地址权重；
-- `full`：drafter scope 下更新全部 DFlash 自有浮点参数，或作为 full-rank tail 消融。
-  target embedding、target LM head 与 target model 始终冻结。
-
-DFlash 支持 drafter Full/LoRA 与三种 tail mode。DSpark 和 EAGLE/EAGLE3 刻意只支持
-tail scope：residual、tail LoRA 与 full-rank tail。DSpark 在 Markov correction 之前，
-对 post-normalization 的真实 LM-head 输入施加 tail；EAGLE 从 draft-extend 到 verify
-持续钉住 proposal version，存在尚未验证的 proposal 时禁止发布。
-
-在线可选 optimizer 为 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与 `lion`。Muon 对二维
-参数使用 matrix orthogonalization，对非 matrix 参数使用显式配置的辅助 AdamW。
-Optimizer 身份及全部专属字段都进入 cohort、selection、layout 与 evidence hash。
-
-历史 drafter KV 不可变。发布前的 KV 不重建、不参与梯度；发布后新建的 KV 记录新
-source version。实际 proposal distribution 始终用于 exact speculative rejection
-sampling。
-
-## 证据与安全
-
-正式 confirmation 在每种方法中将 32 个不同的 held-out controlled prompt 以一次有序的原生
-batch 请求全部提交给 SGLang，并使用八个独立方法顺序 block 与一个已选择负载。锁定的 server
-admission limit 控制 active batch，队列排空前不 reset cohort；每个 method/block 只拥有其
-active decode 区间的并集。Request 诊断独立记录，避免把共享 batch 时间伪重复成 32 个
-goodput 样本。40,960 token 模型上限包含 tokenized prompt；正式的
-prompt-plus-generated context 在 40,928 停止，为 DFlash 保留两个 block-16
-speculative KV reservation。Headline 区域从 16K generated tokens 开始。TTS 与 L0
-必须分别通过已注册的速度阈值、repetition-block 配对 BCa 区间和零安全事件要求。
-
-缺少内容绑定的 GPU attestation 时，gate 不能输出 `PASS`。Attestation 同时绑定
-manifest、tuning selection、patched SGLang tree、模型 revision、硬件报告和准确的
-Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASURED`。
+只有 content-bound GPU attestation 同时覆盖 registry/manifest、selection、模型与数据
+revision、runtime capability 与 patched tree、hardware/power report、trace 身份及精确
+Parquet 输入时，gate 才可能返回 `PASS`。本地 mock、历史 v2 evidence 或正向算术仍然是
+`UNMEASURED`。本 release 故意未配置 trusted hardware attester；caller-authored
+doctor/attestation JSON 会被拒绝，任何 analyzer 都不能产生新的 `MEASURED` GPU outcome。
 
 ## 文档
 
@@ -194,18 +181,22 @@ Parquet 输入。本地或合成数据即使算术上为正，也仍是 `UNMEASU
 - [OnlineSPEC baseline](docs/zh-CN/onlinespec-baseline.md)
 - [故障排查](docs/zh-CN/troubleshooting.md)
 
-## 限制与路线图
+## 限制
 
-- GPU 状态目前为 `UNMEASURED`，不声明任何加速；
-- Adaptation 要求 TP=DP=1 与未量化 drafter/KV。Drafter-scope Full/LoRA 仅用于
-  DFlash；DSpark 必须使用 verify-all；EAGLE/EAGLE3 必须 single layer、fixed depth、
-  top-k one，并使用 exact full-vocabulary rejection sampling。其他组合在分配
-  adaptation 显存前 fail closed；
-- 历史 KV 按设计冻结；重算旧 KV 会定义另一种方法和显存边界；
-- 正式 DFlash 模型对之外的 GPU 认证与多 GPU adaptation 属于未来工作；实现兼容不
-  代表已经实测加速。
-- OnlineSPEC 对比是对论文在线 learner 公式的 clean-room 实现。固定审计 commit 上的
-  官方仓库没有项目级许可证文件，因此本项目没有重新分发或复制其上游源码。
+- 全部新 GPU 结果均为 `UNMEASURED`；Stage B 因缺少 native terminal speculative-
+  evidence provider、provider credential 与已注册硬件而保持 `BLOCKED`；
+- 当前端到端 industrial execution surface 只有 TP1/DP1 Target-only。TP2/DP2 仅存在于
+  目标 registry/coordinator contract，本 release 会拒绝它们。不声明 multi-node、
+  Kubernetes、elastic cluster、remote object store 或自动 failover；
+- CPU `gloo` 合同不是 GPU/NCCL 证据。Topology config 只是目标 vocabulary；无论 caller
+  是否提供 patched-runtime capability receipt，本
+  release 都会拒绝 TP2/DP2；
+- Static/TTS/L0 在准确 native terminal evidence hook 实现并绑定固定 tree 前保持
+  `BLOCKED`。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与所有 TP2/DP2 cell 同样
+  `BLOCKED`，绝不能暗示成功；
+- ChronoBelief tuning cell 在 authoritative update equation 与 source identity 注册前保持
+  `BLOCKED`，不会使用替代 optimizer；
+- 历史 KV 按设计冻结。重新计算它需要新的算法、显存边界、协议与结论。
 
 ## 贡献与许可证
 

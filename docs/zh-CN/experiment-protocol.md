@@ -2,131 +2,166 @@
 
 [English](../en/experiment-protocol.md) · [首页](../../README_zh-CN.md)
 
-## 注册问题
+## 问题与当前状态
 
-专项实验检验严格按论文实现的 TTS 与 first-ready L0 是否分别比未修改的 Static 获得
-更高 decode goodput。实验不预设 acceptance 收益足以覆盖训练与调度成本。只有完整
-协议生成内容绑定的 attestation 后，GPU 状态才会离开 `UNMEASURED`。
+工业级研究考察在线 drafter adaptation 在何处有效、为何有效，以及其成本或操作风险何时
+超过节省的 target work。Target-only、Static、TTS 与 L0 始终分开；TTS 与 L0 使用相同
+candidate，只在发布时间上不同。
 
-主模型对为 Qwen3-8B + DFlash。Checkpoint/模型的 prompt-plus-generated context 上限为
-40,960；正式测量将该 context 截断在 40,928，为请求边界保留两个 block-16
-speculative KV reservation。正式长区间从已生成 16K token 开始，到该安全请求上限
-结束。TTS 与 L0 必须共享 candidate 计算、optimizer、更新
-模式、参数范围、rank、学习率、stride、监督、sampling 与 load；唯一差别是发布策略。
+所有新 GPU 结果都是 `UNMEASURED`。代码、CPU 测试与 registry 建立目标 protocol 与
+coordinator contract，不是完整可运行 speculative surface 或 benchmark 结果。Industrial
+executor 当前只运行 TP1/DP1 Target-only。Static/TTS/L0 会在任何 mutation 前因缺少
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` 而 `BLOCKED`；固定
+integration 没有实现该 hook。Stage B 还因缺少 provider credential 与已注册硬件而 blocked。
+历史 v2 evidence 只用于 regression/debugging，不得进入 schema-v3 selection、power sizing、
+confirmation 或结论。
 
-## 数据隔离
+## 不可变 Dependency DAG
 
-Controlled adapter 从有限词表确定性生成无外部版权依赖的 prompt。三个内容不重叠且由
-hash 绑定的窗口分别包含八个 load prompt、十六个 tuning prompt 和三十二个 confirmation
-prompt。Confirmation 数据不得影响负载或超参数选择。
+Registry 固定以下顺序：
 
-Context 按每次 proposal 前真实 `prefix_len_before` 记录。生成位置 bucket 为 0、2K、
-4K、8K、16K、24K、32K 与安全上限。自然 EOS 副表使用锁定 revision 的 LiveCodeBench
-与 Math500，各三十二个 prompt，并在每个 bucket 报告仍处于 at-risk 的请求数。它们用于
-现实任务复现，不决定正式 gate。
+```text
+preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+```
 
-## 负载与调参
+每个目标 definition 命名 dependency、locked output 与科学 axis。每个 cell 再绑定完整身份：
+experiment/model/backend/task/method、parameterization/native scope、optimizer/schedule、
+context/regime/width/arrival/SLO、cohort/topology、seed/block、GPU UUID、port、cache/evidence
+root、workload class 及真实 status/reason。
 
-Static 独立扫描 concurrency 1、2、4、8、16、32、48。只有 OOM 和 retraction 均为零，
-KV capacity 足以容纳 `concurrency × 40,928`，且 p99 ITL 不超过 Static-c1 两倍的负载
-才可选。满足条件后选择 decode goodput 最高者，并对三种方法固定。选择还要求 32-prompt
-confirmation window 能提供足够的 active request；c48 screen 仍是容量诊断，不能成为只含
-32 个请求的不满载正式负载。
+只有准确 dependency receipt 验证通过且 cell 通过 executable-release preflight 后，stage
+才可能 dispatch。Receipt 绑定 registry、
+runtime、split、dependency-output 与 locked-output SHA-256，并声明 selection 已在下游
+unblinding 前封存。编辑 registry artifact 或以另一 digest 重新序列化 dependency 都会
+fail closed。
 
-调参对 drafter Full/LoRA 搜索 Adam、AdamW、SGDm、NAG、Muon 与 Lion，并为不同
-optimizer 使用各自的 learning-rate 范围，同时覆盖 rank、stride、weight decay 与全局
-gradient clipping。Muon 的 matrix step 与辅助 AdamW 字段绑定为一个 candidate identity，
-run 后不能拆开选择。Successive halving 只能读取 tuning 窗口。共享配置最大化
+## Stage 与 Locked Decision
 
-\[
-\min\left(V_{\mathrm{TTS}}/V_{\mathrm{Static}},
-V_{\mathrm{L0}}/V_{\mathrm{Static}}\right),
-\]
+| Stage | 目的 | 下游使用前锁定的输出 |
+|---|---|---|
+| Preflight | source/runtime/model/data identity、exactness、HBM、telemetry、双 GPU interference | runtime envelope |
+| E3a | Target-only/Static context、regime、concurrency 与 draft-width capacity | reference load、matched width、crossover 与 drift witness |
+| E1 | DFlash layer scope 与 Full/LoRA geometry，使用 AdamW/SGDm anchor | safe Pareto set 与 common load |
+| E2 | optimizer、log learning-rate grid、schedule 与 successive halving | 一个 DFlash recipe |
+| E4 | 累积 systems mechanism 与隔离 profiling | mechanism gate |
+| E3b | 配对 long-context Target-only/Static/TTS/L0 confirmation | long-context confirmation |
+| E1a | 原生 DSpark transfer 与 retuning | 一个 DSpark recipe |
+| E5 | production arrival、cohort、topology、SLO 与 failure | production/topology surface |
+| E6 | 原生 NEXTN interface 与双 rank fit，随后 transfer | native MTP transfer surface |
+| E0 | model/backend/task breadth，包括隔离 OnlineSPEC | breadth surface |
 
-并先满足 exactness 与稳定性检查。并列时依次选择较低 peak HBM、较低 p99 ITL、较低
-exposed update time。不可变 selection artifact 绑定 grid、tuning window、model lock、
-patched tree、load 与 tuning evidence。
+E1 将四种 native layer scope 与 Full 加七个 LoRA rank、两个 optimizer anchor 交叉，在下游
+optimizer 搜索前恰有 64 个 geometry cell。E2 将 optimizer 专属字段和 `constant`、按
+published update 的 inverse-square-root、cosine-to-zero schedule 保持为不同身份。
+ChronoBelief declaration 显式为 `BLOCKED`：当前未注册 authoritative update equation 或
+source identity，禁止用另一 optimizer 替代。
 
-若目标是范围更窄的复现，也可以从完整 terminal tuning 三元组中锁定一个属于注册 grid
-的 anchor。该 artifact 会显式标记为 `heldout_anchor`：它仍使用相同的独立 confirmation
-与 GPU gate，但绝不声称该 anchor 是全网格最优解。
+E1a 恰有 56 个 adaptive configuration。32 个 layer-only cell 将
+`last1/last3/last5/all` 与 Full 加七个 LoRA rank 交叉，并冻结 DSpark native head。24 个
+hybrid cell 将 `last1/last3/last5` 与相同八种 backbone parameterization 交叉，同时把原生
+W1、W2 与 scalar acceptance/confidence state 作为 Full 训练。Fixed verification budget
+只用于 tuning control；转移后的 candidate 还必须通过 native scheduler。
 
-## 独立 Confirmation
+这些是已注册 scientific grid，不是当前 executor support。固定 patch 会拒绝
+DSpark/EAGLE/EAGLE3/NEXTN adaptation、非 constant schedule 与全部 multi-rank execution。
+即使其底层 TP1/DP1 DFlash path，也必须先实现 native terminal provider 才能生成可声明的
+industrial evidence。
 
-Confirmation 包含八个 repetition block。每个 block 都在每种方法前独立 reset cohort，
-随机排列 Static/TTS/L0，并将 32 个不同 prompt 通过一次有序的原生 batch 请求全部提交。
-这会消除 host thread 的到达竞态而不限制 GPU；SGLang 锁定的 admission limit 负责
-continuous batching，队列排空期间不 reset
-engine/cohort。Warmup 位于计时区间之外；每个 method/block batch 只拥有 active decode
-区间的并集，排除 request queue/prefill 空档；不合并 repetition，也不把 batch 指标复制到
-prompt 或 bucket 行。
+## 数据、Context 与 Trace
 
-Request 级 ITL、TTFT、输出 identity 与单请求 decode 诊断独立记录，不能冒充系统聚合
-goodput。Load screen 和早期 tuning stage 只有在 prompt 数少于 concurrency 时，才按完整
-窗口 round-robin 补足负载；confirmation 与自然任务绝不通过复制 prompt 制造并发。
+Controlled prompt window 内容不重叠并绑定 digest；selection 数据不能进入 confirmation。
+Model/tokenizer revision、prompt compiler、task split、max context、generation budget 与安全
+speculative headroom 都是不可变输入。Natural dataset 要求准确外部 revision，并保持在
+仓库之外。
 
-已注册的 controlled profile 使用 greedy。这样 Static 与每种 exact adaptation 方法都会
-沿同一条 target-token 轨迹运行，配对计时效应不会来自方法相关的随机数消耗。
-调参与 confirmation 仅保存每条生成轨迹的 SHA-256；任一配对方法摘要不同都会 fail
-closed，证据表不保留生成文本。Stochastic
-coupled-RNG 与分布检查仍是必需的 GPU 测试；stochastic 自然任务只作为鲁棒性副表，不是
-因果速度 headline。
+Long-context axis 为 1K、2K、4K、8K、16K、24K、32K 与 40,928 token，覆盖
+long-input/short-output、short-input/long-generation、multi-turn shared-prefix regime。
+DFlash draft width 为 4、8、16。E3b 分别报告 matched-width 与 deployment-optimal-width
+panel；看到 confirmation 后再改变 width 属于禁止行为。
 
-每个完整 run 都有绑定规范化 Parquet shard 的 terminal receipt。Resume 只复用身份匹配
-的 receipt。中断 shard 不是证据，因此长时间实验可以续跑，不会重复或静默遗漏完整 cell。
+Production trace 分离 content identity 与 arrival identity。Open-loop Poisson、immediate
+burst、BurstGPT-shaped 与 soak trace 绑定准确 arrival offset。Closed-loop run 改为绑定最大
+request pool、population 与每个 client 的顺序；每次实际 offer 必须晚于该 client 上一次
+terminal event。各 method 可以消费不同的连续 prefix；固定 arrival window 结束前耗尽任一
+client pool 会使 run 不可用于结论。没有不可变外部 corpus digest 时，synthetic
+BurstGPT-shaped trace 绝不标成真实 dataset。
 
-## 指标与推断
+配对 open-loop method 消费相同 trace byte；配对 closed-loop method 消费相同 pool 与 client
+顺序。每个实际 offered request 恰好记为 rejected、completed、timed out、cancelled 或
+unfinished；unfinished 工作按注册 timeout boundary 留在 denominator。缺失 row 不补零。
 
-Headline 指标来自一条覆盖 16K 至上限的专用 `long_region` batch 记录，以及完整轨迹的
-配对 batch decode-goodput effect；位置 bucket 只用于解释，不会等权平均进 headline。TTS 与
-L0 分别使用 repetition-block BCa 95% 区间对比 Static。Repetition block 才是独立计时
-和随机化单元；把共享同一 wall-clock interval 的 32 个请求当作 32 个独立 goodput 样本
-会构成伪重复。二者都必须达到注册的平均提升门槛，且置信区间下界大于零。另一个配对区间
-直接比较 L0 与 TTS：固定零 margin 合同要求 L0 的平均相对 goodput 及 BCa 下界均不小于零，
-不能仅因为二者分别超过 Static 就判定通过。
+## 双 GPU Staging
 
-解释性指标保留 survival-weighted accepted prefix、每次 verification 的 committed 与
-verified draft、verification waste、target calls/output token、TTFT、ITL 分位数、各 CUDA
-lane 时间、exposed update time、overlap、graph replay、batch fill、queue occupancy、
-peak HBM、KV/optimizer 显存、loss 与 trainable parameter count。Target-only estimated
-MFU 与 profiler 实测设备利用率使用不同名称。
+Registry 要求两个显式 GPU UUID。并行工作前，preflight 记录 clock、temperature、power
+state、background process、driver/runtime identity、topology receipt、per-rank HBM 与
+interference receipt。缺少该 receipt 时，确定性 scheduler 会串行全部单 GPU cell。
 
-Optimizer 显存按类别记录，不从 parameter count 反推，从而区分双 moment 的
-Adam/AdamW、单 moment 的 SGDm/NAG/Lion，以及 Muon 的 matrix momentum 与非 matrix
-辅助 AdamW state。
+双 GPU、headline、profiler、download 与 compile cell 都是 exclusive。只有 interference
+gate 通过后，GPU UUID、port、cache root 与 evidence root 都不相交的两个单 GPU cell 才能
+共享 dispatch wave。Queue 是数据，不是同时启动全部 argv 的指令。
 
-Adapted run 还为每个 verification round 保留语义记录，包括真实 `prefix_len_before`、
-有效的 verified/accepted/committed 计数、proposal source version 与 frozen-KV version
-segments。Static 只启用聚合实验计数，绝不分配 adaptation trace buffer。
+TP2 与 sticky-replica DP2 是目标 coordinator contract。未来 release 将要求 verified
+patched-runtime capability receipt，并由全部 rank 为同一 publication identity 提供
+prepare/decide/apply/receipt evidence。当前 `RunConfig` 会在 model loading 前拒绝全部
+TP2/DP2 cell；CPU `gloo` harness 只是状态机测试，不能启用这些 cell。
 
-详细 profiling 使用独立 run；headline decoding 不逐轮 synchronize。Acceptance 单独
-改善不能表述为加速。
+任何 stage 都不声明 multi-node、超过两个 rank、Kubernetes scheduling、elastic membership
+或 automatic failover。
 
-## OnlineSPEC 对比协议
+## Production 指标与安全
 
-OnlineSPEC 作为重要对比被注册在独立 manifest 与证据 namespace 下。它使用 controlled
-tuning/confirmation window，但不能读取核心 TTS/L0 tuning row 或 confirmation 结果。
-三种 learner 在 successive halving 中各自独立缩减。OnlineSPEC 使用写入 manifest identity
-的长轨迹阶段：2/16K、4/24K、8/32K 和 16/40,928（prompt 数/context），不复用核心实验
-4K/8K 的早期阶段；随后每种 learner 选择一个安全配置，并与配对 Static reference 比较。
+每个 system point 报告 offered/admitted/terminal request accounting、throughput/decode
+goodput、按 prompt bucket 的 TTFT、within-request ITL、completion/error rate、target
+call/work、accepted/verified/committed draft、update/candidate/publication count、exposed/
+overlapped update time、queue/batch occupancy、HBM category、每个 output token 能耗与
+hardware envelope validity。
 
-Confirmation 在每种方法中将 32 个 held-out prompt 各提交一次并进入同一个 SGLang queue，
-同时使用八个随机 block、相同 seed、一个锁定 concurrency，以及相同的 16K 到安全上限
-区域。聚合 goodput 只在八个独立 method/block active-interval 并集上推断，prompt 级行仅用于诊断。派生表分别报告 OGD、
-optimistic OGD 与 Hedge，绝不把它们折叠成 best-of-baselines 结果。每项比较都包含配对 BCa 区间、安全
-计数、update 数、HBM 分类，以及 [OnlineSPEC baseline](onlinespec-baseline.md)定义的
-learner-specific 诊断。
+已注册 production SLO 要求 short/medium/long prompt 的 TTFT 不超过 2/5/10 秒，
+within-request p99 ITL 不超过 100 ms，qualification 至少 99%，error 至多 0.1%，completion
+至少 99.9%。完成请求少于 10,000 时，p99 结论是 `UNRESOLVED`；不能用小样本估计后表示为
+qualified。
 
-该对比使用自己的内容绑定 GPU attestation。缺少 attestation 时结果为 `UNMEASURED`；
-即使具备 attestation，它仍然是诊断结果，不能改变核心正式 gate 或其选择配置。
+Exactness violation、重复/混合身份、non-finite candidate、partial publication、fallback、
+OOM、retraction、evidence drop、不完整 terminal accounting 或超出 hardware envelope 的
+观测都会使对应 block 无效。Profiler 与带同步的诊断必须独立运行，并禁止进入 headline
+evidence。
 
-## 正式门槛
+## Power 与统计推断
 
-两种 adaptation 方法都必须分别比 Static 获得至少百分之三的平均 goodput 提升，配对
-BCa 95% 下界大于零。Exactness violation、version mismatch、fallback、non-finite update、
-OOM 与 retraction 必须全部为零；adapted run 必须实际 launch 并 publish update。
+恰好四个 paired pilot block 只用于估计 L0--Static 与 L0--TTS 的 log-effect variance；
+pilot ID 永久排除在 confirmation 外。Family alpha 0.05、第一 Holm threshold、3% 最小相对
+效应与 80% target power 全部预先固定。Power grid 从 12 至 20 选择能同时满足两个 contrast
+的最小 common final-block count；若没有合格数量，状态为 `UNDERPOWERED`，confirmation
+不能开始。
 
-只有 attestation 同时绑定 manifest、selection、精确 evidence bytes、模型 revision、
-patched SGLang tree 与 GPU 硬件报告时，gate 才可能返回 `PASS`。未 attested 的计算始终
-是 `UNMEASURED`；实测但未满足任一条件时是 `BLOCKED`。本仓库只包含协议代码，不包含
-结果 artifact 或性能宣传。
+最终 goodput effect 是 paired log ratio，并在独立 repetition block 上计算 95% BCa 区间。
+Primary family 恰好包含 L0--Static 与 L0--TTS，使用 Holm family-wise adjustment。
+Secondary breadth hypothesis 必须显式分组并使用 Benjamini--Hochberg FDR；看到结果后不能
+把它升级到 primary family。
+
+Long-context request-level summary 使用 hierarchical bootstrap：先重采样独立 block，再
+在每个 sampled block 内重采样 request。Production arrival 实验重采样整个 time block，以
+保留 block 内 tail dependence。二者均使用固定 95% 区间与已注册 seed/repetition count。
+共享一个 service interval 的 request 不能视为独立 system replicate。
+
+Power、clock、temperature、throttling reason 与 background process 作为 per-block hardware
+envelope 锁定。缺失或越界观测会使 block 无效，不能在事后选择为 covariate。
+
+## 证据、恢复与结论
+
+Evidence 逐步写入有界、fsynced Parquet WAL segment。只有 table coverage 完整且没有不允许
+的 drop，才能组装 final shard 并获得 exclusive content-bound receipt。中断和 aborted
+attempt 保持可审计，但其 row 被排除。Resume 只跳过一个完整身份及 file digest 都验证通过
+的 receipt；出现竞争 completed attempt 属于错误。
+
+该端到端 evidence path 当前只会关闭 Target-only run。所有 speculative method 都需要准确
+固定 native terminal hook 来绑定 request/round/update/performance row；缺少 hook 是 mutation
+前的 `BLOCKED` outcome，不代表可以合成或省略 evidence。
+
+Empirical gate 还要求 attestation 绑定 registry/manifest、selection/stage receipt、准确
+runtime/capability 与 patched tree、model/tokenizer/data/trace identity、hardware/power
+report 及每个 final Parquet digest。缺少它时，即使本地算术为正，状态仍为 `UNMEASURED`；
+有效 attested evidence 未通过注册标准时为 `BLOCKED`。仓库只包含协议代码，不包含性能
+结论或 result artifact；本 release 也不包含任何 GPU 结果。
+本 release 未配置 trusted hardware-attester identity，因此内容自洽但由 caller 编写的
+attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`。

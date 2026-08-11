@@ -2,167 +2,198 @@
 
 [中文](../zh-CN/experiment-protocol.md) · [Home](../../README.md)
 
-## Registered question
+## Question and current status
 
-The study tests whether paper-faithful TTS and first-ready L0 each increase
-decode goodput over unchanged Static. It does not assume that acceptance gains
-pay for training or scheduling cost. GPU status remains `UNMEASURED` until the
-complete protocol produces a content-bound attestation.
+The industrial study asks where online drafter adaptation helps, why it helps,
+and when its cost or operational risk outweighs saved target work. Target-only,
+Static, TTS, and L0 are kept distinct. TTS and L0 use the same candidates and
+differ only in publication time.
 
-The primary model pair is Qwen3-8B + DFlash. The checkpoint/model context limit
-is 40,960 prompt-plus-generated tokens. Formal measurement caps that context at
-40,928, leaving two block-16 speculative KV reservations at the request
-boundary. The formal long region begins at 16K generated tokens and ends at
-that safe request limit.
-TTS and L0 must share candidate computation, optimizer, update mode, parameter
-scope, rank, learning rate, stride, supervision, sampling, and load. Their only
-difference is publication policy.
+All new GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
+establish target protocol and coordinator contracts, not a fully runnable
+speculative surface or a benchmark result. The industrial executor currently
+runs only TP1/DP1 Target-only. Static/TTS/L0 are `BLOCKED` before mutation
+pending `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`,
+which the pinned integration does not implement. Stage B is also blocked on
+provider credentials and registered hardware. Historical v2 evidence is
+regression/debugging material only and is excluded from schema-v3 selection,
+power sizing, confirmation, and claims.
 
-## Data isolation
+## Immutable dependency DAG
 
-The controlled adapter deterministically generates copyright-independent
-prompts from a finite vocabulary. Three content-disjoint, hash-bound windows
-contain eight load prompts, sixteen tuning prompts, and thirty-two confirmation
-prompts. Confirmation data cannot influence load or hyperparameter selection.
+The registry fixes this order:
 
-Context is recorded as the actual `prefix_len_before` each proposal. Generated
-position buckets are 0, 2K, 4K, 8K, 16K, 24K, 32K, and the safe limit. Natural
-EOS side tables use locked LiveCodeBench and Math500 revisions, thirty-two
-prompts each, and report the number of requests still at risk in every bucket.
-They replicate behavior but do not determine the formal gate.
+```text
+preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+```
 
-## Load and tuning
+Each target definition names dependencies, locked outputs, and scientific
+axes. Each cell then binds its complete identity: experiment/model/backend/
+task/method, parameterization and native scope, optimizer and schedule,
+context/regime/width/arrival/SLO, cohort/topology, seed/block, GPU UUIDs, ports,
+cache and evidence roots, workload class, and truthful status/reason.
 
-Static independently scans concurrency 1, 2, 4, 8, 16, 32, and 48. A load is
-eligible only with zero OOM and retractions, KV capacity for
-`concurrency × 40,928`, and p99 ITL no greater than twice Static-c1. The
-eligible load with highest decode goodput is fixed for all three methods.
-Selection also requires no more active requests than the 32-prompt confirmation
-window can supply; the c48 screen remains a capacity diagnostic rather than an
-underfilled formal load.
+A stage could dispatch only after exact dependency receipts validate and the
+cell passes executable-release preflight. A receipt binds registry, runtime,
+split, dependency-output, and locked-output SHA-256 values and asserts that
+selection was sealed before downstream unblinding.
+Editing a registry artifact or reserializing a dependency under another digest
+fails closed.
 
-Tuning searches drafter Full and LoRA across Adam, AdamW, SGDm, NAG, Muon, and
-Lion with optimizer-specific learning-rate ranges, rank, stride, weight decay,
-and global gradient clipping. Muon's matrix step and auxiliary AdamW fields are
-one bound candidate identity; they cannot be selected independently after the
-run. Successive halving reads only the tuning window. The final shared
-configuration maximizes
+## Stages and locked decisions
 
-\[
-\min\left(V_{\mathrm{TTS}}/V_{\mathrm{Static}},
-V_{\mathrm{L0}}/V_{\mathrm{Static}}\right),
-\]
+| Stage | Purpose | Output locked before downstream use |
+|---|---|---|
+| Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, two-GPU interference | runtime envelope |
+| E3a | Target-only/Static context, regime, concurrency, and draft-width capacity | reference load, matched width, crossover and drift witness |
+| E1 | DFlash layer scope and Full/LoRA geometry at AdamW/SGDm anchors | safe Pareto set and common load |
+| E2 | optimizer, log learning-rate grid, schedule, and successive halving | one DFlash recipe |
+| E4 | cumulative systems mechanisms and isolated profiling | mechanism gate |
+| E3b | paired long-context Target-only/Static/TTS/L0 confirmation | long-context confirmation |
+| E1a | native DSpark transfer and retuning | one DSpark recipe |
+| E5 | production arrivals, cohorts, topologies, SLOs, and failures | production and topology surfaces |
+| E6 | native NEXTN interface and two-rank fit, then transfer | native MTP transfer surface |
+| E0 | model/backend/task breadth including isolated OnlineSPEC | breadth surface |
 
-after exactness and stability checks. Ties prefer lower peak HBM, then lower
-p99 ITL, then lower exposed update time. The immutable selection artifact binds
-the grid, tuning window, model lock, patched tree, load, and tuning evidence.
+E1 crosses four native layer scopes with Full plus seven LoRA ranks and two
+optimizer anchors: exactly 64 geometry cells before downstream optimizer
+search. E2 keeps optimizer-specific fields and the schedules `constant`,
+inverse-square-root by published update, and cosine-to-zero as separate
+identities. ChronoBelief declarations are explicitly `BLOCKED`: no authoritative
+update equation or source identity is registered, and substituting another
+optimizer is forbidden.
 
-For a narrowly scoped reproduction, a registered-grid anchor may instead be
-locked from a complete terminal tuning triplet. That artifact is explicitly
-labeled `heldout_anchor`: it uses the same independent confirmation and GPU
-gate, but makes no claim that the anchor is the grid optimum.
+E1a has exactly 56 adaptive configurations. Its 32 layer-only cells cross
+`last1/last3/last5/all` with Full plus seven LoRA ranks while freezing DSpark
+native heads. Its 24 hybrid cells cross `last1/last3/last5` with the same eight
+backbone parameterizations and additionally train native W1, W2, and scalar
+acceptance/confidence state as Full. Fixed verification budget is a tuning
+control; the transferred candidate must also survive the native scheduler.
 
-## Independent confirmation
+These are registered scientific grids, not current executor support. The
+pinned patch rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation, nonconstant
+schedules, and all multi-rank execution. Even its lower-level TP1/DP1 DFlash
+path cannot produce claimable industrial evidence until the native terminal
+provider is implemented.
 
-Confirmation has eight repetition blocks. Every block independently resets the
-cohort before each method, randomly orders Static/TTS/L0, and submits all 32
-distinct prompts once in one ordered native batch request. This removes
-host-thread arrival races without throttling the GPU: SGLang's locked admission
-limit owns continuous batching, and the engine and cohort are not reset while
-the queue drains. A warmup occurs outside the interval. One method/block batch owns the
-union of its active decode intervals, excluding request queue and prefill gaps;
-repetitions are never merged and batch metrics are never copied onto prompt or
-bucket rows.
+## Data, contexts, and traces
 
-Request-level ITL, TTFT, output identity, and per-request decode diagnostics are
-recorded separately. They do not masquerade as aggregate system goodput. Load
-and early tuning stages fill an undersized prompt window round-robin only until
-the registered concurrency is occupied; confirmation and natural-task runs
-never replicate prompts to manufacture load.
+Controlled prompt windows are content-disjoint and digest-bound. Selection
+data cannot enter confirmation. Model and tokenizer revisions, prompt compiler,
+task split, maximum context, generation budget, and safe speculative headroom
+are immutable inputs. Natural datasets require exact external revisions and
+remain outside the repository.
 
-The registered controlled profile is greedy. This makes the target-token
-trajectory identical across Static and every exact adapted method, so a paired
-timing effect cannot be caused by method-dependent random-number consumption.
-Tuning and confirmation store only a SHA-256 of each generated trajectory and
-fail closed unless every paired method has the same digest; generated text is
-not retained in the evidence tables.
-Stochastic coupled-RNG and distribution checks remain mandatory GPU tests;
-stochastic natural-task runs are robustness side tables, not the causal speed
-headline.
+Long-context axes are 1K, 2K, 4K, 8K, 16K, 24K, 32K, and 40,928 tokens across
+long-input/short-output, short-input/long-generation, and multi-turn
+shared-prefix regimes. DFlash draft widths are 4, 8, and 16. E3b reports a
+matched-width panel and a deployment-optimal-width panel separately; changing
+width after seeing confirmation is forbidden.
 
-Every complete run has a terminal receipt binding its normalized Parquet
-shards. Resume reuses only identity-matched receipts. Interrupted shards are
-not evidence, so a stopped multi-hour study can continue without duplicating
-or silently dropping completed cells.
+Production traces separate content identity from arrival identity. Open-loop
+Poisson, immediate-burst, BurstGPT-shaped, and soak traces bind exact arrival
+offsets. Closed-loop runs instead bind a maximum request pool, population, and
+per-client order; every realized offer time must follow the prior terminal
+event for that client. Each method may consume a different contiguous prefix,
+and exhausting any client pool before the fixed arrival window is a
+nonclaimable failure. A synthetic BurstGPT-shaped trace is never labelled as
+the real dataset without an immutable external corpus digest.
 
-## Metrics and inference
+Paired open-loop methods consume identical trace bytes; paired closed-loop
+methods consume the same pool and client ordering. Every actual offer is
+accounted exactly once as rejected, completed, timed out, cancelled, or
+unfinished. Unfinished work remains in the denominator through its registered
+timeout boundary. Missing rows are not filled with zero.
 
-Headline metrics are paired batch decode-goodput effects for one dedicated
-`long_region` row spanning 16K-to-limit and for the full trajectory. Position
-buckets remain explanatory and are never averaged into the headline. TTS and L0 are evaluated separately against
-Static using repetition-block BCa 95% intervals. The repetition block is the
-independent timing and randomization unit; treating 32 requests that share one
-wall-clock interval as 32 independent goodput samples would be
-pseudoreplication. Each method must reach the registered mean threshold and
-have a confidence lower bound above zero. A third paired interval compares L0
-directly with TTS. The fixed zero-margin contract requires L0's mean relative
-goodput and its BCa lower bound to be non-negative; a run cannot pass merely
-because both methods separately beat Static.
+## Two-GPU staging
 
-Interpretation retains survival-weighted accepted prefix, committed and
-verified drafts per verification, verification waste, target calls per output
-token, TTFT, ITL percentiles, CUDA lane times, exposed update time, overlap,
-graph replay, batch fill, queue occupancy, peak HBM, KV and optimizer memory,
-loss, and trainable parameter count. Target-only estimated MFU and profiler
-device utilization use different names.
+The registry requires two explicit GPU UUIDs. Before concurrent work, preflight
+records clocks, temperature, power state, background processes, driver/runtime
+identity, topology receipts, per-rank HBM, and an interference receipt. Without
+that receipt, the deterministic scheduler runs every single-GPU cell serially.
 
-Optimizer memory is reported by category rather than inferred from parameter
-count. This distinguishes two-moment Adam/AdamW, one-moment SGDm/NAG/Lion, and
-Muon's matrix momentum plus non-matrix auxiliary AdamW state.
+Two-GPU, headline, profiler, download, and compile cells are exclusive. After a
+passing interference gate, only two single-GPU cells with disjoint UUIDs,
+ports, cache roots, and evidence roots may share a dispatch wave. A queue is
+data, not an instruction to launch every argv simultaneously.
 
-Adapted runs also retain one semantic record per verification round, including
-the real `prefix_len_before`, valid verified/accepted/committed counts, proposal
-source version, and frozen-KV version segments. Static enables only aggregate
-study counters and never allocates adaptation trace buffers.
+TP2 and sticky-replica DP2 are target coordinator contracts. A future release
+would require a verified patched-runtime capability receipt and all-rank
+prepare/decide/apply/receipt evidence for one publication identity. The current
+`RunConfig` rejects every TP2/DP2 cell before model loading; the CPU `gloo`
+harness is only a state-machine test and cannot enable those cells.
 
-Detailed profiling is a separate run; headline decoding never synchronizes
-once per round. Acceptance alone is not a speed claim.
+No stage claims multi-node, more than two ranks, Kubernetes scheduling, elastic
+membership, or automatic failover.
 
-## OnlineSPEC comparison protocol
+## Production metrics and safety
 
-OnlineSPEC is registered as an important comparison with a separate manifest
-and evidence namespace. It uses the controlled tuning and confirmation windows
-but cannot consume core TTS/L0 tuning rows or confirmation outcomes. Its three
-learners are reduced independently during successive halving. OnlineSPEC owns
-a manifest-bound long-trajectory schedule of 2/16K, 4/24K, 8/32K, and
-16/40,928 prompt/context pairs; it does not reuse the core study's 4K/8K early
-stages. One safe configuration per learner is then compared with a paired
-Static reference.
+Every system point reports offered/admitted/terminal request accounting,
+throughput and decode goodput, TTFT by prompt bucket, within-request ITL,
+completion and error rates, target calls/work, accepted/verified/committed
+drafts, update/candidate/publication counts, exposed and overlapped update time,
+queue/batch occupancy, HBM categories, energy per output token, and hardware
+envelope validity.
 
-Confirmation uses 32 held-out prompts submitted once per method to one SGLang
-queue, eight randomized blocks, identical seeds, one locked concurrency, and
-the same 16K-to-safe-limit region. Aggregate goodput is inferred over the eight
-independent method/block active-interval unions; prompt-level rows remain
-diagnostic.
-The derived table reports OGD, optimistic OGD, and Hedge separately; it never
-collapses them into a best-of-baselines result. Each comparison includes paired
-BCa intervals, safety counters, update counts, HBM categories, and the
-learner-specific diagnostics defined in [OnlineSPEC
-baseline](onlinespec-baseline.md).
+The registered production SLO requires TTFT no greater than 2/5/10 seconds for
+short/medium/long prompts, within-request p99 ITL no greater than 100 ms,
+qualification at least 99%, error at most 0.1%, and completion at least 99.9%.
+A p99 claim is `UNRESOLVED` below 10,000 completed requests; it is not estimated
+from a smaller sample and presented as qualified.
 
-The comparison has its own content-bound GPU attestation. Without it the result
-is `UNMEASURED`. With it, the result is still diagnostic and cannot alter the
-core formal gate or its selected configuration.
+Exactness violations, duplicate/mixed identities, non-finite candidates,
+partial publication, fallback, OOM, retraction, evidence drops, incomplete
+terminal accounting, or out-of-envelope hardware observations invalidate the
+affected block. Profilers and synchronizing diagnostics run separately with
+headline evidence forbidden.
 
-## Formal gate
+## Power and statistical inference
 
-Both adapted methods must independently show at least three percent mean
-goodput improvement over Static, with paired BCa 95% lower bounds above zero.
-Exactness violations, version mismatches, fallbacks, non-finite updates, OOM,
-and retractions must all be zero; adapted runs must launch and publish updates.
+Exactly four paired pilot blocks estimate the log-effect variance for
+L0--Static and L0--TTS. Pilot IDs are permanently excluded from confirmation.
+With family alpha 0.05, the first Holm threshold, a 3% minimum relative effect,
+and 80% target power fixed in advance, the power grid selects the smallest
+common final-block count from 12 through 20 that powers both contrasts. If no
+count qualifies, status is `UNDERPOWERED` and confirmation cannot start.
 
-The gate returns `PASS` only with an attestation binding the manifest,
-selection, exact evidence bytes, model revisions, patched SGLang tree, and GPU
-hardware report. An unattested calculation is always `UNMEASURED`; a measured
-run that misses any criterion is `BLOCKED`. This repository contains protocol
-code, not result artifacts or performance claims.
+Final goodput effects are paired log ratios with 95% BCa intervals over
+independent repetition blocks. The primary family contains exactly
+L0--Static and L0--TTS and uses Holm family-wise adjustment. Secondary breadth
+hypotheses are grouped explicitly and use Benjamini--Hochberg FDR; they cannot
+be promoted into the primary family after results are known.
+
+Long-context request-level summaries use hierarchical bootstrap: resample
+independent blocks, then requests inside the sampled blocks. Production
+arrival experiments resample whole time blocks to preserve within-block tail
+dependence. Both use fixed 95% intervals and registered seeds/repetition counts.
+Requests sharing one service interval are not treated as independent system
+replicates.
+
+Power, clocks, temperature, throttling reasons, and background processes are
+locked as a per-block hardware envelope. Missing or out-of-range observations
+invalidate the block rather than becoming covariates chosen after the fact.
+
+## Evidence, resume, and claims
+
+Evidence is written incrementally to bounded, fsynced Parquet WAL segments.
+Only complete table coverage with zero disallowed drops can be assembled into
+final shards and receive an exclusive content-bound receipt. Interrupted and
+aborted attempts remain inspectable, but their rows are excluded. Resume skips
+only a single receipt whose full identity and file digests validate; competing
+completed attempts are an error.
+
+This end-to-end evidence path currently closes only Target-only runs. Every
+speculative method requires the exact pinned native terminal hook to bind its
+request/round/update/performance rows; absence of that hook is a pre-mutation
+`BLOCKED` outcome, not permission to synthesize or omit evidence.
+
+An empirical gate additionally requires an attestation binding the registry or
+manifest, selections and stage receipts, exact runtime/capability and patched
+tree, model/tokenizer/data/trace identities, hardware and power report, and
+every final Parquet digest. Without it, status is `UNMEASURED` even when local
+arithmetic is positive. Valid attested evidence that fails a registered
+criterion is `BLOCKED`. The repository contains protocol code, not performance
+claims or result artifacts, and this release contains no GPU results.
+No trusted hardware-attester identity is configured in this release. Therefore
+content-consistent caller-authored attestation files cannot promote either the
+industrial or legacy analyzers to `MEASURED`.

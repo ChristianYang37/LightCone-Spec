@@ -34,7 +34,7 @@ def sha256(path: Path) -> str:
 
 
 def test_package_and_schema_version_are_focused_release() -> None:
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
 
 
 def test_cli_exposes_content_bound_onlinespec_source_verifier(capsys) -> None:
@@ -109,11 +109,23 @@ def test_patch_manifest_binds_series_files_and_tree() -> None:
     ]
     assert series == [entry["file"] for entry in manifest["patches"]]
     assert len(series) == PINNED_SGLANG_PATCH_COUNT
+    assert sorted(path.name for path in PATCH_ROOT.glob("*.patch")) == series
     for entry in manifest["patches"]:
         patch = PATCH_ROOT / entry["file"]
         assert patch.is_file()
         assert sha256(patch) == entry["sha256"]
         assert entry["files"] == sorted(set(entry["files"]))
+
+
+def test_patch_exports_exact_official_sglang_output_token_ids() -> None:
+    manifest = json.loads((PATCH_ROOT / "manifest.json").read_text())
+    files = manifest["patches"][0]["files"]
+    assert "python/sglang/benchmark/serving.py" in files
+    assert "test/registered/unit/benchmark/test_serving_output_token_ids.py" in files
+    patch = (PATCH_ROOT / manifest["patches"][0]["file"]).read_text()
+    assert "generated_token_ids: Optional[List[int]] = None" in patch
+    assert "_merge_sglang_generated_token_ids" in patch
+    assert 'data["output_ids"]' in patch
 
 
 def test_patch_apply_script_requires_exact_clean_upstream() -> None:
@@ -307,7 +319,7 @@ def test_cli_builds_and_validates_immutable_manifest(tmp_path, capsys) -> None:
     assert main(["build-speed-study", "--output", str(output)]) == 0
     manifest = SpeedStudyManifest.load(output)
     assert manifest.gpu_evidence == "UNMEASURED"
-    assert manifest.methods == ("static", "tts", "naive_async")
+    assert manifest.methods == ("static", "tts", "l0")
     assert capsys.readouterr().out.strip() == manifest.sha256
 
 

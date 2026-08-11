@@ -4,121 +4,178 @@
 
 ## Schema identity
 
-All run configurations use schema version 2 and reject unknown fields. There
-are three core methods: `static`, `tts`, and `naive_async`. The registered
-OnlineSPEC comparison adds `onlinespec_ogd`, `onlinespec_opt`, and
-`onlinespec_ens` under a separate manifest, selection, and evidence identity.
-They are not valid substitutes in the core speed study and cannot affect its
-gate.
+Run configurations use schema version 3, are immutable after validation, and
+reject unknown fields. Core methods are `target_only`, `static`, `tts`, and
+`l0`. The isolated OnlineSPEC comparison adds
+`onlinespec_ogd`, `onlinespec_opt`, and `onlinespec_ens`; it has separate
+selection and evidence identities and cannot replace a core method.
 
-Every real run binds immutable target and drafter revisions, the pinned SGLang
-commit, a sampling-profile digest, a tenant, and a runtime load. Old schemas or
-retired method names fail as unknown input before model loading.
+Every run binds exact target/drafter revisions, backend algorithm, context and
+draft depth, pinned SGLang commit, sampling-profile SHA-256, tenant, and runtime
+topology. Target-only requires `speculation_enabled=false`. Every other method
+requires speculation, and its verification width must equal draft depth plus
+one. Unknown schemas and retired adaptation fields fail before model loading.
 
-## Adaptation configuration
+These names include target protocol vocabulary, not a promise that every valid
+scientific declaration is executable. The current end-to-end industrial
+executor accepts only TP1/DP1 Target-only. Static/TTS/L0 are blocked before
+mutation pending
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`; the pinned
+patch does not provide that provider. The lower-level adaptive patch path is
+limited to TP1/DP1 DFlash, constant schedule, zero extra logical delay, and
+`update_round` teacher rows.
 
-TTS and L0 share one identical adaptation object:
+## Method and disabled-path contract
 
-| Field | Allowed contract |
+Target-only and Static schema configs require both `adaptation: null` and
+`online_spec: null`. Target-only launches the target path without speculation;
+Static describes native speculative decoding. Neither may allocate optimizer,
+gradient, master, candidate, or cohort-adaptation state. Only Target-only is
+currently end-to-end executable. Static requires content-bound request,
+performance, and aggregate speculative safety evidence, while preserving zero
+round/update detailed-trace allocation; it therefore fails executor preflight.
+
+TTS and L0 require byte-equivalent model, runtime, adaptation, sampling, and
+load identities after removing the method field. They use one candidate
+implementation and may differ only in publication timing. Exact
+full-vocabulary rejection sampling is mandatory; absence of the registered
+kernel is an error, never a silent greedy fallback.
+
+## Adaptation object
+
+| Field | Schema-v3 contract |
 |---|---|
-| `weight_update_mode` | `residual`, `lora`, or `full` |
-| `parameter_scope` | `tail` or `drafter` |
+| `weight_update_mode` | `full` or `lora` |
+| `parameter_scope` | `last1`, `last3`, `last5`, `all`; DSpark also permits the three `*_native_heads` scopes |
 | `kv_history_policy` | exactly `frozen` |
 | `adaptation_scope` | exactly `cohort` |
-| `adaptation_group_id` | explicit, non-empty group identity |
-| `optimizer.name` | `adam`, `adamw`, `sgdm`, `nag`, `muon`, or `lion` |
-| `rank` | explicit for residual/LoRA; `null` for full |
+| `adaptation_group_id` | explicit non-empty cohort identity |
+| `rank`, `lora_alpha` | both `null` for Full; same registered rank for LoRA so `alpha/r=1` |
+| `lora_matrix_policy` | exactly `registered_matrices_v1` |
+| `native_head_policy` | `frozen` for layer-only; `full` for a DSpark hybrid |
 | `stride` | positive integer |
 | `max_in_flight` | exactly one |
+| `canvas_tokens` | equals speculative verification width |
+| `teacher_row_policy` | `update_round` or registered `quota_shadow` |
 
-Residual is tail-only. Drafter Full/LoRA is DFlash-only and requires an
-unquantized TP=DP=1 path with a canvas width equal to the speculative block
-size. DSpark and EAGLE/EAGLE3 accept only tail scope. Adapted DSpark requires
-verify-all execution. Adapted EAGLE/EAGLE3 requires one layer, fixed proposal
-depth, top-k one, no token-map remapping, and exact full-vocabulary rejection
-sampling. Target embedding, target LM head, and target model remain frozen.
+LoRA ranks are exactly 1, 2, 4, 8, 16, 32, and 64. A LoRA plan selects only
+registered two-dimensional native matrices and begins with zero functional
+delta. Full selects all eligible floating parameters in the named native layer
+scope. Borrowed target embeddings, target LM head, and target model remain
+frozen. Quantized or unowned trainable coordinates fail preflight.
 
-Static requires `adaptation: null`. This is a semantic fast-path requirement:
-no optimizer, gradient, trace, candidate, or adaptation-reserve allocation may
-be created.
+The trainable-plan digest covers selected and frozen parameters, shapes,
+dtypes, parameterization, LoRA rank/alpha, and sharded versus replicated
+ownership. Changing any of these values creates a new configuration, memory
+plan, selection, and evidence identity.
 
-The formal launcher explicitly adds `--speculative-speed-study-metrics` and
-exact rejection sampling to all three endpoints. Without that study flag,
-native SGLang allocates no LightCone metric state. With it, DFlash, rejection
-sampling, and both acceptance thresholds equal to one are mandatory; a
-missing exact kernel is an error and never falls back to greedy decoding.
+## Backend-specific fields
 
-## Optimizer contracts
+This section specifies target contracts. In the current executable schema,
+adaptive configurations must use DFlash; DSpark, EAGLE, EAGLE3, and NEXTN are
+rejected before model loading. DFlash's target contract uses native
+differentiable-canvas evidence. EAGLE/EAGLE3 would require
+`speculative_eagle_topk=1` for adaptation and pin one proposal source version.
+NEXTN would require a separately preflighted native interface digest; registry
+E6 also targets a two-rank memory-fit receipt. Those prerequisites do not make
+the cells executable in the current schema.
 
-All online optimizers are functional: a side stream computes candidate
-parameters and candidate state without mutating the active optimizer. The
-candidate becomes active only when the TTS or L0 publication policy commits it.
-The configuration is strict rather than accepting silently unused fields:
+DSpark layer-only scopes freeze W1, W2, and acceptance/confidence state. Hybrid
+scopes `last1_native_heads`, `last3_native_heads`, and `last5_native_heads`
+select the named backbone scope while training W1, W2, and the scalar native
+acceptance/confidence parameter as Full replicated state. A hybrid requires a
+non-null `confidence_loss_weight`; a layer-only plan rejects it.
 
-| Optimizer | Required fields | Decay and resident state |
+`verification_mode` is `fixed_budget` only when
+`fixed_verification_budget` is present; otherwise it is `native_scheduler`.
+The fixed-budget phase is a tuning control, while confirmation uses the native
+scheduler. Proposal cross-entropy and the proper confidence loss use the real
+native Markov features and actual sampled predecessor. A configuration cannot
+substitute reconstructed placeholder features.
+
+The E1a registry contains exactly 56 adaptive configurations: four layer-only
+scopes and three hybrid scopes, each crossed with Full plus seven LoRA ranks.
+
+## Optimizer contract
+
+The target TTS/L0 optimizer registry contains `adam`, `adamw`, `sgdm`, `nag`,
+`muon`, and `lion`. They make a functional parameter/state proposal and mutate
+active state only on commit. Plain `sgd` is reserved for OnlineSPEC.
+
+| Optimizer | Required identity | Resident moment rule |
 |---|---|---|
-| `adam` | learning rate, betas, epsilon | no weight decay; FP32 first and second moments |
-| `adamw` | learning rate, betas, epsilon | decoupled decay; FP32 first and second moments |
-| `sgdm` | learning rate, `momentum` | coupled weight decay; one FP32 momentum buffer |
-| `nag` | learning rate, `momentum` | PyTorch-style Nesterov with coupled weight decay; one FP32 momentum buffer |
-| `lion` | learning rate, betas | decoupled decay; one FP32 momentum buffer |
-| `muon` | learning rate, `momentum`, `muon_ns_steps`, auxiliary AdamW learning rate and decay | Muon for 2-D tensors; auxiliary AdamW and two moments for non-matrix tensors |
+| Adam | learning rate, betas, epsilon | FP32 first and second moments; no decay |
+| AdamW | learning rate, betas, epsilon, decay | FP32 first and second moments; decoupled decay |
+| SGDm | learning rate, momentum, optional decay | one FP32 momentum; coupled decay |
+| NAG | learning rate, momentum, optional decay | one FP32 momentum; coupled decay |
+| Lion | learning rate, betas, optional decay | one FP32 moment; decoupled decay |
+| Muon | learning rate, momentum, Newton--Schulz steps, auxiliary AdamW fields | matrix momentum plus two auxiliary moments for non-matrices |
 
-`grad_clip` is mandatory and global across the candidate parameter list.
-`momentum` is rejected for optimizers that do not use it. Muon-only fields are
-rejected for every other optimizer. Adam's unused weight decay and Lion's
-unused epsilon variants are likewise rejected instead of forming fake tuning
-identities. Static uses no optimizer. Plain `sgd` is reserved for the registered
-OnlineSPEC learners and is not a TTS/L0 optimizer choice.
+Global `grad_clip` is positive and evidence-bound. Unused optimizer fields are
+rejected. The target schedule vocabulary includes `constant`,
+`inverse_sqrt_published_update`, and `cosine_to_zero`, advancing from
+published-update count rather than attempted work. The current adaptive
+`RunConfig` accepts only `constant`; the other schedules remain registered but
+non-executable. Optimizer and schedule identities enter cohort, plan,
+selection, and evidence digests.
 
-The HBM ledger counts the FP32 master, every allocated moment, and the device
-step scalar. Empty moments are not allocated: SGDm, NAG, and Lion therefore do
-not pay for a second state tensor, while Muon pays two moments only for the
-non-matrix parameters handled by auxiliary AdamW.
+## Runtime topology
 
-## Cohort identity
+The target registry/coordinator vocabulary describes one node and at most two
+ranks:
 
-An update may be shared only by requests with identical target and drafter
-revisions, algorithm, sampling profile, tenant, experiment group, parameter
-layout, and optimizer configuration. Each active request contributes only its
-latest legal supervision signal. Cancellation, epoch rollover, slot reuse, or
-source-version conflict invalidates the candidate.
+| Shape | Required fields |
+|---|---|
+| TP1/DP1 | `distributed_runtime_capability=single_rank`, no capability receipt |
+| TP2/DP1 | `patched_two_gpu_v1`, capability receipt, distinct rank/device identities |
+| TP1/DP2 | same capability receipt plus an explicit sticky `router_identity` |
 
-## Runtime rendering
+Rank fields must lie inside their TP/DP dimensions. Device, rendezvous, router,
+clock, process-group backend, and capability receipt are part of target runtime
+identity. The current release accepts only the TP1/DP1 row and rejects all
+TP2/DP2 `RunConfig` values before model loading; a caller-authored receipt
+cannot enable them.
 
-`render-runtime` consumes a locked selection artifact and emits three matched
-run configs plus an argv-only launch plan. The adaptation reserve and Static KV
-memory fraction are mandatory hardware-preflight inputs; neither has a source
-default. Generated runtime files and absolute model roots belong under the
-ignored artifact directory and must not be committed.
+`process_group_backend=gloo` is valid for the CPU collective contract. It does
+not certify NCCL/CUDA behavior and must not be used as a GPU capability receipt.
+The CPU contract preserves future receipt vocabulary only. Production TP2/DP2
+work remains `BLOCKED` until a new pinned runtime implements and emits the GPU
+receipt plus all-rank publication evidence.
 
-TTS and L0 configs must be byte-equivalent after removing the `method` field.
-Changing a hyperparameter, sampling profile, load, model revision, or runtime
-tree requires a new selection and evidence root.
+Prefill/decode disaggregation and two-batch overlap remain disabled. Multi-node
+and more-than-two-rank configurations fail validation; there is no Kubernetes,
+elastic, or automatic-failover setting.
 
-## OnlineSPEC comparison configuration
+## HBM and cohort policy
 
-Every OnlineSPEC run has the ordinary `adaptation` object plus a required
-`online_spec` object. Its optimizer must be plain `sgd`; paper-specific state
-is not expressed through an Adam or momentum alias.
+Runtime rendering takes explicit adaptation reserve and model/KV memory
+fractions from preflight; there is no universal source default. Admission uses
+the least-headroom rank after charging all model, KV, optimizer, candidate,
+activation, graph, telemetry, and safety-margin categories.
+
+Fixed cohort slabs are quota-bound per tenant and replica. Optional cold
+offload must be configured explicitly and applies only to inactive cohorts.
+Memory pressure never silently changes Full to LoRA, precision, optimizer, or
+scope. Any such change requires a new config, load screen, selection, and
+evidence root.
+
+## OnlineSPEC comparison
+
+The isolated OnlineSPEC protocol adds a required `online_spec` object. Its
+optimizer must be plain SGD, and its declarations remain TP1/DP1 under a
+separately registered tuning protocol. This separate schema/runtime surface
+does not supply the industrial executor's missing native terminal evidence
+provider and does not make an industrial speculative cell runnable.
 
 | Field | Contract |
 |---|---|
-| `projection_radius` | optional positive Euclidean radius around the initial decision |
-| `additional_learning_rates` | strictly increasing expert rates, Hedge only |
-| `hedge_learning_rate` | positive Hedge meta rate, Hedge only |
+| `projection_radius` | optional positive Euclidean radius |
+| `additional_learning_rates` | unique increasing expert rates, ensemble only |
+| `hedge_learning_rate` | positive meta rate, ensemble only |
 
-OGD and optimistic OGD reject ensemble fields. Hedge requires at least two
-ordered expert rates. DFlash supports two explicitly distinct Hedge decision
-classes: `full` averages dense drafter-parameter decisions, while `lora`
-averages the registered factor coordinates at a common rank. LoRA Hedge is a
-memory-bounded decision class and is not relabeled as dense parameter
-averaging. DFlash supports drafter Full/LoRA for all three learners. DSpark and
-EAGLE/EAGLE3 accept only the shared tail scope and retain their ordinary
-backend restrictions. All OnlineSPEC methods require TP=DP=1, frozen historical
-KV, cohort isolation, exact rejection sampling, and one in-flight update.
-
-The `online_spec` identity, expert rates, projection radius, and learner method
-enter configuration, layout, selection, memory, and evidence hashes. See the
-[OnlineSPEC baseline](onlinespec-baseline.md) for the state transitions and
-separate registered protocol.
+OGD and optimistic OGD reject ensemble fields. The ensemble requires at least
+two ordered expert rates. Full and LoRA remain distinct decision-coordinate
+classes; averaging LoRA factors is not relabelled as averaging dense updates.
+OnlineSPEC uses the same registered native layer scopes, frozen historical KV,
+exact proposal distribution, cohort isolation, and one-candidate bound, but its
+manifest, selection, evidence, and attestation never enter the core gate.

@@ -144,9 +144,9 @@ def test_native_batch_stream_preserves_order_and_per_request_itl() -> None:
             side_effect=[10.0, 10.1, 10.2, 10.3, 10.4, 10.5],
         ),
     ):
-        rows, elapsed = SGLangHTTPClient(
-            "http://server"
-        ).stream_generate_batch(payloads)
+        rows, elapsed = SGLangHTTPClient("http://server").stream_generate_batch(
+            payloads
+        )
     assert [row.request_id for row in rows] == ["r0", "r1"]
     assert rows[0].input_tokens == 7
     assert rows[0].inter_token_ms == pytest.approx((0.0, 200.0, 0.0))
@@ -392,7 +392,7 @@ class FakeClient:
     [
         "static",
         "tts",
-        "naive_async",
+        "l0",
         "onlinespec_ogd",
         "onlinespec_opt",
         "onlinespec_ens",
@@ -428,8 +428,7 @@ def test_loaded_batch_submits_the_complete_queue_to_sglang() -> None:
 
     client = QueueClient()
     payloads = tuple(
-        {"rid": f"r{index}", "text": "x", "sampling_params": {}}
-        for index in range(4)
+        {"rid": f"r{index}", "text": "x", "sampling_params": {}} for index in range(4)
     )
     rows, elapsed = client.run_loaded_batch(
         payloads,
@@ -457,7 +456,7 @@ def test_payloads_use_native_sglang_rid_and_paired_seed() -> None:
     )
     l0 = _payloads(
         sample,
-        method="naive_async",
+        method="l0",
         block=1,
         concurrency=2,
         max_new_tokens=8,
@@ -488,9 +487,7 @@ def test_warmup_request_namespace_cannot_reuse_measured_rids() -> None:
         sampling_profile=SamplingProfile(),
         request_namespace="warmup",
     )
-    assert {row["rid"] for row in measured}.isdisjoint(
-        row["rid"] for row in warmup
-    )
+    assert {row["rid"] for row in measured}.isdisjoint(row["rid"] for row in warmup)
     with pytest.raises(ValueError, match="namespace"):
         _payloads(
             sample,
@@ -573,9 +570,7 @@ def test_controlled_slice_executes_one_continuous_batch(monkeypatch) -> None:
             replace(
                 result(str(payload["rid"]), 8),
                 input_tokens=2,
-                token_arrival_ms=tuple(
-                    index * 100.0 + offset for offset in range(8)
-                ),
+                token_arrival_ms=tuple(index * 100.0 + offset for offset in range(8)),
             )
             for index, payload in enumerate(requests)
         )
@@ -709,6 +704,16 @@ def test_adaptation_evidence_never_uses_missing_defaults() -> None:
     assert len(records) == 1
     assert records[0].prefix_len_before == 7
     assert records[0].generated_tokens_before == 0
+    inconsistent = snapshot_payload(adapted=True)
+    inconsistent["internal_state"]["speculative_adaptation_info_record"][
+        "online_adaptation"
+    ]["counters"]["updates_published"] = 0
+    with pytest.raises(RuntimeError, match="published update counter"):
+        _adaptation_fields(
+            "tts",
+            ServerSnapshot.parse(inconsistent),
+            "c" * 64,
+        )
     broken = snapshot_payload(adapted=True)
     del broken["internal_state"]["speculative_adaptation_info_record"][
         "online_adaptation"
@@ -796,9 +801,7 @@ def test_round_evidence_binds_queued_prompt_kv_to_its_start_version() -> None:
         **diagnostics["rounds"][0],
         "source_version": 7,
     }
-    diagnostics["kv_segments"]["r0"] = [
-        {"start": 0, "end": 11, "source_version": 7}
-    ]
+    diagnostics["kv_segments"]["r0"] = [{"start": 0, "end": 11, "source_version": 7}]
     records = _round_records(
         run_id="run-queued",
         diagnostics=diagnostics,

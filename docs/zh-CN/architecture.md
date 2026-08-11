@@ -2,111 +2,170 @@
 
 [English](../en/architecture.md) · [README](../../README_zh-CN.md)
 
-## 系统边界
+## 边界与状态
 
-LightCone-Spec 将三类职责分开：Python 包负责配置、实验身份、证据与统计推断；mail
-patch 只向一次性 SGLang checkout 加入必要 runtime hook；模型、数据集、CUDA 库和
-run artifact 全部位于仓库之外。
+LightCone-Spec 分离 Python 协议、面向一次性 SGLang checkout 的 semantic mail-patch
+集成，以及外部模型/数据/run artifact。唯一 runtime 源码身份是固定 upstream commit、
+完整 patch series 与 expected final Git tree。工作区 checkout 永远不是隐式依赖。
 
-任何本地 SGLang 目录都不是依赖或事实来源。唯一集成身份是 exact upstream commit 与
-`patches/sglang/manifest.json` 中的 expected final Git tree。
+CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。当前端到端
+industrial executor 只支持 TP1/DP1 Target-only。除非固定 tree 提供
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，否则它会在 server launch
+前阻止全部 speculative plan；本 release 没有实现该 provider。实证 Stage B 还因缺少
+provider credential 与已注册硬件而 `BLOCKED`。历史 v2 evidence 仅可用于
+regression/debugging，不能支撑新结论。
 
-## 解码生命周期
+## 统一 Decode 与 Candidate 生命周期
 
-Static 使用所选 backend 的原生路径，不导入 adaptation module。TTS 与 L0 在每个
-server process 中创建一个同质 cohort runtime：
+Target-only 关闭 speculation，是 industrial executor 当前唯一可完成的 path。Static 是
+零 adaptation 分配的原生 speculative 目标 path，但在 terminal evidence hook 可用前会被
+executor preflight 阻止。两者的 schema contract 都不导入 adaptation state，也不分配
+optimizer、gradient、candidate 或 adaptation trace。
 
-1. Verification round 暴露当前 teacher logits、drafter hidden、semantic mask 和
-   source version；
-2. 到达配置 stride 时，每个活跃请求只保留最近一次合法信号，并归一化为 cohort batch；
-3. 低优先级 CUDA stream 重建当前 DFlash canvas，与 inference 输出核对，计算 KL
-   gradient，并在不修改 active state 的前提下生成 optimizer proposal；
-4. Candidate 绑定 cohort epoch、slot generation、source round 与 source version；
-5. TTS 等待下一个固定边界；L0 在每个合法边界查询 ready event。发布把 staging 值
-   copy 到固定地址 tensor；
-6. Stale、cancelled、non-finite、conflicting 或未认证 candidate 都是 no-op；原生解码
-   继续执行，并记录原因。
+目标 TTS/L0 contract 共用一个 candidate 生命周期；固定 patch 只为 TP1/DP1 DFlash 实现
+底层路径，但缺少 terminal evidence provider 时不构成端到端 executor 支持：
 
-最多只有一个 in-flight candidate，从协议上限制 side-stream 工作并明确取消语义。
+1. Verification 为实际被采样的 proposal 生成一个 `ProposalEvidence` envelope；
+2. Cohort 只保留每个请求最新的合法 supervision row，并把 batch 绑定到 cohort、epoch、
+   slot/buffer generation、source round 与 source adapter version；
+3. Side device stream 重建 backend-native 可微 proposal，应用已选择 trainable plan，
+   计算 loss，并在不修改 active parameter 或 optimizer state 的情况下生成 functional
+   optimizer candidate；
+4. Device check 覆盖 finiteness、reconstruction 与 supervision validity。三 byte receipt
+   会异步复制到 pinned host memory，并且只在 nonblocking ready-event query 确认完成后、
+   measured update timing 之外读取；ready event 身份与预留 scratch byte 属于 candidate；
+5. TTS 等待下一个固定更新边界；L0 在同一个 candidate ready 后的首个合法 graph 边界发布；
+6. Commit 把完整 candidate 恰好一次复制到固定地址 inference storage。Stale、duplicate、
+   cancelled、generation mismatch、non-finite 或 conflicting candidate 都带终止原因被丢弃。
 
-## OnlineSPEC 对比生命周期
+Candidate 创建、commit、discard、cancellation、reset 与 disable 各自只有一个终止转移。
+每个 cohort 最多一个 in-flight candidate，因此 side-stream 工作与 scratch memory 有界。
 
-已注册 OnlineSPEC baseline 复用同一 cohort、监督、版本、exactness 与固定地址发布基础
-设施，但保存自己的 prequential learner state。Proposal 使用当前 online decision；
-verification 给出反馈；随后 transactional candidate 在下一次 prediction boundary 提交。
-OGD 保存一个 decision；optimistic OGD 保存 anchor 与 gradient hint；Hedge 为每个学习率
-专家保存独立 decision 和累计 loss。
+## 公共 Backend 证据与重建
 
-这些状态不会经过 TTS/L0 optimizer 或发布时间策略。该对比使用独立 manifest、selection、
-证据 namespace 与 attestation，并且不能影响核心速度 gate。详见
-[OnlineSPEC baseline](onlinespec-baseline.md)。
+`ProposalEvidence` 刻意保持小而 backend-neutral，包含：
 
-## Backend 合同
+- adapter-free 与 deployed proposal logits；
+- 采样实际使用的 normalized corrected distribution；
+- semantic valid mask 与 target teacher row；
+- sampled predecessor token ID 与 embedding；
+- 可选 confidence row；
+- 唯一 request ID、cohort digest、source version 与 typed backend payload。
 
-DFlash 暴露真实 proposal hidden，同时支持 drafter-scope Full/LoRA 与共享 tail
-parameterization。只有 update round 进入可微 current-canvas path；普通 proposal round
-保留 graph replay，也不额外执行 vocabulary projection。
+目标 contract 要求构造阶段检查 shape、dtype、device、唯一性与身份，同时把数值检查保留
+为 device predicate；还要求 backend validator 重建 `proposal_logits`、
+`corrected_distribution` 与可选 confidence，并在 native inference 已施加 adapter 时拒绝
+额外 delta。当前 patch 只为 TP1/DP1 DFlash 实现该底层 adaptive reconstruction。
 
-DSpark 严格分开两种 hidden 身份：Markov feature 是 Markov head 消费的原始 drafter
-输出；tail feature 是经过 collapse 与 final normalization 后，进入冻结 LM head 的真实
-输入。Tail correction 在 Markov bias 前施加。Adapter-free logits 在相同 sampled
-predecessor-token path 下重建，因此真实 proposal distribution 不会被重复 correction，
-verification 也不会换用另一份分布。Adaptation 必须使用 verify-all；confidence-based
-draft truncation 会删除监督 row，因而 fail closed。
+目标 envelope 声明、但本 release 不执行下列 cross-backend 语义：
 
-EAGLE/EAGLE3 从 `draft_extend` 到随后的 verification 钉住同一个 source adapter
-version。首个 proposal 与每个内部 proposal step 使用同一固定地址 tail bank。任何 pinned
-proposal 尚未完成时都禁止发布。合法顺序为
-`verify -> candidate -> publish boundary -> draft_extend`。Filter、merge、overlap
-future、retraction、finish 与 abort 都以事务方式传播或失效 version state。在线支持形状
-刻意收窄为 single layer、fixed depth、top-k one、无 token map 与 exact full-vocabulary
-rejection sampling。
+- DFlash 绑定 deployed differentiable canvas 与 sampling-time proposal correction；只有该
+  backend 具有底层 adaptive patch path；
+- DSpark 绑定真实 inference-native Markov W1/W2 feature、实际 sampled predecessor、
+  scheduler mode、proposal distribution 与 confidence state；
+- EAGLE/EAGLE3 绑定 tree state、top-k-one execution，以及贯穿整个 proposal/verification
+  chain 的一个 source version；
+- NEXTN 绑定 native MTP hidden state 与不可变 upstream interface digest。其目标 contract
+  还将要求 interface 与 memory-fit preflight；当前 schema 会独立拒绝它。
 
-## 参数布局
+DSpark、EAGLE、EAGLE3 与 NEXTN adaptation 会在 model loading 前保持 `BLOCKED`。在目标
+contract 中，历史 drafter KV 被 detach、不可变且带版本；合格 update path 可把它当作
+state 使用，但绝不能重建或对其求导，未来 KV 记录最新 published version。
 
-Drafter `full` 覆盖全部 DFlash 自有浮点参数，包括 transformer linear、norm、final
-norm 与 `fc`；target embedding、LM head 和 target model 是借用且冻结的组件。Drafter
-`lora` 选择 DFlash 自有二维 `fc`、QKV、output、gate/up 与 down matrix。A/B 因子作为
-FP32 optimizer state；发布时只合并已选择 matrix，并保持原模型 storage 不变。
+## Trainable Plan
 
-Tail 消融先修正 hidden，再只执行一次 target-head projection。Residual tail correction
-复用 proposal 输出，不再运行第二次 target-head projection。
+目标 adaptation contract 只有 Full 与 LoRA 两种 parameterization。每个 plan 都列出 selected/frozen name、
+shape、dtype、Full/LoRA coordinate 身份及 sharded/replicated ownership；其 digest 进入配置
+和证据。Full 为所选 native parameter 保留 FP32 master。LoRA 只选择已注册二维 matrix，
+初始 functional delta 为零，rank 为 1/2/4/8/16/32/64，并固定 `alpha/r=1`。
 
-## KV 与版本
+DFlash、EAGLE/EAGLE3 与 NEXTN 使用 `last1`、`last3`、`last5` 或 `all` native layer
+scope。借用的 target embedding、LM head 与 target model 始终冻结。
 
-历史 drafter KV 是不可变状态输入，不是 trainable tensor。仅 update round 使用的可微
-路径把受限 paged history gather 到 scratch 后 detach；当前 canvas K/V 保持可微。发布
-后产生的新 KV 使用新权重版本；遥测以 half-open segment 记录 source version。
+DSpark 使用相同四种 layer-only scope，此时全部 native W1/W2/acceptance 参数冻结。
+另有 `last1_native_heads`、`last3_native_heads` 与 `last5_native_heads`：所选 backbone
+matrix 按 Full 或 LoRA 处理，W1、W2 与 scalar acceptance/confidence 参数则始终为 Full
+且 replicated。已注册 E1a 集合恰好为：
 
-该合同避免在长请求中使全部历史 KV 失效。它不声称等价于用新权重重建旧 KV；后者是
-另一种算法。
+```text
+4 layer-only scopes x (Full + 7 LoRA ranks) = 32
+3 hybrid scopes     x (Full + 7 LoRA ranks) = 24
+total                                             56
+```
 
-## 显存与并发
+Plan 按实际 coordinate 与 optimizer state 计算显存，而不是使用 model size 的固定倍数。
 
-Adaptation 显存在 KV-pool sizing 前分配。账本拆分 active/base、FP32 master、gradient、
-实际分配的 optimizer moment、optimizer metadata、staging、training activation、KV
-gather scratch、candidate scratch、graph buffer 和 telemetry。Adam/AdamW 分配两个
-moment；SGDm/NAG/Lion 分配一个；Muon 对 matrix 分配一个，对辅助 AdamW 处理的每个
-非 matrix 参数分配两个。Resident adaptation state 不可驱逐，也不静默 offload 或降档；
-剩余 HBM 决定 KV capacity 与 admission。
+## Topology 与发布
 
-Candidate scratch 按真实 master、已分配 moment、functional proposal copy 与 backend
-merge tensor 计算，不再使用 trainable parameter count 的固定倍数。
+目标 schema 与 CPU coordinator vocabulary 描述单主机 TP1/DP1、TP2/DP1 与 TP1/DP2
+identity。当前 `RunConfig` 只接受 TP1/DP1；由于本 release 无法签发内容绑定的
+`patched_two_gpu_v1` capability receipt，它会在 model loading 前拒绝全部 TP2/DP2 config。
+目标 multi-rank receipt 会绑定 global/local/TP/DP rank、device、node、process、rendezvous、
+router、clock、runtime 与 model identity。
 
-OnlineSPEC 预检还会计算共享 reset/projection snapshot、optimistic anchor/hint、独立
-Hedge 专家 decision 与 gradient、累计 loss 和 weighted-merge staging。Snapshot 记入
-active/base state，learner-only tensor 记为 `online_state` bytes；两类都不会被隐藏在
-KV budget 中。
+在该不可执行目标 coordinator contract 中，TP trainable state 跟随 inference ownership。Sharded parameter 保持 local；replicated
+parameter 只在所属 TP replica 内 reduce。DP 使用 sticky cohort routing：一个 cohort 始终
+留在 replica-local，replica 之间绝不平均 adaptation gradient。
 
-只有模型 revision、算法、sampling profile、tenant、实验组、参数布局和 optimizer identity
-全部相同的请求才能共享更新。Batch 对每个请求只保留最近一次合法信号，不积累跳过轮次
-的 stale supervision。
+目标 distributed publication 分两阶段。每个 rank 对同一个 retry-stable update/candidate 身份
+prepare，并报告 source version、epoch、buffer/optimizer generation、readiness、finiteness、
+memory reservation、safe boundary 与 process-group health。单一 all-rank decision 要么全部
+commit，要么全部 abort；post-copy receipt 会拒绝 partial application。Collective 或 split
+decision 失败会令 service unready、停止新 admission，并要求同 topology 显式 restart。
 
-## 证据链
+`GlooPublicationTransport` 是该状态机的真实双进程 CPU harness。它刻意拒绝 NCCL，
+不能验证 CUDA event、graph capture、固定地址 device copy、GPU 数值、性能或资源竞争。
 
-每个 run 写入 process-unique 的 run、request、round、update 和 performance Parquet
-shard。缺失计数是错误，不会补零。Run-scope speculative count 不会复制到 generated-token
-bucket。派生的 `speed_study.parquet` 只写入 ignored artifact root。
+## HBM 与 Cohort 治理
 
-正式 gate 必须有 attestation，同时绑定源 manifest、selection、模型 revision、patched
-runtime tree、硬件报告与精确 evidence file digest；否则状态保持 `UNMEASURED`。
+HBM ledger 分别计费 active/base state、FP32 master、gradient、实际 optimizer moment、
+metadata、candidate/staging buffer、training activation、KV gather scratch、graph buffer、
+telemetry 与 safety margin。Admission 由 headroom 最小的 rank 决定；只在一个 rank 可容纳
+而另一个不可容纳的总量，会在昂贵分配前被拒绝。
+
+显存压力按固定顺序处理：保留 immutable/runtime correctness，保留 active KV 与 published
+state，只驱逐 native inactive prefix，取消 pending adaptation 并释放 temporary state，
+最后 queue 或拒绝新工作。可选 cold-cohort offload 排在末尾，必须显式启用与计时，默认
+关闭。任何路径都不会静默改变 parameterization、precision 或 optimizer。
+
+Cohort manager 使用有界固定大小 slab 与 tenant quota。Key 包含 tenant、cohort digest 与
+replica；slot/optimizer generation 阻止 stale reuse。只有 inactive cohort 可被回收或 cold
+offload；transfer/reclamation receipt 保留 slab 与 byte 身份。
+
+## Trace 与 Durable Telemetry
+
+Load trace 为 request content、arrival、timeout/cancellation 与 warmup/scored window 绑定
+相互独立的身份。Synthetic Poisson 与 immediate-burst generator 按 seed 确定，并明确标为
+synthetic。没有不可变外部 corpus digest 时，BurstGPT-shaped trace 不会被表示成真实数据集。
+配对方法必须绑定相同 trace digest，并把每个 offered request 恰好计为 rejected、completed、
+timed out、cancelled 或 unfinished。
+
+Evidence schema 可以表示每个 process/rank 的 run、request、round、update 与 performance
+record，并通过有界 queue 写入。
+Durable index 拒绝重复 primary identity。周期或容量触发的 flush 会创建 fsynced Parquet WAL
+segment 与 checkpoint；backpressure 与任何显式 drop 都有计数。端到端 executor 当前只
+封存 Target-only evidence。Static 必须保持 round/update 详细 trace 零分配；在准确 native
+terminal hook 绑定 request/performance row 与汇总 speculative safety counter 前仍保持
+blocked。
+
+成功 close 时，WAL segment 先通过 coverage 检查，再组装为 process-unique Parquet shard；
+随后才发布 exclusive terminal receipt，绑定 schema、row-group coverage、counter、file size、
+schema digest 与 SHA-256。中断或 aborted WAL 保持可审计，但不能进入分析。Completed
+receipt 不可覆盖，也不能与竞争 attempt 合并。
+
+## Industrial Registry 边界
+
+不可变 registry 声明顺序
+`preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0`。
+每个 cell 绑定 axis、seed、status/reason、GPU UUID、port、cache/evidence root 与 workload
+隔离。Stage receipt 在下游 unblinding 前绑定准确 dependency output、runtime、split 与
+selection state。
+
+纯 two-GPU planner 会串行任何双 GPU 或 exclusive workload。只有单独的 interference
+receipt 说明并行合格后，它才会配对互不相交的单 GPU cell。Registry 与 planner 不分配
+device state，也不产生结果结论。它们的目标 declaration 不会绕过 executor preflight；
+本 release 中全部 speculative 与 TP2/DP2 cell 都保持 `BLOCKED`。
+
+本 release 不声明 speculative industrial execution、multi-rank execution、multi-node
+execution、Kubernetes scheduling、elastic membership、remote evidence storage 或
+automatic failover，也不包含任何新 GPU 结果。

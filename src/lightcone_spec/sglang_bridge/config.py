@@ -9,13 +9,13 @@ from lightcone_spec.config.schema import RunConfig
 
 
 def sglang_adaptation_payload(config: RunConfig) -> dict | None:
-    if config.method == "static":
+    if config.method in {"target_only", "static"}:
         return None
     adaptation = config.adaptation
     if adaptation is None:
         raise AssertionError("validated non-static config has no adaptation")
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "method": config.method,
         "algorithm": config.model.algorithm,
         "weight_update_mode": adaptation.weight_update_mode,
@@ -26,14 +26,41 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         "tenant_id": config.tenant_id,
         "optimizer": adaptation.optimizer.model_dump(mode="json"),
         "rank": adaptation.rank,
+        "lora_alpha": adaptation.lora_alpha,
+        "lora_matrix_policy": adaptation.lora_matrix_policy,
+        "native_head_policy": adaptation.native_head_policy,
         "stride": adaptation.stride,
         "max_in_flight": 1,
         "canvas_tokens": adaptation.canvas_tokens,
         "loss_position_decay": adaptation.loss_position_decay,
+        "extra_logical_delay": adaptation.extra_logical_delay,
+        "teacher_row_policy": adaptation.teacher_row_policy,
+        "verification_mode": adaptation.verification_mode,
+        "fixed_verification_budget": adaptation.fixed_verification_budget,
+        "confidence_loss_weight": adaptation.confidence_loss_weight,
         "target_revision": config.model.target_revision,
         "drafter_revision": config.model.drafter_revision,
         "sampling_profile_sha256": (config.runtime.sampling_profile_sha256),
         "telemetry_detail": config.runtime.telemetry_detail,
+        "topology": {
+            "tensor_parallel_size": config.runtime.tensor_parallel_size,
+            "data_parallel_size": config.runtime.data_parallel_size,
+            "tp_rank": config.runtime.tp_rank,
+            "dp_rank": config.runtime.dp_rank,
+            "node_count": config.runtime.node_count,
+            "node_rank": config.runtime.node_rank,
+            "device_identity": config.runtime.device_identity,
+            "rendezvous_identity": config.runtime.rendezvous_identity,
+            "router_identity": config.runtime.router_identity,
+            "clock_identity": config.runtime.clock_identity,
+            "process_group_backend": config.runtime.process_group_backend,
+            "distributed_runtime_capability": (
+                config.runtime.distributed_runtime_capability
+            ),
+            "distributed_capability_receipt_sha256": (
+                config.runtime.distributed_capability_receipt_sha256
+            ),
+        },
     }
     if config.online_spec is not None:
         payload["online_spec"] = config.online_spec.model_dump(mode="json")

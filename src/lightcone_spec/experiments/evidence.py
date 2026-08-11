@@ -55,7 +55,7 @@ class GpuEvidenceAttestation:
     def validate(self) -> None:
         if self.schema_version != 2 or self.status != "MEASURED":
             raise ValueError("formal GPU evidence must be schema-v2 MEASURED")
-        if self.methods != ("static", "tts", "naive_async"):
+        if self.methods != ("static", "tts", "l0"):
             raise ValueError("GPU evidence methods do not match the formal study")
         if self.repetitions != 8:
             raise ValueError("GPU evidence requires eight repetition blocks")

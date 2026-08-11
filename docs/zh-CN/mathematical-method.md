@@ -2,148 +2,174 @@
 
 [English](../en/mathematical-method.md) · [README](../../README_zh-CN.md)
 
-## 优化目标
+## 目标与 Semantic Row
 
-令 \(p_t\) 为 target distribution，\(q_\theta\) 为某个合法 draft 位置的 DFlash
-proposal。更新最小化带位置权重的 target-to-draft KL：
+下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。
+Industrial executor 当前只完成 TP1/DP1 Target-only；Static/TTS/L0 需要尚未实现的
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook。固定 patch 只为
+TP1/DP1 DFlash 包含底层 adaptive implementation，并且目前没有任何新 GPU 结果。
 
-\[
-\mathcal L(\theta)=
-\frac{\sum_{b,k}m_{b,k}\lambda^k
-D_{\mathrm{KL}}(p_{b,k}\Vert q_{\theta,b,k})}
-{\sum_{b,k}m_{b,k}\lambda^k}.
-\]
-
-Semantic mask \(m\) 排除越过请求上限的位置和 terminal token 之后的位置，但刻意保留
-首次 rejection 后由 drafter 采样的反事实 suffix：target verification 已经为完整 canvas
-给出了有效 teacher distribution，这与 TTS 目标一致。Gradient 在 cohort 内归一化，
-因此 batch size 不会暗中改变 learning rate。对于已注册的 block-16 DFlash checkpoint，
-位置权重绑定其训练 recipe：
+令 target distribution 为 (p)，重建 proposal 为 (q_\theta)，semantic mask 为 (m)，
+可选 position weight 为 (w_k)。公共 proposal objective 是 target-to-draft cross entropy
+（与 KL 只相差 target entropy）：
 
 \[
-w_k=\exp\!\left(-\frac{k-1}{7}\right),
-\qquad \lambda=\exp(-1/7).
+\mathcal L_{\mathrm{proposal}}(\theta)=
+\frac{\sum_{b,k}m_{b,k}w_k
+[-\sum_v p_{b,k,v}\log q_{\theta,b,k,v}]}
+{\sum_{b,k}m_{b,k}w_k}.
 \]
 
-DFlash 不使用均匀位置权重，因为靠前 token 的错误会令其后的全部 token 无法通过
-prefix verification。因此该 decay 属于 run identity，而不是静默默认值或由结果反推的
-超参数。参见 [DFlash 论文](https://arxiv.org/abs/2602.06036)。
+Mask 排除超出 request budget 及 terminal state 之后的 row，但保留 verifier 为完整合法
+canvas 生成的 teacher row，包括更早 rejection 后的 sampled counterfactual suffix。Cohort
+归一化阻止 batch size 静默缩放 learning rate。空或 non-finite denominator 会产生无效
+device candidate 并被丢弃，绝不会转成 zero loss。
 
-## 相同 candidate，不同发布时刻
-
-对于 source round \(r\)，两种 adaptation 方法计算同一个 functional optimizer
-proposal \(u_r\)。发布之前，active parameter 与 moment 不会变化。
-
-设 update stride 为 \(S\)，TTS 不早于下一个固定更新边界发布：
+已注册 block-16 DFlash recipe 使用
 
 \[
-a_{\mathrm{TTS}}=
-\max\!\left(a_{\mathrm{ready}},
-(\lfloor r/S\rfloor+1)S\right).
+w_k=\exp(-(k-1)/7).
 \]
 
-L0 在 side event ready 后的首个合法 decode 边界发布：
+Position weight、teacher-row policy、canvas width 与 source version 都属于 config/evidence
+身份，不是从结果反推的选择。
+
+## Backend 证据与重建
+
+令 (E_b) 为 backend-native `ProposalEvidence` envelope。公共字段包括 adapter-free logits
+(z^0)、deployed proposal logits、normalized sampling distribution
+(q^{\mathrm{sample}})、mask/teacher row、真实 sampled predecessor、cohort/source 身份与
+backend payload。注册 backend reconstruction
 
 \[
-a_{\mathrm{L0}}=a_{\mathrm{ready}}.
+R_b(E_b,\Delta_\theta)
+  \longrightarrow (z_\theta,q_\theta,c_\theta?)
 \]
 
-Candidate tensor、loss、optimizer、rank、stride、supervision 与 source version 全部
-保持一致。任何数值 candidate 差异都是实现错误，而不是方法差异。
+必须保持 row/vocabulary shape 与 confidence availability。Zero functional delta 会与 native
+inference 核对。如果 inference 已施加 adapter，再传入非零 delta 会被拒绝，避免更新重复
+计入。
 
-## 截断在线梯度
+结构验证在昂贵工作前由 host 执行。Finiteness、normalization 与 reconstruction/
+supervision validity 生成三 byte device receipt；side stream 会在 completion event 前把它
+异步复制到 pinned host memory。合法 publication boundary 先执行 nonblocking event query；
+仅在完成后、measured update interval 之外读取 receipt。该路径不使用 `.item()` 或 blocking
+event synchronization。Invalid receipt 不推进 optimizer step 或 active version，也不发布
+任何 tensor。
 
-Update round 将历史 paged KV gather 后 detach。当前 canvas K/V 通过可微 DFlash
-linear、RMSNorm、NeoX RoPE 与 non-causal SDPA 重算。Device-side reconstruction
-predicate 将重算 hidden 与真实 inference hidden 比较；不匹配时 proposal 变为 no-op，
-并关闭该 cohort 后续 adaptation。
+当前底层 patch 为 TP1/DP1 重建 DFlash differentiable canvas。目标 DSpark contract 要求
+native Markov W1/W2 feature 与实际 sampled predecessor；EAGLE/EAGLE3 将绑定 tree state 与
+贯穿 proposal chain 的一个 source version；NEXTN 将绑定 native MTP hidden state 与
+upstream interface 内容 digest。这些 payload 不能互换，并且 DSpark/EAGLE/EAGLE3/NEXTN
+adaptation 保持 `BLOCKED`。
 
-Target embedding 与 LM head 冻结。最终 target head 将可微 DFlash hidden 映射为 draft
-logits。Source-point proximal KL 的一阶导数为零，因此实现不物化无效项，也不把其系数
-作为伪 tuning 维度。
+## DSpark Composite Objective
 
-## 参数化
-
-对已选择 base matrix \(W\)，LoRA 使用
+不可执行的目标 DSpark contract 中，hybrid plan 还可训练 native confidence/acceptance
+state。对 verified target row (p)
+与 sampling-bound proposal (q)，定义 stop-gradient conditional-survival target
 
 \[
-W'=W+BA,
-\qquad A\in\mathbb R^{r\times d_{in}},\quad
-B\in\mathbb R^{d_{out}\times r},
+s=1-\operatorname{TV}(p,q)
+=1-\frac12\sum_v|p_v-q_v|,\qquad s\in[0,1].
 \]
 
-其中 \(A\) 按锁定 seed 初始化，\(B\) 为零，两者均可训练。Inference 只看到合并后的
-固定地址 matrix。Full 为每个 DFlash 自有浮点参数保留 FP32 master。Tail LoRA/full
-计算 \(h'=h+\Delta h\)，再通过冻结 target head 投影一次；residual tail 直接对 logits
-施加低秩修正。
-
-对于 DSpark，\(h\) 特指 normalized LM-head input，Markov state 保持为另一份冻结
-feature。对于 EAGLE/EAGLE3，同一 proposal chain 中的所有 hidden 都使用钉在同一 source
-version 的 tail bank。
-
-## Optimizer 动力学
-
-每个 optimizer 都实现为 functional proposal
-\((\theta_t,s_t,g_t)\mapsto(\hat\theta_{t+1},\hat s_{t+1})\)。只有发布提交
-candidate 后，active parameter/state 才会改变。因此，即使 TTS 与 L0 的 candidate 在
-不同 decode boundary 才能发布，它们仍执行完全相同的 optimizer 算术。
-
-Adam 与 AdamW 使用 bias-corrected FP32 一阶、二阶动量；AdamW 使用 decoupled decay。
-对 coupled-decay momentum 方法，令 \(\tilde g_t=g_t+\lambda\theta_t\)，SGDm 与 NAG 为
+令 confidence logit 为 (a_\theta)，tuning-locked 非负系数为 \(\gamma\)，masked hybrid
+objective 为
 
 \[
-v_t=\mu v_{t-1}+\tilde g_t,\qquad
-d_t^{\mathrm{SGDm}}=v_t,\qquad
-d_t^{\mathrm{NAG}}=\tilde g_t+\mu v_t.
+\mathcal L_{\mathrm{DSpark}}
+=\mathcal L_{\mathrm{proposal}}
++\gamma\,\operatorname{BCEWithLogits}(a_\theta,s).
 \]
 
-Lion 只保留一个 moment：
+Survival target 被 detach，因此 confidence term 不能通过对自身 label 求导来移动 proposal。
+Layer-only DSpark 冻结 W1、W2 与 confidence，并拒绝 \(\gamma\)。Hybrid DSpark 把 W1、W2
+与 scalar acceptance/confidence parameter 作为 Full replicated state 训练，所选 backbone
+layer matrix 则使用选定 Full 或 LoRA plan。
+
+Fixed-budget verification 只用于 tuning control；native-scheduler confirmation 与其分开。
+缺失 supervision row 不能通过看到结果后修改 mask 来补救。
+
+## Parameterization 与显存
+
+对所选 native matrix (W)，LoRA 使用
 
 \[
-d_t=\operatorname{sign}(\beta_1m_{t-1}+(1-\beta_1)g_t),\qquad
-m_t=\beta_2m_{t-1}+(1-\beta_2)g_t,
+W'=W+BA,\qquad
+A\in\mathbb R^{r\times d_{in}},\quad
+B\in\mathbb R^{d_{out}\times r}.
 \]
 
-并使用 decoupled weight decay。Muon 对每个二维参数构造 Nesterov momentum proposal，
-执行已注册的 quintic Newton--Schulz orthogonalization，并按
-\(\sqrt{\max(1,d_{out}/d_{in})}\) 缩放 matrix step。Bias、norm 与其他非 matrix 参数
-执行显式配置的辅助 AdamW。任何 optimizer 都不会静默分配无用 moment，也不会退回
-另一种更新规则。
+初始化确定且 functional delta 为零。注册 rank 为 (1,2,4,8,16,32,64)，并固定
+\(\alpha/r=1\)。Full 为所选 `last1`、`last3`、`last5` 或 `all` native layer scope 中每个
+合格浮点参数保留 FP32 master。借用的 target embedding、target head 与 target model 冻结。
 
-## OnlineSPEC 对比 learner
+DSpark 另允许 last-1/3/5 hybrid scope 加 native head。完整 E1a geometry 为
+(4\times8+3\times8=56) 个配置。Full/LoRA、scope、rank、alpha、selected/frozen name、
+dtype 与 sharded/replicated ownership 全部绑定 digest。
 
-独立 OnlineSPEC baseline 使用 projected OGD，而不是核心 optimizer。给定已揭示 gradient
-$g_t$，OGD 为
+显存按实际 trainable coordinate 推导：active merged value、FP32 master/gradient、真实
+optimizer moment、functional candidate、staging、activation/scratch、graph、KV 与 telemetry。
+Admission 使用所有 rank 中最小 headroom；任何方法都不能为适应显存而被静默改变。
+
+## Functional Optimizer 与发布
+
+每个 optimizer 实现 functional proposal
+
+\[
+(\theta_t,s_t,g_t)\mapsto(\widehat\theta_{t+1},\widehat s_{t+1}).
+\]
+
+只有完整 candidate commit 时，active parameter 与 optimizer state 才改变。Adam/AdamW
+使用两个 FP32 moment；SGDm/NAG/Lion 使用一个。Muon 使用 matrix momentum 与注册
+Newton--Schulz transform，并对 non-matrix 使用辅助 AdamW moment。Schedule 按 published
+update 而非 attempted/discarded candidate 前进。
+
+对 source round (r)，TTS 与 L0 计算同一 candidate (u_r)。设 stride 为 (S)，TTS 在
+ready 后等待下一个注册 update boundary，L0 则使用 ready 后首个合法 graph boundary。
+Loss、trainable plan、optimizer arithmetic、source row 与 candidate byte 必须一致；数值
+不同属于实现失败。
+
+在目标 CPU coordinator contract 中，TP2 sharded coordinate 留在 inference owner，
+replicated coordinate 在 TP replica 内部 reduce；DP2 cohort sticky 且 replica-local。所有
+rank 将对一个 update identity prepare，并导出一个 commit/abort decision。当前 `RunConfig`
+会在 model loading 前拒绝全部 TP2/DP2 plan，因此这些公式不是 multi-rank execution claim。
+
+## OnlineSPEC 对比 Learner
+
+独立注册的 OnlineSPEC baseline 使用 projected SGD decision。Projected OGD 为
 
 \[
 w_{t+1}=\Pi_K(w_t-\eta g_t).
 \]
 
-Optimistic OGD 保存 anchor \(\hat w_t\)，并将最近一次揭示的 gradient 作为下一轮 hint。
-Hedge 保存相互独立的 OGD 专家，在每个专家自己的 decision 上计算其 loss 与 gradient，
-再用负累计 loss 的指数权重在一种已注册 coordinate class 内形成下一轮 decision。Full
-使用稠密参数；LoRA 使用固定 rank 的 factor-coordinate decision，并单独报告。实现是
-transactional 的，只在得到反馈后提交，因此收到 gradient 的 decision 正是生成
-proposal 的 decision。
+Optimistic OGD 保存 anchor，并把最近一次 revealed gradient 作为 hint。Hedge 保存独立
+expert，在各自 decision 上计算 loss/gradient，并按负累计 loss 的指数权重形成未来 decision。
+Full 与 LoRA factor-coordinate decision 是不同 class；factor averaging 不等价于对 dense
+product (BA) 求平均。
 
-完整公式、projection 语义与 clean-room 源码边界见
-[OnlineSPEC baseline](onlinespec-baseline.md)。这些是对比方法的数学，不改变
-Static/TTS/L0 objective 或速度 gate。
+OnlineSPEC 是 transactional 的，并在独立协议下保持 TP1/DP1。其公式与证据不能改变
+TTS/L0 candidate、selection、power plan 或核心 gate。
 
-## Exact speculative sampling
+## Exact Speculative Sampling
 
-Verification 记录的 proposal probability \(q\) 必须正是生成 draft token 的分布。给定
-target probability \(p\)，proposal token \(x\) 的接受概率为
+记录的 proposal probability (q) 必须正是生成 draft token 的 distribution。给定 target
+probability (p)，token (x) 的接受概率为
 
 \[
-\alpha(x)=\min\left(1,\frac{p(x)}{q(x)}\right).
+\alpha(x)=\min(1,p(x)/q(x)).
 \]
 
-拒绝时从归一化的 \((p-q)_+\) 采样 replacement。即使历史 KV 由旧 drafter version
-产生，也保持 target distribution。正式 controlled speed profile 使用 greedy，确保
-所有方法遵循相同 token 轨迹；stochastic coupled-RNG 与分布 exactness 单独检查。
+拒绝时，从归一化 \((p-q)_+\) 采样 replacement。这是 exact speculative sampling 必需的
+positive-part rejection residual，不是 adaptation parameterization、trainable module、
+schema value 或历史 alias。删除旧 adaptation option 不会改变 sampler exactness rule，二者
+必须明确区分。
 
-## 加速条件
+Greedy controlled trace 保持配对 token trajectory 相同。Stochastic coupled-RNG 与
+distributional test 仍是独立 GPU 要求。
+
+## 速度与结论条件
 
 实测 decode time 分解为
 
@@ -153,6 +179,7 @@ T_m=T_{\mathrm{static}}-\Delta T_{\mathrm{target}}
 +T_{\mathrm{draft}}^{\mathrm{extra}}+T_{\mathrm{barrier}}.
 \]
 
-Acceptance 单独提升不充分。只有配对 long-region decode goodput 提升、target calls 不与
-该提升矛盾，且 exactness、version、fallback、non-finite、OOM 与 retraction 计数均为
-零时，方法才通过工程门槛。
+Acceptance 不是速度结果。结论要求注册 paired goodput inference、target-work consistency、
+production SLO/completion accounting、exactness/version/publication safety、HBM/energy
+evidence、hardware-envelope validity、durable receipt 与 content-bound GPU attestation。
+缺少这些证据时，全部新结果保持 `UNMEASURED`。

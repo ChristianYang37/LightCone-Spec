@@ -44,10 +44,19 @@ def main() -> int:
 
     repository = Path(__file__).resolve().parents[1]
     patch_root = repository / "patches" / "sglang"
-    manifest = json.loads(
-        (patch_root / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((patch_root / "manifest.json").read_text(encoding="utf-8"))
     upstream = manifest["upstream"]["commit"]
+    registered_files = [entry["file"] for entry in manifest["patches"]]
+    series_files = [
+        line.strip()
+        for line in (patch_root / "series").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if series_files != registered_files:
+        raise SystemExit("patch series does not match manifest order")
+    artifact_files = sorted(path.name for path in patch_root.glob("*.patch"))
+    if artifact_files != sorted(registered_files):
+        raise SystemExit("patch directory contains unregistered mail patches")
     source = args.upstream_checkout.resolve()
     if _run("git", "rev-parse", "HEAD", cwd=source) != upstream:
         raise SystemExit("upstream checkout is not at the pinned commit")
@@ -63,10 +72,30 @@ def main() -> int:
         _run("git", "clone", "--quiet", str(source), str(checkout))
         _run("git", "checkout", "--quiet", upstream, cwd=checkout)
         _run(str(patch_root / "apply.sh"), str(checkout))
-        if _run("git", "rev-parse", "HEAD^{tree}", cwd=checkout) != manifest[
-            "expected_tree"
-        ]:
+        if (
+            _run("git", "rev-parse", "HEAD^{tree}", cwd=checkout)
+            != manifest["expected_tree"]
+        ):
             raise SystemExit("patched tree does not match manifest")
+        commits = _run(
+            "git", "rev-list", "--reverse", f"{upstream}..HEAD", cwd=checkout
+        ).splitlines()
+        if len(commits) != len(manifest["patches"]):
+            raise SystemExit("applied commit count does not match manifest")
+        for entry, commit in zip(manifest["patches"], commits, strict=True):
+            changed = sorted(
+                _run(
+                    "git",
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    commit,
+                    cwd=checkout,
+                ).splitlines()
+            )
+            if changed != entry["files"]:
+                raise SystemExit(f"patch file list mismatch: {entry['file']}")
 
         changed_python = sorted(
             {
@@ -92,6 +121,7 @@ def main() -> int:
                     "-m",
                     "pytest",
                     "-q",
+                    "test/registered/unit/benchmark/test_serving_output_token_ids.py",
                     "test/registered/unit/spec/test_online_adaptation_protocol.py",
                 ],
                 cwd=checkout,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import torch
 from pydantic import ValidationError
 
 from lightcone_spec import PINNED_SGLANG_COMMIT
@@ -16,7 +17,7 @@ from lightcone_spec.sglang_bridge.config import (
 
 def config_value(method: str = "tts") -> dict:
     value = {
-        "schema_version": 2,
+        "schema_version": 3,
         "method": method,
         "model": {
             "key": "qwen3_8b_dflash16",
@@ -38,7 +39,7 @@ def config_value(method: str = "tts") -> dict:
         },
         "adaptation": {
             "weight_update_mode": "lora",
-            "parameter_scope": "drafter",
+            "parameter_scope": "all",
             "kv_history_policy": "frozen",
             "adaptation_scope": "cohort",
             "adaptation_group_id": "confirmation-a",
@@ -52,6 +53,7 @@ def config_value(method: str = "tts") -> dict:
                 "grad_clip": 1.0,
             },
             "rank": 8,
+            "lora_alpha": 8,
             "stride": 10,
             "max_in_flight": 1,
             "canvas_tokens": 16,
@@ -59,23 +61,34 @@ def config_value(method: str = "tts") -> dict:
         },
         "tenant_id": "research",
     }
-    if method == "static":
+    if method in {"target_only", "static"}:
         value["adaptation"] = None
+    if method == "target_only":
+        value["runtime"]["speculation_enabled"] = False
     return value
 
 
-def test_static_has_no_adaptation_payload() -> None:
-    config = RunConfig.model_validate(config_value("static"))
+@pytest.mark.parametrize("method", ["target_only", "static"])
+def test_disabled_methods_have_no_adaptation_payload_or_tensor_allocation(
+    method: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_allocation(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("disabled method attempted a tensor allocation")
+
+    for name in ("empty", "zeros", "ones", "tensor", "randn"):
+        monkeypatch.setattr(torch, name, forbidden_allocation)
+    config = RunConfig.model_validate(config_value(method))
     assert sglang_adaptation_payload(config) is None
     assert sglang_adaptation_sha256(config) is None
 
 
-@pytest.mark.parametrize("method", ["tts", "naive_async"])
-def test_formal_adaptation_payload_is_schema_v2(method: str) -> None:
+@pytest.mark.parametrize("method", ["tts", "l0"])
+def test_formal_adaptation_payload_is_schema_v3(method: str) -> None:
     config = RunConfig.model_validate(config_value(method))
     payload = sglang_adaptation_payload(config)
     assert payload is not None
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["method"] == method
     assert payload["algorithm"] == "DFLASH"
     assert payload["kv_history_policy"] == "frozen"
@@ -85,7 +98,7 @@ def test_formal_adaptation_payload_is_schema_v2(method: str) -> None:
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("schema_version",), 1),
+        (("schema_version",), 2),
         (("method",), "unsupported"),
         (("runtime", "sglang_commit"), "0" * 40),
         (("model", "target_revision"), "main"),
@@ -105,24 +118,29 @@ def test_legacy_or_unlocked_identity_fails(
 
 
 @pytest.mark.parametrize(
-    ("mode", "scope", "rank", "valid"),
+    ("mode", "scope", "rank", "alpha", "valid"),
     [
-        ("residual", "tail", 8, True),
-        ("residual", "drafter", 8, False),
-        ("lora", "tail", 8, True),
-        ("lora", "drafter", 8, True),
-        ("lora", "drafter", None, False),
-        ("full", "tail", None, True),
-        ("full", "drafter", None, True),
-        ("full", "drafter", 8, False),
+        ("lora", "last1", 8, 8, True),
+        ("lora", "all", 64, 64, True),
+        ("lora", "all", 8, 16, False),
+        ("lora", "all", None, None, False),
+        ("full", "last5", None, None, True),
+        ("full", "all", 8, None, False),
     ],
 )
 def test_update_mode_contract(
-    mode: str, scope: str, rank: int | None, valid: bool
+    mode: str,
+    scope: str,
+    rank: int | None,
+    alpha: int | None,
+    valid: bool,
 ) -> None:
     value = config_value()
     value["adaptation"].update(
-        weight_update_mode=mode, parameter_scope=scope, rank=rank
+        weight_update_mode=mode,
+        parameter_scope=scope,
+        rank=rank,
+        lora_alpha=alpha,
     )
     if valid:
         RunConfig.model_validate(value)
@@ -134,7 +152,7 @@ def test_update_mode_contract(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("tensor_parallel_size", 2, "requires TP=DP=1"),
+        ("node_count", 2, "multi-node"),
         ("speculative_num_draft_tokens", 8, r"draft_depth \+ 1"),
         ("canvas_tokens", 8, "canvas width"),
     ],
@@ -153,28 +171,97 @@ def test_uncertified_runtime_fails_closed(
         RunConfig.model_validate(config)
 
 
-@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
-@pytest.mark.parametrize("method", ["tts", "naive_async"])
-def test_tail_adaptation_is_available_on_linear_backends(
+def test_unimplemented_tp2_and_replica_local_dp2_topologies_fail_closed() -> None:
+    tp = config_value()
+    tp["runtime"].update(
+        tensor_parallel_size=2,
+        tp_rank=1,
+        distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_capability_receipt_sha256="d" * 64,
+    )
+    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+        RunConfig.model_validate(tp)
+    dp = config_value()
+    dp["runtime"].update(
+        data_parallel_size=2,
+        dp_rank=1,
+        router_identity="sticky-router-v1",
+        distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_capability_receipt_sha256="d" * 64,
+    )
+    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+        RunConfig.model_validate(dp)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"tensor_parallel_size": 2, "tp_rank": 1},
+        {
+            "data_parallel_size": 2,
+            "dp_rank": 1,
+            "router_identity": "sticky-router-v1",
+        },
+    ],
+)
+def test_two_gpu_schema_fails_closed_without_runtime_receipt(updates: dict) -> None:
+    value = config_value()
+    value["runtime"].update(updates)
+    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+        RunConfig.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "schedule",
+            "inverse_sqrt_published_update",
+            "only a constant optimizer schedule",
+        ),
+        ("extra_logical_delay", 1, "positive extra logical delay"),
+        ("teacher_row_policy", "quota_shadow", "quota-shadow teacher rows"),
+    ],
+)
+def test_patch_unimplemented_adaptation_modes_fail_closed(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    config = config_value()
+    target = (
+        config["adaptation"]["optimizer"]
+        if field == "schedule"
+        else config["adaptation"]
+    )
+    target[field] = value
+    with pytest.raises(ValidationError, match=message):
+        RunConfig.model_validate(config)
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3", "NEXTN"])
+@pytest.mark.parametrize("method", ["tts", "l0"])
+def test_unimplemented_backend_adaptation_fails_closed(
     algorithm: str, method: str
 ) -> None:
     value = config_value(method)
     value["model"]["algorithm"] = algorithm
-    value["adaptation"].update(
-        weight_update_mode="residual",
-        parameter_scope="tail",
-        rank=8,
-    )
+    value["adaptation"].update(parameter_scope="last1")
+    if algorithm == "DSPARK":
+        value["adaptation"].update(
+            parameter_scope="last3_native_heads",
+            native_head_policy="full",
+            confidence_loss_weight=0.25,
+            verification_mode="fixed_budget",
+            fixed_verification_budget=8,
+        )
     if algorithm in {"EAGLE", "EAGLE3"}:
         value["runtime"]["speculative_eagle_topk"] = 1
-    config = RunConfig.model_validate(value)
-    payload = sglang_adaptation_payload(config)
-    assert payload is not None
-    assert payload["algorithm"] == algorithm
-    assert payload["method"] == method
+    with pytest.raises(ValidationError, match="adaptation only for DFLASH"):
+        RunConfig.model_validate(value)
 
 
-@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3", "NEXTN"])
 def test_static_is_native_on_every_compatibility_backend(algorithm: str) -> None:
     value = config_value("static")
     value["model"]["algorithm"] = algorithm
@@ -182,16 +269,6 @@ def test_static_is_native_on_every_compatibility_backend(algorithm: str) -> None
         value["runtime"]["speculative_eagle_topk"] = 1
     config = RunConfig.model_validate(value)
     assert sglang_adaptation_payload(config) is None
-
-
-@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3"])
-def test_cross_backend_drafter_scope_fails_closed(algorithm: str) -> None:
-    value = config_value()
-    value["model"]["algorithm"] = algorithm
-    if algorithm in {"EAGLE", "EAGLE3"}:
-        value["runtime"]["speculative_eagle_topk"] = 1
-    with pytest.raises(ValidationError, match="parameter_scope=tail"):
-        RunConfig.model_validate(value)
 
 
 @pytest.mark.parametrize(
@@ -261,7 +338,7 @@ def test_external_baseline_has_explicit_clean_room_runtime_state() -> None:
     value = config_value("onlinespec_ogd")
     value["adaptation"].update(
         weight_update_mode="full",
-        parameter_scope="tail",
+        parameter_scope="all",
         optimizer={
             "name": "sgd",
             "learning_rate": 0.1,
@@ -272,6 +349,7 @@ def test_external_baseline_has_explicit_clean_room_runtime_state() -> None:
             "grad_clip": 1.0,
         },
         rank=None,
+        lora_alpha=None,
     )
     value["online_spec"] = {
         "projection_radius": None,

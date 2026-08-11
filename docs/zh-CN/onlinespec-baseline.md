@@ -25,7 +25,11 @@ Online-LR 的 reasoning-level DPO 流程不会被描述成 token-level drafter b
 LightCone-Spec 实现的是能够在同一 speculative-decoding 反馈与 exactness 合同下比较的
 三种在线学习规则：OGD、optimistic OGD，以及 OGD 专家上的 Hedge。
 
-GPU 状态为 `UNMEASURED`。本文描述协议与实现，不提供性能结果。
+GPU 状态为 `UNMEASURED`。本文描述隔离的 source-level/CPU protocol 与目标实现，不提供
+性能结果，也不表示当前 industrial executor support。与其他 speculative method 一样，
+OnlineSPEC industrial run 将需要尚未实现的
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` provider；目前只有
+Target-only 可在该 executor 中端到端执行。
 
 ## 源码审计
 
@@ -69,9 +73,9 @@ LightCone-Spec 只在注册的 tuning window 上选择归一化 loss 对应的 l
 | Opt-Hydra | 多头 Hydra draft head | feature reconstruction 加 teacher/token loss。发布源码中的“optimistic”路径实际使用 momentum 0.9、学习率 0.1、3 个 epoch 的 SGD，而不是论文双状态转移。 | 每 80 个样本为一个 chunk；跨 chunk 从磁盘加载 trainer checkpoint 与 optimizer state。 | 在受支持 drafter 参数上实现论文双状态 optimistic learner；不把 momentum 当成数学意义上的 optimism。 |
 | Ens-EAGLE / EAGLE3 | 三个相互独立的 EAGLE 或 EAGLE3 draft head | 不同学习率分别训练。注册脚本中 EAGLE 为 3e-5/6e-5/1.2e-4、5 个 epoch，EAGLE3 为 1e-4/2e-4/4e-4、2 个 epoch；不同源码变体对累计 loss 与仅上一 chunk loss 的处理并不一致。 | 每 40 个样本为一个 chunk；评估前在 CPU 加载并合并 checkpoint。 | 保留相互独立的 projected-OGD expert 与 cumulative-loss Hedge，但在设备上更新并形成同一 decision class 内的加权 decision。expert backward 逐个流式执行，因此同时只保留一份 expert gradient scratch。 |
 
-因此，本项目中“完整实现”具有精确定义：用于同一 speculative-decoding 对比的三种已发表
+因此，本项目中“完整实现”具有准确且非 industrial 的定义：用于同一 speculative-decoding 对比的三种已发表
 online learner 转移——OGD、双状态 optimistic OGD 与 cumulative-loss Hedge——均具有完整
-schema、runtime、tuning、confirmation、telemetry 与安全实现。它不表示 Online-LR、Hydra
+schema、CPU/runtime contract、tuning、confirmation、telemetry 与安全源码实现。它不表示 Online-LR、Hydra
 与 EAGLE 在架构上被强行做成相同系统，因为那会同时改变模型对、监督信号和系统预算，
 无法再单独比较 online learner。
 
@@ -108,7 +112,7 @@ tuning-only 协议边界，不是已报告的最优配置。
 ## 在线 learner
 
 令 $K$ 为允许的参数集合，Π 为其 Euclidean 投影，$w_t$ 为 proposal 第 $t$ 轮使用的
-decision，$g_t=\nabla\ell_t(w_t)$ 为 verification 后获得的 loss gradient。可执行合同中，
+decision，$g_t=\nabla\ell_t(w_t)$ 为 verification 后获得的 loss gradient。目标 learner contract 中，
 每个 learner 会先独立对 $g_t$ 应用配置绑定的 global-norm clip，再执行下述转移。
 
 Projected OGD 为
@@ -175,11 +179,12 @@ barrier，也不能在产生监督的 proposal 尚未结束时发布。
 
 ## 后端与参数支持
 
-- DFlash 支持 drafter-scope `full`、`lora` 以及共享 tail 消融；只有 update round 会运行
-  differentiable current-canvas 路径；整个同质 cohort 会作为一个 batched SDPA/MLP graph
-  重建，而不是用 Python 按请求循环。
-- DSpark 与 EAGLE/EAGLE3 使用 cache-safe tail 路径及其既有后端限制，不伪装提供
-  drafter-wide gradient。
+- 已跟踪 comparison 使用 DFlash `full` 与 `lora`，scope 为已注册 `last1`、`last3`、
+  `last5` 或 `all` native layer。只有 update round 运行 differentiable current-canvas
+  路径；整个同质 cohort 作为一个 batched SDPA/MLP graph 重建，而不是 Python 逐请求循环。
+- 公共 schema-v3 evidence envelope 声明 DSpark、EAGLE/EAGLE3 与 NEXTN validator
+  contract，但当前 patch 没有实现这些 adaptive hook。它们保持 `BLOCKED`；tracked
+  OnlineSPEC manifest 不能从目标 CPU contract 推断 cross-backend 结果。
 - OGD 与 optimistic OGD 在已注册 DFlash 网格中支持 Full 与 LoRA。
 - Hedge 支持显式区分的 Full 与 LoRA decision class，并至少使用两个有序专家学习率；
   所有 LoRA expert 使用相同的注册 rank。
@@ -255,16 +260,19 @@ analyze-onlinespec-study
 ```
 
 准确参数以 `lightcone-spec COMMAND --help` 为准。生成的 selection、性能数据与
-attestation 必须保存在 ignored artifact root。该比较是重要证据，但
-`analyze-onlinespec-study` 会显式输出 `core_speed_gate_affected=false`、逐 learner
-加速判定、`selection_protocol` 与 `optimized_grid_claim`。
+attestation 必须保存在 ignored artifact root。这些隔离 command 会运行已注册 source
+protocol，但不会绕过 industrial executor 的 native-terminal-evidence blocker，也不能建立
+schema-v3 GPU 结果。`analyze-onlinespec-study` 会显式输出
+`core_speed_gate_affected=false`、逐 learner 诊断判定、`selection_protocol` 与
+`optimized_grid_claim`。
 
 ## 复现声明
 
-LightCone-Spec 声明的是：在同一工业化 speculative-decoding runtime 中，对 OnlineSPEC
-在线 drafter learner 的论文公式进行 clean-room 实现。它不声明与官方脚本逐字节一致，
-不重新分发其代码，也不把 Online-LR 的 reasoning DPO 流程当作 token-level draft-model
-adaptation。未来若扩展该流程，必须另行定义 objective、数据、显存合同与已注册比较协议。
+LightCone-Spec 声明的是 OnlineSPEC 在线 drafter learner 论文公式的 clean-room 源码实现与
+CPU/runtime 目标 contract。它不声明当前端到端 industrial execution、GPU 结果、与官方脚本
+逐字节一致或重新分发其代码，也不把 Online-LR 的 reasoning DPO 流程当作 token-level
+draft-model adaptation。未来 executable extension 必须提供准确 native terminal provider，
+并另行定义 objective、数据、显存合同与已注册比较协议。
 
 若要重复源码审计，应把官方仓库克隆到本项目之外，并 detached 到已记录 commit：
 

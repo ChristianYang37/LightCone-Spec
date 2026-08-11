@@ -10,11 +10,18 @@ distributed with this repository. The patches target:
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
 
-The patch series changes SGLang to add focused DFlash Full/LoRA, cache-safe
-DFlash/DSpark/EAGLE/EAGLE3 tail adaptation, resident optimizer choices,
-memory-bounded LoRA-coordinate Hedge decisions,
-versioned frozen-KV lifecycle, memory accounting, and evidence hooks for the
-Static/TTS/L0 study and the isolated GPU-resident OnlineSPEC comparison.
+The semantic patch changes SGLang to add strict schema-v3 preflight, focused
+DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
+resident optimizer choices, memory-bounded LoRA-coordinate Hedge decisions,
+versioned frozen-KV lifecycle, event-fenced fixed-address publication,
+memory accounting, and lower-level adaptation/evidence fields for the
+Static/TTS/L0 target study and isolated OnlineSPEC comparison. It also carries
+the server-provided ordered output token IDs through SGLang's official serving
+benchmark adapter without retokenizing generated text. The patch does not
+provide the industrial executor's content-bound terminal speculative-evidence
+hook, so only
+Target-only is currently end-to-end executable there. DSpark, EAGLE/EAGLE3,
+NEXTN, and all TP2/DP2 execution fail before model loading.
 See patches/sglang/manifest.json for the exact patch and tree identities.
 
 The registered OnlineSPEC comparison is a clean-room implementation of online

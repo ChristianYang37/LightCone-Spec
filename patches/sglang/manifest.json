@@ -4,39 +4,26 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "e795eccfd921aef80c6205a7bca5b4704ddcd28c",
+  "expected_tree": "ac3393f7c1b12e801d2c5551a07257b082c66977",
   "patches": [
     {
-      "file": "0001-feat-spec-add-strict-online-adaptation-preflight.patch",
-      "sha256": "04b3528070b45a6b55002bdd211ddc198705d91240406ab3242888ce2e60c5a0",
+      "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
+      "sha256": "bdb65a88518df71d33a52118acb5a858892648942b287e74345056ae9c8a6573",
       "files": [
+        "python/sglang/benchmark/serving.py",
         "python/sglang/srt/arg_groups/speculative_hook.py",
-        "python/sglang/srt/server_args.py",
-        "python/sglang/srt/speculative/online_adaptation_config.py"
-      ]
-    },
-    {
-      "file": "0002-feat-spec-add-cohort-optimizer-and-publication-runti.patch",
-      "sha256": "4d7a585218a83464386aa2791b13cdb88c62f69f15961de18abbc63e4868a4e7",
-      "files": [
-        "python/sglang/srt/speculative/online_adaptation_runtime.py"
-      ]
-    },
-    {
-      "file": "0003-feat-dflash-add-differentiable-online-update-path.patch",
-      "sha256": "57b588a38d1e7d86280e1cdd2ad8d51f60cde12440b4dabc8255f838cac941d6",
-      "files": [
-        "python/sglang/srt/speculative/dflash_online_adaptation.py",
-        "python/sglang/srt/speculative/online_valid_mask.py"
-      ]
-    },
-    {
-      "file": "0004-feat-spec-add-cache-safe-DFlash-DSpark-and-EAGLE-tai.patch",
-      "sha256": "37e6b9e1ab5b5414cb443f4693ec35c02eaeb36a3ff5a9d54729e7e2a0e57d15",
-      "files": [
         "python/sglang/srt/managers/overlap_utils.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+        "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
+        "python/sglang/srt/mem_cache/allocation_sizing.py",
+        "python/sglang/srt/mem_cache/kv_cache_configurator.py",
         "python/sglang/srt/models/deepseek_v4_dspark.py",
         "python/sglang/srt/models/dspark.py",
+        "python/sglang/srt/server_args.py",
+        "python/sglang/srt/speculative/base_spec_worker.py",
+        "python/sglang/srt/speculative/dflash_info_v2.py",
+        "python/sglang/srt/speculative/dflash_online_adaptation.py",
         "python/sglang/srt/speculative/dflash_worker_v2.py",
         "python/sglang/srt/speculative/dspark_components/dspark_draft.py",
         "python/sglang/srt/speculative/dspark_components/dspark_proposal.py",
@@ -45,61 +32,11 @@
         "python/sglang/srt/speculative/eagle_info.py",
         "python/sglang/srt/speculative/eagle_worker_common.py",
         "python/sglang/srt/speculative/eagle_worker_v2.py",
-        "python/sglang/srt/speculative/online_eagle_adaptation.py",
-        "python/sglang/srt/speculative/online_tail_adaptation.py"
-      ]
-    },
-    {
-      "file": "0005-feat-spec-add-memory-lifecycle-and-telemetry-integra.patch",
-      "sha256": "86f96ad7cf34098345b145ad818ed3ba8d35512fbb533c2f860cb108bd1cca5c",
-      "files": [
-        "python/sglang/srt/managers/scheduler.py",
-        "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
-        "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
-        "python/sglang/srt/mem_cache/kv_cache_configurator.py",
-        "python/sglang/srt/speculative/base_spec_worker.py"
-      ]
-    },
-    {
-      "file": "0006-test-spec-cover-cross-backend-adaptation-protocols.patch",
-      "sha256": "b2be593cb918893f3b7de8fd2f1af95748f688e4e8e01c5d46998b76e3bfe557",
-      "files": [
-        "test/registered/unit/spec/test_online_adaptation_protocol.py"
-      ]
-    },
-    {
-      "file": "0007-fix-spec-bound-request-boundary-KV-reservations.patch",
-      "sha256": "398c13d96536d0730e04ba669cb418c7884d7399ce0ccc68ccc43af88fbbd740",
-      "files": [
-        "python/sglang/srt/mem_cache/allocation_sizing.py",
-        "python/sglang/srt/speculative/dflash_info_v2.py",
-        "test/registered/unit/spec/test_online_adaptation_protocol.py"
-      ]
-    },
-    {
-      "file": "0008-feat-spec-support-low-memory-OnlineSPEC-Hedge-decisions.patch",
-      "sha256": "bd2df150a81039d3b5d9a5fed80949a0261188d6162735da06fa8f210297a02f",
-      "files": [
         "python/sglang/srt/speculative/online_adaptation_config.py",
-        "test/registered/unit/spec/test_online_adaptation_protocol.py"
-      ]
-    },
-    {
-      "file": "0009-fix-spec-derive-request-budgets-from-committed-prefi.patch",
-      "sha256": "8d0dcfc7d9ed6dd53fe9c74e2802348f6ff5bfad752c6472ba13ca7b005279e2",
-      "files": [
-        "python/sglang/srt/speculative/dflash_worker_v2.py",
-        "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
-        "python/sglang/srt/speculative/online_eagle_adaptation.py",
-        "python/sglang/srt/speculative/online_valid_mask.py",
-        "test/registered/unit/spec/test_online_adaptation_protocol.py"
-      ]
-    },
-    {
-      "file": "0010-fix-spec-preserve-logical-prefixes-across-overlap-ro.patch",
-      "sha256": "12f63191d12941958437340df84e5825793edf921beea8f64bceb350f93bb2c8",
-      "files": [
         "python/sglang/srt/speculative/online_adaptation_runtime.py",
+        "python/sglang/srt/speculative/online_parameter_plan.py",
+        "python/sglang/srt/speculative/online_valid_mask.py",
+        "test/registered/unit/benchmark/test_serving_output_token_ids.py",
         "test/registered/unit/spec/test_online_adaptation_protocol.py"
       ]
     }

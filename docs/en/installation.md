@@ -4,10 +4,13 @@
 
 ## Framework environment
 
-Use an isolated environment. The core package has no SGLang source dependency:
+Use CPython 3.12 in an isolated user-space environment. The project pins
+PyTorch 2.11.0 to the exact requirement of the pinned SGLang checkout; allowing
+the package resolver to upgrade PyTorch creates an unsupported runtime. The
+core package does not import a vendored SGLang tree:
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
@@ -15,13 +18,20 @@ lightcone-spec doctor
 pytest -q
 ```
 
-The optional `gpu` extra installs the dataset loader used by the natural-task
-side tables. Controlled prompts and all CPU tests work without it.
+The optional `gpu` extra installs external dataset support. Controlled traces,
+registry generation, statistics, evidence durability, and CPU/gloo tests do not
+require it. CPU success does not imply a GPU measurement.
 
-## Patched SGLang checkout
+On a restricted China network, set a temporary organization-approved package
+index or Hugging Face endpoint in the shell that performs the download, record
+that endpoint in the sanitized environment receipt, and unset it afterward.
+Do not commit mirror credentials or silently replace a locked artifact when a
+mirror is missing it.
 
-SGLang must live outside this repository. Clone the exact pin and apply the
-mail series to that clean checkout:
+## SGLang patch gate
+
+SGLang must remain outside this repository. Clone the exact pin and apply the
+complete mail series to a clean disposable checkout:
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git /path/to/sglang
@@ -30,33 +40,61 @@ git -C /path/to/sglang checkout --detach \
 patches/sglang/apply.sh /path/to/sglang
 ```
 
-To audit the series without changing the source checkout:
+Audit from a separate clean upstream checkout:
 
 ```bash
 python scripts/verify_sglang_patchset.py \
   --upstream-checkout /path/to/clean-upstream --compile-only
 ```
 
-Omit `--compile-only` only in an environment that has the pinned SGLang test
-dependencies. The verifier clones into a temporary directory, applies all
-patches, checks the expected Git tree, compiles the changed Python surface,
-runs the focused test when requested, reverses the patches, and confirms that
-the supplied upstream checkout remained clean.
+The schema-v3 patch has passed clean-HEAD, patch-digest, expected-tree,
+changed-source compile/focused-test, and reverse-removal verification. Running
+with `--compile-only` checks patch integrity but is not the release gate; the CI
+gate installs the pinned dependencies and runs the focused patched-tree tests.
+Record a fresh verifier output and final-tree receipt before GPU work. This
+result does not constitute GPU validation.
 
-## GPU environment contract
+## GPU and two-rank contract
 
-Run `lightcone-spec doctor --path /path/to/patched-sglang` before model loading.
-Record the NVIDIA driver, toolkit, PyTorch runtime, compiler, free storage, and
-patched tree with the eventual evidence. Do not replace system Python or CUDA,
-use `sudo`, or reuse an unidentified environment.
+Run `lightcone-spec doctor --project-root /path/to/lightcone-spec
+--sglang-root /path/to/patched-sglang` before loading a model. Capture driver,
+toolkit, PyTorch/CUDA runtime, compiler, GPU UUIDs, clocks, temperature, power
+state, storage, background processes, and patched tree. Do not replace system
+Python/CUDA, use `sudo`, or reuse an unidentified environment.
 
-The repository deliberately has no one-command GPU installer: CUDA and wheel
-compatibility depend on the measured host. Create a user-space environment,
-pin its resolved packages, and keep the model cache and run artifacts outside
-the source tree. A failed preflight is a stop condition, not permission to
-silently change precision, update mode, or memory policy.
+The target registry and CPU coordinator describe one-node TP2 and sticky DP2
+identities, but the current release accepts only TP1/DP1 and rejects every
+TP2/DP2 `RunConfig` before model loading. A future multi-rank release would
+require a content-bound `patched_two_gpu_v1` capability receipt and matching
+receipts from every rank. The real CPU `gloo` harness tests collective state
+transitions only; it cannot enable that release surface or supply GPU/NCCL
+evidence.
 
-## Model preparation
+HBM preflight must measure every rank and uses the least feasible rank. Choose
+adaptation reserve, KV pool, safety margin, fixed cohort-slab capacity, and
+telemetry queue bounds from the registered memory ledger. Never make a run fit
+by silently changing Full to LoRA, precision, scope, optimizer, or context.
+
+## Provider staging
+
+The repository deliberately has no one-command cloud installer. Provider
+images, drivers, mounts, and firewall behavior are external state. Before
+creating an instance, obtain credentials through the provider's secure channel,
+confirm the requested two GPUs and storage are available, and record a
+sanitized provisioning receipt. Never place provider secrets, temporary URLs,
+instance addresses, or access tokens in commands, manifests, evidence, handoff
+documents, or Git.
+
+At present, empirical Stage B is `BLOCKED` because the pinned integration lacks
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`, and because
+provider credentials and registered hardware are unavailable. The industrial
+executor can run only TP1/DP1 Target-only end to end; Static/TTS/L0 fail
+preflight before mutation. Hardware access alone will not unblock speculative
+work. A new pinned patch/provider must first supply the exact content-bound
+terminal hook; DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
+additional implementations and remain blocked.
+
+## Model and data preparation
 
 Resolve immutable revisions before downloading:
 
@@ -69,6 +107,20 @@ lightcone-spec prepare-models \
   --output artifacts/locks/model-roots.json
 ```
 
-Pass credentials only through a temporary `HF_TOKEN` environment variable or
-another secure credential channel. Never put a token in a command argument,
-manifest, log, or repository file.
+Use a temporary `HF_TOKEN` environment variable or another secure credential
+channel. Lock tokenizer, dataset revision, split, prompt compiler, and trace
+identity separately. A BurstGPT-shaped synthetic trace remains labelled
+synthetic unless an immutable external corpus is supplied and digested.
+
+## Evidence roots
+
+Keep model snapshots, runtime caches, provider state, traces, WAL segments,
+Parquet shards, receipts, profiles, selections, attestations, and handoff files
+under ignored external roots. Each rank/process gets a unique evidence prefix.
+Interrupted WALs are retained for audit but cannot enter analysis without an
+exclusive terminal receipt.
+
+Do not commit model/data payloads, experimental results, selected
+hyperparameters derived from results, machine paths, credentials, or provider
+metadata. A source checkout should remain clean except for deliberate code and
+documentation changes.

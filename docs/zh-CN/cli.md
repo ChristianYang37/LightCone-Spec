@@ -2,192 +2,197 @@
 
 [English](../en/cli.md) · [首页](../../README_zh-CN.md)
 
-## 命令
+## 命令 Surface
 
-参数以 `lightcone-spec --help` 为准。0.2.0 提供：
+准确参数以 `lightcone-spec --help` 与 `lightcone-spec COMMAND --help` 为准。Schema-v3 与
+industrial 命令包括：
 
 | 命令 | 用途 |
 |---|---|
-| `doctor` | 只读检查 host、Python、CUDA 与源码树 |
-| `validate-config` | 解析一份严格 schema-v2 run config |
-| `build-speed-study` | 物化不可变源协议 |
-| `lock-models` | 把模型 ID 解析为不可变 revision |
-| `prepare-models` | 下载或离线核验锁定 snapshot |
-| `list-tuning-candidates` | 物化已注册的 Full/LoRA 搜索网格 |
-| `render-static-load-runtime` | 生成一个不分配 adaptation 状态的 Static 负载端点 |
-| `render-tuning-runtime` | 为单个 candidate 渲染独占的 TTS/L0 slice |
-| `run-controlled-slice` | 测量一个 load-screen 或 tuning slice |
-| `collect-static-load-screen` | 验证 Static 负载网格并选择负载 |
-| `advance-tuning-stage` | 验证 tuning stage 并写入 survivor 集合 |
-| `select-speed-config` | 执行只读取 tuning 的 maximin 规则 |
-| `select-anchor-config` | 锁定一个 terminal tuning anchor，用于 held-out 复现 |
-| `render-runtime` | 输出顺序执行的匹配 confirmation 配置与 argv |
-| `build-confirmation-queue` | 注册 24 个 clean-server confirmation job |
+| `doctor` | 只读 host、Python、CUDA 与 source identity 报告 |
+| `validate-config` | 验证一份严格 schema-v3 run config 与 sidecar |
+| `build-industrial-registry` | 绑定两个 GPU UUID 并生成不可变实验 DAG |
+| `plan-industrial-dispatch` | 验证 receipt 并生成确定性单/双 GPU wave |
+| `seal-industrial-stage` | 绑定 completed stage 的 runtime、split、dependency 与 locked output |
+| `analyze-industrial` | 验证 schema-v3 terminal evidence，并写入绑定的 E3b/E5 analysis manifest |
+| `build-speed-study` | 生成较小的核心源协议 |
+| `lock-models` | 把 model ID 解析为不可变 revision |
+| `prepare-models` | 下载或 offline 验证 locked snapshot |
+| `list-tuning-candidates` | 写入已注册 Full/LoRA tuning grid |
+| `render-target-only-runtime` | 渲染关闭 speculation 的 Target-only endpoint |
+| `render-static-load-runtime` | 渲染零 adaptation 分配的 Static endpoint |
+| `render-tuning-runtime` | 渲染 matched TTS/L0 tuning endpoint |
+| `run-controlled-slice` | 测量一个已注册 controlled slice |
+| `collect-static-load-screen` | 验证 Static load coverage 并选择 reference load |
+| `advance-tuning-stage` | 验证 halving stage 并封存 survivor |
+| `select-speed-config` | 应用 tuning-only 注册 selection rule |
+| `select-anchor-config` | 锁定 terminal registered anchor，但不声明 optimum |
+| `render-runtime` | 生成 matched sequential 核心 config 与 launch argv |
+| `build-confirmation-queue` | 生成 clean-server confirmation job |
 | `run-confirmation` | 执行一个 method/block confirmation slice |
-| `collect-speed-study` | 从完整 receipt 派生正式表 |
-| `render-replication-runtime` | 渲染自然任务或仅 profiler 使用的 slice |
-| `run-natural-slice` | 运行一个锁定的自然 EOS 副表 slice |
-| `build-profiler-plan` | 构建隔离的 Nsight/device-monitor 计划 |
-| `attest-speed-study` | 绑定 GPU、runtime、模型、selection 和证据身份 |
-| `analyze-speed-study` | 计算已注册的配对速度门槛 |
+| `collect-speed-study` | 从 completed receipt-bound evidence 派生 table |
+| `render-replication-runtime` | 渲染 natural-task 或 profiler-only slice |
+| `run-natural-slice` | 运行一个 locked natural-task slice |
+| `build-profiler-plan` | 生成隔离 profile plan，并禁止 headline evidence |
+| `attest-speed-study` | 绑定 GPU、runtime、model、selection、trace 与 evidence identity |
+| `analyze-speed-study` | 评估已注册 paired gate |
 
-重要但与核心 gate 隔离的 OnlineSPEC 对比拥有一组平行命令：
+隔离的 OnlineSPEC command family 为：
 
 | 命令 | 用途 |
 |---|---|
-| `build-onlinespec-study` | 物化绑定 provenance 的对比协议 |
-| `verify-onlinespec-source` | 按已注册源码审计验证外部 clean checkout |
-| `list-onlinespec-candidates` | 写出 OGD、optimistic 与 Hedge 调参网格 |
-| `render-onlinespec-tuning-runtime` | 渲染配对 Static/candidate tuning endpoint |
+| `build-onlinespec-study` | 生成 provenance-bound comparison protocol |
+| `verify-onlinespec-source` | 按 source audit 验证外部 clean checkout |
+| `list-onlinespec-candidates` | 写 OGD、optimistic 与 ensemble candidate |
+| `render-onlinespec-tuning-runtime` | 渲染 paired Static/candidate tuning endpoint |
 | `run-onlinespec-tuning-slice` | 测量一个 learner tuning slice |
-| `advance-onlinespec-tuning-stage` | 在每个 learner 内独立减半 candidate |
-| `select-onlinespec-config` | 为每个 learner 选择一个安全 terminal candidate |
-| `select-onlinespec-anchor-config` | 锁定三个 terminal learner anchor，且不声称全网格最优 |
-| `render-onlinespec-runtime` | 渲染 Static 与三个互斥对比 endpoint |
-| `build-onlinespec-queue` | 注册随机化 clean-server 对比 job |
-| `run-onlinespec-confirmation` | 执行一个 method/block 对比 slice |
-| `collect-onlinespec-study` | 派生配对对比表 |
-| `attest-onlinespec-study` | 把对比证据绑定到 GPU 与源码身份 |
-| `analyze-onlinespec-study` | 生成 learner 对 Static 的诊断区间 |
+| `advance-onlinespec-tuning-stage` | 各 learner 独立 halving |
+| `select-onlinespec-config` | 每个 learner 选择一个 safe terminal candidate |
+| `select-onlinespec-anchor-config` | 锁定三个 terminal anchor，不声明 grid optimum |
+| `render-onlinespec-runtime` | 渲染 sequential Static 与 learner endpoint |
+| `build-onlinespec-queue` | 生成 randomized clean-server comparison job |
+| `run-onlinespec-confirmation` | 执行一个 learner/method block |
+| `collect-onlinespec-study` | 派生隔离 comparison table |
+| `attest-onlinespec-study` | 绑定 comparison evidence 与 source identity |
+| `analyze-onlinespec-study` | 生成 learner-versus-Static 诊断区间 |
 
-项目不提供通用 method override 或 replay 命令。正式流程刻意保持狭窄，源码 manifest
-永远不包含实测结果。
+不存在 generic method override，也不存在把无 receipt 目录转换为 completed evidence 的命令。
 
-## 身份链
+## Industrial Registry 工作流
 
-最小依赖链为：
-
-```text
-manifest + model lock + sampling profile + registered grid
-                            |
-                            v
-              load screen + staged tuning
-                            |
-                            v
-                   selection artifact
-                            |
-                            v
-       sequential launch plan + completed evidence
-                            |
-                            v
-          derived table + attestation + speed gate
-```
-
-每个 artifact 都有 sidecar 或内嵌 digest。身份不匹配是可操作错误；CLI 不会生成空的
-成功 run，也不会用默认配置替代缺失输入。`select-speed-config` 必须同时接收 terminal
-tuning artifact、完整 Static load-screen artifact、源 manifest、controlled sampling
-profile 与 model lock。生成的 selection 会绑定这些身份、完整 tuning grid 与 patched
-SGLang tree。
-
-## OnlineSPEC 流程
-
-OnlineSPEC 复用 model lock、host preflight、controlled sampling 与已选择的 Static 负载，
-但绝不复用核心 tuning 或 confirmation row。正式比较前，
-`verify-onlinespec-source` 会验证外部 checkout 的精确 commit/tree、clean
-状态、全部已注册关键文件哈希与许可证文件清单。其内容绑定 receipt 应写入 ignored artifact
-root；upstream 源码继续保留在本仓库之外。从已跟踪的
-`manifests/speed-study/onlinespec_baseline_v2.json` 开始，每个 stage 为一个 candidate
-及其唯一配对 Static reference 渲染运行时，并在 selection 前完成全部注册 stage。
-Successive halving 在每个 learner 内独立执行。
-
-若只做范围较窄的复现，`select-onlinespec-anchor-config` 必须同时接收各一个已注册的
-OGD、optimistic、Hedge candidate，以及包含配对 Static 在内的四个完整 terminal tuning
-slice；它仍强制绑定核心 selection 和 16-prompt/40,928-token terminal tuning window。
-产物会标记为 `heldout_anchor`，可以进入同一套独立 confirmation 与 attestation，但
-`optimized_grid_claim` 固定为 false。该入口不能读取 confirmation 证据，也不能把 pilot
-改写成正式结果。
-
-Terminal selection 绑定完整 terminal-stage artifact 的 SHA-256，而不只是重新序列化的
-winner row。它还强制要求 `--core-selection`，继承其中选定的 Static 并发量，并绑定其
-SHA-256；OnlineSPEC 不再有独立并发覆盖。由于 confirmation 只有 32 个唯一 prompt，
-正式 selection 不可能把并发 48 写成真实负载。随后 `render-onlinespec-runtime` 输出四个
-共享端口与设备的描述；Static、OGD、optimistic 与 Hedge 必须按 manifest 的随机顺序依次执行。
+使用不可变 device UUID，不要使用 CUDA ordinal：
 
 ```bash
-lightcone-spec select-onlinespec-config \
-  --measurements artifacts/onlinespec/terminal-tuning.json \
-  --manifest manifests/speed-study/onlinespec_baseline_v2.json \
-  --model-lock artifacts/locks/models.json \
-  --sampling-profile manifests/speed-study/sampling_profile_v2.json \
-  --core-selection artifacts/selection.json \
-  --output artifacts/onlinespec/selection.json
+lightcone-spec build-industrial-registry \
+  --gpu-uuid GPU-UUID-0 GPU-UUID-1 \
+  --base-port 24000 \
+  --cache-root runtime-cache/industrial \
+  --evidence-root artifacts/industrial \
+  --seed 20260811 \
+  --output artifacts/industrial/registry.json
 ```
 
-`analyze-onlinespec-study` 与核心分析使用相同的内容绑定 attestation 纪律。缺少
-attestation 时状态为 `UNMEASURED` 且退出码为 42；attested 证据若有任何安全失败则为
-`BLOCKED`，同样退出 42。安全的实测输出仍然只是诊断，并固定
-`core_speed_gate_affected=false`。输出还会记录 `selection_protocol` 与
-`optimized_grid_claim`，因此 anchor 不可能被写成 exhaustive grid optimum。完整公式、
-源码审计边界和显存账本见 [OnlineSPEC baseline](onlinespec-baseline.md)。
+输出嵌入 generator identity、输入 parameter、完整 declaration 与 registry SHA-256。加载时
+会重新生成 registry 并比较准确内容，因此手工编辑 cell 会被拒绝。
 
-## 负载扫描与调参
+没有 receipt 时，planner 只生成 `preflight` wave；由于 interference gate 尚未通过，单 GPU
+工作保持串行：
 
-两阶段都使用 controlled sampling profile。Static 负载扫描必须为每个注册 concurrency
-生成一份 `run-controlled-slice --phase static-load` measurement。
-`collect-static-load-screen` 会拒绝覆盖不全、重复、OOM、retraction 或身份不匹配的证据。
+```bash
+lightcone-spec plan-industrial-dispatch \
+  --registry artifacts/industrial/registry.json \
+  --output artifacts/industrial/preflight-dispatch.json
+```
 
-每个负载点使用 `render-static-load-runtime --concurrency C`，它只生成一个原生
-Static 端点，不接受 adaptation group 或 adaptation HBM reserve，启动参数也不包含
-adaptation flag。进入下一个负载点前必须停止当前 server。所有 renderer 还必须显式提供
-`--sglang-checkout /path/to/patched-sglang`；该 checkout 必须 clean，且 Git tree 与本版本
-记录的精确 patchset tree 一致。
+Stage 的注册 output durable 后再封存。每个 `--locked-output` 格式为
+`NAME=LOWERCASE_SHA256`；dependency 必须传 receipt file，而不是复制 hash string：
 
-Tuning 从 `list-tuning-candidates` 开始。先按选定 concurrency 只渲染一个 Static
-端点，并在每个 stage 中复用其不可变启动描述作为唯一 Static baseline。每个 active
-candidate/stage 使用 `render-tuning-runtime` 在同一端口只生成 TTS 与 L0 两个互斥
-slice，因此不会意外重复 Static 证据。只启动当前要测量的 slice，
-执行 `run-controlled-slice --phase tune`，关闭 server 后再继续。
-Candidate JSON 包含完整 optimizer identity：Adam/AdamW 的 beta 与 decay、SGDm/NAG
-momentum、Lion beta，或 Muon momentum、Newton--Schulz steps 与辅助 AdamW 字段。
-不得删除字段，也不得手工把两个 optimizer candidate 归一化为同一 identity。
-`advance-tuning-stage`
-强制检查注册的 prompt 数与 context 上限、Static/TTS/L0 配对覆盖、安全计数与 survivor
-身份。后续 stage 必须引用前一 stage 的 survivor artifact；confirmation 数据永不作为输入。
+```bash
+lightcone-spec seal-industrial-stage \
+  --registry artifacts/industrial/registry.json \
+  --experiment preflight \
+  --runtime-sha256 RUNTIME_SHA256 \
+  --split-sha256 SPLIT_SHA256 \
+  --locked-output runtime_envelope=OUTPUT_SHA256 \
+  --output artifacts/industrial/receipts/preflight.json
+```
 
-`select-anchor-config` 是更窄的复现入口。它要求完整的 terminal tuning-window
-Static/TTS/L0 三元组、完整 Static load screen，并且 anchor 必须属于已注册 grid。生成的
-selection 会标记为 `heldout_anchor`：它可以验证这个锁定配置在 held-out 数据上的速度，
-但绝不声称它是全网格最优配置。该入口不能读取 confirmation 证据，也不能绕过任何
-confirmation、attestation 或安全门槛。
+下游 stage 对其准确 declared dependency 重复 `--dependency-receipt`，随后把所有 completed
+receipt 交给 planner：
 
-## Confirmation 与恢复
+```bash
+lightcone-spec plan-industrial-dispatch \
+  --registry artifacts/industrial/registry.json \
+  --receipt artifacts/industrial/receipts/preflight.json \
+  --completed-cells artifacts/industrial/completed-cells.json \
+  --interference-receipt artifacts/industrial/interference.json \
+  --output artifacts/industrial/next-dispatch.json
+```
 
-`render-runtime` 输出的三个方法描述刻意共用一个端口，并要求独占设备。
-`build-confirmation-queue` 把 manifest 中由 seed 固定的方法顺序展开为 24 个 job。对每个
-job，启动其 `launch_argv`、等待健康检查、执行 `run_argv`，然后关闭该 server，才能开始
-下一项。同时运行三个 endpoint 会改变 HBM、KV 容量、batching 与竞争，因此属于无效实验。
+可选 completed-cell artifact 必须把每个 cell 绑定到 measured evidence 与 terminal receipt。
+可选 interference artifact 必须针对相同 registry/GPU UUID 且为 `PASS`；缺少时 cell 保持
+串行。即使通过，exclusive work 也绝不配对。
 
-启动 wrapper 只从已验证 checkout 导入 SGLang。服务端 diagnostics 必须报告精确
-adaptation config 的 SHA-256；method、optimizer、学习率、rank、stride 或 cohort 任一
-不匹配，都会在提交证据前使该 slice 失效。
+Dispatch plan 是目标 protocol 数据，不证明 cell 可执行。Library industrial executor 会在
+launch 前验证 provider state，目前只有 TP1/DP1 Target-only 可端到端运行。除非 injected
+provider 针对准确固定 tree 实现
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，否则全部 speculative cell
+会在 process/network mutation 前被阻止；本 release 不包含该 provider。CLI 不会静默启动
+server 或 provision hardware。
 
-`run-confirmation` 每次只执行一个 method/block slice；它只 reset 一次 engine/cohort，默认
-执行不计时 warmup，然后将 32 个不同 prompt 以一次有序的原生 batch 请求全部提交。
-SGLang 锁定的 `max_running_requests` 负责 admission，cohort 在队列排空期间保持连续。它记录
-active decode 区间的并集以及 request 级绝对 streaming arrival time。模型的 40,960-token
-上限包含 tokenized prompt；每个 prompt 独立截断到已注册的 40,928 安全上限，从而保留
-两个 block-16 KV reservation。
+## 身份与 Topology 链
 
-每个完整 slice 最后写入 SHA-256 绑定的 receipt。重复执行相同 job 时，只有在 manifest、
-config、method、block、batch window、load 和全部 shard 均验证通过后才跳过。缺少 receipt 的
-中断 shard 永不进入 `speed_study.parquet`；被修改或重复的 terminal 会 fail closed。
-`--no-warmup` 只能用于诊断，不能用于正式协议。
+最小 industrial identity chain 为：
 
-## 自然任务复现与 Profiling
+```text
+source + patch tree + model/data locks + two-GPU capability
+                         |
+                         v
+              immutable registry + traces
+                         |
+                         v
+           dependency receipts + dispatch waves
+                         |
+                         v
+              terminal evidence receipts
+                         |
+                         v
+        derived statistics + GPU attestation + gate
+```
 
-自然副表使用 `render-replication-runtime --phase natural` 和独立的 EOS-enabled sampling
-profile，再对每个方法和锁定 dataset revision 执行 `run-natural-slice`。它们报告 at-risk
-request，但不能影响 selection 或正式 gate。
+TP2 与 sticky DP2 字段是目标 registry/CPU-coordinator vocabulary。当前 `RunConfig` 会在
+model loading 前拒绝全部 TP2/DP2 value；CPU `gloo` contract 或 caller 自己填写 receipt 都
+不能启用。未来实现必须准确绑定 rank、UUID、rendezvous、router、clock、process-group、
+ownership 与 receipt identity。
 
-详细 profiling 使用 `--phase profile` 与 `build-profiler-plan`。计划中固定
-`headline_evidence_forbidden=true`；带同步开销的 profiler 输出不得合并进 headline 计时证据。
+当 command contract 要求时，generated JSON 使用相邻 `.sha256` sidecar。Loader 验证
+canonical content，不只检查 filename。
 
-## Attestation 与退出状态
+## 核心 Tuning 与 Confirmation
 
-未提供 attestation 时，`analyze-speed-study` 可以计算诊断，但状态固定为 `UNMEASURED`
-且退出码为 42。提供有效的内容绑定 GPU attestation 后，只有两种 adaptation 方法都
-通过才退出零；有效的实测失败是 `BLOCKED`，同样退出 42。输入、身份、runtime 或证据
-错误属于普通非零失败，不能表述为科学结果。
+Target-only 与 Static 渲染时不含 adaptation object 或 reserve。TTS 与 L0 的目标 declaration
+从已注册 native layer scope 共享一个 Full/LoRA candidate。Rendering 只是 pure planning；
+当前 release 只有 Target-only 可以进入 industrial execution。Static/TTS/L0 会在 endpoint
+启动前因 native terminal-evidence preflight 失败。
 
-Artifact、模型根目录、profiler trace 和生成的 selection 应位于 ignored 输出根目录。
-不得把 secret 放入 CLI 参数；模型访问只使用临时 `HF_TOKEN` 环境变量。
+Load screening 与 tuning 只能使用各自注册 data window。后续 halving stage 必须绑定前一
+survivor artifact。`select-speed-config` 要求完整 safe coverage；`select-anchor-config` 是较窄
+reproduction 路径，并记录未优化全网格。Confirmation data 不能进入任一 selection。
+
+每个 completed slice 都以 content-bound evidence 结束。只有 manifest/config/method/block/
+data/trace 与全部 shard digest 验证通过，resume 才跳过它。中断 Parquet WAL segment 没有
+terminal receipt，会被排除。Profiler output 带 `headline_evidence_forbidden=true`，不能合并
+进 measured timing table。
+
+## OnlineSPEC 工作流
+
+OnlineSPEC 复用 model lock、controlled data 与 paired Static reference，但绝不复用核心
+tuning/confirmation row。`verify-onlinespec-source` 检查外部 checkout 的准确 commit/tree、
+clean status、audited key-file hash 与 license inventory；checkout 保持在仓库外。
+
+Successive halving 在 OGD、optimistic OGD 与 ensemble 内独立运行。Selection 还绑定核心
+reference load，但不能改变该 load 或影响核心 gate。Anchor selection 标注
+`optimized_grid_claim=false`。OnlineSPEC 保持 TP1/DP1，并使用自己的 GPU attestation。
+
+## 状态、Resume 与 Exit Code
+
+缺少 attestation 时，`analyze-speed-study` 可输出诊断，但状态为 `UNMEASURED` 且退出 42。
+提供有效 content-bound GPU evidence 后，只有完整注册 pass 才退出零；有效 evidence 未满足
+任一标准时为 `BLOCKED`，同样退出 42。Identity、schema、I/O、receipt 或 runtime 错误是
+普通 nonzero failure，不是科学结果。
+当前 release 没有 trusted hardware-attester identity，因此 supplied legacy attestation
+会被拒绝；即使 JSON 内部一致，`analyze-industrial` 仍保持
+`UNRESOLVED`/`UNMEASURED` 并退出 42。
+
+Industrial registry 可能把目标 cell 声明为 `UNMEASURED`，但 declaration status 不等于
+executable readiness。准确 native terminal hook 缺失时，executor preflight 会把
+Static/TTS/L0 解析为 `BLOCKED`；当前 schema/patch 同样阻止全部 TP2/DP2 与
+DSpark/EAGLE/EAGLE3/NEXTN adaptive cell。历史 v2 artifact 仅用于 regression，不能作为
+schema-v3 stage receipt。
+
+## Credential 与 Output Root
+
+Artifact、model root、cache、trace、provider state、profile、selection、attestation 与
+handoff file 必须位于 ignored external root。通过临时 `HF_TOKEN` 环境变量或其他安全渠道
+传递模型权限。不要把 token、password、provider API key、private prompt、instance address
+或 machine-specific path 放入 argument、manifest、log、文档或 Git。

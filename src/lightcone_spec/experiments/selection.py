@@ -73,7 +73,7 @@ class SliceMeasurement:
             raise ValueError("slice measurement phase is not selectable")
         allowed_methods = {
             "static_load_screen": {"static"},
-            "shared_config_tuning": {"static", "tts", "naive_async"},
+            "shared_config_tuning": {"static", "tts", "l0"},
             "onlinespec_tuning": {
                 "static",
                 "onlinespec_ogd",
@@ -207,7 +207,7 @@ class CandidateMeasurement:
     def validate(self) -> None:
         if self.phase != "tune":
             raise ValueError("confirmation evidence must never enter selection")
-        if self.method not in {"tts", "naive_async"}:
+        if self.method not in {"tts", "l0"}:
             raise ValueError("selection accepts only TTS and L0 measurements")
         for name in (
             "goodput_ratio_to_static",
@@ -301,7 +301,7 @@ def reduce_tuning_stage(
         ):
             raise ValueError("tuning slices are not paired to the Static baseline")
     if set(grouped) != set(active_candidate_ids) or any(
-        set(methods) != {"tts", "naive_async"} for methods in grouped.values()
+        set(methods) != {"tts", "l0"} for methods in grouped.values()
     ):
         raise ValueError("tuning stage coverage is incomplete")
     rows: list[CandidateMeasurement] = []
@@ -311,7 +311,7 @@ def reduce_tuning_stage(
         methods = grouped[candidate_id]
         ratios = []
         candidate_rows: list[CandidateMeasurement] = []
-        for method in ("tts", "naive_async"):
+        for method in ("tts", "l0"):
             source = methods[method]
             ratio = source.decode_goodput_tps / static.decode_goodput_tps
             ratios.append(ratio)
@@ -468,7 +468,7 @@ def select_shared_config(
         methods[row.method] = row
     eligible: list[tuple[tuple[float, int, float, float, str], str]] = []
     for candidate_id, methods in grouped.items():
-        if set(methods) != {"tts", "naive_async"}:
+        if set(methods) != {"tts", "l0"}:
             continue
         rows = tuple(methods.values())
         if not all(row.safe for row in rows):

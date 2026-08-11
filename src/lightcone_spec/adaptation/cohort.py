@@ -5,9 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from lightcone_spec.methods.core import CandidateUpdate, MethodPolicy
+from lightcone_spec.methods.core import (
+    CandidateTermination,
+    CandidateUpdate,
+    MethodPolicy,
+    publication_round,
+)
 
 
 @dataclass(frozen=True)
@@ -68,8 +73,7 @@ class SupervisionSignal:
 
     def __post_init__(self) -> None:
         if len(self.cohort_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.cohort_sha256
+            character not in "0123456789abcdef" for character in self.cohort_sha256
         ):
             raise ValueError("cohort_sha256 must be a lowercase SHA-256")
         if not self.request_id:
@@ -125,9 +129,12 @@ class CohortRuntime:
     epoch: int = 0
     active_version: int = 0
     slot_generation: int = 0
+    buffer_generation: int = 0
+    optimizer_state_generation: int = 0
     signals: LatestSignalBatch = field(init=False)
     in_flight: CandidateUpdate | None = None
     disabled_reason: str | None = None
+    last_termination: CandidateTermination | None = None
 
     def __post_init__(self) -> None:
         self.signals = LatestSignalBatch(self.identity.sha256)
@@ -163,6 +170,8 @@ class CohortRuntime:
             cohort_epoch=self.epoch,
             slot_generation=self.slot_generation,
             ready_round=ready_round,
+            buffer_generation=self.buffer_generation,
+            optimizer_state_generation=self.optimizer_state_generation,
         )
         self.in_flight = candidate
         return candidate
@@ -174,6 +183,7 @@ class CohortRuntime:
         policy: MethodPolicy,
         current_round: int,
         stride: int,
+        extra_logical_delay: int = 0,
     ) -> tuple[bool, str]:
         if stride < 1:
             raise ValueError("stride must be positive")
@@ -185,42 +195,122 @@ class CohortRuntime:
             return False, "stale_slot_generation"
         if candidate.source_version != self.active_version:
             return False, "source_version_conflict"
+        if candidate.buffer_generation != self.buffer_generation:
+            return False, "stale_buffer_generation"
+        if candidate.optimizer_state_generation != self.optimizer_state_generation:
+            return False, "stale_optimizer_state_generation"
+        if not candidate.numerically_valid:
+            return False, "nonfinite_candidate"
         if current_round < candidate.ready_round:
             return False, "side_stream_not_ready"
         if policy is MethodPolicy.STATIC:
             return False, "static_disabled"
-        if policy is MethodPolicy.FIXED_BARRIER:
-            boundary = ((candidate.source_round // stride) + 1) * stride
-            if current_round < boundary:
-                return False, "waiting_fixed_boundary"
+        boundary = publication_round(
+            policy,
+            candidate,
+            stride,
+            extra_logical_delay,
+        )
+        if boundary is None:
+            return False, "static_disabled"
+        if current_round < boundary:
+            if current_round < candidate.ready_round + extra_logical_delay:
+                return False, "waiting_extra_logical_delay"
+            return False, "waiting_fixed_boundary"
         return True, "ready"
 
-    def commit(self, candidate: CandidateUpdate) -> int:
-        if candidate is not self.in_flight:
-            raise RuntimeError("candidate is not active")
+    def commit(
+        self,
+        candidate: CandidateUpdate,
+        *,
+        policy: MethodPolicy,
+        current_round: int,
+        stride: int,
+        extra_logical_delay: int = 0,
+    ) -> int:
+        """Publish only after revalidating the complete boundary authority.
+
+        Requiring the boundary inputs here prevents a caller from using
+        ``commit`` as a back door around stale/version/numerical/readiness
+        checks performed by :meth:`can_publish`.
+        """
+
+        allowed, reason = self.can_publish(
+            candidate,
+            policy=policy,
+            current_round=current_round,
+            stride=stride,
+            extra_logical_delay=extra_logical_delay,
+        )
+        if not allowed:
+            raise RuntimeError(f"candidate lacks publication authority: {reason}")
         self.active_version += 1
-        self.in_flight = None
+        self.optimizer_state_generation += 1
+        self._terminate(
+            candidate,
+            outcome="published",
+            reason="committed",
+            published_version=self.active_version,
+        )
         return self.active_version
 
-    def discard(self, candidate: CandidateUpdate) -> None:
-        if candidate is self.in_flight:
-            self.in_flight = None
+    def _terminate(
+        self,
+        candidate: CandidateUpdate,
+        *,
+        outcome: Literal["published", "discarded"],
+        reason: str,
+        published_version: int | None = None,
+    ) -> CandidateTermination:
+        if (
+            self.last_termination is not None
+            and self.last_termination.candidate is candidate
+        ):
+            raise RuntimeError("candidate was already terminated")
+        if candidate is not self.in_flight:
+            raise RuntimeError("candidate is not active")
+        termination = CandidateTermination(
+            candidate=candidate,
+            outcome=outcome,
+            reason=reason,
+            published_version=published_version,
+        )
+        self.in_flight = None
+        self.last_termination = termination
+        return termination
+
+    def discard(
+        self,
+        candidate: CandidateUpdate,
+        reason: str = "discarded",
+    ) -> CandidateTermination:
+        return self._terminate(
+            candidate,
+            outcome="discarded",
+            reason=reason,
+        )
 
     def cancel_request(self, request_id: str) -> None:
         self.signals.discard_request(request_id)
+        if self.in_flight is not None:
+            self.discard(self.in_flight, "request_cancelled")
         self.slot_generation += 1
-        self.in_flight = None
+        self.buffer_generation += 1
 
     def reset(self) -> None:
+        if self.in_flight is not None:
+            self.discard(self.in_flight, "cohort_reset")
         self.epoch += 1
         self.active_version = 0
         self.slot_generation += 1
-        self.in_flight = None
+        self.buffer_generation += 1
+        self.optimizer_state_generation = 0
         self.signals = LatestSignalBatch(self.identity.sha256)
         self.disabled_reason = None
 
     def disable(self, reason: str) -> None:
         if not reason:
             raise ValueError("disabled cohorts require an evidence reason")
+        if self.in_flight is not None:
+            self.discard(self.in_flight, reason)
         self.disabled_reason = reason
-        self.in_flight = None

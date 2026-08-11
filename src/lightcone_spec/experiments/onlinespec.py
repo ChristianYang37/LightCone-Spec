@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.adaptation.parameters import LAYER_SCOPES, LORA_RANKS
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -229,16 +230,14 @@ class OnlineSpecCandidate:
     def validate(self) -> None:
         if self.method not in ONLINE_SPEC_METHODS:
             raise ValueError("unknown OnlineSPEC method")
-        if self.weight_update_mode not in {"residual", "lora", "full"}:
+        if self.weight_update_mode not in {"lora", "full"}:
             raise ValueError("unknown OnlineSPEC update mode")
-        if self.parameter_scope not in {"tail", "drafter"}:
+        if self.parameter_scope not in LAYER_SCOPES:
             raise ValueError("unknown OnlineSPEC parameter scope")
-        if self.weight_update_mode == "residual" and self.parameter_scope != "tail":
-            raise ValueError("residual OnlineSPEC is tail-only")
         if self.weight_update_mode == "full" and self.rank is not None:
             raise ValueError("full OnlineSPEC requires rank=null")
-        if self.weight_update_mode != "full" and (self.rank is None or self.rank < 1):
-            raise ValueError("factorized OnlineSPEC requires a positive rank")
+        if self.weight_update_mode == "lora" and self.rank not in LORA_RANKS:
+            raise ValueError("factorized OnlineSPEC requires a registered LoRA rank")
         numeric = (self.learning_rate, self.grad_clip)
         if any(not math.isfinite(value) or value <= 0 for value in numeric):
             raise ValueError("OnlineSPEC optimizer values must be positive and finite")
@@ -285,7 +284,7 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                     OnlineSpecCandidate(
                         method,
                         "full",
-                        "drafter",
+                        "all",
                         learning_rate,
                         None,
                         stride,
@@ -297,7 +296,7 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                         OnlineSpecCandidate(
                             method,
                             "lora",
-                            "drafter",
+                            "all",
                             learning_rate,
                             rank,
                             stride,
@@ -320,7 +319,7 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
                         OnlineSpecCandidate(
                             "onlinespec_ens",
                             weight_update_mode,
-                            "drafter",
+                            "all",
                             learning_rate,
                             rank,
                             stride,

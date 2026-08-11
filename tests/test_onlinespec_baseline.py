@@ -18,7 +18,7 @@ from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 
 def baseline_config(method: str = "onlinespec_ogd") -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "method": method,
         "model": {
             "key": "qwen3_8b_dflash16",
@@ -42,7 +42,7 @@ def baseline_config(method: str = "onlinespec_ogd") -> dict:
         },
         "adaptation": {
             "weight_update_mode": "full",
-            "parameter_scope": "tail",
+            "parameter_scope": "all",
             "kv_history_policy": "frozen",
             "adaptation_scope": "cohort",
             "adaptation_group_id": "onlinespec-baseline",
@@ -221,7 +221,7 @@ def test_online_baselines_are_routed_to_sglang(method: str, extra: dict) -> None
 
 def test_hedge_supports_lora_decisions_and_rejects_incomplete_grid() -> None:
     value = baseline_config("onlinespec_ens")
-    value["adaptation"].update(weight_update_mode="lora", rank=8)
+    value["adaptation"].update(weight_update_mode="lora", rank=8, lora_alpha=8)
     value["online_spec"].update(
         additional_learning_rates=[0.03], hedge_learning_rate=0.5
     )

@@ -7,13 +7,19 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import asdict
 from pathlib import Path
+from typing import NoReturn
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
+from lightcone_spec import (
+    PINNED_SGLANG_COMMIT,
+    PINNED_SGLANG_PATCH_COUNT,
+    PINNED_SGLANG_TREE,
+)
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
 from lightcone_spec.experiments.data import (
@@ -25,6 +31,12 @@ from lightcone_spec.experiments.data import (
 from lightcone_spec.experiments.evidence import (
     GpuEvidenceAttestation,
     evidence_files_sha256,
+)
+from lightcone_spec.experiments.industrial_analysis import (
+    BoundArtifact,
+    IndustrialBlockEvidence,
+    IndustrialCellEvidence,
+    reduce_industrial_schema_v3,
 )
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_METHODS,
@@ -54,6 +66,15 @@ from lightcone_spec.experiments.protocol import (
     tuning_candidates,
     tuning_stage,
 )
+from lightcone_spec.experiments.registry import (
+    ConfirmationBlockPlan,
+    ExperimentReceipt,
+    ExperimentRegistry,
+    LockedOutput,
+    StageActivationPlan,
+    TwoGpuResourceScheduler,
+    build_industrial_registry,
+)
 from lightcone_spec.experiments.runner import (
     collect_confirmation_performance,
     collect_onlinespec_performance,
@@ -71,7 +92,12 @@ from lightcone_spec.experiments.selection import (
     select_heldout_anchor,
     select_shared_config,
 )
-from lightcone_spec.experiments.statistics import evaluate_speed_gate
+from lightcone_spec.experiments.statistics import (
+    HardwareEnvelope,
+    PairedBcaContrast,
+    evaluate_speed_gate,
+    paired_bca_contrast,
+)
 from lightcone_spec.locking import ModelLock, prepare_models, resolve_model_lock
 from lightcone_spec.orchestration import (
     SpeedStudyManifest,
@@ -80,6 +106,7 @@ from lightcone_spec.orchestration import (
     render_replication_runtime_plan,
     render_runtime_plan,
     render_static_load_runtime_plan,
+    render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
 from lightcone_spec.sglang_bridge import (
@@ -87,6 +114,7 @@ from lightcone_spec.sglang_bridge import (
     sglang_adaptation_sha256,
     verify_patched_checkout,
 )
+from lightcone_spec.telemetry import load_completed_evidence
 
 
 def _write_json(path: str | Path, value: object) -> None:
@@ -116,6 +144,17 @@ def _is_lower_sha256(value: object) -> bool:
     )
 
 
+def _file_sha256(path: str | Path) -> str:
+    source = Path(path)
+    if not source.is_file() or source.is_symlink():
+        raise ValueError(f"content-bound artifact is not a regular file: {source}")
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _load_bound_json(path: str | Path) -> object:
     source = Path(path)
     value = json.loads(source.read_text(encoding="utf-8"))
@@ -127,6 +166,13 @@ def _load_bound_json(path: str | Path) -> object:
     return value
 
 
+def _artifact_sha256(path: str | Path) -> str:
+    source = Path(path)
+    if source.suffix.lower() == ".json":
+        return _canonical_sha256(_load_bound_json(source))
+    return _file_sha256(source)
+
+
 def _load_bound_run_config(path: str | Path) -> RunConfig:
     source = Path(path)
     config = load_run_config(source)
@@ -136,6 +182,435 @@ def _load_bound_run_config(path: str | Path) -> RunConfig:
     ).strip() != run_config_sha256(config):
         raise ValueError(f"run-config sidecar is missing or invalid: {source}")
     return config
+
+
+_INDUSTRIAL_REGISTRY_GENERATOR = (
+    "lightcone_spec.experiments.registry.build_industrial_registry:v1"
+)
+# No hardware-rooted/provider signing identity is registered in this source
+# release.  Self-authored JSON plus hashes proves content consistency, not GPU
+# provenance, and therefore cannot mint a claim-bearing receipt.
+_TRUSTED_HARDWARE_ATTESTER_ID: str | None = None
+
+
+def _trusted_attester_unavailable(label: str) -> RuntimeError:
+    return RuntimeError(f"{label} is BLOCKED: trusted_hardware_attester_unavailable")
+
+
+def _industrial_registry_artifact(
+    registry: ExperimentRegistry,
+    *,
+    base_port: int,
+    cache_root: str,
+    evidence_root: str,
+    seed: int,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "generator": _INDUSTRIAL_REGISTRY_GENERATOR,
+        "parameters": {
+            "gpu_uuids": list(registry.gpu_uuids),
+            "base_port": base_port,
+            "cache_root": cache_root,
+            "evidence_root": evidence_root,
+            "seed": seed,
+        },
+        "registry_sha256": registry.sha256,
+        "registry": registry.to_dict(),
+    }
+
+
+def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
+    value = _load_bound_json(path)
+    if not isinstance(value, dict):
+        raise TypeError("industrial registry artifact must be an object")
+    if (
+        value.get("schema_version") != 1
+        or value.get("generator") != _INDUSTRIAL_REGISTRY_GENERATOR
+    ):
+        raise ValueError("industrial registry generator identity mismatch")
+    parameters = value.get("parameters")
+    if not isinstance(parameters, dict):
+        raise TypeError("industrial registry parameters are missing")
+    gpu_uuids = parameters.get("gpu_uuids")
+    if (
+        not isinstance(gpu_uuids, list)
+        or len(gpu_uuids) != 2
+        or not all(isinstance(item, str) and item for item in gpu_uuids)
+    ):
+        raise ValueError("industrial registry requires two explicit GPU UUIDs")
+    registry = build_industrial_registry(
+        gpu_uuids=(gpu_uuids[0], gpu_uuids[1]),
+        base_port=int(parameters.get("base_port", 0)),
+        cache_root=str(parameters.get("cache_root", "")),
+        evidence_root=str(parameters.get("evidence_root", "")),
+        seed=int(parameters.get("seed", -1)),
+    )
+    if value.get("registry_sha256") != registry.sha256:
+        raise ValueError("industrial registry content digest mismatch")
+    if value.get("registry") != registry.to_dict():
+        raise ValueError(
+            "industrial registry declarations were edited after generation"
+        )
+    return registry
+
+
+def _industrial_receipt_from_value(value: object) -> ExperimentReceipt:
+    if not isinstance(value, dict):
+        raise TypeError("industrial dependency receipt must be an object")
+
+    def locked_rows(name: str) -> tuple[LockedOutput, ...]:
+        rows = value.get(name)
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise TypeError(f"industrial receipt {name} must be a list")
+        return tuple(
+            LockedOutput(
+                name=str(row.get("name", "")),
+                content_sha256=str(row.get("content_sha256", "")),
+            )
+            for row in rows
+        )
+
+    return ExperimentReceipt(
+        experiment=str(value.get("experiment", "")),
+        registry_sha256=str(value.get("registry_sha256", "")),
+        runtime_sha256=str(value.get("runtime_sha256", "")),
+        split_sha256=str(value.get("split_sha256", "")),
+        completed_cells_sha256=str(value.get("completed_cells_sha256", "")),
+        dependency_receipts=locked_rows("dependency_receipts"),
+        outputs=locked_rows("outputs"),
+        selection_state=str(value.get("selection_state", "")),
+    )
+
+
+def _load_industrial_receipts(paths: list[str]) -> tuple[ExperimentReceipt, ...]:
+    if paths and _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        raise _trusted_attester_unavailable("industrial dependency receipts")
+    return tuple(
+        _industrial_receipt_from_value(_load_bound_json(path)) for path in paths
+    )
+
+
+def _load_stage_activation_plan(path: str | None) -> StageActivationPlan | None:
+    if path is None:
+        return None
+    value = _load_bound_json(path)
+    expected = {
+        "registry_sha256",
+        "experiment",
+        "dependency_receipt_sha256",
+        "runtime_sha256",
+        "split_sha256",
+        "source_selection_sha256",
+        "activation_round",
+        "status",
+        "activated_cell_ids",
+        "not_applicable_cell_ids",
+        "blocked_cell_ids",
+        "deferred_cell_ids",
+        "reason_code",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("stage activation plan fields do not match schema")
+    return StageActivationPlan(
+        registry_sha256=value["registry_sha256"],
+        experiment=value["experiment"],
+        dependency_receipt_sha256=value["dependency_receipt_sha256"],
+        runtime_sha256=value["runtime_sha256"],
+        split_sha256=value["split_sha256"],
+        source_selection_sha256=value["source_selection_sha256"],
+        activation_round=value["activation_round"],
+        status=value["status"],
+        activated_cell_ids=tuple(value["activated_cell_ids"]),
+        not_applicable_cell_ids=tuple(value["not_applicable_cell_ids"]),
+        blocked_cell_ids=tuple(value["blocked_cell_ids"]),
+        deferred_cell_ids=tuple(value["deferred_cell_ids"]),
+        reason_code=value["reason_code"],
+    )
+
+
+def _load_confirmation_block_plan(path: str | None) -> ConfirmationBlockPlan | None:
+    if path is None:
+        return None
+    value = _load_bound_json(path)
+    expected = {
+        "registry_sha256",
+        "experiment",
+        "runtime_sha256",
+        "split_sha256",
+        "pilot_evidence_sha256",
+        "completed_pilot_cells_sha256",
+        "status",
+        "selected_final_blocks",
+        "reason_code",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("confirmation block plan fields do not match schema")
+    return ConfirmationBlockPlan(**value)
+
+
+def _analysis_manifest_path(
+    manifest_path: Path,
+    value: object,
+    *,
+    label: str,
+) -> Path:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise ValueError(f"{label} path must be a non-empty string")
+    path = Path(value)
+    return path if path.is_absolute() else manifest_path.parent / path
+
+
+def _analysis_file_binding(
+    manifest_path: Path,
+    value: object,
+    *,
+    label: str,
+) -> BoundArtifact:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+        raise ValueError(f"{label} binding fields do not match schema")
+    sha256 = value.get("sha256")
+    if not _is_lower_sha256(sha256):
+        raise ValueError(f"{label} digest must be lower-case SHA-256")
+    return BoundArtifact(
+        path=_analysis_manifest_path(manifest_path, value.get("path"), label=label),
+        sha256=sha256,
+    )
+
+
+def _analysis_bound_json_path(
+    manifest_path: Path,
+    value: object,
+    *,
+    label: str,
+) -> Path:
+    binding = _analysis_file_binding(manifest_path, value, label=label)
+    path = binding.path
+    sidecar = Path(f"{path}.sha256")
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or sidecar.is_symlink()
+        or not sidecar.is_file()
+    ):
+        raise ValueError(f"{label} must be a regular bound JSON artifact")
+    payload = _load_bound_json(path)
+    if _canonical_sha256(payload) != binding.sha256:
+        raise ValueError(f"{label} manifest digest mismatch")
+    return path
+
+
+def _analysis_hardware_envelope(value: object) -> HardwareEnvelope:
+    expected = {
+        "gpu_clock_mhz_min",
+        "gpu_clock_mhz_max",
+        "memory_clock_mhz_min",
+        "memory_clock_mhz_max",
+        "temperature_c_max",
+        "power_watts_min",
+        "power_watts_max",
+        "power_state",
+        "allowed_throttling_reasons",
+        "allowed_background_processes",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("hardware envelope fields do not match schema")
+    throttling = value.get("allowed_throttling_reasons")
+    processes = value.get("allowed_background_processes")
+    if not isinstance(throttling, list) or not isinstance(processes, list):
+        raise TypeError("hardware envelope allowlists must be JSON arrays")
+    return HardwareEnvelope(
+        gpu_clock_mhz_min=value["gpu_clock_mhz_min"],
+        gpu_clock_mhz_max=value["gpu_clock_mhz_max"],
+        memory_clock_mhz_min=value["memory_clock_mhz_min"],
+        memory_clock_mhz_max=value["memory_clock_mhz_max"],
+        temperature_c_max=value["temperature_c_max"],
+        power_watts_min=value["power_watts_min"],
+        power_watts_max=value["power_watts_max"],
+        power_state=value["power_state"],
+        allowed_throttling_reasons=tuple(throttling),
+        allowed_background_processes=tuple(processes),
+    )
+
+
+def _load_industrial_analysis_manifest(
+    path: str | Path,
+) -> tuple[
+    ExperimentRegistry,
+    ConfirmationBlockPlan,
+    HardwareEnvelope,
+    tuple[IndustrialBlockEvidence, ...],
+    BoundArtifact | None,
+    BoundArtifact | None,
+    int,
+    int,
+]:
+    manifest_path = Path(path)
+    manifest_sidecar = Path(f"{manifest_path}.sha256")
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_sidecar.is_symlink()
+        or not manifest_sidecar.is_file()
+    ):
+        raise ValueError("industrial analysis manifest must be a regular bound file")
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "confirmation_plan",
+        "gpu_attestation",
+        "doctor_report",
+        "hardware_envelope",
+        "bootstrap",
+        "blocks",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("industrial analysis manifest fields do not match schema")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "industrial_analysis_manifest"
+    ):
+        raise ValueError("industrial analysis manifest identity mismatch")
+
+    registry_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("registry_artifact"),
+        label="registry artifact",
+    )
+    plan_path = _analysis_bound_json_path(
+        manifest_path,
+        value.get("confirmation_plan"),
+        label="confirmation plan",
+    )
+    registry = _load_industrial_registry(registry_path)
+    plan = _load_confirmation_block_plan(str(plan_path))
+    if plan is None:
+        raise AssertionError("required confirmation plan unexpectedly resolved to None")
+    raw_attestation = value.get("gpu_attestation")
+    raw_doctor = value.get("doctor_report")
+    if (raw_attestation is None) != (raw_doctor is None):
+        raise ValueError(
+            "industrial GPU attestation and doctor report must be supplied together"
+        )
+    gpu_attestation = (
+        None
+        if raw_attestation is None
+        else _analysis_file_binding(
+            manifest_path,
+            raw_attestation,
+            label="industrial GPU attestation",
+        )
+    )
+    doctor_report = (
+        None
+        if raw_doctor is None
+        else _analysis_file_binding(
+            manifest_path,
+            raw_doctor,
+            label="doctor report",
+        )
+    )
+    envelope = _analysis_hardware_envelope(value.get("hardware_envelope"))
+
+    bootstrap = value.get("bootstrap")
+    if not isinstance(bootstrap, dict) or set(bootstrap) != {
+        "repetitions",
+        "seed",
+    }:
+        raise ValueError("industrial analysis bootstrap fields do not match schema")
+    repetitions = bootstrap.get("repetitions")
+    seed = bootstrap.get("seed")
+    if (
+        not isinstance(repetitions, int)
+        or isinstance(repetitions, bool)
+        or repetitions < 100
+        or not isinstance(seed, int)
+        or isinstance(seed, bool)
+    ):
+        raise ValueError("industrial analysis bootstrap values are invalid")
+
+    raw_blocks = value.get("blocks")
+    if not isinstance(raw_blocks, list) or not raw_blocks:
+        raise ValueError("industrial analysis manifest requires block evidence")
+    blocks: list[IndustrialBlockEvidence] = []
+    for raw_block in raw_blocks:
+        if not isinstance(raw_block, dict) or set(raw_block) != {
+            "block",
+            "qualification_lock",
+            "cells",
+        }:
+            raise ValueError("industrial analysis block fields do not match schema")
+        block = raw_block.get("block")
+        raw_cells = raw_block.get("cells")
+        if (
+            not isinstance(block, int)
+            or isinstance(block, bool)
+            or not isinstance(raw_cells, list)
+            or not raw_cells
+        ):
+            raise ValueError("industrial analysis block identity is invalid")
+        cells: list[IndustrialCellEvidence] = []
+        for raw_cell in raw_cells:
+            if not isinstance(raw_cell, dict) or set(raw_cell) != {
+                "cell_id",
+                "terminal_receipts",
+                "hardware_receipt",
+            }:
+                raise ValueError("industrial analysis cell fields do not match schema")
+            terminal = raw_cell.get("terminal_receipts")
+            if not isinstance(terminal, list) or not terminal:
+                raise ValueError("industrial analysis cell requires rank receipts")
+            cells.append(
+                IndustrialCellEvidence(
+                    cell_id=raw_cell.get("cell_id"),
+                    terminal_receipts=tuple(
+                        _analysis_file_binding(
+                            manifest_path,
+                            receipt,
+                            label="terminal receipt",
+                        )
+                        for receipt in terminal
+                    ),
+                    hardware_receipt=_analysis_file_binding(
+                        manifest_path,
+                        raw_cell.get("hardware_receipt"),
+                        label="hardware receipt",
+                    ),
+                )
+            )
+        blocks.append(
+            IndustrialBlockEvidence(
+                block=block,
+                cells=tuple(cells),
+                qualification_lock=_analysis_file_binding(
+                    manifest_path,
+                    raw_block.get("qualification_lock"),
+                    label="qualification lock",
+                ),
+            )
+        )
+    return (
+        registry,
+        plan,
+        envelope,
+        tuple(blocks),
+        gpu_attestation,
+        doctor_report,
+        repetitions,
+        seed,
+    )
+
+
+def _parse_locked_outputs(values: list[str]) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    for value in values:
+        name, separator, path = value.partition("=")
+        if not separator or not name or not path or name in outputs:
+            raise ValueError("locked outputs must be unique NAME=PATH values")
+        outputs[name] = _artifact_sha256(path)
+    return outputs
 
 
 def _static_load_rows(
@@ -223,13 +698,55 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     doctor = commands.add_parser("doctor")
-    doctor.add_argument("--path", default=".")
+    doctor.add_argument(
+        "--project-root",
+        help="clean LightCone-Spec checkout containing the runtime manifest",
+    )
+    doctor.add_argument(
+        "--sglang-root",
+        help="separate clean checkout with the complete pinned SGLang patch set",
+    )
+    doctor.add_argument(
+        "--path",
+        help="legacy shorthand that uses one path for both roots (not ready)",
+    )
 
     validate = commands.add_parser("validate-config")
     validate.add_argument("config")
 
     build = commands.add_parser("build-speed-study")
     build.add_argument("--output", required=True)
+
+    build_industrial = commands.add_parser("build-industrial-registry")
+    build_industrial.add_argument("--gpu-uuid", nargs=2, required=True)
+    build_industrial.add_argument("--base-port", type=int, default=24000)
+    build_industrial.add_argument("--cache-root", default="runtime-cache/industrial")
+    build_industrial.add_argument("--evidence-root", default="artifacts/industrial")
+    build_industrial.add_argument("--seed", type=int, default=20260811)
+    build_industrial.add_argument("--output", required=True)
+
+    seal_industrial = commands.add_parser("seal-industrial-stage")
+    seal_industrial.add_argument("--registry", required=True)
+    seal_industrial.add_argument("--experiment", required=True)
+    seal_industrial.add_argument("--runtime-artifact", required=True)
+    seal_industrial.add_argument("--split-artifact", required=True)
+    seal_industrial.add_argument("--completed-cells", required=True)
+    seal_industrial.add_argument("--dependency-receipt", action="append", default=[])
+    seal_industrial.add_argument("--locked-output", action="append", required=True)
+    seal_industrial.add_argument("--output", required=True)
+
+    plan_industrial = commands.add_parser("plan-industrial-dispatch")
+    plan_industrial.add_argument("--registry", required=True)
+    plan_industrial.add_argument("--receipt", action="append", default=[])
+    plan_industrial.add_argument("--completed-cells")
+    plan_industrial.add_argument("--interference-receipt")
+    plan_industrial.add_argument("--activation-plan")
+    plan_industrial.add_argument("--confirmation-block-plan")
+    plan_industrial.add_argument("--output", required=True)
+
+    analyze_industrial = commands.add_parser("analyze-industrial")
+    analyze_industrial.add_argument("--manifest", required=True)
+    analyze_industrial.add_argument("--output", required=True)
 
     build_online = commands.add_parser("build-onlinespec-study")
     build_online.add_argument("--output", required=True)
@@ -337,6 +854,17 @@ def _parser() -> argparse.ArgumentParser:
     render_static.add_argument("--host", default="127.0.0.1")
     render_static.add_argument("--first-port", type=int, default=30000)
 
+    render_target = commands.add_parser("render-target-only-runtime")
+    render_target.add_argument("--concurrency", type=int, required=True)
+    render_target.add_argument("--model-lock", required=True)
+    render_target.add_argument("--model-roots", required=True)
+    render_target.add_argument("--sglang-checkout", required=True)
+    render_target.add_argument("--sampling-profile", required=True)
+    render_target.add_argument("--mem-fraction-static", type=float, required=True)
+    render_target.add_argument("--output-root", required=True)
+    render_target.add_argument("--host", default="127.0.0.1")
+    render_target.add_argument("--first-port", type=int, default=30000)
+
     render_tuning = commands.add_parser("render-tuning-runtime")
     render_tuning.add_argument("--candidate-id", required=True)
     render_tuning.add_argument("--concurrency", type=int, required=True)
@@ -375,9 +903,7 @@ def _parser() -> argparse.ArgumentParser:
     controlled.add_argument("--config", required=True)
     controlled.add_argument("--url", required=True)
     controlled.add_argument("--phase", choices=("static-load", "tune"), required=True)
-    controlled.add_argument(
-        "--method", choices=("static", "tts", "naive_async"), required=True
-    )
+    controlled.add_argument("--method", choices=("static", "tts", "l0"), required=True)
     controlled.add_argument("--candidate-id")
     controlled.add_argument("--stage", type=int, default=-1)
     controlled.add_argument("--concurrency", type=int, required=True)
@@ -406,9 +932,7 @@ def _parser() -> argparse.ArgumentParser:
     natural.add_argument("--sampling-profile", required=True)
     natural.add_argument("--config", required=True)
     natural.add_argument("--url", required=True)
-    natural.add_argument(
-        "--method", choices=("static", "tts", "naive_async"), required=True
-    )
+    natural.add_argument("--method", choices=("static", "tts", "l0"), required=True)
     natural.add_argument(
         "--dataset", choices=("livecodebench", "math500"), required=True
     )
@@ -419,9 +943,7 @@ def _parser() -> argparse.ArgumentParser:
 
     profiler = commands.add_parser("build-profiler-plan")
     profiler.add_argument("--launch-plan", required=True)
-    profiler.add_argument(
-        "--method", choices=("static", "tts", "naive_async"), required=True
-    )
+    profiler.add_argument("--method", choices=("static", "tts", "l0"), required=True)
     profiler.add_argument("--trace-root", required=True)
     profiler.add_argument("--output", required=True)
     profiler.add_argument("workload_argv", nargs=argparse.REMAINDER)
@@ -452,9 +974,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--sampling-profile", required=True)
     run.add_argument("--config", required=True)
     run.add_argument("--url", required=True)
-    run.add_argument(
-        "--method", choices=("static", "tts", "naive_async"), required=True
-    )
+    run.add_argument("--method", choices=("static", "tts", "l0"), required=True)
     run.add_argument("--block", type=int, required=True)
     run.add_argument("--adaptation-group-id", required=True)
     run.add_argument("--output-root", required=True)
@@ -1343,9 +1863,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
         stage=args.stage,
     )
     next_stage = (
-        args.stage + 1
-        if args.stage + 1 < len(ONLINE_SPEC_TUNING_STAGES)
-        else None
+        args.stage + 1 if args.stage + 1 < len(ONLINE_SPEC_TUNING_STAGES) else None
     )
     artifact = {
         "schema_version": 2,
@@ -1409,7 +1927,7 @@ def _confirmation_configs(args: argparse.Namespace) -> dict:
     return {
         "static": _load_bound_run_config(args.static_config),
         "tts": _load_bound_run_config(args.tts_config),
-        "naive_async": _load_bound_run_config(args.l0_config),
+        "l0": _load_bound_run_config(args.l0_config),
     }
 
 
@@ -1660,6 +2178,33 @@ def _render_static_load_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_target_only_runtime(args: argparse.Namespace) -> int:
+    if args.concurrency < 1:
+        raise ValueError("Target-only concurrency must be positive")
+    launches = render_target_only_runtime_plan(
+        output_root=args.output_root,
+        concurrency=args.concurrency,
+        model_lock=ModelLock.load(args.model_lock),
+        model_roots=_load_bound_json(args.model_roots),
+        sampling_profile=SamplingProfile.load(args.sampling_profile),
+        sglang_checkout=args.sglang_checkout,
+        mem_fraction_static=args.mem_fraction_static,
+        host=args.host,
+        first_port=args.first_port,
+    )
+    launch = launches[0]
+    if (
+        launch.method != "target_only"
+        or launch.adaptation_config is not None
+        or launch.telemetry_path is not None
+        or any("speculative" in argument for argument in launch.argv)
+        or any("draft" in argument for argument in launch.argv)
+    ):
+        raise AssertionError("Target-only renderer allocated speculative state")
+    print(Path(args.output_root).resolve() / "launch-plan.json")
+    return 0
+
+
 def _render_tuning_runtime(args: argparse.Namespace) -> int:
     grid = {candidate.candidate_id: candidate for candidate in tuning_candidates()}
     candidate = grid.get(args.candidate_id)
@@ -1684,7 +2229,7 @@ def _render_tuning_runtime(args: argparse.Namespace) -> int:
         host=args.host,
         first_port=args.first_port,
     )
-    if [launch.method for launch in launches] != ["tts", "naive_async"] or len(
+    if [launch.method for launch in launches] != ["tts", "l0"] or len(
         {launch.base_url for launch in launches}
     ) != 1:
         raise AssertionError("tuning runtime must contain two adapted slices")
@@ -1859,7 +2404,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         if not isinstance(row, dict):
             raise TypeError("launch plan server entry is not an object")
         method = row.get("method")
-        if method not in {"static", "tts", "naive_async"} or method in servers:
+        if method not in {"static", "tts", "l0"} or method in servers:
             raise ValueError("launch plan has invalid or duplicate methods")
         if row.get("exclusive_device") is not True:
             raise ValueError("every formal slice must own the GPU exclusively")
@@ -2054,6 +2599,140 @@ def _build_onlinespec_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+_ATTESTATION_DOCTOR_CHECKS = frozenset(
+    {
+        "compatibility_manifest",
+        "project_patch_binding",
+        "project_sglang_roots_distinct",
+        "project_source_tree",
+        "python",
+        "linux_host",
+        "torch",
+        "triton",
+        "flashinfer",
+        "flashinfer_cuda_flavor",
+        "cuda_build",
+        "cuda_toolkit",
+        "torch_cuda_visibility",
+        "driver",
+        "gpu_count",
+        "gpu_identity",
+        "gpu_memory",
+        "gpu_topology",
+        "compiler",
+        "disk",
+        "network",
+        "sglang_commit_lineage",
+        "sglang_tree",
+        "sglang_import",
+    }
+)
+
+
+def _validate_attestation_doctor(hardware: object, *, label: str) -> dict:
+    def reject(reason: str) -> NoReturn:
+        raise ValueError(
+            f"{label} attestation requires a complete PASS doctor report: {reason}"
+        )
+
+    if not isinstance(hardware, dict) or hardware.get("schema_version") != 1:
+        reject("doctor schema-v1 object is required")
+    readiness = hardware.get("readiness")
+    compatibility = hardware.get("compatibility")
+    if hardware.get("status") != "PASS":
+        reject("top-level readiness is not PASS")
+    if not isinstance(readiness, dict) or readiness.get("status") != "PASS":
+        reject("readiness.status is not PASS")
+    if not isinstance(compatibility, dict) or compatibility.get("status") != "PASS":
+        reject("compatibility.status is not PASS")
+
+    runtime_manifest = hardware.get("runtime_manifest")
+    if (
+        not isinstance(runtime_manifest, dict)
+        or runtime_manifest.get("valid") is not True
+    ):
+        reject("runtime compatibility manifest is not valid")
+    manifest_sha256 = runtime_manifest.get("sha256")
+    if (
+        not _is_lower_sha256(manifest_sha256)
+        or runtime_manifest.get("sidecar_sha256") != manifest_sha256
+        or runtime_manifest.get("error") is not None
+        or compatibility.get("manifest_sha256") != manifest_sha256
+    ):
+        reject("runtime compatibility manifest digests are inconsistent")
+
+    checks = hardware.get("checks")
+    if not isinstance(checks, dict):
+        reject("doctor checks are missing")
+    missing_checks = sorted(_ATTESTATION_DOCTOR_CHECKS - checks.keys())
+    if missing_checks:
+        reject(f"required doctor checks are missing: {', '.join(missing_checks)}")
+    if any(
+        not isinstance(check, dict) or check.get("status") != "PASS"
+        for check in checks.values()
+    ):
+        reject("every doctor check must be PASS")
+    if (
+        readiness.get("pass_count") != len(checks)
+        or readiness.get("fail_count") != 0
+        or readiness.get("unknown_count") != 0
+    ):
+        reject("doctor readiness counters do not match its checks")
+
+    roots = hardware.get("roots")
+    if not isinstance(roots, dict):
+        reject("project and patched-SGLang roots are missing")
+    project_root = roots.get("project")
+    sglang_root = roots.get("patched_sglang")
+    if (
+        roots.get("distinct") is not True
+        or not isinstance(project_root, str)
+        or not project_root
+        or not isinstance(sglang_root, str)
+        or not sglang_root
+        or project_root == sglang_root
+    ):
+        reject("project and patched-SGLang roots must be distinct")
+
+    source_tree = hardware.get("source_tree")
+    source_head = source_tree.get("head") if isinstance(source_tree, dict) else None
+    if (
+        not isinstance(source_tree, dict)
+        or source_tree.get("path") != sglang_root
+        or source_tree.get("is_git_checkout") is not True
+        or source_tree.get("root_matches_toplevel") is not True
+        or not isinstance(source_head, str)
+        or len(source_head) != 40
+        or any(char not in "0123456789abcdef" for char in source_head)
+        or source_tree.get("tree") != PINNED_SGLANG_TREE
+        or source_tree.get("dirty") is not False
+        or source_tree.get("pinned_ancestor") is not True
+        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
+    ):
+        reject("patched SGLang source-tree identity is not exact")
+    if (
+        compatibility.get("sglang_commit") != PINNED_SGLANG_COMMIT
+        or compatibility.get("sglang_tree") != PINNED_SGLANG_TREE
+        or compatibility.get("patch_count") != PINNED_SGLANG_PATCH_COUNT
+        or compatibility.get("python_supported") is not True
+        or compatibility.get("single_node_only") is not True
+        or compatibility.get("multi_node_supported") is not False
+    ):
+        reject("compatibility identities do not match the release")
+
+    commands = hardware.get("commands")
+    nvidia = commands.get("nvidia_smi") if isinstance(commands, dict) else None
+    gpu = hardware.get("gpu")
+    if (
+        not isinstance(nvidia, str)
+        or not nvidia.strip()
+        or not isinstance(gpu, dict)
+        or gpu.get("two_gpu_visible") is not True
+    ):
+        reject("successful two-GPU nvidia-smi evidence is required")
+    return hardware
+
+
 def _attest(args: argparse.Namespace) -> int:
     manifest = SpeedStudyManifest.load(args.manifest)
     selection = SelectionArtifact.load(args.selection)
@@ -2072,22 +2751,12 @@ def _attest(args: argparse.Namespace) -> int:
         selection=selection,
         model_lock=model_lock,
     )
-    hardware = json.loads(Path(args.doctor_json).read_text(encoding="utf-8"))
-    nvidia = hardware.get("commands", {}).get("nvidia_smi")
-    if not isinstance(nvidia, str) or not nvidia.strip():
-        raise ValueError("GPU attestation requires a successful nvidia-smi report")
-    source_tree = hardware.get("source_tree")
-    if (
-        not isinstance(source_tree, dict)
-        or source_tree.get("is_git_checkout") is not True
-        or source_tree.get("tree") != PINNED_SGLANG_TREE
-        or source_tree.get("dirty") is not False
-        or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
-    ):
-        raise ValueError(
-            "GPU attestation requires doctor --path on the exact clean patched checkout"
-        )
+    hardware = _validate_attestation_doctor(
+        json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
+        label="GPU",
+    )
+    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        raise _trusted_attester_unavailable("legacy GPU attestation")
     attestation = GpuEvidenceAttestation(
         schema_version=2,
         status="MEASURED",
@@ -2143,20 +2812,12 @@ def _attest_onlinespec(args: argparse.Namespace) -> int:
         selection=selection,
         lock=lock,
     )
-    hardware = json.loads(Path(args.doctor_json).read_text(encoding="utf-8"))
-    nvidia = hardware.get("commands", {}).get("nvidia_smi")
-    source_tree = hardware.get("source_tree")
-    if not isinstance(nvidia, str) or not nvidia.strip():
-        raise ValueError("OnlineSPEC attestation requires nvidia-smi evidence")
-    if (
-        not isinstance(source_tree, dict)
-        or source_tree.get("is_git_checkout") is not True
-        or source_tree.get("tree") != PINNED_SGLANG_TREE
-        or source_tree.get("dirty") is not False
-        or source_tree.get("pinned_ancestor") is not True
-        or source_tree.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
-    ):
-        raise ValueError("OnlineSPEC attestation requires the exact patched checkout")
+    hardware = _validate_attestation_doctor(
+        json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
+        label="OnlineSPEC GPU",
+    )
+    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        raise _trusted_attester_unavailable("legacy OnlineSPEC GPU attestation")
     attestation = OnlineSpecGpuAttestation(
         schema_version=2,
         status="MEASURED",
@@ -2190,6 +2851,8 @@ def _analyze(args: argparse.Namespace) -> int:
     evidence_state = "UNMEASURED"
     evidence_sha256 = None
     if args.attestation:
+        if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+            raise _trusted_attester_unavailable("legacy analysis attestation")
         attestation = GpuEvidenceAttestation.load(args.attestation)
         attestation.verify_performance((args.performance,))
         if attestation.manifest_sha256 != manifest.sha256:
@@ -2238,6 +2901,10 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
     evidence = "UNMEASURED"
     attestation_sha256 = None
     if args.attestation:
+        if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+            raise _trusted_attester_unavailable(
+                "legacy OnlineSPEC analysis attestation"
+            )
         attestation = OnlineSpecGpuAttestation.load(args.attestation)
         if (
             attestation.manifest_sha256 != manifest.sha256
@@ -2251,13 +2918,13 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
         attestation_sha256 = attestation.sha256
     comparisons = compare_onlinespec(table.to_pylist(), seed=args.bootstrap_seed)
     safety_pass = all(comparison.safety_pass for comparison in comparisons)
-    acceleration_pass = any(
-        comparison.acceleration_pass for comparison in comparisons
-    )
+    acceleration_pass = any(comparison.acceleration_pass for comparison in comparisons)
     status = (
         "UNMEASURED"
         if evidence == "UNMEASURED"
-        else "PASS" if safety_pass and acceleration_pass else "BLOCKED"
+        else "PASS"
+        if safety_pass and acceleration_pass
+        else "BLOCKED"
     )
     _write_json(
         args.output,
@@ -2271,9 +2938,7 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             "safety_pass": safety_pass,
             "at_least_one_acceleration_pass": acceleration_pass,
             "passing_methods": [
-                comparison.method
-                for comparison in comparisons
-                if comparison.passed
+                comparison.method for comparison in comparisons if comparison.passed
             ],
             "selection_protocol": selection.selection_protocol,
             "optimized_grid_claim": (
@@ -2285,10 +2950,1226 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
     return 0 if status == "PASS" else 42
 
 
+def _build_industrial_registry(args: argparse.Namespace) -> int:
+    registry = build_industrial_registry(
+        gpu_uuids=(args.gpu_uuid[0], args.gpu_uuid[1]),
+        base_port=args.base_port,
+        cache_root=args.cache_root,
+        evidence_root=args.evidence_root,
+        seed=args.seed,
+    )
+    artifact = _industrial_registry_artifact(
+        registry,
+        base_port=args.base_port,
+        cache_root=args.cache_root,
+        evidence_root=args.evidence_root,
+        seed=args.seed,
+    )
+    _write_json(args.output, artifact)
+    print(registry.sha256)
+    return 0
+
+
+def _seal_industrial_stage(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    registry.definition(args.experiment)
+    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+        artifact = {
+            "schema_version": 1,
+            "kind": "industrial_stage_seal_decision",
+            "status": "BLOCKED",
+            "gpu_evidence": "UNMEASURED",
+            "reason_code": "trusted_hardware_attester_unavailable",
+            "registry_sha256": registry.sha256,
+            "experiment": args.experiment,
+            "trusted_attester_id": None,
+        }
+        _write_json(args.output, artifact)
+        print(_canonical_sha256(artifact))
+        return 42
+    dependencies = _load_industrial_receipts(args.dependency_receipt)
+    runtime_sha256 = _artifact_sha256(args.runtime_artifact)
+    split_contract = _load_bound_json(args.split_artifact)
+    split_sha256 = _canonical_sha256(split_contract)
+    completed, completed_sha256 = _completed_industrial_cells(
+        args.completed_cells,
+        registry,
+        experiment=args.experiment,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        split_contract=split_contract,
+        require_industrial_contract=True,
+    )
+    if completed_sha256 is None:
+        raise ValueError("stage sealing requires content-bound completed-cell evidence")
+    expected = {
+        cell.cell_id for cell in registry.cells_for(args.experiment) if cell.runnable
+    }
+    if set(completed) != expected:
+        missing = len(expected - set(completed))
+        extra = len(set(completed) - expected)
+        raise ValueError(
+            "stage completion must cover every runnable cell exactly "
+            f"(missing={missing}, extra={extra})"
+        )
+    receipt = registry.make_receipt(
+        args.experiment,
+        _parse_locked_outputs(args.locked_output),
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        completed_cells_sha256=completed_sha256,
+        dependencies=dependencies,
+    )
+    _write_json(args.output, receipt.to_dict())
+    print(receipt.sha256)
+    return 0
+
+
+def _completed_industrial_cells(
+    path: str | None,
+    registry: ExperimentRegistry,
+    *,
+    experiment: str | None = None,
+    runtime_sha256: str | None = None,
+    split_sha256: str | None = None,
+    split_contract: object | None = None,
+    require_industrial_contract: bool = False,
+) -> tuple[tuple[str, ...], str | None]:
+    if path is None:
+        return (), None
+    value = _load_bound_json(path)
+    if not isinstance(value, dict):
+        raise TypeError("completed-cell artifact must be an object")
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {1, 2}
+        or value.get("kind") != "industrial_completed_cells"
+        or value.get("registry_sha256") != registry.sha256
+    ):
+        raise ValueError("completed-cell artifact identity mismatch")
+    strict = schema_version == 2
+    if require_industrial_contract and not strict:
+        raise ValueError(
+            "stage sealing requires a schema-version-2 per-rank industrial contract"
+        )
+
+    known = {cell.cell_id: cell for cell in registry.cells}
+    contract_by_cell: dict[str, dict] = {}
+    stage: str | None = None
+    if strict:
+        stage = value.get("experiment")
+        embedded_split = value.get("split_contract")
+        if (
+            not isinstance(stage, str)
+            or not stage
+            or value.get("runtime_sha256") is None
+            or not _is_lower_sha256(value.get("runtime_sha256"))
+            or not _is_lower_sha256(value.get("split_sha256"))
+            or not isinstance(embedded_split, dict)
+            or _canonical_sha256(embedded_split) != value.get("split_sha256")
+        ):
+            raise ValueError("industrial completion contract identity is incomplete")
+        if experiment is not None and stage != experiment:
+            raise ValueError("completed cells belong to another industrial stage")
+        if runtime_sha256 is not None and value["runtime_sha256"] != runtime_sha256:
+            raise ValueError("completed cells bind another runtime artifact")
+        if split_sha256 is not None and value["split_sha256"] != split_sha256:
+            raise ValueError("completed cells bind another locked split")
+        if split_contract is not None and embedded_split != split_contract:
+            raise ValueError("embedded locked split differs from the sealing artifact")
+        if (
+            not isinstance(embedded_split.get("schema_version"), int)
+            or isinstance(embedded_split.get("schema_version"), bool)
+            or embedded_split.get("schema_version") != 1
+            or embedded_split.get("kind") != "industrial_locked_split"
+            or embedded_split.get("registry_sha256") != registry.sha256
+            or embedded_split.get("experiment") != stage
+        ):
+            raise ValueError("industrial locked-split identity mismatch")
+        split_cells = embedded_split.get("cells")
+        if not isinstance(split_cells, list) or not all(
+            isinstance(row, dict) for row in split_cells
+        ):
+            raise TypeError("industrial locked split lacks cell contracts")
+        runnable = {
+            cell.cell_id: cell for cell in registry.cells_for(stage) if cell.runnable
+        }
+        for contract in split_cells:
+            cell_id = contract.get("cell_id")
+            if cell_id not in runnable or cell_id in contract_by_cell:
+                raise ValueError("locked split contains an unknown or duplicate cell")
+            cell = runnable[str(cell_id)]
+            request_ids = contract.get("request_ids")
+            expected_request_rows = contract.get("expected_request_rows")
+            if (
+                not isinstance(request_ids, list)
+                or not request_ids
+                or not all(isinstance(item, str) and item for item in request_ids)
+                or len(request_ids) != len(set(request_ids))
+                or not isinstance(expected_request_rows, int)
+                or isinstance(expected_request_rows, bool)
+                or expected_request_rows != len(request_ids)
+                or contract.get("request_ids_sha256") != _canonical_sha256(request_ids)
+            ):
+                raise ValueError("locked split request coverage is invalid")
+            for name in (
+                "corpus_sha256",
+                "arrival_trace_sha256",
+                "request_ids_sha256",
+                "sampling_profile_sha256",
+                "model_lock_sha256",
+            ):
+                if not _is_lower_sha256(contract.get(name)):
+                    raise ValueError(f"locked split {name} is invalid")
+            rank_config_sha256s = contract.get("rank_config_sha256s")
+            if stage == "preflight":
+                if rank_config_sha256s is not None:
+                    raise ValueError(
+                        "preflight split cannot claim serving RunConfig identities"
+                    )
+            elif (
+                not isinstance(rank_config_sha256s, list)
+                or len(rank_config_sha256s) != len(cell.resources.gpu_uuids)
+                or not all(_is_lower_sha256(item) for item in rank_config_sha256s)
+            ):
+                raise ValueError(
+                    "serving split must bind one rank-config digest per rank"
+                )
+            if contract.get("patched_sglang_tree") != PINNED_SGLANG_TREE:
+                raise ValueError("locked split uses another patched SGLang tree")
+            expected_workload = (
+                f"industrial_preflight_{cell.identity.method}"
+                if stage == "preflight"
+                else (
+                    f"industrial_{cell.identity.method}"
+                    if cell.identity.method in {"target_only", "static"}
+                    else "industrial_adapted"
+                )
+            )
+            if contract.get("workload_contract") != expected_workload:
+                raise ValueError(
+                    "locked split workload contract disagrees with its cell"
+                )
+            counts = {
+                name: contract.get(name)
+                for name in (
+                    "expected_round_rows",
+                    "expected_update_rows",
+                    "expected_performance_rows",
+                )
+            }
+            if (
+                any(
+                    not isinstance(count, int) or isinstance(count, bool) or count < 0
+                    for count in counts.values()
+                )
+                or counts["expected_performance_rows"] < 1
+            ):
+                raise ValueError("locked split evidence row counts are invalid")
+            adapted = cell.identity.method not in {"target_only", "static"}
+            requires_rounds = adapted
+            requires_updates = adapted
+            if (counts["expected_round_rows"] > 0) is not requires_rounds or (
+                counts["expected_update_rows"] > 0
+            ) is not requires_updates:
+                raise ValueError(
+                    "locked split table coverage disagrees with the method"
+                )
+            contract_by_cell[str(cell_id)] = contract
+        if set(contract_by_cell) != set(runnable):
+            raise ValueError("locked split does not cover every runnable stage cell")
+
+    rows = value.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise TypeError("completed-cell rows are missing")
+    if strict:
+        assert stage is not None
+        stage_ids = {cell.cell_id for cell in registry.cells_for(stage)}
+        if any(row.get("cell_id") not in stage_ids for row in rows):
+            raise ValueError("completed-cell rows cross an industrial stage boundary")
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(str(row.get("cell_id")), []).append(row)
+        if set(grouped) != stage_ids:
+            raise ValueError(
+                "completion outcomes do not cover every declared stage cell"
+            )
+        for cell_id, cell_rows in grouped.items():
+            cell = known[cell_id]
+            if cell.runnable:
+                if len(cell_rows) != len(cell.resources.gpu_uuids) or any(
+                    row.get("status") != "MEASURED" for row in cell_rows
+                ):
+                    raise ValueError(
+                        "runnable cells require one measured outcome per claimed GPU"
+                    )
+                continue
+            if cell_rows != [
+                {
+                    "cell_id": cell_id,
+                    "status": cell.status.value,
+                    "reason_code": cell.reason_code,
+                    "reason": cell.reason,
+                }
+            ]:
+                raise ValueError(
+                    "BLOCKED/N/A cells require one exact immutable outcome row"
+                )
+
+    completed: list[str] = []
+    rank_coverage: dict[str, set[int]] = {}
+    consensus: dict[str, dict[str, object]] = {}
+    nonce_owner: dict[str, str] = {}
+    run_owner: dict[str, str] = {}
+    for row in rows:
+        cell_id = row.get("cell_id")
+        if strict and cell_id in known and not known[str(cell_id)].runnable:
+            continue
+        evidence_root = row.get("evidence_root")
+        run_id = row.get("run_id")
+        rank = row.get("rank")
+        if (
+            not _is_lower_sha256(cell_id)
+            or cell_id not in known
+            or not isinstance(evidence_root, str)
+            or not evidence_root
+            or not isinstance(run_id, str)
+            or not run_id
+            or not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or rank < 0
+            or rank >= len(known[str(cell_id)].resources.gpu_uuids)
+            or not _is_lower_sha256(row.get("evidence_sha256"))
+            or not _is_lower_sha256(row.get("terminal_receipt_sha256"))
+            or row.get("status") != "MEASURED"
+        ):
+            raise ValueError(
+                "completed cells require known identities and durable measured evidence"
+            )
+        cell = known[str(cell_id)]
+        owner = run_owner.setdefault(run_id, str(cell_id))
+        if strict and owner != cell_id:
+            raise ValueError("industrial run identity is reused across registry cells")
+        root = Path(evidence_root)
+        if strict and root.resolve() != Path(cell.resources.evidence_root).resolve():
+            raise ValueError(
+                "completed-cell evidence root differs from its resource claim"
+            )
+        evidence = load_completed_evidence(root, run_id=run_id, rank=rank)
+        if evidence is None:
+            raise ValueError("completed cell has no valid terminal evidence receipt")
+        receipt_path = root / f"{run_id}.rank{rank}.complete.json"
+        if _file_sha256(receipt_path) != row["terminal_receipt_sha256"]:
+            raise ValueError("completed-cell terminal receipt digest mismatch")
+        if evidence_files_sha256(evidence.values()) != row["evidence_sha256"]:
+            raise ValueError("completed-cell evidence digest mismatch")
+        run_columns = ["manifest_sha256", "config_sha256", "status"]
+        if strict:
+            run_columns.extend(
+                (
+                    "method",
+                    "model_pair",
+                    "repetition_block",
+                    "industrial_cell_id",
+                    "rank_config_sha256",
+                    "runtime_sha256",
+                    "split_sha256",
+                    "corpus_sha256",
+                    "arrival_trace_sha256",
+                    "request_ids_sha256",
+                    "sampling_profile_sha256",
+                    "model_lock_sha256",
+                    "patched_sglang_tree",
+                    "run_nonce_sha256",
+                    "topology_sha256",
+                    "tensor_parallel_size",
+                    "data_parallel_size",
+                    "world_size",
+                    "rank",
+                    "expected_request_rows",
+                    "expected_round_rows",
+                    "expected_update_rows",
+                    "expected_performance_rows",
+                    "workload_contract",
+                    "preflight_attestation_sha256",
+                )
+            )
+        run = pq.read_table(evidence["run"], columns=run_columns).to_pylist()
+        if len(run) != 1:
+            raise ValueError("completed evidence must contain exactly one run identity")
+        run_row = run[0]
+        if any(
+            run_row.get(name) != expected
+            for name, expected in (
+                ("manifest_sha256", registry.sha256),
+                ("config_sha256", cell_id),
+                ("status", "complete"),
+            )
+        ):
+            raise ValueError("completed evidence is not bound to its registry cell")
+        contract: dict | None = None
+        topology_sha256: str | None = None
+        if strict:
+            contract = contract_by_cell[str(cell_id)]
+            topology = cell.identity.topology
+            tensor_parallel_size = 2 if topology == "tp2_dp1" else 1
+            data_parallel_size = 2 if topology == "two_replica_tp1_dp2" else 1
+            world_size = len(cell.resources.gpu_uuids)
+            topology_sha256 = _canonical_sha256(
+                {
+                    "schema_version": 1,
+                    "cell_id": cell_id,
+                    "topology": topology,
+                    "gpu_uuids": list(cell.resources.gpu_uuids),
+                    "tensor_parallel_size": tensor_parallel_size,
+                    "data_parallel_size": data_parallel_size,
+                    "world_size": world_size,
+                }
+            )
+            expected_run = {
+                "method": cell.identity.method,
+                "model_pair": cell.identity.model,
+                "repetition_block": cell.identity.block,
+                "industrial_cell_id": cell_id,
+                "rank_config_sha256": (
+                    None
+                    if stage == "preflight"
+                    else contract["rank_config_sha256s"][rank]
+                ),
+                "runtime_sha256": value["runtime_sha256"],
+                "split_sha256": value["split_sha256"],
+                "corpus_sha256": contract["corpus_sha256"],
+                "arrival_trace_sha256": contract["arrival_trace_sha256"],
+                "request_ids_sha256": contract["request_ids_sha256"],
+                "sampling_profile_sha256": contract["sampling_profile_sha256"],
+                "model_lock_sha256": contract["model_lock_sha256"],
+                "patched_sglang_tree": PINNED_SGLANG_TREE,
+                "topology_sha256": topology_sha256,
+                "tensor_parallel_size": tensor_parallel_size,
+                "data_parallel_size": data_parallel_size,
+                "world_size": world_size,
+                "rank": rank,
+                "expected_round_rows": contract["expected_round_rows"],
+                "expected_update_rows": contract["expected_update_rows"],
+                "expected_performance_rows": contract["expected_performance_rows"],
+                "workload_contract": contract["workload_contract"],
+            }
+            closed_loop = str(cell.identity.arrival).startswith("closed_loop")
+            if not closed_loop:
+                expected_run["expected_request_rows"] = contract[
+                    "expected_request_rows"
+                ]
+            if any(
+                run_row.get(name) != expected for name, expected in expected_run.items()
+            ):
+                raise ValueError(
+                    "industrial run identity differs from its locked contract"
+                )
+            if not _is_lower_sha256(run_row.get("run_nonce_sha256")):
+                raise ValueError("industrial run lacks a content-bound nonce")
+            nonce = str(run_row["run_nonce_sha256"])
+            owner = nonce_owner.setdefault(nonce, str(cell_id))
+            if owner != cell_id:
+                raise ValueError("industrial run nonce is reused across registry cells")
+            if cell.identity.experiment == "preflight":
+                attestation_path = row.get("preflight_attestation_path")
+                if not isinstance(attestation_path, str) or not attestation_path:
+                    raise ValueError("preflight completion lacks an attestation path")
+                attestation_source = Path(attestation_path)
+                attestation_sidecar = Path(f"{attestation_source}.sha256")
+                if (
+                    not attestation_source.is_file()
+                    or attestation_source.is_symlink()
+                    or not attestation_sidecar.is_file()
+                    or attestation_sidecar.is_symlink()
+                    or attestation_source.resolve().parent != root.resolve()
+                ):
+                    raise ValueError(
+                        "preflight attestation must live in its evidence root"
+                    )
+                attestation = _load_bound_json(attestation_source)
+                attestation_sha256 = _canonical_sha256(attestation)
+                if (
+                    not isinstance(attestation, dict)
+                    or row.get("preflight_attestation_sha256") != attestation_sha256
+                    or run_row.get("preflight_attestation_sha256") != attestation_sha256
+                ):
+                    raise ValueError("preflight attestation digest mismatch")
+                required_checks = {
+                    "environment_and_patch_preflight": {
+                        "identity",
+                        "environment",
+                        "patch_apply",
+                        "compile",
+                        "patch_tests",
+                        "compatibility",
+                    },
+                    "exactness_memory_telemetry_preflight": {
+                        "exactness",
+                        "memory",
+                        "telemetry",
+                        "target_only_allocation",
+                        "static_allocation",
+                    },
+                    "simultaneous_single_gpu_interference": {
+                        "isolated",
+                        "simultaneous",
+                        "hardware",
+                        "paired_blocks",
+                    },
+                }[cell.identity.task]
+                checks = attestation.get("checks")
+                source_files = attestation.get("source_files")
+                if (
+                    not isinstance(attestation.get("schema_version"), int)
+                    or isinstance(attestation.get("schema_version"), bool)
+                    or attestation.get("schema_version") != 1
+                    or attestation.get("kind") != "industrial_preflight_attestation"
+                    or attestation.get("status") != "PASS"
+                    or attestation.get("registry_sha256") != registry.sha256
+                    or attestation.get("cell_id") != cell_id
+                    or attestation.get("runtime_sha256") != value["runtime_sha256"]
+                    or attestation.get("split_sha256") != value["split_sha256"]
+                    or attestation.get("run_nonce_sha256")
+                    != run_row["run_nonce_sha256"]
+                    or attestation.get("topology_sha256") != topology_sha256
+                    or not isinstance(attestation.get("rank"), int)
+                    or isinstance(attestation.get("rank"), bool)
+                    or attestation.get("rank") != rank
+                    or attestation.get("gpu_uuid") != cell.resources.gpu_uuids[rank]
+                    or not isinstance(checks, dict)
+                    or set(checks) != required_checks
+                    or any(result != "PASS" for result in checks.values())
+                    or not isinstance(source_files, list)
+                    or not source_files
+                    or not all(isinstance(item, str) and item for item in source_files)
+                    or len(source_files) != len(set(source_files))
+                    or not _is_lower_sha256(attestation.get("source_evidence_sha256"))
+                    or evidence_files_sha256(source_files)
+                    != attestation.get("source_evidence_sha256")
+                ):
+                    raise ValueError("preflight attestation contract is incomplete")
+                resolved_root = root.resolve()
+                source_paths = tuple(Path(item) for item in source_files)
+                if any(
+                    not source.is_file()
+                    or source.is_symlink()
+                    or (
+                        source.resolve() != resolved_root
+                        and resolved_root not in source.resolve().parents
+                    )
+                    for source in source_paths
+                ):
+                    raise ValueError(
+                        "preflight source evidence must be regular files in its root"
+                    )
+            elif (
+                run_row.get("preflight_attestation_sha256") is not None
+                or row.get("preflight_attestation_path") is not None
+                or row.get("preflight_attestation_sha256") is not None
+            ):
+                raise ValueError(
+                    "non-preflight completion carries a preflight attestation"
+                )
+
+        performance = pq.read_table(
+            evidence["performance"],
+            columns=[
+                "region",
+                "method",
+                "optimizer_bytes",
+                "trainable_parameters",
+                "training_cuda_ms",
+                "optimizer_cuda_ms",
+                "merge_cuda_ms",
+                "publish_cuda_ms",
+                "updates_launched",
+                "updates_published",
+                "exactness_violations",
+                "version_mismatches",
+                "fallbacks",
+                "nonfinite_updates",
+                "oom_events",
+                "retractions",
+                "communicator_failures",
+                "admission_rejections",
+                "timeouts",
+                "cancellations",
+                "offered_requests",
+                "admitted_requests",
+                "completed_requests",
+                "unfinished_requests",
+                "evidence_backpressure_events",
+                "evidence_dropped_rows",
+            ],
+        ).to_pylist()
+        if (
+            not performance
+            or (strict and len(performance) != contract["expected_performance_rows"])
+            or any(
+                row["method"] != cell.identity.method
+                or row["evidence_dropped_rows"] != 0
+                for row in performance
+            )
+        ):
+            raise ValueError(
+                "industrial completion requires nonempty, lossless performance evidence"
+            )
+        if cell.identity.task != "failure_injection" and any(
+            any(
+                row[field] != 0
+                for field in (
+                    "exactness_violations",
+                    "version_mismatches",
+                    "fallbacks",
+                    "nonfinite_updates",
+                    "oom_events",
+                    "retractions",
+                    "communicator_failures",
+                )
+            )
+            for row in performance
+        ):
+            raise ValueError("industrial completion contains a safety violation")
+        if strict and any(
+            not isinstance(row["evidence_backpressure_events"], int)
+            or isinstance(row["evidence_backpressure_events"], bool)
+            or row["evidence_backpressure_events"] < 0
+            for row in performance
+        ):
+            raise ValueError("industrial completion lacks backpressure accounting")
+        if cell.identity.method in {"target_only", "static"}:
+            if any(
+                row["optimizer_bytes"] != 0
+                or row["trainable_parameters"] != 0
+                or row["updates_launched"] != 0
+                or row["updates_published"] != 0
+                or any(
+                    row[field] is not None
+                    for field in (
+                        "training_cuda_ms",
+                        "optimizer_cuda_ms",
+                        "merge_cuda_ms",
+                        "publish_cuda_ms",
+                    )
+                )
+                for row in performance
+            ):
+                raise ValueError(
+                    "Target-only/Static completion allocated adaptation work"
+                )
+        elif cell.identity.task != "failure_injection" and any(
+            not isinstance(row["updates_launched"], int)
+            or row["updates_launched"] < 1
+            or not isinstance(row["updates_published"], int)
+            or row["updates_published"] < 1
+            for row in performance
+        ):
+            raise ValueError("adapted completion has no launched/published update")
+        requests = pq.read_table(
+            evidence["request"],
+            columns=[
+                "request_id",
+                "method",
+                "repetition_block",
+                "finished",
+                "outcome_status",
+                "output_sha256",
+                "arrival_ns",
+                "admitted_ns",
+                "completed_ns",
+            ],
+        ).to_pylist()
+        allowed_outcomes = {
+            "completed",
+            "rejected",
+            "timed_out",
+            "cancelled",
+            "unfinished",
+        }
+        if not requests or any(
+            row["method"] != cell.identity.method
+            or row["repetition_block"] != cell.identity.block
+            or row["outcome_status"] not in allowed_outcomes
+            or row["finished"] is not (row["outcome_status"] == "completed")
+            or (row["completed_ns"] is None and row["outcome_status"] != "unfinished")
+            or (
+                row["completed_ns"] is not None
+                and row["outcome_status"] == "unfinished"
+            )
+            or not _is_lower_sha256(row["output_sha256"])
+            for row in requests
+        ):
+            raise ValueError(
+                "industrial completion has incomplete terminal-outcome evidence"
+            )
+        request_outputs = {
+            request["request_id"]: request["output_sha256"] for request in requests
+        }
+        if len(request_outputs) != len(requests):
+            raise ValueError(
+                "industrial request evidence contains duplicate identities"
+            )
+        if strict:
+            assert contract is not None
+            closed_loop = str(cell.identity.arrival).startswith("closed_loop")
+            if closed_loop:
+                concurrency = cell.identity.concurrency
+                if concurrency is None and cell.identity.arrival == "closed_loop_c1":
+                    concurrency = 1
+                if (
+                    not isinstance(concurrency, int)
+                    or isinstance(concurrency, bool)
+                    or concurrency < 1
+                    or not requests
+                    or run_row["expected_request_rows"] != len(requests)
+                ):
+                    raise ValueError(
+                        "closed-loop request coverage lacks a realized population"
+                    )
+                actual_ids = set(request_outputs)
+                if actual_ids - set(contract["request_ids"]):
+                    raise ValueError("closed-loop evidence crosses its request pool")
+                request_by_id = {str(row["request_id"]): row for row in requests}
+                for lane in range(concurrency):
+                    seen_gap = False
+                    previous_completed_ns: int | None = None
+                    lane_request_ids = contract["request_ids"][lane::concurrency]
+                    if not lane_request_ids or lane_request_ids[0] not in actual_ids:
+                        raise ValueError(
+                            "closed-loop evidence omits a registered client lane"
+                        )
+                    for request_id in lane_request_ids:
+                        present = request_id in actual_ids
+                        if seen_gap and present:
+                            raise ValueError(
+                                "closed-loop evidence is not a per-client prefix"
+                            )
+                        if present and stage != "preflight":
+                            request = request_by_id[request_id]
+                            arrival_ns = request.get("arrival_ns")
+                            completed_ns = request.get("completed_ns")
+                            if (
+                                not isinstance(arrival_ns, int)
+                                or isinstance(arrival_ns, bool)
+                                or not isinstance(completed_ns, int)
+                                or isinstance(completed_ns, bool)
+                                or (
+                                    previous_completed_ns is None
+                                    and arrival_ns != run_row["started_ns"]
+                                )
+                                or (
+                                    previous_completed_ns is not None
+                                    and arrival_ns != previous_completed_ns
+                                )
+                            ):
+                                raise ValueError(
+                                    "closed-loop evidence is not zero-think"
+                                )
+                            previous_completed_ns = completed_ns
+                        seen_gap = seen_gap or not present
+            elif len(requests) != contract["expected_request_rows"] or set(
+                request_outputs
+            ) != set(contract["request_ids"]):
+                raise ValueError("request evidence does not match the locked split")
+            if contract["expected_round_rows"]:
+                rounds = pq.read_table(
+                    evidence["round"], columns=["request_id"]
+                ).to_pylist()
+                if len(rounds) != contract["expected_round_rows"] or {
+                    round_row["request_id"] for round_row in rounds
+                } != set(contract["request_ids"]):
+                    raise ValueError("round evidence does not match the locked split")
+            if contract["expected_update_rows"]:
+                updates = pq.read_table(
+                    evidence["update"], columns=["request_ids"]
+                ).to_pylist()
+                if len(updates) != contract["expected_update_rows"]:
+                    raise ValueError(
+                        "update evidence count differs from the locked split"
+                    )
+                for update in updates:
+                    try:
+                        update_request_ids = json.loads(update["request_ids"])
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            "update evidence has invalid request identities"
+                        ) from exc
+                    if (
+                        not isinstance(update_request_ids, list)
+                        or not update_request_ids
+                        or not set(update_request_ids) <= set(contract["request_ids"])
+                    ):
+                        raise ValueError("update evidence crosses the locked split")
+            outcome_counts = {
+                outcome: sum(
+                    request["outcome_status"] == outcome for request in requests
+                )
+                for outcome in allowed_outcomes
+            }
+            if outcome_counts["unfinished"]:
+                raise ValueError(
+                    "unfinished requests cannot enter a completed claim artifact"
+                )
+            aggregate_rows = [
+                performance_row
+                for performance_row in performance
+                if performance_row["offered_requests"] is not None
+            ]
+            if len(aggregate_rows) != 1:
+                raise ValueError(
+                    "industrial completion requires one exact load-accounting row"
+                )
+            aggregate = aggregate_rows[0]
+            expected_accounting = {
+                "offered_requests": len(requests),
+                "admitted_requests": sum(
+                    request["admitted_ns"] is not None for request in requests
+                ),
+                "completed_requests": outcome_counts["completed"],
+                "admission_rejections": outcome_counts["rejected"],
+                "timeouts": outcome_counts["timed_out"],
+                "cancellations": outcome_counts["cancelled"],
+                "unfinished_requests": outcome_counts["unfinished"],
+            }
+            if any(
+                not isinstance(aggregate.get(name), int)
+                or isinstance(aggregate.get(name), bool)
+                or aggregate.get(name) != expected
+                for name, expected in expected_accounting.items()
+            ):
+                raise ValueError(
+                    "performance load accounting differs from request outcomes"
+                )
+        covered = rank_coverage.setdefault(str(cell_id), set())
+        if rank in covered:
+            raise ValueError("completed-cell artifact duplicates a rank receipt")
+        covered.add(rank)
+        if strict:
+            current_consensus = {
+                "run_id": run_id,
+                "run_nonce_sha256": run_row["run_nonce_sha256"],
+                "topology_sha256": topology_sha256,
+                "runtime_sha256": run_row["runtime_sha256"],
+                "split_sha256": run_row["split_sha256"],
+                "request_ids_sha256": run_row["request_ids_sha256"],
+                "request_outputs": request_outputs,
+            }
+            previous_consensus = consensus.setdefault(str(cell_id), current_consensus)
+            if previous_consensus != current_consensus:
+                raise ValueError("cell ranks do not agree on one run/output identity")
+        completed.append(str(cell_id))
+    for cell_id, ranks in rank_coverage.items():
+        expected_ranks = set(range(len(known[cell_id].resources.gpu_uuids)))
+        if ranks != expected_ranks:
+            raise ValueError("completed cell lacks exact per-rank evidence coverage")
+    unique = tuple(dict.fromkeys(completed))
+    return unique, _canonical_sha256(value)
+
+
+def _interference_gate_passed(
+    path: str | None, registry: ExperimentRegistry
+) -> tuple[bool, str | None]:
+    if path is None:
+        return False, None
+    value = _load_bound_json(path)
+    if not isinstance(value, dict):
+        raise TypeError("interference receipt must be an object")
+    source_files = value.get("source_evidence_files")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "two_gpu_interference_gate"
+        or value.get("status") != "PASS"
+        or value.get("registry_sha256") != registry.sha256
+        or value.get("gpu_uuids") != list(registry.gpu_uuids)
+        or not _is_lower_sha256(value.get("source_evidence_sha256"))
+        or not isinstance(source_files, list)
+        or not source_files
+        or not all(isinstance(path, str) and path for path in source_files)
+    ):
+        raise ValueError(
+            "parallel dispatch requires a matching PASS interference receipt"
+        )
+    if evidence_files_sha256(source_files) != value["source_evidence_sha256"]:
+        raise ValueError("interference receipt does not bind its source evidence")
+    contrasts = _recompute_interference_contrasts(source_files, registry)
+    for contrast in contrasts:
+        if (
+            abs(contrast.mean_relative_gain) > 0.01
+            or contrast.ci_lower_relative_gain > 0.0
+            or contrast.ci_upper_relative_gain < 0.0
+        ):
+            raise ValueError(
+                "parallel dispatch requires <=1% throughput/ITL differences "
+                "with 95% intervals containing zero"
+            )
+    expected_metrics = {
+        contrast.name: {
+            "mean_relative_difference": contrast.mean_relative_gain,
+            "ci95_relative_difference": [
+                contrast.ci_lower_relative_gain,
+                contrast.ci_upper_relative_gain,
+            ],
+            "paired_blocks": list(contrast.block_ids),
+        }
+        for contrast in contrasts
+    }
+    if value.get("metrics") != expected_metrics:
+        raise ValueError(
+            "interference summary does not match recomputed paired evidence"
+        )
+    return True, _canonical_sha256(value)
+
+
+def _recompute_interference_contrasts(
+    source_files: list[str],
+    registry: ExperimentRegistry,
+) -> tuple[PairedBcaContrast, PairedBcaContrast]:
+    """Recompute interference contrasts from durable schema-v3 request rows."""
+    throughput: dict[str, tuple[float, float]] = {}
+    itl: dict[str, tuple[float, float]] = {}
+    used_receipts: set[str] = set()
+    interference_cells = [
+        cell
+        for cell in registry.cells_for("preflight")
+        if cell.identity.task == "simultaneous_single_gpu_interference"
+    ]
+    if len(interference_cells) != 1:
+        raise ValueError("registry lacks one interference calibration cell")
+    interference_cell = interference_cells[0]
+
+    def percentile(values: list[float], quantile: float) -> float:
+        if not values:
+            raise ValueError("interference calibration lacks exact token intervals")
+        ordered = sorted(values)
+        position = quantile * (len(ordered) - 1)
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        fraction = position - lower
+        return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+    def condition_metrics(
+        condition: object,
+        *,
+        block_id: str,
+        condition_name: str,
+    ) -> tuple[float, float]:
+        if not isinstance(condition, dict) or set(condition) != {"terminal_receipts"}:
+            raise ValueError(
+                "interference conditions must contain only terminal receipts"
+            )
+        bindings = condition["terminal_receipts"]
+        if not isinstance(bindings, list) or len(bindings) != len(registry.gpu_uuids):
+            raise ValueError(
+                "interference conditions require exact per-GPU receipt coverage"
+            )
+        observed_ranks: set[int] = set()
+        observed_gpus: set[str] = set()
+        run_ids: set[str] = set()
+        per_rank_throughput: list[float] = []
+        intervals: list[float] = []
+        for binding in bindings:
+            if not isinstance(binding, dict) or set(binding) != {
+                "path",
+                "sha256",
+                "gpu_uuid",
+            }:
+                raise ValueError("interference terminal binding schema is ambiguous")
+            raw_path = binding["path"]
+            raw_sha256 = binding["sha256"]
+            gpu_uuid = binding["gpu_uuid"]
+            if (
+                not isinstance(raw_path, str)
+                or not raw_path
+                or not _is_lower_sha256(raw_sha256)
+                or not isinstance(gpu_uuid, str)
+                or gpu_uuid not in registry.gpu_uuids
+            ):
+                raise ValueError("interference terminal binding identity is invalid")
+            receipt_path = Path(raw_path)
+            if (
+                not receipt_path.is_file()
+                or receipt_path.is_symlink()
+                or receipt_path.resolve().parent
+                != Path(interference_cell.resources.evidence_root).resolve()
+                or _file_sha256(receipt_path) != raw_sha256
+                or raw_sha256 in used_receipts
+            ):
+                raise ValueError(
+                    "interference terminal receipt is missing, reused, or changed"
+                )
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "interference terminal receipt is invalid JSON"
+                ) from error
+            if not isinstance(receipt, dict) or receipt.get("schema_version") != 3:
+                raise ValueError("interference calibration requires schema-v3 receipts")
+            run_id = receipt.get("run_id")
+            rank = receipt.get("rank")
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or not isinstance(rank, int)
+                or isinstance(rank, bool)
+                or rank < 0
+                or rank >= len(registry.gpu_uuids)
+                or gpu_uuid != registry.gpu_uuids[rank]
+                or receipt_path.name != f"{run_id}.rank{rank}.complete.json"
+            ):
+                raise ValueError("interference receipt rank/GPU identity mismatch")
+            evidence = load_completed_evidence(
+                receipt_path.parent,
+                run_id=run_id,
+                rank=rank,
+            )
+            if evidence is None:
+                raise ValueError("interference receipt has no durable evidence")
+            run_rows = pq.read_table(evidence["run"]).to_pylist()
+            request_rows = pq.read_table(evidence["request"]).to_pylist()
+            if len(run_rows) != 1 or not request_rows:
+                raise ValueError("interference receipt has incomplete raw tables")
+            run = run_rows[0]
+            block_match = re.fullmatch(r"block-([0-9]+)", block_id)
+            if (
+                block_match is None
+                or run.get("run_id") != run_id
+                or run.get("manifest_sha256") != registry.sha256
+                or run.get("config_sha256") != interference_cell.cell_id
+                or run.get("method") != "static"
+                or run.get("repetition_block") != int(block_match.group(1))
+                or run.get("status") != "complete"
+            ):
+                raise ValueError("interference run differs from the calibration cell")
+            arrivals: list[int] = []
+            completions: list[int] = []
+            output_tokens = 0
+            for request in request_rows:
+                arrival_ns = request.get("arrival_ns")
+                completed_ns = request.get("completed_ns")
+                tokens = request.get("output_tokens")
+                try:
+                    request_intervals = json.loads(request.get("inter_token_ms"))
+                except (TypeError, json.JSONDecodeError) as error:
+                    raise ValueError(
+                        "interference request lacks exact token intervals"
+                    ) from error
+                if (
+                    request.get("run_id") != run_id
+                    or request.get("method") != "static"
+                    or request.get("repetition_block") != int(block_match.group(1))
+                    or request.get("outcome_status") != "completed"
+                    or request.get("finished") is not True
+                    or not isinstance(arrival_ns, int)
+                    or isinstance(arrival_ns, bool)
+                    or not isinstance(completed_ns, int)
+                    or isinstance(completed_ns, bool)
+                    or completed_ns <= arrival_ns
+                    or not isinstance(tokens, int)
+                    or isinstance(tokens, bool)
+                    or tokens < 2
+                    or request.get("token_timing_coverage") != 1.0
+                    or request.get("coalesced_intervals") != 0
+                    or not isinstance(request_intervals, list)
+                    or len(request_intervals) != tokens - 1
+                    or any(
+                        not isinstance(item, (int, float))
+                        or isinstance(item, bool)
+                        or not math.isfinite(float(item))
+                        or float(item) < 0.0
+                        for item in request_intervals
+                    )
+                ):
+                    raise ValueError(
+                        "interference request timing/outcome evidence is incomplete"
+                    )
+                arrivals.append(arrival_ns)
+                completions.append(completed_ns)
+                output_tokens += tokens
+                intervals.extend(float(item) for item in request_intervals)
+            elapsed_s = (max(completions) - min(arrivals)) / 1_000_000_000
+            if elapsed_s <= 0.0:
+                raise ValueError("interference calibration duration is not positive")
+            observed_ranks.add(rank)
+            observed_gpus.add(gpu_uuid)
+            run_ids.add(run_id)
+            per_rank_throughput.append(output_tokens / elapsed_s)
+            used_receipts.add(str(raw_sha256))
+        if observed_ranks != set(
+            range(len(registry.gpu_uuids))
+        ) or observed_gpus != set(registry.gpu_uuids):
+            raise ValueError("interference condition lacks exact rank/GPU coverage")
+        if len(run_ids) != 1:
+            raise ValueError(
+                f"{condition_name} interference ranks do not share one run identity"
+            )
+        return sum(per_rank_throughput), percentile(intervals, 0.99)
+
+    for source_path in source_files:
+        source = _load_bound_json(source_path)
+        if not isinstance(source, dict):
+            raise TypeError("interference calibration source must be an object")
+        if set(source) != {
+            "schema_version",
+            "kind",
+            "registry_sha256",
+            "gpu_uuids",
+            "paired_blocks",
+        } or (
+            source.get("schema_version") != 2
+            or source.get("kind") != "two_gpu_interference_calibration"
+            or source.get("registry_sha256") != registry.sha256
+            or source.get("gpu_uuids") != list(registry.gpu_uuids)
+        ):
+            raise ValueError("interference calibration identity mismatch")
+        blocks = source.get("paired_blocks")
+        if not isinstance(blocks, list) or not blocks:
+            raise ValueError("interference calibration has no paired blocks")
+        for block in blocks:
+            if not isinstance(block, dict):
+                raise TypeError("interference paired block must be an object")
+            block_id = block.get("block_id")
+            isolated = block.get("isolated")
+            simultaneous = block.get("simultaneous")
+            if (
+                not isinstance(block_id, str)
+                or not block_id
+                or block_id in throughput
+                or not isinstance(isolated, dict)
+                or not isinstance(simultaneous, dict)
+                or set(block) != {"block_id", "isolated", "simultaneous"}
+            ):
+                raise ValueError("interference paired block identity is invalid")
+            isolated_metrics = condition_metrics(
+                isolated,
+                block_id=block_id,
+                condition_name="isolated",
+            )
+            simultaneous_metrics = condition_metrics(
+                simultaneous,
+                block_id=block_id,
+                condition_name="simultaneous",
+            )
+            throughput[block_id] = (simultaneous_metrics[0], isolated_metrics[0])
+            itl[block_id] = (simultaneous_metrics[1], isolated_metrics[1])
+    if len(throughput) < 4:
+        raise ValueError(
+            "interference calibration requires at least four paired blocks"
+        )
+    return (
+        paired_bca_contrast("throughput", throughput, seed=1701),
+        paired_bca_contrast("itl", itl, seed=1702),
+    )
+
+
+def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    receipts = _load_industrial_receipts(args.receipt)
+    completed, completed_sha256 = _completed_industrial_cells(
+        args.completed_cells,
+        registry,
+    )
+    interference_passed, interference_sha256 = _interference_gate_passed(
+        args.interference_receipt, registry
+    )
+    activation_plan = _load_stage_activation_plan(args.activation_plan)
+    confirmation_block_plan = _load_confirmation_block_plan(
+        args.confirmation_block_plan
+    )
+    scheduler = TwoGpuResourceScheduler(registry)
+    waves = scheduler.schedule(
+        receipts=receipts,
+        completed_cell_ids=completed,
+        interference_gate_passed=interference_passed,
+        activation_plan=activation_plan,
+        confirmation_block_plan=confirmation_block_plan,
+    )
+    experiment = registry.ready_experiment(receipts)
+    artifact = {
+        "schema_version": 1,
+        "kind": "industrial_dispatch_plan",
+        "registry_sha256": registry.sha256,
+        "experiment": experiment,
+        "dependency_receipt_sha256s": [receipt.sha256 for receipt in receipts],
+        "completed_cells_sha256": completed_sha256,
+        "interference_gate": "PASS" if interference_passed else "NOT_PASSED",
+        "interference_receipt_sha256": interference_sha256,
+        "activation_plan_sha256": (
+            activation_plan.sha256 if activation_plan is not None else None
+        ),
+        "confirmation_block_plan_sha256": (
+            confirmation_block_plan.sha256
+            if confirmation_block_plan is not None
+            else None
+        ),
+        "waves": [
+            {
+                "ordinal": ordinal,
+                "wave_sha256": wave.sha256,
+                "cells": [
+                    {
+                        "cell_id": cell.cell_id,
+                        "status": cell.status.value,
+                        "reason_code": cell.reason_code,
+                        "gpu_uuids": list(cell.resources.gpu_uuids),
+                        "ports": list(cell.resources.ports),
+                        "cache_root": cell.resources.cache_root,
+                        "evidence_root": cell.resources.evidence_root,
+                        "workload_class": cell.resources.workload_class.value,
+                    }
+                    for cell in wave.cells
+                ],
+            }
+            for ordinal, wave in enumerate(waves)
+        ],
+    }
+    _write_json(args.output, artifact)
+    print(_canonical_sha256(artifact))
+    return 0
+
+
+def _analyze_industrial(args: argparse.Namespace) -> int:
+    (
+        registry,
+        plan,
+        envelope,
+        blocks,
+        gpu_attestation,
+        doctor_report,
+        repetitions,
+        seed,
+    ) = _load_industrial_analysis_manifest(args.manifest)
+    reduction = reduce_industrial_schema_v3(
+        registry=registry,
+        confirmation_plan=plan,
+        blocks=blocks,
+        hardware_envelope=envelope,
+        gpu_attestation=gpu_attestation,
+        doctor_report=doctor_report,
+        bootstrap_repetitions=repetitions,
+        bootstrap_seed=seed,
+    )
+    artifact = reduction.artifact.to_dict()
+    if _canonical_sha256(artifact) != reduction.artifact.sha256:
+        raise RuntimeError("industrial reducer artifact digest is not canonical")
+    _write_json(args.output, artifact)
+    if _artifact_sha256(args.output) != reduction.artifact.sha256:
+        raise RuntimeError("written industrial reducer artifact identity changed")
+    print(reduction.artifact.sha256)
+    # The current release has no hardware-rooted attester. Content-bound caller
+    # artifacts remain diagnostic and can never produce a positive exit claim.
+    return 42
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "doctor":
-        print(format_doctor(args.path))
+        project_root = args.project_root or args.path or "."
+        sglang_root = args.sglang_root or args.path
+        print(format_doctor(project_root, sglang_root))
         return 0
     if args.command == "validate-config":
         config = load_run_config(args.config)
@@ -2299,6 +4180,14 @@ def main(argv: list[str] | None = None) -> int:
         manifest.write(args.output)
         print(manifest.sha256)
         return 0
+    if args.command == "build-industrial-registry":
+        return _build_industrial_registry(args)
+    if args.command == "seal-industrial-stage":
+        return _seal_industrial_stage(args)
+    if args.command == "plan-industrial-dispatch":
+        return _plan_industrial_dispatch(args)
+    if args.command == "analyze-industrial":
+        return _analyze_industrial(args)
     if args.command == "build-onlinespec-study":
         manifest = OnlineSpecManifest.default()
         manifest.write(args.output)
@@ -2349,6 +4238,8 @@ def main(argv: list[str] | None = None) -> int:
         return _render_onlinespec_tuning_runtime(args)
     if args.command == "render-static-load-runtime":
         return _render_static_load_runtime(args)
+    if args.command == "render-target-only-runtime":
+        return _render_target_only_runtime(args)
     if args.command == "render-tuning-runtime":
         return _render_tuning_runtime(args)
     if args.command == "render-replication-runtime":

@@ -5,67 +5,116 @@
 ## Source boundary
 
 SGLang is an external Apache-2.0 project. LightCone-Spec pins upstream commit
-`3312645a307453893a00778592f105581e3d1c3d` and distributes only mail-formatted
-patches. The repository contains no SGLang source, submodule, or modified
+`3312645a307453893a00778592f105581e3d1c3d` and distributes only semantic
+mail patches. The repository contains no SGLang source, submodule, or modified
 checkout. A local `sglang/` directory is ignored and is never an integration
 identity.
 
-## Series layers
+Only the complete ordered series is supported. Patch count, filenames,
+SHA-256 values, modified-file inventory, upstream identity, and expected final
+tree are read from `patches/sglang/series` and
+`patches/sglang/manifest.json`; documentation does not duplicate them as an
+independent authority.
 
-The ten-patch series has one-way semantic dependencies:
+## Schema-v3 target and verified patch surface
 
-1. strict cross-backend schema, preflight, and disabled fast path;
-2. cohort, resident optimizer and OnlineSPEC learner state, source-version,
-   CUDA-event, and publication runtime;
-3. differentiable DFlash drafter Full/LoRA and OnlineSPEC update path;
-4. cache-safe DFlash, DSpark, EAGLE, and EAGLE3 tail paths;
-5. memory accounting, lifecycle, telemetry, and profiling integration;
-6. cross-backend optimizer, proposal, exactness, and regression tests;
-7. request-boundary speculative KV headroom and bounded reservation checks;
-8. the memory-bounded LoRA-coordinate OnlineSPEC Hedge decision class and its
-   protocol regression test; and
-9. device-resident request budgets derived from committed prefixes under
-   overlap scheduling; and
-10. logical-prefix continuity across final overlap and publication rounds.
+The schema-v3 envelope defines one coherent **target** runtime surface. Items
+in this list are contracts and registry vocabulary; they are not claims that
+the current patch implements every item:
 
-Only the complete series is supported. Intermediate patch states are review
-boundaries, not runnable product variants.
+1. strict Target-only/Static/TTS/L0 and backend-native configuration with a
+   disabled path that allocates no adaptation state;
+2. common proposal evidence, backend payload validation, differentiable
+   reconstruction, and exact sampling-distribution preservation;
+3. Full/LoRA native layer plans, DSpark W1/W2/acceptance hybrids, functional
+   optimizer candidates, source/buffer/optimizer generations, and fixed-address
+   publication;
+4. DFlash, DSpark, EAGLE/EAGLE3, and NEXTN native proposal-hook contracts without
+   double-applying an adapter;
+5. one-node TP2 and sticky DP2 identity/ownership, all-rank prepare/decision/
+   receipt publication, and fail-closed process-group handling;
+6. least-rank HBM admission, fixed cohort slabs, bounded device/event telemetry,
+   durable Parquet WAL evidence, lifecycle cleanup, and focused regressions;
+7. OnlineSPEC comparison hooks folded into the same version/exactness/evidence
+   infrastructure while remaining gate-isolated.
 
-OnlineSPEC is folded into these existing semantic layers instead of creating a
-parallel runtime patch: schema in patch one, learner state in patch two,
-DFlash gradients in patch three, cross-backend tail routing in patch four,
-memory and diagnostics in patch five, protocol tests in patch six, strict
-request-boundary KV lifecycle checks in patch seven, and the optional
-low-memory Hedge decision class in patch eight, committed-prefix request
-budgets in patch nine, and logical-prefix continuity in patch ten. This
-preserves one version, event, exactness, and disabled-path implementation.
+Intermediate patch states are review boundaries, not product variants. An
+addition that depends on an earlier patch must remain in the complete series;
+the verifier never skips a patch to make a partial combination apply.
+
+The current pinned patch implements and tests strict schema-v3 parsing,
+allocation-free Target-only/Static, and TP1/DP1 DFlash native-layer Full/LoRA
+adaptation with fixed-address device-predicated publication. That is a
+lower-level patched-server surface, not end-to-end industrial executor support.
+It also makes the official SGLang serving benchmark expose the server-provided,
+ordered `output_ids` for both cumulative/incremental streaming and non-streaming
+responses. Those IDs are never reconstructed by retokenizing generated text;
+missing, discontinuous, or rewritten trajectories fail the claim-grade
+exactness gate.
+The patch does not implement the executor's required content-bound terminal
+provider hook,
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`. Therefore
+the executor runs only Target-only end to end and blocks Static/TTS/L0 before
+server launch. It also rejects the following before model loading because their
+execution contracts are not implemented:
+
+- DSpark, EAGLE, EAGLE3, and NEXTN adaptation;
+- every TP2 or DP2 run;
+- positive extra logical publication delay and nonconstant optimizer schedules;
+- DSpark composite-head training and NEXTN training interfaces.
+
+Those rows remain `BLOCKED`, not simulated through DFlash or reported as
+`UNMEASURED` runnable work. The lower-level DFlash implementation cannot be
+promoted to claimable evidence without the exact terminal hook bound to the
+pinned tree. No CUDA graph, multi-GPU, speed, capacity, or other GPU result is
+reported by this release.
 
 ## Application
 
 `patches/sglang/apply.sh` accepts only a clean checkout at the exact upstream
-HEAD. It verifies every patch digest, applies with `git am`, and checks the
-final Git tree recorded in `manifest.json`:
+HEAD. It checks the registered patch digests, applies in order with `git am`,
+and compares the resulting Git tree with the manifest:
 
 ```bash
 patches/sglang/apply.sh /path/to/clean-sglang
 ```
 
-Any dirty state, wrong commit, changed patch, failed mail application, or final
-tree mismatch stops immediately. The script never rebases, stashes, resets, or
-edits the supplied checkout to make a mismatch disappear.
+Dirty state, a wrong commit, modified patch bytes, mail-application failure, or
+final-tree mismatch stops immediately. The script does not stash, reset,
+rebase, or edit the supplied checkout to hide a mismatch.
 
 ## Verification and authoring
 
-Run the disposable verifier before publishing:
+Use a separate clean upstream checkout:
 
 ```bash
 python scripts/verify_sglang_patchset.py \
   --upstream-checkout /path/to/clean-upstream
 ```
 
-New integration changes are patch-first: create a temporary branch from the
-pin, make one semantic commit, add focused tests, export with `git format-patch`,
-then update `series`, patch SHA-256 values, modified-file lists, expected final
-tree, Python pin constants, NOTICE, and documentation together. Finally verify
-application and reverse removal while confirming the original upstream source
-remains clean.
+The verifier must apply the full series in a disposable clone, confirm the
+expected tree and modified-file inventory, compile changed Python, run the
+requested focused tests, reverse the series, and prove the caller's upstream
+checkout stayed clean.
+
+New integration work is patch-first: branch temporarily from the pin, make a
+focused semantic commit with tests, export through `git format-patch`, and
+update series order, patch digests, modified files, expected final tree, Python
+pin constants, NOTICE, and EN/zh documentation atomically. Never edit or
+commit a patched checkout.
+
+## Current evidence gate
+
+The final schema-v3 patch has passed the repository's complete
+apply/compile/focused-test/reverse verifier. That is a patch-integrity result,
+not GPU validation. A CPU package test or an older patched-tree receipt is
+insufficient. TP1/DP1 DFlash is implemented only below the executor boundary;
+because no provider implements the exact native terminal hook, Static/TTS/L0
+industrial cells are `BLOCKED` before mutation rather than runnable
+`UNMEASURED` work. DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2
+cell remain `BLOCKED`. Target-only is the only end-to-end executor path.
+
+Historical v2 evidence remains useful for regression comparison only. It does
+not carry the new Target-only, backend-plan, topology, registry, trace,
+statistics, or telemetry identities and cannot be upgraded by changing a
+label.
