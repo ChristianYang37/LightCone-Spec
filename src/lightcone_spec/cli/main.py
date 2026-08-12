@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import math
 import os
+import stat
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import NoReturn
@@ -21,6 +24,8 @@ from lightcone_spec import (
 )
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
+from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.experiments.capacity_authority import bind_capacity_authority
 from lightcone_spec.experiments.data import (
     DFLASH_MODEL_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -43,11 +48,18 @@ from lightcone_spec.experiments.industrial_analysis import (
     BoundArtifact,
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
+    RawEvidenceAliasManifest,
     _validate_allocation_free_performance,
     _validate_disabled_session_run_fields,
+    raw_evidence_alias_manifest_from_dict,
     reduce_confirmation_family_power,
     reduce_e2_stage_from_raw,
+    reduce_evidence_alias,
     reduce_industrial_schema_v3,
+)
+from lightcone_spec.experiments.inventory import (
+    build_serial_interference_envelope,
+    collect_gpu_inventory,
 )
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_METHODS,
@@ -67,32 +79,39 @@ from lightcone_spec.experiments.onlinespec import (
     verify_onlinespec_source_checkout,
 )
 from lightcone_spec.experiments.planning import (
-    BudgetInventoryIdentity,
+    BudgetDispositionStatus,
     BudgetObservationReceipt,
+    BudgetPlan,
     ConfirmationFamilyPowerReductionArtifact,
     DispositionStatus,
     EvidenceDependenceMap,
     FamilyActivationArtifact,
+    budget_inventory_identity_from_gpu_inventory,
     build_evidence_dependence_map,
     estimate_industrial_budget,
     materialize_confirmation_pilots,
     materialize_confirmation_prefix,
     materialize_e2_final_recipe,
+    materialize_industrial_budgets,
     reduce_e1_activation,
     reduce_e2_activation,
 )
 from lightcone_spec.experiments.planning_artifacts import (
+    budget_load_binding_from_dict,
+    budget_plan_from_dict,
+    budget_plan_to_dict,
+    budget_policy_from_dict,
+    capacity_envelope_from_dict,
     confirmation_family_identity_from_dict,
     confirmation_family_power_reduction_artifact_to_dict,
     e1_pareto_artifact_from_dict,
     e2_final_recipe_artifact_from_dict,
     e2_stage_reduction_artifact_to_dict,
-    evidence_alias_receipt_from_dict,
-    evidence_alias_receipt_to_dict,
+    evidence_alias_reduction_artifact_from_dict,
+    evidence_alias_reduction_artifact_to_dict,
     evidence_dependence_map_from_dict,
     evidence_dependence_map_to_dict,
     experiment_budget_from_dict,
-    experiment_budget_sequence_from_dict,
     family_activation_artifact_from_dict,
     family_activation_artifact_to_dict,
     industrial_budget_report_to_dict,
@@ -135,6 +154,14 @@ from lightcone_spec.experiments.selection import (
     select_heldout_anchor,
     select_shared_config,
 )
+from lightcone_spec.experiments.stage_activation import (
+    RegistryStageActivationArtifact,
+    RegistryStageDispositionStatus,
+    materialize_registry_stage_activation,
+    registry_stage_activation_from_dict,
+    registry_stage_activation_to_dict,
+    verify_registry_stage_activation,
+)
 from lightcone_spec.experiments.statistics import (
     HardwareEnvelope,
     evaluate_speed_gate,
@@ -150,6 +177,10 @@ from lightcone_spec.orchestration import (
     render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
+from lightcone_spec.orchestration.execution_bundle import (
+    ExecutionBundleBlockedError,
+    execute_dispatch_wave_bundles,
+)
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.sglang_bridge import (
     SGLangHTTPClient,
@@ -159,23 +190,134 @@ from lightcone_spec.sglang_bridge import (
 from lightcone_spec.telemetry import OUTPUT_HASH_FORMAT, load_completed_evidence
 
 
+def _read_regular_bytes(path: Path, *, label: str) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} is not a readable regular file: {path}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} is not a regular file: {path}")
+        body = bytearray()
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            body.extend(block)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+            or not stat.S_ISREG(current.st_mode)
+        ):
+            raise ValueError(f"{label} changed while it was read: {path}")
+        return bytes(body)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_immutable_bytes(path: Path, body: bytes, *, label: str) -> None:
+    try:
+        existing = _read_regular_bytes(path, label=label)
+    except ValueError:
+        if path.exists() or path.is_symlink():
+            raise
+    else:
+        if existing != body:
+            raise ValueError(f"refusing to overwrite immutable artifact {path}")
+        return
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if _read_regular_bytes(path, label=label) != body:
+                raise ValueError(f"refusing to overwrite immutable artifact {path}")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _write_json(path: str | Path, value: object) -> None:
-    output = Path(path)
+    output = Path(os.path.abspath(os.fspath(path)))
     output.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    if output.exists() and output.read_text(encoding="utf-8") != body:
-        raise ValueError(f"refusing to overwrite immutable artifact {output}")
-    output.write_text(body, encoding="utf-8")
+    if output.parent.is_symlink() or output.parent.resolve() != output.parent:
+        raise ValueError("artifact parent must be an existing resolved directory")
+    body = (json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
     digest = _canonical_sha256(value)
     sidecar = Path(f"{output}.sha256")
-    if sidecar.exists() and sidecar.read_text(encoding="utf-8").strip() != digest:
-        raise ValueError(f"artifact sidecar does not match {output}")
-    sidecar.write_text(digest + "\n", encoding="utf-8")
+    _publish_immutable_bytes(output, body, label="JSON artifact")
+    _publish_immutable_bytes(
+        sidecar,
+        f"{digest}\n".encode("ascii"),
+        label="JSON artifact sidecar",
+    )
+    directory = os.open(output.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _canonical_sha256(value: object) -> str:
-    body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    body = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
     return hashlib.sha256(body).hexdigest()
+
+
+def _strict_json_bytes(body: bytes, *, label: str) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"{label} contains duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> NoReturn:
+        raise ValueError(f"{label} contains non-finite JSON constant {value!r}")
+
+    try:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not strict UTF-8 JSON") from error
+
+    def reject_nonfinite(item: object) -> None:
+        if type(item) is float and not math.isfinite(item):
+            raise ValueError(f"{label} contains a non-finite JSON number")
+        if type(item) is dict:
+            for nested in item.values():
+                reject_nonfinite(nested)
+        elif type(item) is list:
+            for nested in item:
+                reject_nonfinite(nested)
+
+    reject_nonfinite(value)
+    return value
 
 
 def _is_lower_sha256(value: object) -> bool:
@@ -221,23 +363,28 @@ def _validate_request_output_identity(row: dict[str, object]) -> None:
 
 
 def _file_sha256(path: str | Path) -> str:
-    source = Path(path)
-    if not source.is_file() or source.is_symlink():
-        raise ValueError(f"content-bound artifact is not a regular file: {source}")
-    digest = hashlib.sha256()
-    with source.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    source = Path(os.path.abspath(os.fspath(path)))
+    return hashlib.sha256(
+        _read_regular_bytes(source, label="content-bound artifact")
+    ).hexdigest()
 
 
 def _load_bound_json(path: str | Path) -> object:
-    source = Path(path)
-    value = json.loads(source.read_text(encoding="utf-8"))
+    source = Path(os.path.abspath(os.fspath(path)))
+    value = _strict_json_bytes(
+        _read_regular_bytes(source, label="JSON artifact"),
+        label="JSON artifact",
+    )
     sidecar = Path(f"{source}.sha256")
-    if not sidecar.is_file() or sidecar.read_text(
-        encoding="utf-8"
-    ).strip() != _canonical_sha256(value):
+    try:
+        sidecar_value = _read_regular_bytes(
+            sidecar, label="JSON artifact sidecar"
+        ).decode("ascii")
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError(
+            f"JSON artifact sidecar is missing or invalid: {source}"
+        ) from error
+    if sidecar_value != f"{_canonical_sha256(value)}\n":
         raise ValueError(f"JSON artifact sidecar is missing or invalid: {source}")
     return value
 
@@ -328,8 +475,8 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
     logical_gpu_slots = parameters.get("logical_gpu_slots")
     if (
         not isinstance(logical_gpu_slots, list)
-        or len(logical_gpu_slots) != 2
-        or len(set(logical_gpu_slots)) != 2
+        or not logical_gpu_slots
+        or len(set(logical_gpu_slots)) != len(logical_gpu_slots)
         or not all(
             isinstance(item, str)
             and item.strip()
@@ -338,7 +485,7 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
             for item in logical_gpu_slots
         )
     ):
-        raise ValueError("industrial registry requires two logical rank slots")
+        raise ValueError("industrial registry requires unique logical rank slots")
     if (
         type(parameters["base_port"]) is not int
         or type(parameters["seed"]) is not int
@@ -349,7 +496,7 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
     ):
         raise TypeError("industrial registry parameter types do not match schema")
     registry = build_industrial_registry(
-        gpu_uuids=(logical_gpu_slots[0], logical_gpu_slots[1]),
+        gpu_uuids=tuple(logical_gpu_slots),
         base_port=parameters["base_port"],
         cache_root=parameters["cache_root"],
         evidence_root=parameters["evidence_root"],
@@ -380,12 +527,125 @@ def _load_interference_envelope(path: str | Path) -> InterferenceEnvelope:
     return envelope
 
 
-def _load_experiment_budgets(path: str | Path):
-    value = _load_bound_json(path)
-    budgets = experiment_budget_sequence_from_dict(value)
-    if not budgets:
-        raise ValueError("experiment budget artifact cannot be empty")
-    return budgets
+def _load_budget_plan(path: str | Path) -> BudgetPlan:
+    return budget_plan_from_dict(_load_bound_json(path))
+
+
+def _load_budget_materialization_inputs(
+    *,
+    policy_path: str | Path,
+    load_binding_paths: list[str],
+    capacity_envelope_path: str | Path,
+    capacity_manifest_path: str | Path | None = None,
+    capacity_verification_receipt_path: str | Path | None = None,
+):
+    policy = budget_policy_from_dict(_load_bound_json(policy_path))
+    bindings = tuple(
+        budget_load_binding_from_dict(_load_bound_json(path))
+        for path in load_binding_paths
+    )
+    if len({binding.cell_id for binding in bindings}) != len(bindings):
+        raise ValueError("duplicate budget load binding")
+    capacity = capacity_envelope_from_dict(_load_bound_json(capacity_envelope_path))
+    if (capacity_manifest_path is None) != (capacity_verification_receipt_path is None):
+        raise ValueError(
+            "capacity manifest and verification receipt must be supplied together"
+        )
+    capacity_authority = (
+        None
+        if capacity_manifest_path is None
+        else bind_capacity_authority(
+            capacity_manifest_path,
+            capacity_verification_receipt_path,
+        )
+    )
+    return policy, bindings, capacity, capacity_authority
+
+
+def _load_budget_activation_bundle(
+    *,
+    activation_paths: list[str],
+    family_activation_paths: list[str],
+    family_power_plan_paths: list[str],
+):
+    activations = tuple(
+        artifact
+        for path in activation_paths
+        if (artifact := _load_stage_activation_plan(path)) is not None
+    )
+    if len({artifact.sha256 for artifact in activations}) != len(activations):
+        raise ValueError("duplicate reducer activation artifact")
+    family_activations = _load_family_activations(family_activation_paths)
+    family_power_reductions = _load_family_power_reductions(family_power_plan_paths)
+    if not activations and not family_activations:
+        raise RuntimeError(
+            "industrial budget materialization is BLOCKED: "
+            "reducer_owned_activation_manifest_missing; no bound reducer-owned "
+            "activation manifest was supplied"
+        )
+    return activations, family_activations, family_power_reductions
+
+
+def _rematerialize_budget_plan(
+    *,
+    registry: ExperimentRegistry,
+    gpu_inventory: GpuInventory,
+    declared_plan_path: str | Path,
+    activation_paths: list[str],
+    family_activation_paths: list[str],
+    family_power_plan_paths: list[str],
+    policy_path: str | Path,
+    load_binding_paths: list[str],
+    capacity_envelope_path: str | Path,
+    capacity_manifest_path: str | Path | None = None,
+    capacity_verification_receipt_path: str | Path | None = None,
+    require_ready: bool = True,
+) -> tuple[BudgetPlan, tuple, tuple, tuple]:
+    """Rebuild one plan from raw authority and reject serialized-plan trust."""
+
+    activations, family_activations, family_power_reductions = (
+        _load_budget_activation_bundle(
+            activation_paths=activation_paths,
+            family_activation_paths=family_activation_paths,
+            family_power_plan_paths=family_power_plan_paths,
+        )
+    )
+    (
+        policy,
+        load_bindings,
+        capacity_envelope,
+        capacity_authority,
+    ) = _load_budget_materialization_inputs(
+        policy_path=policy_path,
+        load_binding_paths=load_binding_paths,
+        capacity_envelope_path=capacity_envelope_path,
+        capacity_manifest_path=capacity_manifest_path,
+        capacity_verification_receipt_path=(capacity_verification_receipt_path),
+    )
+    rematerialized = materialize_industrial_budgets(
+        registry,
+        activations=activations,
+        family_activations=family_activations,
+        family_power_reductions=family_power_reductions,
+        load_bindings=load_bindings,
+        policy=policy,
+        inventory=budget_inventory_identity_from_gpu_inventory(gpu_inventory),
+        capacity_envelope=capacity_envelope,
+        capacity_authority=capacity_authority,
+    )
+    declared = _load_budget_plan(declared_plan_path)
+    if declared != rematerialized or declared.sha256 != rematerialized.sha256:
+        raise ValueError(
+            "serialized BudgetPlan differs from first-party rematerialization"
+        )
+    if require_ready:
+        declared.require_ready()
+    return (
+        declared,
+        activations,
+        family_activations,
+        family_power_reductions,
+    )
 
 
 def _industrial_receipt_from_value(value: object) -> ExperimentReceipt:
@@ -438,10 +698,90 @@ def _load_industrial_receipts(paths: list[str]) -> tuple[ExperimentReceipt, ...]
     )
 
 
+def _load_registry_stage_activation_manifest(
+    path: str | Path,
+) -> RegistryStageActivationArtifact:
+    value = _load_bound_json(path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "experiment",
+        "runtime_artifact",
+        "split_artifact",
+        "dependency_receipts",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("registry-stage activation manifest fields differ")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("kind") != ("industrial_registry_stage_activation_manifest")
+    ):
+        raise ValueError("registry-stage activation manifest identity mismatch")
+
+    def artifact_path(name: str) -> str:
+        candidate = value.get(name)
+        if (
+            not isinstance(candidate, str)
+            or not candidate.strip()
+            or "\n" in candidate
+            or "\r" in candidate
+        ):
+            raise ValueError(f"registry-stage manifest {name} is invalid")
+        return candidate
+
+    experiment = value.get("experiment")
+    if (
+        not isinstance(experiment, str)
+        or not experiment.strip()
+        or "\n" in experiment
+        or "\r" in experiment
+    ):
+        raise ValueError("registry-stage manifest experiment is invalid")
+    dependency_paths = value.get("dependency_receipts")
+    if (
+        not isinstance(dependency_paths, list)
+        or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or "\n" in item
+            or "\r" in item
+            for item in dependency_paths
+        )
+        or len(dependency_paths) != len(set(dependency_paths))
+    ):
+        raise ValueError(
+            "registry-stage dependency receipt paths must be unique strings"
+        )
+    registry = _load_industrial_registry(artifact_path("registry_artifact"))
+    artifact = materialize_registry_stage_activation(
+        registry,
+        experiment=experiment,
+        dependency_receipts=_load_industrial_receipts(dependency_paths),
+        runtime_sha256=_artifact_sha256(artifact_path("runtime_artifact")),
+        split_sha256=_artifact_sha256(artifact_path("split_artifact")),
+    )
+    verify_registry_stage_activation(registry, artifact)
+    return artifact
+
+
 def _load_stage_activation_plan(path: str | None):
     if path is None:
         return None
     value = _load_bound_json(path)
+    if (
+        isinstance(value, dict)
+        and value.get("kind") == "industrial_registry_stage_activation_manifest"
+    ):
+        return _load_registry_stage_activation_manifest(path)
+    if (
+        isinstance(value, dict)
+        and value.get("artifact_kind") == "registry_stage_activation"
+    ):
+        raise ValueError(
+            "registry-stage consumers require the bound raw activation manifest"
+        )
     if (
         isinstance(value, dict)
         and value.get("kind") == "industrial_e2_activation_manifest"
@@ -585,6 +925,9 @@ def _industrial_physical_assignment_from_dict(
         "inventory_source_receipt_sha256",
         "dispatch_plan_sha256",
         "experiment_budget_sha256",
+        "budget_plan_sha256",
+        "capacity_authority_sha256",
+        "budget_materialization_authority_sha256",
         "assignment_sha256",
         "work_item_sha256",
         "gpu_uuids",
@@ -598,7 +941,7 @@ def _industrial_physical_assignment_from_dict(
     }
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("physical assignment receipt fields differ from schema")
-    if value.get("schema_version") != 1 or value.get("kind") != (
+    if value.get("schema_version") != 3 or value.get("kind") != (
         "industrial_physical_assignment"
     ):
         raise ValueError("physical assignment receipt identity mismatch")
@@ -629,6 +972,11 @@ def _industrial_physical_assignment_from_dict(
             inventory_source_receipt_sha256=value["inventory_source_receipt_sha256"],
             dispatch_plan_sha256=value["dispatch_plan_sha256"],
             experiment_budget_sha256=value["experiment_budget_sha256"],
+            budget_plan_sha256=value["budget_plan_sha256"],
+            capacity_authority_sha256=value["capacity_authority_sha256"],
+            budget_materialization_authority_sha256=value[
+                "budget_materialization_authority_sha256"
+            ],
             assignment_sha256=value["assignment_sha256"],
             work_item_sha256=value["work_item_sha256"],
             gpu_uuids=tuple(gpu_uuids),
@@ -799,23 +1147,43 @@ def _industrial_completion_activation_contract(
             current.extend(artifact.dispositions)
         disposition_rows = tuple(current)
     else:
-        if activation_artifact is not None or family_rows or power_rows:
-            raise ValueError("activation artifacts do not belong to this stage")
+        if family_rows or power_rows:
+            raise ValueError("family artifacts do not belong to this stage")
+        if not isinstance(activation_artifact, RegistryStageActivationArtifact):
+            raise ValueError(
+                "generic stage completion requires reducer-owned registry activation"
+            )
+        verify_registry_stage_activation(registry, activation_artifact)
+        if (
+            activation_artifact.experiment != experiment
+            or activation_artifact.runtime_sha256 != runtime_sha256
+            or activation_artifact.split_sha256 != split_sha256
+            or activation_artifact.direct_dependency_receipt_sha256
+            != direct_dependency_receipt_sha256
+        ):
+            raise ValueError(
+                "registry-stage activation runtime/split/dependency identity mismatch"
+            )
+        if require_stage_sealable and activation_artifact.status != "AVAILABLE":
+            raise ValueError(
+                "generic stage cannot seal without an AVAILABLE registry activation"
+            )
+        status_map = {
+            RegistryStageDispositionStatus.ACTIVATED: DispositionStatus.ACTIVATED,
+            RegistryStageDispositionStatus.BLOCKED: DispositionStatus.BLOCKED,
+            RegistryStageDispositionStatus.NOT_APPLICABLE: (
+                DispositionStatus.NOT_APPLICABLE
+            ),
+        }
         disposition_rows = tuple(
             {
-                "cell_id": cell.cell_id,
-                "status": (
-                    DispositionStatus.ACTIVATED
-                    if cell.runnable
-                    else DispositionStatus(cell.status.value)
-                ),
-                "reason_code": (
-                    "registry_materialized" if cell.runnable else cell.reason_code
-                ),
+                "cell_id": row.cell_id,
+                "status": status_map[row.status],
+                "reason_code": row.reason_code,
             }
-            for cell in stage_cells.values()
+            for row in activation_artifact.dispositions
         )
-        activation_round = "registry_materialized"
+        activation_round = activation_artifact.activation_round
 
     for row in disposition_rows:
         if isinstance(row, dict):
@@ -1413,6 +1781,7 @@ def _load_industrial_analysis_manifest(
     GpuInventory,
     HardwareEnvelope,
     tuple[IndustrialBlockEvidence, ...],
+    tuple[RawEvidenceAliasManifest, ...],
     EvidenceDependenceMap | None,
     BoundArtifact | None,
     BoundArtifact | None,
@@ -1437,6 +1806,7 @@ def _load_industrial_analysis_manifest(
         "final_activation",
         "confirmation_power_manifest",
         "gpu_inventory",
+        "evidence_alias_manifests",
         "evidence_dependence_map",
         "gpu_attestation",
         "doctor_report",
@@ -1447,7 +1817,7 @@ def _load_industrial_analysis_manifest(
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("industrial analysis manifest fields do not match schema")
     if (
-        value.get("schema_version") != 2
+        value.get("schema_version") != 3
         or value.get("kind") != "industrial_analysis_manifest"
     ):
         raise ValueError("industrial analysis manifest identity mismatch")
@@ -1481,6 +1851,23 @@ def _load_industrial_analysis_manifest(
         label="analysis GPU inventory",
     )
     inventory = _load_gpu_inventory(inventory_path)
+    raw_alias_bindings = value.get("evidence_alias_manifests")
+    if type(raw_alias_bindings) is not list:
+        raise ValueError("industrial analysis alias manifests must be a JSON array")
+    alias_manifests = tuple(
+        raw_evidence_alias_manifest_from_dict(
+            _load_bound_json(
+                _analysis_bound_json_path(
+                    manifest_path,
+                    binding,
+                    label=f"raw evidence alias manifest {index}",
+                )
+            )
+        )
+        for index, binding in enumerate(raw_alias_bindings)
+    )
+    if len({manifest.sha256 for manifest in alias_manifests}) != len(alias_manifests):
+        raise ValueError("duplicate raw evidence alias manifest")
     raw_dependence = value.get("evidence_dependence_map")
     dependence = None
     if raw_dependence is not None:
@@ -1564,6 +1951,7 @@ def _load_industrial_analysis_manifest(
         inventory,
         envelope,
         blocks,
+        alias_manifests,
         dependence,
         gpu_attestation,
         doctor_report,
@@ -1601,6 +1989,7 @@ def _static_load_rows(
         "phase": "static_load_screen",
         "manifest_sha256": manifest.sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["load"],
     }
     if any(
@@ -1633,6 +2022,9 @@ def _formal_table_metadata(
         b"lightcone_sampling_profile_sha256": (
             manifest.sampling_profile_sha256.encode()
         ),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
+        ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_sha256).encode(),
         b"lightcone_source_evidence_sha256": source_evidence_sha256.encode(),
@@ -1657,6 +2049,9 @@ def _load_formal_table(
         b"lightcone_model_lock_sha256": model_lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": (
             manifest.sampling_profile_sha256.encode()
+        ),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
         ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
@@ -1700,11 +2095,11 @@ def _parser() -> argparse.ArgumentParser:
     build_industrial = commands.add_parser("build-industrial-registry")
     build_industrial.add_argument(
         "--logical-gpu-slot",
-        nargs=2,
+        nargs="+",
         default=("logical-rank-slot-0", "logical-rank-slot-1"),
-        metavar=("SLOT_0", "SLOT_1"),
+        metavar="SLOT",
         help=(
-            "two stable logical rank slots; physical GPU UUIDs come only from "
+            "one or more stable logical rank slots; physical GPU UUIDs come only from "
             "the inventory and frozen dispatch assignment"
         ),
     )
@@ -1713,6 +2108,16 @@ def _parser() -> argparse.ArgumentParser:
     build_industrial.add_argument("--evidence-root", default="artifacts/industrial")
     build_industrial.add_argument("--seed", type=int, default=20260811)
     build_industrial.add_argument("--output", required=True)
+
+    collect_inventory = commands.add_parser("collect-gpu-inventory")
+    collect_inventory.add_argument("--challenge-nonce-sha256", required=True)
+    collect_inventory.add_argument("--receipt-output", required=True)
+    collect_inventory.add_argument("--output", required=True)
+
+    build_interference = commands.add_parser("build-interference-envelope")
+    build_interference.add_argument("--inventory", required=True)
+    build_interference.add_argument("--receipt-output", required=True)
+    build_interference.add_argument("--output", required=True)
 
     seal_industrial = commands.add_parser("seal-industrial-stage")
     seal_industrial.add_argument("--registry", required=True)
@@ -1734,13 +2139,43 @@ def _parser() -> argparse.ArgumentParser:
     plan_industrial.add_argument("--inventory", required=True)
     plan_industrial.add_argument("--interference-envelope", required=True)
     plan_industrial.add_argument("--budget-plan", required=True)
+    plan_industrial.add_argument("--budget-policy", required=True)
+    plan_industrial.add_argument("--budget-load-binding", action="append", default=[])
+    plan_industrial.add_argument("--capacity-envelope", required=True)
+    plan_industrial.add_argument("--capacity-manifest")
+    plan_industrial.add_argument("--capacity-verification-receipt")
     plan_industrial.add_argument("--receipt", action="append", default=[])
     plan_industrial.add_argument("--completed-cells")
     plan_industrial.add_argument("--completed-e2-stage-manifest")
-    plan_industrial.add_argument("--activation-plan")
+    plan_industrial.add_argument("--activation-plan", action="append", default=[])
     plan_industrial.add_argument("--family-activation", action="append", default=[])
     plan_industrial.add_argument("--family-power-plan", action="append", default=[])
     plan_industrial.add_argument("--output", required=True)
+
+    execute_wave = commands.add_parser("execute-dispatch-wave", allow_abbrev=False)
+    execute_wave.add_argument("--bundle", action="append", default=[])
+    execute_wave.add_argument("--wave-index", type=int, required=True)
+    execute_wave.add_argument("--resume-receipt")
+    execute_wave.add_argument("--receipt-output", required=True)
+
+    materialize_budget = commands.add_parser("materialize-industrial-budgets")
+    materialize_budget.add_argument("--registry", required=True)
+    materialize_budget.add_argument("--activation-plan", action="append", default=[])
+    materialize_budget.add_argument("--family-activation", action="append", default=[])
+    materialize_budget.add_argument("--family-power-plan", action="append", default=[])
+    materialize_budget.add_argument("--budget-policy", required=True)
+    materialize_budget.add_argument(
+        "--budget-load-binding", action="append", default=[]
+    )
+    materialize_budget.add_argument("--capacity-envelope", required=True)
+    materialize_budget.add_argument("--capacity-manifest")
+    materialize_budget.add_argument("--capacity-verification-receipt")
+    materialize_budget.add_argument("--inventory", required=True)
+    materialize_budget.add_argument("--output", required=True)
+
+    materialize_stage = commands.add_parser("materialize-stage-activation")
+    materialize_stage.add_argument("--manifest", required=True)
+    materialize_stage.add_argument("--output", required=True)
 
     estimate_budget = commands.add_parser("estimate-industrial-budget")
     estimate_budget.add_argument("--registry", required=True)
@@ -1748,7 +2183,13 @@ def _parser() -> argparse.ArgumentParser:
     estimate_budget.add_argument("--family-activation", action="append", default=[])
     estimate_budget.add_argument("--family-power-plan", action="append", default=[])
     estimate_budget.add_argument("--inventory", required=True)
-    estimate_budget.add_argument("--budgets", required=True)
+    estimate_budget.add_argument("--interference-envelope", required=True)
+    estimate_budget.add_argument("--budget-plan", required=True)
+    estimate_budget.add_argument("--budget-policy", required=True)
+    estimate_budget.add_argument("--budget-load-binding", action="append", default=[])
+    estimate_budget.add_argument("--capacity-envelope", required=True)
+    estimate_budget.add_argument("--capacity-manifest")
+    estimate_budget.add_argument("--capacity-verification-receipt")
     estimate_budget.add_argument("--output", required=True)
 
     reduce_e1 = commands.add_parser("reduce-e1-activation")
@@ -1778,13 +2219,18 @@ def _parser() -> argparse.ArgumentParser:
     family_prefix.add_argument("--power-manifest", required=True)
     family_prefix.add_argument("--output", required=True)
 
-    validate_alias = commands.add_parser("validate-evidence-alias")
-    validate_alias.add_argument("--alias", required=True)
+    validate_alias = commands.add_parser("validate-evidence-alias", allow_abbrev=False)
+    validate_alias.add_argument("--manifest", required=True)
+    validate_alias.add_argument("--registry", required=True)
+    validate_alias.add_argument("--inventory", required=True)
+    validate_alias.add_argument("--hardware-envelope", required=True)
     validate_alias.add_argument("--output", required=True)
 
-    dependence = commands.add_parser("build-evidence-dependence-map")
+    dependence = commands.add_parser(
+        "build-evidence-dependence-map", allow_abbrev=False
+    )
     dependence.add_argument("--direct-map", required=True)
-    dependence.add_argument("--alias", action="append", default=[])
+    dependence.add_argument("--alias-reduction", action="append", default=[])
     dependence.add_argument("--output", required=True)
 
     analyze_industrial = commands.add_parser("analyze-industrial")
@@ -2164,6 +2610,8 @@ def _select(args: argparse.Namespace) -> int:
         raise ValueError("selection inputs belong to a different model lock")
     if (
         tuning_artifact.get("sampling_profile_sha256") != sampling.sha256
+        or tuning_artifact.get("execution_policy_sha256")
+        != manifest.execution_policy_sha256
         or tuning_artifact.get("window_sha256")
         != manifest.controlled_window_hashes["tune"]
         or tuning_artifact.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
@@ -2270,6 +2718,7 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
         or value.get("manifest_sha256") != manifest.sha256
         or value.get("model_lock_sha256") != lock.sha256
         or value.get("sampling_profile_sha256") != sampling.sha256
+        or value.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or value.get("window_sha256") != manifest.tuning_window_sha256
         or value.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
         or value.get("stage") != len(ONLINE_SPEC_TUNING_STAGES) - 1
@@ -2520,6 +2969,7 @@ def _collect_static_load(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": next(iter(model_locks)),
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": expected_window,
         "rows": rows,
     }
@@ -2550,6 +3000,7 @@ def _advance_tuning(args: argparse.Namespace) -> int:
             or prior.get("stage") != args.stage - 1
             or not isinstance(prior.get("survivors"), list)
             or prior.get("sampling_profile_sha256") != manifest.sampling_profile_sha256
+            or prior.get("execution_policy_sha256") != manifest.execution_policy_sha256
             or prior.get("window_sha256") != manifest.controlled_window_hashes["tune"]
             or prior.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
             or (args.stage == 1 and prior.get("prior_stage_sha256") is not None)
@@ -2598,6 +3049,7 @@ def _advance_tuning(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": model_lock_sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["tune"],
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "concurrency": concurrency,
@@ -2675,6 +3127,8 @@ def _assert_locked_config(
 ) -> None:
     if config.runtime.sampling_profile_sha256 != sampling_profile.sha256:
         raise ValueError("run config does not match the sampling profile")
+    if config.runtime.execution_policy_sha256 != ControlledExecutionPolicy().sha256:
+        raise ValueError("run config does not match the registered execution policy")
     locked = {model.model_id: model.revision for model in model_lock.models}
     pair = config.model
     if (
@@ -2700,6 +3154,7 @@ def _load_target_reference(
         model_lock_sha256=model_lock.sha256,
         target_revision=target_revision,
         sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256=LongContinuationAdapter().window_sha256("confirm"),
         concurrency=concurrency,
     )
@@ -2926,6 +3381,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
             or prior.get("tuning_grid_sha256") != manifest.tuning_grid_sha256
             or prior.get("window_sha256") != manifest.tuning_window_sha256
             or prior.get("sampling_profile_sha256") != manifest.sampling_profile_sha256
+            or prior.get("execution_policy_sha256") != manifest.execution_policy_sha256
             or prior.get("stage") != args.stage - 1
             or prior.get("next_stage") != args.stage
             or not isinstance(prior.get("survivors"), list)
@@ -2974,6 +3430,7 @@ def _advance_onlinespec_tuning(args: argparse.Namespace) -> int:
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": model_lock_sha256,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "window_sha256": manifest.tuning_window_sha256,
         "measurement_window_sha256": expected_window,
@@ -3092,6 +3549,8 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
     for config in configs.values():
         if config.runtime.sampling_profile_sha256 != manifest.sampling_profile_sha256:
             raise ValueError("run config does not match the manifest sampling profile")
+        if config.runtime.execution_policy_sha256 != manifest.execution_policy_sha256:
+            raise ValueError("run config does not match the execution policy")
         locked = {model.model_id: model.revision for model in model_lock.models}
         if (
             locked.get(config.model.target) != config.model.target_revision
@@ -3124,6 +3583,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
         target_reference=target_reference,
         model_lock_sha256=model_lock.sha256,
         sampling_profile_sha256=manifest.sampling_profile_sha256,
+        execution_policy_sha256=manifest.execution_policy_sha256,
         target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
@@ -3175,6 +3635,8 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
     for method, config in configs.items():
         if config.runtime.sampling_profile_sha256 != selection.sampling_profile_sha256:
             raise ValueError("OnlineSPEC config sampling identity mismatch")
+        if config.runtime.execution_policy_sha256 != manifest.execution_policy_sha256:
+            raise ValueError("OnlineSPEC config execution-policy identity mismatch")
         if (
             locked.get(config.model.target) != config.model.target_revision
             or locked.get(config.model.drafter) != config.model.drafter_revision
@@ -3201,6 +3663,7 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         target_reference=target_reference,
         model_lock_sha256=lock.sha256,
         sampling_profile_sha256=selection.sampling_profile_sha256,
+        execution_policy_sha256=manifest.execution_policy_sha256,
         target_revision=target_revision,
     )
     table = _concat_evidence_tables(performance)
@@ -3211,6 +3674,9 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": selection.sampling_profile_sha256.encode(),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
+        ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_config_set_sha256": _canonical_sha256(config_hashes).encode(),
         b"lightcone_source_evidence_sha256": evidence_sha256.encode(),
@@ -3490,6 +3956,7 @@ def _build_profiler_plan(args: argparse.Namespace) -> int:
         or source.get("phase") != "independent_profiler"
         or source.get("execution_mode") != "sequential_exclusive_device"
         or source.get("patched_sglang_tree") != PINNED_SGLANG_TREE
+        or source.get("execution_policy_sha256") != ControlledExecutionPolicy().sha256
     ):
         raise ValueError("profiler requires an independent-profiler launch plan")
     verify_patched_checkout(str(source.get("sglang_checkout", "")))
@@ -3550,6 +4017,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         or plan.get("selection_sha256") != selection.sha256
         or plan.get("model_lock_sha256") != model_lock.sha256
         or plan.get("sampling_profile_sha256") != sampling.sha256
+        or plan.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or plan.get("patched_sglang_tree") != PINNED_SGLANG_TREE
     ):
         raise ValueError("launch plan identity does not match the speed study")
@@ -3641,6 +4109,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         "selection_sha256": selection.sha256,
         "model_lock_sha256": model_lock.sha256,
         "sampling_profile_sha256": sampling.sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "patched_sglang_tree": PINNED_SGLANG_TREE,
         "launch_plan_sha256": _canonical_sha256(plan),
         "schedule_seed": manifest.confirmation_schedule_seed,
@@ -3664,6 +4133,7 @@ def _build_onlinespec_queue(args: argparse.Namespace) -> int:
         or plan.get("selection_sha256") != selection.sha256
         or plan.get("model_lock_sha256") != lock.sha256
         or plan.get("sampling_profile_sha256") != sampling.sha256
+        or plan.get("execution_policy_sha256") != manifest.execution_policy_sha256
         or plan.get("patched_sglang_tree") != PINNED_SGLANG_TREE
     ):
         raise ValueError("OnlineSPEC launch plan identity mismatch")
@@ -3748,6 +4218,7 @@ def _build_onlinespec_queue(args: argparse.Namespace) -> int:
         "selection_sha256": selection.sha256,
         "model_lock_sha256": lock.sha256,
         "sampling_profile_sha256": sampling.sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "patched_sglang_tree": PINNED_SGLANG_TREE,
         "launch_plan_sha256": _canonical_sha256(plan),
         "schedule_seed": manifest.confirmation_schedule_seed,
@@ -3886,9 +4357,12 @@ def _validate_attestation_doctor(hardware: object, *, label: str) -> dict:
         not isinstance(nvidia, str)
         or not nvidia.strip()
         or not isinstance(gpu, dict)
-        or gpu.get("two_gpu_visible") is not True
+        or gpu.get("gpu_pool_visible") is not True
+        or not isinstance(gpu.get("visible_gpu_count"), int)
+        or isinstance(gpu.get("visible_gpu_count"), bool)
+        or gpu["visible_gpu_count"] < 1
     ):
-        reject("successful two-GPU nvidia-smi evidence is required")
+        reject("successful same-host GPU-pool nvidia-smi evidence is required")
     return hardware
 
 
@@ -3964,6 +4438,9 @@ def _onlinespec_table(
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
         b"lightcone_sampling_profile_sha256": selection.sampling_profile_sha256.encode(),
+        b"lightcone_execution_policy_sha256": (
+            manifest.execution_policy_sha256.encode()
+        ),
         b"lightcone_patched_sglang_tree": PINNED_SGLANG_TREE.encode(),
         b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
@@ -4148,8 +4625,8 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
 def _build_industrial_registry(args: argparse.Namespace) -> int:
     logical_slots = tuple(args.logical_gpu_slot)
     if (
-        len(logical_slots) != 2
-        or len(set(logical_slots)) != 2
+        not logical_slots
+        or len(set(logical_slots)) != len(logical_slots)
         or any(
             not isinstance(slot, str)
             or not slot.strip()
@@ -4158,9 +4635,9 @@ def _build_industrial_registry(args: argparse.Namespace) -> int:
             for slot in logical_slots
         )
     ):
-        raise ValueError("logical GPU rank slots must be two unique names")
+        raise ValueError("logical GPU rank slots must be one or more unique names")
     registry = build_industrial_registry(
-        gpu_uuids=(logical_slots[0], logical_slots[1]),
+        gpu_uuids=logical_slots,
         base_port=args.base_port,
         cache_root=args.cache_root,
         evidence_root=args.evidence_root,
@@ -4798,6 +5275,7 @@ def _completed_industrial_cells(
                     "method",
                     "model_pair",
                     "repetition_block",
+                    "started_ns",
                     "industrial_cell_id",
                     "rank_config_sha256",
                     "runtime_sha256",
@@ -5540,11 +6018,19 @@ def _materialize_confirmation_final_prefix(args: argparse.Namespace) -> int:
 
 
 def _validate_evidence_alias(args: argparse.Namespace) -> int:
-    artifact = evidence_alias_receipt_from_dict(_load_bound_json(args.alias))
+    manifest = raw_evidence_alias_manifest_from_dict(_load_bound_json(args.manifest))
+    artifact = reduce_evidence_alias(
+        registry=_load_industrial_registry(args.registry),
+        manifest=manifest,
+        hardware_envelope=_analysis_hardware_envelope(
+            _load_bound_json(args.hardware_envelope)
+        ),
+        inventory=_load_gpu_inventory(args.inventory),
+    )
     return _write_planning_artifact(
         args.output,
         artifact=artifact,
-        encode=evidence_alias_receipt_to_dict,
+        encode=evidence_alias_reduction_artifact_to_dict,
     )
 
 
@@ -5560,7 +6046,8 @@ def _build_evidence_dependence_map(args: argparse.Namespace) -> int:
             )
         direct_cell_ids.append(unit.source_cell_id)
     aliases = tuple(
-        evidence_alias_receipt_from_dict(_load_bound_json(path)) for path in args.alias
+        evidence_alias_reduction_artifact_from_dict(_load_bound_json(path))
+        for path in args.alias_reduction
     )
     if len({alias.sha256 for alias in aliases}) != len(aliases):
         raise ValueError("duplicate evidence alias artifact")
@@ -5575,85 +6062,165 @@ def _build_evidence_dependence_map(args: argparse.Namespace) -> int:
     )
 
 
+def _collect_gpu_inventory(args: argparse.Namespace) -> int:
+    inventory, receipt = collect_gpu_inventory(
+        challenge_nonce_sha256=args.challenge_nonce_sha256
+    )
+    if inventory.source_receipt_sha256 != receipt.get("receipt_sha256"):
+        raise RuntimeError("GPU inventory source receipt binding changed")
+    _write_json(args.receipt_output, receipt)
+    _write_json(args.output, inventory.to_dict())
+    reloaded = _load_gpu_inventory(args.output)
+    if reloaded != inventory:
+        raise RuntimeError("written GPU inventory changed identity")
+    print(inventory.sha256)
+    return 0
+
+
+def _build_interference_envelope(args: argparse.Namespace) -> int:
+    inventory = _load_gpu_inventory(args.inventory)
+    envelope, receipt = build_serial_interference_envelope(inventory)
+    if envelope.source_receipt_sha256 != receipt.get("receipt_sha256"):
+        raise RuntimeError("interference-envelope source receipt binding changed")
+    _write_json(args.receipt_output, receipt)
+    _write_json(args.output, envelope.to_dict())
+    reloaded = _load_interference_envelope(args.output)
+    if reloaded != envelope:
+        raise RuntimeError("written interference envelope changed identity")
+    print(envelope.sha256)
+    return 0
+
+
+def _materialize_industrial_budget_plan(args: argparse.Namespace) -> int:
+    registry = _load_industrial_registry(args.registry)
+    gpu_inventory = _load_gpu_inventory(args.inventory)
+    if not args.activation_plan and not args.family_activation:
+        decision = {
+            "schema_version": 1,
+            "kind": "industrial_budget_materialization_decision",
+            "status": "BLOCKED",
+            "reason_code": "reducer_owned_activation_manifest_missing",
+            "registry_sha256": registry.sha256,
+            "gpu_inventory_sha256": gpu_inventory.sha256,
+            "detail": ("no bound reducer-owned activation manifest was supplied"),
+        }
+        _write_json(args.output, decision)
+        print(_canonical_sha256(decision))
+        return 42
+    activations, family_activations, family_power_reductions = (
+        _load_budget_activation_bundle(
+            activation_paths=args.activation_plan,
+            family_activation_paths=args.family_activation,
+            family_power_plan_paths=args.family_power_plan,
+        )
+    )
+    (
+        policy,
+        load_bindings,
+        capacity_envelope,
+        capacity_authority,
+    ) = _load_budget_materialization_inputs(
+        policy_path=args.budget_policy,
+        load_binding_paths=args.budget_load_binding,
+        capacity_envelope_path=args.capacity_envelope,
+        capacity_manifest_path=args.capacity_manifest,
+        capacity_verification_receipt_path=args.capacity_verification_receipt,
+    )
+    plan = materialize_industrial_budgets(
+        registry,
+        activations=activations,
+        family_activations=family_activations,
+        family_power_reductions=family_power_reductions,
+        load_bindings=load_bindings,
+        policy=policy,
+        inventory=budget_inventory_identity_from_gpu_inventory(gpu_inventory),
+        capacity_envelope=capacity_envelope,
+        capacity_authority=capacity_authority,
+    )
+    _write_json(args.output, budget_plan_to_dict(plan))
+    if _load_budget_plan(args.output) != plan:
+        raise RuntimeError("written BudgetPlan changed identity")
+    print(plan.sha256)
+    return 0 if plan.status == "READY" else 42
+
+
+def _materialize_stage_activation(args: argparse.Namespace) -> int:
+    artifact = _load_registry_stage_activation_manifest(args.manifest)
+    _write_json(args.output, registry_stage_activation_to_dict(artifact))
+    reloaded = registry_stage_activation_from_dict(_load_bound_json(args.output))
+    if reloaded != artifact:
+        raise RuntimeError("written registry-stage activation changed identity")
+    print(artifact.sha256)
+    return 0 if artifact.status == "AVAILABLE" else 42
+
+
 def _estimate_industrial_budget(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
-    inventory = _load_gpu_inventory(args.inventory)
-    budgets = _load_experiment_budgets(args.budgets)
-    activations = tuple(
-        artifact
-        for path in args.activation_plan
-        if (artifact := _load_stage_activation_plan(path)) is not None
+    gpu_inventory = _load_gpu_inventory(args.inventory)
+    interference_envelope = _load_interference_envelope(args.interference_envelope)
+    plan, _, _, _ = _rematerialize_budget_plan(
+        registry=registry,
+        gpu_inventory=gpu_inventory,
+        declared_plan_path=args.budget_plan,
+        activation_paths=args.activation_plan,
+        family_activation_paths=args.family_activation,
+        family_power_plan_paths=args.family_power_plan,
+        policy_path=args.budget_policy,
+        load_binding_paths=args.budget_load_binding,
+        capacity_envelope_path=args.capacity_envelope,
+        capacity_manifest_path=args.capacity_manifest,
+        capacity_verification_receipt_path=args.capacity_verification_receipt,
+        require_ready=False,
     )
-    if len({artifact.sha256 for artifact in activations}) != len(activations):
-        raise ValueError("duplicate reducer activation artifact")
-    family_activations = _load_family_activations(args.family_activation)
-    family_power_reductions = _load_family_power_reductions(args.family_power_plan)
-    confirmation_cell_ids = _validate_family_artifact_bundle(
-        registry,
-        activations=family_activations,
-        power_reductions=family_power_reductions,
-    )
-    if not activations and not family_activations:
-        raise ValueError(
-            "budget estimation requires a reducer-generated activation artifact"
+    plan_assumptions = tuple(
+        sorted(
+            {
+                row.reason_code
+                for row in plan.dispositions
+                if row.status is BudgetDispositionStatus.UNRESOLVED
+            }
         )
-    if any(
-        artifact.plan.registry_sha256 != registry.sha256 for artifact in activations
-    ):
-        raise ValueError("budget activation belongs to another registry")
-    reducer_cell_ids = tuple(
-        cell_id
-        for artifact in activations
-        for cell_id in artifact.plan.activated_cell_ids
-    )
-    activated_cell_ids = reducer_cell_ids + confirmation_cell_ids
-    if len(activated_cell_ids) != len(set(activated_cell_ids)):
-        raise ValueError("budget activation artifacts select overlapping cells")
-    activated_cell_ids = tuple(sorted(activated_cell_ids))
-    activation_sha256 = _canonical_sha256(
-        {
-            "reducer_activation_sha256s": sorted(
-                artifact.sha256 for artifact in activations
-            ),
-            "family_activation_sha256s": sorted(
-                artifact.sha256 for artifact in family_activations
-            ),
-            "family_power_reduction_sha256s": sorted(
-                reduction.sha256 for reduction in family_power_reductions
-            ),
-        }
-    )
-    budget_inventory = BudgetInventoryIdentity(
-        schema_version=1,
-        host_sha256=_canonical_sha256(list(inventory.host_ids)),
-        gpu_uuids=tuple(device.uuid for device in inventory.devices),
-        topology_sha256=_canonical_sha256(
-            [group.to_dict() for group in inventory.topology_groups]
-        ),
     )
     report = estimate_industrial_budget(
         registry,
-        activated_cell_ids=activated_cell_ids,
-        activation_sha256=activation_sha256,
-        budgets=budgets,
-        inventory=budget_inventory,
+        activated_cell_ids=plan.activated_cell_ids,
+        activation_sha256=plan.activation_sha256,
+        budgets=plan.diagnostic_budgets,
+        inventory=plan.inventory,
+        gpu_inventory=gpu_inventory,
+        interference_envelope=interference_envelope,
+        unresolved_assumptions=plan_assumptions,
     )
     artifact = industrial_budget_report_to_dict(report)
     _write_json(args.output, artifact)
     print(report.sha256)
-    return 0
+    return 0 if not report.unresolved_assumptions else 42
 
 
 def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
     inventory = _load_gpu_inventory(args.inventory)
     envelope = _load_interference_envelope(args.interference_envelope)
-    budgets = _load_experiment_budgets(args.budget_plan)
+    budget_plan, activations, family_activations, family_power_reductions = (
+        _rematerialize_budget_plan(
+            registry=registry,
+            gpu_inventory=inventory,
+            declared_plan_path=args.budget_plan,
+            activation_paths=args.activation_plan,
+            family_activation_paths=args.family_activation,
+            family_power_plan_paths=args.family_power_plan,
+            policy_path=args.budget_policy,
+            load_binding_paths=args.budget_load_binding,
+            capacity_envelope_path=args.capacity_envelope,
+            capacity_manifest_path=args.capacity_manifest,
+            capacity_verification_receipt_path=(args.capacity_verification_receipt),
+        )
+    )
+    if len(activations) > 1:
+        raise ValueError("dispatch accepts at most one reducer activation artifact")
     receipts = _load_industrial_receipts(args.receipt)
-    activation_artifact = _load_stage_activation_plan(args.activation_plan)
+    activation_artifact = None if not activations else activations[0]
     completed_activation_artifact = activation_artifact
-    family_activations = _load_family_activations(args.family_activation)
-    family_power_reductions = _load_family_power_reductions(args.family_power_plan)
     completed_family_activations = tuple(
         artifact
         for artifact in family_activations
@@ -5712,7 +6279,11 @@ def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
         registry=registry,
         inventory=inventory,
         interference_envelope=envelope,
-        budgets=tuple(sorted(budgets, key=lambda budget: budget.cell_id)),
+        budgets=tuple(
+            budget
+            for budget in budget_plan.require_ready()
+            if budget.cell_id not in completed
+        ),
         receipts=receipts,
         completed_cell_ids=tuple(sorted(completed)),
         activation_artifact=activation_artifact,
@@ -5734,6 +6305,58 @@ def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _execute_dispatch_wave(args: argparse.Namespace) -> int:
+    """Run one receipt-bounded wave, or report an immutable prelaunch block."""
+
+    try:
+        receipt = asyncio.run(
+            execute_dispatch_wave_bundles(
+                tuple(args.bundle),
+                wave_index=args.wave_index,
+                receipt_output=args.receipt_output,
+                resume_receipt_path=args.resume_receipt,
+            )
+        )
+    except ExecutionBundleBlockedError as error:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "industrial_dispatch_wave_execution_decision",
+                    "status": "BLOCKED",
+                    "reason_code": error.reason_code,
+                    "wave_index": args.wave_index,
+                    "bundle_count": len(args.bundle),
+                },
+                sort_keys=True,
+            )
+        )
+        return 42
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "industrial_dispatch_wave_execution_decision",
+                    "status": "BLOCKED",
+                    "reason_code": "industrial_execution_bundle_or_resume_invalid",
+                    "wave_index": args.wave_index,
+                    "bundle_count": len(args.bundle),
+                    "failure_sha256": _canonical_sha256(
+                        {
+                            "exception_type": type(error).__qualname__,
+                            "message": str(error),
+                        }
+                    ),
+                },
+                sort_keys=True,
+            )
+        )
+        return 42
+    print(receipt.sha256)
+    return 42 if receipt.phase.value == "FAILED" else 0
+
+
 def _analyze_industrial(args: argparse.Namespace) -> int:
     (
         registry,
@@ -5743,6 +6366,7 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
         inventory,
         envelope,
         blocks,
+        alias_manifests,
         dependence,
         gpu_attestation,
         doctor_report,
@@ -5758,6 +6382,7 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
         hardware_envelope=envelope,
         inventory=inventory,
         evidence_dependence_map=dependence,
+        evidence_alias_manifests=alias_manifests,
         gpu_attestation=gpu_attestation,
         doctor_report=doctor_report,
         bootstrap_repetitions=repetitions,
@@ -5780,8 +6405,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         project_root = args.project_root or args.path or "."
         sglang_root = args.sglang_root or args.path
-        print(format_doctor(project_root, sglang_root))
-        return 0
+        formatted = format_doctor(project_root, sglang_root)
+        print(formatted)
+        report = json.loads(formatted)
+        return 0 if report.get("status") == "PASS" else 42
     if args.command == "validate-config":
         config = load_run_config(args.config)
         print(config.model_dump_json(indent=2))
@@ -5793,10 +6420,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "build-industrial-registry":
         return _build_industrial_registry(args)
+    if args.command == "collect-gpu-inventory":
+        return _collect_gpu_inventory(args)
+    if args.command == "build-interference-envelope":
+        return _build_interference_envelope(args)
     if args.command == "seal-industrial-stage":
         return _seal_industrial_stage(args)
     if args.command == "plan-industrial-dispatch":
         return _plan_industrial_dispatch(args)
+    if args.command == "execute-dispatch-wave":
+        return _execute_dispatch_wave(args)
+    if args.command == "materialize-industrial-budgets":
+        return _materialize_industrial_budget_plan(args)
+    if args.command == "materialize-stage-activation":
+        return _materialize_stage_activation(args)
     if args.command == "estimate-industrial-budget":
         return _estimate_industrial_budget(args)
     if args.command == "reduce-e1-activation":

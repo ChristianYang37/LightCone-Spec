@@ -35,8 +35,7 @@ class ModelLock:
             raise ValueError("locked model IDs must be non-empty and unique")
         for model in self.models:
             if len(model.revision) != 40 or any(
-                character not in "0123456789abcdef"
-                for character in model.revision
+                character not in "0123456789abcdef" for character in model.revision
             ):
                 raise ValueError("model revisions must be immutable Git SHAs")
 
@@ -51,15 +50,11 @@ class ModelLock:
         self.validate()
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        body = json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":")
-        )
+        body = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
         if output.exists() and output.read_text(encoding="utf-8") != body:
             raise ValueError("model lock is immutable; choose a new output path")
         output.write_text(body, encoding="utf-8")
-        Path(f"{output}.sha256").write_text(
-            self.sha256 + "\n", encoding="utf-8"
-        )
+        Path(f"{output}.sha256").write_text(self.sha256 + "\n", encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> ModelLock:
@@ -67,21 +62,16 @@ class ModelLock:
         data = json.loads(source.read_text(encoding="utf-8"))
         if set(data) != {"schema_version", "models"}:
             raise ValueError("model lock fields do not match schema-v2")
-        if data.get("schema_version") != 2 or not isinstance(
-            data.get("models"), list
-        ):
+        if data.get("schema_version") != 2 or not isinstance(data.get("models"), list):
             raise ValueError("model lock must use schema version 2")
         if any(
-            not isinstance(model, dict)
-            or set(model) != {"model_id", "revision"}
+            not isinstance(model, dict) or set(model) != {"model_id", "revision"}
             for model in data["models"]
         ):
             raise ValueError("locked model records are malformed")
         lock = cls(
             schema_version=2,
-            models=tuple(
-                LockedModel(**model) for model in data["models"]
-            ),
+            models=tuple(LockedModel(**model) for model in data["models"]),
         )
         lock.validate()
         sidecar = Path(f"{source}.sha256")
@@ -90,7 +80,9 @@ class ModelLock:
         return lock
 
 
-def resolve_model_lock(model_ids: tuple[str, ...], token: str | None = None) -> ModelLock:
+def resolve_model_lock(
+    model_ids: tuple[str, ...], token: str | None = None
+) -> ModelLock:
     from huggingface_hub import HfApi
 
     if not model_ids or len(set(model_ids)) != len(model_ids):

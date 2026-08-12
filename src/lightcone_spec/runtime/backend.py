@@ -109,7 +109,10 @@ class ProposalEvidence:
             raise ValueError("predecessor-token identity must cover proposal rows")
         if self.predecessor_embeddings.shape[:-1] != self.valid_mask.shape:
             raise ValueError("predecessor embeddings must cover proposal rows")
-        if self.confidence is not None and self.confidence.shape != self.valid_mask.shape:
+        if (
+            self.confidence is not None
+            and self.confidence.shape != self.valid_mask.shape
+        ):
             raise ValueError("confidence must cover proposal rows")
         if self.proposal_logits.shape[0] != len(self.request_ids):
             raise ValueError("request identity count must match the proposal batch")
@@ -241,7 +244,10 @@ class FunctionalBackendContract:
     ]
 
     def validate_payload(self, evidence: ProposalEvidence) -> None:
-        if evidence.backend != self.name or evidence.payload.schema != self.payload_schema:
+        if (
+            evidence.backend != self.name
+            or evidence.payload.schema != self.payload_schema
+        ):
             raise ValueError("proposal evidence is bound to a different backend schema")
         missing = self.required_payload_fields - evidence.payload.values.keys()
         if missing:
@@ -262,10 +268,15 @@ class FunctionalBackendContract:
         if result.proposal_logits.shape != evidence.proposal_logits.shape:
             raise ValueError("backend reconstruction changed proposal-logit shape")
         if result.corrected_distribution.shape != evidence.corrected_distribution.shape:
-            raise ValueError("backend reconstruction changed proposal-distribution shape")
+            raise ValueError(
+                "backend reconstruction changed proposal-distribution shape"
+            )
         if (result.confidence is None) != (evidence.confidence is None):
             raise ValueError("backend reconstruction changed confidence availability")
-        if result.confidence is not None and result.confidence.shape != evidence.valid_mask.shape:
+        if (
+            result.confidence is not None
+            and result.confidence.shape != evidence.valid_mask.shape
+        ):
             raise ValueError("backend reconstruction changed confidence shape")
         return result
 
@@ -282,9 +293,7 @@ class DFlashBackendContract(FunctionalBackendContract):
         super().__init__(
             name="DFLASH",
             payload_schema="dflash-native-v1",
-            required_payload_fields=frozenset(
-                {"canvas_state", "proposal_correction"}
-            ),
+            required_payload_fields=frozenset({"canvas_state", "proposal_correction"}),
             reconstruct_fn=reconstruct_fn,
         )
 
@@ -432,7 +441,10 @@ def dspark_composite_loss(
         raise ValueError("confidence loss weight must be finite and non-negative")
     if teacher_distribution.shape != proposal_distribution.shape:
         raise ValueError("target and proposal distributions must align")
-    if valid_mask.dtype is not torch.bool or valid_mask.shape != confidence_logits.shape:
+    if (
+        valid_mask.dtype is not torch.bool
+        or valid_mask.shape != confidence_logits.shape
+    ):
         raise ValueError("confidence mask and logits must align")
     if teacher_distribution.shape[:-1] != valid_mask.shape:
         raise ValueError("proposal rows and confidence mask must align")

@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import hashlib
+import json
 from collections.abc import Callable, Mapping
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from lightcone_spec.orchestration.executor import (
+    TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON,
+    native_evidence_preflight,
+)
 from lightcone_spec.orchestration.native_terminal import (
     CAPABILITY_PATH,
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
@@ -18,7 +29,10 @@ from lightcone_spec.orchestration.native_terminal import (
     TerminalRequestExpectation,
     canonical_json_bytes,
     canonical_sha256,
+    validate_native_terminal_artifact,
 )
+from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
+from lightcone_spec.telemetry.writer import EvidenceWriter
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -26,6 +40,26 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
 SHA_F = "f" * 64
+
+
+def _release_policy(
+    private_key: Ed25519PrivateKey,
+    *,
+    attester_id: str = "prod-hsm-1",
+    key_id: str = "release-key-1",
+) -> TrustedAttesterPolicy:
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    public_key_sha256 = hashlib.sha256(public_key).hexdigest()
+    policy = TrustedAttesterPolicy(
+        policy_id="release-terminal-attesters-v1",
+        trusted_attesters=((attester_id, key_id, public_key_sha256),),
+        public_keys=((public_key_sha256, base64.b64encode(public_key).decode()),),
+    )
+    policy.validate()
+    return policy
 
 
 def _binding(
@@ -283,6 +317,7 @@ class FakeAdminTransport:
         override_client_with_server: bool = False,
         attester_id: str | None = None,
         trust_domain: str | None = None,
+        signing_key: Ed25519PrivateKey | None = None,
     ) -> None:
         self.binding = binding
         self.warmup = warmup
@@ -292,6 +327,7 @@ class FakeAdminTransport:
         self.override_client_with_server = override_client_with_server
         self.attester_id = attester_id
         self.trust_domain = trust_domain
+        self.signing_key = signing_key
         self.get_paths: list[str] = []
         self.posts: list[tuple[str, dict[str, object]]] = []
         self.begin_receipt: dict[str, object] | None = None
@@ -493,6 +529,7 @@ class FakeAdminTransport:
                 "signature_hex": None,
             }
         else:
+            assert self.signing_key is not None
             value["attestation"] = {
                 "schema_version": 1,
                 "status": "SIGNED",
@@ -500,7 +537,9 @@ class FakeAdminTransport:
                 "message_sha256": canonical_sha256(message),
                 "attester_id": self.attester_id,
                 "trust_domain": self.trust_domain,
-                "signature_hex": "aabb",
+                "signature_hex": self.signing_key.sign(
+                    canonical_json_bytes(message)
+                ).hex(),
             }
         return value
 
@@ -752,19 +791,69 @@ def test_warmup_token_digest_is_verified_before_scored_reset() -> None:
     assert provider.phase == "FAILED"
 
 
+def test_release_owned_ed25519_allowlist_is_the_only_positive_trust_path() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
+    binding = _binding(warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+        attester_id="prod-hsm-1",
+        trust_domain="hardware",
+        signing_key=private_key,
+    )
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=policy,
+    )
+
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+
+    assert terminal.trusted_attestation is True
+    assert terminal.attestation.key_id == "release-key-1"
+    assert terminal.attestation.public_key_sha256 == policy.trusted_attesters[0][2]
+    assert terminal.trusted_attester_policy_sha256 == policy.sha256
+
+
+def test_caller_release_policy_cannot_unlock_speculative_preflight() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
+    binding = _binding(method="l0", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=policy,
+    )
+    plan = SimpleNamespace(
+        runtime_plan=SimpleNamespace(
+            rank_configs=(SimpleNamespace(method="l0"),),
+        ),
+        trusted_attester_policy=policy,
+    )
+
+    preflight = native_evidence_preflight(plan, provider)
+
+    assert preflight.status == "BLOCKED"
+    assert preflight.reason_code == TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
+    assert preflight.missing_hook is None
+
+
 @pytest.mark.parametrize(
-    ("attester_id", "trust_domain", "trusted"),
+    ("attester_id", "trust_domain"),
     [
-        ("prod-hsm-1", "hardware", True),
-        ("cpu-fixture-1", "hardware", False),
-        ("test-key-1", "test", False),
+        ("cpu-fixture-1", "hardware"),
+        ("test-key-1", "test"),
     ],
 )
-def test_only_verified_nonfixture_hardware_signature_is_trusted(
+def test_valid_but_nonrelease_signer_identity_remains_untrusted(
     attester_id: str,
     trust_domain: str,
-    trusted: bool,
 ) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
     binding = _binding(warmup=())
     scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
     transport = FakeAdminTransport(
@@ -773,19 +862,120 @@ def test_only_verified_nonfixture_hardware_signature_is_trusted(
         scored=scored,
         attester_id=attester_id,
         trust_domain=trust_domain,
+        signing_key=private_key,
     )
-
-    def verifier(message: bytes, signature: bytes) -> bool:
-        assert b"lightcone_terminal_attestation_challenge" in message
-        return signature == bytes.fromhex("aabb")
-
     provider = NativeTerminalProvider(
         transport,
-        trusted_hardware_verifiers={attester_id: verifier},
+        trusted_attester_policy=policy,
     )
     _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
 
-    assert terminal.trusted_attestation is trusted
+    assert terminal.trusted_attestation is False
+    assert terminal.attestation.key_id is None
+    assert terminal.attestation.public_key_sha256 is None
+
+
+def test_caller_verifier_keyword_cannot_create_a_trust_root() -> None:
+    binding = _binding(warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        NativeTerminalProvider(
+            transport,
+            trusted_hardware_verifiers={"prod-hsm-1": lambda *_: True},
+        )
+
+
+def test_artifact_roundtrip_reverifies_identity_policy_and_signature() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
+    binding = _binding()
+    warmup = (_server_request("warm-0", inputs=(1,), outputs=(2,)),)
+    scored = (_server_request("score-0", inputs=(3, 4), outputs=(5, 6)),)
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=warmup,
+        scored=scored,
+        attester_id="prod-hsm-1",
+        trust_domain="hardware",
+        signing_key=private_key,
+    )
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=policy,
+    )
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+    artifact = terminal.to_artifact(warmup_requests=warmup)
+    persisted = json.loads(canonical_json_bytes(artifact))
+
+    replayed = validate_native_terminal_artifact(
+        persisted,
+        trusted_attester_policy=policy,
+        expected_binding=binding,
+        expected_warmup_requests=warmup,
+        expected_scored_requests=scored,
+    )
+
+    assert replayed.terminal_sha256 == terminal.terminal_sha256
+    assert replayed.trusted_attestation is True
+
+    tampered = copy.deepcopy(persisted)
+    terminal_row = tampered["terminal"]
+    assert isinstance(terminal_row, dict)
+    attestation = terminal_row["attestation"]
+    assert isinstance(attestation, dict)
+    signature = bytearray.fromhex(str(attestation["signature_hex"]))
+    signature[0] ^= 1
+    attestation["signature_hex"] = signature.hex()
+    with pytest.raises(ValueError, match="Ed25519 signature is invalid"):
+        validate_native_terminal_artifact(
+            tampered,
+            trusted_attester_policy=policy,
+            expected_binding=binding,
+            expected_warmup_requests=warmup,
+            expected_scored_requests=scored,
+        )
+
+    another_policy = _release_policy(Ed25519PrivateKey.generate())
+    with pytest.raises(ValueError, match="another release policy"):
+        validate_native_terminal_artifact(
+            persisted,
+            trusted_attester_policy=another_policy,
+        )
+
+
+def test_writer_exclusively_persists_the_canonical_native_bundle(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(method="target_only", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+    )
+    _, _, _, terminal = asyncio.run(_run(transport))
+    writer = EvidenceWriter(tmp_path, run_id=binding.run_id, rank=0)
+
+    artifact_binding = writer.persist_native_terminal_artifact(
+        terminal.to_artifact(warmup_requests=())
+    )
+
+    artifact_path = tmp_path / str(artifact_binding["path"])
+    body = artifact_path.read_bytes()
+    assert artifact_path.is_file() and not artifact_path.is_symlink()
+    assert artifact_binding["size"] == len(body)
+    assert artifact_binding["raw_sha256"] == hashlib.sha256(body).hexdigest()
+    assert artifact_binding["terminal_sha256"] == terminal.terminal_sha256
+    assert artifact_binding["trusted_attester_policy_sha256"] == (
+        terminal.trusted_attester_policy_sha256
+    )
+    with pytest.raises(RuntimeError, match="already persisted"):
+        writer.persist_native_terminal_artifact(
+            terminal.to_artifact(warmup_requests=())
+        )
+    writer.abort(reason="persistence-only fixture")
 
 
 def test_final_hook_patch_and_tree_are_exactly_pinned() -> None:
@@ -793,8 +983,8 @@ def test_final_hook_patch_and_tree_are_exactly_pinned() -> None:
         "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
     )
     assert PINNED_SGLANG_PATCH_SHA256 == (
-        "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08"
+        "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
     )
-    assert PINNED_SGLANG_TREE == "2810ac94ed225aa78b4256ded56e78890a4a590f"
+    assert PINNED_SGLANG_TREE == "22bd0d1d16aab33addbdacdbf75ad5bfe21164a8"
     assert canonical_sha256({"b": 2, "a": 1}) == canonical_sha256({"a": 1, "b": 2})
     assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'

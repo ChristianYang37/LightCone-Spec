@@ -17,10 +17,12 @@
       "SYS"
     ],
     "compute_capability": "12.0",
-    "count": 2,
+    "minimum_count": 1,
     "minimum_memory_mib": 96000,
     "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-    "nominal_memory_gib": 96
+    "nominal_memory_gib": 96,
+    "reference_count": 2,
+    "same_host_required": true
   },
   "host": {
     "compiler_required": true,
@@ -124,11 +126,11 @@
   "schema_version": 1,
   "sglang": {
     "expected_patch_count": 1,
-    "expected_tree": "2810ac94ed225aa78b4256ded56e78890a4a590f",
+    "expected_tree": "22bd0d1d16aab33addbdacdbf75ad5bfe21164a8",
     "patches": [
       {
         "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
-        "sha256": "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08"
+        "sha256": "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
       }
     ],
     "repository": "https://github.com/sgl-project/sglang.git",

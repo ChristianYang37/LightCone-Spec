@@ -4,6 +4,7 @@ from dataclasses import fields, replace
 
 import pytest
 
+from lightcone_spec.experiments.gpu_pool import registry_pool_work_item
 from lightcone_spec.experiments.registry import (
     CONTEXT_GRID,
     CONTEXT_REGIMES,
@@ -338,6 +339,35 @@ def test_status_reason_is_preserved_without_changing_cell_identity(
     assert blocked.status.value == "BLOCKED"
     assert source.cell_id == not_applicable.cell_id == blocked.cell_id
     assert len({source.sha256, not_applicable.sha256, blocked.sha256}) == 3
+
+
+def test_authoritative_registry_cell_contract_accepts_arbitrary_gpu_gangs(
+    registry: ExperimentRegistry,
+) -> None:
+    source = next(
+        cell
+        for cell in registry.cells_for("E3a")
+        if cell.identity.method == "target_only" and cell.resources.gpu_count == 1
+    )
+    logical_slots = tuple(f"logical-slot-{index}" for index in range(4))
+    expanded = replace(
+        source,
+        identity=replace(
+            source.identity,
+            topology="tp4_dp1",
+            gpu_uuids=logical_slots,
+        ),
+        resources=replace(
+            source.resources,
+            gpu_uuids=logical_slots,
+            ports=(25000, 25001, 25002, 25003, 25004),
+        ),
+    )
+    item = registry_pool_work_item(expanded, estimated_duration_seconds=10.0)
+    assert item.claim.gang_shape.tensor_parallel_size == 4
+    assert item.claim.gang_shape.data_parallel_size == 1
+    assert item.claim.gang_shape.gpu_count == 4
+    assert item.claim.estimated_gpu_seconds == 40.0
     with pytest.raises(ValueError, match="reason_code"):
         source.with_status(
             CellStatus.BLOCKED,

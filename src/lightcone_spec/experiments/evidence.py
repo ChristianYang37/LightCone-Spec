@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
@@ -37,8 +38,10 @@ def evidence_files_sha256(paths: Iterable[str | Path]) -> str:
 
 
 def _is_sha256(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(
-        char in "0123456789abcdef" for char in value
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
     )
 
 
@@ -82,6 +85,7 @@ class GreedyTargetReference:
     target_model_id: str
     target_revision: str
     sampling_profile_sha256: str
+    execution_policy_sha256: str
     window_sha256: str
     runtime_config_sha256: str
     hardware_sha256: str
@@ -96,19 +100,24 @@ class GreedyTargetReference:
             raise ValueError("target reference must be schema-v2 UNMEASURED")
         if self.target_model_id != "Qwen/Qwen3-8B":
             raise ValueError("target reference uses the wrong target model")
-        if not isinstance(self.target_revision, str) or len(self.target_revision) != 40 or any(
-            char not in "0123456789abcdef" for char in self.target_revision
+        if (
+            not isinstance(self.target_revision, str)
+            or len(self.target_revision) != 40
+            or any(char not in "0123456789abcdef" for char in self.target_revision)
         ):
             raise ValueError("target reference requires an immutable revision")
         for value in (
             self.model_lock_sha256,
             self.sampling_profile_sha256,
+            self.execution_policy_sha256,
             self.window_sha256,
             self.runtime_config_sha256,
             self.hardware_sha256,
         ):
             if not _is_sha256(value):
                 raise ValueError("target-reference identities must be SHA-256 values")
+        if self.execution_policy_sha256 != ControlledExecutionPolicy().sha256:
+            raise ValueError("target reference uses an unregistered execution policy")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
             raise ValueError("target reference uses another SGLang runtime tree")
         if self.output_hash_format != OUTPUT_HASH_FORMAT:
@@ -136,6 +145,7 @@ class GreedyTargetReference:
         model_lock_sha256: str,
         target_revision: str,
         sampling_profile_sha256: str,
+        execution_policy_sha256: str,
         window_sha256: str,
         concurrency: int,
     ) -> None:
@@ -145,6 +155,7 @@ class GreedyTargetReference:
             "model_lock_sha256": model_lock_sha256,
             "target_revision": target_revision,
             "sampling_profile_sha256": sampling_profile_sha256,
+            "execution_policy_sha256": execution_policy_sha256,
             "window_sha256": window_sha256,
             "concurrency": concurrency,
         }
@@ -154,9 +165,7 @@ class GreedyTargetReference:
     @property
     def sha256(self) -> str:
         self.validate()
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def write(self, path: str | Path) -> None:
@@ -180,6 +189,7 @@ class GreedyTargetReference:
             "target_model_id",
             "target_revision",
             "sampling_profile_sha256",
+            "execution_policy_sha256",
             "window_sha256",
             "runtime_config_sha256",
             "hardware_sha256",
@@ -256,18 +266,20 @@ class GpuEvidenceAttestation:
             "hardware_sha256",
         ):
             value = getattr(self, name)
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            if len(value) != 64 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
                 raise ValueError(f"{name} must be a lowercase SHA-256")
         for name in ("target_revision", "drafter_revision"):
             value = getattr(self, name)
-            if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+            if len(value) != 40 or any(
+                char not in "0123456789abcdef" for char in value
+            ):
                 raise ValueError(f"{name} must be an immutable Git revision")
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def write(self, path: str | Path) -> None:
@@ -284,9 +296,7 @@ class GpuEvidenceAttestation:
     def load(cls, path: str | Path) -> GpuEvidenceAttestation:
         source = Path(path)
         value = json.loads(source.read_text(encoding="utf-8"))
-        attestation = cls(
-            **{**value, "methods": tuple(value.get("methods", ()))}
-        )
+        attestation = cls(**{**value, "methods": tuple(value.get("methods", ()))})
         attestation.validate()
         sidecar = Path(f"{source}.sha256")
         if not sidecar.is_file() or sidecar.read_text().strip() != attestation.sha256:

@@ -12,6 +12,7 @@ from lightcone_spec.adaptation.parameters import (
     LAYER_SCOPES,
     LORA_RANKS,
 )
+from lightcone_spec.execution import ControlledExecutionPolicy
 
 CoreMethod = Literal["target_only", "static", "tts", "l0"]
 BaselineMethod = Literal["onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"]
@@ -35,9 +36,7 @@ class ModelPair(StrictModel):
     drafter: str = "z-lab/Qwen3-8B-DFlash-b16"
     target_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     drafter_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-    algorithm: Literal["DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN"] = (
-        "DFLASH"
-    )
+    algorithm: Literal["DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN"] = "DFLASH"
     max_context_length: int = Field(default=40960, ge=1)
     draft_depth: int = Field(default=15, ge=1)
 
@@ -54,9 +53,9 @@ class OptimizerConfig(StrictModel):
     muon_ns_steps: int | None = Field(default=None, ge=1, le=20)
     muon_auxiliary_learning_rate: float | None = Field(default=None, gt=0.0)
     muon_auxiliary_weight_decay: float | None = Field(default=None, ge=0.0)
-    schedule: Literal[
-        "constant", "inverse_sqrt_published_update", "cosine_to_zero"
-    ] = "constant"
+    schedule: Literal["constant", "inverse_sqrt_published_update", "cosine_to_zero"] = (
+        "constant"
+    )
     schedule_total_published_updates: int | None = Field(default=None, ge=2)
 
     @model_validator(mode="after")
@@ -91,7 +90,9 @@ class OptimizerConfig(StrictModel):
             self.muon_auxiliary_weight_decay,
         )
         if self.name == "muon" and any(value is None for value in auxiliary):
-            raise ValueError("muon requires explicit auxiliary AdamW lr and weight decay")
+            raise ValueError(
+                "muon requires explicit auxiliary AdamW lr and weight decay"
+            )
         if self.name != "muon" and any(value is not None for value in auxiliary):
             raise ValueError("Muon auxiliary AdamW fields require optimizer=muon")
         if (self.schedule == "cosine_to_zero") != (
@@ -120,9 +121,7 @@ class AdaptationConfig(StrictModel):
     loss_position_decay: float = Field(default=1.0, gt=0.0, le=1.0)
     extra_logical_delay: int = Field(default=0, ge=0)
     teacher_row_policy: Literal["update_round", "quota_shadow"] = "update_round"
-    verification_mode: Literal["native_scheduler", "fixed_budget"] = (
-        "native_scheduler"
-    )
+    verification_mode: Literal["native_scheduler", "fixed_budget"] = "native_scheduler"
     fixed_verification_budget: int | None = Field(default=None, ge=1)
     confidence_loss_weight: float | None = Field(default=None, ge=0.0)
 
@@ -164,6 +163,18 @@ class OnlineSpecConfig(StrictModel):
 class RuntimeConfig(StrictModel):
     sglang_commit: Literal[PINNED_SGLANG_COMMIT] = PINNED_SGLANG_COMMIT
     sampling_profile_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    execution_policy_sha256: str = Field(
+        default=ControlledExecutionPolicy().sha256,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    context_length: Literal[40960] = 40960
+    random_seed: Literal[1] = 1
+    disable_radix_cache: Literal[True] = True
+    disable_cuda_graph: Literal[True] = True
+    target_reference_disable_overlap_schedule: Literal[True] = True
+    speculative_disable_overlap_schedule: Literal[False] = False
+    enable_deterministic_inference: Literal[False] = False
+    incremental_streaming_output: Literal[False] = False
     speculation_enabled: bool = True
     tensor_parallel_size: int = Field(default=1, ge=1, le=2)
     data_parallel_size: int = Field(default=1, ge=1, le=2)
@@ -176,9 +187,9 @@ class RuntimeConfig(StrictModel):
     router_identity: str = Field(default="single-replica", min_length=1)
     clock_identity: str = Field(default="monotonic", min_length=1)
     process_group_backend: Literal["nccl", "gloo"] = "nccl"
-    distributed_runtime_capability: Literal[
-        "single_rank", "patched_two_gpu_v1"
-    ] = "single_rank"
+    distributed_runtime_capability: Literal["single_rank", "patched_two_gpu_v1"] = (
+        "single_rank"
+    )
     distributed_capability_receipt_sha256: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
     )
@@ -192,6 +203,22 @@ class RuntimeConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_topology(self) -> RuntimeConfig:
+        policy = ControlledExecutionPolicy(
+            context_length=self.context_length,
+            random_seed=self.random_seed,
+            disable_radix_cache=self.disable_radix_cache,
+            disable_cuda_graph=self.disable_cuda_graph,
+            target_reference_disable_overlap_schedule=(
+                self.target_reference_disable_overlap_schedule
+            ),
+            speculative_disable_overlap_schedule=(
+                self.speculative_disable_overlap_schedule
+            ),
+            enable_deterministic_inference=self.enable_deterministic_inference,
+            incremental_streaming_output=self.incremental_streaming_output,
+        )
+        if self.execution_policy_sha256 != policy.sha256:
+            raise ValueError("runtime execution-policy identity mismatch")
         if self.tp_rank >= self.tensor_parallel_size:
             raise ValueError("tp_rank is outside tensor_parallel_size")
         if self.dp_rank >= self.data_parallel_size:
@@ -201,7 +228,9 @@ class RuntimeConfig(StrictModel):
         if self.node_count != 1:
             raise ValueError("multi-node LightCone remains UNMEASURED and fail-closed")
         if self.tensor_parallel_size * self.data_parallel_size > 2:
-            raise ValueError("the registered two-GPU topology supports at most two ranks")
+            raise ValueError(
+                "the registered two-GPU topology supports at most two ranks"
+            )
         if self.data_parallel_size > 1 and self.router_identity == "single-replica":
             raise ValueError("DP replicas require an explicit sticky router identity")
         distributed = self.tensor_parallel_size * self.data_parallel_size > 1
@@ -244,7 +273,9 @@ class RunConfig(StrictModel):
             raise ValueError(f"{algorithm} verify width must equal draft_depth + 1")
         if algorithm in {"DFLASH", "DSPARK", "NEXTN"}:
             if self.runtime.speculative_eagle_topk is not None:
-                raise ValueError("speculative_eagle_topk is only valid for EAGLE backends")
+                raise ValueError(
+                    "speculative_eagle_topk is only valid for EAGLE backends"
+                )
         elif self.runtime.speculative_eagle_topk is None:
             raise ValueError("EAGLE backends require speculative_eagle_topk")
         if self.method == "static":
@@ -317,7 +348,10 @@ class RunConfig(StrictModel):
                 raise ValueError("composite DSpark candidates require confidence loss")
             if not hybrid and self.adaptation.confidence_loss_weight is not None:
                 raise ValueError("layer-only DSpark keeps the confidence head frozen")
-        if algorithm in {"EAGLE", "EAGLE3"} and self.runtime.speculative_eagle_topk != 1:
+        if (
+            algorithm in {"EAGLE", "EAGLE3"}
+            and self.runtime.speculative_eagle_topk != 1
+        ):
             raise ValueError("adapted EAGLE/EAGLE3 currently requires topk=1")
 
     def _validate_onlinespec(self) -> None:
@@ -339,7 +373,9 @@ class RunConfig(StrictModel):
                 *self.online_spec.additional_learning_rates,
             )
             if len(rates) < 2 or tuple(sorted(rates)) != rates:
-                raise ValueError("OnlineSPEC Hedge requires an increasing multi-rate grid")
+                raise ValueError(
+                    "OnlineSPEC Hedge requires an increasing multi-rate grid"
+                )
             if self.online_spec.hedge_learning_rate is None:
                 raise ValueError("OnlineSPEC Hedge requires hedge_learning_rate")
         elif (

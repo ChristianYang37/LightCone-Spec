@@ -52,7 +52,9 @@ def _dns(host: str, *, resolved: bool = True) -> dict[str, object]:
     }
 
 
-def _passing_facts(project: Path, sglang: Path) -> dict[str, object]:
+def _passing_facts(
+    project: Path, sglang: Path, *, gpu_count: int = 2
+) -> dict[str, object]:
     devices = [
         {
             "uuid": f"GPU-00000000-0000-0000-0000-00000000000{index}",
@@ -62,7 +64,18 @@ def _passing_facts(project: Path, sglang: Path) -> dict[str, object]:
             "compute_capability": "12.0",
             "pci_bus_id": f"00000000:{index + 1:02x}:00.0",
         }
-        for index in range(2)
+        for index in range(gpu_count)
+    ]
+    gpu_rows = [f"GPU{index}" for index in range(gpu_count)]
+    topology_pairs = [
+        {
+            "left": left,
+            "right": right,
+            "link": "PHB",
+            "reciprocal_link": "PHB",
+        }
+        for left_index, left in enumerate(gpu_rows)
+        for right in gpu_rows[left_index + 1 :]
     ]
     return {
         "python": {
@@ -104,9 +117,8 @@ def _passing_facts(project: Path, sglang: Path) -> dict[str, object]:
             "inventory": {"devices": devices, "parse_error": None},
             "topology_raw": "mock two-GPU topology",
             "topology": {
-                "gpu_rows": ["GPU0", "GPU1"],
-                "pair_link": "PHB",
-                "reciprocal_link": "PHB",
+                "gpu_rows": gpu_rows,
+                "pairs": topology_pairs,
                 "parse_error": None,
             },
             "torch": {
@@ -115,7 +127,7 @@ def _passing_facts(project: Path, sglang: Path) -> dict[str, object]:
                 "version": "2.11.0+cu130",
                 "cuda_build": "13.0",
                 "cuda_available": True,
-                "device_count": 2,
+                "device_count": gpu_count,
             },
         },
         "commands": {
@@ -186,10 +198,32 @@ def test_gpu_inventory_and_topology_parsers_preserve_exact_identity() -> None:
     )
     assert topology == {
         "gpu_rows": ["GPU0", "GPU1"],
-        "pair_link": "PHB",
-        "reciprocal_link": "PHB",
+        "pairs": [
+            {
+                "left": "GPU0",
+                "right": "GPU1",
+                "link": "PHB",
+                "reciprocal_link": "PHB",
+            }
+        ],
         "parse_error": None,
     }
+
+
+def test_topology_parser_preserves_all_eight_gpu_pairs() -> None:
+    gpu_rows = [f"GPU{index}" for index in range(8)]
+    header = " ".join((*gpu_rows, "CPU", "Affinity"))
+    rows = []
+    for left_index, left in enumerate(gpu_rows):
+        links = [
+            "X" if left_index == right_index else "PHB" for right_index in range(8)
+        ]
+        rows.append(" ".join((left, *links, "0-31")))
+    topology = _parse_topology("\n".join((header, *rows)))
+    assert topology["parse_error"] is None
+    assert topology["gpu_rows"] == gpu_rows
+    assert len(topology["pairs"]) == 28
+    assert {pair["link"] for pair in topology["pairs"]} == {"PHB"}
 
 
 def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
@@ -216,7 +250,7 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
             {
                 "file": ("0001-feat-spec-add-schema-v3-native-online-adaptation.patch"),
                 "sha256": (
-                    "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08"
+                    "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
                 ),
             }
         ],
@@ -257,6 +291,20 @@ def test_doctor_passes_only_exact_mocked_industrial_runtime(
     assert report["project_source_tree"]["tree"] != PINNED_SGLANG_TREE
 
 
+def test_doctor_accepts_complete_same_host_eight_gpu_inventory(
+    monkeypatch, tmp_path
+) -> None:
+    sglang = tmp_path / "patched-sglang"
+    facts = _passing_facts(ROOT, sglang, gpu_count=8)
+    monkeypatch.setattr("lightcone_spec.doctor._collect_facts", lambda *_args: facts)
+    report = doctor_report(ROOT, sglang)
+    assert report["status"] == "PASS"
+    assert report["gpu"]["visible_gpu_count"] == 8
+    assert report["gpu"]["gpu_pool_visible"] is True
+    assert report["gpu"]["two_gpu_visible"] is False
+    assert len(report["gpu"]["parsed_topology"]["pairs"]) == 28
+
+
 def test_doctor_emits_fail_for_incompatible_known_facts(monkeypatch, tmp_path) -> None:
     sglang = tmp_path / "patched-sglang"
     facts = _passing_facts(ROOT, sglang)
@@ -295,8 +343,7 @@ def test_doctor_propagates_unknown_without_claiming_readiness(
     facts["gpu"]["topology_raw"] = None
     facts["gpu"]["topology"] = {
         "gpu_rows": [],
-        "pair_link": None,
-        "reciprocal_link": None,
+        "pairs": [],
         "parse_error": None,
     }
     facts["disk"].update(
@@ -389,7 +436,7 @@ def test_cli_accepts_distinct_project_and_sglang_roots(
                 str(sglang),
             ]
         )
-        == 0
+        == 42
     )
     assert calls == [(str(project), str(sglang))]
     assert json.loads(capsys.readouterr().out) == {"status": "UNKNOWN"}

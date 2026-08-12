@@ -41,7 +41,6 @@ from lightcone_spec.experiments.planning import (
     ReducerActivationArtifact,
     ScenarioMilliseconds,
     SealedE3aSelection,
-    build_evidence_dependence_map,
     family_pilot_block_id,
 )
 from lightcone_spec.experiments.planning_artifacts import (
@@ -269,6 +268,8 @@ def _budget_report() -> IndustrialBudgetReport:
             budget.wall_time
         ),
         unresolved_assumptions=(),
+        scheduler_gpu_inventory_sha256=_sha("scheduler-inventory"),
+        interference_envelope_sha256=_sha("interference-envelope"),
     )
 
 
@@ -676,8 +677,14 @@ def _alias() -> EvidenceAliasReceipt:
 
 def _dependence_map() -> EvidenceDependenceMap:
     alias = _alias()
-    return build_evidence_dependence_map(
-        direct_observation_cell_ids=(alias.source.cell_id,), aliases=(alias,)
+    unit = AnalysisDependenceUnit(
+        unit_sha256=alias.dependence_unit_sha256,
+        source_cell_id=alias.source.cell_id,
+        member_cell_ids=tuple(sorted((alias.source.cell_id, alias.target.cell_id))),
+    )
+    return EvidenceDependenceMap(
+        schema_version=1,
+        units=(unit,),
     )
 
 

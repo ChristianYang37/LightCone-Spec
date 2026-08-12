@@ -11,6 +11,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from lightcone_spec.runtime.compile_cache import (
+    COMPILE_CACHE_ENVIRONMENT_VARIABLES,
+    CompileCacheLaunchPlan,
+    start_compile_cache_launch,
+)
+
 from .checkout import verify_patched_checkout
 
 
@@ -71,6 +77,7 @@ def _validate_blackwell_jit_toolchain() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lightcone-sglang-launch")
     parser.add_argument("--checkout", required=True)
+    parser.add_argument("--compile-cache-plan", required=True)
     parser.add_argument("server_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     server_argv = list(args.server_argv)
@@ -78,16 +85,52 @@ def main(argv: list[str] | None = None) -> int:
         server_argv = server_argv[1:]
     if not server_argv:
         raise ValueError("SGLang server arguments are required after --")
-    checkout = verify_patched_checkout(args.checkout)
-    python_root = str(checkout / "python")
     if "sglang" in sys.modules:
         raise RuntimeError("sglang was imported before checkout verification")
-    _bind_interpreter_tools()
-    _validate_blackwell_jit_toolchain()
-    sys.path.insert(0, python_root)
-    sys.argv = ["sglang.launch_server", *server_argv]
-    runpy.run_module("sglang.launch_server", run_name="__main__")
-    return 0
+    checkout = verify_patched_checkout(args.checkout)
+    plan = CompileCacheLaunchPlan.load(args.compile_cache_plan)
+    session = start_compile_cache_launch(plan)
+
+    python_root = str(checkout / "python")
+    original_argv = sys.argv
+    original_path = list(sys.path)
+    original_dont_write_bytecode = sys.dont_write_bytecode
+    managed_environment = {
+        name: os.environ.get(name)
+        for name in (*COMPILE_CACHE_ENVIRONMENT_VARIABLES, "PATH")
+    }
+    try:
+        cache_environment = session.environment(os.environ)
+        for name in cache_environment.keys() & managed_environment.keys():
+            os.environ[name] = cache_environment[name]
+        _bind_interpreter_tools()
+        _validate_blackwell_jit_toolchain()
+        # A verified disposable checkout is source, never a bytecode cache.
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, python_root)
+        sys.argv = ["sglang.launch_server", *server_argv]
+        runpy.run_module("sglang.launch_server", run_name="__main__")
+    except SystemExit as error:
+        if error.code is not None and error.code != 0:
+            session.fail(error, reason_code="sglang_launch_failed")
+        else:
+            session.complete()
+        raise
+    except BaseException as error:
+        session.fail(error, reason_code="sglang_launch_failed")
+        raise
+    else:
+        session.complete()
+        return 0
+    finally:
+        sys.argv = original_argv
+        sys.path[:] = original_path
+        sys.dont_write_bytecode = original_dont_write_bytecode
+        for name, value in managed_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 if __name__ == "__main__":

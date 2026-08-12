@@ -2,10 +2,12 @@
 
 from .attestation import (
     NO_TRUSTED_ATTESTERS,
+    RELEASE_TRUSTED_ATTESTER_POLICY,
     AttestationChallenge,
     SignedAttestation,
     TrustedAttesterPolicy,
     attestation_message,
+    require_release_trusted_attester_policy,
     verify_attestation_signature,
 )
 from .backend import (
@@ -23,12 +25,21 @@ from .backend import (
     dspark_conditional_survival_target,
 )
 from .compile_cache import (
+    COMPILE_CACHE_ENVIRONMENT_VARIABLES,
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    CompileCacheAttemptReceipt,
     CompileCacheCorruptionError,
     CompileCacheFile,
+    CompileCacheForeignIdentityError,
+    CompileCacheIncompleteError,
     CompileCacheKey,
+    CompileCacheLaunchPlan,
+    CompileCacheLaunchSession,
     CompileCacheOverlay,
     CompileCacheReceipt,
     ImmutableCompileCache,
+    preflight_compile_cache_launch,
+    start_compile_cache_launch,
 )
 from .dflash_canvas import (
     CanvasReconstruction,
@@ -59,7 +70,10 @@ from .exactness import rejection_sample
 from .publication import CudaPublicationCoordinator
 
 __all__ = [
+    "COMPILE_CACHE_ENVIRONMENT_VARIABLES",
     "NO_TRUSTED_ATTESTERS",
+    "PINNED_SGLANG_COMPILE_SOURCE_SHA256",
+    "RELEASE_TRUSTED_ATTESTER_POLICY",
     "AllRankPublicationCoordinator",
     "AttestationChallenge",
     "BackendContract",
@@ -67,9 +81,14 @@ __all__ = [
     "BackendRegistry",
     "CanvasReconstruction",
     "CohortRouteIdentity",
+    "CompileCacheAttemptReceipt",
     "CompileCacheCorruptionError",
     "CompileCacheFile",
+    "CompileCacheForeignIdentityError",
+    "CompileCacheIncompleteError",
     "CompileCacheKey",
+    "CompileCacheLaunchPlan",
+    "CompileCacheLaunchSession",
     "CompileCacheOverlay",
     "CompileCacheReceipt",
     "CudaPublicationCoordinator",
@@ -103,7 +122,10 @@ __all__ = [
     "dspark_composite_loss",
     "dspark_conditional_survival_target",
     "position_weighted_kl",
+    "preflight_compile_cache_launch",
     "rejection_sample",
+    "require_release_trusted_attester_policy",
+    "start_compile_cache_launch",
     "validate_decision_receipts",
     "verify_attestation_signature",
 ]

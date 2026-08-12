@@ -7,9 +7,10 @@ the scientific identity of any cell.
 
 This module has no CUDA, process, filesystem, or network side effects.  The
 only side-effecting entry point is :func:`execute_dispatch_plan`, whose caller
-must inject an async assignment runner.  Execution is wave-ordered and returns
-immutable cost receipts.  Resume remains blocked until a durable raw-terminal
-store can authorize every prior attempt.
+must inject an async assignment runner and, for formal execution, release-owned
+durable journal hooks. Execution is wave-ordered and returns immutable cost
+receipts. Failed-attempt resume is accepted only when a raw journal replay and
+every successful terminal authority independently authorize the same receipt.
 """
 
 from __future__ import annotations
@@ -18,17 +19,27 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
 from itertools import combinations
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from lightcone_spec.experiments.completion_authority import (
+        AssignmentTerminalAuthority,
+        AssignmentTerminalBinding,
+        CompletedCellAuthority,
+    )
 
 from lightcone_spec.experiments.planning import (
+    BudgetMaterializationAuthorityBinding,
+    BudgetPlan,
     ConfirmationFamilyPowerReductionArtifact,
     ExperimentBudget,
     FamilyActivationArtifact,
     ReducerActivationArtifact,
+    budget_inventory_identity_from_gpu_inventory,
     materialize_confirmation_prefix,
     verify_confirmation_pilot_activation,
 )
@@ -42,7 +53,11 @@ from lightcone_spec.experiments.registry import (
     ResourceClaim,
     WorkloadClass,
     content_sha256,
-    serving_cell_rejection_reason,
+)
+from lightcone_spec.experiments.stage_activation import (
+    RegistryStageActivationArtifact,
+    release_dispatch_rejection_reason,
+    verify_registry_stage_activation,
 )
 
 _LOWER_SHA256_LENGTH = 64
@@ -2140,7 +2155,9 @@ class GpuPoolScheduler:
         budgets_by_cell_id: Mapping[str, ExperimentBudget],
         receipts: Sequence[ExperimentReceipt] = (),
         completed_cell_ids: Sequence[str] = (),
-        activation_artifact: ReducerActivationArtifact | None = None,
+        activation_artifact: (
+            ReducerActivationArtifact | RegistryStageActivationArtifact | None
+        ) = None,
         family_activations: Sequence[FamilyActivationArtifact] = (),
         family_power_reductions: Sequence[
             ConfirmationFamilyPowerReductionArtifact
@@ -2156,22 +2173,24 @@ class GpuPoolScheduler:
             raise ValueError("completed cells include an identity outside the registry")
         experiment = self.registry.ready_experiment(receipts)
         if experiment is None:
-            if family_activations or family_power_reductions:
-                raise ValueError(
-                    "confirmation family artifacts do not match a ready stage"
-                )
+            if (
+                activation_artifact is not None
+                or family_activations
+                or family_power_reductions
+            ):
+                raise ValueError("activation artifacts do not match a ready stage")
             pending: tuple[ExperimentCell, ...] = ()
         else:
-            activated = self._activated_cell_ids(
-                experiment=experiment,
-                receipts=receipts,
-                artifact=activation_artifact,
-            )
             confirmation_activated = self._activated_confirmation_cell_ids(
                 experiment=experiment,
                 completed=completed,
                 artifacts=family_activations,
                 power_reductions=family_power_reductions,
+            )
+            activated = self._activated_cell_ids(
+                experiment=experiment,
+                receipts=receipts,
+                artifact=activation_artifact,
             )
             if confirmation_activated is not None:
                 if activated is not None:
@@ -2532,33 +2551,46 @@ class GpuPoolScheduler:
 
     @staticmethod
     def _dispatchable(cell: ExperimentCell) -> bool:
-        if cell.status is not CellStatus.UNMEASURED:
-            return False
-        if cell.identity.experiment == "preflight":
-            return cell.identity.method == "target_only"
-        if cell.resources.workload_class in {
-            WorkloadClass.DOWNLOAD,
-            WorkloadClass.COMPILE,
-        }:
-            return cell.identity.method == "target_only"
-        if cell.identity.method != "target_only":
-            return False
-        return serving_cell_rejection_reason(cell) is None
+        return release_dispatch_rejection_reason(cell) is None
 
     def _activated_cell_ids(
         self,
         *,
         experiment: str,
         receipts: Sequence[ExperimentReceipt],
-        artifact: ReducerActivationArtifact | None,
+        artifact: ReducerActivationArtifact | RegistryStageActivationArtifact | None,
     ) -> set[str] | None:
-        plan = None if artifact is None else artifact.plan
         if experiment not in {"E1", "E2"}:
-            if artifact is not None:
-                raise ValueError("activation plan does not match the ready stage")
-            return None
-        if artifact is None or plan is None:
-            raise ValueError(f"{experiment} requires a sealed stage activation plan")
+            if experiment in {"E3b", "E5"}:
+                if artifact is not None:
+                    raise ValueError(
+                        "activation plan does not match the ready confirmation stage"
+                    )
+                return None
+            if not isinstance(artifact, RegistryStageActivationArtifact):
+                raise ValueError(
+                    f"{experiment} requires reducer-owned registry-stage activation"
+                )
+            verify_registry_stage_activation(self.registry, artifact)
+            if artifact.experiment != experiment:
+                raise ValueError(
+                    "registry-stage activation does not match the ready stage"
+                )
+            receipt_by_name = self.registry.validate_receipts(receipts)
+            if set(receipt_by_name) != {
+                receipt.experiment for receipt in artifact.dependency_receipts
+            } or any(
+                receipt_by_name[receipt.experiment] != receipt
+                for receipt in artifact.dependency_receipts
+            ):
+                raise ValueError(
+                    "registry-stage activation dependency authority differs from "
+                    "the scheduler receipts"
+                )
+            return set(artifact.activated_cell_ids)
+        if not isinstance(artifact, ReducerActivationArtifact):
+            raise TypeError(f"{experiment} requires a sealed stage activation plan")
+        plan = artifact.plan
         if artifact.schema_version != 1:
             raise ValueError("activation artifact schema is unsupported")
         if (
@@ -2779,7 +2811,9 @@ class GpuDispatchPlanningContext:
     budgets: tuple[ExperimentBudget, ...]
     receipts: tuple[ExperimentReceipt, ...] = ()
     completed_cell_ids: tuple[str, ...] = ()
-    activation_artifact: ReducerActivationArtifact | None = None
+    activation_artifact: (
+        ReducerActivationArtifact | RegistryStageActivationArtifact | None
+    ) = None
     family_activations: tuple[FamilyActivationArtifact, ...] = ()
     family_power_reductions: tuple[ConfirmationFamilyPowerReductionArtifact, ...] = ()
     port_start: int = 24_000
@@ -2820,7 +2854,8 @@ class GpuDispatchPlanningContext:
                 "dispatch-context family power reductions must be raw reducer artifacts"
             )
         if self.activation_artifact is not None and not isinstance(
-            self.activation_artifact, ReducerActivationArtifact
+            self.activation_artifact,
+            (ReducerActivationArtifact, RegistryStageActivationArtifact),
         ):
             raise TypeError(
                 "execution-context activation must be a reducer activation artifact"
@@ -2899,13 +2934,287 @@ class GpuDispatchPlanningContext:
 class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
     """Scheduler authority that is safe to consume at an execution boundary."""
 
+    budget_plan: BudgetPlan = field(kw_only=True)
+    budget_materialization_authority: BudgetMaterializationAuthorityBinding = field(
+        kw_only=True
+    )
+    completion_authorities: tuple[CompletedCellAuthority, ...] = ()
+    # Resume authorities deliberately do not enter ``authority_dict``: adding
+    # them after a failed attempt must not mutate the identity of the frozen
+    # plan.  Every successful receipt binds and revalidates its exact authority
+    # separately in ``validate_dispatch_resume``.
+    resume_terminal_authorities: tuple[AssignmentTerminalAuthority, ...] = ()
+
     def __post_init__(self) -> None:
         super().__post_init__()
+        # A rule-bearing interference envelope is only a compact scheduler
+        # input.  It cannot authorize concurrent execution without replaying
+        # the release-owned raw calibration authority.  The current release
+        # deliberately has no registered acceptance threshold, so formal
+        # execution must stop here before scheduling or launch side effects.
+        from lightcone_spec.experiments.interference_authority import (
+            require_calibrated_interference_execution_authority,
+        )
+
+        require_calibrated_interference_execution_authority(
+            self.interference_envelope,
+            authority=None,
+        )
+        self._validate_budget_plan_identity()
+        self._revalidate_budget_materialization_authority()
         if self.completed_cell_ids:
             raise ValueError(
                 "execution context cannot trust bare completed cell IDs; use a "
                 "planning context until durable terminal bindings are available"
             )
+        from lightcone_spec.experiments.completion_authority import (
+            AssignmentTerminalAuthority,
+            CompletedCellAuthority,
+        )
+
+        if any(
+            type(authority) is not CompletedCellAuthority
+            for authority in self.completion_authorities
+        ):
+            raise TypeError(
+                "execution completed cells require exact raw completion authorities"
+            )
+        if any(
+            type(authority) is not AssignmentTerminalAuthority
+            for authority in self.resume_terminal_authorities
+        ):
+            raise TypeError(
+                "execution resume cells require exact assignment terminal authorities"
+            )
+        if len({authority.sha256 for authority in self.completion_authorities}) != len(
+            self.completion_authorities
+        ):
+            raise ValueError("execution completion authorities are duplicated")
+        if len(
+            {authority.sha256 for authority in self.resume_terminal_authorities}
+        ) != len(self.resume_terminal_authorities):
+            raise ValueError("execution resume authorities are duplicated")
+        if any(
+            authority.registry != self.registry or authority.inventory != self.inventory
+            for authority in self.completion_authorities
+        ) or any(
+            authority.registry != self.registry or authority.inventory != self.inventory
+            for authority in self.resume_terminal_authorities
+        ):
+            raise ValueError(
+                "execution completion/resume authority belongs to another "
+                "registry/inventory"
+            )
+
+    def _validate_budget_plan_identity(self) -> None:
+        """Compare the raw execution inputs to one exact budget-plan authority.
+
+        This structural pass deliberately does not turn an ``UNRESOLVED`` plan
+        into an executable one.  :meth:`require_ready_budget_authority` performs
+        the source-owned capacity replay immediately before every scheduling or
+        launch validation.
+        """
+
+        if type(self.budget_plan) is not BudgetPlan:
+            raise TypeError("execution context requires one exact BudgetPlan")
+        activation_replay = self._budget_activation_replay()
+        if self.receipts != activation_replay.dependency_receipts:
+            raise ValueError(
+                "execution receipts differ from the raw activation authority"
+            )
+        if self.budget_plan.registry_sha256 != self.registry.sha256:
+            raise ValueError("execution BudgetPlan belongs to another registry")
+        expected_inventory = budget_inventory_identity_from_gpu_inventory(
+            self.inventory
+        )
+        if self.budget_plan.inventory != expected_inventory:
+            raise ValueError("execution BudgetPlan differs from the full inventory")
+        capacity_authority = self.budget_plan.capacity_authority
+        if capacity_authority is None:
+            raise ValueError(
+                "execution BudgetPlan lacks source-owned raw capacity authority"
+            )
+        if (
+            capacity_authority.gpu_inventory_sha256 != self.inventory.sha256
+            or capacity_authority.inventory_source_receipt_sha256
+            != self.inventory.source_receipt_sha256
+        ):
+            raise ValueError(
+                "execution capacity authority differs from the full GPU inventory"
+            )
+
+        reducer_sha256s = (
+            ()
+            if activation_replay.activation_artifact is None
+            else (activation_replay.activation_artifact.sha256,)
+        )
+        family_sha256s = tuple(
+            sorted(artifact.sha256 for artifact in activation_replay.family_activations)
+        )
+        power_sha256s = tuple(
+            sorted(
+                reduction.sha256
+                for reduction in activation_replay.family_power_reductions
+            )
+        )
+        if (
+            tuple(sorted(reducer_sha256s))
+            != self.budget_plan.reducer_activation_sha256s
+            or family_sha256s != self.budget_plan.family_activation_sha256s
+            or power_sha256s != self.budget_plan.family_power_reduction_sha256s
+        ):
+            raise ValueError(
+                "execution BudgetPlan differs from the raw activation authority"
+            )
+        activated_cell_ids = tuple(
+            sorted(
+                cell_id
+                for artifact in (
+                    *(
+                        (activation_replay.activation_artifact,)
+                        if activation_replay.activation_artifact
+                        else ()
+                    ),
+                    *activation_replay.family_activations,
+                )
+                for cell_id in artifact.activated_cell_ids
+            )
+        )
+        if len(activated_cell_ids) != len(set(activated_cell_ids)):
+            raise ValueError("execution activation authorities overlap cells")
+        if activated_cell_ids != self.budget_plan.activated_cell_ids:
+            raise ValueError(
+                "execution BudgetPlan activated cells differ from raw activation"
+            )
+        if self.budgets != self.budget_plan.diagnostic_budgets:
+            raise ValueError(
+                "execution context budgets differ from the exact BudgetPlan rows"
+            )
+
+    def require_ready_budget_authority(self) -> tuple[ExperimentBudget, ...]:
+        """Reopen raw reducer inputs and require their exact plan to be READY."""
+
+        self._validate_budget_plan_identity()
+        from lightcone_spec.experiments.budget_authority import (
+            require_ready_budget_materialization_authority_binding,
+        )
+
+        result = require_ready_budget_materialization_authority_binding(
+            self.budget_materialization_authority,
+            expected_registry=self.registry,
+            expected_inventory=budget_inventory_identity_from_gpu_inventory(
+                self.inventory
+            ),
+            expected_gpu_inventory=self.inventory,
+            expected_activation=self._budget_activation_replay().selected_activation,
+            expected_plan=self.budget_plan,
+        )
+        return result.budget_plan.budgets
+
+    def _budget_activation_replay(self):
+        """Reopen the tagged raw activation authority and compare context inputs."""
+
+        from lightcone_spec.experiments.budget_authority import (
+            replay_budget_activation_authority,
+        )
+
+        replay = replay_budget_activation_authority(
+            self.budget_materialization_authority.activation
+        )
+        if replay.stage_family_authorities or replay.auxiliary_authority is not None:
+            raise ValueError(
+                "confirmation stage aggregate is completion authority, not an "
+                "execution activation"
+            )
+        if (
+            replay.registry != self.registry
+            or replay.activation_artifact != self.activation_artifact
+            or replay.family_activations != self.family_activations
+            or replay.family_power_reductions != self.family_power_reductions
+        ):
+            raise ValueError(
+                "execution activation inputs differ from their tagged raw authority"
+            )
+        return replay
+
+    def _revalidate_budget_materialization_authority(self) -> None:
+        if (
+            type(self.budget_materialization_authority)
+            is not BudgetMaterializationAuthorityBinding
+        ):
+            raise TypeError(
+                "execution context requires one exact raw budget materialization "
+                "authority"
+            )
+        from lightcone_spec.experiments.budget_authority import (
+            revalidate_budget_materialization_authority_binding,
+        )
+
+        revalidate_budget_materialization_authority_binding(
+            self.budget_materialization_authority,
+            expected_registry=self.registry,
+            expected_inventory=budget_inventory_identity_from_gpu_inventory(
+                self.inventory
+            ),
+            expected_activation=self._budget_activation_replay().selected_activation,
+            expected_plan=self.budget_plan,
+        )
+
+    def derive_completed_cell_ids(self) -> tuple[str, ...]:
+        """Replay every durable authority; copied IDs never enter execution."""
+
+        derived = tuple(
+            cell_id
+            for authority in self.completion_authorities
+            for cell_id in authority.derive_completed_cell_ids()
+        )
+        if len(derived) != len(set(derived)):
+            raise ValueError("execution completion authorities overlap")
+        return tuple(sorted(derived))
+
+    def issue_plan(self) -> GpuDispatchPlan:
+        """Revalidate raw completion before sole-scheduler replay."""
+
+        self.require_ready_budget_authority()
+        scheduler = GpuPoolScheduler(
+            registry=self.registry,
+            inventory=self.inventory,
+            interference_envelope=self.interference_envelope,
+            port_start=self.port_start,
+            port_end=self.port_end,
+            seed=self.seed,
+        )
+        return scheduler.schedule(
+            budgets_by_cell_id=self.budgets_by_cell_id,
+            receipts=self.receipts,
+            completed_cell_ids=self.derive_completed_cell_ids(),
+            activation_artifact=self.activation_artifact,
+            family_activations=self.family_activations,
+            family_power_reductions=self.family_power_reductions,
+        )
+
+    def authority_dict(self) -> dict[str, Any]:
+        """Bind both raw authority identities and freshly derived cells."""
+
+        self._validate_budget_plan_identity()
+        self._revalidate_budget_materialization_authority()
+        capacity_authority = self.budget_plan.capacity_authority
+        if capacity_authority is None:  # pragma: no cover - constructor invariant
+            raise RuntimeError("execution capacity authority disappeared")
+        value = super().authority_dict()
+        self._budget_activation_replay()
+        value["schema_version"] = 3
+        value["kind"] = "gpu_dispatch_execution_context"
+        value["budget_plan_sha256"] = self.budget_plan.sha256
+        value["capacity_authority_sha256"] = capacity_authority.sha256
+        value["budget_materialization_authority_sha256"] = (
+            self.budget_materialization_authority.sha256
+        )
+        value["completed_cell_ids"] = list(self.derive_completed_cell_ids())
+        value["completion_authority_sha256s"] = [
+            authority.sha256 for authority in self.completion_authorities
+        ]
+        return value
 
 
 def validate_dispatch_plan_for_planning(
@@ -2949,8 +3258,103 @@ class AssignmentExecutionStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class DispatchAttemptJournalToken:
+    """Opaque durable-intent token returned before an assignment may run."""
+
+    started_monotonic_ns: int
+    intent_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.started_monotonic_ns, bool)
+            or not isinstance(self.started_monotonic_ns, int)
+            or self.started_monotonic_ns < 0
+        ):
+            raise ValueError("attempt intent monotonic time must be non-negative")
+        _require_sha256("attempt intent SHA-256", self.intent_sha256)
+
+
+@dataclass(frozen=True)
+class DispatchAttemptJournalReplay:
+    """Path-bound journal snapshot authorized by the orchestration boundary.
+
+    This value is deliberately only a bridge into the pure execution engine.
+    The engine checks its exact schedule identity, while the orchestration
+    boundary is responsible for reopening the raw append-only files and every
+    successful terminal authority before constructing it.
+    """
+
+    journal_path: str
+    manifest_sha256: str
+    head_event_sha256: str
+    event_count: int
+    schedule_receipt_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_text("attempt journal path", self.journal_path)
+        for name in (
+            "manifest_sha256",
+            "head_event_sha256",
+            "schedule_receipt_sha256",
+        ):
+            _require_sha256(name, getattr(self, name))
+        if (
+            isinstance(self.event_count, bool)
+            or not isinstance(self.event_count, int)
+            or self.event_count < 1
+        ):
+            raise ValueError("attempt journal replay requires at least one event")
+
+
+class DispatchAttemptJournalSink(Protocol):
+    """Durable release-owned hooks around one assignment runner call."""
+
+    async def begin_wave_attempts(
+        self,
+        *,
+        plan: GpuDispatchPlan,
+        wave: GpuDispatchWave,
+        attempts: tuple[
+            tuple[
+                GpuAssignment,
+                int,
+                ExperimentBudget,
+                AssignmentExecutionReceipt | None,
+            ],
+            ...,
+        ],
+        prior_schedule_receipt_sha256: str | None,
+    ) -> None: ...
+
+    async def begin_attempt(
+        self,
+        *,
+        plan: GpuDispatchPlan,
+        wave: GpuDispatchWave,
+        assignment: GpuAssignment,
+        attempt: int,
+        budget: ExperimentBudget,
+        fixed_instance_gpu_count: int,
+        prior_attempt_receipt: AssignmentExecutionReceipt | None,
+        prior_schedule_receipt_sha256: str | None,
+    ) -> DispatchAttemptJournalToken: ...
+
+    async def finish_attempt(
+        self,
+        *,
+        token: DispatchAttemptJournalToken,
+        receipt: AssignmentExecutionReceipt,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
 class AssignmentExecutionReceipt:
-    """Terminal result plus cumulative monotonic cost for one assignment."""
+    """Terminal result plus cumulative monotonic cost for one assignment.
+
+    On success, ``terminal_receipt_sha256`` is the digest of the structured
+    raw-file binding in ``terminal_binding``.  A caller-provided digest alone
+    can never mint a successful assignment.
+    """
 
     plan_sha256: str
     wave_sha256: str
@@ -2959,6 +3363,7 @@ class AssignmentExecutionReceipt:
     attempt: int
     status: AssignmentExecutionStatus
     terminal_receipt_sha256: str | None
+    terminal_binding: AssignmentTerminalBinding | None
     failure_sha256: str | None
     prior_attempt_receipt_sha256: str | None
     gpu_count: int
@@ -3019,8 +3424,24 @@ class AssignmentExecutionReceipt:
         ):
             raise ValueError("assignment accounting semantics are unsupported")
         if self.status is AssignmentExecutionStatus.SUCCEEDED:
+            from lightcone_spec.experiments.completion_authority import (
+                AssignmentTerminalBinding,
+            )
+
             if not _is_sha256(self.terminal_receipt_sha256):
                 raise ValueError("successful assignment needs a terminal receipt")
+            if type(self.terminal_binding) is not AssignmentTerminalBinding:
+                raise TypeError(
+                    "successful assignment needs an exact raw terminal binding"
+                )
+            if (
+                self.terminal_receipt_sha256 != self.terminal_binding.sha256
+                or self.terminal_binding.assignment_sha256 != self.assignment_sha256
+                or self.terminal_binding.budget_sha256 != self.budget_sha256
+            ):
+                raise ValueError(
+                    "successful assignment terminal binding identity mismatch"
+                )
             if self.failure_sha256 is not None:
                 raise ValueError("successful assignment cannot carry failure evidence")
         else:
@@ -3028,6 +3449,8 @@ class AssignmentExecutionReceipt:
                 raise ValueError("failed assignment needs bound failure evidence")
             if self.terminal_receipt_sha256 is not None:
                 raise ValueError("failed assignment cannot carry a terminal receipt")
+            if self.terminal_binding is not None:
+                raise ValueError("failed assignment cannot carry a terminal binding")
 
     @cached_property
     def sha256(self) -> str:
@@ -3042,6 +3465,11 @@ class AssignmentExecutionReceipt:
             "attempt": self.attempt,
             "status": self.status.value,
             "terminal_receipt_sha256": self.terminal_receipt_sha256,
+            "terminal_binding": (
+                None
+                if self.terminal_binding is None
+                else self.terminal_binding.to_dict()
+            ),
             "failure_sha256": self.failure_sha256,
             "prior_attempt_receipt_sha256": self.prior_attempt_receipt_sha256,
             "gpu_count": self.gpu_count,
@@ -3071,6 +3499,7 @@ class AssignmentExecutionReceipt:
                     "attempt",
                     "status",
                     "terminal_receipt_sha256",
+                    "terminal_binding",
                     "failure_sha256",
                     "prior_attempt_receipt_sha256",
                     "gpu_count",
@@ -3083,6 +3512,17 @@ class AssignmentExecutionReceipt:
                 }
             ),
         )
+        terminal_binding_value = row["terminal_binding"]
+        if terminal_binding_value is None:
+            terminal_binding = None
+        else:
+            from lightcone_spec.experiments.completion_authority import (
+                AssignmentTerminalBinding,
+            )
+
+            terminal_binding = AssignmentTerminalBinding.from_dict(
+                terminal_binding_value
+            )
         intervals = tuple(
             tuple(
                 _strict_int("attempt monotonic endpoint", endpoint)
@@ -3107,6 +3547,7 @@ class AssignmentExecutionReceipt:
             terminal_receipt_sha256=_optional_text(
                 "terminal_receipt_sha256", row["terminal_receipt_sha256"]
             ),
+            terminal_binding=terminal_binding,
             failure_sha256=_optional_text("failure_sha256", row["failure_sha256"]),
             prior_attempt_receipt_sha256=_optional_text(
                 "prior_attempt_receipt_sha256",
@@ -3480,11 +3921,20 @@ class DispatchScheduleReceipt:
         if self.phase is DispatchExecutionPhase.COMPLETE:
             if not all(receipt.succeeded for receipt in self.wave_receipts):
                 raise ValueError("COMPLETE schedule receipt contains failed work")
+        elif self.phase is DispatchExecutionPhase.RUNNING:
+            if not self.wave_receipts or not all(
+                receipt.succeeded for receipt in self.wave_receipts
+            ):
+                raise ValueError(
+                    "RUNNING schedule receipt must contain a successful wave prefix"
+                )
         elif self.phase is DispatchExecutionPhase.FAILED:
             if not self.wave_receipts or self.wave_receipts[-1].succeeded:
                 raise ValueError("FAILED schedule receipt lacks a failed terminal wave")
         else:
-            raise ValueError("durable schedule receipts must be COMPLETE or FAILED")
+            raise ValueError(
+                "durable schedule receipts must be RUNNING, COMPLETE, or FAILED"
+            )
 
     @cached_property
     def sha256(self) -> str:
@@ -3614,7 +4064,10 @@ class DispatchScheduleReceipt:
         return ArtifactSidecar(1, "dispatch_schedule_receipt.v1", self.sha256)
 
 
-AssignmentRunner = Callable[[GpuAssignment], Awaitable[str]]
+AssignmentRunner = Callable[
+    [GpuAssignment],
+    Awaitable["AssignmentTerminalAuthority"],
+]
 
 
 def _validate_wave_receipt(
@@ -3650,6 +4103,18 @@ def _validate_wave_receipt(
             raise ValueError("resume assignment receipt gang-size mismatch")
         if row.attempt > budget.retry_allowance + 1:
             raise ValueError("resume assignment receipt exceeds retry allowance")
+        if row.status is AssignmentExecutionStatus.SUCCEEDED:
+            binding = row.terminal_binding
+            if binding is None:
+                raise ValueError("resume success lacks a raw terminal binding")
+            if (
+                binding.cell_id != assignment.work_item.item_id
+                or binding.inventory_sha256 != execution_context.inventory.sha256
+                or binding.physical_gpu_uuids != assignment.gpu_uuids
+            ):
+                raise ValueError(
+                    "resume terminal binding differs from its assignment/inventory"
+                )
 
 
 def _validate_dispatch_resume_structure(
@@ -3681,6 +4146,31 @@ def _validate_dispatch_resume_structure(
         receipt.wave_receipts
     ) != len(plan.waves):
         raise ValueError("complete resume receipt does not cover the whole plan")
+    succeeded = tuple(row.succeeded for row in receipt.wave_receipts)
+    if receipt.phase is DispatchExecutionPhase.PLANNED:
+        if receipt.wave_receipts:
+            raise ValueError("planned resume receipt cannot contain a wave")
+    elif receipt.phase is DispatchExecutionPhase.RUNNING:
+        if (
+            not receipt.wave_receipts
+            or len(receipt.wave_receipts) >= len(plan.waves)
+            or not all(succeeded)
+        ):
+            raise ValueError(
+                "running resume receipt must be a nonempty successful wave prefix"
+            )
+    elif receipt.phase is DispatchExecutionPhase.FAILED:
+        if (
+            not receipt.wave_receipts
+            or receipt.wave_receipts[-1].succeeded
+            or not all(succeeded[:-1])
+        ):
+            raise ValueError(
+                "failed resume receipt must end in one failed wave after a "
+                "successful prefix"
+            )
+    elif not all(succeeded):
+        raise ValueError("complete resume receipt contains a failed wave")
 
 
 def validate_dispatch_resume(
@@ -3688,18 +4178,71 @@ def validate_dispatch_resume(
     receipt: DispatchScheduleReceipt,
     *,
     execution_context: GpuDispatchExecutionContext,
+    attempt_journal_replay: DispatchAttemptJournalReplay | None = None,
 ) -> None:
-    """Fail closed until raw terminal artifacts can authorize resume."""
+    """Reopen every successful assignment's raw terminal authority."""
 
     _validate_dispatch_resume_structure(
         plan,
         receipt,
         execution_context=execution_context,
     )
-    raise ValueError(
-        "dispatch resume is blocked until a durable terminal artifact store "
-        "can revalidate raw terminal identity"
-    )
+    if receipt.wave_receipts and attempt_journal_replay is None:
+        raise ValueError(
+            "dispatch resume is blocked without a release-owned append-only "
+            "attempt/cost authority"
+        )
+    if attempt_journal_replay is not None:
+        if type(attempt_journal_replay) is not DispatchAttemptJournalReplay:
+            raise TypeError("attempt journal replay authority must be exact")
+        if attempt_journal_replay.schedule_receipt_sha256 != receipt.sha256:
+            raise ValueError(
+                "attempt journal replay differs from the resumed schedule receipt"
+            )
+    required = {
+        row.terminal_binding.authority_sha256
+        for wave in receipt.wave_receipts
+        for row in wave.assignment_receipts
+        if row.status is AssignmentExecutionStatus.SUCCEEDED
+        and row.terminal_binding is not None
+    }
+    provided = {
+        authority.sha256: authority
+        for authority in execution_context.resume_terminal_authorities
+    }
+    if set(provided) != required:
+        raise ValueError(
+            "resume requires the exact raw terminal authority set referenced by "
+            "successful assignments"
+        )
+
+    budgets = execution_context.budgets_by_cell_id
+    for wave, wave_receipt in zip(
+        plan.waves[: len(receipt.wave_receipts)],
+        receipt.wave_receipts,
+        strict=True,
+    ):
+        assignments = {
+            assignment.assignment_id: assignment for assignment in wave.assignments
+        }
+        for row in wave_receipt.assignment_receipts:
+            if row.status is not AssignmentExecutionStatus.SUCCEEDED:
+                continue
+            binding = row.terminal_binding
+            if binding is None:
+                raise ValueError("resume success lacks a raw terminal binding")
+            assignment = assignments[row.assignment_sha256]
+            expected = provided[binding.authority_sha256].revalidate(
+                registry=execution_context.registry,
+                inventory=execution_context.inventory,
+                assignment_sha256=assignment.assignment_id,
+                budget_sha256=budgets[assignment.work_item.item_id].sha256,
+                physical_gpu_uuids=assignment.gpu_uuids,
+            )
+            if binding != expected:
+                raise ValueError(
+                    "resume terminal binding differs from freshly revalidated raw files"
+                )
 
 
 def _make_wave_execution_receipt(
@@ -3781,29 +4324,65 @@ async def _run_assignment(
     assignment: GpuAssignment,
     attempt: int,
     budget: ExperimentBudget,
+    registry: ExperimentRegistry,
+    inventory: GpuInventory,
     fixed_instance_gpu_count: int,
     prior_attempt_receipt: AssignmentExecutionReceipt | None,
     runner: AssignmentRunner,
+    attempt_journal: DispatchAttemptJournalSink | None,
+    prior_schedule_receipt_sha256: str | None,
 ) -> AssignmentExecutionReceipt:
-    started_ns = time.monotonic_ns()
+    if attempt_journal is None:
+        token = None
+        started_ns = time.monotonic_ns()
+    else:
+        token = await attempt_journal.begin_attempt(
+            plan=plan,
+            wave=wave,
+            assignment=assignment,
+            attempt=attempt,
+            budget=budget,
+            fixed_instance_gpu_count=fixed_instance_gpu_count,
+            prior_attempt_receipt=prior_attempt_receipt,
+            prior_schedule_receipt_sha256=prior_schedule_receipt_sha256,
+        )
+        if type(token) is not DispatchAttemptJournalToken:
+            raise TypeError("attempt journal returned a non-authoritative token")
+        started_ns = token.started_monotonic_ns
     try:
-        terminal_sha256 = await runner(assignment)
+        terminal = await runner(assignment)
+        from lightcone_spec.experiments.completion_authority import (
+            AssignmentTerminalAuthority,
+        )
+
+        if type(terminal) is not AssignmentTerminalAuthority:
+            raise TypeError(
+                "assignment runner must return an exact AssignmentTerminalAuthority; "
+                "a digest cannot authorize success"
+            )
+        terminal_binding = terminal.revalidate(
+            registry=registry,
+            inventory=inventory,
+            assignment_sha256=assignment.assignment_id,
+            budget_sha256=budget.sha256,
+            physical_gpu_uuids=assignment.gpu_uuids,
+        )
         finished_ns = time.monotonic_ns()
-        _require_sha256("runner terminal receipt", terminal_sha256)
         intervals = (
             ()
             if prior_attempt_receipt is None
             else prior_attempt_receipt.attempt_intervals_monotonic_ns
         ) + ((started_ns, finished_ns),)
         elapsed_ns = _interval_union_ns(intervals)
-        return AssignmentExecutionReceipt(
+        receipt = AssignmentExecutionReceipt(
             plan_sha256=plan.sha256,
             wave_sha256=wave.sha256,
             assignment_sha256=assignment.assignment_id,
             budget_sha256=budget.sha256,
             attempt=attempt,
             status=AssignmentExecutionStatus.SUCCEEDED,
-            terminal_receipt_sha256=terminal_sha256,
+            terminal_receipt_sha256=terminal_binding.sha256,
+            terminal_binding=terminal_binding,
             failure_sha256=None,
             prior_attempt_receipt_sha256=(
                 None if prior_attempt_receipt is None else prior_attempt_receipt.sha256
@@ -3833,7 +4412,7 @@ async def _run_assignment(
                 "finished_monotonic_ns": finished_ns,
             }
         )
-        return AssignmentExecutionReceipt(
+        receipt = AssignmentExecutionReceipt(
             plan_sha256=plan.sha256,
             wave_sha256=wave.sha256,
             assignment_sha256=assignment.assignment_id,
@@ -3841,6 +4420,7 @@ async def _run_assignment(
             attempt=attempt,
             status=AssignmentExecutionStatus.FAILED,
             terminal_receipt_sha256=None,
+            terminal_binding=None,
             failure_sha256=failure_sha256,
             prior_attempt_receipt_sha256=(
                 None if prior_attempt_receipt is None else prior_attempt_receipt.sha256
@@ -3851,6 +4431,11 @@ async def _run_assignment(
             attributed_gpu_ns=elapsed_ns * len(assignment.gpu_uuids),
             attributed_fixed_instance_gpu_ns=(elapsed_ns * fixed_instance_gpu_count),
         )
+    if attempt_journal is not None:
+        if token is None:  # pragma: no cover - branch follows the journal check
+            raise RuntimeError("attempt journal token disappeared")
+        await attempt_journal.finish_attempt(token=token, receipt=receipt)
+    return receipt
 
 
 async def execute_dispatch_plan(
@@ -3859,29 +4444,55 @@ async def execute_dispatch_plan(
     execution_context: GpuDispatchExecutionContext,
     runner: AssignmentRunner,
     resume_receipt: DispatchScheduleReceipt | None = None,
+    attempt_journal: DispatchAttemptJournalSink | None = None,
+    attempt_journal_replay: DispatchAttemptJournalReplay | None = None,
+    stop_after_wave_index: int | None = None,
 ) -> DispatchScheduleReceipt:
     """Execute frozen waves with structured sibling completion.
 
     A failed sibling does not erase successful sibling receipts.  Execution
-    stops before the next wave.  Durable resume inputs are structurally checked
-    but rejected until a raw terminal-artifact store can authorize every prior
-    attempt.  No bare ``completed_cell_ids`` resume path exists.
+    stops before the next wave.  A resume reopens the exact raw completion
+    authority bound by every successful assignment before it skips that work.
+    No bare digest or ``completed_cell_ids`` resume path exists.  Supplying
+    ``stop_after_wave_index`` returns a durable ``RUNNING`` prefix after that
+    successful wave, allowing a CLI to publish each wave before starting the
+    next one.
     """
 
     if not plan.scientific_budget_bound:
         raise ValueError("dispatch plan lacks exact per-cell ExperimentBudget bindings")
     validate_dispatch_plan_for_execution(plan, execution_context=execution_context)
+    if stop_after_wave_index is not None and (
+        isinstance(stop_after_wave_index, bool)
+        or not isinstance(stop_after_wave_index, int)
+        or stop_after_wave_index < 0
+        or stop_after_wave_index >= len(plan.waves)
+    ):
+        raise ValueError("dispatch stop wave index is outside the frozen plan")
 
     if resume_receipt is not None:
         validate_dispatch_resume(
             plan,
             resume_receipt,
             execution_context=execution_context,
+            attempt_journal_replay=attempt_journal_replay,
         )
+        if resume_receipt.phase is DispatchExecutionPhase.COMPLETE:
+            return resume_receipt
+        prior_receipts = list(resume_receipt.wave_receipts)
+        if resume_receipt.phase is DispatchExecutionPhase.FAILED:
+            failed_prior = prior_receipts.pop()
+            start_wave_index = failed_prior.wave_index
+        else:
+            failed_prior = None
+            start_wave_index = len(prior_receipts)
     else:
         prior_receipts = []
         failed_prior = None
         start_wave_index = 0
+    current_schedule_receipt = resume_receipt
+    if stop_after_wave_index is not None and stop_after_wave_index < start_wave_index:
+        raise ValueError("dispatch stop wave precedes the receipt-authorized prefix")
     if not plan.waves:
         return _make_schedule_receipt(
             plan=plan,
@@ -3902,7 +4513,10 @@ async def execute_dispatch_plan(
         next_wave_index=start_wave_index,
         wave_receipt_sha256=tuple(row.sha256 for row in prior_receipts),
     ).begin(total_waves=len(plan.waves))
-    for wave in plan.waves[start_wave_index:]:
+    stop = (
+        len(plan.waves) - 1 if stop_after_wave_index is None else stop_after_wave_index
+    )
+    for wave in plan.waves[start_wave_index : stop + 1]:
         successful_prior: dict[str, AssignmentExecutionReceipt] = {}
         prior_attempts: dict[str, AssignmentExecutionReceipt] = {}
         if failed_prior is not None and wave.wave_index == failed_prior.wave_index:
@@ -3936,6 +4550,17 @@ async def execute_dispatch_plan(
                 )
             pending.append((assignment, attempt, budget, prior_attempt))
         tasks: dict[str, asyncio.Task[AssignmentExecutionReceipt]] = {}
+        if attempt_journal is not None:
+            await attempt_journal.begin_wave_attempts(
+                plan=plan,
+                wave=wave,
+                attempts=tuple(pending),
+                prior_schedule_receipt_sha256=(
+                    None
+                    if current_schedule_receipt is None
+                    else current_schedule_receipt.sha256
+                ),
+            )
         async with asyncio.TaskGroup() as group:
             for assignment, attempt, budget, prior_attempt in pending:
                 tasks[assignment.assignment_id] = group.create_task(
@@ -3945,11 +4570,19 @@ async def execute_dispatch_plan(
                         assignment=assignment,
                         attempt=attempt,
                         budget=budget,
+                        registry=execution_context.registry,
+                        inventory=execution_context.inventory,
                         fixed_instance_gpu_count=len(
                             execution_context.inventory.devices
                         ),
                         prior_attempt_receipt=prior_attempt,
                         runner=runner,
+                        attempt_journal=attempt_journal,
+                        prior_schedule_receipt_sha256=(
+                            None
+                            if current_schedule_receipt is None
+                            else current_schedule_receipt.sha256
+                        ),
                     )
                 )
         assignment_receipts = tuple(
@@ -3969,25 +4602,22 @@ async def execute_dispatch_plan(
         else:
             prior_receipts.append(wave_receipt)
         state = state.accept(wave_receipt, total_waves=len(plan.waves))
+        current_schedule_receipt = _make_schedule_receipt(
+            plan=plan,
+            phase=state.phase,
+            wave_receipts=tuple(prior_receipts),
+            execution_context=execution_context,
+            prior_schedule_receipt_sha256=(
+                None
+                if current_schedule_receipt is None
+                else current_schedule_receipt.sha256
+            ),
+        )
         if state.phase is DispatchExecutionPhase.FAILED:
-            return _make_schedule_receipt(
-                plan=plan,
-                phase=DispatchExecutionPhase.FAILED,
-                wave_receipts=tuple(prior_receipts),
-                execution_context=execution_context,
-                prior_schedule_receipt_sha256=(
-                    None if resume_receipt is None else resume_receipt.sha256
-                ),
-            )
-    return _make_schedule_receipt(
-        plan=plan,
-        phase=DispatchExecutionPhase.COMPLETE,
-        wave_receipts=tuple(prior_receipts),
-        execution_context=execution_context,
-        prior_schedule_receipt_sha256=(
-            None if resume_receipt is None else resume_receipt.sha256
-        ),
-    )
+            return current_schedule_receipt
+    if current_schedule_receipt is None:  # pragma: no cover - nonempty plan invariant
+        raise RuntimeError("dispatch execution produced no schedule receipt")
+    return current_schedule_receipt
 
 
 def supported_pool_size(size: int) -> bool:

@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from test_evidence_alias_authority import _alias_artifact
+from test_evidence_alias_authority import _manifest as _raw_alias_manifest
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import _load_stage_activation_plan, main
@@ -16,6 +19,10 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuTopologyGroup,
     InterferenceEnvelope,
 )
+from lightcone_spec.experiments.industrial_analysis import (
+    RawEvidenceAliasManifest,
+    raw_evidence_alias_manifest_to_dict,
+)
 from lightcone_spec.experiments.planning import (
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
@@ -24,13 +31,9 @@ from lightcone_spec.experiments.planning import (
     ConfirmationFamilyPowerPlan,
     ConfirmationFamilyPowerReductionArtifact,
     DispositionStatus,
-    EvidenceAliasCandidate,
-    EvidenceAliasReceipt,
-    ExecutionSemanticsIdentity,
     ExpectedMaximumCount,
     ExperimentBudget,
     P99AnchorStatus,
-    PresentationAxis,
     RawEvidenceRunBinding,
     ReducerActivationArtifact,
     ScenarioMilliseconds,
@@ -43,10 +46,10 @@ from lightcone_spec.experiments.planning import (
 from lightcone_spec.experiments.planning_artifacts import (
     confirmation_family_identity_to_dict,
     confirmation_family_power_reduction_artifact_to_dict,
-    evidence_alias_receipt_to_dict,
+    evidence_alias_reduction_artifact_from_dict,
+    evidence_alias_reduction_artifact_to_dict,
     evidence_dependence_map_from_dict,
     evidence_dependence_map_to_dict,
-    experiment_budget_sequence_from_dict,
     experiment_budget_sequence_to_dict,
     family_activation_artifact_from_dict,
     family_activation_artifact_to_dict,
@@ -59,7 +62,11 @@ from lightcone_spec.experiments.registry import (
     build_industrial_registry,
     content_sha256,
 )
-from lightcone_spec.experiments.statistics import PilotBlock, preregister_power_sizing
+from lightcone_spec.experiments.statistics import (
+    HardwareEnvelope,
+    PilotBlock,
+    preregister_power_sizing,
+)
 from lightcone_spec.telemetry import (
     OUTPUT_HASH_FORMAT,
     EvidenceWriter,
@@ -378,13 +385,13 @@ def _standard_budget(cell) -> ExperimentBudget:
     )
 
 
-def test_registry_planner_writes_deterministic_full_gpu_dispatch_plan(
+def test_dispatch_rejects_bare_budget_sequence_without_raw_materialization(
     tmp_path: Path,
 ) -> None:
     registry_path, registry = _build_registry(tmp_path)
     inventory_path, envelope_path, budget_path = _pool_inputs(tmp_path, registry)
     first_plan = tmp_path / "preflight-plan.json"
-    assert (
+    with pytest.raises(SystemExit):
         main(
             [
                 "plan-industrial-dispatch",
@@ -400,98 +407,7 @@ def test_registry_planner_writes_deterministic_full_gpu_dispatch_plan(
                 str(first_plan),
             ]
         )
-        == 0
-    )
-    preflight = json.loads(first_plan.read_text(encoding="utf-8"))
-    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
-    expected_cell = next(
-        cell
-        for cell in registry["registry"]["cells"]
-        if cell["identity"]["experiment"] == "preflight"
-        and cell["identity"]["method"] == "target_only"
-    )
-    assert set(preflight) == {
-        "schema_version",
-        "registry_sha256",
-        "inventory_sha256",
-        "receipts_sha256",
-        "interference_envelope_sha256",
-        "budget_sha256_by_cell",
-        "scientific_budget_bound",
-        "seed",
-        "waves",
-        "wave_sha256",
-        "completed_cell_ids",
-        "estimated_wall_seconds",
-        "estimated_gpu_seconds",
-        "estimated_gpu_hours",
-    }
-    assert preflight["registry_sha256"] == registry["registry_sha256"]
-    assert preflight["inventory_sha256"] == _sha(inventory)
-    assert preflight["interference_envelope_sha256"] == _sha(envelope)
-    assert preflight["receipts_sha256"] == content_sha256(())
-    assert preflight["scientific_budget_bound"] is True
-    assert preflight["budget_sha256_by_cell"] == [
-        {
-            "cell_id": budget.cell_id,
-            "experiment_budget_sha256": budget.sha256,
-        }
-        for budget in experiment_budget_sequence_from_dict(
-            json.loads(budget_path.read_text(encoding="utf-8"))
-        )
-    ]
-    assert preflight["completed_cell_ids"] == []
-    assert preflight["estimated_wall_seconds"] == pytest.approx(2.0)
-    assert preflight["estimated_gpu_seconds"] == pytest.approx(4.0)
-    assert preflight["estimated_gpu_hours"] == pytest.approx(4.0 / 3600.0)
-    assert len(preflight["waves"]) == 1
-    wave = preflight["waves"][0]
-    assert set(wave) == {
-        "wave_index",
-        "assignments",
-        "assignment_sha256",
-        "interference_envelope_sha256",
-    }
-    assert wave["wave_index"] == 0
-    assert wave["interference_envelope_sha256"] == _sha(envelope)
-    assert len(wave["assignments"]) == 1
-    assignment = wave["assignments"][0]
-    assert set(assignment) == {
-        "work_item",
-        "work_item_sha256",
-        "gpu_uuids",
-        "rank_groups",
-        "ports",
-    }
-    assert assignment["gpu_uuids"] == ["GPU-pool-000", "GPU-pool-001"]
-    assert assignment["rank_groups"] == [
-        ["GPU-pool-000", "GPU-pool-001"],
-    ]
-    assert assignment["work_item"]["cell"]["identity"] == expected_cell["identity"]
-    assert assignment["work_item"]["claim"]["estimated_duration_seconds"] == 2.0
-    assert assignment["work_item"]["claim"]["estimated_gpu_seconds"] == 4.0
-
-    repeated_plan = tmp_path / "preflight-plan-repeated.json"
-    assert (
-        main(
-            [
-                "plan-industrial-dispatch",
-                "--registry",
-                str(registry_path),
-                "--inventory",
-                str(inventory_path),
-                "--interference-envelope",
-                str(envelope_path),
-                "--budget-plan",
-                str(budget_path),
-                "--output",
-                str(repeated_plan),
-            ]
-        )
-        == 0
-    )
-    assert json.loads(repeated_plan.read_text(encoding="utf-8")) == preflight
+    assert not first_plan.exists()
     with pytest.raises(SystemExit):
         main(
             [
@@ -504,6 +420,10 @@ def test_registry_planner_writes_deterministic_full_gpu_dispatch_plan(
                 str(envelope_path),
                 "--budget-plan",
                 str(budget_path),
+                "--budget-policy",
+                str(tmp_path / "policy.json"),
+                "--capacity-envelope",
+                str(tmp_path / "capacity.json"),
                 "--confirmation-block-plan",
                 str(tmp_path / "legacy-confirmation.json"),
                 "--output",
@@ -572,6 +492,10 @@ def test_registry_and_receipt_edits_fail_closed(tmp_path: Path) -> None:
                 str(envelope_path),
                 "--budget-plan",
                 str(budget_path),
+                "--budget-policy",
+                str(tmp_path / "policy.json"),
+                "--capacity-envelope",
+                str(tmp_path / "capacity.json"),
                 "--output",
                 str(tmp_path / "plan.json"),
             ]
@@ -604,6 +528,10 @@ def test_dispatch_rejects_boolean_substitution_for_interference_envelope(
                 str(forged_path),
                 "--budget-plan",
                 str(budget_path),
+                "--budget-policy",
+                str(tmp_path / "policy.json"),
+                "--capacity-envelope",
+                str(tmp_path / "capacity.json"),
                 "--output",
                 str(tmp_path / "plan.json"),
             ]
@@ -646,6 +574,30 @@ def test_registry_uses_logical_slots_and_rejects_physical_uuid_flag(
                 str(tmp_path / "physical-registry.json"),
             ]
         )
+
+
+def test_registry_cli_accepts_arbitrary_logical_rank_slots(tmp_path: Path) -> None:
+    output = tmp_path / "four-slot-registry.json"
+    logical_slots = tuple(f"logical-rank-slot-{index}" for index in range(4))
+    assert (
+        main(
+            [
+                "build-industrial-registry",
+                "--logical-gpu-slot",
+                *logical_slots,
+                "--cache-root",
+                str(tmp_path / "cache"),
+                "--evidence-root",
+                str(tmp_path / "evidence"),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    value = json.loads(output.read_text(encoding="utf-8"))
+    assert value["parameters"]["logical_gpu_slots"] == list(logical_slots)
+    assert value["registry"]["cells"]
 
 
 def _confirmation_family_inputs(tmp_path: Path):
@@ -883,7 +835,7 @@ def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(
     assert final.activation_round == "final_prefix"
     assert len(final.activated_cell_ids) == 4 * plan.selected_final_blocks
 
-    inventory_path, _, _ = _pool_inputs(
+    inventory_path, envelope_path, _ = _pool_inputs(
         tmp_path,
         json.loads(registry_path.read_text(encoding="utf-8")),
     )
@@ -913,8 +865,14 @@ def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(
                 str(power_path),
                 "--inventory",
                 str(inventory_path),
-                "--budgets",
+                "--interference-envelope",
+                str(envelope_path),
+                "--budget-plan",
                 str(budget_path),
+                "--budget-policy",
+                str(tmp_path / "policy.json"),
+                "--capacity-envelope",
+                str(tmp_path / "capacity.json"),
                 "--output",
                 str(report_path),
             ]
@@ -930,79 +888,99 @@ def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(
                 str(final_path),
                 "--inventory",
                 str(inventory_path),
-                "--budgets",
+                "--interference-envelope",
+                str(envelope_path),
+                "--budget-plan",
                 str(budget_path),
+                "--budget-policy",
+                str(tmp_path / "policy.json"),
+                "--capacity-envelope",
+                str(tmp_path / "capacity.json"),
                 "--output",
                 str(tmp_path / "legacy-budget-report.json"),
             ]
         )
 
 
-def _alias_semantics() -> ExecutionSemanticsIdentity:
-    return ExecutionSemanticsIdentity(
-        target_model="target-model",
-        target_revision="revision",
-        runtime_sha256=_sha("alias-runtime"),
-        patched_tree_identity="patched-tree",
-        sampling_sha256=_sha("alias-sampling"),
-        seed=7,
-        request_corpus_sha256=_sha("alias-corpus"),
-        arrival_trace_sha256=_sha("alias-arrival"),
-        maximum_context_tokens=4096,
-        maximum_output_tokens=256,
-        hardware_envelope_sha256=_sha("alias-hardware"),
-        topology="tp1_dp1",
-        rank_layout_sha256=_sha("alias-ranks"),
-        method="target_only",
-        method_implementation_sha256=_sha("alias-implementation"),
-        server_config_sha256=_sha("alias-server"),
-        evidence_schema="schema_v3",
-        output_token_contract_sha256=_sha("alias-output"),
-        timing_contract_sha256=_sha("alias-timing"),
+def test_alias_cli_replays_raw_authority_and_dependence_uses_reduction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry_path, registry_value = _build_registry(tmp_path)
+    inventory_path, _, _ = _pool_inputs(tmp_path, registry_value)
+    hardware_value = {
+        "gpu_clock_mhz_min": 1500.0,
+        "gpu_clock_mhz_max": 2100.0,
+        "memory_clock_mhz_min": 1000.0,
+        "memory_clock_mhz_max": 1500.0,
+        "temperature_c_max": 80.0,
+        "power_watts_min": 100.0,
+        "power_watts_max": 600.0,
+        "power_state": "P0",
+        "allowed_throttling_reasons": [],
+        "allowed_background_processes": [],
+    }
+    hardware_path = tmp_path / "hardware-envelope.json"
+    _write_bound(hardware_path, hardware_value)
+    raw_manifest = _raw_alias_manifest(tmp_path)
+    raw_manifest_path = tmp_path / "raw-alias-manifest.json"
+    _write_bound(
+        raw_manifest_path,
+        raw_evidence_alias_manifest_to_dict(raw_manifest),
     )
+    reduced = _alias_artifact()
+    replayed: list[str] = []
 
+    def replay_alias(*, registry, manifest, hardware_envelope, inventory):
+        assert isinstance(manifest, RawEvidenceAliasManifest)
+        assert manifest == raw_manifest
+        assert registry.sha256 == registry_value["registry_sha256"]
+        assert hardware_envelope == HardwareEnvelope(
+            gpu_clock_mhz_min=1500.0,
+            gpu_clock_mhz_max=2100.0,
+            memory_clock_mhz_min=1000.0,
+            memory_clock_mhz_max=1500.0,
+            temperature_c_max=80.0,
+            power_watts_min=100.0,
+            power_watts_max=600.0,
+            power_state="P0",
+        )
+        assert isinstance(inventory, GpuInventory)
+        replayed.append(manifest.sha256)
+        return reduced
 
-def test_alias_validation_and_dependence_map_use_full_artifacts(tmp_path: Path) -> None:
-    semantics = _alias_semantics()
-    source = EvidenceAliasCandidate(
-        cell_id=_sha("alias-source-cell"),
-        semantics=semantics,
-        presentation_axes=(PresentationAxis("backend_label", "DFLASH"),),
+    monkeypatch.setattr(
+        "lightcone_spec.cli.main.reduce_evidence_alias",
+        replay_alias,
     )
-    target = EvidenceAliasCandidate(
-        cell_id=_sha("alias-target-cell"),
-        semantics=semantics,
-        presentation_axes=(PresentationAxis("backend_label", "EAGLE3"),),
-    )
-    alias = EvidenceAliasReceipt(
-        schema_version=1,
-        source=source,
-        target=target,
-        source_evidence_sha256=_sha("alias-source-evidence"),
-        removed_presentation_axis="backend_label",
-        reason_code="target_only_backend_label_only",
-        analysis_state="sealed_before_analysis",
-    )
-    alias_path = tmp_path / "alias.json"
-    alias_value = evidence_alias_receipt_to_dict(alias)
-    _write_bound(alias_path, alias_value)
-    validated_path = tmp_path / "validated-alias.json"
+    reduction_path = tmp_path / "alias-reduction.json"
     assert (
         main(
             [
                 "validate-evidence-alias",
-                "--alias",
-                str(alias_path),
+                "--manifest",
+                str(raw_manifest_path),
+                "--registry",
+                str(registry_path),
+                "--inventory",
+                str(inventory_path),
+                "--hardware-envelope",
+                str(hardware_path),
                 "--output",
-                str(validated_path),
+                str(reduction_path),
             ]
         )
         == 0
     )
-    assert json.loads(validated_path.read_text(encoding="utf-8")) == alias_value
+    assert replayed == [raw_manifest.sha256]
+    assert (
+        evidence_alias_reduction_artifact_from_dict(
+            json.loads(reduction_path.read_text(encoding="utf-8"))
+        )
+        == reduced
+    )
 
     direct = build_evidence_dependence_map(
-        direct_observation_cell_ids=(source.cell_id,), aliases=()
+        direct_observation_cell_ids=(reduced.source_cell_id,), aliases=()
     )
     direct_path = tmp_path / "direct-map.json"
     _write_bound(direct_path, evidence_dependence_map_to_dict(direct))
@@ -1013,8 +991,8 @@ def test_alias_validation_and_dependence_map_use_full_artifacts(tmp_path: Path) 
                 "build-evidence-dependence-map",
                 "--direct-map",
                 str(direct_path),
-                "--alias",
-                str(alias_path),
+                "--alias-reduction",
+                str(reduction_path),
                 "--output",
                 str(output),
             ]
@@ -1026,19 +1004,120 @@ def test_alias_validation_and_dependence_map_use_full_artifacts(tmp_path: Path) 
     )
     assert dependence.independent_unit_count == 1
     assert dependence.units[0].member_cell_ids == tuple(
-        sorted((source.cell_id, target.cell_id))
+        sorted((reduced.source_cell_id, reduced.target_cell_id))
     )
 
-    forged = dict(alias_value)
-    forged["unknown_score"] = 1.0
-    _write_bound(alias_path, forged)
-    with pytest.raises(ValueError, match="fields differ"):
+
+def test_alias_cli_rejects_legacy_flags_receipts_and_reduction_summaries(
+    tmp_path: Path,
+) -> None:
+    legacy_path = tmp_path / "legacy-alias-receipt.json"
+    _write_bound(
+        legacy_path,
+        {
+            "schema_version": 1,
+            "artifact_kind": "evidence_alias_receipt",
+            "artifact_sha256": _sha("legacy-alias-receipt"),
+            "source": {},
+            "target": {},
+        },
+    )
+    reduction_path = tmp_path / "caller-authored-alias-reduction.json"
+    _write_bound(
+        reduction_path,
+        evidence_alias_reduction_artifact_to_dict(_alias_artifact()),
+    )
+    with pytest.raises(SystemExit):
         main(
             [
                 "validate-evidence-alias",
                 "--alias",
-                str(alias_path),
+                str(legacy_path),
                 "--output",
-                str(tmp_path / "forged-alias-output.json"),
+                str(tmp_path / "legacy-output.json"),
             ]
         )
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "build-evidence-dependence-map",
+                "--direct-map",
+                str(reduction_path),
+                "--alias",
+                str(legacy_path),
+                "--output",
+                str(tmp_path / "legacy-dependence.json"),
+            ]
+        )
+    for manifest_path in (legacy_path, reduction_path):
+        with pytest.raises(ValueError, match="ambiguous schema"):
+            main(
+                [
+                    "validate-evidence-alias",
+                    "--manifest",
+                    str(manifest_path),
+                    "--registry",
+                    str(manifest_path),
+                    "--inventory",
+                    str(manifest_path),
+                    "--hardware-envelope",
+                    str(manifest_path),
+                    "--output",
+                    str(tmp_path / f"rejected-{manifest_path.name}"),
+                ]
+            )
+
+
+def test_analyze_industrial_forwards_raw_alias_manifests_to_formal_reducer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw_manifest = _raw_alias_manifest(tmp_path)
+    loaded = (
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        (object(),),
+        (raw_manifest,),
+        None,
+        None,
+        None,
+        100,
+        17,
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.cli.main._load_industrial_analysis_manifest",
+        lambda _path: loaded,
+    )
+    artifact_value = {"kind": "raw_alias_forwarding_probe"}
+    artifact = SimpleNamespace(
+        sha256=_sha(artifact_value),
+        to_dict=lambda: artifact_value,
+    )
+    received: list[tuple[RawEvidenceAliasManifest, ...]] = []
+
+    def reduce_probe(**kwargs):
+        received.append(kwargs["evidence_alias_manifests"])
+        return SimpleNamespace(artifact=artifact)
+
+    monkeypatch.setattr(
+        "lightcone_spec.cli.main.reduce_industrial_schema_v3",
+        reduce_probe,
+    )
+    output = tmp_path / "analysis-output.json"
+    assert (
+        main(
+            [
+                "analyze-industrial",
+                "--manifest",
+                str(tmp_path / "analysis-manifest.json"),
+                "--output",
+                str(output),
+            ]
+        )
+        == 42
+    )
+    assert received == [(raw_manifest,)]
+    assert json.loads(output.read_text(encoding="utf-8")) == artifact_value

@@ -123,7 +123,5 @@ def position_weighted_kl(
     target_probability = torch.softmax(target_logits.to(torch.float32), dim=-1)
     target_log = torch.log_softmax(target_logits.to(torch.float32), dim=-1)
     draft_log = torch.log_softmax(draft_logits.to(torch.float32), dim=-1)
-    per_position = (
-        target_probability * (target_log - draft_log)
-    ).sum(dim=-1)
+    per_position = (target_probability * (target_log - draft_log)).sum(dim=-1)
     return (per_position * weights).sum() / weights.sum().clamp_min(1.0)

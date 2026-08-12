@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -273,7 +274,10 @@ def snapshot_payload(*, adapted: bool = False, target_calls: int = 4) -> dict:
         state["speculative_adaptation_info_record"] = {
             "online_adaptation": adaptation_payload(target_calls=target_calls)
         }
-    return {"incremental_streaming_output": False, "internal_state": state}
+    return {
+        **ControlledExecutionPolicy().server_info_fields(role="speculative"),
+        "internal_state": state,
+    }
 
 
 def adaptation_payload(*, target_calls: int = 4) -> dict:
@@ -536,6 +540,7 @@ class TargetReferenceClient:
     def __init__(self, *, server_updates: dict | None = None) -> None:
         revision = "a" * 40
         self.info = {
+            **ControlledExecutionPolicy().server_info_fields(role="target_reference"),
             "version": "0.5.5",
             "model_path": f"/models/snapshots/{revision}",
             "context_length": 40960,
@@ -547,17 +552,13 @@ class TargetReferenceClient:
             "speculative_adaptation_config": None,
             "speculative_adaptation_telemetry_path": None,
             "speculative_adaptation_reserve_mb": 0,
-            "speculative_speed_study_metrics": False,
+            "speculative_speed_study_metrics": True,
             "dtype": "bfloat16",
             "kv_cache_dtype": "auto",
             "attention_backend": "flashinfer",
             "sampling_backend": "flashinfer",
             "schedule_policy": "lpm",
             "mem_fraction_static": 0.95,
-            "disable_cuda_graph": False,
-            "enable_deterministic_inference": False,
-            "random_seed": 1,
-            "incremental_streaming_output": False,
             "internal_states": [
                 {
                     "effective_max_running_requests_per_dp": 8,
@@ -644,7 +645,16 @@ def test_target_runtime_identity_rejects_study_allocations() -> None:
     )
     assert len(identity) == 64
     client.info["internal_states"][0]["speed_study_metrics"] = {}
-    with pytest.raises(RuntimeError, match="allocated speculative study state"):
+    assert (
+        len(
+            _target_runtime_identity(
+                client.server_info(), target_revision="a" * 40, concurrency=8
+            )
+        )
+        == 64
+    )
+    client.info["internal_states"][0]["speculative_adaptation_info_record"] = {}
+    with pytest.raises(RuntimeError, match="allocated adaptation state"):
         _target_runtime_identity(
             client.server_info(), target_revision="a" * 40, concurrency=8
         )

@@ -708,7 +708,7 @@ index 861c13f..e4878bf 100644
  
          # Init schedule policy and new token estimation
          self.init_schedule_policy()
-@@ -1095,6 +1109,547 @@ class Scheduler(
+@@ -1095,6 +1109,549 @@ class Scheduler(
              metrics_collector=self.metrics_collector,
          )
  
@@ -890,7 +890,9 @@ index 861c13f..e4878bf 100644
 +            raise RuntimeError("terminal reset requires a drained scheduler")
 +        if not self.flush_cache(empty_cache=False):
 +            raise RuntimeError("terminal reset could not flush native state")
-+        seed = int(run_nonce_sha256[:8], 16)
++        # Reset to the launch-attested seed.  The nonce isolates evidence
++        # identity; it must not silently mutate the registered RNG policy.
++        seed = int(self.server_args.random_seed)
 +        set_random_seed(seed)
 +        self.forward_ct = 0
 +        self.total_prefill_uncached_tokens = 0
@@ -4747,7 +4749,7 @@ new file mode 100644
 index 0000000..ee7ff09
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2094 @@
+@@ -0,0 +1,2112 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -4755,6 +4757,7 @@ index 0000000..ee7ff09
 +import hashlib
 +import json
 +import math
++import time
 +from collections import deque
 +from collections.abc import Callable, Iterator, Sequence
 +from contextlib import contextmanager
@@ -4765,6 +4768,13 @@ index 0000000..ee7ff09
 +from sglang.srt.speculative.online_adaptation_config import (
 +    OnlineAdaptationConfig,
 +)
++
++TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S = 30.0
++TTS_FIXED_BOUNDARY_PROTOCOL_SHA256 = hashlib.sha256(
++    b'{"event_completion":"event_query","main_stream_wait":true,'
++    b'"schema_version":1,"timeout_s":30.0,'
++    b'"timeout_status":"raise_no_publish"}'
++).hexdigest()
 +
 +_MUON_COEFFICIENTS = (3.4445, -4.7750, 2.0315)
 +
@@ -6205,11 +6215,21 @@ index 0000000..ee7ff09
 +            next_boundary = candidate.binding.source_round + self.config.stride
 +            if self.round < next_boundary:
 +                return False
-+        # The asynchronous DtoH receipt was enqueued before ``ready``. Querying
-+        # the event is nonblocking; receipt bytes are read only after it reports
-+        # completion and outside every measured timing region.
-+        if not ready.query():
-+            return False
++        if self.config.method == "l0":
++            if not ready.query():
++                return False
++        else:
++            main = torch.cuda.current_stream(self.device)
++            deadline = time.monotonic() + TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S
++            with self.timing("barrier"):
++                main.wait_event(ready)
++                while not ready.query():
++                    if time.monotonic() >= deadline:
++                        raise RuntimeError(
++                            "TTS fixed-boundary candidate readiness timed out"
++                        )
++                    time.sleep(0)
++        # Host receipt reads follow confirmed event completion for both policies.
 +        receipt = candidate.host_validity.tolist()
 +        if len(receipt) != 3:
 +            raise RuntimeError("candidate validity receipt is malformed")
@@ -6223,10 +6243,7 @@ index 0000000..ee7ff09
 +            )
 +            return False
 +        main = torch.cuda.current_stream(self.device)
-+        if self.config.method != "l0":
-+            with self.timing("barrier"):
-+                main.wait_event(ready)
-+        else:
++        if self.config.method == "l0":
 +            main.wait_event(ready)
 +        with self.timing("publish"):
 +            self._archive_latest_device_lengths()
@@ -6695,6 +6712,9 @@ index 0000000..ee7ff09
 +        payload = {
 +            "schema_version": 2,
 +            "adaptation_config_sha256": self.config.sha256,
++            "tts_fixed_boundary_protocol_sha256": (
++                TTS_FIXED_BOUNDARY_PROTOCOL_SHA256
++            ),
 +            "enabled": self.disabled_reason is None,
 +            "disabled_reason": self.disabled_reason,
 +            "cohort_sha256": self.cohort_sha256,
@@ -8751,7 +8771,7 @@ new file mode 100644
 index 0000000..4c50e25
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,672 @@
 +from __future__ import annotations
 +
 +import hashlib
@@ -8764,6 +8784,7 @@ index 0000000..4c50e25
 +import unittest
 +from pathlib import Path
 +from types import ModuleType, SimpleNamespace
++from unittest.mock import patch
 +
 +import torch
 +
@@ -9191,13 +9212,24 @@ index 0000000..4c50e25
 +        self.assertIn("host_validity.tolist()", source)
 +
 +    @staticmethod
-+    def _invalid_runtime(receipt, *, ready=True):
++    def _invalid_runtime(
++        receipt, *, ready=True, method="l0", allow_publish=False
++    ):
 +        class Event:
-+            queried = False
++            def __init__(self):
++                self.queried = False
++                self.completed = False
++                self.answers = list(ready if isinstance(ready, tuple) else (ready,))
 +
 +            def query(self):
 +                self.queried = True
-+                return ready
++                answer = (
++                    self.answers.pop(0)
++                    if len(self.answers) > 1
++                    else self.answers[0]
++                )
++                self.completed = bool(answer)
++                return self.completed
 +
 +        event = Event()
 +
@@ -9205,28 +9237,42 @@ index 0000000..4c50e25
 +            read = False
 +
 +            def tolist(self):
-+                if not event.queried:
++                if not event.completed:
 +                    raise AssertionError("receipt read preceded event completion")
 +                self.read = True
 +                return list(receipt)
 +
 +        class Optimizer:
 +            step = 11
++            committed = False
 +
 +            def commit(self, *_args, **_kwargs):
-+                raise AssertionError("invalid candidate committed optimizer state")
++                if not allow_publish:
++                    raise AssertionError("invalid candidate committed optimizer state")
++                self.committed = True
 +
 +        class Bank:
++            published = False
++
 +            def publish(self, *_args, **_kwargs):
-+                raise AssertionError("invalid candidate published inference state")
++                if not allow_publish:
++                    raise AssertionError("invalid candidate published inference state")
++                self.published = True
++
++        class Timing:
++            def __enter__(self):
++                return None
++
++            def __exit__(self, *_args):
++                return None
 +
 +        runtime = object.__new__(OnlineCohortRuntime)
-+        runtime.config = SimpleNamespace(method="l0", stride=10)
++        runtime.config = SimpleNamespace(method=method, stride=10)
 +        runtime.device = torch.device("cpu")
 +        runtime.epoch = 2
 +        runtime.active_version = 7
 +        runtime.slot_generation = 3
-+        runtime.round = 10
++        runtime.round = 10 if method == "l0" else 20
 +        runtime.disabled_reason = None
 +        runtime.reserved = None
 +        runtime.counters = {
@@ -9247,12 +9293,15 @@ index 0000000..4c50e25
 +                prefix_count=1,
 +            )
 +        ]
++        runtime.timing = lambda _name: Timing()
++        runtime._archive_latest_device_lengths = lambda: None
 +        optimizer = Optimizer()
++        bank = Bank()
 +        runtime.pending = ReadyCandidate(
 +            binding=CandidateBinding(2, 7, 3, 10),
 +            optimizer=optimizer,
 +            optimizer_proposal=SimpleNamespace(step=torch.tensor(12)),
-+            inference_bank=Bank(),
++            inference_bank=bank,
 +            ready_event=event,
 +            host_validity=Receipt(),
 +            candidate_tensors=(),
@@ -9262,6 +9311,74 @@ index 0000000..4c50e25
 +            trace_index=0,
 +        )
 +        return runtime, optimizer, event, runtime.pending.host_validity
++
++    def test_tts_waits_at_exact_stride_while_l0_is_first_ready(self):
++        class MainStream:
++            def __init__(self):
++                self.waited = []
++
++            def wait_event(self, event):
++                self.waited.append(event)
++
++        tts, optimizer, event, receipt = self._invalid_runtime(
++            (True, True, True),
++            ready=(False, True),
++            method="tts",
++            allow_publish=True,
++        )
++        tts_stream = MainStream()
++        with patch("torch.cuda.current_stream", return_value=tts_stream):
++            self.assertTrue(tts.boundary())
++        self.assertEqual(len(tts_stream.waited), 1)
++        self.assertTrue(event.completed)
++        self.assertTrue(receipt.read)
++        self.assertTrue(optimizer.committed)
++        self.assertEqual(tts.active_version, 8)
++        self.assertIsNone(tts.pending)
++
++        l0, optimizer, event, receipt = self._invalid_runtime(
++            (True, True, True),
++            ready=(False, True),
++            method="l0",
++            allow_publish=True,
++        )
++        l0_stream = MainStream()
++        with patch("torch.cuda.current_stream", return_value=l0_stream):
++            self.assertFalse(l0.boundary())
++        self.assertEqual(l0_stream.waited, [])
++        self.assertFalse(event.completed)
++        self.assertFalse(receipt.read)
++        self.assertFalse(optimizer.committed)
++        self.assertEqual(l0.active_version, 7)
++        self.assertIsNotNone(l0.pending)
++
++    def test_tts_never_ready_timeout_fails_closed_without_publication(self):
++        class MainStream:
++            def __init__(self):
++                self.waited = []
++
++            def wait_event(self, event):
++                self.waited.append(event)
++
++        runtime, optimizer, event, receipt = self._invalid_runtime(
++            (True, True, True),
++            ready=False,
++            method="tts",
++            allow_publish=True,
++        )
++        stream = MainStream()
++        with (
++            patch("torch.cuda.current_stream", return_value=stream),
++            patch.object(RUNTIME_MODULE.time, "monotonic", side_effect=(10.0, 41.0)),
++            self.assertRaisesRegex(RuntimeError, "readiness timed out"),
++        ):
++            runtime.boundary()
++        self.assertEqual(len(stream.waited), 1)
++        self.assertFalse(event.completed)
++        self.assertFalse(receipt.read)
++        self.assertFalse(optimizer.committed)
++        self.assertEqual(runtime.active_version, 7)
++        self.assertIsNotNone(runtime.pending)
 +
 +    def test_invalid_receipt_is_not_read_before_event_completion(self):
 +        runtime, optimizer, event, receipt = self._invalid_runtime(
@@ -9895,4 +10012,3 @@ index 0000000..59aad36
 +    unittest.main()
 -- 
 2.55.0
-

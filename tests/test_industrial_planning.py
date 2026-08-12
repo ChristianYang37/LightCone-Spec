@@ -287,8 +287,14 @@ def test_experiment_budget_exact_arithmetic_and_observation_delta(
     assert report.gpu_cell_units == 2
     assert report.compute_gpu_ms.registered == 3_400
     assert report.compute_gpu_hours == ExactScenarioHours(3_400, 3_400, 3_400)
-    assert report.estimated_wall_ms == _milliseconds(1_700)
-    assert report.schedule_fixed_instance_billed_gpu_ms == _milliseconds(3_400)
+    assert report.estimated_wall_ms is None
+    assert report.schedule_fixed_instance_billed_gpu_ms is None
+    assert report.unresolved_assumptions == (
+        (
+            "exact_inventory_schedule_unresolved:"
+            "full_inventory_and_interference_required"
+        ),
+    )
     assert report.output_tokens == ExpectedMaximumCount(2_000, 4_000)
     assert report.excluded_warmup_requests == ExpectedMaximumCount(16, 20)
     assert report.minimum_completed_requests == 128
@@ -1020,7 +1026,7 @@ def _semantics(**changes: object) -> ExecutionSemanticsIdentity:
         "target_model": "Qwen/Qwen3-8B",
         "target_revision": "revision-1",
         "runtime_sha256": _sha("alias-runtime"),
-        "patched_tree_identity": "2810ac94ed225aa78b4256ded56e78890a4a590f",
+        "patched_tree_identity": "22bd0d1d16aab33addbdacdbf75ad5bfe21164a8",
         "sampling_sha256": _sha("alias-sampling"),
         "seed": 7,
         "request_corpus_sha256": _sha("alias-corpus"),
@@ -1067,11 +1073,11 @@ def test_evidence_alias_is_exact_and_analysis_preserves_dependence() -> None:
         reason_code="target_only_backend_label_only",
         analysis_state="sealed_before_analysis",
     )
-    dependence = build_evidence_dependence_map(
-        direct_observation_cell_ids=(source.cell_id,), aliases=(alias,)
-    )
-    assert dependence.independent_unit_count == 1
-    assert dependence.unit_for(source.cell_id) == dependence.unit_for(target.cell_id)
+    with pytest.raises(TypeError, match="first-party"):
+        build_evidence_dependence_map(
+            direct_observation_cell_ids=(source.cell_id,),
+            aliases=(alias,),  # type: ignore[arg-type]
+        )
 
     changed = _alias_candidate(
         "changed",
@@ -1090,8 +1096,8 @@ def test_evidence_alias_is_exact_and_analysis_preserves_dependence() -> None:
         )
     with pytest.raises(ValueError, match="only Target-only"):
         _semantics(method="static")
-    with pytest.raises(ValueError, match="cannot also be"):
+    with pytest.raises(TypeError, match="first-party"):
         build_evidence_dependence_map(
             direct_observation_cell_ids=(source.cell_id, target.cell_id),
-            aliases=(alias,),
+            aliases=(alias,),  # type: ignore[arg-type]
         )

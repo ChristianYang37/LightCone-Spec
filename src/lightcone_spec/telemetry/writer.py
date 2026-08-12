@@ -12,8 +12,8 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Callable
-from dataclasses import asdict, fields
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Literal, Self, get_args, get_type_hints
 
@@ -33,6 +33,176 @@ type EvidenceRecord = (
     RunRecord | RequestRecord | RoundRecord | UpdateRecord | PerformanceRecord
 )
 type OverflowPolicy = Literal["backpressure", "drop"]
+
+
+@dataclass(frozen=True)
+class EvidenceWriterPolicy:
+    """Registered batching, checkpoint, and durability policy for one run."""
+
+    schema_version: int
+    async_queue_rows: int
+    async_batch_rows: int
+    writer_queue_rows: int
+    parquet_row_group_rows: int
+    checkpoint_interval_ms: int
+    overflow_policy: OverflowPolicy
+    sqlite_journal_mode: str
+    sqlite_synchronous: str
+    wal_fsync: bool
+    directory_fsync: bool
+    checkpoint_fsync: bool
+
+    def validate(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("only evidence-writer policy schema 1 is supported")
+        for name in (
+            "async_queue_rows",
+            "async_batch_rows",
+            "writer_queue_rows",
+            "parquet_row_group_rows",
+            "checkpoint_interval_ms",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.async_batch_rows > self.async_queue_rows:
+            raise ValueError("async evidence batch exceeds its queue bound")
+        if self.parquet_row_group_rows > self.writer_queue_rows:
+            raise ValueError("Parquet row group exceeds the writer queue bound")
+        if self.overflow_policy != "backpressure":
+            raise ValueError("claimable evidence requires backpressure overflow policy")
+        if self.sqlite_journal_mode != "WAL":
+            raise ValueError("evidence index requires SQLite WAL mode")
+        if self.sqlite_synchronous != "FULL":
+            raise ValueError("evidence index requires SQLite FULL synchronization")
+        if not (self.wal_fsync and self.directory_fsync and self.checkpoint_fsync):
+            raise ValueError("claimable evidence requires every registered fsync gate")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "kind": "industrial_evidence_writer_policy",
+            "async_queue_rows": self.async_queue_rows,
+            "async_batch_rows": self.async_batch_rows,
+            "writer_queue_rows": self.writer_queue_rows,
+            "parquet_row_group_rows": self.parquet_row_group_rows,
+            "checkpoint_interval_ms": self.checkpoint_interval_ms,
+            "overflow_policy": self.overflow_policy,
+            "sqlite_journal_mode": self.sqlite_journal_mode,
+            "sqlite_synchronous": self.sqlite_synchronous,
+            "wal_fsync": self.wal_fsync,
+            "directory_fsync": self.directory_fsync,
+            "checkpoint_fsync": self.checkpoint_fsync,
+        }
+
+    @property
+    def sha256(self) -> str:
+        body = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(body).hexdigest()
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        fields = {
+            "schema_version",
+            "kind",
+            "async_queue_rows",
+            "async_batch_rows",
+            "writer_queue_rows",
+            "parquet_row_group_rows",
+            "checkpoint_interval_ms",
+            "overflow_policy",
+            "sqlite_journal_mode",
+            "sqlite_synchronous",
+            "wal_fsync",
+            "directory_fsync",
+            "checkpoint_fsync",
+        }
+        if type(value) is not dict or set(value) != fields:
+            raise ValueError("evidence-writer policy fields differ")
+        if value.get("kind") != "industrial_evidence_writer_policy":
+            raise ValueError("evidence-writer policy kind differs")
+
+        def integer(name: str) -> int:
+            result = value[name]
+            if isinstance(result, bool) or not isinstance(result, int):
+                raise TypeError(f"evidence-writer {name} must be an integer")
+            return result
+
+        for name in ("wal_fsync", "directory_fsync", "checkpoint_fsync"):
+            if type(value[name]) is not bool:
+                raise TypeError(f"evidence-writer {name} must be boolean")
+        result = cls(
+            schema_version=integer("schema_version"),
+            async_queue_rows=integer("async_queue_rows"),
+            async_batch_rows=integer("async_batch_rows"),
+            writer_queue_rows=integer("writer_queue_rows"),
+            parquet_row_group_rows=integer("parquet_row_group_rows"),
+            checkpoint_interval_ms=integer("checkpoint_interval_ms"),
+            overflow_policy=value["overflow_policy"],
+            sqlite_journal_mode=value["sqlite_journal_mode"],
+            sqlite_synchronous=value["sqlite_synchronous"],
+            wal_fsync=value["wal_fsync"],
+            directory_fsync=value["directory_fsync"],
+            checkpoint_fsync=value["checkpoint_fsync"],
+        )
+        result.validate()
+        return result
+
+
+DEFAULT_EVIDENCE_WRITER_POLICY = EvidenceWriterPolicy(
+    schema_version=1,
+    async_queue_rows=1024,
+    async_batch_rows=128,
+    writer_queue_rows=1024,
+    parquet_row_group_rows=256,
+    checkpoint_interval_ms=5000,
+    overflow_policy="backpressure",
+    sqlite_journal_mode="WAL",
+    sqlite_synchronous="FULL",
+    wal_fsync=True,
+    directory_fsync=True,
+    checkpoint_fsync=True,
+)
+DEFAULT_EVIDENCE_WRITER_POLICY.validate()
+
+
+def evidence_writer_policy_from_receipt(
+    path: str | Path,
+) -> EvidenceWriterPolicy | None:
+    """Load the exact registered writer policy from one terminal receipt."""
+
+    source = Path(path)
+    if not source.is_file() or source.is_symlink():
+        raise RuntimeError("evidence terminal receipt is not a regular file")
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("evidence terminal receipt is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise TypeError("evidence terminal receipt is not an object")
+    policy_value = value.get("writer_policy")
+    policy_sha256 = value.get("writer_policy_sha256")
+    if policy_value is None and policy_sha256 is None:
+        return None
+    if policy_value is None or policy_sha256 is None:
+        raise RuntimeError("evidence terminal receipt has a partial writer policy")
+    try:
+        policy = EvidenceWriterPolicy.from_dict(policy_value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "evidence terminal receipt writer policy is invalid"
+        ) from error
+    if policy_sha256 != policy.sha256:
+        raise RuntimeError("evidence terminal receipt writer policy digest differs")
+    return policy
+
 
 _TABLE = {
     RunRecord: "run",
@@ -66,6 +236,36 @@ _BUDGET_OBSERVED_WORKLOAD_CONTRACTS = {
     "industrial_target_only",
     "industrial_static",
     "industrial_adapted",
+}
+_NATIVE_TERMINAL_RUN_FIELDS = (
+    "native_terminal_artifact_path",
+    "native_terminal_artifact_size",
+    "native_terminal_raw_sha256",
+    "native_terminal_sha256",
+    "trusted_attester_policy_sha256",
+)
+_NATIVE_TERMINAL_BINDING_FIELDS = {
+    "path",
+    "size",
+    "raw_sha256",
+    "terminal_sha256",
+    "trusted_attester_policy_sha256",
+}
+_NATIVE_TERMINAL_ARTIFACT_FIELDS = {
+    "schema_version",
+    "artifact_kind",
+    "run_id",
+    "rank",
+    "trusted_attester_policy_sha256",
+    "begin_sha256",
+    "reset_sha256",
+    "terminal_sha256",
+    "binding",
+    "warmup_requests",
+    "scored_requests",
+    "begin",
+    "reset",
+    "terminal",
 }
 _BUDGET_OBSERVATION_KIND = "industrial_budget_observation_receipt_v1"
 _BUDGET_OBSERVATION_COMPONENTS = (
@@ -245,6 +445,77 @@ def _publish_receipt_exclusive(path: Path, value: object) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _validate_native_terminal_artifact_binding(
+    root: Path,
+    *,
+    binding: object,
+    run_id: str,
+    rank: int,
+    expected_prefix: str | None = None,
+) -> Path:
+    """Resolve and hash-check one canonical release terminal artifact."""
+
+    if type(binding) is not dict or set(binding) != _NATIVE_TERMINAL_BINDING_FIELDS:
+        raise RuntimeError("native terminal artifact binding is incomplete")
+    name = binding.get("path")
+    size = binding.get("size")
+    raw_sha256 = binding.get("raw_sha256")
+    terminal_sha256 = binding.get("terminal_sha256")
+    policy_sha256 = binding.get("trusted_attester_policy_sha256")
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or _SAFE_COMPONENT.fullmatch(name) is None
+        or (
+            expected_prefix is not None
+            and name != f"{expected_prefix}.native-terminal.json"
+        )
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or not isinstance(raw_sha256, str)
+        or _LOWER_SHA256.fullmatch(raw_sha256) is None
+        or not isinstance(terminal_sha256, str)
+        or _LOWER_SHA256.fullmatch(terminal_sha256) is None
+        or not isinstance(policy_sha256, str)
+        or _LOWER_SHA256.fullmatch(policy_sha256) is None
+    ):
+        raise RuntimeError("native terminal artifact binding is malformed")
+    path = root / name
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("native terminal artifact path is not a regular file")
+    try:
+        body = path.read_bytes()
+        value = json.loads(body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("native terminal artifact is unreadable") from exc
+    canonical = (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if (
+        len(body) != size
+        or hashlib.sha256(body).hexdigest() != raw_sha256
+        or body != canonical
+        or type(value) is not dict
+        or set(value) != _NATIVE_TERMINAL_ARTIFACT_FIELDS
+        or value.get("schema_version") != 1
+        or value.get("artifact_kind") != "native_terminal_evidence_bundle_v1"
+        or value.get("run_id") != run_id
+        or value.get("rank") != rank
+        or value.get("terminal_sha256") != terminal_sha256
+        or value.get("trusted_attester_policy_sha256") != policy_sha256
+    ):
+        raise RuntimeError("native terminal artifact content binding is invalid")
+    return path
+
+
 def _arrow_type(annotation: object) -> pa.DataType:
     optional = [
         argument for argument in get_args(annotation) if argument is not type(None)
@@ -325,6 +596,7 @@ def _validate_row(table: str, row: dict[str, object]) -> None:
             row.get("session_open_receipt_sha256"),
             row.get("reset_receipt_sha256"),
             row.get("session_epoch"),
+            *(row.get(name) for name in _NATIVE_TERMINAL_RUN_FIELDS),
         )
         if contract is None:
             if any(value is not None for value in industrial_values):
@@ -432,6 +704,30 @@ def _validate_row(table: str, row: dict[str, object]) -> None:
                 or session_values[3] < 0
             ):
                 raise ValueError("industrial session identity is invalid")
+        native_values = tuple(row.get(name) for name in _NATIVE_TERMINAL_RUN_FIELDS)
+        requires_native_terminal = contract in _BUDGET_OBSERVED_WORKLOAD_CONTRACTS
+        if requires_native_terminal:
+            if any(value is None for value in native_values):
+                raise ValueError(
+                    "serving runs require a complete native terminal artifact binding"
+                )
+            native_path, native_size, *native_hashes = native_values
+            if (
+                not isinstance(native_path, str)
+                or Path(native_path).name != native_path
+                or _SAFE_COMPONENT.fullmatch(native_path) is None
+                or not native_path.endswith(".native-terminal.json")
+                or not isinstance(native_size, int)
+                or isinstance(native_size, bool)
+                or native_size < 1
+                or any(
+                    not isinstance(value, str) or _LOWER_SHA256.fullmatch(value) is None
+                    for value in native_hashes
+                )
+            ):
+                raise ValueError("native terminal artifact binding is invalid")
+        elif any(value is not None for value in native_values):
+            raise ValueError("only serving runs may bind a native terminal artifact")
         expected = _expected_tables(str(row["method"]), str(contract))
         if ("round" in expected) != (counters["expected_round_rows"] > 0):
             raise ValueError(
@@ -568,6 +864,16 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
         run_columns.append("workload_contract")
     if "experiment_budget_sha256" in run_parquet.schema_arrow.names:
         run_columns.append("experiment_budget_sha256")
+    native_schema_fields = set(_NATIVE_TERMINAL_RUN_FIELDS) & set(
+        run_parquet.schema_arrow.names
+    )
+    if native_schema_fields and native_schema_fields != set(
+        _NATIVE_TERMINAL_RUN_FIELDS
+    ):
+        raise RuntimeError(f"run evidence has a partial native binding {path}")
+    native_columns_present = bool(native_schema_fields)
+    if native_columns_present:
+        run_columns.extend(_NATIVE_TERMINAL_RUN_FIELDS)
     run_rows = run_parquet.iter_batches(batch_size=1, columns=run_columns)
     try:
         run_batch = next(run_rows)
@@ -593,6 +899,46 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
     if set(resolved) != expected:
         raise RuntimeError(f"receipt binds invalid run evidence {path}")
     if schema_version == 3:
+        native_receipt_binding = value.get("native_terminal_artifact")
+        requires_native_terminal = (
+            workload_contract in _BUDGET_OBSERVED_WORKLOAD_CONTRACTS
+        )
+        if native_columns_present:
+            native_run_binding = {
+                "path": run_values["native_terminal_artifact_path"][0],
+                "size": run_values["native_terminal_artifact_size"][0],
+                "raw_sha256": run_values["native_terminal_raw_sha256"][0],
+                "terminal_sha256": run_values["native_terminal_sha256"][0],
+                "trusted_attester_policy_sha256": run_values[
+                    "trusted_attester_policy_sha256"
+                ][0],
+            }
+            if requires_native_terminal:
+                if (
+                    any(value is None for value in native_run_binding.values())
+                    or native_receipt_binding != native_run_binding
+                ):
+                    raise RuntimeError(
+                        f"receipt lacks its native terminal artifact binding {path}"
+                    )
+                _validate_native_terminal_artifact_binding(
+                    path.parent,
+                    binding=native_run_binding,
+                    run_id=run_id,
+                    rank=rank,
+                    expected_prefix=str(prefix),
+                )
+            elif (
+                any(value is not None for value in native_run_binding.values())
+                or native_receipt_binding is not None
+            ):
+                raise RuntimeError(
+                    f"non-serving evidence carries a native terminal binding {path}"
+                )
+        elif native_receipt_binding is not None:
+            raise RuntimeError(
+                f"legacy run evidence cannot bind a native terminal artifact {path}"
+            )
         if experiment_budget_sha256 is not None:
             if (
                 not isinstance(experiment_budget_sha256, str)
@@ -629,6 +975,45 @@ def _load_receipt(path: Path, *, run_id: str, rank: int) -> dict[str, Path]:
             or _sha256(checkpoint_path) != checkpoint.get("sha256")
         ):
             raise RuntimeError(f"completion receipt does not bind {checkpoint_path}")
+        receipt_policy_value = value.get("writer_policy")
+        receipt_policy_sha256 = value.get("writer_policy_sha256")
+        try:
+            checkpoint_value = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"completion checkpoint is not valid JSON {checkpoint_path}"
+            ) from error
+        if not isinstance(checkpoint_value, dict):
+            raise RuntimeError(
+                f"completion checkpoint is not an object {checkpoint_path}"
+            )
+        checkpoint_policy_value = checkpoint_value.get("writer_policy")
+        checkpoint_policy_sha256 = checkpoint_value.get("writer_policy_sha256")
+        if (receipt_policy_value is None) != (receipt_policy_sha256 is None):
+            raise RuntimeError(f"completion receipt has a partial writer policy {path}")
+        if receipt_policy_value is None:
+            if (
+                checkpoint_policy_value is not None
+                or checkpoint_policy_sha256 is not None
+            ):
+                raise RuntimeError(
+                    f"completion checkpoint changes the writer policy {path}"
+                )
+        else:
+            try:
+                registered_policy = EvidenceWriterPolicy.from_dict(receipt_policy_value)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"completion receipt has an invalid writer policy {path}"
+                ) from error
+            if (
+                receipt_policy_sha256 != registered_policy.sha256
+                or checkpoint_policy_value != receipt_policy_value
+                or checkpoint_policy_sha256 != registered_policy.sha256
+            ):
+                raise RuntimeError(
+                    f"completion receipt writer policy binding differs {path}"
+                )
         dropped = counters.get("dropped_by_table")
         if not isinstance(dropped, dict) or any(
             dropped.get(table) != 0 for table in expected
@@ -1132,6 +1517,7 @@ class EvidenceWriter:
         row_group_rows: int = 256,
         checkpoint_interval_s: float | None = 5.0,
         overflow_policy: OverflowPolicy = "backpressure",
+        registered_policy: EvidenceWriterPolicy | None = None,
     ) -> None:
         if not _SAFE_COMPONENT.fullmatch(run_id):
             raise ValueError("run_id must be a safe non-empty path component")
@@ -1162,6 +1548,22 @@ class EvidenceWriter:
             raise ValueError("checkpoint_interval_s must be positive or None")
         if overflow_policy not in {"backpressure", "drop"}:
             raise ValueError("overflow_policy must be backpressure or drop")
+        if registered_policy is not None:
+            if type(registered_policy) is not EvidenceWriterPolicy:
+                raise TypeError(
+                    "registered evidence policy must be an EvidenceWriterPolicy"
+                )
+            registered_policy.validate()
+            expected_checkpoint_s = registered_policy.checkpoint_interval_ms / 1000
+            if (
+                max_queued_rows != registered_policy.writer_queue_rows
+                or row_group_rows != registered_policy.parquet_row_group_rows
+                or checkpoint_interval_s != expected_checkpoint_s
+                or overflow_policy != registered_policy.overflow_policy
+            ):
+                raise ValueError(
+                    "evidence writer settings differ from the registered policy"
+                )
 
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1185,6 +1587,7 @@ class EvidenceWriter:
         self.row_group_rows = row_group_rows
         self.checkpoint_interval_s = checkpoint_interval_s
         self.overflow_policy = overflow_policy
+        self.registered_policy = registered_policy
         self._queues: dict[str, list[dict[str, object]]] = {
             table: [] for table in _TABLE.values()
         }
@@ -1207,6 +1610,7 @@ class EvidenceWriter:
         self._closed = False
         self._prepared_receipt: dict[str, object] | None = None
         self._prepared_files: dict[str, Path] | None = None
+        self._native_terminal_binding: dict[str, object] | None = None
         self._state = "open"
         self._checkpoint_path = self.root / f"{self.prefix}.checkpoint.json"
         self._index_path = self.root / f"{self.prefix}.index.sqlite3"
@@ -1262,6 +1666,67 @@ class EvidenceWriter:
             "max_observed_queued_rows": self._max_observed_queued_rows,
         }
 
+    def persist_native_terminal_artifact(
+        self,
+        artifact: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Exclusively publish one canonical begin/reset/final bundle."""
+
+        if self._closed or self._prepared_receipt is not None:
+            raise RuntimeError("evidence writer is closed or prepared")
+        if self._native_terminal_binding is not None:
+            raise RuntimeError("native terminal artifact is already persisted")
+        value = dict(artifact)
+        if (
+            set(value) != _NATIVE_TERMINAL_ARTIFACT_FIELDS
+            or value.get("schema_version") != 1
+            or value.get("artifact_kind") != "native_terminal_evidence_bundle_v1"
+            or value.get("run_id") != self.run_id
+            or value.get("rank") != self.rank
+        ):
+            raise ValueError("native terminal artifact differs from this writer")
+        try:
+            body = (
+                json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("native terminal artifact is not strict JSON") from exc
+        terminal_sha256 = value.get("terminal_sha256")
+        policy_sha256 = value.get("trusted_attester_policy_sha256")
+        if (
+            not isinstance(terminal_sha256, str)
+            or _LOWER_SHA256.fullmatch(terminal_sha256) is None
+            or not isinstance(policy_sha256, str)
+            or _LOWER_SHA256.fullmatch(policy_sha256) is None
+        ):
+            raise ValueError("native terminal artifact lacks release digest bindings")
+        path = self.root / f"{self.prefix}.native-terminal.json"
+        _publish_receipt_exclusive(path, value)
+        binding: dict[str, object] = {
+            "path": path.name,
+            "size": len(body),
+            "raw_sha256": hashlib.sha256(body).hexdigest(),
+            "terminal_sha256": terminal_sha256,
+            "trusted_attester_policy_sha256": policy_sha256,
+        }
+        _validate_native_terminal_artifact_binding(
+            self.root,
+            binding=binding,
+            run_id=self.run_id,
+            rank=self.rank,
+            expected_prefix=self.prefix,
+        )
+        self._native_terminal_binding = binding
+        self._write_checkpoint()
+        return dict(binding)
+
     def _identity(self, table: str, row: dict[str, object]) -> tuple[object, ...]:
         if table == "run":
             return ("run",)
@@ -1304,6 +1769,17 @@ class EvidenceWriter:
             "wal_row_groups": dict(self._row_groups),
             "queued_rows": self._queued_rows,
             "counters": self.counters,
+            "native_terminal_artifact": self._native_terminal_binding,
+            "writer_policy": (
+                None
+                if self.registered_policy is None
+                else self.registered_policy.to_dict()
+            ),
+            "writer_policy_sha256": (
+                None
+                if self.registered_policy is None
+                else self.registered_policy.sha256
+            ),
         }
 
     def _write_checkpoint(self) -> None:
@@ -1462,6 +1938,35 @@ class EvidenceWriter:
                         ],
                     ).to_pylist():
                         _validate_output_token_identity(row)
+            if workload_contract in _BUDGET_OBSERVED_WORKLOAD_CONTRACTS:
+                if self._native_terminal_binding is None:
+                    raise RuntimeError(
+                        "serving completion lacks its native terminal artifact"
+                    )
+                run_binding = {
+                    "path": self._run_record.get("native_terminal_artifact_path"),
+                    "size": self._run_record.get("native_terminal_artifact_size"),
+                    "raw_sha256": self._run_record.get("native_terminal_raw_sha256"),
+                    "terminal_sha256": self._run_record.get("native_terminal_sha256"),
+                    "trusted_attester_policy_sha256": self._run_record.get(
+                        "trusted_attester_policy_sha256"
+                    ),
+                }
+                if run_binding != self._native_terminal_binding:
+                    raise RuntimeError(
+                        "run evidence changed its native terminal binding"
+                    )
+                _validate_native_terminal_artifact_binding(
+                    self.root,
+                    binding=run_binding,
+                    run_id=self.run_id,
+                    rank=self.rank,
+                    expected_prefix=self.prefix,
+                )
+            elif self._native_terminal_binding is not None:
+                raise RuntimeError(
+                    "non-serving completion carries a native terminal artifact"
+                )
         return method, expected
 
     def _build_final_table(self, table: str) -> Path:
@@ -1534,6 +2039,16 @@ class EvidenceWriter:
             },
             "coverage": coverage,
             "counters": self.counters,
+            "writer_policy": (
+                None
+                if self.registered_policy is None
+                else self.registered_policy.to_dict()
+            ),
+            "writer_policy_sha256": (
+                None
+                if self.registered_policy is None
+                else self.registered_policy.sha256
+            ),
             "files": {
                 table: {
                     "name": path.name,
@@ -1548,6 +2063,8 @@ class EvidenceWriter:
         experiment_budget_sha256 = self._run_record.get("experiment_budget_sha256")
         if experiment_budget_sha256 is not None:
             receipt["experiment_budget_sha256"] = experiment_budget_sha256
+        if self._native_terminal_binding is not None:
+            receipt["native_terminal_artifact"] = dict(self._native_terminal_binding)
         prepared_path = self.root / f"{self.run_id}.rank{self.rank}.prepared.json"
         if os.path.lexists(prepared_path):
             raise RuntimeError(

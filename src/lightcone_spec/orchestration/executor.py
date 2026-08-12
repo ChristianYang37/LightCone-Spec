@@ -10,10 +10,13 @@ the repository's durable :class:`EvidenceWriter` terminal-receipt protocol.
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -28,10 +31,13 @@ from urllib.request import Request, urlopen
 
 import pyarrow.parquet as pq
 
-from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
+from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchExecutionContext,
     GpuDispatchPlan,
+    GpuInventory,
     validate_dispatch_plan_for_execution,
 )
 from lightcone_spec.experiments.load import (
@@ -47,6 +53,7 @@ from lightcone_spec.experiments.load import (
 from lightcone_spec.experiments.planning import (
     BudgetJobKind,
     BudgetObservationReceipt,
+    BudgetPlan,
     ExperimentBudget,
     P99AnchorStatus,
 )
@@ -76,17 +83,31 @@ from lightcone_spec.orchestration.native_terminal import (
     NativeTerminalRunBinding,
     TerminalRequestExpectation,
     ValidatedNativeTerminalEvidence,
+    validate_native_terminal_artifact,
 )
 from lightcone_spec.orchestration.runtime import (
     ServerLaunch,
+    _execution_argv,
+    _execution_role,
     _immutable_json,
     _render_server,
+    _runtime_execution_policy,
 )
 from lightcone_spec.orchestration.session import (
     SHARED_SESSION_UNAVAILABLE_REASON,
     SessionExecutionBinding,
     SessionExecutionLifecycle,
     SharedSessionUnavailableError,
+)
+from lightcone_spec.runtime.attestation import (
+    NO_TRUSTED_ATTESTERS,
+    TrustedAttesterPolicy,
+    require_release_trusted_attester_policy,
+)
+from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    CompileCacheLaunchPlan,
+    preflight_compile_cache_launch,
 )
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
@@ -99,7 +120,10 @@ from lightcone_spec.telemetry.records import (
     UpdateRecord,
 )
 from lightcone_spec.telemetry.writer import (
+    DEFAULT_EVIDENCE_WRITER_POLICY,
     EvidenceWriter,
+    EvidenceWriterPolicy,
+    evidence_writer_policy_from_receipt,
     load_completed_evidence,
     publish_prepared_evidence_completion,
 )
@@ -109,6 +133,23 @@ TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON = (
     "trusted_native_terminal_attester_unavailable"
 )
 MAX_IN_MEMORY_REQUEST_EXECUTIONS = 100_000
+
+_GPU_INVENTORY_QUERY = (
+    "index,uuid,name,memory.total,driver_version,compute_cap,pci.bus_id,"
+    "power.limit,temperature.gpu.tlimit,clocks.max.sm,persistence_mode"
+)
+_GPU_INVENTORY_ARGV = (
+    "nvidia-smi",
+    f"--query-gpu={_GPU_INVENTORY_QUERY}",
+    "--format=csv,noheader,nounits",
+)
+_GPU_PROCESS_ARGV = (
+    "nvidia-smi",
+    "--query-compute-apps=gpu_uuid,pid,process_name",
+    "--format=csv,noheader,nounits",
+)
+_GPU_TOPOLOGY_ARGV = ("nvidia-smi", "topo", "-m")
+_NVCC_RELEASE = re.compile(r"\brelease\s+(\d+\.\d+)\b")
 
 _BUDGET_OBSERVATION_COMPONENTS = (
     "startup_model_load",
@@ -704,6 +745,366 @@ class ArtifactBinding:
         }
 
 
+def _bound_json_object(binding: ArtifactBinding, *, label: str) -> dict[str, object]:
+    binding.assert_unchanged()
+    try:
+        value = json.loads(Path(binding.path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not valid JSON") from error
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be a JSON object")
+    return value
+
+
+def _required_object(
+    value: object,
+    *,
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be a JSON object")
+    return value
+
+
+def _required_command(
+    commands: Mapping[str, object],
+    *,
+    name: str,
+    expected_argv: tuple[str, ...],
+) -> str:
+    command = _required_object(commands.get(name), label=f"inventory {name} command")
+    if set(command) != {"argv", "stdout"}:
+        raise ValueError(f"inventory {name} command fields are incomplete")
+    argv = command["argv"]
+    stdout = command["stdout"]
+    if argv != list(expected_argv) or not isinstance(stdout, str):
+        raise ValueError(f"inventory {name} command authority differs")
+    return stdout
+
+
+def _csv_rows(value: str, *, columns: int, label: str) -> tuple[tuple[str, ...], ...]:
+    rows = tuple(
+        tuple(field.strip() for field in row)
+        for row in csv.reader(io.StringIO(value))
+        if any(field.strip() for field in row)
+    )
+    if any(len(row) != columns or any(not field for field in row) for row in rows):
+        raise ValueError(f"{label} has an ambiguous CSV schema")
+    return rows
+
+
+def _validate_inventory_source_artifact(
+    binding: ArtifactBinding,
+    *,
+    inventory: GpuInventory,
+) -> str:
+    """Reparse the exact first-party inventory receipt and return its driver."""
+
+    if binding.name != "gpu_inventory_source_receipt":
+        raise ValueError("GPU inventory source artifact has the wrong identity")
+    receipt = _bound_json_object(binding, label="GPU inventory source receipt")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "challenge_nonce_sha256",
+        "host_id",
+        "hostname",
+        "machine_id_sha256",
+        "commands",
+        "parsed_topology",
+        "pci_locality",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_fields:
+        raise ValueError("GPU inventory source receipt fields are incomplete")
+    receipt_sha256 = receipt.get("receipt_sha256")
+    receipt_content = {
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    }
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "gpu_inventory_probe_receipt"
+        or not _is_sha256(receipt.get("challenge_nonce_sha256"))
+        or not _is_sha256(receipt.get("machine_id_sha256"))
+        or not isinstance(receipt.get("host_id"), str)
+        or not isinstance(receipt.get("hostname"), str)
+        or not str(receipt.get("hostname")).strip()
+        or "\n" in str(receipt.get("hostname"))
+        or not _is_sha256(receipt_sha256)
+        or content_sha256(receipt_content) != receipt_sha256
+        or binding.content_sha256 != receipt_sha256
+        or inventory.source_receipt_sha256 != receipt_sha256
+    ):
+        raise ValueError("GPU inventory source receipt identity differs")
+    host_id = str(receipt["host_id"])
+    if not host_id or {device.host_id for device in inventory.devices} != {host_id}:
+        raise ValueError("GPU inventory source host differs from the scheduler pool")
+
+    commands = _required_object(receipt["commands"], label="inventory commands")
+    if set(commands) != {"gpu", "processes", "topology"}:
+        raise ValueError("GPU inventory source command set is incomplete")
+    gpu_rows = _csv_rows(
+        _required_command(commands, name="gpu", expected_argv=_GPU_INVENTORY_ARGV),
+        columns=11,
+        label="GPU inventory probe",
+    )
+    process_rows = _csv_rows(
+        _required_command(commands, name="processes", expected_argv=_GPU_PROCESS_ARGV),
+        columns=3,
+        label="GPU process probe",
+    )
+    _required_command(commands, name="topology", expected_argv=_GPU_TOPOLOGY_ARGV)
+    if len(gpu_rows) != len(inventory.devices):
+        raise ValueError("GPU inventory source changed full-pool cardinality")
+    try:
+        indexed = tuple(sorted(gpu_rows, key=lambda row: int(row[0])))
+    except ValueError as error:
+        raise ValueError("GPU inventory source contains a malformed index") from error
+    if tuple(int(row[0]) for row in indexed) != tuple(range(len(indexed))):
+        raise ValueError("GPU inventory source indices are not contiguous")
+    devices = {device.uuid: device for device in inventory.devices}
+    processes: dict[str, list[str]] = {uuid: [] for uuid in devices}
+    for uuid, pid, process_name in process_rows:
+        if uuid not in devices or not pid.isdigit() or int(pid) < 1:
+            raise ValueError("GPU process source references an invalid device/process")
+        processes[uuid].append(f"{pid}:{process_name}")
+
+    drivers: set[str] = set()
+    for row in indexed:
+        (
+            _,
+            uuid,
+            model,
+            memory_mib,
+            driver,
+            compute_capability,
+            pci_bus_id,
+            power_limit,
+            thermal_limit,
+            max_sm_clock,
+            persistence_mode,
+        ) = row
+        device = devices.get(uuid)
+        if device is None:
+            raise ValueError("GPU inventory source references a foreign UUID")
+        try:
+            compute = tuple(int(value) for value in compute_capability.split("."))
+            memory_bytes = int(memory_mib) * 1024 * 1024
+            power_watts = float(power_limit)
+            thermal_celsius = float(thermal_limit)
+            max_sm_mhz = int(max_sm_clock)
+        except ValueError as error:
+            raise ValueError(
+                "GPU inventory source contains malformed hardware"
+            ) from error
+        if (
+            len(compute) != 2
+            or device.model != model
+            or device.memory_bytes != memory_bytes
+            or device.compute_capability != compute
+            or device.pci_bus_id.lower() != pci_bus_id.lower()
+            or device.power_limit_watts != power_watts
+            or device.thermal_limit_celsius != thermal_celsius
+            or device.clock_policy
+            != f"persistence={persistence_mode};max_sm_mhz={max_sm_mhz}"
+            or device.reserved_processes != tuple(sorted(processes[uuid]))
+        ):
+            raise ValueError("GPU inventory source differs from scheduler hardware")
+        drivers.add(driver)
+    if len(drivers) != 1:
+        raise ValueError("GPU inventory source lacks one exact host driver authority")
+
+    locality = receipt["pci_locality"]
+    if not isinstance(locality, list) or len(locality) != len(indexed):
+        raise ValueError("GPU inventory source PCI locality is incomplete")
+    index_by_uuid = {row[1]: int(row[0]) for row in indexed}
+    for row in locality:
+        if type(row) is not dict or set(row) != {
+            "index",
+            "uuid",
+            "pci_bus_id",
+            "pci_root",
+            "numa_node",
+        }:
+            raise ValueError("GPU inventory source PCI locality is malformed")
+        device = devices.get(row["uuid"])
+        if device is None or (
+            row["index"] != index_by_uuid.get(device.uuid)
+            or row["pci_bus_id"] != device.pci_bus_id.lower()
+            or row["pci_root"] != device.pci_root
+            or row["numa_node"] != device.numa_node
+        ):
+            raise ValueError("GPU inventory source PCI locality differs")
+    topology = _required_object(
+        receipt["parsed_topology"], label="inventory parsed topology"
+    )
+    if topology.get("parse_error") is not None:
+        raise ValueError("GPU inventory source topology is incomplete")
+    return next(iter(drivers))
+
+
+def _validate_compile_key_for_run_config(
+    plan: CompileCacheLaunchPlan,
+    *,
+    config: RunConfig,
+) -> None:
+    plan.validate()
+    key = plan.key
+    expected_drafter = (
+        None if config.method == "target_only" else config.model.drafter_revision
+    )
+    if (
+        key.source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256
+        or key.target_revision != config.model.target_revision
+        or key.drafter_revision != expected_drafter
+        or key.tensor_parallel_size != config.runtime.tensor_parallel_size
+        or key.context_limit != config.runtime.context_length
+        or key.max_running_requests != config.runtime.max_running_requests
+    ):
+        raise ValueError("compile-cache key differs from the exact RunConfig")
+
+
+def _validate_runtime_envelope_artifact(
+    binding: ArtifactBinding,
+    *,
+    inventory: GpuInventory,
+    checkout: Path,
+    compile_plan: CompileCacheLaunchPlan,
+    config: RunConfig,
+    inventory_driver: str,
+    assigned_gpu_uuid: str,
+) -> None:
+    """Bind compile inputs to the complete PASS doctor envelope."""
+
+    if binding.name != "runtime_envelope":
+        raise ValueError("runtime authority must be the locked runtime_envelope")
+    report = _bound_json_object(binding, label="runtime envelope")
+    readiness = _required_object(report.get("readiness"), label="runtime readiness")
+    checks = _required_object(report.get("checks"), label="runtime checks")
+    manifest = _required_object(
+        report.get("runtime_manifest"), label="runtime compatibility manifest"
+    )
+    if (
+        report.get("schema_version") != 1
+        or report.get("status") != "PASS"
+        or readiness.get("status") != "PASS"
+        or readiness.get("fail_count") != 0
+        or readiness.get("unknown_count") != 0
+        or not checks
+        or readiness.get("pass_count") != len(checks)
+        or any(
+            type(value) is not dict or value.get("status") != "PASS"
+            for value in checks.values()
+        )
+        or manifest.get("valid") is not True
+        or not _is_sha256(manifest.get("sha256"))
+        or manifest.get("sidecar_sha256") != manifest.get("sha256")
+    ):
+        raise ValueError("runtime envelope is not a complete PASS authority")
+    roots = _required_object(report.get("roots"), label="runtime roots")
+    source = _required_object(report.get("source_tree"), label="SGLang source tree")
+    if (
+        roots.get("patched_sglang") != str(checkout)
+        or roots.get("distinct") is not True
+        or source.get("path") != str(checkout)
+        or source.get("is_git_checkout") is not True
+        or source.get("root_matches_toplevel") is not True
+        or source.get("dirty") is not False
+        or source.get("pinned_ancestor") is not True
+        or source.get("patch_commits") != PINNED_SGLANG_PATCH_COUNT
+        or source.get("tree") != PINNED_SGLANG_TREE
+    ):
+        raise ValueError("runtime envelope differs from the verified SGLang source")
+
+    gpu = _required_object(report.get("gpu"), label="runtime GPU envelope")
+    parsed = _required_object(
+        gpu.get("parsed_inventory"), label="runtime parsed GPU inventory"
+    )
+    raw_devices = parsed.get("devices")
+    if parsed.get("parse_error") is not None or not isinstance(raw_devices, list):
+        raise ValueError("runtime envelope GPU inventory is incomplete")
+    devices = {device.uuid: device for device in inventory.devices}
+    if len(raw_devices) != len(devices):
+        raise ValueError("runtime envelope changed full-pool cardinality")
+    doctor_drivers: set[str] = set()
+    seen: set[str] = set()
+    for raw in raw_devices:
+        if type(raw) is not dict:
+            raise TypeError("runtime envelope GPU row must be an object")
+        uuid = raw.get("uuid")
+        device = devices.get(uuid) if isinstance(uuid, str) else None
+        if device is None or uuid in seen:
+            raise ValueError("runtime envelope contains a foreign/duplicate GPU")
+        seen.add(uuid)
+        expected_memory_mib, remainder = divmod(device.memory_bytes, 1024 * 1024)
+        if (
+            remainder
+            or raw.get("name") != device.model
+            or raw.get("memory_total_mib") != expected_memory_mib
+            or raw.get("compute_capability")
+            != ".".join(str(value) for value in device.compute_capability)
+            or str(raw.get("pci_bus_id", "")).lower() != device.pci_bus_id.lower()
+            or not isinstance(raw.get("driver_version"), str)
+        ):
+            raise ValueError("runtime envelope GPU row differs from scheduler hardware")
+        doctor_drivers.add(str(raw["driver_version"]))
+    if seen != set(devices) or doctor_drivers != {inventory_driver}:
+        raise ValueError("runtime envelope driver authority differs from inventory")
+
+    torch_runtime = _required_object(gpu.get("torch"), label="runtime Torch envelope")
+    python = _required_object(report.get("python"), label="runtime Python envelope")
+    packages = _required_object(report.get("packages"), label="runtime packages")
+    commands = _required_object(report.get("commands"), label="runtime commands")
+    nvcc = commands.get("nvcc")
+    nvcc_match = _NVCC_RELEASE.search(nvcc) if isinstance(nvcc, str) else None
+    key = compile_plan.key
+    if (
+        torch_runtime.get("importable") is not True
+        or torch_runtime.get("cuda_available") is not True
+        or torch_runtime.get("device_count") != len(devices)
+        or key.python_version != python.get("version")
+        or key.torch_version != torch_runtime.get("version")
+        or packages.get("torch")
+        != str(torch_runtime.get("version", "")).partition("+")[0]
+        or key.triton_version != packages.get("triton")
+        or key.cuda_version != torch_runtime.get("cuda_build")
+        or nvcc_match is None
+        or key.cuda_version != nvcc_match.group(1)
+        or key.driver_version != inventory_driver
+    ):
+        raise ValueError("compile-cache key differs from exact runtime toolchain")
+    assigned = devices.get(assigned_gpu_uuid)
+    if assigned is None:
+        raise ValueError("compile-cache launch lacks its assigned GPU authority")
+    expected_sm = "sm_" + "".join(str(value) for value in assigned.compute_capability)
+    if key.gpu_model != assigned.model or key.sm_architecture != expected_sm:
+        raise ValueError("compile-cache key differs from assigned GPU model/SM")
+    _validate_compile_key_for_run_config(compile_plan, config=config)
+
+
+def _load_server_compile_plan(launch: ServerLaunch) -> CompileCacheLaunchPlan:
+    if (
+        not isinstance(launch.compile_cache_plan, str)
+        or not isinstance(launch.compile_cache_plan_sha256, str)
+        or not isinstance(launch.compile_cache_key_sha256, str)
+    ):
+        raise TypeError("server launch lacks an exact compile-cache plan binding")
+    path = Path(launch.compile_cache_plan)
+    if (
+        not path.is_absolute()
+        or path != path.resolve(strict=False)
+        or path.is_symlink()
+    ):
+        raise ValueError("server compile-cache plan path is not immutable/absolute")
+    plan = CompileCacheLaunchPlan.load(path)
+    if (
+        plan.sha256 != launch.compile_cache_plan_sha256
+        or plan.key.sha256 != launch.compile_cache_key_sha256
+    ):
+        raise ValueError("server compile-cache plan identity differs")
+    return plan
+
+
 def _bound_sampling_profile(binding: ArtifactBinding) -> SamplingProfile:
     """Load the exact schema-v2 sampling semantics from a byte-bound file."""
 
@@ -935,6 +1336,7 @@ def _validate_runtime_dispatch_authority(
     runtime_plan: IndustrialRuntimePlan,
     dispatch_plan: GpuDispatchPlan,
     dispatch_context: GpuDispatchExecutionContext,
+    budget_plan: BudgetPlan,
     budget: ExperimentBudget,
 ) -> None:
     """Replay the scheduler and compare the complete launch-time binding."""
@@ -945,6 +1347,14 @@ def _validate_runtime_dispatch_authority(
         raise TypeError(
             "execution dispatch_context must be a GpuDispatchExecutionContext"
         )
+    if type(budget_plan) is not BudgetPlan:
+        raise TypeError("execution requires one exact BudgetPlan")
+    if dispatch_context.budget_plan != budget_plan:
+        raise ValueError("launch BudgetPlan differs from the dispatch authority")
+    ready_budgets = dispatch_context.require_ready_budget_authority()
+    capacity_authority = budget_plan.capacity_authority
+    if capacity_authority is None:
+        raise ValueError("launch BudgetPlan lacks raw capacity authority")
     validate_dispatch_plan_for_execution(
         dispatch_plan,
         execution_context=dispatch_context,
@@ -968,6 +1378,8 @@ def _validate_runtime_dispatch_authority(
         raise ValueError("launch runtime cell differs from the canonical registry cell")
     if dispatch_context.budgets_by_cell_id.get(runtime_plan.cell_id) != budget:
         raise ValueError("launch budget differs from the scheduler authority")
+    if {row.cell_id: row for row in ready_budgets}.get(runtime_plan.cell_id) != budget:
+        raise ValueError("launch budget differs from the READY BudgetPlan")
     assignments = tuple(
         assignment
         for wave in dispatch_plan.waves
@@ -1011,6 +1423,11 @@ def _validate_runtime_dispatch_authority(
         inventory_source_receipt_sha256=inventory.source_receipt_sha256,
         dispatch_plan_sha256=dispatch_plan.sha256,
         experiment_budget_sha256=budget.sha256,
+        budget_plan_sha256=budget_plan.sha256,
+        capacity_authority_sha256=capacity_authority.sha256,
+        budget_materialization_authority_sha256=(
+            dispatch_context.budget_materialization_authority.sha256
+        ),
         assignment_sha256=assignment.sha256,
         work_item_sha256=assignment.work_item.sha256,
         gpu_uuids=assignment.gpu_uuids,
@@ -1035,6 +1452,7 @@ class IndustrialExecutionPlan:
     runtime_plan: IndustrialRuntimePlan
     dispatch_plan: GpuDispatchPlan
     dispatch_context: GpuDispatchExecutionContext
+    budget_plan: BudgetPlan
     budget: ExperimentBudget
     load_plan: ProductionLoadPlan
     server_launch: ServerLaunch
@@ -1044,19 +1462,31 @@ class IndustrialExecutionPlan:
     split_artifact: ArtifactBinding
     sampling_artifact: ArtifactBinding
     model_lock_artifact: ArtifactBinding
+    compile_cache_plan: CompileCacheLaunchPlan
+    inventory_source_artifact: ArtifactBinding
+    runtime_envelope_artifact: ArtifactBinding
     warmup_requests: tuple[BoundServingRequest, ...]
     scored_requests: tuple[BoundServingRequest, ...]
     bench_argv: tuple[str, ...]
+    evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY
+    trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS
     patched_sglang_tree: str = PINNED_SGLANG_TREE
     startup_timeout_s: float = 300.0
     shutdown_timeout_s: float = 30.0
     abort_grace_s: float = 30.0
 
     def validate(self) -> None:
+        if type(self.evidence_writer_policy) is not EvidenceWriterPolicy:
+            raise TypeError("execution writer policy must be an exact policy")
+        self.evidence_writer_policy.validate()
+        if type(self.trusted_attester_policy) is not TrustedAttesterPolicy:
+            raise TypeError("execution trust requires an exact release policy")
+        require_release_trusted_attester_policy(self.trusted_attester_policy)
         _validate_runtime_dispatch_authority(
             runtime_plan=self.runtime_plan,
             dispatch_plan=self.dispatch_plan,
             dispatch_context=self.dispatch_context,
+            budget_plan=self.budget_plan,
             budget=self.budget,
         )
         if not self.runtime_plan.physical_dispatch_ready:
@@ -1092,6 +1522,11 @@ class IndustrialExecutionPlan:
         if (
             physical_assignment is None
             or physical_assignment.experiment_budget_sha256 != budget.sha256
+            or physical_assignment.budget_plan_sha256 != self.budget_plan.sha256
+            or physical_assignment.capacity_authority_sha256
+            != self.budget_plan.capacity_authority.sha256
+            or physical_assignment.budget_materialization_authority_sha256
+            != self.dispatch_context.budget_materialization_authority.sha256
         ):
             raise ValueError(
                 "ExperimentBudget differs from the physical dispatch-plan binding"
@@ -1198,6 +1633,8 @@ class IndustrialExecutionPlan:
             self.split_artifact,
             self.sampling_artifact,
             self.model_lock_artifact,
+            self.inventory_source_artifact,
+            self.runtime_envelope_artifact,
         ):
             artifact.assert_unchanged()
         expected = tuple(sorted(self.expected_dependency_outputs))
@@ -1214,6 +1651,15 @@ class IndustrialExecutionPlan:
         if actual != expected:
             raise ValueError(
                 "dependency artifacts do not cover the locked outputs exactly"
+            )
+        locked_runtime_envelopes = tuple(
+            artifact
+            for artifact in self.dependency_artifacts
+            if artifact.name == "runtime_envelope"
+        )
+        if locked_runtime_envelopes != (self.runtime_envelope_artifact,):
+            raise ValueError(
+                "runtime envelope authority is not the exact locked dependency"
             )
         if self.dependency_receipt_sha256s != (
             self.runtime_plan.dependency_receipt_sha256s
@@ -1240,7 +1686,31 @@ class IndustrialExecutionPlan:
             for request in (*self.warmup_requests, *self.scored_requests)
         ):
             raise ValueError("request corpus exceeds the cell context bound")
-        _validate_server_launch(self.runtime_plan, self.server_launch)
+        loaded_compile_plan = _validate_server_launch(
+            self.runtime_plan, self.server_launch
+        )
+        if (
+            type(self.compile_cache_plan) is not CompileCacheLaunchPlan
+            or loaded_compile_plan != self.compile_cache_plan
+            or loaded_compile_plan.sha256 != self.compile_cache_plan.sha256
+        ):
+            raise ValueError("execution compile-cache plan changed after binding")
+        preflight_compile_cache_launch(loaded_compile_plan)
+        inventory_driver = _validate_inventory_source_artifact(
+            self.inventory_source_artifact,
+            inventory=self.dispatch_context.inventory,
+        )
+        if len(self.runtime_plan.physical_gpu_uuids) != 1:
+            raise ValueError("compile-cache launch requires one assigned physical GPU")
+        _validate_runtime_envelope_artifact(
+            self.runtime_envelope_artifact,
+            inventory=self.dispatch_context.inventory,
+            checkout=Path(self.server_launch.argv[4]),
+            compile_plan=loaded_compile_plan,
+            config=config,
+            inventory_driver=inventory_driver,
+            assigned_gpu_uuid=self.runtime_plan.physical_gpu_uuids[0],
+        )
         expected_bench = official_bench_argv(
             base_url=self.server_launch.base_url,
             served_model=config.model.target,
@@ -1253,14 +1723,22 @@ class IndustrialExecutionPlan:
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
+        capacity_authority = self.budget_plan.capacity_authority
+        if capacity_authority is None:  # pragma: no cover - validation invariant
+            raise RuntimeError("execution capacity authority disappeared")
         hashes = self.load_plan.scored.hashes
         return {
-            "schema_version": 1,
+            "schema_version": 3,
             "runtime_plan_sha256": self.runtime_plan.sha256,
             "dispatch_plan_sha256": self.dispatch_plan.sha256,
             "dispatch_context_sha256": self.dispatch_context.sha256,
             "dispatch_plan": self.dispatch_plan.to_dict(),
             "dispatch_authority": self.dispatch_context.authority_dict(),
+            "budget_plan_sha256": self.budget_plan.sha256,
+            "capacity_authority_sha256": capacity_authority.sha256,
+            "budget_materialization_authority_sha256": (
+                self.dispatch_context.budget_materialization_authority.sha256
+            ),
             "experiment_budget_sha256": self.budget.sha256,
             "rank_config_sha256": self.rank_config_sha256,
             "topology_sha256": self.topology_sha256,
@@ -1281,8 +1759,17 @@ class IndustrialExecutionPlan:
                 "window_sha256": self.load_plan.window.sha256,
             },
             "server_launch": asdict(self.server_launch),
+            "compile_cache": {
+                "plan_path": self.server_launch.compile_cache_plan,
+                "plan_sha256": self.compile_cache_plan.sha256,
+                "key_sha256": self.compile_cache_plan.key.sha256,
+                "mode": self.compile_cache_plan.cache_mode,
+                "builder_id": self.compile_cache_plan.builder_id,
+            },
             "bench_adapter": ("sglang.benchmark.serving.async_request_sglang_generate"),
             "bench_argv": list(self.bench_argv),
+            "evidence_writer_policy": self.evidence_writer_policy.to_dict(),
+            "evidence_writer_policy_sha256": self.evidence_writer_policy.sha256,
             "dependency_receipt_sha256s": list(self.dependency_receipt_sha256s),
             "dependency_artifacts": [
                 artifact.identity_dict()
@@ -1293,13 +1780,24 @@ class IndustrialExecutionPlan:
             ],
             "split_artifact": self.split_artifact.identity_dict(),
             "sampling_artifact": self.sampling_artifact.identity_dict(),
+            "controlled_execution_policy_sha256": (
+                self.runtime_plan.rank_configs[0].runtime.execution_policy_sha256
+            ),
             "model_lock_artifact": self.model_lock_artifact.identity_dict(),
+            "inventory_source_artifact": (
+                self.inventory_source_artifact.identity_dict()
+            ),
+            "runtime_envelope_artifact": (
+                self.runtime_envelope_artifact.identity_dict()
+            ),
             "warmup_request_bindings": [
                 request.sha256 for request in self.warmup_requests
             ],
             "scored_request_bindings": [
                 request.sha256 for request in self.scored_requests
             ],
+            "trusted_attester_policy": self.trusted_attester_policy.to_dict(),
+            "trusted_attester_policy_sha256": self.trusted_attester_policy.sha256,
             "patched_sglang_tree": self.patched_sglang_tree,
             "startup_timeout_s": self.startup_timeout_s,
             "shutdown_timeout_s": self.shutdown_timeout_s,
@@ -1358,7 +1856,7 @@ class IndustrialExecutionPlan:
 def _validate_server_launch(
     runtime_plan: IndustrialRuntimePlan,
     launch: ServerLaunch,
-) -> None:
+) -> CompileCacheLaunchPlan:
     if not runtime_plan.physical_dispatch_ready:
         raise ValueError("logical runtime plan cannot validate a server launch")
     config = runtime_plan.rank_configs[0]
@@ -1396,8 +1894,10 @@ def _validate_server_launch(
         launch.adaptation_config is not None and launch.telemetry_path is not None
     ):
         raise ValueError("server adaptation artifacts differ from the method contract")
+    compile_plan = _load_server_compile_plan(launch)
+    _validate_compile_key_for_run_config(compile_plan, config=config)
     argv = launch.argv
-    if len(argv) < 18 or argv[:4] != (
+    if len(argv) < 20 or argv[:4] != (
         sys.executable,
         "-m",
         "lightcone_spec.sglang_bridge.launch",
@@ -1405,9 +1905,16 @@ def _validate_server_launch(
     ):
         raise ValueError("server launch argv is not the registered SGLang launcher")
     checkout = Path(argv[4])
-    if not checkout.is_dir() or argv[5] != "--":
-        raise ValueError("server argv lacks its local disposable checkout")
-    base = argv[6:18]
+    if (
+        not checkout.is_dir()
+        or argv[5] != "--compile-cache-plan"
+        or argv[6] != launch.compile_cache_plan
+        or argv[7] != "--"
+    ):
+        raise ValueError(
+            "server argv lacks its checkout/compile-cache launch authority"
+        )
+    base = argv[8:20]
     expected_keys = (
         "--model-path",
         "--max-running-requests",
@@ -1437,11 +1944,19 @@ def _validate_server_launch(
         or port != parsed.port
     ):
         raise ValueError("server base argv differs from the RunConfig/base URL")
-    remainder = argv[18:]
+    remainder = argv[20:]
+    role = _execution_role(config.method)
+    execution_argv = tuple(_execution_argv(config.runtime, role=role))
+    if remainder[: len(execution_argv)] != execution_argv:
+        raise ValueError("server execution-policy argv differs from the RunConfig role")
+    remainder = remainder[len(execution_argv) :]
     if config.method == "target_only":
-        if remainder:
-            raise ValueError("target-only argv cannot enable speculative state")
-        return
+        if remainder != ("--speculative-speed-study-metrics",):
+            raise ValueError(
+                "target-only argv requires only native terminal accounting after "
+                "its execution policy"
+            )
+        return compile_plan
     if len(remainder) < 13:
         raise ValueError("speculative server argv is incomplete")
     expected_speculative_keys = (
@@ -1479,7 +1994,7 @@ def _validate_server_launch(
             raise ValueError(
                 "Static argv requires only the native terminal-evidence hook"
             )
-        return
+        return compile_plan
     if not adaptation_argv or adaptation_argv[0] != "--speculative-speed-study-metrics":
         raise ValueError("adapted server argv lacks native speed-study evidence")
     adaptation_argv = adaptation_argv[1:]
@@ -1507,6 +2022,7 @@ def _validate_server_launch(
         raise ValueError("adaptation config artifact is invalid") from error
     if adaptation_payload != sglang_adaptation_payload(config):
         raise ValueError("adaptation config artifact differs from the RunConfig")
+    return compile_plan
 
 
 def build_industrial_execution_plan(
@@ -1514,6 +2030,7 @@ def build_industrial_execution_plan(
     runtime_plan: IndustrialRuntimePlan,
     dispatch_plan: GpuDispatchPlan,
     dispatch_context: GpuDispatchExecutionContext,
+    budget_plan: BudgetPlan,
     budget: ExperimentBudget,
     load_plan: ProductionLoadPlan,
     server_launch: ServerLaunch,
@@ -1522,6 +2039,11 @@ def build_industrial_execution_plan(
     split_artifact: ArtifactBinding,
     sampling_artifact: ArtifactBinding,
     model_lock_artifact: ArtifactBinding,
+    compile_cache_plan: CompileCacheLaunchPlan,
+    inventory_source_artifact: ArtifactBinding,
+    runtime_envelope_artifact: ArtifactBinding,
+    evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY,
+    trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
     startup_timeout_s: float = 300.0,
     shutdown_timeout_s: float = 30.0,
     abort_grace_s: float = 30.0,
@@ -1546,6 +2068,7 @@ def build_industrial_execution_plan(
         runtime_plan=runtime_plan,
         dispatch_plan=dispatch_plan,
         dispatch_context=dispatch_context,
+        budget_plan=budget_plan,
         budget=budget,
         load_plan=load_plan,
         server_launch=server_launch,
@@ -1555,6 +2078,9 @@ def build_industrial_execution_plan(
         split_artifact=split_artifact,
         sampling_artifact=sampling_artifact,
         model_lock_artifact=model_lock_artifact,
+        compile_cache_plan=compile_cache_plan,
+        inventory_source_artifact=inventory_source_artifact,
+        runtime_envelope_artifact=runtime_envelope_artifact,
         warmup_requests=_request_routes(load_plan.warmup, route_id=route_id),
         scored_requests=_request_routes(load_plan.scored, route_id=route_id),
         bench_argv=official_bench_argv(
@@ -1564,6 +2090,8 @@ def build_industrial_execution_plan(
             concurrency=runtime_plan.rank_configs[0].runtime.max_running_requests,
             arrival_kind=load_plan.scored.source_kind,
         ),
+        evidence_writer_policy=evidence_writer_policy,
+        trusted_attester_policy=trusted_attester_policy,
         startup_timeout_s=startup_timeout_s,
         shutdown_timeout_s=shutdown_timeout_s,
         abort_grace_s=abort_grace_s,
@@ -1579,6 +2107,7 @@ def render_industrial_execution_plan(
     runtime_plan: IndustrialRuntimePlan,
     dispatch_plan: GpuDispatchPlan,
     dispatch_context: GpuDispatchExecutionContext,
+    budget_plan: BudgetPlan,
     budget: ExperimentBudget,
     load_plan: ProductionLoadPlan,
     dependency_receipts: tuple[ExperimentReceipt, ...],
@@ -1587,13 +2116,25 @@ def render_industrial_execution_plan(
     sampling_artifact: ArtifactBinding,
     model_lock_artifact: ArtifactBinding,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
+    inventory_source_artifact: ArtifactBinding,
+    runtime_envelope_artifact: ArtifactBinding,
     model_roots: Mapping[str, str],
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
+    evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY,
+    trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
     host: str = "127.0.0.1",
 ) -> IndustrialExecutionPlan:
     """Render one argv-only launch, then bind it to the execution plan."""
 
+    _validate_runtime_dispatch_authority(
+        runtime_plan=runtime_plan,
+        dispatch_plan=dispatch_plan,
+        dispatch_context=dispatch_context,
+        budget_plan=budget_plan,
+        budget=budget,
+    )
     if len(runtime_plan.rank_configs) != 1:
         raise ValueError("server rendering supports the released one-rank topology")
     if not runtime_plan.physical_dispatch_ready:
@@ -1619,6 +2160,7 @@ def render_industrial_execution_plan(
     if not 0 < mem_fraction_static < 1:
         raise ValueError("mem_fraction_static must lie in (0, 1)")
     verified = verify_patched_checkout(sglang_checkout)
+    compile_cache_plan = CompileCacheLaunchPlan.load(compile_cache_plan_path)
     launch = _render_server(
         output=Path(output_root).resolve(),
         method=config.method,
@@ -1631,6 +2173,7 @@ def render_industrial_execution_plan(
         mem_fraction_static=mem_fraction_static,
         host=host,
         port=runtime_plan.physical_ports[0],
+        compile_cache_plan_path=compile_cache_plan_path,
     )
     if config.method == "static":
         launch = replace(
@@ -1641,6 +2184,7 @@ def render_industrial_execution_plan(
         runtime_plan=runtime_plan,
         dispatch_plan=dispatch_plan,
         dispatch_context=dispatch_context,
+        budget_plan=budget_plan,
         budget=budget,
         load_plan=load_plan,
         server_launch=launch,
@@ -1649,6 +2193,11 @@ def render_industrial_execution_plan(
         split_artifact=split_artifact,
         sampling_artifact=sampling_artifact,
         model_lock_artifact=model_lock_artifact,
+        compile_cache_plan=compile_cache_plan,
+        inventory_source_artifact=inventory_source_artifact,
+        runtime_envelope_artifact=runtime_envelope_artifact,
+        evidence_writer_policy=evidence_writer_policy,
+        trusted_attester_policy=trusted_attester_policy,
     )
     _immutable_json(
         Path(output_root).resolve() / "industrial-execution-plan.json",
@@ -1883,28 +2432,32 @@ def native_evidence_preflight(
     plan: IndustrialExecutionPlan,
     provider: NativeTerminalProvider | None,
 ) -> NativeEvidencePreflight:
-    """Structurally gate the sole wire provider before process mutation.
-
-    Target-only may omit the hook or use the concrete wire provider.  The
-    released speculative path is blocked before mutation until an immutable
-    release-owned attester policy exists; caller callables and object
-    attributes never establish that trust root.
-    """
+    """Bind the sole wire provider and release policy before process mutation."""
 
     method = plan.runtime_plan.rank_configs[0].method
-    if method != "target_only":
-        # The current release has no content-bound TrustedAttesterPolicy or
-        # allowlisted public-key identity.  A caller-supplied verifier callable
-        # can therefore never unlock a speculative claim, regardless of the
-        # provider object's concrete type or live server capability response.
+    if not _is_exact_native_terminal_provider(provider):
         status = "BLOCKED"
-        reason_code = TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
-        missing_hook = None
+        reason_code = MISSING_NATIVE_EVIDENCE_REASON
+        missing_hook = NATIVE_TERMINAL_EVIDENCE_HOOK
     else:
-        ready = provider is None or _is_exact_native_terminal_provider(provider)
-        status = "READY" if ready else "BLOCKED"
-        reason_code = None if ready else MISSING_NATIVE_EVIDENCE_REASON
-        missing_hook = None if ready else NATIVE_TERMINAL_EVIDENCE_HOOK
+        try:
+            release_policy = require_release_trusted_attester_policy(
+                plan.trusted_attester_policy
+            )
+        except (AttributeError, TypeError, ValueError):
+            release_policy = None
+        if (
+            release_policy is None
+            or provider.trusted_attester_policy_sha256 != release_policy.sha256
+            or (method != "target_only" and not release_policy.release_ready)
+        ):
+            status = "BLOCKED"
+            reason_code = TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
+            missing_hook = None
+        else:
+            status = "READY"
+            reason_code = None
+            missing_hook = None
     value = NativeEvidencePreflight(
         status=status,
         reason_code=reason_code,
@@ -2005,12 +2558,26 @@ async def launch_server_subprocess(launch: ServerLaunch) -> ServerHandle:
         != (sys.executable, "-m", "lightcone_spec.sglang_bridge.launch")
     ):
         raise ValueError("subprocess launch requires the registered loopback launcher")
+    if (
+        len(launch.argv) < 8
+        or launch.argv[3] != "--checkout"
+        or launch.argv[5] != "--compile-cache-plan"
+        or launch.argv[6] != launch.compile_cache_plan
+        or launch.argv[7] != "--"
+    ):
+        raise ValueError("subprocess launch lacks its exact compile-cache argv")
+    compile_plan = _load_server_compile_plan(launch)
+    preflight_compile_cache_launch(compile_plan)
     config_path = Path(launch.run_config)
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        device_identity = config["runtime"]["device_identity"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        config = RunConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
         raise ValueError("subprocess launch lacks a device-bound RunConfig") from error
+    if launch.method != config.method:
+        raise ValueError("subprocess launch method differs from its RunConfig")
+    _validate_compile_key_for_run_config(compile_plan, config=config)
+    verify_patched_checkout(launch.argv[4])
+    device_identity = config.runtime.device_identity
     if (
         not isinstance(device_identity, str)
         or not device_identity.startswith("GPU-")
@@ -2047,6 +2614,91 @@ class IndustrialExecutionResult:
     budget_observation_sha256: str
     evidence_files: tuple[str, ...]
     accounting: LoadAccounting | None
+
+
+@dataclass(frozen=True)
+class IndustrialExecutionTerminalBinding:
+    """Freshly revalidated raw-file authority for one serving assignment."""
+
+    cell_id: str
+    run_id: str
+    run_nonce_sha256: str
+    execution_plan_sha256: str
+    dispatch_plan_sha256: str
+    assignment_sha256: str
+    experiment_budget_sha256: str
+    inventory_sha256: str
+    physical_gpu_uuids: tuple[str, ...]
+    terminal_receipt_path: str
+    terminal_receipt_sha256: str
+    budget_observation_path: str
+    budget_observation_sha256: str
+    budget_observation_sidecar_path: str
+    budget_observation_sidecar_sha256: str
+    native_terminal_artifact_path: str
+    native_terminal_raw_sha256: str
+    native_terminal_sha256: str
+    trusted_attester_policy_sha256: str
+    trusted_attestation: bool
+    evidence_file_paths: tuple[str, ...]
+    evidence_file_sha256s: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in (
+            "cell_id",
+            "run_nonce_sha256",
+            "execution_plan_sha256",
+            "dispatch_plan_sha256",
+            "assignment_sha256",
+            "experiment_budget_sha256",
+            "inventory_sha256",
+            "terminal_receipt_sha256",
+            "budget_observation_sha256",
+            "budget_observation_sidecar_sha256",
+            "native_terminal_raw_sha256",
+            "native_terminal_sha256",
+            "trusted_attester_policy_sha256",
+        ):
+            if not _is_sha256(getattr(self, name)):
+                raise ValueError(f"{name} must be a lowercase SHA-256")
+        if not self.run_id or "\n" in self.run_id:
+            raise ValueError("terminal binding run_id is invalid")
+        if type(self.trusted_attestation) is not bool:
+            raise TypeError("terminal binding trust status must be a boolean")
+        if not self.physical_gpu_uuids or len(set(self.physical_gpu_uuids)) != len(
+            self.physical_gpu_uuids
+        ):
+            raise ValueError("terminal binding GPU coverage is invalid")
+        paths = (
+            self.terminal_receipt_path,
+            self.budget_observation_path,
+            self.budget_observation_sidecar_path,
+            self.native_terminal_artifact_path,
+            *self.evidence_file_paths,
+        )
+        if any(
+            not Path(value).is_absolute() or Path(value).resolve() != Path(value)
+            for value in paths
+        ):
+            raise ValueError("terminal binding paths must be absolute and resolved")
+        if (
+            not self.evidence_file_paths
+            or len(self.evidence_file_paths) != len(self.evidence_file_sha256s)
+            or len(set(self.evidence_file_paths)) != len(self.evidence_file_paths)
+            or tuple(sorted(self.evidence_file_paths)) != self.evidence_file_paths
+            or any(not _is_sha256(value) for value in self.evidence_file_sha256s)
+        ):
+            raise ValueError("terminal binding evidence-file coverage is invalid")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "industrial_execution_terminal_binding",
+                **asdict(self),
+            }
+        )
 
 
 def industrial_run_id(plan: IndustrialExecutionPlan, run_nonce_sha256: str) -> str:
@@ -2216,6 +2868,31 @@ def _bind_native_terminal_transport(
         raise ValueError("native admin and serving traffic use different HTTP pools")
     transport.bind_native_admin_base_url(base_url)
     return transport
+
+
+async def _require_live_controlled_execution_policy(
+    *,
+    transport: PinnedBenchServingTransport,
+    config: RunConfig,
+) -> str:
+    """Reopen the exact live server policy through the bound serving pool."""
+
+    if type(config) is not RunConfig:
+        raise TypeError("live execution-policy validation requires an exact RunConfig")
+    policy = _runtime_execution_policy(config.runtime)
+    if type(policy) is not ControlledExecutionPolicy:  # pragma: no cover
+        raise TypeError("runtime did not resolve an exact controlled execution policy")
+    server_info = await transport.get_json("/server_info")
+    try:
+        policy.validate_server_info(
+            server_info,
+            role=_execution_role(config.method),
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "live server differs from the registered controlled execution policy"
+        ) from error
+    return policy.sha256
 
 
 async def _sleep_until(
@@ -2843,6 +3520,274 @@ def _workload_contract(method: str) -> str:
     return "industrial_adapted"
 
 
+def _persisted_terminal_expectations(
+    request_rows: Sequence[Mapping[str, object]],
+    *,
+    plan: IndustrialExecutionPlan,
+) -> tuple[TerminalRequestExpectation, ...]:
+    """Reconstruct client/server terminal identities from durable request rows."""
+
+    by_id = {str(row.get("request_id")): row for row in request_rows}
+    if len(by_id) != len(request_rows) or set(by_id) != {
+        request.request_id for request in plan.scored_requests
+    }:
+        raise RuntimeError(
+            "native terminal resume requires exact durable request coverage"
+        )
+    expectations: list[TerminalRequestExpectation] = []
+    for request in plan.scored_requests:
+        row = by_id[request.request_id]
+        status = row.get("outcome_status")
+        submitted = row.get("admitted_ns") is not None
+        serialized = row.get("output_token_ids")
+        try:
+            output_values = (
+                json.loads(serialized) if isinstance(serialized, str) else None
+            )
+        except json.JSONDecodeError as error:
+            raise RuntimeError("durable request output IDs are malformed") from error
+        if output_values is not None and (
+            not isinstance(output_values, list)
+            or any(
+                not isinstance(token_id, int)
+                or isinstance(token_id, bool)
+                or token_id < 0
+                for token_id in output_values
+            )
+        ):
+            raise RuntimeError("durable request output IDs are invalid")
+        if submitted:
+            if status == "completed":
+                terminal_status = "completed"
+                terminal_reason = "FINISH_LENGTH"
+                if (
+                    output_values is None
+                    or len(output_values) != request.requested_output_tokens
+                ):
+                    raise RuntimeError(
+                        "durable completion lacks its exact FINISH_LENGTH output"
+                    )
+            elif status in {"cancelled", "timed_out"}:
+                terminal_status = "aborted"
+                terminal_reason = "FINISH_ABORT"
+                if output_values is None:
+                    raise RuntimeError(
+                        "durable aborted request lacks ordered output IDs"
+                    )
+            else:
+                raise RuntimeError(
+                    "durable submitted request has no native terminal status"
+                )
+            output_token_ids: tuple[int, ...] | None = tuple(output_values)
+        else:
+            if status not in {"rejected", "cancelled", "timed_out"}:
+                raise RuntimeError(
+                    "durable non-submitted request has no client terminal status"
+                )
+            terminal_status = str(status)
+            terminal_reason_value = row.get("admission_code")
+            if not isinstance(terminal_reason_value, str):
+                raise RuntimeError(
+                    "durable non-submitted request lacks its terminal reason"
+                )
+            terminal_reason = terminal_reason_value
+            output_token_ids = None
+        expectation = TerminalRequestExpectation(
+            request_id=request.request_id,
+            input_token_ids=request.input_token_ids,
+            output_token_ids=output_token_ids,
+            terminal_status=terminal_status,
+            terminal_reason=terminal_reason,
+            submitted_to_server=submitted,
+        )
+        expectation.validate()
+        expectations.append(expectation)
+    return tuple(expectations)
+
+
+def _artifact_warmup_expectations(
+    artifact: Mapping[str, object],
+    *,
+    plan: IndustrialExecutionPlan,
+) -> tuple[TerminalRequestExpectation, ...]:
+    """Recover warm-up rows while independently checking immutable inputs."""
+
+    rows = artifact.get("warmup_requests")
+    if not isinstance(rows, list) or len(rows) != len(plan.warmup_requests):
+        raise RuntimeError("native terminal artifact changed warmup coverage")
+    fields = {
+        "request_id",
+        "input_token_ids",
+        "output_token_ids",
+        "terminal_status",
+        "terminal_reason",
+        "submitted_to_server",
+    }
+    expectations: list[TerminalRequestExpectation] = []
+    for raw, request in zip(rows, plan.warmup_requests, strict=True):
+        if type(raw) is not dict or set(raw) != fields:
+            raise RuntimeError("native terminal artifact warmup row is malformed")
+        input_values = raw["input_token_ids"]
+        output_values = raw["output_token_ids"]
+        if (
+            not isinstance(input_values, list)
+            or not isinstance(output_values, list)
+            or any(
+                not isinstance(token_id, int)
+                or isinstance(token_id, bool)
+                or token_id < 0
+                for token_id in (*input_values, *output_values)
+            )
+        ):
+            raise RuntimeError("native terminal warmup token identity is invalid")
+        expectation = TerminalRequestExpectation(
+            request_id=str(raw["request_id"]),
+            input_token_ids=tuple(input_values),
+            output_token_ids=tuple(output_values),
+            terminal_status=str(raw["terminal_status"]),
+            terminal_reason=str(raw["terminal_reason"]),
+            submitted_to_server=raw["submitted_to_server"],
+        )
+        expectation.validate()
+        if (
+            expectation.request_id != request.request_id
+            or expectation.input_token_ids != request.input_token_ids
+            or expectation.terminal_status != "completed"
+            or expectation.terminal_reason != "FINISH_LENGTH"
+            or expectation.submitted_to_server is not True
+            or expectation.output_token_ids is None
+            or len(expectation.output_token_ids) != request.requested_output_tokens
+        ):
+            raise RuntimeError("native terminal artifact changed its warmup identity")
+        expectations.append(expectation)
+    return tuple(expectations)
+
+
+def _validate_resumed_native_terminal(
+    *,
+    completed: Mapping[str, Path],
+    run_row: Mapping[str, object],
+    request_rows: Sequence[Mapping[str, object]],
+    performance_row: Mapping[str, object],
+    run_id: str,
+    plan: IndustrialExecutionPlan,
+    run_nonce_sha256: str,
+    session_binding: SessionExecutionBinding | None,
+) -> Path:
+    """Re-read, reverify, and reconvert the durable signed terminal bundle."""
+
+    name = run_row.get("native_terminal_artifact_path")
+    size = run_row.get("native_terminal_artifact_size")
+    raw_sha256 = run_row.get("native_terminal_raw_sha256")
+    terminal_sha256 = run_row.get("native_terminal_sha256")
+    policy_sha256 = run_row.get("trusted_attester_policy_sha256")
+    if (
+        not isinstance(name, str)
+        or Path(name).name != name
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or not isinstance(raw_sha256, str)
+        or not _is_sha256(raw_sha256)
+        or not isinstance(terminal_sha256, str)
+        or not _is_sha256(terminal_sha256)
+        or policy_sha256 != plan.trusted_attester_policy.sha256
+    ):
+        raise RuntimeError("completed run lacks its release terminal binding")
+    artifact_path = completed["run"].parent / name
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise RuntimeError("completed native terminal artifact is not a regular file")
+    try:
+        body = artifact_path.read_bytes()
+        artifact = json.loads(body.decode("utf-8"))
+        canonical = (
+            json.dumps(
+                artifact,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise RuntimeError("completed native terminal artifact is invalid") from error
+    if (
+        type(artifact) is not dict
+        or len(body) != size
+        or hashlib.sha256(body).hexdigest() != raw_sha256
+        or body != canonical
+    ):
+        raise RuntimeError("completed native terminal artifact changed on disk")
+    scored_expectations = _persisted_terminal_expectations(
+        request_rows,
+        plan=plan,
+    )
+    warmup_expectations = _artifact_warmup_expectations(artifact, plan=plan)
+    terminal = validate_native_terminal_artifact(
+        artifact,
+        trusted_attester_policy=plan.trusted_attester_policy,
+        expected_warmup_requests=warmup_expectations,
+        expected_scored_requests=scored_expectations,
+    )
+    if terminal.terminal_sha256 != terminal_sha256:
+        raise RuntimeError("completed native terminal semantic digest changed")
+    binding = terminal.binding
+    if session_binding is None:
+        expected_session_id = content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "standalone_native_terminal_session",
+                "execution_plan_sha256": plan.sha256,
+                "run_nonce_sha256": run_nonce_sha256,
+            }
+        )
+        expected_session_epoch = 1
+        expected_previous_run_id = None
+    else:
+        expected_session_id = session_binding.native_session_id
+        expected_session_epoch = session_binding.native_trace_epoch
+        expected_previous_run_id = session_binding.native_previous_run_id
+    if (
+        binding.run_id != run_id
+        or binding.run_nonce_sha256 != run_nonce_sha256
+        or binding.execution_plan_sha256 != plan.sha256
+        or binding.rank_config_sha256 != plan.rank_config_sha256
+        or binding.session_id != expected_session_id
+        or binding.session_epoch != expected_session_epoch
+        or binding.previous_run_id != expected_previous_run_id
+        or binding.method != plan.runtime_plan.rank_configs[0].method
+        or binding.warmup_request_ids
+        != tuple(request.request_id for request in plan.warmup_requests)
+        or binding.scored_request_ids
+        != tuple(request.request_id for request in plan.scored_requests)
+        or (session_binding is None and terminal.begin_receipt.reset_generation != 1)
+        or (session_binding is None and terminal.reset_receipt.reset_generation != 2)
+    ):
+        raise RuntimeError("completed native terminal artifact changed run identity")
+    if binding.method != "target_only" and not terminal.trusted_attestation:
+        raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+    native = terminal.to_native_evidence_batch()
+    round_rows = (
+        pq.read_table(completed["round"]).to_pylist() if "round" in completed else []
+    )
+    update_rows = (
+        pq.read_table(completed["update"]).to_pylist() if "update" in completed else []
+    )
+    if (
+        [asdict(row) for row in native.rounds] != round_rows
+        or [asdict(row) for row in native.updates] != update_rows
+        or any(
+            performance_row.get(key) != value
+            for key, value in native.performance_overrides
+        )
+    ):
+        raise RuntimeError(
+            "completed native terminal artifact no longer converts to durable rows"
+        )
+    return artifact_path
+
+
 def _validate_resume(
     *,
     completed: dict[str, Path],
@@ -2850,7 +3795,16 @@ def _validate_resume(
     plan: IndustrialExecutionPlan,
     run_nonce_sha256: str,
     session_binding: SessionExecutionBinding | None = None,
-) -> None:
+) -> Path:
+    root = completed["run"].parent
+    terminal_receipt = root / f"{run_id}.rank0.complete.json"
+    if not terminal_receipt.exists():
+        terminal_receipt = root / f"{run_id}.rank0.prepared.json"
+    registered_writer_policy = evidence_writer_policy_from_receipt(terminal_receipt)
+    if registered_writer_policy != plan.evidence_writer_policy:
+        raise RuntimeError(
+            "completed evidence differs from the registered writer policy"
+        )
     run_rows = pq.read_table(completed["run"]).to_pylist()
     request_rows = pq.read_table(completed["request"]).to_pylist()
     performance_rows = pq.read_table(completed["performance"]).to_pylist()
@@ -3013,6 +3967,150 @@ def _validate_resume(
         raise RuntimeError(
             "completed industrial receipt has mismatched load accounting"
         )
+    return _validate_resumed_native_terminal(
+        completed=completed,
+        run_row=run_rows[0],
+        request_rows=request_rows,
+        performance_row=performance,
+        run_id=run_id,
+        plan=plan,
+        run_nonce_sha256=run_nonce_sha256,
+        session_binding=session_binding,
+    )
+
+
+def revalidate_industrial_execution_result(
+    *,
+    plan: IndustrialExecutionPlan,
+    result: IndustrialExecutionResult,
+    run_nonce_sha256: str,
+) -> IndustrialExecutionTerminalBinding:
+    """Reopen a serving result and return its exact durable terminal binding.
+
+    This is the first-party assignment boundary used by the pool executor.  It
+    trusts neither ``IndustrialExecutionResult`` nor copied digests: the plan,
+    final/prepared evidence chain, budget observation sidecar, Parquet rows,
+    and native terminal artifact are all replayed from disk first.
+    """
+
+    if type(plan) is not IndustrialExecutionPlan:
+        raise TypeError("terminal revalidation requires an exact execution plan")
+    if type(result) is not IndustrialExecutionResult:
+        raise TypeError("terminal revalidation requires an exact execution result")
+    if not _is_sha256(run_nonce_sha256):
+        raise ValueError("terminal revalidation requires a lowercase run nonce")
+    plan.validate()
+    physical = plan.runtime_plan.physical_assignment
+    if physical is None:
+        raise ValueError("terminal revalidation lacks a physical assignment")
+    if plan.runtime_plan.cell.resources.workload_class in {
+        WorkloadClass.COMPILE,
+        WorkloadClass.DOWNLOAD,
+    }:
+        raise ValueError("non-serving execution has no terminal-result contract")
+    run_id = industrial_run_id(plan, run_nonce_sha256)
+    if result.run_id != run_id:
+        raise ValueError("execution result names another run")
+    root = Path(plan.runtime_plan.cell.resources.evidence_root).resolve()
+    terminal_receipt = (root / f"{run_id}.rank0.complete.json").resolve()
+    if (
+        Path(result.terminal_receipt) != terminal_receipt
+        or terminal_receipt.is_symlink()
+        or not terminal_receipt.is_file()
+        or _file_sha256(terminal_receipt) != result.terminal_receipt_sha256
+    ):
+        raise RuntimeError("execution result terminal receipt changed or is foreign")
+    completed = load_completed_evidence(root, run_id=run_id, rank=0)
+    if completed is None:
+        raise RuntimeError("execution result lacks durable completed evidence")
+    native_path = _validate_resume(
+        completed=completed,
+        run_id=run_id,
+        plan=plan,
+        run_nonce_sha256=run_nonce_sha256,
+    )
+    observation, observation_path, observation_sidecar = _load_budget_observation(
+        root=root,
+        run_id=run_id,
+        plan=plan,
+        terminal_receipt=terminal_receipt,
+    )
+    if (
+        result.execution_plan_sha256 != plan.sha256
+        or result.experiment_budget_sha256 != plan.budget.sha256
+        or result.rank_config_sha256 != plan.rank_config_sha256
+        or result.topology_sha256 != plan.topology_sha256
+        or result.budget_observation != str(observation_path)
+        or result.budget_observation_sidecar != str(observation_sidecar)
+        or result.budget_observation_sha256 != observation.sha256
+    ):
+        raise ValueError("execution result summary differs from revalidated raw files")
+    expected_evidence = tuple(
+        sorted(
+            {
+                *(str(path.resolve()) for path in completed.values()),
+                str(native_path.resolve()),
+                str(observation_path.resolve()),
+                str(observation_sidecar.resolve()),
+            }
+        )
+    )
+    if tuple(sorted(result.evidence_files)) != expected_evidence:
+        raise ValueError("execution result evidence-file coverage is not exact")
+    evidence_paths = tuple(Path(value) for value in expected_evidence)
+    if any(
+        path.is_symlink() or not path.is_file() or path.resolve() != path
+        for path in evidence_paths
+    ):
+        raise RuntimeError("execution result evidence contains a changed file")
+    run_rows = pq.read_table(completed["run"]).to_pylist()
+    if len(run_rows) != 1:
+        raise RuntimeError("execution result run evidence is no longer singular")
+    run_row = run_rows[0]
+    native_raw_sha256 = run_row.get("native_terminal_raw_sha256")
+    native_terminal_sha256 = run_row.get("native_terminal_sha256")
+    if (
+        not isinstance(native_raw_sha256, str)
+        or not _is_sha256(native_raw_sha256)
+        or not isinstance(native_terminal_sha256, str)
+        or not _is_sha256(native_terminal_sha256)
+        or _file_sha256(native_path) != native_raw_sha256
+    ):
+        raise RuntimeError("execution result native terminal binding changed")
+    try:
+        native_artifact = json.loads(native_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "execution result native terminal artifact is invalid"
+        ) from error
+    validated_native = validate_native_terminal_artifact(
+        native_artifact,
+        trusted_attester_policy=plan.trusted_attester_policy,
+    )
+    return IndustrialExecutionTerminalBinding(
+        cell_id=plan.runtime_plan.cell_id,
+        run_id=run_id,
+        run_nonce_sha256=run_nonce_sha256,
+        execution_plan_sha256=plan.sha256,
+        dispatch_plan_sha256=plan.dispatch_plan.sha256,
+        assignment_sha256=physical.assignment_sha256,
+        experiment_budget_sha256=plan.budget.sha256,
+        inventory_sha256=plan.dispatch_context.inventory.sha256,
+        physical_gpu_uuids=physical.gpu_uuids,
+        terminal_receipt_path=str(terminal_receipt),
+        terminal_receipt_sha256=result.terminal_receipt_sha256,
+        budget_observation_path=str(observation_path),
+        budget_observation_sha256=observation.sha256,
+        budget_observation_sidecar_path=str(observation_sidecar),
+        budget_observation_sidecar_sha256=_file_sha256(observation_sidecar),
+        native_terminal_artifact_path=str(native_path),
+        native_terminal_raw_sha256=native_raw_sha256,
+        native_terminal_sha256=native_terminal_sha256,
+        trusted_attester_policy_sha256=plan.trusted_attester_policy.sha256,
+        trusted_attestation=validated_native.trusted_attestation,
+        evidence_file_paths=expected_evidence,
+        evidence_file_sha256s=tuple(_file_sha256(path) for path in evidence_paths),
+    )
 
 
 async def execute_industrial_plan(
@@ -3046,6 +4144,8 @@ async def execute_industrial_plan(
     evidence_preflight = native_evidence_preflight(plan, native_evidence)
     if evidence_preflight.status == "BLOCKED":
         raise NativeEvidenceUnavailableError(evidence_preflight)
+    if native_evidence is None:  # pragma: no cover - preflight invariant
+        raise RuntimeError("native terminal preflight lost its exact provider")
     session_binding: SessionExecutionBinding | None = None
     session_startup_interval_ns: tuple[int, int] | None = None
     session_prepare_observed_ms = 0
@@ -3071,7 +4171,7 @@ async def execute_industrial_plan(
             raise RuntimeError(
                 "shared-session execution cannot resume preexisting trace evidence"
             )
-        _validate_resume(
+        native_terminal_artifact_path = _validate_resume(
             completed=completed,
             run_id=run_id,
             plan=plan,
@@ -3100,6 +4200,7 @@ async def execute_industrial_plan(
                 str(path)
                 for path in (
                     *completed.values(),
+                    native_terminal_artifact_path,
                     observation_path,
                     observation_sidecar,
                 )
@@ -3124,8 +4225,22 @@ async def execute_industrial_plan(
             session_prepare_completed_ns,
         )
 
-    writer = EvidenceWriter(root, run_id=run_id, rank=0)
-    sink = _AsyncEvidenceSink(writer)
+    writer_policy = plan.evidence_writer_policy
+    writer = EvidenceWriter(
+        root,
+        run_id=run_id,
+        rank=0,
+        max_queued_rows=writer_policy.writer_queue_rows,
+        row_group_rows=writer_policy.parquet_row_group_rows,
+        checkpoint_interval_s=writer_policy.checkpoint_interval_ms / 1000,
+        overflow_policy=writer_policy.overflow_policy,
+        registered_policy=writer_policy,
+    )
+    sink = _AsyncEvidenceSink(
+        writer,
+        max_queued_rows=writer_policy.async_queue_rows,
+        max_batch_rows=writer_policy.async_batch_rows,
+    )
     handle: ServerHandle | None = existing_handle
     transport_open = transport_already_open
     owns_handle = existing_handle is None
@@ -3145,22 +4260,26 @@ async def execute_industrial_plan(
                 abort_timeout_s=plan.abort_grace_s,
             )
             transport_open = True
-        if native_evidence is not None:
-            _bind_native_terminal_transport(
-                provider=native_evidence,
-                transport=transport,
-                base_url=plan.server_launch.base_url,
-            )
-            capability = await native_evidence.capability(expected_method=method)
-            if method != "target_only" and not capability.trusted_attester_configured:
-                raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
-            native_binding = _native_terminal_binding(
-                plan=plan,
-                run_id=run_id,
-                run_nonce_sha256=run_nonce_sha256,
-                session_binding=session_binding,
-            )
-            await native_evidence.begin(native_binding)
+        pinned_transport = _bind_native_terminal_transport(
+            provider=native_evidence,
+            transport=transport,
+            base_url=plan.server_launch.base_url,
+        )
+        config = plan.runtime_plan.rank_configs[0]
+        live_execution_policy_sha256 = await _require_live_controlled_execution_policy(
+            transport=pinned_transport,
+            config=config,
+        )
+        capability = await native_evidence.capability(expected_method=method)
+        if method != "target_only" and not capability.trusted_attester_configured:
+            raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+        native_binding = _native_terminal_binding(
+            plan=plan,
+            run_id=run_id,
+            run_nonce_sha256=run_nonce_sha256,
+            session_binding=session_binding,
+        )
+        await native_evidence.begin(native_binding)
         startup_completed_ns = time.perf_counter_ns()
         observed_session_startup_ms = (
             0
@@ -3171,7 +4290,6 @@ async def execute_industrial_plan(
             _elapsed_milliseconds(startup_started_ns, startup_completed_ns)
             + observed_session_startup_ms
         )
-        config = plan.runtime_plan.rank_configs[0]
         concurrency = config.runtime.max_running_requests
         warmup_started_ns = startup_completed_ns
         warmup: tuple[RequestExecution, ...] = ()
@@ -3193,12 +4311,10 @@ async def execute_industrial_plan(
             if any(row.outcome.status != "completed" for row in warmup):
                 raise RuntimeError("excluded warm-up did not complete exactly")
         warmup_requests_completed_ns = time.perf_counter_ns()
-        if native_evidence is not None:
-            await native_evidence.reset(
-                warmup_requests=tuple(
-                    _terminal_request_expectation(row) for row in warmup
-                )
-            )
+        warmup_terminal_requests = tuple(
+            _terminal_request_expectation(row) for row in warmup
+        )
+        await native_evidence.reset(warmup_requests=warmup_terminal_requests)
         native_reset_completed_ns = time.perf_counter_ns()
         observed_component_ms["excluded_warmup"] = (
             _elapsed_milliseconds(warmup_started_ns, warmup_requests_completed_ns)
@@ -3287,25 +4403,48 @@ async def execute_industrial_plan(
             plan.load_plan,
             tuple(row.outcome for row in requests),
         )
-        if native_evidence is None:
-            if config.method != "target_only":
-                raise RuntimeError(
-                    "speculative serving requires trusted native terminal evidence"
-                )
-            native = NativeEvidenceBatch()
-        else:
-            if native_binding is None:
-                raise RuntimeError("native terminal binding was not established")
-            terminal = await native_evidence.finalize(
-                requests=tuple(_terminal_request_expectation(row) for row in requests)
+        if native_binding is None:
+            raise RuntimeError("native terminal binding was not established")
+        terminal_requests = tuple(
+            _terminal_request_expectation(row) for row in requests
+        )
+        terminal = await native_evidence.finalize(requests=terminal_requests)
+        if (
+            await _require_live_controlled_execution_policy(
+                transport=pinned_transport,
+                config=config,
             )
-            if not isinstance(terminal, ValidatedNativeTerminalEvidence):
-                raise TypeError("native provider returned an untyped terminal envelope")
-            if terminal.binding != native_binding:
-                raise RuntimeError("native terminal envelope changed its run binding")
-            if config.method != "target_only" and not terminal.trusted_attestation:
-                raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
-            native = terminal.to_native_evidence_batch()
+            != live_execution_policy_sha256
+        ):
+            raise RuntimeError("live execution-policy identity changed during scoring")
+        if not isinstance(terminal, ValidatedNativeTerminalEvidence):
+            raise TypeError("native provider returned an untyped terminal envelope")
+        if terminal.binding != native_binding:
+            raise RuntimeError("native terminal envelope changed its run binding")
+        if (
+            terminal.trusted_attester_policy_sha256
+            != plan.trusted_attester_policy.sha256
+        ):
+            raise RuntimeError("native terminal envelope changed its release policy")
+        if config.method != "target_only" and not terminal.trusted_attestation:
+            raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+        terminal_artifact = terminal.to_artifact(
+            warmup_requests=warmup_terminal_requests
+        )
+        revalidated_terminal = validate_native_terminal_artifact(
+            terminal_artifact,
+            trusted_attester_policy=plan.trusted_attester_policy,
+            expected_binding=native_binding,
+            expected_warmup_requests=warmup_terminal_requests,
+            expected_scored_requests=terminal_requests,
+        )
+        if (
+            revalidated_terminal.terminal_sha256 != terminal.terminal_sha256
+            or revalidated_terminal.raw_json != terminal.raw_json
+        ):
+            raise RuntimeError("native terminal envelope changed during revalidation")
+        terminal = revalidated_terminal
+        native = terminal.to_native_evidence_batch()
         native.validate(run_id=run_id, method=config.method)
         completed_request_ids = {
             row.request.request_id
@@ -3324,6 +4463,10 @@ async def execute_industrial_plan(
         )
         evidence_started_ns = finalization_completed_ns
         await sink.flush()
+        native_terminal_artifact = await asyncio.to_thread(
+            writer.persist_native_terminal_artifact,
+            terminal_artifact,
+        )
         completed_ns = clock.wall_ns()
         for row in native.rounds:
             await sink.write(row)
@@ -3392,6 +4535,13 @@ async def execute_industrial_plan(
                 ),
                 session_epoch=(
                     None if session_binding is None else session_binding.session_epoch
+                ),
+                native_terminal_artifact_path=str(native_terminal_artifact["path"]),
+                native_terminal_artifact_size=int(native_terminal_artifact["size"]),
+                native_terminal_raw_sha256=str(native_terminal_artifact["raw_sha256"]),
+                native_terminal_sha256=str(native_terminal_artifact["terminal_sha256"]),
+                trusted_attester_policy_sha256=str(
+                    native_terminal_artifact["trusted_attester_policy_sha256"]
                 ),
             )
         )
@@ -3492,6 +4642,7 @@ async def execute_industrial_plan(
                 str(path)
                 for path in (
                     *written.values(),
+                    root / str(native_terminal_artifact["path"]),
                     observation_path,
                     observation_sidecar,
                 )

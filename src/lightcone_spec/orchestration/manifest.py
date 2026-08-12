@@ -7,6 +7,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_SAFE_CONTEXT_LIMIT,
     LongContinuationAdapter,
@@ -58,6 +59,7 @@ class SpeedStudyManifest:
     controlled_window_hashes: dict[str, str] = field(default_factory=dict)
     tuning_grid_sha256: str = ""
     sampling_profile_sha256: str = ""
+    execution_policy_sha256: str = ""
     natural_side_tables: tuple[str, ...] = ("livecodebench", "math500")
     gpu_evidence: str = "UNMEASURED"
 
@@ -72,6 +74,7 @@ class SpeedStudyManifest:
             },
             tuning_grid_sha256=_tuning_grid_sha256(),
             sampling_profile_sha256=SamplingProfile().sha256,
+            execution_policy_sha256=ControlledExecutionPolicy().sha256,
         )
 
     def validate(self) -> None:
@@ -133,6 +136,8 @@ class SpeedStudyManifest:
             raise ValueError("tuning grid identity mismatch")
         if self.sampling_profile_sha256 != SamplingProfile().sha256:
             raise ValueError("sampling profile identity mismatch")
+        if self.execution_policy_sha256 != ControlledExecutionPolicy().sha256:
+            raise ValueError("execution policy identity mismatch")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -147,16 +152,12 @@ class SpeedStudyManifest:
     def write(self, path: str | Path) -> None:
         self.validate()
         output = Path(path)
-        body = json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":")
-        ) + "\n"
+        body = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
         if output.exists() and output.read_text(encoding="utf-8") != body:
             raise ValueError("manifest is immutable; choose a new output path")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(body, encoding="utf-8")
-        Path(f"{output}.sha256").write_text(
-            self.sha256 + "\n", encoding="utf-8"
-        )
+        Path(f"{output}.sha256").write_text(self.sha256 + "\n", encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path) -> SpeedStudyManifest:

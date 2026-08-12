@@ -38,9 +38,7 @@ class SamplingProfile:
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":")
-        ).encode()
+        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def parameters(self, *, seed: int, max_new_tokens: int) -> dict:

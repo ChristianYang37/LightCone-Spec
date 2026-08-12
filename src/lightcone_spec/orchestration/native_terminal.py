@@ -17,17 +17,23 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from lightcone_spec.runtime.attestation import (
+    NO_TRUSTED_ATTESTERS,
+    TrustedAttesterPolicy,
+)
+
 NATIVE_TERMINAL_EVIDENCE_HOOK = (
     "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
 )
 PINNED_SGLANG_UPSTREAM_COMMIT = "3312645a307453893a00778592f105581e3d1c3d"
 PINNED_SGLANG_PATCH_SHA256 = (
-    "c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08"
+    "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
 )
-PINNED_SGLANG_TREE = "2810ac94ed225aa78b4256ded56e78890a4a590f"
+PINNED_SGLANG_TREE = "22bd0d1d16aab33addbdacdbf75ad5bfe21164a8"
 
 CAPABILITY_PATH = "/v1/lightcone-spec/terminal-evidence/capability"
 TERMINAL_EVIDENCE_PATH = "/v1/lightcone-spec/terminal-evidence"
+NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v1"
 
 NATIVE_TERMINAL_EVIDENCE_FIELDS = (
     "schema_version",
@@ -329,6 +335,44 @@ _ATTESTATION_KEYS = {
     "signature_hex",
 }
 _TERMINAL_KEYS = set(NATIVE_TERMINAL_EVIDENCE_FIELDS)
+_ARTIFACT_KEYS = {
+    "schema_version",
+    "artifact_kind",
+    "run_id",
+    "rank",
+    "trusted_attester_policy_sha256",
+    "begin_sha256",
+    "reset_sha256",
+    "terminal_sha256",
+    "binding",
+    "warmup_requests",
+    "scored_requests",
+    "begin",
+    "reset",
+    "terminal",
+}
+_ARTIFACT_BINDING_KEYS = {
+    "run_id",
+    "run_nonce_sha256",
+    "execution_plan_sha256",
+    "rank_config_sha256",
+    "attempt_id",
+    "session_id",
+    "session_epoch",
+    "previous_run_id",
+    "challenge_nonce_sha256",
+    "method",
+    "warmup_request_ids",
+    "scored_request_ids",
+}
+_ARTIFACT_REQUEST_KEYS = {
+    "request_id",
+    "input_token_ids",
+    "output_token_ids",
+    "terminal_status",
+    "terminal_reason",
+    "submitted_to_server",
+}
 
 
 class AsyncNativeTerminalAdminTransport(Protocol):
@@ -344,6 +388,9 @@ class AsyncNativeTerminalAdminTransport(Protocol):
     ) -> object: ...
 
 
+# Deprecated import compatibility only.  Provider construction deliberately
+# accepts no caller-supplied verifier; release trust is rooted exclusively in
+# ``TrustedAttesterPolicy``.
 SignatureVerifier = Callable[[bytes, bytes], bool]
 
 
@@ -600,6 +647,9 @@ class NativeTerminalAttestation:
     attester_id: str | None
     trust_domain: str | None
     signature_hex: str | None
+    key_id: str | None
+    public_key_sha256: str | None
+    trusted_attester_policy_sha256: str
     trusted: bool
 
 
@@ -623,11 +673,56 @@ class ValidatedNativeTerminalEvidence:
     def trusted_attestation(self) -> bool:
         return self.attestation.trusted
 
+    @property
+    def trusted_attester_policy_sha256(self) -> str:
+        return self.attestation.trusted_attester_policy_sha256
+
     def to_dict(self) -> dict[str, object]:
         value = json.loads(self.raw_json)
         if not isinstance(value, dict):  # pragma: no cover - construction invariant
             raise TypeError("validated terminal JSON stopped being an object")
         return value
+
+    def to_artifact(
+        self,
+        *,
+        warmup_requests: Sequence[TerminalRequestExpectation],
+        rank: int = 0,
+    ) -> dict[str, object]:
+        """Return one canonicalizable bundle for durable terminal publication."""
+
+        warmup = _validate_request_expectations(
+            warmup_requests,
+            expected_ids=self.binding.warmup_request_ids,
+            warmup=True,
+        )
+        scored = _validate_request_expectations(
+            self.requests,
+            expected_ids=self.binding.scored_request_ids,
+            warmup=False,
+        )
+        artifact: dict[str, object] = {
+            "schema_version": 1,
+            "artifact_kind": NATIVE_TERMINAL_ARTIFACT_KIND,
+            "run_id": self.binding.run_id,
+            "rank": rank,
+            "trusted_attester_policy_sha256": (self.trusted_attester_policy_sha256),
+            "begin_sha256": self.begin_receipt.begin_sha256,
+            "reset_sha256": self.reset_receipt.reset_sha256,
+            "terminal_sha256": self.terminal_sha256,
+            "binding": _binding_artifact(self.binding),
+            "warmup_requests": [
+                _request_expectation_artifact(request) for request in warmup
+            ],
+            "scored_requests": [
+                _request_expectation_artifact(request) for request in scored
+            ],
+            "begin": json.loads(self.begin_receipt.raw_json),
+            "reset": json.loads(self.reset_receipt.raw_json),
+            "terminal": self.to_dict(),
+        }
+        _validate_strict_json(artifact, "native terminal artifact")
+        return artifact
 
     def to_native_evidence_batch(self):
         """Convert exact native rows without imputing absent per-update timing.
@@ -773,6 +868,151 @@ class ValidatedNativeTerminalEvidence:
         )
         batch.validate(run_id=self.binding.run_id, method=self.binding.method)
         return batch
+
+
+def _binding_artifact(binding: NativeTerminalRunBinding) -> dict[str, object]:
+    binding.validate()
+    return {
+        **_identity_values(binding),
+        "warmup_request_ids": list(binding.warmup_request_ids),
+        "scored_request_ids": list(binding.scored_request_ids),
+    }
+
+
+def _binding_from_artifact(value: object) -> NativeTerminalRunBinding:
+    raw = _exact_object(value, _ARTIFACT_BINDING_KEYS, "terminal artifact binding")
+    warmup = raw.pop("warmup_request_ids")
+    scored = raw.pop("scored_request_ids")
+    if not isinstance(warmup, list) or not isinstance(scored, list):
+        raise TypeError("terminal artifact request IDs must be JSON lists")
+    binding = NativeTerminalRunBinding(
+        **raw,
+        warmup_request_ids=tuple(warmup),
+        scored_request_ids=tuple(scored),
+    )
+    binding.validate()
+    return binding
+
+
+def _request_expectation_artifact(
+    request: TerminalRequestExpectation,
+) -> dict[str, object]:
+    request.validate()
+    return {
+        "request_id": request.request_id,
+        "input_token_ids": list(request.input_token_ids),
+        "output_token_ids": (
+            None if request.output_token_ids is None else list(request.output_token_ids)
+        ),
+        "terminal_status": request.terminal_status,
+        "terminal_reason": request.terminal_reason,
+        "submitted_to_server": request.submitted_to_server,
+    }
+
+
+def _request_expectation_from_artifact(value: object) -> TerminalRequestExpectation:
+    raw = _exact_object(value, _ARTIFACT_REQUEST_KEYS, "terminal artifact request")
+    inputs = _token_ids(raw.pop("input_token_ids"), "artifact input_token_ids")
+    raw_outputs = raw.pop("output_token_ids")
+    outputs = (
+        None
+        if raw_outputs is None
+        else _token_ids(raw_outputs, "artifact output_token_ids")
+    )
+    request = TerminalRequestExpectation(
+        **raw,
+        input_token_ids=inputs,
+        output_token_ids=outputs,
+    )
+    request.validate()
+    return request
+
+
+def validate_native_terminal_artifact(
+    value: object,
+    *,
+    trusted_attester_policy: TrustedAttesterPolicy,
+    expected_binding: NativeTerminalRunBinding | None = None,
+    expected_warmup_requests: Sequence[TerminalRequestExpectation] | None = None,
+    expected_scored_requests: Sequence[TerminalRequestExpectation] | None = None,
+) -> ValidatedNativeTerminalEvidence:
+    """Revalidate a durable begin/reset/final bundle and its release signature."""
+
+    if type(trusted_attester_policy) is not TrustedAttesterPolicy:
+        raise TypeError("terminal artifact requires an exact release policy")
+    trusted_attester_policy.validate()
+    raw = _exact_object(value, _ARTIFACT_KEYS, "native terminal artifact")
+    if (
+        raw["schema_version"] != 1
+        or raw["artifact_kind"] != NATIVE_TERMINAL_ARTIFACT_KIND
+        or raw["rank"] != 0
+    ):
+        raise ValueError("native terminal artifact schema/rank is unsupported")
+    policy_sha256 = _sha256(
+        raw["trusted_attester_policy_sha256"],
+        "trusted_attester_policy_sha256",
+    )
+    if policy_sha256 != trusted_attester_policy.sha256:
+        raise ValueError("native terminal artifact uses another release policy")
+    binding = _binding_from_artifact(raw["binding"])
+    if raw["run_id"] != binding.run_id:
+        raise ValueError("native terminal artifact changed its run identity")
+    if expected_binding is not None and binding != expected_binding:
+        raise ValueError("native terminal artifact changed its expected binding")
+    warmup_values = raw["warmup_requests"]
+    scored_values = raw["scored_requests"]
+    if not isinstance(warmup_values, list) or not isinstance(scored_values, list):
+        raise TypeError("native terminal artifact request coverage is malformed")
+    warmup = _validate_request_expectations(
+        tuple(_request_expectation_from_artifact(row) for row in warmup_values),
+        expected_ids=binding.warmup_request_ids,
+        warmup=True,
+    )
+    scored = _validate_request_expectations(
+        tuple(_request_expectation_from_artifact(row) for row in scored_values),
+        expected_ids=binding.scored_request_ids,
+        warmup=False,
+    )
+    if expected_warmup_requests is not None and warmup != tuple(
+        expected_warmup_requests
+    ):
+        raise ValueError("native terminal artifact changed warmup expectations")
+    if expected_scored_requests is not None and scored != tuple(
+        expected_scored_requests
+    ):
+        raise ValueError("native terminal artifact changed scored expectations")
+    begin_raw = _exact_object(
+        raw["begin"], _BEGIN_RECEIPT_KEYS, "artifact begin receipt"
+    )
+    begin_generation = _integer(
+        begin_raw["reset_generation"], "artifact begin reset_generation", minimum=1
+    )
+    begin = _validate_begin_receipt(
+        begin_raw,
+        binding=binding,
+        prior_reset_generation=begin_generation - 1,
+        prior_process=None,
+    )
+    reset = _validate_reset_receipt(
+        raw["reset"],
+        begin=begin,
+        warmup_requests=warmup,
+    )
+    terminal = _validate_terminal(
+        raw["terminal"],
+        begin=begin,
+        reset=reset,
+        requests=scored,
+        trusted_attester_policy=trusted_attester_policy,
+    )
+    if (
+        _sha256(raw["begin_sha256"], "artifact begin_sha256") != begin.begin_sha256
+        or _sha256(raw["reset_sha256"], "artifact reset_sha256") != reset.reset_sha256
+        or _sha256(raw["terminal_sha256"], "artifact terminal_sha256")
+        != terminal.terminal_sha256
+    ):
+        raise ValueError("native terminal artifact digest binding is inconsistent")
+    return terminal
 
 
 def _validate_capability(
@@ -1534,8 +1774,10 @@ def _validate_attestation(
     value: object,
     *,
     envelope: Mapping[str, object],
-    verifiers: Mapping[str, SignatureVerifier],
+    trusted_attester_policy: TrustedAttesterPolicy,
 ) -> NativeTerminalAttestation:
+    trusted_attester_policy.validate()
+    policy_sha256 = trusted_attester_policy.sha256
     raw = _exact_object(value, _ATTESTATION_KEYS, "terminal attestation")
     if raw["schema_version"] != 1:
         raise ValueError("terminal attestation schema is unsupported")
@@ -1562,6 +1804,9 @@ def _validate_attestation(
             attester_id=None,
             trust_domain=None,
             signature_hex=None,
+            key_id=None,
+            public_key_sha256=None,
+            trusted_attester_policy_sha256=policy_sha256,
             trusted=False,
         )
     if status != "SIGNED":
@@ -1573,22 +1818,23 @@ def _validate_attestation(
         raise ValueError("terminal attestation trust domain is unsupported")
     if (
         not isinstance(signature_hex, str)
+        or len(signature_hex) != 128
         or _LOWER_HEX.fullmatch(signature_hex) is None
     ):
         raise ValueError("terminal attestation signature is not canonical hex")
-    signature = bytes.fromhex(signature_hex)
-    release_identity = trust_domain == "hardware" and not str(
-        attester_id
-    ).lower().startswith(("test", "fixture", "cpu"))
-    verifier = verifiers.get(str(attester_id)) if release_identity else None
+    key_id: str | None = None
+    public_key_sha256: str | None = None
     trusted = False
-    if verifier is not None:
-        try:
-            trusted = verifier(canonical_json_bytes(message), signature) is True
-        except Exception as error:
-            raise ValueError("terminal attestation verifier failed") from error
-        if not trusted:
-            raise ValueError("terminal attestation signature verification failed")
+    if trust_domain == "hardware" and trusted_attester_policy.allows_terminal_attester(
+        str(attester_id)
+    ):
+        key_id, public_key_sha256 = trusted_attester_policy.verify_terminal_signature(
+            attester_id=str(attester_id),
+            trust_domain=str(trust_domain),
+            message=canonical_json_bytes(message),
+            signature_hex=signature_hex,
+        )
+        trusted = True
     return NativeTerminalAttestation(
         status=status,
         challenge_nonce_sha256=challenge,
@@ -1596,6 +1842,9 @@ def _validate_attestation(
         attester_id=str(attester_id),
         trust_domain=str(trust_domain),
         signature_hex=signature_hex,
+        key_id=key_id,
+        public_key_sha256=public_key_sha256,
+        trusted_attester_policy_sha256=policy_sha256,
         trusted=trusted,
     )
 
@@ -1606,7 +1855,7 @@ def _validate_terminal(
     begin: NativeTerminalBeginReceipt,
     reset: NativeTerminalResetReceipt,
     requests: tuple[TerminalRequestExpectation, ...],
-    verifiers: Mapping[str, SignatureVerifier],
+    trusted_attester_policy: TrustedAttesterPolicy,
 ) -> ValidatedNativeTerminalEvidence:
     raw = _exact_object(value, _TERMINAL_KEYS, "terminal evidence")
     binding = begin.binding
@@ -1663,7 +1912,9 @@ def _validate_terminal(
         performance=performance,
     )
     attestation = _validate_attestation(
-        raw["attestation"], envelope=raw, verifiers=verifiers
+        raw["attestation"],
+        envelope=raw,
+        trusted_attester_policy=trusted_attester_policy,
     )
     return ValidatedNativeTerminalEvidence(
         binding=binding,
@@ -1689,14 +1940,14 @@ class NativeTerminalProvider:
         self,
         transport: AsyncNativeTerminalAdminTransport,
         *,
-        trusted_hardware_verifiers: Mapping[str, SignatureVerifier] | None = None,
+        trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
     ) -> None:
+        if type(trusted_attester_policy) is not TrustedAttesterPolicy:
+            raise TypeError("native terminal trust requires an exact release policy")
+        trusted_attester_policy.validate()
         self._transport = transport
-        self._verifiers = dict(trusted_hardware_verifiers or {})
-        for attester_id, verifier in self._verifiers.items():
-            _safe_id(attester_id, "trusted attester ID")
-            if not callable(verifier):
-                raise TypeError("trusted hardware verifier must be callable")
+        self._trusted_attester_policy = trusted_attester_policy
+        self._trusted_attester_policy_sha256 = trusted_attester_policy.sha256
         self._phase = "IDLE"
         self._binding: NativeTerminalRunBinding | None = None
         self._begin: NativeTerminalBeginReceipt | None = None
@@ -1712,6 +1963,17 @@ class NativeTerminalProvider:
     @property
     def phase(self) -> str:
         return self._phase
+
+    @property
+    def trusted_attester_policy(self) -> TrustedAttesterPolicy:
+        if self._trusted_attester_policy.sha256 != self._trusted_attester_policy_sha256:
+            raise RuntimeError("native terminal release policy identity changed")
+        return self._trusted_attester_policy
+
+    @property
+    def trusted_attester_policy_sha256(self) -> str:
+        _ = self.trusted_attester_policy
+        return self._trusted_attester_policy_sha256
 
     async def capability(self, *, expected_method: str) -> NativeTerminalCapability:
         if self._phase == "FAILED":
@@ -1843,7 +2105,7 @@ class NativeTerminalProvider:
                 begin=self._begin,
                 reset=self._reset,
                 requests=expected,
-                verifiers=self._verifiers,
+                trusted_attester_policy=self.trusted_attester_policy,
             )
             self._last_finalized_run_id = self._binding.run_id
             self._next_session_epoch += 1

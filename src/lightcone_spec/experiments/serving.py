@@ -2,8 +2,8 @@
 
 The industrial executor owns arrival, admission, cancellation, and evidence
 semantics.  This module deliberately reuses SGLang's official asynchronous
-``async_request_sglang_generate`` implementation for the network request.  It
-does not reproduce the upstream HTTP client or its benchmark metric reducer.
+session open/close, generate, and abort functions with one caller-owned pool.
+It does not reproduce the upstream HTTP client or its benchmark metric reducer.
 
 Upstream's request result reports ITLs after distributing one SSE chunk gap
 over every token in that chunk.  Those values are unsuitable for a p99 claim.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import json
 import math
 import sys
@@ -228,7 +229,60 @@ class BenchServingTransport(Protocol):
     def metrics(self) -> dict[str, int]: ...
 
 
-_OfficialRequest = Callable[..., Awaitable[Any]]
+_OfficialAsyncCallable = Callable[..., Awaitable[Any]]
+
+
+def _require_official_signature(
+    function: _OfficialAsyncCallable,
+    *,
+    name: str,
+    expected: tuple[tuple[str, object, object], ...],
+) -> None:
+    """Fail closed if one pinned official HTTP callable drifts."""
+
+    if not inspect.iscoroutinefunction(function):
+        raise TypeError(f"official {name} must be async")
+    try:
+        parameters = tuple(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"official {name} signature is unavailable") from error
+    actual = tuple(
+        (parameter.name, parameter.kind, parameter.default) for parameter in parameters
+    )
+    if actual != expected:
+        raise ValueError(f"official {name} signature differs from the pinned contract")
+
+
+_OPEN_SESSION_SIGNATURE = (
+    (
+        "total_timeout_s",
+        inspect.Parameter.KEYWORD_ONLY,
+        6 * 60 * 60,
+    ),
+)
+_CLOSE_SESSION_SIGNATURE = (
+    (
+        "client_session",
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.empty,
+    ),
+)
+_GENERATE_SIGNATURE = (
+    (
+        "request_func_input",
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.empty,
+    ),
+    ("pbar", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ("client_session", inspect.Parameter.KEYWORD_ONLY, None),
+    ("timeout_s", inspect.Parameter.KEYWORD_ONLY, None),
+)
+_ABORT_SIGNATURE = (
+    ("request_id", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("base_url", inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty),
+    ("client_session", inspect.Parameter.KEYWORD_ONLY, None),
+    ("timeout_s", inspect.Parameter.KEYWORD_ONLY, None),
+)
 
 
 class PinnedBenchServingTransport:
@@ -238,9 +292,12 @@ class PinnedBenchServingTransport:
         self,
         *,
         request_type: type,
-        request_callable: _OfficialRequest,
+        request_callable: _OfficialAsyncCallable,
+        abort_callable: _OfficialAsyncCallable,
+        open_session_callable: _OfficialAsyncCallable,
+        close_session_callable: _OfficialAsyncCallable,
         set_global_args: Callable[[Any], None],
-        session_factory: Callable[[], Any] | None = None,
+        trace_config_factory: Callable[[], Any],
         headers_factory: Callable[[], dict[str, str]] | None = None,
         module_identity: str,
     ) -> None:
@@ -248,17 +305,45 @@ class PinnedBenchServingTransport:
             raise ValueError("official bench module identity is not pinned")
         self._request_type = request_type
         self._request_callable = request_callable
+        self._abort_callable = abort_callable
+        self._open_session_callable = open_session_callable
+        self._close_session_callable = close_session_callable
         self._set_global_args = set_global_args
-        self._session_factory = session_factory
+        self._trace_config_factory = trace_config_factory
         self._headers_factory = headers_factory
-        self._session_context: Any | None = None
         self._session: Any | None = None
         self._request_timeout_s: float | None = None
         self._abort_timeout_s: float | None = None
         self._native_admin_base_url: str | None = None
         self._connections_created = 0
+        self._reused_requests = 0
         self._submitted_requests = 0
         self.module_identity = module_identity
+        for function, name, expected in (
+            (
+                self._open_session_callable,
+                "open_bench_client_session",
+                _OPEN_SESSION_SIGNATURE,
+            ),
+            (
+                self._close_session_callable,
+                "close_bench_client_session",
+                _CLOSE_SESSION_SIGNATURE,
+            ),
+            (
+                self._request_callable,
+                "async_request_sglang_generate",
+                _GENERATE_SIGNATURE,
+            ),
+            (
+                self._abort_callable,
+                "async_request_sglang_abort",
+                _ABORT_SIGNATURE,
+            ),
+        ):
+            _require_official_signature(function, name=name, expected=expected)
+        if not callable(self._trace_config_factory):
+            raise TypeError("aiohttp trace-config factory must be callable")
         self._set_global_args(
             SimpleNamespace(
                 cache_report=False,
@@ -274,40 +359,80 @@ class PinnedBenchServingTransport:
             )
         )
 
+    def _connection_trace_config(self) -> Any:
+        trace_config = self._trace_config_factory()
+
+        async def connection_created(
+            _session: Any,
+            _trace_config_ctx: Any,
+            _params: Any,
+        ) -> None:
+            self._connections_created += 1
+
+        async def connection_reused(
+            _session: Any,
+            _trace_config_ctx: Any,
+            _params: Any,
+        ) -> None:
+            self._reused_requests += 1
+
+        try:
+            trace_config.on_connection_create_end.append(connection_created)
+            trace_config.on_connection_reuseconn.append(connection_reused)
+            trace_config.freeze()
+        except AttributeError as error:
+            raise TypeError(
+                "aiohttp connection trace contract is unavailable"
+            ) from error
+        return trace_config
+
+    def _install_connection_trace(self, session: Any) -> None:
+        trace_configs = getattr(session, "trace_configs", None)
+        if not isinstance(trace_configs, list):
+            raise TypeError("official bench session does not expose aiohttp traces")
+        if trace_configs:
+            raise RuntimeError(
+                "official bench session unexpectedly carries prior traces"
+            )
+        trace_configs.append(self._connection_trace_config())
+
     async def open(
         self,
         *,
         request_timeout_s: float,
         abort_timeout_s: float,
     ) -> None:
-        if self._session is not None or self._session_context is not None:
+        if self._session is not None:
             raise RuntimeError("official bench transport is already open")
-        if self._session_factory is None:
-            raise RuntimeError("official bench session factory is unavailable")
         for name, value in (
             ("request timeout", request_timeout_s),
             ("abort timeout", abort_timeout_s),
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        context = self._session_factory()
-        session = await context.__aenter__()
-        self._session_context = context
+        session = await self._open_session_callable(
+            total_timeout_s=max(request_timeout_s, abort_timeout_s)
+        )
+        if session is None or bool(getattr(session, "closed", False)):
+            raise RuntimeError("official bench open returned no live session")
+        try:
+            self._install_connection_trace(session)
+        except BaseException:
+            await self._close_session_callable(session)
+            raise
         self._session = session
         self._request_timeout_s = request_timeout_s
         self._abort_timeout_s = abort_timeout_s
-        self._connections_created += 1
 
     async def close(self) -> None:
-        if self._session is None or self._session_context is None:
+        if self._session is None:
             raise RuntimeError("official bench transport is not open")
-        context = self._session_context
+        session = self._session
         self._session = None
-        self._session_context = None
         self._request_timeout_s = None
         self._abort_timeout_s = None
         self._native_admin_base_url = None
-        await context.__aexit__(None, None, None)
+        await self._close_session_callable(session)
 
     def bind_native_admin_base_url(self, base_url: str) -> None:
         """Bind the native admin endpoints to this pool's serving process.
@@ -417,9 +542,7 @@ class PinnedBenchServingTransport:
         return {
             "connections_created": self._connections_created,
             "submitted_requests": self._submitted_requests,
-            "reused_requests": max(
-                0, self._submitted_requests - self._connections_created
-            ),
+            "reused_requests": self._reused_requests,
         }
 
     @classmethod
@@ -450,8 +573,11 @@ class PinnedBenchServingTransport:
         return cls(
             request_type=module.RequestFuncInput,
             request_callable=module.async_request_sglang_generate,
+            abort_callable=module.async_request_sglang_abort,
+            open_session_callable=module.open_bench_client_session,
+            close_session_callable=module.close_bench_client_session,
             set_global_args=module.set_global_args,
-            session_factory=module._create_bench_client_session,
+            trace_config_factory=module.aiohttp.TraceConfig,
             headers_factory=module.get_request_headers,
             module_identity=("sglang.benchmark.serving.async_request_sglang_generate"),
         )
@@ -490,13 +616,13 @@ class PinnedBenchServingTransport:
             timestamp=request.arrival_us / 1000.0,
             routing_key=request.route_id,
         )
-        async with asyncio.timeout(self._request_timeout_s):
-            raw = await self._request_callable(
-                request_func_input=value,
-                pbar=None,
-                client_session=self._session,
-            )
         self._submitted_requests += 1
+        raw = await self._request_callable(
+            request_func_input=value,
+            pbar=None,
+            client_session=self._session,
+            timeout_s=self._request_timeout_s,
+        )
         latency = float(raw.latency)
         if not math.isfinite(latency) or latency < 0:
             raise RuntimeError("official bench result has invalid latency")
@@ -557,14 +683,12 @@ class PinnedBenchServingTransport:
             raise ValueError("abort requires a request ID and HTTP(S) base URL")
         if self._session is None or self._abort_timeout_s is None:
             raise RuntimeError("official bench transport must be opened before abort")
-        async with asyncio.timeout(self._abort_timeout_s):
-            async with self._session.post(
-                url=base_url.rstrip("/") + "/abort_request",
-                json={"rid": request_id, "abort_all": False},
-                headers=(self._headers_factory() if self._headers_factory else {}),
-            ) as response:
-                if int(response.status) != 200:
-                    raise RuntimeError("SGLang did not acknowledge request abort")
+        await self._abort_callable(
+            request_id,
+            base_url,
+            client_session=self._session,
+            timeout_s=self._abort_timeout_s,
+        )
 
 
 def official_bench_argv(

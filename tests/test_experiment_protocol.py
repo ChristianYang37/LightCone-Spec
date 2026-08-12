@@ -20,6 +20,7 @@ from lightcone_spec.cli.main import (
     _write_json,
 )
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
     DFLASH_MODEL_CONTEXT_LIMIT,
     DFLASH_SAFE_CONTEXT_LIMIT,
@@ -305,6 +306,7 @@ def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": "a" * 64,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["load"],
         "rows": load_screen_rows(),
     }
@@ -352,6 +354,7 @@ def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
         "manifest_sha256": manifest.sha256,
         "model_lock_sha256": "f" * 64,
         "sampling_profile_sha256": manifest.sampling_profile_sha256,
+        "execution_policy_sha256": manifest.execution_policy_sha256,
         "window_sha256": manifest.controlled_window_hashes["tune"],
         "tuning_grid_sha256": manifest.tuning_grid_sha256,
         "concurrency": 8,
@@ -947,6 +950,7 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         target_model_id="Qwen/Qwen3-8B",
         target_revision="c" * 40,
         sampling_profile_sha256="1" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="2" * 64,
         runtime_config_sha256="3" * 64,
         hardware_sha256="e" * 64,
@@ -1007,6 +1011,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         target_model_id="Qwen/Qwen3-8B",
         target_revision="b" * 40,
         sampling_profile_sha256="c" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="d" * 64,
         runtime_config_sha256="e" * 64,
         hardware_sha256="f" * 64,
@@ -1031,6 +1036,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         model_lock_sha256="a" * 64,
         target_revision="b" * 40,
         sampling_profile_sha256="c" * 64,
+        execution_policy_sha256=ControlledExecutionPolicy().sha256,
         window_sha256="d" * 64,
         concurrency=8,
     )
@@ -1039,6 +1045,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
             model_lock_sha256="a" * 64,
             target_revision="b" * 40,
             sampling_profile_sha256="c" * 64,
+            execution_policy_sha256=ControlledExecutionPolicy().sha256,
             window_sha256="d" * 64,
             concurrency=4,
         )
@@ -1138,13 +1145,13 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     assert all(
         "--speculative-adaptation-config" in launch.argv for launch in launches[1:]
     )
-    assert all("--disable-cuda-graph" not in launch.argv for launch in launches)
+    assert all("--disable-cuda-graph" in launch.argv for launch in launches)
+    assert all("--disable-radix-cache" in launch.argv for launch in launches)
     assert all(
         "--speculative-use-rejection-sampling" in launch.argv for launch in launches
     )
-    assert "--speculative-speed-study-metrics" not in launches[0].argv
     assert all(
-        "--speculative-speed-study-metrics" in launch.argv for launch in launches[1:]
+        "--speculative-speed-study-metrics" in launch.argv for launch in launches
     )
     assert all(
         "lightcone_spec.sglang_bridge.launch" in launch.argv
@@ -1204,7 +1211,9 @@ def test_static_load_renderer_has_no_adaptation_identity_or_allocation(
     assert launch.telemetry_path is None
     assert "--speculative-adaptation-config" not in launch.argv
     assert "--speculative-use-rejection-sampling" in launch.argv
-    assert "--speculative-speed-study-metrics" not in launch.argv
+    assert "--speculative-speed-study-metrics" in launch.argv
+    assert "--disable-cuda-graph" in launch.argv
+    assert "--disable-radix-cache" in launch.argv
     config = RunConfig.model_validate_json(
         (tmp_path / "static-c48" / "static" / "run-config.json").read_text()
     )
@@ -1247,8 +1256,15 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
     assert launch.adaptation_config is None
     assert launch.telemetry_path is None
     assert not any("draft" in argument for argument in launch.argv)
-    assert not any("speculative" in argument for argument in launch.argv)
+    assert "--speculative-algorithm" not in launch.argv
+    assert "--speculative-speed-study-metrics" in launch.argv
     assert not any("adaptation" in argument for argument in launch.argv)
+    assert "--context-length" in launch.argv
+    assert "40960" in launch.argv
+    assert "--random-seed" in launch.argv
+    assert "--disable-radix-cache" in launch.argv
+    assert "--disable-cuda-graph" in launch.argv
+    assert "--disable-overlap-schedule" in launch.argv
 
 
 def test_tuning_renderer_cannot_duplicate_static_baseline(

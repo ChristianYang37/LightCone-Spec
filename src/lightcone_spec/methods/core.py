@@ -136,9 +136,7 @@ def publication_delay(
     )
 
 
-def assert_candidate_equivalence(
-    left: CandidateUpdate, right: CandidateUpdate
-) -> None:
+def assert_candidate_equivalence(left: CandidateUpdate, right: CandidateUpdate) -> None:
     """Fail closed if a comparison changes anything except publication policy."""
     if left != right:
         raise ValueError("TTS and L0 must receive the identical candidate update")

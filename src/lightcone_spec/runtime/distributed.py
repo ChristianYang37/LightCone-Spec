@@ -705,9 +705,13 @@ class GlooPublicationTransport:
         if distributed.get_backend(self.process_group) != "gloo":
             raise RuntimeError("CPU publication harness requires the gloo backend")
         if distributed.get_world_size(self.process_group) != self.topology.world_size:
-            raise RuntimeError("process-group world size differs from topology receipts")
+            raise RuntimeError(
+                "process-group world size differs from topology receipts"
+            )
         if distributed.get_rank(self.process_group) != self.local_rank:
-            raise RuntimeError("process-group rank differs from the local topology rank")
+            raise RuntimeError(
+                "process-group rank differs from the local topology rank"
+            )
         return distributed
 
     def prepare_and_decide(

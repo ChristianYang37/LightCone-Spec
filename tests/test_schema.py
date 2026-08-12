@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from lightcone_spec import PINNED_SGLANG_COMMIT
 from lightcone_spec.config import load_run_config, run_config_sha256
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.sglang_bridge.config import (
     sglang_adaptation_payload,
     sglang_adaptation_sha256,
@@ -81,6 +82,21 @@ def test_disabled_methods_have_no_adaptation_payload_or_tensor_allocation(
     config = RunConfig.model_validate(config_value(method))
     assert sglang_adaptation_payload(config) is None
     assert sglang_adaptation_sha256(config) is None
+
+
+def test_runtime_binds_registered_role_safe_execution_policy() -> None:
+    config = RunConfig.model_validate(config_value("static"))
+    assert config.runtime.context_length == 40960
+    assert config.runtime.random_seed == 1
+    assert config.runtime.disable_radix_cache is True
+    assert config.runtime.disable_cuda_graph is True
+    assert config.runtime.target_reference_disable_overlap_schedule is True
+    assert config.runtime.speculative_disable_overlap_schedule is False
+    assert config.runtime.execution_policy_sha256 == ControlledExecutionPolicy().sha256
+    value = config_value("static")
+    value["runtime"]["execution_policy_sha256"] = "0" * 64
+    with pytest.raises(ValidationError, match="execution-policy identity mismatch"):
+        RunConfig.model_validate(value)
 
 
 @pytest.mark.parametrize("method", ["tts", "l0"])

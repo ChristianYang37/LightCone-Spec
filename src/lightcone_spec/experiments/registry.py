@@ -61,6 +61,18 @@ REGISTERED_CONFIRMATION_BLOCKS = PILOT_BLOCKS + FINAL_BLOCKS
 # Ports are reused only across sequential waves: one per independent GPU and
 # three reserved for an exclusive two-GPU server/router group.
 INDUSTRIAL_PORT_SPAN = 5
+
+
+def _industrial_port_span(logical_gpu_count: int) -> int:
+    if logical_gpu_count < 2:
+        raise ValueError(
+            "the registered industrial protocol requires at least two logical GPU slots"
+        )
+    # One single-rank port per logical slot, followed by the registered TP2
+    # server/router group's two rank ports and one coordinator port.
+    return logical_gpu_count + 3
+
+
 E5_CLOSED_LOOP_CONCURRENCY = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 E5_OPEN_LOOP_LOAD_FACTORS = (0.25, 0.50, 0.75, 0.90, 1.00, 1.10, 1.25)
 E5_COHORT_COUNTS = (1, 4, 16, 64)
@@ -331,10 +343,8 @@ class CellIdentity:
             raise ValueError("load_factor must be finite and positive")
         if self.cohort_count < 1:
             raise ValueError("cohort_count must be positive")
-        if len(self.gpu_uuids) not in {1, 2} or len(set(self.gpu_uuids)) != len(
-            self.gpu_uuids
-        ):
-            raise ValueError("a cell must identify one or two distinct GPUs")
+        if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
+            raise ValueError("a cell must identify one or more distinct GPU slots")
         for gpu_uuid in self.gpu_uuids:
             _require_text("GPU UUID", gpu_uuid)
 
@@ -352,10 +362,8 @@ class ResourceClaim:
     workload_class: WorkloadClass
 
     def __post_init__(self) -> None:
-        if len(self.gpu_uuids) not in {1, 2} or len(set(self.gpu_uuids)) != len(
-            self.gpu_uuids
-        ):
-            raise ValueError("a resource claim must reserve one or two GPUs")
+        if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
+            raise ValueError("a resource claim must reserve one or more GPUs")
         if not self.ports or len(self.ports) != len(set(self.ports)):
             raise ValueError("resource ports must be non-empty and unique")
         if any(port < 1024 or port > 65535 for port in self.ports):
@@ -371,7 +379,7 @@ class ResourceClaim:
 
     @property
     def exclusive(self) -> bool:
-        return self.gpu_count == 2 or self.workload_class in _EXCLUSIVE_WORKLOADS
+        return self.gpu_count > 1 or self.workload_class in _EXCLUSIVE_WORKLOADS
 
     @cached_property
     def sha256(self) -> str:
@@ -847,7 +855,7 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
 class ExperimentRegistry:
     schema_version: int
     name: str
-    gpu_uuids: tuple[str, str]
+    gpu_uuids: tuple[str, ...]
     definitions: tuple[ExperimentDefinition, ...]
     cells: tuple[ExperimentCell, ...]
 
@@ -855,8 +863,10 @@ class ExperimentRegistry:
         if self.schema_version != 1:
             raise ValueError("only industrial registry schema version 1 is supported")
         _require_text("registry name", self.name)
-        if len(self.gpu_uuids) != 2 or len(set(self.gpu_uuids)) != 2:
-            raise ValueError("the industrial scheduler requires exactly two GPU UUIDs")
+        if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
+            raise ValueError(
+                "the industrial registry requires unique logical GPU slots"
+            )
         definition_names = tuple(definition.name for definition in self.definitions)
         if definition_names != INDUSTRIAL_EXPERIMENT_ORDER:
             raise ValueError("industrial experiment dependency order is immutable")
@@ -1000,15 +1010,16 @@ class _CellFactory:
     def __init__(
         self,
         *,
-        gpu_uuids: tuple[str, str],
+        gpu_uuids: tuple[str, ...],
         base_port: int,
         cache_root: str,
         evidence_root: str,
         seed: int,
     ) -> None:
-        if len(gpu_uuids) != 2 or len(set(gpu_uuids)) != 2:
-            raise ValueError("exactly two distinct GPU UUIDs are required")
-        if base_port < 1024 or base_port + INDUSTRIAL_PORT_SPAN - 1 > 65_535:
+        if len(gpu_uuids) < 2 or len(set(gpu_uuids)) != len(gpu_uuids):
+            raise ValueError("two or more distinct logical GPU slots are required")
+        port_span = _industrial_port_span(len(gpu_uuids))
+        if base_port < 1024 or base_port + port_span - 1 > 65_535:
             raise ValueError("base_port must leave room for the dispatch port pool")
         _require_text("cache_root", cache_root)
         _require_text("evidence_root", evidence_root)
@@ -1081,19 +1092,28 @@ class _CellFactory:
                     "optimizer schedules before model loading."
                 )
         if gpu_count == 1:
-            if gpu_index is not None and gpu_index not in {0, 1}:
-                raise ValueError("gpu_index must be zero or one")
-            selected_gpu = self.single_gpu_index % 2 if gpu_index is None else gpu_index
+            if gpu_index is not None and gpu_index not in range(len(self.gpu_uuids)):
+                raise ValueError("gpu_index lies outside the logical GPU slots")
+            selected_gpu = (
+                self.single_gpu_index % len(self.gpu_uuids)
+                if gpu_index is None
+                else gpu_index
+            )
             assigned = (self.gpu_uuids[selected_gpu],)
             self.single_gpu_index += 1
             ports = (self.base_port + selected_gpu,)
-        elif gpu_count == 2:
+        elif 1 < gpu_count <= len(self.gpu_uuids):
             if gpu_index is not None:
-                raise ValueError("two-GPU cells cannot select one gpu_index")
-            assigned = self.gpu_uuids
-            ports = tuple(range(self.base_port + 2, self.base_port + 5))
+                raise ValueError("gang cells cannot select one gpu_index")
+            assigned = self.gpu_uuids[:gpu_count]
+            gang_port_start = (
+                self.base_port + 2
+                if gpu_count == 2 and len(self.gpu_uuids) == 2
+                else self.base_port + len(self.gpu_uuids)
+            )
+            ports = tuple(range(gang_port_start, gang_port_start + gpu_count + 1))
         else:
-            raise ValueError("gpu_count must be one or two")
+            raise ValueError("gpu_count must fit the logical GPU-slot inventory")
         identity = CellIdentity(
             experiment=experiment,
             model=model,
@@ -1873,7 +1893,7 @@ def _add_e0_cells(factory: _CellFactory) -> None:
 
 def build_industrial_registry(
     *,
-    gpu_uuids: tuple[str, str] = (
+    gpu_uuids: tuple[str, ...] = (
         "logical-rank-slot-0",
         "logical-rank-slot-1",
     ),
@@ -1884,7 +1904,8 @@ def build_industrial_registry(
 ) -> ExperimentRegistry:
     """Build the immutable Phase-II registry without allocating device state."""
 
-    if base_port + INDUSTRIAL_PORT_SPAN - 1 > 65_535:
+    port_span = _industrial_port_span(len(gpu_uuids))
+    if base_port + port_span - 1 > 65_535:
         raise ValueError(
             "base_port cannot fit the complete collision-free industrial port span"
         )
@@ -1914,6 +1935,6 @@ def build_industrial_registry(
         cells=tuple(factory.cells),
     )
     used_ports = {port for cell in registry.cells for port in cell.resources.ports}
-    if used_ports != set(range(base_port, base_port + INDUSTRIAL_PORT_SPAN)):
+    if used_ports != set(range(base_port, base_port + port_span)):
         raise AssertionError("industrial port-pool declaration is out of date")
     return registry

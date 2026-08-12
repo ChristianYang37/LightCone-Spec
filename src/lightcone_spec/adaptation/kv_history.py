@@ -33,10 +33,7 @@ class FrozenKVHistory:
             raise ValueError("token_count must be positive")
         start = self.length
         segment = KVSegment(start, start + token_count, source_version)
-        if (
-            self.segments
-            and self.segments[-1].source_version == source_version
-        ):
+        if self.segments and self.segments[-1].source_version == source_version:
             previous = self.segments[-1]
             segment = KVSegment(
                 previous.start_token,

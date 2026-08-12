@@ -13,9 +13,7 @@ from typing import ClassVar
 # decode boundary, so formal measurements stop before those reserved slots.
 DFLASH_MODEL_CONTEXT_LIMIT = 40960
 DFLASH_SPECULATIVE_HEADROOM = 2 * 16
-DFLASH_SAFE_CONTEXT_LIMIT = (
-    DFLASH_MODEL_CONTEXT_LIMIT - DFLASH_SPECULATIVE_HEADROOM
-)
+DFLASH_SAFE_CONTEXT_LIMIT = DFLASH_MODEL_CONTEXT_LIMIT - DFLASH_SPECULATIVE_HEADROOM
 
 
 @dataclass(frozen=True)
@@ -64,9 +62,7 @@ class LongContinuationAdapter:
     def sample(self, index: int) -> PromptSample:
         if index < 0:
             raise ValueError("sample index must be non-negative")
-        digest = hashlib.sha256(
-            f"{self.namespace}:{index}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256(f"{self.namespace}:{index}".encode()).hexdigest()
         seed = int(digest[:8], 16)
         vocabulary = (
             "amber",
@@ -109,10 +105,7 @@ class LongContinuationAdapter:
             window = self.WINDOWS[name]
         except KeyError as exc:
             raise ValueError(f"unknown controlled window {name!r}") from exc
-        return tuple(
-            self.sample(index)
-            for index in range(window.offset, window.stop)
-        )
+        return tuple(self.sample(index) for index in range(window.offset, window.stop))
 
     def window_sha256(self, name: str) -> str:
         return sample_set_sha256(self.window(name))
@@ -121,8 +114,7 @@ class LongContinuationAdapter:
     def default_hashes(cls) -> dict[str, str]:
         adapter = cls()
         return {
-            name: adapter.window_sha256(name)
-            for name in ("load", "tune", "confirm")
+            name: adapter.window_sha256(name) for name in ("load", "tune", "confirm")
         }
 
     @classmethod

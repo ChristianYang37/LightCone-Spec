@@ -13,6 +13,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from functools import cached_property
 from itertools import pairwise
 from types import MappingProxyType
 from typing import Literal
@@ -246,7 +247,7 @@ class ImmutableRequest:
         if self.request_id != expected:
             raise ValueError("request ID does not match immutable request content")
 
-    @property
+    @cached_property
     def field_hashes(self) -> RequestFieldHashes:
         self.validate()
         return RequestFieldHashes(
@@ -344,7 +345,7 @@ class RequestCorpus:
             identifiers.add(request.request_id)
             last_arrival = request.arrival_us
 
-    @property
+    @cached_property
     def hashes(self) -> CorpusHashes:
         self.validate()
         fields = tuple(request.field_hashes for request in self.requests)
@@ -859,7 +860,7 @@ class ProductionWindow:
         self.validate()
         return self.arrival_duration_us + self.drain_duration_us
 
-    @property
+    @cached_property
     def sha256(self) -> str:
         self.validate()
         return _sha256(asdict(self))
@@ -907,7 +908,7 @@ class ProductionLoadPlan:
         if not self.cold_start_separate:
             raise ValueError("cold start must be measured separately")
 
-    @property
+    @cached_property
     def paired_replay_sha256(self) -> str:
         self.validate()
         return _sha256(

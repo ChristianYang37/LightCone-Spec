@@ -14,27 +14,55 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from functools import cache, cached_property
-from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Literal,
+    TypeAliasType,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
+from lightcone_spec.experiments.load import ProductionLoadPlan
 from lightcone_spec.experiments.planning import (
     BudgetGroupTotal,
     BudgetInventoryIdentity,
+    BudgetLoadBinding,
+    BudgetMaterializationAuthorityBinding,
+    BudgetPlan,
+    BudgetPolicy,
+    CapacityAuthorityBinding,
+    CapacityEnvelope,
+    ConfirmationAuxiliaryActivationAuthorityBinding,
+    ConfirmationAuxiliaryCompletionAuthorityBinding,
+    ConfirmationFamilyCompletionAuthorityBinding,
     ConfirmationFamilyIdentity,
     ConfirmationFamilyPowerPlan,
     ConfirmationFamilyPowerReductionArtifact,
+    ConfirmationFinalActivationAuthorityBinding,
+    ConfirmationPilotActivationAuthorityBinding,
+    ConfirmationStageAggregateAuthorityBinding,
+    ConfirmationStageFamilyAuthorityBinding,
+    E1ActivationAuthorityBinding,
     E1ParetoArtifact,
+    E2ActivationAuthorityBinding,
     E2FinalRecipeArtifact,
+    E2StageCompletionAuthorityBinding,
     E2StageEvidenceArtifact,
     E2StageReductionArtifact,
     E2SurvivorReceipt,
     EvidenceAliasReceipt,
+    EvidenceAliasReductionArtifact,
     EvidenceDependenceMap,
     ExactScenarioHours,
     ExpectedMaximumCount,
     ExperimentBudget,
     FamilyActivationArtifact,
+    FamilyPilotCompletionAuthorityBinding,
     IndustrialBudgetReport,
     ReducerActivationArtifact,
+    RegistryStageActivationAuthorityBinding,
     ScenarioMilliseconds,
     SealedE3aSelection,
 )
@@ -155,6 +183,8 @@ def _decode_literal(expected: object, value: object, *, path: str) -> object:
 
 
 def _decode_value(expected: object, value: object, *, path: str) -> Any:
+    if isinstance(expected, TypeAliasType):
+        return _decode_value(expected.__value__, value, path=path)
     origin = get_origin(expected)
     arguments = get_args(expected)
     if origin is Literal:
@@ -619,12 +649,205 @@ def _make_from_dict(model: type[Any], artifact_kind: str):
 
 experiment_budget_to_dict = _make_to_dict(ExperimentBudget, "experiment_budget")
 experiment_budget_from_dict = _make_from_dict(ExperimentBudget, "experiment_budget")
+
+
+def production_load_plan_to_dict(value: ProductionLoadPlan) -> dict[str, Any]:
+    """Serialize a complete load plan under its paired-replay identity."""
+
+    if type(value) is not ProductionLoadPlan:
+        raise TypeError("production_load_plan must be an exact ProductionLoadPlan")
+    value.validate()
+    content = _encode_value(value, path="production_load_plan")
+    rebuilt = _decode_dataclass(
+        ProductionLoadPlan,
+        content,
+        path="production_load_plan",
+    )
+    rebuilt.validate()
+    if rebuilt != value:
+        raise ValueError("production_load_plan is not canonically representable")
+    artifact_sha256 = _require_sha256(
+        "production_load_plan.paired_replay_sha256",
+        value.paired_replay_sha256,
+    )
+    return {
+        _ARTIFACT_KIND_FIELD: "production_load_plan",
+        _ARTIFACT_SHA256_FIELD: artifact_sha256,
+        **content,
+    }
+
+
+def production_load_plan_from_dict(
+    value: object,
+    *,
+    sidecar: SidecarInput = None,
+) -> ProductionLoadPlan:
+    """Strictly reconstruct and sidecar-check a complete load plan."""
+
+    expected = frozenset(field.name for field in fields(ProductionLoadPlan)) | {
+        _ARTIFACT_KIND_FIELD,
+        _ARTIFACT_SHA256_FIELD,
+    }
+    row = _strict_object("production_load_plan", value, frozenset(expected))
+    if (
+        _strict_text(
+            "production_load_plan.artifact_kind",
+            row[_ARTIFACT_KIND_FIELD],
+        )
+        != "production_load_plan"
+    ):
+        raise ValueError("production_load_plan wire kind mismatch")
+    declared_sha256 = _require_sha256(
+        "production_load_plan.artifact_sha256",
+        row[_ARTIFACT_SHA256_FIELD],
+    )
+    content = {field.name: row[field.name] for field in fields(ProductionLoadPlan)}
+    artifact = _decode_dataclass(
+        ProductionLoadPlan,
+        content,
+        path="production_load_plan",
+    )
+    artifact.validate()
+    actual_sha256 = _require_sha256(
+        "production_load_plan.computed_sha256",
+        artifact.paired_replay_sha256,
+    )
+    if declared_sha256 != actual_sha256:
+        raise ValueError("production_load_plan redundant artifact SHA-256 mismatch")
+    _validate_sidecar(
+        artifact_kind="production_load_plan",
+        artifact_sha256=actual_sha256,
+        sidecar=sidecar,
+    )
+    return artifact
+
+
 budget_inventory_identity_to_dict = _make_to_dict(
     BudgetInventoryIdentity, "budget_inventory_identity"
 )
 budget_inventory_identity_from_dict = _make_from_dict(
     BudgetInventoryIdentity, "budget_inventory_identity"
 )
+budget_load_binding_to_dict = _make_to_dict(BudgetLoadBinding, "budget_load_binding")
+budget_load_binding_from_dict = _make_from_dict(
+    BudgetLoadBinding, "budget_load_binding"
+)
+budget_materialization_authority_binding_to_dict = _make_to_dict(
+    BudgetMaterializationAuthorityBinding,
+    "budget_materialization_authority_binding",
+)
+budget_materialization_authority_binding_from_dict = _make_from_dict(
+    BudgetMaterializationAuthorityBinding,
+    "budget_materialization_authority_binding",
+)
+e1_activation_authority_binding_to_dict = _make_to_dict(
+    E1ActivationAuthorityBinding,
+    "e1_activation_authority_binding",
+)
+e1_activation_authority_binding_from_dict = _make_from_dict(
+    E1ActivationAuthorityBinding,
+    "e1_activation_authority_binding",
+)
+e2_activation_authority_binding_to_dict = _make_to_dict(
+    E2ActivationAuthorityBinding,
+    "e2_activation_authority_binding",
+)
+e2_activation_authority_binding_from_dict = _make_from_dict(
+    E2ActivationAuthorityBinding,
+    "e2_activation_authority_binding",
+)
+e2_stage_completion_authority_binding_to_dict = _make_to_dict(
+    E2StageCompletionAuthorityBinding,
+    "e2_stage_completion_authority_binding",
+)
+e2_stage_completion_authority_binding_from_dict = _make_from_dict(
+    E2StageCompletionAuthorityBinding,
+    "e2_stage_completion_authority_binding",
+)
+confirmation_pilot_activation_authority_binding_to_dict = _make_to_dict(
+    ConfirmationPilotActivationAuthorityBinding,
+    "confirmation_pilot_activation_authority_binding",
+)
+confirmation_pilot_activation_authority_binding_from_dict = _make_from_dict(
+    ConfirmationPilotActivationAuthorityBinding,
+    "confirmation_pilot_activation_authority_binding",
+)
+confirmation_auxiliary_activation_authority_binding_to_dict = _make_to_dict(
+    ConfirmationAuxiliaryActivationAuthorityBinding,
+    "confirmation_auxiliary_activation_authority_binding",
+)
+confirmation_auxiliary_activation_authority_binding_from_dict = _make_from_dict(
+    ConfirmationAuxiliaryActivationAuthorityBinding,
+    "confirmation_auxiliary_activation_authority_binding",
+)
+confirmation_auxiliary_completion_authority_binding_to_dict = _make_to_dict(
+    ConfirmationAuxiliaryCompletionAuthorityBinding,
+    "confirmation_auxiliary_completion_authority_binding",
+)
+confirmation_auxiliary_completion_authority_binding_from_dict = _make_from_dict(
+    ConfirmationAuxiliaryCompletionAuthorityBinding,
+    "confirmation_auxiliary_completion_authority_binding",
+)
+family_pilot_completion_authority_binding_to_dict = _make_to_dict(
+    FamilyPilotCompletionAuthorityBinding,
+    "family_pilot_completion_authority_binding",
+)
+family_pilot_completion_authority_binding_from_dict = _make_from_dict(
+    FamilyPilotCompletionAuthorityBinding,
+    "family_pilot_completion_authority_binding",
+)
+confirmation_final_activation_authority_binding_to_dict = _make_to_dict(
+    ConfirmationFinalActivationAuthorityBinding,
+    "confirmation_final_activation_authority_binding",
+)
+confirmation_final_activation_authority_binding_from_dict = _make_from_dict(
+    ConfirmationFinalActivationAuthorityBinding,
+    "confirmation_final_activation_authority_binding",
+)
+confirmation_family_completion_authority_binding_to_dict = _make_to_dict(
+    ConfirmationFamilyCompletionAuthorityBinding,
+    "confirmation_family_completion_authority_binding",
+)
+confirmation_family_completion_authority_binding_from_dict = _make_from_dict(
+    ConfirmationFamilyCompletionAuthorityBinding,
+    "confirmation_family_completion_authority_binding",
+)
+confirmation_stage_family_authority_binding_to_dict = _make_to_dict(
+    ConfirmationStageFamilyAuthorityBinding,
+    "confirmation_stage_family_authority_binding",
+)
+confirmation_stage_family_authority_binding_from_dict = _make_from_dict(
+    ConfirmationStageFamilyAuthorityBinding,
+    "confirmation_stage_family_authority_binding",
+)
+confirmation_stage_aggregate_authority_binding_to_dict = _make_to_dict(
+    ConfirmationStageAggregateAuthorityBinding,
+    "confirmation_stage_aggregate_authority_binding",
+)
+confirmation_stage_aggregate_authority_binding_from_dict = _make_from_dict(
+    ConfirmationStageAggregateAuthorityBinding,
+    "confirmation_stage_aggregate_authority_binding",
+)
+registry_stage_activation_authority_binding_to_dict = _make_to_dict(
+    RegistryStageActivationAuthorityBinding,
+    "registry_stage_activation_authority_binding",
+)
+registry_stage_activation_authority_binding_from_dict = _make_from_dict(
+    RegistryStageActivationAuthorityBinding,
+    "registry_stage_activation_authority_binding",
+)
+budget_policy_to_dict = _make_to_dict(BudgetPolicy, "budget_policy")
+budget_policy_from_dict = _make_from_dict(BudgetPolicy, "budget_policy")
+budget_plan_to_dict = _make_to_dict(BudgetPlan, "budget_plan")
+budget_plan_from_dict = _make_from_dict(BudgetPlan, "budget_plan")
+capacity_authority_binding_to_dict = _make_to_dict(
+    CapacityAuthorityBinding, "capacity_authority_binding"
+)
+capacity_authority_binding_from_dict = _make_from_dict(
+    CapacityAuthorityBinding, "capacity_authority_binding"
+)
+capacity_envelope_to_dict = _make_to_dict(CapacityEnvelope, "capacity_envelope")
+capacity_envelope_from_dict = _make_from_dict(CapacityEnvelope, "capacity_envelope")
 industrial_budget_report_to_dict = _make_to_dict(
     IndustrialBudgetReport, "industrial_budget_report"
 )
@@ -696,6 +919,12 @@ evidence_alias_receipt_to_dict = _make_to_dict(
 )
 evidence_alias_receipt_from_dict = _make_from_dict(
     EvidenceAliasReceipt, "evidence_alias_receipt"
+)
+evidence_alias_reduction_artifact_to_dict = _make_to_dict(
+    EvidenceAliasReductionArtifact, "evidence_alias_reduction_artifact"
+)
+evidence_alias_reduction_artifact_from_dict = _make_from_dict(
+    EvidenceAliasReductionArtifact, "evidence_alias_reduction_artifact"
 )
 evidence_dependence_map_to_dict = _make_to_dict(
     EvidenceDependenceMap, "evidence_dependence_map"
@@ -781,14 +1010,46 @@ __all__ = [
     "PlanningArtifactSidecar",
     "budget_inventory_identity_from_dict",
     "budget_inventory_identity_to_dict",
+    "budget_load_binding_from_dict",
+    "budget_load_binding_to_dict",
+    "budget_materialization_authority_binding_from_dict",
+    "budget_materialization_authority_binding_to_dict",
+    "budget_plan_from_dict",
+    "budget_plan_to_dict",
+    "budget_policy_from_dict",
+    "budget_policy_to_dict",
+    "capacity_authority_binding_from_dict",
+    "capacity_authority_binding_to_dict",
+    "capacity_envelope_from_dict",
+    "capacity_envelope_to_dict",
+    "confirmation_auxiliary_activation_authority_binding_from_dict",
+    "confirmation_auxiliary_activation_authority_binding_to_dict",
+    "confirmation_auxiliary_completion_authority_binding_from_dict",
+    "confirmation_auxiliary_completion_authority_binding_to_dict",
+    "confirmation_family_completion_authority_binding_from_dict",
+    "confirmation_family_completion_authority_binding_to_dict",
     "confirmation_family_identity_from_dict",
     "confirmation_family_identity_to_dict",
     "confirmation_family_power_plan_from_dict",
     "confirmation_family_power_plan_to_dict",
     "confirmation_family_power_reduction_artifact_from_dict",
     "confirmation_family_power_reduction_artifact_to_dict",
+    "confirmation_final_activation_authority_binding_from_dict",
+    "confirmation_final_activation_authority_binding_to_dict",
+    "confirmation_pilot_activation_authority_binding_from_dict",
+    "confirmation_pilot_activation_authority_binding_to_dict",
+    "confirmation_stage_aggregate_authority_binding_from_dict",
+    "confirmation_stage_aggregate_authority_binding_to_dict",
+    "confirmation_stage_family_authority_binding_from_dict",
+    "confirmation_stage_family_authority_binding_to_dict",
+    "e1_activation_authority_binding_from_dict",
+    "e1_activation_authority_binding_to_dict",
     "e1_pareto_artifact_from_dict",
     "e1_pareto_artifact_to_dict",
+    "e2_activation_authority_binding_from_dict",
+    "e2_activation_authority_binding_to_dict",
+    "e2_stage_completion_authority_binding_from_dict",
+    "e2_stage_completion_authority_binding_to_dict",
     "e2_stage_evidence_artifact_from_dict",
     "e2_stage_evidence_artifact_to_dict",
     "e2_stage_reduction_artifact_from_dict",
@@ -797,6 +1058,8 @@ __all__ = [
     "e2_survivor_receipt_to_dict",
     "evidence_alias_receipt_from_dict",
     "evidence_alias_receipt_to_dict",
+    "evidence_alias_reduction_artifact_from_dict",
+    "evidence_alias_reduction_artifact_to_dict",
     "evidence_dependence_map_from_dict",
     "evidence_dependence_map_to_dict",
     "experiment_budget_from_dict",
@@ -805,10 +1068,16 @@ __all__ = [
     "experiment_budget_to_dict",
     "family_activation_artifact_from_dict",
     "family_activation_artifact_to_dict",
+    "family_pilot_completion_authority_binding_from_dict",
+    "family_pilot_completion_authority_binding_to_dict",
     "industrial_budget_report_from_dict",
     "industrial_budget_report_to_dict",
+    "production_load_plan_from_dict",
+    "production_load_plan_to_dict",
     "reducer_activation_artifact_from_dict",
     "reducer_activation_artifact_to_dict",
+    "registry_stage_activation_authority_binding_from_dict",
+    "registry_stage_activation_authority_binding_to_dict",
     "sealed_e3a_selection_from_dict",
     "sealed_e3a_selection_to_dict",
 ]

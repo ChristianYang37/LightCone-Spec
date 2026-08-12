@@ -229,9 +229,7 @@ class GPUOptimizer:
                 parameter - learning_rate * direction
                 for parameter, direction in zip(self.master, directions, strict=True)
             )
-            return self._proposal(
-                parameters, first, self.second_moments, step, grads
-            )
+            return self._proposal(parameters, first, self.second_moments, step, grads)
 
         if self.config.name == "lion":
             beta1 = self.config.beta1
@@ -249,9 +247,7 @@ class GPUOptimizer:
                 parameter * decay - learning_rate * direction
                 for parameter, direction in zip(self.master, directions, strict=True)
             )
-            return self._proposal(
-                parameters, first, self.second_moments, step, grads
-            )
+            return self._proposal(parameters, first, self.second_moments, step, grads)
 
         if self.config.name == "muon":
             momentum = self.config.momentum
@@ -294,8 +290,7 @@ class GPUOptimizer:
                         max(1.0, parameter.shape[0] / parameter.shape[1])
                     )
                     updated = (
-                        parameter
-                        * (1.0 - learning_rate * self.config.weight_decay)
+                        parameter * (1.0 - learning_rate * self.config.weight_decay)
                         - adjusted_lr * direction
                     )
                     next_second = old_second

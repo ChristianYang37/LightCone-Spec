@@ -52,7 +52,7 @@ def _passing_doctor() -> dict:
             "patch_commits": PINNED_SGLANG_PATCH_COUNT,
         },
         "commands": {"nvidia_smi": "two exact GPU inventory rows"},
-        "gpu": {"two_gpu_visible": True},
+        "gpu": {"gpu_pool_visible": True, "visible_gpu_count": 2},
         "compatibility": {
             "status": "PASS",
             "python_supported": True,
@@ -97,7 +97,8 @@ def test_complete_pass_doctor_is_accepted_for_legacy_attestation() -> None:
         (("source_tree", "tree"), "c" * 40, "source-tree identity"),
         (("source_tree", "dirty"), True, "source-tree identity"),
         (("commands", "nvidia_smi"), "", "nvidia-smi"),
-        (("gpu", "two_gpu_visible"), False, "two-GPU"),
+        (("gpu", "gpu_pool_visible"), False, "GPU-pool"),
+        (("gpu", "visible_gpu_count"), 0, "GPU-pool"),
     ),
 )
 def test_legacy_attestation_rejects_incomplete_doctor_contract(

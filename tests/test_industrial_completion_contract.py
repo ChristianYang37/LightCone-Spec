@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -8,11 +9,19 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
+from test_native_terminal_provider import (
+    FakeAdminTransport,
+    _server_request,
+)
+from test_native_terminal_provider import (
+    _run as _run_native_terminal,
+)
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import (
     _completed_industrial_cells,
     _industrial_completion_activation_contract,
+    _industrial_physical_assignment_from_dict,
     main,
 )
 from lightcone_spec.experiments.evidence import evidence_files_sha256
@@ -34,13 +43,24 @@ from lightcone_spec.experiments.planning import (
 )
 from lightcone_spec.experiments.planning_artifacts import experiment_budget_to_dict
 from lightcone_spec.experiments.registry import (
+    INDUSTRIAL_EXPERIMENT_ORDER,
     CellStatus,
     ExperimentCell,
+    ExperimentReceipt,
     ExperimentRegistry,
+    WorkloadClass,
     build_industrial_registry,
 )
+from lightcone_spec.experiments.stage_activation import (
+    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
+    RegistryStageActivationArtifact,
+    materialize_registry_stage_activation,
+    release_dispatch_rejection_reason,
+)
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
+from lightcone_spec.orchestration.native_terminal import NativeTerminalRunBinding
 from lightcone_spec.telemetry import (
+    DEFAULT_EVIDENCE_WRITER_POLICY,
     OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
@@ -53,6 +73,29 @@ from lightcone_spec.telemetry import (
 def _sha(value: object) -> str:
     body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(body).hexdigest()
+
+
+def _receipt_prefix(
+    registry: ExperimentRegistry,
+    experiment: str,
+) -> tuple[ExperimentReceipt, ...]:
+    receipts: list[ExperimentReceipt] = []
+    target_index = INDUSTRIAL_EXPERIMENT_ORDER.index(experiment)
+    for name in INDUSTRIAL_EXPERIMENT_ORDER[:target_index]:
+        definition = registry.definition(name)
+        receipt = registry.make_receipt(
+            name,
+            {
+                output: _sha({"stage": name, "output": output})
+                for output in definition.locked_outputs
+            },
+            runtime_sha256=_sha({"stage": name, "artifact": "runtime"}),
+            split_sha256=_sha({"stage": name, "artifact": "split"}),
+            completed_cells_sha256=_sha({"stage": name, "artifact": "completed_cells"}),
+            dependencies=tuple(receipts),
+        )
+        receipts.append(receipt)
+    return tuple(receipts)
 
 
 def _write_bound(path: Path, value: object) -> None:
@@ -182,6 +225,11 @@ def _physical_assignment(
         inventory_source_receipt_sha256=inventory.source_receipt_sha256,
         dispatch_plan_sha256=_sha({"dispatch": cell.cell_id}),
         experiment_budget_sha256=budget.sha256,
+        budget_plan_sha256=_sha({"budget-plan": cell.cell_id}),
+        capacity_authority_sha256=_sha({"capacity-authority": cell.cell_id}),
+        budget_materialization_authority_sha256=_sha(
+            {"budget-materialization-authority": cell.cell_id}
+        ),
         assignment_sha256=_sha({"assignment": cell.cell_id}),
         work_item_sha256=_sha({"work-item": cell.cell_id}),
         gpu_uuids=gpu_uuids,
@@ -467,6 +515,7 @@ def _request(
         output_token_ids=serialized_token_ids,
         output_token_ids_sha256=canonical_output_sha256,
         outcome_status="completed" if finished else "cancelled",
+        arrival_ns=1,
         admitted_ns=1,
         completed_ns=2,
     )
@@ -522,7 +571,6 @@ def _preflight_bundle(
     *,
     invalid_attestation: bool = False,
     mismatched_rank_output: bool = False,
-    reused_nonce: bool = False,
     not_applicable_task: str | None = None,
 ) -> dict[str, object]:
     registry_path, registry = _build_registry(tmp_path)
@@ -552,7 +600,11 @@ def _preflight_bundle(
     _write_bound(runtime_path, runtime)
     runtime_sha256 = _sha(runtime)
 
-    cells = tuple(cell for cell in registry.cells_for("preflight") if cell.runnable)
+    cells = tuple(
+        cell
+        for cell in registry.cells_for("preflight")
+        if release_dispatch_rejection_reason(cell) is None
+    )
     budgets = {cell.cell_id: _budget(cell) for cell in cells}
     assignments = {
         cell.cell_id: _physical_assignment(
@@ -584,6 +636,13 @@ def _preflight_bundle(
     split_path = tmp_path / "split.json"
     _write_bound(split_path, split)
     split_sha256 = _sha(split)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+    )
+    assert set(activation.activated_cell_ids) == {cell.cell_id for cell in cells}
     _, activation_dispositions, activation_binding = (
         _industrial_completion_activation_contract(
             registry,
@@ -591,7 +650,7 @@ def _preflight_bundle(
             runtime_sha256=runtime_sha256,
             split_sha256=split_sha256,
             direct_dependency_receipt_sha256=None,
-            activation_artifact=None,
+            activation_artifact=activation,
             family_activations=(),
             family_power_reductions=(),
         )
@@ -607,7 +666,7 @@ def _preflight_bundle(
         run_nonce_sha256 = _sha(
             {
                 "kind": "run_nonce",
-                "cell_id": None if reused_nonce else cell.cell_id,
+                "cell_id": cell.cell_id,
             }
         )
         tp_size, dp_size, world_size, topology_sha256 = _topology(
@@ -740,7 +799,7 @@ def _preflight_bundle(
     rows.extend(
         activation_dispositions[cell.cell_id]
         for cell in registry.cells_for("preflight")
-        if not cell.runnable
+        if cell.cell_id not in activation.activated_cell_ids
     )
 
     completed = {
@@ -769,6 +828,7 @@ def _preflight_bundle(
         "runtime_path": runtime_path,
         "split": split,
         "split_path": split_path,
+        "activation": activation,
         "completed": completed,
         "completed_path": completed_path,
         "locked_output": locked_output,
@@ -782,10 +842,39 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
         evidence_root=str(tmp_path / "serving-evidence"),
     )
     inventory = _inventory()
-    stage = "E1a"
-    direct_dependency_sha256 = _sha({"dependency": "E3b"})
+    stage = "E3a"
+    active_candidates = tuple(
+        cell
+        for cell in registry.cells_for(stage)
+        if release_dispatch_rejection_reason(cell) is None
+        and cell.resources.gpu_count == 1
+        and cell.identity.concurrency == 1
+    )
+    assert active_candidates
+    selected = active_candidates[0]
+    registry = replace(
+        registry,
+        cells=tuple(
+            cell.with_status(
+                CellStatus.BLOCKED,
+                reason_code="fixture_reduced_scope",
+                reason="The focused completion fixture executes one exact cell.",
+            )
+            if cell.identity.experiment == stage
+            and cell.cell_id != selected.cell_id
+            and release_dispatch_rejection_reason(cell) is None
+            else cell
+            for cell in registry.cells
+        ),
+    )
+    dependency_receipts = _receipt_prefix(registry, stage)
+    direct_dependency_sha256 = dependency_receipts[-1].sha256
     runtime_sha256 = _sha({"runtime": stage})
-    cells = tuple(cell for cell in registry.cells_for(stage) if cell.runnable)
+    cells = tuple(
+        cell
+        for cell in registry.cells_for(stage)
+        if release_dispatch_rejection_reason(cell) is None
+    )
     budgets = {cell.cell_id: _budget(cell) for cell in cells}
     assignments = {
         cell.cell_id: _physical_assignment(
@@ -815,13 +904,21 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
         "cells": [contracts[cell.cell_id] for cell in cells],
     }
     split_sha256 = _sha(split)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment=stage,
+        dependency_receipts=dependency_receipts,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+    )
+    assert set(activation.activated_cell_ids) == {cell.cell_id for cell in cells}
     _, dispositions, activation_binding = _industrial_completion_activation_contract(
         registry,
         experiment=stage,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         direct_dependency_receipt_sha256=direct_dependency_sha256,
-        activation_artifact=None,
+        activation_artifact=activation,
         family_activations=(),
         family_power_reductions=(),
     )
@@ -844,7 +941,38 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
             run_id=run_id,
             rank=0,
             process_id=cell_index + 100,
-            checkpoint_interval_s=None,
+            registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
+        )
+        run_nonce_sha256 = _sha({"nonce": cell.cell_id})
+        output_seed_sha256 = _sha({"output": request_id})
+        output_token_ids = (int(output_seed_sha256[:8], 16),)
+        native_run_binding = NativeTerminalRunBinding(
+            run_id=run_id,
+            run_nonce_sha256=run_nonce_sha256,
+            execution_plan_sha256=str(contract["execution_plan_sha256"]),
+            rank_config_sha256=str(contract["rank_config_sha256s"][0]),
+            attempt_id=writer.attempt_id,
+            session_id=f"standalone-{cell_index}",
+            session_epoch=1,
+            previous_run_id=None,
+            challenge_nonce_sha256=_sha({"challenge": cell.cell_id}),
+            method=cell.identity.method,
+            warmup_request_ids=(),
+            scored_request_ids=(request_id,),
+        )
+        scored_request = _server_request(
+            request_id,
+            inputs=(1,),
+            outputs=output_token_ids,
+        )
+        native_transport = FakeAdminTransport(
+            binding=native_run_binding,
+            warmup=(),
+            scored=(scored_request,),
+        )
+        _, _, _, native_terminal = asyncio.run(_run_native_terminal(native_transport))
+        native_artifact_binding = writer.persist_native_terminal_artifact(
+            native_terminal.to_artifact(warmup_requests=())
         )
         writer.write(
             RunRecord(
@@ -867,7 +995,7 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
                 sampling_profile_sha256=str(contract["sampling_profile_sha256"]),
                 model_lock_sha256=str(contract["model_lock_sha256"]),
                 patched_sglang_tree=PINNED_SGLANG_TREE,
-                run_nonce_sha256=_sha({"nonce": cell.cell_id}),
+                run_nonce_sha256=run_nonce_sha256,
                 topology_sha256=topology_sha256,
                 tensor_parallel_size=1,
                 data_parallel_size=1,
@@ -880,6 +1008,13 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
                 workload_contract=str(contract["workload_contract"]),
                 experiment_budget_sha256=budget.sha256,
                 preflight_attestation_sha256=None,
+                native_terminal_artifact_path=str(native_artifact_binding["path"]),
+                native_terminal_artifact_size=int(native_artifact_binding["size"]),
+                native_terminal_raw_sha256=str(native_artifact_binding["raw_sha256"]),
+                native_terminal_sha256=str(native_artifact_binding["terminal_sha256"]),
+                trusted_attester_policy_sha256=str(
+                    native_artifact_binding["trusted_attester_policy_sha256"]
+                ),
             )
         )
         writer.write(
@@ -887,7 +1022,7 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
                 run_id,
                 cell,
                 request_id,
-                _sha({"output": request_id}),
+                output_seed_sha256,
             )
         )
         writer.write(_performance(run_id, cell))
@@ -916,6 +1051,13 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
         terminal_sha256 = _file_sha256(terminal_path)
         terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
         assert terminal["prepared_receipt_sha256"] == prepared_sha256
+        assert terminal["writer_policy"] == (DEFAULT_EVIDENCE_WRITER_POLICY.to_dict())
+        assert terminal["writer_policy_sha256"] == (
+            DEFAULT_EVIDENCE_WRITER_POLICY.sha256
+        )
+        assert terminal["budget_observation"]["budget_observation_sha256"] == (
+            observation_sha256
+        )
         rows.append(
             {
                 "cell_id": cell.cell_id,
@@ -939,7 +1081,7 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
     rows.extend(
         dispositions[cell.cell_id]
         for cell in registry.cells_for(stage)
-        if not cell.runnable
+        if cell.cell_id not in activation.activated_cell_ids
     )
     completed = {
         "schema_version": 4,
@@ -962,7 +1104,9 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
         "stage": stage,
         "runtime_sha256": runtime_sha256,
         "split": split,
+        "direct_dependency_receipt": dependency_receipts[-1],
         "direct_dependency_sha256": direct_dependency_sha256,
+        "activation": activation,
         "completed": completed,
         "completed_path": completed_path,
     }
@@ -975,9 +1119,11 @@ def _validate_bundle(
     runtime = bundle["runtime"]
     split = bundle["split"]
     inventory = bundle["inventory"]
+    activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
     assert isinstance(split, dict)
     assert isinstance(inventory, GpuInventory)
+    assert isinstance(activation, RegistryStageActivationArtifact)
     completed, digest = _completed_industrial_cells(
         str(path),
         registry,
@@ -986,6 +1132,7 @@ def _validate_bundle(
         split_sha256=_sha(split),
         split_contract=split,
         require_industrial_contract=True,
+        activation_artifact=activation,
         inventory=inventory,
     )
     assert digest is not None
@@ -998,9 +1145,11 @@ def _validate_serving_bundle(
     registry = bundle["registry"]
     split = bundle["split"]
     inventory = bundle["inventory"]
+    activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
     assert isinstance(split, dict)
     assert isinstance(inventory, GpuInventory)
+    assert isinstance(activation, RegistryStageActivationArtifact)
     completed, digest = _completed_industrial_cells(
         str(path),
         registry,
@@ -1010,22 +1159,130 @@ def _validate_serving_bundle(
         split_contract=split,
         require_industrial_contract=True,
         direct_dependency_receipt_sha256=str(bundle["direct_dependency_sha256"]),
+        activation_artifact=activation,
         inventory=inventory,
     )
     assert digest is not None
     return completed, digest
 
 
-def test_preflight_stage_cannot_seal_without_trusted_attester(tmp_path: Path) -> None:
+def _rebind_generic_activation(
+    bundle: dict[str, object],
+    completed: dict[str, object],
+) -> RegistryStageActivationArtifact:
+    registry = bundle["registry"]
+    prior = bundle["activation"]
+    assert isinstance(registry, ExperimentRegistry)
+    assert isinstance(prior, RegistryStageActivationArtifact)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment=str(completed["experiment"]),
+        dependency_receipts=prior.dependency_receipts,
+        runtime_sha256=str(completed["runtime_sha256"]),
+        split_sha256=str(completed["split_sha256"]),
+    )
+    _, _, binding = _industrial_completion_activation_contract(
+        registry,
+        experiment=activation.experiment,
+        runtime_sha256=activation.runtime_sha256,
+        split_sha256=activation.split_sha256,
+        direct_dependency_receipt_sha256=(activation.direct_dependency_receipt_sha256),
+        activation_artifact=activation,
+        family_activations=(),
+        family_power_reductions=(),
+    )
+    completed["activation_binding"] = binding
+    return activation
+
+
+def test_physical_assignment_parser_requires_schema3_raw_budget_authority(
+    tmp_path: Path,
+) -> None:
+    bundle = _serving_bundle(tmp_path)
+    completed = bundle["completed"]
+    assert isinstance(completed, dict)
+    split = completed["split_contract"]
+    assert isinstance(split, dict)
+    cells = split["cells"]
+    assert isinstance(cells, list) and cells
+    assignment = cells[0]["physical_assignment"]
+    assert isinstance(assignment, dict)
+
+    restored = _industrial_physical_assignment_from_dict(copy.deepcopy(assignment))
+    assert restored.to_dict() == assignment
+    assert restored.to_dict()["schema_version"] == 3
+
+    missing = copy.deepcopy(assignment)
+    missing.pop("budget_materialization_authority_sha256")
+    with pytest.raises(ValueError, match="fields differ from schema"):
+        _industrial_physical_assignment_from_dict(missing)
+
+    legacy = copy.deepcopy(assignment)
+    legacy["schema_version"] = 2
+    with pytest.raises(ValueError, match="identity mismatch"):
+        _industrial_physical_assignment_from_dict(legacy)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing_raw_budget_authority", "fields differ from schema"),
+        ("legacy_schema", "identity mismatch"),
+        ("foreign_billing", "billing (semantics )?mismatch"),
+    ),
+)
+def test_completion_contract_requires_exact_physical_assignment_schema3(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    bundle = _serving_bundle(tmp_path)
+    tampered = copy.deepcopy(bundle["completed"])
+    split = tampered["split_contract"]
+    assignment = split["cells"][0]["physical_assignment"]
+    if mutation == "missing_raw_budget_authority":
+        assignment.pop("budget_materialization_authority_sha256")
+    elif mutation == "legacy_schema":
+        assignment["schema_version"] = 2
+    else:
+        assignment["fixed_instance_billing_semantics"] = "per_assigned_gpu"
+    tampered["split_sha256"] = _sha(split)
+    activation = _rebind_generic_activation(bundle, tampered)
+    path = tmp_path / f"physical-assignment-{mutation}.json"
+    _write_bound(path, tampered)
+
+    with pytest.raises(ValueError, match=message):
+        _validate_serving_bundle(
+            {**bundle, "split": split, "activation": activation},
+            path,
+        )
+
+
+def test_preflight_stage_has_no_executable_compile_assignment(tmp_path: Path) -> None:
     bundle = _preflight_bundle(tmp_path)
     completed_path = bundle["completed_path"]
     assert isinstance(completed_path, Path)
     completed, digest = _validate_bundle(bundle, completed_path)
     registry = bundle["registry"]
+    activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
-    assert set(completed) == {
-        cell.cell_id for cell in registry.cells_for("preflight") if cell.runnable
-    }
+    assert isinstance(activation, RegistryStageActivationArtifact)
+    assert activation.status == "BLOCKED"
+    assert activation.activated_cell_ids == ()
+    compile_cell = next(
+        cell
+        for cell in registry.cells_for("preflight")
+        if cell.resources.workload_class is WorkloadClass.COMPILE
+    )
+    compile_disposition = next(
+        row for row in activation.dispositions if row.cell_id == compile_cell.cell_id
+    )
+    assert (
+        compile_disposition.reason_code
+        == RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
+    )
+    assert not Path(compile_cell.resources.evidence_root).exists()
+    assert set(completed) == set(activation.activated_cell_ids)
     assert digest == _sha(bundle["completed"])
 
     receipt_path = tmp_path / "preflight-receipt.json"
@@ -1065,22 +1322,15 @@ def test_preflight_stage_cannot_seal_without_trusted_attester(tmp_path: Path) ->
         "trusted_attester_id": None,
     }
 
-    wrong_root = copy.deepcopy(bundle["completed"])
-    wrong_root["rows"][0]["evidence_root"] = str(tmp_path / "wrong-root")
-    wrong_root_path = tmp_path / "wrong-root-completed.json"
-    _write_bound(wrong_root_path, wrong_root)
-    with pytest.raises(ValueError, match="resource claim"):
-        _validate_bundle(bundle, wrong_root_path)
-
-    missing_rank = copy.deepcopy(bundle["completed"])
-    missing_rank["rows"].pop()
-    missing_rank_path = tmp_path / "missing-rank-completed.json"
-    _write_bound(missing_rank_path, missing_rank)
-    with pytest.raises(ValueError, match="one measured outcome per physical rank"):
-        _validate_bundle(bundle, missing_rank_path)
+    forged_disposition = copy.deepcopy(bundle["completed"])
+    forged_disposition["rows"][0]["reason_code"] = "caller_claimed_success"
+    forged_path = tmp_path / "forged-disposition.json"
+    _write_bound(forged_path, forged_disposition)
+    with pytest.raises(ValueError, match="exact immutable disposition"):
+        _validate_bundle(bundle, forged_path)
 
 
-def test_formal_completion_rejects_forged_activation_physical_and_budget_bindings(
+def test_blocked_preflight_rejects_forged_activation_and_measured_rows(
     tmp_path: Path,
 ) -> None:
     bundle = _preflight_bundle(tmp_path)
@@ -1099,95 +1349,42 @@ def test_formal_completion_rejects_forged_activation_physical_and_budget_binding
         )
     )
 
-    logical_gpu = copy.deepcopy(bundle["completed"])
-    measured = next(row for row in logical_gpu["rows"] if row["status"] == "MEASURED")
-    measured["physical_gpu_uuid"] = registry.gpu_uuids[0]
+    forged_measured = copy.deepcopy(bundle["completed"])
+    compile_cell = next(
+        cell
+        for cell in registry.cells_for("preflight")
+        if cell.resources.workload_class is WorkloadClass.COMPILE
+    )
+    compile_row = next(
+        row for row in forged_measured["rows"] if row["cell_id"] == compile_cell.cell_id
+    )
+    compile_row["status"] = "MEASURED"
     cases.append(
         (
-            "logical-gpu-substitution",
-            logical_gpu,
-            "differs from its physical assignment",
+            "forged-compile-measured-row",
+            forged_measured,
+            "exact immutable disposition",
         )
     )
 
-    forged_binding = copy.deepcopy(bundle["completed"])
-    measured = next(
-        row for row in forged_binding["rows"] if row["status"] == "MEASURED"
+    forged_reason = copy.deepcopy(bundle["completed"])
+    compile_row = next(
+        row for row in forged_reason["rows"] if row["cell_id"] == compile_cell.cell_id
     )
-    measured["physical_binding_sha256"] = "1" * 64
+    compile_row["reason_code"] = "caller_rehashed_compile_success"
     cases.append(
         (
-            "forged-physical-digest",
-            forged_binding,
-            "differs from its physical assignment",
-        )
-    )
-
-    bad_billing = copy.deepcopy(bundle["completed"])
-    split = bad_billing["split_contract"]
-    split["cells"][0]["physical_assignment"]["fixed_instance_billing_semantics"] = (
-        "reserved_gang_only"
-    )
-    bad_billing["split_sha256"] = _sha(split)
-    cases.append(
-        (
-            "forged-billing-semantics",
-            bad_billing,
-            "billing semantics mismatch",
-        )
-    )
-
-    forged_budget = copy.deepcopy(bundle["completed"])
-    split = forged_budget["split_contract"]
-    split["cells"][0]["experiment_budget"]["artifact_sha256"] = "2" * 64
-    forged_budget["split_sha256"] = _sha(split)
-    cases.append(
-        (
-            "forged-budget",
-            forged_budget,
-            "forged ExperimentBudget",
-        )
-    )
-
-    imputed_observation = copy.deepcopy(bundle["completed"])
-    measured = next(
-        row for row in imputed_observation["rows"] if row["status"] == "MEASURED"
-    )
-    measured["budget_observation_status"] = "OBSERVED"
-    measured["budget_observation_reason_code"] = None
-    cases.append(
-        (
-            "preflight-zero-imputation",
-            imputed_observation,
-            "non-serving budget observation disposition is not exact",
-        )
-    )
-
-    unknown_field = copy.deepcopy(bundle["completed"])
-    measured = next(row for row in unknown_field["rows"] if row["status"] == "MEASURED")
-    measured["caller_claimed_gpu"] = "GPU-forged"
-    cases.append(
-        (
-            "unknown-row-field",
-            unknown_field,
-            "completed-rank fields differ from schema",
+            "forged-compile-disposition",
+            forged_reason,
+            "exact immutable disposition",
         )
     )
 
     for name, artifact, message in cases:
         path = tmp_path / f"{name}.json"
         _write_bound(path, artifact)
-        validation_bundle = (
-            {**bundle, "split": artifact["split_contract"]}
-            if name
-            in {
-                "forged-billing-semantics",
-                "forged-budget",
-            }
-            else bundle
-        )
         with pytest.raises(ValueError, match=message):
-            _validate_bundle(validation_bundle, path)
+            _validate_bundle(bundle, path)
 
 
 def test_serving_completion_requires_exact_observed_budget_receipt(
@@ -1198,10 +1395,10 @@ def test_serving_completion_requires_exact_observed_budget_receipt(
     assert isinstance(completed_path, Path)
     completed, _ = _validate_serving_bundle(bundle, completed_path)
     registry = bundle["registry"]
+    activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
-    assert set(completed) == {
-        cell.cell_id for cell in registry.cells_for("E1a") if cell.runnable
-    }
+    assert isinstance(activation, RegistryStageActivationArtifact)
+    assert set(completed) == set(activation.activated_cell_ids)
 
     missing = copy.deepcopy(bundle["completed"])
     measured = next(row for row in missing["rows"] if row["status"] == "MEASURED")
@@ -1274,35 +1471,14 @@ def test_two_gpu_inventory_rejects_coordinated_one_gpu_underbilling(
     measured["budget_observation_path"] = str(observation_path)
     measured["budget_observation_sha256"] = observation_sha256
     tampered["split_sha256"] = _sha(split)
+    rebound_activation = _rebind_generic_activation(bundle, tampered)
     path = tmp_path / "coordinated-one-gpu-underbill.json"
     _write_bound(path, tampered)
     with pytest.raises(ValueError, match="differs from the bound GPU inventory"):
-        _validate_serving_bundle({**bundle, "split": split}, path)
-
-
-@pytest.mark.parametrize(
-    ("failure", "message"),
-    [
-        ("attestation", "preflight attestation contract is incomplete"),
-        ("consensus", "cell ranks do not agree"),
-        ("nonce", "run nonce is reused"),
-    ],
-)
-def test_preflight_rejects_task_or_rank_contract_tamper(
-    tmp_path: Path,
-    failure: str,
-    message: str,
-) -> None:
-    bundle = _preflight_bundle(
-        tmp_path,
-        invalid_attestation=failure == "attestation",
-        mismatched_rank_output=failure == "consensus",
-        reused_nonce=failure == "nonce",
-    )
-    completed_path = bundle["completed_path"]
-    assert isinstance(completed_path, Path)
-    with pytest.raises(ValueError, match=message):
-        _validate_bundle(bundle, completed_path)
+        _validate_serving_bundle(
+            {**bundle, "split": split, "activation": rebound_activation},
+            path,
+        )
 
 
 def test_blocked_and_not_applicable_outcomes_are_explicit_and_exact(
@@ -1316,10 +1492,10 @@ def test_blocked_and_not_applicable_outcomes_are_explicit_and_exact(
     assert isinstance(completed_path, Path)
     completed, _ = _validate_bundle(bundle, completed_path)
     registry = bundle["registry"]
+    activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
-    assert set(completed) == {
-        cell.cell_id for cell in registry.cells_for("preflight") if cell.runnable
-    }
+    assert isinstance(activation, RegistryStageActivationArtifact)
+    assert set(completed) == set(activation.activated_cell_ids)
 
     forged = copy.deepcopy(bundle["completed"])
     disposition = next(row for row in forged["rows"] if row.get("status") == "N/A")

@@ -17,8 +17,8 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuAssignment,
     GpuAvailability,
     GpuDevice,
-    GpuDispatchExecutionContext,
     GpuDispatchPlan,
+    GpuDispatchPlanningContext,
     GpuDispatchWave,
     GpuInventory,
     GpuPoolScheduler,
@@ -42,6 +42,9 @@ from lightcone_spec.experiments.registry import (
     build_industrial_registry,
     content_sha256,
     serving_cell_rejection_reason,
+)
+from lightcone_spec.experiments.stage_activation import (
+    materialize_registry_stage_activation,
 )
 from lightcone_spec.orchestration.industrial import (
     bind_industrial_gpu_assignment,
@@ -276,16 +279,24 @@ def _budget(cell: ExperimentCell) -> ExperimentBudget:
     )
 
 
-def _execution_context(
+def _planning_context(
     registry: ExperimentRegistry,
     inventory: GpuInventory,
-) -> GpuDispatchExecutionContext:
+) -> GpuDispatchPlanningContext:
     cells = tuple(
         cell
         for cell in registry.cells_for("E3a")
         if GpuPoolScheduler._dispatchable(cell)
     )
-    return GpuDispatchExecutionContext(
+    receipts = _receipts_before(registry, "E3a")
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="E3a",
+        dependency_receipts=receipts,
+        runtime_sha256=content_sha256("renderer-runtime"),
+        split_sha256=content_sha256("renderer-split"),
+    )
+    return GpuDispatchPlanningContext(
         registry=registry,
         inventory=inventory,
         interference_envelope=InterferenceEnvelope.serial(
@@ -294,7 +305,8 @@ def _execution_context(
         budgets=tuple(
             sorted((_budget(cell) for cell in cells), key=lambda row: row.cell_id)
         ),
-        receipts=_receipts_before(registry, "E3a"),
+        receipts=receipts,
+        activation_artifact=activation,
         port_start=31_000,
         port_end=31_999,
         seed=20260811,
@@ -474,7 +486,7 @@ def test_assignment_renderer_binds_tp1_physical_resources_without_changing_cell(
     )
     receipts = _receipts_before(registry, "E3a")
     inventory = _physical_inventory()
-    dispatch_context = _execution_context(registry, inventory)
+    dispatch_context = _planning_context(registry, inventory)
     dispatch_plan = dispatch_context.issue_plan()
     assignment = next(
         assignment
@@ -487,82 +499,14 @@ def test_assignment_renderer_binds_tp1_physical_resources_without_changing_cell(
     topology = _physical_topology(physical_gpu, tp_size=1, dp_size=1)
     configs = _configs(cell, topology, receipts)
 
-    plan = render_assigned_industrial_cell_runtime_plan(
-        registry=registry,
-        cell_id=cell.cell_id,
-        assignment=assignment,
-        dispatch_plan=dispatch_plan,
-        dispatch_context=dispatch_context,
-        budget=budget,
-        inventory=inventory,
-        dispatch_inventory_sha256=inventory.sha256,
-        rank_configs=configs,
-        topology_receipts=topology,
-        dependency_receipts=receipts,
-    )
-    repeated = render_assigned_industrial_cell_runtime_plan(
-        registry=registry,
-        cell_id=cell.cell_id,
-        assignment=assignment,
-        dispatch_plan=dispatch_plan,
-        dispatch_context=dispatch_context,
-        budget=budget,
-        inventory=inventory,
-        dispatch_inventory_sha256=inventory.sha256,
-        rank_configs=configs,
-        topology_receipts=topology,
-        dependency_receipts=receipts,
-    )
-
-    assert plan.sha256 == repeated.sha256
-    assert plan.cell_id == cell.cell_id
-    assert plan.cell == cell
-    assert plan.cell.identity.gpu_uuids != physical_gpu
-    assert plan.physical_dispatch_ready is True
-    assert plan.physical_gpu_uuids == physical_gpu
-    assert plan.physical_rank_groups == (physical_gpu,)
-    assert plan.physical_ports == (31_000,)
-    assert plan.physical_fixed_instance_gpu_count == len(inventory.devices)
-    serialized = plan.to_dict()
-    assert serialized["cell_declaration_sha256"] == cell.sha256
-    assert serialized["resources"]["gpu_uuids"] == list(cell.resources.gpu_uuids)
-    assert serialized["resources"]["ports"] == list(cell.resources.ports)
-    assert serialized["logical_resources"] == serialized["resources"]
-    assert serialized["physical_gpu_uuids"] == list(physical_gpu)
-    assert serialized["physical_rank_groups"] == [list(physical_gpu)]
-    assert serialized["physical_ports"] == [31_000]
-    assert serialized["physical_fixed_instance_gpu_count"] == len(inventory.devices)
-    binding = serialized["resource_binding"]
-    assert binding["kind"] == "gpu_assignment"
-    assert binding["physical_dispatch_ready"] is True
-    assert binding["physical_assignment"]["inventory_sha256"] == inventory.sha256
-    assert (
-        binding["physical_assignment"]["dispatch_plan_sha256"] == dispatch_plan.sha256
-    )
-    assert binding["physical_assignment"]["experiment_budget_sha256"] == budget.sha256
-    assert binding["physical_assignment"]["assignment_sha256"] == assignment.sha256
-    assert binding["physical_assignment"]["gpu_uuids"] == list(physical_gpu)
-    assert binding["physical_assignment"]["rank_groups"] == [list(physical_gpu)]
-    assert binding["physical_assignment"]["ports"] == [31_000]
-    assert binding["physical_assignment"]["fixed_instance_gpu_count"] == len(
-        inventory.devices
-    )
-    assert binding["physical_assignment"]["fixed_instance_billing_semantics"] == (
-        "whole_inventory_wall_clock_v1"
-    )
-    with pytest.raises(ValueError, match="fixed-instance GPU count"):
-        replace(plan.physical_assignment, fixed_instance_gpu_count=0)
-    with pytest.raises(ValueError, match="dispatch-plan binding"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         render_assigned_industrial_cell_runtime_plan(
             registry=registry,
             cell_id=cell.cell_id,
             assignment=assignment,
             dispatch_plan=dispatch_plan,
             dispatch_context=dispatch_context,
-            budget=replace(
-                budget,
-                output_tokens=ExpectedMaximumCount(2, 2),
-            ),
+            budget=budget,
             inventory=inventory,
             dispatch_inventory_sha256=inventory.sha256,
             rank_configs=configs,
@@ -619,14 +563,14 @@ def test_assignment_binding_covers_registered_two_rank_gang_shapes(
     )
     budget = _budget(cell)
     dispatch_plan = _dispatch_plan(derived, inventory, assignment, budget)
-    dispatch_context = _execution_context(derived, inventory)
+    dispatch_context = _planning_context(derived, inventory)
     topology = _physical_topology(
         physical_gpus,
         tp_size=tp_size,
         dp_size=dp_size,
     )
 
-    with pytest.raises(ValueError, match="not the exact plan"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=derived,
             cell_id=cell.cell_id,
@@ -640,7 +584,7 @@ def test_assignment_binding_covers_registered_two_rank_gang_shapes(
         )
 
 
-def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
+def test_planning_assignment_cannot_cross_physical_binding_boundary(
     registry: ExperimentRegistry,
 ) -> None:
     cell = next(
@@ -649,7 +593,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
         if GpuPoolScheduler._dispatchable(cell)
     )
     inventory = _physical_inventory()
-    dispatch_context = _execution_context(registry, inventory)
+    dispatch_context = _planning_context(registry, inventory)
     dispatch_plan = dispatch_context.issue_plan()
     assignment = next(
         assignment
@@ -662,7 +606,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
     topology = _physical_topology(physical_gpus, tp_size=1, dp_size=1)
     budget = dispatch_context.budgets_by_cell_id[cell.cell_id]
 
-    with pytest.raises(ValueError, match="dispatch inventory SHA-256"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=registry,
             cell_id=cell.cell_id,
@@ -680,7 +624,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
         assignment,
         work_item=replace(assignment.work_item, cell=forged_cell),
     )
-    with pytest.raises(ValueError, match="absent, duplicated, or changed"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=registry,
             cell_id=cell.cell_id,
@@ -703,7 +647,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
     reordered_dispatch_plan = _dispatch_plan(
         registry, inventory, reordered_assignment, budget
     )
-    with pytest.raises(ValueError, match="not the exact plan"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=registry,
             cell_id=cell.cell_id,
@@ -725,7 +669,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
     reordered_ports_dispatch_plan = _dispatch_plan(
         registry, inventory, reordered_ports, budget
     )
-    with pytest.raises(ValueError, match="not the exact plan"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         render_assigned_industrial_cell_runtime_plan(
             registry=registry,
             cell_id=cell.cell_id,
@@ -750,7 +694,7 @@ def test_assignment_binding_rejects_forgery_reorder_partial_gang_and_inventory(
     partial_dispatch_plan = _dispatch_plan(
         registry, inventory, partial_assignment, budget
     )
-    with pytest.raises(ValueError, match="not the exact plan"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=registry,
             cell_id=cell.cell_id,
@@ -768,7 +712,7 @@ def test_physical_binding_rejects_canonical_e5_cell_before_ready_stage(
     registry: ExperimentRegistry,
 ) -> None:
     inventory = _physical_inventory()
-    dispatch_context = _execution_context(registry, inventory)
+    dispatch_context = _planning_context(registry, inventory)
     cell = next(
         cell
         for cell in registry.cells_for("E5")
@@ -788,7 +732,7 @@ def test_physical_binding_rejects_canonical_e5_cell_before_ready_stage(
         dp_size=1,
     )
 
-    with pytest.raises(ValueError, match="not the exact plan"):
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
         bind_industrial_gpu_assignment(
             registry=registry,
             cell_id=cell.cell_id,

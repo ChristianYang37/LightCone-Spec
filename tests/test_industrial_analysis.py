@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import asdict, replace
@@ -8,6 +9,14 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
+from test_native_terminal_provider import (
+    FakeAdminTransport,
+    _rehash_terminal,
+    _server_request,
+)
+from test_native_terminal_provider import (
+    _run as _run_native_terminal,
+)
 
 from lightcone_spec import (
     PINNED_SGLANG_COMMIT,
@@ -71,7 +80,12 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
+from lightcone_spec.orchestration.native_terminal import (
+    NativeTerminalRunBinding,
+    canonical_sha256,
+)
 from lightcone_spec.telemetry import (
+    DEFAULT_EVIDENCE_WRITER_POLICY,
     OUTPUT_HASH_FORMAT,
     EvidenceWriter,
     PerformanceRecord,
@@ -100,12 +114,18 @@ _BUDGET_OBSERVATION_COMPONENTS = (
 
 
 def _gpu_inventory(*, gpu_count: int = 2) -> GpuInventory:
+    gpu_uuids = tuple(
+        sorted(
+            _PHYSICAL_GPU_UUIDS
+            + tuple(f"GPU-analysis-{index}" for index in range(2, gpu_count))
+        )
+    )
     devices = tuple(
         GpuDevice(
             uuid=uuid,
             host_id="analysis-host",
             model="A100",
-            memory_bytes=80_000_000_000,
+            memory_bytes=80_000 * 1024 * 1024,
             compute_capability=(8, 0),
             pci_bus_id=f"0000:{index + 1:02x}:00.0",
             pci_root="root-0",
@@ -119,7 +139,7 @@ def _gpu_inventory(*, gpu_count: int = 2) -> GpuInventory:
             reserved_processes=(),
             allowed_topology_groups=("analysis-nvlink",),
         )
-        for index, uuid in enumerate(_PHYSICAL_GPU_UUIDS[:gpu_count])
+        for index, uuid in enumerate(gpu_uuids[:gpu_count])
     )
     return GpuInventory(
         schema_version=1,
@@ -143,6 +163,89 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _persist_native_terminal_artifact(
+    writer: EvidenceWriter,
+    *,
+    method: str,
+    run_nonce_sha256: str,
+    execution_plan_sha256: str,
+    rank_config_sha256: str,
+    request_id: str,
+    output_token_ids: tuple[int, ...],
+) -> dict[str, object]:
+    """Exercise the real provider and persist its canonical begin/reset/final chain."""
+
+    binding = NativeTerminalRunBinding(
+        run_id=writer.run_id,
+        run_nonce_sha256=run_nonce_sha256,
+        execution_plan_sha256=execution_plan_sha256,
+        rank_config_sha256=rank_config_sha256,
+        attempt_id=writer.attempt_id,
+        session_id=f"standalone-{writer.run_id}",
+        session_epoch=1,
+        previous_run_id=None,
+        challenge_nonce_sha256=content_sha256(
+            {"challenge": writer.run_id, "attempt": writer.attempt_id}
+        ),
+        method=method,
+        warmup_request_ids=(),
+        scored_request_ids=(request_id,),
+    )
+    scored_request = _server_request(
+        request_id,
+        inputs=(1,),
+        outputs=output_token_ids,
+    )
+
+    def align_adapted_terminal(value: dict[str, object]) -> None:
+        if method not in {"tts", "l0"}:
+            return
+        request_round_rows = value["request_round_rows"]
+        performance = value["performance_counters"]
+        assert isinstance(request_round_rows, dict)
+        assert isinstance(performance, dict)
+        rounds = request_round_rows["rounds"]
+        assert isinstance(rounds, list) and len(rounds) == 1
+        round_row = rounds[0]
+        assert isinstance(round_row, dict)
+        accepted = max(len(output_token_ids) - 1, 0)
+        round_row.update(
+            {
+                "verify_len": accepted,
+                "accepted_drafts": accepted,
+                "committed_tokens": len(output_token_ids),
+            }
+        )
+        unsigned_round = dict(round_row)
+        unsigned_round.pop("round_sha256", None)
+        round_row["round_sha256"] = canonical_sha256(unsigned_round)
+        performance.update(
+            {
+                "accepted_drafts": accepted,
+                "committed_tokens": len(output_token_ids),
+                "verified_drafts": accepted,
+                "accepted_drafts_per_verify": float(accepted),
+                "committed_tokens_per_verify": float(len(output_token_ids)),
+                "verified_drafts_per_verify": float(accepted),
+                "verification_waste": 0,
+            }
+        )
+        _rehash_terminal(value)
+
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=(scored_request,),
+        terminal_mutator=align_adapted_terminal,
+    )
+    _, _, _, terminal = asyncio.run(_run_native_terminal(transport))
+    assert terminal.binding == binding
+    assert terminal.requests == (scored_request,)
+    return writer.persist_native_terminal_artifact(
+        terminal.to_artifact(warmup_requests=())
+    )
+
+
 def _write_json(path: Path, value: object) -> BoundArtifact:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -155,6 +258,24 @@ def _write_json(path: Path, value: object) -> BoundArtifact:
 def _validate_durable_test_binding(reference: BoundArtifact) -> None:
     if not reference.path.is_file() or _file_sha256(reference.path) != reference.sha256:
         raise RuntimeError("test budget observation is not durably content-bound")
+
+
+def _assert_registered_terminal_chain(
+    *,
+    terminal_path: Path,
+    prepared_receipt: Path,
+    budget_observation: BoundArtifact,
+) -> None:
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    observation = json.loads(budget_observation.path.read_text(encoding="utf-8"))
+    assert terminal["prepared_receipt_sha256"] == _file_sha256(prepared_receipt)
+    assert observation["terminal_evidence_sha256"] == _file_sha256(prepared_receipt)
+    assert (
+        terminal["budget_observation"]["budget_observation_sha256"]
+        == (observation["budget_observation_sha256"])
+    )
+    assert terminal["writer_policy"] == DEFAULT_EVIDENCE_WRITER_POLICY.to_dict()
+    assert terminal["writer_policy_sha256"] == DEFAULT_EVIDENCE_WRITER_POLICY.sha256
 
 
 def _write_budget_observation(path: Path, value: dict[str, object]) -> BoundArtifact:
@@ -306,22 +427,39 @@ def _hardware_envelope() -> HardwareEnvelope:
     )
 
 
-def _passing_doctor(registry: ExperimentRegistry) -> dict:
+def _passing_doctor(
+    registry: ExperimentRegistry,
+    *,
+    inventory_authority: GpuInventory | None = None,
+) -> dict:
+    del registry
+    inventory_authority = inventory_authority or _gpu_inventory()
     devices = [
         {
-            "uuid": gpu_uuid,
-            "name": "NVIDIA H200",
-            "memory_total_mib": 141_000,
+            "uuid": device.uuid,
+            "name": device.model,
+            "memory_total_mib": device.memory_bytes // (1024 * 1024),
             "driver_version": "580.65.06",
-            "compute_capability": "9.0",
-            "pci_bus_id": f"00000000:{index + 1:02x}:00.0",
+            "compute_capability": ".".join(
+                str(component) for component in device.compute_capability
+            ),
+            "pci_bus_id": device.pci_bus_id,
         }
-        for index, gpu_uuid in enumerate(_PHYSICAL_GPU_UUIDS)
+        for device in inventory_authority.devices
     ]
+    gpu_rows = [f"GPU{index}" for index in range(len(devices))]
     topology = {
-        "gpu_rows": ["GPU0", "GPU1"],
-        "pair_link": "NV18",
-        "reciprocal_link": "NV18",
+        "gpu_rows": gpu_rows,
+        "pairs": [
+            {
+                "left": left,
+                "right": right,
+                "link": "NV18",
+                "reciprocal_link": "NV18",
+            }
+            for left_index, left in enumerate(gpu_rows)
+            for right in gpu_rows[left_index + 1 :]
+        ],
         "parse_error": None,
     }
     checks = {name: {"status": "PASS"} for name in _INDUSTRIAL_DOCTOR_CHECKS}
@@ -364,7 +502,9 @@ def _passing_doctor(registry: ExperimentRegistry) -> dict:
             "inventory": inventory,
             "parsed_inventory": {"devices": devices, "parse_error": None},
             "parsed_topology": topology,
-            "two_gpu_visible": True,
+            "visible_gpu_count": len(devices),
+            "gpu_pool_visible": True,
+            "two_gpu_visible": len(devices) == 2,
         },
         "commands": {"nvidia_smi": inventory},
         "compatibility": {
@@ -647,12 +787,33 @@ def _build_evidence(
             )
             run_id = f"analysis-{block}-{method.replace('_', '-')}"
             evidence_root = Path(cell.resources.evidence_root)
+            output_token_ids = tuple(range(100, 200))
+            output_token_ids_json = json.dumps(
+                output_token_ids,
+                separators=(",", ":"),
+            )
+            output_token_ids_sha256 = hashlib.sha256(
+                output_token_ids_json.encode("utf-8")
+            ).hexdigest()
+            run_nonce_sha256 = content_sha256({"nonce": cell.cell_id, "run": run_id})
+            rank_config_sha256 = content_sha256(
+                {"rank_config": cell.cell_id, "rank": 0}
+            )
             writer = EvidenceWriter(
                 evidence_root,
                 run_id=run_id,
                 rank=0,
                 process_id=block * 10 + CORE_METHODS.index(method) + 1,
-                checkpoint_interval_s=None,
+                registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
+            )
+            native_artifact_binding = _persist_native_terminal_artifact(
+                writer,
+                method=method,
+                run_nonce_sha256=run_nonce_sha256,
+                execution_plan_sha256=runtime_sha256,
+                rank_config_sha256=rank_config_sha256,
+                request_id=request_id,
+                output_token_ids=output_token_ids,
             )
             adapted = method in {"tts", "l0"}
             expected_rounds = 1 if adapted else 0
@@ -675,16 +836,12 @@ def _build_evidence(
                     status="complete",
                     industrial_cell_id=cell.cell_id,
                     experiment_budget_sha256=budget.sha256,
-                    rank_config_sha256=content_sha256(
-                        {"rank_config": cell.cell_id, "rank": 0}
-                    ),
+                    rank_config_sha256=rank_config_sha256,
                     runtime_sha256=runtime_sha256,
                     split_sha256=split_sha256,
                     **identities,
                     patched_sglang_tree=PINNED_SGLANG_TREE,
-                    run_nonce_sha256=content_sha256(
-                        {"nonce": cell.cell_id, "run": run_id}
-                    ),
+                    run_nonce_sha256=run_nonce_sha256,
                     topology_sha256=content_sha256(
                         {
                             "schema_version": 1,
@@ -705,6 +862,17 @@ def _build_evidence(
                     expected_update_rows=expected_updates,
                     expected_performance_rows=1,
                     workload_contract=workload_contract,
+                    native_terminal_artifact_path=str(native_artifact_binding["path"]),
+                    native_terminal_artifact_size=int(native_artifact_binding["size"]),
+                    native_terminal_raw_sha256=str(
+                        native_artifact_binding["raw_sha256"]
+                    ),
+                    native_terminal_sha256=str(
+                        native_artifact_binding["terminal_sha256"]
+                    ),
+                    trusted_attester_policy_sha256=str(
+                        native_artifact_binding["trusted_attester_policy_sha256"]
+                    ),
                 )
             )
             arrival_ns = 1_000_000
@@ -717,11 +885,6 @@ def _build_evidence(
                 )
                 * 1_000_000_000
             )
-            output_token_ids = tuple(range(100, 200))
-            output_token_ids_json = json.dumps(output_token_ids, separators=(",", ":"))
-            output_token_ids_sha256 = hashlib.sha256(
-                output_token_ids_json.encode("utf-8")
-            ).hexdigest()
             writer.write(
                 RequestRecord(
                     run_id=run_id,
@@ -787,6 +950,11 @@ def _build_evidence(
                 validate_post_binding=lambda reference=budget_observation: (
                     _validate_durable_test_binding(reference)
                 )
+            )
+            _assert_registered_terminal_chain(
+                terminal_path=terminal_path,
+                prepared_receipt=prepared_receipt,
+                budget_observation=budget_observation,
             )
             terminal = BoundArtifact(
                 path=terminal_path,
@@ -978,12 +1146,23 @@ def _build_e2_stage_evidence(
         )
         run_id = f"e2-raw-{index}-{method.replace('_', '-')}"
         evidence_root = Path(cell.resources.evidence_root)
+        run_nonce_sha256 = content_sha256({"nonce": cell.cell_id, "run": run_id})
+        rank_config_sha256 = content_sha256({"rank_config": cell.cell_id, "rank": 0})
         writer = EvidenceWriter(
             evidence_root,
             run_id=run_id,
             rank=0,
             process_id=10_000 + index,
-            checkpoint_interval_s=None,
+            registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
+        )
+        native_artifact_binding = _persist_native_terminal_artifact(
+            writer,
+            method=method,
+            run_nonce_sha256=run_nonce_sha256,
+            execution_plan_sha256=runtime_sha256,
+            rank_config_sha256=rank_config_sha256,
+            request_id=request_id,
+            output_token_ids=output_token_ids,
         )
         writer.write(
             RunRecord(
@@ -998,14 +1177,12 @@ def _build_e2_stage_evidence(
                 status="complete",
                 industrial_cell_id=cell.cell_id,
                 experiment_budget_sha256=budget.sha256,
-                rank_config_sha256=content_sha256(
-                    {"rank_config": cell.cell_id, "rank": 0}
-                ),
+                rank_config_sha256=rank_config_sha256,
                 runtime_sha256=runtime_sha256,
                 split_sha256=split_sha256,
                 **identities,
                 patched_sglang_tree=PINNED_SGLANG_TREE,
-                run_nonce_sha256=content_sha256({"nonce": cell.cell_id, "run": run_id}),
+                run_nonce_sha256=run_nonce_sha256,
                 topology_sha256=topology_sha256,
                 tensor_parallel_size=1,
                 data_parallel_size=1,
@@ -1017,6 +1194,13 @@ def _build_e2_stage_evidence(
                 expected_performance_rows=1,
                 workload_contract=(
                     "industrial_adapted" if adapted else f"industrial_{method}"
+                ),
+                native_terminal_artifact_path=str(native_artifact_binding["path"]),
+                native_terminal_artifact_size=int(native_artifact_binding["size"]),
+                native_terminal_raw_sha256=str(native_artifact_binding["raw_sha256"]),
+                native_terminal_sha256=str(native_artifact_binding["terminal_sha256"]),
+                trusted_attester_policy_sha256=str(
+                    native_artifact_binding["trusted_attester_policy_sha256"]
                 ),
             )
         )
@@ -1076,6 +1260,11 @@ def _build_e2_stage_evidence(
             validate_post_binding=lambda reference=budget_observation: (
                 _validate_durable_test_binding(reference)
             )
+        )
+        _assert_registered_terminal_chain(
+            terminal_path=terminal_path,
+            prepared_receipt=prepared_receipt,
+            budget_observation=budget_observation,
         )
         terminal = BoundArtifact(
             path=terminal_path,
@@ -1205,7 +1394,7 @@ def _analysis_manifest(
     power_manifest_path = tmp_path / f"{name}-power-manifest.json"
     _write_bound_json(power_manifest_path, power_manifest)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "industrial_analysis_manifest",
         "registry_artifact": {
             "path": str(registry_path),
@@ -1224,6 +1413,7 @@ def _analysis_manifest(
             "sha256": content_sha256(power_manifest),
         },
         "gpu_inventory": inventory_binding,
+        "evidence_alias_manifests": [],
         "evidence_dependence_map": None,
         "gpu_attestation": (
             None if gpu_attestation is None else _bound_reference(gpu_attestation)
@@ -1515,7 +1705,7 @@ def test_industrial_attestation_contract_binds_doctor_gpu_and_run_chain(
     doctor = _write_json(tmp_path / "doctor.json", doctor_value)
     _validate_industrial_doctor(
         doctor,
-        physical_gpu_uuids=_PHYSICAL_GPU_UUIDS,
+        inventory_authority=_gpu_inventory(),
     )
 
     mismatched_manifest = json.loads(json.dumps(doctor_value))
@@ -1525,16 +1715,16 @@ def test_industrial_attestation_contract_binds_doctor_gpu_and_run_chain(
             _write_json(
                 tmp_path / "doctor-manifest-mismatch.json", mismatched_manifest
             ),
-            physical_gpu_uuids=_PHYSICAL_GPU_UUIDS,
+            inventory_authority=_gpu_inventory(),
         )
 
     mismatched_gpu = json.loads(json.dumps(doctor_value))
     mismatched_gpu["gpu"]["parsed_inventory"]["devices"][0]["uuid"] = "GPU-other"
     mismatched_gpu["checks"]["gpu_identity"]["observed"][0]["uuid"] = "GPU-other"
-    with pytest.raises(ValueError, match="physical GPU UUIDs"):
+    with pytest.raises(ValueError, match="complete GPU inventory"):
         _validate_industrial_doctor(
             _write_json(tmp_path / "doctor-gpu-mismatch.json", mismatched_gpu),
-            physical_gpu_uuids=_PHYSICAL_GPU_UUIDS,
+            inventory_authority=_gpu_inventory(),
         )
 
     expected_chain = {
@@ -1572,6 +1762,23 @@ def test_industrial_attestation_contract_binds_doctor_gpu_and_run_chain(
             doctor_report=doctor,
             expected_chain=expected_chain,
         )
+
+
+def test_industrial_doctor_binds_complete_eight_gpu_inventory(
+    evidence_bundle,
+    tmp_path: Path,
+) -> None:
+    registry, *_ = evidence_bundle
+    inventory = _gpu_inventory(gpu_count=8)
+    doctor = _write_json(
+        tmp_path / "doctor-eight-gpu.json",
+        _passing_doctor(registry, inventory_authority=inventory),
+    )
+    _validate_industrial_doctor(doctor, inventory_authority=inventory)
+
+    reduced = _gpu_inventory(gpu_count=4)
+    with pytest.raises(ValueError, match="complete GPU inventory"):
+        _validate_industrial_doctor(doctor, inventory_authority=reduced)
 
 
 def test_static_terminal_evidence_has_no_round_or_update_trace_state(
@@ -1910,7 +2117,10 @@ def test_family_artifacts_gate_exact_pilots_plan_sha_and_activated_cells(
         evidence[-1],
         cells=(unactivated_cell, *evidence[-1].cells[1:]),
     )
-    with pytest.raises(ValueError, match="missing or unactivated"):
+    with pytest.raises(
+        ValueError,
+        match="direct evidence plus raw aliases must exactly cover activation",
+    ):
         reduce_industrial_schema_v3(
             registry=registry,
             pilot_activation=pilot_activation,
@@ -2080,7 +2290,10 @@ def test_reducer_fails_closed_on_missing_paired_method_or_rank(evidence_bundle) 
         )
 
     missing_method = replace(evidence[-1], cells=evidence[-1].cells[:-1])
-    with pytest.raises(ValueError, match="missing or unactivated"):
+    with pytest.raises(
+        ValueError,
+        match="direct evidence plus raw aliases must exactly cover activation",
+    ):
         reduce_industrial_schema_v3(
             registry=registry,
             pilot_activation=pilot_activation,

@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+import lightcone_spec.experiments.gpu_pool as gpu_pool_module
+import lightcone_spec.orchestration.execution_bundle as execution_bundle_module
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments.completion_authority import (
+    AssignmentTerminalAuthority,
+    AssignmentTerminalBinding,
+)
 from lightcone_spec.experiments.gpu_pool import (
     ArtifactSidecar,
+    AssignmentExecutionReceipt,
     AssignmentExecutionStatus,
     CapabilityRejectionError,
     DispatchExecutionPhase,
@@ -62,7 +72,20 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
     serving_cell_rejection_reason,
 )
+from lightcone_spec.experiments.stage_activation import (
+    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
+    RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE,
+    RegistryStageActivationArtifact,
+    RegistryStageDispositionStatus,
+    materialize_registry_stage_activation,
+    release_dispatch_rejection_reason,
+)
 from lightcone_spec.experiments.statistics import PilotBlock, preregister_power_sizing
+from lightcone_spec.orchestration.execution_bundle import (
+    DispatchAttemptJournal,
+    ExecutionBundleBlockedError,
+    publish_dispatch_schedule_receipt,
+)
 
 
 @pytest.fixture(scope="module")
@@ -491,7 +514,7 @@ def _e3a_execution_context(
     registry: ExperimentRegistry,
     inventory: GpuInventory,
     envelope: InterferenceEnvelope,
-) -> GpuDispatchExecutionContext:
+) -> GpuDispatchPlanningContext:
     cells = tuple(
         cell
         for cell in registry.cells_for("E3a")
@@ -509,16 +532,158 @@ def _e3a_execution_context(
             key=lambda budget: budget.cell_id,
         )
     )
-    return GpuDispatchExecutionContext(
+    receipts = _receipts_through(registry, "preflight")
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="E3a",
+        dependency_receipts=receipts,
+        runtime_sha256=content_sha256("e3a-scheduler-runtime"),
+        split_sha256=content_sha256("e3a-scheduler-split"),
+    )
+    return GpuDispatchPlanningContext(
         registry=registry,
         inventory=inventory,
         interference_envelope=envelope,
         budgets=budgets,
-        receipts=_receipts_through(registry, "preflight"),
+        receipts=receipts,
+        activation_artifact=activation,
         port_start=31_000,
         port_end=31_999,
         seed=20260811,
     )
+
+
+async def _execute_planning_dispatch_for_engine_test(
+    plan: GpuDispatchPlan,
+    *,
+    execution_context: GpuDispatchPlanningContext,
+    runner,
+    resume_receipt: DispatchScheduleReceipt | None = None,
+    stop_after_wave_index: int | None = None,
+) -> DispatchScheduleReceipt:
+    """Exercise the post-authority engine without weakening production gates.
+
+    Formal execution requires path-bound budget/completion authorities that the
+    scheduler unit tests intentionally do not fabricate.  Replaying the exact
+    planning context here preserves plan-forgery coverage while a local patch
+    bypasses only the production context type gate for the duration of one
+    downstream state-machine test.
+    """
+
+    gpu_pool_module.validate_dispatch_plan_for_planning(
+        plan,
+        planning_context=execution_context,
+    )
+
+    def validate_replayed_plan(candidate, *, execution_context: object) -> None:
+        if execution_context is not execution_context_value:
+            raise AssertionError("engine test changed its planning context")
+        gpu_pool_module.validate_dispatch_plan_for_planning(
+            candidate,
+            planning_context=execution_context_value,
+        )
+
+    execution_context_value = execution_context
+    with patch.object(
+        gpu_pool_module,
+        "validate_dispatch_plan_for_execution",
+        validate_replayed_plan,
+    ):
+        return await execute_dispatch_plan(
+            plan,
+            execution_context=execution_context,  # type: ignore[arg-type]
+            runner=runner,
+            resume_receipt=resume_receipt,
+            stop_after_wave_index=stop_after_wave_index,
+        )
+
+
+def _validate_planning_resume_for_engine_test(
+    plan: GpuDispatchPlan,
+    receipt: DispatchScheduleReceipt,
+    *,
+    execution_context: GpuDispatchPlanningContext,
+) -> None:
+    """Reach receipt-structure gates after an exact planning replay."""
+
+    def validate_replayed_plan(candidate, *, execution_context: object) -> None:
+        if execution_context is not execution_context_value:
+            raise AssertionError("resume test changed its planning context")
+        gpu_pool_module.validate_dispatch_plan_for_planning(
+            candidate,
+            planning_context=execution_context_value,
+        )
+
+    execution_context_value = execution_context
+    with patch.object(
+        gpu_pool_module,
+        "validate_dispatch_plan_for_execution",
+        validate_replayed_plan,
+    ):
+        validate_dispatch_resume(
+            plan,
+            receipt,
+            execution_context=execution_context,  # type: ignore[arg-type]
+        )
+
+
+def _restore_planning_schedule_receipt_for_engine_test(
+    value: object,
+    *,
+    sidecar: ArtifactSidecar,
+    plan: GpuDispatchPlan,
+    execution_context: GpuDispatchPlanningContext,
+) -> DispatchScheduleReceipt:
+    """Round-trip a receipt while retaining exact planning-plan replay."""
+
+    def validate_replayed_plan(candidate, *, execution_context: object) -> None:
+        if execution_context is not execution_context_value:
+            raise AssertionError("receipt test changed its planning context")
+        gpu_pool_module.validate_dispatch_plan_for_planning(
+            candidate,
+            planning_context=execution_context_value,
+        )
+
+    execution_context_value = execution_context
+    with patch.object(
+        gpu_pool_module,
+        "validate_dispatch_plan_for_execution",
+        validate_replayed_plan,
+    ):
+        return DispatchScheduleReceipt.from_dict(
+            value,
+            sidecar=sidecar,
+            plan=plan,
+            execution_context=execution_context,  # type: ignore[arg-type]
+        )
+
+
+def test_generic_stage_activation_is_replayed_before_scheduling(
+    registry: ExperimentRegistry,
+) -> None:
+    context = _e3a_execution_context(
+        registry,
+        _inventory(2),
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("generic-activation-replay")
+        ),
+    )
+    artifact = context.activation_artifact
+    assert isinstance(artifact, RegistryStageActivationArtifact)
+    blocked_index = next(
+        index
+        for index, row in enumerate(artifact.dispositions)
+        if row.status is RegistryStageDispositionStatus.BLOCKED
+    )
+    edited_rows = list(artifact.dispositions)
+    edited_rows[blocked_index] = replace(
+        edited_rows[blocked_index],
+        reason_code="caller_edited_dispatch_disposition",
+    )
+    edited = replace(artifact, dispositions=tuple(edited_rows))
+
+    with pytest.raises(ValueError, match="exact reducer-generated"):
+        replace(context, activation_artifact=edited).issue_plan()
 
 
 def test_bare_completed_cells_are_planning_only_and_cannot_skip_the_runner(
@@ -539,6 +704,7 @@ def test_bare_completed_cells_are_planning_only_and_cannot_skip_the_runner(
         ),
         receipts=base.receipts,
         completed_cell_ids=(completed_cell_id,),
+        activation_artifact=base.activation_artifact,
         port_start=base.port_start,
         port_end=base.port_end,
         seed=base.seed,
@@ -565,7 +731,7 @@ def test_bare_completed_cells_are_planning_only_and_cannot_skip_the_runner(
                 runner=runner,
             )
         )
-    with pytest.raises(ValueError, match="cannot trust bare completed cell IDs"):
+    with pytest.raises(TypeError, match="budget_plan"):
         GpuDispatchExecutionContext(
             registry=registry,
             inventory=inventory,
@@ -573,6 +739,7 @@ def test_bare_completed_cells_are_planning_only_and_cannot_skip_the_runner(
             budgets=planning.budgets,
             receipts=planning.receipts,
             completed_cell_ids=planning.completed_cell_ids,
+            activation_artifact=planning.activation_artifact,
             port_start=planning.port_start,
             port_end=planning.port_end,
             seed=planning.seed,
@@ -880,7 +1047,7 @@ def test_required_pool_sizes_fill_one_deterministic_wave(
 
 
 @pytest.mark.parametrize("size", (1, 2, 4, 8, 16))
-def test_scheduler_issued_context_executes_on_required_pool_sizes(
+def test_digest_only_runner_cannot_complete_required_pool_sizes(
     registry: ExperimentRegistry,
     size: int,
 ) -> None:
@@ -903,24 +1070,29 @@ def test_scheduler_issued_context_executes_on_required_pool_sizes(
         return content_sha256({"terminal": assignment.assignment_id})
 
     receipt = asyncio.run(
-        execute_dispatch_plan(
+        _execute_planning_dispatch_for_engine_test(
             plan,
             execution_context=context,
             runner=runner,
         )
     )
 
-    assert receipt.phase is DispatchExecutionPhase.COMPLETE
-    assert len(calls) == len(context.budgets)
+    assert receipt.phase is DispatchExecutionPhase.FAILED
+    assert set(calls) == {
+        assignment.assignment_id for assignment in plan.waves[0].assignments
+    }
+    assert all(
+        row.status is AssignmentExecutionStatus.FAILED
+        and row.terminal_receipt_sha256 is None
+        and row.terminal_binding is None
+        and row.failure_sha256 is not None
+        for row in receipt.wave_receipts[0].assignment_receipts
+    )
     assert receipt.fixed_instance_gpu_count == size
     assert receipt.fixed_instance_actual_billed_gpu_ns == (
         sum(finish - start for start, finish in receipt.active_intervals_monotonic_ns)
         * size
     )
-    if size > 1:
-        assert receipt.per_assignment_attributed_fixed_instance_gpu_ns > (
-            receipt.fixed_instance_actual_billed_gpu_ns
-        )
 
 
 def test_scheduler_accepts_positive_non_gate_pool_size(
@@ -978,9 +1150,25 @@ def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
         for cell in registry.cells_for("preflight")
         if cell.identity.method == "target_only"
     )
-    item = registry_pool_work_item(preflight, estimated_duration_seconds=1.0)
-    scheduler = _scheduler(
+    # Exercise the generic TP placement primitive without treating the blocked
+    # COMPILE declaration as executable authority.
+    topology_cell = replace(
+        preflight,
+        resources=replace(
+            preflight.resources,
+            workload_class=WorkloadClass.CORRECTNESS,
+        ),
+    )
+    topology_registry = replace(
         registry,
+        cells=tuple(
+            topology_cell if cell.cell_id == preflight.cell_id else cell
+            for cell in registry.cells
+        ),
+    )
+    item = registry_pool_work_item(topology_cell, estimated_duration_seconds=1.0)
+    scheduler = _scheduler(
+        topology_registry,
         inventory,
         InterferenceEnvelope.serial(source_receipt_sha256=content_sha256("serial")),
     )
@@ -1012,7 +1200,7 @@ def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
     one_gpu = _inventory(1)
     with pytest.raises(CapabilityRejectionError, match="no ready capability"):
         _scheduler(
-            registry,
+            topology_registry,
             one_gpu,
             InterferenceEnvelope.serial(
                 source_receipt_sha256=content_sha256("serial-one")
@@ -1091,7 +1279,7 @@ def test_affinity_groups_stay_on_one_gpu_and_balance_across_pool(
     assert max(counts.values()) - min(counts.values()) == 0
 
 
-def test_compile_is_host_exclusive_and_blocked_methods_never_dispatch(
+def test_nonserving_cells_without_terminal_contracts_never_dispatch(
     registry: ExperimentRegistry,
 ) -> None:
     inventory = _inventory(4)
@@ -1102,6 +1290,17 @@ def test_compile_is_host_exclusive_and_blocked_methods_never_dispatch(
         registry_pool_work_item(cell, estimated_duration_seconds=1.0)
         for cell in registry.cells_for("preflight")
         if cell.identity.method == "target_only"
+    )
+    download = next(
+        registry_pool_work_item(cell, estimated_duration_seconds=1.0)
+        for cell in registry.cells_for("E6")
+        if cell.resources.workload_class is WorkloadClass.DOWNLOAD
+    )
+    assert release_dispatch_rejection_reason(preflight.cell) == (
+        RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
+    )
+    assert release_dispatch_rejection_reason(download.cell) == (
+        RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE
     )
     rules = tuple(
         sorted(
@@ -1121,20 +1320,12 @@ def test_compile_is_host_exclusive_and_blocked_methods_never_dispatch(
         rules=rules,
         source_receipt_sha256=content_sha256("envelope"),
     )
-    plan = _scheduler(registry, inventory, envelope).schedule_work_items(
-        (tuning, preflight), receipts_sha256=content_sha256("receipts")
-    )
-
-    compile_waves = tuple(
-        wave
-        for wave in plan.waves
-        if any(
-            assignment.work_item.claim.workload_class is WorkloadClass.COMPILE
-            for assignment in wave.assignments
-        )
-    )
-    assert len(compile_waves) == 1
-    assert len(compile_waves[0].assignments) == 1
+    for nonserving in (preflight, download):
+        with pytest.raises(ValueError, match="non-executable"):
+            _scheduler(registry, inventory, envelope).schedule_work_items(
+                (tuning, nonserving),
+                receipts_sha256=content_sha256("receipts"),
+            )
 
     blocked_profile = next(
         registry_pool_work_item(cell, estimated_duration_seconds=1.0)
@@ -1222,7 +1413,7 @@ def test_forged_static_plan_is_rejected_before_runner_or_contextual_parse(
         )
     with pytest.raises(ValueError, match="not the exact plan"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 forged,
                 execution_context=context,
                 runner=runner,
@@ -1275,7 +1466,7 @@ def test_canonical_e5_target_cannot_bypass_ready_stage_dag(
 
     with pytest.raises(ValueError, match="not the exact plan"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 forged,
                 execution_context=context,
                 runner=runner,
@@ -1312,7 +1503,7 @@ def test_forged_noncanonical_claim_is_rejected_before_runner(
 
     with pytest.raises(ValueError, match="not the exact plan"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 forged,
                 execution_context=context,
                 runner=runner,
@@ -1346,7 +1537,7 @@ def test_forged_unready_capability_assignment_is_rejected_before_runner(
 
     with pytest.raises(ValueError, match="not the exact plan"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 forged,
                 execution_context=context,
                 runner=runner,
@@ -1388,7 +1579,7 @@ def test_forged_concurrent_wave_recomputes_interference_before_runner(
 
     with pytest.raises(ValueError, match="not the exact plan"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 forged,
                 execution_context=context,
                 runner=runner,
@@ -1397,7 +1588,7 @@ def test_forged_concurrent_wave_recomputes_interference_before_runner(
     assert calls == []
 
 
-def test_partial_sibling_failure_is_receipted_but_untrusted_resume_is_blocked(
+def test_digest_siblings_and_rehashed_failure_resume_fail_closed(
     registry: ExperimentRegistry,
 ) -> None:
     inventory = _inventory(2)
@@ -1407,8 +1598,8 @@ def test_partial_sibling_failure_is_receipted_but_untrusted_resume_is_blocked(
     envelope = _envelope_for(inventory, first_item, (2,))
     context = _e3a_execution_context(registry, inventory, envelope)
     plan = context.issue_plan()
-    assert len(plan.waves[-1].assignments) == 2
-    failed_id = plan.waves[-1].assignments[0].assignment_id
+    assert len(plan.waves[0].assignments) == 2
+    failed_id = plan.waves[0].assignments[0].assignment_id
     first_calls: list[str] = []
 
     async def first_runner(assignment):
@@ -1418,18 +1609,24 @@ def test_partial_sibling_failure_is_receipted_but_untrusted_resume_is_blocked(
         return content_sha256({"terminal": assignment.assignment_id})
 
     failed = asyncio.run(
-        execute_dispatch_plan(
+        _execute_planning_dispatch_for_engine_test(
             plan,
             execution_context=context,
             runner=first_runner,
         )
     )
     assert failed.phase is DispatchExecutionPhase.FAILED
-    assert failed.wave_receipts[-1].partial_sibling_failure
-    assert len(first_calls) == len(context.budgets)
+    assert not failed.wave_receipts[-1].partial_sibling_failure
+    assert set(first_calls) == {
+        assignment.assignment_id for assignment in plan.waves[0].assignments
+    }
     assert {
         receipt.status for receipt in failed.wave_receipts[-1].assignment_receipts
-    } == {AssignmentExecutionStatus.SUCCEEDED, AssignmentExecutionStatus.FAILED}
+    } == {AssignmentExecutionStatus.FAILED}
+    assert all(
+        row.terminal_receipt_sha256 is None and row.terminal_binding is None
+        for row in failed.wave_receipts[-1].assignment_receipts
+    )
     failed_attempt = next(
         row
         for row in failed.wave_receipts[-1].assignment_receipts
@@ -1449,9 +1646,9 @@ def test_partial_sibling_failure_is_receipted_but_untrusted_resume_is_blocked(
         resume_calls.append(assignment.assignment_id)
         return content_sha256({"terminal": assignment.assignment_id, "retry": 2})
 
-    with pytest.raises(ValueError, match="durable terminal artifact store"):
+    with pytest.raises(ValueError, match="append-only attempt/cost authority"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 plan,
                 execution_context=context,
                 runner=resume_runner,
@@ -1460,12 +1657,52 @@ def test_partial_sibling_failure_is_receipted_but_untrusted_resume_is_blocked(
         )
     assert resume_calls == []
 
+    forged_rows = tuple(
+        replace(
+            row,
+            attempt_intervals_monotonic_ns=((0, 0),),
+            attributed_gpu_ns=0,
+            attributed_fixed_instance_gpu_ns=0,
+        )
+        for row in failed.wave_receipts[-1].assignment_receipts
+    )
+    forged_wave = replace(
+        failed.wave_receipts[-1],
+        assignment_receipts=forged_rows,
+        active_intervals_monotonic_ns=((0, 0),),
+        fixed_instance_actual_billed_gpu_ns=0,
+        per_assignment_attributed_gpu_ns=0,
+        per_assignment_attributed_fixed_instance_gpu_ns=0,
+    )
+    forged = replace(
+        failed,
+        wave_receipts=(forged_wave,),
+        active_intervals_monotonic_ns=((0, 0),),
+        fixed_instance_actual_billed_gpu_ns=0,
+        per_assignment_attributed_gpu_ns=0,
+        per_assignment_attributed_fixed_instance_gpu_ns=0,
+    )
+    assert forged.sha256 != failed.sha256
+    restored = _restore_planning_schedule_receipt_for_engine_test(
+        json.loads(json.dumps(forged.to_dict())),
+        sidecar=forged.sidecar(),
+        plan=plan,
+        execution_context=context,
+    )
+    assert restored == forged
+    with pytest.raises(ValueError, match="append-only attempt/cost authority"):
+        _validate_planning_resume_for_engine_test(
+            plan,
+            restored,
+            execution_context=context,
+        )
+
     other_inventory = _inventory(2, source="other-inventory")
     other_envelope = _envelope_for(other_inventory, first_item, (2,))
     foreign_context = _e3a_execution_context(registry, other_inventory, other_envelope)
     foreign_plan = foreign_context.issue_plan()
     with pytest.raises(ValueError, match="another dispatch plan"):
-        validate_dispatch_resume(
+        _validate_planning_resume_for_engine_test(
             foreign_plan,
             failed,
             execution_context=foreign_context,
@@ -1486,7 +1723,7 @@ def test_forged_inner_plan_wave_receipt_cannot_skip_runner(
         return content_sha256({"terminal": assignment.assignment_id})
 
     complete = asyncio.run(
-        execute_dispatch_plan(
+        _execute_planning_dispatch_for_engine_test(
             plan,
             execution_context=context,
             runner=initial_runner,
@@ -1517,7 +1754,7 @@ def test_forged_inner_plan_wave_receipt_cannot_skip_runner(
 
     with pytest.raises(ValueError, match="plan/wave mismatch"):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 plan,
                 execution_context=context,
                 runner=resume_runner,
@@ -1551,7 +1788,7 @@ def test_unbound_low_level_diagnostic_plan_cannot_execute(
         asyncio.run(
             execute_dispatch_plan(
                 plan,
-                execution_context=context,
+                execution_context=context,  # type: ignore[arg-type]
                 runner=runner,
             )
         )
@@ -1572,7 +1809,7 @@ def test_dispatch_cancellation_is_not_relabelled_as_a_failed_measurement(
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
-            execute_dispatch_plan(
+            _execute_planning_dispatch_for_engine_test(
                 plan,
                 execution_context=context,
                 runner=runner,
@@ -1602,7 +1839,7 @@ def test_failure_stops_before_later_frozen_wave(
         raise RuntimeError("wave failure")
 
     receipt = asyncio.run(
-        execute_dispatch_plan(
+        _execute_planning_dispatch_for_engine_test(
             plan,
             execution_context=context,
             runner=runner,
@@ -1612,6 +1849,103 @@ def test_failure_stops_before_later_frozen_wave(
     assert receipt.phase is DispatchExecutionPhase.FAILED
     assert len(receipt.wave_receipts) == 1
     assert set(calls) == first_wave_ids
+
+
+def test_successful_wave_prefix_is_a_durable_running_receipt(
+    registry: ExperimentRegistry,
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(1)
+    envelope = InterferenceEnvelope.serial(
+        source_receipt_sha256=content_sha256("durable-wave-prefix")
+    )
+    context = _e3a_execution_context(registry, inventory, envelope)
+    plan = context.issue_plan()
+    assert len(plan.waves) > 1
+
+    def synthetic_success(**kwargs):
+        assignment = kwargs["assignment"]
+        budget = kwargs["budget"]
+        wave = kwargs["wave"]
+        evidence_path = str(
+            (tmp_path / f"{assignment.assignment_id}.parquet").resolve()
+        )
+        binding = AssignmentTerminalBinding(
+            authority_sha256=content_sha256(
+                {"assignment": assignment.assignment_id, "authority": "raw-test"}
+            ),
+            cell_id=assignment.work_item.item_id,
+            assignment_sha256=assignment.assignment_id,
+            budget_sha256=budget.sha256,
+            inventory_sha256=inventory.sha256,
+            physical_gpu_uuids=assignment.gpu_uuids,
+            execution_plan_sha256=content_sha256("synthetic-execution-plan"),
+            dispatch_plan_sha256=plan.sha256,
+            run_id=f"synthetic-{assignment.assignment_id[:16]}",
+            run_nonce_sha256=content_sha256("synthetic-run-nonce"),
+            terminal_receipt_path=str((tmp_path / "terminal.json").resolve()),
+            terminal_receipt_sha256=content_sha256("terminal"),
+            budget_observation_path=str((tmp_path / "budget.json").resolve()),
+            budget_observation_sha256=content_sha256("budget"),
+            budget_observation_sidecar_path=str(
+                (tmp_path / "budget.json.sha256").resolve()
+            ),
+            budget_observation_sidecar_sha256=content_sha256("budget-sidecar"),
+            native_terminal_artifact_path=str((tmp_path / "native.json").resolve()),
+            native_terminal_raw_sha256=content_sha256("native-raw"),
+            native_terminal_sha256=content_sha256("native"),
+            trusted_attester_policy_sha256=content_sha256("trusted-policy"),
+            evidence_file_paths=(evidence_path,),
+            evidence_file_sha256s=(content_sha256("evidence"),),
+        )
+        return AssignmentExecutionReceipt(
+            plan_sha256=plan.sha256,
+            wave_sha256=wave.sha256,
+            assignment_sha256=assignment.assignment_id,
+            budget_sha256=budget.sha256,
+            attempt=kwargs["attempt"],
+            status=AssignmentExecutionStatus.SUCCEEDED,
+            terminal_receipt_sha256=binding.sha256,
+            terminal_binding=binding,
+            failure_sha256=None,
+            prior_attempt_receipt_sha256=None,
+            gpu_count=len(assignment.gpu_uuids),
+            fixed_instance_gpu_count=len(inventory.devices),
+            attempt_intervals_monotonic_ns=((1, 2),),
+            attributed_gpu_ns=len(assignment.gpu_uuids),
+            attributed_fixed_instance_gpu_ns=len(inventory.devices),
+        )
+
+    wave = plan.waves[0]
+    assignment_receipts = tuple(
+        synthetic_success(
+            assignment=assignment,
+            budget=context.budgets_by_cell_id[assignment.work_item.item_id],
+            wave=wave,
+            attempt=1,
+        )
+        for assignment in wave.assignments
+    )
+    wave_receipt = gpu_pool_module._make_wave_execution_receipt(
+        plan=plan,
+        wave=wave,
+        assignment_receipts=assignment_receipts,
+        execution_context=context,
+    )
+    receipt = gpu_pool_module._make_schedule_receipt(
+        plan=plan,
+        phase=DispatchExecutionPhase.RUNNING,
+        wave_receipts=(wave_receipt,),
+        execution_context=context,
+        prior_schedule_receipt_sha256=None,
+    )
+
+    assert receipt.phase is DispatchExecutionPhase.RUNNING
+    assert len(receipt.wave_receipts) == 1
+    serialized = json.loads(json.dumps(receipt.to_dict()))
+    assert serialized["phase"] == DispatchExecutionPhase.RUNNING.value
+    assert serialized["wave_receipt_sha256"] == [wave_receipt.sha256]
+    assert receipt.sidecar().artifact_sha256 == receipt.sha256
 
 
 def test_inventory_and_interference_digests_are_canonical() -> None:
@@ -1637,14 +1971,14 @@ def test_inventory_and_interference_digests_are_canonical() -> None:
         )
 
 
-def test_empty_frozen_plan_has_a_complete_noop_receipt(
+def test_empty_planning_plan_cannot_mint_an_execution_receipt(
     registry: ExperimentRegistry,
 ) -> None:
     inventory = _inventory(1)
     envelope = InterferenceEnvelope.serial(
         source_receipt_sha256=content_sha256("serial")
     )
-    context = GpuDispatchExecutionContext(
+    context = GpuDispatchPlanningContext(
         registry=registry,
         inventory=inventory,
         interference_envelope=envelope,
@@ -1658,21 +1992,13 @@ def test_empty_frozen_plan_has_a_complete_noop_receipt(
     async def runner(_assignment):
         raise AssertionError("empty plan must not invoke its runner")
 
-    receipt = asyncio.run(
-        execute_dispatch_plan(
-            plan,
-            execution_context=context,
-            runner=runner,
-        )
-    )
-
-    assert receipt.phase is DispatchExecutionPhase.COMPLETE
-    assert receipt.wave_receipts == ()
-    with pytest.raises(ValueError, match="durable terminal artifact store"):
-        validate_dispatch_resume(
-            plan,
-            receipt,
-            execution_context=context,
+    with pytest.raises(TypeError, match="GpuDispatchExecutionContext"):
+        asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=context,  # type: ignore[arg-type]
+                runner=runner,
+            )
         )
 
 
@@ -1725,14 +2051,14 @@ def test_cli_artifacts_round_trip_full_content_and_reject_tampering(
         return content_sha256({"terminal": assignment.assignment_id})
 
     receipt = asyncio.run(
-        execute_dispatch_plan(
+        _execute_planning_dispatch_for_engine_test(
             plan,
             execution_context=context,
             runner=runner,
         )
     )
     receipt_json = json.loads(json.dumps(receipt.to_dict()))
-    restored_receipt = DispatchScheduleReceipt.from_dict(
+    restored_receipt = _restore_planning_schedule_receipt_for_engine_test(
         receipt_json,
         sidecar=receipt.sidecar(),
         plan=restored_plan,
@@ -1763,3 +2089,910 @@ def test_cli_artifacts_round_trip_full_content_and_reject_tampering(
             tampered,
             planning_context=context,
         )
+
+
+def _journal_terminal_binding(
+    tmp_path: Path,
+    *,
+    plan: GpuDispatchPlan,
+    context: GpuDispatchPlanningContext,
+    assignment: GpuAssignment,
+    budget: ExperimentBudget,
+    label: str,
+) -> AssignmentTerminalBinding:
+    evidence_path = str((tmp_path / f"{label}.evidence.parquet").resolve())
+    return AssignmentTerminalBinding(
+        authority_sha256=content_sha256({"authority": label}),
+        cell_id=assignment.work_item.item_id,
+        assignment_sha256=assignment.assignment_id,
+        budget_sha256=budget.sha256,
+        inventory_sha256=context.inventory.sha256,
+        physical_gpu_uuids=assignment.gpu_uuids,
+        execution_plan_sha256=content_sha256({"execution-plan": label}),
+        dispatch_plan_sha256=plan.sha256,
+        run_id=f"journal-{label}",
+        run_nonce_sha256=content_sha256({"nonce": label}),
+        terminal_receipt_path=str((tmp_path / f"{label}.terminal.json").resolve()),
+        terminal_receipt_sha256=content_sha256({"terminal": label}),
+        budget_observation_path=str((tmp_path / f"{label}.budget.json").resolve()),
+        budget_observation_sha256=content_sha256({"budget": label}),
+        budget_observation_sidecar_path=str(
+            (tmp_path / f"{label}.budget.json.sha256").resolve()
+        ),
+        budget_observation_sidecar_sha256=content_sha256({"budget-sidecar": label}),
+        native_terminal_artifact_path=str(
+            (tmp_path / f"{label}.native.json").resolve()
+        ),
+        native_terminal_raw_sha256=content_sha256({"native-raw": label}),
+        native_terminal_sha256=content_sha256({"native": label}),
+        trusted_attester_policy_sha256=content_sha256({"policy": label}),
+        evidence_file_paths=(evidence_path,),
+        evidence_file_sha256s=(content_sha256({"evidence": label}),),
+    )
+
+
+def _journal_assignment_receipt(
+    *,
+    plan: GpuDispatchPlan,
+    wave: GpuDispatchWave,
+    assignment: GpuAssignment,
+    budget: ExperimentBudget,
+    attempt: int,
+    started_ns: int,
+    prior: AssignmentExecutionReceipt | None,
+    fixed_instance_gpu_count: int,
+    terminal_binding: AssignmentTerminalBinding | None,
+) -> AssignmentExecutionReceipt:
+    finished_ns = started_ns + 1
+    intervals = (() if prior is None else prior.attempt_intervals_monotonic_ns) + (
+        (started_ns, finished_ns),
+    )
+    elapsed_ns = sum(finish - start for start, finish in intervals)
+    succeeded = terminal_binding is not None
+    return AssignmentExecutionReceipt(
+        plan_sha256=plan.sha256,
+        wave_sha256=wave.sha256,
+        assignment_sha256=assignment.assignment_id,
+        budget_sha256=budget.sha256,
+        attempt=attempt,
+        status=(
+            AssignmentExecutionStatus.SUCCEEDED
+            if succeeded
+            else AssignmentExecutionStatus.FAILED
+        ),
+        terminal_receipt_sha256=(
+            None if terminal_binding is None else terminal_binding.sha256
+        ),
+        terminal_binding=terminal_binding,
+        failure_sha256=(
+            None
+            if succeeded
+            else content_sha256(
+                {"assignment": assignment.assignment_id, "attempt": attempt}
+            )
+        ),
+        prior_attempt_receipt_sha256=None if prior is None else prior.sha256,
+        gpu_count=len(assignment.gpu_uuids),
+        fixed_instance_gpu_count=fixed_instance_gpu_count,
+        attempt_intervals_monotonic_ns=intervals,
+        attributed_gpu_ns=elapsed_ns * len(assignment.gpu_uuids),
+        attributed_fixed_instance_gpu_ns=elapsed_ns * fixed_instance_gpu_count,
+    )
+
+
+def test_append_only_journal_recovers_partial_sibling_and_retries_only_failure(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(2)
+    first_item = registry_pool_work_item(
+        _target_tuning_cells(registry, 1)[0], estimated_duration_seconds=1.0
+    )
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        _envelope_for(inventory, first_item, (2,)),
+    )
+    plan = context.issue_plan()
+    wave = plan.waves[0]
+    assert len(wave.assignments) == 2
+    budgets = context.budgets_by_cell_id
+    attempts = tuple(
+        (assignment, 1, budgets[assignment.work_item.item_id], None)
+        for assignment in wave.assignments
+    )
+    journal_root = tmp_path / "attempt-journal"
+    journal = DispatchAttemptJournal.open_or_create(
+        journal_root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+
+    async def first_wave() -> None:
+        await journal.begin_wave_attempts(
+            plan=plan,
+            wave=wave,
+            attempts=attempts,
+            prior_schedule_receipt_sha256=None,
+        )
+        tokens = []
+        for assignment, attempt, budget, prior in attempts:
+            tokens.append(
+                await journal.begin_attempt(
+                    plan=plan,
+                    wave=wave,
+                    assignment=assignment,
+                    attempt=attempt,
+                    budget=budget,
+                    fixed_instance_gpu_count=len(inventory.devices),
+                    prior_attempt_receipt=prior,
+                    prior_schedule_receipt_sha256=None,
+                )
+            )
+        success_assignment, failed_assignment = wave.assignments
+        success_budget = budgets[success_assignment.work_item.item_id]
+        failed_budget = budgets[failed_assignment.work_item.item_id]
+        success = _journal_assignment_receipt(
+            plan=plan,
+            wave=wave,
+            assignment=success_assignment,
+            budget=success_budget,
+            attempt=1,
+            started_ns=tokens[0].started_monotonic_ns,
+            prior=None,
+            fixed_instance_gpu_count=len(inventory.devices),
+            terminal_binding=_journal_terminal_binding(
+                tmp_path,
+                plan=plan,
+                context=context,
+                assignment=success_assignment,
+                budget=success_budget,
+                label="sibling-success",
+            ),
+        )
+        failure = _journal_assignment_receipt(
+            plan=plan,
+            wave=wave,
+            assignment=failed_assignment,
+            budget=failed_budget,
+            attempt=1,
+            started_ns=tokens[1].started_monotonic_ns,
+            prior=None,
+            fixed_instance_gpu_count=len(inventory.devices),
+            terminal_binding=None,
+        )
+        await journal.finish_attempt(token=tokens[0], receipt=success)
+        await journal.finish_attempt(token=tokens[1], receipt=failure)
+
+    asyncio.run(first_wave())
+    failed_snapshot = journal.replay()
+    failed_snapshot.require_complete_cost_authority()
+    assert failed_snapshot.receipt is not None
+    assert failed_snapshot.receipt.phase is DispatchExecutionPhase.FAILED
+    assert failed_snapshot.receipt.wave_receipts[-1].partial_sibling_failure
+    original_binding = failed_snapshot.binding
+    assert original_binding is not None
+    envelope_path = tmp_path / "failed-wave-receipt.json"
+    publish_dispatch_schedule_receipt(
+        envelope_path,
+        failed_snapshot.receipt,
+        attempt_journal=original_binding,
+    )
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    assert envelope["schema_version"] == 2
+    assert envelope["attempt_journal"] == original_binding.to_dict()
+
+    # Coordinator crash after all FINISH rows but before the schedule envelope.
+    reopened = DispatchAttemptJournal.open_or_create(
+        journal_root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+    assert reopened.replay().receipt == failed_snapshot.receipt
+    failed_row = next(
+        row
+        for row in failed_snapshot.latest_assignment_receipts
+        if row.status is AssignmentExecutionStatus.FAILED
+    )
+    failed_assignment = next(
+        row
+        for row in wave.assignments
+        if row.assignment_id == failed_row.assignment_sha256
+    )
+    failed_budget = budgets[failed_assignment.work_item.item_id]
+
+    async def retry_failure_only() -> None:
+        retry_attempts = ((failed_assignment, 2, failed_budget, failed_row),)
+        await reopened.begin_wave_attempts(
+            plan=plan,
+            wave=wave,
+            attempts=retry_attempts,
+            prior_schedule_receipt_sha256=failed_snapshot.receipt.sha256,
+        )
+        token = await reopened.begin_attempt(
+            plan=plan,
+            wave=wave,
+            assignment=failed_assignment,
+            attempt=2,
+            budget=failed_budget,
+            fixed_instance_gpu_count=len(inventory.devices),
+            prior_attempt_receipt=failed_row,
+            prior_schedule_receipt_sha256=failed_snapshot.receipt.sha256,
+        )
+        succeeded = _journal_assignment_receipt(
+            plan=plan,
+            wave=wave,
+            assignment=failed_assignment,
+            budget=failed_budget,
+            attempt=2,
+            started_ns=token.started_monotonic_ns,
+            prior=failed_row,
+            fixed_instance_gpu_count=len(inventory.devices),
+            terminal_binding=_journal_terminal_binding(
+                tmp_path,
+                plan=plan,
+                context=context,
+                assignment=failed_assignment,
+                budget=failed_budget,
+                label="sibling-retry-success",
+            ),
+        )
+        await reopened.finish_attempt(token=token, receipt=succeeded)
+
+    asyncio.run(retry_failure_only())
+    recovered = reopened.replay()
+    recovered.require_complete_cost_authority()
+    assert recovered.receipt is not None
+    assert recovered.receipt.wave_receipts[0].succeeded
+    retried = next(
+        row
+        for row in recovered.latest_assignment_receipts
+        if row.assignment_sha256 == failed_assignment.assignment_id
+    )
+    assert retried.attempt == 2
+    assert len(retried.attempt_intervals_monotonic_ns) == 2
+    assert retried.prior_attempt_receipt_sha256 == failed_row.sha256
+
+    # The older receipt remains a valid immutable prefix after append-only retry.
+    DispatchAttemptJournal.open_or_create(
+        journal_root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+        expected_prefix=original_binding,
+    )
+
+    final_binding = recovered.binding
+    assert final_binding is not None
+    event_paths = tuple(sorted((journal_root / "events").iterdir()))
+    first_event = event_paths[0]
+    first_body = first_event.read_bytes()
+    first_event.chmod(0o600)
+    first_event.write_bytes(first_body + b" ")
+    first_event.chmod(0o400)
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="event_digest_mismatch",
+    ):
+        reopened.replay()
+    first_event.chmod(0o600)
+    first_event.write_bytes(first_body)
+    first_event.chmod(0o400)
+
+    deleted_body = first_event.read_bytes()
+    first_event.unlink()
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="sequence_gap",
+    ):
+        reopened.replay()
+    first_event.write_bytes(deleted_body)
+    first_event.chmod(0o400)
+
+    outside = tmp_path / "symlink-event-backup.json"
+    first_event.replace(outside)
+    first_event.symlink_to(outside)
+    with pytest.raises((RuntimeError, ValueError)):
+        reopened.replay()
+    first_event.unlink()
+    outside.replace(first_event)
+
+    # Coordinated row+file rehash still cannot cross the immutable envelope
+    # head that was published before the mutation.
+    last_event = tuple(sorted((journal_root / "events").iterdir()))[-1]
+    last_value = json.loads(last_event.read_text(encoding="utf-8"))
+    binding_value = last_value["payload"]["assignment_receipt"]["terminal_binding"]
+    binding_value["run_id"] = "jointly-rehashed-run"
+    last_value["payload"]["assignment_receipt"]["terminal_receipt_sha256"] = (
+        content_sha256(binding_value)
+    )
+    rewritten_body = (
+        json.dumps(
+            last_value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    rewritten_digest = hashlib.sha256(rewritten_body).hexdigest()
+    rewritten_path = last_event.with_name(
+        f"{int(last_event.name.split('.')[0]):012d}.{rewritten_digest}.json"
+    )
+    last_event.unlink()
+    rewritten_path.write_bytes(rewritten_body)
+    rewritten_path.chmod(0o400)
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="receipt_prefix_mismatch",
+    ):
+        DispatchAttemptJournal.open_or_create(
+            journal_root,
+            plan=plan,
+            execution_context=context,  # type: ignore[arg-type]
+            expected_prefix=final_binding,
+        )
+
+
+def test_append_only_journal_blocks_unfinished_intent_and_foreign_plan(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(1)
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("journal-unfinished")
+        ),
+    )
+    plan = context.issue_plan()
+    wave = plan.waves[0]
+    assignment = wave.assignments[0]
+    budget = context.budgets_by_cell_id[assignment.work_item.item_id]
+    root = tmp_path / "unfinished-journal"
+    journal = DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+
+    async def leave_intent() -> None:
+        await journal.begin_wave_attempts(
+            plan=plan,
+            wave=wave,
+            attempts=((assignment, 1, budget, None),),
+            prior_schedule_receipt_sha256=None,
+        )
+
+    asyncio.run(leave_intent())
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_intent_without_finish_cost_unresolved",
+    ):
+        journal.replay().require_complete_cost_authority()
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="manifest_identity_mismatch",
+    ):
+        DispatchAttemptJournal.open_or_create(
+            root,
+            plan=replace(plan, seed=plan.seed + 1),
+            execution_context=context,  # type: ignore[arg-type]
+        )
+
+
+def test_append_only_journal_enforces_retry_allowance(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(1)
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("journal-retry-limit")
+        ),
+    )
+    plan = context.issue_plan()
+    wave = plan.waves[0]
+    assignment = wave.assignments[0]
+    budget = context.budgets_by_cell_id[assignment.work_item.item_id]
+    assert budget.retry_allowance == 1
+    journal = DispatchAttemptJournal.open_or_create(
+        tmp_path / "retry-limit-journal",
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+
+    async def fail_attempt(
+        attempt: int,
+        prior: AssignmentExecutionReceipt | None,
+        prior_schedule_sha256: str | None,
+    ) -> AssignmentExecutionReceipt:
+        attempts = ((assignment, attempt, budget, prior),)
+        await journal.begin_wave_attempts(
+            plan=plan,
+            wave=wave,
+            attempts=attempts,
+            prior_schedule_receipt_sha256=prior_schedule_sha256,
+        )
+        token = await journal.begin_attempt(
+            plan=plan,
+            wave=wave,
+            assignment=assignment,
+            attempt=attempt,
+            budget=budget,
+            fixed_instance_gpu_count=1,
+            prior_attempt_receipt=prior,
+            prior_schedule_receipt_sha256=prior_schedule_sha256,
+        )
+        receipt = _journal_assignment_receipt(
+            plan=plan,
+            wave=wave,
+            assignment=assignment,
+            budget=budget,
+            attempt=attempt,
+            started_ns=token.started_monotonic_ns,
+            prior=prior,
+            fixed_instance_gpu_count=1,
+            terminal_binding=None,
+        )
+        await journal.finish_attempt(token=token, receipt=receipt)
+        return receipt
+
+    first = asyncio.run(fail_attempt(1, None, None))
+    first_schedule = journal.replay().receipt
+    assert first_schedule is not None
+    asyncio.run(fail_attempt(2, first, first_schedule.sha256))
+    second_snapshot = journal.replay()
+    second_schedule = second_snapshot.receipt
+    assert second_schedule is not None
+    assert second_snapshot.replay_authority is not None
+
+    class ResumeContext:
+        resume_terminal_authorities = ()
+
+        def __getattr__(self, name):
+            return getattr(context, name)
+
+    resume_context = ResumeContext()
+    with patch.object(
+        gpu_pool_module,
+        "validate_dispatch_plan_for_execution",
+        lambda candidate, *, execution_context: None,
+    ):
+        validate_dispatch_resume(
+            plan,
+            second_schedule,
+            execution_context=resume_context,  # type: ignore[arg-type]
+            attempt_journal_replay=second_snapshot.replay_authority,
+        )
+        with pytest.raises(ValueError, match="journal replay differs"):
+            validate_dispatch_resume(
+                plan,
+                replace(
+                    second_schedule,
+                    prior_schedule_receipt_sha256=content_sha256(
+                        "caller-rehashed-schedule"
+                    ),
+                ),
+                execution_context=resume_context,  # type: ignore[arg-type]
+                attempt_journal_replay=second_snapshot.replay_authority,
+            )
+    with pytest.raises(ValueError, match="retry would exceed"):
+        asyncio.run(
+            journal.begin_wave_attempts(
+                plan=plan,
+                wave=wave,
+                attempts=(
+                    (
+                        assignment,
+                        3,
+                        budget,
+                        journal.replay().latest_assignment_receipts[0],
+                    ),
+                ),
+                prior_schedule_receipt_sha256=second_schedule.sha256,
+            )
+        )
+
+
+def test_execute_dispatch_plan_uses_raw_journal_for_failed_resume(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(1)
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("journal-engine-resume")
+        ),
+    )
+    plan = context.issue_plan()
+    journal = DispatchAttemptJournal.open_or_create(
+        tmp_path / "engine-journal",
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+
+    class EngineContext:
+        resume_terminal_authorities = ()
+
+        def __getattr__(self, name):
+            return getattr(context, name)
+
+    engine_context = EngineContext()
+    calls: list[str] = []
+
+    async def failing_runner(assignment):
+        calls.append(assignment.assignment_id)
+        raise RuntimeError("journal-bound synthetic failure")
+
+    with patch.object(
+        gpu_pool_module,
+        "validate_dispatch_plan_for_execution",
+        lambda candidate, *, execution_context: None,
+    ):
+        first = asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=engine_context,  # type: ignore[arg-type]
+                runner=failing_runner,
+                attempt_journal=journal,
+                stop_after_wave_index=0,
+            )
+        )
+        first_snapshot = journal.replay()
+        assert first_snapshot.receipt == first
+        assert first_snapshot.replay_authority is not None
+        second = asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=engine_context,  # type: ignore[arg-type]
+                runner=failing_runner,
+                resume_receipt=first,
+                attempt_journal=journal,
+                attempt_journal_replay=first_snapshot.replay_authority,
+                stop_after_wave_index=0,
+            )
+        )
+        second_snapshot = journal.replay()
+        assert second_snapshot.receipt == second
+        assert second.wave_receipts[-1].assignment_receipts[0].attempt == 2
+        assert (
+            len(
+                second.wave_receipts[-1]
+                .assignment_receipts[0]
+                .attempt_intervals_monotonic_ns
+            )
+            == 2
+        )
+        assert second_snapshot.replay_authority is not None
+        with pytest.raises(ValueError, match="retry would exceed"):
+            asyncio.run(
+                execute_dispatch_plan(
+                    plan,
+                    execution_context=engine_context,  # type: ignore[arg-type]
+                    runner=failing_runner,
+                    resume_receipt=second,
+                    attempt_journal=journal,
+                    attempt_journal_replay=second_snapshot.replay_authority,
+                    stop_after_wave_index=0,
+                )
+            )
+    assert len(calls) == 2
+
+
+def test_execute_dispatch_plan_journal_preserves_true_partial_sibling(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(2)
+    first_item = registry_pool_work_item(
+        _target_tuning_cells(registry, 1)[0], estimated_duration_seconds=1.0
+    )
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        _envelope_for(inventory, first_item, (2,)),
+    )
+    plan = context.issue_plan()
+    wave = plan.waves[0]
+    assert len(wave.assignments) == 2
+    budgets = context.budgets_by_cell_id
+    bindings = {
+        assignment.assignment_id: _journal_terminal_binding(
+            tmp_path,
+            plan=plan,
+            context=context,
+            assignment=assignment,
+            budget=budgets[assignment.work_item.item_id],
+            label=f"engine-partial-{index}",
+        )
+        for index, assignment in enumerate(wave.assignments)
+    }
+    exact_terminal = object.__new__(AssignmentTerminalAuthority)
+
+    def revalidate_terminal(
+        _authority,
+        *,
+        registry,
+        inventory,
+        assignment_sha256,
+        budget_sha256,
+        physical_gpu_uuids,
+    ):
+        assert registry == context.registry
+        assert inventory == context.inventory
+        binding = bindings[assignment_sha256]
+        assert binding.budget_sha256 == budget_sha256
+        assert binding.physical_gpu_uuids == physical_gpu_uuids
+        return binding
+
+    class ResumeAuthority:
+        def __init__(self, binding: AssignmentTerminalBinding) -> None:
+            self.binding = binding
+            self.sha256 = binding.authority_sha256
+
+        def revalidate(self, **kwargs):
+            assert kwargs["assignment_sha256"] == self.binding.assignment_sha256
+            assert kwargs["budget_sha256"] == self.binding.budget_sha256
+            assert kwargs["physical_gpu_uuids"] == self.binding.physical_gpu_uuids
+            return self.binding
+
+    class EngineContext:
+        def __init__(self, resume_authorities=()) -> None:
+            self.resume_terminal_authorities = resume_authorities
+
+        def __getattr__(self, name):
+            return getattr(context, name)
+
+    failed_id = wave.assignments[-1].assignment_id
+    first_calls: list[str] = []
+
+    async def partial_runner(assignment):
+        first_calls.append(assignment.assignment_id)
+        if assignment.assignment_id == failed_id:
+            raise RuntimeError("synthetic true sibling failure")
+        return exact_terminal
+
+    root = tmp_path / "engine-partial-journal"
+    journal = DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+    with (
+        patch.object(
+            gpu_pool_module,
+            "validate_dispatch_plan_for_execution",
+            lambda candidate, *, execution_context: None,
+        ),
+        patch.object(
+            AssignmentTerminalAuthority,
+            "revalidate",
+            revalidate_terminal,
+        ),
+    ):
+        failed = asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=EngineContext(),  # type: ignore[arg-type]
+                runner=partial_runner,
+                attempt_journal=journal,
+                stop_after_wave_index=0,
+            )
+        )
+        failed_snapshot = journal.replay()
+        assert failed_snapshot.receipt == failed
+        assert failed.phase is DispatchExecutionPhase.FAILED
+        assert failed.wave_receipts[-1].partial_sibling_failure
+        succeeded_row = next(
+            row
+            for row in failed.wave_receipts[-1].assignment_receipts
+            if row.status is AssignmentExecutionStatus.SUCCEEDED
+        )
+        assert set(first_calls) == {
+            assignment.assignment_id for assignment in wave.assignments
+        }
+        assert failed_snapshot.binding is not None
+        assert failed_snapshot.replay_authority is not None
+
+        # Simulate a new coordinator process: reconstruct exclusively from the
+        # raw journal and the successful row's reopened terminal authority.
+        reopened = DispatchAttemptJournal.open_or_create(
+            root,
+            plan=plan,
+            execution_context=context,  # type: ignore[arg-type]
+            expected_prefix=failed_snapshot.binding,
+        )
+        replay = reopened.replay()
+        assert replay.receipt == failed
+        assert replay.replay_authority is not None
+        retry_calls: list[str] = []
+
+        async def retry_runner(assignment):
+            retry_calls.append(assignment.assignment_id)
+            return exact_terminal
+
+        recovered = asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=EngineContext(
+                    (ResumeAuthority(bindings[succeeded_row.assignment_sha256]),)
+                ),  # type: ignore[arg-type]
+                runner=retry_runner,
+                resume_receipt=replay.receipt,
+                attempt_journal=reopened,
+                attempt_journal_replay=replay.replay_authority,
+                stop_after_wave_index=0,
+            )
+        )
+
+    assert retry_calls == [failed_id]
+    assert recovered.wave_receipts[0].succeeded
+    retried_row = next(
+        row
+        for row in recovered.wave_receipts[0].assignment_receipts
+        if row.assignment_sha256 == failed_id
+    )
+    assert retried_row.attempt == 2
+    assert len(retried_row.attempt_intervals_monotonic_ns) == 2
+    assert reopened.replay().receipt == recovered
+
+
+def test_execute_dispatch_plan_chains_each_journaled_wave_receipt(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(1)
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("journal-multi-wave-chain")
+        ),
+    )
+    plan = context.issue_plan()
+    assert len(plan.waves) > 1
+    budgets = context.budgets_by_cell_id
+    selected_assignments = tuple(
+        assignment for wave in plan.waves[:2] for assignment in wave.assignments
+    )
+    bindings = {
+        assignment.assignment_id: _journal_terminal_binding(
+            tmp_path,
+            plan=plan,
+            context=context,
+            assignment=assignment,
+            budget=budgets[assignment.work_item.item_id],
+            label=f"engine-chain-{index}",
+        )
+        for index, assignment in enumerate(selected_assignments)
+    }
+    exact_terminal = object.__new__(AssignmentTerminalAuthority)
+
+    def revalidate_terminal(
+        _authority,
+        *,
+        registry,
+        inventory,
+        assignment_sha256,
+        budget_sha256,
+        physical_gpu_uuids,
+    ):
+        assert registry == context.registry
+        assert inventory == context.inventory
+        binding = bindings[assignment_sha256]
+        assert binding.budget_sha256 == budget_sha256
+        assert binding.physical_gpu_uuids == physical_gpu_uuids
+        return binding
+
+    class EngineContext:
+        resume_terminal_authorities = ()
+
+        def __getattr__(self, name):
+            return getattr(context, name)
+
+    async def successful_runner(_assignment):
+        return exact_terminal
+
+    journal = DispatchAttemptJournal.open_or_create(
+        tmp_path / "engine-multi-wave-journal",
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+    with (
+        patch.object(
+            gpu_pool_module,
+            "validate_dispatch_plan_for_execution",
+            lambda candidate, *, execution_context: None,
+        ),
+        patch.object(
+            AssignmentTerminalAuthority,
+            "revalidate",
+            revalidate_terminal,
+        ),
+    ):
+        receipt = asyncio.run(
+            execute_dispatch_plan(
+                plan,
+                execution_context=EngineContext(),  # type: ignore[arg-type]
+                runner=successful_runner,
+                attempt_journal=journal,
+                stop_after_wave_index=1,
+            )
+        )
+
+    snapshot = journal.replay()
+    assert snapshot.receipt == receipt
+    assert len(receipt.wave_receipts) == 2
+    wave_events = []
+    for path in sorted((journal.root / "events").iterdir()):
+        event = json.loads(path.read_text(encoding="utf-8"))
+        if event["event_type"] == "WAVE":
+            wave_events.append(event)
+    assert len(wave_events) == 2
+    assert wave_events[0]["payload"]["prior_schedule_receipt_sha256"] is None
+    second_sequence = wave_events[1]["sequence"]
+    prefix = journal.replay(event_count=second_sequence)
+    assert prefix.receipt is not None
+    assert (
+        wave_events[1]["payload"]["prior_schedule_receipt_sha256"]
+        == prefix.receipt.sha256
+    )
+    assert receipt.prior_schedule_receipt_sha256 == prefix.receipt.sha256
+
+
+@pytest.mark.parametrize("crash_point", ("root", "events", "manifest_prefix"))
+def test_attempt_journal_initialization_safe_prefix_is_idempotent(
+    tmp_path: Path,
+    registry: ExperimentRegistry,
+    crash_point: str,
+) -> None:
+    inventory = _inventory(1)
+    context = _e3a_execution_context(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256({"journal-init-crash": crash_point})
+        ),
+    )
+    plan = context.issue_plan()
+    root = tmp_path / f"journal-init-{crash_point}"
+    root.mkdir(mode=0o700)
+    if crash_point in {"events", "manifest_prefix"}:
+        (root / "events").mkdir(mode=0o700)
+    if crash_point == "manifest_prefix":
+        manifest = {
+            "schema_version": 1,
+            "kind": "industrial_dispatch_attempt_journal",
+            "protocol_sha256": DispatchAttemptJournal._PROTOCOL_SHA256,
+            "journal_path": str(root),
+            "events_path": str(root / "events"),
+            "plan_sha256": plan.sha256,
+            "execution_context_sha256": context.sha256,
+            "inventory_sha256": inventory.sha256,
+            "fixed_instance_gpu_count": 1,
+        }
+        body = execution_bundle_module._canonical_bytes(manifest) + b"\n"
+        (root / "manifest.json").write_bytes(body[: len(body) // 2])
+        (root / "manifest.json").chmod(0o400)
+
+    journal = DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,  # type: ignore[arg-type]
+    )
+    snapshot = journal.replay()
+    assert snapshot.receipt is None
+    assert snapshot.event_sha256s == ()
+    assert tuple(sorted(path.name for path in root.iterdir())) == (
+        "events",
+        "manifest.json",
+    )
+    assert (
+        json.loads((root / "manifest.json").read_text(encoding="utf-8"))["plan_sha256"]
+        == plan.sha256
+    )

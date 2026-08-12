@@ -23,7 +23,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+_LOWER_HEX = re.compile(r"[0-9a-f]+\Z")
 _NONCE_BYTES = 32
+_FORBIDDEN_RELEASE_PREFIXES = ("test", "fixture", "cpu")
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -47,6 +49,10 @@ def _decode_base64(name: str, value: str, *, expected_length: int) -> bytes:
     if len(decoded) != expected_length or base64.b64encode(decoded).decode() != value:
         raise ValueError(f"{name} has the wrong length or noncanonical encoding")
     return decoded
+
+
+def _forbidden_release_identity(value: str) -> bool:
+    return value.lower().startswith(_FORBIDDEN_RELEASE_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -216,34 +222,137 @@ class TrustedAttesterPolicy:
 
     policy_id: str
     trusted_attesters: tuple[tuple[str, str, str], ...]
+    # Terminal wire evidence intentionally never carries a public key.  The
+    # release policy therefore owns the key bytes as well as the allowlisted
+    # digest; accepting key material from the terminal envelope would recreate
+    # a caller-selected trust root.  Rows are ``(public_key_sha256, base64)``.
+    public_keys: tuple[tuple[str, str], ...] = ()
 
     def validate(self) -> None:
         if not _SAFE_ID.fullmatch(self.policy_id):
             raise ValueError("trusted-attester policy ID is unsafe")
         identities = tuple(row[0] for row in self.trusted_attesters)
+        key_ids = tuple(row[1] for row in self.trusted_attesters)
         keys = tuple((row[0], row[1]) for row in self.trusted_attesters)
+        public_key_digests = tuple(row[0] for row in self.public_keys)
         if (
             keys != tuple(sorted(set(keys)))
+            or identities != tuple(sorted(set(identities)))
+            or key_ids != tuple(sorted(set(key_ids)))
             or any(
                 not _SAFE_ID.fullmatch(attester_id)
                 or not _SAFE_ID.fullmatch(key_id)
                 or not _SHA256.fullmatch(public_key_sha256)
+                or _forbidden_release_identity(attester_id)
+                or _forbidden_release_identity(key_id)
                 for attester_id, key_id, public_key_sha256 in self.trusted_attesters
             )
-            or any(identity.lower().startswith("test") for identity in identities)
         ):
             raise ValueError("trusted-attester policy entries are invalid")
+        if public_key_digests != tuple(sorted(set(public_key_digests))):
+            raise ValueError("trusted-attester public keys are duplicated or unsorted")
+        decoded_keys: dict[str, bytes] = {}
+        for public_key_sha256, public_key_base64 in self.public_keys:
+            if not _SHA256.fullmatch(public_key_sha256):
+                raise ValueError("trusted-attester public-key digest is invalid")
+            public_key = _decode_base64(
+                "trusted-attester public key",
+                public_key_base64,
+                expected_length=32,
+            )
+            if hashlib.sha256(public_key).hexdigest() != public_key_sha256:
+                raise ValueError("trusted-attester public key differs from its digest")
+            decoded_keys[public_key_sha256] = public_key
+        required_digests = {row[2] for row in self.trusted_attesters}
+        if set(decoded_keys) != required_digests:
+            raise ValueError(
+                "trusted-attester allowlist and release-owned public keys differ"
+            )
 
     @property
     def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the public, content-addressed release verification policy."""
+
         self.validate()
-        return _content_sha256(
-            {
-                "schema_version": 1,
-                "policy_id": self.policy_id,
-                "trusted_attesters": [list(row) for row in self.trusted_attesters],
-            }
+        return {
+            "schema_version": 1,
+            "policy_id": self.policy_id,
+            "trusted_attesters": [list(row) for row in self.trusted_attesters],
+            "public_keys": [list(row) for row in self.public_keys],
+        }
+
+    @property
+    def release_ready(self) -> bool:
+        self.validate()
+        return bool(self.trusted_attesters)
+
+    def allows_terminal_attester(self, attester_id: str) -> bool:
+        """Return whether terminal verification may select this policy identity."""
+
+        self.validate()
+        return (
+            isinstance(attester_id, str)
+            and not _forbidden_release_identity(attester_id)
+            and sum(row[0] == attester_id for row in self.trusted_attesters) == 1
         )
+
+    def _release_key(self, attester_id: str) -> tuple[str, str, bytes]:
+        self.validate()
+        if not _SAFE_ID.fullmatch(attester_id) or _forbidden_release_identity(
+            attester_id
+        ):
+            raise ValueError("test, fixture, and CPU attesters cannot be trusted")
+        matches = tuple(row for row in self.trusted_attesters if row[0] == attester_id)
+        if len(matches) != 1:
+            raise ValueError("attester identity is not uniquely allowlisted")
+        _, key_id, public_key_sha256 = matches[0]
+        public_key_base64 = dict(self.public_keys)[public_key_sha256]
+        return (
+            key_id,
+            public_key_sha256,
+            _decode_base64(
+                "trusted-attester public key",
+                public_key_base64,
+                expected_length=32,
+            ),
+        )
+
+    def verify_terminal_signature(
+        self,
+        *,
+        attester_id: str,
+        trust_domain: str,
+        message: bytes,
+        signature_hex: str,
+    ) -> tuple[str, str]:
+        """Verify the pinned terminal wire message against this release policy.
+
+        The terminal hook exposes only an attester ID and signature.  Key ID and
+        public key are selected exclusively from this immutable policy.
+        """
+
+        if trust_domain != "hardware":
+            raise ValueError("only hardware terminal attestations can be trusted")
+        if not isinstance(message, bytes) or not message:
+            raise ValueError("terminal attestation message must be non-empty bytes")
+        if (
+            not isinstance(signature_hex, str)
+            or len(signature_hex) != 128
+            or _LOWER_HEX.fullmatch(signature_hex) is None
+        ):
+            raise ValueError("terminal Ed25519 signature is not canonical")
+        key_id, public_key_sha256, public_key = self._release_key(attester_id)
+        try:
+            Ed25519PublicKey.from_public_bytes(public_key).verify(
+                bytes.fromhex(signature_hex),
+                message,
+            )
+        except InvalidSignature as error:
+            raise ValueError("terminal Ed25519 signature is invalid") from error
+        return key_id, public_key_sha256
 
     def verify_release(
         self,
@@ -264,6 +373,10 @@ class TrustedAttesterPolicy:
             raise ValueError(
                 "test attestation identities cannot support release claims"
             )
+        if _forbidden_release_identity(
+            attestation.attester_id
+        ) or _forbidden_release_identity(attestation.key_id):
+            raise ValueError("test, fixture, and CPU identities cannot support claims")
         expected = (
             attestation.attester_id,
             attestation.key_id,
@@ -271,9 +384,43 @@ class TrustedAttesterPolicy:
         )
         if expected not in self.trusted_attesters:
             raise ValueError("attester public key is not in the release policy")
+        _, expected_digest, expected_public_key = self._release_key(
+            attestation.attester_id
+        )
+        observed_public_key = _decode_base64(
+            "public key", attestation.public_key_base64, expected_length=32
+        )
+        if (
+            expected_digest != attestation.public_key_sha256
+            or expected_public_key != observed_public_key
+        ):
+            raise ValueError("signed attestation does not use the release-owned key")
 
 
 NO_TRUSTED_ATTESTERS = TrustedAttesterPolicy(
     policy_id="lightcone-release-no-trusted-attester-v1",
     trusted_attesters=(),
 )
+
+# This is the trust root compiled into the current source release.  Public-key
+# verification remains reusable as a library primitive, but formal execution
+# and reduction must never promote an arbitrary caller-supplied policy into a
+# release authority.  A future hardware rollout must change this constant in a
+# reviewed source release (and update the runtime manifest) before any signer
+# can unlock claims.
+RELEASE_TRUSTED_ATTESTER_POLICY = NO_TRUSTED_ATTESTERS
+
+
+def require_release_trusted_attester_policy(
+    policy: TrustedAttesterPolicy,
+) -> TrustedAttesterPolicy:
+    """Return the policy only when it is the source-owned release trust root."""
+
+    if type(policy) is not TrustedAttesterPolicy:
+        raise TypeError("release trust requires an exact TrustedAttesterPolicy")
+    policy.validate()
+    if policy != RELEASE_TRUSTED_ATTESTER_POLICY:
+        raise ValueError(
+            "caller-supplied trusted-attester policies cannot authorize this release"
+        )
+    return policy

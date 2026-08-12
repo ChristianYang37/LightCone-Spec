@@ -128,6 +128,27 @@ def test_patch_exports_exact_official_sglang_output_token_ids() -> None:
     assert 'data["output_ids"]' in patch
 
 
+def test_patch_binds_terminal_accounting_seed_and_role_publication_contracts() -> None:
+    manifest = json.loads((PATCH_ROOT / "manifest.json").read_text())
+    patch = (PATCH_ROOT / manifest["patches"][0]["file"]).read_text()
+    assert '"enabled": bool(server_args.speculative_speed_study_metrics)' in patch
+    assert 'allocation_free = method in {"target_only", "static"}' in patch
+    assert "seed = int(self.server_args.random_seed)" in patch
+    assert "int(run_nonce_sha256[:8], 16)" not in patch
+    assert 'if self.config.method == "l0":\n+            if not ready.query()' in patch
+    assert (
+        'with self.timing("barrier"):\n+                main.wait_event(ready)' in patch
+    )
+    assert "TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S = 30.0" in patch
+    assert "while not ready.query():\n+                    if time.monotonic()" in patch
+    assert "TTS fixed-boundary candidate readiness timed out" in patch
+    boundary = patch.split("+    def boundary(self) -> bool:", 1)[1].split(
+        "+    def begin_round(", 1
+    )[0]
+    assert ".synchronize(" not in boundary
+    assert ".item(" not in boundary
+
+
 def test_patch_apply_script_requires_exact_clean_upstream() -> None:
     text = (PATCH_ROOT / "apply.sh").read_text()
     assert PINNED_SGLANG_COMMIT in text

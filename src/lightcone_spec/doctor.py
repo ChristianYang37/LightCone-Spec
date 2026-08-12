@@ -297,33 +297,62 @@ def _parse_topology(value: str | None) -> dict[str, Any]:
     if not value:
         return {
             "gpu_rows": [],
-            "pair_link": None,
-            "reciprocal_link": None,
+            "pairs": [],
             "parse_error": None,
         }
     lines = [line.split() for line in value.splitlines() if line.strip()]
-    header = next((line for line in lines if line[:2] == ["GPU0", "GPU1"]), None)
-    rows = {line[0]: line for line in lines if re.fullmatch(r"GPU\d+", line[0])}
-    if header is None or "GPU0" not in rows or "GPU1" not in rows:
+    header = next(
+        (
+            line
+            for line in lines
+            if line and line[0] == "GPU0" and re.fullmatch(r"GPU\d+", line[0])
+        ),
+        None,
+    )
+    rows = {
+        line[0]: line for line in lines if line and re.fullmatch(r"GPU\d+", line[0])
+    }
+    if header is None:
         return {
-            "gpu_rows": sorted(rows),
-            "pair_link": None,
-            "reciprocal_link": None,
-            "parse_error": "missing_two_gpu_matrix",
+            "gpu_rows": sorted(rows, key=lambda name: int(name[3:])),
+            "pairs": [],
+            "parse_error": "missing_gpu_matrix",
         }
-    gpu1_column = header.index("GPU1") + 1
-    gpu0_column = header.index("GPU0") + 1
-    if len(rows["GPU0"]) <= gpu1_column or len(rows["GPU1"]) <= gpu0_column:
+    header_gpus = tuple(token for token in header if re.fullmatch(r"GPU\d+", token))
+    expected_gpus = tuple(f"GPU{index}" for index in range(len(header_gpus)))
+    if not header_gpus or header_gpus != expected_gpus or set(rows) != set(header_gpus):
         return {
-            "gpu_rows": sorted(rows),
-            "pair_link": None,
-            "reciprocal_link": None,
-            "parse_error": "truncated_two_gpu_matrix",
+            "gpu_rows": sorted(rows, key=lambda name: int(name[3:])),
+            "pairs": [],
+            "parse_error": "inconsistent_gpu_matrix",
         }
+    columns = {gpu: header.index(gpu) + 1 for gpu in header_gpus}
+    if any(len(rows[gpu]) <= max(columns.values()) for gpu in header_gpus):
+        return {
+            "gpu_rows": list(header_gpus),
+            "pairs": [],
+            "parse_error": "truncated_gpu_matrix",
+        }
+    pairs = []
+    for left_index, left in enumerate(header_gpus):
+        if rows[left][columns[left]] != "X":
+            return {
+                "gpu_rows": list(header_gpus),
+                "pairs": [],
+                "parse_error": "invalid_gpu_diagonal",
+            }
+        for right in header_gpus[left_index + 1 :]:
+            pairs.append(
+                {
+                    "left": left,
+                    "right": right,
+                    "link": rows[left][columns[right]],
+                    "reciprocal_link": rows[right][columns[left]],
+                }
+            )
     return {
-        "gpu_rows": sorted(rows),
-        "pair_link": rows["GPU0"][gpu1_column],
-        "reciprocal_link": rows["GPU1"][gpu0_column],
+        "gpu_rows": list(header_gpus),
+        "pairs": pairs,
         "parse_error": None,
     }
 
@@ -434,7 +463,9 @@ def _manifest_structure_error(value: Mapping[str, Any]) -> str | None:
             ("cuda", "toolkit_release"),
             ("system", "minimum_driver"),
             ("sglang", "patches"),
-            ("gpu", "count"),
+            ("gpu", "minimum_count"),
+            ("gpu", "reference_count"),
+            ("gpu", "same_host_required"),
             ("gpu", "model"),
             ("gpu", "compute_capability"),
             ("gpu", "minimum_memory_mib"),
@@ -462,6 +493,18 @@ def _manifest_structure_error(value: Mapping[str, Any]) -> str | None:
         observed_gates = tuple((row["mode"], row["reason_code"]) for row in blocked)
         if observed_gates != _FAIL_CLOSED_MODE_GATES:
             return "release_mode_gates_mismatch"
+        minimum_count = value["gpu"]["minimum_count"]
+        reference_count = value["gpu"]["reference_count"]
+        if (
+            not isinstance(minimum_count, int)
+            or isinstance(minimum_count, bool)
+            or minimum_count < 1
+            or not isinstance(reference_count, int)
+            or isinstance(reference_count, bool)
+            or reference_count < minimum_count
+            or value["gpu"]["same_host_required"] is not True
+        ):
+            return "invalid_gpu_pool_cardinality_contract"
     except (KeyError, TypeError):
         return "missing_or_invalid_required_field"
     return None
@@ -797,12 +840,19 @@ def _evaluate(
         torch_visibility_status = (
             "PASS"
             if torch_runtime.get("cuda_available") is True
-            and torch_runtime.get("device_count") == int(gpu_requirement["count"])
+            and torch_runtime.get("device_count")
+            == len(facts["gpu"]["inventory"]["devices"])
+            and torch_runtime.get("device_count")
+            >= int(gpu_requirement["minimum_count"])
             else "FAIL"
         )
     checks["torch_cuda_visibility"] = _check(
         torch_visibility_status,
-        expected={"cuda_available": True, "device_count": gpu_requirement["count"]},
+        expected={
+            "cuda_available": True,
+            "device_count_matches_nvidia_inventory": True,
+            "minimum_count": gpu_requirement["minimum_count"],
+        },
         observed={
             "cuda_available": torch_runtime.get("cuda_available"),
             "device_count": torch_runtime.get("device_count"),
@@ -812,12 +862,17 @@ def _evaluate(
 
     inventory = facts["gpu"]["inventory"]
     devices = inventory["devices"]
-    expected_count = int(gpu_requirement["count"])
+    minimum_count = int(gpu_requirement["minimum_count"])
+    observed_count = len(devices)
     checks["gpu_count"] = _check(
-        "PASS" if len(devices) == expected_count else "FAIL",
-        expected=expected_count,
-        observed={"count": len(devices), "parse_error": inventory["parse_error"]},
-        reason_code="gpu_count_exact",
+        (
+            "PASS"
+            if inventory["parse_error"] is None and observed_count >= minimum_count
+            else "FAIL"
+        ),
+        expected={"minimum_count": minimum_count, "same_host": True},
+        observed={"count": observed_count, "parse_error": inventory["parse_error"]},
+        reason_code="gpu_pool_count_supported",
     )
     if not devices:
         identity_status = memory_status = driver_status = "UNKNOWN"
@@ -826,7 +881,7 @@ def _evaluate(
         unique_bus = len({device["pci_bus_id"] for device in devices}) == len(devices)
         identity_status = (
             "PASS"
-            if len(devices) == expected_count
+            if observed_count >= minimum_count
             and unique_uuid
             and unique_bus
             and all(
@@ -839,7 +894,7 @@ def _evaluate(
         )
         memory_status = (
             "PASS"
-            if len(devices) == expected_count
+            if observed_count >= minimum_count
             and all(
                 device["memory_total_mib"] >= int(gpu_requirement["minimum_memory_mib"])
                 for device in devices
@@ -862,7 +917,7 @@ def _evaluate(
     checks["gpu_identity"] = _check(
         identity_status,
         expected={
-            "count": expected_count,
+            "minimum_count": minimum_count,
             "model": gpu_requirement["model"],
             "compute_capability": gpu_requirement["compute_capability"],
             "unique_uuid_and_pci_bus_id": True,
@@ -889,30 +944,38 @@ def _evaluate(
         reason_code="nvidia_driver_compatible",
     )
     topology = facts["gpu"]["topology"]
-    topology_links = {
-        topology.get("pair_link"),
-        topology.get("reciprocal_link"),
-    }
     accepted_links = set(gpu_requirement["accepted_topology_links"])
+    expected_gpu_rows = [f"GPU{index}" for index in range(observed_count)]
+    pairs = topology.get("pairs")
+    topology_pairs_valid = isinstance(pairs, list) and len(pairs) == (
+        observed_count * (observed_count - 1) // 2
+    )
+    if topology_pairs_valid:
+        topology_pairs_valid = all(
+            isinstance(pair, dict)
+            and set(pair) == {"left", "right", "link", "reciprocal_link"}
+            and pair["link"] == pair["reciprocal_link"]
+            and pair["link"] in accepted_links
+            for pair in pairs
+        )
     if facts["gpu"].get("topology_raw") is None:
         topology_status = "UNKNOWN"
     else:
         topology_status = (
             "PASS"
             if topology["parse_error"] is None
-            and topology["gpu_rows"] == ["GPU0", "GPU1"]
-            and len(topology_links) == 1
-            and topology_links <= accepted_links
+            and topology["gpu_rows"] == expected_gpu_rows
+            and topology_pairs_valid
             else "FAIL"
         )
     checks["gpu_topology"] = _check(
         topology_status,
         expected={
-            "gpu_rows": ["GPU0", "GPU1"],
-            "symmetric_link_one_of": sorted(accepted_links),
+            "gpu_rows": expected_gpu_rows,
+            "all_pairs_symmetric_link_one_of": sorted(accepted_links),
         },
         observed=topology,
-        reason_code="two_gpu_topology_declared",
+        reason_code="same_host_gpu_pool_topology_declared",
     )
     compiler_observed = {
         "compiler": facts["commands"].get("compiler"),
@@ -1086,6 +1149,8 @@ def doctor_report(
             "topology": facts["gpu"]["topology_raw"],
             "parsed_topology": facts["gpu"]["topology"],
             "torch": facts["gpu"]["torch"],
+            "visible_gpu_count": len(facts["gpu"]["inventory"]["devices"]),
+            "gpu_pool_visible": checks["gpu_count"]["status"] == "PASS",
             "two_gpu_visible": len(facts["gpu"]["inventory"]["devices"]) == 2,
         },
         "commands": facts["commands"],

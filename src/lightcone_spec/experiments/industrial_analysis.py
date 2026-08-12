@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import stat
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -28,10 +30,19 @@ from lightcone_spec import (
     PINNED_SGLANG_PATCH_COUNT,
     PINNED_SGLANG_TREE,
 )
+from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.experiments.budget_authority import (
+    replay_budget_activation_authority,
+    require_ready_budget_materialization_authority_binding,
+    revalidate_budget_materialization_authority_binding,
+)
 from lightcone_spec.experiments.gpu_pool import GpuInventory
 from lightcone_spec.experiments.planning import (
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
+    EVIDENCE_ALIAS_REDUCER_PROTOCOL_SHA256,
+    BudgetMaterializationAuthorityBinding,
+    BudgetPlan,
     ConfirmationFamilyIdentity,
     ConfirmationFamilyPowerReductionArtifact,
     E1ParetoArtifact,
@@ -39,18 +50,26 @@ from lightcone_spec.experiments.planning import (
     E2CandidateIdentity,
     E2StageEvidenceArtifact,
     E2StageReductionArtifact,
+    EvidenceAliasReductionArtifact,
     EvidenceDependenceMap,
+    ExecutionDerivedAliasSemantics,
     FamilyActivationArtifact,
     RawEvidenceRunBinding,
     ReducerActivationArtifact,
     _reduce_e2_successive_halving,
     _seal_confirmation_family_power,
+    budget_inventory_identity_from_gpu_inventory,
+    build_evidence_dependence_map,
     family_pilot_block_id,
     materialize_confirmation_prefix,
     reduce_e2_activation,
     verify_confirmation_pilot_activation,
 )
-from lightcone_spec.experiments.planning_artifacts import experiment_budget_from_dict
+from lightcone_spec.experiments.planning_artifacts import (
+    budget_materialization_authority_binding_from_dict,
+    experiment_budget_from_dict,
+    production_load_plan_from_dict,
+)
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
     PILOT_BLOCKS,
@@ -59,6 +78,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     content_sha256,
 )
+from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.statistics import (
     PRIMARY_CONTRASTS,
     BootstrapInterval,
@@ -80,8 +100,19 @@ from lightcone_spec.experiments.statistics import (
     time_block_bootstrap,
     validate_hardware_block,
 )
+from lightcone_spec.locking.models import LockedModel, ModelLock
+from lightcone_spec.orchestration.native_terminal import (
+    validate_native_terminal_artifact,
+)
+from lightcone_spec.runtime.attestation import (
+    TrustedAttesterPolicy,
+    require_release_trusted_attester_policy,
+)
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
-from lightcone_spec.telemetry.writer import load_completed_evidence
+from lightcone_spec.telemetry.writer import (
+    EvidenceWriterPolicy,
+    load_completed_evidence,
+)
 
 type BootstrapStatistic = Callable[[np.ndarray], float | np.ndarray]
 type ReducerStatus = Literal["UNRESOLVED"]
@@ -175,25 +206,102 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _bound_file(path: Path, expected_sha256: str, *, label: str) -> bytes:
+def _stable_regular_file_bytes(path: Path, *, label: str) -> bytes:
+    if not path.is_absolute() or path.resolve() != path:
+        raise ValueError(f"{label} path must be absolute, resolved, and non-symlink")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} must be a regular non-symlink file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular non-symlink file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            body = handle.read()
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or len(body) != after.st_size
+        ):
+            raise ValueError(f"{label} changed while it was read")
+        return body
+    finally:
+        os.close(descriptor)
+
+
+def _bound_file(
+    path: Path,
+    expected_sha256: str,
+    *,
+    label: str,
+    require_sidecar: bool = False,
+    expected_sidecar_sha256: str | None = None,
+) -> bytes:
     if not _is_sha256(expected_sha256):
         raise ValueError(f"{label} digest must be lower-case SHA-256")
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label} must be a regular non-symlink file")
-    if _file_sha256(path) != expected_sha256:
+    if expected_sidecar_sha256 is not None and not _is_sha256(expected_sidecar_sha256):
+        raise ValueError(f"{label} sidecar digest must be lower-case SHA-256")
+    if expected_sidecar_sha256 is not None and not require_sidecar:
+        raise ValueError(f"{label} cannot bind a sidecar digest without a sidecar")
+    body = _stable_regular_file_bytes(path, label=label)
+    if hashlib.sha256(body).hexdigest() != expected_sha256:
         raise ValueError(f"{label} digest mismatch")
-    return path.read_bytes()
+    if require_sidecar:
+        sidecar_body = _stable_regular_file_bytes(
+            Path(f"{path}.sha256"), label=f"{label} SHA-256 sidecar"
+        )
+        sidecar_sha256 = expected_sidecar_sha256 or expected_sha256
+        if sidecar_body != f"{sidecar_sha256}\n".encode("ascii"):
+            raise ValueError(f"{label} SHA-256 sidecar mismatch")
+    return body
 
 
 def _bound_json(path: Path, expected_sha256: str, *, label: str) -> dict[str, Any]:
     body = _bound_file(path, expected_sha256, label=label)
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{label} contains forbidden JSON constant {value!r}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(body)
-    except json.JSONDecodeError as exc:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} is not valid JSON") from exc
+    _validate_finite_json(value, label=label)
     if not isinstance(value, dict):
         raise TypeError(f"{label} must contain one JSON object")
     return value
+
+
+def _validate_finite_json(value: object, *, label: str) -> None:
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(f"{label} contains a non-finite JSON number")
+    if type(value) is list:
+        for item in value:
+            _validate_finite_json(item, label=label)
+    elif type(value) is dict:
+        for item in value.values():
+            _validate_finite_json(item, label=label)
 
 
 @dataclass(frozen=True)
@@ -229,6 +337,307 @@ class IndustrialCellEvidence:
 
 
 @dataclass(frozen=True)
+class AliasExecutionArtifacts:
+    """Raw files needed to reconstruct one execution-plan alias candidate."""
+
+    execution_plan: BoundArtifact
+    load_plan: BoundArtifact
+    run_config: BoundArtifact
+    split_artifact: BoundArtifact
+    sampling_artifact: BoundArtifact
+    model_lock_artifact: BoundArtifact
+    experiment_budget: BoundArtifact
+    budget_materialization_authority: BoundArtifact
+
+    def __post_init__(self) -> None:
+        for name in (
+            "execution_plan",
+            "load_plan",
+            "run_config",
+            "split_artifact",
+            "sampling_artifact",
+            "model_lock_artifact",
+            "experiment_budget",
+            "budget_materialization_authority",
+        ):
+            if type(getattr(self, name)) is not BoundArtifact:
+                raise TypeError(f"alias {name} must be an exact BoundArtifact")
+
+    @property
+    def identity(self) -> dict[str, str]:
+        return {
+            name: getattr(self, name).sha256
+            for name in (
+                "execution_plan",
+                "load_plan",
+                "run_config",
+                "split_artifact",
+                "sampling_artifact",
+                "model_lock_artifact",
+                "experiment_budget",
+                "budget_materialization_authority",
+            )
+        }
+
+
+@dataclass(frozen=True)
+class RawEvidenceAliasManifest:
+    """Operational, path-bearing input to the evidence-alias raw reducer.
+
+    There is deliberately no target evidence field: a target with an
+    independent terminal result is not an evidence alias.
+    """
+
+    schema_version: int
+    source: AliasExecutionArtifacts
+    target: AliasExecutionArtifacts
+    source_evidence: IndustrialCellEvidence
+    source_native_terminal_artifacts: tuple[BoundArtifact, ...]
+    inventory_source_receipt: BoundArtifact
+    removed_presentation_axis: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 2:
+            raise ValueError("only raw evidence alias manifest schema 2 is supported")
+        if (
+            type(self.source) is not AliasExecutionArtifacts
+            or type(self.target) is not AliasExecutionArtifacts
+        ):
+            raise TypeError("raw evidence alias candidates must be exact artifact sets")
+        if type(self.source_evidence) is not IndustrialCellEvidence:
+            raise TypeError("raw evidence alias requires exact source evidence")
+        if not self.source_native_terminal_artifacts or any(
+            type(reference) is not BoundArtifact
+            for reference in self.source_native_terminal_artifacts
+        ):
+            raise TypeError(
+                "raw evidence alias requires bound native terminal artifacts"
+            )
+        if type(self.inventory_source_receipt) is not BoundArtifact:
+            raise TypeError("raw evidence alias requires a bound inventory receipt")
+        for name, value in (
+            ("removed presentation axis", self.removed_presentation_axis),
+            ("reason code", self.reason_code),
+        ):
+            if not isinstance(value, str) or not value.strip() or "\n" in value:
+                raise ValueError(f"raw evidence alias {name} is invalid")
+
+    @property
+    def sha256(self) -> str:
+        evidence = self.source_evidence
+        return content_sha256(
+            {
+                "schema_version": 2,
+                "source": self.source.identity,
+                "target": self.target.identity,
+                "source_evidence": {
+                    "cell_id": evidence.cell_id,
+                    "terminal_receipts": [
+                        reference.sha256 for reference in evidence.terminal_receipts
+                    ],
+                    "hardware_receipt": evidence.hardware_receipt.sha256,
+                    "budget_observation": evidence.budget_observation.sha256,
+                },
+                "source_native_terminal_artifacts": [
+                    reference.sha256
+                    for reference in self.source_native_terminal_artifacts
+                ],
+                "inventory_source_receipt": self.inventory_source_receipt.sha256,
+                "removed_presentation_axis": self.removed_presentation_axis,
+                "reason_code": self.reason_code,
+            }
+        )
+
+
+def _alias_bound_artifact_to_dict(reference: BoundArtifact) -> dict[str, str]:
+    return {"path": str(reference.path), "sha256": reference.sha256}
+
+
+def _alias_bound_artifact_from_dict(value: object, *, label: str) -> BoundArtifact:
+    if type(value) is not dict or set(value) != {"path", "sha256"}:
+        raise ValueError(f"{label} must be one exact bound-artifact object")
+    path = value.get("path")
+    digest = value.get("sha256")
+    if not isinstance(path, str) or not path or not _is_sha256(digest):
+        raise ValueError(f"{label} bound-artifact identity is invalid")
+    return BoundArtifact(path=Path(path), sha256=str(digest))
+
+
+def _alias_execution_artifacts_to_dict(
+    artifacts: AliasExecutionArtifacts,
+) -> dict[str, dict[str, str]]:
+    return {
+        name: _alias_bound_artifact_to_dict(getattr(artifacts, name))
+        for name in (
+            "execution_plan",
+            "load_plan",
+            "run_config",
+            "split_artifact",
+            "sampling_artifact",
+            "model_lock_artifact",
+            "experiment_budget",
+            "budget_materialization_authority",
+        )
+    }
+
+
+def _alias_execution_artifacts_from_dict(
+    value: object, *, label: str
+) -> AliasExecutionArtifacts:
+    names = {
+        "execution_plan",
+        "load_plan",
+        "run_config",
+        "split_artifact",
+        "sampling_artifact",
+        "model_lock_artifact",
+        "experiment_budget",
+        "budget_materialization_authority",
+    }
+    if type(value) is dict and "budget_materialization_authority" not in value:
+        raise ValueError(
+            f"formal evidence alias is BLOCKED: {label} lacks raw budget "
+            "materialization authority path"
+        )
+    if type(value) is not dict or set(value) != names:
+        raise ValueError(f"{label} execution artifacts have an ambiguous schema")
+    return AliasExecutionArtifacts(
+        **{
+            name: _alias_bound_artifact_from_dict(value[name], label=f"{label}.{name}")
+            for name in names
+        }
+    )
+
+
+def raw_evidence_alias_manifest_to_dict(
+    manifest: RawEvidenceAliasManifest,
+) -> dict[str, object]:
+    """Serialize the path-bearing reducer input without inventing identities."""
+
+    if type(manifest) is not RawEvidenceAliasManifest:
+        raise TypeError("raw alias serialization requires an exact manifest")
+    source = manifest.source_evidence
+    return {
+        "schema_version": 2,
+        "artifact_kind": "raw_evidence_alias_manifest",
+        "artifact_sha256": manifest.sha256,
+        "source": _alias_execution_artifacts_to_dict(manifest.source),
+        "target": _alias_execution_artifacts_to_dict(manifest.target),
+        "source_evidence": {
+            "cell_id": source.cell_id,
+            "terminal_receipts": [
+                _alias_bound_artifact_to_dict(reference)
+                for reference in source.terminal_receipts
+            ],
+            "hardware_receipt": _alias_bound_artifact_to_dict(source.hardware_receipt),
+            "budget_observation": _alias_bound_artifact_to_dict(
+                source.budget_observation
+            ),
+        },
+        "source_native_terminal_artifacts": [
+            _alias_bound_artifact_to_dict(reference)
+            for reference in manifest.source_native_terminal_artifacts
+        ],
+        "inventory_source_receipt": _alias_bound_artifact_to_dict(
+            manifest.inventory_source_receipt
+        ),
+        "removed_presentation_axis": manifest.removed_presentation_axis,
+        "reason_code": manifest.reason_code,
+    }
+
+
+def raw_evidence_alias_manifest_from_dict(
+    value: object,
+) -> RawEvidenceAliasManifest:
+    """Strictly reconstruct a raw alias manifest and every BoundArtifact."""
+
+    expected = {
+        "schema_version",
+        "artifact_kind",
+        "artifact_sha256",
+        "source",
+        "target",
+        "source_evidence",
+        "source_native_terminal_artifacts",
+        "inventory_source_receipt",
+        "removed_presentation_axis",
+        "reason_code",
+    }
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError("raw evidence alias manifest has an ambiguous schema")
+    if (
+        value.get("schema_version") != 2
+        or value.get("artifact_kind") != "raw_evidence_alias_manifest"
+        or not _is_sha256(value.get("artifact_sha256"))
+    ):
+        if value.get("schema_version") == 1:
+            raise ValueError(
+                "formal evidence alias is BLOCKED: schema 1 lacks the raw budget "
+                "materialization authority path"
+            )
+        raise ValueError("raw evidence alias manifest identity is invalid")
+    evidence = value.get("source_evidence")
+    if type(evidence) is not dict or set(evidence) != {
+        "cell_id",
+        "terminal_receipts",
+        "hardware_receipt",
+        "budget_observation",
+    }:
+        raise ValueError("raw evidence alias source evidence schema is ambiguous")
+    cell_id = evidence.get("cell_id")
+    terminals = evidence.get("terminal_receipts")
+    native = value.get("source_native_terminal_artifacts")
+    if (
+        not _is_sha256(cell_id)
+        or type(terminals) is not list
+        or not terminals
+        or type(native) is not list
+        or not native
+        or type(value.get("removed_presentation_axis")) is not str
+        or type(value.get("reason_code")) is not str
+    ):
+        raise ValueError("raw evidence alias lacks strict source/axis evidence")
+    manifest = RawEvidenceAliasManifest(
+        schema_version=2,
+        source=_alias_execution_artifacts_from_dict(value["source"], label="source"),
+        target=_alias_execution_artifacts_from_dict(value["target"], label="target"),
+        source_evidence=IndustrialCellEvidence(
+            cell_id=str(cell_id),
+            terminal_receipts=tuple(
+                _alias_bound_artifact_from_dict(
+                    row, label=f"source_evidence.terminal_receipts[{index}]"
+                )
+                for index, row in enumerate(terminals)
+            ),
+            hardware_receipt=_alias_bound_artifact_from_dict(
+                evidence["hardware_receipt"],
+                label="source_evidence.hardware_receipt",
+            ),
+            budget_observation=_alias_bound_artifact_from_dict(
+                evidence["budget_observation"],
+                label="source_evidence.budget_observation",
+            ),
+        ),
+        source_native_terminal_artifacts=tuple(
+            _alias_bound_artifact_from_dict(
+                row, label=f"source_native_terminal_artifacts[{index}]"
+            )
+            for index, row in enumerate(native)
+        ),
+        inventory_source_receipt=_alias_bound_artifact_from_dict(
+            value["inventory_source_receipt"],
+            label="inventory_source_receipt",
+        ),
+        removed_presentation_axis=value["removed_presentation_axis"],
+        reason_code=value["reason_code"],
+    )
+    if manifest.sha256 != value["artifact_sha256"]:
+        raise ValueError("raw evidence alias manifest redundant SHA-256 mismatch")
+    return manifest
+
+
+@dataclass(frozen=True)
 class IndustrialBlockEvidence:
     """One paired block with all four methods and its pre-run qualification lock."""
 
@@ -241,6 +650,422 @@ class IndustrialBlockEvidence:
             raise TypeError("industrial block must be an integer")
         if not self.cells:
             raise ValueError("industrial block evidence requires cells")
+
+
+def _raw_evidence_reference_to_dict(reference: BoundArtifact) -> dict[str, str]:
+    if type(reference) is not BoundArtifact:
+        raise TypeError("raw evidence reference must be an exact BoundArtifact")
+    return {"path": str(reference.path), "sha256": reference.sha256}
+
+
+def _raw_evidence_reference_from_dict(value: object, *, label: str) -> BoundArtifact:
+    if type(value) is not dict or set(value) != {"path", "sha256"}:
+        raise ValueError(f"{label} must be one exact raw evidence reference")
+    path = value.get("path")
+    digest = value.get("sha256")
+    if type(path) is not str or not path or not _is_sha256(digest):
+        raise ValueError(f"{label} raw evidence reference is invalid")
+    return BoundArtifact(path=Path(path), sha256=str(digest))
+
+
+def _raw_cell_to_dict(cell: IndustrialCellEvidence) -> dict[str, object]:
+    if type(cell) is not IndustrialCellEvidence:
+        raise TypeError("raw cell evidence must be exact")
+    return {
+        "cell_id": cell.cell_id,
+        "terminal_receipts": [
+            _raw_evidence_reference_to_dict(reference)
+            for reference in cell.terminal_receipts
+        ],
+        "hardware_receipt": _raw_evidence_reference_to_dict(cell.hardware_receipt),
+        "budget_observation": _raw_evidence_reference_to_dict(cell.budget_observation),
+    }
+
+
+def _raw_cell_from_dict(value: object, *, label: str) -> IndustrialCellEvidence:
+    if type(value) is not dict or set(value) != {
+        "cell_id",
+        "terminal_receipts",
+        "hardware_receipt",
+        "budget_observation",
+    }:
+        raise ValueError(f"{label} fields differ from the raw cell schema")
+    terminals = value.get("terminal_receipts")
+    if type(terminals) is not list or not terminals:
+        raise ValueError(f"{label} requires terminal receipts")
+    return IndustrialCellEvidence(
+        cell_id=str(value.get("cell_id")),
+        terminal_receipts=tuple(
+            _raw_evidence_reference_from_dict(
+                reference,
+                label=f"{label}.terminal_receipts[{index}]",
+            )
+            for index, reference in enumerate(terminals)
+        ),
+        hardware_receipt=_raw_evidence_reference_from_dict(
+            value.get("hardware_receipt"), label=f"{label}.hardware_receipt"
+        ),
+        budget_observation=_raw_evidence_reference_from_dict(
+            value.get("budget_observation"), label=f"{label}.budget_observation"
+        ),
+    )
+
+
+def _raw_block_to_dict(block: IndustrialBlockEvidence) -> dict[str, object]:
+    if type(block) is not IndustrialBlockEvidence:
+        raise TypeError("raw block evidence must be exact")
+    return {
+        "block": block.block,
+        "cells": [_raw_cell_to_dict(cell) for cell in block.cells],
+        "qualification_lock": _raw_evidence_reference_to_dict(block.qualification_lock),
+    }
+
+
+def _raw_block_from_dict(value: object, *, label: str) -> IndustrialBlockEvidence:
+    if type(value) is not dict or set(value) != {
+        "block",
+        "cells",
+        "qualification_lock",
+    }:
+        raise ValueError(f"{label} fields differ from the raw block schema")
+    block = value.get("block")
+    cells = value.get("cells")
+    if type(block) is not int or type(cells) is not list or not cells:
+        raise ValueError(f"{label} identity or cells are invalid")
+    return IndustrialBlockEvidence(
+        block=block,
+        cells=tuple(
+            _raw_cell_from_dict(cell, label=f"{label}.cells[{index}]")
+            for index, cell in enumerate(cells)
+        ),
+        qualification_lock=_raw_evidence_reference_from_dict(
+            value.get("qualification_lock"),
+            label=f"{label}.qualification_lock",
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class RawE3aSelectionEvidenceManifest:
+    """Path-bearing complete E3a terminal evidence, never a selection summary."""
+
+    schema_version: int
+    cells: tuple[IndustrialCellEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only raw E3a selection manifest schema 1 is supported")
+        ids = tuple(cell.cell_id for cell in self.cells)
+        if not ids or ids != tuple(sorted(set(ids))):
+            raise ValueError("raw E3a cells must be cell-sorted and unique")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(raw_e3a_selection_manifest_to_dict(self, digest=False))
+
+
+@dataclass(frozen=True)
+class RawE1ParetoEvidenceManifest:
+    """Path-bearing exact 130-cell E1 evidence for first-party Pareto replay."""
+
+    schema_version: int
+    cells: tuple[IndustrialCellEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only raw E1 Pareto manifest schema 1 is supported")
+        ids = tuple(cell.cell_id for cell in self.cells)
+        if not ids or ids != tuple(sorted(set(ids))):
+            raise ValueError("raw E1 cells must be cell-sorted and unique")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(raw_e1_pareto_manifest_to_dict(self, digest=False))
+
+
+@dataclass(frozen=True)
+class RawE2StageEvidenceManifest:
+    """Path-bearing terminal evidence for exactly one successive-halving round."""
+
+    schema_version: int
+    stage_index: int
+    cells: tuple[IndustrialCellEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only raw E2 stage manifest schema 1 is supported")
+        if type(self.stage_index) is not int or self.stage_index not in range(4):
+            raise ValueError("raw E2 stage index is invalid")
+        ids = tuple(cell.cell_id for cell in self.cells)
+        if not ids or ids != tuple(sorted(set(ids))):
+            raise ValueError("raw E2 cells must be cell-sorted and unique")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(raw_e2_stage_manifest_to_dict(self, digest=False))
+
+
+@dataclass(frozen=True)
+class RawConfirmationFamilyPowerEvidenceManifest:
+    """Path-bearing four-pilot evidence; no caller-authored power is accepted."""
+
+    schema_version: int
+    blocks: tuple[IndustrialBlockEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError(
+                "only raw confirmation family power manifest schema 1 is supported"
+            )
+        block_ids = tuple(block.block for block in self.blocks)
+        if block_ids != PILOT_BLOCKS:
+            raise ValueError("raw family power requires exactly four ordered pilots")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(
+            raw_confirmation_family_power_manifest_to_dict(self, digest=False)
+        )
+
+
+def validate_raw_evidence_manifest_sidecars(
+    manifest: (
+        RawE3aSelectionEvidenceManifest
+        | RawE1ParetoEvidenceManifest
+        | RawE2StageEvidenceManifest
+        | RawConfirmationFamilyPowerEvidenceManifest
+    ),
+) -> None:
+    """Require the source-owned sibling sidecar for every formal raw path.
+
+    Terminal, hardware, and qualification files have no separate semantic ID,
+    so their sidecars bind the exact raw bytes named by ``BoundArtifact``.  A
+    budget observation is deliberately different: its durable writer publishes
+    the reducer-recomputed ``budget_observation_sha256`` in the sibling sidecar.
+    Treating that established semantic sidecar as a raw-file digest would make
+    genuine first-party observations impossible to replay.
+    """
+
+    if type(manifest) in {
+        RawE3aSelectionEvidenceManifest,
+        RawE1ParetoEvidenceManifest,
+        RawE2StageEvidenceManifest,
+    }:
+        cells = manifest.cells
+        extra: tuple[BoundArtifact, ...] = ()
+    elif type(manifest) is RawConfirmationFamilyPowerEvidenceManifest:
+        cells = tuple(cell for block in manifest.blocks for cell in block.cells)
+        extra = tuple(block.qualification_lock for block in manifest.blocks)
+    else:
+        raise TypeError("formal raw evidence requires an exact manifest type")
+    references: list[tuple[BoundArtifact, str]] = []
+    for cell in cells:
+        references.extend(
+            (reference, reference.sha256) for reference in cell.terminal_receipts
+        )
+        references.append((cell.hardware_receipt, cell.hardware_receipt.sha256))
+        budget = _bound_json(
+            cell.budget_observation.path,
+            cell.budget_observation.sha256,
+            label="formal raw budget observation",
+        )
+        budget_semantic_sha256 = budget.get("budget_observation_sha256")
+        if not _is_sha256(budget_semantic_sha256):
+            raise ValueError("formal raw budget observation lacks its semantic SHA-256")
+        references.append((cell.budget_observation, str(budget_semantic_sha256)))
+    references.extend((reference, reference.sha256) for reference in extra)
+
+    by_path: dict[Path, tuple[str, str]] = {}
+    for reference, sidecar_sha256 in references:
+        identity = (reference.sha256, sidecar_sha256)
+        prior = by_path.setdefault(reference.path, identity)
+        if prior != identity:
+            raise ValueError("raw evidence aliases one path under two identities")
+        _bound_file(
+            reference.path,
+            reference.sha256,
+            label="formal raw evidence",
+            require_sidecar=True,
+            expected_sidecar_sha256=sidecar_sha256,
+        )
+
+
+def _raw_cell_manifest_to_dict(
+    *,
+    schema_version: int,
+    kind: str,
+    cells: tuple[IndustrialCellEvidence, ...],
+    artifact_sha256: str | None,
+    stage_index: int | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema_version": schema_version,
+        "kind": kind,
+        "cells": [_raw_cell_to_dict(cell) for cell in cells],
+    }
+    if stage_index is not None:
+        value["stage_index"] = stage_index
+    if artifact_sha256 is not None:
+        value["artifact_sha256"] = artifact_sha256
+    return value
+
+
+def raw_e3a_selection_manifest_to_dict(
+    manifest: RawE3aSelectionEvidenceManifest, *, digest: bool = True
+) -> dict[str, object]:
+    if type(manifest) is not RawE3aSelectionEvidenceManifest:
+        raise TypeError("raw E3a manifest serialization requires an exact value")
+    return _raw_cell_manifest_to_dict(
+        schema_version=manifest.schema_version,
+        kind="raw_e3a_selection_evidence_manifest",
+        cells=manifest.cells,
+        artifact_sha256=manifest.sha256 if digest else None,
+    )
+
+
+def raw_e1_pareto_manifest_to_dict(
+    manifest: RawE1ParetoEvidenceManifest, *, digest: bool = True
+) -> dict[str, object]:
+    if type(manifest) is not RawE1ParetoEvidenceManifest:
+        raise TypeError("raw E1 manifest serialization requires an exact value")
+    return _raw_cell_manifest_to_dict(
+        schema_version=manifest.schema_version,
+        kind="raw_e1_pareto_evidence_manifest",
+        cells=manifest.cells,
+        artifact_sha256=manifest.sha256 if digest else None,
+    )
+
+
+def raw_e2_stage_manifest_to_dict(
+    manifest: RawE2StageEvidenceManifest, *, digest: bool = True
+) -> dict[str, object]:
+    if type(manifest) is not RawE2StageEvidenceManifest:
+        raise TypeError("raw E2 manifest serialization requires an exact value")
+    return _raw_cell_manifest_to_dict(
+        schema_version=manifest.schema_version,
+        kind="raw_e2_stage_evidence_manifest",
+        cells=manifest.cells,
+        stage_index=manifest.stage_index,
+        artifact_sha256=manifest.sha256 if digest else None,
+    )
+
+
+def raw_confirmation_family_power_manifest_to_dict(
+    manifest: RawConfirmationFamilyPowerEvidenceManifest,
+    *,
+    digest: bool = True,
+) -> dict[str, object]:
+    if type(manifest) is not RawConfirmationFamilyPowerEvidenceManifest:
+        raise TypeError("raw family power serialization requires an exact value")
+    value: dict[str, object] = {
+        "schema_version": manifest.schema_version,
+        "kind": "raw_confirmation_family_power_evidence_manifest",
+        "blocks": [_raw_block_to_dict(block) for block in manifest.blocks],
+    }
+    if digest:
+        value["artifact_sha256"] = manifest.sha256
+    return value
+
+
+def _raw_cell_manifest_from_dict(
+    value: object,
+    *,
+    kind: str,
+    stage_index: bool,
+) -> tuple[int | None, tuple[IndustrialCellEvidence, ...], str]:
+    fields = {"schema_version", "kind", "artifact_sha256", "cells"}
+    if stage_index:
+        fields.add("stage_index")
+    if type(value) is not dict or set(value) != fields:
+        raise ValueError(f"{kind} fields differ from the strict schema")
+    if value.get("schema_version") != 1 or value.get("kind") != kind:
+        raise ValueError(f"{kind} identity is invalid")
+    cells = value.get("cells")
+    if type(cells) is not list or not cells:
+        raise ValueError(f"{kind} requires raw cell evidence")
+    parsed = tuple(
+        _raw_cell_from_dict(cell, label=f"{kind}.cells[{index}]")
+        for index, cell in enumerate(cells)
+    )
+    return (
+        value.get("stage_index") if stage_index else None,
+        parsed,
+        str(value.get("artifact_sha256")),
+    )
+
+
+def raw_e3a_selection_manifest_from_dict(
+    value: object,
+) -> RawE3aSelectionEvidenceManifest:
+    _, cells, declared = _raw_cell_manifest_from_dict(
+        value,
+        kind="raw_e3a_selection_evidence_manifest",
+        stage_index=False,
+    )
+    manifest = RawE3aSelectionEvidenceManifest(schema_version=1, cells=cells)
+    if declared != manifest.sha256:
+        raise ValueError("raw E3a manifest redundant SHA-256 mismatch")
+    return manifest
+
+
+def raw_e1_pareto_manifest_from_dict(
+    value: object,
+) -> RawE1ParetoEvidenceManifest:
+    _, cells, declared = _raw_cell_manifest_from_dict(
+        value,
+        kind="raw_e1_pareto_evidence_manifest",
+        stage_index=False,
+    )
+    manifest = RawE1ParetoEvidenceManifest(schema_version=1, cells=cells)
+    if declared != manifest.sha256:
+        raise ValueError("raw E1 manifest redundant SHA-256 mismatch")
+    return manifest
+
+
+def raw_e2_stage_manifest_from_dict(value: object) -> RawE2StageEvidenceManifest:
+    stage_index, cells, declared = _raw_cell_manifest_from_dict(
+        value,
+        kind="raw_e2_stage_evidence_manifest",
+        stage_index=True,
+    )
+    manifest = RawE2StageEvidenceManifest(
+        schema_version=1,
+        stage_index=stage_index,  # type: ignore[arg-type]
+        cells=cells,
+    )
+    if declared != manifest.sha256:
+        raise ValueError("raw E2 manifest redundant SHA-256 mismatch")
+    return manifest
+
+
+def raw_confirmation_family_power_manifest_from_dict(
+    value: object,
+) -> RawConfirmationFamilyPowerEvidenceManifest:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "kind",
+        "artifact_sha256",
+        "blocks",
+    }:
+        raise ValueError("raw family power manifest fields differ")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "raw_confirmation_family_power_evidence_manifest"
+    ):
+        raise ValueError("raw family power manifest identity is invalid")
+    blocks = value.get("blocks")
+    if type(blocks) is not list:
+        raise TypeError("raw family power blocks must be an array")
+    manifest = RawConfirmationFamilyPowerEvidenceManifest(
+        schema_version=1,
+        blocks=tuple(
+            _raw_block_from_dict(block, label=f"family_power.blocks[{index}]")
+            for index, block in enumerate(blocks)
+        ),
+    )
+    if value.get("artifact_sha256") != manifest.sha256:
+        raise ValueError("raw family power manifest redundant SHA-256 mismatch")
+    return manifest
 
 
 @dataclass(frozen=True)
@@ -306,6 +1131,7 @@ class IndustrialReducerArtifact:
     final_activation_sha256: str
     confirmation_plan_sha256: str
     evidence_dependence_map_sha256: str | None
+    evidence_alias_reduction_sha256s: tuple[str, ...]
     patched_sglang_tree: str | None
     model_lock_sha256: str | None
     hardware_envelope_sha256: str
@@ -348,6 +1174,9 @@ class IndustrialReducerArtifact:
                 "final_activation_sha256": self.final_activation_sha256,
                 "confirmation_plan_sha256": self.confirmation_plan_sha256,
                 "evidence_dependence_map_sha256": (self.evidence_dependence_map_sha256),
+                "evidence_alias_reduction_sha256s": list(
+                    self.evidence_alias_reduction_sha256s
+                ),
                 "patched_sglang_tree": self.patched_sglang_tree,
                 "model_lock_sha256": self.model_lock_sha256,
                 "hardware_envelope_sha256": self.hardware_envelope_sha256,
@@ -411,6 +1240,8 @@ class _E2RunIdentity:
 @dataclass(frozen=True)
 class _LoadedCell:
     cell: ExperimentCell
+    observation_source_cell_id: str
+    evidence_alias_reduction_sha256: str | None
     run_rows: tuple[dict[str, Any], ...]
     request_rows: tuple[dict[str, Any], ...]
     performance_rows_by_rank: tuple[tuple[dict[str, Any], ...], ...]
@@ -679,12 +1510,12 @@ def _expected_topology(cell: ExperimentCell) -> tuple[int, int, int]:
 def _read_terminal_receipt(
     reference: BoundArtifact,
 ) -> tuple[dict[str, Any], dict[str, Path]]:
-    body = _bound_file(reference.path, reference.sha256, label="terminal receipt")
-    try:
-        receipt = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise ValueError("terminal receipt is not valid JSON") from exc
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != 3:
+    receipt = _bound_json(
+        reference.path,
+        reference.sha256,
+        label="terminal receipt",
+    )
+    if receipt.get("schema_version") != 3:
         raise ValueError("industrial reduction requires schema-v3 terminal receipts")
     run_id = receipt.get("run_id")
     rank = receipt.get("rank")
@@ -1534,6 +2365,8 @@ def _load_cell(
     )
     return _LoadedCell(
         cell=cell,
+        observation_source_cell_id=cell.cell_id,
+        evidence_alias_reduction_sha256=None,
         run_rows=tuple(run_rows),
         request_rows=rank_zero_requests,
         performance_rows_by_rank=tuple(performance_rows_by_rank),
@@ -1551,6 +2384,1487 @@ def _load_cell(
         budget_observation_sha256=budget_observation_sha256,
         hardware_validity=hardware_validity,
     )
+
+
+@dataclass(frozen=True)
+class _AliasRunIdentity:
+    experiment: str
+    runtime_sha256: str
+    split_sha256: str
+
+
+@dataclass(frozen=True)
+class _AliasExecutionCandidate:
+    cell: ExperimentCell
+    execution_plan_file_sha256: str
+    execution_plan_sha256: str
+    execution_plan: Mapping[str, Any]
+    load_plan: Any
+    budget: Any
+    budget_plan: BudgetPlan
+    budget_materialization_authority: BudgetMaterializationAuthorityBinding
+    semantics: ExecutionDerivedAliasSemantics
+
+
+def _exact_object(value: object, *, fields: set[str], label: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != fields:
+        raise ValueError(f"{label} has an ambiguous schema")
+    return value
+
+
+def _load_alias_wrapped_artifact(
+    reference: BoundArtifact,
+    *,
+    label: str,
+    decoder: Callable[[object], Any],
+) -> Any:
+    value = _bound_json(reference.path, reference.sha256, label=label)
+    try:
+        return decoder(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not a strict planning artifact") from exc
+
+
+def _load_alias_budget_materialization_authority(
+    artifacts: AliasExecutionArtifacts,
+) -> BudgetMaterializationAuthorityBinding:
+    """Load the path-bearing authority; replay is performed by its reducer."""
+
+    value = _bound_json(
+        artifacts.budget_materialization_authority.path,
+        artifacts.budget_materialization_authority.sha256,
+        label="alias budget materialization authority",
+    )
+    try:
+        binding = budget_materialization_authority_binding_from_dict(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "alias budget materialization authority is not a strict artifact"
+        ) from exc
+    if type(binding) is not BudgetMaterializationAuthorityBinding:
+        raise TypeError("alias budget authority decoder returned a foreign value")
+    return binding
+
+
+def _validate_alias_budget_materialization_digest_bindings(
+    plan: Mapping[str, Any],
+    *,
+    runtime_plan: Mapping[str, Any],
+    authority: BudgetMaterializationAuthorityBinding,
+) -> None:
+    """Reject coordinated wire rehashes before reopening expensive raw inputs."""
+
+    dispatch_authority = plan.get("dispatch_authority")
+    resource_binding = runtime_plan.get("resource_binding")
+    physical_assignment = (
+        resource_binding.get("physical_assignment")
+        if type(resource_binding) is dict
+        else None
+    )
+    expected = authority.sha256
+    if (
+        plan.get("budget_materialization_authority_sha256") != expected
+        or type(dispatch_authority) is not dict
+        or dispatch_authority.get("budget_materialization_authority_sha256") != expected
+        or type(physical_assignment) is not dict
+        or physical_assignment.get("budget_materialization_authority_sha256")
+        != expected
+    ):
+        raise ValueError(
+            "alias execution/dispatch/physical plan differs from its raw budget "
+            "materialization authority"
+        )
+
+
+def _validate_alias_artifact_binding(
+    identity: object,
+    reference: BoundArtifact,
+    *,
+    label: str,
+) -> str:
+    row = _exact_object(
+        identity,
+        fields={"experiment", "name", "content_sha256", "file_sha256", "size"},
+        label=label,
+    )
+    body = _bound_file(reference.path, reference.sha256, label=label)
+    if (
+        row.get("file_sha256") != reference.sha256
+        or row.get("size") != len(body)
+        or not _is_sha256(row.get("content_sha256"))
+        or not isinstance(row.get("name"), str)
+        or not row["name"]
+        or (
+            row.get("experiment") is not None and not isinstance(row["experiment"], str)
+        )
+    ):
+        raise ValueError(f"{label} differs from its execution-plan binding")
+    return str(row["content_sha256"])
+
+
+def _validate_alias_sampling_artifact(
+    reference: BoundArtifact,
+    *,
+    semantic_sha256: str,
+) -> None:
+    value = _bound_json(
+        reference.path,
+        reference.sha256,
+        label="alias sampling artifact",
+    )
+    value = _exact_object(
+        value,
+        fields={"schema_version", "purpose", "temperature", "top_p", "ignore_eos"},
+        label="alias sampling artifact",
+    )
+    try:
+        profile = SamplingProfile(**value)
+        profile.validate()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alias sampling artifact is not strict schema v2") from exc
+    if profile.sha256 != semantic_sha256:
+        raise ValueError("alias sampling artifact differs from its semantic digest")
+
+
+def _validate_alias_model_lock_artifact(
+    reference: BoundArtifact,
+    *,
+    semantic_sha256: str,
+    target_model: str,
+    target_revision: str,
+) -> None:
+    value = _bound_json(
+        reference.path,
+        reference.sha256,
+        label="alias model-lock artifact",
+    )
+    value = _exact_object(
+        value,
+        fields={"schema_version", "models"},
+        label="alias model-lock artifact",
+    )
+    models = value.get("models")
+    if type(models) is not list or any(
+        type(row) is not dict or set(row) != {"model_id", "revision"} for row in models
+    ):
+        raise ValueError("alias model-lock artifact has malformed model rows")
+    try:
+        lock = ModelLock(
+            schema_version=value["schema_version"],
+            models=tuple(LockedModel(**row) for row in models),
+        )
+        lock.validate()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alias model-lock artifact is not a strict lock") from exc
+    locked = {model.model_id: model.revision for model in lock.models}
+    if lock.sha256 != semantic_sha256 or locked.get(target_model) != target_revision:
+        raise ValueError("alias model-lock artifact differs from its semantic digest")
+
+
+def _alias_trusted_attester_policy(plan: Mapping[str, Any]) -> TrustedAttesterPolicy:
+    value = _exact_object(
+        plan.get("trusted_attester_policy"),
+        fields={
+            "schema_version",
+            "policy_id",
+            "trusted_attesters",
+            "public_keys",
+        },
+        label="alias trusted-attester policy",
+    )
+    trusted = value.get("trusted_attesters")
+    public_keys = value.get("public_keys")
+    if (
+        value.get("schema_version") != 1
+        or type(value.get("policy_id")) is not str
+        or type(trusted) is not list
+        or any(
+            type(row) is not list
+            or len(row) != 3
+            or any(type(item) is not str for item in row)
+            for row in trusted
+        )
+        or type(public_keys) is not list
+        or any(
+            type(row) is not list
+            or len(row) != 2
+            or any(type(item) is not str for item in row)
+            for row in public_keys
+        )
+    ):
+        raise ValueError("alias trusted-attester policy schema is invalid")
+    policy = TrustedAttesterPolicy(
+        policy_id=value["policy_id"],
+        trusted_attesters=tuple(tuple(row) for row in trusted),
+        public_keys=tuple(tuple(row) for row in public_keys),
+    )
+    policy.validate()
+    require_release_trusted_attester_policy(policy)
+    if policy.to_dict() != value or policy.sha256 != plan.get(
+        "trusted_attester_policy_sha256"
+    ):
+        raise ValueError("alias trusted-attester policy identity changed")
+    return policy
+
+
+def _alias_load_identity(load_plan: Any) -> dict[str, object]:
+    load_plan.validate()
+    scored = load_plan.scored.hashes
+    return {
+        "paired_replay_sha256": load_plan.paired_replay_sha256,
+        "warmup_corpus_sha256": (
+            None if load_plan.warmup is None else load_plan.warmup.hashes.corpus_sha256
+        ),
+        "scored_corpus_sha256": scored.corpus_sha256,
+        "request_ids_sha256": scored.request_ids_sha256,
+        "arrivals_sha256": scored.arrivals_sha256,
+        "cohorts_sha256": scored.cohorts_sha256,
+        "cancellations_sha256": scored.cancellations_sha256,
+        "window_sha256": load_plan.window.sha256,
+    }
+
+
+def _alias_split_semantics(value: Mapping[str, Any]) -> str:
+    fields = (
+        "scored_split",
+        "paired_replay_sha256",
+        "warmup_corpus_sha256",
+        "corpus_sha256",
+        "request_ids_sha256",
+        "arrivals_sha256",
+        "cohorts_sha256",
+        "cancellations_sha256",
+        "source_kind",
+        "source_identity_sha256",
+        "source_parameters",
+        "window_sha256",
+        "sampling_profile_sha256",
+        "model_lock_sha256",
+    )
+    return content_sha256({name: value[name] for name in fields})
+
+
+def _alias_budget_semantics(budget: Any) -> str:
+    value = asdict(budget)
+    value.pop("cell_id")
+    # The registry experiment name is a presentation/analysis label.  All
+    # executable budget semantics remain locked below (job kind, workload,
+    # durations, request/token floors, gang size, topology, and billing).
+    value.pop("experiment")
+    return content_sha256(value)
+
+
+def _alias_rank_layout(
+    runtime_plan: Mapping[str, Any],
+    *,
+    inventory: GpuInventory,
+    budget_plan: BudgetPlan,
+    budget_materialization_authority: BudgetMaterializationAuthorityBinding,
+) -> tuple[str, int]:
+    binding = _exact_object(
+        runtime_plan.get("resource_binding"),
+        fields={
+            "kind",
+            "physical_dispatch_ready",
+            "physical_assignment_sha256",
+            "physical_binding_sha256",
+            "physical_assignment",
+        },
+        label="alias runtime resource binding",
+    )
+    assignment = _exact_object(
+        binding.get("physical_assignment"),
+        fields={
+            "schema_version",
+            "kind",
+            "inventory_sha256",
+            "inventory_source_receipt_sha256",
+            "dispatch_plan_sha256",
+            "experiment_budget_sha256",
+            "budget_plan_sha256",
+            "capacity_authority_sha256",
+            "budget_materialization_authority_sha256",
+            "assignment_sha256",
+            "work_item_sha256",
+            "gpu_uuids",
+            "rank_groups",
+            "ports",
+            "gang_shape",
+            "fixed_instance_gpu_count",
+            "fixed_instance_billing_semantics",
+            "host_id",
+            "topology_group_ids",
+        },
+        label="alias physical assignment",
+    )
+    capacity_authority = budget_plan.capacity_authority
+    if capacity_authority is None:
+        raise ValueError(
+            "formal evidence alias is BLOCKED: BudgetPlan lacks raw capacity authority"
+        )
+    if (
+        binding.get("kind") != "gpu_assignment"
+        or binding.get("physical_dispatch_ready") is not True
+        or assignment.get("schema_version") != 3
+        or assignment.get("kind") != "industrial_physical_assignment"
+        or assignment.get("inventory_sha256") != inventory.sha256
+        or assignment.get("inventory_source_receipt_sha256")
+        != inventory.source_receipt_sha256
+        or assignment.get("fixed_instance_gpu_count") != len(inventory.devices)
+        or assignment.get("budget_plan_sha256") != budget_plan.sha256
+        or assignment.get("capacity_authority_sha256") != capacity_authority.sha256
+        or assignment.get("budget_materialization_authority_sha256")
+        != budget_materialization_authority.sha256
+    ):
+        raise ValueError("alias execution plan lacks exact inventory assignment")
+    if binding.get("physical_assignment_sha256") != assignment.get(
+        "assignment_sha256"
+    ) or binding.get("physical_binding_sha256") != content_sha256(assignment):
+        raise ValueError("alias physical assignment digest binding changed")
+    gang_shape = _exact_object(
+        assignment.get("gang_shape"),
+        fields={"tensor_parallel_size", "data_parallel_size"},
+        label="alias physical assignment gang shape",
+    )
+    gpu_uuids = assignment.get("gpu_uuids")
+    rank_groups = assignment.get("rank_groups")
+    ports = assignment.get("ports")
+    topology_group_ids = assignment.get("topology_group_ids")
+    if (
+        type(gpu_uuids) is not list
+        or type(rank_groups) is not list
+        or any(type(group) is not list for group in rank_groups)
+        or type(ports) is not list
+        or type(topology_group_ids) is not list
+        or any(type(group) is not list for group in topology_group_ids)
+    ):
+        raise ValueError("alias physical assignment rank arrays are invalid")
+    from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
+
+    try:
+        reconstructed = IndustrialPhysicalAssignment(
+            inventory_sha256=assignment["inventory_sha256"],
+            inventory_source_receipt_sha256=assignment[
+                "inventory_source_receipt_sha256"
+            ],
+            dispatch_plan_sha256=assignment["dispatch_plan_sha256"],
+            experiment_budget_sha256=assignment["experiment_budget_sha256"],
+            budget_plan_sha256=assignment["budget_plan_sha256"],
+            capacity_authority_sha256=assignment["capacity_authority_sha256"],
+            budget_materialization_authority_sha256=assignment[
+                "budget_materialization_authority_sha256"
+            ],
+            assignment_sha256=assignment["assignment_sha256"],
+            work_item_sha256=assignment["work_item_sha256"],
+            gpu_uuids=tuple(gpu_uuids),
+            rank_groups=tuple(tuple(group) for group in rank_groups),
+            ports=tuple(ports),
+            tensor_parallel_size=gang_shape["tensor_parallel_size"],
+            data_parallel_size=gang_shape["data_parallel_size"],
+            fixed_instance_gpu_count=assignment["fixed_instance_gpu_count"],
+            host_id=assignment["host_id"],
+            topology_group_ids=tuple(tuple(group) for group in topology_group_ids),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alias physical assignment is not strict schema v3") from exc
+    if reconstructed.to_dict() != assignment:
+        raise ValueError("alias physical assignment is not canonical schema v3")
+    semantic_fields = (
+        "inventory_sha256",
+        "inventory_source_receipt_sha256",
+        "gpu_uuids",
+        "rank_groups",
+        "gang_shape",
+        "fixed_instance_gpu_count",
+        "fixed_instance_billing_semantics",
+        "host_id",
+        "topology_group_ids",
+    )
+    if any(name not in assignment for name in semantic_fields):
+        raise ValueError("alias physical rank layout is incomplete")
+    return (
+        content_sha256({name: assignment[name] for name in semantic_fields}),
+        reconstructed.fixed_instance_gpu_count,
+    )
+
+
+def _validate_alias_dispatch_authority(
+    plan: Mapping[str, Any],
+    *,
+    runtime_plan: Mapping[str, Any],
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+    budget_sha256: str,
+    budget_plan: BudgetPlan,
+    budget_materialization_authority: BudgetMaterializationAuthorityBinding,
+    budget_activation_artifact_sha256: str | None,
+    budget_family_activation_sha256s: tuple[str, ...],
+    budget_family_power_reduction_sha256s: tuple[str, ...],
+    budget_activation_receipt_sha256s: tuple[str, ...],
+    budget_completion_authorities: tuple[Any, ...],
+    inventory: GpuInventory,
+) -> None:
+    dispatch = _exact_object(
+        plan.get("dispatch_plan"),
+        fields={
+            "schema_version",
+            "registry_sha256",
+            "inventory_sha256",
+            "receipts_sha256",
+            "interference_envelope_sha256",
+            "budget_sha256_by_cell",
+            "seed",
+            "waves",
+            "completed_cell_ids",
+            "estimated_wall_seconds",
+            "estimated_gpu_seconds",
+            "estimated_gpu_hours",
+            "wave_sha256",
+            "scientific_budget_bound",
+        },
+        label="alias dispatch plan",
+    )
+    authority = _exact_object(
+        plan.get("dispatch_authority"),
+        fields={
+            "schema_version",
+            "kind",
+            "registry_sha256",
+            "inventory_sha256",
+            "interference_envelope_sha256",
+            "budget_sha256s",
+            "receipt_sha256s",
+            "completed_cell_ids",
+            "completion_authority_sha256s",
+            "activation_artifact_sha256",
+            "family_activation_sha256s",
+            "family_power_reduction_sha256s",
+            "budget_plan_sha256",
+            "capacity_authority_sha256",
+            "budget_materialization_authority_sha256",
+            "port_start",
+            "port_end",
+            "seed",
+        },
+        label="alias dispatch authority",
+    )
+    budget_bindings = dispatch.get("budget_sha256_by_cell")
+    authority_budgets = authority.get("budget_sha256s")
+    capacity_authority = budget_plan.capacity_authority
+    if capacity_authority is None:
+        raise ValueError(
+            "formal evidence alias is BLOCKED: BudgetPlan lacks raw capacity authority"
+        )
+    expected_budget_bindings = [
+        {
+            "cell_id": budget.cell_id,
+            "experiment_budget_sha256": budget.sha256,
+        }
+        for budget in budget_plan.diagnostic_budgets
+    ]
+    expected_budget_sha256s = [
+        budget.sha256 for budget in budget_plan.diagnostic_budgets
+    ]
+    completed_cell_ids = tuple(
+        sorted(
+            cell_id
+            for completion in budget_completion_authorities
+            for cell_id in completion.derive_completed_cell_ids()
+        )
+    )
+    if len(completed_cell_ids) != len(set(completed_cell_ids)):
+        raise ValueError("alias raw completion authorities overlap cells")
+    completion_authority_sha256s = tuple(
+        completion.sha256 for completion in budget_completion_authorities
+    )
+    for name in (
+        "receipt_sha256s",
+        "family_activation_sha256s",
+        "family_power_reduction_sha256s",
+    ):
+        values = authority.get(name)
+        if type(values) is not list or any(not _is_sha256(value) for value in values):
+            raise ValueError(f"alias dispatch authority {name} is invalid")
+    reducer_sha256s = (
+        []
+        if authority.get("activation_artifact_sha256") is None
+        else [authority.get("activation_artifact_sha256")]
+    )
+    if (
+        dispatch.get("schema_version") != 1
+        or dispatch.get("registry_sha256") != registry.sha256
+        or dispatch.get("inventory_sha256") != inventory.sha256
+        or dispatch.get("completed_cell_ids") != list(completed_cell_ids)
+        or plan.get("dispatch_plan_sha256") != content_sha256(dispatch)
+        or authority.get("schema_version") != 3
+        or authority.get("kind") != "gpu_dispatch_execution_context"
+        or authority.get("registry_sha256") != registry.sha256
+        or authority.get("inventory_sha256") != inventory.sha256
+        or authority.get("interference_envelope_sha256")
+        != dispatch.get("interference_envelope_sha256")
+        or authority.get("seed") != dispatch.get("seed")
+        or authority.get("completed_cell_ids") != list(completed_cell_ids)
+        or authority.get("completion_authority_sha256s")
+        != list(completion_authority_sha256s)
+        or authority.get("activation_artifact_sha256")
+        != budget_activation_artifact_sha256
+        or authority.get("receipt_sha256s") != list(budget_activation_receipt_sha256s)
+        or authority.get("family_activation_sha256s")
+        != list(budget_family_activation_sha256s)
+        or authority.get("family_power_reduction_sha256s")
+        != list(budget_family_power_reduction_sha256s)
+        or authority.get("budget_plan_sha256") != budget_plan.sha256
+        or authority.get("capacity_authority_sha256") != capacity_authority.sha256
+        or authority.get("budget_materialization_authority_sha256")
+        != budget_materialization_authority.sha256
+        or plan.get("budget_plan_sha256") != budget_plan.sha256
+        or plan.get("capacity_authority_sha256") != capacity_authority.sha256
+        or plan.get("dispatch_context_sha256") != content_sha256(authority)
+        or plan.get("dependency_receipt_sha256s")
+        != list(budget_activation_receipt_sha256s)
+        or runtime_plan.get("dependency_receipt_sha256s")
+        != list(budget_activation_receipt_sha256s)
+        or type(budget_bindings) is not list
+        or type(authority_budgets) is not list
+        or budget_bindings != expected_budget_bindings
+        or authority_budgets != expected_budget_sha256s
+        or dispatch.get("receipts_sha256")
+        != content_sha256(authority.get("receipt_sha256s"))
+        or tuple(sorted(reducer_sha256s)) != budget_plan.reducer_activation_sha256s
+        or tuple(sorted(authority.get("family_activation_sha256s", ())))
+        != budget_plan.family_activation_sha256s
+        or tuple(sorted(authority.get("family_power_reduction_sha256s", ())))
+        != budget_plan.family_power_reduction_sha256s
+        or {
+            "cell_id": cell.cell_id,
+            "experiment_budget_sha256": budget_sha256,
+        }
+        not in budget_bindings
+    ):
+        raise ValueError(
+            "alias dispatch plan is not bound to registry/inventory/budget"
+        )
+    waves = dispatch.get("waves")
+    if type(waves) is not list:
+        raise ValueError("alias dispatch plan lacks canonical waves")
+    from lightcone_spec.experiments.gpu_pool import GpuDispatchPlan, GpuDispatchWave
+
+    try:
+        reconstructed_waves = tuple(GpuDispatchWave.from_dict(wave) for wave in waves)
+        reconstructed_budget_bindings = tuple(
+            (
+                row["cell_id"],
+                row["experiment_budget_sha256"],
+            )
+            for row in (
+                _exact_object(
+                    value,
+                    fields={"cell_id", "experiment_budget_sha256"},
+                    label="alias dispatch budget binding",
+                )
+                for value in budget_bindings
+            )
+        )
+        reconstructed_dispatch = GpuDispatchPlan(
+            schema_version=dispatch["schema_version"],
+            registry_sha256=dispatch["registry_sha256"],
+            inventory_sha256=dispatch["inventory_sha256"],
+            receipts_sha256=dispatch["receipts_sha256"],
+            interference_envelope_sha256=dispatch["interference_envelope_sha256"],
+            budget_sha256_by_cell=reconstructed_budget_bindings,
+            seed=dispatch["seed"],
+            waves=reconstructed_waves,
+            completed_cell_ids=tuple(dispatch["completed_cell_ids"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("alias dispatch plan is not strict schema v1") from exc
+    if reconstructed_dispatch.to_dict() != dispatch:
+        raise ValueError("alias dispatch plan is not canonical schema v1")
+    assignments = [
+        assignment
+        for wave in reconstructed_dispatch.waves
+        for assignment in wave.assignments
+        if assignment.work_item.cell == cell
+    ]
+    if len(assignments) != 1:
+        raise ValueError("alias cell lacks one exact dispatch assignment")
+    assignment = assignments[0]
+    physical = runtime_plan["resource_binding"]["physical_assignment"]
+    if (
+        physical.get("dispatch_plan_sha256") != reconstructed_dispatch.sha256
+        or physical.get("experiment_budget_sha256") != budget_sha256
+        or physical.get("budget_plan_sha256") != budget_plan.sha256
+        or physical.get("capacity_authority_sha256") != capacity_authority.sha256
+        or physical.get("budget_materialization_authority_sha256")
+        != budget_materialization_authority.sha256
+        or physical.get("assignment_sha256") != assignment.sha256
+        or physical.get("work_item_sha256") != assignment.work_item.sha256
+        or physical.get("gpu_uuids") != list(assignment.gpu_uuids)
+        or physical.get("rank_groups")
+        != [list(group) for group in assignment.rank_groups]
+        or physical.get("ports") != list(assignment.ports)
+        or runtime_plan.get("physical_gpu_uuids") != physical.get("gpu_uuids")
+        or runtime_plan.get("physical_rank_groups") != physical.get("rank_groups")
+        or runtime_plan.get("physical_ports") != physical.get("ports")
+        or runtime_plan.get("physical_fixed_instance_gpu_count")
+        != physical.get("fixed_instance_gpu_count")
+    ):
+        raise ValueError("alias runtime assignment differs from scheduler authority")
+
+
+def _registry_alias_presentation_values(
+    source: ExperimentCell,
+    target: ExperimentCell,
+    *,
+    axis: str,
+) -> tuple[str, str]:
+    source_identity = asdict(source.identity)
+    target_identity = asdict(target.identity)
+    differences = {
+        name
+        for name in source_identity
+        if source_identity[name] != target_identity[name]
+    }
+    allowed: dict[str, set[str]] = {
+        "backend_label": {"backend"},
+        "width_panel_label": {"width", "variant"},
+        "load_panel_label": {"arrival", "concurrency", "load_factor", "variant"},
+        "breadth_panel_label": {"backend", "task", "variant"},
+        "analysis_panel": {"experiment", "task", "variant"},
+    }
+    if axis not in allowed or not differences or not differences <= allowed[axis]:
+        raise ValueError(
+            "alias registry cells do not differ on exactly one presentation-only axis"
+        )
+    if (
+        source.identity.method != "target_only"
+        or target.identity.method != "target_only"
+    ):
+        raise ValueError("evidence aliases are Target-only only")
+    if source.identity.block != target.identity.block:
+        raise ValueError("an alias cannot remove the independent repetition block")
+    if source.resources.workload_class is not target.resources.workload_class:
+        raise ValueError("alias cells use different workload isolation")
+    if source.resources.gpu_count != target.resources.gpu_count:
+        raise ValueError("alias cells use different gang sizes")
+    if axis == "backend_label":
+        return source.identity.backend, target.identity.backend
+    if axis == "width_panel_label":
+        return (
+            f"width={source.identity.width};variant={source.identity.variant}",
+            f"width={target.identity.width};variant={target.identity.variant}",
+        )
+    if axis == "load_panel_label":
+        return (
+            f"arrival={source.identity.arrival};variant={source.identity.variant}",
+            f"arrival={target.identity.arrival};variant={target.identity.variant}",
+        )
+    if axis == "breadth_panel_label":
+        return (
+            (
+                f"backend={source.identity.backend};task={source.identity.task};"
+                f"variant={source.identity.variant}"
+            ),
+            (
+                f"backend={target.identity.backend};task={target.identity.task};"
+                f"variant={target.identity.variant}"
+            ),
+        )
+    return (
+        (
+            f"experiment={source.identity.experiment};task={source.identity.task};"
+            f"variant={source.identity.variant}"
+        ),
+        (
+            f"experiment={target.identity.experiment};task={target.identity.task};"
+            f"variant={target.identity.variant}"
+        ),
+    )
+
+
+def _audit_alias_execution_candidate(
+    artifacts: AliasExecutionArtifacts,
+    *,
+    registry: ExperimentRegistry,
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+) -> _AliasExecutionCandidate:
+    plan = _bound_json(
+        artifacts.execution_plan.path,
+        artifacts.execution_plan.sha256,
+        label="industrial execution plan",
+    )
+    plan_fields = {
+        "schema_version",
+        "runtime_plan_sha256",
+        "dispatch_plan_sha256",
+        "dispatch_context_sha256",
+        "dispatch_plan",
+        "dispatch_authority",
+        "budget_plan_sha256",
+        "capacity_authority_sha256",
+        "budget_materialization_authority_sha256",
+        "experiment_budget_sha256",
+        "rank_config_sha256",
+        "topology_sha256",
+        "topology_receipt_sha256",
+        "runtime_plan",
+        "load",
+        "server_launch",
+        "compile_cache",
+        "bench_adapter",
+        "bench_argv",
+        "dependency_receipt_sha256s",
+        "dependency_artifacts",
+        "split_artifact",
+        "sampling_artifact",
+        "controlled_execution_policy_sha256",
+        "model_lock_artifact",
+        "inventory_source_artifact",
+        "runtime_envelope_artifact",
+        "warmup_request_bindings",
+        "scored_request_bindings",
+        "evidence_writer_policy",
+        "evidence_writer_policy_sha256",
+        "trusted_attester_policy",
+        "trusted_attester_policy_sha256",
+        "patched_sglang_tree",
+        "startup_timeout_s",
+        "shutdown_timeout_s",
+        "abort_grace_s",
+    }
+    _exact_object(plan, fields=plan_fields, label="industrial execution plan")
+    if plan.get("schema_version") != 3:
+        raise ValueError("alias requires industrial execution plan schema 3")
+    runtime_plan = _exact_object(
+        plan.get("runtime_plan"),
+        fields={
+            "schema_version",
+            "registry_sha256",
+            "cell_id",
+            "cell_declaration_sha256",
+            "dependency_receipt_sha256s",
+            "topology_receipt_sha256",
+            "parameter_plan_sha256",
+            "rank_config_sha256s",
+            "rank_configs",
+            "workload",
+            "resources",
+            "logical_resources",
+            "physical_gpu_uuids",
+            "physical_rank_groups",
+            "physical_ports",
+            "physical_fixed_instance_gpu_count",
+            "resource_binding",
+        },
+        label="alias runtime plan",
+    )
+    if (
+        runtime_plan.get("schema_version") != 2
+        or runtime_plan.get("registry_sha256") != registry.sha256
+        or plan.get("runtime_plan_sha256") != content_sha256(runtime_plan)
+    ):
+        raise ValueError("alias runtime plan differs from its registry authority")
+    budget_materialization_authority = _load_alias_budget_materialization_authority(
+        artifacts
+    )
+    _validate_alias_budget_materialization_digest_bindings(
+        plan,
+        runtime_plan=runtime_plan,
+        authority=budget_materialization_authority,
+    )
+    cell_id = runtime_plan.get("cell_id")
+    matches = tuple(cell for cell in registry.cells if cell.cell_id == cell_id)
+    if len(matches) != 1:
+        raise ValueError("alias execution plan does not resolve one registry cell")
+    cell = matches[0]
+    if (
+        not cell.runnable
+        or cell.identity.method != "target_only"
+        or runtime_plan.get("cell_declaration_sha256") != cell.sha256
+    ):
+        raise ValueError("alias execution plan is not one runnable Target-only cell")
+    rank_configs = runtime_plan.get("rank_configs")
+    rank_config_sha256s = runtime_plan.get("rank_config_sha256s")
+    if (
+        type(rank_configs) is not list
+        or len(rank_configs) != 1
+        or type(rank_config_sha256s) is not list
+        or len(rank_config_sha256s) != 1
+        or plan.get("rank_config_sha256") != rank_config_sha256s[0]
+    ):
+        raise ValueError("alias execution plan lacks one exact RunConfig")
+    run_config_value = _bound_json(
+        artifacts.run_config.path,
+        artifacts.run_config.sha256,
+        label="alias run config",
+    )
+    if run_config_value != rank_configs[0]:
+        raise ValueError("alias raw RunConfig differs from the execution plan")
+    try:
+        run_config = RunConfig.model_validate(run_config_value)
+    except ValueError as exc:
+        raise ValueError("alias raw RunConfig is not strict schema v3") from exc
+    if (
+        run_config.model_dump(mode="json") != run_config_value
+        or run_config.method != "target_only"
+        or content_sha256(run_config_value) != rank_config_sha256s[0]
+        or plan.get("controlled_execution_policy_sha256")
+        != run_config.runtime.execution_policy_sha256
+    ):
+        raise ValueError("alias raw RunConfig is incomplete or non-Target-only")
+    workload = runtime_plan.get("workload")
+    expected_workload = {
+        "experiment": cell.identity.experiment,
+        "task": cell.identity.task,
+        "context": cell.identity.context,
+        "regime": cell.identity.regime,
+        "width": cell.identity.width,
+        "arrival": cell.identity.arrival,
+        "slo": cell.identity.slo,
+        "cohort": cell.identity.cohort,
+        "seed": cell.identity.seed,
+        "block": cell.identity.block,
+        "variant": cell.identity.variant,
+        "concurrency": cell.identity.concurrency,
+        "load_factor": cell.identity.load_factor,
+        "cohort_count": cell.identity.cohort_count,
+    }
+    if workload != expected_workload:
+        raise ValueError("alias runtime workload differs from its registry cell")
+    load_plan = _load_alias_wrapped_artifact(
+        artifacts.load_plan,
+        label="alias ProductionLoadPlan",
+        decoder=production_load_plan_from_dict,
+    )
+    if plan.get("load") != _alias_load_identity(load_plan):
+        raise ValueError("alias raw load plan differs from the execution plan")
+    budget = _load_alias_wrapped_artifact(
+        artifacts.experiment_budget,
+        label="alias ExperimentBudget",
+        decoder=experiment_budget_from_dict,
+    )
+    if (
+        budget.cell_id != cell.cell_id
+        or budget.method != "target_only"
+        or plan.get("experiment_budget_sha256") != budget.sha256
+    ):
+        raise ValueError("alias ExperimentBudget differs from its registry/plan")
+    budget_materialization = revalidate_budget_materialization_authority_binding(
+        budget_materialization_authority,
+        expected_registry=registry,
+        expected_inventory=budget_inventory_identity_from_gpu_inventory(inventory),
+    )
+    activation_replay = replay_budget_activation_authority(
+        budget_materialization_authority.activation
+    )
+    if (
+        activation_replay.registry != registry
+        or activation_replay.selected_activation != budget_materialization.activation
+        or activation_replay.family_activations
+        != budget_materialization.family_activations
+        or activation_replay.family_power_reductions
+        != budget_materialization.family_power_reductions
+    ):
+        raise ValueError("alias raw activation replay differs from its BudgetPlan")
+    if (
+        activation_replay.stage_family_authorities
+        or activation_replay.auxiliary_authority is not None
+    ):
+        raise ValueError(
+            "formal evidence alias is BLOCKED: confirmation stage aggregate is "
+            "completion authority, not an execution activation"
+        )
+    budget_plan = budget_materialization.budget_plan
+    capacity_authority = budget_materialization.capacity_authority
+    budget_plan_by_cell = {row.cell_id: row for row in budget_plan.diagnostic_budgets}
+    if capacity_authority is None:
+        raise ValueError(
+            "formal evidence alias is BLOCKED: raw BudgetPlan lacks capacity authority"
+        )
+    if (
+        budget_plan.registry_sha256 != registry.sha256
+        or budget_plan.inventory
+        != budget_inventory_identity_from_gpu_inventory(inventory)
+        or budget_plan_by_cell.get(cell.cell_id) != budget
+        or plan.get("budget_plan_sha256") != budget_plan.sha256
+        or plan.get("capacity_authority_sha256") != capacity_authority.sha256
+        or plan.get("budget_materialization_authority_sha256")
+        != budget_materialization_authority.sha256
+        or capacity_authority.gpu_inventory_sha256 != inventory.sha256
+        or capacity_authority.inventory_source_receipt_sha256
+        != inventory.source_receipt_sha256
+    ):
+        raise ValueError(
+            "alias raw BudgetPlan/capacity authority differs from execution authority"
+        )
+    sampling_sha256 = _validate_alias_artifact_binding(
+        plan.get("sampling_artifact"),
+        artifacts.sampling_artifact,
+        label="alias sampling artifact",
+    )
+    model_lock_sha256 = _validate_alias_artifact_binding(
+        plan.get("model_lock_artifact"),
+        artifacts.model_lock_artifact,
+        label="alias model-lock artifact",
+    )
+    split_sha256 = _validate_alias_artifact_binding(
+        plan.get("split_artifact"),
+        artifacts.split_artifact,
+        label="alias split artifact",
+    )
+    _validate_alias_sampling_artifact(
+        artifacts.sampling_artifact,
+        semantic_sha256=sampling_sha256,
+    )
+    _validate_alias_model_lock_artifact(
+        artifacts.model_lock_artifact,
+        semantic_sha256=model_lock_sha256,
+        target_model=run_config.model.target,
+        target_revision=run_config.model.target_revision,
+    )
+    split_value = _bound_json(
+        artifacts.split_artifact.path,
+        artifacts.split_artifact.sha256,
+        label="alias split artifact",
+    )
+    from lightcone_spec.orchestration.executor import (
+        industrial_execution_split_contract,
+    )
+
+    expected_split = industrial_execution_split_contract(
+        registry_sha256=registry.sha256,
+        cell=cell,
+        load_plan=load_plan,
+        sampling_profile_sha256=sampling_sha256,
+        model_lock_sha256=model_lock_sha256,
+    )
+    if split_value != expected_split or split_sha256 != content_sha256(split_value):
+        raise ValueError("alias split artifact cannot be reconstructed")
+    _validate_alias_dispatch_authority(
+        plan,
+        runtime_plan=runtime_plan,
+        registry=registry,
+        cell=cell,
+        budget_sha256=budget.sha256,
+        budget_plan=budget_plan,
+        budget_materialization_authority=budget_materialization_authority,
+        budget_activation_artifact_sha256=(
+            activation_replay.activation_artifact.sha256
+            if activation_replay.activation_artifact is not None
+            else None
+        ),
+        budget_family_activation_sha256s=tuple(
+            activation.sha256 for activation in activation_replay.family_activations
+        ),
+        budget_family_power_reduction_sha256s=tuple(
+            reduction.sha256 for reduction in activation_replay.family_power_reductions
+        ),
+        budget_activation_receipt_sha256s=tuple(
+            receipt.sha256 for receipt in activation_replay.dependency_receipts
+        ),
+        budget_completion_authorities=(
+            *activation_replay.prior_e2_stage_authorities,
+            *activation_replay.prior_family_authorities,
+        ),
+        inventory=inventory,
+    )
+    try:
+        writer_policy = EvidenceWriterPolicy.from_dict(
+            plan.get("evidence_writer_policy")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alias evidence-writer policy is not strict") from exc
+    if writer_policy.sha256 != plan.get("evidence_writer_policy_sha256"):
+        raise ValueError("alias evidence-writer policy digest changed")
+    rank_layout_sha256, fixed_instance_gpu_count = _alias_rank_layout(
+        runtime_plan,
+        inventory=inventory,
+        budget_plan=budget_plan,
+        budget_materialization_authority=budget_materialization_authority,
+    )
+    if budget.fixed_instance_billed_gpu_ms != budget.wall_time.scale(
+        fixed_instance_gpu_count
+    ):
+        raise ValueError("alias budget does not bill its complete inventory")
+    scored = load_plan.scored.hashes
+    maximum_output_tokens = max(
+        request.requested_output_tokens
+        for corpus in (load_plan.warmup, load_plan.scored)
+        if corpus is not None
+        for request in corpus.requests
+    )
+    runtime_authority_sha256 = content_sha256(
+        {
+            "dependency_receipt_sha256s": plan["dependency_receipt_sha256s"],
+            "dependency_artifacts": plan["dependency_artifacts"],
+            "trusted_attester_policy_sha256": plan["trusted_attester_policy_sha256"],
+            "compile_cache": plan["compile_cache"],
+            "runtime_envelope_artifact": plan["runtime_envelope_artifact"],
+            "evidence_writer_policy_sha256": writer_policy.sha256,
+        }
+    )
+    method_implementation_sha256 = content_sha256(
+        {
+            "method": "target_only",
+            "patched_sglang_tree": plan["patched_sglang_tree"],
+            "bench_adapter": plan["bench_adapter"],
+            "compile_cache_key_sha256": plan["compile_cache"]["key_sha256"],
+        }
+    )
+    server_config_sha256 = content_sha256(run_config_value)
+    semantics = ExecutionDerivedAliasSemantics(
+        schema_version=1,
+        target_model=run_config.model.target,
+        target_revision=run_config.model.target_revision,
+        runtime_authority_sha256=runtime_authority_sha256,
+        patched_tree_identity=str(plan["patched_sglang_tree"]),
+        run_config_sha256=server_config_sha256,
+        sampling_profile_sha256=sampling_sha256,
+        seed=cell.identity.seed,
+        load_plan_sha256=load_plan.paired_replay_sha256,
+        warmup_corpus_sha256=(
+            None if load_plan.warmup is None else load_plan.warmup.hashes.corpus_sha256
+        ),
+        request_corpus_sha256=scored.corpus_sha256,
+        arrival_trace_sha256=scored.arrivals_sha256,
+        request_ids_sha256=scored.request_ids_sha256,
+        maximum_context_tokens=run_config.model.max_context_length,
+        maximum_output_tokens=maximum_output_tokens,
+        split_semantics_sha256=_alias_split_semantics(split_value),
+        model_lock_sha256=model_lock_sha256,
+        experiment_budget_semantics_sha256=_alias_budget_semantics(budget),
+        hardware_envelope_sha256=content_sha256(hardware_envelope),
+        inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        fixed_instance_gpu_count=fixed_instance_gpu_count,
+        topology=cell.identity.topology,
+        rank_layout_sha256=rank_layout_sha256,
+        method="target_only",
+        method_implementation_sha256=method_implementation_sha256,
+        server_config_sha256=server_config_sha256,
+        evidence_schema="schema_v3_native_terminal_v1",
+        output_token_contract_sha256=content_sha256(
+            {
+                "warmup_request_bindings": plan["warmup_request_bindings"],
+                "scored_request_bindings": plan["scored_request_bindings"],
+                "request_ids_sha256": scored.request_ids_sha256,
+            }
+        ),
+        timing_contract_sha256=load_plan.window.sha256,
+    )
+    return _AliasExecutionCandidate(
+        cell=cell,
+        execution_plan_file_sha256=artifacts.execution_plan.sha256,
+        execution_plan_sha256=content_sha256(plan),
+        execution_plan=MappingProxyType(plan),
+        load_plan=load_plan,
+        budget=budget,
+        budget_plan=budget_plan,
+        budget_materialization_authority=budget_materialization_authority,
+        semantics=semantics,
+    )
+
+
+def _load_alias_execution_candidate(
+    artifacts: AliasExecutionArtifacts,
+    *,
+    registry: ExperimentRegistry,
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+) -> _AliasExecutionCandidate:
+    """Audit raw execution inputs, then replay the formal budget authority."""
+
+    candidate = _audit_alias_execution_candidate(
+        artifacts,
+        registry=registry,
+        hardware_envelope=hardware_envelope,
+        inventory=inventory,
+    )
+    ready = require_ready_budget_materialization_authority_binding(
+        candidate.budget_materialization_authority,
+        expected_registry=registry,
+        expected_inventory=budget_inventory_identity_from_gpu_inventory(inventory),
+        expected_gpu_inventory=inventory,
+        expected_plan=candidate.budget_plan,
+    )
+    if candidate.budget not in ready.budget_plan.require_ready():
+        raise ValueError(
+            "formal evidence alias BudgetPlan does not authorize its exact budget"
+        )
+    return candidate
+
+
+def _validate_alias_inventory_receipt(
+    reference: BoundArtifact,
+    *,
+    inventory: GpuInventory,
+) -> None:
+    value = _bound_json(
+        reference.path,
+        reference.sha256,
+        label="alias inventory source receipt",
+    )
+    declared = value.get("receipt_sha256")
+    content = {name: item for name, item in value.items() if name != "receipt_sha256"}
+    if (
+        declared != inventory.source_receipt_sha256
+        or content_sha256(content) != inventory.source_receipt_sha256
+        or value.get("kind") != "gpu_inventory_probe_receipt"
+        or value.get("schema_version") != 1
+    ):
+        raise ValueError("alias inventory receipt differs from the GPU inventory")
+
+
+def _validate_alias_native_terminal_artifacts(
+    manifest: RawEvidenceAliasManifest,
+    *,
+    source: _AliasExecutionCandidate,
+    loaded: _LoadedCell,
+) -> tuple[str, ...]:
+    terminals = manifest.source_evidence.terminal_receipts
+    native_references = manifest.source_native_terminal_artifacts
+    if len(terminals) != len(native_references) or len(terminals) != len(
+        loaded.run_rows
+    ):
+        raise ValueError("alias native terminal artifacts lack exact rank coverage")
+    policy = _alias_trusted_attester_policy(source.execution_plan)
+    native_sha256s: list[str] = []
+    for rank, (terminal_reference, native_reference, run) in enumerate(
+        zip(terminals, native_references, loaded.run_rows, strict=True)
+    ):
+        terminal = _bound_json(
+            terminal_reference.path,
+            terminal_reference.sha256,
+            label="alias terminal receipt",
+        )
+        receipt_binding = terminal.get("native_terminal_artifact")
+        if type(receipt_binding) is not dict or set(receipt_binding) != {
+            "path",
+            "size",
+            "raw_sha256",
+            "terminal_sha256",
+            "trusted_attester_policy_sha256",
+        }:
+            raise ValueError("alias terminal receipt lacks native artifact authority")
+        native_body = _bound_file(
+            native_reference.path,
+            native_reference.sha256,
+            label="alias native terminal artifact",
+        )
+        try:
+            native = json.loads(native_body.decode("utf-8"))
+            canonical_native = (
+                json.dumps(
+                    native,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("alias native terminal artifact is not JSON") from exc
+        if native_body != canonical_native:
+            raise ValueError("alias native terminal artifact is not canonical JSON")
+        native = _exact_object(
+            native,
+            fields={
+                "schema_version",
+                "artifact_kind",
+                "run_id",
+                "rank",
+                "trusted_attester_policy_sha256",
+                "begin_sha256",
+                "reset_sha256",
+                "terminal_sha256",
+                "binding",
+                "warmup_requests",
+                "scored_requests",
+                "begin",
+                "reset",
+                "terminal",
+            },
+            label="alias native terminal artifact",
+        )
+        binding = _exact_object(
+            native.get("binding"),
+            fields={
+                "run_id",
+                "run_nonce_sha256",
+                "execution_plan_sha256",
+                "rank_config_sha256",
+                "attempt_id",
+                "session_id",
+                "session_epoch",
+                "previous_run_id",
+                "challenge_nonce_sha256",
+                "method",
+                "warmup_request_ids",
+                "scored_request_ids",
+            },
+            label="alias native terminal binding",
+        )
+        try:
+            validated = validate_native_terminal_artifact(
+                native,
+                trusted_attester_policy=policy,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "alias native terminal artifact fails first-party validation"
+            ) from exc
+        validated_binding = validated.binding
+        expected_warmup = (
+            []
+            if source.load_plan.warmup is None
+            else [request.request_id for request in source.load_plan.warmup.requests]
+        )
+        expected_scored = [
+            request.request_id for request in source.load_plan.scored.requests
+        ]
+        warmup_requests = (
+            () if source.load_plan.warmup is None else source.load_plan.warmup.requests
+        )
+        native_warmup = native.get("warmup_requests")
+        if type(native_warmup) is not list or len(native_warmup) != len(
+            warmup_requests
+        ):
+            raise ValueError("alias native warm-up coverage differs from its load")
+        for request, raw_expectation in zip(
+            warmup_requests,
+            native_warmup,
+            strict=True,
+        ):
+            expectation = _exact_object(
+                raw_expectation,
+                fields={
+                    "request_id",
+                    "input_token_ids",
+                    "output_token_ids",
+                    "terminal_status",
+                    "terminal_reason",
+                    "submitted_to_server",
+                },
+                label="alias native warm-up expectation",
+            )
+            if (
+                expectation.get("request_id") != request.request_id
+                or expectation.get("input_token_ids") != list(request.input_token_ids)
+                or expectation.get("terminal_status") != "completed"
+                or expectation.get("terminal_reason") != "FINISH_LENGTH"
+                or expectation.get("submitted_to_server") is not True
+                or type(expectation.get("output_token_ids")) is not list
+                or len(expectation["output_token_ids"])
+                != request.requested_output_tokens
+            ):
+                raise ValueError(
+                    "alias native warm-up expectation differs from its load"
+                )
+        request_rows = {str(row.get("request_id")): row for row in loaded.request_rows}
+        plan_requests = {
+            request.request_id: request for request in source.load_plan.scored.requests
+        }
+        if set(request_rows) != set(plan_requests):
+            raise ValueError("alias native scored coverage differs from its load")
+        for expectation in validated.requests:
+            request = plan_requests.get(expectation.request_id)
+            row = request_rows.get(expectation.request_id)
+            if request is None or row is None:
+                raise ValueError("alias native terminal names an unknown request")
+            submitted = row.get("admitted_ns") is not None
+            outcome = row.get("outcome_status")
+            expected_status = (
+                "completed"
+                if submitted and outcome == "completed"
+                else "aborted"
+                if submitted and outcome in {"cancelled", "timed_out"}
+                else outcome
+            )
+            output_ids = _parse_output_token_ids(row)
+            expected_output_ids = output_ids if submitted else None
+            if (
+                expectation.input_token_ids != request.input_token_ids
+                or expectation.submitted_to_server is not submitted
+                or expectation.terminal_status != expected_status
+                or expectation.output_token_ids != expected_output_ids
+            ):
+                raise ValueError(
+                    "alias native terminal differs from load/telemetry evidence"
+                )
+        if (
+            receipt_binding.get("raw_sha256") != native_reference.sha256
+            or receipt_binding.get("path") != native_reference.path.name
+            or receipt_binding.get("size") != len(native_body)
+            or receipt_binding.get("terminal_sha256") != native.get("terminal_sha256")
+            or receipt_binding.get("trusted_attester_policy_sha256")
+            != native.get("trusted_attester_policy_sha256")
+            or native.get("schema_version") != 1
+            or native.get("artifact_kind") != "native_terminal_evidence_bundle_v1"
+            or native.get("run_id") != run.get("run_id")
+            or native.get("rank") != rank
+            or validated.terminal_sha256 != native.get("terminal_sha256")
+            or binding.get("run_id") != run.get("run_id")
+            or binding.get("run_nonce_sha256") != run.get("run_nonce_sha256")
+            or binding.get("execution_plan_sha256") != source.execution_plan_sha256
+            or binding.get("rank_config_sha256") != run.get("rank_config_sha256")
+            or binding.get("method") != "target_only"
+            or binding.get("warmup_request_ids") != expected_warmup
+            or binding.get("scored_request_ids") != expected_scored
+            or validated_binding.run_id != run.get("run_id")
+            or validated_binding.run_nonce_sha256 != run.get("run_nonce_sha256")
+            or validated_binding.execution_plan_sha256 != source.execution_plan_sha256
+            or validated_binding.rank_config_sha256 != run.get("rank_config_sha256")
+            or validated_binding.method != "target_only"
+            or validated_binding.warmup_request_ids != tuple(expected_warmup)
+            or validated_binding.scored_request_ids != tuple(expected_scored)
+            or run.get("native_terminal_artifact_path") != native_reference.path.name
+            or run.get("native_terminal_artifact_size") != len(native_body)
+            or run.get("native_terminal_raw_sha256") != native_reference.sha256
+            or run.get("native_terminal_sha256") != validated.terminal_sha256
+            or run.get("trusted_attester_policy_sha256") != policy.sha256
+        ):
+            raise ValueError(
+                "alias native terminal artifact differs from execution/run evidence"
+            )
+        native_sha256s.append(native_reference.sha256)
+    return tuple(native_sha256s)
+
+
+def _reduce_evidence_alias(
+    *,
+    registry: ExperimentRegistry,
+    manifest: RawEvidenceAliasManifest,
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+) -> tuple[EvidenceAliasReductionArtifact, _LoadedCell]:
+    if type(manifest) is not RawEvidenceAliasManifest:
+        raise TypeError("evidence alias reduction requires an exact raw manifest")
+    if not isinstance(registry, ExperimentRegistry):
+        raise TypeError("evidence alias reduction requires an ExperimentRegistry")
+    if not isinstance(inventory, GpuInventory):
+        raise TypeError("evidence alias reduction requires an exact GPU inventory")
+    _validate_alias_inventory_receipt(
+        manifest.inventory_source_receipt,
+        inventory=inventory,
+    )
+    source = _load_alias_execution_candidate(
+        manifest.source,
+        registry=registry,
+        hardware_envelope=hardware_envelope,
+        inventory=inventory,
+    )
+    target = _load_alias_execution_candidate(
+        manifest.target,
+        registry=registry,
+        hardware_envelope=hardware_envelope,
+        inventory=inventory,
+    )
+    source_value, target_value = _registry_alias_presentation_values(
+        source.cell,
+        target.cell,
+        axis=manifest.removed_presentation_axis,
+    )
+    if source.semantics != target.semantics:
+        raise ValueError(
+            "alias source and target differ in reconstructed execution semantics"
+        )
+    hardware = _bound_json(
+        manifest.source_evidence.hardware_receipt.path,
+        manifest.source_evidence.hardware_receipt.sha256,
+        label="alias source hardware receipt",
+    )
+    runtime_sha256 = hardware.get("runtime_sha256")
+    split_sha256 = hardware.get("split_sha256")
+    if not _is_sha256(runtime_sha256) or not _is_sha256(split_sha256):
+        raise ValueError("alias source hardware receipt lacks run identity")
+    family = _AliasRunIdentity(
+        experiment=source.cell.identity.experiment,
+        runtime_sha256=str(runtime_sha256),
+        split_sha256=str(split_sha256),
+    )
+    cells_by_id = {cell.cell_id: cell for cell in registry.cells}
+    loaded = _load_cell(
+        manifest.source_evidence,
+        registry=registry,
+        family=family,
+        cells_by_id=cells_by_id,
+        envelope=hardware_envelope,
+        inventory=inventory,
+    )
+    run = loaded.run_rows[0]
+    if (
+        loaded.cell != source.cell
+        or str(run["rank_config_sha256"]) != source.execution_plan["rank_config_sha256"]
+        or str(run["split_sha256"])
+        != source.execution_plan["split_artifact"]["content_sha256"]
+        or str(run["corpus_sha256"]) != source.load_plan.scored.hashes.corpus_sha256
+        or str(run["arrival_trace_sha256"])
+        != source.load_plan.scored.hashes.arrivals_sha256
+        or str(run["request_ids_sha256"])
+        != source.load_plan.scored.hashes.request_ids_sha256
+        or str(run["sampling_profile_sha256"])
+        != source.execution_plan["sampling_artifact"]["content_sha256"]
+        or str(run["model_lock_sha256"])
+        != source.execution_plan["model_lock_artifact"]["content_sha256"]
+        or str(run["experiment_budget_sha256"]) != source.budget.sha256
+        or any(status != "VALID" for _, status, _ in loaded.hardware_validity)
+    ):
+        raise ValueError(
+            "alias source terminal evidence differs from its locked execution plan"
+        )
+    native_sha256s = _validate_alias_native_terminal_artifacts(
+        manifest,
+        source=source,
+        loaded=loaded,
+    )
+    source_run_binding = _loaded_cell_raw_run_binding(
+        loaded,
+        scientific_unit=f"evidence_alias:block={source.cell.identity.block}",
+    )
+    artifact = EvidenceAliasReductionArtifact(
+        schema_version=1,
+        registry_sha256=registry.sha256,
+        source_cell_id=source.cell.cell_id,
+        target_cell_id=target.cell.cell_id,
+        source_cell_declaration_sha256=source.cell.sha256,
+        target_cell_declaration_sha256=target.cell.sha256,
+        source_execution_plan_file_sha256=(source.execution_plan_file_sha256),
+        source_execution_plan_sha256=source.execution_plan_sha256,
+        target_execution_plan_file_sha256=(target.execution_plan_file_sha256),
+        target_execution_plan_sha256=target.execution_plan_sha256,
+        raw_manifest_sha256=manifest.sha256,
+        source_semantics=source.semantics,
+        target_semantics=target.semantics,
+        source_run_binding=source_run_binding,
+        source_native_terminal_sha256s=native_sha256s,
+        removed_presentation_axis=manifest.removed_presentation_axis,
+        source_presentation_value=source_value,
+        target_presentation_value=target_value,
+        reason_code=manifest.reason_code,
+        target_result_status="ABSENT_REUSED_SOURCE",
+        reducer_protocol_sha256=EVIDENCE_ALIAS_REDUCER_PROTOCOL_SHA256,
+    )
+    return artifact, loaded
+
+
+def reduce_evidence_alias(
+    *,
+    registry: ExperimentRegistry,
+    manifest: RawEvidenceAliasManifest,
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+) -> EvidenceAliasReductionArtifact:
+    """Recompute one formal Target-only alias from raw execution evidence."""
+
+    artifact, _ = _reduce_evidence_alias(
+        registry=registry,
+        manifest=manifest,
+        hardware_envelope=hardware_envelope,
+        inventory=inventory,
+    )
+    return artifact
 
 
 def _qualification_rows(
@@ -1699,6 +4013,10 @@ def _reduce_block(
     cells_by_id: Mapping[str, ExperimentCell],
     envelope: HardwareEnvelope,
     inventory: GpuInventory,
+    alias_cells_by_target: Mapping[
+        str, tuple[EvidenceAliasReductionArtifact, _LoadedCell]
+    ]
+    | None = None,
 ) -> _BlockReduction:
     block = block_reference.block
     loaded_sequence = tuple(
@@ -1712,6 +4030,20 @@ def _reduce_block(
         )
         for reference in block_reference.cells
     )
+    supplied_cell_ids = {cell.cell.cell_id for cell in loaded_sequence}
+    aliased_sequence = tuple(
+        replace(
+            source_loaded,
+            cell=cells_by_id[target_cell_id],
+            evidence_alias_reduction_sha256=artifact.sha256,
+        )
+        for target_cell_id, (artifact, source_loaded) in (
+            {} if alias_cells_by_target is None else alias_cells_by_target
+        ).items()
+        if cells_by_id[target_cell_id].identity.block == block
+        and target_cell_id not in supplied_cell_ids
+    )
+    loaded_sequence = (*loaded_sequence, *aliased_sequence)
     if any(cell.cell.identity.block != block for cell in loaded_sequence):
         raise ValueError("block evidence contains a cell from another block")
     loaded = {cell.cell.identity.method: cell for cell in loaded_sequence}
@@ -1891,6 +4223,7 @@ def _unresolved_artifact(
     final_activation: FamilyActivationArtifact,
     reduction: ConfirmationFamilyPowerReductionArtifact,
     evidence_dependence_map: EvidenceDependenceMap | None,
+    evidence_alias_reduction_sha256s: tuple[str, ...],
     pilot_evidence_sha256: str,
     completed_pilot_cells_sha256: str,
     blocks: Sequence[_BlockReduction],
@@ -1953,6 +4286,7 @@ def _unresolved_artifact(
         evidence_dependence_map_sha256=(
             None if evidence_dependence_map is None else evidence_dependence_map.sha256
         ),
+        evidence_alias_reduction_sha256s=evidence_alias_reduction_sha256s,
         patched_sglang_tree=patched_sglang_tree,
         model_lock_sha256=model_lock_sha256,
         hardware_envelope_sha256=content_sha256(hardware_envelope),
@@ -1996,7 +4330,7 @@ def _run_bindings(
                 IndustrialRunBinding(
                     block=block.block,
                     method=method,
-                    cell_id=cell.cell.cell_id,
+                    cell_id=cell.observation_source_cell_id,
                     config_sha256=str(run["config_sha256"]),
                     rank_config_sha256s=tuple(
                         str(rank_run["rank_config_sha256"])
@@ -2037,7 +4371,7 @@ def _loaded_cell_raw_run_binding(
     run = cell.run_rows[0]
     return RawEvidenceRunBinding(
         schema_version=1,
-        cell_id=cell.cell.cell_id,
+        cell_id=cell.observation_source_cell_id,
         experiment=cell.cell.identity.experiment,
         method=cell.cell.identity.method,
         scientific_unit=scientific_unit,
@@ -2069,17 +4403,15 @@ def _loaded_cell_raw_run_binding(
 def _validate_industrial_doctor(
     reference: BoundArtifact,
     *,
-    physical_gpu_uuids: Sequence[str],
+    inventory_authority: GpuInventory,
 ) -> None:
-    """Validate one exact, content-bound schema-v1 GPU readiness report."""
+    """Validate one exact, content-bound arbitrary-N GPU readiness report."""
 
-    physical = tuple(physical_gpu_uuids)
-    if (
-        not physical
-        or len(physical) != len(set(physical))
-        or any(not isinstance(value, str) or not value.strip() for value in physical)
-    ):
-        raise ValueError("industrial doctor requires exact physical GPU UUIDs")
+    if not isinstance(inventory_authority, GpuInventory):
+        raise TypeError("industrial doctor requires an exact GPU inventory authority")
+    if len(inventory_authority.host_ids) != 1:
+        raise ValueError("industrial doctor requires one same-host GPU inventory")
+    expected_devices = {device.uuid: device for device in inventory_authority.devices}
     report = _bound_json(reference.path, reference.sha256, label="doctor report")
     readiness = report.get("readiness")
     compatibility = report.get("compatibility")
@@ -2164,33 +4496,57 @@ def _validate_industrial_doctor(
     }
     if (
         not isinstance(gpu, dict)
-        or gpu.get("two_gpu_visible") is not True
+        or gpu.get("gpu_pool_visible") is not True
+        or gpu.get("visible_gpu_count") != len(expected_devices)
         or not isinstance(inventory, dict)
         or set(inventory) != {"devices", "parse_error"}
         or inventory.get("parse_error") is not None
         or not isinstance(devices, list)
-        or len(devices) != 2
+        or len(devices) != len(expected_devices)
         or any(
             not isinstance(device, dict) or set(device) != expected_device_fields
             for device in devices
         )
-        or not set(physical) <= {device["uuid"] for device in devices}
-        or len({device["pci_bus_id"] for device in devices}) != 2
+        or {device["uuid"] for device in devices} != set(expected_devices)
+        or len({device["pci_bus_id"] for device in devices}) != len(devices)
     ):
-        raise ValueError("industrial doctor does not bind the physical GPU UUIDs")
+        raise ValueError("industrial doctor does not bind the complete GPU inventory")
+    for observed in devices:
+        expected = expected_devices[str(observed["uuid"])]
+        expected_compute_capability = ".".join(
+            str(component) for component in expected.compute_capability
+        )
+        if (
+            observed["name"] != expected.model
+            or observed["memory_total_mib"] * 1024 * 1024 != expected.memory_bytes
+            or observed["compute_capability"] != expected_compute_capability
+            or observed["pci_bus_id"] != expected.pci_bus_id
+        ):
+            raise ValueError(
+                "industrial doctor device identity differs from the GPU inventory"
+            )
 
     topology = gpu.get("parsed_topology")
     gpu_topology_check = checks.get("gpu_topology")
     gpu_identity_check = checks.get("gpu_identity")
     commands = report.get("commands")
+    expected_gpu_rows = [f"GPU{index}" for index in range(len(devices))]
+    pairs = topology.get("pairs") if isinstance(topology, dict) else None
     if (
         not isinstance(topology, dict)
-        or set(topology) != {"gpu_rows", "pair_link", "reciprocal_link", "parse_error"}
+        or set(topology) != {"gpu_rows", "pairs", "parse_error"}
         or topology.get("parse_error") is not None
-        or topology.get("gpu_rows") != ["GPU0", "GPU1"]
-        or not isinstance(topology.get("pair_link"), str)
-        or not topology["pair_link"]
-        or topology.get("reciprocal_link") != topology["pair_link"]
+        or topology.get("gpu_rows") != expected_gpu_rows
+        or not isinstance(pairs, list)
+        or len(pairs) != len(devices) * (len(devices) - 1) // 2
+        or any(
+            not isinstance(pair, dict)
+            or set(pair) != {"left", "right", "link", "reciprocal_link"}
+            or not isinstance(pair["link"], str)
+            or not pair["link"]
+            or pair["reciprocal_link"] != pair["link"]
+            for pair in pairs
+        )
         or not isinstance(gpu_topology_check, dict)
         or gpu_topology_check.get("observed") != topology
         or not isinstance(gpu_identity_check, dict)
@@ -2200,7 +4556,7 @@ def _validate_industrial_doctor(
         or not isinstance(commands, dict)
         or commands.get("nvidia_smi") != gpu["inventory"]
     ):
-        raise ValueError("industrial doctor two-GPU topology is not exact")
+        raise ValueError("industrial doctor arbitrary-N topology is not exact")
 
 
 def _attestation_chain(
@@ -3024,6 +5380,7 @@ def reduce_industrial_schema_v3(
     hardware_envelope: HardwareEnvelope,
     inventory: GpuInventory,
     evidence_dependence_map: EvidenceDependenceMap | None = None,
+    evidence_alias_manifests: Sequence[RawEvidenceAliasManifest] = (),
     gpu_attestation: BoundArtifact | None = None,
     doctor_report: BoundArtifact | None = None,
     bootstrap_repetitions: int = 10_000,
@@ -3049,6 +5406,11 @@ def reduce_industrial_schema_v3(
         evidence_dependence_map, EvidenceDependenceMap
     ):
         raise TypeError("evidence_dependence_map must be an EvidenceDependenceMap")
+    alias_manifests = tuple(evidence_alias_manifests)
+    if any(type(row) is not RawEvidenceAliasManifest for row in alias_manifests):
+        raise TypeError("formal aliases require exact raw evidence alias manifests")
+    if len({row.sha256 for row in alias_manifests}) != len(alias_manifests):
+        raise ValueError("formal alias manifests must be unique")
     confirmation_plan = confirmation_reduction.plan
     family = confirmation_reduction.family
     inventory_host_id = _inventory_host_id(inventory)
@@ -3105,11 +5467,48 @@ def reduce_industrial_schema_v3(
     activated_cell_ids = (
         pilot_activation.activated_cell_ids + final_activation.activated_cell_ids
     )
-    if set(evidence_cell_ids) != set(activated_cell_ids):
-        raise ValueError(
-            "industrial evidence contains missing or unactivated family candidates"
+    alias_pairs = tuple(
+        _reduce_evidence_alias(
+            registry=registry,
+            manifest=manifest,
+            hardware_envelope=hardware_envelope,
+            inventory=inventory,
         )
-    if evidence_dependence_map is not None:
+        for manifest in alias_manifests
+    )
+    alias_artifacts = tuple(row[0] for row in alias_pairs)
+    alias_targets = tuple(row.target_cell_id for row in alias_artifacts)
+    alias_sources = tuple(row.source_cell_id for row in alias_artifacts)
+    if len(set(alias_targets)) != len(alias_targets):
+        raise ValueError("a formal alias target can be defined only once")
+    if set(alias_sources) & set(alias_targets):
+        raise ValueError("formal alias chains are forbidden")
+    if set(alias_targets) - set(final_activation.activated_cell_ids):
+        raise ValueError("only final, non-pilot cells may be alias targets")
+    if set(alias_targets) & set(evidence_cell_ids):
+        raise ValueError("an alias target cannot carry an independent result")
+    if set(evidence_cell_ids) | set(alias_targets) != set(activated_cell_ids):
+        raise ValueError(
+            "industrial direct evidence plus raw aliases must exactly cover activation"
+        )
+    if set(evidence_cell_ids) - set(activated_cell_ids):
+        raise ValueError("industrial evidence contains an unactivated family candidate")
+    if alias_artifacts:
+        regenerated_map = build_evidence_dependence_map(
+            direct_observation_cell_ids=tuple(
+                sorted(set(evidence_cell_ids) | set(alias_sources))
+            ),
+            aliases=alias_artifacts,
+        )
+        if (
+            evidence_dependence_map is not None
+            and evidence_dependence_map != regenerated_map
+        ):
+            raise ValueError(
+                "serialized evidence dependence map differs from raw alias replay"
+            )
+        evidence_dependence_map = regenerated_map
+    elif evidence_dependence_map is not None:
         _validate_analysis_dependence_map(
             evidence_dependence_map,
             active_cell_ids=activated_cell_ids,
@@ -3138,6 +5537,9 @@ def reduce_industrial_schema_v3(
         )
 
     cells_by_id = {cell.cell_id: cell for cell in registry.cells}
+    alias_cells_by_target = {
+        artifact.target_cell_id: (artifact, loaded) for artifact, loaded in alias_pairs
+    }
     reduced = tuple(
         _reduce_block(
             reference,
@@ -3146,6 +5548,7 @@ def reduce_industrial_schema_v3(
             cells_by_id=cells_by_id,
             envelope=hardware_envelope,
             inventory=inventory,
+            alias_cells_by_target=alias_cells_by_target,
         )
         for reference in sorted(block_references, key=lambda item: item.block)
     )
@@ -3154,12 +5557,12 @@ def reduce_industrial_schema_v3(
     for block in reduced:
         for cell in block.cells.values():
             nonce = str(cell.run_rows[0]["run_nonce_sha256"])
-            owner = nonces.setdefault(nonce, cell.cell.cell_id)
-            if owner != cell.cell.cell_id:
+            owner = nonces.setdefault(nonce, cell.observation_source_cell_id)
+            if owner != cell.observation_source_cell_id:
                 raise ValueError("run nonce is reused across registry cells")
             run_id = str(cell.run_rows[0]["run_id"])
-            run_owner = run_ids.setdefault(run_id, cell.cell.cell_id)
-            if run_owner != cell.cell.cell_id:
+            run_owner = run_ids.setdefault(run_id, cell.observation_source_cell_id)
+            if run_owner != cell.observation_source_cell_id:
                 raise ValueError("run identity is reused across registry cells")
 
     pilots = tuple(block for block in reduced if block.block in PILOT_BLOCKS)
@@ -3203,15 +5606,7 @@ def reduce_industrial_schema_v3(
             )
         _validate_industrial_doctor(
             doctor_report,
-            physical_gpu_uuids=tuple(
-                sorted(
-                    {
-                        gpu_uuid
-                        for binding in run_bindings
-                        for gpu_uuid in binding.gpu_uuids
-                    }
-                )
-            ),
+            inventory_authority=inventory,
         )
         _validate_industrial_gpu_attestation(
             gpu_attestation,
@@ -3264,6 +5659,9 @@ def reduce_industrial_schema_v3(
             final_activation=final_activation,
             reduction=confirmation_reduction,
             evidence_dependence_map=evidence_dependence_map,
+            evidence_alias_reduction_sha256s=tuple(
+                sorted(row.sha256 for row in alias_artifacts)
+            ),
             pilot_evidence_sha256=pilot_evidence_sha256,
             completed_pilot_cells_sha256=completed_pilot_cells_sha256,
             blocks=reduced,
@@ -3293,6 +5691,9 @@ def reduce_industrial_schema_v3(
             final_activation=final_activation,
             reduction=confirmation_reduction,
             evidence_dependence_map=evidence_dependence_map,
+            evidence_alias_reduction_sha256s=tuple(
+                sorted(row.sha256 for row in alias_artifacts)
+            ),
             pilot_evidence_sha256=pilot_evidence_sha256,
             completed_pilot_cells_sha256=completed_pilot_cells_sha256,
             blocks=reduced,
@@ -3472,6 +5873,9 @@ def reduce_industrial_schema_v3(
         confirmation_plan_sha256=confirmation_reduction.sha256,
         evidence_dependence_map_sha256=(
             None if evidence_dependence_map is None else evidence_dependence_map.sha256
+        ),
+        evidence_alias_reduction_sha256s=tuple(
+            sorted(row.sha256 for row in alias_artifacts)
         ),
         patched_sglang_tree=patched_sglang_tree,
         model_lock_sha256=model_lock_sha256,

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+    PINNED_SGLANG_PATCH_SHA256,
     CompileCacheCorruptionError,
     CompileCacheKey,
     ImmutableCompileCache,
@@ -16,6 +18,8 @@ from lightcone_spec.runtime.compile_cache import (
 def _key(**updates: object) -> CompileCacheKey:
     values: dict[str, object] = {
         "patched_sglang_tree": "a" * 40,
+        "patch_manifest_sha256": PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+        "patch_sha256": PINNED_SGLANG_PATCH_SHA256,
         "source_sha256": "b" * 64,
         "python_version": "3.12.11",
         "torch_version": "2.11.0+cu130",

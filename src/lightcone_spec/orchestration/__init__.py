@@ -8,6 +8,7 @@ from .executor import (
     ExecutionClock,
     IndustrialExecutionPlan,
     IndustrialExecutionResult,
+    IndustrialExecutionTerminalBinding,
     NativeEvidenceBatch,
     NativeEvidencePreflight,
     NativeEvidenceProvider,
@@ -21,6 +22,7 @@ from .executor import (
     launch_server_subprocess,
     native_evidence_preflight,
     render_industrial_execution_plan,
+    revalidate_industrial_execution_result,
 )
 from .industrial import (
     IndustrialPhysicalAssignment,
@@ -63,14 +65,17 @@ from .runtime import (
     render_tuning_runtime_plan,
 )
 from .session import (
+    SHARED_SESSION_FALLBACK_MODE,
     SHARED_SESSION_UNAVAILABLE_REASON,
     IndustrialResetReceipt,
+    IndustrialServerBlockResult,
     IndustrialServerSessionKey,
     IndustrialServerSessionPlan,
     IndustrialSessionOpenReceipt,
     IndustrialSessionTraceReceipt,
     SessionBoundaryState,
     SharedSessionUnavailableError,
+    execute_industrial_server_session,
 )
 
 __all__ = [
@@ -81,6 +86,7 @@ __all__ = [
     "PINNED_SGLANG_PATCH_SHA256",
     "PINNED_SGLANG_TREE",
     "PINNED_SGLANG_UPSTREAM_COMMIT",
+    "SHARED_SESSION_FALLBACK_MODE",
     "SHARED_SESSION_UNAVAILABLE_REASON",
     "SUPPORTED_METHODS",
     "TERMINAL_EVIDENCE_PATH",
@@ -91,9 +97,11 @@ __all__ = [
     "ExecutionClock",
     "IndustrialExecutionPlan",
     "IndustrialExecutionResult",
+    "IndustrialExecutionTerminalBinding",
     "IndustrialPhysicalAssignment",
     "IndustrialResetReceipt",
     "IndustrialRuntimePlan",
+    "IndustrialServerBlockResult",
     "IndustrialServerSessionKey",
     "IndustrialServerSessionPlan",
     "IndustrialSessionOpenReceipt",
@@ -122,6 +130,7 @@ __all__ = [
     "canonical_json_bytes",
     "canonical_sha256",
     "execute_industrial_plan",
+    "execute_industrial_server_session",
     "industrial_execution_split_contract",
     "industrial_run_id",
     "launch_server_subprocess",
@@ -136,4 +145,5 @@ __all__ = [
     "render_static_load_runtime_plan",
     "render_target_only_runtime_plan",
     "render_tuning_runtime_plan",
+    "revalidate_industrial_execution_result",
 ]

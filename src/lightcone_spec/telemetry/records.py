@@ -49,6 +49,14 @@ class RunRecord:
     session_open_receipt_sha256: str | None = None
     reset_receipt_sha256: str | None = None
     session_epoch: int | None = None
+    # Release-side native terminal bundle.  The raw digest covers the canonical
+    # begin/reset/final artifact bytes; the semantic terminal and policy digests
+    # permit independent signature and identity revalidation on resume.
+    native_terminal_artifact_path: str | None = None
+    native_terminal_artifact_size: int | None = None
+    native_terminal_raw_sha256: str | None = None
+    native_terminal_sha256: str | None = None
+    trusted_attester_policy_sha256: str | None = None
 
 
 @dataclass(frozen=True)

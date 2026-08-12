@@ -15,7 +15,9 @@ def _validate_probability(name: str, value: Tensor) -> None:
         raise ValueError(f"{name} contains a negative probability")
     mass = value.sum(dim=-1)
     tolerance = 32 * torch.finfo(value.dtype).eps
-    if not bool(torch.allclose(mass, torch.ones_like(mass), atol=tolerance, rtol=tolerance)):
+    if not bool(
+        torch.allclose(mass, torch.ones_like(mass), atol=tolerance, rtol=tolerance)
+    ):
         raise ValueError(f"{name} rows must sum to one")
 
 
@@ -75,18 +77,15 @@ def rejection_sample(
         )
     threshold = torch.minimum(
         torch.ones_like(gathered_target),
-        gathered_target / gathered_proposal.clamp_min(
-            torch.finfo(gathered_proposal.dtype).tiny
-        ),
+        gathered_target
+        / gathered_proposal.clamp_min(torch.finfo(gathered_proposal.dtype).tiny),
     )
     accepted = uniform < threshold
     residual = torch.relu(target_probability - proposal_probability)
     residual_mass = residual.sum(dim=-1, keepdim=True)
     rejection_probability = torch.where(
         residual_mass > 0,
-        residual / residual_mass.clamp_min(
-            torch.finfo(residual.dtype).tiny
-        ),
+        residual / residual_mass.clamp_min(torch.finfo(residual.dtype).tiny),
         target_probability,
     )
     replacement = torch.multinomial(

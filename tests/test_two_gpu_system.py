@@ -13,9 +13,7 @@ import torch.multiprocessing as mp
 pytestmark = pytest.mark.system
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_RUNTIME_MANIFEST = (
-    _PROJECT_ROOT / "manifests/runtime/industrial_compatibility_v1.json"
-)
+_RUNTIME_MANIFEST = _PROJECT_ROOT / "manifests/runtime/industrial_compatibility_v1.json"
 
 
 def _nccl_all_reduce_worker(
@@ -64,9 +62,7 @@ def test_declared_two_gpu_host_supports_nccl_collective(tmp_path: Path) -> None:
 
     manifest = json.loads(_RUNTIME_MANIFEST.read_text(encoding="utf-8"))
     expected = manifest["gpu"]
-    blocked_modes = {
-        row["mode"] for row in manifest["release_capabilities"]["blocked"]
-    }
+    blocked_modes = {row["mode"] for row in manifest["release_capabilities"]["blocked"]}
     assert {"tp2", "dp2"}.issubset(blocked_modes)
 
     assert torch.cuda.is_available(), "the registered system host requires CUDA"

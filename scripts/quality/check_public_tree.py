@@ -27,8 +27,17 @@ FORBIDDEN_NAMES = {
     "SSH_AGENT_HANDOFF_PROMPT_2026-08-04.md",
 }
 TEXT_SUFFIXES = {
-    ".cfg", ".ini", ".json", ".md", ".patch", ".py", ".sh", ".toml",
-    ".txt", ".yaml", ".yml",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".md",
+    ".patch",
+    ".py",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
 }
 TEXT_NAMES = {
     ".dockerignore",
@@ -56,10 +65,14 @@ RETIRED_DESIGN = re.compile(
 
 
 def tracked() -> list[Path]:
-    output = subprocess.check_output(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        cwd=ROOT,
-    ).decode().split("\0")
+    output = (
+        subprocess.check_output(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=ROOT,
+        )
+        .decode()
+        .split("\0")
+    )
     return [ROOT / value for value in output if value and (ROOT / value).is_file()]
 
 
@@ -84,9 +97,7 @@ def check_text(files: list[Path]) -> None:
         "JWT-like credential": re.compile(
             r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"
         ),
-        "private key": re.compile(
-            "-----BEGIN " + r"[A-Z ]*" + "PRIVATE KEY-----"
-        ),
+        "private key": re.compile("-----BEGIN " + r"[A-Z ]*" + "PRIVATE KEY-----"),
     }
     for path in files:
         if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_NAMES:
@@ -164,9 +175,7 @@ def check_manifest_sidecars() -> None:
         if not sidecar.is_file():
             fail(f"manifest sidecar missing: {path.relative_to(ROOT)}")
         value = json.loads(path.read_text())
-        canonical = json.dumps(
-            value, sort_keys=True, separators=(",", ":")
-        ).encode()
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         if hashlib.sha256(canonical).hexdigest() != sidecar.read_text().strip():
             fail(f"manifest sidecar mismatch: {path.relative_to(ROOT)}")
 

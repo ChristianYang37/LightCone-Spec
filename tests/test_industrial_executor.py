@@ -3,26 +3,43 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pyarrow.parquet as pq
 import pytest
+from test_budget_materialization_authority import (
+    _AuthorityFixture,
+    _build_authority_fixture,
+)
+from test_native_terminal_provider import (
+    FakeAdminTransport,
+    _client_request,
+    _server_request,
+)
 
+import lightcone_spec.experiments.serving as serving_module
 import lightcone_spec.orchestration.executor as executor_module
 import lightcone_spec.orchestration.session as session_module
 import lightcone_spec.telemetry.writer as writer_module
+from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
+from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.experiments.completion_authority import (
+    AssignmentTerminalAuthority,
+    AssignmentTerminalBinding,
+    CompletionAuthorityUnavailableError,
+)
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
     GpuDevice,
     GpuDispatchExecutionContext,
     GpuInventory,
-    GpuPoolScheduler,
     InterferenceEnvelope,
 )
 from lightcone_spec.experiments.load import (
@@ -37,12 +54,19 @@ from lightcone_spec.experiments.load import (
     immediate_burst_corpus,
 )
 from lightcone_spec.experiments.planning import (
+    BUDGET_MATERIALIZATION_PROTOCOL_SHA256,
+    BudgetDisposition,
+    BudgetDispositionStatus,
     BudgetJobKind,
     BudgetObservationReceipt,
+    BudgetPlan,
+    CapacityAuthorityBinding,
+    CapacityEnvelope,
     ExpectedMaximumCount,
     ExperimentBudget,
     P99AnchorStatus,
     ScenarioMilliseconds,
+    budget_inventory_identity_from_gpu_inventory,
 )
 from lightcone_spec.experiments.registry import (
     build_industrial_registry,
@@ -54,6 +78,9 @@ from lightcone_spec.experiments.serving import (
     BoundServingRequest,
     PinnedBenchServingTransport,
 )
+from lightcone_spec.experiments.stage_activation import (
+    materialize_registry_stage_activation,
+)
 from lightcone_spec.orchestration.executor import (
     NATIVE_TERMINAL_EVIDENCE_HOOK,
     ArtifactBinding,
@@ -64,18 +91,33 @@ from lightcone_spec.orchestration.executor import (
     industrial_execution_split_contract,
     launch_server_subprocess,
     native_evidence_preflight,
+    render_industrial_execution_plan,
+    revalidate_industrial_execution_result,
 )
 from lightcone_spec.orchestration.industrial import (
     render_assigned_industrial_cell_runtime_plan,
 )
-from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
+from lightcone_spec.orchestration.native_terminal import (
+    NATIVE_TERMINAL_EVIDENCE_FIELDS,
+    NativeTerminalProvider,
+    NativeTerminalRunBinding,
+)
 from lightcone_spec.orchestration.runtime import ServerLaunch
 from lightcone_spec.orchestration.session import (
     SHARED_SESSION_UNAVAILABLE_REASON,
     IndustrialServerSessionPlan,
     IndustrialSessionOpenReceipt,
     SharedSessionUnavailableError,
-    execute_industrial_server_session,
+)
+from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
+from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+    PINNED_SGLANG_PATCH_SHA256,
+    CompileCacheCorruptionError,
+    CompileCacheKey,
+    CompileCacheLaunchPlan,
+    start_compile_cache_launch,
 )
 from lightcone_spec.runtime.distributed import (
     RankTopologyReceipt,
@@ -84,6 +126,51 @@ from lightcone_spec.runtime.distributed import (
 )
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT, RequestRecord
 from lightcone_spec.telemetry.writer import EvidenceWriter, load_completed_evidence
+
+
+class _FakeTraceConfig:
+    def __init__(self) -> None:
+        self.on_connection_create_end: list[Callable[..., object]] = []
+        self.on_connection_reuseconn: list[Callable[..., object]] = []
+        self.frozen = False
+
+    def freeze(self) -> None:
+        self.frozen = True
+
+
+def _official_session_lifecycle(session):
+    async def open_bench_client_session(*, total_timeout_s: float = 6 * 60 * 60):
+        assert total_timeout_s > 0
+        if not hasattr(session, "trace_configs"):
+            session.trace_configs = []
+        enter = getattr(session, "__aenter__", None)
+        return session if enter is None else await enter()
+
+    async def close_bench_client_session(client_session) -> None:
+        assert client_session is session
+        exit_context = getattr(session, "__aexit__", None)
+        if exit_context is not None:
+            await exit_context(None, None, None)
+
+    return open_bench_client_session, close_bench_client_session
+
+
+async def _official_noop_abort(
+    request_id,
+    base_url,
+    *,
+    client_session=None,
+    timeout_s=None,
+) -> None:
+    assert request_id and base_url and client_session is not None and timeout_s > 0
+
+
+async def _emit_connection_trace(session, *, reused: bool) -> None:
+    signal_name = "on_connection_reuseconn" if reused else "on_connection_create_end"
+    for trace_config in session.trace_configs:
+        assert trace_config.frozen
+        for callback in getattr(trace_config, signal_name):
+            await callback(session, SimpleNamespace(), SimpleNamespace())
 
 
 def _write_artifact(
@@ -132,6 +219,135 @@ def _topology(device_id: str) -> TopologyReceiptSet:
 class _Fixture:
     plan: IndustrialExecutionPlan
     dependency_artifacts: tuple[ArtifactBinding, ...]
+
+
+_EXECUTOR_DOWNSTREAM_AUTHORITY: _AuthorityFixture | None = None
+
+
+def _executor_downstream_authority(root: Path) -> _AuthorityFixture:
+    """Return a real raw binding used only as a post-authority test token."""
+
+    global _EXECUTOR_DOWNSTREAM_AUTHORITY
+    if _EXECUTOR_DOWNSTREAM_AUTHORITY is None:
+        authority_root = root / "executor-downstream-authority"
+        authority_root.mkdir(parents=True)
+        _EXECUTOR_DOWNSTREAM_AUTHORITY = _build_authority_fixture(authority_root)
+    return _EXECUTOR_DOWNSTREAM_AUTHORITY
+
+
+class _ExecutorDownstreamDispatchContext(GpuDispatchExecutionContext):
+    """Validated seam for executor mechanics after the formal release gate.
+
+    Raw materialization and release-verifier behavior have dedicated tests.  The
+    current release intentionally cannot mint a READY E3a plan, so this test-only
+    context preserves every structural BudgetPlan/scheduler check while treating
+    one exact, real raw binding as an already-validated downstream token.
+    """
+
+    def _revalidate_budget_materialization_authority(self) -> None:
+        fixture = _EXECUTOR_DOWNSTREAM_AUTHORITY
+        if (
+            fixture is None
+            or self.budget_materialization_authority is not fixture.authority
+        ):
+            raise TypeError("executor test requires its exact raw authority token")
+
+    def _budget_activation_replay(self):
+        """Return the fixture activation at this explicit post-authority seam."""
+
+        return SimpleNamespace(
+            registry=self.registry,
+            activation_artifact=self.activation_artifact,
+            family_activations=self.family_activations,
+            family_power_reductions=self.family_power_reductions,
+            selected_activation=self.activation_artifact,
+            dependency_receipts=self.receipts,
+            prior_e2_stage_authorities=(),
+            prior_family_authorities=(),
+            stage_family_authorities=(),
+            auxiliary_authority=None,
+        )
+
+    def require_ready_budget_authority(self) -> tuple[ExperimentBudget, ...]:
+        self._validate_budget_plan_identity()
+        self._revalidate_budget_materialization_authority()
+        return self.budget_plan.budgets
+
+
+def _executor_downstream_budget_plan(
+    *,
+    registry,
+    inventory: GpuInventory,
+    activation,
+    budgets: tuple[ExperimentBudget, ...],
+    authority_fixture: _AuthorityFixture,
+) -> BudgetPlan:
+    """Build a structural unresolved plan that can never claim release authority."""
+
+    inventory_identity = budget_inventory_identity_from_gpu_inventory(inventory)
+    capacity = CapacityEnvelope(
+        schema_version=1,
+        budget_inventory_sha256=inventory_identity.sha256,
+        provider_quota_gpu_ms=10**18,
+        host_free_bytes=10**18,
+        host_quota_bytes=10**18,
+        cell_requirements=(),
+        source_receipt_sha256=content_sha256(
+            {"executor-downstream-capacity": registry.sha256}
+        ),
+    )
+    source_capacity = authority_fixture.authority.capacity_authority
+    capacity_authority = CapacityAuthorityBinding(
+        schema_version=1,
+        source_manifest=source_capacity.source_manifest,
+        verification_receipt=source_capacity.verification_receipt,
+        registry_sha256=registry.sha256,
+        budget_inventory_sha256=inventory_identity.sha256,
+        capacity_envelope_sha256=capacity.sha256,
+        gpu_inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        trusted_verifier_policy_sha256=(source_capacity.trusted_verifier_policy_sha256),
+        authority_protocol_sha256=source_capacity.authority_protocol_sha256,
+    )
+    activated_cell_ids = activation.activated_cell_ids
+    budget_by_cell = {row.cell_id: row for row in budgets}
+    if set(budget_by_cell) != set(activated_cell_ids):
+        raise AssertionError("executor test budgets must cover the activated set")
+    reducer_sha256s = (activation.sha256,)
+    return BudgetPlan(
+        schema_version=2,
+        registry_sha256=registry.sha256,
+        activation_sha256=content_sha256(
+            {
+                "reducer_activation_sha256s": reducer_sha256s,
+                "family_activation_sha256s": (),
+                "family_power_reduction_sha256s": (),
+            }
+        ),
+        reducer_activation_sha256s=reducer_sha256s,
+        family_activation_sha256s=(),
+        family_power_reduction_sha256s=(),
+        policy=authority_fixture.plan.policy,
+        inventory=inventory_identity,
+        capacity_envelope=capacity,
+        capacity_authority=capacity_authority,
+        activated_cell_ids=activated_cell_ids,
+        budgets=budgets,
+        dispositions=tuple(
+            BudgetDisposition(
+                cell_id=cell_id,
+                status=BudgetDispositionStatus.UNRESOLVED,
+                reason_code="executor_test_downstream_authority_seam",
+                source_semantics_sha256=content_sha256(
+                    {"executor-test-budget": cell_id}
+                ),
+                experiment_budget_sha256=None,
+            )
+            for cell_id in activated_cell_ids
+        ),
+        status="UNRESOLVED",
+        reducer_protocol_sha256=BUDGET_MATERIALIZATION_PROTOCOL_SHA256,
+    )
 
 
 def _fixture_budget(
@@ -311,23 +527,104 @@ def _execution_fixture(
         "split",
         json.dumps(split_value, sort_keys=True, separators=(",", ":")).encode(),
     )
-    preflight_outputs: dict[str, str] = {}
-    dependencies: list[ArtifactBinding] = []
-    for name in registry.definition("preflight").locked_outputs:
-        artifact = _write_artifact(
-            tmp_path,
-            name,
-            json.dumps({"output": name}, sort_keys=True).encode(),
-            experiment="preflight",
-        )
-        dependencies.append(artifact)
-        preflight_outputs[name] = artifact.content_sha256
-    receipt = registry.make_receipt(
-        "preflight",
-        preflight_outputs,
-        runtime_sha256=content_sha256({"runtime": "preflight"}),
-        split_sha256=split.content_sha256,
-        completed_cells_sha256=content_sha256({"completed": "preflight"}),
+    checkout = tmp_path / "verified-checkout"
+    checkout.mkdir()
+    target_root = tmp_path / "target-model"
+    target_root.mkdir()
+    drafter_root = tmp_path / "drafter-model"
+    drafter_root.mkdir()
+
+    driver_version = "580.65.06"
+    gpu_model = "executor-gpu"
+    memory_mib = 80 * 1024
+    gpu_rows = (
+        (
+            "0",
+            physical_gpu_uuid,
+            gpu_model,
+            str(memory_mib),
+            driver_version,
+            "9.0",
+            "0000:01:00.0",
+            "700.0",
+            "83.0",
+            "1500",
+            "Enabled",
+        ),
+        (
+            "1",
+            "GPU-physical-idle",
+            gpu_model,
+            str(memory_mib),
+            driver_version,
+            "9.0",
+            "0000:02:00.0",
+            "700.0",
+            "83.0",
+            "1500",
+            "Enabled",
+        ),
+    )
+    gpu_stdout = "".join(", ".join(row) + "\n" for row in gpu_rows)
+    topology = {
+        "gpu_rows": ["GPU0", "GPU1"],
+        "pairs": [
+            {
+                "left": "GPU0",
+                "right": "GPU1",
+                "link": "PHB",
+                "reciprocal_link": "PHB",
+            }
+        ],
+        "parse_error": None,
+    }
+    inventory_receipt_content = {
+        "schema_version": 1,
+        "kind": "gpu_inventory_probe_receipt",
+        "challenge_nonce_sha256": content_sha256({"challenge": "executor"}),
+        "host_id": "executor-host",
+        "hostname": "executor-hostname",
+        "machine_id_sha256": content_sha256({"machine": "executor"}),
+        "commands": {
+            "gpu": {
+                "argv": list(executor_module._GPU_INVENTORY_ARGV),
+                "stdout": gpu_stdout,
+            },
+            "processes": {
+                "argv": list(executor_module._GPU_PROCESS_ARGV),
+                "stdout": "",
+            },
+            "topology": {
+                "argv": list(executor_module._GPU_TOPOLOGY_ARGV),
+                "stdout": "mock topology\n",
+            },
+        },
+        "parsed_topology": topology,
+        "pci_locality": [
+            {
+                "index": index,
+                "uuid": row[1],
+                "pci_bus_id": row[6],
+                "pci_root": "executor-root",
+                "numa_node": 0,
+            }
+            for index, row in enumerate(gpu_rows)
+        ],
+    }
+    inventory_receipt_sha256 = content_sha256(inventory_receipt_content)
+    inventory_receipt = {
+        **inventory_receipt_content,
+        "receipt_sha256": inventory_receipt_sha256,
+    }
+    inventory_receipt_path = tmp_path / "gpu-inventory-source-receipt.json"
+    inventory_receipt_path.write_text(
+        json.dumps(inventory_receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    inventory_source_artifact = ArtifactBinding.from_path(
+        name="gpu_inventory_source_receipt",
+        path=inventory_receipt_path,
+        semantic_sha256=inventory_receipt_sha256,
     )
     inventory = GpuInventory(
         schema_version=1,
@@ -335,7 +632,7 @@ def _execution_fixture(
             GpuDevice(
                 uuid=physical_gpu_uuid,
                 host_id="executor-host",
-                model="executor-gpu",
+                model=gpu_model,
                 memory_bytes=80 * 1024**3,
                 compute_capability=(9, 0),
                 pci_bus_id="0000:01:00.0",
@@ -343,7 +640,7 @@ def _execution_fixture(
                 numa_node=0,
                 interconnects=("pcie",),
                 peer_access_class="executor-peer",
-                clock_policy="locked",
+                clock_policy="persistence=Enabled;max_sm_mhz=1500",
                 power_limit_watts=700.0,
                 thermal_limit_celsius=83.0,
                 availability=GpuAvailability.READY,
@@ -353,7 +650,7 @@ def _execution_fixture(
             GpuDevice(
                 uuid="GPU-physical-idle",
                 host_id="executor-host",
-                model="executor-gpu",
+                model=gpu_model,
                 memory_bytes=80 * 1024**3,
                 compute_capability=(9, 0),
                 pci_bus_id="0000:02:00.0",
@@ -361,7 +658,7 @@ def _execution_fixture(
                 numa_node=0,
                 interconnects=("pcie",),
                 peer_access_class="executor-peer",
-                clock_policy="locked",
+                clock_policy="persistence=Enabled;max_sm_mhz=1500",
                 power_limit_watts=700.0,
                 thermal_limit_celsius=83.0,
                 availability=GpuAvailability.RESERVED,
@@ -370,11 +667,104 @@ def _execution_fixture(
             ),
         ),
         topology_groups=(),
-        source_receipt_sha256=content_sha256({"inventory": "executor"}),
+        source_receipt_sha256=inventory_receipt_sha256,
+    )
+    manifest_sha256 = content_sha256({"runtime-manifest": "executor"})
+    runtime_envelope = {
+        "schema_version": 1,
+        "status": "PASS",
+        "readiness": {
+            "status": "PASS",
+            "pass_count": 1,
+            "fail_count": 0,
+            "unknown_count": 0,
+        },
+        "roots": {
+            "project": str(tmp_path.resolve()),
+            "patched_sglang": str(checkout.resolve()),
+            "distinct": True,
+        },
+        "runtime_manifest": {
+            "valid": True,
+            "sha256": manifest_sha256,
+            "sidecar_sha256": manifest_sha256,
+        },
+        "checks": {"fixture_authority": {"status": "PASS"}},
+        "source_tree": {
+            "path": str(checkout.resolve()),
+            "is_git_checkout": True,
+            "root_matches_toplevel": True,
+            "head": "fixture-head",
+            "tree": PINNED_SGLANG_TREE,
+            "dirty": False,
+            "pinned_ancestor": True,
+            "patch_commits": PINNED_SGLANG_PATCH_COUNT,
+        },
+        "python": {"version": "3.12.11"},
+        "gpu": {
+            "parsed_inventory": {
+                "devices": [
+                    {
+                        "uuid": row[1],
+                        "name": row[2],
+                        "memory_total_mib": int(row[3]),
+                        "driver_version": row[4],
+                        "compute_capability": row[5],
+                        "pci_bus_id": row[6],
+                    }
+                    for row in gpu_rows
+                ],
+                "parse_error": None,
+            },
+            "torch": {
+                "importable": True,
+                "version": "2.11.0+cu130",
+                "cuda_build": "13.0",
+                "cuda_available": True,
+                "device_count": 2,
+            },
+        },
+        "commands": {"nvcc": "Cuda compilation tools, release 13.0, V13.0.88"},
+        "packages": {"torch": "2.11.0", "triton": "3.6.0"},
+    }
+    preflight_outputs: dict[str, str] = {}
+    dependencies: list[ArtifactBinding] = []
+    runtime_envelope_artifact: ArtifactBinding | None = None
+    for name in registry.definition("preflight").locked_outputs:
+        artifact = _write_artifact(
+            tmp_path,
+            name,
+            json.dumps(
+                runtime_envelope if name == "runtime_envelope" else {"output": name},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            experiment="preflight",
+        )
+        if name == "runtime_envelope":
+            runtime_envelope_artifact = artifact
+        dependencies.append(artifact)
+        preflight_outputs[name] = artifact.content_sha256
+    if runtime_envelope_artifact is None:
+        raise AssertionError("preflight lacks its runtime_envelope output")
+    receipt = registry.make_receipt(
+        "preflight",
+        preflight_outputs,
+        runtime_sha256=content_sha256({"runtime": "preflight"}),
+        split_sha256=split.content_sha256,
+        completed_cells_sha256=content_sha256({"completed": "preflight"}),
+    )
+    activation_artifact = materialize_registry_stage_activation(
+        registry,
+        experiment="E3a",
+        dependency_receipts=(receipt,),
+        runtime_sha256=content_sha256({"runtime": "E3a"}),
+        split_sha256=split.content_sha256,
     )
     envelope = InterferenceEnvelope.serial(
         source_receipt_sha256=content_sha256({"interference": "executor"})
     )
+    activated_cell_ids = set(activation_artifact.activated_cell_ids)
     dispatch_budgets = tuple(
         sorted(
             (
@@ -386,21 +776,44 @@ def _execution_fixture(
                     request_count=request_count,
                 )
                 for candidate in registry.cells_for("E3a")
-                if GpuPoolScheduler._dispatchable(candidate)
+                if candidate.cell_id in activated_cell_ids
             ),
             key=lambda row: row.cell_id,
         )
     )
-    dispatch_context = GpuDispatchExecutionContext(
-        registry=registry,
-        inventory=inventory,
-        interference_envelope=envelope,
-        budgets=dispatch_budgets,
-        receipts=(receipt,),
-        port_start=physical_port,
-        port_end=physical_port + 999,
-        seed=20260811,
-    )
+    context_kwargs = {
+        "registry": registry,
+        "inventory": inventory,
+        "interference_envelope": envelope,
+        "budgets": dispatch_budgets,
+        "receipts": (receipt,),
+        "activation_artifact": activation_artifact,
+        "port_start": physical_port,
+        "port_end": physical_port + 999,
+        "seed": 20260811,
+    }
+    try:
+        # Evidence-alias tests replace this constructor with a path-bound raw
+        # authority factory.  The ordinary executor suite deliberately falls
+        # through to its explicit post-authority seam below.
+        dispatch_context = GpuDispatchExecutionContext(**context_kwargs)
+    except TypeError as error:
+        if "budget_plan" not in str(error):
+            raise
+        authority_fixture = _executor_downstream_authority(tmp_path)
+        budget_plan = _executor_downstream_budget_plan(
+            registry=registry,
+            inventory=inventory,
+            activation=activation_artifact,
+            budgets=dispatch_budgets,
+            authority_fixture=authority_fixture,
+        )
+        dispatch_context = _ExecutorDownstreamDispatchContext(
+            **context_kwargs,
+            budget_plan=budget_plan,
+            budget_materialization_authority=authority_fixture.authority,
+        )
+    budget_plan = dispatch_context.budget_plan
     dispatch_plan = dispatch_context.issue_plan()
     matching_assignments = tuple(
         assignment
@@ -429,18 +842,45 @@ def _execution_fixture(
         json.dumps(config.model_dump(mode="json"), sort_keys=True),
         encoding="utf-8",
     )
-    checkout = tmp_path / "verified-checkout"
-    checkout.mkdir()
-    target_root = tmp_path / "target-model"
-    target_root.mkdir()
-    drafter_root = tmp_path / "drafter-model"
-    drafter_root.mkdir()
+    compile_key = CompileCacheKey(
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        patch_manifest_sha256=PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+        patch_sha256=PINNED_SGLANG_PATCH_SHA256,
+        source_sha256=PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+        python_version="3.12.11",
+        torch_version="2.11.0+cu130",
+        triton_version="3.6.0",
+        cuda_version="13.0",
+        driver_version=driver_version,
+        sm_architecture="sm_90",
+        gpu_model=gpu_model,
+        dtype="bfloat16",
+        target_revision=config.model.target_revision,
+        drafter_revision=(
+            None if method == "target_only" else config.model.drafter_revision
+        ),
+        tensor_parallel_size=config.runtime.tensor_parallel_size,
+        context_limit=config.runtime.context_length,
+        max_running_requests=config.runtime.max_running_requests,
+        graph_buckets=(1,),
+        allocator="cuda_malloc_async",
+        build_flags=(),
+    )
+    compile_plan = CompileCacheLaunchPlan.issue(
+        key=compile_key,
+        cache_root=tmp_path / "compile-cache",
+        cache_mode="build",
+    )
+    compile_plan_path = tmp_path / "compile-cache-plan.json"
+    compile_plan.write(compile_plan_path)
     server_argv = (
         sys.executable,
         "-m",
         "lightcone_spec.sglang_bridge.launch",
         "--checkout",
         str(checkout),
+        "--compile-cache-plan",
+        str(compile_plan_path),
         "--",
         "--model-path",
         str(target_root),
@@ -454,7 +894,15 @@ def _execution_fixture(
         "127.0.0.1",
         "--port",
         str(physical_port),
+        "--context-length",
+        "40960",
+        "--random-seed",
+        "1",
+        "--disable-radix-cache",
+        "--disable-cuda-graph",
     )
+    if method == "target_only":
+        server_argv += ("--disable-overlap-schedule",)
     if method == "static":
         server_argv += (
             "--speculative-algorithm",
@@ -472,6 +920,8 @@ def _execution_fixture(
             "--speculative-use-rejection-sampling",
             "--speculative-speed-study-metrics",
         )
+    else:
+        server_argv += ("--speculative-speed-study-metrics",)
     launch = ServerLaunch(
         method=method,
         base_url=f"http://127.0.0.1:{physical_port}",
@@ -480,11 +930,15 @@ def _execution_fixture(
         adaptation_config=None,
         telemetry_path=None,
         argv=server_argv,
+        compile_cache_plan=str(compile_plan_path),
+        compile_cache_plan_sha256=compile_plan.sha256,
+        compile_cache_key_sha256=compile_plan.key.sha256,
     )
     plan = build_industrial_execution_plan(
         runtime_plan=runtime,
         dispatch_plan=dispatch_plan,
         dispatch_context=dispatch_context,
+        budget_plan=budget_plan,
         budget=budget,
         load_plan=load,
         server_launch=launch,
@@ -493,11 +947,44 @@ def _execution_fixture(
         split_artifact=split,
         sampling_artifact=sampling,
         model_lock_artifact=model_lock,
+        compile_cache_plan=compile_plan,
+        inventory_source_artifact=inventory_source_artifact,
+        runtime_envelope_artifact=runtime_envelope_artifact,
         startup_timeout_s=1.0,
         shutdown_timeout_s=1.0,
         abort_grace_s=1.0,
     )
     return _Fixture(plan=plan, dependency_artifacts=tuple(dependencies))
+
+
+def _with_compile_key(
+    fixture: _Fixture,
+    tmp_path: Path,
+    *,
+    label: str,
+    **updates: object,
+) -> IndustrialExecutionPlan:
+    key = replace(fixture.plan.compile_cache_plan.key, **updates)
+    compile_plan = CompileCacheLaunchPlan.issue(
+        key=key,
+        cache_root=tmp_path / f"compile-cache-{label}",
+        cache_mode="build",
+    )
+    path = tmp_path / f"compile-cache-plan-{label}.json"
+    compile_plan.write(path)
+    launch = fixture.plan.server_launch
+    argv = (*launch.argv[:6], str(path), *launch.argv[7:])
+    return replace(
+        fixture.plan,
+        compile_cache_plan=compile_plan,
+        server_launch=replace(
+            launch,
+            argv=argv,
+            compile_cache_plan=str(path),
+            compile_cache_plan_sha256=compile_plan.sha256,
+            compile_cache_key_sha256=compile_plan.key.sha256,
+        ),
+    )
 
 
 class _FakeHandle:
@@ -514,13 +1001,142 @@ class _FakeHandle:
         self.terminated += 1
 
 
-class _FakeTransport:
-    def __init__(self, *, delay_s: float = 0.003) -> None:
+class _FakeTransport(PinnedBenchServingTransport):
+    """Strict CPU transport whose admin side still passes the real wire parser."""
+
+    def __init__(
+        self,
+        *,
+        plan: IndustrialExecutionPlan | None = None,
+        delay_s: float = 0.003,
+        events: list[str] | None = None,
+        on_reset: Callable[[], None] | None = None,
+        on_finalize: Callable[[], None] | None = None,
+    ) -> None:
         self.requests: list[str] = []
         self.aborts: list[str] = []
+        self.plan = plan
         self.delay_s = delay_s
         self.opened = 0
         self.closed = 0
+        self.events = events
+        self.on_reset = on_reset
+        self.on_finalize = on_finalize
+        self._native_admin: FakeAdminTransport | None = None
+        self._native_admin_base_url: str | None = None
+
+    def bind_native_admin_base_url(self, base_url: str) -> None:
+        assert self.plan is not None and base_url == self.plan.server_launch.base_url
+        self._native_admin_base_url = base_url
+
+    async def get_json(self, path: str) -> object:
+        assert self._native_admin_base_url is not None
+        assert self.plan is not None
+        method = self.plan.runtime_plan.rank_configs[0].method
+        if path == "/server_info":
+            if self.events is not None:
+                self.events.append("server_info")
+            role = "target_reference" if method == "target_only" else "speculative"
+            return ControlledExecutionPolicy().server_info_fields(role=role)
+        if self.events is not None:
+            self.events.append("capability")
+        if self._native_admin is not None:
+            return await self._native_admin.get_json(path)
+        return {
+            "schema_version": 1,
+            "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+            "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
+            "supported_methods": ["l0", "static", "target_only", "tts"],
+            "enabled": True,
+            "active_method": method,
+            "method_evidence_supported": True,
+            "topology_supported": True,
+            "trusted_attester_configured": False,
+        }
+
+    def _terminal_expectations(
+        self,
+        *,
+        client_rows: tuple[dict[str, object], ...] = (),
+    ):
+        assert self.plan is not None
+        client_by_id = {str(row["request_id"]): row for row in client_rows}
+        expectations = []
+        for request in self.plan.scored_requests:
+            if request.request_id in client_by_id:
+                row = client_by_id[request.request_id]
+                expectations.append(
+                    _client_request(
+                        request.request_id,
+                        inputs=request.input_token_ids,
+                        status=str(row["terminal_status"]),
+                        reason=str(row["terminal_reason"]),
+                    )
+                )
+            else:
+                aborted = request.request_id in self.aborts
+                expectations.append(
+                    _server_request(
+                        request.request_id,
+                        inputs=request.input_token_ids,
+                        outputs=(101, 102),
+                        status="aborted" if aborted else "completed",
+                        reason="FINISH_ABORT" if aborted else "FINISH_LENGTH",
+                    )
+                )
+        return tuple(expectations)
+
+    async def post_json(
+        self,
+        path: str,
+        body: Mapping[str, object],
+    ) -> object:
+        assert self.plan is not None and self._native_admin_base_url is not None
+        action = body.get("action")
+        payload = body.get("payload")
+        assert isinstance(payload, dict)
+        if action == "begin":
+            binding = NativeTerminalRunBinding(
+                run_id=str(payload["run_id"]),
+                run_nonce_sha256=str(payload["run_nonce_sha256"]),
+                execution_plan_sha256=str(payload["execution_plan_sha256"]),
+                rank_config_sha256=str(payload["rank_config_sha256"]),
+                attempt_id=str(payload["attempt_id"]),
+                session_id=str(payload["session_id"]),
+                session_epoch=int(payload["session_epoch"]),
+                previous_run_id=payload["previous_run_id"],
+                challenge_nonce_sha256=str(payload["challenge_nonce_sha256"]),
+                method=str(payload["method"]),
+                warmup_request_ids=tuple(payload["warmup_request_ids"]),
+                scored_request_ids=tuple(payload["scored_request_ids"]),
+            )
+            warmup = tuple(
+                _server_request(
+                    request.request_id,
+                    inputs=request.input_token_ids,
+                    outputs=(101, 102),
+                )
+                for request in self.plan.warmup_requests
+            )
+            self._native_admin = FakeAdminTransport(
+                binding=binding,
+                warmup=warmup,
+                scored=self._terminal_expectations(),
+            )
+        assert self._native_admin is not None
+        if self.events is not None and action in {"begin", "reset", "finalize"}:
+            self.events.append(str(action))
+        if action == "reset" and self.on_reset is not None:
+            self.on_reset()
+        if action == "finalize":
+            client_values = payload.get("client_terminal_rows")
+            assert isinstance(client_values, list)
+            self._native_admin.scored = self._terminal_expectations(
+                client_rows=tuple(client_values)
+            )
+            if self.on_finalize is not None:
+                self.on_finalize()
+        return await self._native_admin.post_json(path, body)
 
     async def open(
         self,
@@ -551,6 +1167,8 @@ class _FakeTransport:
         assert base_url.startswith("http://127.0.0.1:")
         assert served_model == "Qwen/Qwen3-8B"
         self.requests.append(request.request_id)
+        if self.events is not None:
+            self.events.append("submit")
         await asyncio.sleep(self.delay_s)
         result = BenchServingResult(
             request_id=request.request_id,
@@ -594,10 +1212,17 @@ def test_official_adapter_preserves_exact_request_and_marks_coalescing() -> None
 
     session = Session()
 
-    async def request_callable(*, request_func_input, pbar, client_session):
+    async def request_callable(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
         assert pbar is None
         assert request_func_input is not None
         assert client_session is session
+        assert timeout_s == 1.0
         return SimpleNamespace(
             success=True,
             generated_text="two tokens",
@@ -609,11 +1234,15 @@ def test_official_adapter_preserves_exact_request_and_marks_coalescing() -> None
             itl=[0.001],
         )
 
+    open_session, close_session = _official_session_lifecycle(session)
     transport = PinnedBenchServingTransport(
         request_type=RequestInput,
         request_callable=request_callable,
+        abort_callable=_official_noop_abort,
+        open_session_callable=open_session,
+        close_session_callable=close_session,
         set_global_args=lambda value: observed.setdefault("args", value),
-        session_factory=lambda: session,
+        trace_config_factory=_FakeTraceConfig,
         module_identity="sglang.benchmark.serving.async_request_sglang_generate",
     )
     corpus = immediate_burst_corpus(
@@ -656,7 +1285,7 @@ def test_official_adapter_preserves_exact_request_and_marks_coalescing() -> None
     assert result.chunks[0].per_token_observed_at_us is None
     assert result.chunks[0].token_count == 2
     assert transport.metrics() == {
-        "connections_created": 1,
+        "connections_created": 0,
         "submitted_requests": 1,
         "reused_requests": 0,
     }
@@ -674,9 +1303,16 @@ def test_official_adapter_rejects_missing_ordered_token_ids() -> None:
         async def __aexit__(self, exc_type, exc, traceback):
             return None
 
-    async def request_callable(*, request_func_input, pbar, client_session):
+    async def request_callable(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
         assert request_func_input is not None and pbar is None
         assert client_session is not None
+        assert timeout_s == 1.0
         return SimpleNamespace(
             success=True,
             generated_text="decoded text is not an exact token identity",
@@ -685,11 +1321,16 @@ def test_official_adapter_rejects_missing_ordered_token_ids() -> None:
             ttft=0.001,
         )
 
+    session = Session()
+    open_session, close_session = _official_session_lifecycle(session)
     transport = PinnedBenchServingTransport(
         request_type=RequestInput,
         request_callable=request_callable,
+        abort_callable=_official_noop_abort,
+        open_session_callable=open_session,
+        close_session_callable=close_session,
         set_global_args=lambda value: None,
-        session_factory=Session,
+        trace_config_factory=_FakeTraceConfig,
         module_identity="sglang.benchmark.serving.async_request_sglang_generate",
     )
     corpus = immediate_burst_corpus(
@@ -776,8 +1417,20 @@ def test_official_adapter_reuses_one_pool_for_submit_and_abort() -> None:
 
     session = Session()
 
-    async def request_callable(*, request_func_input, pbar, client_session):
+    request_count = 0
+
+    async def request_callable(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
+        nonlocal request_count
         assert pbar is None and client_session is session
+        assert timeout_s == 1.0
+        await _emit_connection_trace(session, reused=request_count > 0)
+        request_count += 1
         return SimpleNamespace(
             success=True,
             generated_text="token",
@@ -787,11 +1440,32 @@ def test_official_adapter_reuses_one_pool_for_submit_and_abort() -> None:
             generated_token_ids=(101,),
         )
 
+    async def abort_callable(
+        request_id,
+        base_url,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ) -> None:
+        assert request_id and base_url == "http://127.0.0.1:30000"
+        assert client_session is session and timeout_s == 1.0
+        await _emit_connection_trace(session, reused=True)
+        async with client_session.post(
+            url=base_url + "/abort_request",
+            json={"rid": request_id, "abort_all": False},
+            headers={"x-test": "1"},
+        ) as response:
+            assert response.status == 200
+
+    open_session, close_session = _official_session_lifecycle(session)
     transport = PinnedBenchServingTransport(
         request_type=RequestInput,
         request_callable=request_callable,
+        abort_callable=abort_callable,
+        open_session_callable=open_session,
+        close_session_callable=close_session,
         set_global_args=lambda value: None,
-        session_factory=lambda: session,
+        trace_config_factory=_FakeTraceConfig,
         headers_factory=lambda: {"x-test": "1"},
         module_identity="sglang.benchmark.serving.async_request_sglang_generate",
     )
@@ -840,7 +1514,7 @@ def test_official_adapter_reuses_one_pool_for_submit_and_abort() -> None:
     assert transport.metrics() == {
         "connections_created": 1,
         "submitted_requests": 2,
-        "reused_requests": 1,
+        "reused_requests": 2,
     }
 
 
@@ -866,11 +1540,42 @@ def test_official_adapter_enforces_registered_abort_timeout() -> None:
             return SlowResponse()
 
     session = Session()
+
+    async def request_callable(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
+        raise AssertionError("generate was not expected")
+
+    async def abort_callable(
+        request_id,
+        base_url,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ) -> None:
+        assert request_id == "request"
+        assert base_url == "http://127.0.0.1:30000"
+        assert client_session is session and timeout_s == 0.001
+        async with asyncio.timeout(timeout_s):
+            async with client_session.post(
+                url=base_url + "/abort_request",
+                json={"rid": request_id, "abort_all": False},
+            ) as response:
+                assert response.status == 200
+
+    open_session, close_session = _official_session_lifecycle(session)
     transport = PinnedBenchServingTransport(
         request_type=SimpleNamespace,
-        request_callable=lambda **kwargs: None,
+        request_callable=request_callable,
+        abort_callable=abort_callable,
+        open_session_callable=open_session,
+        close_session_callable=close_session,
         set_global_args=lambda value: None,
-        session_factory=lambda: session,
+        trace_config_factory=_FakeTraceConfig,
         module_identity="sglang.benchmark.serving.async_request_sglang_generate",
     )
 
@@ -883,13 +1588,345 @@ def test_official_adapter_enforces_registered_abort_timeout() -> None:
     asyncio.run(exercise())
 
 
+def _fake_pinned_serving_module(module_path: Path, *, session) -> SimpleNamespace:
+    class RequestInput:
+        def __init__(self, **kwargs) -> None:
+            vars(self).update(kwargs)
+
+    async def open_bench_client_session(*, total_timeout_s: float = 6 * 60 * 60):
+        session.open_timeout_s = total_timeout_s
+        return session
+
+    async def close_bench_client_session(client_session) -> None:
+        assert client_session is session
+        session.closed_by_official = True
+
+    async def async_request_sglang_generate(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
+        raise AssertionError("generate was not expected")
+
+    async def async_request_sglang_abort(
+        request_id,
+        base_url,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ) -> None:
+        raise AssertionError("abort was not expected")
+
+    return SimpleNamespace(
+        __file__=str(module_path),
+        RequestFuncInput=RequestInput,
+        open_bench_client_session=open_bench_client_session,
+        close_bench_client_session=close_bench_client_session,
+        async_request_sglang_generate=async_request_sglang_generate,
+        async_request_sglang_abort=async_request_sglang_abort,
+        set_global_args=lambda value: None,
+        get_request_headers=dict,
+        aiohttp=SimpleNamespace(TraceConfig=_FakeTraceConfig),
+    )
+
+
+def test_from_checkout_binds_complete_official_http_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "sglang"
+    module_path = checkout / "python/sglang/benchmark/serving.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.touch()
+    session = SimpleNamespace(trace_configs=[], closed=False)
+    module = _fake_pinned_serving_module(module_path, session=session)
+    monkeypatch.delitem(sys.modules, "sglang", raising=False)
+    monkeypatch.setattr(
+        serving_module, "verify_patched_checkout", lambda path: checkout
+    )
+    monkeypatch.setattr(
+        serving_module.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    transport = PinnedBenchServingTransport.from_checkout(checkout)
+
+    assert transport._request_callable is module.async_request_sglang_generate
+    assert transport._abort_callable is module.async_request_sglang_abort
+    assert transport._open_session_callable is module.open_bench_client_session
+    assert transport._close_session_callable is module.close_bench_client_session
+
+    async def exercise() -> None:
+        await transport.open(request_timeout_s=2.0, abort_timeout_s=3.0)
+        await transport.close()
+
+    asyncio.run(exercise())
+    assert session.open_timeout_s == 3.0
+    assert session.closed_by_official is True
+
+
+@pytest.mark.parametrize(
+    "drift_name",
+    (
+        "open_bench_client_session",
+        "close_bench_client_session",
+        "async_request_sglang_generate",
+        "async_request_sglang_abort",
+    ),
+)
+def test_from_checkout_rejects_official_signature_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift_name: str,
+) -> None:
+    checkout = tmp_path / drift_name
+    module_path = checkout / "python/sglang/benchmark/serving.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.touch()
+    module = _fake_pinned_serving_module(
+        module_path,
+        session=SimpleNamespace(trace_configs=[], closed=False),
+    )
+
+    async def drifted_callable(unregistered_parameter=None):
+        return None
+
+    setattr(module, drift_name, drifted_callable)
+    monkeypatch.delitem(sys.modules, "sglang", raising=False)
+    monkeypatch.setattr(
+        serving_module, "verify_patched_checkout", lambda path: checkout
+    )
+    monkeypatch.setattr(
+        serving_module.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(ValueError, match="signature differs from the pinned contract"):
+        PinnedBenchServingTransport.from_checkout(checkout)
+
+
+def test_real_aiohttp_pool_counts_connections_reuse_abort_and_timeout() -> None:
+    aiohttp = pytest.importorskip("aiohttp")
+    web = pytest.importorskip("aiohttp.web")
+    observed: dict[str, object] = {
+        "opened": 0,
+        "closed": 0,
+        "session_ids": [],
+        "aborts": [],
+        "admin_gets": 0,
+        "admin_posts": 0,
+    }
+
+    class RequestInput:
+        def __init__(self, **kwargs) -> None:
+            vars(self).update(kwargs)
+
+    async def generate_endpoint(request):
+        payload = await request.json()
+        request_id = payload["rid"]
+        await asyncio.sleep(0.2 if request_id.endswith("timeout") else 0.01)
+        return web.json_response(
+            {
+                "generated_text": request_id,
+                "generated_token_ids": [101],
+            }
+        )
+
+    async def abort_endpoint(request):
+        payload = await request.json()
+        observed["aborts"].append(payload["rid"])
+        return web.json_response({"ok": True})
+
+    async def capability_endpoint(request):
+        observed["admin_gets"] += 1
+        return web.json_response({"kind": "capability"})
+
+    async def terminal_endpoint(request):
+        await request.json()
+        observed["admin_posts"] += 1
+        return web.json_response({"kind": "terminal"})
+
+    async def open_bench_client_session(*, total_timeout_s: float = 6 * 60 * 60):
+        observed["opened"] += 1
+        return aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=total_timeout_s),
+            connector=aiohttp.TCPConnector(limit=8),
+        )
+
+    async def close_bench_client_session(client_session) -> None:
+        observed["closed"] += 1
+        await client_session.close()
+
+    async def async_request_sglang_generate(
+        request_func_input,
+        pbar=None,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ):
+        assert pbar is None and timeout_s == 0.05
+        observed["session_ids"].append(id(client_session))
+        started = asyncio.get_running_loop().time()
+        async with client_session.post(
+            request_func_input.api_url,
+            json={"rid": request_func_input.extra_request_body["rid"]},
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as response:
+            response.raise_for_status()
+            body = await response.json()
+        latency = asyncio.get_running_loop().time() - started
+        return SimpleNamespace(
+            success=True,
+            generated_text=body["generated_text"],
+            generated_token_ids=body["generated_token_ids"],
+            output_len=1,
+            latency=latency,
+            ttft=latency,
+        )
+
+    async def async_request_sglang_abort(
+        request_id,
+        base_url,
+        *,
+        client_session=None,
+        timeout_s=None,
+    ) -> None:
+        assert timeout_s == 0.04
+        observed["session_ids"].append(id(client_session))
+        async with client_session.post(
+            base_url.rstrip("/") + "/abort_request",
+            json={"rid": request_id, "abort_all": False},
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as response:
+            response.raise_for_status()
+
+    def bound_requests() -> tuple[BoundServingRequest, ...]:
+        corpus = immediate_burst_corpus(
+            tuple(
+                RequestTemplate(
+                    input_token_ids=(index + 1,),
+                    requested_output_tokens=1,
+                    sampling=FrozenSamplingParameters.from_mapping(
+                        {"temperature": 0.0}
+                    ),
+                )
+                for index in range(3)
+            ),
+            namespace="real-aiohttp-pool",
+            split="confirmation",
+            cohort_count=1,
+            cohort_popularity="uniform",
+            cohort_seed=1,
+        )
+        values = [
+            BoundServingRequest.create(request, route_id="single-replica")
+            for request in corpus.requests
+        ]
+        values[-1] = replace(values[-1], request_id="request-timeout")
+        return tuple(values)
+
+    async def exercise() -> None:
+        app = web.Application()
+        app.router.add_post("/generate", generate_endpoint)
+        app.router.add_post("/abort_request", abort_endpoint)
+        app.router.add_get(
+            "/v1/lightcone-spec/terminal-evidence/capability",
+            capability_endpoint,
+        )
+        app.router.add_post(
+            "/v1/lightcone-spec/terminal-evidence",
+            terminal_endpoint,
+        )
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        sockets = site._server.sockets
+        assert sockets
+        base_url = f"http://127.0.0.1:{sockets[0].getsockname()[1]}"
+        transport = PinnedBenchServingTransport(
+            request_type=RequestInput,
+            request_callable=async_request_sglang_generate,
+            abort_callable=async_request_sglang_abort,
+            open_session_callable=open_bench_client_session,
+            close_session_callable=close_bench_client_session,
+            set_global_args=lambda value: None,
+            trace_config_factory=aiohttp.TraceConfig,
+            module_identity=("sglang.benchmark.serving.async_request_sglang_generate"),
+        )
+        requests = bound_requests()
+        try:
+            await transport.open(request_timeout_s=0.05, abort_timeout_s=0.04)
+            normal_results = await asyncio.gather(
+                *(
+                    transport.submit(
+                        request,
+                        base_url=base_url,
+                        served_model="model",
+                    )
+                    for request in requests[:2]
+                )
+            )
+            assert [result.output_tokens for result in normal_results] == [1, 1]
+            transport.bind_native_admin_base_url(base_url)
+            assert await transport.get_json(
+                "/v1/lightcone-spec/terminal-evidence/capability"
+            ) == {"kind": "capability"}
+            assert await transport.post_json(
+                "/v1/lightcone-spec/terminal-evidence",
+                {"action": "begin"},
+            ) == {"kind": "terminal"}
+            await transport.abort(requests[0].request_id, base_url=base_url)
+            with pytest.raises(TimeoutError):
+                await transport.submit(
+                    requests[-1],
+                    base_url=base_url,
+                    served_model="model",
+                )
+            assert transport.metrics() == {
+                "connections_created": 2,
+                "submitted_requests": 3,
+                "reused_requests": 4,
+            }
+            await transport.close()
+        finally:
+            if transport._session is not None:
+                await transport.close()
+            await runner.cleanup()
+
+    asyncio.run(exercise())
+    assert observed["opened"] == 1 and observed["closed"] == 1
+    assert len(set(observed["session_ids"])) == 1
+    assert len(observed["aborts"]) == 1
+    assert observed["admin_gets"] == 1 and observed["admin_posts"] == 1
+
+
 def test_native_provider_cannot_use_a_different_pool_from_serving() -> None:
     def transport() -> PinnedBenchServingTransport:
+        session = SimpleNamespace(trace_configs=[])
+
+        async def request_callable(
+            request_func_input,
+            pbar=None,
+            *,
+            client_session=None,
+            timeout_s=None,
+        ):
+            raise AssertionError("generate was not expected")
+
+        open_session, close_session = _official_session_lifecycle(session)
         return PinnedBenchServingTransport(
             request_type=SimpleNamespace,
-            request_callable=lambda **kwargs: None,
+            request_callable=request_callable,
+            abort_callable=_official_noop_abort,
+            open_session_callable=open_session,
+            close_session_callable=close_session,
             set_global_args=lambda value: None,
-            session_factory=lambda: SimpleNamespace(),
+            trace_config_factory=_FakeTraceConfig,
             module_identity=("sglang.benchmark.serving.async_request_sglang_generate"),
         )
 
@@ -981,85 +2018,13 @@ def test_executor_orders_native_lifecycle_and_buckets_reset_exactly(
     perf_counter = SyntheticPerfCounter()
     monkeypatch.setattr(executor_module.time, "perf_counter_ns", perf_counter)
 
-    class RequestInput:
-        def __init__(self, **kwargs) -> None:
-            self.request_id = kwargs["extra_request_body"]["rid"]
-
-    class Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return None
-
-    session = Session()
-
-    async def request_callable(*, request_func_input, pbar, client_session):
-        assert pbar is None and client_session is session
-        events.append("submit")
-        await asyncio.sleep(0.004)
-        return SimpleNamespace(
-            success=True,
-            generated_text="native-static",
-            output_len=2,
-            latency=0.001,
-            ttft=0.0005,
-            generated_token_ids=(101, 102),
-        )
-
-    transport = PinnedBenchServingTransport(
-        request_type=RequestInput,
-        request_callable=request_callable,
-        set_global_args=lambda value: None,
-        session_factory=lambda: session,
-        module_identity="sglang.benchmark.serving.async_request_sglang_generate",
+    transport = _FakeTransport(
+        plan=plan,
+        events=events,
+        on_reset=lambda: perf_counter.advance_ms(7),
+        on_finalize=lambda: perf_counter.advance_ms(11),
     )
     provider = NativeTerminalProvider(transport)
-    state: dict[str, object] = {}
-
-    async def capability(self, *, expected_method):
-        assert self is provider and expected_method == "target_only"
-        events.append("capability")
-        return SimpleNamespace(trusted_attester_configured=True)
-
-    async def begin(self, binding):
-        assert self is provider and binding.method == "target_only"
-        state["binding"] = binding
-        events.append("begin")
-
-    async def reset(self, *, warmup_requests=()):
-        assert self is provider and tuple(warmup_requests) == ()
-        events.append("reset")
-        perf_counter.advance_ms(7)
-
-    async def finalize(self, *, requests):
-        assert self is provider and len(requests) == 1
-        request = requests[0]
-        assert request.submitted_to_server
-        assert request.terminal_status == "completed"
-        assert request.terminal_reason == "FINISH_LENGTH"
-        assert request.output_token_ids == (101, 102)
-        events.append("finalize")
-        perf_counter.advance_ms(11)
-        return executor_module.ValidatedNativeTerminalEvidence(
-            binding=state["binding"],
-            begin_receipt=SimpleNamespace(),
-            reset_receipt=SimpleNamespace(),
-            requests=tuple(requests),
-            attestation=SimpleNamespace(trusted=False),
-            terminal_sha256="a" * 64,
-            raw_json="{}",
-        )
-
-    monkeypatch.setattr(NativeTerminalProvider, "capability", capability)
-    monkeypatch.setattr(NativeTerminalProvider, "begin", begin)
-    monkeypatch.setattr(NativeTerminalProvider, "reset", reset)
-    monkeypatch.setattr(NativeTerminalProvider, "finalize", finalize)
-    monkeypatch.setattr(
-        executor_module.ValidatedNativeTerminalEvidence,
-        "to_native_evidence_batch",
-        lambda self: executor_module.NativeEvidenceBatch(),
-    )
 
     async def launch(server: ServerLaunch) -> _FakeHandle:
         return _FakeHandle()
@@ -1081,7 +2046,16 @@ def test_executor_orders_native_lifecycle_and_buckets_reset_exactly(
     assert components["reset_finalization"] == 18
     assert observation["measured_gpu_ms"] == 18
     assert observation["fixed_instance_billed_gpu_ms"] == 36
-    assert events == ["capability", "begin", "reset", "submit", "finalize"]
+    assert events == [
+        "server_info",
+        "capability",
+        "capability",
+        "begin",
+        "reset",
+        "submit",
+        "finalize",
+        "server_info",
+    ]
 
 
 def test_target_only_execution_writes_terminal_receipt_and_resumes(
@@ -1098,7 +2072,8 @@ def test_target_only_execution_writes_terminal_receipt_and_resumes(
         launch_count += 1
         return handle
 
-    transport = _FakeTransport()
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     first = asyncio.run(
         execute_industrial_plan(
@@ -1107,6 +2082,7 @@ def test_target_only_execution_writes_terminal_receipt_and_resumes(
             run_nonce_sha256="9" * 64,
             launch_server=launch,
             transport=transport,
+            native_evidence=provider,
         )
     )
     assert not first.resumed
@@ -1140,6 +2116,23 @@ def test_target_only_execution_writes_terminal_receipt_and_resumes(
     assert run["topology_sha256"] == plan.topology_sha256
     assert run["experiment_budget_sha256"] == plan.budget.sha256
     terminal = json.loads(Path(first.terminal_receipt).read_text(encoding="utf-8"))
+    native_binding = terminal["native_terminal_artifact"]
+    native_path = output / native_binding["path"]
+    native_body = native_path.read_bytes()
+    assert native_path.is_file()
+    assert native_binding == {
+        "path": run["native_terminal_artifact_path"],
+        "size": run["native_terminal_artifact_size"],
+        "raw_sha256": run["native_terminal_raw_sha256"],
+        "terminal_sha256": run["native_terminal_sha256"],
+        "trusted_attester_policy_sha256": run["trusted_attester_policy_sha256"],
+    }
+    assert native_binding["size"] == len(native_body)
+    assert native_binding["raw_sha256"] == hashlib.sha256(native_body).hexdigest()
+    assert native_binding["trusted_attester_policy_sha256"] == (
+        plan.trusted_attester_policy.sha256
+    )
+    assert str(native_path) in first.evidence_files
     assert terminal["experiment_budget_sha256"] == plan.budget.sha256
     assert first.experiment_budget_sha256 == plan.budget.sha256
     assert (
@@ -1235,12 +2228,110 @@ def test_target_only_execution_writes_terminal_receipt_and_resumes(
             run_nonce_sha256="9" * 64,
             launch_server=launch,
             transport=transport,
+            native_evidence=provider,
         )
     )
     assert resumed.resumed
     assert resumed.run_id == first.run_id
     assert resumed.budget_observation_sha256 == first.budget_observation_sha256
     assert resumed.terminal_receipt_sha256 == first.terminal_receipt_sha256
+    assert launch_count == 1
+
+    terminal_binding = revalidate_industrial_execution_result(
+        plan=plan,
+        result=first,
+        run_nonce_sha256="9" * 64,
+    )
+    physical = plan.runtime_plan.physical_assignment
+    assert physical is not None
+    assert terminal_binding.assignment_sha256 == physical.assignment_sha256
+    assert terminal_binding.experiment_budget_sha256 == plan.budget.sha256
+    assert terminal_binding.physical_gpu_uuids == physical.gpu_uuids
+    authority = AssignmentTerminalAuthority(
+        plan=plan,
+        result=first,
+        run_nonce_sha256="9" * 64,
+    )
+    with pytest.raises(
+        CompletionAuthorityUnavailableError,
+        match="trusted_hardware_attester_unavailable",
+    ):
+        authority.revalidate(
+            registry=plan.dispatch_context.registry,
+            inventory=plan.dispatch_context.inventory,
+            assignment_sha256=physical.assignment_sha256,
+            budget_sha256=plan.budget.sha256,
+            physical_gpu_uuids=physical.gpu_uuids,
+        )
+
+    raw_binding = AssignmentTerminalBinding(
+        authority_sha256=authority.sha256,
+        cell_id=terminal_binding.cell_id,
+        assignment_sha256=terminal_binding.assignment_sha256,
+        budget_sha256=terminal_binding.experiment_budget_sha256,
+        inventory_sha256=terminal_binding.inventory_sha256,
+        physical_gpu_uuids=terminal_binding.physical_gpu_uuids,
+        execution_plan_sha256=terminal_binding.execution_plan_sha256,
+        dispatch_plan_sha256=terminal_binding.dispatch_plan_sha256,
+        run_id=terminal_binding.run_id,
+        run_nonce_sha256=terminal_binding.run_nonce_sha256,
+        terminal_receipt_path=terminal_binding.terminal_receipt_path,
+        terminal_receipt_sha256=terminal_binding.terminal_receipt_sha256,
+        budget_observation_path=terminal_binding.budget_observation_path,
+        budget_observation_sha256=terminal_binding.budget_observation_sha256,
+        budget_observation_sidecar_path=(
+            terminal_binding.budget_observation_sidecar_path
+        ),
+        budget_observation_sidecar_sha256=(
+            terminal_binding.budget_observation_sidecar_sha256
+        ),
+        native_terminal_artifact_path=(terminal_binding.native_terminal_artifact_path),
+        native_terminal_raw_sha256=terminal_binding.native_terminal_raw_sha256,
+        native_terminal_sha256=terminal_binding.native_terminal_sha256,
+        trusted_attester_policy_sha256=(
+            terminal_binding.trusted_attester_policy_sha256
+        ),
+        evidence_file_paths=terminal_binding.evidence_file_paths,
+        evidence_file_sha256s=terminal_binding.evidence_file_sha256s,
+    )
+    restored_binding = AssignmentTerminalBinding.from_dict(
+        json.loads(json.dumps(raw_binding.to_dict()))
+    )
+    assert restored_binding == raw_binding
+    with pytest.raises(
+        CompletionAuthorityUnavailableError,
+        match="trusted_hardware_attester_unavailable",
+    ):
+        AssignmentTerminalAuthority.from_binding(restored_binding, plan=plan)
+    tampered_result = replace(first, terminal_receipt_sha256="0" * 64)
+    tampered_authority = AssignmentTerminalAuthority(
+        plan=plan,
+        result=tampered_result,
+        run_nonce_sha256="9" * 64,
+    )
+    tampered_binding = replace(
+        raw_binding,
+        authority_sha256=tampered_authority.sha256,
+        terminal_receipt_sha256="0" * 64,
+    )
+    with pytest.raises(RuntimeError, match="terminal receipt changed or is foreign"):
+        AssignmentTerminalAuthority.from_binding(tampered_binding, plan=plan)
+
+    native_path.write_bytes(native_body + b" ")
+    with pytest.raises(
+        RuntimeError,
+        match="native terminal artifact content binding is invalid",
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                plan,
+                output_root=output,
+                run_nonce_sha256="9" * 64,
+                launch_server=launch,
+                transport=transport,
+                native_evidence=provider,
+            )
+        )
     assert launch_count == 1
 
 
@@ -1256,12 +2347,40 @@ def test_logical_runtime_plan_cannot_cross_the_execution_boundary(
         logical.validate()
 
 
+def test_execution_schema3_binds_the_exact_raw_budget_authority(
+    tmp_path: Path,
+) -> None:
+    plan = _execution_fixture(tmp_path, request_count=1).plan
+    physical = plan.runtime_plan.physical_assignment
+    assert physical is not None
+    authority_sha256 = plan.dispatch_context.budget_materialization_authority.sha256
+
+    physical_wire = physical.to_dict()
+    execution_wire = plan.to_dict()
+    assert physical_wire["schema_version"] == 3
+    assert execution_wire["schema_version"] == 3
+    assert physical_wire["budget_materialization_authority_sha256"] == (
+        authority_sha256
+    )
+    assert execution_wire["budget_materialization_authority_sha256"] == (
+        authority_sha256
+    )
+    assert (
+        execution_wire["dispatch_authority"]["budget_materialization_authority_sha256"]
+        == authority_sha256
+    )
+
+
 @pytest.mark.parametrize(
     "field",
     (
         "inventory_sha256",
         "inventory_source_receipt_sha256",
         "dispatch_plan_sha256",
+        "experiment_budget_sha256",
+        "budget_plan_sha256",
+        "capacity_authority_sha256",
+        "budget_materialization_authority_sha256",
         "assignment_sha256",
         "work_item_sha256",
     ),
@@ -1369,13 +2488,15 @@ def test_soak_job_records_its_own_scoring_clock(tmp_path: Path) -> None:
     async def launch(server: ServerLaunch) -> _FakeHandle:
         return _FakeHandle()
 
+    transport = _FakeTransport(plan=plan)
     result = asyncio.run(
         execute_industrial_plan(
             plan,
             output_root=plan.runtime_plan.cell.resources.evidence_root,
             run_nonce_sha256="a" * 64,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=NativeTerminalProvider(transport),
         )
     )
     observation = json.loads(Path(result.budget_observation).read_text())
@@ -1417,13 +2538,15 @@ def test_retry_budget_is_an_envelope_but_first_attempt_observes_zero(
     async def launch(server: ServerLaunch) -> _FakeHandle:
         return _FakeHandle()
 
+    transport = _FakeTransport(plan=plan)
     result = asyncio.run(
         execute_industrial_plan(
             plan,
             output_root=plan.runtime_plan.cell.resources.evidence_root,
             run_nonce_sha256="b" * 64,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=NativeTerminalProvider(transport),
         )
     )
     observation = json.loads(Path(result.budget_observation).read_text())
@@ -1502,13 +2625,16 @@ def test_resume_requires_immutable_budget_observation(tmp_path: Path) -> None:
         return _FakeHandle()
 
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     first = asyncio.run(
         execute_industrial_plan(
             plan,
             output_root=output,
             run_nonce_sha256="6" * 64,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     Path(first.budget_observation_sidecar).write_text("0" * 64 + "\n", encoding="utf-8")
@@ -1519,7 +2645,8 @@ def test_resume_requires_immutable_budget_observation(tmp_path: Path) -> None:
                 output_root=output,
                 run_nonce_sha256="6" * 64,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
 
@@ -1537,13 +2664,16 @@ def test_resume_rejects_rehashed_underreported_gpu_observation(
 
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     nonce = "c" * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     first = asyncio.run(
         execute_industrial_plan(
             plan,
             output_root=output,
             run_nonce_sha256=nonce,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     observation_path = Path(first.budget_observation)
@@ -1587,7 +2717,8 @@ def test_resume_rejects_rehashed_underreported_gpu_observation(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
 
@@ -1630,7 +2761,8 @@ def test_resume_rejects_rehashed_underreported_gpu_observation(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     assert launches == 1
@@ -1659,6 +2791,8 @@ def test_resume_promotes_observation_bound_prepared_terminal(
     monkeypatch.setattr(EvidenceWriter, "publish_close", fail_terminal_publish)
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     nonce = "d" * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     with pytest.raises(OSError, match="terminal publication failure"):
         asyncio.run(
             execute_industrial_plan(
@@ -1666,7 +2800,8 @@ def test_resume_promotes_observation_bound_prepared_terminal(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     run_id = executor_module.industrial_run_id(plan, nonce)
@@ -1693,7 +2828,8 @@ def test_resume_promotes_observation_bound_prepared_terminal(
             output_root=output,
             run_nonce_sha256=nonce,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     assert resumed.resumed
@@ -1725,6 +2861,8 @@ def test_post_terminal_publish_failure_still_has_observation_and_resumes(
     monkeypatch.setattr(EvidenceWriter, "publish_close", publish_then_fail)
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     nonce = "f" * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     with pytest.raises(OSError, match="post-terminal failure"):
         asyncio.run(
             execute_industrial_plan(
@@ -1732,7 +2870,8 @@ def test_post_terminal_publish_failure_still_has_observation_and_resumes(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     run_id = executor_module.industrial_run_id(plan, nonce)
@@ -1760,7 +2899,8 @@ def test_post_terminal_publish_failure_still_has_observation_and_resumes(
             output_root=output,
             run_nonce_sha256=nonce,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     assert resumed.resumed
@@ -1790,6 +2930,8 @@ def test_prepared_only_completion_fails_closed_before_relaunch(
     )
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     nonce = "e" * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     with pytest.raises(OSError, match="observation publication failure"):
         asyncio.run(
             execute_industrial_plan(
@@ -1797,7 +2939,8 @@ def test_prepared_only_completion_fails_closed_before_relaunch(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     run_id = executor_module.industrial_run_id(plan, nonce)
@@ -1817,7 +2960,8 @@ def test_prepared_only_completion_fails_closed_before_relaunch(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     assert launches == 1
@@ -1862,6 +3006,8 @@ def test_prepared_recovery_rejects_symlink_and_tamper_before_relaunch(
         "prepared_bytes": "8",
         "observation_symlink": "b",
     }.get(tamper, "9") * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     with pytest.raises(OSError, match="terminal publication failure"):
         asyncio.run(
             execute_industrial_plan(
@@ -1869,7 +3015,8 @@ def test_prepared_recovery_rejects_symlink_and_tamper_before_relaunch(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     run_id = executor_module.industrial_run_id(plan, nonce)
@@ -1899,7 +3046,8 @@ def test_prepared_recovery_rejects_symlink_and_tamper_before_relaunch(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     assert launches == 1
@@ -1929,6 +3077,8 @@ def test_prepared_recovery_validates_plan_before_canonical_promotion(
     monkeypatch.setattr(EvidenceWriter, "publish_close", fail_terminal_publish)
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     nonce = "a" * 64
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
     with pytest.raises(OSError, match="terminal publication failure"):
         asyncio.run(
             execute_industrial_plan(
@@ -1936,7 +3086,8 @@ def test_prepared_recovery_validates_plan_before_canonical_promotion(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     monkeypatch.setattr(EvidenceWriter, "publish_close", original_publish)
@@ -1959,7 +3110,8 @@ def test_prepared_recovery_validates_plan_before_canonical_promotion(
             output_root=output,
             run_nonce_sha256=nonce,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     assert resumed.resumed
@@ -2169,131 +3321,7 @@ def test_server_session_blocks_before_foreign_boundary_launch(
     assert session_module._STARTUP_TIMING_AUTHORITIES == startup_authorities
 
 
-def test_shared_session_rejects_completed_trace_before_any_side_effect(
-    tmp_path: Path,
-) -> None:
-    plan = _execution_fixture(tmp_path, request_count=1).plan
-    output = Path(plan.runtime_plan.cell.resources.evidence_root)
-    nonce = "6" * 64
-    initial_handle = _FakeHandle()
-
-    async def initial_launch(server: ServerLaunch) -> _FakeHandle:
-        assert server == plan.server_launch
-        return initial_handle
-
-    completed = asyncio.run(
-        execute_industrial_plan(
-            plan,
-            output_root=output,
-            run_nonce_sha256=nonce,
-            launch_server=initial_launch,
-            transport=_FakeTransport(),
-        )
-    )
-    assert Path(completed.terminal_receipt).is_file()
-    assert initial_handle.ready == 1 and initial_handle.terminated == 1
-
-    session_plan = IndustrialServerSessionPlan.create(
-        (plan,),
-        capability_receipt_sha256="a" * 64,
-        compile_cache_receipt_sha256="b" * 64,
-        dtype="bfloat16",
-        precision="bf16",
-        graph_buckets=(1,),
-        hbm_reservation_bytes=0,
-    )
-    side_effects: list[str] = []
-
-    async def forbidden_launch(server: ServerLaunch) -> _FakeHandle:
-        side_effects.append("launch")
-        return _FakeHandle()
-
-    class ForbiddenTransport(_FakeTransport):
-        async def open(
-            self,
-            *,
-            request_timeout_s: float,
-            abort_timeout_s: float,
-        ) -> None:
-            side_effects.append("transport_open")
-            await super().open(
-                request_timeout_s=request_timeout_s,
-                abort_timeout_s=abort_timeout_s,
-            )
-
-    class ForbiddenBoundaryRuntime:
-        async def attest_open(self, *, session_plan, handle):
-            side_effects.append("attest_open")
-            raise AssertionError("preexisting evidence reached native attestation")
-
-    transport = ForbiddenTransport()
-    with pytest.raises(
-        SharedSessionUnavailableError,
-        match=SHARED_SESSION_UNAVAILABLE_REASON,
-    ):
-        asyncio.run(
-            execute_industrial_server_session(
-                session_plan,
-                (plan,),
-                output_roots=(output,),
-                run_nonce_sha256s=(nonce,),
-                launch_server=forbidden_launch,
-                transport=transport,
-                boundary_runtime=ForbiddenBoundaryRuntime(),  # type: ignore[arg-type]
-            )
-        )
-    assert side_effects == []
-    assert transport.opened == 0 and transport.closed == 0
-
-
-def test_block_scoped_session_is_blocked_without_any_claimable_evidence(
-    tmp_path: Path,
-) -> None:
-    first = _execution_fixture(tmp_path, request_count=2).plan
-    second = replace(first, abort_grace_s=2.0)
-    session_plan = IndustrialServerSessionPlan.create(
-        (first, second),
-        capability_receipt_sha256="a" * 64,
-        compile_cache_receipt_sha256="b" * 64,
-        dtype="bfloat16",
-        precision="bf16",
-        graph_buckets=(1,),
-        hbm_reservation_bytes=0,
-    )
-    root = Path(first.runtime_plan.cell.resources.evidence_root)
-    side_effects: list[str] = []
-
-    async def forbidden_launch(server: ServerLaunch) -> _FakeHandle:
-        side_effects.append("launch")
-        return _FakeHandle()
-
-    class ForbiddenBoundaryRuntime:
-        async def attest_open(self, *, session_plan, handle):
-            side_effects.append("attest_open")
-            raise AssertionError("blocked session reached native boundary")
-
-    transport = _FakeTransport()
-    with pytest.raises(
-        SharedSessionUnavailableError,
-        match=SHARED_SESSION_UNAVAILABLE_REASON,
-    ):
-        asyncio.run(
-            execute_industrial_server_session(
-                session_plan,
-                (first, second),
-                output_roots=(root, root),
-                run_nonce_sha256s=("4" * 64, "5" * 64),
-                launch_server=forbidden_launch,
-                transport=transport,
-                boundary_runtime=ForbiddenBoundaryRuntime(),  # type: ignore[arg-type]
-            )
-        )
-    assert side_effects == []
-    assert transport.opened == 0 and transport.closed == 0
-    assert not root.exists()
-
-
-def test_terminal_bench_failure_is_durable_unfinished_evidence(
+def test_terminal_bench_failure_preserves_wal_but_cannot_publish_native_evidence(
     tmp_path: Path,
 ) -> None:
     plan = _execution_fixture(tmp_path, request_count=2).plan
@@ -2330,33 +3358,37 @@ def test_terminal_bench_failure_is_durable_unfinished_evidence(
         return _FakeHandle()
 
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
-    with pytest.raises(RuntimeError, match="evidence is nonclaimable"):
+    transport = FailedTransport(plan=plan)
+    with pytest.raises(
+        RuntimeError,
+        match="submitted request lacks a reconciliable terminal outcome",
+    ):
         asyncio.run(
             execute_industrial_plan(
                 plan,
                 output_root=output,
                 run_nonce_sha256=hashlib.sha256(b"terminal-failure").hexdigest(),
                 launch_server=launch,
-                transport=FailedTransport(),
+                transport=transport,
+                native_evidence=NativeTerminalProvider(transport),
             )
         )
     assert not tuple(output.glob("*.complete.json"))
     request_paths = sorted(output.glob("*.request.wal.*.parquet"))
-    performance_path = next(output.glob("*.performance.wal.*.parquet"))
-    run_path = next(output.glob("*.run.wal.*.parquet"))
     requests = pq.read_table([str(path) for path in request_paths]).to_pylist()
-    performance = pq.read_table(performance_path).to_pylist()[0]
-    run = pq.read_table(run_path).to_pylist()[0]
     assert [request["outcome_status"] for request in requests] == [
         "completed",
         "unfinished",
     ]
     assert requests[1]["error_code"] == "official_bench_error:server_overloaded"
     assert requests[1]["finished"] is False
-    assert performance["offered_requests"] == 2
-    assert performance["completed_requests"] == 1
-    assert performance["unfinished_requests"] == 1
-    assert run["status"] == "aborted"
+    assert not tuple(output.glob("*.performance.wal.*.parquet"))
+    assert not tuple(output.glob("*.run.wal.*.parquet"))
+    assert not tuple(output.glob("*.native-terminal.json"))
+    aborted = json.loads(next(output.glob("*.aborted.json")).read_text())
+    assert (
+        "submitted request lacks a reconciliable terminal outcome" in aborted["reason"]
+    )
 
 
 def test_closed_loop_request_pool_exhaustion_is_nonclaimable(tmp_path: Path) -> None:
@@ -2548,7 +3580,7 @@ def test_static_execution_is_blocked_without_a_trusted_terminal_provider(
         _execution_fixture(tmp_path, method="static", request_count=1)
 
 
-def test_adapted_native_evidence_preflight_remains_fail_closed() -> None:
+def test_adapted_native_evidence_preflight_requires_the_wire_provider() -> None:
     plan = SimpleNamespace(
         runtime_plan=SimpleNamespace(
             rank_configs=(SimpleNamespace(method="l0"),),
@@ -2557,11 +3589,8 @@ def test_adapted_native_evidence_preflight_remains_fail_closed() -> None:
     )
     preflight = native_evidence_preflight(plan, None)
     assert preflight.status == "BLOCKED"
-    assert (
-        preflight.reason_code
-        == executor_module.TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON
-    )
-    assert preflight.missing_hook is None
+    assert preflight.reason_code == executor_module.MISSING_NATIVE_EVIDENCE_REASON
+    assert preflight.missing_hook == NATIVE_TERMINAL_EVIDENCE_HOOK
     with pytest.raises(NativeEvidenceUnavailableError):
         raise NativeEvidenceUnavailableError(preflight)
 
@@ -2646,13 +3675,16 @@ def test_resume_rejects_a_receipt_from_another_content_plan(
 
     output = Path(fixture.plan.runtime_plan.cell.resources.evidence_root)
     nonce = "8" * 64
+    transport = _FakeTransport(plan=fixture.plan)
+    provider = NativeTerminalProvider(transport)
     first = asyncio.run(
         execute_industrial_plan(
             fixture.plan,
             output_root=output,
             run_nonce_sha256=nonce,
             launch_server=launch,
-            transport=_FakeTransport(),
+            transport=transport,
+            native_evidence=provider,
         )
     )
     other_split = _write_artifact(
@@ -2673,7 +3705,8 @@ def test_resume_rejects_a_receipt_from_another_content_plan(
                 output_root=output,
                 run_nonce_sha256=nonce,
                 launch_server=launch,
-                transport=_FakeTransport(),
+                transport=transport,
+                native_evidence=provider,
             )
         )
     assert launched == 1
@@ -2703,21 +3736,263 @@ def test_artifact_mutation_fails_before_server_launch(tmp_path: Path) -> None:
     assert not launched
 
 
+def test_missing_compile_cache_plan_fails_before_server_launch(tmp_path: Path) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    Path(fixture.plan.server_launch.compile_cache_plan or "").unlink()
+    launched = False
+
+    async def launch(_server: ServerLaunch) -> _FakeHandle:
+        nonlocal launched
+        launched = True
+        return _FakeHandle()
+
+    with pytest.raises(ValueError, match="plan must be a regular file"):
+        asyncio.run(
+            execute_industrial_plan(
+                fixture.plan,
+                output_root=fixture.plan.runtime_plan.cell.resources.evidence_root,
+                run_nonce_sha256=hashlib.sha256(b"missing-compile-plan").hexdigest(),
+                launch_server=launch,
+                transport=_FakeTransport(),
+            )
+        )
+    assert not launched
+
+
+def test_compile_cache_plan_sidecar_tamper_fails_closed(tmp_path: Path) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    path = Path(fixture.plan.server_launch.compile_cache_plan or "")
+    Path(f"{path}.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sidecar differs"):
+        fixture.plan.validate()
+
+
+def test_reuse_base_is_reverified_before_output_or_server_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    build_plan = fixture.plan.compile_cache_plan
+    session = start_compile_cache_launch(
+        build_plan,
+        process_id=909,
+        attempt_id="executor-preflight-base",
+    )
+    kernel = session.overlay.path / "triton" / "kernel.bin"
+    kernel.parent.mkdir(parents=True)
+    kernel.write_bytes(b"verified-compile-object")
+    object_path, receipt_path, _ = session.complete()
+    reuse_plan = CompileCacheLaunchPlan.issue(
+        key=build_plan.key,
+        cache_root=build_plan.cache_root,
+        cache_mode="reuse",
+        base_receipt_path=receipt_path,
+    )
+    reuse_plan_path = tmp_path / "compile-cache-reuse-plan.json"
+    reuse_plan.write(reuse_plan_path)
+    launch = fixture.plan.server_launch
+    plan = replace(
+        fixture.plan,
+        compile_cache_plan=reuse_plan,
+        server_launch=replace(
+            launch,
+            argv=(*launch.argv[:6], str(reuse_plan_path), *launch.argv[7:]),
+            compile_cache_plan=str(reuse_plan_path),
+            compile_cache_plan_sha256=reuse_plan.sha256,
+            compile_cache_key_sha256=reuse_plan.key.sha256,
+        ),
+    )
+    plan.validate()
+    kernel = object_path / "triton" / "kernel.bin"
+    os.chmod(kernel.parent, 0o755)
+    kernel.unlink()
+    output = Path(plan.runtime_plan.cell.resources.evidence_root)
+    launched = False
+
+    async def launch_server(_server: ServerLaunch) -> _FakeHandle:
+        nonlocal launched
+        launched = True
+        return _FakeHandle()
+
+    with pytest.raises(CompileCacheCorruptionError, match="content changed"):
+        asyncio.run(
+            execute_industrial_plan(
+                plan,
+                output_root=output,
+                run_nonce_sha256=hashlib.sha256(b"reuse-preflight").hexdigest(),
+                launch_server=launch_server,
+                transport=_FakeTransport(),
+            )
+        )
+    assert not output.exists()
+    assert not launched
+
+    async def create_subprocess(*_argv: str, **_kwargs: object) -> None:
+        pytest.fail("compile-cache corruption must block subprocess creation")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    with pytest.raises(CompileCacheCorruptionError, match="content changed"):
+        asyncio.run(launch_server_subprocess(plan.server_launch))
+
+
+def test_execution_plan_rejects_a_caller_selected_trust_root(tmp_path: Path) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    caller_policy = TrustedAttesterPolicy(
+        policy_id="caller-selected-empty-policy",
+        trusted_attesters=(),
+    )
+
+    with pytest.raises(ValueError, match="caller-supplied"):
+        replace(
+            fixture.plan,
+            trusted_attester_policy=caller_policy,
+        ).validate()
+
+
+def test_executor_restart_reverifies_compile_plan_before_resume(
+    tmp_path: Path,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    plan = fixture.plan
+    launches = 0
+
+    async def launch(_server: ServerLaunch) -> _FakeHandle:
+        nonlocal launches
+        launches += 1
+        return _FakeHandle()
+
+    transport = _FakeTransport(plan=plan)
+    provider = NativeTerminalProvider(transport)
+    nonce = hashlib.sha256(b"compile-plan-restart").hexdigest()
+    first = asyncio.run(
+        execute_industrial_plan(
+            plan,
+            output_root=plan.runtime_plan.cell.resources.evidence_root,
+            run_nonce_sha256=nonce,
+            launch_server=launch,
+            transport=transport,
+            native_evidence=provider,
+        )
+    )
+    assert not first.resumed
+    path = Path(plan.server_launch.compile_cache_plan or "")
+    Path(f"{path}.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sidecar differs"):
+        asyncio.run(
+            execute_industrial_plan(
+                plan,
+                output_root=plan.runtime_plan.cell.resources.evidence_root,
+                run_nonce_sha256=nonce,
+                launch_server=launch,
+                transport=transport,
+                native_evidence=provider,
+            )
+        )
+    assert launches == 1
+
+
+def test_foreign_compile_cache_plan_cannot_replace_bound_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    foreign = _with_compile_key(
+        fixture,
+        tmp_path,
+        label="foreign",
+        driver_version="foreign-driver",
+    )
+    original = fixture.plan.compile_cache_plan
+    crossed = replace(foreign, compile_cache_plan=original)
+    with pytest.raises(ValueError, match="changed after binding"):
+        crossed.validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("driver_version", "foreign-driver", "runtime toolchain"),
+        ("gpu_model", "foreign-gpu", "assigned GPU model/SM"),
+        ("target_revision", "3" * 40, "exact RunConfig"),
+        ("tensor_parallel_size", 2, "exact RunConfig"),
+    ),
+)
+def test_compile_cache_key_must_match_driver_model_revision_and_tp(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    plan = _with_compile_key(
+        fixture,
+        tmp_path,
+        label=field,
+        **{field: value},
+    )
+    with pytest.raises(ValueError, match=message):
+        plan.validate()
+
+
 def test_server_argv_is_part_of_the_validated_immutable_plan(tmp_path: Path) -> None:
     fixture = _execution_fixture(tmp_path, request_count=1)
     launch = fixture.plan.server_launch
+    assert launch.argv[5:7] == (
+        "--compile-cache-plan",
+        launch.compile_cache_plan,
+    )
     tampered = replace(
         fixture.plan,
         server_launch=replace(
             launch,
-            argv=tuple(
-                "2" if value == "1" and index == 13 else value
-                for index, value in enumerate(launch.argv)
-            ),
+            argv=(*launch.argv[:11], "2", *launch.argv[12:]),
         ),
     )
     with pytest.raises(ValueError, match="base argv differs"):
         tampered.validate()
+
+
+def test_industrial_renderer_carries_the_exact_compile_plan_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    source = fixture.plan
+    checkout = Path(source.server_launch.argv[4])
+    monkeypatch.setattr(
+        executor_module,
+        "verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    rendered = render_industrial_execution_plan(
+        output_root=tmp_path / "rendered",
+        runtime_plan=source.runtime_plan,
+        dispatch_plan=source.dispatch_plan,
+        dispatch_context=source.dispatch_context,
+        budget_plan=source.budget_plan,
+        budget=source.budget,
+        load_plan=source.load_plan,
+        dependency_receipts=source.dispatch_context.receipts,
+        dependency_artifacts=source.dependency_artifacts,
+        split_artifact=source.split_artifact,
+        sampling_artifact=source.sampling_artifact,
+        model_lock_artifact=source.model_lock_artifact,
+        sglang_checkout=checkout,
+        compile_cache_plan_path=source.server_launch.compile_cache_plan or "",
+        inventory_source_artifact=source.inventory_source_artifact,
+        runtime_envelope_artifact=source.runtime_envelope_artifact,
+        model_roots={
+            source.runtime_plan.rank_configs[0].model.target: source.server_launch.argv[
+                9
+            ]
+        },
+        adaptation_reserve_mb=0,
+        mem_fraction_static=0.8,
+    )
+    assert rendered.compile_cache_plan == source.compile_cache_plan
+    assert rendered.server_launch.argv[5:7] == (
+        "--compile-cache-plan",
+        source.server_launch.compile_cache_plan,
+    )
 
 
 def test_opt_in_subprocess_launcher_binds_the_exact_gpu_uuid_without_launching(
@@ -2736,6 +4011,11 @@ def test_opt_in_subprocess_launcher_binds_the_exact_gpu_uuid_without_launching(
         observed["environment"] = kwargs["env"]
         return Process()
 
+    monkeypatch.setattr(
+        executor_module,
+        "verify_patched_checkout",
+        lambda path: Path(path),
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
     handle = asyncio.run(launch_server_subprocess(fixture.plan.server_launch))
     assert handle is not None
@@ -2778,7 +4058,7 @@ def test_cancellation_and_timeout_keep_partial_output_without_timing_imputation(
     async def launch(server: ServerLaunch) -> _FakeHandle:
         return handle
 
-    transport = _FakeTransport(delay_s=0.02)
+    transport = _FakeTransport(plan=fixture.plan, delay_s=0.02)
     output = Path(fixture.plan.runtime_plan.cell.resources.evidence_root)
     result = asyncio.run(
         execute_industrial_plan(
@@ -2787,6 +4067,7 @@ def test_cancellation_and_timeout_keep_partial_output_without_timing_imputation(
             run_nonce_sha256=hashlib.sha256(counter.encode()).hexdigest(),
             launch_server=launch,
             transport=transport,
+            native_evidence=NativeTerminalProvider(transport),
         )
     )
     assert result.accounting is not None

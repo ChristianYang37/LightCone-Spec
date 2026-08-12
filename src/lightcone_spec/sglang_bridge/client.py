@@ -9,6 +9,8 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from lightcone_spec.execution import ControlledExecutionPolicy
+
 _MEASURED_METHODS = {
     "static",
     "tts",
@@ -93,8 +95,7 @@ class ServerSnapshot:
         if not required <= set(metrics):
             missing = sorted(required - set(metrics))
             raise RuntimeError(
-                "patched SGLang speed metrics are incomplete: "
-                + ", ".join(missing)
+                "patched SGLang speed metrics are incomplete: " + ", ".join(missing)
             )
         record = state.get("speculative_adaptation_info_record")
         adaptation = None
@@ -300,9 +301,7 @@ class SGLangHTTPClient:
             raise RuntimeError("SGLang did not acknowledge engine reset")
 
     def server_info(self) -> dict:
-        request = urllib.request.Request(
-            f"{self.base_url}/server_info", method="GET"
-        )
+        request = urllib.request.Request(f"{self.base_url}/server_info", method="GET")
         with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
             payload = json.loads(response.read())
         if not isinstance(payload, dict):
@@ -313,7 +312,9 @@ class SGLangHTTPClient:
 
     def tokenize_prompts(self, prompts: Iterable[str]) -> tuple[tuple[int, ...], int]:
         values = tuple(prompts)
-        if not values or any(not isinstance(prompt, str) or not prompt for prompt in values):
+        if not values or any(
+            not isinstance(prompt, str) or not prompt for prompt in values
+        ):
             raise ValueError("tokenization requires non-empty prompt strings")
         request = urllib.request.Request(
             f"{self.base_url}/tokenize",
@@ -436,10 +437,15 @@ class SGLangHTTPClient:
 
 
 def _require_complete_output_stream(server_info: dict) -> None:
-    if server_info.get("incremental_streaming_output") is not False:
-        raise RuntimeError(
-            "formal evidence requires non-incremental streaming with complete output IDs"
+    try:
+        ControlledExecutionPolicy().validate_server_info(
+            server_info, role="speculative"
         )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "formal evidence requires the registered controlled execution policy "
+            "and non-incremental streaming"
+        ) from error
 
 
 def independent_method_run(

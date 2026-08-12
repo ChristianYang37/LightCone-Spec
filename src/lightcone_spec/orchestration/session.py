@@ -18,12 +18,19 @@ import json
 import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, Self
 
 if TYPE_CHECKING:
-    from lightcone_spec.orchestration.executor import IndustrialExecutionPlan
+    from lightcone_spec.experiments.serving import BenchServingTransport
+    from lightcone_spec.orchestration.executor import (
+        IndustrialExecutionPlan,
+        IndustrialExecutionResult,
+        ServerLauncher,
+    )
+    from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
@@ -31,6 +38,7 @@ _GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
 SHARED_SESSION_UNAVAILABLE_REASON = (
     "shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable"
 )
+SHARED_SESSION_FALLBACK_MODE = "fresh_process_per_trace"
 
 
 class SharedSessionUnavailableError(RuntimeError):
@@ -782,6 +790,76 @@ class IndustrialSessionTraceReceipt:
         return _content_sha256({"schema_version": 1, **asdict(self)})
 
 
+@dataclass(frozen=True)
+class IndustrialServerBlockResult:
+    """A block executed as independent cold traces, never as session reuse.
+
+    This is the release-safe fallback while the live shared-session boundary is
+    unavailable.  Every member retains its own terminal receipt and budget
+    observation; this aggregate binds their order without claiming a reset or
+    startup saving.
+    """
+
+    session_plan_sha256: str
+    execution_mode: str
+    fallback_reason: str
+    executions: tuple[IndustrialExecutionResult, ...]
+
+    def validate(self) -> None:
+        from lightcone_spec.orchestration.executor import IndustrialExecutionResult
+
+        _require_sha256("session_plan_sha256", self.session_plan_sha256)
+        if self.execution_mode != SHARED_SESSION_FALLBACK_MODE:
+            raise ValueError("server block execution mode is not release-supported")
+        if self.fallback_reason != SHARED_SESSION_UNAVAILABLE_REASON:
+            raise ValueError("server block fallback reason is not canonical")
+        if not self.executions:
+            raise ValueError("server block result requires at least one execution")
+        if any(type(row) is not IndustrialExecutionResult for row in self.executions):
+            raise TypeError("server block result requires exact execution results")
+        if any(row.resumed for row in self.executions):
+            raise ValueError("fresh-process block execution cannot contain a resume")
+        if len({row.execution_plan_sha256 for row in self.executions}) != len(
+            self.executions
+        ):
+            raise ValueError("server block execution-plan results must be unique")
+        for row in self.executions:
+            for name in (
+                "execution_plan_sha256",
+                "experiment_budget_sha256",
+                "rank_config_sha256",
+                "topology_sha256",
+                "terminal_receipt_sha256",
+                "budget_observation_sha256",
+            ):
+                _require_sha256(name, getattr(row, name))
+            _require_text("run_id", row.run_id)
+
+    @property
+    def sha256(self) -> str:
+        self.validate()
+        return _content_sha256(
+            {
+                "schema_version": 1,
+                "session_plan_sha256": self.session_plan_sha256,
+                "execution_mode": self.execution_mode,
+                "fallback_reason": self.fallback_reason,
+                "executions": [
+                    {
+                        "run_id": row.run_id,
+                        "execution_plan_sha256": row.execution_plan_sha256,
+                        "experiment_budget_sha256": row.experiment_budget_sha256,
+                        "rank_config_sha256": row.rank_config_sha256,
+                        "topology_sha256": row.topology_sha256,
+                        "terminal_receipt_sha256": row.terminal_receipt_sha256,
+                        "budget_observation_sha256": row.budget_observation_sha256,
+                    }
+                    for row in self.executions
+                ],
+            }
+        )
+
+
 def _file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -1261,42 +1339,130 @@ async def execute_industrial_server_session(
     *,
     output_roots: tuple[str | Path, ...],
     run_nonce_sha256s: tuple[str, ...],
-    launch_server: Any,
-    transport: SessionTransport,
-    boundary_runtime: SessionBoundaryRuntime,
-    native_evidence: Any = None,
-) -> tuple[IndustrialSessionTraceReceipt, ...]:
-    """Fail closed before any shared-session process or evidence mutation."""
+    launch_server: ServerLauncher,
+    resources_for_plan: Callable[
+        [IndustrialExecutionPlan],
+        tuple[BenchServingTransport, NativeTerminalProvider],
+    ],
+) -> IndustrialServerBlockResult:
+    """Execute a registered block via one clean process per logical trace.
 
-    _raise_shared_session_unavailable()
+    Live reuse remains unavailable until a release-owned durable boundary can
+    prove reset and continuous whole-instance accounting.  This entry point is
+    the required safe fallback: it validates the entire block and every native
+    provider before the first launch, then delegates each trace to the ordinary
+    standalone executor.  It never calls the caller-authored session boundary
+    protocol and never labels the result as reused-session evidence.
+    """
 
+    from lightcone_spec.experiments.serving import PinnedBenchServingTransport
+    from lightcone_spec.orchestration.executor import (
+        IndustrialExecutionPlan,
+        NativeEvidenceUnavailableError,
+        _preflight_industrial_session_trace_evidence,
+        execute_industrial_plan,
+        native_evidence_preflight,
+    )
+    from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
+
+    if type(session_plan) is not IndustrialServerSessionPlan:
+        raise TypeError("server block requires an exact session-plan authority")
+    if not execution_plans or any(
+        type(plan) is not IndustrialExecutionPlan for plan in execution_plans
+    ):
+        raise TypeError("server block requires exact execution-plan authorities")
     if not (len(execution_plans) == len(output_roots) == len(run_nonce_sha256s)):
         raise ValueError(
             "session trace plans, roots, and nonces must have equal length"
         )
-    session = await open_server_session(
-        session_plan,
+    for plan in execution_plans:
+        plan.validate()
+    session_plan.validate()
+    expected = IndustrialServerSessionPlan.create(
         execution_plans,
-        output_roots=output_roots,
-        run_nonce_sha256s=run_nonce_sha256s,
-        launch_server=launch_server,
-        transport=transport,
-        boundary_runtime=boundary_runtime,
-        native_evidence=native_evidence,
+        capability_receipt_sha256=(session_plan.session_key.capability_receipt_sha256),
+        compile_cache_receipt_sha256=(
+            session_plan.session_key.compile_cache_receipt_sha256
+        ),
+        dtype=session_plan.session_key.dtype,
+        precision=session_plan.session_key.precision,
+        graph_buckets=session_plan.session_key.graph_buckets,
+        hbm_reservation_bytes=session_plan.session_key.hbm_reservation_bytes,
     )
-    receipts: list[IndustrialSessionTraceReceipt] = []
-    try:
-        for output_root, nonce in zip(output_roots, run_nonce_sha256s, strict=True):
-            _, trace_receipt = await execute_trace_in_session(
-                session,
-                output_root=output_root,
-                run_nonce_sha256=nonce,
-                native_evidence=native_evidence,
+    if session_plan != expected:
+        raise ValueError(
+            "server block plan differs from the exact execution-plan replay"
+        )
+    normalized_roots = tuple(Path(root).resolve() for root in output_roots)
+    for plan, output_root, nonce in zip(
+        execution_plans,
+        normalized_roots,
+        run_nonce_sha256s,
+        strict=True,
+    ):
+        _preflight_industrial_session_trace_evidence(
+            plan,
+            output_root=output_root,
+            run_nonce_sha256=nonce,
+        )
+
+    # Materialize and validate every resource pair before the first process or
+    # network mutation.  Distinct identities make the clean-process guarantee
+    # explicit and prevent accidental HTTP/native lifecycle reuse.
+    resources = tuple(resources_for_plan(plan) for plan in execution_plans)
+    if any(type(row) is not tuple or len(row) != 2 for row in resources):
+        raise TypeError("resource factory must return (transport, native provider)")
+    transports = tuple(row[0] for row in resources)
+    providers = tuple(row[1] for row in resources)
+    if len({id(value) for value in transports}) != len(transports) or len(
+        {id(value) for value in providers}
+    ) != len(providers):
+        raise ValueError("clean-process fallback requires unique per-trace resources")
+    for plan, transport, provider in zip(
+        execution_plans,
+        transports,
+        providers,
+        strict=True,
+    ):
+        if not isinstance(transport, PinnedBenchServingTransport):
+            raise TypeError("server block requires the pinned official bench transport")
+        if type(provider) is not NativeTerminalProvider:
+            raise TypeError("server block requires exact native terminal providers")
+        if provider._transport is not transport:
+            raise ValueError(
+                "server block native and serving traffic use different HTTP pools"
             )
-            receipts.append(trace_receipt)
-    finally:
-        if not session.closed:
-            await close_server_session(session)
-    if session.next_trace_index != len(execution_plans):
-        raise RuntimeError("server session ended before every logical trace completed")
-    return tuple(receipts)
+        preflight = native_evidence_preflight(plan, provider)
+        if preflight.status == "BLOCKED":
+            raise NativeEvidenceUnavailableError(preflight)
+
+    results = []
+    for plan, output_root, nonce, transport, provider in zip(
+        execution_plans,
+        normalized_roots,
+        run_nonce_sha256s,
+        transports,
+        providers,
+        strict=True,
+    ):
+        result = await execute_industrial_plan(
+            plan,
+            output_root=output_root,
+            run_nonce_sha256=nonce,
+            launch_server=launch_server,
+            transport=transport,
+            native_evidence=provider,
+        )
+        if result.resumed:
+            raise RuntimeError(
+                "clean-process block fallback unexpectedly resumed prior evidence"
+            )
+        results.append(result)
+    value = IndustrialServerBlockResult(
+        session_plan_sha256=session_plan.sha256,
+        execution_mode=SHARED_SESSION_FALLBACK_MODE,
+        fallback_reason=SHARED_SESSION_UNAVAILABLE_REASON,
+        executions=tuple(results),
+    )
+    value.validate()
+    return value

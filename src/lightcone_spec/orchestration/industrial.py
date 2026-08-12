@@ -51,6 +51,9 @@ class IndustrialPhysicalAssignment:
     inventory_source_receipt_sha256: str
     dispatch_plan_sha256: str
     experiment_budget_sha256: str
+    budget_plan_sha256: str
+    capacity_authority_sha256: str
+    budget_materialization_authority_sha256: str
     assignment_sha256: str
     work_item_sha256: str
     gpu_uuids: tuple[str, ...]
@@ -68,6 +71,9 @@ class IndustrialPhysicalAssignment:
             "inventory_source_receipt_sha256",
             "dispatch_plan_sha256",
             "experiment_budget_sha256",
+            "budget_plan_sha256",
+            "capacity_authority_sha256",
+            "budget_materialization_authority_sha256",
             "assignment_sha256",
             "work_item_sha256",
         ):
@@ -154,12 +160,17 @@ class IndustrialPhysicalAssignment:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 3,
             "kind": "industrial_physical_assignment",
             "inventory_sha256": self.inventory_sha256,
             "inventory_source_receipt_sha256": self.inventory_source_receipt_sha256,
             "dispatch_plan_sha256": self.dispatch_plan_sha256,
             "experiment_budget_sha256": self.experiment_budget_sha256,
+            "budget_plan_sha256": self.budget_plan_sha256,
+            "capacity_authority_sha256": self.capacity_authority_sha256,
+            "budget_materialization_authority_sha256": (
+                self.budget_materialization_authority_sha256
+            ),
             "assignment_sha256": self.assignment_sha256,
             "work_item_sha256": self.work_item_sha256,
             "gpu_uuids": list(self.gpu_uuids),
@@ -460,6 +471,9 @@ def bind_industrial_gpu_assignment(
         )
     if dispatch_plan.budget_sha256_for(cell_id) != budget.sha256:
         raise ValueError("ExperimentBudget differs from the dispatch-plan binding")
+    ready_budgets = dispatch_context.require_ready_budget_authority()
+    if {row.cell_id: row for row in ready_budgets}.get(cell_id) != budget:
+        raise ValueError("ExperimentBudget differs from the READY BudgetPlan")
     context_budget = dispatch_context.budgets_by_cell_id.get(cell_id)
     if context_budget != budget:
         raise ValueError("ExperimentBudget differs from the dispatch context")
@@ -625,11 +639,19 @@ def bind_industrial_gpu_assignment(
         len(inventory.devices)
     ):
         raise ValueError("physical assignment budget undercounts the fixed inventory")
+    capacity_authority = dispatch_context.budget_plan.capacity_authority
+    if capacity_authority is None:  # pragma: no cover - execution-context invariant
+        raise RuntimeError("execution capacity authority disappeared")
     return IndustrialPhysicalAssignment(
         inventory_sha256=inventory.sha256,
         inventory_source_receipt_sha256=inventory.source_receipt_sha256,
         dispatch_plan_sha256=dispatch_plan.sha256,
         experiment_budget_sha256=budget.sha256,
+        budget_plan_sha256=dispatch_context.budget_plan.sha256,
+        capacity_authority_sha256=capacity_authority.sha256,
+        budget_materialization_authority_sha256=(
+            dispatch_context.budget_materialization_authority.sha256
+        ),
         assignment_sha256=canonical_assignment_sha256,
         work_item_sha256=canonical_work_item.sha256,
         gpu_uuids=assignment.gpu_uuids,

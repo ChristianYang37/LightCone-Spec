@@ -17,6 +17,7 @@ from lightcone_spec.config.schema import (
     RunConfig,
     RuntimeConfig,
 )
+from lightcone_spec.execution import ControlledExecutionPolicy, ExecutionRole
 from lightcone_spec.experiments.onlinespec import (
     OnlineSpecCandidate,
     OnlineSpecSelection,
@@ -29,6 +30,7 @@ from lightcone_spec.experiments.protocol import (
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import SelectionArtifact
 from lightcone_spec.locking.models import ModelLock
+from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 
@@ -42,6 +44,9 @@ class ServerLaunch:
     adaptation_config: str | None
     telemetry_path: str | None
     argv: tuple[str, ...]
+    compile_cache_plan: str | None = None
+    compile_cache_plan_sha256: str | None = None
+    compile_cache_key_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,64 @@ def _immutable_json(path: Path, value: object) -> None:
     sidecar.write_text(digest + "\n", encoding="utf-8")
 
 
+def _execution_role(method: str) -> ExecutionRole:
+    if method == "target_only":
+        return "target_reference"
+    if method in {
+        "static",
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }:
+        return "speculative"
+    raise ValueError(f"unknown execution-policy method: {method}")
+
+
+def _runtime_execution_policy(runtime: RuntimeConfig) -> ControlledExecutionPolicy:
+    policy = ControlledExecutionPolicy(
+        context_length=runtime.context_length,
+        random_seed=runtime.random_seed,
+        disable_radix_cache=runtime.disable_radix_cache,
+        disable_cuda_graph=runtime.disable_cuda_graph,
+        target_reference_disable_overlap_schedule=(
+            runtime.target_reference_disable_overlap_schedule
+        ),
+        speculative_disable_overlap_schedule=(
+            runtime.speculative_disable_overlap_schedule
+        ),
+        enable_deterministic_inference=runtime.enable_deterministic_inference,
+        incremental_streaming_output=runtime.incremental_streaming_output,
+    )
+    if runtime.execution_policy_sha256 != policy.sha256:
+        raise ValueError("runtime execution-policy identity mismatch")
+    return policy
+
+
+def _execution_argv(runtime: RuntimeConfig, *, role: ExecutionRole) -> list[str]:
+    """Render only the exact flags represented by the registered policy."""
+
+    policy = _runtime_execution_policy(runtime)
+    argv = [
+        "--context-length",
+        str(policy.context_length),
+        "--random-seed",
+        str(policy.random_seed),
+    ]
+    if policy.disable_radix_cache:
+        argv.append("--disable-radix-cache")
+    if policy.disable_cuda_graph:
+        argv.append("--disable-cuda-graph")
+    if policy.overlap_disabled(role=role):
+        argv.append("--disable-overlap-schedule")
+    if policy.enable_deterministic_inference:
+        argv.append("--enable-deterministic-inference")
+    if policy.incremental_streaming_output:
+        argv.append("--incremental-streaming-output")
+    return argv
+
+
 def _render_server(
     *,
     output: Path,
@@ -86,7 +149,10 @@ def _render_server(
     mem_fraction_static: float,
     host: str,
     port: int,
+    compile_cache_plan_path: str | Path | None = None,
 ) -> ServerLaunch:
+    if method != config.method:
+        raise ValueError("rendered method differs from the RunConfig")
     method_root = output / method
     config_path = method_root / "run-config.json"
     _immutable_json(config_path, config.model_dump(mode="json"))
@@ -99,26 +165,41 @@ def _render_server(
             raise AssertionError("adapted config produced no payload")
         _immutable_json(adaptation_path, payload)
         telemetry_path = method_root / "adaptation-telemetry.json"
+    compile_plan_path: Path | None = None
+    compile_plan: CompileCacheLaunchPlan | None = None
+    if compile_cache_plan_path is not None:
+        unresolved_plan = Path(compile_cache_plan_path)
+        if unresolved_plan.is_symlink():
+            raise ValueError("compile-cache plan cannot be a symlink")
+        compile_plan_path = unresolved_plan.resolve()
+        compile_plan = CompileCacheLaunchPlan.load(compile_plan_path)
     argv = [
         sys.executable,
         "-m",
         "lightcone_spec.sglang_bridge.launch",
         "--checkout",
         str(verified_checkout),
-        "--",
-        "--model-path",
-        str(Path(roots[target_id]).resolve()),
-        "--max-running-requests",
-        str(config.runtime.max_running_requests),
-        "--mem-fraction-static",
-        str(mem_fraction_static),
-        "--tp-size",
-        str(config.runtime.tensor_parallel_size),
-        "--host",
-        host,
-        "--port",
-        str(port),
     ]
+    if compile_plan_path is not None:
+        argv.extend(("--compile-cache-plan", str(compile_plan_path)))
+    argv.extend(
+        (
+            "--",
+            "--model-path",
+            str(Path(roots[target_id]).resolve()),
+            "--max-running-requests",
+            str(config.runtime.max_running_requests),
+            "--mem-fraction-static",
+            str(mem_fraction_static),
+            "--tp-size",
+            str(config.runtime.tensor_parallel_size),
+            "--host",
+            host,
+            "--port",
+            str(port),
+        )
+    )
+    argv.extend(_execution_argv(config.runtime, role=_execution_role(method)))
     if method != "target_only":
         argv.extend(
             (
@@ -137,8 +218,10 @@ def _render_server(
                 "--speculative-use-rejection-sampling",
             )
         )
-    if adaptation_path is not None:
-        argv.append("--speculative-speed-study-metrics")
+    # The pinned patch uses this switch to activate content-bound terminal
+    # accounting for every role, including allocation-free target_only/Static.
+    # It does not by itself create a drafter, adapter, optimizer, or update path.
+    argv.append("--speculative-speed-study-metrics")
     if adaptation_path is not None and telemetry_path is not None:
         argv.extend(
             (
@@ -158,6 +241,15 @@ def _render_server(
         adaptation_config=None if adaptation_path is None else str(adaptation_path),
         telemetry_path=None if telemetry_path is None else str(telemetry_path),
         argv=tuple(argv),
+        compile_cache_plan=(
+            None if compile_plan_path is None else str(compile_plan_path)
+        ),
+        compile_cache_plan_sha256=(
+            None if compile_plan is None else compile_plan.sha256
+        ),
+        compile_cache_key_sha256=(
+            None if compile_plan is None else compile_plan.key.sha256
+        ),
     )
 
 
@@ -278,11 +370,7 @@ def _render_choice_plan(
     methods = (
         ("static",)
         if static_only
-        else (
-            ("static", "tts", "l0")
-            if include_static
-            else ("tts", "l0")
-        )
+        else (("static", "tts", "l0") if include_static else ("tts", "l0"))
     )
     for method in methods:
         config = RunConfig(
@@ -316,6 +404,7 @@ def _render_choice_plan(
             "selection_sha256": choice.selection_sha256,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],
@@ -425,6 +514,7 @@ def render_target_only_runtime_plan(
             "phase": "target_only_baseline",
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": (config.runtime.execution_policy_sha256),
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch)],
@@ -554,8 +644,7 @@ def _locked_dflash_pair(
         raise ValueError("model roots belong to a different model lock")
     roots = model_roots.get("roots")
     if not isinstance(roots, dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in roots.items()
+        isinstance(key, str) and isinstance(value, str) for key, value in roots.items()
     ):
         raise TypeError("model roots mapping is missing or malformed")
     target_id = "Qwen/Qwen3-8B"
@@ -680,9 +769,7 @@ def render_onlinespec_tuning_runtime_plan(
             roots=roots,
             target_id=model.target,
             drafter_id=model.drafter,
-            adaptation_reserve_mb=(
-                0 if method == "static" else adaptation_reserve_mb
-            ),
+            adaptation_reserve_mb=(0 if method == "static" else adaptation_reserve_mb),
             mem_fraction_static=mem_fraction_static,
             host=host,
             port=first_port,
@@ -698,6 +785,7 @@ def render_onlinespec_tuning_runtime_plan(
             "candidate_id": candidate.candidate_id,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],
@@ -788,6 +876,7 @@ def render_onlinespec_runtime_plan(
             "selection_sha256": selection.sha256,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
+            "execution_policy_sha256": runtime.execution_policy_sha256,
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "sglang_checkout": str(verified_checkout),
             "servers": [asdict(launch) for launch in launches],
