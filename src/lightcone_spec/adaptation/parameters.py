@@ -18,6 +18,7 @@ DSPARK_HYBRID_SCOPES = (
     "last3_native_heads",
     "last5_native_heads",
 )
+TRAINABLE_PLAN_OPTIMIZERS = ("adam", "adamw", "lion", "muon", "nag", "sgdm")
 
 _BORROWED_COMPONENTS = (
     "embed_tokens",
@@ -30,6 +31,59 @@ _LORA_LINEAR = re.compile(
     r"gate_proj|gate_up_proj|up_proj|down_proj)(?:\.|$)"
 )
 _LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _content_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "trainable_parameter_plan_reducer_protocol",
+        "sources": (
+            "path_bound_model_lock_first_party_prepared_snapshot_content_"
+            "authority_safetensors_index_headers_run_config_split_and_"
+            "registry_cell_v2"
+        ),
+        "selectors": {
+            "DFLASH": "owned_floating_contiguous_registered_layer_scope_v1",
+            "DSPARK": (
+                "owned_floating_contiguous_registered_layer_scope_plus_exact_"
+                "optional_native_heads_v1"
+            ),
+            "EAGLE_EAGLE3_NEXTN": (
+                "owned_floating_contiguous_registered_layer_scope_v1"
+            ),
+            "lora": "registered_matrix_names_rank_and_alpha_over_rank_one_v1",
+            "full": "selected_native_tensor_v1",
+        },
+        "outputs": (
+            "exact_names_shapes_dtypes_parameterization_ownership_frozen_names_"
+            "state_layout_and_all_optimizer_allocation_memory_digest"
+        ),
+        "serialized_plan_authority": "forbidden_without_raw_replay",
+        "serialized_parameter_inventory": (
+            "non_authoritative_exact_mirror_of_first_party_header_extraction"
+        ),
+        "ownership": (
+            "schema_v3_single_rank_release_rule_all_non_dspark_native_heads_"
+            "local_sharded_and_exact_dspark_native_heads_replicated_v1"
+        ),
+        "identity": (
+            "exact_cell_method_backend_scope_rank_alpha_optimizer_target_and_"
+            "drafter_revisions_cross_checked_against_run_config_and_model_lock"
+        ),
+        "allocation": "metadata_only_no_tensor_allocation",
+    }
+)
 
 
 def _is_owned(name: str) -> bool:
@@ -104,6 +158,20 @@ class PlanMemoryPrediction:
         return (
             self.resident_bytes + self.gradients + self.candidate + self.merge_scratch
         )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "active_merged": self.active_merged,
+            "masters": self.masters,
+            "gradients": self.gradients,
+            "optimizer_first": self.optimizer_first,
+            "optimizer_second": self.optimizer_second,
+            "candidate": self.candidate,
+            "staging": self.staging,
+            "merge_scratch": self.merge_scratch,
+            "resident_bytes": self.resident_bytes,
+            "peak_bytes": self.peak_bytes,
+        }
 
 
 @dataclass(frozen=True)
@@ -183,9 +251,34 @@ class TrainablePlan:
             )
         return tuple(rows)
 
+    @property
+    def state_layout_sha256(self) -> str:
+        return _content_sha256(self.state_layout)
+
+    @property
+    def allocation_memory_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "trainable_plan_allocation_memory",
+            "trainable_plan_sha256": self.sha256,
+            "trainable_parameter_count": self.trainable_parameter_count,
+            "state_layout_sha256": self.state_layout_sha256,
+            "optimizer_predictions": [
+                {
+                    "optimizer": optimizer,
+                    **self.predict_memory(optimizer).to_dict(),
+                }
+                for optimizer in TRAINABLE_PLAN_OPTIMIZERS
+            ],
+        }
+
+    @property
+    def allocation_memory_sha256(self) -> str:
+        return _content_sha256(self.allocation_memory_payload)
+
     def predict_memory(self, optimizer: str) -> PlanMemoryPrediction:
         """Generate state bytes from this exact plan, never a parallel estimator."""
-        if optimizer not in {"adam", "adamw", "sgdm", "nag", "muon", "lion"}:
+        if optimizer not in TRAINABLE_PLAN_OPTIMIZERS:
             raise ValueError("optimizer has no implemented state layout")
         trainable = self.trainable_parameter_count
         masters = 4 * trainable
