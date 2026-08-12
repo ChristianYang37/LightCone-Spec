@@ -14,6 +14,8 @@ authority. The schema-v3 and industrial commands are:
 | `build-industrial-registry` | Bind one or more stable logical rank slots and materialize the immutable experiment DAG |
 | `collect-gpu-inventory` | Collect a nonce-bound physical GPU/topology inventory and raw probe receipt |
 | `build-interference-envelope` | Derive the current serial interference envelope and its inventory-bound raw receipt |
+| `materialize-interference-calibration-bootstrap` | Derive the calibration-only two-way execution envelope from a raw preflight activation and exact inventory |
+| `reduce-interference-calibration` | Reopen path-bound execution bundles and terminal authority, then reduce raw isolated/simultaneous evidence into exact-cardinality rules |
 | `reduce-e1-activation` | Derive the single 130-cell E1 slice from sealed E3a evidence |
 | `reduce-e2-activation` | Materialize one E2 round from the E1 Pareto artifact or prior survivors |
 | `reduce-e2-successive-halving` | Reduce exact E2 stage evidence into a sealed survivor receipt |
@@ -73,6 +75,14 @@ The separate OnlineSPEC family is unchanged in isolation:
 
 There is no generic method override or command that converts an unreceipted
 directory into completed evidence.
+
+The bootstrap envelope is permission to generate only the eight registered
+Static calibration observations. It cannot authorize headline co-tenancy or a
+larger cardinality. `reduce-interference-calibration` checks the release trust
+root before opening caller paths; the current no-signer release therefore
+writes a `BLOCKED` decision and no calibrated envelope. A preflight stage can
+seal `runtime_envelope=PATH` only by reopening that same raw execution
+authority, never from a hand-authored rule list or digest.
 
 ## Industrial registry workflow
 

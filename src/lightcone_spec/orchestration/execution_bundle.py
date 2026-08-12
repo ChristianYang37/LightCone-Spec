@@ -3895,6 +3895,7 @@ __all__ = [
     "ExecutionBundleBlockedError",
     "IndustrialAssignmentExecutionBundle",
     "IndustrialExecutionPlanAudit",
+    "InterferenceCalibrationExecutionAuthority",
     "dispatch_receipt_sidecar_path",
     "execute_dispatch_wave_bundles",
     "execution_policy_to_dict",

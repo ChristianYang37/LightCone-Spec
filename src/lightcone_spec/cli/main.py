@@ -57,6 +57,11 @@ from lightcone_spec.experiments.industrial_analysis import (
     reduce_evidence_alias,
     reduce_industrial_schema_v3,
 )
+from lightcone_spec.experiments.interference_authority import (
+    InterferenceCalibrationBlockedError,
+    materialize_interference_calibration_bootstrap_authority,
+    require_release_interference_attester,
+)
 from lightcone_spec.experiments.inventory import (
     build_serial_interference_envelope,
     collect_gpu_inventory,
@@ -180,6 +185,7 @@ from lightcone_spec.orchestration import (
 )
 from lightcone_spec.orchestration.execution_bundle import (
     ExecutionBundleBlockedError,
+    InterferenceCalibrationExecutionAuthority,
     execute_dispatch_wave_bundles,
 )
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
@@ -2120,6 +2126,20 @@ def _parser() -> argparse.ArgumentParser:
     build_interference.add_argument("--receipt-output", required=True)
     build_interference.add_argument("--output", required=True)
 
+    bootstrap_interference = commands.add_parser(
+        "materialize-interference-calibration-bootstrap"
+    )
+    bootstrap_interference.add_argument("--registry", required=True)
+    bootstrap_interference.add_argument("--activation-manifest", required=True)
+    bootstrap_interference.add_argument("--inventory", required=True)
+    bootstrap_interference.add_argument("--receipt-output", required=True)
+    bootstrap_interference.add_argument("--output", required=True)
+
+    reduce_interference = commands.add_parser("reduce-interference-calibration")
+    reduce_interference.add_argument("--authority", required=True)
+    reduce_interference.add_argument("--envelope-output", required=True)
+    reduce_interference.add_argument("--output", required=True)
+
     seal_industrial = commands.add_parser("seal-industrial-stage")
     seal_industrial.add_argument("--registry", required=True)
     seal_industrial.add_argument("--experiment", required=True)
@@ -2128,6 +2148,7 @@ def _parser() -> argparse.ArgumentParser:
     seal_industrial.add_argument("--completed-cells", required=True)
     seal_industrial.add_argument("--inventory", required=True)
     seal_industrial.add_argument("--e2-final-stage-manifest")
+    seal_industrial.add_argument("--interference-calibration-authority")
     seal_industrial.add_argument("--activation-plan")
     seal_industrial.add_argument("--family-activation", action="append", default=[])
     seal_industrial.add_argument("--family-power-plan", action="append", default=[])
@@ -4721,6 +4742,60 @@ def _validate_e2_final_seal_authority(
         raise ValueError("dflash_recipe is not the raw halving_3 final candidate")
 
 
+def _validate_preflight_interference_seal_authority(
+    *,
+    authority_path: str,
+    registry: ExperimentRegistry,
+    inventory: GpuInventory,
+    runtime_sha256: str,
+    split_sha256: str,
+    completed_cell_ids: tuple[str, ...],
+    locked_output_paths: dict[str, str],
+) -> None:
+    """Reopen raw calibration terminals before sealing the runtime envelope."""
+
+    if set(locked_output_paths) != {"runtime_envelope"}:
+        raise ValueError(
+            "preflight seal requires exactly one runtime_envelope=PATH output"
+        )
+    execution_authority = InterferenceCalibrationExecutionAuthority.from_dict(
+        _load_bound_json(authority_path)
+    )
+    raw_authority = execution_authority.reconstruct()
+    audit = raw_authority.audit_inputs()
+    terminal_plans = tuple(
+        terminal.plan for terminal in raw_authority.terminal_authorities
+    )
+    terminal_cell_ids = tuple(
+        sorted(plan.runtime_plan.cell_id for plan in terminal_plans)
+    )
+    if (
+        audit.inventory != inventory
+        or terminal_cell_ids != tuple(sorted(completed_cell_ids))
+        or len(terminal_cell_ids) != len(set(terminal_cell_ids))
+        or any(
+            plan.dispatch_context.registry != registry
+            or plan.dispatch_context.inventory != inventory
+            or type(plan.dispatch_context.activation_artifact)
+            is not RegistryStageActivationArtifact
+            or plan.dispatch_context.activation_artifact.experiment != "preflight"
+            or plan.dispatch_context.activation_artifact.runtime_sha256
+            != runtime_sha256
+            or plan.dispatch_context.activation_artifact.split_sha256 != split_sha256
+            for plan in terminal_plans
+        )
+    ):
+        raise ValueError(
+            "preflight calibration authority differs from stage lineage or coverage"
+        )
+    expected = raw_authority.require_envelope()
+    actual = _load_interference_envelope(locked_output_paths["runtime_envelope"])
+    if actual != expected:
+        raise ValueError(
+            "preflight runtime envelope differs from raw calibration authority"
+        )
+
+
 def _seal_industrial_stage(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
     registry.definition(args.experiment)
@@ -4771,6 +4846,24 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
     if completed_sha256 is None:
         raise ValueError("stage sealing requires content-bound completed-cell evidence")
     locked_output_paths = _parse_locked_output_paths(args.locked_output)
+    if args.experiment == "preflight":
+        if args.interference_calibration_authority is None:
+            raise ValueError(
+                "preflight seal requires --interference-calibration-authority"
+            )
+        _validate_preflight_interference_seal_authority(
+            authority_path=args.interference_calibration_authority,
+            registry=registry,
+            inventory=inventory,
+            runtime_sha256=runtime_sha256,
+            split_sha256=split_sha256,
+            completed_cell_ids=completed_cell_ids,
+            locked_output_paths=locked_output_paths,
+        )
+    elif args.interference_calibration_authority is not None:
+        raise ValueError(
+            "interference calibration authority cannot seal another experiment"
+        )
     if args.experiment == "E2":
         if args.e2_final_stage_manifest is None:
             raise ValueError("E2 seal requires --e2-final-stage-manifest")
@@ -6089,6 +6182,65 @@ def _build_interference_envelope(args: argparse.Namespace) -> int:
     return 0
 
 
+def _materialize_interference_calibration_bootstrap(
+    args: argparse.Namespace,
+) -> int:
+    """Write the sole release-derived permission for calibration generation."""
+
+    registry = _load_industrial_registry(args.registry)
+    activation = _load_registry_stage_activation_manifest(args.activation_manifest)
+    inventory = _load_gpu_inventory(args.inventory)
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    _write_json(args.receipt_output, authority.source_receipt)
+    _write_json(args.output, authority.bootstrap_envelope.to_dict())
+    if (
+        _load_bound_json(args.receipt_output) != authority.source_receipt
+        or _load_interference_envelope(args.output) != authority.bootstrap_envelope
+    ):
+        raise RuntimeError("written interference bootstrap changed identity")
+    print(authority.sha256)
+    return 0
+
+
+def _reduce_interference_calibration(args: argparse.Namespace) -> int:
+    """Replay raw terminals and materialize an exact-cardinality envelope."""
+
+    try:
+        # The release trust root is checked before opening caller paths.  This
+        # keeps no-card/test keys incapable of probing or minting formal data.
+        require_release_interference_attester()
+    except InterferenceCalibrationBlockedError as error:
+        decision = {
+            "schema_version": 1,
+            "kind": "interference_calibration_reduction_decision",
+            "status": "BLOCKED",
+            "reason_code": error.reason_code,
+            "trusted_attester_id": None,
+        }
+        _write_json(args.output, decision)
+        print(_canonical_sha256(decision))
+        return 42
+
+    execution_authority = InterferenceCalibrationExecutionAuthority.from_dict(
+        _load_bound_json(args.authority)
+    )
+    reduction = execution_authority.reconstruct().revalidate()
+    envelope = reduction.require_envelope()
+    _write_json(args.output, reduction.to_dict())
+    _write_json(args.envelope_output, envelope.to_dict())
+    if (
+        _load_bound_json(args.output) != reduction.to_dict()
+        or _load_interference_envelope(args.envelope_output) != envelope
+    ):
+        raise RuntimeError("written calibrated interference authority changed identity")
+    print(reduction.sha256)
+    return 0
+
+
 def _materialize_industrial_budget_plan(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
     gpu_inventory = _load_gpu_inventory(args.inventory)
@@ -6422,6 +6574,10 @@ def main(argv: list[str] | None = None) -> int:
         return _collect_gpu_inventory(args)
     if args.command == "build-interference-envelope":
         return _build_interference_envelope(args)
+    if args.command == "materialize-interference-calibration-bootstrap":
+        return _materialize_interference_calibration_bootstrap(args)
+    if args.command == "reduce-interference-calibration":
+        return _reduce_interference_calibration(args)
     if args.command == "seal-industrial-stage":
         return _seal_industrial_stage(args)
     if args.command == "plan-industrial-dispatch":

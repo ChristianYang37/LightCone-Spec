@@ -1886,35 +1886,32 @@ class InterferenceCalibrationGroupDiagnostic:
 
     @cached_property
     def sha256(self) -> str:
-        return content_sha256(
-            {
-                "group_id": self.group_id,
-                "simultaneous_jobs": self.simultaneous_jobs,
-                "status": self.status,
-                "reason_codes": list(self.reason_codes),
-                "raw_observation_sha256s": list(self.raw_observation_sha256s),
-                "goodput_ratios": [list(row) for row in self.goodput_ratios],
-                "p99_itl_ratios": [list(row) for row in self.p99_itl_ratios],
-                "goodput_mean_relative_difference": (
-                    self.goodput_mean_relative_difference
-                ),
-                "goodput_ci_lower_relative_difference": (
-                    self.goodput_ci_lower_relative_difference
-                ),
-                "goodput_ci_upper_relative_difference": (
-                    self.goodput_ci_upper_relative_difference
-                ),
-                "p99_itl_mean_relative_difference": (
-                    self.p99_itl_mean_relative_difference
-                ),
-                "p99_itl_ci_lower_relative_difference": (
-                    self.p99_itl_ci_lower_relative_difference
-                ),
-                "p99_itl_ci_upper_relative_difference": (
-                    self.p99_itl_ci_upper_relative_difference
-                ),
-            }
-        )
+        return content_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "group_id": self.group_id,
+            "simultaneous_jobs": self.simultaneous_jobs,
+            "status": self.status,
+            "reason_codes": list(self.reason_codes),
+            "raw_observation_sha256s": list(self.raw_observation_sha256s),
+            "goodput_ratios": [list(row) for row in self.goodput_ratios],
+            "p99_itl_ratios": [list(row) for row in self.p99_itl_ratios],
+            "goodput_mean_relative_difference": (self.goodput_mean_relative_difference),
+            "goodput_ci_lower_relative_difference": (
+                self.goodput_ci_lower_relative_difference
+            ),
+            "goodput_ci_upper_relative_difference": (
+                self.goodput_ci_upper_relative_difference
+            ),
+            "p99_itl_mean_relative_difference": (self.p99_itl_mean_relative_difference),
+            "p99_itl_ci_lower_relative_difference": (
+                self.p99_itl_ci_lower_relative_difference
+            ),
+            "p99_itl_ci_upper_relative_difference": (
+                self.p99_itl_ci_upper_relative_difference
+            ),
+        }
 
 
 def _raw_observation_sha256(value: InterferenceRawObservation) -> str:
@@ -2334,6 +2331,30 @@ class InterferenceCalibrationReduction:
             }
         )
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "kind": "interference_calibration_raw_reduction",
+            "authority_sha256": self.authority_sha256,
+            "source_audit_sha256": self.source_audit_sha256,
+            "diagnostics": [row.to_dict() for row in self.diagnostics],
+            "rules": [row.to_dict() for row in self.rules],
+            "reduction_sha256": self.sha256,
+        }
+
+    def require_envelope(self) -> InterferenceEnvelope:
+        """Materialize only exact-cardinality PASS rules from this reduction."""
+
+        if not self.rules:
+            raise InterferenceCalibrationBlockedError(
+                INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON
+            )
+        return InterferenceEnvelope(
+            schema_version=1,
+            rules=self.rules,
+            source_receipt_sha256=self.sha256,
+        )
+
 
 @dataclass(frozen=True)
 class InterferenceCalibrationAuthority:
@@ -2486,16 +2507,7 @@ class InterferenceCalibrationAuthority:
     def require_envelope(self) -> InterferenceEnvelope:
         """Return exact-cardinality permissions from trusted raw evidence."""
 
-        reduction = self.revalidate()
-        if not reduction.rules:
-            raise InterferenceCalibrationBlockedError(
-                INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON
-            )
-        return InterferenceEnvelope(
-            schema_version=1,
-            rules=reduction.rules,
-            source_receipt_sha256=reduction.sha256,
-        )
+        return self.revalidate().require_envelope()
 
 
 def require_calibrated_interference_execution_authority(

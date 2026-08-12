@@ -27,6 +27,7 @@ from lightcone_spec.experiments.interference_authority import (
     InterferenceCalibrationGroup,
     InterferenceCalibrationManifest,
     InterferenceCalibrationProtocol,
+    InterferenceCalibrationReduction,
     InterferenceCalibrationRun,
     InterferenceCalibrationSourceAuthority,
     InterferenceHardwareEnvelope,
@@ -670,6 +671,30 @@ def test_registered_raw_diagnostic_passes_only_exact_paired_equivalence() -> Non
     assert tuple(row[2] for row in result.goodput_ratios) == (1.0,) * 4
     assert result.goodput_mean_relative_difference == pytest.approx(0.0)
     assert result.simultaneous_jobs == 2
+
+    reduction = InterferenceCalibrationReduction(
+        authority_sha256=_sha("authority"),
+        source_audit_sha256=_sha("source-audit"),
+        diagnostics=(result,),
+        rules=(
+            InterferenceRule(
+                hardware_envelope_sha256=(
+                    inventory.devices[0].hardware_envelope_sha256
+                ),
+                workload_class=WorkloadClass.CORRECTNESS,
+                co_run_signature=group.concurrent[0].co_run_signature,
+                simultaneous_jobs=2,
+                gang_shape=group.concurrent[0].gang_shape,
+                load_thermal_power_envelope=(
+                    group.concurrent[0].load_thermal_power_envelope
+                ),
+                contention_class=group.concurrent[0].contention_class,
+                evidence_sha256=result.sha256,
+            ),
+        ),
+    )
+    assert reduction.to_dict()["reduction_sha256"] == reduction.sha256
+    assert reduction.require_envelope().source_receipt_sha256 == reduction.sha256
 
 
 def test_missing_raw_itl_timing_is_unresolved_not_request_latency() -> None:

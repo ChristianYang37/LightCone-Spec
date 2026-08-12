@@ -461,6 +461,8 @@ def test_stage_sealing_is_blocked_before_cpu_evidence_can_mint_a_receipt(
                 str(completed),
                 "--inventory",
                 str(inventory_path),
+                "--interference-calibration-authority",
+                str(tmp_path / "must-not-be-opened.json"),
                 "--locked-output",
                 f"runtime_envelope={locked}",
                 "--output",

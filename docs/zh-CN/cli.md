@@ -14,6 +14,8 @@ industrial 命令包括：
 | `build-industrial-registry` | 绑定一个或更多稳定 logical rank slot 并生成不可变实验 DAG |
 | `collect-gpu-inventory` | 收集 nonce-bound physical GPU/topology inventory 与 raw probe receipt |
 | `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
+| `materialize-interference-calibration-bootstrap` | 从 raw preflight activation 与准确 inventory 派生仅供校准的 two-way execution envelope |
+| `reduce-interference-calibration` | 重开 path-bound execution bundle 与 terminal authority，把 raw isolated/simultaneous evidence 归约为准确 cardinality rule |
 | `reduce-e1-activation` | 从 sealed E3a evidence 派生唯一 130-cell E1 slice |
 | `reduce-e2-activation` | 从 E1 Pareto artifact 或 prior survivor materialize 一个 E2 round |
 | `reduce-e2-successive-halving` | 把准确 E2 stage evidence 归约为 sealed survivor receipt |
@@ -72,6 +74,12 @@ industrial 命令包括：
 | `analyze-onlinespec-study` | 生成 learner-versus-Static 诊断区间 |
 
 不存在 generic method override，也不存在把无 receipt 目录转换为 completed evidence 的命令。
+
+Bootstrap envelope 只授权生成八个已注册 Static calibration observation，不能授权
+headline co-tenancy 或更大 cardinality。`reduce-interference-calibration` 会在打开 caller
+path 前先检查 release trust root；因此当前无 signer 的 release 只写入 `BLOCKED` decision，
+不会生成 calibrated envelope。Preflight stage 只有在重开同一份 raw execution authority
+后才能封存 `runtime_envelope=PATH`，绝不接受手写 rule list 或 bare digest。
 
 ## Industrial Registry 工作流
 
