@@ -163,7 +163,7 @@ def _state(*, method: str, generation: int, published: int = 0) -> dict[str, obj
         "request_pool_active_slots": 0,
         "allocator_current_hbm_bytes": 32,
         "allocator_reserved_hbm_bytes": 64,
-        "allocator_peak_hbm_bytes": 96,
+        "allocator_peak_hbm_bytes": 3072,
         "kv_token_capacity": 1024,
         "kv_available_tokens": 1000 if adapted else 1024,
         "kv_state_sha256": SHA_A,
@@ -220,11 +220,32 @@ def _performance(
         "sm_utilization": None,
         "dram_utilization": None,
         "target_estimated_mfu": None,
-        "peak_hbm_bytes": 96,
+        "peak_hbm_bytes": 3072,
         "kv_bytes": 4096,
         "kv_token_capacity": 1024,
         "optimizer_bytes": 128 if adapted else 0,
-        "adaptation_memory_ledger": {"optimizer": 128} if adapted else None,
+        "adaptation_memory_ledger": (
+            {
+                "active_or_base_bytes": 32,
+                "master_fp32_bytes": 32,
+                "first_moment_bytes": 32,
+                "second_moment_bytes": 64,
+                "online_state_bytes": 0,
+                "optimizer_metadata_bytes": 0,
+                "gradient_bytes": 32,
+                "staging_bytes": 16,
+                "training_activation_bytes": 32,
+                "kv_gather_scratch_bytes": 16,
+                "candidate_scratch_bytes": 64,
+                "graph_buffer_bytes": 0,
+                "telemetry_bytes": 0,
+                "resident_bytes": 176,
+                "optimizer_bytes": 128,
+                "peak_bytes": 320,
+            }
+            if adapted
+            else None
+        ),
         "trainable_parameters": 4 if adapted else 0,
         "training_cuda_ms": 0.4 if adapted else None,
         "optimizer_cuda_ms": 0.2 if adapted else None,
@@ -744,6 +765,61 @@ def test_missing_static_safety_counter_cannot_finalize() -> None:
     provider = NativeTerminalProvider(transport)
 
     with pytest.raises(ValueError, match="fallbacks"):
+        asyncio.run(_run(transport, provider=provider))
+    assert provider.phase == "FAILED"
+
+
+@pytest.mark.parametrize("mismatch", ["live_request_slot", "peak_hbm"])
+def test_terminal_final_state_must_close_request_pool_and_peak_hbm(
+    mismatch: str,
+) -> None:
+    binding = _binding(warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+
+    def terminal_mutator(value: dict[str, object]) -> None:
+        final_state = value["final_state"]
+        assert isinstance(final_state, dict)
+        if mismatch == "live_request_slot":
+            final_state["request_pool_active_slots"] = 1
+        else:
+            final_state["allocator_peak_hbm_bytes"] = 97
+        _rehash_terminal(value)
+
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+        terminal_mutator=terminal_mutator,
+    )
+    provider = NativeTerminalProvider(transport)
+
+    with pytest.raises(RuntimeError, match="drained|peak HBM"):
+        asyncio.run(_run(transport, provider=provider))
+    assert provider.phase == "FAILED"
+
+
+@pytest.mark.parametrize("field", ["resident_bytes", "optimizer_bytes", "peak_bytes"])
+def test_adaptation_memory_ledger_must_close_before_finalize(field: str) -> None:
+    binding = _binding(method="tts", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+
+    def terminal_mutator(value: dict[str, object]) -> None:
+        performance = value["performance_counters"]
+        assert isinstance(performance, dict)
+        ledger = performance["adaptation_memory_ledger"]
+        assert isinstance(ledger, dict)
+        ledger[field] = int(ledger[field]) + 1
+        _rehash_terminal(value)
+
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+        terminal_mutator=terminal_mutator,
+    )
+    provider = NativeTerminalProvider(transport)
+
+    with pytest.raises(RuntimeError, match="memory ledger"):
         asyncio.run(_run(transport, provider=provider))
     assert provider.phase == "FAILED"
 

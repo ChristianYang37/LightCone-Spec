@@ -303,6 +303,24 @@ _PERFORMANCE_OVERRIDE_KEYS = (
     "collective_exposed_wait_ms",
     "collective_overlap_ratio",
 )
+_ADAPTATION_MEMORY_LEDGER_KEYS = {
+    "active_or_base_bytes",
+    "master_fp32_bytes",
+    "first_moment_bytes",
+    "second_moment_bytes",
+    "online_state_bytes",
+    "optimizer_metadata_bytes",
+    "gradient_bytes",
+    "staging_bytes",
+    "training_activation_bytes",
+    "kv_gather_scratch_bytes",
+    "candidate_scratch_bytes",
+    "graph_buffer_bytes",
+    "telemetry_bytes",
+    "resident_bytes",
+    "optimizer_bytes",
+    "peak_bytes",
+}
 _STATE_KEYS = {
     "schema_version",
     "scheduler_idle",
@@ -1436,6 +1454,50 @@ def _validate_performance(
             _integer(raw[field], f"performance.{field}")
         if raw["adaptation_memory_ledger"] is None:
             raise RuntimeError("adapted performance lacks its memory ledger")
+        ledger = _exact_object(
+            raw["adaptation_memory_ledger"],
+            _ADAPTATION_MEMORY_LEDGER_KEYS,
+            "adaptation memory ledger",
+        )
+        for field in _ADAPTATION_MEMORY_LEDGER_KEYS:
+            _integer(ledger[field], f"adaptation_memory_ledger.{field}")
+        resident_fields = (
+            "active_or_base_bytes",
+            "master_fp32_bytes",
+            "first_moment_bytes",
+            "second_moment_bytes",
+            "online_state_bytes",
+            "optimizer_metadata_bytes",
+            "staging_bytes",
+            "graph_buffer_bytes",
+            "telemetry_bytes",
+        )
+        scratch_fields = (
+            "gradient_bytes",
+            "training_activation_bytes",
+            "kv_gather_scratch_bytes",
+            "candidate_scratch_bytes",
+        )
+        optimizer_fields = (
+            "master_fp32_bytes",
+            "first_moment_bytes",
+            "second_moment_bytes",
+            "online_state_bytes",
+            "optimizer_metadata_bytes",
+        )
+        if ledger["resident_bytes"] != sum(ledger[name] for name in resident_fields):
+            raise RuntimeError("adaptation resident memory ledger does not sum")
+        if ledger["peak_bytes"] != ledger["resident_bytes"] + sum(
+            ledger[name] for name in scratch_fields
+        ):
+            raise RuntimeError("adaptation peak memory ledger does not sum")
+        if (
+            ledger["optimizer_bytes"] != sum(ledger[name] for name in optimizer_fields)
+            or ledger["optimizer_bytes"] != raw["optimizer_bytes"]
+        ):
+            raise RuntimeError("adaptation optimizer memory ledger does not close")
+        if ledger["peak_bytes"] > raw["peak_hbm_bytes"]:
+            raise RuntimeError("adaptation peak memory exceeds observed peak HBM")
     return raw
 
 
@@ -1489,9 +1551,14 @@ def _validate_state(
         not raw["scheduler_idle"]
         or raw["active_requests"] != 0
         or raw["queued_requests"] != 0
+        or raw["request_pool_active_slots"] != 0
         or not raw["completion_event_complete"]
     ):
         raise RuntimeError("terminal final state is not drained and synchronized")
+    if raw["allocator_peak_hbm_bytes"] != performance["peak_hbm_bytes"]:
+        raise RuntimeError(
+            "terminal allocator peak differs from performance peak HBM evidence"
+        )
     if raw["allocator_peak_hbm_bytes"] < raw["allocator_current_hbm_bytes"]:
         raise ValueError("terminal allocator peak is below current allocation")
     if raw["kv_available_tokens"] > raw["kv_token_capacity"]:
