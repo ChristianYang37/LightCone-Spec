@@ -21,8 +21,11 @@ scientific declaration is executable. The current end-to-end industrial
 executor accepts only TP1/DP1 Target-only. Static/TTS/L0 are blocked before
 mutation because the pinned native begin/reset/finalize hook has no configured
 trusted hardware signer. The lower-level adaptive patch path and terminal
-schema are limited to TP1/DP1 DFlash, constant schedule, zero extra logical
-delay, and `update_round` teacher rows.
+schema are limited to TP1/DP1 DFlash. TTS/L0 execute the registered constant,
+inverse-square-root-by-published-update, and finite-horizon cosine schedules,
+plus non-negative logical publication delay. `quota_shadow` is declaration-
+valid, but a real row need fails closed because DFlash currently exposes only
+update-round teacher acquisition.
 
 Every serving run also binds the schema-v2 controlled execution policy. The
 registered policy fixes context length 40,960 and server seed 1, disables radix

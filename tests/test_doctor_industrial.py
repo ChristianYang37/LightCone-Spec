@@ -250,7 +250,7 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
             {
                 "file": ("0001-feat-spec-add-schema-v3-native-online-adaptation.patch"),
                 "sha256": (
-                    "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
+                    "3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23"
                 ),
             }
         ],
@@ -406,9 +406,7 @@ def test_unsupported_release_modes_are_explicit(monkeypatch, tmp_path) -> None:
         "adaptive_eagle3",
         "adaptive_nextn",
         "adaptive_dflash_dspark",
-        "adaptive_nonconstant_schedule",
-        "adaptive_positive_extra_delay_ms",
-        "quota_shadow",
+        "quota_shadow_backend_acquisition",
     } == set(unsupported)
     assert {entry["status"] for entry in unsupported.values()} == {"UNSUPPORTED"}
 

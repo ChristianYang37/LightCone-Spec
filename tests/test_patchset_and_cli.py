@@ -135,12 +135,13 @@ def test_patch_binds_terminal_accounting_seed_and_role_publication_contracts() -
     assert 'allocation_free = method in {"target_only", "static"}' in patch
     assert "seed = int(self.server_args.random_seed)" in patch
     assert "int(run_nonce_sha256[:8], 16)" not in patch
-    assert 'if self.config.method == "l0":\n+            if not ready.query()' in patch
-    assert (
-        'with self.timing("barrier"):\n+                main.wait_event(ready)' in patch
-    )
+    assert "ready_now = ready.query()" in patch
+    assert 'if self.config.method == "l0":\n+            if not ready_now' in patch
+    assert 'with self.timing("barrier"):' in patch
+    assert "main.wait_event(ready)" in patch
     assert "TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S = 30.0" in patch
-    assert "while not ready.query():\n+                    if time.monotonic()" in patch
+    assert "while not ready.query():" in patch
+    assert "if time.monotonic() >= deadline:" in patch
     assert "TTS fixed-boundary candidate readiness timed out" in patch
     boundary = patch.split("+    def boundary(self) -> bool:", 1)[1].split(
         "+    def begin_round(", 1

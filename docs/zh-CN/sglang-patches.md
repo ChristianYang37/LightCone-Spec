@@ -47,8 +47,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前准确 identity 为 patch SHA-256
-`369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7` 和 final tree
-`22bd0d1d16aab33addbdacdbf75ad5bfe21164a8`；manifest 仍是 authority。Lifecycle 绑定
+`3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23` 和 final tree
+`af7e3e052ffe3c646654a6789555549f052d5385`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
@@ -57,8 +57,14 @@ contract 也尚未实现，因此会在 model loading 前拒绝：
 
 - DSpark、EAGLE、EAGLE3 与 NEXTN adaptation；
 - 全部 TP2 或 DP2 run；
-- 正 extra logical publication delay 与非 constant optimizer schedule；
+- update round 缺少 native supervision 时的 quota-shadow teacher acquisition（固定 ledger
+  会记录该需求并由 capability gate 阻止）；
 - DSpark composite-head training 与 NEXTN training interface。
+
+TP1/DP1 DFlash TTS/L0 现在会执行 constant、按 published update 的 inverse-square-root
+以及有限 horizon cosine schedule，也会记录 intrinsic readiness 并应用非负 logical delay，
+同时保持 TTS fixed-boundary 与 L0 first-ready 的 publication 区别。这些 CPU/native contract
+不构成 CUDA 性能证据。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
 底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的

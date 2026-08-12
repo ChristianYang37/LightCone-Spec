@@ -88,8 +88,9 @@ Family 仍是增量 scheduling/power 单位，但 stage dependency receipt 只�
 aggregate 签发：所有 family 按 SHA 排序，并从 raw pilot/final completion authority 现场重放。
 E5 的 264 个非 family failure-injection cells 使用 deterministic auxiliary activation/completion；
 family 与 auxiliary disposition 必须构成该 stage 的准确不交并集。
-固定 patch 仍会拒绝 DSpark/EAGLE/EAGLE3/NEXTN adaptation、非 constant schedule 与全部
-multi-rank execution；其 TP1/DP1 DFlash path 没有 out-of-band trusted signer 时不能产生结论。
+固定 patch 仍会拒绝 DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部 multi-rank execution；
+TP1/DP1 DFlash 已实现注册 E2 schedule 与 logical delay，真实 quota-shadow acquisition 需求
+仍由具名 backend capability gate 阻止。该路径没有 out-of-band trusted signer 时不能产生结论。
 
 ## 数据、Context 与 Trace
 

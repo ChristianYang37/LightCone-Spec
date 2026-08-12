@@ -102,9 +102,11 @@ dependency receipt is issued only from a separate exact-coverage aggregate:
 families are SHA-sorted and replayed from raw pilot/final completion authority.
 E5's 264 non-family failure-injection cells use a deterministic auxiliary
 activation/completion, and the family plus auxiliary dispositions must be an
-exact disjoint cover of the stage. The pinned patch still rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation,
-nonconstant schedules, and all multi-rank execution. Its TP1/DP1 DFlash path
-cannot produce a claim without the out-of-band trusted signer.
+exact disjoint cover of the stage. The pinned patch still rejects
+DSpark/EAGLE/EAGLE3/NEXTN adaptation and all multi-rank execution. TP1/DP1
+DFlash implements the registered E2 schedules and logical delays, while a real
+quota-shadow acquisition need remains a named backend-capability block. This
+path cannot produce a claim without the out-of-band trusted signer.
 
 ## Data, contexts, and traces
 

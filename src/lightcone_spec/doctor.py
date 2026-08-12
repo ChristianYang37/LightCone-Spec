@@ -42,12 +42,10 @@ _FAIL_CLOSED_MODE_GATES = (
     ("adaptive_eagle3", "release_adaptive_backend_unsupported"),
     ("adaptive_nextn", "release_adaptive_backend_unsupported"),
     ("adaptive_dflash_dspark", "release_adaptive_backend_unsupported"),
-    ("adaptive_nonconstant_schedule", "release_schedule_unsupported"),
     (
-        "adaptive_positive_extra_delay_ms",
-        "release_delay_mode_unsupported",
+        "quota_shadow_backend_acquisition",
+        "release_quota_shadow_backend_acquisition_unavailable",
     ),
-    ("quota_shadow", "release_quota_shadow_unsupported"),
 )
 
 

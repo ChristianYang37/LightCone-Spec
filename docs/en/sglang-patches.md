@@ -57,8 +57,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
-`369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7`
-and final tree `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8`; the manifest remains the
+`3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23`
+and final tree `af7e3e052ffe3c646654a6789555549f052d5385`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -69,8 +69,15 @@ model loading because their execution contracts are not implemented:
 
 - DSpark, EAGLE, EAGLE3, and NEXTN adaptation;
 - every TP2 or DP2 run;
-- positive extra logical publication delay and nonconstant optimizer schedules;
+- quota-shadow teacher acquisition when an update round lacks native
+  supervision (the fixed ledger records and capability-blocks that need);
 - DSpark composite-head training and NEXTN training interfaces.
+
+TP1/DP1 DFlash TTS/L0 now execute constant, inverse-square-root-by-published-
+update, and finite-horizon cosine schedules. They also record intrinsic
+readiness and apply non-negative logical delay without changing the TTS
+fixed-boundary versus L0 first-ready publication distinction. These CPU/native
+contracts do not claim CUDA performance evidence.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
 `UNMEASURED` runnable work. The lower-level DFlash implementation and valid

@@ -288,18 +288,6 @@ class RunConfig(StrictModel):
             raise ValueError(
                 "the pinned schema-v3 patch executes adaptation only for DFLASH"
             )
-        if self.adaptation.optimizer.schedule != "constant":
-            raise ValueError(
-                "the pinned schema-v3 patch executes only a constant optimizer schedule"
-            )
-        if self.adaptation.extra_logical_delay != 0:
-            raise ValueError(
-                "the pinned schema-v3 patch does not execute positive extra logical delay"
-            )
-        if self.adaptation.teacher_row_policy != "update_round":
-            raise ValueError(
-                "the pinned schema-v3 patch does not execute quota-shadow teacher rows"
-            )
         self._validate_backend_scope()
         if self.method.startswith("onlinespec_"):
             self._validate_onlinespec()
@@ -360,6 +348,8 @@ class RunConfig(StrictModel):
             raise ValueError("OnlineSPEC baselines require online_spec state")
         if self.adaptation.optimizer.name != "sgd":
             raise ValueError("OnlineSPEC baselines preserve their SGD update")
+        if self.adaptation.optimizer.schedule != "constant":
+            raise ValueError("OnlineSPEC baselines preserve their constant schedule")
         if (
             self.runtime.tensor_parallel_size != 1
             or self.runtime.data_parallel_size != 1

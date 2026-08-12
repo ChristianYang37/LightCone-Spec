@@ -228,21 +228,16 @@ def test_two_gpu_schema_fails_closed_without_runtime_receipt(updates: dict) -> N
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("field", "value"),
     [
-        (
-            "schedule",
-            "inverse_sqrt_published_update",
-            "only a constant optimizer schedule",
-        ),
-        ("extra_logical_delay", 1, "positive extra logical delay"),
-        ("teacher_row_policy", "quota_shadow", "quota-shadow teacher rows"),
+        ("schedule", "inverse_sqrt_published_update"),
+        ("extra_logical_delay", 1),
+        ("teacher_row_policy", "quota_shadow"),
     ],
 )
-def test_patch_unimplemented_adaptation_modes_fail_closed(
+def test_native_e2_adaptation_modes_are_schema_valid(
     field: str,
     value: object,
-    message: str,
 ) -> None:
     config = config_value()
     target = (
@@ -251,8 +246,12 @@ def test_patch_unimplemented_adaptation_modes_fail_closed(
         else config["adaptation"]
     )
     target[field] = value
-    with pytest.raises(ValidationError, match=message):
-        RunConfig.model_validate(config)
+    parsed = RunConfig.model_validate(config)
+    assert parsed.adaptation is not None
+    parsed_target = (
+        parsed.adaptation.optimizer if field == "schedule" else parsed.adaptation
+    )
+    assert getattr(parsed_target, field) == value
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3", "NEXTN"])

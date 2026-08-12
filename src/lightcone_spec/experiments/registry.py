@@ -128,9 +128,6 @@ _PATCH_UNSUPPORTED_ADAPTIVE_BACKENDS = frozenset(
 _PATCH_UNSUPPORTED_ADAPTIVE_TOPOLOGIES = frozenset(
     {"tp2_dp1", "two_replica_tp1_dp2", "tp2_and_two_replica"}
 )
-_PATCH_UNSUPPORTED_SCHEDULES = frozenset(
-    {"inverse_sqrt_published_update", "cosine_to_zero"}
-)
 _SERVING_BACKENDS = frozenset({"DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN"})
 _SERVING_TOPOLOGIES = frozenset({"tp1_dp1", "tp2_dp1", "two_replica_tp1_dp2"})
 _UNRESOLVED_SEMANTIC_FRAGMENTS = (
@@ -1083,13 +1080,6 @@ class _CellFactory:
                 reason = (
                     "The pinned schema-v3 patch rejects adaptive execution for this "
                     "backend before model loading."
-                )
-            elif schedule in _PATCH_UNSUPPORTED_SCHEDULES:
-                status = CellStatus.BLOCKED
-                reason_code = "patched_runtime_schedule_unsupported"
-                reason = (
-                    "The pinned schema-v3 patch rejects nonconstant adaptive "
-                    "optimizer schedules before model loading."
                 )
         if gpu_count == 1:
             if gpu_index is not None and gpu_index not in range(len(self.gpu_uuids)):

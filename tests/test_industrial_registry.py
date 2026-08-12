@@ -254,12 +254,22 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
             cell.identity.backend in {"DSPARK", "EAGLE3", "NEXTN", "DFLASH+DSPARK"}
             or cell.identity.topology
             in {"tp2_dp1", "two_replica_tp1_dp2", "tp2_and_two_replica"}
-            or cell.identity.schedule
-            in {"inverse_sqrt_published_update", "cosine_to_zero"}
         )
     ]
     assert unsupported_adaptive
     assert all(cell.status is CellStatus.BLOCKED for cell in unsupported_adaptive)
+    native_schedule_cells = [
+        cell
+        for cell in registry.cells
+        if cell.identity.method in {"tts", "l0"}
+        and cell.identity.backend == "DFLASH"
+        and cell.identity.topology == "tp1_dp1"
+        and cell.identity.schedule
+        in {"inverse_sqrt_published_update", "cosine_to_zero"}
+        and cell.identity.optimizer != "chronobelief"
+    ]
+    assert native_schedule_cells
+    assert all(cell.status is CellStatus.UNMEASURED for cell in native_schedule_cells)
     unsupported_topology = [
         cell
         for cell in registry.cells

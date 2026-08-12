@@ -17,8 +17,10 @@ draft depth 加一。未知 schema 与已退役 adaptation 字段会在加载模
 这些名称包含目标 protocol vocabulary，不承诺每个合法 scientific declaration 都可执行。
 当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0 会在任何
 mutation 前被阻止，因为固定 native begin/reset/finalize hook 没有配置 trusted hardware
-signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash、constant
-schedule、零 extra logical delay 与 `update_round` teacher row。
+signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash；TTS/L0 会执行
+已注册 constant、按 published update 的 inverse-square-root 与有限 horizon cosine schedule，
+也会执行非负 logical publication delay。`quota_shadow` 可以声明，但 DFlash 当前只提供
+update-round teacher acquisition，因此真实缺 row 时会 fail closed。
 
 每个 serving run 还会绑定 schema-v2 controlled execution policy。注册策略固定 context
 length 40,960 与 server seed 1，关闭 radix cache 和 CUDA Graph，并要求

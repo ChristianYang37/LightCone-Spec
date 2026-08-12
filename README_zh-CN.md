@@ -27,9 +27,9 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8` | 应用当前 patch 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7` | 当前 mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `d0902d27704a98edf0f87f4bbdbe88854fa423c7b56463c22a2efe644afc05a1` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `af7e3e052ffe3c646654a6789555549f052d5385` | 应用当前 patch 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23` | 当前 mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `c9456dc8d6502db8e6d75fe9b9796e88c364c34db8ec81611a50c99f6bca42de` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
@@ -57,13 +57,13 @@ topology、原生 NEXTN preflight 与 breadth template。EAGLE/EAGLE3 仍是带�
 guard 的目标 backend contract；注册并不表示当前 release 可以执行。OnlineSPEC 是重要
 对比，但使用独立 tuning、证据、attestation 与分析，不能选择或改变核心 gate。
 
-当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层 adaptive path，且 optimizer schedule
-为 constant、extra logical delay 为零。它已实现准确 begin/reset/finalize terminal-evidence
+当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层 adaptive path。它会执行注册的
+constant、inverse-square-root 与有限 horizon cosine schedule，也会执行非负 logical
+publication delay。它已实现准确 begin/reset/finalize terminal-evidence
 hook，host adapter 也会验证其内容，但仓库不携带可信 hardware signer。Static/TTS/L0 因此
 仍不可用于结论，并在 release preflight、任何 mutation 之前失败。DSpark/EAGLE/EAGLE3/
-NEXTN adaptation、所有
-TP2/DP2 execution、非 constant schedule 与正 extra delay 同样 fail closed；在新的 patch
-与 provider identity 实现这些能力前，对应 registry cell 保持 `BLOCKED`。
+NEXTN adaptation 与所有 TP2/DP2 execution 同样 fail closed。请求 quota-shadow row 时会记录
+准确 identity 与 quota，但当前 DFlash backend capability 会阻止 acquisition，不会伪造 teacher row。
 
 ## Runtime 合同
 

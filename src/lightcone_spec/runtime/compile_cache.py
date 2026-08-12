@@ -39,10 +39,10 @@ _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # for every contract in this module); the patch digest is over the exact mail
 # patch bytes registered by that manifest.
 PINNED_SGLANG_PATCH_MANIFEST_SHA256 = (
-    "d0902d27704a98edf0f87f4bbdbe88854fa423c7b56463c22a2efe644afc05a1"
+    "c9456dc8d6502db8e6d75fe9b9796e88c364c34db8ec81611a50c99f6bca42de"
 )
 PINNED_SGLANG_PATCH_SHA256 = (
-    "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
+    "3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23"
 )
 SGLANG_FIRST_PARTY_COMPILE_BUILDER = "lightcone_spec.sglang_bridge.launch_server.v1"
 RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE = (

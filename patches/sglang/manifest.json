@@ -4,11 +4,11 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "22bd0d1d16aab33addbdacdbf75ad5bfe21164a8",
+  "expected_tree": "af7e3e052ffe3c646654a6789555549f052d5385",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
-      "sha256": "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7",
+      "sha256": "3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23",
       "files": [
         "python/sglang/benchmark/serving.py",
         "python/sglang/srt/arg_groups/speculative_hook.py",

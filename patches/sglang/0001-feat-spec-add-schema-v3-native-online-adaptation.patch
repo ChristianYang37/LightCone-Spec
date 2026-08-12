@@ -1,4 +1,4 @@
-From 4ccebb951495717615a110e7c949950484ba2f10 Mon Sep 17 00:00:00 2001
+From e7b4328d984eb89452085ceb43f9cf368663e142 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Tue, 11 Aug 2026 11:42:47 +0800
 Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
@@ -9,7 +9,7 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  python/sglang/srt/entrypoints/http_server.py  |   84 +-
  python/sglang/srt/managers/io_struct.py       |   11 +
  python/sglang/srt/managers/overlap_utils.py   |   31 +-
- python/sglang/srt/managers/scheduler.py       |  662 +++++-
+ python/sglang/srt/managers/scheduler.py       |  664 ++++-
  .../batch_result_processor.py                 |   21 +-
  .../scheduler_components/metrics_reporter.py  |   22 +
  .../srt/managers/tokenizer_control_mixin.py   |   89 +-
@@ -20,7 +20,7 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  python/sglang/srt/server_args.py              |   23 +
  .../srt/speculative/base_spec_worker.py       |    4 +
  .../sglang/srt/speculative/dflash_info_v2.py  |   13 +-
- .../speculative/dflash_online_adaptation.py   | 1129 +++++++++
+ .../speculative/dflash_online_adaptation.py   | 1138 ++++++++
  .../srt/speculative/dflash_worker_v2.py       |  169 +-
  .../dspark_components/dspark_draft.py         |   59 +-
  .../dspark_components/dspark_proposal.py      |   45 +
@@ -29,15 +29,15 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  python/sglang/srt/speculative/eagle_info.py   |   19 +
  .../srt/speculative/eagle_worker_common.py    |    1 +
  .../sglang/srt/speculative/eagle_worker_v2.py |   86 +-
- .../speculative/online_adaptation_config.py   |  710 ++++++
- .../speculative/online_adaptation_runtime.py  | 2094 +++++++++++++++++
+ .../speculative/online_adaptation_config.py   |  718 +++++
+ .../speculative/online_adaptation_runtime.py  | 2396 +++++++++++++++++
  .../srt/speculative/online_parameter_plan.py  |  195 ++
  .../srt/speculative/online_valid_mask.py      |  176 ++
- .../terminal_speculative_evidence.py          | 1108 +++++++++
- .../test_serving_output_token_ids.py          |  401 ++++
- .../spec/test_online_adaptation_protocol.py   |  575 +++++
- .../test_terminal_speculative_evidence.py     |  560 +++++
- 33 files changed, 8412 insertions(+), 185 deletions(-)
+ .../terminal_speculative_evidence.py          | 1141 ++++++++
+ .../test_serving_output_token_ids.py          |  401 +++
+ .../spec/test_online_adaptation_protocol.py   |  787 ++++++
+ .../test_terminal_speculative_evidence.py     |  587 ++++
+ 33 files changed, 9005 insertions(+), 185 deletions(-)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/dspark_components/dspark_proposal.py
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
@@ -647,7 +647,7 @@ index 9e2f191..45d4117 100644
              self.dsa_topk_indices_buf is not None
              and payload.dsa_topk_indices is not None
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 861c13f..e4878bf 100644
+index 861c13f..b6d267e 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -15,8 +15,10 @@
@@ -1258,7 +1258,7 @@ index 861c13f..e4878bf 100644
      def init_schedule_policy(self):
          # Init schedule policy and new token estimation
          self.policy = SchedulePolicy(
-@@ -1463,6 +2018,10 @@ class Scheduler(
+@@ -1463,6 +2020,10 @@ class Scheduler(
                  (ShutdownReq, self.handle_shutdown),
                  (GetInternalStateReq, self.get_internal_state),
                  (SetInternalStateReq, self.set_internal_state),
@@ -1269,7 +1269,7 @@ index 861c13f..e4878bf 100644
                  (RpcReqInput, self.handle_rpc_request),
                  (ExpertDistributionReq, self.expert_distribution_handle),
                  (LoadLoRAAdapterReqInput, self.load_lora_adapter),
-@@ -1915,13 +2474,23 @@ class Scheduler(
+@@ -1915,13 +2476,23 @@ class Scheduler(
              get_waiting_queue=lambda: self.waiting_queue,
              get_stats=lambda: self.metrics_reporter.stats,
              get_chunked_req=lambda: self.chunked_req,
@@ -1298,7 +1298,7 @@ index 861c13f..e4878bf 100644
              get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
              get_decode_moment_totals=lambda: self.decode_moment_totals,
          )
-@@ -1960,6 +2529,11 @@ class Scheduler(
+@@ -1960,6 +2531,11 @@ class Scheduler(
              ),
              output_streamer=self.output_streamer,
              abort_request=self.abort_request,
@@ -1310,7 +1310,7 @@ index 861c13f..e4878bf 100644
          )
  
      def init_req_max_new_tokens(self, req):
-@@ -3046,9 +3620,8 @@ class Scheduler(
+@@ -3046,9 +3622,8 @@ class Scheduler(
                      running_batch.batch_is_full = True
  
              if running_batch.batch_is_full:
@@ -1322,7 +1322,7 @@ index 861c13f..e4878bf 100644
                  ):
                      break
  
-@@ -3252,6 +3825,9 @@ class Scheduler(
+@@ -3252,6 +3827,9 @@ class Scheduler(
              )
  
              self.metrics_reporter.num_retracted_reqs = len(retracted_reqs)
@@ -1332,7 +1332,7 @@ index 861c13f..e4878bf 100644
              if self.metrics_reporter.enable_metrics and len(retracted_reqs) > 0:
                  self.metrics_reporter.metrics_collector.increment_retracted_reqs(
                      num_retracted_reqs=len(retracted_reqs),
-@@ -3572,6 +4148,15 @@ class Scheduler(
+@@ -3572,6 +4150,15 @@ class Scheduler(
                      can_run_cuda_graph=can_run_cuda_graph,
                  )
  
@@ -1348,7 +1348,7 @@ index 861c13f..e4878bf 100644
          self._maybe_report_active_ranks()
  
          return ret
-@@ -3974,6 +4559,8 @@ class Scheduler(
+@@ -3974,6 +4561,8 @@ class Scheduler(
  
              if empty_cache:
                  current_platform.empty_cache()
@@ -1357,7 +1357,7 @@ index 861c13f..e4878bf 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4002,6 +4589,53 @@ class Scheduler(
+@@ -4002,6 +4591,53 @@ class Scheduler(
              "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
          }
          ret["effective_max_running_requests_per_dp"] = self.max_running_requests
@@ -1411,7 +1411,7 @@ index 861c13f..e4878bf 100644
  
          if self.server_args.elastic_ep_backend is not None:
              from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-@@ -4024,10 +4658,14 @@ class Scheduler(
+@@ -4024,10 +4660,14 @@ class Scheduler(
          if RECORD_STEP_TIME:
              ret["step_time_dict"] = self.metrics_reporter.step_time_dict
  
@@ -1429,7 +1429,7 @@ index 861c13f..e4878bf 100644
  
          # These fields are not msgpack-serializable (a config object and a bound
          # signal handler); no reader consumes them.
-@@ -4162,6 +4800,8 @@ class Scheduler(
+@@ -4162,6 +4802,8 @@ class Scheduler(
              # This only works for requests that have not started anything.
              # We still need to send something back to TokenizerManager to clean up the state.
              req = self.waiting_queue.pop(i)
@@ -2097,10 +2097,10 @@ index 72162ba..ec8a267 100644
              batch_seq_lens_cpu_t[i] = committed_len
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
-index 0000000..fc16e21
+index 0000000..4b67eb9
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1129 @@
+@@ -0,0 +1,1138 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -2913,6 +2913,15 @@ index 0000000..fc16e21
 +        if not self.runtime.update_due():
 +            return
 +        if not has_supervision:
++            if self.config.teacher_row_policy == "quota_shadow":
++                # The ledger records the exact request/source identity before
++                # consulting the backend capability. DFlash currently exposes
++                # update-round target rows only, so a real shadow need blocks
++                # rather than fabricating or reusing a teacher row.
++                self.runtime.request_quota_shadow(
++                    request_ids=self._captured_request_ids,
++                )
++                return
 +            self.runtime.skip_update_no_supervision()
 +            return
 +        if (
@@ -4030,10 +4039,10 @@ index ee43575..25624f2 100644
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
-index 0000000..c1cb5a1
+index 0000000..7bdca3e
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,718 @@
 +"""Strict schema-v3 boundary for LightCone speculative adaptation."""
 +
 +from __future__ import annotations
@@ -4065,6 +4074,19 @@ index 0000000..c1cb5a1
 +    "NEXTN": "unavailable_exact_training_interface",
 +}
 +IMPLEMENTED_DISTRIBUTED_CAPABILITIES = frozenset({"single_rank"})
++TEACHER_ROW_ACQUISITION_CAPABILITIES = {
++    "DFLASH": "update_round_only_v1",
++    "DSPARK": "unavailable_native_update",
++    "EAGLE": "unavailable_native_update",
++    "EAGLE3": "unavailable_native_update",
++    "NEXTN": "unavailable_exact_training_interface",
++}
++QUOTA_SHADOW_PROTOCOL_SHA256 = hashlib.sha256(
++    b'{"acquisition":"backend_capability_gated","evidence":"every_request",'
++    b'"quota_per_source_round":1,"schema_version":1,'
++    b'"source_binding":["cohort_epoch","source_version","source_round",'
++    b'"request_ids"]}'
++).hexdigest()
 +
 +
 +@dataclass(frozen=True)
@@ -4659,17 +4681,12 @@ index 0000000..c1cb5a1
 +            f"{config.algorithm} adaptation is unavailable in this patch tree "
 +            f"(capability={backend_capability})"
 +        )
-+    if config.optimizer.schedule != "constant":
++    if (
++        config.method.startswith("onlinespec_")
++        and config.optimizer.schedule != "constant"
++    ):
 +        raise ValueError(
-+            "this patch tree implements only the constant optimizer schedule"
-+        )
-+    if config.extra_logical_delay != 0:
-+        raise ValueError(
-+            "extra logical publication delay is not implemented by this patch tree"
-+        )
-+    if config.teacher_row_policy != "update_round":
-+        raise ValueError(
-+            "quota-shadow teacher rows are not implemented by this patch tree"
++            "OnlineSPEC comparison learners require their registered constant schedule"
 +        )
 +
 +
@@ -4746,10 +4763,10 @@ index 0000000..c1cb5a1
 +        raise ValueError("online adaptation requires an explicit pre-KV HBM reserve")
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
-index 0000000..ee7ff09
+index 0000000..78bc29c
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2112 @@
+@@ -0,0 +1,2396 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -4766,6 +4783,8 @@ index 0000000..ee7ff09
 +
 +import torch
 +from sglang.srt.speculative.online_adaptation_config import (
++    QUOTA_SHADOW_PROTOCOL_SHA256,
++    TEACHER_ROW_ACQUISITION_CAPABILITIES,
 +    OnlineAdaptationConfig,
 +)
 +
@@ -4929,6 +4948,8 @@ index 0000000..ee7ff09
 +    second_moments: tuple[torch.Tensor, ...]
 +    step: torch.Tensor
 +    gradient_norms: torch.Tensor
++    effective_learning_rate: torch.Tensor
++    schedule_valid: torch.Tensor
 +
 +
 +@dataclass(frozen=True)
@@ -4985,6 +5006,34 @@ index 0000000..ee7ff09
 +    def metadata_tensors(self) -> tuple[torch.Tensor, ...]:
 +        return (self._step,)
 +
++    def _scheduled_learning_rate(
++        self, step: torch.Tensor, *, base_learning_rate: float | None = None
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Evaluate the schedule from the next *published* update tensor."""
++
++        base = (
++            self.config.learning_rate
++            if base_learning_rate is None
++            else base_learning_rate
++        )
++        floating_step = step.to(torch.float32)
++        if self.config.schedule == "constant":
++            scale = torch.ones_like(floating_step)
++            valid = step >= 1
++        elif self.config.schedule == "inverse_sqrt_published_update":
++            scale = torch.rsqrt(floating_step.clamp_min(1))
++            valid = step >= 1
++        else:
++            horizon = self.config.schedule_total_published_updates
++            if horizon is None:
++                raise AssertionError("validated cosine schedule has no horizon")
++            clamped = floating_step.clamp(min=1, max=horizon)
++            scale = 0.5 * (
++                1.0 + torch.cos(math.pi * (clamped - 1) / (horizon - 1))
++            )
++            valid = (step >= 1) & (step <= horizon)
++        return floating_step.new_tensor(base) * scale, valid
++
 +    def propose(self, gradients: Sequence[torch.Tensor]) -> ParameterProposal:
 +        gradients, gradient_norm = _clip_fp32_gradients(
 +            gradients,
@@ -4993,6 +5042,7 @@ index 0000000..ee7ff09
 +            label="optimizer",
 +        )
 +        step = self._step + 1
++        learning_rate, schedule_valid = self._scheduled_learning_rate(step)
 +        gradient_norms = gradient_norm.reshape(1)
 +        if self.config.name in {"sgdm", "nag"}:
 +            momentum = self.config.momentum
@@ -5016,11 +5066,23 @@ index 0000000..ee7ff09
 +                torch._foreach_add(
 +                    self.master,
 +                    directions,
-+                    alpha=-self.config.learning_rate,
++                    alpha=-1.0,
++                )
++            )
++            parameters = tuple(
++                parameter + learning_rate * (candidate - parameter)
++                for parameter, candidate in zip(
++                    self.master, parameters, strict=True
 +                )
 +            )
 +            return ParameterProposal(
-+                parameters, tuple(first), self.second, step, gradient_norms
++                parameters,
++                tuple(first),
++                self.second,
++                step,
++                gradient_norms,
++                learning_rate,
++                schedule_valid,
 +            )
 +
 +        if self.config.name == "lion":
@@ -5031,19 +5093,31 @@ index 0000000..ee7ff09
 +            torch._foreach_sign_(directions)
 +            first = torch._foreach_mul(self.first, beta2)
 +            torch._foreach_add_(first, gradients, alpha=1 - beta2)
-+            decay = 1 - self.config.learning_rate * self.config.weight_decay
-+            parameters = torch._foreach_mul(self.master, decay)
-+            torch._foreach_add_(
-+                parameters,
-+                directions,
-+                alpha=-self.config.learning_rate,
++            parameters = tuple(
++                parameter * (1 - learning_rate * self.config.weight_decay)
++                - learning_rate * direction
++                for parameter, direction in zip(
++                    self.master, directions, strict=True
++                )
 +            )
 +            return ParameterProposal(
-+                tuple(parameters), tuple(first), self.second, step, gradient_norms
++                parameters,
++                tuple(first),
++                self.second,
++                step,
++                gradient_norms,
++                learning_rate,
++                schedule_valid,
 +            )
 +
 +        if self.config.name == "muon":
-+            return self._propose_muon(gradients, step, gradient_norms)
++            return self._propose_muon(
++                gradients,
++                step,
++                gradient_norms,
++                learning_rate,
++                schedule_valid,
++            )
 +
 +        beta1 = self.config.beta1
 +        beta2 = self.config.beta2
@@ -5071,13 +5145,18 @@ index 0000000..ee7ff09
 +                self.master,
 +                alpha=self.config.weight_decay,
 +            )
-+        parameters = torch._foreach_add(
-+            self.master,
-+            directions,
-+            alpha=-self.config.learning_rate,
++        parameters = tuple(
++            parameter - learning_rate * direction
++            for parameter, direction in zip(self.master, directions, strict=True)
 +        )
 +        return ParameterProposal(
-+            tuple(parameters), tuple(first), tuple(second), step, gradient_norms
++            parameters,
++            tuple(first),
++            tuple(second),
++            step,
++            gradient_norms,
++            learning_rate,
++            schedule_valid,
 +        )
 +
 +    def _adamw_candidate(
@@ -5088,7 +5167,7 @@ index 0000000..ee7ff09
 +        second: torch.Tensor,
 +        step: torch.Tensor,
 +        *,
-+        learning_rate: float,
++        learning_rate: float | torch.Tensor,
 +        weight_decay: float,
 +    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 +        beta1 = self.config.beta1
@@ -5115,6 +5194,8 @@ index 0000000..ee7ff09
 +        gradients: Sequence[torch.Tensor],
 +        step: torch.Tensor,
 +        gradient_norms: torch.Tensor,
++        learning_rate: torch.Tensor,
++        schedule_valid: torch.Tensor,
 +    ) -> ParameterProposal:
 +        momentum = self.config.momentum
 +        ns_steps = self.config.muon_ns_steps
@@ -5144,7 +5225,8 @@ index 0000000..ee7ff09
 +                    old_first,
 +                    old_second,
 +                    step,
-+                    learning_rate=auxiliary_lr,
++                    learning_rate=learning_rate
++                    * (auxiliary_lr / self.config.learning_rate),
 +                    weight_decay=auxiliary_decay,
 +                )
 +            else:
@@ -5155,12 +5237,12 @@ index 0000000..ee7ff09
 +                    steps=ns_steps,
 +                    epsilon=max(self.config.epsilon, 1e-7),
 +                )
-+                adjusted_lr = self.config.learning_rate * math.sqrt(
++                adjusted_lr = learning_rate * math.sqrt(
 +                    max(1.0, parameter.shape[0] / parameter.shape[1])
 +                )
 +                updated = (
 +                    parameter
-+                    * (1 - self.config.learning_rate * self.config.weight_decay)
++                    * (1 - learning_rate * self.config.weight_decay)
 +                    - adjusted_lr * direction
 +                )
 +                next_second = old_second
@@ -5168,7 +5250,13 @@ index 0000000..ee7ff09
 +            first.append(next_first)
 +            second.append(next_second)
 +        return ParameterProposal(
-+            tuple(parameters), tuple(first), tuple(second), step, gradient_norms
++            tuple(parameters),
++            tuple(first),
++            tuple(second),
++            step,
++            gradient_norms,
++            learning_rate,
++            schedule_valid,
 +        )
 +
 +    def commit(
@@ -5374,6 +5462,12 @@ index 0000000..ee7ff09
 +        if self.is_ensemble:
 +            raise RuntimeError("Hedge requires per-expert losses and gradients")
 +        next_step = self._step + 1
++        effective_lr = torch.as_tensor(
++            self.config.learning_rate,
++            device=self.master[0].device,
++            dtype=torch.float32,
++        )
++        schedule_valid = next_step >= 1
 +        if self.method == "onlinespec_ogd":
 +            member = self._ogd(self.master, gradients, self.config.learning_rate)
 +            return ParameterProposal(
@@ -5382,6 +5476,8 @@ index 0000000..ee7ff09
 +                (),
 +                next_step,
 +                member.gradient_norm.reshape(1),
++                effective_lr,
++                schedule_valid,
 +            )
 +        clipped, gradient_norm = self._clip(gradients)
 +        anchor = tuple(
@@ -5403,7 +5499,13 @@ index 0000000..ee7ff09
 +            self.online_spec.projection_radius,
 +        )
 +        return ParameterProposal(
-+            decision, anchor, clipped, next_step, gradient_norm.reshape(1)
++            decision,
++            anchor,
++            clipped,
++            next_step,
++            gradient_norm.reshape(1),
++            effective_lr,
++            schedule_valid,
 +        )
 +
 +    def propose_ensemble(
@@ -5494,6 +5596,12 @@ index 0000000..ee7ff09
 +            (cumulative,),
 +            self._step + 1,
 +            gradient_norms,
++            torch.as_tensor(
++                self.config.learning_rate,
++                device=self.master[0].device,
++                dtype=torch.float32,
++            ),
++            (self._step + 1) >= 1,
 +        )
 +
 +    def commit(
@@ -5631,6 +5739,7 @@ index 0000000..ee7ff09
 +    reconstruction_ok: torch.Tensor
 +    supervision_nonempty: torch.Tensor
 +    trace_index: int
++    intrinsic_ready_round: int | None = None
 +
 +
 +@dataclass
@@ -5649,7 +5758,90 @@ index 0000000..ee7ff09
 +    prefix_count: int
 +    status: str = "pending"
 +    published_version: int | None = None
++    intrinsic_ready_round: int | None = None
++    publication_round: int | None = None
 +    diagnosed: bool = False
++
++
++@dataclass(frozen=True)
++class TeacherRowAcquisitionEvent:
++    source_round: int
++    source_version: int
++    request_ids: tuple[str, ...]
++    quota: int
++    used: int
++    status: str
++    reason_code: str
++    protocol_sha256: str = QUOTA_SHADOW_PROTOCOL_SHA256
++
++
++class QuotaShadowLedger:
++    """One content-bound shadow request per due source round, never implicit."""
++
++    def __init__(self, *, algorithm: str, policy: str) -> None:
++        self.algorithm = algorithm
++        self.policy = policy
++        self._used_source_rounds: set[int] = set()
++        self.events: list[TeacherRowAcquisitionEvent] = []
++
++    def request(
++        self,
++        *,
++        source_round: int,
++        source_version: int,
++        request_ids: Sequence[str],
++    ) -> bool:
++        identifiers = tuple(request_ids)
++        if self.policy != "quota_shadow":
++            raise RuntimeError("quota-shadow acquisition was not registered")
++        if source_round < 1 or source_version < 0 or not identifiers:
++            raise ValueError("quota-shadow request identity is incomplete")
++        if len(set(identifiers)) != len(identifiers):
++            raise ValueError("quota-shadow request IDs must be unique")
++        if source_round in self._used_source_rounds:
++            self.events.append(
++                TeacherRowAcquisitionEvent(
++                    source_round,
++                    source_version,
++                    identifiers,
++                    1,
++                    1,
++                    "EXHAUSTED",
++                    "quota_shadow_source_round_exhausted",
++                )
++            )
++            return False
++        self._used_source_rounds.add(source_round)
++        capability = TEACHER_ROW_ACQUISITION_CAPABILITIES[self.algorithm]
++        if capability != "quota_shadow_native_v1":
++            self.events.append(
++                TeacherRowAcquisitionEvent(
++                    source_round,
++                    source_version,
++                    identifiers,
++                    1,
++                    1,
++                    "BLOCKED",
++                    f"teacher_acquisition_capability:{capability}",
++                )
++            )
++            return False
++        self.events.append(
++            TeacherRowAcquisitionEvent(
++                source_round,
++                source_version,
++                identifiers,
++                1,
++                1,
++                "AUTHORIZED",
++                "quota_shadow_native_acquisition_authorized",
++            )
++        )
++        return True
++
++    def reset(self) -> None:
++        self._used_source_rounds.clear()
++        self.events.clear()
 +
 +
 +@dataclass(frozen=True)
@@ -5762,7 +5954,7 @@ index 0000000..ee7ff09
 +            dtype=torch.int64,
 +        )
 +        self.trace_metrics = torch.empty(
-+            (max_trace_updates, 12),
++            (max_trace_updates, 14),
 +            device=device,
 +            dtype=torch.float32,
 +        )
@@ -5788,11 +5980,19 @@ index 0000000..ee7ff09
 +            dtype=torch.int64,
 +        )
 +        self.disabled_reason: str | None = None
++        self.quota_shadow = QuotaShadowLedger(
++            algorithm=config.algorithm,
++            policy=config.teacher_row_policy,
++        )
 +        self.counters = {
 +            "updates_launched": 0,
 +            "updates_published": 0,
 +            "updates_discarded": 0,
 +            "updates_skipped_no_supervision": 0,
++            "quota_shadow_requests": 0,
++            "quota_shadow_acquired": 0,
++            "quota_shadow_blocked": 0,
++            "quota_shadow_exhausted": 0,
 +            "version_mismatches": 0,
 +            "exactness_violations": 0,
 +            "nonfinite_updates": 0,
@@ -6020,11 +6220,25 @@ index 0000000..ee7ff09
 +            or not gradient_norms.is_floating_point()
 +        ):
 +            raise ValueError("proposal gradient-norm layout mismatch")
++        if (
++            proposal.effective_learning_rate.shape != ()
++            or proposal.effective_learning_rate.device != self.device
++            or not proposal.effective_learning_rate.is_floating_point()
++            or proposal.schedule_valid.shape != ()
++            or proposal.schedule_valid.device != self.device
++            or proposal.schedule_valid.dtype != torch.bool
++        ):
++            raise ValueError("proposal schedule evidence layout mismatch")
 +        # A finite elementwise gradient can still overflow its global norm.
 +        # Keep this check device-resident and reject the complete candidate;
 +        # publishing an apparent zero step after inf-norm clipping would hide
 +        # an invalid update from both the learner and its evidence.
-+        finite = finite & torch.isfinite(gradient_norms).all()
++        finite = (
++            finite
++            & torch.isfinite(gradient_norms).all()
++            & torch.isfinite(proposal.effective_learning_rate)
++            & proposal.schedule_valid
++        )
 +        publish_valid = finite & reconstruction_ok & supervision_nonempty
 +        device_validity = torch.stack(
 +            (finite, reconstruction_ok, supervision_nonempty)
@@ -6071,6 +6285,8 @@ index 0000000..ee7ff09
 +        metric_row[9].copy_(reconstruction_mean_kl.detach().to(torch.float32))
 +        metric_row[10].copy_(supervision_nonempty.detach().to(torch.float32))
 +        metric_row[11].copy_(gradient_norm.detach().to(torch.float32))
++        metric_row[12].copy_(proposal.effective_learning_rate.detach())
++        metric_row[13].copy_(proposal.schedule_valid.detach().to(torch.float32))
 +        optimizer_step_row = self.trace_optimizer_steps[trace_index]
 +        optimizer_step_row.copy_(proposal.step.detach().reshape(()).to(torch.int64))
 +        online_expert_row = self.trace_online_experts[trace_index]
@@ -6095,6 +6311,8 @@ index 0000000..ee7ff09
 +            + (
 +                proposal.step,
 +                gradient_norms,
++                proposal.effective_learning_rate,
++                proposal.schedule_valid,
 +                publish_valid,
 +                device_validity,
 +                loss,
@@ -6180,6 +6398,37 @@ index 0000000..ee7ff09
 +            self.release_reservation(reservation)
 +        self.counters["updates_skipped_no_supervision"] += 1
 +
++    def request_quota_shadow(
++        self,
++        *,
++        request_ids: Sequence[str],
++        reservation: CandidateBinding | None = None,
++    ) -> bool:
++        """Request an extra teacher row through the registered backend gate."""
++
++        binding = reservation
++        if binding is None:
++            binding = self.reserve_update()
++        if binding is None or not self.reservation_ready(binding):
++            raise RuntimeError("quota-shadow request has no current due reservation")
++        self.counters["quota_shadow_requests"] += 1
++        authorized = self.quota_shadow.request(
++            source_round=binding.source_round,
++            source_version=binding.source_version,
++            request_ids=request_ids,
++        )
++        event = self.quota_shadow.events[-1]
++        if authorized:
++            self.counters["quota_shadow_acquired"] += 1
++            return True
++        self.release_reservation(binding)
++        if event.status == "EXHAUSTED":
++            self.counters["quota_shadow_exhausted"] += 1
++        else:
++            self.counters["quota_shadow_blocked"] += 1
++            self.disabled_reason = event.reason_code
++        return False
++
 +    def _binding_fields_current(self, binding: CandidateBinding) -> bool:
 +        return (
 +            binding.cohort_epoch == self.epoch
@@ -6204,6 +6453,17 @@ index 0000000..ee7ff09
 +        ready = candidate.ready_event
 +        if ready is None:
 +            raise RuntimeError("CUDA candidate has no ready event")
++        # Capture the first scheduler round at which the candidate is visible as
++        # ready independently of the publication policy.  In particular, TTS
++        # still publishes only at its fixed boundary, but an already-complete
++        # side update must not acquire an artificial extra stride of "intrinsic"
++        # delay merely because TTS had not reached that boundary yet.
++        ready_now = ready.query()
++        if ready_now and candidate.intrinsic_ready_round is None:
++            candidate.intrinsic_ready_round = self.round
++            self.update_traces[
++                candidate.trace_index
++            ].intrinsic_ready_round = self.round
 +        if self.config.method.startswith("onlinespec_"):
 +            # Prequential online learning evaluates with w_t, observes the
 +            # current feedback, and must expose w_(t+1) before the next
@@ -6216,19 +6476,29 @@ index 0000000..ee7ff09
 +            if self.round < next_boundary:
 +                return False
 +        if self.config.method == "l0":
-+            if not ready.query():
++            if not ready_now:
 +                return False
 +        else:
-+            main = torch.cuda.current_stream(self.device)
-+            deadline = time.monotonic() + TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S
-+            with self.timing("barrier"):
-+                main.wait_event(ready)
-+                while not ready.query():
-+                    if time.monotonic() >= deadline:
-+                        raise RuntimeError(
-+                            "TTS fixed-boundary candidate readiness timed out"
-+                        )
-+                    time.sleep(0)
++            if not ready_now:
++                main = torch.cuda.current_stream(self.device)
++                deadline = time.monotonic() + TTS_FIXED_BOUNDARY_WAIT_TIMEOUT_S
++                with self.timing("barrier"):
++                    main.wait_event(ready)
++                    while not ready.query():
++                        if time.monotonic() >= deadline:
++                            raise RuntimeError(
++                                "TTS fixed-boundary candidate readiness timed out"
++                            )
++                        time.sleep(0)
++        if candidate.intrinsic_ready_round is None:
++            candidate.intrinsic_ready_round = self.round
++            self.update_traces[
++                candidate.trace_index
++            ].intrinsic_ready_round = self.round
++        if self.round < (
++            candidate.intrinsic_ready_round + self.config.extra_logical_delay
++        ):
++            return False
 +        # Host receipt reads follow confirmed event completion for both policies.
 +        receipt = candidate.host_validity.tolist()
 +        if len(receipt) != 3:
@@ -6257,6 +6527,7 @@ index 0000000..ee7ff09
 +        trace = self.update_traces[candidate.trace_index]
 +        trace.status = "decision_enqueued"
 +        trace.published_version = self.active_version
++        trace.publication_round = self.round
 +        self.pending = None
 +        return True
 +
@@ -6451,6 +6722,7 @@ index 0000000..ee7ff09
 +        self.round_traces.clear()
 +        self.active_round_rows.clear()
 +        self.disabled_reason = None
++        self.quota_shadow.reset()
 +        for key in self.counters:
 +            self.counters[key] = 0
 +        for key in self.timings_ms:
@@ -6712,6 +6984,13 @@ index 0000000..ee7ff09
 +        payload = {
 +            "schema_version": 2,
 +            "adaptation_config_sha256": self.config.sha256,
++            "optimizer_schedule": self.config.optimizer.schedule,
++            "schedule_total_published_updates": (
++                self.config.optimizer.schedule_total_published_updates
++            ),
++            "extra_logical_delay": self.config.extra_logical_delay,
++            "teacher_row_policy": self.config.teacher_row_policy,
++            "quota_shadow_protocol_sha256": QUOTA_SHADOW_PROTOCOL_SHA256,
 +            "tts_fixed_boundary_protocol_sha256": (
 +                TTS_FIXED_BOUNDARY_PROTOCOL_SHA256
 +            ),
@@ -6751,6 +7030,15 @@ index 0000000..ee7ff09
 +                        : trace.prefix_count
 +                    ],
 +                    "optimizer_step": int(trace_optimizer_steps[trace.buffer_index]),
++                    "effective_learning_rate": float(
++                        trace_metric_rows[trace.buffer_index][12]
++                    ),
++                    "schedule_valid": bool(
++                        trace_metric_rows[trace.buffer_index][13]
++                    ),
++                    "intrinsic_ready_round": trace.intrinsic_ready_round,
++                    "extra_logical_delay": self.config.extra_logical_delay,
++                    "publication_round": trace.publication_round,
 +                    "published_version": trace.published_version,
 +                    "status": trace.status,
 +                    "loss": float(trace_metric_rows[trace.buffer_index][0]),
@@ -6818,6 +7106,19 @@ index 0000000..ee7ff09
 +                    ),
 +                }
 +                for trace in self.update_traces
++            ],
++            "teacher_row_acquisitions": [
++                {
++                    "source_round": event.source_round,
++                    "source_version": event.source_version,
++                    "request_ids": list(event.request_ids),
++                    "quota": event.quota,
++                    "used": event.used,
++                    "status": event.status,
++                    "reason_code": event.reason_code,
++                    "protocol_sha256": event.protocol_sha256,
++                }
++                for event in self.quota_shadow.events
 +            ],
 +            "rounds": [
 +                {
@@ -7247,10 +7548,10 @@ index 0000000..91fca3a
 +    return accepted, committed
 diff --git a/python/sglang/srt/speculative/terminal_speculative_evidence.py b/python/sglang/srt/speculative/terminal_speculative_evidence.py
 new file mode 100644
-index 0000000..7698f3d
+index 0000000..c123800
 --- /dev/null
 +++ b/python/sglang/srt/speculative/terminal_speculative_evidence.py
-@@ -0,0 +1,1108 @@
+@@ -0,0 +1,1141 @@
 +"""Content-bound terminal evidence for one LightCone serving trace.
 +
 +This module is deliberately independent of the HTTP and scheduler transports.
@@ -8165,6 +8466,11 @@ index 0000000..7698f3d
 +                "request_ids",
 +                "prefix_len_before",
 +                "optimizer_step",
++                "effective_learning_rate",
++                "schedule_valid",
++                "intrinsic_ready_round",
++                "extra_logical_delay",
++                "publication_round",
 +                "published_version",
 +                "status",
 +                "loss",
@@ -8213,6 +8519,34 @@ index 0000000..7698f3d
 +            published = raw["published_version"]
 +            if published is not None:
 +                _require_int(published, "update.published_version")
++            learning_rate = raw["effective_learning_rate"]
++            if (
++                not isinstance(learning_rate, (int, float))
++                or isinstance(learning_rate, bool)
++                or not math.isfinite(learning_rate)
++                or learning_rate < 0
++            ):
++                raise ValueError("terminal update effective learning rate is malformed")
++            if not isinstance(raw["schedule_valid"], bool):
++                raise TypeError("terminal update schedule validity is malformed")
++            intrinsic_ready_round = raw["intrinsic_ready_round"]
++            if intrinsic_ready_round is not None:
++                _require_int(
++                    intrinsic_ready_round, "update.intrinsic_ready_round"
++                )
++            logical_delay = _require_int(
++                raw["extra_logical_delay"], "update.extra_logical_delay"
++            )
++            publication_round = raw["publication_round"]
++            if publication_round is not None:
++                _require_int(publication_round, "update.publication_round")
++            if raw["status"] == "published":
++                if not raw["schedule_valid"]:
++                    raise RuntimeError("published update has an invalid schedule step")
++                if intrinsic_ready_round is None or publication_round is None:
++                    raise RuntimeError("published update lacks logical-delay evidence")
++                if publication_round < intrinsic_ready_round + logical_delay:
++                    raise RuntimeError("published update violates logical delay")
 +            digest = _require_sha256(raw["update_sha256"], "update_sha256")
 +            unsigned = dict(raw)
 +            unsigned.pop("update_sha256")
@@ -8768,16 +9102,17 @@ index 0000000..f333274
 +    unittest.main()
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000..4c50e25
+index 0000000..00a4879
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,787 @@
 +from __future__ import annotations
 +
 +import hashlib
 +import importlib.util
 +import inspect
 +import json
++import math
 +import sys
 +import tempfile
 +import time
@@ -8831,12 +9166,15 @@ index 0000000..4c50e25
 +)
 +
 +BACKEND_ADAPTATION_CAPABILITIES = CONFIG_MODULE.BACKEND_ADAPTATION_CAPABILITIES
++QUOTA_SHADOW_PROTOCOL_SHA256 = CONFIG_MODULE.QUOTA_SHADOW_PROTOCOL_SHA256
 +OnlineAdaptationConfig = CONFIG_MODULE.OnlineAdaptationConfig
 +validate_online_adaptation = CONFIG_MODULE.validate_online_adaptation
 +CandidateBinding = RUNTIME_MODULE.CandidateBinding
 +FixedInferenceBank = RUNTIME_MODULE.FixedInferenceBank
 +OnlineCohortRuntime = RUNTIME_MODULE.OnlineCohortRuntime
++QuotaShadowLedger = RUNTIME_MODULE.QuotaShadowLedger
 +ReadyCandidate = RUNTIME_MODULE.ReadyCandidate
++ResidentOptimizer = RUNTIME_MODULE.ResidentOptimizer
 +UpdateTrace = RUNTIME_MODULE.UpdateTrace
 +build_native_parameter_plan = PARAMETER_PLAN_MODULE.build_native_parameter_plan
 +
@@ -9091,19 +9429,78 @@ index 0000000..4c50e25
 +        with self.assertRaisesRegex(ValueError, "does not match"):
 +            _validate(_payload(), tp=2)
 +
-+    def test_unimplemented_schedule_fails_before_worker_build(self):
++    def test_registered_schedule_and_delay_pass_preflight(self):
 +        value = _payload()
 +        value["optimizer"].update(
 +            schedule="cosine_to_zero", schedule_total_published_updates=20
 +        )
-+        with self.assertRaisesRegex(ValueError, "constant optimizer schedule"):
-+            _validate(value)
++        value["extra_logical_delay"] = 3
++        _validate(value)
 +
-+    def test_unimplemented_teacher_path_fails_before_worker_build(self):
++    def test_quota_shadow_policy_parses_without_claiming_acquisition(self):
 +        value = _payload()
 +        value["teacher_row_policy"] = "quota_shadow"
-+        with self.assertRaisesRegex(ValueError, "quota-shadow teacher rows"):
-+            _validate(value)
++        _validate(value)
++
++
++class ScheduleAndTeacherPolicyTests(unittest.TestCase):
++    def test_schedule_advances_only_after_optimizer_commit(self):
++        value = _payload()
++        value["optimizer"].update(
++            schedule="inverse_sqrt_published_update",
++            learning_rate=0.1,
++        )
++        optimizer = ResidentOptimizer((torch.ones(1),), _load(value).optimizer)
++        first = optimizer.propose((torch.ones(1),))
++        repeated = optimizer.propose((torch.ones(1),))
++        self.assertAlmostEqual(float(first.effective_learning_rate), 0.1, places=7)
++        torch.testing.assert_close(first.parameters[0], repeated.parameters[0])
++        optimizer.commit(first)
++        second = optimizer.propose((torch.ones(1),))
++        self.assertAlmostEqual(
++            float(second.effective_learning_rate),
++            0.1 / math.sqrt(2),
++            places=7,
++        )
++
++    def test_cosine_horizon_is_device_predicated(self):
++        value = _payload()
++        value["optimizer"].update(
++            schedule="cosine_to_zero",
++            schedule_total_published_updates=2,
++        )
++        optimizer = ResidentOptimizer((torch.ones(1),), _load(value).optimizer)
++        first = optimizer.propose((torch.ones(1),))
++        optimizer.commit(first)
++        last = optimizer.propose((torch.ones(1),))
++        self.assertEqual(float(last.effective_learning_rate), 0.0)
++        self.assertTrue(bool(last.schedule_valid))
++        optimizer.commit(last)
++        beyond = optimizer.propose((torch.ones(1),))
++        self.assertFalse(bool(beyond.schedule_valid))
++
++    def test_quota_shadow_is_fixed_bound_and_backend_gated(self):
++        ledger = QuotaShadowLedger(algorithm="DFLASH", policy="quota_shadow")
++        self.assertFalse(
++            ledger.request(
++                source_round=10,
++                source_version=3,
++                request_ids=("r0", "r1"),
++            )
++        )
++        event = ledger.events[-1]
++        self.assertEqual((event.quota, event.used), (1, 1))
++        self.assertEqual(event.status, "BLOCKED")
++        self.assertIn("update_round_only_v1", event.reason_code)
++        self.assertEqual(event.protocol_sha256, QUOTA_SHADOW_PROTOCOL_SHA256)
++        self.assertFalse(
++            ledger.request(
++                source_round=10,
++                source_version=3,
++                request_ids=("r0", "r1"),
++            )
++        )
++        self.assertEqual(ledger.events[-1].status, "EXHAUSTED")
 +
 +
 +class ParameterPlanTests(unittest.TestCase):
@@ -9213,7 +9610,12 @@ index 0000000..4c50e25
 +
 +    @staticmethod
 +    def _invalid_runtime(
-+        receipt, *, ready=True, method="l0", allow_publish=False
++        receipt,
++        *,
++        ready=True,
++        method="l0",
++        allow_publish=False,
++        extra_logical_delay=0,
 +    ):
 +        class Event:
 +            def __init__(self):
@@ -9267,7 +9669,11 @@ index 0000000..4c50e25
 +                return None
 +
 +        runtime = object.__new__(OnlineCohortRuntime)
-+        runtime.config = SimpleNamespace(method=method, stride=10)
++        runtime.config = SimpleNamespace(
++            method=method,
++            stride=10,
++            extra_logical_delay=extra_logical_delay,
++        )
 +        runtime.device = torch.device("cpu")
 +        runtime.epoch = 2
 +        runtime.active_version = 7
@@ -9351,6 +9757,49 @@ index 0000000..4c50e25
 +        self.assertFalse(optimizer.committed)
 +        self.assertEqual(l0.active_version, 7)
 +        self.assertIsNotNone(l0.pending)
++
++    def test_positive_delay_preserves_tts_and_l0_policy_difference(self):
++        class MainStream:
++            def wait_event(self, _event):
++                return None
++
++        l0, optimizer, _event, receipt = self._invalid_runtime(
++            (True, True, True),
++            ready=True,
++            method="l0",
++            allow_publish=True,
++            extra_logical_delay=2,
++        )
++        with patch("torch.cuda.current_stream", return_value=MainStream()):
++            self.assertFalse(l0.boundary())
++            self.assertEqual(l0.pending.intrinsic_ready_round, 10)
++            l0.round = 11
++            self.assertFalse(l0.boundary())
++            l0.round = 12
++            self.assertTrue(l0.boundary())
++        self.assertTrue(receipt.read)
++        self.assertTrue(optimizer.committed)
++        self.assertEqual(l0.update_traces[0].publication_round, 12)
++
++        tts, optimizer, _event, _receipt = self._invalid_runtime(
++            (True, True, True),
++            ready=True,
++            method="tts",
++            allow_publish=True,
++            extra_logical_delay=2,
++        )
++        # TTS records intrinsic readiness immediately, but publication remains
++        # fixed-boundary gated and then receives the same logical delay.
++        tts.round = 19
++        with patch("torch.cuda.current_stream", return_value=MainStream()):
++            self.assertFalse(tts.boundary())
++            self.assertEqual(tts.pending.intrinsic_ready_round, 19)
++            tts.round = 20
++            self.assertFalse(tts.boundary())
++            tts.round = 21
++            self.assertTrue(tts.boundary())
++        self.assertTrue(optimizer.committed)
++        self.assertEqual(tts.update_traces[0].publication_round, 21)
 +
 +    def test_tts_never_ready_timeout_fails_closed_without_publication(self):
 +        class MainStream:
@@ -9446,10 +9895,10 @@ index 0000000..4c50e25
 +    unittest.main()
 diff --git a/test/registered/unit/spec/test_terminal_speculative_evidence.py b/test/registered/unit/spec/test_terminal_speculative_evidence.py
 new file mode 100644
-index 0000000..59aad36
+index 0000000..abe5cb2
 --- /dev/null
 +++ b/test/registered/unit/spec/test_terminal_speculative_evidence.py
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,587 @@
 +from __future__ import annotations
 +
 +import hashlib
@@ -9730,6 +10179,11 @@ index 0000000..59aad36
 +            "request_ids": list(payload["scored_request_ids"]),
 +            "prefix_len_before": [3, 3],
 +            "optimizer_step": 1,
++            "effective_learning_rate": 0.001,
++            "schedule_valid": True,
++            "intrinsic_ready_round": 2,
++            "extra_logical_delay": 2,
++            "publication_round": 4,
 +            "published_version": 1,
 +            "status": "published",
 +            "loss": 0.25,
@@ -9749,6 +10203,28 @@ index 0000000..59aad36
 +        }
 +        update["update_sha256"] = content_sha256(update)
 +        update_rows = [update]
++        delayed_too_little = dict(update)
++        delayed_too_little["publication_round"] = 3
++        delayed_too_little["update_sha256"] = content_sha256(
++            {
++                key: value
++                for key, value in delayed_too_little.items()
++                if key != "update_sha256"
++            }
++        )
++        with self.assertRaisesRegex(RuntimeError, "violates logical delay"):
++            lifecycle._validate_terminal_detail(
++                request_rows=lifecycle._ordered_request_rows(
++                    payload["scored_request_ids"]
++                ),
++                round_rows=round_rows,
++                update_rows=[delayed_too_little],
++                performance_counters=_performance("tts", updates=1),
++                historical_kv_source_versions={
++                    request_id: [{"start": 0, "end": 4, "source_version": 0}]
++                    for request_id in payload["scored_request_ids"]
++                },
++            )
 +        terminal = lifecycle.finalize(
 +            reset_sha256=reset["reset_sha256"],
 +            round_rows=round_rows,
@@ -10012,3 +10488,4 @@ index 0000000..59aad36
 +    unittest.main()
 -- 
 2.55.0
+
