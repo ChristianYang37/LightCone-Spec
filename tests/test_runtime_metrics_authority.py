@@ -11,6 +11,11 @@ import pytest
 from test_compile_cache_launch import _build_base, _key
 from test_industrial_executor import _execution_fixture, _FakeHandle, _FakeTransport
 
+from lightcone_spec.cli.main import (
+    _canonical_sha256,
+    _load_runtime_metrics_authority_manifest,
+    _write_json,
+)
 from lightcone_spec.experiments.runtime_metrics import (
     FormalRuntimeMetricObservation,
     RuntimeMetricName,
@@ -20,6 +25,7 @@ from lightcone_spec.experiments.runtime_metrics import (
     RuntimeMetricUnit,
     bind_compile_runtime_metrics,
     bind_fresh_process_runtime_metrics,
+    bind_fresh_process_runtime_metrics_from_terminal_receipts,
     build_runtime_metrics_authority,
     export_formal_runtime_metrics,
     reduce_runtime_metrics,
@@ -342,4 +348,178 @@ def test_authority_rejects_same_subject_source_collision(tmp_path: Path) -> None
                 first,
                 dataclasses.replace(second, subject_id=first.subject_id),
             )
+        )
+
+
+def test_fresh_process_path_binder_derives_all_metric_identities_onsite(
+    tmp_path: Path,
+) -> None:
+    source, result = _fresh_process_source(tmp_path)
+    rebound = bind_fresh_process_runtime_metrics_from_terminal_receipts(
+        session_plan_sha256=source.session_plan_sha256,
+        terminal_receipt_paths=(result.terminal_receipt,),
+    )
+
+    assert rebound == source
+    reduction = reduce_runtime_metrics(
+        build_runtime_metrics_authority(fresh_process_sources=(rebound,))
+    )
+    assert (
+        reduction.observation(
+            result.run_id,
+            RuntimeMetricName.COLD_START_MS,
+        ).status
+        is RuntimeMetricStatus.MEASURED
+    )
+    with pytest.raises(ValueError, match="sorted, unique"):
+        bind_fresh_process_runtime_metrics_from_terminal_receipts(
+            session_plan_sha256=source.session_plan_sha256,
+            terminal_receipt_paths=(
+                result.terminal_receipt,
+                result.terminal_receipt,
+            ),
+        )
+
+
+def _runtime_manifest_binding(
+    tmp_path: Path,
+    payload: dict[str, object],
+    *,
+    name: str,
+) -> tuple[Path, dict[str, str]]:
+    path = tmp_path / f"{name}.json"
+    _write_json(path, payload)
+    return path, {"path": path.name, "sha256": _canonical_sha256(payload)}
+
+
+def test_cli_runtime_manifest_builds_and_reduces_only_raw_paths(
+    tmp_path: Path,
+) -> None:
+    compile_source = _compile_source(tmp_path, mode="build", label="cli")
+    fresh_source, result = _fresh_process_source(tmp_path / "fresh")
+    payload = {
+        "schema_version": 1,
+        "kind": "runtime_metrics_raw_source_manifest",
+        "compile_sources": [
+            {
+                "plan": compile_source.plan.path,
+                "attempt": compile_source.attempt.path,
+                "result_receipt": compile_source.result_receipt.path,
+                "subject_id": compile_source.subject_id,
+            }
+        ],
+        "fresh_process_sources": [
+            {
+                "session_plan_sha256": fresh_source.session_plan_sha256,
+                "terminal_receipts": [result.terminal_receipt],
+            }
+        ],
+        "native_sources": [],
+    }
+    _, binding = _runtime_manifest_binding(
+        tmp_path,
+        payload,
+        name="runtime-sources",
+    )
+    authority = _load_runtime_metrics_authority_manifest(
+        tmp_path / "analysis.json",
+        binding,
+    )
+
+    assert authority is not None
+    assert len(authority.compile_sources) == 1
+    assert len(authority.fresh_process_sources) == 1
+    exported = export_formal_runtime_metrics(
+        authority,
+        expected_run_ids=(result.run_id,),
+    )
+    assert exported.status is RuntimeMetricStatus.UNRESOLVED
+    assert exported.formal_values(result.run_id) == {}
+    assert all(
+        row.value is None
+        for row in exported.observations
+        if row.status is RuntimeMetricStatus.UNRESOLVED
+    )
+    assert (
+        exported.observation(
+            result.run_id,
+            RuntimeMetricName.COLD_START_MS,
+        ).reason_code
+        == "release_trusted_runtime_source_required"
+    )
+
+    with pytest.raises(ValueError, match="foreign formal runs"):
+        export_formal_runtime_metrics(
+            authority,
+            expected_run_ids=("foreign-run",),
+        )
+
+
+def test_cli_runtime_manifest_rejects_duplicates_tamper_and_observations(
+    tmp_path: Path,
+) -> None:
+    fresh_source, _ = _fresh_process_source(tmp_path / "fresh")
+    native_path = fresh_source.executions[0].native_terminal.artifact.path
+    base = {
+        "schema_version": 1,
+        "kind": "runtime_metrics_raw_source_manifest",
+        "compile_sources": [],
+        "fresh_process_sources": [],
+        "native_sources": [{"artifact": native_path}],
+    }
+    manifest, binding = _runtime_manifest_binding(
+        tmp_path,
+        base,
+        name="native-source",
+    )
+    authority = _load_runtime_metrics_authority_manifest(
+        tmp_path / "analysis.json",
+        binding,
+    )
+    assert authority is not None
+    run_id = fresh_source.executions[0].run_id
+    exported = export_formal_runtime_metrics(
+        authority,
+        expected_run_ids=(run_id,),
+    )
+    assert (
+        exported.observation(
+            run_id,
+            RuntimeMetricName.GRAPH_REPLAY_HIT_RATE,
+        ).reason_code
+        == "release_trusted_runtime_source_required"
+    )
+
+    duplicate = {**base, "native_sources": [base["native_sources"][0]] * 2}
+    _, duplicate_binding = _runtime_manifest_binding(
+        tmp_path,
+        duplicate,
+        name="duplicate-native",
+    )
+    with pytest.raises(ValueError, match="duplicates a path"):
+        _load_runtime_metrics_authority_manifest(
+            tmp_path / "analysis.json",
+            duplicate_binding,
+        )
+
+    injected = {**base, "observations": [{"value": 1e30}]}
+    _, injected_binding = _runtime_manifest_binding(
+        tmp_path,
+        injected,
+        name="injected-observation",
+    )
+    with pytest.raises(ValueError, match="manifest fields differ"):
+        _load_runtime_metrics_authority_manifest(
+            tmp_path / "analysis.json",
+            injected_binding,
+        )
+
+    manifest.write_text(
+        json.dumps({**base, "schema_version": 2}, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sidecar"):
+        _load_runtime_metrics_authority_manifest(
+            tmp_path / "analysis.json",
+            binding,
         )

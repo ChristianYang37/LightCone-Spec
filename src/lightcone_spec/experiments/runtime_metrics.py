@@ -659,25 +659,9 @@ class FreshProcessRuntimeMetricsSource:
             != len(self.executions)
         ):
             raise ValueError("fresh-process metric execution coverage is invalid")
-        expected = content_sha256(
-            {
-                "schema_version": 1,
-                "session_plan_sha256": self.session_plan_sha256,
-                "execution_mode": self.execution_mode,
-                "fallback_reason": self.fallback_reason,
-                "executions": [
-                    {
-                        "run_id": row.run_id,
-                        "execution_plan_sha256": row.execution_plan_sha256,
-                        "experiment_budget_sha256": row.experiment_budget_sha256,
-                        "rank_config_sha256": row.rank_config_sha256,
-                        "topology_sha256": row.topology_sha256,
-                        "terminal_receipt_sha256": row.terminal_receipt_sha256,
-                        "budget_observation_sha256": (row.budget_observation_sha256),
-                    }
-                    for row in self.executions
-                ],
-            }
+        expected = _fresh_process_block_result_sha256(
+            session_plan_sha256=self.session_plan_sha256,
+            executions=self.executions,
         )
         if self.block_result_sha256 != expected:
             raise ValueError("fresh-process metric source changed its block result")
@@ -700,6 +684,40 @@ class FreshProcessRuntimeMetricsSource:
                 **self.to_dict(),
             }
         )
+
+
+def _fresh_process_block_result_sha256(
+    *,
+    session_plan_sha256: str,
+    executions: tuple[FreshProcessExecutionMetricsSource, ...],
+) -> str:
+    """Reconstruct the source block identity without accepting a summary row."""
+
+    _require_sha256("session plan digest", session_plan_sha256)
+    if not executions or any(
+        type(row) is not FreshProcessExecutionMetricsSource for row in executions
+    ):
+        raise TypeError("fresh-process block identity requires exact executions")
+    return content_sha256(
+        {
+            "schema_version": 1,
+            "session_plan_sha256": session_plan_sha256,
+            "execution_mode": SHARED_SESSION_FALLBACK_MODE,
+            "fallback_reason": SHARED_SESSION_UNAVAILABLE_REASON,
+            "executions": [
+                {
+                    "run_id": row.run_id,
+                    "execution_plan_sha256": row.execution_plan_sha256,
+                    "experiment_budget_sha256": row.experiment_budget_sha256,
+                    "rank_config_sha256": row.rank_config_sha256,
+                    "topology_sha256": row.topology_sha256,
+                    "terminal_receipt_sha256": row.terminal_receipt_sha256,
+                    "budget_observation_sha256": row.budget_observation_sha256,
+                }
+                for row in executions
+            ],
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -1699,6 +1717,163 @@ def bind_fresh_process_runtime_metrics(
     return source
 
 
+def bind_fresh_process_runtime_metrics_from_terminal_receipts(
+    *,
+    session_plan_sha256: str,
+    terminal_receipt_paths: tuple[str | Path, ...],
+) -> FreshProcessRuntimeMetricsSource:
+    """Bind a fresh-process block solely from first-party raw artifact paths.
+
+    The caller supplies no serialized observations or execution-result object.
+    Run, topology, budget, native-terminal, and table identities are derived
+    onsite from the terminal receipt and completed Parquet evidence, then the
+    ordinary raw-source reopener validates the resulting cross-file contract.
+    ``session_plan_sha256`` is the grouping identity only; it cannot contribute
+    a metric value.
+    """
+
+    _require_sha256("session plan digest", session_plan_sha256)
+    if not terminal_receipt_paths:
+        raise ValueError("fresh-process path binding requires terminal receipts")
+    executions: list[FreshProcessExecutionMetricsSource] = []
+    canonical_terminal_paths: list[str] = []
+    terminal_suffix = ".rank0.complete.json"
+    for requested_path in terminal_receipt_paths:
+        terminal = BoundRuntimeMetricsFile.bind(requested_path)
+        canonical_terminal_paths.append(terminal.path)
+        if not Path(terminal.path).name.endswith(terminal_suffix):
+            raise ValueError("fresh-process terminal receipt path is not canonical")
+        run_id = Path(terminal.path).name[: -len(terminal_suffix)]
+        _require_text("fresh-process run_id", run_id)
+        root = Path(terminal.path).parent
+        terminal_body = terminal.read_bytes(label="fresh-process terminal receipt")
+        terminal_value = _strict_json(
+            terminal_body,
+            label="fresh-process terminal receipt",
+        )
+        if terminal_body != _canonical_json_bytes(terminal_value, ensure_ascii=True):
+            raise ValueError("fresh-process terminal receipt is not canonical JSON")
+        completed = load_completed_evidence(root, run_id=run_id, rank=0)
+        if completed is None:
+            raise RuntimeError("fresh-process runtime metric source is not complete")
+        if "run" not in completed or "performance" not in completed:
+            raise RuntimeError("fresh-process evidence omits a required table")
+        try:
+            run_rows = pq.read_table(
+                completed["run"],
+                columns=[
+                    "run_id",
+                    "runtime_sha256",
+                    "rank_config_sha256",
+                    "topology_sha256",
+                    "experiment_budget_sha256",
+                ],
+            ).to_pylist()
+        except (KeyError, pa.ArrowException) as error:
+            raise RuntimeError("fresh-process run table is malformed") from error
+        if len(run_rows) != 1 or run_rows[0].get("run_id") != run_id:
+            raise RuntimeError("fresh-process run table identity differs")
+        run_row = run_rows[0]
+        execution_plan_sha256 = _require_sha256(
+            "fresh-process execution plan",
+            run_row.get("runtime_sha256"),
+        )
+        experiment_budget_sha256 = _require_sha256(
+            "fresh-process experiment budget",
+            run_row.get("experiment_budget_sha256"),
+        )
+        rank_config_sha256 = _require_sha256(
+            "fresh-process rank config",
+            run_row.get("rank_config_sha256"),
+        )
+        topology_sha256 = _require_sha256(
+            "fresh-process topology",
+            run_row.get("topology_sha256"),
+        )
+        native_binding = terminal_value.get("native_terminal_artifact")
+        if (
+            type(native_binding) is not dict
+            or type(native_binding.get("path")) is not str
+        ):
+            raise RuntimeError("fresh-process terminal lacks native evidence")
+        native = bind_native_runtime_metrics(root / str(native_binding["path"]))
+        observation_path = (
+            root / f"{run_id}.rank0.budget-observation" / "observation.json"
+        )
+        observation = BoundRuntimeMetricsFile.bind(observation_path)
+        observation_sidecar = BoundRuntimeMetricsFile.bind(
+            observation_path.with_name("observation.json.sha256")
+        )
+        observation_body = observation.read_bytes(
+            label="fresh-process budget observation"
+        )
+        observation_value = _strict_json(
+            observation_body,
+            label="fresh-process budget observation",
+        )
+        if observation_body != _canonical_json_bytes(
+            observation_value,
+            ensure_ascii=True,
+        ):
+            raise ValueError("fresh-process budget observation is not canonical JSON")
+        budget_observation_sha256 = _require_sha256(
+            "fresh-process budget observation",
+            observation_value.get("budget_observation_sha256"),
+        )
+        if (
+            observation_value.get("experiment_budget_sha256")
+            != experiment_budget_sha256
+        ):
+            raise RuntimeError("fresh-process budget observation names another budget")
+        evidence_paths = tuple(
+            sorted(
+                {
+                    *(str(Path(path).resolve()) for path in completed.values()),
+                    native.artifact.path,
+                    observation.path,
+                    observation_sidecar.path,
+                }
+            )
+        )
+        source = FreshProcessExecutionMetricsSource(
+            run_id=run_id,
+            execution_plan_sha256=execution_plan_sha256,
+            experiment_budget_sha256=experiment_budget_sha256,
+            rank_config_sha256=rank_config_sha256,
+            topology_sha256=topology_sha256,
+            terminal_receipt_sha256=terminal.raw_sha256,
+            budget_observation_sha256=budget_observation_sha256,
+            terminal_receipt=terminal,
+            budget_observation=observation,
+            budget_observation_sidecar=observation_sidecar,
+            evidence_files=tuple(
+                BoundRuntimeMetricsFile.bind(path) for path in evidence_paths
+            ),
+            run_evidence=BoundRuntimeMetricsFile.bind(completed["run"]),
+            performance_evidence=BoundRuntimeMetricsFile.bind(completed["performance"]),
+            native_terminal=native,
+        )
+        _reopen_fresh_execution(source)
+        executions.append(source)
+    if canonical_terminal_paths != sorted(set(canonical_terminal_paths)):
+        raise ValueError(
+            "fresh-process terminal paths must be sorted, unique, and canonical"
+        )
+    execution_tuple = tuple(executions)
+    source = FreshProcessRuntimeMetricsSource(
+        session_plan_sha256=session_plan_sha256,
+        block_result_sha256=_fresh_process_block_result_sha256(
+            session_plan_sha256=session_plan_sha256,
+            executions=execution_tuple,
+        ),
+        execution_mode=SHARED_SESSION_FALLBACK_MODE,
+        fallback_reason=SHARED_SESSION_UNAVAILABLE_REASON,
+        executions=execution_tuple,
+    )
+    source.__post_init__()
+    return source
+
+
 def build_runtime_metrics_authority(
     *,
     compile_sources: tuple[CompileRuntimeMetricsSource, ...] = (),
@@ -2160,6 +2335,7 @@ __all__ = [
     "RuntimeMetricsReduction",
     "bind_compile_runtime_metrics",
     "bind_fresh_process_runtime_metrics",
+    "bind_fresh_process_runtime_metrics_from_terminal_receipts",
     "bind_native_runtime_metrics",
     "build_runtime_metrics_authority",
     "export_formal_runtime_metrics",

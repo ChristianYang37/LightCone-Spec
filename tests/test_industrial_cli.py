@@ -1074,6 +1074,7 @@ def test_analyze_industrial_forwards_raw_alias_manifests_to_formal_reducer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     raw_manifest = _raw_alias_manifest(tmp_path)
+    runtime_metrics_authority = object()
     loaded = (
         object(),
         object(),
@@ -1088,6 +1089,7 @@ def test_analyze_industrial_forwards_raw_alias_manifests_to_formal_reducer(
         None,
         100,
         17,
+        runtime_metrics_authority,
     )
     monkeypatch.setattr(
         "lightcone_spec.cli.main._load_industrial_analysis_manifest",
@@ -1098,10 +1100,15 @@ def test_analyze_industrial_forwards_raw_alias_manifests_to_formal_reducer(
         sha256=_sha(artifact_value),
         to_dict=lambda: artifact_value,
     )
-    received: list[tuple[RawEvidenceAliasManifest, ...]] = []
+    received: list[tuple[tuple[RawEvidenceAliasManifest, ...], object]] = []
 
     def reduce_probe(**kwargs):
-        received.append(kwargs["evidence_alias_manifests"])
+        received.append(
+            (
+                kwargs["evidence_alias_manifests"],
+                kwargs["runtime_metrics_authority"],
+            )
+        )
         return SimpleNamespace(artifact=artifact)
 
     monkeypatch.setattr(
@@ -1121,5 +1128,5 @@ def test_analyze_industrial_forwards_raw_alias_manifests_to_formal_reducer(
         )
         == 42
     )
-    assert received == [(raw_manifest,)]
+    assert received == [((raw_manifest,), runtime_metrics_authority)]
     assert json.loads(output.read_text(encoding="utf-8")) == artifact_value

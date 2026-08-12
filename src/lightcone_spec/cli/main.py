@@ -156,6 +156,14 @@ from lightcone_spec.experiments.runner import (
     run_natural_replication_slice,
     run_onlinespec_confirmation_slice,
 )
+from lightcone_spec.experiments.runtime_metrics import (
+    RuntimeMetricsAuthority,
+    bind_compile_runtime_metrics,
+    bind_fresh_process_runtime_metrics_from_terminal_receipts,
+    bind_native_runtime_metrics,
+    build_runtime_metrics_authority,
+    reduce_runtime_metrics,
+)
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import (
     CandidateMeasurement,
@@ -1517,6 +1525,147 @@ def _analysis_bound_json_path(
     return path
 
 
+def _runtime_metrics_source_path(
+    manifest_path: Path,
+    value: object,
+    *,
+    label: str,
+) -> Path:
+    """Resolve one raw source path; metric values are never accepted here."""
+
+    return _analysis_manifest_path(manifest_path, value, label=label)
+
+
+def _load_runtime_metrics_authority_manifest(
+    analysis_manifest_path: Path,
+    binding: object,
+) -> RuntimeMetricsAuthority | None:
+    """Build and replay formal runtime authority from path-only raw sources."""
+
+    if binding is None:
+        return None
+    manifest_path = _analysis_bound_json_path(
+        analysis_manifest_path,
+        binding,
+        label="runtime metrics raw-source manifest",
+    )
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "compile_sources",
+        "fresh_process_sources",
+        "native_sources",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("runtime metrics raw-source manifest fields differ")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "runtime_metrics_raw_source_manifest"
+    ):
+        raise ValueError("runtime metrics raw-source manifest identity differs")
+    compile_rows = value.get("compile_sources")
+    fresh_rows = value.get("fresh_process_sources")
+    native_rows = value.get("native_sources")
+    if any(type(rows) is not list for rows in (compile_rows, fresh_rows, native_rows)):
+        raise TypeError("runtime metrics raw-source groups must be JSON arrays")
+
+    declared_paths: set[Path] = set()
+
+    def source_path(raw: object, *, label: str) -> Path:
+        path = _runtime_metrics_source_path(manifest_path, raw, label=label)
+        canonical = path.resolve(strict=False)
+        if canonical in declared_paths:
+            raise ValueError("runtime metrics raw-source manifest duplicates a path")
+        declared_paths.add(canonical)
+        return path
+
+    compile_sources = []
+    for index, row in enumerate(compile_rows):
+        row_expected = {
+            "plan",
+            "attempt",
+            "result_receipt",
+            "subject_id",
+        }
+        if not isinstance(row, dict) or set(row) != row_expected:
+            raise ValueError("runtime metrics compile source fields differ")
+        subject_id = row.get("subject_id")
+        if subject_id is not None and (
+            not isinstance(subject_id, str)
+            or not subject_id
+            or "\n" in subject_id
+            or "\r" in subject_id
+        ):
+            raise ValueError("runtime metrics compile subject_id is invalid")
+        compile_sources.append(
+            bind_compile_runtime_metrics(
+                plan_path=source_path(
+                    row.get("plan"),
+                    label=f"runtime compile plan {index}",
+                ),
+                attempt_path=source_path(
+                    row.get("attempt"),
+                    label=f"runtime compile attempt {index}",
+                ),
+                result_receipt_path=source_path(
+                    row.get("result_receipt"),
+                    label=f"runtime compile result {index}",
+                ),
+                subject_id=subject_id,
+            )
+        )
+
+    fresh_sources = []
+    for index, row in enumerate(fresh_rows):
+        if not isinstance(row, dict) or set(row) != {
+            "session_plan_sha256",
+            "terminal_receipts",
+        }:
+            raise ValueError("runtime metrics fresh-process source fields differ")
+        terminal_rows = row.get("terminal_receipts")
+        if type(terminal_rows) is not list or not terminal_rows:
+            raise ValueError(
+                "runtime metrics fresh-process source needs terminal paths"
+            )
+        terminals = tuple(
+            source_path(
+                raw,
+                label=f"runtime fresh terminal {index}:{terminal_index}",
+            )
+            for terminal_index, raw in enumerate(terminal_rows)
+        )
+        fresh_sources.append(
+            bind_fresh_process_runtime_metrics_from_terminal_receipts(
+                session_plan_sha256=row.get("session_plan_sha256"),
+                terminal_receipt_paths=terminals,
+            )
+        )
+
+    native_sources = []
+    for index, row in enumerate(native_rows):
+        if not isinstance(row, dict) or set(row) != {"artifact"}:
+            raise ValueError("runtime metrics native source fields differ")
+        native_sources.append(
+            bind_native_runtime_metrics(
+                source_path(
+                    row.get("artifact"),
+                    label=f"runtime native terminal {index}",
+                )
+            )
+        )
+    authority = build_runtime_metrics_authority(
+        compile_sources=tuple(compile_sources),
+        fresh_process_sources=tuple(fresh_sources),
+        native_sources=tuple(native_sources),
+    )
+    # Reject corrupt, foreign-schema, or changed raw evidence before entering
+    # the formal analyzer. The analyzer replays it again at export time.
+    reduction = reduce_runtime_metrics(authority)
+    reduction.validate_against(authority)
+    return authority
+
+
 def _analysis_hardware_envelope(value: object) -> HardwareEnvelope:
     expected = {
         "gpu_clock_mhz_min",
@@ -1885,6 +2034,7 @@ def _load_industrial_analysis_manifest(
     BoundArtifact | None,
     int,
     int,
+    RuntimeMetricsAuthority | None,
 ]:
     manifest_path = Path(path)
     manifest_sidecar = Path(f"{manifest_path}.sha256")
@@ -1912,7 +2062,8 @@ def _load_industrial_analysis_manifest(
         "bootstrap",
         "blocks",
     }
-    if not isinstance(value, dict) or set(value) != expected:
+    allowed_fields = (expected, expected | {"runtime_metrics_manifest"})
+    if not isinstance(value, dict) or set(value) not in allowed_fields:
         raise ValueError("industrial analysis manifest fields do not match schema")
     if (
         value.get("schema_version") != 3
@@ -2041,6 +2192,10 @@ def _load_industrial_analysis_manifest(
         raise ValueError("industrial analysis bootstrap values are invalid")
 
     blocks = _analysis_blocks(manifest_path, value.get("blocks"))
+    runtime_metrics_authority = _load_runtime_metrics_authority_manifest(
+        manifest_path,
+        value.get("runtime_metrics_manifest"),
+    )
     return (
         registry,
         pilot,
@@ -2055,6 +2210,7 @@ def _load_industrial_analysis_manifest(
         doctor_report,
         repetitions,
         seed,
+        runtime_metrics_authority,
     )
 
 
@@ -6773,6 +6929,7 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
         doctor_report,
         repetitions,
         seed,
+        runtime_metrics_authority,
     ) = _load_industrial_analysis_manifest(args.manifest)
     reduction = reduce_industrial_schema_v3(
         registry=registry,
@@ -6786,6 +6943,7 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
         evidence_alias_manifests=alias_manifests,
         gpu_attestation=gpu_attestation,
         doctor_report=doctor_report,
+        runtime_metrics_authority=runtime_metrics_authority,
         bootstrap_repetitions=repetitions,
         bootstrap_seed=seed,
     )

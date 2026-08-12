@@ -1638,6 +1638,7 @@ def _analysis_manifest(
     name: str,
     gpu_attestation: BoundArtifact | None = None,
     doctor_report: BoundArtifact | None = None,
+    runtime_metrics_manifest: dict[str, str] | None = None,
 ) -> Path:
     cache_root = Path(registry.cells[0].resources.cache_root).parents[1]
     evidence_root = Path(registry.cells[0].resources.evidence_root).parents[1]
@@ -1745,6 +1746,8 @@ def _analysis_manifest(
         "bootstrap": {"repetitions": 300, "seed": 17},
         "blocks": [manifest_block(block) for block in evidence],
     }
+    if runtime_metrics_manifest is not None:
+        manifest["runtime_metrics_manifest"] = runtime_metrics_manifest
     manifest_path = tmp_path / f"{name}-manifest.json"
     _write_bound_json(manifest_path, manifest)
     return manifest_path
@@ -2026,7 +2029,9 @@ def test_e3b_raw_stage_reopens_exact_eight_contexts_and_preserves_evidence_level
         replace(
             artifact,
             reductions=(
-                replace(artifact.reductions[0], reduction=artifact.reductions[1].reduction),
+                replace(
+                    artifact.reductions[0], reduction=artifact.reductions[1].reduction
+                ),
                 *artifact.reductions[1:],
             ),
         )
@@ -3516,6 +3521,16 @@ def test_analyze_industrial_cli_uses_only_bound_manifest_evidence(
     assert artifact["identity"]["gpu_attestation_sha256"] is None
     assert artifact["identity"]["doctor_report_sha256"] is None
     assert artifact["identity"]["registry_sha256"] == registry.sha256
+    runtime_metrics = artifact["evidence"]["runtime_metrics"]
+    assert runtime_metrics["status"] == "UNRESOLVED"
+    assert runtime_metrics["authority_sha256"] is None
+    assert runtime_metrics["reduction_sha256"] is None
+    assert runtime_metrics["source_sha256s"] == []
+    assert runtime_metrics["observations"]
+    assert all(
+        row["status"] == "UNRESOLVED" and row["value"] is None
+        for row in runtime_metrics["observations"]
+    )
     assert Path(f"{output}.sha256").read_text(encoding="utf-8").strip() == (
         content_sha256(artifact)
     )
@@ -3534,6 +3549,96 @@ def test_analyze_industrial_cli_uses_only_bound_manifest_evidence(
                 str(tmp_path / "must-not-exist.json"),
             ]
         )
+
+
+def test_analyze_industrial_cli_replays_path_bound_runtime_metrics(
+    evidence_bundle,
+    tmp_path: Path,
+) -> None:
+    registry, pilot_activation, final_activation, plan, evidence, envelope = (
+        evidence_bundle
+    )
+    terminal_path = evidence[0].cells[0].terminal_receipts[0].path
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    native_binding = terminal.get("native_terminal_artifact")
+    assert isinstance(native_binding, dict)
+    native_name = native_binding.get("path")
+    assert isinstance(native_name, str)
+    native_path = terminal_path.parent / native_name
+    runtime_source_manifest = {
+        "schema_version": 1,
+        "kind": "runtime_metrics_raw_source_manifest",
+        "compile_sources": [],
+        "fresh_process_sources": [],
+        "native_sources": [{"artifact": str(native_path)}],
+    }
+    runtime_source_path = tmp_path / "runtime-metrics-raw.json"
+    _write_bound_json(runtime_source_path, runtime_source_manifest)
+    manifest_path = _analysis_manifest(
+        tmp_path,
+        registry=registry,
+        pilot_activation=pilot_activation,
+        final_activation=final_activation,
+        reduction=plan,
+        evidence=evidence,
+        envelope=envelope,
+        name="runtime-source",
+        runtime_metrics_manifest={
+            "path": str(runtime_source_path),
+            "sha256": content_sha256(runtime_source_manifest),
+        },
+    )
+    output = tmp_path / "runtime-source-reducer.json"
+
+    assert (
+        main(
+            [
+                "analyze-industrial",
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(output),
+            ]
+        )
+        == 42
+    )
+    artifact = json.loads(output.read_text(encoding="utf-8"))
+    runtime = artifact["evidence"]["runtime_metrics"]
+    assert runtime["status"] == "UNRESOLVED"
+    assert isinstance(runtime["authority_sha256"], str)
+    assert isinstance(runtime["reduction_sha256"], str)
+    assert len(runtime["source_sha256s"]) == 1
+    untrusted = [
+        row
+        for row in runtime["observations"]
+        if row["metric"] == "graph_replay_hit_rate"
+        and row["source_kind"] == "native_terminal"
+    ]
+    assert len(untrusted) == 1
+    assert untrusted[0]["status"] == "UNRESOLVED"
+    assert untrusted[0]["value"] is None
+    assert untrusted[0]["reason_code"] == ("release_trusted_runtime_source_required")
+    assert untrusted[0]["release_trusted"] is False
+
+    runtime_source_path.write_text(
+        json.dumps(
+            {**runtime_source_manifest, "schema_version": 2},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    rejected_output = tmp_path / "tampered-runtime-must-not-exist.json"
+    with pytest.raises(ValueError, match="sidecar"):
+        main(
+            [
+                "analyze-industrial",
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(rejected_output),
+            ]
+        )
+    assert not rejected_output.exists()
 
 
 def test_analyze_industrial_cli_writes_unresolved_and_returns_nonzero(
