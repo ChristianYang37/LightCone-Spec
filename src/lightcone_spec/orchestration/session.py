@@ -805,7 +805,11 @@ class IndustrialServerBlockResult:
     fallback_reason: str
     executions: tuple[IndustrialExecutionResult, ...]
 
-    def validate(self) -> None:
+    def validate(
+        self,
+        *,
+        session_plan: IndustrialServerSessionPlan | None = None,
+    ) -> None:
         from lightcone_spec.orchestration.executor import IndustrialExecutionResult
 
         _require_sha256("session_plan_sha256", self.session_plan_sha256)
@@ -834,6 +838,20 @@ class IndustrialServerBlockResult:
             ):
                 _require_sha256(name, getattr(row, name))
             _require_text("run_id", row.run_id)
+        if session_plan is not None:
+            if type(session_plan) is not IndustrialServerSessionPlan:
+                raise TypeError(
+                    "server block validation requires an exact session plan"
+                )
+            session_plan.validate()
+            if (
+                self.session_plan_sha256 != session_plan.sha256
+                or tuple(row.execution_plan_sha256 for row in self.executions)
+                != session_plan.execution_plan_sha256s
+            ):
+                raise ValueError(
+                    "server block results differ from the ordered session plan"
+                )
 
     @property
     def sha256(self) -> str:
@@ -1333,7 +1351,88 @@ def _is_internal_session_execution_lifecycle(value: object) -> bool:
     )
 
 
-async def execute_industrial_server_session(
+def _validate_fresh_process_resource_pair(
+    transport: BenchServingTransport,
+    provider: NativeTerminalProvider,
+) -> None:
+    """Reject any HTTP/native state that could refer to an older process."""
+
+    from lightcone_spec.experiments.serving import PinnedBenchServingTransport
+    from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
+
+    if not isinstance(transport, PinnedBenchServingTransport):
+        raise TypeError("server block requires the pinned official bench transport")
+    if type(provider) is not NativeTerminalProvider:
+        raise TypeError("server block requires exact native terminal providers")
+    if provider._transport is not transport:
+        raise ValueError(
+            "server block native and serving traffic use different HTTP pools"
+        )
+    metrics = transport.metrics()
+    if (
+        type(metrics) is not dict
+        or set(metrics)
+        != {"connections_created", "submitted_requests", "reused_requests"}
+        or any(type(value) is not int or value != 0 for value in metrics.values())
+        or getattr(transport, "_native_admin_base_url", None) is not None
+    ):
+        raise ValueError(
+            "clean-process fallback rejects a stale or previously used HTTP pool"
+        )
+    if type(transport) is PinnedBenchServingTransport and any(
+        getattr(transport, name) is not None
+        for name in ("_session", "_request_timeout_s", "_abort_timeout_s")
+    ):
+        raise ValueError("clean-process fallback rejects a live HTTP pool")
+    if (
+        provider.phase != "IDLE"
+        or provider._binding is not None
+        or provider._begin is not None
+        or provider._reset is not None
+        or provider._process is not None
+        or provider._reset_generation != 0
+        or provider._next_session_epoch != 1
+        or provider._last_finalized_run_id is not None
+        or provider._session_id is not None
+        or provider._seen_runs
+        or provider._seen_attempts
+    ):
+        raise ValueError("clean-process fallback rejects stale native terminal state")
+
+
+def _validate_fresh_execution_result(
+    plan: IndustrialExecutionPlan,
+    result: IndustrialExecutionResult,
+) -> None:
+    """Bind one standalone result before another process may be launched."""
+
+    from lightcone_spec.orchestration.executor import IndustrialExecutionResult
+
+    if type(result) is not IndustrialExecutionResult:
+        raise TypeError("standalone executor returned an inexact execution result")
+    if (
+        result.resumed
+        or result.execution_plan_sha256 != plan.sha256
+        or result.experiment_budget_sha256 != plan.budget.sha256
+        or result.rank_config_sha256 != plan.rank_config_sha256
+        or result.topology_sha256 != plan.topology_sha256
+    ):
+        raise ValueError(
+            "fresh-process result differs from its exact standalone execution plan"
+        )
+    for name in (
+        "execution_plan_sha256",
+        "experiment_budget_sha256",
+        "rank_config_sha256",
+        "topology_sha256",
+        "terminal_receipt_sha256",
+        "budget_observation_sha256",
+    ):
+        _require_sha256(name, getattr(result, name))
+    _require_text("run_id", result.run_id)
+
+
+async def execute_industrial_fresh_process_fallback(
     session_plan: IndustrialServerSessionPlan,
     execution_plans: tuple[IndustrialExecutionPlan, ...],
     *,
@@ -1347,15 +1446,13 @@ async def execute_industrial_server_session(
 ) -> IndustrialServerBlockResult:
     """Execute a registered block via one clean process per logical trace.
 
-    Live reuse remains unavailable until a release-owned durable boundary can
-    prove reset and continuous whole-instance accounting.  This entry point is
-    the required safe fallback: it validates the entire block and every native
-    provider before the first launch, then delegates each trace to the ordinary
-    standalone executor.  It never calls the caller-authored session boundary
-    protocol and never labels the result as reused-session evidence.
+    This explicit fallback has no old-handle input.  It validates the entire
+    block and pristine per-trace HTTP/native resources before the first launch,
+    then awaits the ordinary standalone executor for each plan in order.  A
+    failed cleanup therefore stops the block before the next process starts.
+    The result never claims shared-session reset or reuse.
     """
 
-    from lightcone_spec.experiments.serving import PinnedBenchServingTransport
     from lightcone_spec.orchestration.executor import (
         IndustrialExecutionPlan,
         NativeEvidenceUnavailableError,
@@ -1363,7 +1460,6 @@ async def execute_industrial_server_session(
         execute_industrial_plan,
         native_evidence_preflight,
     )
-    from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
 
     if type(session_plan) is not IndustrialServerSessionPlan:
         raise TypeError("server block requires an exact session-plan authority")
@@ -1424,14 +1520,7 @@ async def execute_industrial_server_session(
         providers,
         strict=True,
     ):
-        if not isinstance(transport, PinnedBenchServingTransport):
-            raise TypeError("server block requires the pinned official bench transport")
-        if type(provider) is not NativeTerminalProvider:
-            raise TypeError("server block requires exact native terminal providers")
-        if provider._transport is not transport:
-            raise ValueError(
-                "server block native and serving traffic use different HTTP pools"
-            )
+        _validate_fresh_process_resource_pair(transport, provider)
         preflight = native_evidence_preflight(plan, provider)
         if preflight.status == "BLOCKED":
             raise NativeEvidenceUnavailableError(preflight)
@@ -1453,10 +1542,7 @@ async def execute_industrial_server_session(
             transport=transport,
             native_evidence=provider,
         )
-        if result.resumed:
-            raise RuntimeError(
-                "clean-process block fallback unexpectedly resumed prior evidence"
-            )
+        _validate_fresh_execution_result(plan, result)
         results.append(result)
     value = IndustrialServerBlockResult(
         session_plan_sha256=session_plan.sha256,
@@ -1464,5 +1550,34 @@ async def execute_industrial_server_session(
         fallback_reason=SHARED_SESSION_UNAVAILABLE_REASON,
         executions=tuple(results),
     )
-    value.validate()
+    value.validate(session_plan=session_plan)
     return value
+
+
+async def execute_industrial_server_session(
+    session_plan: IndustrialServerSessionPlan,
+    execution_plans: tuple[IndustrialExecutionPlan, ...],
+    *,
+    output_roots: tuple[str | Path, ...],
+    run_nonce_sha256s: tuple[str, ...],
+    launch_server: ServerLauncher,
+    resources_for_plan: Callable[
+        [IndustrialExecutionPlan],
+        tuple[BenchServingTransport, NativeTerminalProvider],
+    ],
+) -> IndustrialServerBlockResult:
+    """Route the release-blocked shared session to the explicit safe fallback.
+
+    Shared-session open/reset remains blocked before mutation.  Consequently no
+    shared handle exists to reuse or transfer: every trace is delegated to the
+    standalone executor with a pristine resource pair and no session arguments.
+    """
+
+    return await execute_industrial_fresh_process_fallback(
+        session_plan,
+        execution_plans,
+        output_roots=output_roots,
+        run_nonce_sha256s=run_nonce_sha256s,
+        launch_server=launch_server,
+        resources_for_plan=resources_for_plan,
+    )

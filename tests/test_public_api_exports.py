@@ -74,6 +74,9 @@ def test_orchestration_public_api_exports_assignment_and_native_hook() -> None:
             native_terminal.ValidatedNativeTerminalEvidence
         ),
         "bind_industrial_gpu_assignment": industrial.bind_industrial_gpu_assignment,
+        "execute_industrial_fresh_process_fallback": (
+            session.execute_industrial_fresh_process_fallback
+        ),
         "execute_industrial_server_session": (
             session.execute_industrial_server_session
         ),

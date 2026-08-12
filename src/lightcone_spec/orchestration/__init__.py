@@ -75,6 +75,7 @@ from .session import (
     IndustrialSessionTraceReceipt,
     SessionBoundaryState,
     SharedSessionUnavailableError,
+    execute_industrial_fresh_process_fallback,
     execute_industrial_server_session,
 )
 
@@ -129,6 +130,7 @@ __all__ = [
     "build_industrial_execution_plan",
     "canonical_json_bytes",
     "canonical_sha256",
+    "execute_industrial_fresh_process_fallback",
     "execute_industrial_plan",
     "execute_industrial_server_session",
     "industrial_execution_split_contract",
