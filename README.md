@@ -18,6 +18,31 @@ speed or capacity.
 > Historical v2 artifacts are regression/debugging evidence only; they are not
 > evidence for the schema-v3 protocol or a new performance claim.
 
+<!-- RESULT_TRUTH_GATE_BEGIN -->
+## Result truth gate
+
+These fields deliberately separate evidence state, executable-release state,
+host operations, and source identity. Powering a GPU host off does not complete
+an experiment, and a historical measurement does not become a formal result.
+
+| Truth field | Value | Scope |
+|---|---|---|
+| `formal_industrial_gpu_evidence` | `UNMEASURED` | Current schema-v3 formal evidence; no industrial performance claim is released. |
+| `formal_industrial_execution` | `BLOCKED` | Current release authorization; the missing trusted signer and unresolved Stage-B inputs fail closed before mutation. |
+| `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
+| `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
+| `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
+| `current_patched_sglang_tree` | `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8` | Full Git tree expected after applying the current patch. |
+| `current_patch_payload_sha256` | `369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7` | SHA-256 of the current mail-patch bytes. |
+| `current_patch_manifest_sha256` | `d0902d27704a98edf0f87f4bbdbe88854fa423c7b56463c22a2efe644afc05a1` | SHA-256 of the current canonical patch-manifest JSON. |
+| `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
+| `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
+
+The current commit, tree, patch payload, and manifest digest are distinct
+identity domains. The two seven-character historical prefixes are not current
+release identities and cannot satisfy any formal identity gate.
+<!-- RESULT_TRUTH_GATE_END -->
+
 ## Scope
 
 The core comparison has four methods:

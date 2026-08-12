@@ -14,6 +14,29 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 > 与已注册硬件而 `BLOCKED`。历史 v2 artifact 仅可用于
 > regression/debugging；它们不能证明 schema-v3 协议或任何新性能结论。
 
+<!-- RESULT_TRUTH_GATE_BEGIN -->
+## 结果真实性 gate
+
+以下字段明确分隔证据状态、当前 release 可执行状态、主机运营状态与源码身份。GPU 主机关机
+不代表实验完成，历史 measurement 也不会因此升级为 formal result。
+
+| Truth field | 值 | 范围 |
+|---|---|---|
+| `formal_industrial_gpu_evidence` | `UNMEASURED` | 当前 schema-v3 formal 证据；没有发布任何 industrial 性能结论。 |
+| `formal_industrial_execution` | `BLOCKED` | 当前 release 授权；缺少 trusted signer 且 Stage-B 输入未解析，因此在 mutation 前 fail closed。 |
+| `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
+| `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
+| `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
+| `current_patched_sglang_tree` | `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8` | 应用当前 patch 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7` | 当前 mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `d0902d27704a98edf0f87f4bbdbe88854fa423c7b56463c22a2efe644afc05a1` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
+| `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
+
+当前 commit、tree、patch payload 与 manifest digest 是四个不同的身份域。两个七字符历史
+prefix 不是当前 release identity，不能满足任何 formal identity gate。
+<!-- RESULT_TRUTH_GATE_END -->
+
 ## 研究范围
 
 核心对比包含四种方法：
