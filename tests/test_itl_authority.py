@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+
+from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments import itl_authority
+from lightcone_spec.experiments.itl_authority import (
+    ITL_COALESCED_CHUNK_UNPROVEN_REASON,
+    ITL_RAW_RECEIPT_MISSING_REASON,
+    ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256,
+    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    ItlRequestExpectation,
+    ItlTimestampAuthorityBlocked,
+    ReleaseItlTimestampProducer,
+    assess_serving_chunks_for_formal_itl,
+    bind_itl_timestamp_authority,
+    evaluate_e2_itl_timestamp_activation,
+    release_e2_itl_timestamp_plan,
+    require_e2_itl_timestamp_prelaunch,
+    revalidate_itl_timestamp_authority,
+)
+from lightcone_spec.experiments.load import TokenChunkTiming
+from lightcone_spec.experiments.registry import build_industrial_registry
+
+
+def _registry_and_cell():
+    registry = build_industrial_registry()
+    cell = next(
+        row
+        for row in registry.cells_for("E2")
+        if row.identity.method == "tts" and row.identity.optimizer == "adamw"
+    )
+    return registry, cell
+
+
+def _producer(mode: str) -> ReleaseItlTimestampProducer:
+    hook = {
+        "native_per_token_timestamp_hook": (
+            "sglang.schema_v3.native_per_token_timestamp.v1"
+        ),
+        "sse_one_token_per_frame": (
+            "sglang.benchmark.serving.raw_sse_frame_observation.v1"
+        ),
+    }[mode]
+    return ReleaseItlTimestampProducer(
+        producer_id=f"release-{mode}",
+        source_mode=mode,
+        hook_id=hook,
+        producer_version_sha256="a" * 64,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        clock="monotonic_ns",
+        protocol_sha256=ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256,
+    )
+
+
+def _ready_plan(monkeypatch: pytest.MonkeyPatch, mode: str):
+    producer = _producer(mode)
+    monkeypatch.setattr(
+        itl_authority,
+        "RELEASE_ITL_TIMESTAMP_PRODUCERS",
+        (producer,),
+    )
+    registry, cell = _registry_and_cell()
+    return release_e2_itl_timestamp_plan(registry, cell), producer
+
+
+def _receipt(plan, producer) -> dict[str, object]:
+    common = {
+        "request_id": "request-1",
+        "request_started_ns": 100,
+        "request_terminal_ns": 180,
+        "output_token_ids": [10, 11, 12],
+    }
+    if producer.source_mode == "native_per_token_timestamp_hook":
+        common["token_events"] = [
+            {"token_index": 0, "token_id": 10, "observed_ns": 110},
+            {"token_index": 1, "token_id": 11, "observed_ns": 130},
+            {"token_index": 2, "token_id": 12, "observed_ns": 170},
+        ]
+    else:
+        common["raw_sse_frames"] = [
+            {"frame_index": 0, "new_token_ids": [10], "observed_ns": 110},
+            {"frame_index": 1, "new_token_ids": [11], "observed_ns": 130},
+            {"frame_index": 2, "new_token_ids": [12], "observed_ns": 170},
+        ]
+    return {
+        "schema_version": 1,
+        "kind": "formal_itl_timestamp_raw_receipt",
+        "plan_sha256": plan.sha256,
+        "producer_id": producer.producer_id,
+        "producer_version_sha256": producer.producer_version_sha256,
+        "source_mode": producer.source_mode,
+        "hook_id": producer.hook_id,
+        "clock": "monotonic_ns",
+        "complete": True,
+        "requests": [common],
+    }
+
+
+def _expected() -> tuple[ItlRequestExpectation, ...]:
+    return (
+        ItlRequestExpectation(
+            request_id="request-1",
+            request_started_ns=100,
+            request_terminal_ns=180,
+            output_token_ids=(10, 11, 12),
+        ),
+    )
+
+
+def _write(path: Path, value: object) -> Path:
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_current_release_blocks_e2_before_raw_path_is_inspected(tmp_path: Path) -> None:
+    registry, cell = _registry_and_cell()
+    plan = release_e2_itl_timestamp_plan(registry, cell)
+    activation = evaluate_e2_itl_timestamp_activation(plan)
+
+    assert activation.status == "BLOCKED"
+    assert activation.reason_code == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert activation.producer_sha256 is None
+    with pytest.raises(ItlTimestampAuthorityBlocked) as error:
+        require_e2_itl_timestamp_prelaunch(plan)
+    assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+
+    missing = tmp_path / "must-not-be-created" / "raw-itl.json"
+    with pytest.raises(ItlTimestampAuthorityBlocked) as error:
+        bind_itl_timestamp_authority(plan, missing, expected_requests=_expected())
+    assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert not missing.parent.exists()
+
+
+def test_serving_chunks_never_average_a_coalesced_gap() -> None:
+    coalesced = (
+        TokenChunkTiming(
+            request_id="request-1",
+            first_token_index=0,
+            token_count=3,
+            chunk_observed_at_us=900,
+            per_token_observed_at_us=None,
+        ),
+    )
+    assert (
+        assess_serving_chunks_for_formal_itl(
+            request_id="request-1",
+            output_tokens=3,
+            chunks=coalesced,
+        )
+        == ITL_COALESCED_CHUNK_UNPROVEN_REASON
+    )
+
+    exact_looking = tuple(
+        TokenChunkTiming("request-1", index, 1, observed)
+        for index, observed in enumerate((100, 200, 300))
+    )
+    assert (
+        assess_serving_chunks_for_formal_itl(
+            request_id="request-1",
+            output_tokens=3,
+            chunks=exact_looking,
+        )
+        == ITL_RAW_RECEIPT_MISSING_REASON
+    )
+
+
+def test_native_hook_receipt_preserves_exact_token_timestamps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, producer = _ready_plan(monkeypatch, "native_per_token_timestamp_hook")
+    path = _write(tmp_path / "native-itl.json", _receipt(plan, producer)).resolve()
+
+    authority = bind_itl_timestamp_authority(plan, path, expected_requests=_expected())
+
+    request = authority.requests[0]
+    assert request.output_token_ids == (10, 11, 12)
+    assert request.token_observed_ns == (110, 130, 170)
+    assert request.inter_token_ns == (20, 40)
+    assert authority.token_timestamps_for("request-1") == (110, 130, 170)
+    assert revalidate_itl_timestamp_authority(authority) == authority
+
+
+def test_raw_receipt_must_cover_the_complete_terminal_request_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, producer = _ready_plan(monkeypatch, "native_per_token_timestamp_hook")
+    path = _write(tmp_path / "native-itl.json", _receipt(plan, producer)).resolve()
+    expected = _expected() + (
+        ItlRequestExpectation(
+            request_id="request-2",
+            request_started_ns=200,
+            request_terminal_ns=280,
+            output_token_ids=(20, 21),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="omits an expected request"):
+        bind_itl_timestamp_authority(plan, path, expected_requests=expected)
+
+
+def test_sse_receipt_requires_exactly_one_new_token_per_raw_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, producer = _ready_plan(monkeypatch, "sse_one_token_per_frame")
+    receipt = _receipt(plan, producer)
+    path = _write(tmp_path / "sse-itl.json", receipt).resolve()
+    authority = bind_itl_timestamp_authority(plan, path, expected_requests=_expected())
+    assert authority.requests[0].inter_token_ns == (20, 40)
+
+    coalesced = deepcopy(receipt)
+    request = coalesced["requests"][0]
+    request["raw_sse_frames"] = [
+        {"frame_index": 0, "new_token_ids": [10, 11], "observed_ns": 130},
+        {"frame_index": 1, "new_token_ids": [12], "observed_ns": 170},
+    ]
+    _write(path, coalesced)
+    with pytest.raises(ItlTimestampAuthorityBlocked) as error:
+        bind_itl_timestamp_authority(plan, path, expected_requests=_expected())
+    assert error.value.reason == ITL_COALESCED_CHUNK_UNPROVEN_REASON
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing_event", "coverage is incomplete"),
+        ("wrong_token", "differ from ordered output tokens"),
+        ("equal_timestamp", "strictly increasing"),
+        ("outside_lifetime", "outside the request lifetime"),
+    ),
+)
+def test_native_raw_receipt_rejects_incomplete_or_invented_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    plan, producer = _ready_plan(monkeypatch, "native_per_token_timestamp_hook")
+    receipt = _receipt(plan, producer)
+    request = receipt["requests"][0]
+    events = request["token_events"]
+    if mutation == "missing_event":
+        events.pop()
+    elif mutation == "wrong_token":
+        events[1]["token_id"] = 99
+    elif mutation == "equal_timestamp":
+        events[1]["observed_ns"] = 110
+    else:
+        events[-1]["observed_ns"] = 181
+    path = _write(tmp_path / f"bad-{mutation}.json", receipt).resolve()
+
+    with pytest.raises(ValueError, match=message):
+        bind_itl_timestamp_authority(plan, path, expected_requests=_expected())
+
+
+def test_raw_path_symlink_tamper_and_coordinated_rewrite_fail_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, producer = _ready_plan(monkeypatch, "native_per_token_timestamp_hook")
+    receipt = _receipt(plan, producer)
+    path = _write(tmp_path / "native-itl.json", receipt).resolve()
+    link = tmp_path / "native-itl-link.json"
+    link.symlink_to(path)
+    with pytest.raises(ValueError, match="resolved and non-symlink"):
+        bind_itl_timestamp_authority(plan, link, expected_requests=_expected())
+
+    authority = bind_itl_timestamp_authority(plan, path, expected_requests=_expected())
+    changed = deepcopy(receipt)
+    changed["requests"][0]["token_events"][1]["observed_ns"] = 140
+    _write(path, changed)
+    with pytest.raises(ValueError, match="changed during revalidation"):
+        revalidate_itl_timestamp_authority(authority)
+
+
+def test_foreign_cell_and_ambiguous_release_producers_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = build_industrial_registry()
+    foreign = registry.cells_for("E1")[0]
+    with pytest.raises(ValueError, match="foreign to the E2 registry"):
+        release_e2_itl_timestamp_plan(registry, foreign)
+
+    monkeypatch.setattr(
+        itl_authority,
+        "RELEASE_ITL_TIMESTAMP_PRODUCERS",
+        (
+            _producer("native_per_token_timestamp_hook"),
+            _producer("sse_one_token_per_frame"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="allowlist is ambiguous"):
+        release_e2_itl_timestamp_plan(registry, registry.cells_for("E2")[0])
