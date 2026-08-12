@@ -22,6 +22,7 @@ from lightcone_spec.experiments.stage_activation import (
     registry_stage_activation_from_dict,
     registry_stage_activation_to_dict,
     release_dispatch_rejection_reason,
+    release_execution_capability_rejection_reason,
     verify_registry_stage_activation,
 )
 
@@ -125,9 +126,7 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
         registry_stage_activation_from_dict(boolean_schema)
 
 
-def test_generic_reducer_requires_complete_dependency_prefix_and_blocks_methods() -> (
-    None
-):
+def test_generic_reducer_requires_complete_prefix_and_exact_serving_semantics() -> None:
     registry = build_industrial_registry()
     with pytest.raises(ValueError, match="complete dependency receipt prefix"):
         materialize_registry_stage_activation(
@@ -148,10 +147,11 @@ def test_generic_reducer_requires_complete_dependency_prefix_and_blocks_methods(
     assert e3a.status == "AVAILABLE"
     cells = {cell.cell_id: cell for cell in registry.cells_for("E3a")}
     assert {cells[cell_id].identity.method for cell_id in e3a.activated_cell_ids} == {
-        "target_only"
+        "target_only",
+        "static",
     }
     assert all(
-        row.status is RegistryStageDispositionStatus.BLOCKED
+        row.status is RegistryStageDispositionStatus.ACTIVATED
         for row in e3a.dispositions
         if cells[row.cell_id].identity.method == "static"
     )
@@ -170,9 +170,26 @@ def test_generic_reducer_requires_complete_dependency_prefix_and_blocks_methods(
         for row in e4.dispositions
         if row.status is RegistryStageDispositionStatus.BLOCKED
     } <= {
-        "release_method_capability_unsupported",
+        "release_serving_contract_unresolved",
         "release_topology_executor_unsupported",
     }
+    unresolved_adaptive = next(
+        cell
+        for cell in registry.cells_for("E4")
+        if cell.identity.method == "tts"
+        and cell.identity.backend == "DFLASH"
+        and cell.identity.topology == "tp1_dp1"
+    )
+    assert release_execution_capability_rejection_reason(unresolved_adaptive) is None
+    assert release_dispatch_rejection_reason(unresolved_adaptive) == (
+        "release_serving_contract_unresolved"
+    )
+    assert (
+        next(
+            row for row in e4.dispositions if row.cell_id == unresolved_adaptive.cell_id
+        ).status
+        is RegistryStageDispositionStatus.BLOCKED
+    )
     with pytest.raises(ValueError, match="cannot seal without an AVAILABLE"):
         _industrial_completion_activation_contract(
             registry,

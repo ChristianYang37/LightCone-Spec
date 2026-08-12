@@ -573,7 +573,7 @@ def _bundle_fixture(
             (
                 _budget_load_binding(row, execution_cell_id=cell.cell_id)
                 for row in registry.cells_for("E3a")
-                if row.identity.method == "target_only"
+                if row.identity.method in {"target_only", "static"}
                 and row.status.value == "UNMEASURED"
             ),
             key=lambda row: row.cell_id,

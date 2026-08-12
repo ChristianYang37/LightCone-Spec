@@ -163,7 +163,7 @@ def test_context_reopens_exact_authority_and_formal_dependency_is_blocked(
     assert budget_materialization_authority_binding_from_dict(wire) == fixture.authority
     result = _revalidate(fixture, fixture.authority)
     assert result.budget_plan == fixture.plan
-    assert len(result.load_bindings) == len(fixture.plan.activated_cell_ids) == 96
+    assert len(result.load_bindings) == len(fixture.plan.activated_cell_ids) == 360
     summary = fixture.execution.authority_dict()
     assert summary["schema_version"] == 4
     assert summary["interference_calibration_authority_sha256"] is None

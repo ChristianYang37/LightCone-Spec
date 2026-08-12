@@ -51,8 +51,15 @@ REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256 = content_sha256(
         ),
         "compile": "blocked_without_first_party_prewarm_and_result_pointer",
         "download": "blocked_without_first_party_download_terminal_contract",
-        "serving": "target_only_and_registry_serving_contract_only",
-        "unsupported_methods": ("tts", "l0"),
+        "serving": (
+            "target_only_static_and_single_rank_dflash_core_when_exact_semantics_"
+            "are_bound_by_a_first_party_reducer"
+        ),
+        "unsupported_methods": (
+            "onlinespec_ogd",
+            "onlinespec_opt",
+            "onlinespec_ens",
+        ),
         "missing_semantics": "blocked",
     }
 )
@@ -331,11 +338,18 @@ class RegistryStageActivationArtifact:
         return content_sha256(self._payload_dict())
 
 
-def release_dispatch_rejection_reason(cell: ExperimentCell) -> str | None:
-    """Return the release-owned reason a registry cell cannot be dispatched."""
+def release_execution_capability_rejection_reason(
+    cell: ExperimentCell,
+) -> str | None:
+    """Check release method/topology capability without resolving template axes.
+
+    This narrower predicate is only for cells selected by a verified bespoke
+    reducer.  It cannot make a generic registry template executable: callers
+    without reducer authority must use :func:`release_dispatch_rejection_reason`.
+    """
 
     if type(cell) is not ExperimentCell:
-        raise TypeError("release dispatchability requires an exact registry cell")
+        raise TypeError("release capability requires an exact registry cell")
     if cell.status is not CellStatus.UNMEASURED:
         return cell.reason_code
     # Resource isolation is only a placement property.  It is not terminal
@@ -350,10 +364,32 @@ def release_dispatch_rejection_reason(cell: ExperimentCell) -> str | None:
         if is_serving_interference_calibration_cell(cell):
             return None
         return "release_preflight_method_unsupported"
-    if cell.identity.method != "target_only":
-        return "release_method_capability_unsupported"
+    if cell.identity.topology != "tp1_dp1":
+        return "release_topology_executor_unsupported"
+    method = cell.identity.method
+    if method in {"target_only", "static"}:
+        return None
+    if method in {"tts", "l0"} and cell.identity.backend == "DFLASH":
+        return None
+    if method in {"tts", "l0"}:
+        return "release_adaptive_backend_unsupported"
+    if method.startswith("onlinespec_"):
+        return "release_onlinespec_execution_contract_unavailable"
+    return "release_method_capability_unsupported"
+
+
+def release_dispatch_rejection_reason(cell: ExperimentCell) -> str | None:
+    """Return why a cell lacks both release capability and exact semantics."""
+
+    capability = release_execution_capability_rejection_reason(cell)
+    if capability is not None:
+        return capability
+    if is_serving_interference_calibration_cell(cell):
+        return None
     if serving_cell_rejection_reason(cell) is not None:
         return "release_serving_contract_unresolved"
+    if cell.identity.method not in {"target_only", "static", "tts", "l0"}:
+        return "release_method_capability_unsupported"
     return None
 
 
@@ -676,5 +712,6 @@ __all__ = [
     "registry_stage_activation_from_dict",
     "registry_stage_activation_to_dict",
     "release_dispatch_rejection_reason",
+    "release_execution_capability_rejection_reason",
     "verify_registry_stage_activation",
 ]

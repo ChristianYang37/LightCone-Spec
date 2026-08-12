@@ -57,11 +57,14 @@ from lightcone_spec.experiments.planning import (
     ExperimentBudget,
     P99AnchorStatus,
     RawEvidenceRunBinding,
+    ReducerActivationArtifact,
     ScenarioMilliseconds,
+    SealedE3aSelection,
     derive_confirmation_family,
     family_pilot_block_id,
     materialize_confirmation_pilots,
     materialize_confirmation_prefix,
+    reduce_e1_activation,
 )
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
@@ -82,6 +85,7 @@ from lightcone_spec.experiments.stage_activation import (
     RegistryStageDispositionStatus,
     materialize_registry_stage_activation,
     release_dispatch_rejection_reason,
+    release_execution_capability_rejection_reason,
 )
 from lightcone_spec.experiments.statistics import PilotBlock, preregister_power_sizing
 from lightcone_spec.orchestration.execution_bundle import (
@@ -244,6 +248,42 @@ def _receipts_through(
         if definition.name == experiment:
             return tuple(receipts)
     raise AssertionError(f"unknown experiment {experiment}")
+
+
+def _sealed_e1_activation(
+    registry: ExperimentRegistry,
+) -> tuple[tuple[ExperimentReceipt, ...], ReducerActivationArtifact]:
+    preflight = _receipts_through(registry, "preflight")[0]
+    runtime_sha256 = content_sha256("e1-reducer-runtime")
+    split_sha256 = content_sha256("e1-reducer-split")
+    selection = SealedE3aSelection(
+        schema_version=1,
+        registry_sha256=registry.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        width=8,
+        concurrency=8,
+        reducer_evidence_sha256=content_sha256("e1-reducer-evidence"),
+    )
+    e3a_outputs = {
+        output: content_sha256({"e3a-output": output})
+        for output in registry.definition("E3a").locked_outputs
+    }
+    e3a_outputs["matched_width"] = selection.matched_width_output_sha256
+    e3a_outputs["e1_reference_load"] = selection.reference_load_output_sha256
+    e3a = registry.make_receipt(
+        "E3a",
+        e3a_outputs,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        completed_cells_sha256=content_sha256("e3a-reducer-completed"),
+        dependencies=(preflight,),
+    )
+    return (preflight, e3a), reduce_e1_activation(
+        registry,
+        e3a_receipt=e3a,
+        selection=selection,
+    )
 
 
 def _milliseconds(value: int) -> ScenarioMilliseconds:
@@ -466,15 +506,14 @@ def _family_power_reduction(
     )
 
 
-def _target_ids(
+def _reducer_dispatchable_ids(
     registry: ExperimentRegistry, activated_cell_ids: tuple[str, ...]
 ) -> set[str]:
     cells = {cell.cell_id: cell for cell in registry.cells}
     return {
         cell_id
         for cell_id in activated_cell_ids
-        if cells[cell_id].identity.method == "target_only"
-        and serving_cell_rejection_reason(cells[cell_id]) is None
+        if GpuPoolScheduler._dispatchable(cells[cell_id], reducer_authorized=True)
     }
 
 
@@ -673,20 +712,115 @@ def test_generic_stage_activation_is_replayed_before_scheduling(
     )
     artifact = context.activation_artifact
     assert isinstance(artifact, RegistryStageActivationArtifact)
-    blocked_index = next(
+    disposition_index = next(
         index
         for index, row in enumerate(artifact.dispositions)
-        if row.status is RegistryStageDispositionStatus.BLOCKED
+        if row.status is RegistryStageDispositionStatus.ACTIVATED
     )
     edited_rows = list(artifact.dispositions)
-    edited_rows[blocked_index] = replace(
-        edited_rows[blocked_index],
+    edited_rows[disposition_index] = replace(
+        edited_rows[disposition_index],
         reason_code="caller_edited_dispatch_disposition",
     )
     edited = replace(artifact, dispositions=tuple(edited_rows))
 
     with pytest.raises(ValueError, match="exact reducer-generated"):
         replace(context, activation_artifact=edited).issue_plan()
+
+
+def test_exact_e1_reducer_can_schedule_dflash_templates_but_direct_api_cannot(
+    registry: ExperimentRegistry,
+) -> None:
+    receipts, activation = _sealed_e1_activation(registry)
+    selected = set(activation.plan.activated_cell_ids)
+    cells = {cell.cell_id: cell for cell in registry.cells_for("E1")}
+    assert len(selected) == 130
+    assert {cells[cell_id].identity.method for cell_id in selected} == {
+        "target_only",
+        "static",
+        "tts",
+        "l0",
+    }
+    adaptive = next(
+        cells[cell_id]
+        for cell_id in selected
+        if cells[cell_id].identity.method == "tts"
+    )
+    assert release_execution_capability_rejection_reason(adaptive) is None
+    assert release_dispatch_rejection_reason(adaptive) == (
+        "release_serving_contract_unresolved"
+    )
+    assert not GpuPoolScheduler._dispatchable(adaptive)
+    assert GpuPoolScheduler._dispatchable(adaptive, reducer_authorized=True)
+
+    inventory = _inventory(2)
+    scheduler = _scheduler(
+        registry,
+        inventory,
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("e1-reducer-serial")
+        ),
+    )
+    direct_item = registry_pool_work_item(adaptive, estimated_duration_seconds=1.0)
+    with pytest.raises(ValueError, match="non-executable"):
+        scheduler.schedule_work_items(
+            (direct_item,),
+            receipts_sha256=content_sha256("direct-e1-template-receipts"),
+            budget_sha256_by_cell=_diagnostic_budget_bindings((direct_item,)),
+        )
+
+    plan = scheduler.schedule(
+        budgets_by_cell_id=_budgets_for(
+            registry,
+            selected,
+            fixed_instance_gpu_count=len(inventory.devices),
+        ),
+        receipts=receipts,
+        activation_artifact=activation,
+    )
+    assert _planned_cell_ids(plan) == selected
+    assert plan.scientific_budget_bound
+
+
+def test_reducer_capability_never_bypasses_backend_topology_or_method_gates(
+    registry: ExperimentRegistry,
+) -> None:
+    _, activation = _sealed_e1_activation(registry)
+    cells = {cell.cell_id: cell for cell in registry.cells_for("E1")}
+    dflash = next(
+        cells[cell_id]
+        for cell_id in activation.plan.activated_cell_ids
+        if cells[cell_id].identity.method == "l0"
+    )
+    unsupported_backend = replace(
+        dflash,
+        identity=replace(dflash.identity, backend="DSPARK"),
+    )
+    unsupported_topology = next(
+        cell
+        for cell in registry.cells_for("E4")
+        if cell.identity.method == "l0"
+        and cell.identity.topology == "two_gpu_host_exclusive"
+        and cell.runnable
+    )
+    unsupported_method = next(
+        cell
+        for cell in registry.cells_for("E0")
+        if cell.identity.method.startswith("onlinespec_") and cell.runnable
+    )
+    assert release_execution_capability_rejection_reason(unsupported_backend) == (
+        "release_adaptive_backend_unsupported"
+    )
+    assert release_execution_capability_rejection_reason(unsupported_topology) == (
+        "release_topology_executor_unsupported"
+    )
+    assert release_execution_capability_rejection_reason(unsupported_method) == (
+        "release_onlinespec_execution_contract_unavailable"
+    )
+    assert all(
+        not GpuPoolScheduler._dispatchable(cell, reducer_authorized=True)
+        for cell in (unsupported_backend, unsupported_topology, unsupported_method)
+    )
 
 
 def test_bare_completed_cells_are_planning_only_and_cannot_skip_the_runner(
@@ -755,9 +889,9 @@ def test_one_confirmation_family_materializes_only_its_pilots(
 ) -> None:
     family = _e5_family(registry, concurrency=1)
     pilots = materialize_confirmation_pilots(registry, family)
-    expected = _target_ids(registry, pilots.activated_cell_ids)
+    expected = _reducer_dispatchable_ids(registry, pilots.activated_cell_ids)
     assert len(pilots.activated_cell_ids) == len(PILOT_BLOCKS) * len(CORE_METHODS)
-    assert len(expected) == len(PILOT_BLOCKS)
+    assert expected == set(pilots.activated_cell_ids)
     inventory = _inventory(4)
     scheduler = _scheduler(
         registry,
@@ -780,11 +914,11 @@ def test_one_confirmation_family_materializes_only_its_pilots(
     assert _planned_cell_ids(plan) == expected
     assert plan.scientific_budget_bound
     assert set(dict(plan.budget_sha256_by_cell)) == expected
-    assert all(
-        assignment.work_item.cell.identity.method == "target_only"
+    assert {
+        assignment.work_item.cell.identity.method
         for wave in plan.waves
         for assignment in wave.assignments
-    )
+    } == set(CORE_METHODS)
 
 
 @pytest.mark.parametrize("selected_final_blocks", (12, 20))
@@ -808,8 +942,8 @@ def test_family_final_prefix_is_exact_and_unrelated_family_does_not_block(
     )
     unrelated_family = _e5_family(registry, concurrency=2)
     unrelated_pilots = materialize_confirmation_pilots(registry, unrelated_family)
-    expected_final = _target_ids(registry, final.activated_cell_ids)
-    expected_unrelated_pilots = _target_ids(
+    expected_final = _reducer_dispatchable_ids(registry, final.activated_cell_ids)
+    expected_unrelated_pilots = _reducer_dispatchable_ids(
         registry, unrelated_pilots.activated_cell_ids
     )
     expected = expected_final | expected_unrelated_pilots
@@ -836,7 +970,7 @@ def test_family_final_prefix_is_exact_and_unrelated_family_does_not_block(
         family_power_reductions=(power,),
     )
 
-    assert len(expected_final) == selected_final_blocks
+    assert len(expected_final) == selected_final_blocks * len(CORE_METHODS)
     assert _planned_cell_ids(plan) == expected
     final_blocks = {
         assignment.work_item.cell.identity.block
@@ -1202,7 +1336,7 @@ def test_two_way_calibration_never_authorizes_eight_way_execution(
     assert max(len(wave.assignments) for wave in plan.waves) == 2
 
 
-def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
+def test_unsupported_tp_topology_is_encoded_but_never_reaches_placement(
     registry: ExperimentRegistry,
 ) -> None:
     inventory = _inventory(4, paired_topology=True)
@@ -1211,8 +1345,8 @@ def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
         for cell in registry.cells_for("preflight")
         if cell.identity.method == "target_only"
     )
-    # Exercise the generic TP placement primitive without treating the blocked
-    # COMPILE declaration as executable authority.
+    # Retain the gang-shape encoding assertion while proving that an unsupported
+    # topology cannot use the low-level scheduling API as an authority bypass.
     topology_cell = replace(
         preflight,
         resources=replace(
@@ -1243,39 +1377,34 @@ def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
         InterferenceEnvelope.serial(source_receipt_sha256=content_sha256("serial")),
     )
 
-    plan = scheduler.schedule_work_items(
-        (item,), receipts_sha256=content_sha256("receipts")
-    )
-    assignment = plan.waves[0].assignments[0]
-
     assert item.claim.gang_shape == GangShape(2, 1)
-    assert assignment.rank_groups == (assignment.gpu_uuids,)
-    assert set(assignment.gpu_uuids) in (
-        {"GPU-000", "GPU-001"},
-        {"GPU-002", "GPU-003"},
+    assert release_execution_capability_rejection_reason(topology_cell) == (
+        "release_topology_executor_unsupported"
     )
-
-    impossible = replace(
-        item,
-        claim=replace(
-            item.claim,
-            exact_gpu_uuids=("GPU-001", "GPU-002"),
-        ),
-    )
-    with pytest.raises(CapabilityRejectionError, match="no ready capability"):
+    assert not GpuPoolScheduler._dispatchable(topology_cell, reducer_authorized=True)
+    with pytest.raises(ValueError, match="non-executable"):
         scheduler.schedule_work_items(
-            (impossible,), receipts_sha256=content_sha256("receipts")
+            (item,), receipts_sha256=content_sha256("receipts")
         )
 
-    one_gpu = _inventory(1)
-    with pytest.raises(CapabilityRejectionError, match="no ready capability"):
-        _scheduler(
-            topology_registry,
-            one_gpu,
-            InterferenceEnvelope.serial(
-                source_receipt_sha256=content_sha256("serial-one")
-            ),
-        ).schedule_work_items((item,), receipts_sha256=content_sha256("receipts"))
+    candidates = scheduler._candidate_gangs(item)
+    assert {frozenset(candidate) for candidate in candidates} == {
+        frozenset(("GPU-000", "GPU-001")),
+        frozenset(("GPU-002", "GPU-003")),
+    }
+    cross_group = replace(
+        item,
+        claim=replace(item.claim, exact_gpu_uuids=("GPU-001", "GPU-002")),
+    )
+    assert scheduler._candidate_gangs(cross_group) == ()
+    one_gpu_scheduler = _scheduler(
+        topology_registry,
+        _inventory(1),
+        InterferenceEnvelope.serial(
+            source_receipt_sha256=content_sha256("one-gpu-topology-primitive")
+        ),
+    )
+    assert one_gpu_scheduler._candidate_gangs(item) == ()
 
 
 def test_readiness_capability_and_foreign_claims_fail_closed(

@@ -2699,15 +2699,23 @@ def replay_budget_activation_authority(
             raise ValueError(
                 "budget authority supports only runnable serving activation"
             )
-    if type(binding) is RegistryStageActivationAuthorityBinding and any(
-        activated[cell_id].identity.method != "target_only"
-        and not is_serving_interference_calibration_cell(activated[cell_id])
-        for cell_id in set(activated_ids)
-    ):
-        raise ValueError(
-            "generic budget authority supports only target-only serving or the "
-            "registered Static interference calibration activation"
-        )
+    if type(binding) is RegistryStageActivationAuthorityBinding:
+        artifact = rebound.activation_artifact
+        if type(artifact) is not RegistryStageActivationArtifact:  # pragma: no cover
+            raise TypeError("generic authority replay lost its stage activation")
+        if any(
+            activated[cell_id].identity.method != "target_only"
+            and not (
+                artifact.experiment == "E3a"
+                and activated[cell_id].identity.method == "static"
+            )
+            and not is_serving_interference_calibration_cell(activated[cell_id])
+            for cell_id in set(activated_ids)
+        ):
+            raise ValueError(
+                "generic budget authority supports only Target-only, E3a Static, "
+                "or the registered Static interference calibration activation"
+            )
     return rebound
 
 

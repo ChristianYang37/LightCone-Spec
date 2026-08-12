@@ -61,6 +61,7 @@ from lightcone_spec.experiments.registry import (
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
     release_dispatch_rejection_reason,
+    release_execution_capability_rejection_reason,
     verify_registry_stage_activation,
 )
 
@@ -2229,6 +2230,8 @@ class GpuPoolScheduler:
         if set(completed) - known_ids:
             raise ValueError("completed cells include an identity outside the registry")
         experiment = self.registry.ready_experiment(receipts)
+        reducer_authorized: frozenset[str] = frozenset()
+        pending_reducer_authorized: frozenset[str] = frozenset()
         if experiment is None:
             if (
                 activation_artifact is not None
@@ -2253,12 +2256,23 @@ class GpuPoolScheduler:
                 if activated is not None:
                     raise ValueError("stage cannot mix activation protocols")
                 activated = confirmation_activated
+            reducer_authorized = (
+                frozenset(activated)
+                if experiment in {"E1", "E2", "E3b", "E5"} and activated is not None
+                else frozenset()
+            )
             pending = tuple(
                 cell
                 for cell in self.registry.cells_for(experiment)
-                if self._dispatchable(cell)
+                if self._dispatchable(
+                    cell,
+                    reducer_authorized=cell.cell_id in reducer_authorized,
+                )
                 and cell.cell_id not in completed
                 and (activated is None or cell.cell_id in activated)
+            )
+            pending_reducer_authorized = frozenset(
+                reducer_authorized.intersection(cell.cell_id for cell in pending)
             )
         budgets = dict(budgets_by_cell_id)
         if set(budgets) != {cell.cell_id for cell in pending}:
@@ -2293,7 +2307,7 @@ class GpuPoolScheduler:
             )
             for cell in pending
         )
-        return self.schedule_work_items(
+        return self._schedule_work_items(
             work_items,
             receipts_sha256=content_sha256(
                 tuple(sorted(receipt.sha256 for receipt in receipts))
@@ -2302,6 +2316,7 @@ class GpuPoolScheduler:
             budget_sha256_by_cell={
                 cell_id: budget.sha256 for cell_id, budget in budgets.items()
             },
+            reducer_authorized_cell_ids=pending_reducer_authorized,
         )
 
     def schedule_work_items(
@@ -2321,6 +2336,25 @@ class GpuPoolScheduler:
         ExperimentBudget bindings.
         """
 
+        return self._schedule_work_items(
+            work_items,
+            receipts_sha256=receipts_sha256,
+            completed_cell_ids=completed_cell_ids,
+            budget_sha256_by_cell=budget_sha256_by_cell,
+            reducer_authorized_cell_ids=frozenset(),
+        )
+
+    def _schedule_work_items(
+        self,
+        work_items: Sequence[PoolWorkItem],
+        *,
+        receipts_sha256: str,
+        completed_cell_ids: Sequence[str],
+        budget_sha256_by_cell: Mapping[str, str] | None,
+        reducer_authorized_cell_ids: frozenset[str],
+    ) -> GpuDispatchPlan:
+        """Schedule after a trusted caller has bound any reducer-selected cells."""
+
         _require_sha256("receipts_sha256", receipts_sha256)
         items = tuple(work_items)
         if len({item.item_id for item in items}) != len(items):
@@ -2333,7 +2367,15 @@ class GpuPoolScheduler:
         for cell_id, budget_sha256 in budget_bindings.items():
             _require_sha256("dispatch budget cell ID", cell_id)
             _require_sha256("dispatch ExperimentBudget SHA-256", budget_sha256)
-        if any(not self._dispatchable(item.cell) for item in items):
+        if reducer_authorized_cell_ids - {item.item_id for item in items}:
+            raise ValueError("reducer-authorized cells differ from the work-item set")
+        if any(
+            not self._dispatchable(
+                item.cell,
+                reducer_authorized=item.item_id in reducer_authorized_cell_ids,
+            )
+            for item in items
+        ):
             raise ValueError(
                 "work items contain a blocked or non-executable method/capability"
             )
@@ -2623,7 +2665,13 @@ class GpuPoolScheduler:
         return self.interference_envelope.permits(assignments, inventory=self.inventory)
 
     @staticmethod
-    def _dispatchable(cell: ExperimentCell) -> bool:
+    def _dispatchable(
+        cell: ExperimentCell,
+        *,
+        reducer_authorized: bool = False,
+    ) -> bool:
+        if reducer_authorized:
+            return release_execution_capability_rejection_reason(cell) is None
         return release_dispatch_rejection_reason(cell) is None
 
     def _activated_cell_ids(
@@ -2741,7 +2789,10 @@ class GpuPoolScheduler:
             ):
                 raise ValueError("E2 activation must retain matched TTS/L0 pairs")
         if any(
-            not self._dispatchable(stage_cells[cell_id])
+            not self._dispatchable(
+                stage_cells[cell_id],
+                reducer_authorized=True,
+            )
             for cell_id in plan.activated_cell_ids
         ):
             raise ValueError(
