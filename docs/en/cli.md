@@ -26,6 +26,7 @@ authority. The schema-v3 and industrial commands are:
 | `build-evidence-dependence-map` | Preserve shared-observation dependence from reducer-issued alias artifacts |
 | `materialize-stage-activation` | Replay generic registry-stage dispatchability from raw registry, lineage, runtime, and split authority |
 | `materialize-industrial-budgets` | Derive one fail-closed `BudgetPlan` from reducer, load, inventory, policy, and capacity authority |
+| `bind-industrial-budget-authority` | Bind a declared `BudgetPlan` to its complete tagged raw activation/load/capacity closure |
 | `estimate-industrial-budget` | Replay one ready `BudgetPlan` on an exact physical inventory and interference envelope |
 | `plan-industrial-dispatch` | Freeze deterministic topology-aware GPU-pool waves and physical assignments |
 | `execute-dispatch-wave` | Replay path-bound assignment bundles and execute one receipt-bounded frozen wave when all release authorities are available |
@@ -173,6 +174,26 @@ closes through the generic reducer; omitting its bound raw manifest is still an
 explicit unresolved authority error, and a caller-authored activation cannot
 bridge it. Serving activations additionally repeat `--budget-load-binding PATH`
 once per activated serving cell.
+
+Formal consumers do not accept the `BudgetPlan` alone. After materialization,
+publish its path-bound raw closure with the tagged activation manifest (not a
+serialized activation summary):
+
+```bash
+lightcone-spec bind-industrial-budget-authority \
+  --activation-manifest artifacts/industrial/preflight-activation-manifest.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --output artifacts/industrial/budget-authority.json
+```
+
+Repeat `--budget-load-binding PATH` for every activated cell. The command
+reopens all sources, reruns the registered reducer, exact-compares the declared
+plan, and writes only the resulting binding; it never turns an `UNRESOLVED`
+plan into execution permission.
 
 Planning reloads that `BudgetPlan`, reruns materialization from the same raw
 inputs, and requires exact equality before scheduling. It also requires the

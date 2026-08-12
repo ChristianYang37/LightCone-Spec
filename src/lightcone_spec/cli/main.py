@@ -25,6 +25,9 @@ from lightcone_spec import (
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import format_doctor
 from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.experiments.budget_authority import (
+    bind_budget_materialization_authority,
+)
 from lightcone_spec.experiments.capacity_authority import bind_capacity_authority
 from lightcone_spec.experiments.data import (
     DFLASH_MODEL_CONTEXT_LIMIT,
@@ -103,6 +106,7 @@ from lightcone_spec.experiments.planning import (
 )
 from lightcone_spec.experiments.planning_artifacts import (
     budget_load_binding_from_dict,
+    budget_materialization_authority_binding_to_dict,
     budget_plan_from_dict,
     budget_plan_to_dict,
     budget_policy_from_dict,
@@ -2194,6 +2198,20 @@ def _parser() -> argparse.ArgumentParser:
     materialize_budget.add_argument("--capacity-verification-receipt")
     materialize_budget.add_argument("--inventory", required=True)
     materialize_budget.add_argument("--output", required=True)
+
+    bind_budget_authority = commands.add_parser(
+        "bind-industrial-budget-authority", allow_abbrev=False
+    )
+    bind_budget_authority.add_argument("--activation-manifest", required=True)
+    bind_budget_authority.add_argument("--budget-policy", required=True)
+    bind_budget_authority.add_argument(
+        "--budget-load-binding", action="append", default=[]
+    )
+    bind_budget_authority.add_argument("--capacity-envelope", required=True)
+    bind_budget_authority.add_argument("--capacity-manifest", required=True)
+    bind_budget_authority.add_argument("--capacity-verification-receipt", required=True)
+    bind_budget_authority.add_argument("--budget-plan", required=True)
+    bind_budget_authority.add_argument("--output", required=True)
 
     materialize_stage = commands.add_parser("materialize-stage-activation")
     materialize_stage.add_argument("--manifest", required=True)
@@ -6294,6 +6312,29 @@ def _materialize_industrial_budget_plan(args: argparse.Namespace) -> int:
     return 0 if plan.status == "READY" else 42
 
 
+def _bind_industrial_budget_authority(args: argparse.Namespace) -> int:
+    """Publish the sole path-bound authority for formal budget consumers."""
+
+    capacity_authority = bind_capacity_authority(
+        args.capacity_manifest,
+        args.capacity_verification_receipt,
+    )
+    authority = bind_budget_materialization_authority(
+        activation_manifest_path=args.activation_manifest,
+        policy_path=args.budget_policy,
+        load_binding_paths=tuple(args.budget_load_binding),
+        capacity_envelope_path=args.capacity_envelope,
+        capacity_authority=capacity_authority,
+        declared_plan_path=args.budget_plan,
+    )
+    value = budget_materialization_authority_binding_to_dict(authority)
+    _write_json(args.output, value)
+    if _load_bound_json(args.output) != value:
+        raise RuntimeError("written budget materialization authority changed identity")
+    print(authority.sha256)
+    return 0
+
+
 def _materialize_stage_activation(args: argparse.Namespace) -> int:
     artifact = _load_registry_stage_activation_manifest(args.manifest)
     _write_json(args.output, registry_stage_activation_to_dict(artifact))
@@ -6586,6 +6627,8 @@ def main(argv: list[str] | None = None) -> int:
         return _execute_dispatch_wave(args)
     if args.command == "materialize-industrial-budgets":
         return _materialize_industrial_budget_plan(args)
+    if args.command == "bind-industrial-budget-authority":
+        return _bind_industrial_budget_authority(args)
     if args.command == "materialize-stage-activation":
         return _materialize_stage_activation(args)
     if args.command == "estimate-industrial-budget":

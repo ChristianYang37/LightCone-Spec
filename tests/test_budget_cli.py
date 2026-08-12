@@ -831,14 +831,14 @@ def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
                 str(activation_path),
             ]
         )
-        == 42
+        == 0
     )
     activation = registry_stage_activation_from_dict(
         json.loads(activation_path.read_text(encoding="utf-8"))
     )
     assert activation.experiment == "preflight"
-    assert activation.status == "BLOCKED"
-    assert activation.activated_cell_ids == ()
+    assert activation.status == "AVAILABLE"
+    assert activation.activated_cell_ids
     assert {
         row.reason_code
         for row in activation.dispositions
@@ -847,6 +847,11 @@ def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
         RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
         "release_preflight_method_unsupported",
     }
+    assert all(
+        row.cell_id not in activation.activated_cell_ids
+        for row in activation.dispositions
+        if row.reason_code == RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
+    )
 
     policy = _budget_policy()
     policy_path = tmp_path / "preflight-budget-policy.json"
@@ -870,10 +875,7 @@ def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
         str(capacity_path),
     ]
     plan_path = tmp_path / "preflight-budget-plan.json"
-    with pytest.raises(
-        ValueError,
-        match="budget materialization requires at least one activated cell",
-    ):
+    assert (
         main(
             [
                 "materialize-industrial-budgets",
@@ -882,7 +884,11 @@ def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
                 str(plan_path),
             ]
         )
-    assert not plan_path.exists()
+        == 42
+    )
+    plan = budget_plan_from_dict(json.loads(plan_path.read_text(encoding="utf-8")))
+    assert plan.status == "UNRESOLVED"
+    assert set(plan.activated_cell_ids) == set(activation.activated_cell_ids)
 
     with pytest.raises(ValueError, match="bound raw activation manifest"):
         main(

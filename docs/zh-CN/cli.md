@@ -26,6 +26,7 @@ industrial 命令包括：
 | `build-evidence-dependence-map` | 从 reducer 签发的 alias artifact 保留 shared-observation dependence |
 | `materialize-stage-activation` | 从 raw registry、lineage、runtime 与 split authority 重放 generic stage dispatchability |
 | `materialize-industrial-budgets` | 从 reducer、load、inventory、policy 与 capacity authority 派生 fail-closed `BudgetPlan` |
+| `bind-industrial-budget-authority` | 把声明的 `BudgetPlan` 绑定到完整 tagged raw activation/load/capacity 闭包 |
 | `estimate-industrial-budget` | 在准确 physical inventory 与 interference envelope 上重放 ready `BudgetPlan` |
 | `plan-industrial-dispatch` | 冻结确定性、topology-aware GPU-pool wave 与 physical assignment |
 | `execute-dispatch-wave` | 重放 path-bound assignment bundle，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
@@ -159,6 +160,24 @@ lightcone-spec materialize-industrial-budgets \
 闭合；若省略 bound raw manifest，仍会得到明确 unresolved authority error，caller-authored
 activation 不能绕过。Serving activation 还要为每个 activated serving cell 重复传入一次
 `--budget-load-binding PATH`。
+
+Formal consumer 不接受单独的 `BudgetPlan`。Materialization 后，必须用 tagged raw
+activation manifest（不是 serialized activation summary）发布其 path-bound 原始闭包：
+
+```bash
+lightcone-spec bind-industrial-budget-authority \
+  --activation-manifest artifacts/industrial/preflight-activation-manifest.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --output artifacts/industrial/budget-authority.json
+```
+
+每个 activated cell 还要重复 `--budget-load-binding PATH`。该命令会重开所有原始来源、
+现场重跑注册 reducer 并准确比较 declared plan，只写出 binding；它绝不会把
+`UNRESOLVED` plan 变成 execution permission。
 
 Planning 会重新加载 `BudgetPlan`，用相同 raw input 现场重跑 materialization，并在调度前
 要求两者完全相等；同时还强制要求成对的 interference authority：
