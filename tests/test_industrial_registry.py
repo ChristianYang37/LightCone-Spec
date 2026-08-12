@@ -269,7 +269,10 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
         and cell.identity.optimizer != "chronobelief"
     ]
     assert native_schedule_cells
-    assert all(cell.status is CellStatus.UNMEASURED for cell in native_schedule_cells)
+    assert all(cell.status is CellStatus.BLOCKED for cell in native_schedule_cells)
+    assert {cell.reason_code for cell in native_schedule_cells} == {
+        "adaptation_recipe_values_unregistered"
+    }
     unsupported_topology = [
         cell
         for cell in registry.cells

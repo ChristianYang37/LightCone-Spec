@@ -446,8 +446,8 @@ def _e1_pareto_and_receipt(
     cell = next(
         cell
         for cell in registry.cells_for("E2")
-        if cell.runnable
-        and cell.identity.method == "tts"
+        if cell.identity.method == "tts"
+        and cell.identity.optimizer != "chronobelief"
         and "halving_stage=0:" in cell.identity.variant
     )
     geometry = E1GeometryIdentity.from_cell(cell)
@@ -475,6 +475,17 @@ def _e1_pareto_and_receipt(
         split_sha256=pareto.split_sha256,
     )
     return pareto, receipt
+
+
+def _require_executable_e2_recipe_authority(registry: ExperimentRegistry) -> None:
+    if not any(
+        cell.runnable
+        for cell in registry.cells_for("E2")
+        if cell.identity.method in {"tts", "l0"}
+    ):
+        pytest.skip(
+            "E2 positive halving path awaits source-owned optimizer/stride/width values"
+        )
 
 
 def _active_e2_candidates(
@@ -581,6 +592,7 @@ def _stage_evidence(
 def test_e2_successive_halving_materializes_only_sealed_survivors(
     registry: ExperimentRegistry,
 ) -> None:
+    _require_executable_e2_recipe_authority(registry)
     pareto, receipt = _e1_pareto_and_receipt(registry)
     stage_zero = reduce_e2_activation(
         registry,
@@ -675,6 +687,7 @@ def test_e2_successive_halving_materializes_only_sealed_survivors(
 def test_e2_family_floor_blocks_unsafe_family_and_never_promotes_it(
     registry: ExperimentRegistry,
 ) -> None:
+    _require_executable_e2_recipe_authority(registry)
     pareto, receipt = _e1_pareto_and_receipt(registry)
     activation = reduce_e2_activation(
         registry,
@@ -717,6 +730,7 @@ def test_e2_family_floor_blocks_unsafe_family_and_never_promotes_it(
 def _final_e2_reduction(
     registry: ExperimentRegistry, *, inventory: GpuInventory | None = None
 ):
+    _require_executable_e2_recipe_authority(registry)
     pareto, receipt = _e1_pareto_and_receipt(registry)
     reductions = []
     prior = None
@@ -845,6 +859,30 @@ def test_e2_final_seal_revalidates_recipe_and_raw_completion_receipts(
             completed_cells_path=str(wrong_completed_path),
             locked_output_paths={"dflash_recipe": str(recipe_path)},
         )
+
+
+def test_e2_activation_seals_named_block_when_recipe_authority_is_incomplete(
+    registry: ExperimentRegistry,
+) -> None:
+    pareto, receipt = _e1_pareto_and_receipt(registry)
+    activation = reduce_e2_activation(
+        registry,
+        e1_receipt=receipt,
+        pareto=pareto,
+        stage_index=0,
+    )
+    assert activation.plan.status == "BLOCKED"
+    assert activation.plan.activated_cell_ids == ()
+    assert activation.plan.reason_code == "e2_adaptation_recipe_authority_blocked"
+    assert activation.plan.blocked_cell_ids
+    assert {
+        row.reason_code
+        for row in activation.dispositions
+        if row.status is DispositionStatus.BLOCKED
+    } >= {
+        "adaptation_recipe_values_unregistered",
+        "optimizer_equation_unresolved",
+    }
 
 
 def _family(registry: ExperimentRegistry, *, context: int):

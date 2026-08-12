@@ -40,6 +40,11 @@ CONTEXT_REGIMES = (
     "multi_turn_shared_prefix",
 )
 DRAFT_WIDTHS = (4, 8, 16)
+# E2 is downstream of the sealed E3a width decision.  Its declarative cells are
+# one template per optimizer recipe, not three speculative-width cells.  The
+# exact width is materialized from this selector; an integer in an E2 template
+# would silently turn today's middle grid value into a scientific decision.
+E2_DRAFT_WIDTH_SELECTOR = "sealed_e3a_selection.matched_width"
 E3A_CONCURRENCY_GRID = (1, 2, 4, 8, 16, 32, 64)
 E1_SCOPES = ("last1", "last3", "last5", "all")
 E1_OPTIMIZER_ANCHORS = ("adamw", "sgdm")
@@ -638,6 +643,628 @@ class ParameterConfiguration:
         return content_sha256(self)
 
 
+@dataclass(frozen=True)
+class AdaptationRecipeLookupKey:
+    """Scientific fields that select one source-owned adaptation recipe.
+
+    TTS and L0 intentionally share a key.  E1 keys carry an exact width.  E2
+    keys carry a selector slot instead, because the width is an E3a output and
+    is not an optimizer-grid axis.
+    """
+
+    experiment: str
+    backend: str
+    scope: str
+    parameterization: str
+    rank: int | None
+    alpha_over_rank: float | None
+    optimizer: str
+    learning_rate: float | None
+    schedule: str
+    cohort: str
+    draft_width: int | None
+    draft_width_selector: str | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "experiment",
+            "backend",
+            "scope",
+            "parameterization",
+            "optimizer",
+            "schedule",
+            "cohort",
+        ):
+            _require_text(f"adaptation recipe {name}", getattr(self, name))
+        if self.experiment not in {"E1", "E2"}:
+            raise ValueError("adaptation recipes are registered only for E1/E2")
+        if self.backend != "DFLASH":
+            raise ValueError("E1/E2 adaptation recipes require DFLASH")
+        if self.parameterization == "full":
+            if self.rank is not None or self.alpha_over_rank is not None:
+                raise ValueError("Full recipe keys cannot carry LoRA fields")
+        elif self.parameterization == "lora":
+            if self.rank not in LORA_RANKS or self.alpha_over_rank != 1.0:
+                raise ValueError("LoRA recipe keys require the registered rank grid")
+        else:
+            raise ValueError("recipe parameterization must be full or lora")
+        if self.learning_rate is not None and (
+            not math.isfinite(self.learning_rate) or self.learning_rate <= 0
+        ):
+            raise ValueError("recipe learning rate must be finite and positive")
+        exact_width = self.draft_width is not None
+        selected_width = self.draft_width_selector is not None
+        if exact_width == selected_width:
+            raise ValueError("recipe key requires exactly one draft-width authority")
+        if exact_width:
+            if self.experiment != "E1" or self.draft_width not in DRAFT_WIDTHS:
+                raise ValueError("only E1 recipe keys may carry an exact grid width")
+        elif (
+            self.experiment != "E2"
+            or self.draft_width_selector != E2_DRAFT_WIDTH_SELECTOR
+        ):
+            raise ValueError("E2 recipe keys require the sealed E3a width selector")
+
+    @classmethod
+    def from_cell(cls, cell: ExperimentCell) -> AdaptationRecipeLookupKey:
+        identity = cell.identity
+        if identity.experiment not in {"E1", "E2"} or identity.method not in {
+            "tts",
+            "l0",
+        }:
+            raise ValueError("adaptation recipe lookup requires an E1/E2 TTS/L0 cell")
+        if (
+            identity.scope is None
+            or identity.optimizer is None
+            or identity.schedule is None
+        ):
+            raise ValueError("adaptation recipe cell contains unresolved key fields")
+        if identity.experiment == "E1":
+            if identity.width is None:
+                raise ValueError("E1 adaptation recipes require an exact width")
+            selector = None
+        else:
+            if identity.width is not None:
+                raise ValueError(
+                    "E2 registry cells are width templates, not fixed-width cells"
+                )
+            selector = E2_DRAFT_WIDTH_SELECTOR
+        return cls(
+            experiment=identity.experiment,
+            backend=identity.backend,
+            scope=identity.scope,
+            parameterization=identity.parameterization,
+            rank=identity.rank,
+            alpha_over_rank=identity.alpha_over_rank,
+            optimizer=identity.optimizer,
+            learning_rate=identity.learning_rate,
+            schedule=identity.schedule,
+            cohort=identity.cohort,
+            draft_width=identity.width,
+            draft_width_selector=selector,
+        )
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+_OPTIMIZER_RECIPE_FIELDS = frozenset(
+    {
+        "learning_rate",
+        "weight_decay",
+        "beta1",
+        "beta2",
+        "epsilon",
+        "grad_clip",
+        "momentum",
+        "muon_ns_steps",
+        "muon_auxiliary_learning_rate",
+        "muon_auxiliary_weight_decay",
+        "schedule_total_published_updates",
+    }
+)
+
+
+@dataclass(frozen=True)
+class OptimizerRecipeDeclaration:
+    """Every OptimizerConfig field, without an implicit schema default."""
+
+    name: str
+    learning_rate: float | None
+    weight_decay: float | None
+    beta1: float | None
+    beta2: float | None
+    epsilon: float | None
+    grad_clip: float | None
+    momentum: float | None
+    muon_ns_steps: int | None
+    muon_auxiliary_learning_rate: float | None
+    muon_auxiliary_weight_decay: float | None
+    schedule: str
+    schedule_total_published_updates: int | None
+    unresolved_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_text("optimizer recipe name", self.name)
+        _require_text("optimizer recipe schedule", self.schedule)
+        if self.schedule not in E2_SCHEDULES:
+            raise ValueError("optimizer recipe schedule is outside the registry")
+        if self.unresolved_fields != tuple(sorted(set(self.unresolved_fields))):
+            raise ValueError("optimizer unresolved fields must be sorted and unique")
+        if not set(self.unresolved_fields) <= _OPTIMIZER_RECIPE_FIELDS:
+            raise ValueError("optimizer recipe names an unknown unresolved field")
+        for name in (
+            "learning_rate",
+            "weight_decay",
+            "beta1",
+            "beta2",
+            "epsilon",
+            "grad_clip",
+            "momentum",
+            "muon_auxiliary_learning_rate",
+            "muon_auxiliary_weight_decay",
+        ):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"optimizer recipe {name} must be finite")
+        if self.learning_rate is not None and self.learning_rate <= 0:
+            raise ValueError("optimizer recipe learning rate must be positive")
+        if self.weight_decay is not None and self.weight_decay < 0:
+            raise ValueError("optimizer recipe weight decay must be non-negative")
+        if self.beta1 is not None and not 0 < self.beta1 < 1:
+            raise ValueError("optimizer recipe beta1 must be in (0, 1)")
+        if self.beta2 is not None and not 0 < self.beta2 < 1:
+            raise ValueError("optimizer recipe beta2 must be in (0, 1)")
+        if self.epsilon is not None and self.epsilon <= 0:
+            raise ValueError("optimizer recipe epsilon must be positive")
+        if self.grad_clip is not None and self.grad_clip <= 0:
+            raise ValueError("optimizer recipe grad_clip must be positive")
+        if self.momentum is not None and not 0 < self.momentum < 1:
+            raise ValueError("optimizer recipe momentum must be in (0, 1)")
+        if self.muon_ns_steps is not None and not 1 <= self.muon_ns_steps <= 20:
+            raise ValueError("optimizer recipe Muon steps must be in [1, 20]")
+        if (
+            self.schedule_total_published_updates is not None
+            and self.schedule_total_published_updates < 2
+        ):
+            raise ValueError("cosine horizon must cover at least two publications")
+        for name in self.unresolved_fields:
+            if getattr(self, name) is not None:
+                raise ValueError("an unresolved optimizer field must remain null")
+
+    def to_optimizer_config(self):
+        """Build only a completely declared config, passing every field."""
+
+        if self.unresolved_fields:
+            raise ValueError(
+                "optimizer recipe is BLOCKED by unresolved fields: "
+                + ",".join(self.unresolved_fields)
+            )
+        if None in (
+            self.learning_rate,
+            self.weight_decay,
+            self.beta1,
+            self.beta2,
+            self.epsilon,
+            self.grad_clip,
+        ):
+            raise ValueError("optimizer recipe is not fully declared")
+        from lightcone_spec.config.schema import OptimizerConfig
+
+        return OptimizerConfig(
+            name=self.name,
+            learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay,
+            beta1=self.beta1,
+            beta2=self.beta2,
+            epsilon=self.epsilon,
+            grad_clip=self.grad_clip,
+            momentum=self.momentum,
+            muon_ns_steps=self.muon_ns_steps,
+            muon_auxiliary_learning_rate=self.muon_auxiliary_learning_rate,
+            muon_auxiliary_weight_decay=self.muon_auxiliary_weight_decay,
+            schedule=self.schedule,
+            schedule_total_published_updates=(self.schedule_total_published_updates),
+        )
+
+
+_ADAPTATION_RECIPE_FIELDS = frozenset(
+    {"stride", "canvas_tokens", "extra_logical_delay"}
+)
+
+
+@dataclass(frozen=True)
+class AdaptationRecipeDeclaration:
+    """Registry-owned, content-bound declaration of full adaptation semantics."""
+
+    schema_version: int
+    lookup_key: AdaptationRecipeLookupKey
+    source_authority: str
+    source_authority_sha256: str
+    weight_update_mode: str
+    parameter_scope: str
+    kv_history_policy: str
+    adaptation_scope: str
+    adaptation_group_id: str
+    optimizer: OptimizerRecipeDeclaration
+    rank: int | None
+    lora_alpha: int | None
+    lora_matrix_policy: str
+    native_head_policy: str
+    stride: int | None
+    max_in_flight: int
+    canvas_tokens: int | None
+    loss_position_decay: float
+    extra_logical_delay: int | None
+    teacher_row_policy: str
+    verification_mode: str
+    fixed_verification_budget: int | None
+    confidence_loss_weight: float | None
+    status: str
+    blocker_codes: tuple[str, ...]
+    unresolved_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("only adaptation recipe declaration schema 1 is supported")
+        for name in (
+            "source_authority",
+            "weight_update_mode",
+            "parameter_scope",
+            "kv_history_policy",
+            "adaptation_scope",
+            "adaptation_group_id",
+            "lora_matrix_policy",
+            "native_head_policy",
+            "teacher_row_policy",
+            "verification_mode",
+        ):
+            _require_text(f"adaptation recipe {name}", getattr(self, name))
+        if not _LOWER_SHA256(self.source_authority_sha256):
+            raise ValueError("recipe source authority must be content-bound")
+        if self.lookup_key.scope != self.parameter_scope:
+            raise ValueError("recipe scope differs from its lookup key")
+        if self.lookup_key.parameterization != self.weight_update_mode:
+            raise ValueError("recipe parameterization differs from its lookup key")
+        if self.lookup_key.rank != self.rank:
+            raise ValueError("recipe rank differs from its lookup key")
+        expected_alpha = self.rank if self.weight_update_mode == "lora" else None
+        if self.lora_alpha != expected_alpha:
+            raise ValueError("recipe LoRA alpha must bind alpha/r=1")
+        if self.lookup_key.optimizer != self.optimizer.name:
+            raise ValueError("recipe optimizer differs from its lookup key")
+        if self.lookup_key.experiment == "E1":
+            if self.lookup_key.learning_rate is not None:
+                raise ValueError("E1 anchor LR belongs to the recipe declaration")
+        elif self.lookup_key.learning_rate != self.optimizer.learning_rate:
+            raise ValueError("recipe learning rate differs from its lookup key")
+        if self.lookup_key.schedule != self.optimizer.schedule:
+            raise ValueError("recipe schedule differs from its lookup key")
+        if self.lookup_key.cohort != self.adaptation_group_id:
+            raise ValueError("recipe cohort differs from its lookup key")
+        if self.lookup_key.draft_width is not None:
+            if self.canvas_tokens != self.lookup_key.draft_width:
+                raise ValueError("exact-width recipe canvas differs from its key")
+        elif (
+            self.canvas_tokens is not None
+            or "canvas_tokens" not in self.unresolved_fields
+        ):
+            raise ValueError("selected-width recipes must retain a null canvas slot")
+        if self.unresolved_fields != tuple(sorted(set(self.unresolved_fields))):
+            raise ValueError("adaptation unresolved fields must be sorted and unique")
+        if not set(self.unresolved_fields) <= _ADAPTATION_RECIPE_FIELDS:
+            raise ValueError("adaptation recipe names an unknown unresolved field")
+        for name in self.unresolved_fields:
+            if getattr(self, name) is not None:
+                raise ValueError("an unresolved adaptation field must remain null")
+        if not math.isfinite(self.loss_position_decay) or not (
+            0 < self.loss_position_decay <= 1
+        ):
+            raise ValueError("recipe loss position decay must be in (0, 1]")
+        if self.extra_logical_delay is not None and self.extra_logical_delay < 0:
+            raise ValueError("recipe extra logical delay must be non-negative")
+        if self.max_in_flight != 1:
+            raise ValueError("registered adaptation recipes permit one candidate")
+        if self.status == "AVAILABLE":
+            if (
+                self.blocker_codes
+                or self.unresolved_fields
+                or self.optimizer.unresolved_fields
+            ):
+                raise ValueError("AVAILABLE recipes cannot retain unresolved semantics")
+            # This is deliberately an all-fields call.  It proves that no
+            # Pydantic default is needed to turn a declaration into a config.
+            self.to_adaptation_config()
+        elif self.status == "BLOCKED":
+            if not self.blocker_codes:
+                raise ValueError("BLOCKED recipes require named blocker codes")
+        else:
+            raise ValueError("recipe status must be AVAILABLE or BLOCKED")
+        if self.blocker_codes != tuple(sorted(set(self.blocker_codes))) or any(
+            not _REASON_CODE(code) for code in self.blocker_codes
+        ):
+            raise ValueError("recipe blocker codes must be sorted stable tokens")
+
+    def to_adaptation_config(self):
+        """Materialize an available declaration with no implicit field values."""
+
+        if self.status != "AVAILABLE":
+            raise ValueError(
+                "adaptation recipe is BLOCKED: " + ",".join(self.blocker_codes)
+            )
+        if (
+            self.unresolved_fields
+            or self.stride is None
+            or self.canvas_tokens is None
+            or self.extra_logical_delay is None
+        ):
+            raise ValueError("adaptation recipe is not fully declared")
+        from lightcone_spec.config.schema import AdaptationConfig
+
+        return AdaptationConfig(
+            weight_update_mode=self.weight_update_mode,
+            parameter_scope=self.parameter_scope,
+            kv_history_policy=self.kv_history_policy,
+            adaptation_scope=self.adaptation_scope,
+            adaptation_group_id=self.adaptation_group_id,
+            optimizer=self.optimizer.to_optimizer_config(),
+            rank=self.rank,
+            lora_alpha=self.lora_alpha,
+            lora_matrix_policy=self.lora_matrix_policy,
+            native_head_policy=self.native_head_policy,
+            stride=self.stride,
+            max_in_flight=self.max_in_flight,
+            canvas_tokens=self.canvas_tokens,
+            loss_position_decay=self.loss_position_decay,
+            extra_logical_delay=self.extra_logical_delay,
+            teacher_row_policy=self.teacher_row_policy,
+            verification_mode=self.verification_mode,
+            fixed_verification_budget=self.fixed_verification_budget,
+            confidence_loss_weight=self.confidence_loss_weight,
+        )
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+def _e1_recipe_declaration(
+    key: AdaptationRecipeLookupKey,
+) -> AdaptationRecipeDeclaration:
+    from lightcone_spec.experiments.protocol import (
+        DFLASH_LOSS_POSITION_DECAY,
+        tuning_candidates,
+    )
+
+    matches = tuple(
+        candidate
+        for candidate in tuning_candidates()
+        if (
+            candidate.parameter_scope,
+            candidate.weight_update_mode,
+            candidate.rank,
+            candidate.optimizer,
+        )
+        == (key.scope, key.parameterization, key.rank, key.optimizer)
+    )
+    if len(matches) != 1:
+        raise ValueError("E1 recipe key does not resolve one registered candidate")
+    candidate = matches[0]
+    if key.learning_rate is not None or key.schedule != candidate.schedule:
+        raise ValueError("E1 cell identity conflicts with its registered anchor")
+    optimizer = OptimizerRecipeDeclaration(
+        name=candidate.optimizer,
+        learning_rate=candidate.learning_rate,
+        weight_decay=candidate.weight_decay,
+        beta1=candidate.beta1,
+        beta2=candidate.beta2,
+        epsilon=1e-8,
+        grad_clip=candidate.grad_clip,
+        momentum=candidate.momentum,
+        muon_ns_steps=candidate.muon_ns_steps,
+        muon_auxiliary_learning_rate=candidate.muon_auxiliary_learning_rate,
+        muon_auxiliary_weight_decay=candidate.muon_auxiliary_weight_decay,
+        schedule=candidate.schedule,
+        schedule_total_published_updates=(candidate.schedule_total_published_updates),
+    )
+    fixed_semantics = {
+        "kv_history_policy": "frozen",
+        "adaptation_scope": "cohort",
+        "lora_matrix_policy": "registered_matrices_v1",
+        "native_head_policy": "frozen",
+        "max_in_flight": 1,
+        "loss_position_decay": DFLASH_LOSS_POSITION_DECAY,
+        "extra_logical_delay": 0,
+        "teacher_row_policy": "update_round",
+        "verification_mode": "native_scheduler",
+        "fixed_verification_budget": None,
+        "confidence_loss_weight": None,
+    }
+    return AdaptationRecipeDeclaration(
+        schema_version=1,
+        lookup_key=key,
+        source_authority="registered_e1_tuning_grid_v1",
+        source_authority_sha256=content_sha256(
+            {
+                "candidate_id": candidate.candidate_id,
+                "fixed_semantics": fixed_semantics,
+            }
+        ),
+        weight_update_mode=candidate.weight_update_mode,
+        parameter_scope=candidate.parameter_scope,
+        kv_history_policy="frozen",
+        adaptation_scope="cohort",
+        adaptation_group_id=key.cohort,
+        optimizer=optimizer,
+        rank=candidate.rank,
+        lora_alpha=candidate.lora_alpha,
+        lora_matrix_policy="registered_matrices_v1",
+        native_head_policy="frozen",
+        stride=candidate.stride,
+        max_in_flight=1,
+        canvas_tokens=key.draft_width,
+        loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
+        extra_logical_delay=0,
+        teacher_row_policy="update_round",
+        verification_mode="native_scheduler",
+        fixed_verification_budget=None,
+        confidence_loss_weight=None,
+        status="AVAILABLE",
+        blocker_codes=(),
+    )
+
+
+def _e2_optimizer_declaration(
+    key: AdaptationRecipeLookupKey,
+) -> tuple[OptimizerRecipeDeclaration, tuple[str, ...]]:
+    optimizer = key.optimizer
+    unresolved: set[str] = {
+        "weight_decay",
+        "beta1",
+        "beta2",
+        "epsilon",
+        "grad_clip",
+    }
+    blockers: set[str] = {
+        "e2_weight_decay_unregistered",
+        "e2_beta_values_unregistered",
+        "e2_epsilon_unregistered",
+        "e2_grad_clip_unregistered",
+    }
+    weight_decay: float | None = None
+    beta1: float | None = None
+    beta2: float | None = None
+    epsilon: float | None = None
+    momentum: float | None = None
+    muon_ns_steps: int | None = None
+    auxiliary_lr: float | None = None
+    auxiliary_decay: float | None = None
+
+    if optimizer == "chronobelief":
+        unresolved.update(_OPTIMIZER_RECIPE_FIELDS)
+        blockers.add("chronobelief_equation_unregistered")
+    else:
+        if optimizer in {"sgdm", "nag", "muon"}:
+            unresolved.add("momentum")
+            blockers.add("e2_momentum_unregistered")
+        if optimizer == "muon":
+            unresolved.update(
+                {
+                    "muon_ns_steps",
+                    "muon_auxiliary_learning_rate",
+                    "muon_auxiliary_weight_decay",
+                }
+            )
+            blockers.add("e2_muon_parameters_unregistered")
+        if key.schedule == "cosine_to_zero":
+            unresolved.add("schedule_total_published_updates")
+            blockers.add("e2_cosine_horizon_unregistered")
+    values = {
+        "name": optimizer,
+        "learning_rate": key.learning_rate,
+        "weight_decay": weight_decay,
+        "beta1": beta1,
+        "beta2": beta2,
+        "epsilon": epsilon,
+        "grad_clip": None,
+        "momentum": momentum,
+        "muon_ns_steps": muon_ns_steps,
+        "muon_auxiliary_learning_rate": auxiliary_lr,
+        "muon_auxiliary_weight_decay": auxiliary_decay,
+        "schedule": key.schedule,
+        "schedule_total_published_updates": None,
+    }
+    # ChronoBelief has no registered LR grid.  Other E2 keys must already bind
+    # the exact optimizer-specific logarithmic value from the registry.
+    if optimizer == "chronobelief":
+        values["learning_rate"] = None
+    return (
+        OptimizerRecipeDeclaration(
+            **values,
+            unresolved_fields=tuple(sorted(unresolved)),
+        ),
+        tuple(sorted(blockers)),
+    )
+
+
+def _e2_recipe_declaration(
+    key: AdaptationRecipeLookupKey,
+) -> AdaptationRecipeDeclaration:
+    from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
+
+    optimizer, optimizer_blockers = _e2_optimizer_declaration(key)
+    blockers = tuple(
+        sorted(
+            {
+                *optimizer_blockers,
+                "e2_draft_width_selector_unresolved",
+                "e2_extra_logical_delay_unregistered",
+                "e2_update_stride_unregistered",
+            }
+        )
+    )
+    return AdaptationRecipeDeclaration(
+        schema_version=1,
+        lookup_key=key,
+        source_authority="registered_e2_optimizer_template_v1",
+        source_authority_sha256=content_sha256(
+            {
+                "lookup_key": key,
+                "optimizer": optimizer,
+                "blocker_codes": blockers,
+                "draft_width_selector": E2_DRAFT_WIDTH_SELECTOR,
+            }
+        ),
+        weight_update_mode=key.parameterization,
+        parameter_scope=key.scope,
+        kv_history_policy="frozen",
+        adaptation_scope="cohort",
+        adaptation_group_id=key.cohort,
+        optimizer=optimizer,
+        rank=key.rank,
+        lora_alpha=key.rank if key.parameterization == "lora" else None,
+        lora_matrix_policy="registered_matrices_v1",
+        native_head_policy="frozen",
+        stride=None,
+        max_in_flight=1,
+        canvas_tokens=None,
+        loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
+        extra_logical_delay=None,
+        teacher_row_policy="update_round",
+        verification_mode="native_scheduler",
+        fixed_verification_budget=None,
+        confidence_loss_weight=None,
+        status="BLOCKED",
+        blocker_codes=blockers,
+        unresolved_fields=("canvas_tokens", "extra_logical_delay", "stride"),
+    )
+
+
+def _build_adaptation_recipe_declarations(
+    cells: Sequence[ExperimentCell],
+) -> tuple[AdaptationRecipeDeclaration, ...]:
+    keys: dict[str, AdaptationRecipeLookupKey] = {}
+    for cell in cells:
+        if cell.identity.experiment not in {"E1", "E2"} or cell.identity.method not in {
+            "tts",
+            "l0",
+        }:
+            continue
+        key = AdaptationRecipeLookupKey.from_cell(cell)
+        keys[key.sha256] = key
+    declarations = tuple(
+        _e1_recipe_declaration(key)
+        if key.experiment == "E1"
+        else _e2_recipe_declaration(key)
+        for _, key in sorted(keys.items())
+    )
+    identities = tuple(row.lookup_key.sha256 for row in declarations)
+    if identities != tuple(sorted(set(identities))):
+        raise AssertionError("adaptation recipe declarations are not canonical")
+    return declarations
+
+
 def e1a_adaptive_configurations() -> tuple[ParameterConfiguration, ...]:
     """Return the preregistered 56 DSpark adaptive configurations."""
 
@@ -857,8 +1484,8 @@ class ExperimentRegistry:
     cells: tuple[ExperimentCell, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only industrial registry schema version 1 is supported")
+        if self.schema_version != 2:
+            raise ValueError("only industrial registry schema version 2 is supported")
         _require_text("registry name", self.name)
         if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
             raise ValueError(
@@ -888,6 +1515,29 @@ class ExperimentRegistry:
             seen_stages.add(cell.identity.experiment)
         if seen_stages != known:
             raise ValueError("every experiment must have at least one declared cell")
+        declarations = {
+            row.lookup_key.sha256: row for row in self.adaptation_recipe_declarations
+        }
+        for cell in self.cells:
+            if cell.identity.experiment not in {
+                "E1",
+                "E2",
+            } or cell.identity.method not in {
+                "tts",
+                "l0",
+            }:
+                continue
+            key = AdaptationRecipeLookupKey.from_cell(cell)
+            declaration = declarations.get(key.sha256)
+            if declaration is None:
+                raise ValueError("E1/E2 adaptive cell lacks a recipe declaration")
+            if (
+                declaration.status == "BLOCKED"
+                and cell.status is not CellStatus.BLOCKED
+            ):
+                raise ValueError(
+                    "blocked adaptation recipe must block its registry cell"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -895,6 +1545,12 @@ class ExperimentRegistry:
             "name": self.name,
             "gpu_uuids": list(self.gpu_uuids),
             "definitions": [_canonical(row) for row in self.definitions],
+            "adaptation_recipe_declarations": [
+                _canonical(row) for row in self.adaptation_recipe_declarations
+            ],
+            "adaptation_recipe_declarations_sha256": (
+                self.adaptation_recipe_declarations_sha256
+            ),
             "cells": [
                 _canonical(cell)
                 for cell in sorted(self.cells, key=lambda row: row.cell_id)
@@ -919,6 +1575,48 @@ class ExperimentRegistry:
                 key=lambda row: row.cell_id,
             )
         )
+
+    @cached_property
+    def adaptation_recipe_declarations(
+        self,
+    ) -> tuple[AdaptationRecipeDeclaration, ...]:
+        return _build_adaptation_recipe_declarations(self.cells)
+
+    @cached_property
+    def adaptation_recipe_declarations_sha256(self) -> str:
+        return content_sha256(self.adaptation_recipe_declarations)
+
+    def adaptation_recipe_for_cell(
+        self, cell_or_id: ExperimentCell | str
+    ) -> AdaptationRecipeDeclaration:
+        """Resolve only a cell owned by this registry to one exact declaration."""
+
+        if isinstance(cell_or_id, str):
+            matches = tuple(cell for cell in self.cells if cell.cell_id == cell_or_id)
+            if len(matches) != 1:
+                raise ValueError(
+                    "adaptation recipe cell ID is absent from the registry"
+                )
+            cell = matches[0]
+        elif isinstance(cell_or_id, ExperimentCell):
+            matches = tuple(
+                candidate
+                for candidate in self.cells
+                if candidate.cell_id == cell_or_id.cell_id
+            )
+            if len(matches) != 1 or matches[0] != cell_or_id:
+                raise ValueError("adaptation recipe cell is not registry-owned")
+            cell = cell_or_id
+        else:
+            raise TypeError("adaptation recipe lookup requires a cell or cell ID")
+        key = AdaptationRecipeLookupKey.from_cell(cell)
+        declarations = {
+            row.lookup_key.sha256: row for row in self.adaptation_recipe_declarations
+        }
+        try:
+            return declarations[key.sha256]
+        except KeyError as exc:
+            raise ValueError("registry cell lacks an adaptation recipe") from exc
 
     def make_receipt(
         self,
@@ -1275,7 +1973,7 @@ def _add_reference_baselines(
     context: int,
     arrival: str = "locked_reference_load",
     variant: str = "reference_baseline",
-    width: int = DRAFT_WIDTHS[1],
+    width: int | None = DRAFT_WIDTHS[1],
     concurrency: int | None = None,
     gpu_index: int | None = None,
 ) -> None:
@@ -1438,6 +2136,7 @@ def _add_e2_cells(factory: _CellFactory) -> None:
             context=context,
             arrival="e1_common_load",
             variant=f"{stage}:reference_baseline",
+            width=None,
             gpu_index=reference_gpu,
         )
         for configuration in _dflash_parameter_configurations():
@@ -1473,7 +2172,7 @@ def _add_e2_cells(factory: _CellFactory) -> None:
                                 schedule=schedule,
                                 context=context,
                                 regime="short_input_long_generation",
-                                width=DRAFT_WIDTHS[1],
+                                width=None,
                                 arrival="e1_common_load",
                                 slo="tuning_safety",
                                 parameterization=configuration.parameterization,
@@ -1516,12 +2215,19 @@ def _add_e2_cells(factory: _CellFactory) -> None:
                                 schedule=schedule,
                                 context=context,
                                 regime="short_input_long_generation",
-                                width=DRAFT_WIDTHS[1],
+                                width=None,
                                 arrival="e1_common_load",
                                 slo="tuning_safety",
                                 parameterization=configuration.parameterization,
                                 variant=f"{stage}:optimizer_specific_log_lr",
                                 gpu_index=pair_gpu,
+                                status=CellStatus.BLOCKED,
+                                reason_code="adaptation_recipe_values_unregistered",
+                                reason=(
+                                    "The E2 recipe declaration retains named unresolved "
+                                    "optimizer, stride, or E3a-selected width semantics; "
+                                    "schema defaults cannot authorize execution."
+                                ),
                             )
 
 
@@ -1927,7 +2633,7 @@ def build_industrial_registry(
     _add_e6_cells(factory)
     _add_e0_cells(factory)
     registry = ExperimentRegistry(
-        schema_version=1,
+        schema_version=2,
         name="lightcone-industrial-experiment-registry",
         gpu_uuids=gpu_uuids,
         definitions=_industrial_definitions(),

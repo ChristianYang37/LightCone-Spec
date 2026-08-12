@@ -82,6 +82,7 @@ from lightcone_spec.experiments.planning_artifacts import (
 )
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
+    E2_DRAFT_WIDTH_SELECTOR,
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     StageActivationPlan,
@@ -477,10 +478,11 @@ def _e2_final_recipe() -> E2FinalRecipeArtifact:
         optimizer="adamw",
         learning_rate=0.001,
         schedule="constant",
-        width=8,
+        width=None,
+        draft_width_selector=E2_DRAFT_WIDTH_SELECTOR,
     )
     return E2FinalRecipeArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=_sha("registry"),
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),

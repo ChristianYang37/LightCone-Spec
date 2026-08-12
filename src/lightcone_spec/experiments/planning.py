@@ -24,6 +24,7 @@ from lightcone_spec.experiments.load import ProductionLoadPlan
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
     DRAFT_WIDTHS,
+    E2_DRAFT_WIDTH_SELECTOR,
     E2_HALVING_STAGES,
     FINAL_BLOCKS,
     INDUSTRIAL_EXPERIMENT_ORDER,
@@ -98,9 +99,11 @@ E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
 )
 E2_HALVING_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "e2_successive_halving_protocol",
         "stages": E2_HALVING_STAGES,
+        "draft_width_authority": E2_DRAFT_WIDTH_SELECTOR,
+        "adaptation_recipe_authority": "registry_declaration_schema_v1",
         "retention_numerator": _E2_RETENTION_NUMERATOR,
         "retention_denominator": _E2_RETENTION_DENOMINATOR,
         "optimizer_schedule_family_floor": _E2_FAMILY_FLOOR,
@@ -3448,7 +3451,8 @@ class E2CandidateIdentity:
     optimizer: str
     learning_rate: float
     schedule: str
-    width: int
+    width: int | None
+    draft_width_selector: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("model", "backend", "task", "scope", "optimizer", "schedule"):
@@ -3465,8 +3469,15 @@ class E2CandidateIdentity:
             raise ValueError("LoRA E2 candidates require rank and alpha/r=1")
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0:
             raise ValueError("E2 learning rate must be finite and positive")
-        if self.width < 1:
-            raise ValueError("E2 width must be positive")
+        exact_width = self.width is not None
+        selected_width = self.draft_width_selector is not None
+        if exact_width == selected_width:
+            raise ValueError("E2 candidate requires exactly one width authority")
+        if exact_width:
+            if self.width is None or self.width < 1:
+                raise ValueError("E2 width must be positive")
+        elif self.draft_width_selector != E2_DRAFT_WIDTH_SELECTOR:
+            raise ValueError("E2 template requires the sealed E3a width selector")
 
     @classmethod
     def from_cell(cls, cell: ExperimentCell) -> E2CandidateIdentity:
@@ -3478,9 +3489,10 @@ class E2CandidateIdentity:
             or identity.optimizer is None
             or identity.learning_rate is None
             or identity.schedule is None
-            or identity.width is None
         ):
             raise ValueError("E2 candidate identity contains unresolved fields")
+        if identity.width is not None:
+            raise ValueError("E2 registry candidate must remain a width template")
         return cls(
             model=identity.model,
             backend=identity.backend,
@@ -3492,7 +3504,8 @@ class E2CandidateIdentity:
             optimizer=identity.optimizer,
             learning_rate=identity.learning_rate,
             schedule=identity.schedule,
-            width=identity.width,
+            width=None,
+            draft_width_selector=E2_DRAFT_WIDTH_SELECTOR,
         )
 
     @cached_property
@@ -3690,6 +3703,39 @@ def reduce_e2_activation(
     current = tuple(cell for cell in cells if _e2_stage(cell) == stage_index)
     current_runnable = tuple(cell for cell in current if cell.runnable)
     pairs = _e2_candidate_pairs(current_runnable)
+    if not pairs:
+        rows = tuple(
+            CellDisposition(
+                cell.cell_id,
+                (
+                    DispositionStatus.NOT_APPLICABLE
+                    if cell.status is CellStatus.NOT_APPLICABLE
+                    else (
+                        DispositionStatus.BLOCKED
+                        if not cell.runnable
+                        else DispositionStatus.DEFERRED
+                    )
+                ),
+                (
+                    cell.reason_code
+                    if not cell.runnable
+                    else "awaiting_complete_adaptation_recipe_declaration"
+                ),
+            )
+            for cell in cells
+        )
+        return _make_activation(
+            registry=registry,
+            experiment="E2",
+            dependency_receipt=e1_receipt,
+            runtime_sha256=pareto.runtime_sha256,
+            split_sha256=pareto.split_sha256,
+            source_selection_sha256=source_selection_sha256,
+            activation_round=f"halving_{stage_index}",
+            rows=rows,
+            reason_code="e2_adaptation_recipe_authority_blocked",
+            reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
+        )
     selected_cells: set[str] = {
         cell.cell_id
         for cell in current_runnable
@@ -4202,8 +4248,8 @@ class E2FinalRecipeArtifact:
     selection_state: Literal["locked_from_raw_halving_3"]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only E2 final-recipe schema version 1 is supported")
+        if self.schema_version != 2:
+            raise ValueError("only E2 final-recipe schema version 2 is supported")
         for name in (
             "registry_sha256",
             "runtime_sha256",
@@ -4256,7 +4302,7 @@ def materialize_e2_final_recipe(
     if receipt.survivor_candidate_ids != (candidate_id,):
         raise ValueError("E2 final reduction does not lock exactly one candidate")
     return E2FinalRecipeArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=registry.sha256,
         runtime_sha256=reduction.runtime_sha256,
         split_sha256=reduction.split_sha256,

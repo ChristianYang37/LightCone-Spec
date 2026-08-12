@@ -828,14 +828,13 @@ def test_nonserving_blocked_and_unresolved_cells_fail_before_allocation(
         )
 
 
-def test_adapted_cell_binds_optimizer_schedule_and_parameter_plan(
+def test_e2_caller_defaults_cannot_unlock_blocked_recipe_declaration(
     registry: ExperimentRegistry,
 ) -> None:
     source = next(
         cell
         for cell in registry.cells_for("E2")
-        if cell.runnable
-        and cell.identity.method == "l0"
+        if cell.identity.method == "l0"
         and cell.identity.parameterization == "full"
         and cell.identity.scope == "last1"
         and cell.identity.optimizer == "adamw"
@@ -846,6 +845,10 @@ def test_adapted_cell_binds_optimizer_schedule_and_parameter_plan(
     derived = _replace_cell(registry, source, cell)
     receipts = _receipts_before(derived, "E2")
     topology = _topology(cell)
+    declaration = derived.adaptation_recipe_for_cell(cell)
+    assert declaration.status == "BLOCKED"
+    assert "e2_weight_decay_unregistered" in declaration.blocker_codes
+    assert declaration.lookup_key.draft_width_selector is not None
     adaptation = AdaptationConfig(
         weight_update_mode="full",
         parameter_scope="last1",
@@ -871,7 +874,7 @@ def test_adapted_cell_binds_optimizer_schedule_and_parameter_plan(
         native_head_policy="frozen",
         stride=10,
         max_in_flight=1,
-        canvas_tokens=identity.width,
+        canvas_tokens=16,
         loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
         extra_logical_delay=0,
         teacher_row_policy="update_round",
@@ -886,42 +889,11 @@ def test_adapted_cell_binds_optimizer_schedule_and_parameter_plan(
         scope="last1",
     )
 
-    plan = render_industrial_cell_runtime_plan(
-        registry=derived,
-        cell_id=cell.cell_id,
-        rank_configs=configs,
-        topology_receipts=topology,
-        dependency_receipts=receipts,
-        parameter_plan=parameter_plan,
-    )
-    assert plan.parameter_plan_sha256 == parameter_plan.sha256
-    assert (
-        plan.to_dict()["rank_configs"][0]["adaptation"]["optimizer"]["schedule"]
-        == "constant"
-    )
-
-    wrong_plan = DFlashParameterPlan.build(
-        {"layers.0.q_proj.weight": torch.zeros(4, 4)},
-        mode="full",
-        scope="all",
-    )
-    with pytest.raises(ValueError, match="trainable parameter plan differs"):
+    with pytest.raises(ValueError, match="only UNMEASURED"):
         render_industrial_cell_runtime_plan(
             registry=derived,
             cell_id=cell.cell_id,
             rank_configs=configs,
-            topology_receipts=topology,
-            dependency_receipts=receipts,
-            parameter_plan=wrong_plan,
-        )
-
-    changed = configs[0].model_dump(mode="json")
-    changed["adaptation"]["optimizer"]["learning_rate"] *= 3
-    with pytest.raises(ValueError, match="learning rate differs"):
-        render_industrial_cell_runtime_plan(
-            registry=derived,
-            cell_id=cell.cell_id,
-            rank_configs=(RunConfig.model_validate(changed),),
             topology_receipts=topology,
             dependency_receipts=receipts,
             parameter_plan=parameter_plan,
