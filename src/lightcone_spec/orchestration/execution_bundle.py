@@ -103,6 +103,7 @@ from lightcone_spec.orchestration.executor import (
     IndustrialExecutionPlan,
     build_industrial_execution_plan,
     execute_industrial_plan,
+    industrial_execution_split_contract,
     industrial_run_id,
     launch_server_subprocess,
 )
@@ -135,6 +136,17 @@ _DISPATCH_RECEIPT_ENVELOPE_KIND = "industrial_dispatch_schedule_receipt_envelope
 _DISPATCH_ATTEMPT_JOURNAL_KIND = "industrial_dispatch_attempt_journal"
 _DISPATCH_ATTEMPT_EVENT_KIND = "industrial_dispatch_attempt_event"
 TRUSTED_DISPATCH_ATTESTER_UNAVAILABLE_REASON = "trusted_hardware_attester_unavailable"
+_ACTIVATION_MANIFEST_ROLES = frozenset(
+    {
+        "registry_stage_activation_manifest",
+        "e1_activation_authority_manifest",
+        "e2_activation_authority_manifest",
+        "confirmation_auxiliary_activation_authority_manifest",
+        "confirmation_pilot_activation_authority_manifest",
+        "confirmation_final_activation_authority_manifest",
+        "confirmation_stage_aggregate_authority_manifest",
+    }
+)
 
 
 class ExecutionBundleBlockedError(RuntimeError):
@@ -2810,11 +2822,12 @@ class IndustrialAssignmentExecutionBundle:
             raise ValueError("bundle activation semantic identity mismatch")
         if activation_replay.dependency_receipts != receipts:
             raise ValueError("bundle activation swapped dependency receipts")
-        if self.activation_runtime != self.runtime_envelope_artifact.source:
-            raise ValueError(
-                "activation runtime must be the exact bound runtime-envelope "
-                "artifact used by execution"
-            )
+        # These are two independent domains.  ``activation_runtime`` is the
+        # shared reducer-lineage input and is replayed by the budget authority;
+        # ``runtime_envelope_artifact`` is the per-execution doctor authority
+        # and is reopened here, then structurally validated by plan.validate().
+        self.activation_runtime.load()
+        self.runtime_envelope_artifact.source.load()
         interference_bootstrap_authority = None
         if envelope.rules and interference_calibration_authority is None:
             interference_bootstrap_authority = _replay_interference_bootstrap_authority(
@@ -3056,13 +3069,19 @@ class IndustrialAssignmentExecutionBundle:
                 "dependency artifacts do not cover the locked outputs exactly"
             )
         split = self.split_artifact.artifact_binding()
+        expected_execution_split = industrial_execution_split_contract(
+            registry_sha256=registry.sha256,
+            cell=cell,
+            load_plan=load,
+            sampling_profile_sha256=sampling.sha256,
+            model_lock_sha256=model_lock.sha256,
+        )
         if (
             self.activation_split.semantic_sha256 != activation.split_sha256
-            or split.content_sha256 != activation.split_sha256
+            or self.split_artifact.source.load() != expected_execution_split
+            or split.content_sha256 != content_sha256(expected_execution_split)
         ):
-            raise ValueError(
-                "execution split differs from the reducer activation split"
-            )
+            raise ValueError("execution or activation split identity changed")
         sampling_binding = self.sampling_artifact.artifact_binding()
         model_lock_binding = self.model_lock_artifact.artifact_binding()
         inventory_source = self.inventory_source_artifact.artifact_binding()
@@ -3413,11 +3432,12 @@ def _compare_budget_raw_binding(
         or binding.sidecar_size != 65
     ):
         raise ValueError(f"{label} differs from its raw budget binding")
-    # The raw manifest itself is canonically bound by the budget reducer while
-    # the bundle records the activation produced from that manifest.  Every
-    # other role has the same domain semantic identity in both layers.
+    # An activation manifest is canonically bound by the budget reducer while
+    # the bundle records the reducer output produced from that manifest.  The
+    # two values intentionally inhabit different semantic domains.  Every
+    # non-manifest role must retain the same semantic identity in both layers.
     if (
-        binding.role != "registry_stage_activation_manifest"
+        binding.role not in _ACTIVATION_MANIFEST_ROLES
         and source.semantic_sha256 != binding.semantic_sha256
     ):
         raise ValueError(f"{label} semantic identity differs")

@@ -353,6 +353,10 @@ def _load_exact_cells(
 ) -> dict[str, _LoadedCell]:
     if type(manifest) is not expected_manifest_type:
         raise TypeError(f"{experiment} reduction requires its exact raw manifest")
+    if manifest.schema_version != 2:
+        raise ValueError(
+            f"{experiment} formal reduction requires raw evidence schema 2"
+        )
     references = tuple(manifest.cells)
     reference_ids = tuple(reference.cell_id for reference in references)
     if reference_ids != expected_cell_ids:

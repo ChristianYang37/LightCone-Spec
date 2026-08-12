@@ -127,10 +127,17 @@ def test_raw_selection_manifests_round_trip_and_require_exact_sidecars(
             {"budget_observation_sha256": budget_semantic_sha256},
             sidecar_sha256=budget_semantic_sha256,
         ),
+        completion_contract=_write_bound(
+            tmp_path / "completed.json",
+            {"schema_version": 4, "kind": "industrial_completed_cells"},
+            sidecar_sha256=content_sha256(
+                {"schema_version": 4, "kind": "industrial_completed_cells"}
+            ),
+        ),
     )
-    e3a = RawE3aSelectionEvidenceManifest(schema_version=1, cells=(cell,))
-    e1 = RawE1ParetoEvidenceManifest(schema_version=1, cells=(cell,))
-    e2 = RawE2StageEvidenceManifest(schema_version=1, stage_index=0, cells=(cell,))
+    e3a = RawE3aSelectionEvidenceManifest(schema_version=2, cells=(cell,))
+    e1 = RawE1ParetoEvidenceManifest(schema_version=2, cells=(cell,))
+    e2 = RawE2StageEvidenceManifest(schema_version=2, stage_index=0, cells=(cell,))
 
     assert (
         raw_e3a_selection_manifest_from_dict(raw_e3a_selection_manifest_to_dict(e3a))
@@ -199,6 +206,11 @@ def test_raw_confirmation_manifest_binds_four_pilot_sidecar_sets(
                 {"budget_observation_sha256": budget_semantic_sha256},
                 sidecar_sha256=budget_semantic_sha256,
             ),
+            completion_contract=_write_bound(
+                tmp_path / f"pilot-{block}-completed.json",
+                {"schema_version": 4, "block": block},
+                sidecar_sha256=content_sha256({"schema_version": 4, "block": block}),
+            ),
         )
         blocks.append(
             IndustrialBlockEvidence(
@@ -211,7 +223,7 @@ def test_raw_confirmation_manifest_binds_four_pilot_sidecar_sets(
             )
         )
     manifest = RawConfirmationFamilyPowerEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         blocks=tuple(blocks),
     )
     assert (

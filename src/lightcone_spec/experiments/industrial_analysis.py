@@ -188,6 +188,57 @@ _DISABLED_SESSION_RUN_FIELDS = (
     "reset_receipt_sha256",
     "session_epoch",
 )
+_COMPLETION_CELL_CONTRACT_FIELDS = {
+    "cell_id",
+    "request_ids",
+    "expected_request_rows",
+    "expected_round_rows",
+    "expected_update_rows",
+    "expected_performance_rows",
+    "request_ids_sha256",
+    "corpus_sha256",
+    "arrival_trace_sha256",
+    "sampling_profile_sha256",
+    "model_lock_sha256",
+    "patched_sglang_tree",
+    "workload_contract",
+    "rank_config_sha256s",
+    "physical_assignment",
+    "physical_binding_sha256",
+    "topology_receipt_sha256",
+    "experiment_budget_sha256",
+    "experiment_budget",
+    "execution_plan_sha256",
+    "execution_split_sha256",
+}
+_COMPLETION_MEASURED_ROW_FIELDS = {
+    "cell_id",
+    "evidence_root",
+    "run_id",
+    "rank",
+    "evidence_sha256",
+    "terminal_receipt_sha256",
+    "physical_gpu_uuid",
+    "physical_binding_sha256",
+    "experiment_budget_sha256",
+    "budget_observation_status",
+    "budget_observation_reason_code",
+    "budget_observation_path",
+    "budget_observation_sha256",
+    "preflight_attestation_path",
+    "preflight_attestation_sha256",
+    "status",
+}
+_COMPLETION_ACTIVATION_BINDING_FIELDS = {
+    "schema_version",
+    "kind",
+    "stage_activation_sha256",
+    "family_activation_sha256s",
+    "family_power_reduction_sha256s",
+    "direct_dependency_receipt_sha256",
+    "activation_round",
+    "dispositions_sha256",
+}
 
 
 def _is_sha256(value: object) -> bool:
@@ -326,6 +377,8 @@ class IndustrialCellEvidence:
     terminal_receipts: tuple[BoundArtifact, ...]
     hardware_receipt: BoundArtifact
     budget_observation: BoundArtifact
+    completion_contract: BoundArtifact | None = None
+    diagnostic_lineage_identity: bool = False
 
     def __post_init__(self) -> None:
         if not _is_sha256(self.cell_id):
@@ -334,6 +387,16 @@ class IndustrialCellEvidence:
             raise ValueError("cell evidence requires terminal rank receipts")
         if not isinstance(self.budget_observation, BoundArtifact):
             raise TypeError("cell evidence requires a bound budget observation")
+        if self.completion_contract is not None and not isinstance(
+            self.completion_contract, BoundArtifact
+        ):
+            raise TypeError("cell completion contract must be a bound artifact")
+        if type(self.diagnostic_lineage_identity) is not bool:
+            raise TypeError("cell diagnostic lineage marker must be boolean")
+        if self.completion_contract is not None and self.diagnostic_lineage_identity:
+            raise ValueError(
+                "cell evidence cannot mix completion and diagnostic identities"
+            )
 
 
 @dataclass(frozen=True)
@@ -407,6 +470,13 @@ class RawEvidenceAliasManifest:
             raise TypeError("raw evidence alias candidates must be exact artifact sets")
         if type(self.source_evidence) is not IndustrialCellEvidence:
             raise TypeError("raw evidence alias requires exact source evidence")
+        if (
+            self.source_evidence.completion_contract is None
+            or self.source_evidence.diagnostic_lineage_identity
+        ):
+            raise ValueError(
+                "formal raw evidence alias requires its schema-v4 completion contract"
+            )
         if not self.source_native_terminal_artifacts or any(
             type(reference) is not BoundArtifact
             for reference in self.source_native_terminal_artifacts
@@ -438,6 +508,11 @@ class RawEvidenceAliasManifest:
                     ],
                     "hardware_receipt": evidence.hardware_receipt.sha256,
                     "budget_observation": evidence.budget_observation.sha256,
+                    "completion_contract": (
+                        None
+                        if evidence.completion_contract is None
+                        else evidence.completion_contract.sha256
+                    ),
                 },
                 "source_native_terminal_artifacts": [
                     reference.sha256
@@ -534,6 +609,11 @@ def raw_evidence_alias_manifest_to_dict(
             "budget_observation": _alias_bound_artifact_to_dict(
                 source.budget_observation
             ),
+            "completion_contract": _alias_bound_artifact_to_dict(
+                source.completion_contract
+            )
+            if source.completion_contract is not None
+            else None,
         },
         "source_native_terminal_artifacts": [
             _alias_bound_artifact_to_dict(reference)
@@ -583,6 +663,7 @@ def raw_evidence_alias_manifest_from_dict(
         "terminal_receipts",
         "hardware_receipt",
         "budget_observation",
+        "completion_contract",
     }:
         raise ValueError("raw evidence alias source evidence schema is ambiguous")
     cell_id = evidence.get("cell_id")
@@ -617,6 +698,10 @@ def raw_evidence_alias_manifest_from_dict(
             budget_observation=_alias_bound_artifact_from_dict(
                 evidence["budget_observation"],
                 label="source_evidence.budget_observation",
+            ),
+            completion_contract=_alias_bound_artifact_from_dict(
+                evidence["completion_contract"],
+                label="source_evidence.completion_contract",
             ),
         ),
         source_native_terminal_artifacts=tuple(
@@ -671,6 +756,10 @@ def _raw_evidence_reference_from_dict(value: object, *, label: str) -> BoundArti
 def _raw_cell_to_dict(cell: IndustrialCellEvidence) -> dict[str, object]:
     if type(cell) is not IndustrialCellEvidence:
         raise TypeError("raw cell evidence must be exact")
+    if cell.completion_contract is None or cell.diagnostic_lineage_identity:
+        raise ValueError(
+            "formal raw cell evidence requires its schema-v4 completion contract"
+        )
     return {
         "cell_id": cell.cell_id,
         "terminal_receipts": [
@@ -679,6 +768,9 @@ def _raw_cell_to_dict(cell: IndustrialCellEvidence) -> dict[str, object]:
         ],
         "hardware_receipt": _raw_evidence_reference_to_dict(cell.hardware_receipt),
         "budget_observation": _raw_evidence_reference_to_dict(cell.budget_observation),
+        "completion_contract": _raw_evidence_reference_to_dict(
+            cell.completion_contract
+        ),
     }
 
 
@@ -688,6 +780,7 @@ def _raw_cell_from_dict(value: object, *, label: str) -> IndustrialCellEvidence:
         "terminal_receipts",
         "hardware_receipt",
         "budget_observation",
+        "completion_contract",
     }:
         raise ValueError(f"{label} fields differ from the raw cell schema")
     terminals = value.get("terminal_receipts")
@@ -707,6 +800,9 @@ def _raw_cell_from_dict(value: object, *, label: str) -> IndustrialCellEvidence:
         ),
         budget_observation=_raw_evidence_reference_from_dict(
             value.get("budget_observation"), label=f"{label}.budget_observation"
+        ),
+        completion_contract=_raw_evidence_reference_from_dict(
+            value.get("completion_contract"), label=f"{label}.completion_contract"
         ),
     )
 
@@ -753,8 +849,8 @@ class RawE3aSelectionEvidenceManifest:
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("only raw E3a selection manifest schema 1 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only raw E3a selection manifest schema 2 is supported")
         ids = tuple(cell.cell_id for cell in self.cells)
         if not ids or ids != tuple(sorted(set(ids))):
             raise ValueError("raw E3a cells must be cell-sorted and unique")
@@ -772,8 +868,8 @@ class RawE1ParetoEvidenceManifest:
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("only raw E1 Pareto manifest schema 1 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only raw E1 Pareto manifest schema 2 is supported")
         ids = tuple(cell.cell_id for cell in self.cells)
         if not ids or ids != tuple(sorted(set(ids))):
             raise ValueError("raw E1 cells must be cell-sorted and unique")
@@ -792,8 +888,8 @@ class RawE2StageEvidenceManifest:
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("only raw E2 stage manifest schema 1 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only raw E2 stage manifest schema 2 is supported")
         if type(self.stage_index) is not int or self.stage_index not in range(4):
             raise ValueError("raw E2 stage index is invalid")
         ids = tuple(cell.cell_id for cell in self.cells)
@@ -813,9 +909,9 @@ class RawConfirmationFamilyPowerEvidenceManifest:
     blocks: tuple[IndustrialBlockEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError(
-                "only raw confirmation family power manifest schema 1 is supported"
+                "only raw confirmation family power manifest schema 2 is supported"
             )
         block_ids = tuple(block.block for block in self.blocks)
         if block_ids != PILOT_BLOCKS:
@@ -860,10 +956,20 @@ def validate_raw_evidence_manifest_sidecars(
         raise TypeError("formal raw evidence requires an exact manifest type")
     references: list[tuple[BoundArtifact, str]] = []
     for cell in cells:
+        if cell.completion_contract is None:
+            raise ValueError(
+                "formal raw evidence lacks its schema-v4 completion contract"
+            )
         references.extend(
             (reference, reference.sha256) for reference in cell.terminal_receipts
         )
         references.append((cell.hardware_receipt, cell.hardware_receipt.sha256))
+        completion_value = _bound_json(
+            cell.completion_contract.path,
+            cell.completion_contract.sha256,
+            label="schema-v4 completion contract",
+        )
+        references.append((cell.completion_contract, content_sha256(completion_value)))
         budget = _bound_json(
             cell.budget_observation.path,
             cell.budget_observation.sha256,
@@ -978,7 +1084,7 @@ def _raw_cell_manifest_from_dict(
         fields.add("stage_index")
     if type(value) is not dict or set(value) != fields:
         raise ValueError(f"{kind} fields differ from the strict schema")
-    if value.get("schema_version") != 1 or value.get("kind") != kind:
+    if value.get("schema_version") != 2 or value.get("kind") != kind:
         raise ValueError(f"{kind} identity is invalid")
     cells = value.get("cells")
     if type(cells) is not list or not cells:
@@ -1002,7 +1108,7 @@ def raw_e3a_selection_manifest_from_dict(
         kind="raw_e3a_selection_evidence_manifest",
         stage_index=False,
     )
-    manifest = RawE3aSelectionEvidenceManifest(schema_version=1, cells=cells)
+    manifest = RawE3aSelectionEvidenceManifest(schema_version=2, cells=cells)
     if declared != manifest.sha256:
         raise ValueError("raw E3a manifest redundant SHA-256 mismatch")
     return manifest
@@ -1016,7 +1122,7 @@ def raw_e1_pareto_manifest_from_dict(
         kind="raw_e1_pareto_evidence_manifest",
         stage_index=False,
     )
-    manifest = RawE1ParetoEvidenceManifest(schema_version=1, cells=cells)
+    manifest = RawE1ParetoEvidenceManifest(schema_version=2, cells=cells)
     if declared != manifest.sha256:
         raise ValueError("raw E1 manifest redundant SHA-256 mismatch")
     return manifest
@@ -1029,7 +1135,7 @@ def raw_e2_stage_manifest_from_dict(value: object) -> RawE2StageEvidenceManifest
         stage_index=True,
     )
     manifest = RawE2StageEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         stage_index=stage_index,  # type: ignore[arg-type]
         cells=cells,
     )
@@ -1049,7 +1155,7 @@ def raw_confirmation_family_power_manifest_from_dict(
     }:
         raise ValueError("raw family power manifest fields differ")
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version") != 2
         or value.get("kind") != "raw_confirmation_family_power_evidence_manifest"
     ):
         raise ValueError("raw family power manifest identity is invalid")
@@ -1057,7 +1163,7 @@ def raw_confirmation_family_power_manifest_from_dict(
     if type(blocks) is not list:
         raise TypeError("raw family power blocks must be an array")
     manifest = RawConfirmationFamilyPowerEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         blocks=tuple(
             _raw_block_from_dict(block, label=f"family_power.blocks[{index}]")
             for index, block in enumerate(blocks)
@@ -2149,6 +2255,179 @@ def _load_budget_observation(
     return observation_sha256
 
 
+@dataclass(frozen=True)
+class _CellExecutionIdentity:
+    """Per-cell identities reconstructed from the stage completion contract."""
+
+    experiment: str
+    runtime_sha256: str
+    split_sha256: str
+
+
+def _replay_cell_execution_identity(
+    reference: IndustrialCellEvidence,
+    *,
+    registry: ExperimentRegistry,
+    family: _RunEvidenceIdentity,
+    cell: ExperimentCell,
+    inventory: GpuInventory,
+) -> _CellExecutionIdentity:
+    """Separate shared activation lineage from one cell's execution identity."""
+
+    source = reference.completion_contract
+    if source is None:
+        if not reference.diagnostic_lineage_identity:
+            raise ValueError(
+                "formal raw evidence lacks its schema-v4 completion contract"
+            )
+        # Explicit CPU-only diagnostics may retain the historical lineage
+        # identity.  This marker is not encoded by any formal raw schema.
+        return _CellExecutionIdentity(
+            experiment=family.experiment,
+            runtime_sha256=family.runtime_sha256,
+            split_sha256=family.split_sha256,
+        )
+    value = _bound_json(
+        source.path,
+        source.sha256,
+        label="schema-v4 completion contract",
+    )
+    completion_fields = {
+        "schema_version",
+        "kind",
+        "registry_sha256",
+        "experiment",
+        "runtime_sha256",
+        "split_sha256",
+        "split_contract",
+        "activation_binding",
+        "inventory_sha256",
+        "inventory_source_receipt_sha256",
+        "rows",
+    }
+    if set(value) != completion_fields:
+        raise ValueError("schema-v4 completion contract fields are ambiguous")
+    split = value.get("split_contract")
+    rows = value.get("rows")
+    activation_binding = value.get("activation_binding")
+    if (
+        value.get("schema_version") != 4
+        or value.get("kind") != "industrial_completed_cells"
+        or value.get("registry_sha256") != registry.sha256
+        or value.get("experiment") != family.experiment
+        or value.get("runtime_sha256") != family.runtime_sha256
+        or value.get("split_sha256") != family.split_sha256
+        or value.get("inventory_sha256") != inventory.sha256
+        or value.get("inventory_source_receipt_sha256")
+        != inventory.source_receipt_sha256
+        or type(split) is not dict
+        or content_sha256(split) != family.split_sha256
+        or type(rows) is not list
+        or type(activation_binding) is not dict
+    ):
+        raise ValueError(
+            "schema-v4 completion contract differs from activation lineage"
+        )
+    if (
+        set(activation_binding) != _COMPLETION_ACTIVATION_BINDING_FIELDS
+        or activation_binding.get("schema_version") != 1
+        or activation_binding.get("kind") != "industrial_stage_activation_binding"
+        or not _is_sha256(activation_binding.get("dispositions_sha256"))
+        or any(
+            type(activation_binding.get(name)) is not list
+            or any(not _is_sha256(item) for item in activation_binding[name])
+            for name in (
+                "family_activation_sha256s",
+                "family_power_reduction_sha256s",
+            )
+        )
+        or (
+            activation_binding.get("stage_activation_sha256") is not None
+            and not _is_sha256(activation_binding["stage_activation_sha256"])
+        )
+        or (
+            activation_binding.get("direct_dependency_receipt_sha256") is not None
+            and not _is_sha256(activation_binding["direct_dependency_receipt_sha256"])
+        )
+        or type(activation_binding.get("activation_round")) is not str
+        or not activation_binding["activation_round"]
+    ):
+        raise ValueError("schema-v4 completion activation binding is ambiguous")
+    if set(split) != {
+        "schema_version",
+        "kind",
+        "registry_sha256",
+        "experiment",
+        "cells",
+    } or any(
+        split.get(name) != expected
+        for name, expected in (
+            ("schema_version", 1),
+            ("kind", "industrial_locked_split"),
+            ("registry_sha256", registry.sha256),
+            ("experiment", family.experiment),
+        )
+    ):
+        raise ValueError("schema-v4 completion contains a foreign activation split")
+    contracts = split.get("cells")
+    if type(contracts) is not list or any(type(item) is not dict for item in contracts):
+        raise TypeError("schema-v4 completion lacks exact cell contracts")
+    matching = tuple(item for item in contracts if item.get("cell_id") == cell.cell_id)
+    if len(matching) != 1:
+        raise ValueError("schema-v4 completion lacks one exact cell contract")
+    contract = matching[0]
+    if set(contract) != _COMPLETION_CELL_CONTRACT_FIELDS:
+        raise ValueError("schema-v4 cell completion contract fields are ambiguous")
+    execution_plan_sha256 = contract.get("execution_plan_sha256")
+    execution_split_sha256 = contract.get("execution_split_sha256")
+    if not _is_sha256(execution_plan_sha256) or not _is_sha256(execution_split_sha256):
+        raise ValueError("cell completion lacks execution plan/split identities")
+    measured = tuple(
+        item
+        for item in rows
+        if type(item) is dict
+        and item.get("cell_id") == cell.cell_id
+        and item.get("status") == "MEASURED"
+    )
+    if any(set(item) != _COMPLETION_MEASURED_ROW_FIELDS for item in measured):
+        raise ValueError("schema-v4 measured completion row fields are ambiguous")
+    _, _, world_size = _expected_topology(cell)
+    if (
+        len(measured) != world_size
+        or tuple(item.get("rank") for item in measured) != tuple(range(world_size))
+        or tuple(item.get("terminal_receipt_sha256") for item in measured)
+        != tuple(item.sha256 for item in reference.terminal_receipts)
+        or any(
+            item.get("evidence_root") != cell.resources.evidence_root
+            for item in measured
+        )
+    ):
+        raise ValueError(
+            "cell completion contract differs from terminal receipt coverage"
+        )
+    for rank, (row, terminal) in enumerate(
+        zip(measured, reference.terminal_receipts, strict=True)
+    ):
+        terminal_value = _bound_json(
+            terminal.path,
+            terminal.sha256,
+            label="completion-bound terminal receipt",
+        )
+        if (
+            terminal_value.get("schema_version") != 3
+            or terminal_value.get("run_id") != row.get("run_id")
+            or terminal_value.get("rank") != rank
+        ):
+            raise ValueError(
+                "schema-v4 completion row differs from its terminal receipt"
+            )
+    return _CellExecutionIdentity(
+        experiment=family.experiment,
+        runtime_sha256=str(execution_plan_sha256),
+        split_sha256=str(execution_split_sha256),
+    )
+
+
 def _load_cell(
     reference: IndustrialCellEvidence,
     *,
@@ -2178,6 +2457,13 @@ def _load_cell(
     _, _, world_size = _expected_topology(cell)
     if len(reference.terminal_receipts) != world_size:
         raise ValueError("cell evidence lacks complete rank coverage")
+    execution_identity = _replay_cell_execution_identity(
+        reference,
+        registry=registry,
+        family=family,
+        cell=cell,
+        inventory=inventory,
+    )
 
     run_rows: list[dict[str, Any]] = []
     request_rows_by_rank: list[tuple[dict[str, Any], ...]] = []
@@ -2197,7 +2483,7 @@ def _load_cell(
         _validate_run_row(
             run_row,
             registry=registry,
-            family=family,
+            family=execution_identity,
             cell=cell,
             rank=expected_rank,
         )
@@ -2334,7 +2620,7 @@ def _load_cell(
     physical_gpu_uuids, hardware_validity = _load_hardware_receipt(
         reference.hardware_receipt,
         registry=registry,
-        family=family,
+        family=execution_identity,
         cell=cell,
         terminal_receipts=reference.terminal_receipts,
         topology_sha256=str(run_rows[0]["topology_sha256"]),

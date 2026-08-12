@@ -129,6 +129,7 @@ def _reference(tmp_path: Path, cell_id: str) -> IndustrialCellEvidence:
         terminal_receipts=(bound("terminal"),),
         hardware_receipt=bound("hardware"),
         budget_observation=bound("budget"),
+        completion_contract=bound("schema-v4-completion"),
     )
 
 
@@ -296,7 +297,7 @@ def _e3a_fixture(
         for index, cell in enumerate(cells)
     }
     manifest = RawE3aSelectionEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         cells=tuple(_reference(tmp_path, cell.cell_id) for cell in cells),
     )
     return manifest, loaded, runtime_sha256, split_sha256
@@ -487,7 +488,7 @@ def test_e3a_reducer_rejects_coverage_confirmation_and_token_tamper(
     with pytest.raises(ValueError, match="confirmation"):
         reduce_e3a_selection_from_raw(**kwargs, confirmation_data_visible=True)
     incomplete = RawE3aSelectionEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         cells=manifest.cells[:-1],
     )
     with pytest.raises(ValueError, match="exactly cover"):
@@ -607,7 +608,7 @@ def _e1_fixture(
             exposed_update_ms=exposed,
         )
     manifest = RawE1ParetoEvidenceManifest(
-        schema_version=1,
+        schema_version=2,
         cells=tuple(_reference(tmp_path, cell.cell_id) for cell in active),
     )
     return (

@@ -183,6 +183,7 @@ def _manifest(tmp_path: Path) -> RawEvidenceAliasManifest:
             "native-terminal",
             "hardware",
             "budget-observation",
+            "completion-contract",
             "inventory-source",
         )
     }
@@ -205,6 +206,7 @@ def _manifest(tmp_path: Path) -> RawEvidenceAliasManifest:
             terminal_receipts=(references["terminal"],),
             hardware_receipt=references["hardware"],
             budget_observation=references["budget-observation"],
+            completion_contract=references["completion-contract"],
         ),
         source_native_terminal_artifacts=(references["native-terminal"],),
         inventory_source_receipt=references["inventory-source"],

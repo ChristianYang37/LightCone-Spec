@@ -999,6 +999,7 @@ def _build_evidence(
                     terminal_receipts=(terminal,),
                     hardware_receipt=hardware,
                     budget_observation=budget_observation,
+                    diagnostic_lineage_identity=True,
                 )
             )
         qualification = _write_json(
@@ -1299,6 +1300,7 @@ def _build_e2_stage_evidence(
                 terminal_receipts=(terminal,),
                 hardware_receipt=hardware,
                 budget_observation=budget_observation,
+                diagnostic_lineage_identity=True,
             )
         )
     return registry, receipt, pareto, tuple(result), envelope
