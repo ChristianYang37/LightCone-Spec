@@ -25,6 +25,9 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
     serving_cell_rejection_reason,
 )
+from lightcone_spec.runtime.compile_cache import (
+    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
+)
 
 _SHA256_LENGTH = 64
 _SPECIAL_REDUCER_STAGES = frozenset({"E1", "E2", "E3b", "E5"})
@@ -34,9 +37,6 @@ _GENERIC_REGISTRY_STAGES = tuple(
     if stage not in _SPECIAL_REDUCER_STAGES
 )
 
-RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
-    "release_compile_assignment_contract_unavailable"
-)
 RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
     "release_download_assignment_contract_unavailable"
 )

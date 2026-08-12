@@ -4,12 +4,19 @@ The cache deliberately separates reusable read-only objects from a private
 writable overlay owned by one process/attempt.  A completed object is selected
 only through a content-bound receipt; directory discovery is never evidence
 that a cache entry is safe to reuse.
+
+This module also freezes the *future* compile-only assignment envelope.  The
+current release intentionally cannot execute that envelope: it has no exact
+prewarm/finalization implementation or atomic result-pointer replay.  A valid
+typed envelope is therefore diagnostic input only and is deterministically
+blocked before a cache store, overlay, model process, or GPU state is created.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -19,7 +26,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Self
+from typing import NoReturn, Self
 
 from lightcone_spec import PINNED_SGLANG_TREE
 
@@ -38,6 +45,9 @@ PINNED_SGLANG_PATCH_SHA256 = (
     "369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7"
 )
 SGLANG_FIRST_PARTY_COMPILE_BUILDER = "lightcone_spec.sglang_bridge.launch_server.v1"
+RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
+    "release_compile_assignment_contract_unavailable"
+)
 
 _CACHE_ENVIRONMENT = {
     "CCACHE_DIR": "ccache",
@@ -63,6 +73,7 @@ def _canonical_bytes(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -83,6 +94,76 @@ PINNED_SGLANG_COMPILE_SOURCE_SHA256 = _content_sha256(
     }
 )
 
+# These protocol identities describe the minimum missing terminal boundary.
+# They do not claim that a runner or result pointer exists in this release.
+COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "compile_only_graceful_shutdown_protocol",
+        "required_acknowledgement": (
+            "assignment_sha256",
+            "compile_plan_sha256",
+            "prewarm_manifest_sha256",
+            "attempt_id",
+            "process_id",
+            "shutdown_requested_ns",
+            "process_exited_ns",
+            "exit_code",
+            "active_requests",
+            "queued_requests",
+            "final_cache_receipt_sha256",
+        ),
+        "success_requires_zero_active_and_queued_requests": True,
+        "provider_summary_is_not_authority": True,
+    }
+)
+COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "compile_only_atomic_result_pointer_protocol",
+        "required_path_bindings": (
+            "assignment_manifest",
+            "prewarm_manifest",
+            "attempt_receipt",
+            "graceful_shutdown_receipt",
+            "final_cache_receipt",
+            "immutable_cache_object_manifest",
+        ),
+        "each_binding_requires": ("absolute_path", "raw_sha256", "size"),
+        "publication": "atomic_no_replace_with_exact_sidecar",
+        "resume": "reopen_and_revalidate_every_bound_path",
+        "serialized_summary_is_not_authority": True,
+    }
+)
+COMPILE_ONLY_ASSIGNMENT_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "compile_only_assignment_protocol",
+        "required_authority": (
+            "registry_runtime_split",
+            "physical_assignment",
+            "experiment_budget",
+            "budget_materialization_authority",
+            "inventory_and_source_receipt",
+            "exact_gpu_uuids_and_host",
+            "compile_plan_and_key",
+            "model_revisions",
+            "tp_context_concurrency_graph_buckets",
+            "deterministic_prewarm_payloads",
+            "graceful_shutdown_acknowledgement",
+            "atomic_result_pointer",
+        ),
+        "graceful_shutdown_protocol_sha256": (
+            COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256
+        ),
+        "result_pointer_protocol_sha256": (COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256),
+        "release_execution_available": False,
+        "blocked_before_mutation_reason": (
+            RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
+        ),
+    }
+)
+
 
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -93,6 +174,97 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stable_regular_file_bytes(path: Path, *, label: str) -> bytes:
+    """Read one absolute regular file without following or racing a symlink."""
+
+    if not path.is_absolute() or path.resolve(strict=False) != path:
+        raise ValueError(f"{label} path must be absolute and normalized")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{label} must be a readable regular file") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            body = handle.read()
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        identity = lambda row: (
+            row.st_dev,
+            row.st_ino,
+            row.st_size,
+            row.st_mtime_ns,
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or identity(before) != identity(after)
+            or identity(after) != identity(current)
+            or len(body) != after.st_size
+        ):
+            raise ValueError(f"{label} changed while it was read")
+        return body
+    finally:
+        os.close(descriptor)
+
+
+def _strict_json_object(body: bytes, *, label: str) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> NoReturn:
+        raise ValueError(f"{label} contains non-finite JSON constant {value!r}")
+
+    try:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not strict UTF-8 JSON") from error
+
+    def require_finite(item: object) -> None:
+        if type(item) is float and not math.isfinite(item):
+            raise ValueError(f"{label} contains a non-finite JSON number")
+        if type(item) is list:
+            for child in item:
+                require_finite(child)
+        elif type(item) is dict:
+            for child in item.values():
+                require_finite(child)
+
+    require_finite(value)
+    if type(value) is not dict:
+        raise TypeError(f"{label} must contain one JSON object")
+    if body != _canonical_bytes(value) + b"\n":
+        raise ValueError(f"{label} must use canonical JSON encoding")
+    return value
+
+
+def _load_canonical_json_with_sidecar(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[dict[str, object], str]:
+    body = _stable_regular_file_bytes(path, label=label)
+    value = _strict_json_object(body, label=label)
+    semantic_sha256 = _content_sha256(value)
+    sidecar = _stable_regular_file_bytes(
+        Path(f"{path}.sha256"), label=f"{label} SHA-256 sidecar"
+    )
+    if sidecar != f"{semantic_sha256}\n".encode("ascii"):
+        raise ValueError(f"{label} SHA-256 sidecar differs from content")
+    return value, semantic_sha256
 
 
 def _fsync_file(path: Path) -> None:
@@ -466,6 +638,25 @@ class CompileCacheLaunchPlan:
         return _content_sha256(asdict(self))
 
     @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            "schema_version",
+            "kind",
+            "key",
+            "cache_root",
+            "cache_mode",
+            "builder_id",
+            "base_receipt_path",
+            "base_receipt_sha256",
+        }:
+            raise ValueError("compile-cache plan has unknown or missing fields")
+        payload = dict(raw)
+        key = CompileCacheKey.from_dict(payload.pop("key"))
+        value = cls(**payload, key=key)
+        value.validate()
+        return value
+
+    @classmethod
     def issue(
         cls,
         *,
@@ -489,12 +680,12 @@ class CompileCacheLaunchPlan:
         if requested_root.is_symlink():
             raise ValueError("compile-cache root cannot be a symlink")
         root = requested_root.resolve()
-        cache = ImmutableCompileCache(root)
         selected_path: str | None = None
         selected_sha256: str | None = None
         if cache_mode == "reuse":
             if base_receipt_path is None:
                 raise ValueError("cache reuse requires an explicit receipt")
+            cache = ImmutableCompileCache._open_existing_read_only(root)
             requested_receipt = Path(base_receipt_path)
             if requested_receipt.is_symlink():
                 raise ValueError("base receipt cannot be a symlink")
@@ -548,26 +739,391 @@ class CompileCacheLaunchPlan:
         if resolved.is_symlink() or not resolved.is_file():
             raise ValueError("compile-cache plan must be a regular file")
         raw = json.loads(resolved.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or set(raw) != {
-            "schema_version",
-            "kind",
-            "key",
-            "cache_root",
-            "cache_mode",
-            "builder_id",
-            "base_receipt_path",
-            "base_receipt_sha256",
-        }:
-            raise ValueError("compile-cache plan has unknown or missing fields")
-        key = CompileCacheKey.from_dict(raw.pop("key"))
-        value = cls(**raw, key=key)
-        value.validate()
+        value = cls.from_dict(raw)
         sidecar = resolved.with_name(f"{resolved.name}.sha256")
         if sidecar.is_symlink() or not sidecar.is_file():
             raise ValueError("compile-cache plan sidecar is missing")
         if sidecar.read_text(encoding="utf-8").strip() != value.sha256:
             raise ValueError("compile-cache plan sidecar differs from content")
         return value
+
+
+@dataclass(frozen=True)
+class CompileOnlyPrewarmPayload:
+    """One exact, ordered input used by a future graph/JIT prewarm lifecycle."""
+
+    request_id: str
+    graph_bucket: int
+    input_token_ids: tuple[int, ...]
+    requested_output_tokens: int
+    sampling_seed: int
+
+    def validate(self) -> None:
+        if not _SAFE_COMPONENT.fullmatch(self.request_id):
+            raise ValueError("compile prewarm request ID is unsafe")
+        for name in ("graph_bucket", "requested_output_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"compile prewarm {name} must be positive")
+        if type(self.sampling_seed) is not int or self.sampling_seed < 0:
+            raise ValueError("compile prewarm sampling seed must be non-negative")
+        if not self.input_token_ids or any(
+            type(token_id) is not int or token_id < 0
+            for token_id in self.input_token_ids
+        ):
+            raise ValueError("compile prewarm input token IDs are invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "request_id": self.request_id,
+            "graph_bucket": self.graph_bucket,
+            "input_token_ids": list(self.input_token_ids),
+            "requested_output_tokens": self.requested_output_tokens,
+            "sampling_seed": self.sampling_seed,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            "request_id",
+            "graph_bucket",
+            "input_token_ids",
+            "requested_output_tokens",
+            "sampling_seed",
+        }:
+            raise ValueError("compile prewarm payload fields differ from schema")
+        token_ids = raw.get("input_token_ids")
+        if type(token_ids) is not list:
+            raise TypeError("compile prewarm input token IDs must be a JSON array")
+        value = cls(
+            request_id=raw.get("request_id"),
+            graph_bucket=raw.get("graph_bucket"),
+            input_token_ids=tuple(token_ids),
+            requested_output_tokens=raw.get("requested_output_tokens"),
+            sampling_seed=raw.get("sampling_seed"),
+        )
+        value.validate()
+        return value
+
+
+@dataclass(frozen=True)
+class CompileOnlyPrewarmManifest:
+    """Exact payload order for a future release-owned compile-only attempt."""
+
+    schema_version: int
+    kind: str
+    model_lock_sha256: str
+    sampling_profile_sha256: str
+    payloads: tuple[CompileOnlyPrewarmPayload, ...]
+
+    def validate(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != "compile_only_prewarm_manifest"
+        ):
+            raise ValueError("compile prewarm manifest schema is unsupported")
+        _require_sha256("compile prewarm model lock", self.model_lock_sha256)
+        _require_sha256(
+            "compile prewarm sampling profile", self.sampling_profile_sha256
+        )
+        if not self.payloads or any(
+            type(payload) is not CompileOnlyPrewarmPayload for payload in self.payloads
+        ):
+            raise TypeError("compile prewarm manifest requires exact payloads")
+        for payload in self.payloads:
+            payload.validate()
+        request_ids = tuple(payload.request_id for payload in self.payloads)
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("compile prewarm request IDs must be unique")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "model_lock_sha256": self.model_lock_sha256,
+            "sampling_profile_sha256": self.sampling_profile_sha256,
+            "payloads": [payload.to_dict() for payload in self.payloads],
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            "schema_version",
+            "kind",
+            "model_lock_sha256",
+            "sampling_profile_sha256",
+            "payloads",
+        }:
+            raise ValueError("compile prewarm manifest fields differ from schema")
+        payloads = raw.get("payloads")
+        if type(payloads) is not list:
+            raise TypeError("compile prewarm payloads must be a JSON array")
+        value = cls(
+            schema_version=raw.get("schema_version"),
+            kind=raw.get("kind"),
+            model_lock_sha256=raw.get("model_lock_sha256"),
+            sampling_profile_sha256=raw.get("sampling_profile_sha256"),
+            payloads=tuple(
+                CompileOnlyPrewarmPayload.from_dict(payload) for payload in payloads
+            ),
+        )
+        value.validate()
+        return value
+
+
+@dataclass(frozen=True)
+class CompileOnlyAssignmentContract:
+    """Complete future compile assignment shape, never current launch authority.
+
+    The object deliberately carries all fields required by the registered
+    future boundary.  :func:`require_release_compile_only_assignment` still
+    rejects it unconditionally because this release cannot create or replay the
+    required graceful-shutdown receipt and atomic result pointer.
+    """
+
+    schema_version: int
+    kind: str
+    assignment_protocol_sha256: str
+    cell_id: str
+    registry_sha256: str
+    runtime_sha256: str
+    split_sha256: str
+    physical_assignment_sha256: str
+    experiment_budget_sha256: str
+    budget_materialization_authority_sha256: str
+    inventory_sha256: str
+    inventory_source_receipt_sha256: str
+    gpu_uuids: tuple[str, ...]
+    host_id: str
+    fixed_instance_gpu_count: int
+    compile_cache_plan: CompileCacheLaunchPlan
+    prewarm_manifest: CompileOnlyPrewarmManifest
+    graceful_shutdown_protocol_sha256: str
+    result_pointer_protocol_sha256: str
+    result_pointer_path: str
+
+    def validate(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != "compile_only_assignment_contract"
+        ):
+            raise ValueError("compile-only assignment schema is unsupported")
+        if self.assignment_protocol_sha256 != (COMPILE_ONLY_ASSIGNMENT_PROTOCOL_SHA256):
+            raise ValueError("compile-only assignment uses another release protocol")
+        for name in (
+            "cell_id",
+            "registry_sha256",
+            "runtime_sha256",
+            "split_sha256",
+            "physical_assignment_sha256",
+            "experiment_budget_sha256",
+            "budget_materialization_authority_sha256",
+            "inventory_sha256",
+            "inventory_source_receipt_sha256",
+        ):
+            _require_sha256(f"compile-only {name}", getattr(self, name))
+        if (
+            not self.gpu_uuids
+            or len(self.gpu_uuids) != len(set(self.gpu_uuids))
+            or any(
+                type(gpu_uuid) is not str
+                or not gpu_uuid.strip()
+                or "\n" in gpu_uuid
+                or "\r" in gpu_uuid
+                for gpu_uuid in self.gpu_uuids
+            )
+        ):
+            raise ValueError("compile-only GPU UUIDs must be non-empty and unique")
+        _require_text("compile-only host ID", self.host_id)
+        if type(
+            self.fixed_instance_gpu_count
+        ) is not int or self.fixed_instance_gpu_count < len(self.gpu_uuids):
+            raise ValueError(
+                "compile-only fixed-instance GPU count cannot be smaller than its gang"
+            )
+        if type(self.compile_cache_plan) is not CompileCacheLaunchPlan:
+            raise TypeError("compile-only assignment requires an exact cache plan")
+        self.compile_cache_plan.validate()
+        if self.compile_cache_plan.cache_mode != "build":
+            raise ValueError("compile-only assignments can build only a new cache base")
+        if type(self.prewarm_manifest) is not CompileOnlyPrewarmManifest:
+            raise TypeError(
+                "compile-only assignment requires an exact prewarm manifest"
+            )
+        self.prewarm_manifest.validate()
+        key = self.compile_cache_plan.key
+        manifest_buckets = tuple(
+            sorted({payload.graph_bucket for payload in self.prewarm_manifest.payloads})
+        )
+        if manifest_buckets != key.graph_buckets:
+            raise ValueError(
+                "compile prewarm payloads must exactly cover the cache graph buckets"
+            )
+        if any(
+            len(payload.input_token_ids) + payload.requested_output_tokens
+            > key.context_limit
+            for payload in self.prewarm_manifest.payloads
+        ):
+            raise ValueError("compile prewarm payload exceeds the cache context limit")
+        if self.graceful_shutdown_protocol_sha256 != (
+            COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256
+        ):
+            raise ValueError("compile-only assignment uses another shutdown protocol")
+        if self.result_pointer_protocol_sha256 != (
+            COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256
+        ):
+            raise ValueError(
+                "compile-only assignment uses another result-pointer protocol"
+            )
+        _strict_absolute_path(
+            "compile-only result pointer path", self.result_pointer_path
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "assignment_protocol_sha256": self.assignment_protocol_sha256,
+            "cell_id": self.cell_id,
+            "registry_sha256": self.registry_sha256,
+            "runtime_sha256": self.runtime_sha256,
+            "split_sha256": self.split_sha256,
+            "physical_assignment_sha256": self.physical_assignment_sha256,
+            "experiment_budget_sha256": self.experiment_budget_sha256,
+            "budget_materialization_authority_sha256": (
+                self.budget_materialization_authority_sha256
+            ),
+            "inventory_sha256": self.inventory_sha256,
+            "inventory_source_receipt_sha256": (self.inventory_source_receipt_sha256),
+            "gpu_uuids": list(self.gpu_uuids),
+            "host_id": self.host_id,
+            "fixed_instance_gpu_count": self.fixed_instance_gpu_count,
+            "compile_cache_plan": asdict(self.compile_cache_plan),
+            "prewarm_manifest": self.prewarm_manifest.to_dict(),
+            "graceful_shutdown_protocol_sha256": (
+                self.graceful_shutdown_protocol_sha256
+            ),
+            "result_pointer_protocol_sha256": (self.result_pointer_protocol_sha256),
+            "result_pointer_path": self.result_pointer_path,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        fields = {
+            "schema_version",
+            "kind",
+            "assignment_protocol_sha256",
+            "cell_id",
+            "registry_sha256",
+            "runtime_sha256",
+            "split_sha256",
+            "physical_assignment_sha256",
+            "experiment_budget_sha256",
+            "budget_materialization_authority_sha256",
+            "inventory_sha256",
+            "inventory_source_receipt_sha256",
+            "gpu_uuids",
+            "host_id",
+            "fixed_instance_gpu_count",
+            "compile_cache_plan",
+            "prewarm_manifest",
+            "graceful_shutdown_protocol_sha256",
+            "result_pointer_protocol_sha256",
+            "result_pointer_path",
+        }
+        if type(raw) is not dict or set(raw) != fields:
+            raise ValueError("compile-only assignment fields differ from schema")
+        gpu_uuids = raw.get("gpu_uuids")
+        if type(gpu_uuids) is not list:
+            raise TypeError("compile-only GPU UUIDs must be a JSON array")
+        value = cls(
+            schema_version=raw.get("schema_version"),
+            kind=raw.get("kind"),
+            assignment_protocol_sha256=raw.get("assignment_protocol_sha256"),
+            cell_id=raw.get("cell_id"),
+            registry_sha256=raw.get("registry_sha256"),
+            runtime_sha256=raw.get("runtime_sha256"),
+            split_sha256=raw.get("split_sha256"),
+            physical_assignment_sha256=raw.get("physical_assignment_sha256"),
+            experiment_budget_sha256=raw.get("experiment_budget_sha256"),
+            budget_materialization_authority_sha256=raw.get(
+                "budget_materialization_authority_sha256"
+            ),
+            inventory_sha256=raw.get("inventory_sha256"),
+            inventory_source_receipt_sha256=raw.get("inventory_source_receipt_sha256"),
+            gpu_uuids=tuple(gpu_uuids),
+            host_id=raw.get("host_id"),
+            fixed_instance_gpu_count=raw.get("fixed_instance_gpu_count"),
+            compile_cache_plan=CompileCacheLaunchPlan.from_dict(
+                raw.get("compile_cache_plan")
+            ),
+            prewarm_manifest=CompileOnlyPrewarmManifest.from_dict(
+                raw.get("prewarm_manifest")
+            ),
+            graceful_shutdown_protocol_sha256=raw.get(
+                "graceful_shutdown_protocol_sha256"
+            ),
+            result_pointer_protocol_sha256=raw.get("result_pointer_protocol_sha256"),
+            result_pointer_path=raw.get("result_pointer_path"),
+        )
+        value.validate()
+        return value
+
+    def write(self, path: str | Path) -> Path:
+        self.validate()
+        destination = _strict_absolute_path("compile-only assignment", str(path))
+        if destination.parent.is_symlink() or not destination.parent.is_dir():
+            raise ValueError("compile-only assignment parent must be a directory")
+        _publish_json(destination, self.to_dict())
+        _publish_text(Path(f"{destination}.sha256"), self.sha256)
+        if self.load(destination) != self:
+            raise RuntimeError("compile-only assignment changed during publication")
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        source = _strict_absolute_path("compile-only assignment", str(path))
+        raw, semantic_sha256 = _load_canonical_json_with_sidecar(
+            source, label="compile-only assignment"
+        )
+        value = cls.from_dict(raw)
+        if semantic_sha256 != value.sha256:
+            raise ValueError("compile-only assignment semantic digest differs")
+        return value
+
+
+class CompileOnlyAssignmentUnavailableError(RuntimeError):
+    """A compile-only request reached a release with no terminal authority."""
+
+    reason_code = RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
+
+
+def require_release_compile_only_assignment(
+    contract: CompileOnlyAssignmentContract | None = None,
+) -> NoReturn:
+    """Deterministically block compile-only work before any runtime mutation."""
+
+    if contract is not None:
+        if type(contract) is not CompileOnlyAssignmentContract:
+            raise TypeError("compile-only gate requires an exact assignment contract")
+        contract.validate()
+    raise CompileOnlyAssignmentUnavailableError(
+        "compile-only execution is BLOCKED: "
+        f"{RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE}"
+    )
 
 
 @dataclass(frozen=True)

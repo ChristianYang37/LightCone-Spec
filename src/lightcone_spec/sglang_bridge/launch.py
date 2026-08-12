@@ -14,6 +14,8 @@ from pathlib import Path
 from lightcone_spec.runtime.compile_cache import (
     COMPILE_CACHE_ENVIRONMENT_VARIABLES,
     CompileCacheLaunchPlan,
+    CompileOnlyAssignmentContract,
+    require_release_compile_only_assignment,
     start_compile_cache_launch,
 )
 
@@ -78,11 +80,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lightcone-sglang-launch")
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--compile-cache-plan", required=True)
+    parser.add_argument("--compile-only-assignment")
     parser.add_argument("server_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     server_argv = list(args.server_argv)
     if server_argv and server_argv[0] == "--":
         server_argv = server_argv[1:]
+    compile_only_flag = any(
+        argument == "--compile-only" or argument.startswith("--compile-only=")
+        for argument in server_argv
+    )
+    # Compile-only is a distinct assignment lifecycle, not an SGLang server
+    # flag that may borrow the serving cache launcher.  Block it before checkout
+    # verification, cache-plan loading, directory creation, model import, or GPU
+    # mutation.  A future release must replace this gate only together with its
+    # registered prewarm/finalization and atomic result-pointer implementation.
+    if args.compile_only_assignment is not None:
+        assignment = CompileOnlyAssignmentContract.load(
+            Path(args.compile_only_assignment)
+        )
+        require_release_compile_only_assignment(assignment)
+    if compile_only_flag:
+        require_release_compile_only_assignment()
     if not server_argv:
         raise ValueError("SGLang server arguments are required after --")
     if "sglang" in sys.modules:
