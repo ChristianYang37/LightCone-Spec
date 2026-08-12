@@ -151,7 +151,15 @@ def test_e3b_cli_manifest_reopens_bound_family_paths_and_rejects_duplicates(
         name="duplicate.json",
     )
     with pytest.raises(ValueError, match="duplicates a raw family path"):
-        cli._load_e3b_long_context_analysis_manifest(duplicate_manifest)
+        cli.main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(duplicate_manifest),
+                "--output",
+                str(tmp_path / "duplicate-must-not-exist.json"),
+            ]
+        )
 
 
 def test_e3b_cli_manifest_and_family_sidecars_are_strict(
@@ -169,7 +177,15 @@ def test_e3b_cli_manifest_and_family_sidecars_are_strict(
     )
     Path(f"{missing_sidecar}.sha256").unlink()
     with pytest.raises(ValueError, match="must be a regular bound file"):
-        cli._load_e3b_long_context_analysis_manifest(missing_sidecar)
+        cli.main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(missing_sidecar),
+                "--output",
+                str(tmp_path / "sidecar-must-not-exist.json"),
+            ]
+        )
 
     forged_binding = [dict(bindings[0], sha256="0" * 64)]
     forged_manifest = _outer_manifest(
@@ -178,7 +194,15 @@ def test_e3b_cli_manifest_and_family_sidecars_are_strict(
         name="forged-binding.json",
     )
     with pytest.raises(ValueError, match="manifest digest mismatch"):
-        cli._load_e3b_long_context_analysis_manifest(forged_manifest)
+        cli.main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(forged_manifest),
+                "--output",
+                str(tmp_path / "forged-must-not-exist.json"),
+            ]
+        )
 
     tampered_manifest = _outer_manifest(
         tmp_path,
@@ -188,7 +212,15 @@ def test_e3b_cli_manifest_and_family_sidecars_are_strict(
     family_path = tmp_path / bindings[0]["path"]
     family_path.write_text('{"tampered":true}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="sidecar is missing or invalid"):
-        cli._load_e3b_long_context_analysis_manifest(tampered_manifest)
+        cli.main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(tampered_manifest),
+                "--output",
+                str(tmp_path / "tampered-must-not-exist.json"),
+            ]
+        )
 
 
 @pytest.mark.parametrize(
