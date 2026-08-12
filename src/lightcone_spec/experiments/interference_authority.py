@@ -8,13 +8,13 @@ receipt, the derived physical hardware envelope, a calibration-only manifest,
 and every first-party terminal authority used for the isolated/concurrent
 comparison.
 
-The current protocol intentionally has no registered performance-equivalence
-threshold.  Raw evidence can therefore establish a hard ``FAIL`` (for example
-wrong topology, missing coverage, unsafe counters, or changed token
-trajectories), but it cannot establish ``PASS``.  Formal calibrated execution
-is blocked with
-``interference_calibration_acceptance_protocol_unregistered``.  The serial
-deny-all envelope remains the only evidence-free scheduling policy.
+The registered protocol compares paired isolated and simultaneous Static
+blocks.  Both committed-token goodput and raw within-request p99 ITL must stay
+within one percent and their paired BCa 95% intervals must include zero.  Raw
+request-latency summaries and coalesced SSE timing are never substituted for
+ITL.  A calibrated ``PASS`` can authorize only the exact measured cardinality,
+and only after replay under the source-owned trusted-attester policy.  The
+serial deny-all envelope remains the only evidence-free scheduling policy.
 """
 
 from __future__ import annotations
@@ -32,19 +32,26 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import pyarrow.parquet as pq
 
 from lightcone_spec.experiments.gpu_pool import (
     GpuAssignment,
     GpuInventory,
     InterferenceEnvelope,
+    InterferenceRule,
     PoolResourceClaim,
 )
 from lightcone_spec.experiments.registry import WorkloadClass, content_sha256
+from lightcone_spec.experiments.statistics import (
+    REGISTERED_CONFIDENCE,
+    bca_mean_interval,
+)
 from lightcone_spec.runtime.attestation import (
     RELEASE_TRUSTED_ATTESTER_POLICY,
     require_release_trusted_attester_policy,
 )
+from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 from lightcone_spec.telemetry.writer import load_completed_evidence
 
 if TYPE_CHECKING:
@@ -76,8 +83,11 @@ _SAFETY_COUNTERS = (
 TRUSTED_INTERFERENCE_ATTESTER_UNAVAILABLE_REASON = (
     "trusted_hardware_attester_unavailable"
 )
-INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON = (
-    "interference_calibration_acceptance_protocol_unregistered"
+INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON = (
+    "interference_calibration_raw_itl_evidence_incomplete"
+)
+INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON = (
+    "interference_calibration_has_no_passing_cardinality"
 )
 CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON = (
     "calibrated_interference_raw_authority_required"
@@ -102,11 +112,18 @@ INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256 = content_sha256(
         ],
         "performance_metrics": [
             "completed_request_goodput_tps_from_raw_timestamps_and_tokens",
-            "request_latency_p99_ms_from_raw_timestamps",
+            "within_request_p99_itl_ms_from_complete_raw_token_timestamps",
         ],
         "cardinality": "exact_only_no_upward_inference",
         "confirmation_data": "forbidden",
-        "acceptance_threshold": "UNREGISTERED",
+        "acceptance_threshold": {
+            "maximum_absolute_paired_relative_difference": 0.01,
+            "confidence": 0.95,
+            "interval": "paired_bca_mean_log_ratio_v1",
+            "bootstrap_repetitions": 10_000,
+            "bootstrap_seed": 0,
+            "interval_must_include_zero": True,
+        },
     }
 )
 
@@ -589,7 +606,7 @@ class InterferenceHardwareEnvelope:
 
 @dataclass(frozen=True)
 class InterferenceCalibrationProtocol:
-    """Pre-confirmation protocol input; schema 1 deliberately cannot PASS."""
+    """Registered pre-confirmation interference acceptance protocol."""
 
     schema_version: int
     kind: Literal["interference_calibration_protocol"]
@@ -598,14 +615,17 @@ class InterferenceCalibrationProtocol:
     hardware_envelope_sha256: str
     data_partition: Literal["interference_calibration_only"]
     confirmation_data_visible: Literal[False]
-    acceptance_status: Literal["UNREGISTERED"]
+    acceptance_status: Literal["REGISTERED"]
     minimum_isolated_repetitions: int
     minimum_concurrent_repetitions: int
-    goodput_ratio_floor: None
-    p99_latency_ratio_ceiling: None
+    maximum_absolute_relative_difference: float
+    confidence: float
+    interval_method: Literal["paired_bca_mean_log_ratio_v1"]
+    bootstrap_repetitions: int
+    bootstrap_seed: int
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != "interference_calibration_protocol":
+        if self.schema_version != 2 or self.kind != "interference_calibration_protocol":
             raise ValueError("interference calibration protocol schema is unsupported")
         if (
             self.reducer_protocol_sha256
@@ -619,21 +639,30 @@ class InterferenceCalibrationProtocol:
             or self.confirmation_data_visible is not False
         ):
             raise ValueError("confirmation data cannot enter interference calibration")
-        if (
-            self.acceptance_status != "UNREGISTERED"
-            or self.goodput_ratio_floor is not None
-            or self.p99_latency_ratio_ceiling is not None
+        if self.acceptance_status != "REGISTERED":
+            raise ValueError("interference acceptance protocol must be registered")
+        if not math.isclose(
+            self.maximum_absolute_relative_difference,
+            0.01,
+            rel_tol=0.0,
+            abs_tol=0.0,
         ):
-            raise ValueError("schema-1 interference acceptance thresholds are absent")
+            raise ValueError("registered interference difference threshold is 1%")
+        if self.confidence != REGISTERED_CONFIDENCE:
+            raise ValueError("registered interference intervals are fixed at 95%")
+        if self.interval_method != "paired_bca_mean_log_ratio_v1":
+            raise ValueError("registered interference interval method changed")
+        if self.bootstrap_repetitions != 10_000 or self.bootstrap_seed != 0:
+            raise ValueError("registered interference bootstrap configuration changed")
         _strict_int(
             "minimum isolated repetitions",
             self.minimum_isolated_repetitions,
-            minimum=1,
+            minimum=2,
         )
         _strict_int(
             "minimum concurrent repetitions",
             self.minimum_concurrent_repetitions,
-            minimum=1,
+            minimum=2,
         )
 
     @classmethod
@@ -653,8 +682,11 @@ class InterferenceCalibrationProtocol:
                     "acceptance_status",
                     "minimum_isolated_repetitions",
                     "minimum_concurrent_repetitions",
-                    "goodput_ratio_floor",
-                    "p99_latency_ratio_ceiling",
+                    "maximum_absolute_relative_difference",
+                    "confidence",
+                    "interval_method",
+                    "bootstrap_repetitions",
+                    "bootstrap_seed",
                 }
             ),
         )
@@ -682,15 +714,32 @@ class InterferenceCalibrationProtocol:
             minimum_isolated_repetitions=_strict_int(
                 "minimum isolated repetitions",
                 row["minimum_isolated_repetitions"],
-                minimum=1,
+                minimum=2,
             ),
             minimum_concurrent_repetitions=_strict_int(
                 "minimum concurrent repetitions",
                 row["minimum_concurrent_repetitions"],
-                minimum=1,
+                minimum=2,
             ),
-            goodput_ratio_floor=row["goodput_ratio_floor"],
-            p99_latency_ratio_ceiling=row["p99_latency_ratio_ceiling"],
+            maximum_absolute_relative_difference=_strict_float(
+                "maximum absolute relative difference",
+                row["maximum_absolute_relative_difference"],
+                positive=True,
+            ),
+            confidence=_strict_float(
+                "interference confidence", row["confidence"], positive=True
+            ),
+            interval_method=_strict_text(
+                "interference interval method", row["interval_method"]
+            ),
+            bootstrap_repetitions=_strict_int(
+                "interference bootstrap repetitions",
+                row["bootstrap_repetitions"],
+                minimum=100,
+            ),
+            bootstrap_seed=_strict_int(
+                "interference bootstrap seed", row["bootstrap_seed"]
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -705,8 +754,13 @@ class InterferenceCalibrationProtocol:
             "acceptance_status": self.acceptance_status,
             "minimum_isolated_repetitions": self.minimum_isolated_repetitions,
             "minimum_concurrent_repetitions": self.minimum_concurrent_repetitions,
-            "goodput_ratio_floor": self.goodput_ratio_floor,
-            "p99_latency_ratio_ceiling": self.p99_latency_ratio_ceiling,
+            "maximum_absolute_relative_difference": (
+                self.maximum_absolute_relative_difference
+            ),
+            "confidence": self.confidence,
+            "interval_method": self.interval_method,
+            "bootstrap_repetitions": self.bootstrap_repetitions,
+            "bootstrap_seed": self.bootstrap_seed,
         }
 
     @cached_property
@@ -1472,7 +1526,7 @@ class InterferenceRawObservation:
     completed_requests: int
     output_tokens: int
     goodput_tps: float
-    latency_p99_ms: float
+    p99_itl_ms: float | None
     safety_counters: tuple[tuple[str, int], ...]
     hardware_valid: bool
 
@@ -1502,7 +1556,8 @@ class InterferenceRawObservation:
         ):
             raise ValueError("raw observation request/token counts are invalid")
         _strict_float("raw goodput", self.goodput_tps, positive=True)
-        _strict_float("raw p99 latency", self.latency_p99_ms, positive=True)
+        if self.p99_itl_ms is not None:
+            _strict_float("raw p99 ITL", self.p99_itl_ms, positive=True)
         if tuple(name for name, _ in self.safety_counters) != _SAFETY_COUNTERS:
             raise ValueError("raw observation safety coverage is incomplete")
         if any(
@@ -1517,21 +1572,42 @@ class InterferenceRawObservation:
 class InterferenceCalibrationGroupDiagnostic:
     group_id: str
     simultaneous_jobs: int
-    status: Literal["FAIL", "UNRESOLVED"]
+    status: Literal["PASS", "FAIL", "UNRESOLVED"]
     reason_codes: tuple[str, ...]
     raw_observation_sha256s: tuple[str, ...]
     goodput_ratios: tuple[tuple[int, int, float], ...]
-    p99_latency_ratios: tuple[tuple[int, int, float], ...]
+    p99_itl_ratios: tuple[tuple[int, int, float], ...]
+    goodput_mean_relative_difference: float | None
+    goodput_ci_lower_relative_difference: float | None
+    goodput_ci_upper_relative_difference: float | None
+    p99_itl_mean_relative_difference: float | None
+    p99_itl_ci_lower_relative_difference: float | None
+    p99_itl_ci_upper_relative_difference: float | None
 
     def __post_init__(self) -> None:
-        if self.status not in {"FAIL", "UNRESOLVED"}:
+        if self.status not in {"PASS", "FAIL", "UNRESOLVED"}:
             raise ValueError("interference diagnostic status is unsupported")
-        if not self.reason_codes or self.reason_codes != tuple(
-            sorted(set(self.reason_codes))
-        ):
+        if self.reason_codes != tuple(sorted(set(self.reason_codes))):
             raise ValueError("interference diagnostic reasons must be canonical")
+        if self.status == "PASS" and self.reason_codes:
+            raise ValueError("passing interference diagnostics cannot carry reasons")
+        if self.status != "PASS" and not self.reason_codes:
+            raise ValueError("non-passing interference diagnostics need reasons")
         if any(not _is_sha256(value) for value in self.raw_observation_sha256s):
             raise ValueError("raw observation diagnostic digest is invalid")
+        interval_values = (
+            self.goodput_mean_relative_difference,
+            self.goodput_ci_lower_relative_difference,
+            self.goodput_ci_upper_relative_difference,
+            self.p99_itl_mean_relative_difference,
+            self.p99_itl_ci_lower_relative_difference,
+            self.p99_itl_ci_upper_relative_difference,
+        )
+        if any(
+            value is not None and (type(value) is not float or not math.isfinite(value))
+            for value in interval_values
+        ):
+            raise ValueError("interference interval summaries must be finite")
 
     @cached_property
     def sha256(self) -> str:
@@ -1543,7 +1619,25 @@ class InterferenceCalibrationGroupDiagnostic:
                 "reason_codes": list(self.reason_codes),
                 "raw_observation_sha256s": list(self.raw_observation_sha256s),
                 "goodput_ratios": [list(row) for row in self.goodput_ratios],
-                "p99_latency_ratios": [list(row) for row in self.p99_latency_ratios],
+                "p99_itl_ratios": [list(row) for row in self.p99_itl_ratios],
+                "goodput_mean_relative_difference": (
+                    self.goodput_mean_relative_difference
+                ),
+                "goodput_ci_lower_relative_difference": (
+                    self.goodput_ci_lower_relative_difference
+                ),
+                "goodput_ci_upper_relative_difference": (
+                    self.goodput_ci_upper_relative_difference
+                ),
+                "p99_itl_mean_relative_difference": (
+                    self.p99_itl_mean_relative_difference
+                ),
+                "p99_itl_ci_lower_relative_difference": (
+                    self.p99_itl_ci_lower_relative_difference
+                ),
+                "p99_itl_ci_upper_relative_difference": (
+                    self.p99_itl_ci_upper_relative_difference
+                ),
             }
         )
 
@@ -1563,7 +1657,7 @@ def _raw_observation_sha256(value: InterferenceRawObservation) -> str:
             "completed_requests": value.completed_requests,
             "output_tokens": value.output_tokens,
             "goodput_tps": value.goodput_tps,
-            "latency_p99_ms": value.latency_p99_ms,
+            "p99_itl_ms": value.p99_itl_ms,
             "safety_counters": [list(row) for row in value.safety_counters],
             "hardware_valid": value.hardware_valid,
         }
@@ -1573,16 +1667,15 @@ def _raw_observation_sha256(value: InterferenceRawObservation) -> str:
 def diagnose_interference_calibration(
     group: InterferenceCalibrationGroup,
     observations: Sequence[InterferenceRawObservation],
+    *,
+    protocol: InterferenceCalibrationProtocol,
 ) -> InterferenceCalibrationGroupDiagnostic:
-    """Reduce raw metrics without minting a scheduling permission.
-
-    This diagnostic function is intentionally incapable of returning ``PASS``.
-    Only the path-bound formal authority may eventually produce an envelope,
-    after a new registered acceptance protocol is added.
-    """
+    """Apply the registered paired 1% and BCa-95% interference rule."""
 
     if type(group) is not InterferenceCalibrationGroup:
         raise TypeError("interference diagnostic requires one exact group")
+    if type(protocol) is not InterferenceCalibrationProtocol:
+        raise TypeError("interference diagnostic requires the registered protocol")
     rows = tuple(observations)
     declared = {row.observation_id: row for row in (*group.isolated, *group.concurrent)}
     by_id = {row.observation_id: row for row in rows}
@@ -1613,7 +1706,7 @@ def diagnose_interference_calibration(
         (row.repetition, row.slot): row for row in rows if row.mode == "concurrent"
     }
     goodput_ratios: list[tuple[int, int, float]] = []
-    latency_ratios: list[tuple[int, int, float]] = []
+    itl_ratios: list[tuple[int, int, float]] = []
     for key in sorted(isolated):
         left = isolated[key]
         right = concurrent[key]
@@ -1623,9 +1716,10 @@ def diagnose_interference_calibration(
         ):
             reasons.add("terminal_token_trajectory_change")
         goodput_ratios.append((key[0], key[1], right.goodput_tps / left.goodput_tps))
-        latency_ratios.append(
-            (key[0], key[1], right.latency_p99_ms / left.latency_p99_ms)
-        )
+        if left.p99_itl_ms is None or right.p99_itl_ms is None:
+            reasons.add(INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON)
+        else:
+            itl_ratios.append((key[0], key[1], right.p99_itl_ms / left.p99_itl_ms))
     isolated_intervals = sorted(
         (row.started_ns, row.finished_ns) for row in isolated.values()
     )
@@ -1642,12 +1736,56 @@ def diagnose_interference_calibration(
             row.finished_ns for row in concurrent_rows
         ):
             reasons.add("concurrent_interval_nonoverlap")
-    status: Literal["FAIL", "UNRESOLVED"]
-    if reasons:
+    hard_reasons = set(reasons) - {INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON}
+
+    def paired_interval(
+        ratios: Sequence[tuple[int, int, float]],
+    ) -> tuple[float, float, float]:
+        by_repetition: dict[str, np.ndarray] = {}
+        for repetition in group.repetitions:
+            values = np.asarray(
+                [
+                    math.log(ratio)
+                    for row_repetition, _, ratio in ratios
+                    if row_repetition == repetition
+                ],
+                dtype=np.float64,
+            )
+            if values.size != group.simultaneous_jobs:
+                raise ValueError("interference pairs lack exact repetition coverage")
+            by_repetition[str(repetition)] = values
+        estimate, lower, upper = bca_mean_interval(
+            by_repetition,
+            confidence=protocol.confidence,
+            repetitions=protocol.bootstrap_repetitions,
+            seed=protocol.bootstrap_seed,
+        )
+        return tuple(float(math.expm1(value)) for value in (estimate, lower, upper))
+
+    goodput_interval = paired_interval(goodput_ratios)
+    itl_interval = (
+        paired_interval(itl_ratios)
+        if len(itl_ratios) == len(goodput_ratios)
+        else (None, None, None)
+    )
+    threshold = protocol.maximum_absolute_relative_difference
+    if abs(goodput_interval[0]) > threshold:
+        reasons.add("paired_goodput_difference_exceeds_1pct")
+    if goodput_interval[1] > 0.0 or goodput_interval[2] < 0.0:
+        reasons.add("paired_goodput_95pct_interval_excludes_zero")
+    if itl_interval[0] is not None:
+        if abs(itl_interval[0]) > threshold:
+            reasons.add("paired_itl_difference_exceeds_1pct")
+        if itl_interval[1] > 0.0 or itl_interval[2] < 0.0:
+            reasons.add("paired_itl_95pct_interval_excludes_zero")
+
+    status: Literal["PASS", "FAIL", "UNRESOLVED"]
+    if hard_reasons or any(reason.startswith("paired_") for reason in reasons):
         status = "FAIL"
-    else:
+    elif INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON in reasons:
         status = "UNRESOLVED"
-        reasons.add(INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON)
+    else:
+        status = "PASS"
     return InterferenceCalibrationGroupDiagnostic(
         group_id=group.group_id,
         simultaneous_jobs=group.simultaneous_jobs,
@@ -1658,7 +1796,13 @@ def diagnose_interference_calibration(
             for row in sorted(rows, key=lambda item: item.observation_id)
         ),
         goodput_ratios=tuple(goodput_ratios),
-        p99_latency_ratios=tuple(latency_ratios),
+        p99_itl_ratios=tuple(itl_ratios),
+        goodput_mean_relative_difference=goodput_interval[0],
+        goodput_ci_lower_relative_difference=goodput_interval[1],
+        goodput_ci_upper_relative_difference=goodput_interval[2],
+        p99_itl_mean_relative_difference=itl_interval[0],
+        p99_itl_ci_lower_relative_difference=itl_interval[1],
+        p99_itl_ci_upper_relative_difference=itl_interval[2],
     )
 
 
@@ -1692,7 +1836,84 @@ def _output_token_ids(row: Mapping[str, Any]) -> tuple[int, ...]:
         type(token) is not int or token < 0 for token in value
     ):
         raise ValueError("calibration output token IDs are malformed")
+    output_tokens = row.get("output_tokens")
+    encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    if (
+        type(output_tokens) is not int
+        or output_tokens != len(value)
+        or row.get("output_hash_format") != OUTPUT_HASH_FORMAT
+        or row.get("output_token_ids_sha256") != digest
+        or row.get("output_sha256") != digest
+    ):
+        raise ValueError("calibration output token identity is inconsistent")
     return tuple(value)
+
+
+def _request_itls_ms(
+    row: Mapping[str, Any], tokens: Sequence[int]
+) -> tuple[float, ...] | None:
+    raw_timestamps = row.get("token_timestamps_ns")
+    raw_intervals = row.get("inter_token_ms")
+    coverage = row.get("token_timing_coverage")
+    coalesced = row.get("coalesced_intervals")
+    if raw_timestamps is None:
+        if raw_intervals is not None:
+            raise ValueError("calibration ITL summary lacks raw token timestamps")
+        return None
+    if type(raw_timestamps) is not str:
+        raise ValueError("calibration token timestamps are not JSON")
+    try:
+        timestamps = json.loads(raw_timestamps)
+    except json.JSONDecodeError as error:
+        raise ValueError("calibration token timestamps are invalid JSON") from error
+    if (
+        type(timestamps) is not list
+        or len(timestamps) != len(tokens)
+        or any(type(value) is not int or value < 0 for value in timestamps)
+    ):
+        raise ValueError("calibration token timestamps have invalid coverage")
+    arrival = row.get("arrival_ns")
+    completed = row.get("completed_ns")
+    if timestamps and (
+        type(arrival) is not int
+        or type(completed) is not int
+        or timestamps[0] != row.get("first_token_ns")
+        or timestamps[0] < arrival
+        or timestamps[-1] > completed
+    ):
+        raise ValueError("calibration token timestamps are outside the request")
+    intervals = tuple(
+        (right - left) / 1_000_000.0 for left, right in pairwise(timestamps)
+    )
+    if any(value <= 0.0 for value in intervals):
+        raise ValueError("calibration token timestamps are not strictly increasing")
+    if coverage != 1.0 or coalesced != 0:
+        if raw_intervals is not None:
+            raise ValueError("partial calibration timing cannot claim ITL")
+        return None
+    if not intervals:
+        if raw_intervals is not None:
+            raise ValueError("single-token calibration row cannot carry ITL samples")
+        return ()
+    if type(raw_intervals) is not str:
+        raise ValueError("complete calibration timing lacks raw ITL samples")
+    try:
+        declared = json.loads(raw_intervals)
+    except json.JSONDecodeError as error:
+        raise ValueError("calibration ITL samples are invalid JSON") from error
+    if (
+        type(declared) is not list
+        or len(declared) != len(intervals)
+        or any(type(value) not in {int, float} for value in declared)
+        or any(not math.isfinite(float(value)) for value in declared)
+        or any(
+            not math.isclose(float(value), interval, rel_tol=0.0, abs_tol=1e-12)
+            for value, interval in zip(declared, intervals, strict=True)
+        )
+    ):
+        raise ValueError("calibration ITL samples disagree with raw timestamps")
+    return intervals
 
 
 def _load_raw_observation(
@@ -1747,7 +1968,8 @@ def _load_raw_observation(
     token_rows: list[tuple[str, tuple[int, ...]]] = []
     arrivals: list[int] = []
     completions: list[int] = []
-    latencies_ms: list[float] = []
+    itls_ms: list[float] = []
+    complete_itl_evidence = True
     output_tokens = 0
     for row in request_rows:
         request_id = row.get("request_id")
@@ -1764,11 +1986,15 @@ def _load_raw_observation(
         ):
             raise ValueError("calibration request terminal row is incomplete")
         tokens = _output_token_ids(row)
+        request_itls = _request_itls_ms(row, tokens)
+        if request_itls is None:
+            complete_itl_evidence = False
+        else:
+            itls_ms.extend(request_itls)
         request_ids.append(request_id)
         token_rows.append((request_id, tokens))
         arrivals.append(arrival)
         completions.append(completed_ns)
-        latencies_ms.append((completed_ns - arrival) / 1_000_000.0)
         output_tokens += len(tokens)
     if len(request_ids) != len(set(request_ids)) or output_tokens < 1:
         raise ValueError("calibration request coverage is duplicated or empty")
@@ -1794,7 +2020,9 @@ def _load_raw_observation(
         completed_requests=len(request_ids),
         output_tokens=output_tokens,
         goodput_tps=output_tokens / (elapsed_ns / 1_000_000_000.0),
-        latency_p99_ms=_percentile_99(latencies_ms),
+        p99_itl_ms=(
+            _percentile_99(itls_ms) if complete_itl_evidence and itls_ms else None
+        ),
         safety_counters=tuple(safety),
         hardware_valid=True,
     )
@@ -1805,6 +2033,7 @@ class InterferenceCalibrationReduction:
     authority_sha256: str
     source_audit_sha256: str
     diagnostics: tuple[InterferenceCalibrationGroupDiagnostic, ...]
+    rules: tuple[InterferenceRule, ...]
 
     def __post_init__(self) -> None:
         _require_sha256("interference authority", self.authority_sha256)
@@ -1812,17 +2041,21 @@ class InterferenceCalibrationReduction:
         group_ids = tuple(row.group_id for row in self.diagnostics)
         if not group_ids or group_ids != tuple(sorted(set(group_ids))):
             raise ValueError("interference diagnostics must be group-sorted and unique")
+        rule_keys = tuple(rule.key for rule in self.rules)
+        if rule_keys != tuple(sorted(set(rule_keys))):
+            raise ValueError("interference reduction rules must be canonical")
 
     @cached_property
     def sha256(self) -> str:
         return content_sha256(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "interference_calibration_raw_reduction",
                 "authority_sha256": self.authority_sha256,
                 "source_audit_sha256": self.source_audit_sha256,
                 "diagnostic_sha256s": [row.sha256 for row in self.diagnostics],
-                "acceptance_status": "UNREGISTERED",
+                "rule_sha256s": [row.sha256 for row in self.rules],
+                "acceptance_status": "REGISTERED",
             }
         )
 
@@ -1924,7 +2157,7 @@ class InterferenceCalibrationAuthority:
         return audit
 
     def revalidate(self) -> InterferenceCalibrationReduction:
-        """Replay full raw evidence and return only a non-authorizing diagnostic."""
+        """Replay full raw evidence under the source-owned release trust root."""
 
         audit = self.audit_inputs()
         require_release_interference_attester()
@@ -1941,19 +2174,52 @@ class InterferenceCalibrationAuthority:
                 )
                 for run in (*group.isolated, *group.concurrent)
             )
-            diagnostics.append(diagnose_interference_calibration(group, observations))
+            diagnostics.append(
+                diagnose_interference_calibration(
+                    group,
+                    observations,
+                    protocol=audit.protocol,
+                )
+            )
+        diagnostics_tuple = tuple(diagnostics)
+        rules = []
+        for group, diagnostic in zip(
+            audit.manifest.groups, diagnostics_tuple, strict=True
+        ):
+            if diagnostic.status != "PASS":
+                continue
+            exemplar = group.concurrent[0]
+            rules.append(
+                InterferenceRule(
+                    hardware_envelope_sha256=exemplar.hardware_envelope_sha256,
+                    workload_class=exemplar.workload_class,
+                    co_run_signature=exemplar.co_run_signature,
+                    simultaneous_jobs=group.simultaneous_jobs,
+                    gang_shape=exemplar.gang_shape,
+                    load_thermal_power_envelope=(exemplar.load_thermal_power_envelope),
+                    contention_class=exemplar.contention_class,
+                    evidence_sha256=diagnostic.sha256,
+                )
+            )
         return InterferenceCalibrationReduction(
             authority_sha256=self.sha256,
             source_audit_sha256=audit.sha256,
-            diagnostics=tuple(diagnostics),
+            diagnostics=diagnostics_tuple,
+            rules=tuple(sorted(rules, key=lambda row: row.key)),
         )
 
     def require_envelope(self) -> InterferenceEnvelope:
-        """Refuse calibrated scheduling until an acceptance protocol is registered."""
+        """Return exact-cardinality permissions from trusted raw evidence."""
 
-        self.revalidate()
-        raise InterferenceCalibrationBlockedError(
-            INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON
+        reduction = self.revalidate()
+        if not reduction.rules:
+            raise InterferenceCalibrationBlockedError(
+                INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON
+            )
+        return InterferenceEnvelope(
+            schema_version=1,
+            rules=reduction.rules,
+            source_receipt_sha256=reduction.sha256,
         )
 
 
@@ -1965,8 +2231,8 @@ def require_calibrated_interference_execution_authority(
     """Formal-consumer hook for a calibrated (non-serial) envelope.
 
     Serial deny-all envelopes need no calibration authority.  Any rule-bearing
-    envelope requires the exact raw authority and can currently only end in a
-    named BLOCKED state; a caller-provided rule/evidence digest is never enough.
+    envelope requires the exact raw authority; a caller-provided rule/evidence
+    digest is never enough.
     """
 
     if type(envelope) is not InterferenceEnvelope:
@@ -1980,14 +2246,15 @@ def require_calibrated_interference_execution_authority(
             CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON
         )
     reduced = authority.require_envelope()
-    if reduced != envelope:  # pragma: no cover - current protocol always blocks
+    if reduced != envelope:
         raise ValueError("calibrated envelope differs from its raw authority")
 
 
 __all__ = [
     "CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON",
-    "INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON",
+    "INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON",
     "INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256",
+    "INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON",
     "TRUSTED_INTERFERENCE_ATTESTER_UNAVAILABLE_REASON",
     "InterferenceCalibrationAuthority",
     "InterferenceCalibrationBlockedError",

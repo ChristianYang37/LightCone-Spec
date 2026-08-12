@@ -2990,9 +2990,9 @@ def _validate_serial_interference_authority(
     """Replay the only current release interference policy from its receipt."""
 
     # Rule-bearing envelopes require a separate path-bound calibration
-    # authority.  No acceptance threshold is registered in this release, so
-    # the shared formal hook must reject them before a caller-controlled
-    # receipt can be compared as though it were the serial policy.
+    # authority.  This bundle schema deliberately carries only the serial
+    # receipt; registered calibrated envelopes must use the formal raw
+    # calibration-authority path rather than a caller-controlled receipt.
     from lightcone_spec.experiments.interference_authority import (
         InterferenceCalibrationBlockedError,
         require_calibrated_interference_execution_authority,

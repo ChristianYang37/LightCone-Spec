@@ -39,6 +39,13 @@ runtime、split、dependency-output 与 locked-output SHA-256，并声明 select
 unblinding 前封存。编辑 registry artifact 或以另一 digest 重新序列化 dependency 都会
 fail closed。
 
+同 host interference calibration 使用成对的 isolated 与 simultaneous Static block。
+committed-token goodput 和原始 within-request p99 ITL 的成对平均相对差都必须不超过
+1%，且各自的 paired BCa 95% interval 必须包含零。缺少逐 token 时间戳时保持
+UNRESOLVED；request latency 与对 SSE gap 的均摊都不能替代 ITL。通过的 rule 只授权实测
+cardinality，并且仍必须通过 release-owned trusted-attester chain；缺少该信任链时 headline
+scheduling 保持 serial，正式测量继续 blocked。
+
 ## Stage 与 Locked Decision
 
 | Stage | 目的 | 下游使用前锁定的输出 |

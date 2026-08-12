@@ -18,8 +18,8 @@ from lightcone_spec.experiments.gpu_pool import (
 )
 from lightcone_spec.experiments.interference_authority import (
     CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON,
-    INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON,
     INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256,
+    INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON,
     TRUSTED_INTERFERENCE_ATTESTER_UNAVAILABLE_REASON,
     InterferenceCalibrationBlockedError,
     InterferenceCalibrationGroup,
@@ -199,7 +199,11 @@ def _run(
 
 
 def _group(
-    inventory: GpuInventory, cardinality: int, *, label: str = "g"
+    inventory: GpuInventory,
+    cardinality: int,
+    *,
+    label: str = "g",
+    repetitions: int = 2,
 ) -> InterferenceCalibrationGroup:
     return InterferenceCalibrationGroup(
         group_id=f"group-{cardinality}-{label}",
@@ -208,20 +212,22 @@ def _group(
             _run(
                 inventory,
                 mode="isolated",
-                repetition=0,
+                repetition=repetition,
                 slot=slot,
                 label=label,
             )
+            for repetition in range(repetitions)
             for slot in range(cardinality)
         ),
         concurrent=tuple(
             _run(
                 inventory,
                 mode="concurrent",
-                repetition=0,
+                repetition=repetition,
                 slot=slot,
                 label=label,
             )
+            for repetition in range(repetitions)
             for slot in range(cardinality)
         ),
     )
@@ -231,18 +237,21 @@ def _protocol(
     inventory: GpuInventory, hardware: InterferenceHardwareEnvelope
 ) -> InterferenceCalibrationProtocol:
     return InterferenceCalibrationProtocol(
-        schema_version=1,
+        schema_version=2,
         kind="interference_calibration_protocol",
         reducer_protocol_sha256=INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256,
         inventory_sha256=inventory.sha256,
         hardware_envelope_sha256=hardware.sha256,
         data_partition="interference_calibration_only",
         confirmation_data_visible=False,
-        acceptance_status="UNREGISTERED",
-        minimum_isolated_repetitions=1,
-        minimum_concurrent_repetitions=1,
-        goodput_ratio_floor=None,
-        p99_latency_ratio_ceiling=None,
+        acceptance_status="REGISTERED",
+        minimum_isolated_repetitions=2,
+        minimum_concurrent_repetitions=2,
+        maximum_absolute_relative_difference=0.01,
+        confidence=0.95,
+        interval_method="paired_bca_mean_log_ratio_v1",
+        bootstrap_repetitions=10_000,
+        bootstrap_seed=0,
     )
 
 
@@ -344,6 +353,8 @@ def _observation(
     finish: int,
     token_label: str,
     safety: int = 0,
+    goodput_ratio: float = 1.0,
+    itl_ratio: float | None = 1.0,
 ) -> InterferenceRawObservation:
     return InterferenceRawObservation(
         observation_id=run.observation_id,
@@ -357,8 +368,14 @@ def _observation(
         token_trajectory_sha256=_sha(token_label),
         completed_requests=2,
         output_tokens=32,
-        goodput_tps=100.0 if run.mode == "isolated" else 97.0,
-        latency_p99_ms=10.0 if run.mode == "isolated" else 10.4,
+        goodput_tps=(100.0 if run.mode == "isolated" else 100.0 * goodput_ratio),
+        p99_itl_ms=(
+            None
+            if itl_ratio is None
+            else 10.0
+            if run.mode == "isolated"
+            else 10.0 * itl_ratio
+        ),
         safety_counters=(
             ("exactness_violations", safety),
             ("version_mismatches", 0),
@@ -372,52 +389,124 @@ def _observation(
     )
 
 
-def test_raw_diagnostic_never_invents_pass_and_records_ratios() -> None:
+def _observations(
+    group: InterferenceCalibrationGroup,
+    *,
+    goodput_ratio: float = 1.0,
+    itl_ratio: float | None = 1.0,
+) -> tuple[InterferenceRawObservation, ...]:
+    rows = []
+    for index, run in enumerate(group.isolated):
+        rows.append(
+            _observation(
+                run,
+                start=index * 100,
+                finish=(index + 1) * 100,
+                token_label=f"r{run.repetition}-s{run.slot}",
+                goodput_ratio=goodput_ratio,
+                itl_ratio=itl_ratio,
+            )
+        )
+    for run in group.concurrent:
+        start = 1_000 + run.repetition * 200 + run.slot * 10
+        rows.append(
+            _observation(
+                run,
+                start=start,
+                finish=1_100 + run.repetition * 200,
+                token_label=f"r{run.repetition}-s{run.slot}",
+                goodput_ratio=goodput_ratio,
+                itl_ratio=itl_ratio,
+            )
+        )
+    return tuple(rows)
+
+
+def test_registered_raw_diagnostic_passes_only_exact_paired_equivalence() -> None:
     inventory, _ = _inventory(2)
     group = _group(inventory, 2)
-    observations = (
-        _observation(group.isolated[0], start=0, finish=100, token_label="slot-0"),
-        _observation(group.isolated[1], start=100, finish=200, token_label="slot-1"),
-        _observation(group.concurrent[0], start=300, finish=500, token_label="slot-0"),
-        _observation(group.concurrent[1], start=320, finish=490, token_label="slot-1"),
+    hardware = InterferenceHardwareEnvelope.from_inventory(inventory)
+    observations = _observations(group)
+
+    result = diagnose_interference_calibration(
+        group, observations, protocol=_protocol(inventory, hardware)
     )
 
-    result = diagnose_interference_calibration(group, observations)
+    assert result.status == "PASS"
+    assert result.reason_codes == ()
+    assert tuple(row[2] for row in result.goodput_ratios) == (1.0,) * 4
+    assert result.goodput_mean_relative_difference == pytest.approx(0.0)
+    assert result.simultaneous_jobs == 2
+
+
+def test_missing_raw_itl_timing_is_unresolved_not_request_latency() -> None:
+    inventory, _ = _inventory(2)
+    group = _group(inventory, 2)
+    hardware = InterferenceHardwareEnvelope.from_inventory(inventory)
+
+    result = diagnose_interference_calibration(
+        group,
+        _observations(group, itl_ratio=None),
+        protocol=_protocol(inventory, hardware),
+    )
 
     assert result.status == "UNRESOLVED"
-    assert result.reason_codes == (
-        INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON,
+    assert result.reason_codes == (INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON,)
+
+
+@pytest.mark.parametrize(
+    ("goodput_ratio", "reason"),
+    (
+        (0.98, "paired_goodput_difference_exceeds_1pct"),
+        (0.995, "paired_goodput_95pct_interval_excludes_zero"),
+    ),
+)
+def test_registered_goodput_threshold_and_interval_fail_closed(
+    goodput_ratio: float, reason: str
+) -> None:
+    inventory, _ = _inventory(2)
+    group = _group(inventory, 2)
+    hardware = InterferenceHardwareEnvelope.from_inventory(inventory)
+
+    result = diagnose_interference_calibration(
+        group,
+        _observations(group, goodput_ratio=goodput_ratio),
+        protocol=_protocol(inventory, hardware),
     )
-    assert tuple(row[2] for row in result.goodput_ratios) == (0.97, 0.97)
-    assert result.simultaneous_jobs == 2
+
+    assert result.status == "FAIL"
+    assert reason in result.reason_codes
 
 
 def test_raw_diagnostic_hard_failure_stays_fail() -> None:
     inventory, _ = _inventory(2)
     group = _group(inventory, 2)
-    observations = (
-        _observation(
-            group.isolated[0],
-            start=0,
-            finish=150,
-            token_label="slot-0",
-            safety=1,
+    hardware = InterferenceHardwareEnvelope.from_inventory(inventory)
+    observations = list(_observations(group))
+    observations[0] = replace(
+        observations[0],
+        finished_ns=150,
+        safety_counters=(
+            ("exactness_violations", 1),
+            *observations[0].safety_counters[1:],
         ),
-        _observation(group.isolated[1], start=100, finish=200, token_label="slot-1"),
-        _observation(group.concurrent[0], start=300, finish=310, token_label="changed"),
-        _observation(group.concurrent[1], start=320, finish=400, token_label="slot-1"),
+    )
+    concurrent_offset = len(group.isolated)
+    observations[concurrent_offset] = replace(
+        observations[concurrent_offset],
+        token_trajectory_sha256=_sha("changed"),
+        finished_ns=1_005,
     )
 
-    result = diagnose_interference_calibration(group, observations)
+    result = diagnose_interference_calibration(
+        group, observations, protocol=_protocol(inventory, hardware)
+    )
 
     assert result.status == "FAIL"
     assert "isolated_interval_overlap" in result.reason_codes
     assert "concurrent_interval_nonoverlap" in result.reason_codes
     assert "nonzero_safety_counter" in result.reason_codes
     assert "terminal_token_trajectory_change" in result.reason_codes
-    assert INTERFERENCE_ACCEPTANCE_PROTOCOL_UNREGISTERED_REASON not in (
-        result.reason_codes
-    )
 
 
 def test_two_way_manifest_does_not_cover_eight_way() -> None:
@@ -429,19 +518,23 @@ def test_two_way_manifest_does_not_cover_eight_way() -> None:
 
     assert tuple(group.simultaneous_jobs for group in manifest.groups) == (2,)
     with pytest.raises(ValueError, match="raw observations differ"):
-        diagnose_interference_calibration(two_way, ())
+        diagnose_interference_calibration(
+            two_way, (), protocol=_protocol(inventory, hardware)
+        )
 
 
 def test_group_rejects_wrong_load_and_cardinality() -> None:
     inventory, _ = _inventory(4)
     group = _group(inventory, 2)
     wrong_load = replace(group.concurrent[1], load_thermal_power_envelope="other")
+    concurrent = list(group.concurrent)
+    concurrent[1] = wrong_load
     with pytest.raises(ValueError, match="mixes claim/load/topology"):
         InterferenceCalibrationGroup(
             group_id="wrong-load",
             simultaneous_jobs=2,
             isolated=group.isolated,
-            concurrent=(group.concurrent[0], wrong_load),
+            concurrent=tuple(concurrent),
         )
     with pytest.raises(ValueError, match="cardinality lacks exact slot coverage"):
         InterferenceCalibrationGroup(
@@ -458,7 +551,9 @@ def test_source_audit_rejects_wrong_topology(tmp_path: Path) -> None:
     protocol = _protocol(inventory, hardware)
     group = _group(inventory, 2)
     wrong = replace(group.concurrent[0], topology_sha256=_sha("wrong-topology"))
-    group = replace(group, concurrent=(wrong, group.concurrent[1]))
+    concurrent = list(group.concurrent)
+    concurrent[0] = wrong
+    group = replace(group, concurrent=tuple(concurrent))
     manifest = _manifest(inventory, hardware, protocol, (group,))
     paths = {
         "inventory": _write_bound(tmp_path / "inventory.json", inventory.to_dict()),
@@ -503,8 +598,8 @@ def test_confirmation_data_and_threshold_injection_are_rejected() -> None:
 
     with pytest.raises(ValueError, match="confirmation data"):
         replace(protocol, confirmation_data_visible=True)
-    with pytest.raises(ValueError, match="thresholds are absent"):
-        replace(protocol, goodput_ratio_floor=0.95)
+    with pytest.raises(ValueError, match="threshold is 1%"):
+        replace(protocol, maximum_absolute_relative_difference=0.02)
 
 
 def test_release_trust_is_fixed_and_currently_blocked() -> None:

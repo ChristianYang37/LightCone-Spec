@@ -45,6 +45,15 @@ selection was sealed before downstream unblinding.
 Editing a registry artifact or reserializing a dependency under another digest
 fails closed.
 
+Same-host interference calibration uses paired isolated and simultaneous
+Static blocks. Both committed-token goodput and raw within-request p99 ITL must
+have at most a 1% paired mean relative difference, and each paired BCa 95%
+interval must include zero. Missing per-token timestamps remain UNRESOLVED;
+request latency and evenly distributed SSE gaps are not ITL substitutes. A
+passing rule authorizes only the measured cardinality and still requires the
+release-owned trusted-attester chain. In its absence, headline scheduling stays
+serial and formal measurements remain blocked.
+
 ## Stages and locked decisions
 
 | Stage | Purpose | Output locked before downstream use |
