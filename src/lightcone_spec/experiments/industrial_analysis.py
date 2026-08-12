@@ -17,6 +17,7 @@ import stat
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -37,6 +38,19 @@ from lightcone_spec.experiments.budget_authority import (
     revalidate_budget_materialization_authority_binding,
 )
 from lightcone_spec.experiments.gpu_pool import GpuInventory
+from lightcone_spec.experiments.long_context_analysis import (
+    E3B_CONTEXT_GRID,
+    E3B_LONG_CONTEXT_PROTOCOL_SHA256,
+    E3bLongContextAnalysisPlan,
+    E3bLongContextReduction,
+    E3bMethod,
+    E3bMetric,
+    E3bObservationDisposition,
+    E3bPairedRequestObservation,
+    E3bReductionStatus,
+    reduce_e3b_long_context_pair,
+    unresolved_e3b_long_context_pair,
+)
 from lightcone_spec.experiments.planning import (
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
@@ -75,6 +89,7 @@ from lightcone_spec.experiments.planning_artifacts import (
 )
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
+    FINAL_BLOCKS,
     PILOT_BLOCKS,
     ExperimentCell,
     ExperimentReceipt,
@@ -124,6 +139,10 @@ from lightcone_spec.telemetry.writer import (
 
 type BootstrapStatistic = Callable[[np.ndarray], float | np.ndarray]
 type ReducerStatus = Literal["UNRESOLVED"]
+type E3bStageEvidenceLevel = Literal[
+    "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED",
+    "RAW_UNRESOLVED",
+]
 
 _LOWER_SHA256_LENGTH = 64
 _METHODS = tuple(CORE_METHODS)
@@ -1350,6 +1369,23 @@ class _RequestMetric:
     latency_ms: float
 
 
+class _E3bSourceUnavailable(ValueError):
+    """A registered E3b raw metric source is absent, not numerically zero."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+class _RequestTerminalTimingUnavailable(ValueError):
+    """A terminal request has no raw interval endpoint for time-based metrics."""
+
+    reason_code = "e3b_goodput_terminal_timestamp_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.reason_code)
+
+
 class _RunEvidenceIdentity(Protocol):
     experiment: str
     runtime_sha256: str
@@ -1384,6 +1420,7 @@ class _LoadedCell:
     hardware_validity: tuple[tuple[str, str, tuple[str, ...]], ...]
     observed_budget: ExperimentBudget | None = None
     analysis_budget: ExperimentBudget | None = None
+    round_rows_by_rank: tuple[tuple[dict[str, Any], ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1404,6 +1441,7 @@ class IndustrialReduction:
     artifact: IndustrialReducerArtifact
     _request_metrics: Mapping[str, Mapping[str, tuple[_RequestMetric, ...]]]
     _uses_evidence_dependence_units: bool = False
+    _loaded_blocks: tuple[_BlockReduction, ...] = ()
 
     def _bootstrap_rows(
         self,
@@ -1477,6 +1515,252 @@ class IndustrialReduction:
                 independent_units=("evidence_dependence_unit",),
             )
         return interval
+
+
+@dataclass(frozen=True)
+class E3bLongContextRawFamilyInput:
+    """One context family's path-bound formal confirmation inputs."""
+
+    pilot_activation: FamilyActivationArtifact
+    final_activation: FamilyActivationArtifact
+    confirmation_reduction: ConfirmationFamilyPowerReductionArtifact
+    blocks: tuple[IndustrialBlockEvidence, ...]
+    evidence_alias_manifests: tuple[RawEvidenceAliasManifest, ...] = ()
+    evidence_dependence_map: EvidenceDependenceMap | None = None
+    gpu_attestation: BoundArtifact | None = None
+    doctor_report: BoundArtifact | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.pilot_activation) is not FamilyActivationArtifact:
+            raise TypeError("E3b raw input requires an exact pilot activation")
+        if type(self.final_activation) is not FamilyActivationArtifact:
+            raise TypeError("E3b raw input requires an exact final activation")
+        if (
+            type(self.confirmation_reduction)
+            is not ConfirmationFamilyPowerReductionArtifact
+        ):
+            raise TypeError("E3b raw input requires an exact family reduction")
+        if self.confirmation_reduction.family.experiment != "E3b":
+            raise ValueError("long-context input must be an E3b family")
+        if any(type(block) is not IndustrialBlockEvidence for block in self.blocks):
+            raise TypeError("E3b raw input blocks must be exact path evidence")
+        if any(
+            type(manifest) is not RawEvidenceAliasManifest
+            for manifest in self.evidence_alias_manifests
+        ):
+            raise TypeError("E3b raw aliases must be exact path manifests")
+        if self.evidence_dependence_map is not None and (
+            type(self.evidence_dependence_map) is not EvidenceDependenceMap
+        ):
+            raise TypeError("E3b dependence map must be exact")
+        if (self.gpu_attestation is None) != (self.doctor_report is None):
+            raise ValueError("E3b attestation and doctor report must be paired")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "e3b_long_context_raw_family_input",
+                "pilot_activation_sha256": self.pilot_activation.sha256,
+                "final_activation_sha256": self.final_activation.sha256,
+                "confirmation_reduction_sha256": self.confirmation_reduction.sha256,
+                "blocks": [_raw_block_to_dict(block) for block in self.blocks],
+                "evidence_alias_manifest_sha256s": tuple(
+                    manifest.sha256 for manifest in self.evidence_alias_manifests
+                ),
+                "evidence_dependence_map_sha256": (
+                    None
+                    if self.evidence_dependence_map is None
+                    else self.evidence_dependence_map.sha256
+                ),
+                "gpu_attestation": (
+                    None
+                    if self.gpu_attestation is None
+                    else _raw_evidence_reference_to_dict(self.gpu_attestation)
+                ),
+                "doctor_report": (
+                    None
+                    if self.doctor_report is None
+                    else _raw_evidence_reference_to_dict(self.doctor_report)
+                ),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class E3bNamedLongContextReduction:
+    metric: E3bMetric
+    candidate_method: E3bMethod
+    baseline_method: E3bMethod
+    reduction: E3bLongContextReduction
+
+    def __post_init__(self) -> None:
+        if type(self.metric) is not E3bMetric:
+            raise TypeError("E3b named reduction metric must be exact")
+        if (
+            type(self.candidate_method) is not E3bMethod
+            or type(self.baseline_method) is not E3bMethod
+        ):
+            raise TypeError("E3b named reduction methods must be exact")
+        if type(self.reduction) is not E3bLongContextReduction:
+            raise TypeError("E3b named reduction payload must be exact")
+
+    @property
+    def name(self) -> str:
+        return (
+            f"{self.metric.value}:{self.candidate_method.value}:"
+            f"{self.baseline_method.value}"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "metric": self.metric.value,
+            "candidate_method": self.candidate_method.value,
+            "baseline_method": self.baseline_method.value,
+            "reduction_sha256": self.reduction.sha256,
+            "reduction": self.reduction.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class E3bLongContextStageArtifact:
+    """Formal stage-level E3b result rebuilt only from raw family evidence."""
+
+    schema_version: int
+    status: ReducerStatus
+    evidence_level: E3bStageEvidenceLevel
+    reasons: tuple[str, ...]
+    registry_sha256: str
+    protocol_sha256: str
+    context_family_sha256: str
+    raw_family_input_sha256s: tuple[str, ...]
+    family_reduction_sha256s: tuple[str, ...]
+    final_block_ids: tuple[int, ...] | None
+    bootstrap_repetitions: int
+    bootstrap_seed: int
+    reductions: tuple[E3bNamedLongContextReduction, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("E3b stage artifact schema is unsupported")
+        if self.status != "UNRESOLVED":
+            raise ValueError("current release cannot emit a claimable E3b stage")
+        has_observed_reduction = any(
+            row.reduction.status is E3bReductionStatus.OBSERVED
+            for row in self.reductions
+        )
+        expected_evidence_level: E3bStageEvidenceLevel = (
+            "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED"
+            if has_observed_reduction
+            else "RAW_UNRESOLVED"
+        )
+        if self.evidence_level != expected_evidence_level:
+            raise ValueError("E3b stage evidence level differs from its reductions")
+        if has_observed_reduction and not any(
+            reason.startswith("gpu_attestation:") for reason in self.reasons
+        ):
+            raise ValueError("observed E3b diagnostics require an attestation blocker")
+        if not self.reasons or tuple(sorted(set(self.reasons))) != self.reasons:
+            raise ValueError("E3b stage reasons must be sorted and unique")
+        for label, digest in (
+            ("registry", self.registry_sha256),
+            ("protocol", self.protocol_sha256),
+            ("context family", self.context_family_sha256),
+        ):
+            if not _is_sha256(digest):
+                raise ValueError(f"E3b stage {label} SHA-256 is invalid")
+        if self.protocol_sha256 != E3B_LONG_CONTEXT_PROTOCOL_SHA256:
+            raise ValueError("E3b stage changes the registered reducer protocol")
+        for values, label in (
+            (self.raw_family_input_sha256s, "raw input"),
+            (self.family_reduction_sha256s, "family reduction"),
+        ):
+            if values != tuple(sorted(set(values))) or any(
+                not _is_sha256(value) for value in values
+            ):
+                raise ValueError(f"E3b stage {label} identities are not canonical")
+        if (
+            self.final_block_ids is not None
+            and self.final_block_ids != (FINAL_BLOCKS[: len(self.final_block_ids)])
+        ):
+            raise ValueError("E3b stage final blocks are not the registered prefix")
+        if type(self.bootstrap_repetitions) is not int or (
+            self.bootstrap_repetitions < 100
+        ):
+            raise ValueError("E3b stage bootstrap count is invalid")
+        if type(self.bootstrap_seed) is not int or not 0 <= self.bootstrap_seed < 2**64:
+            raise ValueError("E3b stage bootstrap seed is invalid")
+        names = tuple(reduction.name for reduction in self.reductions)
+        if names != tuple(sorted(set(names))):
+            raise ValueError("E3b named reductions must be name-sorted and unique")
+        if self.reductions:
+            expected_names = tuple(
+                sorted(
+                    {
+                        "accepted_length:l0:static",
+                        "accepted_length:l0:target_only",
+                        "accepted_length:l0:tts",
+                        "committed_token_goodput:l0:static",
+                        "committed_token_goodput:l0:target_only",
+                    }
+                )
+            )
+            if names != expected_names:
+                raise ValueError("E3b stage reductions do not cover the registered set")
+            if (
+                self.final_block_ids is None
+                or len(self.raw_family_input_sha256s) != len(E3B_CONTEXT_GRID)
+                or len(self.family_reduction_sha256s) != len(E3B_CONTEXT_GRID)
+            ):
+                raise ValueError("E3b numerical reductions lack eight raw families")
+            for row in self.reductions:
+                expected_plan = E3bLongContextAnalysisPlan(
+                    schema_version=1,
+                    protocol_sha256=self.protocol_sha256,
+                    family_sha256=self.context_family_sha256,
+                    metric=row.metric,
+                    candidate_method=row.candidate_method,
+                    baseline_method=row.baseline_method,
+                    final_block_ids=self.final_block_ids,
+                    bootstrap_repetitions=self.bootstrap_repetitions,
+                    bootstrap_seed=self.bootstrap_seed,
+                )
+                if row.reduction.plan_sha256 != expected_plan.sha256:
+                    raise ValueError("E3b named reduction swaps its registered plan")
+                if (
+                    row.reduction.status is E3bReductionStatus.UNRESOLVED
+                    and f"{row.name}:{row.reduction.reason_code}" not in self.reasons
+                ):
+                    raise ValueError("E3b stage omits a named unresolved metric reason")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": "e3b_long_context_stage_reducer",
+            "status": self.status,
+            "evidence_level": self.evidence_level,
+            "reasons": list(self.reasons),
+            "registry_sha256": self.registry_sha256,
+            "protocol_sha256": self.protocol_sha256,
+            "context_family_sha256": self.context_family_sha256,
+            "raw_family_input_sha256s": list(self.raw_family_input_sha256s),
+            "family_reduction_sha256s": list(self.family_reduction_sha256s),
+            "final_block_ids": (
+                None if self.final_block_ids is None else list(self.final_block_ids)
+            ),
+            "bootstrap": {
+                "repetitions": self.bootstrap_repetitions,
+                "seed": self.bootstrap_seed,
+                "resampling_unit": "paired_block_then_paired_request",
+            },
+            "reductions": [reduction.to_dict() for reduction in self.reductions],
+        }
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self.to_dict())
 
 
 def _dependence_unit(
@@ -1905,6 +2189,15 @@ def _request_metric(row: Mapping[str, Any]) -> _RequestMetric:
     arrival = row.get("arrival_ns")
     terminal = row.get("completed_ns")
     first_token = row.get("first_token_ns")
+    outcome_status = row.get("outcome_status")
+    finished = row.get("finished")
+    if (
+        (arrival is None or terminal is None)
+        and outcome_status in {"completed", "rejected", "timed_out", "cancelled"}
+        and isinstance(finished, bool)
+        and finished == (outcome_status == "completed")
+    ):
+        raise _RequestTerminalTimingUnavailable
     if any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
         for value in (arrival, terminal)
@@ -1937,8 +2230,6 @@ def _request_metric(row: Mapping[str, Any]) -> _RequestMetric:
         or output_tokens < 0
     ):
         raise ValueError("request output_tokens must be a non-negative integer")
-    finished = row.get("finished")
-    outcome_status = row.get("outcome_status")
     if not isinstance(finished, bool):
         raise TypeError("request finished flag must be boolean")
     if outcome_status not in {"completed", "rejected", "timed_out", "cancelled"}:
@@ -2611,6 +2902,7 @@ def _load_cell(
     run_rows: list[dict[str, Any]] = []
     request_rows_by_rank: list[tuple[dict[str, Any], ...]] = []
     performance_rows_by_rank: list[tuple[dict[str, Any], ...]] = []
+    round_rows_by_rank: list[tuple[dict[str, Any], ...]] = []
     update_rows_by_rank: list[tuple[dict[str, Any], ...]] = []
     terminal_receipt_values: list[dict[str, Any]] = []
     run_ids: set[str] = set()
@@ -2643,6 +2935,7 @@ def _load_cell(
         performance_rows = _read_table(evidence["performance"])
         adapted = cell.identity.method in {"tts", "l0"}
         if adapted:
+            round_rows: tuple[dict[str, Any], ...] = ()
             update_rows: tuple[dict[str, Any], ...] = ()
             for table_name, expected_rows in (
                 ("round", run_row["expected_round_rows"]),
@@ -2659,6 +2952,8 @@ def _load_cell(
                     )
                 if table_name == "update":
                     update_rows = detail_rows
+                else:
+                    round_rows = detail_rows
         elif (
             run_row["expected_round_rows"] != 0
             or run_row["expected_update_rows"] != 0
@@ -2669,6 +2964,7 @@ def _load_cell(
                 "Target-only/Static must allocate no round or update trace tables"
             )
         else:
+            round_rows = ()
             update_rows = ()
         if (
             len(request_rows) != run_row["expected_request_rows"]
@@ -2694,6 +2990,7 @@ def _load_cell(
         run_rows.append(run_row)
         request_rows_by_rank.append(request_rows)
         performance_rows_by_rank.append(performance_rows)
+        round_rows_by_rank.append(round_rows)
         update_rows_by_rank.append(update_rows)
     if len(run_ids) != 1:
         raise ValueError("all ranks of one topology must share one run_id")
@@ -2800,6 +3097,7 @@ def _load_cell(
         run_rows=tuple(run_rows),
         request_rows=rank_zero_requests,
         performance_rows_by_rank=tuple(performance_rows_by_rank),
+        round_rows_by_rank=tuple(round_rows_by_rank),
         update_rows_by_rank=tuple(update_rows_by_rank),
         terminal_receipt_sha256s=tuple(
             receipt.sha256 for receipt in reference.terminal_receipts
@@ -4802,6 +5100,7 @@ def _unresolved_artifact(
         artifact=artifact,
         _request_metrics=MappingProxyType({}),
         _uses_evidence_dependence_units=evidence_dependence_map is not None,
+        _loaded_blocks=tuple(blocks),
     )
 
 
@@ -6424,4 +6723,597 @@ def reduce_industrial_schema_v3(
         artifact=artifact,
         _request_metrics=frozen_metrics,
         _uses_evidence_dependence_units=evidence_dependence_map is not None,
+        _loaded_blocks=reduced,
+    )
+
+
+def _e3b_context_family_identity(
+    families: Sequence[ConfirmationFamilyIdentity],
+) -> tuple[str, str | None]:
+    """Bind all non-context axes and report missing registered contexts."""
+
+    rows = tuple(sorted(families, key=lambda family: family.context))
+    if len({family.context for family in rows}) != len(rows):
+        raise ValueError("E3b long-context input duplicates a context family")
+    available = tuple(family.context for family in rows)
+    digest = content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "e3b_long_context_family_axis",
+            "families": tuple((family.context, family.sha256) for family in rows),
+        }
+    )
+    if available != E3B_CONTEXT_GRID:
+        return digest, "e3b_registered_context_family_coverage_incomplete"
+    first = rows[0]
+    identity = (
+        first.registry_sha256,
+        first.experiment,
+        first.model,
+        first.backend,
+        first.task,
+        first.regime,
+        first.arrival,
+        first.load_arrival_sha256,
+        first.width_panel,
+        first.topology,
+        first.cohort_family,
+        first.cohort_count,
+        first.method_family,
+        first.runtime_sha256,
+        first.split_sha256,
+        first.trace_sha256,
+        first.sampling_sha256,
+        first.hardware_envelope_sha256,
+    )
+    for family in rows[1:]:
+        candidate = (
+            family.registry_sha256,
+            family.experiment,
+            family.model,
+            family.backend,
+            family.task,
+            family.regime,
+            family.arrival,
+            family.load_arrival_sha256,
+            family.width_panel,
+            family.topology,
+            family.cohort_family,
+            family.cohort_count,
+            family.method_family,
+            family.runtime_sha256,
+            family.split_sha256,
+            family.trace_sha256,
+            family.sampling_sha256,
+            family.hardware_envelope_sha256,
+        )
+        if candidate != identity:
+            return digest, "e3b_context_families_cross_a_registered_axis"
+    return digest, None
+
+
+def _e3b_raw_request_row_by_id(
+    cell: _LoadedCell,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in cell.request_rows:
+        request_id = row.get("request_id")
+        if type(request_id) is not str or not request_id:
+            raise ValueError("E3b raw request row lacks its request identity")
+        if request_id in result:
+            raise ValueError("E3b raw request rows duplicate a request identity")
+        result[request_id] = row
+    return result
+
+
+def _e3b_goodput_observations(
+    *,
+    final_by_context: Mapping[int, tuple[_BlockReduction, ...]],
+    candidate_method: E3bMethod,
+    baseline_method: E3bMethod,
+) -> tuple[E3bPairedRequestObservation, ...]:
+    observations: list[E3bPairedRequestObservation] = []
+    for context in E3B_CONTEXT_GRID:
+        blocks = final_by_context[context]
+        for block in blocks:
+            candidate_cell = block.cells[candidate_method.value]
+            baseline_cell = block.cells[baseline_method.value]
+            candidate_rows = _e3b_raw_request_row_by_id(candidate_cell)
+            baseline_rows = _e3b_raw_request_row_by_id(baseline_cell)
+            if not candidate_rows or not baseline_rows:
+                raise _E3bSourceUnavailable("e3b_raw_request_source_missing")
+            if set(candidate_rows) != set(baseline_rows):
+                raise _E3bSourceUnavailable("e3b_paired_goodput_request_source_missing")
+            for request_id in sorted(candidate_rows):
+                candidate = candidate_rows[request_id]
+                baseline = baseline_rows[request_id]
+                candidate_metric = _request_metric(candidate)
+                baseline_metric = _request_metric(baseline)
+                observations.append(
+                    E3bPairedRequestObservation(
+                        block_id=block.block,
+                        context_tokens=context,
+                        request_id=request_id,
+                        disposition=E3bObservationDisposition.OBSERVED,
+                        candidate_numerator=None,
+                        candidate_denominator=None,
+                        baseline_numerator=None,
+                        baseline_denominator=None,
+                        source_sha256=content_sha256(
+                            {
+                                "schema_version": 1,
+                                "kind": "e3b_raw_paired_goodput_request",
+                                "candidate_cell_id": (
+                                    candidate_cell.observation_source_cell_id
+                                ),
+                                "candidate_alias_sha256": (
+                                    candidate_cell.evidence_alias_reduction_sha256
+                                ),
+                                "candidate_terminal_receipt_sha256s": (
+                                    candidate_cell.terminal_receipt_sha256s
+                                ),
+                                "candidate_request": {
+                                    "request_id": request_id,
+                                    "outcome_status": candidate["outcome_status"],
+                                    "output_tokens": candidate["output_tokens"],
+                                    "arrival_ns": candidate["arrival_ns"],
+                                    "completed_ns": candidate["completed_ns"],
+                                },
+                                "baseline_cell_id": (
+                                    baseline_cell.observation_source_cell_id
+                                ),
+                                "baseline_alias_sha256": (
+                                    baseline_cell.evidence_alias_reduction_sha256
+                                ),
+                                "baseline_terminal_receipt_sha256s": (
+                                    baseline_cell.terminal_receipt_sha256s
+                                ),
+                                "baseline_request": {
+                                    "request_id": request_id,
+                                    "outcome_status": baseline["outcome_status"],
+                                    "output_tokens": baseline["output_tokens"],
+                                    "arrival_ns": baseline["arrival_ns"],
+                                    "completed_ns": baseline["completed_ns"],
+                                },
+                            }
+                        ),
+                        candidate_completed_tokens=(
+                            candidate_metric.output_tokens
+                            if candidate_metric.completed
+                            else 0
+                        ),
+                        candidate_arrival_ns=int(candidate["arrival_ns"]),
+                        candidate_completed_ns=int(candidate["completed_ns"]),
+                        baseline_completed_tokens=(
+                            baseline_metric.output_tokens
+                            if baseline_metric.completed
+                            else 0
+                        ),
+                        baseline_arrival_ns=int(baseline["arrival_ns"]),
+                        baseline_completed_ns=int(baseline["completed_ns"]),
+                    )
+                )
+    return tuple(observations)
+
+
+def _e3b_round_ratios_by_request(
+    cell: _LoadedCell,
+) -> dict[str, tuple[int, int, str]]:
+    if len(cell.round_rows_by_rank) != 1 or not cell.round_rows_by_rank[0]:
+        raise _E3bSourceUnavailable("e3b_adapted_round_source_missing_or_invalid")
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in cell.round_rows_by_rank[0]:
+        request_id = row.get("request_id")
+        accepted = row.get("accepted_drafts")
+        target_calls = row.get("target_calls")
+        if (
+            type(request_id) is not str
+            or not request_id
+            or type(accepted) is not int
+            or accepted < 0
+            or type(target_calls) is not int
+            or target_calls < 1
+        ):
+            raise ValueError("E3b accepted length raw round row is invalid")
+        grouped[request_id].append(row)
+    request_ids = set(_e3b_raw_request_row_by_id(cell))
+    if set(grouped) != request_ids:
+        raise _E3bSourceUnavailable("e3b_adapted_round_request_coverage_missing")
+    result: dict[str, tuple[int, int, str]] = {}
+    for request_id in sorted(grouped):
+        rows = tuple(sorted(grouped[request_id], key=lambda row: row["round_index"]))
+        result[request_id] = (
+            sum(int(row["accepted_drafts"]) for row in rows),
+            sum(int(row["target_calls"]) for row in rows),
+            content_sha256(
+                {
+                    "cell_id": cell.observation_source_cell_id,
+                    "terminal_receipt_sha256s": cell.terminal_receipt_sha256s,
+                    "request_id": request_id,
+                    "rounds": tuple(
+                        {
+                            "round_index": row["round_index"],
+                            "accepted_drafts": row["accepted_drafts"],
+                            "target_calls": row["target_calls"],
+                        }
+                        for row in rows
+                    ),
+                }
+            ),
+        )
+    return result
+
+
+def _e3b_accepted_length_observations(
+    *,
+    final_by_context: Mapping[int, tuple[_BlockReduction, ...]],
+) -> tuple[E3bPairedRequestObservation, ...]:
+    observations: list[E3bPairedRequestObservation] = []
+    for context in E3B_CONTEXT_GRID:
+        for block in final_by_context[context]:
+            candidate = _e3b_round_ratios_by_request(block.cells["l0"])
+            baseline = _e3b_round_ratios_by_request(block.cells["tts"])
+            if set(candidate) != set(baseline):
+                raise ValueError("E3b paired accepted-length request IDs differ")
+            for request_id in sorted(candidate):
+                candidate_accepted, candidate_calls, candidate_sha256 = candidate[
+                    request_id
+                ]
+                baseline_accepted, baseline_calls, baseline_sha256 = baseline[
+                    request_id
+                ]
+                observations.append(
+                    E3bPairedRequestObservation(
+                        block_id=block.block,
+                        context_tokens=context,
+                        request_id=request_id,
+                        disposition=E3bObservationDisposition.OBSERVED,
+                        candidate_numerator=candidate_accepted,
+                        candidate_denominator=candidate_calls,
+                        baseline_numerator=baseline_accepted,
+                        baseline_denominator=baseline_calls,
+                        source_sha256=content_sha256(
+                            {
+                                "schema_version": 1,
+                                "kind": "e3b_raw_paired_accepted_length_request",
+                                "candidate_source_sha256": candidate_sha256,
+                                "baseline_source_sha256": baseline_sha256,
+                            }
+                        ),
+                    )
+                )
+    return tuple(observations)
+
+
+def _e3b_long_plan(
+    *,
+    context_family_sha256: str,
+    metric: E3bMetric,
+    candidate: E3bMethod,
+    baseline: E3bMethod,
+    final_block_ids: tuple[int, ...],
+    bootstrap_repetitions: int,
+    bootstrap_seed: int,
+) -> E3bLongContextAnalysisPlan:
+    return E3bLongContextAnalysisPlan(
+        schema_version=1,
+        protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
+        family_sha256=context_family_sha256,
+        metric=metric,
+        candidate_method=candidate,
+        baseline_method=baseline,
+        final_block_ids=final_block_ids,
+        bootstrap_repetitions=bootstrap_repetitions,
+        bootstrap_seed=bootstrap_seed,
+    )
+
+
+def _e3b_stage_artifact(
+    *,
+    registry: ExperimentRegistry,
+    inputs: tuple[E3bLongContextRawFamilyInput, ...],
+    context_family_sha256: str,
+    reasons: Sequence[str],
+    final_block_ids: tuple[int, ...] | None,
+    bootstrap_repetitions: int,
+    bootstrap_seed: int,
+    reductions: Sequence[E3bNamedLongContextReduction] = (),
+) -> E3bLongContextStageArtifact:
+    ordered_reductions = tuple(sorted(reductions, key=lambda value: value.name))
+    return E3bLongContextStageArtifact(
+        schema_version=1,
+        status="UNRESOLVED",
+        evidence_level=(
+            "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED"
+            if any(
+                value.reduction.status is E3bReductionStatus.OBSERVED
+                for value in ordered_reductions
+            )
+            else "RAW_UNRESOLVED"
+        ),
+        reasons=tuple(sorted(set(reasons))),
+        registry_sha256=registry.sha256,
+        protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
+        context_family_sha256=context_family_sha256,
+        raw_family_input_sha256s=tuple(sorted(value.sha256 for value in inputs)),
+        family_reduction_sha256s=tuple(
+            sorted(value.confirmation_reduction.sha256 for value in inputs)
+        ),
+        final_block_ids=final_block_ids,
+        bootstrap_repetitions=bootstrap_repetitions,
+        bootstrap_seed=bootstrap_seed,
+        reductions=ordered_reductions,
+    )
+
+
+def reduce_e3b_long_context_from_raw(
+    *,
+    registry: ExperimentRegistry,
+    families: Sequence[E3bLongContextRawFamilyInput],
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+    bootstrap_repetitions: int = 10_000,
+    bootstrap_seed: int = 0,
+) -> E3bLongContextStageArtifact:
+    """Reopen all eight E3b families and reduce registered context curves.
+
+    There is intentionally no observation or metric-summary parameter.  Every
+    numerical contribution is reconstructed after the ordinary formal family
+    reducer has reopened schema-v4 completion contracts, terminal receipts,
+    Parquet request/round tables, hardware evidence, and budgets.
+    """
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("E3b stage reducer requires an exact registry")
+    if type(hardware_envelope) is not HardwareEnvelope:
+        raise TypeError("E3b stage reducer requires an exact hardware envelope")
+    if type(inventory) is not GpuInventory:
+        raise TypeError("E3b stage reducer requires an exact GPU inventory")
+    inputs = tuple(families)
+    if any(type(value) is not E3bLongContextRawFamilyInput for value in inputs):
+        raise TypeError("E3b stage accepts only exact raw family inputs")
+    if not inputs:
+        raise ValueError("E3b stage requires raw family evidence")
+    if type(bootstrap_repetitions) is not int or bootstrap_repetitions < 100:
+        raise ValueError("E3b stage bootstrap requires at least 100 refits")
+    if type(bootstrap_seed) is not int or not 0 <= bootstrap_seed < 2**64:
+        raise ValueError("E3b stage bootstrap seed must be unsigned 64-bit")
+
+    family_identities = tuple(value.confirmation_reduction.family for value in inputs)
+    if any(family.registry_sha256 != registry.sha256 for family in family_identities):
+        raise ValueError("E3b long-context family belongs to another registry")
+    context_family_sha256, identity_reason = _e3b_context_family_identity(
+        family_identities
+    )
+    if identity_reason is not None:
+        return _e3b_stage_artifact(
+            registry=registry,
+            inputs=inputs,
+            context_family_sha256=context_family_sha256,
+            reasons=(identity_reason,),
+            final_block_ids=None,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+    final_prefixes = {
+        reduction.confirmation_reduction.plan.selected_final_prefix
+        for reduction in inputs
+    }
+    if len(final_prefixes) != 1:
+        return _e3b_stage_artifact(
+            registry=registry,
+            inputs=inputs,
+            context_family_sha256=context_family_sha256,
+            reasons=("e3b_context_families_use_different_final_prefixes",),
+            final_block_ids=None,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+    final_block_ids = next(iter(final_prefixes))
+    if not final_block_ids:
+        return _e3b_stage_artifact(
+            registry=registry,
+            inputs=inputs,
+            context_family_sha256=context_family_sha256,
+            reasons=("e3b_context_family_underpowered",),
+            final_block_ids=None,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+    by_context: dict[int, IndustrialReduction] = {}
+    for value in sorted(
+        inputs,
+        key=lambda item: item.confirmation_reduction.family.context,
+    ):
+        context = value.confirmation_reduction.family.context
+        try:
+            by_context[context] = reduce_industrial_schema_v3(
+                registry=registry,
+                pilot_activation=value.pilot_activation,
+                final_activation=value.final_activation,
+                confirmation_reduction=value.confirmation_reduction,
+                blocks=value.blocks,
+                hardware_envelope=hardware_envelope,
+                inventory=inventory,
+                evidence_dependence_map=value.evidence_dependence_map,
+                evidence_alias_manifests=value.evidence_alias_manifests,
+                gpu_attestation=value.gpu_attestation,
+                doctor_report=value.doctor_report,
+                bootstrap_repetitions=bootstrap_repetitions,
+                bootstrap_seed=bootstrap_seed,
+            )
+        except _RequestTerminalTimingUnavailable as error:
+            return _e3b_stage_artifact(
+                registry=registry,
+                inputs=inputs,
+                context_family_sha256=context_family_sha256,
+                reasons=(f"context-{context}:{error.reason_code}",),
+                final_block_ids=final_block_ids,
+                bootstrap_repetitions=bootstrap_repetitions,
+                bootstrap_seed=bootstrap_seed,
+            )
+
+    permitted_family_reasons = {
+        "gpu_attestation:missing",
+        "gpu_attestation:untrusted_attester",
+    }
+    blocking_reasons = {
+        f"context-{context}:{reason}"
+        for context, reduction in by_context.items()
+        for reason in reduction.artifact.reasons
+        if reason not in permitted_family_reasons
+    }
+    if blocking_reasons:
+        return _e3b_stage_artifact(
+            registry=registry,
+            inputs=inputs,
+            context_family_sha256=context_family_sha256,
+            reasons=tuple(blocking_reasons),
+            final_block_ids=final_block_ids,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+
+    final_by_context: dict[int, tuple[_BlockReduction, ...]] = {}
+    for context, reduction in by_context.items():
+        final = tuple(
+            block
+            for block in reduction._loaded_blocks
+            if block.block in final_block_ids
+        )
+        if tuple(block.block for block in final) != final_block_ids:
+            raise RuntimeError("validated E3b raw final prefix changed")
+        if reduction._uses_evidence_dependence_units:
+            for denominator in ("static", "target_only", "tts"):
+                components = _paired_dependence_components(
+                    final,
+                    numerator="l0",
+                    denominator=denominator,
+                    dependence_map=next(
+                        value.evidence_dependence_map
+                        for value in inputs
+                        if value.confirmation_reduction.family.context == context
+                    ),
+                )
+                if any(len(component) != 1 for _, component in components):
+                    blocking_reasons.add(
+                        f"context-{context}:e3b_cross_block_evidence_dependence"
+                    )
+        final_by_context[context] = final
+    if blocking_reasons:
+        return _e3b_stage_artifact(
+            registry=registry,
+            inputs=inputs,
+            context_family_sha256=context_family_sha256,
+            reasons=tuple(blocking_reasons),
+            final_block_ids=final_block_ids,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+
+    named: list[E3bNamedLongContextReduction] = []
+    for baseline in (E3bMethod.STATIC, E3bMethod.TARGET_ONLY):
+        plan = _e3b_long_plan(
+            context_family_sha256=context_family_sha256,
+            metric=E3bMetric.COMMITTED_TOKEN_GOODPUT,
+            candidate=E3bMethod.L0,
+            baseline=baseline,
+            final_block_ids=final_block_ids,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+        try:
+            observations = _e3b_goodput_observations(
+                final_by_context=final_by_context,
+                candidate_method=E3bMethod.L0,
+                baseline_method=baseline,
+            )
+        except (_E3bSourceUnavailable, _RequestTerminalTimingUnavailable) as error:
+            reduction = unresolved_e3b_long_context_pair(
+                plan,
+                reason_code=error.reason_code,
+            )
+        else:
+            reduction = reduce_e3b_long_context_pair(plan, observations)
+        named.append(
+            E3bNamedLongContextReduction(
+                metric=plan.metric,
+                candidate_method=plan.candidate_method,
+                baseline_method=plan.baseline_method,
+                reduction=reduction,
+            )
+        )
+
+    accepted_plan = _e3b_long_plan(
+        context_family_sha256=context_family_sha256,
+        metric=E3bMetric.ACCEPTED_LENGTH,
+        candidate=E3bMethod.L0,
+        baseline=E3bMethod.TTS,
+        final_block_ids=final_block_ids,
+        bootstrap_repetitions=bootstrap_repetitions,
+        bootstrap_seed=bootstrap_seed,
+    )
+    try:
+        accepted_observations = _e3b_accepted_length_observations(
+            final_by_context=final_by_context
+        )
+    except _E3bSourceUnavailable as error:
+        accepted_reduction = unresolved_e3b_long_context_pair(
+            accepted_plan,
+            reason_code=error.reason_code,
+        )
+    else:
+        accepted_reduction = reduce_e3b_long_context_pair(
+            accepted_plan,
+            accepted_observations,
+        )
+    named.append(
+        E3bNamedLongContextReduction(
+            metric=accepted_plan.metric,
+            candidate_method=accepted_plan.candidate_method,
+            baseline_method=accepted_plan.baseline_method,
+            reduction=accepted_reduction,
+        )
+    )
+    for baseline in (E3bMethod.STATIC, E3bMethod.TARGET_ONLY):
+        plan = _e3b_long_plan(
+            context_family_sha256=context_family_sha256,
+            metric=E3bMetric.ACCEPTED_LENGTH,
+            candidate=E3bMethod.L0,
+            baseline=baseline,
+            final_block_ids=final_block_ids,
+            bootstrap_repetitions=bootstrap_repetitions,
+            bootstrap_seed=bootstrap_seed,
+        )
+        named.append(
+            E3bNamedLongContextReduction(
+                metric=plan.metric,
+                candidate_method=plan.candidate_method,
+                baseline_method=plan.baseline_method,
+                reduction=unresolved_e3b_long_context_pair(
+                    plan,
+                    reason_code="e3b_baseline_round_source_unavailable",
+                ),
+            )
+        )
+
+    reasons = {
+        reason
+        for reduction in by_context.values()
+        for reason in reduction.artifact.reasons
+    }
+    reasons.update(
+        f"{value.name}:{value.reduction.reason_code}"
+        for value in named
+        if value.reduction.status is E3bReductionStatus.UNRESOLVED
+    )
+    return _e3b_stage_artifact(
+        registry=registry,
+        inputs=inputs,
+        context_family_sha256=context_family_sha256,
+        reasons=tuple(reasons),
+        final_block_ids=final_block_ids,
+        bootstrap_repetitions=bootstrap_repetitions,
+        bootstrap_seed=bootstrap_seed,
+        reductions=named,
     )

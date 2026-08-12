@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -34,19 +36,29 @@ from lightcone_spec.experiments.gpu_pool import (
 from lightcone_spec.experiments.industrial_analysis import (
     _INDUSTRIAL_DOCTOR_CHECKS,
     BoundArtifact,
+    E3bLongContextRawFamilyInput,
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
+    IndustrialReduction,
     _alias_analysis_budget,
+    _BlockReduction,
     _guard_preregistered_p99_analysis,
     _load_budget_observation,
+    _LoadedCell,
     _replay_cell_execution_identity,
+    _RequestTerminalTimingUnavailable,
     _validate_allocation_free_performance,
     _validate_industrial_doctor,
     _validate_industrial_gpu_attestation,
     _validate_run_row,
     reduce_confirmation_family_power,
     reduce_e2_stage_from_raw,
+    reduce_e3b_long_context_from_raw,
     reduce_industrial_schema_v3,
+)
+from lightcone_spec.experiments.long_context_analysis import (
+    E3B_CONTEXT_GRID,
+    E3bReductionStatus,
 )
 from lightcone_spec.experiments.planning import (
     AnalysisDependenceUnit,
@@ -62,6 +74,7 @@ from lightcone_spec.experiments.planning import (
     P99AnchorStatus,
     ScenarioMilliseconds,
     derive_confirmation_family,
+    family_pilot_block_id,
     materialize_confirmation_pilots,
     materialize_confirmation_prefix,
     reduce_e2_activation,
@@ -1740,6 +1753,646 @@ def _analysis_manifest(
 @pytest.fixture(scope="module")
 def evidence_bundle(tmp_path_factory: pytest.TempPathFactory):
     return _build_evidence(tmp_path_factory.mktemp("industrial-analysis"))
+
+
+def _e3b_raw_family_inputs_from_template(
+    evidence_bundle,
+) -> tuple[ExperimentRegistry, tuple[E3bLongContextRawFamilyInput, ...]]:
+    registry, _, _, template, blocks, _ = evidence_bundle
+    result: list[E3bLongContextRawFamilyInput] = []
+    for context in E3B_CONTEXT_GRID:
+        family = replace(template.family, context=context)
+        pilot = materialize_confirmation_pilots(registry, family)
+        power_sizing = replace(
+            template.plan.power_sizing,
+            pilot_block_ids=tuple(
+                family_pilot_block_id(family, block) for block in PILOT_BLOCKS
+            ),
+        )
+        pilot_cells = {
+            (cell.identity.block, cell.identity.method): cell
+            for cell in registry.cells
+            if cell.cell_id in set(pilot.activated_cell_ids)
+        }
+        run_bindings = tuple(
+            sorted(
+                (
+                    replace(
+                        binding,
+                        cell_id=pilot_cells[
+                            (
+                                int(binding.scientific_unit.rsplit("_", 1)[1]),
+                                binding.method,
+                            )
+                        ].cell_id,
+                        config_sha256=pilot_cells[
+                            (
+                                int(binding.scientific_unit.rsplit("_", 1)[1]),
+                                binding.method,
+                            )
+                        ].cell_id,
+                    )
+                    for binding in template.run_bindings
+                ),
+                key=lambda binding: binding.cell_id,
+            )
+        )
+        power_plan = replace(
+            template.plan,
+            family=family,
+            pilot_activation_sha256=pilot.sha256,
+            completed_pilot_cells_sha256=content_sha256(
+                tuple(sorted(pilot.activated_cell_ids))
+            ),
+            power_sizing=power_sizing,
+        )
+        reduction = replace(template, plan=power_plan, run_bindings=run_bindings)
+        final = materialize_confirmation_prefix(
+            registry,
+            family=family,
+            reduction=reduction,
+            pilot_activation=pilot,
+        )
+        result.append(
+            E3bLongContextRawFamilyInput(
+                pilot_activation=pilot,
+                final_activation=final,
+                confirmation_reduction=reduction,
+                blocks=blocks,
+            )
+        )
+    return registry, tuple(result)
+
+
+def _synthetic_e3b_loaded_reduction(
+    *,
+    registry: ExperimentRegistry,
+    raw: E3bLongContextRawFamilyInput,
+    missing_request_method: str | None = None,
+    missing_round_method: str | None = None,
+    uses_evidence_dependence_units: bool = False,
+) -> IndustrialReduction:
+    by_id = {cell.cell_id: cell for cell in registry.cells}
+    activated = tuple(
+        by_id[cell_id] for cell_id in raw.final_activation.activated_cell_ids
+    )
+    blocks: list[_BlockReduction] = []
+    goodput_by_method = {
+        "target_only": 90.0,
+        "static": 100.0,
+        "tts": 105.0,
+        "l0": 110.0,
+    }
+    for block in raw.confirmation_reduction.selected_final_prefix:
+        loaded: dict[str, _LoadedCell] = {}
+        for method in CORE_METHODS:
+            cell = next(
+                value
+                for value in activated
+                if value.identity.block == block and value.identity.method == method
+            )
+            request_id = f"e3b-{raw.confirmation_reduction.family.context}-{block}"
+            arrival_ns = 1_000_000
+            completed_ns = arrival_ns + round(
+                100 / goodput_by_method[method] * 1_000_000_000
+            )
+            request_rows = (
+                ()
+                if missing_request_method == method
+                else (
+                    {
+                        "request_id": request_id,
+                        "output_tokens": 100,
+                        "finished": True,
+                        "outcome_status": "completed",
+                        "arrival_ns": arrival_ns,
+                        "completed_ns": completed_ns,
+                        "first_token_ns": None,
+                        "ttft_ms": None,
+                        "token_timestamps_ns": None,
+                        "inter_token_ms": None,
+                    },
+                )
+            )
+            rounds = (
+                (
+                    {
+                        "request_id": request_id,
+                        "round_index": 0,
+                        "accepted_drafts": 8 if method == "l0" else 7,
+                        "target_calls": 1,
+                    },
+                )
+                if method in {"tts", "l0"} and method != missing_round_method
+                else ()
+            )
+            digest = content_sha256(
+                {
+                    "context": raw.confirmation_reduction.family.context,
+                    "block": block,
+                    "method": method,
+                }
+            )
+            loaded[method] = _LoadedCell(
+                cell=cell,
+                observation_source_cell_id=cell.cell_id,
+                evidence_alias_reduction_sha256=None,
+                run_rows=(),
+                request_rows=request_rows,
+                performance_rows_by_rank=(),
+                update_rows_by_rank=(),
+                terminal_receipt_sha256s=(digest,),
+                hardware_receipt_sha256=digest,
+                physical_gpu_uuids=("GPU-analysis-a",),
+                experiment_budget_sha256=digest,
+                inventory_sha256=digest,
+                inventory_source_receipt_sha256=digest,
+                fixed_instance_gpu_count=2,
+                physical_host_id="analysis-host",
+                budget_observation_sha256=digest,
+                hardware_validity=(),
+                round_rows_by_rank=(rounds,),
+            )
+        blocks.append(
+            _BlockReduction(
+                block=block,
+                qualification_sha256=content_sha256({"qualification": block}),
+                cells=MappingProxyType(loaded),
+                request_metrics=MappingProxyType({}),
+                goodput_tps=MappingProxyType({}),
+                slo_goodput_tps=MappingProxyType({}),
+                slo_requests=MappingProxyType({}),
+            )
+        )
+    return IndustrialReduction(
+        artifact=SimpleNamespace(reasons=("gpu_attestation:missing",)),
+        _request_metrics=MappingProxyType({}),
+        _uses_evidence_dependence_units=uses_evidence_dependence_units,
+        _loaded_blocks=tuple(blocks),
+    )
+
+
+def _replace_e3b_raw_family_identity(
+    raw: E3bLongContextRawFamilyInput,
+    *,
+    family,
+) -> E3bLongContextRawFamilyInput:
+    pilot = replace(raw.pilot_activation, family=family)
+    power_sizing = replace(
+        raw.confirmation_reduction.plan.power_sizing,
+        pilot_block_ids=tuple(
+            family_pilot_block_id(family, block) for block in PILOT_BLOCKS
+        ),
+    )
+    power_plan = replace(
+        raw.confirmation_reduction.plan,
+        family=family,
+        pilot_activation_sha256=pilot.sha256,
+        power_sizing=power_sizing,
+    )
+    reduction = replace(raw.confirmation_reduction, plan=power_plan)
+    final = replace(
+        raw.final_activation,
+        family=family,
+        power_plan_sha256=power_plan.sha256,
+    )
+    return replace(
+        raw,
+        pilot_activation=pilot,
+        final_activation=final,
+        confirmation_reduction=reduction,
+    )
+
+
+def test_e3b_raw_stage_reopens_exact_eight_contexts_and_preserves_evidence_level(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+    calls: list[str] = []
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        assert kwargs["blocks"] is raw.blocks
+        calls.append(raw.confirmation_reduction.family.sha256)
+        return _synthetic_e3b_loaded_reduction(registry=registry, raw=raw)
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families,
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+        bootstrap_seed=17,
+    )
+
+    assert tuple(sorted(calls)) == tuple(
+        sorted(value.confirmation_reduction.family.sha256 for value in families)
+    )
+    assert (
+        tuple(sorted(value.confirmation_reduction.family.context for value in families))
+        == E3B_CONTEXT_GRID
+    )
+    assert artifact.status == "UNRESOLVED"
+    assert artifact.evidence_level == "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED"
+    assert artifact.final_block_ids == FINAL_BLOCKS[:12]
+    reductions = {value.name: value.reduction for value in artifact.reductions}
+    assert reductions["committed_token_goodput:l0:static"].status is (
+        E3bReductionStatus.OBSERVED
+    )
+    assert reductions["committed_token_goodput:l0:target_only"].status is (
+        E3bReductionStatus.OBSERVED
+    )
+    assert reductions["accepted_length:l0:tts"].status is E3bReductionStatus.OBSERVED
+    for baseline in ("static", "target_only"):
+        row = reductions[f"accepted_length:l0:{baseline}"]
+        assert row.status is E3bReductionStatus.UNRESOLVED
+        assert row.reason_code == "e3b_baseline_round_source_unavailable"
+        assert row.curve_points is None
+    assert (
+        "observations"
+        not in inspect.signature(reduce_e3b_long_context_from_raw).parameters
+    )
+    assert artifact.sha256 == content_sha256(artifact.to_dict())
+    with pytest.raises(ValueError, match="swaps its registered plan"):
+        replace(
+            artifact,
+            reductions=(
+                replace(artifact.reductions[0], reduction=artifact.reductions[1].reduction),
+                *artifact.reductions[1:],
+            ),
+        )
+
+
+def test_e3b_raw_stage_missing_request_is_named_unresolved(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        return _synthetic_e3b_loaded_reduction(
+            registry=registry,
+            raw=raw,
+            missing_request_method=(
+                "l0" if raw.confirmation_reduction.family.context == 1024 else None
+            ),
+        )
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families,
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    reductions = {value.name: value.reduction for value in artifact.reductions}
+    for baseline in ("static", "target_only"):
+        row = reductions[f"committed_token_goodput:l0:{baseline}"]
+        assert row.status is E3bReductionStatus.UNRESOLVED
+        assert row.reason_code == "e3b_raw_request_source_missing"
+        assert row.curve_points is None
+
+
+def test_e3b_raw_stage_missing_terminal_timestamp_is_typed_stage_unresolved(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        if raw.confirmation_reduction.family.context == 1024:
+            raise _RequestTerminalTimingUnavailable
+        return _synthetic_e3b_loaded_reduction(registry=registry, raw=raw)
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families,
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    assert artifact.evidence_level == "RAW_UNRESOLVED"
+    assert artifact.reductions == ()
+    assert artifact.reasons == (
+        "context-1024:e3b_goodput_terminal_timestamp_unavailable",
+    )
+
+
+def test_e3b_raw_stage_missing_adapted_round_is_named_unresolved(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        return _synthetic_e3b_loaded_reduction(
+            registry=registry,
+            raw=raw,
+            missing_round_method=(
+                "l0" if raw.confirmation_reduction.family.context == 1024 else None
+            ),
+        )
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families,
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    reductions = {value.name: value.reduction for value in artifact.reductions}
+    accepted = reductions["accepted_length:l0:tts"]
+    assert accepted.status is E3bReductionStatus.UNRESOLVED
+    assert accepted.reason_code == "e3b_adapted_round_source_missing_or_invalid"
+    assert accepted.curve_points is None
+    assert reductions["committed_token_goodput:l0:static"].status is (
+        E3bReductionStatus.OBSERVED
+    )
+
+
+def test_e3b_raw_stage_propagates_bound_request_tamper(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+    target = next(
+        value
+        for value in families
+        if value.confirmation_reduction.family.context == 4096
+    )
+    first_block = target.blocks[0]
+    first_cell = first_block.cells[0]
+    first_terminal = first_cell.terminal_receipts[0]
+    tampered_terminal = replace(first_terminal, sha256="0" * 64)
+    tampered_cell = replace(
+        first_cell,
+        terminal_receipts=(tampered_terminal, *first_cell.terminal_receipts[1:]),
+    )
+    tampered_block = replace(
+        first_block,
+        cells=(tampered_cell, *first_block.cells[1:]),
+    )
+    tampered_target = replace(
+        target,
+        blocks=(tampered_block, *target.blocks[1:]),
+    )
+    tampered_families = tuple(
+        tampered_target if value is target else value for value in families
+    )
+    real_reducer = reduce_industrial_schema_v3
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in tampered_families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        if raw.confirmation_reduction.family.context == 4096:
+            return real_reducer(**kwargs)
+        return _synthetic_e3b_loaded_reduction(registry=registry, raw=raw)
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    with pytest.raises(ValueError, match="completion contract differs"):
+        reduce_e3b_long_context_from_raw(
+            registry=registry,
+            families=tampered_families,
+            hardware_envelope=evidence_bundle[-1],
+            inventory=_gpu_inventory(),
+            bootstrap_repetitions=100,
+        )
+
+
+def test_e3b_raw_stage_rejects_prefix_mismatch_before_raw_reopen(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+    target = families[-1]
+    power_sizing = replace(
+        target.confirmation_reduction.plan.power_sizing,
+        selected_final_blocks=13,
+        power_grid=tuple(
+            replace(cell, power=0.0) if cell.final_blocks == 12 else cell
+            for cell in target.confirmation_reduction.plan.power_sizing.power_grid
+        ),
+    )
+    plan = replace(
+        target.confirmation_reduction.plan,
+        power_sizing=power_sizing,
+        selected_final_blocks=13,
+        selected_final_prefix=FINAL_BLOCKS[:13],
+    )
+    mismatched = replace(
+        target,
+        confirmation_reduction=replace(target.confirmation_reduction, plan=plan),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        lambda **_: pytest.fail("prefix mismatch reached raw evidence"),
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=(*families[:-1], mismatched),
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    assert artifact.reasons == ("e3b_context_families_use_different_final_prefixes",)
+    assert artifact.final_block_ids is None
+    assert artifact.reductions == ()
+
+
+def test_e3b_raw_stage_rejects_cross_block_alias_dependence(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+    target = families[0]
+    dependence = _singleton_dependence_map(
+        pilot_activation=target.pilot_activation,
+        final_activation=target.final_activation,
+    )
+    by_id = {cell.cell_id: cell for cell in registry.cells}
+    final_l0 = tuple(
+        cell_id
+        for cell_id in target.final_activation.activated_cell_ids
+        if by_id[cell_id].identity.method == "l0"
+    )[:2]
+    dependence = _replace_with_unverified_alias(
+        dependence,
+        source_cell_id=final_l0[0],
+        target_cell_id=final_l0[1],
+    )
+    dependent = replace(target, evidence_dependence_map=dependence)
+    dependent_families = (dependent, *families[1:])
+
+    def reopen(**kwargs):
+        raw = next(
+            value
+            for value in dependent_families
+            if value.confirmation_reduction == kwargs["confirmation_reduction"]
+        )
+        return _synthetic_e3b_loaded_reduction(
+            registry=registry,
+            raw=raw,
+            uses_evidence_dependence_units=(raw is dependent),
+        )
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        reopen,
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=dependent_families,
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    assert artifact.reductions == ()
+    assert artifact.evidence_level == "RAW_UNRESOLVED"
+    assert artifact.reasons == ("context-1024:e3b_cross_block_evidence_dependence",)
+
+
+def test_e3b_context_axis_and_coverage_fail_closed_before_raw_reopen(
+    evidence_bundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, families = _e3b_raw_family_inputs_from_template(evidence_bundle)
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.industrial_analysis.reduce_industrial_schema_v3",
+        lambda **_: pytest.fail("invalid context identity reached raw evidence"),
+    )
+    missing = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families[:-1],
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    assert missing.evidence_level == "RAW_UNRESOLVED"
+    assert missing.reasons == ("e3b_registered_context_family_coverage_incomplete",)
+
+    cross_axis_family = replace(
+        families[-1].confirmation_reduction.family, width_panel="deployment_optimal"
+    )
+    cross_axis = _replace_e3b_raw_family_identity(
+        families[-1], family=cross_axis_family
+    )
+    rejected = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=(*families[:-1], cross_axis),
+        hardware_envelope=evidence_bundle[-1],
+        inventory=_gpu_inventory(),
+        bootstrap_repetitions=100,
+    )
+    assert rejected.reasons == ("e3b_context_families_cross_a_registered_axis",)
+    assert rejected.reductions == ()
+
+
+def test_analyze_e3b_long_context_cli_exports_typed_incomplete_raw_stage(
+    evidence_bundle,
+    tmp_path: Path,
+) -> None:
+    registry, pilot, final, reduction, evidence, envelope = evidence_bundle
+    family_manifest = _analysis_manifest(
+        tmp_path,
+        registry=registry,
+        pilot_activation=pilot,
+        final_activation=final,
+        reduction=reduction,
+        evidence=evidence,
+        envelope=envelope,
+        name="e3b-long-context-single-family",
+    )
+    family_value = json.loads(family_manifest.read_text(encoding="utf-8"))
+    stage_value = {
+        "schema_version": 1,
+        "kind": "industrial_e3b_long_context_analysis_manifest",
+        "family_manifests": [
+            {
+                "path": str(family_manifest),
+                "sha256": content_sha256(family_value),
+            }
+        ],
+        "bootstrap": {"repetitions": 300, "seed": 17},
+    }
+    manifest = tmp_path / "e3b-long-context-manifest.json"
+    _write_bound_json(manifest, stage_value)
+    output = tmp_path / "e3b-long-context-reducer.json"
+
+    assert (
+        main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(manifest),
+                "--output",
+                str(output),
+            ]
+        )
+        == 42
+    )
+    artifact = json.loads(output.read_text(encoding="utf-8"))
+    assert artifact["status"] == "UNRESOLVED"
+    assert artifact["evidence_level"] == "RAW_UNRESOLVED"
+    assert artifact["reasons"] == ["e3b_registered_context_family_coverage_incomplete"]
+    assert artifact["reductions"] == []
+    assert len(artifact["raw_family_input_sha256s"]) == 1
+
+    tampered = json.loads(json.dumps(stage_value))
+    tampered["family_manifests"][0]["sha256"] = "0" * 64
+    tampered_path = tmp_path / "e3b-long-context-tampered.json"
+    _write_bound_json(tampered_path, tampered)
+    with pytest.raises(ValueError, match="manifest digest mismatch"):
+        main(
+            [
+                "analyze-e3b-long-context",
+                "--manifest",
+                str(tampered_path),
+                "--output",
+                str(tmp_path / "must-not-exist.json"),
+            ]
+        )
 
 
 def _singleton_dependence_map(

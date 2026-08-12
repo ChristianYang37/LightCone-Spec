@@ -375,7 +375,35 @@ class E3bLongContextReduction:
 
     @cached_property
     def sha256(self) -> str:
-        return content_sha256(self)
+        return content_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the canonical JSON-compatible reducer payload."""
+
+        return {
+            "schema_version": self.schema_version,
+            "kind": "e3b_long_context_reduction",
+            "status": self.status.value,
+            "reason_code": self.reason_code,
+            "protocol_sha256": self.protocol_sha256,
+            "plan_sha256": self.plan_sha256,
+            "observations_sha256": self.observations_sha256,
+            "curve_points": (
+                None
+                if self.curve_points is None
+                else [asdict(point) for point in self.curve_points]
+            ),
+            "crossover": {
+                **asdict(self.crossover),
+                "outcome": self.crossover.outcome.value,
+                "infeasible_methods": [
+                    method.value for method in self.crossover.infeasible_methods
+                ],
+            },
+            "bootstrap_repetitions_completed": (self.bootstrap_repetitions_completed),
+            "resampling_unit": self.resampling_unit,
+            "interval_method": self.interval_method,
+        }
 
 
 @dataclass(frozen=True)
@@ -476,6 +504,24 @@ def _unresolved(
         ),
         bootstrap_repetitions_completed=None,
     )
+
+
+def unresolved_e3b_long_context_pair(
+    plan: E3bLongContextAnalysisPlan,
+    *,
+    reason_code: str,
+) -> E3bLongContextReduction:
+    """Emit a named null reduction when the registered raw source is absent.
+
+    This helper cannot mint an observed result: its observation digest and all
+    numeric payloads are necessarily null.
+    """
+
+    if type(plan) is not E3bLongContextAnalysisPlan:
+        raise TypeError("E3b unresolved reduction requires an exact plan")
+    if not _is_reason(reason_code):
+        raise ValueError("E3b unresolved reason must be a stable reason code")
+    return _unresolved(plan, (), reason_code)
 
 
 def _validate_numeric(value: object, *, numerator: bool) -> float:
