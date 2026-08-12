@@ -24,6 +24,7 @@ from lightcone_spec import (
     PINNED_SGLANG_TREE,
 )
 from lightcone_spec.cli.main import main
+from lightcone_spec.experiments.evidence import evidence_files_sha256
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
     GpuDevice,
@@ -35,7 +36,10 @@ from lightcone_spec.experiments.industrial_analysis import (
     BoundArtifact,
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
+    _alias_analysis_budget,
+    _guard_preregistered_p99_analysis,
     _load_budget_observation,
+    _replay_cell_execution_identity,
     _validate_allocation_free_performance,
     _validate_industrial_doctor,
     _validate_industrial_gpu_attestation,
@@ -64,6 +68,8 @@ from lightcone_spec.experiments.planning import (
 )
 from lightcone_spec.experiments.planning_artifacts import (
     confirmation_family_power_reduction_artifact_from_dict,
+    confirmation_family_power_reduction_artifact_to_dict,
+    experiment_budget_to_dict,
     family_activation_artifact_from_dict,
     family_activation_artifact_to_dict,
 )
@@ -79,7 +85,9 @@ from lightcone_spec.experiments.registry import (
     build_industrial_registry,
     content_sha256,
 )
+from lightcone_spec.experiments.runtime_metrics import RuntimeMetricStatus
 from lightcone_spec.experiments.statistics import HardwareEnvelope
+from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.orchestration.native_terminal import (
     NativeTerminalRunBinding,
     canonical_sha256,
@@ -372,6 +380,203 @@ def _execution_budget(cell: ExperimentCell) -> ExperimentBudget:
         fixed_instance_billed_gpu_ms=milliseconds(
             observed_wall_ms * len(_PHYSICAL_GPU_UUIDS)
         ),
+    )
+
+
+def _analysis_physical_assignment(
+    cell: ExperimentCell,
+    *,
+    budget: ExperimentBudget,
+    inventory: GpuInventory,
+    physical_gpu_uuids: tuple[str, ...],
+    cell_index: int,
+) -> IndustrialPhysicalAssignment:
+    shape = {
+        "tp1_dp1": (1, 1),
+        "tp2_dp1": (2, 1),
+        "two_replica_tp1_dp2": (1, 2),
+        "two_gpu_host": (1, 2),
+        "two_independent_tp1": (1, 2),
+    }.get(cell.identity.topology)
+    if shape is None or shape[0] * shape[1] != len(physical_gpu_uuids):
+        raise ValueError("analysis fixture has no exact physical gang shape")
+    tensor_parallel_size, data_parallel_size = shape
+    rank_groups = tuple(
+        physical_gpu_uuids[
+            replica * tensor_parallel_size : (replica + 1) * tensor_parallel_size
+        ]
+        for replica in range(data_parallel_size)
+    )
+    return IndustrialPhysicalAssignment(
+        inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        dispatch_plan_sha256=content_sha256({"analysis_dispatch": cell.cell_id}),
+        experiment_budget_sha256=budget.sha256,
+        budget_plan_sha256=content_sha256({"analysis_budget_plan": cell.cell_id}),
+        capacity_authority_sha256=content_sha256({"analysis_capacity": cell.cell_id}),
+        budget_materialization_authority_sha256=content_sha256(
+            {"analysis_budget_authority": cell.cell_id}
+        ),
+        assignment_sha256=content_sha256({"analysis_assignment": cell.cell_id}),
+        work_item_sha256=content_sha256({"analysis_work_item": cell.cell_id}),
+        gpu_uuids=physical_gpu_uuids,
+        rank_groups=rank_groups,
+        ports=tuple(32_000 + cell_index * 4 + index for index in range(3)),
+        tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
+        fixed_instance_gpu_count=len(inventory.devices),
+        host_id=inventory.host_ids[0],
+        topology_group_ids=tuple(
+            (
+                ()
+                if tensor_parallel_size == 1
+                else (inventory.topology_groups[0].group_id,)
+            )
+            for _ in range(data_parallel_size)
+        ),
+    )
+
+
+def _analysis_locked_cell_contract(
+    cell: ExperimentCell,
+    *,
+    request_id: str,
+    identities: dict[str, str],
+    budget: ExperimentBudget,
+    assignment: IndustrialPhysicalAssignment,
+) -> dict[str, object]:
+    adapted = cell.identity.method in {"tts", "l0"}
+    workload_contract = (
+        f"industrial_{cell.identity.method}"
+        if cell.identity.method in {"target_only", "static"}
+        else "industrial_adapted"
+    )
+    return {
+        "cell_id": cell.cell_id,
+        "request_ids": [request_id],
+        "expected_request_rows": 1,
+        "expected_round_rows": 1 if adapted else 0,
+        "expected_update_rows": 1 if adapted else 0,
+        "expected_performance_rows": 1,
+        "request_ids_sha256": identities["request_ids_sha256"],
+        "corpus_sha256": identities["corpus_sha256"],
+        "arrival_trace_sha256": identities["arrival_trace_sha256"],
+        "sampling_profile_sha256": identities["sampling_profile_sha256"],
+        "model_lock_sha256": identities["model_lock_sha256"],
+        "patched_sglang_tree": PINNED_SGLANG_TREE,
+        "workload_contract": workload_contract,
+        "rank_config_sha256s": [
+            content_sha256({"rank_config": cell.cell_id, "rank": rank})
+            for rank in range(len(assignment.gpu_uuids))
+        ],
+        "physical_assignment": assignment.to_dict(),
+        "physical_binding_sha256": assignment.sha256,
+        "topology_receipt_sha256": content_sha256(
+            {"analysis_topology_receipt": cell.cell_id}
+        ),
+        "experiment_budget_sha256": budget.sha256,
+        "experiment_budget": experiment_budget_to_dict(budget),
+        "execution_plan_sha256": content_sha256(
+            {"analysis_execution_plan": cell.cell_id}
+        ),
+        "execution_split_sha256": content_sha256(
+            {"analysis_execution_split": cell.cell_id}
+        ),
+    }
+
+
+def _analysis_activation_binding(
+    *,
+    activation_round: str,
+    activations: tuple[FamilyActivationArtifact, ...],
+    reductions: tuple[ConfirmationFamilyPowerReductionArtifact, ...],
+) -> dict[str, object]:
+    latest_by_family: dict[str, FamilyActivationArtifact] = {}
+    for activation in activations:
+        prior = latest_by_family.get(activation.family.sha256)
+        if prior is None or activation.activation_round == "final_prefix":
+            latest_by_family[activation.family.sha256] = activation
+    disposition_rows = [
+        {
+            "cell_id": row.cell_id,
+            "status": row.status.value,
+            "reason_code": row.reason_code,
+        }
+        for activation in latest_by_family.values()
+        for row in activation.dispositions
+    ]
+    return {
+        "schema_version": 1,
+        "kind": "industrial_stage_activation_binding",
+        "stage_activation_sha256": None,
+        "family_activation_sha256s": sorted(
+            activation.sha256 for activation in activations
+        ),
+        "family_power_reduction_sha256s": sorted(
+            reduction.sha256 for reduction in reductions
+        ),
+        "direct_dependency_receipt_sha256": content_sha256(
+            {"analysis_dependency": "E3a"}
+        ),
+        "activation_round": activation_round,
+        "dispositions_sha256": content_sha256(
+            sorted(disposition_rows, key=lambda row: row["cell_id"])
+        ),
+    }
+
+
+def _write_analysis_completion_contract(
+    path: Path,
+    *,
+    registry: ExperimentRegistry,
+    runtime_sha256: str,
+    split_contract: dict[str, object],
+    inventory: GpuInventory,
+    activation_binding: dict[str, object],
+    rows: tuple[dict[str, object], ...],
+) -> BoundArtifact:
+    value = {
+        "schema_version": 4,
+        "kind": "industrial_completed_cells",
+        "registry_sha256": registry.sha256,
+        "experiment": "E3b",
+        "runtime_sha256": runtime_sha256,
+        "split_sha256": content_sha256(split_contract),
+        "split_contract": split_contract,
+        "activation_binding": activation_binding,
+        "inventory_sha256": inventory.sha256,
+        "inventory_source_receipt_sha256": inventory.source_receipt_sha256,
+        "rows": list(rows),
+    }
+    reference = _write_json(path, value)
+    Path(f"{path}.sha256").write_text(
+        f"{content_sha256(value)}\n",
+        encoding="ascii",
+    )
+    return reference
+
+
+def _attach_completion_contract(
+    evidence: tuple[IndustrialBlockEvidence, ...],
+    *,
+    cell_ids: frozenset[str],
+    completion_contract: BoundArtifact,
+) -> tuple[IndustrialBlockEvidence, ...]:
+    return tuple(
+        replace(
+            block,
+            cells=tuple(
+                replace(
+                    cell,
+                    completion_contract=completion_contract,
+                    diagnostic_lineage_identity=False,
+                )
+                if cell.cell_id in cell_ids
+                else cell
+                for cell in block.cells
+            ),
+        )
+        for block in evidence
     )
 
 
@@ -752,9 +957,56 @@ def _build_evidence(
         evidence_root=str(tmp_path / "evidence"),
     )
     runtime_sha256 = content_sha256({"runtime": "analysis-test"})
-    split_sha256 = content_sha256({"split": "analysis-test"})
     envelope = _hardware_envelope()
     block_cells = _slice_cells(registry, final_block_count=final_block_count)
+    inventory = _gpu_inventory()
+    identities_by_block: dict[int, dict[str, str]] = {}
+    budgets: dict[str, ExperimentBudget] = {}
+    assignments: dict[str, IndustrialPhysicalAssignment] = {}
+    locked_cells: dict[str, dict[str, object]] = {}
+    cell_index = 0
+    for block, methods in block_cells.items():
+        request_id = f"request-{block}"
+        identities = {
+            "corpus_sha256": content_sha256({"corpus": block}),
+            "arrival_trace_sha256": content_sha256({"trace": block}),
+            "request_ids_sha256": content_sha256([request_id]),
+            "sampling_profile_sha256": content_sha256({"sampling": "greedy"}),
+            "model_lock_sha256": content_sha256({"model": "qwen3-8b"}),
+        }
+        identities_by_block[block] = identities
+        for method in CORE_METHODS:
+            cell = methods[method]
+            budget = _execution_budget(cell)
+            physical_gpu_uuids = tuple(
+                _PHYSICAL_GPU_UUIDS[registry.gpu_uuids.index(logical_slot)]
+                for logical_slot in cell.resources.gpu_uuids
+            )
+            assignment = _analysis_physical_assignment(
+                cell,
+                budget=budget,
+                inventory=inventory,
+                physical_gpu_uuids=physical_gpu_uuids,
+                cell_index=cell_index,
+            )
+            budgets[cell.cell_id] = budget
+            assignments[cell.cell_id] = assignment
+            locked_cells[cell.cell_id] = _analysis_locked_cell_contract(
+                cell,
+                request_id=request_id,
+                identities=identities,
+                budget=budget,
+                assignment=assignment,
+            )
+            cell_index += 1
+    split_contract: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "industrial_locked_split",
+        "registry_sha256": registry.sha256,
+        "experiment": "E3b",
+        "cells": [locked_cells[cell_id] for cell_id in sorted(locked_cells)],
+    }
+    split_sha256 = content_sha256(split_contract)
     family = derive_confirmation_family(
         registry,
         cell_id=block_cells[PILOT_BLOCKS[0]]["target_only"].cell_id,
@@ -766,25 +1018,18 @@ def _build_evidence(
     )
     pilot_activation = materialize_confirmation_pilots(registry, family)
     block_evidence: list[IndustrialBlockEvidence] = []
+    completion_rows: dict[str, dict[str, object]] = {}
 
     for block, methods in block_cells.items():
         request_id = f"request-{block}"
-        request_ids_sha256 = content_sha256([request_id])
-        identities = {
-            "corpus_sha256": content_sha256({"corpus": block}),
-            "arrival_trace_sha256": content_sha256({"trace": block}),
-            "request_ids_sha256": request_ids_sha256,
-            "sampling_profile_sha256": content_sha256({"sampling": "greedy"}),
-            "model_lock_sha256": content_sha256({"model": "qwen3-8b"}),
-        }
+        identities = identities_by_block[block]
         cell_evidence: list[IndustrialCellEvidence] = []
         for method in CORE_METHODS:
             cell = methods[method]
-            budget = _execution_budget(cell)
-            physical_gpu_uuids = tuple(
-                _PHYSICAL_GPU_UUIDS[registry.gpu_uuids.index(logical_slot)]
-                for logical_slot in cell.resources.gpu_uuids
-            )
+            budget = budgets[cell.cell_id]
+            assignment = assignments[cell.cell_id]
+            contract = locked_cells[cell.cell_id]
+            physical_gpu_uuids = assignment.gpu_uuids
             run_id = f"analysis-{block}-{method.replace('_', '-')}"
             evidence_root = Path(cell.resources.evidence_root)
             output_token_ids = tuple(range(100, 200))
@@ -796,9 +1041,7 @@ def _build_evidence(
                 output_token_ids_json.encode("utf-8")
             ).hexdigest()
             run_nonce_sha256 = content_sha256({"nonce": cell.cell_id, "run": run_id})
-            rank_config_sha256 = content_sha256(
-                {"rank_config": cell.cell_id, "rank": 0}
-            )
+            rank_config_sha256 = str(contract["rank_config_sha256s"][0])
             writer = EvidenceWriter(
                 evidence_root,
                 run_id=run_id,
@@ -810,7 +1053,7 @@ def _build_evidence(
                 writer,
                 method=method,
                 run_nonce_sha256=run_nonce_sha256,
-                execution_plan_sha256=runtime_sha256,
+                execution_plan_sha256=str(contract["execution_plan_sha256"]),
                 rank_config_sha256=rank_config_sha256,
                 request_id=request_id,
                 output_token_ids=output_token_ids,
@@ -837,8 +1080,8 @@ def _build_evidence(
                     industrial_cell_id=cell.cell_id,
                     experiment_budget_sha256=budget.sha256,
                     rank_config_sha256=rank_config_sha256,
-                    runtime_sha256=runtime_sha256,
-                    split_sha256=split_sha256,
+                    runtime_sha256=str(contract["execution_plan_sha256"]),
+                    split_sha256=str(contract["execution_split_sha256"]),
                     **identities,
                     patched_sglang_tree=PINNED_SGLANG_TREE,
                     run_nonce_sha256=run_nonce_sha256,
@@ -848,14 +1091,14 @@ def _build_evidence(
                             "cell_id": cell.cell_id,
                             "topology": cell.identity.topology,
                             "gpu_uuids": list(physical_gpu_uuids),
-                            "tensor_parallel_size": 1,
-                            "data_parallel_size": 1,
-                            "world_size": 1,
+                            "tensor_parallel_size": assignment.tensor_parallel_size,
+                            "data_parallel_size": assignment.data_parallel_size,
+                            "world_size": len(assignment.gpu_uuids),
                         }
                     ),
-                    tensor_parallel_size=1,
-                    data_parallel_size=1,
-                    world_size=1,
+                    tensor_parallel_size=assignment.tensor_parallel_size,
+                    data_parallel_size=assignment.data_parallel_size,
+                    world_size=len(assignment.gpu_uuids),
                     rank=0,
                     expected_request_rows=1,
                     expected_round_rows=expected_rounds,
@@ -937,16 +1180,17 @@ def _build_evidence(
             _, prepared_receipt = writer.prepare_close()
             terminal_path = evidence_root / f"{run_id}.rank0.complete.json"
             prepared_receipt_sha256 = _file_sha256(prepared_receipt)
+            budget_observation_value = _budget_observation_value(
+                budget,
+                terminal_receipt_sha256=prepared_receipt_sha256,
+            )
             budget_observation = _write_budget_observation(
                 evidence_root
                 / f"{run_id}.rank0.budget-observation"
                 / "observation.json",
-                _budget_observation_value(
-                    budget,
-                    terminal_receipt_sha256=prepared_receipt_sha256,
-                ),
+                budget_observation_value,
             )
-            writer.publish_close(
+            completed_evidence = writer.publish_close(
                 validate_post_binding=lambda reference=budget_observation: (
                     _validate_durable_test_binding(reference)
                 )
@@ -966,8 +1210,8 @@ def _build_evidence(
                     "schema_version": 1,
                     "kind": "industrial_hardware_receipt",
                     "registry_sha256": registry.sha256,
-                    "runtime_sha256": runtime_sha256,
-                    "split_sha256": split_sha256,
+                    "runtime_sha256": contract["execution_plan_sha256"],
+                    "split_sha256": contract["execution_split_sha256"],
                     "cell_id": cell.cell_id,
                     "block": block,
                     "topology_sha256": content_sha256(
@@ -976,9 +1220,9 @@ def _build_evidence(
                             "cell_id": cell.cell_id,
                             "topology": cell.identity.topology,
                             "gpu_uuids": list(physical_gpu_uuids),
-                            "tensor_parallel_size": 1,
-                            "data_parallel_size": 1,
-                            "world_size": 1,
+                            "tensor_parallel_size": assignment.tensor_parallel_size,
+                            "data_parallel_size": assignment.data_parallel_size,
+                            "world_size": len(assignment.gpu_uuids),
                         }
                     ),
                     "hardware_envelope_sha256": content_sha256(envelope),
@@ -993,6 +1237,26 @@ def _build_evidence(
                     ],
                 },
             )
+            completion_rows[cell.cell_id] = {
+                "cell_id": cell.cell_id,
+                "evidence_root": cell.resources.evidence_root,
+                "run_id": run_id,
+                "rank": 0,
+                "evidence_sha256": evidence_files_sha256(completed_evidence.values()),
+                "terminal_receipt_sha256": terminal.sha256,
+                "physical_gpu_uuid": physical_gpu_uuids[0],
+                "physical_binding_sha256": assignment.sha256,
+                "experiment_budget_sha256": budget.sha256,
+                "budget_observation_status": "OBSERVED",
+                "budget_observation_reason_code": None,
+                "budget_observation_path": str(budget_observation.path),
+                "budget_observation_sha256": budget_observation_value[
+                    "budget_observation_sha256"
+                ],
+                "preflight_attestation_path": None,
+                "preflight_attestation_sha256": None,
+                "status": "MEASURED",
+            }
             cell_evidence.append(
                 IndustrialCellEvidence(
                     cell_id=cell.cell_id,
@@ -1029,12 +1293,31 @@ def _build_evidence(
             )
         )
     evidence = tuple(block_evidence)
+    pilot_cell_ids = frozenset(pilot_activation.activated_cell_ids)
+    pilot_completion = _write_analysis_completion_contract(
+        tmp_path / "completion" / "pilot-completed.json",
+        registry=registry,
+        runtime_sha256=runtime_sha256,
+        split_contract=split_contract,
+        inventory=inventory,
+        activation_binding=_analysis_activation_binding(
+            activation_round="excluded_pilots",
+            activations=(pilot_activation,),
+            reductions=(),
+        ),
+        rows=tuple(completion_rows[cell_id] for cell_id in sorted(pilot_cell_ids)),
+    )
+    evidence = _attach_completion_contract(
+        evidence,
+        cell_ids=pilot_cell_ids,
+        completion_contract=pilot_completion,
+    )
     plan = reduce_confirmation_family_power(
         registry=registry,
         pilot_activation=pilot_activation,
         blocks=tuple(block for block in evidence if block.block in PILOT_BLOCKS),
         hardware_envelope=envelope,
-        inventory=_gpu_inventory(),
+        inventory=inventory,
         confirmation_data_visible=False,
     )
     assert plan.selected_final_blocks == (final_block_count or None)
@@ -1044,6 +1327,26 @@ def _build_evidence(
         reduction=plan,
         pilot_activation=pilot_activation,
     )
+    final_cell_ids = frozenset(final_activation.activated_cell_ids)
+    if final_cell_ids:
+        final_completion = _write_analysis_completion_contract(
+            tmp_path / "completion" / "final-completed.json",
+            registry=registry,
+            runtime_sha256=runtime_sha256,
+            split_contract=split_contract,
+            inventory=inventory,
+            activation_binding=_analysis_activation_binding(
+                activation_round="final_prefix",
+                activations=(pilot_activation, final_activation),
+                reductions=(plan,),
+            ),
+            rows=tuple(completion_rows[cell_id] for cell_id in sorted(final_cell_ids)),
+        )
+        evidence = _attach_completion_contract(
+            evidence,
+            cell_ids=final_cell_ids,
+            completion_contract=final_completion,
+        )
     return (
         registry,
         pilot_activation,
@@ -1360,6 +1663,7 @@ def _analysis_manifest(
     }
 
     def manifest_block(block: IndustrialBlockEvidence) -> dict[str, object]:
+        assert all(cell.completion_contract is not None for cell in block.cells)
         return {
             "block": block.block,
             "qualification_lock": _bound_reference(block.qualification_lock),
@@ -1371,6 +1675,7 @@ def _analysis_manifest(
                     ],
                     "hardware_receipt": _bound_reference(cell.hardware_receipt),
                     "budget_observation": _bound_reference(cell.budget_observation),
+                    "completion_contract": _bound_reference(cell.completion_contract),
                 }
                 for cell in block.cells
             ],
@@ -1491,7 +1796,19 @@ def _replace_with_unverified_alias(
 def test_budget_observation_requires_a_positive_registered_factor_anchor(
     tmp_path: Path,
 ) -> None:
-    budget = _zero_budget("a" * 64)
+    registry = build_industrial_registry()
+    registry_cell = next(
+        cell
+        for cell in registry.cells_for("E3b")
+        if cell.runnable
+        and cell.identity.method == "target_only"
+        and cell.resources.gpu_count == 1
+        and cell.identity.topology == "tp1_dp1"
+    )
+    budget = replace(
+        _zero_budget(registry_cell.cell_id),
+        workload_class=registry_cell.resources.workload_class,
+    )
     terminal_sha256 = "b" * 64
     observed_rows = [[name, 0] for name in _BUDGET_OBSERVATION_COMPONENTS]
     observation_content = {
@@ -1523,6 +1840,7 @@ def test_budget_observation_requires_a_positive_registered_factor_anchor(
     with pytest.raises(ValueError, match="positive scenario anchors"):
         _load_budget_observation(
             reference,
+            cell=registry_cell,
             experiment_budget_sha256=budget.sha256,
             terminal_receipt_sha256=terminal_sha256,
             fixed_instance_gpu_count=2,
@@ -1555,6 +1873,7 @@ def test_tp1_on_two_gpu_instance_underbilling_fails_exact_factor(
     with pytest.raises(ValueError, match="derived accounting"):
         _load_budget_observation(
             tampered,
+            cell=next(row for row in registry.cells if row.cell_id == cell.cell_id),
             experiment_budget_sha256=value["experiment_budget_sha256"],
             terminal_receipt_sha256=value["terminal_evidence_sha256"],
             fixed_instance_gpu_count=2,
@@ -1578,9 +1897,136 @@ def test_tp1_on_two_gpu_instance_underbilling_fails_exact_factor(
     with pytest.raises(ValueError, match="bound inventory count"):
         _load_budget_observation(
             coordinated,
+            cell=registry_cell,
             experiment_budget_sha256=coordinated_budget.sha256,
             terminal_receipt_sha256=value["terminal_evidence_sha256"],
             fixed_instance_gpu_count=2,
+        )
+
+
+def test_budget_observation_rejects_foreign_registry_cell(
+    evidence_bundle,
+) -> None:
+    registry, _, _, _, evidence, _ = evidence_bundle
+    reference = evidence[0].cells[0]
+    value = json.loads(reference.budget_observation.path.read_text(encoding="utf-8"))
+    foreign = next(
+        cell
+        for cell in registry.cells_for("E3b")
+        if cell.runnable and cell.cell_id != reference.cell_id
+    )
+    with pytest.raises(ValueError, match="differs from its registry cell"):
+        _load_budget_observation(
+            reference.budget_observation,
+            cell=foreign,
+            experiment_budget_sha256=value["experiment_budget_sha256"],
+            terminal_receipt_sha256=value["terminal_evidence_sha256"],
+            fixed_instance_gpu_count=2,
+        )
+
+
+def test_p99_analysis_requires_one_locked_preregistered_anchor() -> None:
+    registry = build_industrial_registry()
+    cell = next(
+        row
+        for row in registry.cells_for("E3b")
+        if row.runnable and row.identity.method == "target_only"
+    )
+    minimum = 12_000
+    locked = replace(
+        _execution_budget(cell),
+        job_kind=BudgetJobKind.P99_ANCHOR,
+        minimum_completed_requests=minimum,
+        p99_anchor_status=P99AnchorStatus.LOCKED,
+    )
+    completed = (87.0,) * minimum
+    claimable = _guard_preregistered_p99_analysis(
+        family_experiment="E3b",
+        method="target_only",
+        analysis_budgets=(locked,),
+        independent_observations=((locked, completed),),
+    )
+    assert claimable.claimable
+    assert claimable.minimum_completions == minimum
+    assert claimable.completed_requests == minimum
+    assert claimable.observed_p99_ms == 87.0
+
+    below_floor = _guard_preregistered_p99_analysis(
+        family_experiment="E3b",
+        method="target_only",
+        analysis_budgets=(locked,),
+        independent_observations=((locked, completed[:-1]),),
+    )
+    assert below_floor.status == "UNRESOLVED"
+    assert below_floor.observed_p99_ms is None
+
+    standard = replace(
+        locked,
+        job_kind=BudgetJobKind.STANDARD,
+        p99_anchor_status=P99AnchorStatus.NOT_REQUIRED,
+    )
+    standard_result = _guard_preregistered_p99_analysis(
+        family_experiment="E3b",
+        method="target_only",
+        analysis_budgets=(standard,),
+        independent_observations=((standard, completed),),
+    )
+    assert standard_result.status == "UNRESOLVED"
+    assert standard_result.observed_p99_ms is None
+
+    unresolved_anchor = replace(
+        locked,
+        p99_anchor_status=P99AnchorStatus.REQUIRED_UNRESOLVED,
+    )
+    unresolved_result = _guard_preregistered_p99_analysis(
+        family_experiment="E3b",
+        method="target_only",
+        analysis_budgets=(unresolved_anchor,),
+        independent_observations=((unresolved_anchor, completed),),
+    )
+    assert unresolved_result.status == "UNRESOLVED"
+    assert unresolved_result.observed_p99_ms is None
+
+    distinct_anchor = replace(
+        locked,
+        output_tokens=ExpectedMaximumCount(101, 101),
+    )
+    cross_anchor = _guard_preregistered_p99_analysis(
+        family_experiment="E3b",
+        method="target_only",
+        analysis_budgets=(locked, distinct_anchor),
+        independent_observations=(
+            (locked, completed),
+            (distinct_anchor, completed),
+        ),
+    )
+    assert cross_anchor.status == "UNRESOLVED"
+    assert cross_anchor.observed_p99_ms is None
+
+
+def test_alias_analysis_uses_target_raw_budget_without_erasing_source() -> None:
+    registry = build_industrial_registry()
+    source_cell, target_cell = tuple(
+        row
+        for row in registry.cells_for("E3b")
+        if row.runnable and row.identity.method == "target_only"
+    )[:2]
+    source_budget = _execution_budget(source_cell)
+    target_budget = _execution_budget(target_cell)
+    assert source_budget != target_budget
+    analysis_budget = _alias_analysis_budget(
+        observed_source_budget=source_budget,
+        source_budget=source_budget,
+        target_budget=target_budget,
+    )
+    assert analysis_budget is target_budget
+    assert source_budget.cell_id == source_cell.cell_id
+    assert analysis_budget.cell_id == target_cell.cell_id
+    with pytest.raises(ValueError, match="source budget observation"):
+        _alias_analysis_budget(
+            observed_source_budget=target_budget,
+            source_budget=source_budget,
+            target_budget=target_budget,
         )
 
 
@@ -1814,11 +2260,18 @@ def test_static_terminal_evidence_has_no_round_or_update_trace_state(
     cell = next(
         cell for cell in registry.cells if cell.cell_id == static_reference.cell_id
     )
+    execution_identity = _replay_cell_execution_identity(
+        static_reference,
+        registry=registry,
+        family=plan.family,
+        cell=cell,
+        inventory=_gpu_inventory(),
+    )
     with pytest.raises(ValueError, match="detail-table coverage"):
         _validate_run_row(
             claimed_trace,
             registry=registry,
-            family=plan.family,
+            family=execution_identity,
             cell=cell,
             rank=0,
         )
@@ -1826,7 +2279,7 @@ def test_static_terminal_evidence_has_no_round_or_update_trace_state(
         _validate_run_row(
             {**run, "experiment_budget_sha256": None},
             registry=registry,
-            family=plan.family,
+            family=execution_identity,
             cell=cell,
             rank=0,
         )
@@ -1834,7 +2287,7 @@ def test_static_terminal_evidence_has_no_round_or_update_trace_state(
         _validate_run_row(
             {**run, "workload_contract": "industrial_preflight_static"},
             registry=registry,
-            family=plan.family,
+            family=execution_identity,
             cell=cell,
             rank=0,
         )
@@ -1848,7 +2301,7 @@ def test_static_terminal_evidence_has_no_round_or_update_trace_state(
             _validate_run_row(
                 {**run, field: value},
                 registry=registry,
-                family=plan.family,
+                family=execution_identity,
                 cell=cell,
                 rank=0,
             )
@@ -1856,7 +2309,7 @@ def test_static_terminal_evidence_has_no_round_or_update_trace_state(
         _validate_run_row(
             {**run, "session_close_receipt_sha256": "4" * 64},
             registry=registry,
-            family=plan.family,
+            family=execution_identity,
             cell=cell,
             rank=0,
         )
@@ -2026,6 +2479,9 @@ def test_reducer_derives_only_unattested_diagnostics_from_cpu_terminal_rows(
     assert all(
         row.aggregate_latency_p99.status == "UNRESOLVED" for row in artifact.methods
     )
+    assert all(
+        row.aggregate_latency_p99.observed_p99_ms is None for row in artifact.methods
+    )
     assert len(artifact.terminal_receipt_sha256s) == 16 * 4
     assert len(artifact.budget_observation_sha256s) == 16 * 4
     bound_physical = {
@@ -2168,6 +2624,26 @@ def test_underpowered_family_uses_only_pilots_and_produces_no_final_analysis(
     assert reduction.artifact.primary_contrasts == ()
     assert reduction.artifact.holm_family == ()
     assert len(reduction.artifact.run_bindings) == len(PILOT_BLOCKS) * len(CORE_METHODS)
+    runtime = reduction.artifact.runtime_metrics
+    assert runtime.status is RuntimeMetricStatus.UNRESOLVED
+    assert runtime.authority_sha256 is None
+    assert runtime.reduction_sha256 is None
+    assert runtime.expected_run_ids == tuple(
+        sorted(binding.run_id for binding in reduction.artifact.run_bindings)
+    )
+    assert runtime.observations
+    assert all(
+        row.status is RuntimeMetricStatus.UNRESOLVED for row in runtime.observations
+    )
+    assert all(row.value is None for row in runtime.observations)
+    exported = reduction.artifact.to_dict()["evidence"]["runtime_metrics"]
+    assert reduction.artifact.to_dict()["schema_version"] == 2
+    assert (
+        reduction.artifact.to_dict()["evidence"]["runtime_metrics_sha256"]
+        == runtime.sha256
+    )
+    assert exported["status"] == "UNRESOLVED"
+    assert all(row["value"] is None for row in exported["observations"])
 
 
 def test_dependence_map_rekeys_units_but_rejects_unverified_aliases(
@@ -2505,6 +2981,36 @@ def test_confirmation_family_power_cli_reduces_only_bound_pilot_evidence(
         json.loads(output.read_text(encoding="utf-8"))
     )
     assert reduced == plan
+    assert all(binding.schema_version == 2 for binding in reduced.run_bindings)
+    assert all(
+        binding.runtime_sha256 == reduced.family.runtime_sha256
+        and binding.split_sha256 == reduced.family.split_sha256
+        and binding.execution_plan_sha256 is not None
+        and binding.execution_split_sha256 is not None
+        for binding in reduced.run_bindings
+    )
+    assert any(
+        binding.execution_plan_sha256 != binding.runtime_sha256
+        or binding.execution_split_sha256 != binding.split_sha256
+        for binding in reduced.run_bindings
+    )
+
+    old_mixed_domain = confirmation_family_power_reduction_artifact_to_dict(reduced)
+    for binding in old_mixed_domain["run_bindings"]:
+        del binding["execution_plan_sha256"]
+        del binding["execution_split_sha256"]
+    with pytest.raises(ValueError, match="fields differ"):
+        confirmation_family_power_reduction_artifact_from_dict(old_mixed_domain)
+
+    swapped_lineage = confirmation_family_power_reduction_artifact_to_dict(reduced)
+    swapped_lineage["run_bindings"][0]["runtime_sha256"] = swapped_lineage[
+        "run_bindings"
+    ][0]["execution_plan_sha256"]
+    swapped_lineage["run_bindings"][0]["split_sha256"] = swapped_lineage[
+        "run_bindings"
+    ][0]["execution_split_sha256"]
+    with pytest.raises(ValueError, match="family substantive run provenance"):
+        confirmation_family_power_reduction_artifact_from_dict(swapped_lineage)
     final_output = tmp_path / "family-final-activation.json"
     assert (
         main(

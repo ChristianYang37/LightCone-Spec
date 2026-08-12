@@ -11,6 +11,8 @@ authority. The schema-v3 and industrial commands are:
 |---|---|
 | `doctor` | Read-only host, Python, CUDA, and source identity report |
 | `validate-config` | Validate one strict schema-v3 run config and sidecar |
+| `bind-formal-workload-authority` | Bind a release-allowlisted local LiveCodeBench v6 Hard or MATH-500 Level 5 raw source |
+| `revalidate-formal-workload-authority` | Reopen a diagnostic workload binding and replay its path, revision, bytes, and complete selection |
 | `build-industrial-registry` | Bind one or more stable logical rank slots and materialize the immutable experiment DAG |
 | `collect-gpu-inventory` | Collect a nonce-bound physical GPU/topology inventory and raw probe receipt |
 | `build-interference-envelope` | Derive the current serial interference envelope and its inventory-bound raw receipt |
@@ -84,6 +86,32 @@ root before opening caller paths; the current no-signer release therefore
 writes a `BLOCKED` decision and no calibrated envelope. A preflight stage can
 seal `runtime_envelope=PATH` only by reopening that same raw execution
 authority, never from a hand-authored rule list or digest.
+
+## Formal external workload authority
+
+Formal benchmark data is never downloaded by these commands. The bind command
+accepts only `livecodebench_v6_hard` or `math500_level5`; source code owns the
+exact repository revision, raw-file SHA-256, row counts, filtering protocol,
+and complete selected-row SHA-256. It selects every exact protocol match in raw
+order and never takes the first 32 rows.
+
+```bash
+lightcone-spec bind-formal-workload-authority \
+  --workload math500_level5 \
+  --source /absolute/path/to/math500-locked.json \
+  --output artifacts/industrial/math500-workload-authority.json
+
+lightcone-spec revalidate-formal-workload-authority \
+  --authority artifacts/industrial/math500-workload-authority.json
+```
+
+This release has an empty formal-workload source allowlist. Bind therefore
+returns 42 with `status=BLOCKED` and
+`reason_code=formal_workload_source_allowlist_empty` before inspecting the
+source path or creating the output directory. A future allowlisted source may
+produce a `BOUND_DIAGNOSTIC` artifact, but that artifact permanently carries
+`formal_execution_authorized=false`; it is workload input identity, not GPU
+dispatch, attestation, or a formal result.
 
 ## Industrial registry workflow
 

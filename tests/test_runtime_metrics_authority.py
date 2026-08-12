@@ -12,6 +12,7 @@ from test_compile_cache_launch import _build_base, _key
 from test_industrial_executor import _execution_fixture, _FakeHandle, _FakeTransport
 
 from lightcone_spec.experiments.runtime_metrics import (
+    FormalRuntimeMetricObservation,
     RuntimeMetricName,
     RuntimeMetricObservation,
     RuntimeMetricSourceKind,
@@ -20,6 +21,7 @@ from lightcone_spec.experiments.runtime_metrics import (
     bind_compile_runtime_metrics,
     bind_fresh_process_runtime_metrics,
     build_runtime_metrics_authority,
+    export_formal_runtime_metrics,
     reduce_runtime_metrics,
 )
 from lightcone_spec.orchestration.executor import execute_industrial_plan
@@ -256,6 +258,77 @@ def test_unavailable_metric_cannot_carry_a_fabricated_zero() -> None:
             source_field="missing_first_party_runtime_receipt",
             reason_code="power_sampler_receipt_unavailable",
             release_trusted_attestation=False,
+        )
+
+
+def test_formal_export_without_authority_is_exact_null_coverage() -> None:
+    export = export_formal_runtime_metrics(None, expected_run_ids=("run-b", "run-a"))
+
+    assert export.expected_run_ids == ("run-a", "run-b")
+    assert export.status is RuntimeMetricStatus.UNRESOLVED
+    assert export.authority_sha256 is None
+    assert export.reduction_sha256 is None
+    assert export.source_sha256s == ()
+    assert export.observations
+    assert all(
+        row.status is RuntimeMetricStatus.UNRESOLVED for row in export.observations
+    )
+    assert all(row.value is None for row in export.observations)
+    assert all(
+        row.reason_code == "runtime_metrics_authority_unavailable"
+        for row in export.observations
+    )
+    assert export.formal_values("run-a") == {}
+
+
+def test_formal_export_downgrades_untrusted_resolved_values(tmp_path: Path) -> None:
+    source, result = _fresh_process_source(tmp_path)
+    export = export_formal_runtime_metrics(
+        build_runtime_metrics_authority(fresh_process_sources=(source,)),
+        expected_run_ids=(result.run_id,),
+    )
+
+    cold = export.observation(result.run_id, RuntimeMetricName.COLD_START_MS)
+    graph = export.observation(result.run_id, RuntimeMetricName.GRAPH_REPLAY_HIT_RATE)
+    reset = export.observation(result.run_id, RuntimeMetricName.RESET_DURATION_MS)
+    energy = export.observation(result.run_id, RuntimeMetricName.ENERGY_JOULES)
+    assert (cold.status, cold.value, cold.reason_code) == (
+        RuntimeMetricStatus.UNRESOLVED,
+        None,
+        "release_trusted_runtime_source_required",
+    )
+    assert (graph.status, graph.value, graph.reason_code) == (
+        RuntimeMetricStatus.UNRESOLVED,
+        None,
+        "release_trusted_runtime_source_required",
+    )
+    assert (reset.status, reset.value, reset.reason_code) == (
+        RuntimeMetricStatus.NOT_APPLICABLE,
+        None,
+        "fresh_process_has_no_shared_reset",
+    )
+    assert (energy.status, energy.value) == (RuntimeMetricStatus.UNRESOLVED, None)
+    assert export.formal_values(result.run_id) == {}
+
+    with pytest.raises(ValueError, match="foreign formal runs"):
+        export_formal_runtime_metrics(
+            build_runtime_metrics_authority(fresh_process_sources=(source,)),
+            expected_run_ids=("another-run",),
+        )
+
+
+def test_formal_observation_rejects_untrusted_resolved_value() -> None:
+    with pytest.raises(ValueError, match="untrusted runtime source"):
+        FormalRuntimeMetricObservation(
+            subject_id="run",
+            metric=RuntimeMetricName.ENERGY_JOULES,
+            unit=RuntimeMetricUnit.JOULE,
+            status=RuntimeMetricStatus.MEASURED,
+            value=0.0,
+            source_kind=RuntimeMetricSourceKind.NATIVE_TERMINAL,
+            source_sha256="a" * 64,
+            reason_code=None,
+            release_trusted=False,
         )
 
 

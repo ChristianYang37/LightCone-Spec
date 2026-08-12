@@ -703,6 +703,32 @@ def test_execution_candidate_is_rebuilt_from_current_raw_plan_and_locks(
         )
 
     plan_wire = plan.to_dict()
+    for name, field, value in (
+        ("trainable-authority", "trainable_plan_authority", {}),
+        (
+            "prepared-content-pin",
+            "prepared_model_content_release_manifest_sha256",
+            _sha("caller-prepared-content-pin"),
+        ),
+    ):
+        trainable_tamper = deepcopy(plan_wire)
+        trainable_tamper[field] = value
+        with pytest.raises(
+            ValueError,
+            match="must not carry trainable-plan authority",
+        ):
+            _audit_alias_execution_candidate(
+                replace(
+                    artifacts,
+                    execution_plan=_write_json(
+                        root / f"alias-plan-{name}-tamper.json",
+                        trainable_tamper,
+                    ),
+                ),
+                registry=registry,
+                hardware_envelope=envelope,
+                inventory=plan.dispatch_context.inventory,
+            )
     top_level_tamper = deepcopy(plan_wire)
     top_level_tamper["budget_materialization_authority_sha256"] = _sha(
         "edited-top-level-budget-authority"

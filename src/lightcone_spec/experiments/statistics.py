@@ -637,8 +637,10 @@ def guard_p99_claim(
     *,
     completed_requests: int,
     observed_p99_ms: float | None,
+    minimum_completions: int,
+    preregistered_anchor_locked: bool,
 ) -> P99ClaimGuard:
-    """Mark p99 unresolved below 10,000 completions without fabricating it."""
+    """Gate one p99 only with its explicit preregistered anchor authority."""
     if not isinstance(anchor_id, str) or not anchor_id:
         raise ValueError("anchor ID must be non-empty")
     if (
@@ -647,22 +649,31 @@ def guard_p99_claim(
         or completed_requests < 0
     ):
         raise ValueError("completed request count must be a non-negative integer")
+    if (
+        not isinstance(minimum_completions, int)
+        or isinstance(minimum_completions, bool)
+        or minimum_completions < 0
+    ):
+        raise ValueError("minimum completions must be a non-negative integer")
+    if not isinstance(preregistered_anchor_locked, bool):
+        raise TypeError("preregistered anchor lock must be boolean")
+    if preregistered_anchor_locked and minimum_completions == 0:
+        raise ValueError("locked p99 anchors require a positive completion minimum")
     if observed_p99_ms is not None:
         observed_p99_ms = float(observed_p99_ms)
         if not np.isfinite(observed_p99_ms) or observed_p99_ms < 0.0:
             raise ValueError("observed p99 must be finite and non-negative")
-    if completed_requests >= P99_MINIMUM_COMPLETIONS and observed_p99_ms is None:
+    eligible = preregistered_anchor_locked and completed_requests >= minimum_completions
+    if eligible and observed_p99_ms is None:
         raise ValueError("claimable anchors require an observed p99")
+    if not eligible and observed_p99_ms is not None:
+        raise ValueError("unresolved p99 anchors cannot expose an observed p99")
     return P99ClaimGuard(
         anchor_id=anchor_id,
         completed_requests=completed_requests,
         observed_p99_ms=observed_p99_ms,
-        minimum_completions=P99_MINIMUM_COMPLETIONS,
-        status=(
-            "CLAIMABLE"
-            if completed_requests >= P99_MINIMUM_COMPLETIONS
-            else "UNRESOLVED"
-        ),
+        minimum_completions=minimum_completions,
+        status="CLAIMABLE" if eligible else "UNRESOLVED",
     )
 
 

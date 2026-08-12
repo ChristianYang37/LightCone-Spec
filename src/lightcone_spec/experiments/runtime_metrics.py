@@ -264,6 +264,9 @@ _NATIVE_METRICS = frozenset(
         RuntimeMetricName.OUTPUT_TOKENS_PER_JOULE,
     }
 )
+_FORMAL_RUN_METRICS = frozenset(
+    _BUDGET_METRICS | _PERFORMANCE_METRICS | _NATIVE_METRICS
+)
 
 RUNTIME_METRICS_REDUCER_PROTOCOL_SHA256 = content_sha256(
     {
@@ -282,6 +285,21 @@ RUNTIME_METRICS_REDUCER_PROTOCOL_SHA256 = content_sha256(
         "missing_numeric_values_are_never_zero": True,
         "fresh_process_does_not_claim_shared_reset_or_reuse_savings": True,
         "native_attestation_status_is_retained": True,
+    }
+)
+
+FORMAL_RUNTIME_METRICS_EXPORT_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "formal_runtime_metrics_export_protocol",
+        "run_metrics": sorted(metric.value for metric in _FORMAL_RUN_METRICS),
+        "run_identity": "exact_industrial_reducer_run_bindings",
+        "source": "freshly_replayed_runtime_metrics_authority",
+        "resolved_value_gate": "release_trusted_native_terminal_for_exact_run",
+        "missing_authority_or_run_source": "UNRESOLVED_with_null_value",
+        "untrusted_resolved_value": "downgrade_to_UNRESOLVED_with_null_value",
+        "not_applicable": "preserve_NA_with_null_value",
+        "compile_subjects": "authority_identity_only_not_confirmation_run_metrics",
     }
 )
 
@@ -903,11 +921,14 @@ class RuntimeMetricsReduction:
         return matches[0]
 
     def resolved_performance_overrides(self, subject_id: str) -> dict[str, int | float]:
-        """Return only receipt-backed values understood by ``PerformanceRecord``.
+        """Return diagnostic receipt-backed values understood by ``PerformanceRecord``.
 
         UNRESOLVED and N/A rows are deliberately omitted rather than converted
         to zero.  The fresh-process reset/finalization composite is also omitted
         because it is not the shared-session ``reset_duration_ms`` field.
+        This mapping is not a formal-claim boundary: industrial reducers must
+        use :func:`export_formal_runtime_metrics`, which additionally requires
+        exact run coverage and release-trusted native evidence.
         """
 
         _require_text("runtime metric subject_id", subject_id)
@@ -959,6 +980,197 @@ class RuntimeMetricsReduction:
             "reducer_protocol_sha256": self.reducer_protocol_sha256,
             "source_sha256s": list(self.source_sha256s),
             "observations": [value.to_dict() for value in self.observations],
+        }
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(self.to_dict())
+
+
+@dataclass(frozen=True)
+class FormalRuntimeMetricObservation:
+    """One claim-safe metric row exported to industrial analysis.
+
+    This schema intentionally permits absent provenance only for a synthesized
+    missing-source row.  A value can survive only when the exact run is covered
+    by a release-trusted native terminal source.
+    """
+
+    subject_id: str
+    metric: RuntimeMetricName
+    unit: RuntimeMetricUnit
+    status: RuntimeMetricStatus
+    value: int | float | None
+    source_kind: RuntimeMetricSourceKind | None
+    source_sha256: str | None
+    reason_code: str | None
+    release_trusted: bool
+
+    def __post_init__(self) -> None:
+        _require_text("formal runtime metric subject_id", self.subject_id)
+        if not isinstance(self.metric, RuntimeMetricName):
+            raise TypeError("formal runtime metric name must be typed")
+        if self.metric not in _FORMAL_RUN_METRICS:
+            raise ValueError("compile-only metrics cannot become formal run fields")
+        if self.unit is not _METRIC_SPECS[self.metric].unit:
+            raise ValueError("formal runtime metric unit differs from its schema")
+        if not isinstance(self.status, RuntimeMetricStatus):
+            raise TypeError("formal runtime metric status must be typed")
+        if type(self.release_trusted) is not bool:
+            raise TypeError("formal runtime trust state must be a boolean")
+        if (self.source_kind is None) != (self.source_sha256 is None):
+            raise ValueError(
+                "formal runtime provenance must be wholly present or absent"
+            )
+        if self.source_kind is not None:
+            if not isinstance(self.source_kind, RuntimeMetricSourceKind):
+                raise TypeError("formal runtime source kind must be typed")
+            assert self.source_sha256 is not None
+            _require_sha256("formal runtime source", self.source_sha256)
+        resolved = self.status in {
+            RuntimeMetricStatus.OBSERVED,
+            RuntimeMetricStatus.MEASURED,
+        }
+        if resolved:
+            if not self.release_trusted:
+                raise ValueError(
+                    "untrusted runtime source cannot publish a formal value"
+                )
+            if self.value is None or self.reason_code is not None:
+                raise ValueError("resolved formal runtime metric is incomplete")
+            spec = _METRIC_SPECS[self.metric]
+            if (
+                not isinstance(self.value, (int, float))
+                or isinstance(self.value, bool)
+                or not math.isfinite(float(self.value))
+                or float(self.value) < 0
+            ):
+                raise ValueError("formal runtime metric value must be finite")
+            if spec.integral and type(self.value) is not int:
+                raise TypeError("integral formal runtime metric must remain exact")
+            if spec.maximum is not None and float(self.value) > spec.maximum:
+                raise ValueError("formal runtime metric exceeds its maximum")
+        elif self.value is not None:
+            raise ValueError("unavailable formal runtime metric cannot carry a value")
+        elif (
+            not isinstance(self.reason_code, str)
+            or _SAFE_REASON.fullmatch(self.reason_code) is None
+        ):
+            raise ValueError("unavailable formal runtime metric needs a named reason")
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.subject_id, self.metric.value
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "subject_id": self.subject_id,
+            "metric": self.metric.value,
+            "unit": self.unit.value,
+            "status": self.status.value,
+            "value": self.value,
+            "source_kind": (
+                None if self.source_kind is None else self.source_kind.value
+            ),
+            "source_sha256": self.source_sha256,
+            "reason_code": self.reason_code,
+            "release_trusted": self.release_trusted,
+        }
+
+
+@dataclass(frozen=True)
+class FormalRuntimeMetricsExport:
+    schema_version: int
+    protocol_sha256: str
+    status: RuntimeMetricStatus
+    authority_sha256: str | None
+    reduction_sha256: str | None
+    source_sha256s: tuple[str, ...]
+    expected_run_ids: tuple[str, ...]
+    observations: tuple[FormalRuntimeMetricObservation, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("formal runtime metrics export schema is unsupported")
+        if self.protocol_sha256 != FORMAL_RUNTIME_METRICS_EXPORT_PROTOCOL_SHA256:
+            raise ValueError("formal runtime metrics export uses another protocol")
+        if self.status not in {
+            RuntimeMetricStatus.OBSERVED,
+            RuntimeMetricStatus.UNRESOLVED,
+        }:
+            raise ValueError("formal runtime metrics export status is invalid")
+        if (self.authority_sha256 is None) != (self.reduction_sha256 is None):
+            raise ValueError("formal runtime authority/reduction identity is partial")
+        if self.authority_sha256 is not None:
+            _require_sha256("formal runtime authority", self.authority_sha256)
+            _require_sha256("formal runtime reduction", self.reduction_sha256)
+        if self.source_sha256s != tuple(sorted(set(self.source_sha256s))):
+            raise ValueError("formal runtime source coverage is not canonical")
+        for value in self.source_sha256s:
+            _require_sha256("formal runtime source", value)
+        if self.expected_run_ids != tuple(sorted(set(self.expected_run_ids))):
+            raise ValueError("formal runtime run IDs must be sorted and unique")
+        if not self.expected_run_ids:
+            raise ValueError("formal runtime export requires expected runs")
+        for value in self.expected_run_ids:
+            _require_text("formal runtime run ID", value)
+        keys = tuple(value.key for value in self.observations)
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("formal runtime observations must be sorted and unique")
+        expected_keys = tuple(
+            sorted(
+                (run_id, metric.value)
+                for run_id in self.expected_run_ids
+                for metric in _FORMAL_RUN_METRICS
+            )
+        )
+        if keys != expected_keys:
+            raise ValueError(
+                "formal runtime observations lack exact run/metric coverage"
+            )
+        unresolved = any(
+            row.status is RuntimeMetricStatus.UNRESOLVED for row in self.observations
+        )
+        if (self.status is RuntimeMetricStatus.UNRESOLVED) != unresolved:
+            raise ValueError("formal runtime aggregate status differs from its rows")
+
+    def observation(
+        self, subject_id: str, metric: RuntimeMetricName
+    ) -> FormalRuntimeMetricObservation:
+        matches = tuple(
+            row
+            for row in self.observations
+            if row.subject_id == subject_id and row.metric is metric
+        )
+        if len(matches) != 1:
+            raise KeyError(f"formal runtime metric {metric.value} is not singular")
+        return matches[0]
+
+    def formal_values(self, subject_id: str) -> dict[str, int | float]:
+        _require_text("formal runtime subject", subject_id)
+        if subject_id not in self.expected_run_ids:
+            raise KeyError("formal runtime subject is outside the export")
+        return {
+            row.metric.value: row.value
+            for row in self.observations
+            if row.subject_id == subject_id
+            and row.status
+            in {RuntimeMetricStatus.OBSERVED, RuntimeMetricStatus.MEASURED}
+            and row.release_trusted
+            and row.value is not None
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": "formal_runtime_metrics_export",
+            "protocol_sha256": self.protocol_sha256,
+            "status": self.status.value,
+            "authority_sha256": self.authority_sha256,
+            "reduction_sha256": self.reduction_sha256,
+            "source_sha256s": list(self.source_sha256s),
+            "expected_run_ids": list(self.expected_run_ids),
+            "observations": [row.to_dict() for row in self.observations],
         }
 
     @property
@@ -1803,10 +2015,139 @@ def reduce_runtime_metrics(
     return reduction
 
 
+def export_formal_runtime_metrics(
+    authority: RuntimeMetricsAuthority | None,
+    *,
+    expected_run_ids: tuple[str, ...],
+) -> FormalRuntimeMetricsExport:
+    """Build the only runtime-metric view eligible for formal analysis.
+
+    Every supplied authority is replayed.  Resolved values are retained only
+    for an exact expected run whose native terminal is release trusted.  Other
+    resolved values are downgraded to ``UNRESOLVED`` with ``None``; existing
+    ``UNRESOLVED`` and ``N/A`` states remain unchanged.
+    """
+
+    expected = tuple(sorted(expected_run_ids))
+    if not expected or expected != tuple(sorted(set(expected))):
+        raise ValueError("formal runtime expected runs must be non-empty and unique")
+    for run_id in expected:
+        _require_text("formal runtime expected run", run_id)
+    reduction: RuntimeMetricsReduction | None = None
+    trusted_runs: set[str] = set()
+    observations_by_key: dict[
+        tuple[str, RuntimeMetricName], RuntimeMetricObservation
+    ] = {}
+    if authority is not None:
+        if type(authority) is not RuntimeMetricsAuthority:
+            raise TypeError("formal runtime export requires an exact authority")
+        reduction = reduce_runtime_metrics(authority)
+        execution_subjects = {
+            execution.run_id
+            for block in authority.fresh_process_sources
+            for execution in block.executions
+        } | {source.subject_id for source in authority.native_sources}
+        foreign = execution_subjects - set(expected)
+        if foreign:
+            raise ValueError("runtime metrics authority contains foreign formal runs")
+        trusted_runs.update(
+            execution.run_id
+            for block in authority.fresh_process_sources
+            for execution in block.executions
+            if execution.native_terminal.release_trusted_attestation
+        )
+        trusted_runs.update(
+            source.subject_id
+            for source in authority.native_sources
+            if source.release_trusted_attestation
+        )
+        observations_by_key = {
+            (row.subject_id, row.metric): row
+            for row in reduction.observations
+            if row.subject_id in expected and row.metric in _FORMAL_RUN_METRICS
+        }
+
+    formal_rows: list[FormalRuntimeMetricObservation] = []
+    for run_id in expected:
+        release_trusted = run_id in trusted_runs
+        for metric in sorted(_FORMAL_RUN_METRICS, key=lambda value: value.value):
+            source = observations_by_key.get((run_id, metric))
+            if source is None:
+                formal_rows.append(
+                    FormalRuntimeMetricObservation(
+                        subject_id=run_id,
+                        metric=metric,
+                        unit=_METRIC_SPECS[metric].unit,
+                        status=RuntimeMetricStatus.UNRESOLVED,
+                        value=None,
+                        source_kind=None,
+                        source_sha256=None,
+                        reason_code=(
+                            "runtime_metrics_authority_unavailable"
+                            if authority is None
+                            else "runtime_metric_run_source_unavailable"
+                        ),
+                        release_trusted=False,
+                    )
+                )
+                continue
+            resolved = source.status in {
+                RuntimeMetricStatus.OBSERVED,
+                RuntimeMetricStatus.MEASURED,
+            }
+            if resolved and not release_trusted:
+                formal_rows.append(
+                    FormalRuntimeMetricObservation(
+                        subject_id=run_id,
+                        metric=metric,
+                        unit=source.unit,
+                        status=RuntimeMetricStatus.UNRESOLVED,
+                        value=None,
+                        source_kind=source.source_kind,
+                        source_sha256=source.source_sha256,
+                        reason_code="release_trusted_runtime_source_required",
+                        release_trusted=False,
+                    )
+                )
+                continue
+            formal_rows.append(
+                FormalRuntimeMetricObservation(
+                    subject_id=run_id,
+                    metric=metric,
+                    unit=source.unit,
+                    status=source.status,
+                    value=source.value,
+                    source_kind=source.source_kind,
+                    source_sha256=source.source_sha256,
+                    reason_code=source.reason_code,
+                    release_trusted=release_trusted,
+                )
+            )
+    rows = tuple(sorted(formal_rows, key=lambda value: value.key))
+    status = (
+        RuntimeMetricStatus.UNRESOLVED
+        if any(row.status is RuntimeMetricStatus.UNRESOLVED for row in rows)
+        else RuntimeMetricStatus.OBSERVED
+    )
+    return FormalRuntimeMetricsExport(
+        schema_version=1,
+        protocol_sha256=FORMAL_RUNTIME_METRICS_EXPORT_PROTOCOL_SHA256,
+        status=status,
+        authority_sha256=None if authority is None else authority.sha256,
+        reduction_sha256=None if reduction is None else reduction.sha256,
+        source_sha256s=() if reduction is None else reduction.source_sha256s,
+        expected_run_ids=expected,
+        observations=rows,
+    )
+
+
 __all__ = [
+    "FORMAL_RUNTIME_METRICS_EXPORT_PROTOCOL_SHA256",
     "RUNTIME_METRICS_REDUCER_PROTOCOL_SHA256",
     "BoundRuntimeMetricsFile",
     "CompileRuntimeMetricsSource",
+    "FormalRuntimeMetricObservation",
+    "FormalRuntimeMetricsExport",
     "FreshProcessExecutionMetricsSource",
     "FreshProcessRuntimeMetricsSource",
     "NativeRuntimeMetricsSource",
@@ -1821,5 +2162,6 @@ __all__ = [
     "bind_fresh_process_runtime_metrics",
     "bind_native_runtime_metrics",
     "build_runtime_metrics_authority",
+    "export_formal_runtime_metrics",
     "reduce_runtime_metrics",
 ]

@@ -576,12 +576,19 @@ def _published_update_summary(cell: _LoadedCell) -> tuple[int, int]:
 
 
 def _raw_run_bindings(
-    loaded: Mapping[str, _LoadedCell], *, scientific_unit: str
+    loaded: Mapping[str, _LoadedCell],
+    *,
+    scientific_unit: str,
+    lineage_runtime_sha256: str,
+    lineage_split_sha256: str,
 ) -> tuple[object, ...]:
     analysis = _analysis_api()
     return tuple(
         analysis._loaded_cell_raw_run_binding(
-            loaded[cell_id], scientific_unit=scientific_unit
+            loaded[cell_id],
+            scientific_unit=scientific_unit,
+            lineage_runtime_sha256=lineage_runtime_sha256,
+            lineage_split_sha256=lineage_split_sha256,
         )
         for cell_id in sorted(loaded)
     )
@@ -771,7 +778,12 @@ def reduce_e3a_selection_from_raw(
         key=lambda row: (row[0], row[1], -row[2]),
     )
 
-    run_bindings = _raw_run_bindings(loaded, scientific_unit="e3a_capacity")
+    run_bindings = _raw_run_bindings(
+        loaded,
+        scientific_unit="e3a_capacity",
+        lineage_runtime_sha256=runtime_sha256,
+        lineage_split_sha256=split_sha256,
+    )
     evidence_sha256 = content_sha256(
         {
             "schema_version": 1,
@@ -1092,7 +1104,12 @@ def reduce_e1_pareto_from_raw(
             "model_lock_sha256": common["model_lock_sha256"],
         }
     )
-    run_bindings = _raw_run_bindings(loaded, scientific_unit="e1_geometry_screen")
+    run_bindings = _raw_run_bindings(
+        loaded,
+        scientific_unit="e1_geometry_screen",
+        lineage_runtime_sha256=runtime_sha256,
+        lineage_split_sha256=split_sha256,
+    )
     reducer_evidence_sha256 = content_sha256(
         {
             "schema_version": 1,

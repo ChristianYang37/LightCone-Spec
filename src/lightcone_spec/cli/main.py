@@ -176,6 +176,14 @@ from lightcone_spec.experiments.statistics import (
     HardwareEnvelope,
     evaluate_speed_gate,
 )
+from lightcone_spec.experiments.workload_authority import (
+    FORMAL_WORKLOAD_PROTOCOLS,
+    FormalWorkloadAuthority,
+    FormalWorkloadAuthorityBlocked,
+    FormalWorkloadSample,
+    bind_formal_workload_authority,
+    revalidate_formal_workload_authority,
+)
 from lightcone_spec.locking import ModelLock, prepare_models, resolve_model_lock
 from lightcone_spec.orchestration import (
     SpeedStudyManifest,
@@ -405,6 +413,77 @@ def _artifact_sha256(path: str | Path) -> str:
     if source.suffix.lower() == ".json":
         return _canonical_sha256(_load_bound_json(source))
     return _file_sha256(source)
+
+
+def _formal_workload_cli_artifact(
+    authority: FormalWorkloadAuthority,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "formal_workload_cli_binding",
+        "formal_execution_authorized": False,
+        "authority_sha256": authority.sha256,
+        "authority": authority.to_dict(),
+    }
+
+
+def _formal_workload_authority_from_cli_artifact(
+    value: object,
+) -> FormalWorkloadAuthority:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "formal_execution_authorized",
+        "authority_sha256",
+        "authority",
+    }:
+        raise ValueError("formal workload CLI binding fields differ")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["kind"] != "formal_workload_cli_binding"
+        or value["formal_execution_authorized"] is not False
+        or not _is_lower_sha256(value["authority_sha256"])
+    ):
+        raise ValueError("formal workload CLI binding is not diagnostic-only schema-v1")
+    raw_authority = value["authority"]
+    if not isinstance(raw_authority, dict) or set(raw_authority) != set(
+        FormalWorkloadAuthority.__dataclass_fields__
+    ):
+        raise ValueError("formal workload authority fields differ")
+    raw_samples = raw_authority["samples"]
+    if not isinstance(raw_samples, list) or not raw_samples:
+        raise ValueError("formal workload authority requires selected samples")
+    samples: list[FormalWorkloadSample] = []
+    sample_fields = set(FormalWorkloadSample.__dataclass_fields__)
+    for raw_sample in raw_samples:
+        if not isinstance(raw_sample, dict) or set(raw_sample) != sample_fields:
+            raise ValueError("formal workload sample fields differ")
+        samples.append(
+            FormalWorkloadSample(
+                source_row_id=raw_sample["source_row_id"],  # type: ignore[arg-type]
+                sample_id=raw_sample["sample_id"],  # type: ignore[arg-type]
+                prompt=raw_sample["prompt"],  # type: ignore[arg-type]
+                seed=raw_sample["seed"],  # type: ignore[arg-type]
+            )
+        )
+    authority = FormalWorkloadAuthority(
+        schema_version=raw_authority["schema_version"],  # type: ignore[arg-type]
+        kind=raw_authority["kind"],  # type: ignore[arg-type]
+        workload_id=raw_authority["workload_id"],  # type: ignore[arg-type]
+        raw_source_path=raw_authority["raw_source_path"],  # type: ignore[arg-type]
+        raw_file_sha256=raw_authority["raw_file_sha256"],  # type: ignore[arg-type]
+        repository_revision=raw_authority["repository_revision"],  # type: ignore[arg-type]
+        raw_row_count=raw_authority["raw_row_count"],  # type: ignore[arg-type]
+        selected_row_count=raw_authority["selected_row_count"],  # type: ignore[arg-type]
+        selected_rows_sha256=raw_authority["selected_rows_sha256"],  # type: ignore[arg-type]
+        source_lock_sha256=raw_authority["source_lock_sha256"],  # type: ignore[arg-type]
+        protocol_sha256=raw_authority["protocol_sha256"],  # type: ignore[arg-type]
+        samples=tuple(samples),
+    )
+    if authority.sha256 != value["authority_sha256"]:
+        raise ValueError("formal workload CLI binding changed authority identity")
+    return authority
 
 
 def _load_bound_run_config(path: str | Path) -> RunConfig:
@@ -1499,6 +1578,7 @@ def _analysis_blocks(
                 "terminal_receipts",
                 "hardware_receipt",
                 "budget_observation",
+                "completion_contract",
             }:
                 raise ValueError("industrial analysis cell fields do not match schema")
             terminal = raw_cell.get("terminal_receipts")
@@ -1524,6 +1604,11 @@ def _analysis_blocks(
                         manifest_path,
                         raw_cell.get("budget_observation"),
                         label="budget observation",
+                    ),
+                    completion_contract=_analysis_file_binding(
+                        manifest_path,
+                        raw_cell.get("completion_contract"),
+                        label="schema-v4 completion contract",
                     ),
                 )
             )
@@ -2102,6 +2187,22 @@ def _parser() -> argparse.ArgumentParser:
 
     build = commands.add_parser("build-speed-study")
     build.add_argument("--output", required=True)
+
+    bind_workload = commands.add_parser(
+        "bind-formal-workload-authority", allow_abbrev=False
+    )
+    bind_workload.add_argument(
+        "--workload",
+        choices=tuple(sorted(FORMAL_WORKLOAD_PROTOCOLS)),
+        required=True,
+    )
+    bind_workload.add_argument("--source", required=True)
+    bind_workload.add_argument("--output", required=True)
+
+    revalidate_workload = commands.add_parser(
+        "revalidate-formal-workload-authority", allow_abbrev=False
+    )
+    revalidate_workload.add_argument("--authority", required=True)
 
     build_industrial = commands.add_parser("build-industrial-registry")
     build_industrial.add_argument(
@@ -6591,6 +6692,88 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
     return 42
 
 
+def _print_formal_workload_block(
+    *,
+    workload_id: str | None,
+    reason_code: str,
+) -> int:
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_workload_authority_decision",
+                "status": "BLOCKED",
+                "reason_code": reason_code,
+                "workload_id": workload_id,
+                "authority_sha256": None,
+                "formal_execution_authorized": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 42
+
+
+def _bind_formal_workload_cli(args: argparse.Namespace) -> int:
+    try:
+        authority = bind_formal_workload_authority(args.workload, args.source)
+    except FormalWorkloadAuthorityBlocked as error:
+        return _print_formal_workload_block(
+            workload_id=args.workload,
+            reason_code=error.reason,
+        )
+    artifact = _formal_workload_cli_artifact(authority)
+    _write_json(args.output, artifact)
+    reloaded = _formal_workload_authority_from_cli_artifact(
+        _load_bound_json(args.output)
+    )
+    if reloaded != authority or reloaded.sha256 != authority.sha256:
+        raise RuntimeError("written formal workload authority changed identity")
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_workload_authority_decision",
+                "status": "BOUND_DIAGNOSTIC",
+                "reason_code": None,
+                "workload_id": authority.workload_id,
+                "authority_sha256": authority.sha256,
+                "formal_execution_authorized": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _revalidate_formal_workload_cli(args: argparse.Namespace) -> int:
+    authority = _formal_workload_authority_from_cli_artifact(
+        _load_bound_json(args.authority)
+    )
+    try:
+        rebound = revalidate_formal_workload_authority(authority)
+    except FormalWorkloadAuthorityBlocked as error:
+        return _print_formal_workload_block(
+            workload_id=authority.workload_id,
+            reason_code=error.reason,
+        )
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_workload_authority_decision",
+                "status": "BOUND_DIAGNOSTIC",
+                "reason_code": None,
+                "workload_id": rebound.workload_id,
+                "authority_sha256": rebound.sha256,
+                "formal_execution_authorized": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "doctor":
@@ -6609,6 +6792,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest.write(args.output)
         print(manifest.sha256)
         return 0
+    if args.command == "bind-formal-workload-authority":
+        return _bind_formal_workload_cli(args)
+    if args.command == "revalidate-formal-workload-authority":
+        return _revalidate_formal_workload_cli(args)
     if args.command == "build-industrial-registry":
         return _build_industrial_registry(args)
     if args.command == "collect-gpu-inventory":

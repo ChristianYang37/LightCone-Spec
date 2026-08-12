@@ -3851,7 +3851,15 @@ class E2CandidateEvaluation:
 
 @dataclass(frozen=True)
 class RawEvidenceRunBinding:
-    """Substantive receipt-bound run provenance emitted only by raw reducers."""
+    """Substantive receipt-bound activation and execution provenance.
+
+    ``runtime_sha256`` and ``split_sha256`` bind the shared reducer activation
+    lineage.  ``execution_plan_sha256`` and ``execution_split_sha256`` bind the
+    independently materialized per-cell execution recovered from schema-v4
+    completion evidence.  They are deliberately separate domains: a locked
+    split contains the per-cell execution split and therefore cannot also be
+    that cell's execution split digest without a cryptographic fixed point.
+    """
 
     schema_version: int
     cell_id: str
@@ -3878,10 +3886,34 @@ class RawEvidenceRunBinding:
     terminal_receipt_sha256s: tuple[str, ...]
     hardware_receipt_sha256: str
     budget_observation_sha256: str
+    execution_plan_sha256: str | None = None
+    execution_split_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only raw run-binding schema version 1 is supported")
+        if self.schema_version not in {1, 2}:
+            raise ValueError("only raw run-binding schema versions 1--2 are supported")
+        if self.schema_version == 1:
+            if (
+                self.execution_plan_sha256 is None
+                and self.execution_split_sha256 is None
+            ):
+                # Compatibility for in-process diagnostic constructors.  The
+                # strict JSON codec now requires both explicit fields, so the
+                # old mixed-domain wire schema remains unparseable as formal
+                # input.
+                object.__setattr__(self, "execution_plan_sha256", self.runtime_sha256)
+                object.__setattr__(self, "execution_split_sha256", self.split_sha256)
+            elif (
+                self.execution_plan_sha256 != self.runtime_sha256
+                or self.execution_split_sha256 != self.split_sha256
+            ):
+                raise ValueError(
+                    "legacy raw run bindings cannot claim separate execution identity"
+                )
+        elif self.execution_plan_sha256 is None or self.execution_split_sha256 is None:
+            raise ValueError(
+                "raw run-binding schema version 2 requires per-cell execution identity"
+            )
         for name in ("experiment", "method", "scientific_unit", "run_id", "model_pair"):
             _require_text(f"raw run {name}", getattr(self, name))
         for name in (
@@ -3899,6 +3931,8 @@ class RawEvidenceRunBinding:
             "experiment_budget_sha256",
             "hardware_receipt_sha256",
             "budget_observation_sha256",
+            "execution_plan_sha256",
+            "execution_split_sha256",
         ):
             _require_sha256(f"raw run {name}", getattr(self, name))
         if (

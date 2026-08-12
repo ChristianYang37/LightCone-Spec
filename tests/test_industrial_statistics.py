@@ -261,15 +261,19 @@ def test_p99_claim_guard_requires_ten_thousand_completed_at_anchor() -> None:
     unresolved = guard_p99_claim(
         "anchor-c64",
         completed_requests=P99_MINIMUM_COMPLETIONS - 1,
-        observed_p99_ms=87.0,
+        observed_p99_ms=None,
+        minimum_completions=P99_MINIMUM_COMPLETIONS,
+        preregistered_anchor_locked=True,
     )
     assert unresolved.status == "UNRESOLVED"
     assert not unresolved.claimable
-    assert unresolved.observed_p99_ms == 87.0
+    assert unresolved.observed_p99_ms is None
     claimable = guard_p99_claim(
         "anchor-c64",
         completed_requests=P99_MINIMUM_COMPLETIONS,
         observed_p99_ms=87.0,
+        minimum_completions=P99_MINIMUM_COMPLETIONS,
+        preregistered_anchor_locked=True,
     )
     assert claimable.claimable
     with pytest.raises(ValueError, match="observed p99"):
@@ -277,6 +281,35 @@ def test_p99_claim_guard_requires_ten_thousand_completed_at_anchor() -> None:
             "anchor-c64",
             completed_requests=P99_MINIMUM_COMPLETIONS,
             observed_p99_ms=None,
+            minimum_completions=P99_MINIMUM_COMPLETIONS,
+            preregistered_anchor_locked=True,
+        )
+
+    custom_minimum = P99_MINIMUM_COMPLETIONS + 2_000
+    custom = guard_p99_claim(
+        "anchor-custom",
+        completed_requests=P99_MINIMUM_COMPLETIONS,
+        observed_p99_ms=None,
+        minimum_completions=custom_minimum,
+        preregistered_anchor_locked=True,
+    )
+    assert custom.status == "UNRESOLVED"
+    assert custom.minimum_completions == custom_minimum
+    with pytest.raises(ValueError, match="cannot expose"):
+        guard_p99_claim(
+            "anchor-unregistered",
+            completed_requests=custom_minimum,
+            observed_p99_ms=87.0,
+            minimum_completions=custom_minimum,
+            preregistered_anchor_locked=False,
+        )
+    with pytest.raises(ValueError, match="positive completion minimum"):
+        guard_p99_claim(
+            "anchor-zero",
+            completed_requests=0,
+            observed_p99_ms=None,
+            minimum_completions=0,
+            preregistered_anchor_locked=True,
         )
 
 

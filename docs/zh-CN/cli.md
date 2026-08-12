@@ -11,6 +11,8 @@ industrial 命令包括：
 |---|---|
 | `doctor` | 只读 host、Python、CUDA 与 source identity 报告 |
 | `validate-config` | 验证一份严格 schema-v3 run config 与 sidecar |
+| `bind-formal-workload-authority` | 绑定 release allowlist 中的本地 LiveCodeBench v6 Hard 或 MATH-500 Level 5 raw source |
+| `revalidate-formal-workload-authority` | 重开诊断性 workload binding，并重放其 path、revision、raw bytes 与完整筛选结果 |
 | `build-industrial-registry` | 绑定一个或更多稳定 logical rank slot 并生成不可变实验 DAG |
 | `collect-gpu-inventory` | 收集 nonce-bound physical GPU/topology inventory 与 raw probe receipt |
 | `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
@@ -81,6 +83,30 @@ headline co-tenancy 或更大 cardinality。`reduce-interference-calibration` �
 path 前先检查 release trust root；因此当前无 signer 的 release 只写入 `BLOCKED` decision，
 不会生成 calibrated envelope。Preflight stage 只有在重开同一份 raw execution authority
 后才能封存 `runtime_envelope=PATH`，绝不接受手写 rule list 或 bare digest。
+
+## Formal external workload authority
+
+这些命令绝不会下载 formal benchmark 数据。Bind 命令只接受
+`livecodebench_v6_hard` 或 `math500_level5`；准确 repository revision、raw-file
+SHA-256、row count、筛选协议与完整 selected-row SHA-256 全部由源码拥有。它按 raw 顺序
+选择全部准确匹配项，绝不截取前 32 条。
+
+```bash
+lightcone-spec bind-formal-workload-authority \
+  --workload math500_level5 \
+  --source /absolute/path/to/math500-locked.json \
+  --output artifacts/industrial/math500-workload-authority.json
+
+lightcone-spec revalidate-formal-workload-authority \
+  --authority artifacts/industrial/math500-workload-authority.json
+```
+
+本 release 的 formal-workload source allowlist 为空。因此 bind 会在检查 source path 或创建
+output directory 之前返回 42，并报告 `status=BLOCKED` 与
+`reason_code=formal_workload_source_allowlist_empty`。未来 allowlisted source 可以生成
+`BOUND_DIAGNOSTIC` artifact，但该 artifact 永久携带
+`formal_execution_authorized=false`；它只是 workload input identity，不是 GPU dispatch、
+attestation 或 formal result。
 
 ## Industrial Registry 工作流
 

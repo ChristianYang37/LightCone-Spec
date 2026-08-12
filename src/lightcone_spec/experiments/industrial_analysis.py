@@ -41,6 +41,7 @@ from lightcone_spec.experiments.planning import (
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
     EVIDENCE_ALIAS_REDUCER_PROTOCOL_SHA256,
+    BudgetJobKind,
     BudgetMaterializationAuthorityBinding,
     BudgetPlan,
     ConfirmationFamilyIdentity,
@@ -53,7 +54,9 @@ from lightcone_spec.experiments.planning import (
     EvidenceAliasReductionArtifact,
     EvidenceDependenceMap,
     ExecutionDerivedAliasSemantics,
+    ExperimentBudget,
     FamilyActivationArtifact,
+    P99AnchorStatus,
     RawEvidenceRunBinding,
     ReducerActivationArtifact,
     _reduce_e2_successive_halving,
@@ -77,6 +80,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     content_sha256,
+)
+from lightcone_spec.experiments.runtime_metrics import (
+    FormalRuntimeMetricsExport,
+    RuntimeMetricsAuthority,
+    export_formal_runtime_metrics,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.statistics import (
@@ -1250,6 +1258,7 @@ class IndustrialReducerArtifact:
     hardware_receipt_sha256s: tuple[str, ...]
     budget_observation_sha256s: tuple[str, ...]
     run_bindings: tuple[IndustrialRunBinding, ...]
+    runtime_metrics: FormalRuntimeMetricsExport
     power_plan: PowerSizingPlan | None
     hardware_validity: tuple[tuple[str, str, tuple[str, ...]], ...]
     methods: tuple[MethodReduction, ...]
@@ -1257,9 +1266,18 @@ class IndustrialReducerArtifact:
     holm_family: tuple[MultiplicityDecision, ...]
     bootstrap_hooks: tuple[tuple[str, tuple[str, ...]], ...]
 
+    def __post_init__(self) -> None:
+        if type(self.runtime_metrics) is not FormalRuntimeMetricsExport:
+            raise TypeError("industrial reducer requires exact formal runtime metrics")
+        expected_run_ids = tuple(
+            sorted(binding.run_id for binding in self.run_bindings)
+        )
+        if self.runtime_metrics.expected_run_ids != expected_run_ids:
+            raise ValueError("formal runtime metrics differ from reducer run bindings")
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "industrial_schema_v3_reducer",
             "status": self.status,
             "gpu_evidence": self.gpu_evidence,
@@ -1297,6 +1315,8 @@ class IndustrialReducerArtifact:
                 "hardware_receipt_sha256s": list(self.hardware_receipt_sha256s),
                 "budget_observation_sha256s": list(self.budget_observation_sha256s),
                 "run_bindings": [asdict(binding) for binding in self.run_bindings],
+                "runtime_metrics_sha256": self.runtime_metrics.sha256,
+                "runtime_metrics": self.runtime_metrics.to_dict(),
             },
             "power_plan": None if self.power_plan is None else asdict(self.power_plan),
             "hardware_validity": [
@@ -1362,6 +1382,8 @@ class _LoadedCell:
     physical_host_id: str
     budget_observation_sha256: str
     hardware_validity: tuple[tuple[str, str, tuple[str, ...]], ...]
+    observed_budget: ExperimentBudget | None = None
+    analysis_budget: ExperimentBudget | None = None
 
 
 @dataclass(frozen=True)
@@ -1520,6 +1542,102 @@ def _independent_method_blocks(
         if candidate_is_source and not current_is_source:
             selected[unit] = block
     return tuple(sorted(selected.items(), key=lambda row: row[0]))
+
+
+def _p99_anchor_semantics_sha256(budget: ExperimentBudget) -> str:
+    """Hash preregistered anchor semantics without per-cell/method identity."""
+
+    if type(budget) is not ExperimentBudget:
+        raise TypeError("p99 analysis budget must be an exact ExperimentBudget")
+    value = asdict(budget)
+    value.pop("cell_id")
+    value.pop("method")
+    return content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "industrial_p99_anchor_semantics",
+            "budget": value,
+        }
+    )
+
+
+def _guard_preregistered_p99_analysis(
+    *,
+    family_experiment: str,
+    method: str,
+    analysis_budgets: Sequence[ExperimentBudget],
+    independent_observations: Sequence[tuple[ExperimentBudget, Sequence[float]]],
+) -> P99ClaimGuard:
+    """Require one locked raw-budget anchor before exposing an aggregate p99."""
+
+    budgets = tuple(analysis_budgets)
+    observations = tuple(
+        (budget, tuple(latencies)) for budget, latencies in independent_observations
+    )
+    if not budgets or not observations:
+        raise ValueError("p99 analysis requires budgeted evidence")
+    observed_budgets = tuple(budget for budget, _ in observations)
+    for budget in (*budgets, *observed_budgets):
+        if type(budget) is not ExperimentBudget:
+            raise TypeError("p99 analysis requires exact ExperimentBudget values")
+        if budget.experiment != family_experiment or budget.method != method:
+            raise ValueError("p99 analysis budget crosses its family/method identity")
+    anchor_sha256s = tuple(
+        sorted({_p99_anchor_semantics_sha256(budget) for budget in budgets})
+    )
+    observation_anchor_sha256s = {
+        _p99_anchor_semantics_sha256(budget) for budget in observed_budgets
+    }
+    one_anchor = len(anchor_sha256s) == 1 and observation_anchor_sha256s == {
+        anchor_sha256s[0]
+    }
+    anchor_id = (
+        anchor_sha256s[0]
+        if one_anchor
+        else content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "industrial_unresolved_p99_anchor_set",
+                "family_experiment": family_experiment,
+                "method": method,
+                "anchor_sha256s": anchor_sha256s,
+                "observation_anchor_sha256s": sorted(observation_anchor_sha256s),
+            }
+        )
+    )
+    registered_minimum = sum(
+        budget.minimum_completed_requests for budget in observed_budgets
+    )
+    completed_requests = sum(len(latencies) for _, latencies in observations)
+    preregistered_anchor_locked = (
+        one_anchor
+        and all(
+            budget.job_kind is BudgetJobKind.P99_ANCHOR
+            and budget.p99_anchor_status is P99AnchorStatus.LOCKED
+            for budget in budgets
+        )
+        and all(
+            len(latencies) >= budget.minimum_completed_requests
+            for budget, latencies in observations
+        )
+    )
+    completed_latencies = tuple(
+        float(latency) for _, latencies in observations for latency in latencies
+    )
+    observed_p99 = (
+        float(np.quantile(np.asarray(completed_latencies), 0.99))
+        if preregistered_anchor_locked
+        and completed_requests >= registered_minimum
+        and completed_latencies
+        else None
+    )
+    return guard_p99_claim(
+        anchor_id,
+        completed_requests=completed_requests,
+        observed_p99_ms=observed_p99,
+        minimum_completions=registered_minimum,
+        preregistered_anchor_locked=preregistered_anchor_locked,
+    )
 
 
 def _paired_dependence_components(
@@ -2115,13 +2233,33 @@ def _validate_cell_inventory_authority(
     return host_id
 
 
+def _validate_budget_registry_cell(
+    budget: ExperimentBudget,
+    *,
+    cell: ExperimentCell,
+    label: str,
+) -> None:
+    if type(budget) is not ExperimentBudget:
+        raise TypeError(f"{label} must be an exact ExperimentBudget")
+    if (
+        budget.cell_id != cell.cell_id
+        or budget.experiment != cell.identity.experiment
+        or budget.method != cell.identity.method
+        or budget.workload_class is not cell.resources.workload_class
+        or budget.gpu_count != cell.resources.gpu_count
+        or budget.topology != cell.identity.topology
+    ):
+        raise ValueError(f"{label} differs from its registry cell")
+
+
 def _load_budget_observation(
     reference: BoundArtifact,
     *,
+    cell: ExperimentCell,
     experiment_budget_sha256: str,
     terminal_receipt_sha256: str,
     fixed_instance_gpu_count: int,
-) -> str:
+) -> tuple[str, ExperimentBudget]:
     """Validate required planned-versus-observed timing without making a claim."""
 
     value = _bound_json(
@@ -2185,6 +2323,11 @@ def _load_budget_observation(
         raise ValueError(
             "budget observation does not contain an exact ExperimentBudget"
         ) from exc
+    _validate_budget_registry_cell(
+        parsed_budget,
+        cell=cell,
+        label="budget observation ExperimentBudget",
+    )
     integer_fields = (
         "measured_gpu_ms",
         "fixed_instance_billed_gpu_ms",
@@ -2252,7 +2395,7 @@ def _load_budget_observation(
     observation_sha256 = content_sha256(observation_content)
     if value["budget_observation_sha256"] != observation_sha256:
         raise ValueError("budget observation content digest is inconsistent")
-    return observation_sha256
+    return observation_sha256, parsed_budget
 
 
 @dataclass(frozen=True)
@@ -2643,8 +2786,9 @@ def _load_cell(
     prepared_receipt_sha256 = terminal_receipt_values[0].get("prepared_receipt_sha256")
     if not _is_sha256(prepared_receipt_sha256):
         raise ValueError("terminal receipt lacks its prepared-evidence binding")
-    budget_observation_sha256 = _load_budget_observation(
+    budget_observation_sha256, observed_budget = _load_budget_observation(
         reference.budget_observation,
+        cell=cell,
         experiment_budget_sha256=str(run_rows[0]["experiment_budget_sha256"]),
         terminal_receipt_sha256=str(prepared_receipt_sha256),
         fixed_instance_gpu_count=len(inventory.devices),
@@ -2668,6 +2812,8 @@ def _load_cell(
         fixed_instance_gpu_count=len(inventory.devices),
         physical_host_id=physical_host_id,
         budget_observation_sha256=budget_observation_sha256,
+        observed_budget=observed_budget,
+        analysis_budget=observed_budget,
         hardware_validity=hardware_validity,
     )
 
@@ -2686,7 +2832,7 @@ class _AliasExecutionCandidate:
     execution_plan_sha256: str
     execution_plan: Mapping[str, Any]
     load_plan: Any
-    budget: Any
+    budget: ExperimentBudget
     budget_plan: BudgetPlan
     budget_materialization_authority: BudgetMaterializationAuthorityBinding
     semantics: ExecutionDerivedAliasSemantics
@@ -3411,6 +3557,8 @@ def _audit_alias_execution_candidate(
         "sampling_artifact",
         "controlled_execution_policy_sha256",
         "model_lock_artifact",
+        "trainable_plan_authority",
+        "prepared_model_content_release_manifest_sha256",
         "inventory_source_artifact",
         "runtime_envelope_artifact",
         "warmup_request_bindings",
@@ -3425,8 +3573,8 @@ def _audit_alias_execution_candidate(
         "abort_grace_s",
     }
     _exact_object(plan, fields=plan_fields, label="industrial execution plan")
-    if plan.get("schema_version") != 3:
-        raise ValueError("alias requires industrial execution plan schema 3")
+    if plan.get("schema_version") != 4:
+        raise ValueError("alias requires industrial execution plan schema 4")
     runtime_plan = _exact_object(
         plan.get("runtime_plan"),
         fields={
@@ -3469,6 +3617,18 @@ def _audit_alias_execution_candidate(
     if len(matches) != 1:
         raise ValueError("alias execution plan does not resolve one registry cell")
     cell = matches[0]
+    if cell.identity.method in {"tts", "l0"}:
+        raise ValueError(
+            "adapted alias execution is BLOCKED: "
+            "current_release_adapted_alias_authority_unavailable"
+        )
+    if cell.identity.method in {"target_only", "static"} and (
+        plan.get("trainable_plan_authority") is not None
+        or plan.get("prepared_model_content_release_manifest_sha256") is not None
+    ):
+        raise ValueError(
+            "Target-only/Static alias execution must not carry trainable-plan authority"
+        )
     if (
         not cell.runnable
         or cell.identity.method != "target_only"
@@ -3535,9 +3695,13 @@ def _audit_alias_execution_candidate(
         label="alias ExperimentBudget",
         decoder=experiment_budget_from_dict,
     )
+    _validate_budget_registry_cell(
+        budget,
+        cell=cell,
+        label="alias ExperimentBudget",
+    )
     if (
-        budget.cell_id != cell.cell_id
-        or budget.method != "target_only"
+        budget.method != "target_only"
         or plan.get("experiment_budget_sha256") != budget.sha256
     ):
         raise ValueError("alias ExperimentBudget differs from its registry/plan")
@@ -4113,6 +4277,8 @@ def _reduce_evidence_alias(
     source_run_binding = _loaded_cell_raw_run_binding(
         loaded,
         scientific_unit=f"evidence_alias:block={source.cell.identity.block}",
+        lineage_runtime_sha256=family.runtime_sha256,
+        lineage_split_sha256=family.split_sha256,
     )
     artifact = EvidenceAliasReductionArtifact(
         schema_version=1,
@@ -4137,7 +4303,31 @@ def _reduce_evidence_alias(
         target_result_status="ABSENT_REUSED_SOURCE",
         reducer_protocol_sha256=EVIDENCE_ALIAS_REDUCER_PROTOCOL_SHA256,
     )
-    return artifact, loaded
+    analysis_budget = _alias_analysis_budget(
+        observed_source_budget=loaded.observed_budget,
+        source_budget=source.budget,
+        target_budget=target.budget,
+    )
+    return artifact, replace(loaded, analysis_budget=analysis_budget)
+
+
+def _alias_analysis_budget(
+    *,
+    observed_source_budget: ExperimentBudget | None,
+    source_budget: ExperimentBudget,
+    target_budget: ExperimentBudget,
+) -> ExperimentBudget:
+    """Keep source provenance while assigning target preregistration semantics."""
+
+    if observed_source_budget != source_budget:
+        raise ValueError(
+            "alias source budget observation differs from its raw BudgetPlan budget"
+        )
+    if type(target_budget) is not ExperimentBudget:
+        raise TypeError(
+            "alias target analysis budget must be an exact ExperimentBudget"
+        )
+    return target_budget
 
 
 def reduce_evidence_alias(
@@ -4525,6 +4715,7 @@ def _unresolved_artifact(
     gpu_attestation_sha256: str | None,
     doctor_report_sha256: str | None,
     power_plan: PowerSizingPlan | None,
+    runtime_metrics_authority: RuntimeMetricsAuthority | None,
     reasons: tuple[str, ...],
 ) -> IndustrialReduction:
     plan = reduction.plan
@@ -4551,6 +4742,10 @@ def _unresolved_artifact(
         for cell in block.cells.values()
     )
     run_bindings = _run_bindings(blocks)
+    runtime_metrics = export_formal_runtime_metrics(
+        runtime_metrics_authority,
+        expected_run_ids=tuple(binding.run_id for binding in run_bindings),
+    )
     independent_unit = (
         "evidence_dependence_unit" if evidence_dependence_map is not None else "block"
     )
@@ -4592,6 +4787,7 @@ def _unresolved_artifact(
         hardware_receipt_sha256s=tuple(sorted(hardware)),
         budget_observation_sha256s=tuple(sorted(budget_observations)),
         run_bindings=run_bindings,
+        runtime_metrics=runtime_metrics,
         power_plan=power_plan,
         hardware_validity=validity,
         methods=(),
@@ -4658,10 +4854,12 @@ def _loaded_cell_raw_run_binding(
     cell: _LoadedCell,
     *,
     scientific_unit: str,
+    lineage_runtime_sha256: str,
+    lineage_split_sha256: str,
 ) -> RawEvidenceRunBinding:
     run = cell.run_rows[0]
     return RawEvidenceRunBinding(
-        schema_version=1,
+        schema_version=2,
         cell_id=cell.observation_source_cell_id,
         experiment=cell.cell.identity.experiment,
         method=cell.cell.identity.method,
@@ -4673,8 +4871,8 @@ def _loaded_cell_raw_run_binding(
         run_id=str(run["run_id"]),
         rank_count=len(cell.run_rows),
         model_pair=str(run["model_pair"]),
-        runtime_sha256=str(run["runtime_sha256"]),
-        split_sha256=str(run["split_sha256"]),
+        runtime_sha256=lineage_runtime_sha256,
+        split_sha256=lineage_split_sha256,
         corpus_sha256=str(run["corpus_sha256"]),
         arrival_trace_sha256=str(run["arrival_trace_sha256"]),
         request_ids_sha256=str(run["request_ids_sha256"]),
@@ -4688,6 +4886,8 @@ def _loaded_cell_raw_run_binding(
         terminal_receipt_sha256s=cell.terminal_receipt_sha256s,
         hardware_receipt_sha256=cell.hardware_receipt_sha256,
         budget_observation_sha256=cell.budget_observation_sha256,
+        execution_plan_sha256=str(run["runtime_sha256"]),
+        execution_split_sha256=str(run["split_sha256"]),
     )
 
 
@@ -5403,6 +5603,8 @@ def reduce_e2_stage_from_raw(
                     _loaded_cell_raw_run_binding(
                         row,
                         scientific_unit=f"halving_{stage_index}",
+                        lineage_runtime_sha256=activation.plan.runtime_sha256,
+                        lineage_split_sha256=activation.plan.split_sha256,
                     ).sha256
                     for row in (target, static, *pair.values())
                 ),
@@ -5429,6 +5631,8 @@ def reduce_e2_stage_from_raw(
         _loaded_cell_raw_run_binding(
             row,
             scientific_unit=f"halving_{stage_index}",
+            lineage_runtime_sha256=activation.plan.runtime_sha256,
+            lineage_split_sha256=activation.plan.split_sha256,
         )
         for row in ordered_loaded
     )
@@ -5617,6 +5821,8 @@ def reduce_confirmation_family_power(
                 _loaded_cell_raw_run_binding(
                     cell,
                     scientific_unit=f"excluded_pilot_{block.block}",
+                    lineage_runtime_sha256=family.runtime_sha256,
+                    lineage_split_sha256=family.split_sha256,
                 )
                 for block in reduced
                 for cell in block.cells.values()
@@ -5674,6 +5880,7 @@ def reduce_industrial_schema_v3(
     evidence_alias_manifests: Sequence[RawEvidenceAliasManifest] = (),
     gpu_attestation: BoundArtifact | None = None,
     doctor_report: BoundArtifact | None = None,
+    runtime_metrics_authority: RuntimeMetricsAuthority | None = None,
     bootstrap_repetitions: int = 10_000,
     bootstrap_seed: int = 0,
 ) -> IndustrialReduction:
@@ -5697,6 +5904,10 @@ def reduce_industrial_schema_v3(
         evidence_dependence_map, EvidenceDependenceMap
     ):
         raise TypeError("evidence_dependence_map must be an EvidenceDependenceMap")
+    if runtime_metrics_authority is not None and (
+        type(runtime_metrics_authority) is not RuntimeMetricsAuthority
+    ):
+        raise TypeError("runtime_metrics_authority must be exact")
     alias_manifests = tuple(evidence_alias_manifests)
     if any(type(row) is not RawEvidenceAliasManifest for row in alias_manifests):
         raise TypeError("formal aliases require exact raw evidence alias manifests")
@@ -5967,6 +6178,7 @@ def reduce_industrial_schema_v3(
                 None if doctor_report is None else doctor_report.sha256
             ),
             power_plan=power_plan,
+            runtime_metrics_authority=runtime_metrics_authority,
             reasons=reasons,
         )
 
@@ -5999,6 +6211,7 @@ def reduce_industrial_schema_v3(
                 None if doctor_report is None else doctor_report.sha256
             ),
             power_plan=power_plan,
+            runtime_metrics_authority=runtime_metrics_authority,
             reasons=("confirmation_family:underpowered", attestation_reason),
         )
 
@@ -6078,21 +6291,23 @@ def reduce_industrial_schema_v3(
             for row in block.slo_requests[method]
         )
         slo = account_slo(combined_slo)
-        completed_latencies = tuple(
-            metric.latency_ms
-            for _, block in independent_blocks
-            for metric in block.request_metrics[method]
-            if metric.completed
-        )
-        observed_p99 = (
-            float(np.quantile(np.asarray(completed_latencies), 0.99))
-            if completed_latencies
-            else None
-        )
-        p99_guard = guard_p99_claim(
-            f"{family.experiment}:{method}",
-            completed_requests=len(completed_latencies),
-            observed_p99_ms=observed_p99,
+        p99_guard = _guard_preregistered_p99_analysis(
+            family_experiment=family.experiment,
+            method=method,
+            analysis_budgets=tuple(
+                block.cells[method].analysis_budget for block in final
+            ),
+            independent_observations=tuple(
+                (
+                    block.cells[method].analysis_budget,
+                    tuple(
+                        metric.latency_ms
+                        for metric in block.request_metrics[method]
+                        if metric.completed
+                    ),
+                )
+                for _, block in independent_blocks
+            ),
         )
         methods.append(
             MethodReduction(
@@ -6143,6 +6358,10 @@ def reduce_industrial_schema_v3(
     independent_unit = (
         "evidence_dependence_unit" if evidence_dependence_map is not None else "block"
     )
+    runtime_metrics = export_formal_runtime_metrics(
+        runtime_metrics_authority,
+        expected_run_ids=tuple(binding.run_id for binding in run_bindings),
+    )
     # Hash/field agreement proves integrity, not that a GPU produced the files.
     # This release has no trusted hardware-rooted attester, so even an exactly
     # bound caller artifact remains diagnostic-only.
@@ -6184,6 +6403,7 @@ def reduce_industrial_schema_v3(
         hardware_receipt_sha256s=tuple(sorted(hardware)),
         budget_observation_sha256s=tuple(sorted(budget_observations)),
         run_bindings=run_bindings,
+        runtime_metrics=runtime_metrics,
         power_plan=power_plan,
         hardware_validity=validity,
         methods=tuple(methods),
