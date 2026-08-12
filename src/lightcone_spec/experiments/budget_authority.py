@@ -91,6 +91,7 @@ from lightcone_spec.experiments.registry import (
 )
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
+    is_serving_interference_calibration_cell,
     materialize_registry_stage_activation,
     verify_registry_stage_activation,
 )
@@ -2700,10 +2701,12 @@ def replay_budget_activation_authority(
             )
     if type(binding) is RegistryStageActivationAuthorityBinding and any(
         activated[cell_id].identity.method != "target_only"
+        and not is_serving_interference_calibration_cell(activated[cell_id])
         for cell_id in set(activated_ids)
     ):
         raise ValueError(
-            "generic budget authority supports only target-only serving activation"
+            "generic budget authority supports only target-only serving or the "
+            "registered Static interference calibration activation"
         )
     return rebound
 

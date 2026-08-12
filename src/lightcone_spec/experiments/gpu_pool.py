@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     )
     from lightcone_spec.experiments.interference_authority import (
         InterferenceCalibrationAuthority,
+        InterferenceCalibrationBootstrapAuthority,
     )
 
 from lightcone_spec.experiments.planning import (
@@ -2040,6 +2041,43 @@ def registry_pool_work_item(
             "network_class": "registered",
         }
     )
+    calibration = (
+        cell.identity.experiment == "preflight"
+        and cell.identity.task == "simultaneous_single_gpu_interference"
+    )
+    calibration_mode = (
+        str(cell.identity.variant).split("_slot_", maxsplit=1)[0]
+        if calibration
+        else None
+    )
+    if calibration and calibration_mode not in {"isolated", "concurrent"}:
+        raise ValueError("calibration cell has an invalid registered mode")
+    interference_class = (
+        content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "interference_calibration_bootstrap_class",
+                "model": cell.identity.model,
+                "backend": cell.identity.backend,
+                "task": cell.identity.task,
+                "repetition": cell.identity.block,
+                "context": cell.identity.context,
+                "arrival": cell.identity.arrival,
+                "concurrency": cell.identity.concurrency,
+                "gang_shape": shape.signature,
+                "contention_class": contention_class,
+            }
+        )
+        if calibration
+        else content_sha256(
+            {
+                "workload_class": cell.resources.workload_class,
+                "experiment": cell.identity.experiment,
+                "gang_shape": shape.signature,
+                "contention_class": contention_class,
+            }
+        )
+    )
     claim = PoolResourceClaim(
         gang_shape=shape,
         exact_gpu_uuids=(),
@@ -2048,7 +2086,10 @@ def registry_pool_work_item(
         allowed_fabrics=(),
         same_host=True,
         exclusive_gpu=True,
-        exclusive_host=cell.resources.workload_class in _EXCLUSIVE_HOST_CLASSES,
+        exclusive_host=(
+            cell.resources.workload_class in _EXCLUSIVE_HOST_CLASSES
+            or calibration_mode == "isolated"
+        ),
         cpu_cores=1,
         numa_nodes=(),
         ram_bytes=0,
@@ -2059,14 +2100,7 @@ def registry_pool_work_item(
         cache_root=cell.resources.cache_root,
         evidence_root=cell.resources.evidence_root,
         workload_class=cell.resources.workload_class,
-        interference_class=content_sha256(
-            {
-                "workload_class": cell.resources.workload_class,
-                "experiment": cell.identity.experiment,
-                "gang_shape": shape.signature,
-                "contention_class": contention_class,
-            }
-        ),
+        interference_class=interference_class,
         load_thermal_power_envelope="registered",
         estimated_duration_seconds=float(estimated_duration_seconds),
         estimated_gpu_seconds=float(estimated_duration_seconds * shape.gpu_count),
@@ -2102,6 +2136,26 @@ def _dispatch_order_key(
         }
     )
     return phase, identity.block, paired_group, method_order, item.item_id
+
+
+def _calibration_concurrent_slot(item: PoolWorkItem) -> int | None:
+    """Return the release-owned two-way calibration slot, if applicable."""
+
+    identity = item.cell.identity
+    if (
+        identity.experiment != "preflight"
+        or identity.task != "simultaneous_single_gpu_interference"
+        or identity.method != "static"
+        or item.claim.workload_class is not WorkloadClass.CORRECTNESS
+    ):
+        return None
+    variant = str(identity.variant)
+    if not variant.startswith("concurrent_slot_"):
+        return None
+    raw_slot = variant.removeprefix("concurrent_slot_")
+    if raw_slot not in {"0", "1"}:
+        raise ValueError("calibration concurrent slot is not registered")
+    return int(raw_slot)
 
 
 def _gang_load_key(
@@ -2367,16 +2421,32 @@ class GpuPoolScheduler:
                 for index, device in enumerate(self.inventory.devices)
             }
 
-            selected = min(
-                gangs,
-                key=lambda gang: _gang_load_key(
-                    gang,
-                    device_load_seconds=device_load_seconds,
-                    device_order=device_order,
-                    rotation=rotation,
-                    pool_size=len(self.inventory.devices),
-                ),
-            )
+            calibration_slot = _calibration_concurrent_slot(item)
+            if calibration_slot is not None:
+                if len(gangs) < 2:
+                    raise CapabilityRejectionError(
+                        "two-way calibration has fewer than two compatible GPUs"
+                    )
+                ordered_gangs = tuple(
+                    sorted(
+                        gangs,
+                        key=lambda gang: tuple(device_order[uuid] for uuid in gang),
+                    )
+                )
+                selected = ordered_gangs[
+                    (item.cell.identity.block + calibration_slot) % len(ordered_gangs)
+                ]
+            else:
+                selected = min(
+                    gangs,
+                    key=lambda gang: _gang_load_key(
+                        gang,
+                        device_load_seconds=device_load_seconds,
+                        device_order=device_order,
+                        rotation=rotation,
+                        pool_size=len(self.inventory.devices),
+                    ),
+                )
             if item.affinity_key is not None:
                 affinity_assignments.setdefault(item.affinity_key, selected)
             for uuid in selected:
@@ -2945,6 +3015,9 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         kw_only=True,
         default=None,
     )
+    interference_calibration_bootstrap_authority: (
+        InterferenceCalibrationBootstrapAuthority | None
+    ) = field(kw_only=True, default=None)
     completion_authorities: tuple[CompletedCellAuthority, ...] = ()
     # Resume authorities deliberately do not enter ``authority_dict``: adding
     # them after a failed attempt must not mutate the identity of the frozen
@@ -2959,6 +3032,7 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         # the release-owned raw calibration authority.
         from lightcone_spec.experiments.interference_authority import (
             InterferenceCalibrationAuthority,
+            InterferenceCalibrationBootstrapAuthority,
         )
 
         if (
@@ -2968,6 +3042,21 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         ):
             raise TypeError(
                 "execution interference calibration requires an exact raw authority"
+            )
+        if (
+            self.interference_calibration_bootstrap_authority is not None
+            and type(self.interference_calibration_bootstrap_authority)
+            is not InterferenceCalibrationBootstrapAuthority
+        ):
+            raise TypeError(
+                "execution interference bootstrap requires an exact release authority"
+            )
+        if (
+            self.interference_calibration_authority is not None
+            and self.interference_calibration_bootstrap_authority is not None
+        ):
+            raise ValueError(
+                "calibrated and bootstrap interference authorities conflict"
             )
         self._require_ready_interference_authority()
         self._validate_budget_plan_identity()
@@ -3125,9 +3214,29 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         """Reopen calibrated evidence immediately before every formal use."""
 
         from lightcone_spec.experiments.interference_authority import (
+            InterferenceCalibrationBootstrapAuthority,
+            materialize_interference_calibration_bootstrap_authority,
             require_calibrated_interference_execution_authority,
         )
 
+        bootstrap = self.interference_calibration_bootstrap_authority
+        if bootstrap is not None:
+            if type(bootstrap) is not InterferenceCalibrationBootstrapAuthority:
+                raise TypeError("interference bootstrap authority type changed")
+            if type(self.activation_artifact) is not RegistryStageActivationArtifact:
+                raise ValueError("interference bootstrap requires preflight activation")
+            expected = materialize_interference_calibration_bootstrap_authority(
+                self.registry,
+                self.inventory,
+                self.activation_artifact,
+            )
+            if bootstrap != expected or self.interference_envelope != (
+                expected.bootstrap_envelope
+            ):
+                raise ValueError(
+                    "interference bootstrap differs from registry/inventory/activation"
+                )
+            return
         require_calibrated_interference_execution_authority(
             self.interference_envelope,
             authority=self.interference_calibration_authority,
@@ -3233,6 +3342,11 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
             None
             if self.interference_calibration_authority is None
             else self.interference_calibration_authority.sha256
+        )
+        value["interference_calibration_bootstrap_authority_sha256"] = (
+            None
+            if self.interference_calibration_bootstrap_authority is None
+            else self.interference_calibration_bootstrap_authority.sha256
         )
         value["budget_plan_sha256"] = self.budget_plan.sha256
         value["capacity_authority_sha256"] = capacity_authority.sha256

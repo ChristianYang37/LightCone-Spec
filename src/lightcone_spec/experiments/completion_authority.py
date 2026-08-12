@@ -51,6 +51,7 @@ from lightcone_spec.experiments.registry import (
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
     RegistryStageDispositionStatus,
+    is_serving_interference_calibration_cell,
     verify_registry_stage_activation,
 )
 from lightcone_spec.orchestration.native_terminal import (
@@ -1476,19 +1477,16 @@ class CompletedCellAuthority:
             _require_sha256(f"locked {name}", contract[name])
         if contract["patched_sglang_tree"] != PINNED_SGLANG_TREE:
             raise ValueError("locked split uses another patched SGLang tree")
+        calibration = is_serving_interference_calibration_cell(cell)
         expected_workload = (
-            f"industrial_preflight_{cell.identity.method}"
-            if stage == "preflight"
-            else (
-                f"industrial_{cell.identity.method}"
-                if cell.identity.method in {"target_only", "static"}
-                else "industrial_adapted"
-            )
+            f"industrial_{cell.identity.method}"
+            if cell.identity.method in {"target_only", "static"}
+            else "industrial_adapted"
         )
         if contract["workload_contract"] != expected_workload:
             raise ValueError("locked workload contract differs from registry cell")
         rank_configs = contract["rank_config_sha256s"]
-        if stage == "preflight":
+        if stage == "preflight" and not calibration:
             if rank_configs is not None:
                 raise ValueError("preflight split cannot claim serving configs")
         elif (
@@ -1650,7 +1648,9 @@ class CompletedCellAuthority:
         run_id = row["run_id"]
         if type(run_id) is not str or not run_id:
             raise ValueError("completed row run ID is invalid")
-        if stage == "preflight" or cell.resources.workload_class in {
+        if (
+            stage == "preflight" and not is_serving_interference_calibration_cell(cell)
+        ) or cell.resources.workload_class in {
             WorkloadClass.COMPILE,
             WorkloadClass.DOWNLOAD,
         }:

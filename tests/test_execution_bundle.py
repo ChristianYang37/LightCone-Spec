@@ -926,6 +926,7 @@ def _bundle_fixture(
             "schema_version": 4,
             "kind": "gpu_dispatch_execution_context",
             "interference_calibration_authority_sha256": None,
+            "interference_calibration_bootstrap_authority_sha256": None,
             "budget_plan_sha256": budget_plan.sha256,
             "capacity_authority_sha256": capacity_authority.sha256,
             "budget_materialization_authority_sha256": (

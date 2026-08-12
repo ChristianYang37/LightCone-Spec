@@ -2833,6 +2833,7 @@ def _validate_alias_dispatch_authority(
             "inventory_sha256",
             "interference_envelope_sha256",
             "interference_calibration_authority_sha256",
+            "interference_calibration_bootstrap_authority_sha256",
             "budget_sha256s",
             "receipt_sha256s",
             "completed_cell_ids",
@@ -2904,6 +2905,8 @@ def _validate_alias_dispatch_authority(
         or authority.get("interference_envelope_sha256")
         != dispatch.get("interference_envelope_sha256")
         or authority.get("interference_calibration_authority_sha256") is not None
+        or authority.get("interference_calibration_bootstrap_authority_sha256")
+        is not None
         or authority.get("seed") != dispatch.get("seed")
         or authority.get("completed_cell_ids") != list(completed_cell_ids)
         or authority.get("completion_authority_sha256s")

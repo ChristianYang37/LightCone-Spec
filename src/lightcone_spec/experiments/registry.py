@@ -1184,21 +1184,30 @@ def _add_preflight_cells(factory: _CellFactory) -> None:
         topology="two_gpu_host",
         variant="exactness_memory_telemetry",
     )
-    factory.add(
-        experiment="preflight",
-        model="Qwen/Qwen3-8B",
-        backend="DFLASH",
-        task="simultaneous_single_gpu_interference",
-        method="static",
-        workload_class=WorkloadClass.CORRECTNESS,
-        gpu_count=2,
-        context=4096,
-        regime="short_input_long_generation",
-        arrival="closed_loop_c1",
-        concurrency=1,
-        topology="two_independent_tp1",
-        variant="isolated_vs_simultaneous_gate",
-    )
+    # The calibration reducer consumes matched single-GPU observations, not a
+    # synthetic two-rank serving run.  Two repetitions are the registered
+    # minimum for the paired BCa gate; every slot is an independent terminal
+    # cell whose mode is fixed in the immutable identity.
+    for repetition in range(2):
+        for mode in ("isolated", "concurrent"):
+            for slot in range(2):
+                factory.add(
+                    experiment="preflight",
+                    model="Qwen/Qwen3-8B",
+                    backend="DFLASH",
+                    task="simultaneous_single_gpu_interference",
+                    method="static",
+                    workload_class=WorkloadClass.CORRECTNESS,
+                    gpu_count=1,
+                    context=4096,
+                    regime="short_input_long_generation",
+                    arrival="closed_loop_c1",
+                    concurrency=1,
+                    topology="tp1_dp1",
+                    block=repetition,
+                    variant=f"{mode}_slot_{slot}",
+                    gpu_index=slot,
+                )
 
 
 def _add_e3a_cells(factory: _CellFactory) -> None:

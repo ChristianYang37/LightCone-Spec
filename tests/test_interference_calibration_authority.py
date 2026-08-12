@@ -15,9 +15,11 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuTopologyGroup,
     InterferenceEnvelope,
     InterferenceRule,
+    registry_pool_work_item,
 )
 from lightcone_spec.experiments.interference_authority import (
     CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON,
+    INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256,
     INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256,
     INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON,
     TRUSTED_INTERFERENCE_ATTESTER_UNAVAILABLE_REASON,
@@ -31,6 +33,7 @@ from lightcone_spec.experiments.interference_authority import (
     InterferenceRawObservation,
     RawInterferenceJsonBinding,
     diagnose_interference_calibration,
+    materialize_interference_calibration_bootstrap_authority,
     require_calibrated_interference_execution_authority,
     require_release_interference_attester,
 )
@@ -38,6 +41,13 @@ from lightcone_spec.experiments.registry import (
     WorkloadClass,
     build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.stage_activation import (
+    materialize_registry_stage_activation,
+)
+from lightcone_spec.orchestration.execution_bundle import (
+    BoundJsonSource,
+    _replay_interference_bootstrap_authority,
 )
 
 
@@ -307,6 +317,229 @@ def test_hardware_envelope_covers_arbitrary_same_host_inventory(count: int) -> N
     assert len(envelope.devices) == count
     assert envelope.inventory_sha256 == inventory.sha256
     assert InterferenceHardwareEnvelope.from_dict(envelope.to_dict()) == envelope
+
+
+def test_bootstrap_authority_only_pairs_registered_concurrent_preflight_cells() -> None:
+    registry = build_industrial_registry()
+    inventory, _ = _inventory(2)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=_sha("runtime"),
+        split_sha256=_sha("split"),
+    )
+
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    cells = {
+        cell.cell_id: cell
+        for cell in registry.cells_for("preflight")
+        if cell.identity.task == "simultaneous_single_gpu_interference"
+    }
+    concurrent = tuple(
+        registry_pool_work_item(cell, estimated_duration_seconds=1.0)
+        for cell in cells.values()
+        if cell.identity.block == 0
+        and str(cell.identity.variant).startswith("concurrent_slot_")
+    )
+    isolated = tuple(
+        registry_pool_work_item(cell, estimated_duration_seconds=1.0)
+        for cell in cells.values()
+        if cell.identity.block == 0
+        and str(cell.identity.variant).startswith("isolated_slot_")
+    )
+    from lightcone_spec.experiments.gpu_pool import GpuAssignment
+
+    concurrent_assignments = tuple(
+        GpuAssignment(
+            work_item=item,
+            gpu_uuids=(inventory.devices[index].uuid,),
+            rank_groups=((inventory.devices[index].uuid,),),
+            ports=(24_000 + index,),
+        )
+        for index, item in enumerate(concurrent)
+    )
+    isolated_assignments = tuple(
+        GpuAssignment(
+            work_item=item,
+            gpu_uuids=(inventory.devices[index].uuid,),
+            rank_groups=((inventory.devices[index].uuid,),),
+            ports=(24_100 + index,),
+        )
+        for index, item in enumerate(isolated)
+    )
+
+    assert (
+        authority.protocol_sha256 == INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256
+    )
+    assert set(authority.calibration_cell_ids) == set(cells)
+    assert authority.bootstrap_envelope.permits(
+        concurrent_assignments,
+        inventory=inventory,
+    )
+    assert not authority.bootstrap_envelope.permits(
+        isolated_assignments,
+        inventory=inventory,
+    )
+
+
+def test_bootstrap_authority_does_not_unlock_headline_or_larger_cardinality() -> None:
+    registry = build_industrial_registry()
+    inventory, _ = _inventory(4)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=_sha("runtime"),
+        split_sha256=_sha("split"),
+    )
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+
+    assert {rule.simultaneous_jobs for rule in authority.bootstrap_envelope.rules} == {
+        2
+    }
+    assert {rule.workload_class for rule in authority.bootstrap_envelope.rules} == {
+        WorkloadClass.CORRECTNESS
+    }
+    with pytest.raises(ValueError, match="another release protocol"):
+        replace(authority, protocol_sha256=_sha("caller-policy"))
+
+
+def test_bootstrap_receipt_is_canonical_and_binds_the_exact_envelope() -> None:
+    registry = build_industrial_registry()
+    inventory, _ = _inventory(2)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=_sha("runtime"),
+        split_sha256=_sha("split"),
+    )
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+
+    assert authority.source_receipt == {
+        "schema_version": 1,
+        "kind": "interference_calibration_bootstrap_receipt",
+        "registry_sha256": registry.sha256,
+        "inventory_sha256": inventory.sha256,
+        "activation_sha256": activation.sha256,
+        "protocol_sha256": INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256,
+        "receipt_sha256": authority.bootstrap_envelope.source_receipt_sha256,
+    }
+    forged_envelope = replace(
+        authority.bootstrap_envelope,
+        source_receipt_sha256=_sha("forged-bootstrap-receipt"),
+    )
+    with pytest.raises(RuntimeError, match="receipt identity drifted"):
+        _ = replace(authority, bootstrap_envelope=forged_envelope).source_receipt
+
+
+def test_bootstrap_receipt_is_reduced_from_raw_inputs_not_self_authorized(
+    tmp_path: Path,
+) -> None:
+    registry = build_industrial_registry()
+    inventory, _ = _inventory(2)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=_sha("runtime"),
+        split_sha256=_sha("split"),
+    )
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    receipt_path = _write_bound(tmp_path / "bootstrap.json", authority.source_receipt)
+    source = BoundJsonSource.bind(
+        receipt_path,
+        semantic_sha256=str(authority.source_receipt["receipt_sha256"]),
+    )
+
+    assert (
+        _replay_interference_bootstrap_authority(
+            registry=registry,
+            inventory=inventory,
+            activation=activation,
+            envelope=authority.bootstrap_envelope,
+            receipt_source=source,
+        )
+        == authority
+    )
+
+    forged_content = {
+        key: value
+        for key, value in authority.source_receipt.items()
+        if key != "receipt_sha256"
+    }
+    forged_content["registry_sha256"] = _sha("foreign-registry")
+    forged_receipt = {
+        **forged_content,
+        "receipt_sha256": content_sha256(forged_content),
+    }
+    forged_path = _write_bound(tmp_path / "forged-bootstrap.json", forged_receipt)
+    forged_source = BoundJsonSource.bind(
+        forged_path,
+        semantic_sha256=str(forged_receipt["receipt_sha256"]),
+    )
+    with pytest.raises(ValueError, match="differs from its raw receipt"):
+        _replay_interference_bootstrap_authority(
+            registry=registry,
+            inventory=inventory,
+            activation=activation,
+            envelope=authority.bootstrap_envelope,
+            receipt_source=forged_source,
+        )
+
+
+def test_formal_context_replays_bootstrap_before_budget_authority() -> None:
+    registry = build_industrial_registry()
+    inventory, _ = _inventory(2)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=_sha("runtime"),
+        split_sha256=_sha("split"),
+    )
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+
+    with pytest.raises(TypeError, match="exact BudgetPlan"):
+        GpuDispatchExecutionContext(
+            registry=registry,
+            inventory=inventory,
+            interference_envelope=authority.bootstrap_envelope,
+            budgets=(),
+            activation_artifact=activation,
+            budget_plan=object(),  # type: ignore[arg-type]
+            budget_materialization_authority=object(),  # type: ignore[arg-type]
+            interference_calibration_bootstrap_authority=authority,
+        )
+
+    forged = replace(authority, inventory_sha256=_sha("foreign-inventory"))
+    with pytest.raises(ValueError, match="registry/inventory/activation"):
+        GpuDispatchExecutionContext(
+            registry=registry,
+            inventory=inventory,
+            interference_envelope=authority.bootstrap_envelope,
+            budgets=(),
+            activation_artifact=activation,
+            budget_plan=object(),  # type: ignore[arg-type]
+            budget_materialization_authority=object(),  # type: ignore[arg-type]
+            interference_calibration_bootstrap_authority=forged,
+        )
 
 
 @pytest.mark.parametrize("count", (2, 4, 8, 16))

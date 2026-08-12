@@ -5325,6 +5325,7 @@ def _load_semantics_rejection_reason(
 ) -> str | None:
     plans = binding.load_plans
     expected_split = {
+        "preflight": "tuning",
         "E3a": "tuning",
         "E1": "tuning",
         "E2": "tuning",

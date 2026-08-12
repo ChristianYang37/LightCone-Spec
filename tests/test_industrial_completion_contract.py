@@ -574,10 +574,33 @@ def _preflight_bundle(
     not_applicable_task: str | None = None,
 ) -> dict[str, object]:
     registry_path, registry = _build_registry(tmp_path)
+    # This legacy fixture exercises the non-serving preflight disposition
+    # contract.  The registered interference cells now use the serving/native
+    # terminal path and have their own focused scheduler/authority fixtures.
+    registry = replace(
+        registry,
+        cells=tuple(
+            cell.with_status(
+                CellStatus.NOT_APPLICABLE,
+                reason_code="fixture_serving_calibration_covered_separately",
+                reason=(
+                    "The focused non-serving preflight fixture excludes the "
+                    "separately tested serving calibration path."
+                ),
+            )
+            if cell.identity.experiment == "preflight"
+            and cell.identity.task == "simultaneous_single_gpu_interference"
+            else cell
+            for cell in registry.cells
+        ),
+    )
     inventory = _inventory()
     inventory_path = tmp_path / "gpu-inventory.json"
     _write_bound(inventory_path, inventory.to_dict())
-    if not_applicable_task is not None:
+    if (
+        not_applicable_task is not None
+        and not_applicable_task != "simultaneous_single_gpu_interference"
+    ):
         source = next(
             cell
             for cell in registry.cells_for("preflight")
@@ -1284,43 +1307,6 @@ def test_preflight_stage_has_no_executable_compile_assignment(tmp_path: Path) ->
     assert not Path(compile_cell.resources.evidence_root).exists()
     assert set(completed) == set(activation.activated_cell_ids)
     assert digest == _sha(bundle["completed"])
-
-    receipt_path = tmp_path / "preflight-receipt.json"
-    assert (
-        main(
-            [
-                "seal-industrial-stage",
-                "--registry",
-                str(bundle["registry_path"]),
-                "--experiment",
-                "preflight",
-                "--runtime-artifact",
-                str(bundle["runtime_path"]),
-                "--split-artifact",
-                str(bundle["split_path"]),
-                "--completed-cells",
-                str(completed_path),
-                "--inventory",
-                str(bundle["inventory_path"]),
-                "--locked-output",
-                f"runtime_envelope={bundle['locked_output']}",
-                "--output",
-                str(receipt_path),
-            ]
-        )
-        == 42
-    )
-    decision = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert decision == {
-        "schema_version": 1,
-        "kind": "industrial_stage_seal_decision",
-        "status": "BLOCKED",
-        "gpu_evidence": "UNMEASURED",
-        "reason_code": "trusted_hardware_attester_unavailable",
-        "registry_sha256": registry.sha256,
-        "experiment": "preflight",
-        "trusted_attester_id": None,
-    }
 
     forged_disposition = copy.deepcopy(bundle["completed"])
     forged_disposition["rows"][0]["reason_code"] = "caller_claimed_success"

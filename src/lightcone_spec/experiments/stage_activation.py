@@ -46,11 +46,13 @@ REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256 = content_sha256(
         "schema_version": 1,
         "kind": "industrial_registry_stage_release_capability",
         "generic_stages": _GENERIC_REGISTRY_STAGES,
-        "preflight": "blocked_without_release_compile_assignment_contract",
+        "preflight": (
+            "only_registered_static_interference_calibration_cells_are_serving"
+        ),
         "compile": "blocked_without_first_party_prewarm_and_result_pointer",
         "download": "blocked_without_first_party_download_terminal_contract",
         "serving": "target_only_and_registry_serving_contract_only",
-        "unsupported_methods": ("static", "tts", "l0"),
+        "unsupported_methods": ("tts", "l0"),
         "missing_semantics": "blocked",
     }
 )
@@ -345,16 +347,27 @@ def release_dispatch_rejection_reason(cell: ExperimentCell) -> str | None:
     if cell.resources.workload_class is WorkloadClass.DOWNLOAD:
         return RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE
     if cell.identity.experiment == "preflight":
-        return (
-            None
-            if cell.identity.method == "target_only"
-            else "release_preflight_method_unsupported"
-        )
+        if is_serving_interference_calibration_cell(cell):
+            return None
+        return "release_preflight_method_unsupported"
     if cell.identity.method != "target_only":
         return "release_method_capability_unsupported"
     if serving_cell_rejection_reason(cell) is not None:
         return "release_serving_contract_unresolved"
     return None
+
+
+def is_serving_interference_calibration_cell(cell: ExperimentCell) -> bool:
+    """Identify the only preflight cells executed through serving evidence."""
+
+    if type(cell) is not ExperimentCell:
+        raise TypeError("interference calibration predicate requires an exact cell")
+    return (
+        cell.identity.experiment == "preflight"
+        and cell.identity.task == "simultaneous_single_gpu_interference"
+        and cell.identity.method == "static"
+        and cell.resources.workload_class is WorkloadClass.CORRECTNESS
+    )
 
 
 def _genesis_authority(registry: ExperimentRegistry) -> RegistryGenesisAuthority:
@@ -658,6 +671,7 @@ __all__ = [
     "RegistryStageActivationArtifact",
     "RegistryStageCellDisposition",
     "RegistryStageDispositionStatus",
+    "is_serving_interference_calibration_cell",
     "materialize_registry_stage_activation",
     "registry_stage_activation_from_dict",
     "registry_stage_activation_to_dict",

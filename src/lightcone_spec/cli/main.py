@@ -157,6 +157,7 @@ from lightcone_spec.experiments.selection import (
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
     RegistryStageDispositionStatus,
+    is_serving_interference_calibration_cell,
     materialize_registry_stage_activation,
     registry_stage_activation_from_dict,
     registry_stage_activation_to_dict,
@@ -5044,7 +5045,8 @@ def _completed_industrial_cells(
                 if not _is_lower_sha256(contract.get(name)):
                     raise ValueError(f"locked split {name} is invalid")
             rank_config_sha256s = contract.get("rank_config_sha256s")
-            if stage == "preflight":
+            calibration = is_serving_interference_calibration_cell(cell)
+            if stage == "preflight" and not calibration:
                 if rank_config_sha256s is not None:
                     raise ValueError(
                         "preflight split cannot claim serving RunConfig identities"
@@ -5065,13 +5067,9 @@ def _completed_industrial_cells(
             if contract.get("patched_sglang_tree") != PINNED_SGLANG_TREE:
                 raise ValueError("locked split uses another patched SGLang tree")
             expected_workload = (
-                f"industrial_preflight_{cell.identity.method}"
-                if stage == "preflight"
-                else (
-                    f"industrial_{cell.identity.method}"
-                    if cell.identity.method in {"target_only", "static"}
-                    else "industrial_adapted"
-                )
+                f"industrial_{cell.identity.method}"
+                if cell.identity.method in {"target_only", "static"}
+                else "industrial_adapted"
             )
             if contract.get("workload_contract") != expected_workload:
                 raise ValueError(
@@ -5375,7 +5373,7 @@ def _completed_industrial_cells(
                 "industrial_cell_id": cell_id,
                 "rank_config_sha256": (
                     None
-                    if stage == "preflight"
+                    if stage == "preflight" and not calibration
                     else contract["rank_config_sha256s"][rank]
                 ),
                 "runtime_sha256": (
@@ -5424,7 +5422,7 @@ def _completed_industrial_cells(
             owner = nonce_owner.setdefault(nonce, str(cell_id))
             if owner != cell_id:
                 raise ValueError("industrial run nonce is reused across registry cells")
-            if cell.identity.experiment == "preflight":
+            if cell.identity.experiment == "preflight" and not calibration:
                 attestation_path = row.get("preflight_attestation_path")
                 if not isinstance(attestation_path, str) or not attestation_path:
                     raise ValueError("preflight completion lacks an attestation path")
@@ -5533,9 +5531,9 @@ def _completed_industrial_cells(
             if formal:
                 if assignment is None:
                     raise RuntimeError("formal completion lost its physical assignment")
-                non_serving = stage == "preflight" or (
-                    cell.resources.workload_class.value in {"compile", "download"}
-                )
+                non_serving = (
+                    stage == "preflight" and not calibration
+                ) or cell.resources.workload_class.value in {"compile", "download"}
                 budget_status = row.get("budget_observation_status")
                 budget_reason = row.get("budget_observation_reason_code")
                 budget_path = row.get("budget_observation_path")

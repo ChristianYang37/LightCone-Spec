@@ -67,6 +67,7 @@ from lightcone_spec.experiments.interference_authority import (
     InterferenceCalibrationAuthority,
     InterferenceCalibrationBlockedError,
     InterferenceCalibrationSourceAuthority,
+    materialize_interference_calibration_bootstrap_authority,
     require_calibrated_interference_execution_authority,
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
@@ -82,6 +83,7 @@ from lightcone_spec.experiments.planning_artifacts import (
     production_load_plan_from_dict,
 )
 from lightcone_spec.experiments.registry import (
+    ExperimentCell,
     ExperimentReceipt,
     ExperimentRegistry,
     LockedOutput,
@@ -91,6 +93,10 @@ from lightcone_spec.experiments.registry import (
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.serving import PinnedBenchServingTransport
+from lightcone_spec.experiments.stage_activation import (
+    RegistryStageActivationArtifact,
+    is_serving_interference_calibration_cell,
+)
 from lightcone_spec.locking.models import ModelLock
 from lightcone_spec.orchestration.executor import (
     ArtifactBinding,
@@ -137,6 +143,12 @@ class ExecutionBundleBlockedError(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = _strict_text("bundle BLOCKED reason", reason_code)
         super().__init__(f"industrial execution bundle is BLOCKED: {reason_code}")
+
+
+def _is_interference_calibration_cell(cell: object) -> bool:
+    return type(cell) is ExperimentCell and is_serving_interference_calibration_cell(
+        cell
+    )
 
 
 def _absolute_lexical_path(path: str | Path) -> Path:
@@ -1671,12 +1683,13 @@ async def execute_dispatch_wave_bundles(
         if assignment is None or assignment.work_item.item_id != bundle.cell_id:
             raise ValueError("execution bundle names another dispatch assignment")
         cell = assignment.work_item.cell
+        calibration = _is_interference_calibration_cell(cell)
         if (
-            cell.identity.method != "target_only"
-            or cell.identity.experiment == "preflight"
-            or cell.resources.workload_class
-            in {WorkloadClass.COMPILE, WorkloadClass.DOWNLOAD}
-        ):
+            cell.identity.method != "target_only" and not calibration
+        ) or cell.resources.workload_class in {
+            WorkloadClass.COMPILE,
+            WorkloadClass.DOWNLOAD,
+        }:
             raise ExecutionBundleBlockedError(
                 "current_release_target_only_serving_bundle_required"
             )
@@ -2265,14 +2278,9 @@ class InterferenceCalibrationTerminalBundle:
             or raw_bundle.sha256 != self.execution_bundle.canonical_sha256
         ):
             raise ValueError("calibration execution-bundle identity mismatch")
-        if (
-            raw_bundle.interference_calibration_authority is not None
-            or InterferenceEnvelope.from_dict(
-                raw_bundle.interference_envelope.load()
-            ).rules
-        ):
+        if raw_bundle.interference_calibration_authority is not None:
             raise ValueError(
-                "calibration terminal execution must use the serial preflight path"
+                "calibration terminal cannot recursively consume calibrated evidence"
             )
         plan = raw_bundle.reconstruct_execution_plan()
         return AssignmentTerminalAuthority.from_binding(
@@ -2410,7 +2418,7 @@ class IndustrialExecutionPlanAudit:
 
 @dataclass(frozen=True)
 class IndustrialAssignmentExecutionBundle:
-    """All raw paths required to reconstruct one target-only assignment plan."""
+    """All raw paths required to reconstruct one formal serving assignment."""
 
     schema_version: int
     kind: Literal["industrial_assignment_execution_bundle"]
@@ -2807,6 +2815,15 @@ class IndustrialAssignmentExecutionBundle:
                 "activation runtime must be the exact bound runtime-envelope "
                 "artifact used by execution"
             )
+        interference_bootstrap_authority = None
+        if envelope.rules and interference_calibration_authority is None:
+            interference_bootstrap_authority = _replay_interference_bootstrap_authority(
+                registry=registry,
+                inventory=inventory,
+                activation=activation_replay.activation_artifact,
+                envelope=envelope,
+                receipt_source=self.interference_source_receipt,
+            )
         budgets = budget_plan.diagnostic_budgets
         completion_authorities = (
             *activation_replay.prior_e2_stage_authorities,
@@ -2852,6 +2869,11 @@ class IndustrialAssignmentExecutionBundle:
                         if interference_calibration_authority is None
                         else interference_calibration_authority.sha256
                     ),
+                    "interference_calibration_bootstrap_authority_sha256": (
+                        None
+                        if interference_bootstrap_authority is None
+                        else interference_bootstrap_authority.sha256
+                    ),
                     "budget_plan_sha256": budget_plan.sha256,
                     "capacity_authority_sha256": capacity_authority.sha256,
                     "budget_materialization_authority_sha256": (
@@ -2879,6 +2901,9 @@ class IndustrialAssignmentExecutionBundle:
                 budget_plan=budget_plan,
                 budget_materialization_authority=(budget_materialization_authority),
                 interference_calibration_authority=(interference_calibration_authority),
+                interference_calibration_bootstrap_authority=(
+                    interference_bootstrap_authority
+                ),
                 completion_authorities=completion_authorities,
             )
             expected_context_value = context.authority_dict()
@@ -2906,12 +2931,13 @@ class IndustrialAssignmentExecutionBundle:
         if assignment.work_item.item_id != self.cell_id:
             raise ValueError("execution bundle assignment names another cell")
         cell = assignment.work_item.cell
+        calibration = _is_interference_calibration_cell(cell)
         if (
-            cell.identity.method != "target_only"
-            or cell.identity.experiment == "preflight"
-            or cell.resources.workload_class
-            in {WorkloadClass.COMPILE, WorkloadClass.DOWNLOAD}
-        ):
+            cell.identity.method != "target_only" and not calibration
+        ) or cell.resources.workload_class in {
+            WorkloadClass.COMPILE,
+            WorkloadClass.DOWNLOAD,
+        }:
             raise ExecutionBundleBlockedError(
                 "current_release_target_only_serving_bundle_required"
             )
@@ -3161,9 +3187,7 @@ def _replay_interference_authority(
 
     if envelope.rules:
         if calibration_source is None:
-            raise ExecutionBundleBlockedError(
-                "calibrated_interference_raw_authority_required"
-            )
+            return None
         raw_manifest = calibration_source.source.manifest
         if (
             receipt_source.path != raw_manifest.path
@@ -3206,6 +3230,38 @@ def _replay_interference_authority(
     ):
         raise ValueError("interference envelope differs from its raw serial receipt")
     return None
+
+
+def _replay_interference_bootstrap_authority(
+    *,
+    registry: ExperimentRegistry,
+    inventory: GpuInventory,
+    activation: object,
+    envelope: InterferenceEnvelope,
+    receipt_source: BoundJsonSource,
+):
+    """Re-derive the calibration-only two-way envelope from raw stage inputs."""
+
+    if type(activation) is not RegistryStageActivationArtifact:
+        raise ExecutionBundleBlockedError(
+            "calibrated_interference_raw_authority_required"
+        )
+    authority = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    if envelope != authority.bootstrap_envelope:
+        raise ExecutionBundleBlockedError(
+            "calibrated_interference_raw_authority_required"
+        )
+    receipt = authority.source_receipt
+    if (
+        receipt_source.load() != receipt
+        or receipt_source.semantic_sha256 != receipt["receipt_sha256"]
+    ):
+        raise ValueError("calibration bootstrap envelope differs from its raw receipt")
+    return authority
 
 
 def _rematerialize_budget_authority(
@@ -3409,6 +3465,7 @@ def _context_integer(source: BoundJsonSource, name: str) -> int:
                 "inventory_sha256",
                 "interference_envelope_sha256",
                 "interference_calibration_authority_sha256",
+                "interference_calibration_bootstrap_authority_sha256",
                 "budget_sha256s",
                 "receipt_sha256s",
                 "completed_cell_ids",
@@ -3430,6 +3487,9 @@ def _context_integer(source: BoundJsonSource, name: str) -> int:
     calibration_sha256 = value["interference_calibration_authority_sha256"]
     if calibration_sha256 is not None:
         _require_sha256("dispatch context interference calibration", calibration_sha256)
+    bootstrap_sha256 = value["interference_calibration_bootstrap_authority_sha256"]
+    if bootstrap_sha256 is not None:
+        _require_sha256("dispatch context interference bootstrap", bootstrap_sha256)
     _require_sha256("dispatch context budget plan", value["budget_plan_sha256"])
     _require_sha256(
         "dispatch context capacity authority", value["capacity_authority_sha256"]

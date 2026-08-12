@@ -59,7 +59,7 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
         split_sha256=_sha("preflight-split"),
     )
 
-    assert artifact.status == "BLOCKED"
+    assert artifact.status == "AVAILABLE"
     assert artifact.reducer_protocol_sha256 == (
         REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256
     )
@@ -68,7 +68,7 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
     )
     assert artifact.genesis_authority is not None
     assert artifact.genesis_authority.registry_sha256 == registry.sha256
-    assert len(artifact.dispositions) == len(registry.cells_for("preflight")) == 3
+    assert len(artifact.dispositions) == len(registry.cells_for("preflight")) == 10
     activated = {
         row.cell_id
         for row in artifact.dispositions
@@ -80,7 +80,11 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
         if release_dispatch_rejection_reason(cell) is None
     }
     assert activated == expected
-    assert activated == set()
+    assert activated == {
+        cell.cell_id
+        for cell in registry.cells_for("preflight")
+        if cell.identity.task == "simultaneous_single_gpu_interference"
+    }
     assert {
         row.reason_code
         for row in artifact.dispositions
@@ -88,6 +92,21 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
     } == {
         RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
         "release_preflight_method_unsupported",
+    }
+    calibration = tuple(
+        cell
+        for cell in registry.cells_for("preflight")
+        if cell.identity.task == "simultaneous_single_gpu_interference"
+    )
+    assert len(calibration) == 8
+    assert {
+        (cell.identity.block, cell.identity.variant, cell.resources.gpu_uuids)
+        for cell in calibration
+    } == {
+        (repetition, f"{mode}_slot_{slot}", (registry.gpu_uuids[slot],))
+        for repetition in range(2)
+        for mode in ("isolated", "concurrent")
+        for slot in range(2)
     }
 
     wire = registry_stage_activation_to_dict(artifact)

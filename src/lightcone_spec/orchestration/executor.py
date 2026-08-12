@@ -72,6 +72,9 @@ from lightcone_spec.experiments.serving import (
     PinnedBenchServingTransport,
     official_bench_argv,
 )
+from lightcone_spec.experiments.stage_activation import (
+    is_serving_interference_calibration_cell,
+)
 from lightcone_spec.orchestration.industrial import (
     IndustrialPhysicalAssignment,
     IndustrialRuntimePlan,
@@ -1496,10 +1499,14 @@ class IndustrialExecutionPlan:
         cell = self.runtime_plan.cell
         if not cell.runnable or cell.status is not CellStatus.UNMEASURED:
             raise ValueError("execution plan requires one runnable UNMEASURED cell")
-        if cell.identity.experiment == "preflight" or cell.resources.workload_class in {
-            WorkloadClass.DOWNLOAD,
-            WorkloadClass.COMPILE,
-        }:
+        calibration = is_serving_interference_calibration_cell(cell)
+        if (cell.identity.experiment == "preflight" and not calibration) or (
+            cell.resources.workload_class
+            in {
+                WorkloadClass.DOWNLOAD,
+                WorkloadClass.COMPILE,
+            }
+        ):
             raise ValueError("non-serving/preflight cells cannot enter this executor")
         if len(self.runtime_plan.rank_configs) != 1:
             raise ValueError(

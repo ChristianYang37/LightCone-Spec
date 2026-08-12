@@ -41,8 +41,17 @@ from lightcone_spec.experiments.gpu_pool import (
     InterferenceEnvelope,
     InterferenceRule,
     PoolResourceClaim,
+    registry_pool_work_item,
 )
-from lightcone_spec.experiments.registry import WorkloadClass, content_sha256
+from lightcone_spec.experiments.registry import (
+    ExperimentRegistry,
+    WorkloadClass,
+    content_sha256,
+)
+from lightcone_spec.experiments.stage_activation import (
+    RegistryStageActivationArtifact,
+    verify_registry_stage_activation,
+)
 from lightcone_spec.experiments.statistics import (
     REGISTERED_CONFIDENCE,
     bca_mean_interval,
@@ -92,6 +101,19 @@ INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON = (
 CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON = (
     "calibrated_interference_raw_authority_required"
 )
+INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "interference_calibration_bootstrap_protocol",
+        "scope": "preflight_static_interference_calibration_only",
+        "registered_repetitions": 2,
+        "simultaneous_jobs": 2,
+        "isolated": "exclusive_host",
+        "concurrent": "same_repetition_exact_two_way",
+        "headline_authority": False,
+        "cardinality_inference": "forbidden",
+    }
+)
 
 INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256 = content_sha256(
     {
@@ -126,6 +148,173 @@ INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256 = content_sha256(
         },
     }
 )
+
+
+@dataclass(frozen=True)
+class InterferenceCalibrationBootstrapAuthority:
+    """Release-owned permission to generate, but never consume, calibration data."""
+
+    registry_sha256: str
+    inventory_sha256: str
+    activation_sha256: str
+    calibration_cell_ids: tuple[str, ...]
+    bootstrap_envelope: InterferenceEnvelope
+    protocol_sha256: str = INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("bootstrap registry", self.registry_sha256),
+            ("bootstrap inventory", self.inventory_sha256),
+            ("bootstrap activation", self.activation_sha256),
+            ("bootstrap protocol", self.protocol_sha256),
+        ):
+            _require_sha256(label, value)
+        if self.protocol_sha256 != INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256:
+            raise ValueError("calibration bootstrap uses another release protocol")
+        if self.calibration_cell_ids != tuple(sorted(set(self.calibration_cell_ids))):
+            raise ValueError("calibration bootstrap cells must be sorted and unique")
+        if len(self.calibration_cell_ids) != 8:
+            raise ValueError(
+                "calibration bootstrap must cover all eight registered runs"
+            )
+        if type(self.bootstrap_envelope) is not InterferenceEnvelope:
+            raise TypeError("calibration bootstrap requires an exact envelope")
+        if len(self.bootstrap_envelope.rules) != 2:
+            raise ValueError("calibration bootstrap needs one rule per repetition")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "interference_calibration_bootstrap_authority",
+                "registry_sha256": self.registry_sha256,
+                "inventory_sha256": self.inventory_sha256,
+                "activation_sha256": self.activation_sha256,
+                "calibration_cell_ids": list(self.calibration_cell_ids),
+                "bootstrap_envelope_sha256": self.bootstrap_envelope.sha256,
+                "protocol_sha256": self.protocol_sha256,
+            }
+        )
+
+    @cached_property
+    def source_receipt(self) -> dict[str, object]:
+        """Return the canonical path-bound receipt consumed by dispatch replay."""
+
+        content: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "interference_calibration_bootstrap_receipt",
+            "registry_sha256": self.registry_sha256,
+            "inventory_sha256": self.inventory_sha256,
+            "activation_sha256": self.activation_sha256,
+            "protocol_sha256": self.protocol_sha256,
+        }
+        receipt_sha256 = content_sha256(content)
+        if receipt_sha256 != self.bootstrap_envelope.source_receipt_sha256:
+            raise RuntimeError("calibration bootstrap receipt identity drifted")
+        return {**content, "receipt_sha256": receipt_sha256}
+
+
+def materialize_interference_calibration_bootstrap_authority(
+    registry: ExperimentRegistry,
+    inventory: GpuInventory,
+    activation: RegistryStageActivationArtifact,
+) -> InterferenceCalibrationBootstrapAuthority:
+    """Derive exact two-way calibration-only co-run permission from the registry."""
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("calibration bootstrap requires an exact registry")
+    if type(inventory) is not GpuInventory:
+        raise TypeError("calibration bootstrap requires an exact GPU inventory")
+    if type(activation) is not RegistryStageActivationArtifact:
+        raise TypeError("calibration bootstrap requires a raw reducer activation")
+    verify_registry_stage_activation(registry, activation)
+    if activation.experiment != "preflight":
+        raise ValueError("calibration bootstrap requires the preflight activation")
+    by_id = {cell.cell_id: cell for cell in registry.cells_for("preflight")}
+    activated = tuple(by_id[cell_id] for cell_id in activation.activated_cell_ids)
+    calibration = tuple(
+        cell
+        for cell in activated
+        if cell.identity.task == "simultaneous_single_gpu_interference"
+        and cell.identity.method == "static"
+        and cell.resources.workload_class is WorkloadClass.CORRECTNESS
+    )
+    if len(calibration) != 8 or {cell.cell_id for cell in calibration} != {
+        cell.cell_id for cell in activated
+    }:
+        raise ValueError(
+            "calibration bootstrap activation must contain only all registered runs"
+        )
+    if len(inventory.devices) < 2:
+        raise ValueError("calibration bootstrap requires two physical GPUs")
+    hardware_ids = {
+        device.hardware_envelope_sha256 for device in inventory.devices if device.ready
+    }
+    if len(hardware_ids) != 1 or sum(device.ready for device in inventory.devices) < 2:
+        raise ValueError("calibration bootstrap requires two homogeneous ready GPUs")
+    rules = []
+    for repetition in range(2):
+        rows = tuple(
+            cell
+            for cell in calibration
+            if cell.identity.block == repetition
+            and str(cell.identity.variant).startswith("concurrent_slot_")
+        )
+        if len(rows) != 2:
+            raise ValueError("calibration bootstrap concurrent pair is incomplete")
+        claims = tuple(
+            registry_pool_work_item(cell, estimated_duration_seconds=1.0).claim
+            for cell in rows
+        )
+        if len({claim.interference_class for claim in claims}) != 1:
+            raise ValueError("calibration bootstrap pair has mismatched co-run classes")
+        claim = claims[0]
+        rules.append(
+            InterferenceRule(
+                hardware_envelope_sha256=next(iter(hardware_ids)),
+                workload_class=WorkloadClass.CORRECTNESS,
+                co_run_signature=claim.interference_class,
+                simultaneous_jobs=2,
+                gang_shape=claim.gang_shape.signature,
+                load_thermal_power_envelope=claim.load_thermal_power_envelope,
+                contention_class=claim.contention_class,
+                evidence_sha256=content_sha256(
+                    {
+                        "schema_version": 1,
+                        "kind": "interference_calibration_bootstrap_permission",
+                        "registry_sha256": registry.sha256,
+                        "inventory_sha256": inventory.sha256,
+                        "activation_sha256": activation.sha256,
+                        "repetition": repetition,
+                        "cell_ids": sorted(cell.cell_id for cell in rows),
+                        "protocol_sha256": (
+                            INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256
+                        ),
+                    }
+                ),
+            )
+        )
+    receipt_content = {
+        "schema_version": 1,
+        "kind": "interference_calibration_bootstrap_receipt",
+        "registry_sha256": registry.sha256,
+        "inventory_sha256": inventory.sha256,
+        "activation_sha256": activation.sha256,
+        "protocol_sha256": INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256,
+    }
+    envelope = InterferenceEnvelope(
+        schema_version=1,
+        rules=tuple(sorted(rules, key=lambda rule: rule.key)),
+        source_receipt_sha256=content_sha256(receipt_content),
+    )
+    return InterferenceCalibrationBootstrapAuthority(
+        registry_sha256=registry.sha256,
+        inventory_sha256=inventory.sha256,
+        activation_sha256=activation.sha256,
+        calibration_cell_ids=tuple(sorted(cell.cell_id for cell in calibration)),
+        bootstrap_envelope=envelope,
+    )
 
 
 class InterferenceCalibrationBlockedError(RuntimeError):
@@ -2338,12 +2527,14 @@ def require_calibrated_interference_execution_authority(
 
 __all__ = [
     "CALIBRATED_INTERFERENCE_RAW_AUTHORITY_REQUIRED_REASON",
+    "INTERFERENCE_CALIBRATION_BOOTSTRAP_PROTOCOL_SHA256",
     "INTERFERENCE_CALIBRATION_NO_PASS_RULE_REASON",
     "INTERFERENCE_CALIBRATION_REDUCER_PROTOCOL_SHA256",
     "INTERFERENCE_ITL_EVIDENCE_INCOMPLETE_REASON",
     "TRUSTED_INTERFERENCE_ATTESTER_UNAVAILABLE_REASON",
     "InterferenceCalibrationAuthority",
     "InterferenceCalibrationBlockedError",
+    "InterferenceCalibrationBootstrapAuthority",
     "InterferenceCalibrationGroup",
     "InterferenceCalibrationGroupDiagnostic",
     "InterferenceCalibrationManifest",
@@ -2358,6 +2549,7 @@ __all__ = [
     "InterferenceRawObservation",
     "RawInterferenceJsonBinding",
     "diagnose_interference_calibration",
+    "materialize_interference_calibration_bootstrap_authority",
     "require_calibrated_interference_execution_authority",
     "require_release_interference_attester",
 ]

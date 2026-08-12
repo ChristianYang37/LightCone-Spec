@@ -45,6 +45,9 @@ from lightcone_spec.experiments.gpu_pool import (
     supported_pool_size,
     validate_dispatch_resume,
 )
+from lightcone_spec.experiments.interference_authority import (
+    materialize_interference_calibration_bootstrap_authority,
+)
 from lightcone_spec.experiments.planning import (
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     BudgetJobKind,
@@ -1046,6 +1049,64 @@ def test_required_pool_sizes_fill_one_deterministic_wave(
     )
 
 
+def test_registered_interference_calibration_freezes_isolated_and_paired_waves(
+    registry: ExperimentRegistry,
+) -> None:
+    inventory = _inventory(2)
+    activation = materialize_registry_stage_activation(
+        registry,
+        experiment="preflight",
+        runtime_sha256=content_sha256("calibration-runtime"),
+        split_sha256=content_sha256("calibration-split"),
+    )
+    bootstrap = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    cells_by_id = {cell.cell_id: cell for cell in registry.cells}
+    items = tuple(
+        registry_pool_work_item(cells_by_id[cell_id], estimated_duration_seconds=1.0)
+        for cell_id in activation.activated_cell_ids
+    )
+
+    plan = _scheduler(
+        registry,
+        inventory,
+        bootstrap.bootstrap_envelope,
+    ).schedule_work_items(
+        items,
+        receipts_sha256=content_sha256("calibration-receipts"),
+        budget_sha256_by_cell=_diagnostic_budget_bindings(items),
+    )
+
+    assert sorted(len(wave.assignments) for wave in plan.waves) == [1, 1, 1, 1, 2, 2]
+    paired = tuple(wave for wave in plan.waves if len(wave.assignments) == 2)
+    assert len(paired) == 2
+    assert {
+        tuple(
+            sorted(
+                assignment.work_item.cell.identity.block
+                for assignment in wave.assignments
+            )
+        )
+        for wave in paired
+    } == {(0, 0), (1, 1)}
+    assert all(
+        str(assignment.work_item.cell.identity.variant).startswith("concurrent_slot_")
+        for wave in paired
+        for assignment in wave.assignments
+    )
+    assert all(
+        len(wave.assignments) == 1
+        for wave in plan.waves
+        if any(
+            str(assignment.work_item.cell.identity.variant).startswith("isolated_slot_")
+            for assignment in wave.assignments
+        )
+    )
+
+
 @pytest.mark.parametrize("size", (1, 2, 4, 8, 16))
 def test_digest_only_runner_cannot_complete_required_pool_sizes(
     registry: ExperimentRegistry,
@@ -1157,6 +1218,15 @@ def test_topology_aware_tp_gang_is_atomic_and_cannot_span_groups(
         resources=replace(
             preflight.resources,
             workload_class=WorkloadClass.CORRECTNESS,
+        ),
+        identity=replace(
+            preflight.identity,
+            experiment="E4",
+            task="topology_placement_primitive",
+            backend="NONE",
+            context=4096,
+            concurrency=1,
+            topology="tp2_dp1",
         ),
     )
     topology_registry = replace(
