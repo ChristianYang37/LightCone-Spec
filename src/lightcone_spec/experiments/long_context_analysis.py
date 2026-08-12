@@ -66,12 +66,23 @@ E3B_LONG_CONTEXT_PROTOCOL_SHA256 = content_sha256(
         "smoothing_selection": "forbidden_on_confirmation",
         "elasticity": "-d_log_metric/d_log_context",
         "curvature": "-d2_log_metric/d_log_context2",
-        "point_aggregation": (
-            "paired_ratio_of_sums_within_block_then_equal_mean_across_blocks"
-        ),
+        "point_aggregation": {
+            "ratio_metrics": (
+                "paired_ratio_of_sums_within_block_then_equal_mean_across_blocks"
+            ),
+            "committed_token_goodput": (
+                "sum_completed_tokens_divided_by_max_completed_ns_minus_"
+                "min_arrival_ns_within_block_then_equal_mean_across_blocks"
+            ),
+        },
         "final_block_count": (MINIMUM_FINAL_BLOCKS, MAXIMUM_FINAL_BLOCKS),
         "final_block_identity": "exact_registered_final_prefix",
         "bootstrap": "paired_hierarchical_block_then_request_refit_same_basis",
+        "request_resample_timeline": (
+            "sample_raw_paired_request_rows_with_replacement;token_contribution_"
+            "follows_multiplicity;timestamp_extrema_are_recomputed_from_sampled_"
+            "raw_rows_and_duplicate_rows_do_not_create_a_second_timeline"
+        ),
         "bootstrap_rng": "numpy_pcg64_unsigned_seed_bound_to_plan",
         "minimum_bootstrap_repetitions": _MINIMUM_BOOTSTRAP_REPETITIONS,
         "confidence": REGISTERED_CONFIDENCE,
@@ -202,10 +213,10 @@ class E3bLongContextAnalysisPlan:
 class E3bPairedRequestObservation:
     """One paired request contribution at a registered block/context cell.
 
-    Metrics are reduced as a ratio of sums within each block, then blocks are
-    equally weighted.  A mean-valued outcome uses denominator ``1`` for each
-    contribution.  Keeping numerator and denominator separate avoids averaging
-    caller-precomputed ratios.
+    Ratio metrics retain raw numerator/denominator contributions.  Committed
+    token goodput instead retains completed-token counts and raw arrival/end
+    timestamps so every point and bootstrap replicate can recompute its full
+    active interval.  Exactly one payload form is legal for a plan's metric.
 
     Numeric validation intentionally happens in the reducer so a corrupt or
     non-finite raw row produces ``UNRESOLVED`` rather than escaping as an
@@ -221,6 +232,12 @@ class E3bPairedRequestObservation:
     baseline_numerator: float | int | None
     baseline_denominator: float | int | None
     source_sha256: str
+    candidate_completed_tokens: int | None = None
+    candidate_arrival_ns: int | None = None
+    candidate_completed_ns: int | None = None
+    baseline_completed_tokens: int | None = None
+    baseline_arrival_ns: int | None = None
+    baseline_completed_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -475,6 +492,24 @@ def _validate_numeric(value: object, *, numerator: bool) -> float:
     return checked
 
 
+def _validate_goodput_payload(
+    value: E3bPairedRequestObservation, *, candidate: bool
+) -> None:
+    prefix = "candidate" if candidate else "baseline"
+    completed_tokens = getattr(value, f"{prefix}_completed_tokens")
+    arrival_ns = getattr(value, f"{prefix}_arrival_ns")
+    completed_ns = getattr(value, f"{prefix}_completed_ns")
+    if (
+        type(completed_tokens) is not int
+        or completed_tokens < 0
+        or type(arrival_ns) is not int
+        or arrival_ns < 0
+        or type(completed_ns) is not int
+        or completed_ns < arrival_ns
+    ):
+        raise _UnresolvedEvidenceError("e3b_goodput_raw_timing_invalid")
+
+
 def _validate_observations(
     plan: E3bLongContextAnalysisPlan,
     observations: tuple[E3bPairedRequestObservation, ...],
@@ -526,6 +561,15 @@ def _validate_observations(
         "baseline_numerator",
         "baseline_denominator",
     )
+    goodput_fields = (
+        "candidate_completed_tokens",
+        "candidate_arrival_ns",
+        "candidate_completed_ns",
+        "baseline_completed_tokens",
+        "baseline_arrival_ns",
+        "baseline_completed_ns",
+    )
+    payload_fields = (*numeric_fields, *goodput_fields)
     for key in sorted(grouped):
         rows = grouped[key]
         request_ids = [value.request_id for value in rows]
@@ -533,16 +577,44 @@ def _validate_observations(
             raise _UnresolvedEvidenceError("e3b_paired_request_identity_duplicated")
         dispositions = {value.disposition for value in rows}
         if dispositions == {E3bObservationDisposition.OBSERVED}:
-            for value in rows:
-                _validate_numeric(value.candidate_numerator, numerator=True)
-                _validate_numeric(value.candidate_denominator, numerator=False)
-                _validate_numeric(value.baseline_numerator, numerator=True)
-                _validate_numeric(value.baseline_denominator, numerator=False)
+            if plan.metric is E3bMetric.COMMITTED_TOKEN_GOODPUT:
+                if any(
+                    getattr(value, field) is not None
+                    for value in rows
+                    for field in numeric_fields
+                ):
+                    raise _UnresolvedEvidenceError(
+                        "e3b_goodput_observation_payload_conflict"
+                    )
+                for value in rows:
+                    _validate_goodput_payload(value, candidate=True)
+                    _validate_goodput_payload(value, candidate=False)
+            elif plan.metric in {
+                E3bMetric.ACCEPTED_LENGTH,
+                E3bMetric.TARGET_CALLS_PER_OUTPUT_TOKEN,
+            }:
+                if any(
+                    getattr(value, field) is not None
+                    for value in rows
+                    for field in goodput_fields
+                ):
+                    raise _UnresolvedEvidenceError(
+                        "e3b_ratio_observation_payload_conflict"
+                    )
+                for value in rows:
+                    _validate_numeric(value.candidate_numerator, numerator=True)
+                    _validate_numeric(value.candidate_denominator, numerator=False)
+                    _validate_numeric(value.baseline_numerator, numerator=True)
+                    _validate_numeric(value.baseline_denominator, numerator=False)
+            else:
+                raise _UnresolvedEvidenceError(
+                    "e3b_metric_raw_observation_schema_unavailable"
+                )
         elif len(rows) == 1 and len(dispositions) == 1:
             marker = rows[0]
             if marker.disposition is E3bObservationDisposition.OBSERVED:
                 raise _UnresolvedEvidenceError("e3b_observation_group_invalid")
-            if any(getattr(marker, field) is not None for field in numeric_fields):
+            if any(getattr(marker, field) is not None for field in payload_fields):
                 raise _UnresolvedEvidenceError("e3b_hbm_marker_has_numeric_payload")
             infeasible_contexts.add(marker.context_tokens)
             if marker.disposition in {
@@ -704,6 +776,36 @@ def _ratio_of_sums(
     return result
 
 
+def _active_interval_goodput(
+    rows: Sequence[E3bPairedRequestObservation], *, candidate: bool
+) -> float:
+    prefix = "candidate" if candidate else "baseline"
+    token_field = f"{prefix}_completed_tokens"
+    arrival_field = f"{prefix}_arrival_ns"
+    completed_field = f"{prefix}_completed_ns"
+    completed_tokens = sum(int(getattr(value, token_field)) for value in rows)
+    first_arrival_ns = min(int(getattr(value, arrival_field)) for value in rows)
+    last_completed_ns = max(int(getattr(value, completed_field)) for value in rows)
+    elapsed_ns = last_completed_ns - first_arrival_ns
+    if elapsed_ns <= 0:
+        raise _UnresolvedEvidenceError("e3b_goodput_active_interval_nonpositive")
+    goodput = completed_tokens / (elapsed_ns / 1_000_000_000.0)
+    if not math.isfinite(goodput) or goodput <= 0.0:
+        raise _UnresolvedEvidenceError("e3b_metric_nonpositive")
+    return goodput
+
+
+def _block_metric(
+    plan: E3bLongContextAnalysisPlan,
+    rows: Sequence[E3bPairedRequestObservation],
+    *,
+    candidate: bool,
+) -> float:
+    if plan.metric is E3bMetric.COMMITTED_TOKEN_GOODPUT:
+        return _active_interval_goodput(rows, candidate=candidate)
+    return _ratio_of_sums(rows, candidate=candidate)
+
+
 def _aggregate_context_curves(
     plan: E3bLongContextAnalysisPlan,
     grouped: dict[tuple[int, int], tuple[E3bPairedRequestObservation, ...]],
@@ -712,11 +814,19 @@ def _aggregate_context_curves(
     baseline_values: list[float] = []
     for context in E3B_CONTEXT_GRID:
         candidate_blocks = [
-            _ratio_of_sums(grouped[(block_id, context)], candidate=True)
+            _block_metric(
+                plan,
+                grouped[(block_id, context)],
+                candidate=True,
+            )
             for block_id in plan.final_block_ids
         ]
         baseline_blocks = [
-            _ratio_of_sums(grouped[(block_id, context)], candidate=False)
+            _block_metric(
+                plan,
+                grouped[(block_id, context)],
+                candidate=False,
+            )
             for block_id in plan.final_block_ids
         ]
         candidate_values.append(math.fsum(candidate_blocks) / len(candidate_blocks))
@@ -748,8 +858,12 @@ def _bootstrap_context_curves(
                 sampled_rows = tuple(
                     rows[int(position)] for position in request_positions
                 )
-                candidate_blocks.append(_ratio_of_sums(sampled_rows, candidate=True))
-                baseline_blocks.append(_ratio_of_sums(sampled_rows, candidate=False))
+                candidate_blocks.append(
+                    _block_metric(plan, sampled_rows, candidate=True)
+                )
+                baseline_blocks.append(
+                    _block_metric(plan, sampled_rows, candidate=False)
+                )
             candidate[repetition, context_index] = math.fsum(candidate_blocks) / len(
                 candidate_blocks
             )

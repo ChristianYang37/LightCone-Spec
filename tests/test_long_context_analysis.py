@@ -59,6 +59,8 @@ def _rows(
     *,
     requests: int = 1,
 ) -> tuple[E3bPairedRequestObservation, ...]:
+    if plan.metric is E3bMetric.COMMITTED_TOKEN_GOODPUT:
+        raise ValueError("goodput tests must retain raw timestamps")
     return tuple(
         E3bPairedRequestObservation(
             block_id=block_id,
@@ -76,6 +78,50 @@ def _rows(
                     "request": request_index,
                 }
             ),
+        )
+        for block_id in plan.final_block_ids
+        for context in E3B_CONTEXT_GRID
+        for request_index in range(requests)
+    )
+
+
+def _goodput_rows(
+    plan: E3bLongContextAnalysisPlan,
+    candidate: MetricFunction,
+    baseline: MetricFunction,
+    *,
+    requests: int = 1,
+) -> tuple[E3bPairedRequestObservation, ...]:
+    assert plan.metric is E3bMetric.COMMITTED_TOKEN_GOODPUT
+    token_scale = 100_000_000
+    return tuple(
+        E3bPairedRequestObservation(
+            block_id=block_id,
+            context_tokens=context,
+            request_id=f"request-{request_index:03d}",
+            disposition=E3bObservationDisposition.OBSERVED,
+            candidate_numerator=None,
+            candidate_denominator=None,
+            baseline_numerator=None,
+            baseline_denominator=None,
+            source_sha256=content_sha256(
+                {
+                    "block": block_id,
+                    "context": context,
+                    "request": request_index,
+                    "metric": "goodput",
+                }
+            ),
+            candidate_completed_tokens=round(
+                token_scale * candidate(block_id, context, request_index)
+            ),
+            candidate_arrival_ns=0,
+            candidate_completed_ns=1_000_000_000,
+            baseline_completed_tokens=round(
+                token_scale * baseline(block_id, context, request_index)
+            ),
+            baseline_arrival_ns=0,
+            baseline_completed_ns=1_000_000_000,
         )
         for block_id in plan.final_block_ids
         for context in E3B_CONTEXT_GRID
@@ -206,6 +252,41 @@ def test_request_contributions_are_ratio_of_sums_not_mean_of_ratios() -> None:
         assert point.baseline_fitted_metric.estimate == pytest.approx(1.0)
 
 
+def test_goodput_request_resample_uses_multiplicity_and_raw_time_extrema() -> None:
+    plan = _plan(metric=E3bMetric.COMMITTED_TOKEN_GOODPUT)
+    template = _goodput_rows(
+        plan,
+        lambda _block, _context, _request: 1.0,
+        lambda _block, _context, _request: 1.0,
+    )[0]
+    first = replace(
+        template,
+        request_id="first",
+        candidate_completed_tokens=10,
+        candidate_arrival_ns=0,
+        candidate_completed_ns=10,
+        source_sha256=content_sha256({"request": "first"}),
+    )
+    second = replace(
+        template,
+        request_id="second",
+        candidate_completed_tokens=30,
+        candidate_arrival_ns=20,
+        candidate_completed_ns=40,
+        source_sha256=content_sha256({"request": "second"}),
+    )
+
+    one_copy = analysis._block_metric(plan, (first,), candidate=True)
+    duplicated = analysis._block_metric(plan, (first, first), candidate=True)
+    mixed = analysis._block_metric(plan, (first, first, second), candidate=True)
+
+    assert one_copy == pytest.approx(10 / (10 / 1_000_000_000))
+    # A duplicate contributes its tokens twice but does not create a second
+    # timestamp timeline, so the original min/max remain 0 and 10.
+    assert duplicated == pytest.approx(20 / (10 / 1_000_000_000))
+    assert mixed == pytest.approx(50 / (40 / 1_000_000_000))
+
+
 def test_goodput_reports_first_measured_crossover_bracket_and_root_interval() -> None:
     plan = _plan(metric=E3bMetric.COMMITTED_TOKEN_GOODPUT)
 
@@ -214,7 +295,7 @@ def test_goodput_reports_first_measured_crossover_bracket_and_root_interval() ->
 
     result = reduce_e3b_long_context_pair(
         plan,
-        _rows(plan, candidate, lambda _block, _context, _request: 10.0),
+        _goodput_rows(plan, candidate, lambda _block, _context, _request: 10.0),
     )
 
     assert result.status is E3bReductionStatus.OBSERVED
@@ -226,9 +307,28 @@ def test_goodput_reports_first_measured_crossover_bracket_and_root_interval() ->
     assert result.crossover.root_interval_tokens[1] == pytest.approx(12000.0, rel=1e-10)
 
 
+def test_goodput_rejects_summary_ratio_and_invalid_raw_timing() -> None:
+    plan = _plan(metric=E3bMetric.COMMITTED_TOKEN_GOODPUT)
+    rows = _goodput_rows(plan, _power(0.2), _power(0.3))
+
+    summary_ratio = reduce_e3b_long_context_pair(
+        plan,
+        (replace(rows[0], candidate_numerator=1.0), *rows[1:]),
+    )
+    invalid_timing = reduce_e3b_long_context_pair(
+        plan,
+        (replace(rows[0], candidate_completed_ns=-1), *rows[1:]),
+    )
+
+    _assert_null_numeric_reduction(summary_ratio)
+    _assert_null_numeric_reduction(invalid_timing)
+    assert summary_ratio.reason_code == "e3b_goodput_observation_payload_conflict"
+    assert invalid_timing.reason_code == "e3b_goodput_raw_timing_invalid"
+
+
 def test_no_crossover_through_40928_is_distinct_from_hbm_infeasible() -> None:
     plan = _plan(metric=E3bMetric.COMMITTED_TOKEN_GOODPUT)
-    rows = _rows(
+    rows = _goodput_rows(
         plan,
         _power(0.1),
         lambda _block, context, _request: 0.5 * (context / 1024) ** -0.1,
@@ -254,6 +354,12 @@ def test_no_crossover_through_40928_is_distinct_from_hbm_infeasible() -> None:
         candidate_denominator=None,
         baseline_numerator=None,
         baseline_denominator=None,
+        candidate_completed_tokens=None,
+        candidate_arrival_ns=None,
+        candidate_completed_ns=None,
+        baseline_completed_tokens=None,
+        baseline_arrival_ns=None,
+        baseline_completed_ns=None,
     )
     hbm_rows = (*rows[:marker_index], marker, *rows[marker_index + 1 :])
 
@@ -312,7 +418,7 @@ def test_missing_duplicate_nonfinite_and_nonpositive_inputs_are_null_unresolved(
     ],
     reason: str,
 ) -> None:
-    plan = _plan(metric=E3bMetric.COMMITTED_TOKEN_GOODPUT)
+    plan = _plan()
     rows = _rows(plan, _power(0.2), _power(0.3))
 
     result = reduce_e3b_long_context_pair(plan, mutate(rows, plan))
