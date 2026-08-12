@@ -115,9 +115,11 @@ for one run/rank, is not valid evidence.
   GPUs do not authorize a co-run class that was not calibrated. Gang jobs are
   atomic; profiler/download/compile work is exclusive-host. Never launch every
   assignment merely because it appears in one plan.
-- Resume accepts only complete assignment/wave/schedule receipts. A failed
-  sibling does not erase durable successful receipts, but it also cannot be
-  relabelled as success.
+- Resume replays the path-bound append-only attempt journal and reopens every
+  successful terminal authority. A failed sibling does not erase durable
+  successful receipts and only failed siblings consume a retry. An intent
+  without a finish is `dispatch_attempt_intent_without_finish_cost_unresolved`;
+  do not delete it or impute its cost.
 
 ## Unexpected `UNMEASURED`, `BLOCKED`, or `UNDERPOWERED`
 

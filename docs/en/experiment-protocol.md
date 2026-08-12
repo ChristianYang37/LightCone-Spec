@@ -9,7 +9,7 @@ and when its cost or operational risk outweighs saved target work. Target-only,
 Static, TTS, and L0 are kept distinct. TTS and L0 use the same candidates and
 differ only in publication time.
 
-All new GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
+All formal industrial GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
 establish target protocol and coordinator contracts, not a fully runnable
 speculative surface or a benchmark result. The industrial executor currently
 runs only TP1/DP1 Target-only. Static/TTS/L0 are `BLOCKED` before mutation
@@ -81,9 +81,19 @@ E3a selection and materializes exactly one 130-cell width/load slice; every
 other E1 template receives an immutable disposition. E2 materializes only one
 successive-halving round at a time, preserves matched TTS/L0 pairs and family
 floors, and derives the next round only from the prior sealed survivor receipt.
+Formal E2 reduction requires genuine per-token observation times. The official
+SGLang SSE client may coalesce several token IDs in one chunk, so the adapter
+records those token timestamps as unavailable rather than inventing evenly
+spaced ITLs. E2 therefore remains `BLOCKED` until a native per-token timestamp
+hook is bound or one-token-per-chunk delivery is proven by the pinned runtime.
 Confirmation materialization is family-local: four excluded pilots are reduced
 before confirmation is visible, then only a sealed 12--20-block final prefix is
-activated. The pinned patch still rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation,
+activated. A family remains the incremental scheduling/power unit, but a stage
+dependency receipt is issued only from a separate exact-coverage aggregate:
+families are SHA-sorted and replayed from raw pilot/final completion authority.
+E5's 264 non-family failure-injection cells use a deterministic auxiliary
+activation/completion, and the family plus auxiliary dispositions must be an
+exact disjoint cover of the stage. The pinned patch still rejects DSpark/EAGLE/EAGLE3/NEXTN adaptation,
 nonconstant schedules, and all multi-rank execution. Its TP1/DP1 DFlash path
 cannot produce a claim without the out-of-band trusted signer.
 
@@ -143,6 +153,18 @@ contention. If only two-way concurrency was calibrated on an eight-GPU host,
 the frozen headline waves remain two-way. Runtime completion never creates
 result-dependent co-tenancy. Profiler, download, and compile work is
 exclusive-host and cannot contend with headline timing.
+
+Exclusive-host classification is not execution authority. This release does
+not dispatch COMPILE or DOWNLOAD cells: compile lacks an exact release-owned
+prewarm/finalization manifest and atomic cache-result pointer, and download
+lacks a first-party terminal receipt contract.
+
+A future compile contract must bind the assignment, budget, inventory and GPU
+UUIDs; compile-plan/key and model revisions; TP, context, concurrency, and graph
+buckets; deterministic prewarm payloads; and a graceful-shutdown acknowledgement.
+Its atomically published result pointer must name and hash the manifest, attempt
+receipt, final cache receipt, and immutable cache object. Resume must reopen all
+of those files rather than accept the pointer's serialized summary.
 
 Each dispatch plan binds the exact `ExperimentBudget` digest for every
 assignment. Wall time, requested-gang compute GPU time, reserved GPU time, and
@@ -231,6 +253,10 @@ durability, and zero-drop coverage; temporarily emptying the queue is not an
 implicit fsync boundary. Interrupted and aborted attempts remain inspectable,
 but their rows are excluded. Resume skips only a single receipt whose full
 identity and file digests validate; competing completed attempts are an error.
+Each execution plan also binds the producer queue and batch limits, writer
+queue and Parquet row-group limits, checkpoint interval, overflow mode, SQLite
+WAL/FULL settings, and file/checkpoint/directory fsync gates. The checkpoint,
+prepared receipt, terminal receipt, and resume path must agree on that policy.
 
 The immutable session-key and reset/finalize receipt schemas describe the
 evidence a future compatible method/block server reuse path would need. Live
@@ -238,9 +264,12 @@ shared-session execution is unavailable in this release: no release-owned
 trusted boundary can prove drain/reset/finalize, the session receipts are not
 durably bound into a terminal envelope, and whole-inventory accounting does not
 yet cover the continuous launch-to-termination interval. All reuse mutation
-entry points therefore fail before launch or evidence creation. Within the
-supported single-trace path, submit and abort share one caller-owned official
-HTTP pool, with timeouts bound to the request deadline and abort grace.
+entry points therefore fail before launch or evidence creation. The high-level
+block executor first validates every trace and native provider, then falls back
+to a distinct clean process and HTTP pool per trace; it records no reset or
+startup-saving claim. Within each supported single-trace path, submit and abort
+share that official HTTP pool, with timeouts bound to the request deadline and
+abort grace.
 Immutable compile-cache bases remain content-addressed and verified, each
 process gets a private writable overlay, and CUDA Graphs never cross a process
 or GPU. Fault-injection cells always use a fresh process in this release.

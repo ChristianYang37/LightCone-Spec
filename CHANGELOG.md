@@ -37,14 +37,20 @@ yet been declared.
   Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
 - Made the SGLang adaptation-protocol patch test hermetic by loading only its
   config, runtime, and parameter-plan modules. The resulting patch identity is
-  `c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08`
-  with final tree `2810ac94ed225aa78b4256ded56e78890a4a590f`.
+  `369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7`
+  with final tree `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8`.
 
 ### Evidence status
 
-- No formal GPU timing or new empirical result was produced. All new outcomes
-  remain `UNMEASURED`; hardware execution is blocked pending a trusted signer,
-  resolved model/data/trace locks, and the registered GPU/interference gates.
+- No formal GPU timing was produced by the industrial evidence pipeline. The
+  README separately records one historical, single-block preliminary mechanism
+  snapshot from the GPU-debug branch; it remains non-formal and cannot enter the
+  industrial reducer. All industrial outcomes remain `UNMEASURED`.
+- The strict dependency audit remains `BLOCKED`: the pinned, GPU-qualified
+  PyTorch 2.11.0 line reports `PYSEC-2025-194` and constrains runtime Setuptools
+  to 81.0.0, which reports `PYSEC-2026-3447`. Migrating to the fixed PyTorch
+  line requires requalifying the pinned SGLang patch set rather than a resolver
+  override.
 
 ## [0.3.0] - 2026-08-11
 

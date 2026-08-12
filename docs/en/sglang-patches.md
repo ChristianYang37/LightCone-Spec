@@ -57,8 +57,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
-`c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08`
-and final tree `2810ac94ed225aa78b4256ded56e78890a4a590f`; the manifest remains the
+`369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7`
+and final tree `22bd0d1d16aab33addbdacdbf75ad5bfe21164a8`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.

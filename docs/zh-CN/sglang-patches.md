@@ -47,8 +47,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前准确 identity 为 patch SHA-256
-`c29324de3f5893d2d140829d93a1c069002093216c39144f0d6c19d23710ff08` 和 final tree
-`2810ac94ed225aa78b4256ded56e78890a4a590f`；manifest 仍是 authority。Lifecycle 绑定
+`369f72a3edda128881c79d8af34f0ecaacfc0fd3ee78adc99ad96a7e091154a7` 和 final tree
+`22bd0d1d16aab33addbdacdbf75ad5bfe21164a8`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此

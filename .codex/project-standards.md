@@ -40,9 +40,13 @@ change. `AGENTS.md` points here so there is one normative list.
    and a content-bound GPU attestation.
 3. `UNMEASURED` and `BLOCKED` are valid outcomes. Never relabel, omit, or
    optimize away a negative result.
-4. Do not commit experimental results, selections derived from results, model
-   or dataset payloads, telemetry, traces, profiles, provider state, credentials,
-   personal paths, or handoff material.
+4. Do not commit raw experimental results, result-derived selections, model or
+   dataset payloads, telemetry, traces, profiles, provider state, credentials,
+   personal paths, or handoff material. A compact public result summary is
+   allowed only when the user explicitly requests it and the text identifies
+   the immutable code/runtime/data scope, sample size, evidence level, and
+   limitations. A preliminary summary must never be relabelled as a formal
+   attested result.
 
 ## Engineering and review
 

@@ -205,7 +205,10 @@ whole-inventory accounting from launch through termination. Every shared-session
 mutation entry point therefore fails before launch, network access, reset, or
 evidence-root creation with
 `shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable`.
-Single-trace execution remains the only claimable Target-only path.
+The high-level block executor handles this state by validating all members and
+then using one clean process, HTTP pool, native lifecycle, terminal receipt, and
+budget observation per trace. It does not claim reuse. Single-trace execution
+remains the only claimable Target-only path.
 
 On successful close, WAL segments are coverage-checked and assembled into
 process-unique Parquet shards and a durable prepared receipt. The executor then
@@ -238,7 +241,10 @@ gang placement is atomic and topology-aware, and each headline wave is frozen
 before execution. Concurrent work is bounded by an exact
 `InterferenceEnvelope`, not by the number of idle devices. Resources, ports,
 cache writers, and evidence roots cannot overlap, and receipt-only resume never
-infers completion from a directory.
+infers completion from a directory. Dispatch writes a path-bound WAVE/INTENT/
+FINISH hash chain before and after each runner; partial sibling failures retain
+successful raw terminal authorities, and an unfinished intent blocks rather
+than inventing retry cost.
 
 Reducer-owned activation artifacts materialize the one 130-cell E1 slice and
 each E2 successive-halving round, with an immutable disposition for every

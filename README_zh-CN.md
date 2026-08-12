@@ -6,7 +6,7 @@ LightCone-Spec 是一个以证据为先的 speculative decoding 在线 drafter a
 研究框架。它严格区分 runtime 工程与实证结论：CPU 合同可以验证身份、持久性和
 fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明速度或容量。
 
-> 当前为 Alpha 软件。全部新 GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
+> 当前为 Alpha 软件。全部 formal industrial GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
 > Target-only 可以端到端运行。Static、TTS、L0 及其他所有 speculative method 会在任何
 > process 或 network mutation 前 `BLOCKED`，因为固定
 > `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook 尚未配置可信
@@ -76,6 +76,10 @@ activation/disposition artifact 与 locked output。唯一的确定性同主机 
 会把逻辑声明映射到内容绑定的物理 UUID，并支持 1、2、4、8、16 或更多 GPU。它会串行
 独占 headline/profile/download/compile 工作；只有准确注册的 interference-envelope rule
 允许时，互相独立的工作才可并行。
+
+资源隔离不等于 terminal authority。当前 release 会在预算与 dispatch 前阻止全部 COMPILE
+与 DOWNLOAD cell，因为它既没有 release-owned compile prewarm/finalization result-pointer
+contract，也没有 first-party download terminal receipt contract。
 
 Reducer-owned E1 activation 会从 2,730-cell envelope 只物化一个 130-cell width/load slice；
 E2 只物化当前 quarter-retention successive-halving round。每个 family 的四个 pilot 会在
@@ -153,8 +157,13 @@ lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
   --inventory artifacts/industrial/inventory.json \
   --interference-envelope artifacts/industrial/interference.json \
-  --budget-plan artifacts/industrial/budgets.json \
-  --activation-plan artifacts/industrial/activation.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --budget-load-binding artifacts/industrial/load-cell-000.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --activation-plan artifacts/industrial/stage-activation-manifest.json \
   --output artifacts/industrial/dispatch.json
 ```
 
@@ -191,6 +200,47 @@ collector 要求每种 method 的每个 block 都匹配该 reference；解码文
 method 彼此一致都不充分。该 reference 只能增强 `UNMEASURED` 诊断：它不会让
 Static/TTS/L0 变得可执行，也不能替代缺失的 trusted attester。
 
+## 历史 preliminary 机制 snapshot
+
+以下 snapshot 来自较早的 main-line 实现，仅保留为 preliminary 工程证据。它不会改变
+上文当前 industrial 协议的 formal truth：schema-v3 Stage B 仍为 `UNMEASURED` 且
+`BLOCKED`，这些数字不能激活 cell、选择配置或通过 release gate。
+
+单张 RTX PRO 6000 Blackwell（96 GB）运行 Qwen3-8B + DFlash-b16，使用 16 条重复型
+受控 prompt、并发 8 和 40,928-token 安全 context 上限。每种方法均在单个 timing block
+中生成 654,042 tokens：
+
+| 方法 | Decode goodput | 相对 Static | p99 ITL | Peak HBM |
+|---|---:|---:|---:|---:|
+| Static | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
+| TTS | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
+| L0 | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
+
+本次 snapshot 中 L0 比 TTS 快 0.86%。三种方法的完整有序 token-ID 轨迹一致，且
+exactness violation、version mismatch、fallback、non-finite update、OOM 与 retraction
+计数均为零。绑定的历史身份是 main code `0db2ff4`、旧 patched SGLang tree `e795ecc`、
+execution-policy SHA `231ca579` 与 tuning-window SHA `132019ee`；该策略关闭 CUDA Graph
+与 Radix Cache。
+
+机制诊断表明在线工作已基本隐藏：TTS/L0 的 main-side overlap 约为 96.7%；累计约
+8.4--8.7 秒的 training、optimizer、merge 与 publication 工作，只在 decode critical path
+暴露约 0.27 秒。L0 的优势主要对应更少的 target calls：52,083，而 TTS 为 52,879
+（每次 call 分别 commit 12.558 与 12.369 tokens）。Adaptation 显存账本主要由 candidate
+scratch（7.88 GiB）与 resident buffer（5.91 GiB）占用，而不是约 31.3 MiB 的 optimizer
+state。因此后续优化顺序应为 candidate scratch、staging、training activation 生命周期、
+动态 reserve calibration，最后才是 optimizer moment。固定 16 GiB reserve 使报告中的
+KV capacity 从 461,703 降到 359,227 tokens，约减少 22.2%。
+
+这只是 `n=1` 机制检查，没有正式 BCa 置信区间。循环型 prompt 具有很强的在线可学习性，
+因此它既不是自然任务结果，也不是论文 LiveCodeBench、MATH-500 或 OnlineSPEC 实验复现。
+下一项科学优先级应是锁定的 LiveCodeBench v6 Hard 与 MATH-500 Level 5 协议，而不是临时的
+前 32 条 loader。此前 CUDA-Graph-on 诊断只有 14/16 条 token 轨迹一致，并且慢约 2.85%；
+在修复 graph replay exactness 前继续关闭 CUDA Graph。
+
+Operator 已被有意停止，主机关机。它正确封存 `failed_resumable` 与退出码 143，没有伪装成
+complete；未完成的 Target-only reference 没有最终 JSON，必须重新运行。60 文件 raw archive
+保持 ignored，不提交到 public tree。
+
 ## 文档
 
 - [架构](docs/zh-CN/architecture.md)
@@ -205,7 +255,7 @@ Static/TTS/L0 变得可执行，也不能替代缺失的 trusted attester。
 
 ## 限制
 
-- 全部新 GPU 结果均为 `UNMEASURED`；native terminal hook 已存在，但 Stage B 因缺少可信
+- 全部 formal industrial GPU 结果均为 `UNMEASURED`；native terminal hook 已存在，但 Stage B 因缺少可信
   hardware signer、provider credential、已解析 model/data/trace lock 与已注册硬件而保持
   `BLOCKED`；
 - 当前端到端 industrial execution surface 只有 TP1/DP1 Target-only。TP2/DP2 仅存在于

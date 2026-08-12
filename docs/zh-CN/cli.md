@@ -11,17 +11,22 @@ industrial 命令包括：
 |---|---|
 | `doctor` | 只读 host、Python、CUDA 与 source identity 报告 |
 | `validate-config` | 验证一份严格 schema-v3 run config 与 sidecar |
-| `build-industrial-registry` | 绑定两个稳定 logical rank slot 并生成不可变实验 DAG |
+| `build-industrial-registry` | 绑定一个或更多稳定 logical rank slot 并生成不可变实验 DAG |
+| `collect-gpu-inventory` | 收集 nonce-bound physical GPU/topology inventory 与 raw probe receipt |
+| `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
 | `reduce-e1-activation` | 从 sealed E3a evidence 派生唯一 130-cell E1 slice |
 | `reduce-e2-activation` | 从 E1 Pareto artifact 或 prior survivor materialize 一个 E2 round |
 | `reduce-e2-successive-halving` | 把准确 E2 stage evidence 归约为 sealed survivor receipt |
 | `materialize-confirmation-pilots` | 为一个 confirmation family 激活恰好四个 excluded pilot |
 | `reduce-confirmation-family-power` | 把一个 family 的准确四个 pilot block 归约为 sealed power plan |
 | `materialize-confirmation-prefix` | 只激活 powered family 已封存的 12--20-block final prefix |
-| `validate-evidence-alias` | 严格加载并重写 content-bound evidence alias receipt |
-| `build-evidence-dependence-map` | 保留合法 alias 带来的 shared-observation dependence |
-| `estimate-industrial-budget` | 为指定 inventory 与 activation bundle 归约准确 per-cell budget |
+| `validate-evidence-alias` | 用 registry、hardware、inventory 与 terminal authority 重放 raw alias manifest |
+| `build-evidence-dependence-map` | 从 reducer 签发的 alias artifact 保留 shared-observation dependence |
+| `materialize-stage-activation` | 从 raw registry、lineage、runtime 与 split authority 重放 generic stage dispatchability |
+| `materialize-industrial-budgets` | 从 reducer、load、inventory、policy 与 capacity authority 派生 fail-closed `BudgetPlan` |
+| `estimate-industrial-budget` | 在准确 physical inventory 与 interference envelope 上重放 ready `BudgetPlan` |
 | `plan-industrial-dispatch` | 冻结确定性、topology-aware GPU-pool wave 与 physical assignment |
+| `execute-dispatch-wave` | 重放 path-bound assignment bundle，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
 | `seal-industrial-stage` | 绑定 activated completion、disposition、budget、runtime、split、dependency 与 locked output |
 | `analyze-industrial` | 验证 schema-v3 terminal、budget、family-power 与 hardware evidence |
 | `build-speed-study` | 生成较小的核心源协议 |
@@ -70,7 +75,7 @@ industrial 命令包括：
 
 ## Industrial Registry 工作流
 
-Registry 只包含 scientific identity 与两个 logical rank slot，不包含 host-specific GPU UUID：
+Registry 只包含 scientific identity 与一个或更多 logical rank slot，不包含 host-specific GPU UUID：
 
 ```bash
 lightcone-spec build-industrial-registry \
@@ -87,17 +92,81 @@ lightcone-spec build-industrial-registry \
 inventory 提供 physical UUID、model/memory/capability、PCI/NUMA/interconnect topology、
 availability 与 topology group。
 
-Planning 会 fail closed：它需要 inventory、准确 per-cell budget sequence 与 interference
-envelope。Template stage 还需要 reducer-generated stage/family activation；手写 cell list
-不会被接受。
+没有 E1/E2 或 confirmation-family 专用 reducer 的 stage 使用 first-party generic reducer。
+它的 raw manifest 只能准确包含 registry、stage name、runtime、split 与完整有序 dependency
+receipt path；不接受 caller cell list 或 bare activation plan。Preflight 的 receipt list 为空，
+canonical genesis authority 会由准确 registry 派生：
+
+```json
+{
+  "schema_version": 1,
+  "kind": "industrial_registry_stage_activation_manifest",
+  "registry_artifact": "artifacts/industrial/registry.json",
+  "experiment": "preflight",
+  "runtime_artifact": "artifacts/industrial/runtime.json",
+  "split_artifact": "artifacts/industrial/preflight-split.json",
+  "dependency_receipts": []
+}
+```
+
+为 manifest 写相邻 `.sha256` 后，可生成 canonical artifact 供检查：
+
+```bash
+lightcone-spec materialize-stage-activation \
+  --manifest artifacts/industrial/preflight-activation-manifest.json \
+  --output artifacts/industrial/preflight-activation.json
+```
+
+Consumer 通过 `--activation-plan` 接收 raw manifest path 并现场重放 reducer；单独传序列化
+output 会被拒绝。Reducer 从 registry status 与 release dispatch predicate 为每个 declared
+stage cell 生成 disposition。当前 release 的全部 preflight cell 都被阻止：Target-only
+compile cell 缺少 release-owned 的准确 prewarm manifest、graceful-finalization ACK 与原子
+attempt/final-cache result pointer；Static/TTS/L0 也没有受支持的 execution contract。
+因此 command 写出 canonical `BLOCKED` artifact 并返回 42。E6 download cell 由于没有
+first-party download terminal contract，也会被独立阻止。
+
+Budget materialization 会 fail closed。它消费 reducer-generated stage/family activation、完整
+`BudgetPolicy`、每个 activated serving cell 各一份 `BudgetLoadBinding`、独立来源的
+`CapacityEnvelope`，以及完整 physical inventory。Formal capacity authority 还必须成对传入
+`--capacity-manifest` 与 `--capacity-verification-receipt` raw artifact。Verifier 会重新打开
+每个 path-bound inventory/source、provider quota、host capacity 与逐 cell sizing input，且
+只接受 release-owned trust root。只有 load coverage、provider GPU quota 与 maximum-attempt
+disk capacity 全部闭合时才写 `READY`；否则保留真实派生 budget，写入不可变的诊断性
+`UNRESOLVED` plan 并返回 42。Bare envelope 或 SHA-256 绝不构成 execution authority。
+每个 activated serving cell 都要重复一次 `--budget-load-binding PATH`：
+
+```bash
+lightcone-spec materialize-industrial-budgets \
+  --registry artifacts/industrial/registry.json \
+  --activation-plan artifacts/industrial/preflight-activation-manifest.json \
+  --inventory artifacts/industrial/inventory.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --output artifacts/industrial/budget-plan.json
+```
+
+不存在 caller-selected cell 或 duration-sequence fallback。Preflight 现在由 generic reducer
+闭合；若省略 bound raw manifest，仍会得到明确 unresolved authority error，caller-authored
+activation 不能绕过。Serving activation 还要为每个 activated serving cell 重复传入一次
+`--budget-load-binding PATH`。
+
+Planning 会重新加载 `BudgetPlan`，用相同 raw input 现场重跑 materialization，并在调度前
+要求两者完全相等；同时还强制要求成对的 interference authority：
 
 ```bash
 lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
+  --activation-plan artifacts/industrial/preflight-activation-manifest.json \
   --inventory artifacts/industrial/inventory.json \
   --interference-envelope artifacts/industrial/interference-envelope.json \
-  --budget-plan artifacts/industrial/budgets.json \
-  --output artifacts/industrial/preflight-dispatch.json
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --output artifacts/industrial/dispatch.json
 ```
 
 Frozen plan 会绑定准确 inventory/interference envelope、每个 cell 的 budget digest、physical
@@ -105,9 +174,69 @@ UUID/rank/port/topology assignment、wave membership 与 scheduler identity。Sc
 same-host inventory，并对 1/2/4/8/16 GPU 有 regression test。一个 wave 绝不超过已校准的
 co-run class，因此八块空闲 GPU 不表示可以执行八路 headline concurrency。Envelope 通过
 structural loading 不能证明 calibration；formal timing 仍要求 raw isolated/co-run
-evidence 与 trusted hardware binding。目前没有 `execute-dispatch-wave` CLI command；
-structured library executor 要求 first-party、content-bound launch adapter，不会从 planner
-JSON 推断 launch 配置。
+evidence 与 trusted hardware binding。
+
+`execute-dispatch-wave` 绝不会把 planner JSON 或
+`IndustrialExecutionPlan.to_dict()` summary 当作 launch authority。Frozen dispatch plan 中的
+每个 assignment 都必须重复传入一次 `--bundle`。Schema-v1 bundle 用 absolute resolved path、
+raw/canonical/semantic/file identity 与相邻 sidecar 绑定 registry/inventory、serial
+interference raw receipt、budget policy/load/capacity input、tagged raw activation
+manifest 及其准确 runtime envelope/split/receipt chain、context/dispatch、topology/load/config/
+launch、sampling/model lock/prepared root、compile plan，以及 inventory/runtime evidence。
+Generic、E1、E2、confirmation pilot/final 与 stage-aggregate manifest 都会从完整 path closure
+现场重放。Final prefix 的 prior pilot completion 只能由 schema-v4/native completion authority
+派生，bare completed-cell IDs 会被拒绝。E3b/E5 stage receipt 使用独立、按 family SHA 排序的
+aggregate；E5 还必须为 264 个非 family failure-injection cells 提供 deterministic auxiliary
+activation/completion，且 family 与 auxiliary disposition 必须构成 registry stage 的准确不交并集。
+只读 audit 会重跑 raw reducer 与准确的 planning scheduler，但会把 execution-plan SHA
+明确报告为 `null`/`NOT_VALIDATED`；自洽的 serialized plan summary 不能自我授权。
+Formal reconstruction 必须先现场取得 `READY` `BudgetPlan`，并 path-bound 重验其 policy、
+load、activation、inventory 与 capacity source 的 budget materialization authority；之后
+才可构造 physical plan 并与冗余 summary 做准确比较。当前 execution slice 只接受同时通过
+release capability、raw activation/completion、capacity、interference 与 trusted-attestation
+边界的 Target-only serving assignment；compile/download 以及任何 unsupported serving assignment
+仍明确 `BLOCKED`。
+Launch 前，命令会线性检查每个 assignment-local source，并要求 bundle 完整覆盖且共享同一个
+准确的 schema-v3 dispatch context/raw budget authority。共享 scheduler authority 以 group
+为单位重放；之后只构造请求 wave 的 physical plan（以及 resume receipt 实际引用的历史
+plan），而每个可能真实 launch 的 plan 仍必须通过完整 public validation boundary。
+
+每次命令只执行一个 `--wave-index`。Wave 0 不带 resume input；成功 prefix 的下一波必须传
+上一轮 `--resume-receipt`，failed wave 则在同一 index resume。任何 sibling runner 启动前，
+命令都会先向 private `RECEIPT.attempt-journal` durable append 一个 wave intent 与所有
+per-assignment intent；每次 terminal 或 failure 返回后再 append finish、准确 retry identity
+与累计 monotonic cost。因此 partial wave 会保留成功 sibling，只重跑失败 sibling。若 intent
+没有 finish，成本无法确认，会以
+`dispatch_attempt_intent_without_finish_cost_unresolved` 阻断。
+
+`--receipt-output` 是 schema-v2 canonical immutable envelope，同时内嵌 receipt、structured
+sidecar 与准确 journal manifest/head/event-count prefix。Resume 只把 caller receipt 当作
+anchor：授权来自 raw journal 重放及每个成功 `AssignmentTerminalAuthority` 的现场重开。
+若所有 finish 已落盘、但 coordinator 在 envelope 前崩溃，用相同 wave/output 重跑命令即可
+恢复，不会再次启动 runner。`RECEIPT.sidecar.json` 只是 derived convenience copy，因此在
+该 copy 写入前崩溃不会丢失 resume authority；parent directory 必须已经存在。
+
+相对于已发布 envelope prefix，hash chain 能检测删除、替换、symlink 与 event 联合重哈希；
+它不是外部签名。能够同时替换整个 unsigned journal 与全部 anchor 的 actor 超出这个纯软件
+恢复威胁模型。Formal GPU claim 仍必须使用下述 release-owned trusted attester。
+
+```bash
+lightcone-spec execute-dispatch-wave \
+  --bundle artifacts/industrial/bundles/assignment-000.json \
+  --bundle artifacts/industrial/bundles/assignment-001.json \
+  --wave-index 0 \
+  --receipt-output artifacts/industrial/dispatch-wave-0.json
+```
+
+当前 source release 的 release-owned trust policy 没有 trusted hardware attester。即使
+caller/test signer 的签名在密码学上有效，也不能解锁 formal execution；bare
+`CapacityEnvelope` 同样不能授予 execution authority。因此命令会在读取 bundle、
+创建 receipt parent/evidence root、导入 serving client 或启动 process 之前返回
+`BLOCKED`/42。缺失 bundle 同样不会回退到 planner summary。Fresh execution 会拒绝未被
+journal 授权的已有 per-plan trace file；resume 必须同时重放 raw append-only attempt chain
+并现场重验 structured terminal binding。Bare terminal digest 或 caller 联合重哈希的
+schedule JSON 都不能跳过 work。若 coordinator 在 durable intent 后、durable finish 前
+崩溃，则保持 `BLOCKED`，绝不伪造 monotonic cost。
 
 Dispatch 前要对同一个 activated set 估算。每个 budget field 都是显式值；report 会分别列出
 optimistic、registered 与 quota-envelope scenario 的 wall、compute、reserved 与
@@ -116,11 +245,21 @@ whole-instance billed GPU time：
 ```bash
 lightcone-spec estimate-industrial-budget \
   --registry artifacts/industrial/registry.json \
-  --activation-plan artifacts/industrial/activation.json \
+  --activation-plan artifacts/industrial/preflight-activation-manifest.json \
   --inventory artifacts/industrial/inventory.json \
-  --budgets artifacts/industrial/budgets.json \
+  --interference-envelope artifacts/industrial/interference-envelope.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
   --output artifacts/industrial/budget-report.json
 ```
+
+Estimator 会执行同样的 raw-input rematerialization 与现场 capacity revalidation。Report
+同时绑定 scheduler inventory SHA-256 与 interference-envelope SHA-256；若准确 scheduler
+replay 不可执行，它仍保留真实派生的 GPU-hour diagnostics，记录具名 unresolved assumption
+并返回 42；该 report 不能用作 launch authority。
 
 Stage 的 activated cell 与 disposition durable 后再封存。`--inventory PATH` 是 completed
 evidence 所用 physical GPU identity 与 topology 的 authority。每次重复的
@@ -135,6 +274,7 @@ lightcone-spec seal-industrial-stage \
   --experiment preflight \
   --runtime-artifact artifacts/industrial/runtime.json \
   --split-artifact artifacts/industrial/preflight-split.json \
+  --activation-plan artifacts/industrial/preflight-activation-manifest.json \
   --completed-cells artifacts/industrial/completed-cells.json \
   --locked-output runtime_envelope=artifacts/industrial/runtime-envelope.json \
   --output artifacts/industrial/receipts/preflight.json
@@ -172,10 +312,13 @@ lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
   --inventory artifacts/industrial/inventory.json \
   --interference-envelope artifacts/industrial/interference-envelope.json \
-  --budget-plan artifacts/industrial/budgets.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --budget-load-binding artifacts/industrial/load-cell-000.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
   --receipt artifacts/industrial/receipts/preflight.json \
   --completed-cells artifacts/industrial/completed-cells.json \
-  --activation-plan artifacts/industrial/activation.json \
+  --activation-plan artifacts/industrial/next-stage-activation-manifest.json \
   --output artifacts/industrial/next-dispatch.json
 ```
 
@@ -186,9 +329,10 @@ compile/download N/A 理由或 GPU accounting 都不能替换为零。Resume 只
 
 Dispatch plan 是目标 protocol 数据，不证明 cell 可执行。Library industrial executor 会在
 launch 前验证 provider state。固定 tree 已实现准确 native terminal begin/reset/finalize
-hook，但没有配置 trusted hardware signer。因此 release preflight 只运行 TP1/DP1
-Target-only，并在 process、filesystem、root 或 network mutation 前阻止 Static/TTS/L0。
-CLI 不会静默 provision hardware。
+hook，但没有配置 trusted hardware signer。Generic activation 只记录 canonical blocked
+preflight disposition；它不会创造 compile runner、execution authority 或 performance claim。
+Static/TTS/L0 在缺少 validated native capability 与 trusted signer 时仍被阻止。CLI 不会
+静默 provision hardware，也不会启动 GPU。
 
 ## 身份与 Topology 链
 
@@ -244,12 +388,30 @@ envelope 与四个 pilot block。每个 pilot cell 都提供 terminal receipt、
 budget observation。Reducer 保持 confirmation hidden，并拒绝 missing、extra、cross-family 或
 unsafe evidence。
 
-`validate-evidence-alias` 不会从 label 创造 scientific equivalence；它只接受完全
-content-bound、byte-equivalent 的 receipt。Dependence map 让 shared control 在 covariance/
-bootstrap 中保持一个 observation。Static 是 backend-specific；TTS/L0 永远不能 alias。本
-release 的 formal reducer 会拒绝 non-singleton dependence unit，除非 alias 是从 execution
-plan 与 terminal evidence 重新计算得出；self-described alias 可以通过 structural validation，
-但不能进入 claim。
+`validate-evidence-alias` 不会从 label 创造 scientific equivalence，也不会 round-trip
+caller-authored receipt。它会将 bound raw manifest 对照当前 registry、hardware envelope、
+GPU inventory 及其 source receipt、execution/load/config/split/sampling/model/budget artifact、
+source terminal evidence 与 native terminal artifact 完整重放：
+
+```bash
+lightcone-spec validate-evidence-alias \
+  --manifest artifacts/industrial/raw-alias-manifest.json \
+  --registry artifacts/industrial/registry.json \
+  --inventory artifacts/industrial/gpu-inventory.json \
+  --hardware-envelope artifacts/industrial/hardware-envelope.json \
+  --output artifacts/industrial/alias-reduction.json
+
+lightcone-spec build-evidence-dependence-map \
+  --direct-map artifacts/industrial/direct-dependence-map.json \
+  --alias-reduction artifacts/industrial/alias-reduction.json \
+  --output artifacts/industrial/evidence-dependence-map.json
+```
+
+Dependence map 只接受 first-party reduction artifact，让 shared control 在 covariance/
+bootstrap 中保持一个 observation。Static 是 backend-specific；TTS/L0 永远不能 alias。
+schema-v3 industrial analysis manifest 会列出 raw alias manifests；formal reducer 会逐一重放，
+并拒绝与重放结果不同的 serialized map。旧 alias receipt、caller-authored reduction summary
+以及旧 `--alias` flags 都会被拒绝。
 
 每个 completed slice 都以 content-bound evidence 结束。只有 manifest/config/method/block/
 data/trace 与全部 shard digest 验证通过，resume 才跳过它。中断 Parquet WAL segment 没有

@@ -20,6 +20,13 @@ mutation 前被阻止，因为固定 native begin/reset/finalize hook 没有配�
 signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash、constant
 schedule、零 extra logical delay 与 `update_round` teacher row。
 
+每个 serving run 还会绑定 schema-v2 controlled execution policy。注册策略固定 context
+length 40,960 与 server seed 1，关闭 radix cache 和 CUDA Graph，并要求
+non-incremental output。Target-reference role 关闭 overlap scheduling，speculative role
+保留 overlap。Native begin/reset/finalize 会重验同一策略；reset 必须保持 seed 1，不能根据
+run nonce 派生新 seed。这些值是 preliminary GPU snapshot 实际使用的实验身份，不表示其已被
+证明吞吐最优。
+
 ## 方法与 Disabled Path 合同
 
 Target-only 与 Static schema config 都要求 `adaptation: null` 和 `online_spec: null`。

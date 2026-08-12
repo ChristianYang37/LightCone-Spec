@@ -8,7 +8,7 @@
 超过节省的 target work。Target-only、Static、TTS 与 L0 始终分开；TTS 与 L0 使用相同
 candidate，只在发布时间上不同。
 
-所有新 GPU 结果都是 `UNMEASURED`。代码、CPU 测试与 registry 建立目标 protocol 与
+所有 formal industrial GPU 结果都是 `UNMEASURED`。代码、CPU 测试与 registry 建立目标 protocol 与
 coordinator contract，不是完整可运行 speculative surface 或 benchmark 结果。Industrial
 executor 当前只运行 TP1/DP1 Target-only。Static/TTS/L0 会在任何 mutation 前因缺少
 trusted hardware signer 而 `BLOCKED`；固定 native
@@ -70,8 +70,17 @@ W1、W2 与 scalar acceptance/confidence state 作为 Full 训练。Fixed verifi
 support。E1 activation 消费 sealed E3a selection，只 materialize 一个 130-cell width/load
 slice，并为其他 E1 template 记录 immutable disposition。E2 每次只 materialize 一个
 successive-halving round，保留 matched TTS/L0 pair 与 family floor，且下一 round 只能从 prior
-sealed survivor receipt 派生。Confirmation materialization 以 family 为局部单位：四个
-excluded pilot 会在 confirmation 可见前归约，随后只激活 sealed 12--20-block final prefix。
+sealed survivor receipt 派生。Formal E2 reducer 要求真实的 per-token observation time。
+官方 SGLang SSE client 可能在
+一个 chunk 中合并多个 token ID，因此 adapter 会把这些 token timestamp 记为 unavailable，
+而不是虚构等间隔 ITL。只有绑定 native per-token timestamp hook，或由固定 runtime 证明
+one-token-per-chunk delivery，E2 才能从 `BLOCKED` 解锁。Confirmation materialization 以
+family 为局部单位：四个 excluded pilot 会在 confirmation 可见前归约，随后只激活 sealed
+12--20-block final prefix。
+Family 仍是增量 scheduling/power 单位，但 stage dependency receipt 只能由独立 exact-coverage
+aggregate 签发：所有 family 按 SHA 排序，并从 raw pilot/final completion authority 现场重放。
+E5 的 264 个非 family failure-injection cells 使用 deterministic auxiliary activation/completion；
+family 与 auxiliary disposition 必须构成该 stage 的准确不交并集。
 固定 patch 仍会拒绝 DSpark/EAGLE/EAGLE3/NEXTN adaptation、非 constant schedule 与全部
 multi-rank execution；其 TP1/DP1 DFlash path 没有 out-of-band trusted signer 时不能产生结论。
 
@@ -119,6 +128,16 @@ workload、co-run signature/count、gang shape、thermal/power/load state 与 ho
 索引。如果八 GPU host 只校准过 two-way concurrency，frozen headline wave 仍最多 two-way；
 runtime completion 不能创造 result-dependent co-tenancy。Profiler、download 与 compile
 工作是 exclusive-host，不能与 headline timing 竞争。
+
+Exclusive-host 分类不等于 execution authority。当前 release 不会 dispatch COMPILE 或
+DOWNLOAD cell：compile 缺少准确的 release-owned prewarm/finalization manifest 与原子
+cache-result pointer；download 缺少 first-party terminal receipt contract。
+
+未来的 compile contract 必须绑定 assignment、budget、inventory 与 GPU UUID、compile
+plan/key 与 model revision、TP、context、concurrency、graph bucket、deterministic prewarm
+payload，以及 graceful-shutdown ACK。原子发布的 result pointer 必须给出 manifest、attempt
+receipt、final cache receipt 与 immutable cache object 的路径和 hash；resume 必须重开全部
+原始文件，不能信任 pointer 中的 serialized summary。
 
 每个 dispatch plan 为每个 assignment 绑定准确 `ExperimentBudget` digest。Wall time、requested
 gang compute GPU time、reserved GPU time 与 fixed-instance billed GPU time 必须分开；two-GPU
@@ -191,14 +210,20 @@ time checkpoint 与 terminal boundary 保留 WAL fsync、directory sync、unique
 durability 与 zero-drop coverage；queue 暂时清空不是隐式 fsync boundary。中断和 aborted
 attempt 保持可审计，但其 row 被排除。Resume 只跳过一个完整身份及 file digest 都验证通过
 的 receipt；出现竞争 completed attempt 属于错误。
+每个 execution plan 还绑定 producer queue/batch 上限、writer queue 与 Parquet row-group
+上限、checkpoint interval、overflow mode、SQLite WAL/FULL 设置，以及 file/checkpoint/
+directory fsync gate。checkpoint、prepared receipt、terminal receipt 与 resume 必须认可同一
+policy digest。
 
 Immutable session key 与 reset/finalize receipt schema 描述未来 compatible method/block
 server reuse 路径所需的 evidence。当前 release 不提供 live shared-session execution：没有
 release-owned trusted boundary 可证明 drain/reset/finalize，session receipt 尚未 durable 绑定
 进 terminal envelope，whole-inventory accounting 也未覆盖连续的 launch-to-terminate 区间。
-因此所有 reuse mutation 入口都会在 launch 或 evidence 创建前失败。支持的 single-trace
-路径中，submit/abort 共用一个 caller-owned official HTTP pool，timeout 绑定 registered
-request deadline 与 abort grace。Immutable compile-cache base 仍按内容寻址并验证，每个
+因此所有 reuse mutation 入口都会在 launch 或 evidence 创建前失败。高层 block executor
+先验证每条 trace 与 native provider，再为每条 trace 使用独立 clean process 与 HTTP pool；
+该路径不声明 reset 或 startup saving。每个支持的 single-trace 路径中，submit/abort 共用该
+official HTTP pool，timeout 绑定 registered request deadline 与 abort grace。Immutable
+compile-cache base 仍按内容寻址并验证，每个
 process 都有 private writable overlay，CUDA Graph 绝不跨 process 或 GPU。当前 release 的
 fault-injection cell 始终使用 fresh process。
 

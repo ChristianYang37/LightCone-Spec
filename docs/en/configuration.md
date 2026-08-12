@@ -24,6 +24,15 @@ trusted hardware signer. The lower-level adaptive patch path and terminal
 schema are limited to TP1/DP1 DFlash, constant schedule, zero extra logical
 delay, and `update_round` teacher rows.
 
+Every serving run also binds the schema-v2 controlled execution policy. The
+registered policy fixes context length 40,960 and server seed 1, disables radix
+cache and CUDA Graph, and requires non-incremental output. The target-reference
+role disables overlap scheduling; speculative roles retain it. Native
+begin/reset/finalize revalidate the same policy, and reset must preserve seed 1
+rather than derive a new seed from a run nonce. These values are the
+experimental identity exercised by the preliminary GPU snapshot, not a claim
+that they are throughput-optimal.
+
 ## Method and disabled-path contract
 
 Target-only and Static schema configs require both `adaptation: null` and

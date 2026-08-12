@@ -161,7 +161,9 @@ topology 与 physical GPU UUID、memory/graph/telemetry 配置、compile-cache i
 whole-inventory 计费。因此所有 shared-session mutation 入口都会在 launch、network、reset
 及 evidence-root 创建之前以
 `shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable` 失败。
-当前唯一可声明的 Target-only 路径仍是 single-trace execution。
+高层 block executor 会先验证全部成员，再为每条 trace 使用独立 clean process、HTTP pool、
+native lifecycle、terminal receipt 与 budget observation；该路径不声明 reuse。当前唯一可
+声明的 Target-only 路径仍是 single-trace execution。
 
 成功 close 时，WAL segment 先通过 coverage 检查，再组装为 process-unique Parquet shard
 与 durable prepared receipt。executor 随后完成 native terminal lifecycle，并发布与 prepared
@@ -187,7 +189,9 @@ per-cell `ExperimentBudget` 以及 whole-instance billing。
 8、16 GPU 有明确 regression coverage；gang placement 是 atomic 且 topology-aware，所有
 headline wave 都在执行前冻结。并发上限由准确 `InterferenceEnvelope` 决定，而不是由空闲
 device 数量决定。Resource、port、cache writer 与 evidence root 不能重叠，receipt-only
-resume 也绝不从目录存在推断完成。
+resume 也绝不从目录存在推断完成。Dispatch 会在每个 runner 前后写入 path-bound
+WAVE/INTENT/FINISH hash chain；partial sibling failure 会保留成功 raw terminal authority，
+未完成 intent 则阻断，而不是伪造 retry cost。
 
 Reducer-owned activation artifact 只 materialize E1 的一个 130-cell slice 与 E2 每个
 successive-halving round，并为每个未激活 template 记录 immutable disposition。Confirmation

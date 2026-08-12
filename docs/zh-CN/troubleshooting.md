@@ -96,8 +96,10 @@ combine、truncate 或手工编辑 segment。
 - Concurrency 由准确 matching `InterferenceEnvelope` 限制。更多 idle GPU 不会授权未经校准
   co-run class。Gang job 必须 atomic；profiler/download/compile 为 exclusive-host。不能仅因
   assignment 出现在同一个 plan 就并发启动全部工作；
-- Resume 只接受完整 assignment/wave/schedule receipt。一个 failed sibling 不会抹去 durable
-  successful receipt，但也不能被重标为 success。
+- Resume 会重放 path-bound append-only attempt journal，并现场重开每个成功 terminal
+  authority。Failed sibling 不会抹去 durable successful receipt，且只有失败 sibling 会消耗
+  retry。Intent 若没有 finish，会保持
+  `dispatch_attempt_intent_without_finish_cost_unresolved`；不要删除它或估算其成本。
 
 ## 意外的 `UNMEASURED`、`BLOCKED` 或 `UNDERPOWERED`
 

@@ -8,7 +8,7 @@ empirical claims: CPU contracts can establish identity, durability, and
 fail-closed behavior, but only registered, attested GPU evidence can establish
 speed or capacity.
 
-> Alpha software. Every new GPU outcome is `UNMEASURED`. The industrial
+> Alpha software. Every formal industrial GPU outcome is `UNMEASURED`. The industrial
 > executor currently runs only Target-only end to end. Static, TTS, L0, and
 > every other speculative method are `BLOCKED` before process or network
 > mutation because no trusted hardware signer is provisioned for the pinned
@@ -94,6 +94,11 @@ more GPUs. It serializes exclusive headline/profile/download/compile work and
 permits independent work to overlap only under an exact registered
 interference-envelope rule.
 
+Isolation alone is not terminal authority. The current release blocks all
+COMPILE and DOWNLOAD cells before budgeting or dispatch because it ships no
+release-owned compile prewarm/finalization result-pointer contract and no
+first-party download terminal receipt contract.
+
 Reducer-owned E1 activation materializes one 130-cell width/load slice from
 the 2,730-cell envelope. E2 materializes only the current quarter-retention
 successive-halving round. Family-specific four-pilot evidence fixes either a
@@ -102,7 +107,10 @@ physical assignments, terminal evidence, and observed-versus-registered
 GPU-time receipts are all content-bound. Shared-session key/reset/finalize
 schemas are audit-only in this release; every live reuse entry point is blocked
 before mutation because no trusted durable boundary and continuous accounting
-authority ships.
+authority ships. The high-level block executor therefore validates the whole
+block first and falls back to one clean process, HTTP pool, native lifecycle,
+terminal receipt, and budget observation per logical trace; it never labels
+that path as session reuse.
 
 The target schema and CPU coordinator vocabulary define one-node TP2 and
 sticky-replica DP2 identities, inference-sharded TP state, replica-local DP
@@ -141,6 +149,9 @@ backpressure, and any explicit drops are counted. Final Parquet shards are
 published only after coverage checks and filesystem durability, followed by an
 exclusive content-bound completion receipt. Interrupted WALs remain
 inspectable but cannot enter analysis without that receipt.
+The execution-plan identity registers the producer queue/batch, writer queue,
+Parquet row-group, checkpoint interval, overflow mode, SQLite durability, and
+WAL/checkpoint/directory fsync policy; resume requires the same policy digest.
 
 ## Installation and quick start
 
@@ -182,8 +193,13 @@ lightcone-spec plan-industrial-dispatch \
   --registry artifacts/industrial/registry.json \
   --inventory artifacts/industrial/inventory.json \
   --interference-envelope artifacts/industrial/interference.json \
-  --budget-plan artifacts/industrial/budgets.json \
-  --activation-plan artifacts/industrial/activation.json \
+  --budget-plan artifacts/industrial/budget-plan.json \
+  --budget-policy artifacts/industrial/budget-policy.json \
+  --budget-load-binding artifacts/industrial/load-cell-000.json \
+  --capacity-envelope artifacts/industrial/capacity-envelope.json \
+  --capacity-manifest artifacts/industrial/capacity-source-manifest.json \
+  --capacity-verification-receipt artifacts/industrial/capacity-verification.json \
+  --activation-plan artifacts/industrial/stage-activation-manifest.json \
   --output artifacts/industrial/dispatch.json
 ```
 
@@ -228,6 +244,56 @@ among speculative methods is insufficient. The reference strengthens an
 `UNMEASURED` diagnostic only: it does not make Static/TTS/L0 executable and
 cannot substitute for the absent trusted attester.
 
+## Historical preliminary mechanism snapshot
+
+This separately scoped snapshot comes from the older main-line implementation
+and is retained only as preliminary engineering evidence. It does not change
+the current industrial protocol's formal truth above: schema-v3 Stage B remains
+`UNMEASURED` and `BLOCKED`, and these numbers cannot activate a cell, select a
+configuration, or pass a release gate.
+
+One RTX PRO 6000 Blackwell (96 GB) ran Qwen3-8B + DFlash-b16 on 16 repetitive,
+controlled prompts, at concurrency 8 and a 40,928-token safe context limit.
+Each method generated 654,042 tokens in one timing block:
+
+| Method | Decode goodput | vs. Static | p99 ITL | Peak HBM |
+|---|---:|---:|---:|---:|
+| Static | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
+| TTS | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
+| L0 | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
+
+L0 was 0.86% faster than TTS in this snapshot. All three complete ordered
+token-ID trajectories matched, while exactness-violation, version-mismatch,
+fallback, non-finite-update, OOM, and retraction counters were zero. The bound
+historical identity is main code `0db2ff4`, old patched SGLang tree `e795ecc`,
+execution-policy SHA `231ca579`, and tuning-window SHA `132019ee`; CUDA Graph
+and Radix Cache were disabled by that policy.
+
+The mechanism diagnostics suggest that online work was already mostly hidden:
+TTS/L0 main-side overlap was about 96.7%, and roughly 8.4--8.7 seconds of
+aggregate training, optimizer, merge, and publication work exposed only about
+0.27 seconds on the decode critical path. L0's advantage instead tracked fewer
+target calls: 52,083 versus TTS's 52,879 (12.558 versus 12.369 committed tokens
+per call). The adaptation-memory ledger was dominated by candidate scratch
+(7.88 GiB) and resident buffers (5.91 GiB), not the approximately 31.3 MiB
+optimizer state. The follow-up optimization order is therefore candidate
+scratch, staging, training-activation lifetime, dynamic reserve calibration,
+and only then optimizer moments. The fixed 16 GiB reserve reduced reported KV
+capacity from 461,703 to 359,227 tokens, about 22.2%.
+
+This is an `n=1` mechanism check with no formal BCa confidence interval. The
+cyclic prompts are strongly online-learnable, so this is neither a natural-task
+result nor a reproduction of the paper's LiveCodeBench, MATH-500, or OnlineSPEC
+experiments. The next scientific priority is the locked LiveCodeBench v6 Hard
+and MATH-500 Level 5 protocol, not the provisional first-32-item loader. An
+earlier CUDA-Graph-on diagnostic matched only 14 of 16 token trajectories and
+was about 2.85% slower, so graph replay remains off until exactness is repaired.
+
+The operator was intentionally stopped and the host powered off. It correctly
+sealed `failed_resumable` with exit code 143 rather than reporting completion;
+the unfinished Target-only reference has no final JSON and must be rerun. The
+60-file raw archive remains ignored and is not committed to the public tree.
+
 ## Documentation
 
 - [Architecture](docs/en/architecture.md)
@@ -242,7 +308,7 @@ cannot substitute for the absent trusted attester.
 
 ## Limitations
 
-- All new GPU outcomes are `UNMEASURED`. The native terminal hook is present,
+- All formal industrial GPU outcomes are `UNMEASURED`. The native terminal hook is present,
   but Stage B is `BLOCKED` on the absent trusted hardware signer, provider
   credentials, resolved model/data/trace locks, and registered hardware.
 - The current end-to-end industrial execution surface is Target-only at

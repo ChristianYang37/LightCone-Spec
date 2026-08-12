@@ -20,6 +20,13 @@ pytest -q
 可选 `gpu` extra 安装外部 dataset 支持。Controlled trace、registry generation、statistics、
 evidence durability 与 CPU/gloo 测试不需要它。CPU 成功不表示 GPU measurement。
 
+当前 release dependency audit 为 `BLOCKED`。PyTorch 2.11.0 是固定 SGLang patch tree
+实际验证的准确版本，但 strict audit 报告 `PYSEC-2025-194`（修复版本为 PyTorch
+2.13.0）。PyTorch 2.11.0 同时要求 Setuptools 低于 82，因此解析出的 runtime
+Setuptools 81.0.0 报告 `PYSEC-2026-3447`；隔离 package build 虽使用 Setuptools
+83.0.0，也不能消除 runtime dependency 的告警。不得静默升级其中任一依赖；必须先把
+SGLang patch series 迁移到修复后的 PyTorch 版本并重新做完整资格验证，package 才可发布。
+
 在受限中国网络中，只在执行下载的 shell 临时设置组织批准的 package index 或 Hugging
 Face endpoint，把 endpoint 写入脱敏 environment receipt，并在完成后 unset。不得提交
 mirror credential；mirror 缺少 locked artifact 时也不得静默替换。
@@ -115,8 +122,9 @@ Compile cache 必须构建为 verified content-addressed immutable base，并为
 private writable overlay。不要共享 writable cache，也不要在 process/device 之间移动 captured
 CUDA Graph。当前 release 中 immutable session key 与 boundary receipt schema 仅用于审计；
 在 release-owned trusted boundary、durable session receipt binding 和连续 whole-inventory
-计费可用之前，shared-session execution 会在 mutation 前被阻止。official caller-owned HTTP
-pool 只会在一次 single-trace server execution 内复用。
+计费可用之前，shared-session execution 会在 mutation 前被阻止。高层 block executor 会先
+验证完整 block，再对每个 logical trace 使用独立 clean process、official HTTP pool 与 native
+provider；HTTP pool 只会在该 single-trace server execution 内复用。
 
 不得提交 model/data payload、实验结果、从结果选择的 hyperparameter、machine path、credential
 或 provider metadata。Source checkout 除刻意 code/documentation change 外应保持 clean。
