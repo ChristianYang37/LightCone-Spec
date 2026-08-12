@@ -26,6 +26,11 @@ yet been declared.
   begin/reset/finalize hook and a strict host validator. Static retains zero
   detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
   evidence on the supported TP1/DP1 DFlash boundary.
+- Added a CPU-only DSpark native adaptation contract covering adapter-free
+  reconstruction with actual sampled predecessors and W1 features, exact
+  proposal/teacher distributions, layer-only/hybrid selector invariants,
+  conditional-survival confidence loss, and fixed/native verification-budget
+  semantics. The CUDA worker remains unavailable and capability-gated.
 
 ### Changed
 
@@ -37,8 +42,8 @@ yet been declared.
   Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
 - Made the SGLang adaptation-protocol patch test hermetic by loading only its
   config, runtime, and parameter-plan modules. The resulting patch identity is
-  `3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23`
-  with final tree `af7e3e052ffe3c646654a6789555549f052d5385`.
+  `907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4`
+  with final tree `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4`.
 
 ### Evidence status
 

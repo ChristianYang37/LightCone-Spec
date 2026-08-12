@@ -234,6 +234,7 @@ def main() -> int:
                     "pytest",
                     "-q",
                     "test/registered/unit/benchmark/test_serving_output_token_ids.py",
+                    "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
                     "test/registered/unit/spec/test_online_adaptation_protocol.py",
                     "test/registered/unit/spec/test_terminal_speculative_evidence.py",
                 ],

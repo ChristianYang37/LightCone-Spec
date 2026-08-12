@@ -250,7 +250,7 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
             {
                 "file": ("0001-feat-spec-add-schema-v3-native-online-adaptation.patch"),
                 "sha256": (
-                    "3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23"
+                    "907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4"
                 ),
             }
         ],

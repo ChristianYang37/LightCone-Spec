@@ -32,9 +32,9 @@ an experiment, and a historical measurement does not become a formal result.
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `af7e3e052ffe3c646654a6789555549f052d5385` | Full Git tree expected after applying the current patch. |
-| `current_patch_payload_sha256` | `3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23` | SHA-256 of the current mail-patch bytes. |
-| `current_patch_manifest_sha256` | `c9456dc8d6502db8e6d75fe9b9796e88c364c34db8ec81611a50c99f6bca42de` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4` | Full Git tree expected after applying the current patch. |
+| `current_patch_payload_sha256` | `907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4` | SHA-256 of the current mail-patch bytes. |
+| `current_patch_manifest_sha256` | `cc0b09eb93f8a4b341fcd00c61162ef695b81bed37b514c674b37efa37aaa0d9` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -66,14 +66,17 @@ compatibility guards; registration is not executable release support.
 OnlineSPEC remains an important comparison with separate tuning, evidence,
 attestation, and analysis; it cannot select or alter the core gate.
 
-The current pinned SGLang patch contains a lower-level adaptive path only for
+The current pinned SGLang patch contains a lower-level executable adaptive path only for
 TP1/DP1 DFlash. It executes the registered constant, inverse-square-root, and
 finite-horizon cosine schedules plus non-negative logical publication delay.
 It exposes the exact begin/reset/finalize terminal-evidence hook and
 the host adapter validates its content, but the repository ships no trusted
 hardware signer. Static/TTS/L0 therefore remain non-claimable and fail release
 preflight before mutation.
-DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 execution also fail
+DSpark now has a CPU-only native contract for adapter-free reconstruction,
+actual-predecessor W1 features, native-head selection, composite loss, and
+verification-budget semantics. It does not connect a CUDA worker or authorize
+runtime adaptation. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 execution still fail
 closed. A requested quota-shadow row is identity- and quota-recorded, but the
 current DFlash backend capability blocks acquisition instead of fabricating a
 teacher row.

@@ -46,6 +46,15 @@ The current pinned patch implements and tests strict schema-v3 parsing,
 allocation-free Target-only/Static, and TP1/DP1 DFlash native-layer Full/LoRA
 adaptation with fixed-address device-predicated publication. That is a
 lower-level patched-server surface, not end-to-end industrial executor support.
+It also implements a CPU-only DSpark native contract: adapter-free backbone
+reconstruction applies one candidate delta, actual sampled predecessors select
+real Markov W1 embeddings, layer-only scopes freeze W1/W2/acceptance state,
+hybrid scopes train those heads only in Full mode, and the composite objective
+uses exact proposal/teacher distributions with a stop-gradient `1-TV`
+confidence target. Fixed-budget decisions are exact total-token budgets while
+native-scheduler decisions remain authoritative. This contract is not wired to
+the DSpark worker/CUDA publication path and leaves its runtime capability gate
+closed.
 It also makes the official SGLang serving benchmark expose the server-provided,
 ordered `output_ids` for both cumulative/incremental streaming and non-streaming
 responses. Those IDs are never reconstructed by retokenizing generated text;
@@ -57,8 +66,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
-`3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23`
-and final tree `af7e3e052ffe3c646654a6789555549f052d5385`; the manifest remains the
+`907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4`
+and final tree `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -71,7 +80,7 @@ model loading because their execution contracts are not implemented:
 - every TP2 or DP2 run;
 - quota-shadow teacher acquisition when an update round lacks native
   supervision (the fixed ledger records and capability-blocks that need);
-- DSpark composite-head training and NEXTN training interfaces.
+- DSpark worker/CUDA composite-head training and NEXTN training interfaces.
 
 TP1/DP1 DFlash TTS/L0 now execute constant, inverse-square-root-by-published-
 update, and finite-horizon cosine schedules. They also record intrinsic
@@ -112,8 +121,8 @@ python scripts/verify_sglang_patchset.py \
 The verifier must apply the full series in a disposable clone, confirm the
 expected tree and modified-file inventory, compile changed Python, run the
 requested focused tests, reverse the series, and prove the caller's upstream
-checkout stayed clean. The focused adaptation-protocol test loads only the
-patched config, runtime, and parameter-plan modules through a stub package;
+checkout stayed clean. The focused adaptation-protocol tests load only the
+patched config, runtime, parameter-plan, and DSpark CPU-contract modules through a stub package;
 patch-integrity CI therefore does not depend on SGLang's unrelated optional
 top-level serving packages.
 
@@ -132,8 +141,8 @@ insufficient. TP1/DP1 DFlash and its strict native terminal lifecycle are
 implemented, but the release trust policy has no configured signer;
 Static/TTS/L0 industrial cells are therefore `BLOCKED` before mutation rather
 than runnable `UNMEASURED` work. A test signer, provider object attribute, or
-caller-supplied verifier cannot unlock that policy.
-DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2 cell remain
+caller-supplied verifier cannot unlock that policy. The DSpark CPU contract
+does not authorize execution. DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2 cell remain
 `BLOCKED`. Target-only is the only release-executable path.
 
 Historical v2 evidence remains useful for regression comparison only. It does

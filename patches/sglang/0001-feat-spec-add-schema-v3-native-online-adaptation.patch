@@ -1,4 +1,4 @@
-From e7b4328d984eb89452085ceb43f9cf368663e142 Mon Sep 17 00:00:00 2001
+From 3b1f8fad64ff54a37888b77d2885e003358079f4 Mon Sep 17 00:00:00 2001
 From: Christian Yang <ChristianYang37@users.noreply.github.com>
 Date: Tue, 11 Aug 2026 11:42:47 +0800
 Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
@@ -26,26 +26,30 @@ Subject: [PATCH] feat(spec): add schema-v3 native online adaptation
  .../dspark_components/dspark_proposal.py      |   45 +
  .../dspark_components/dspark_verify.py        |    4 +-
  .../dspark_components/dspark_worker_v2.py     |    4 -
+ .../speculative/dspark_online_adaptation.py   |  599 +++++
  python/sglang/srt/speculative/eagle_info.py   |   19 +
  .../srt/speculative/eagle_worker_common.py    |    1 +
  .../sglang/srt/speculative/eagle_worker_v2.py |   86 +-
  .../speculative/online_adaptation_config.py   |  718 +++++
  .../speculative/online_adaptation_runtime.py  | 2396 +++++++++++++++++
- .../srt/speculative/online_parameter_plan.py  |  195 ++
+ .../srt/speculative/online_parameter_plan.py  |  216 ++
  .../srt/speculative/online_valid_mask.py      |  176 ++
  .../terminal_speculative_evidence.py          | 1141 ++++++++
  .../test_serving_output_token_ids.py          |  401 +++
+ .../test_dspark_online_adaptation_contract.py |  442 +++
  .../spec/test_online_adaptation_protocol.py   |  787 ++++++
  .../test_terminal_speculative_evidence.py     |  587 ++++
- 33 files changed, 9005 insertions(+), 185 deletions(-)
+ 35 files changed, 10067 insertions(+), 185 deletions(-)
  create mode 100644 python/sglang/srt/speculative/dflash_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/dspark_components/dspark_proposal.py
+ create mode 100644 python/sglang/srt/speculative/dspark_online_adaptation.py
  create mode 100644 python/sglang/srt/speculative/online_adaptation_config.py
  create mode 100644 python/sglang/srt/speculative/online_adaptation_runtime.py
  create mode 100644 python/sglang/srt/speculative/online_parameter_plan.py
  create mode 100644 python/sglang/srt/speculative/online_valid_mask.py
  create mode 100644 python/sglang/srt/speculative/terminal_speculative_evidence.py
  create mode 100644 test/registered/unit/benchmark/test_serving_output_token_ids.py
+ create mode 100644 test/registered/unit/spec/test_dspark_online_adaptation_contract.py
  create mode 100644 test/registered/unit/spec/test_online_adaptation_protocol.py
  create mode 100644 test/registered/unit/spec/test_terminal_speculative_evidence.py
 
@@ -3764,6 +3768,611 @@ index ae778ee..b56432a 100644
      def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
          self._forced_budget_frac = frac
          self._verify_planner.set_forced_budget_frac(frac)
+diff --git a/python/sglang/srt/speculative/dspark_online_adaptation.py b/python/sglang/srt/speculative/dspark_online_adaptation.py
+new file mode 100644
+index 0000000..d66483a
+--- /dev/null
++++ b/python/sglang/srt/speculative/dspark_online_adaptation.py
+@@ -0,0 +1,599 @@
++"""Pure DSpark adaptation contracts used before CUDA worker integration.
++
++This module deliberately does not authorize the DSpark runtime capability.  It
++defines the backend-owned evidence and math that a later worker integration
++must satisfy without routing DSpark tensors through the DFlash adapter.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from dataclasses import dataclass
++
++import torch
++import torch.nn.functional as F
++from sglang.srt.speculative.online_adaptation_config import OnlineAdaptationConfig
++
++
++def _protocol_sha256(value: object) -> str:
++    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
++    return hashlib.sha256(encoded).hexdigest()
++
++
++DSPARK_CPU_ADAPTATION_PROTOCOL_SHA256 = _protocol_sha256(
++    {
++        "schema_version": 1,
++        "kind": "dspark_cpu_adaptation_contract",
++        "backbone_evidence": "adapter_free_plus_single_delta",
++        "markov_predecessor": "anchor_then_actual_sampled_token",
++        "confidence_target": "stop_gradient_one_minus_total_variation",
++        "confidence_loss": "bce_with_frozen_temperature",
++        "verification": ["fixed_total_token_budget", "native_scheduler"],
++        "runtime_capability_authorized": False,
++    }
++)
++
++
++def _require_float_tensor(value: object, *, name: str, ndim: int) -> torch.Tensor:
++    if not isinstance(value, torch.Tensor):
++        raise TypeError(f"{name} must be a tensor")
++    if value.ndim != ndim or not value.is_floating_point():
++        raise ValueError(f"{name} must be a rank-{ndim} floating tensor")
++    if not bool(torch.isfinite(value).all()):
++        raise ValueError(f"{name} must be finite")
++    return value
++
++
++def _require_token_tensor(value: object, *, name: str, shape: tuple[int, ...]) -> None:
++    if not isinstance(value, torch.Tensor):
++        raise TypeError(f"{name} must be a tensor")
++    if value.shape != shape or value.dtype not in {torch.int32, torch.int64}:
++        raise ValueError(f"{name} has the wrong token layout")
++
++
++@dataclass(frozen=True)
++class DSparkAdapterFreeEvidence:
++    """Inference evidence with the online backbone delta represented once.
++
++    ``adapter_free_logits`` never include an online delta.  The source model's
++    deployed backbone is exactly ``adapter_free_logits + source_delta_logits``.
++    Candidate reconstruction replaces that delta; it never adds a candidate to
++    already-adapted deployed logits.
++    """
++
++    adapter_free_logits: torch.Tensor
++    source_delta_logits: torch.Tensor
++    source_corrected_logits: torch.Tensor
++    source_sampling_probabilities: torch.Tensor
++    teacher_probabilities: torch.Tensor
++    backbone_features: torch.Tensor
++    anchor_token_ids: torch.Tensor
++    sampled_token_ids: torch.Tensor
++    predecessor_embeddings: torch.Tensor
++    confidence: torch.Tensor | None
++    temperatures: torch.Tensor
++    greedy_mask: torch.Tensor
++    valid_mask: torch.Tensor
++    request_ids: tuple[str, ...]
++    cohort_sha256: str
++    source_adapter_version: int
++
++    @classmethod
++    def capture(
++        cls,
++        *,
++        adapter_free_logits: torch.Tensor,
++        source_delta_logits: torch.Tensor,
++        source_corrected_logits: torch.Tensor,
++        source_sampling_probabilities: torch.Tensor,
++        teacher_probabilities: torch.Tensor,
++        backbone_features: torch.Tensor,
++        anchor_token_ids: torch.Tensor,
++        sampled_token_ids: torch.Tensor,
++        predecessor_embeddings: torch.Tensor,
++        source_markov_w1: torch.Tensor,
++        confidence: torch.Tensor | None,
++        temperatures: torch.Tensor,
++        greedy_mask: torch.Tensor,
++        valid_mask: torch.Tensor,
++        request_ids: tuple[str, ...],
++        cohort_sha256: str,
++        source_adapter_version: int,
++    ) -> DSparkAdapterFreeEvidence:
++        base = _require_float_tensor(
++            adapter_free_logits, name="adapter_free_logits", ndim=3
++        )
++        for name, value in (
++            ("source_delta_logits", source_delta_logits),
++            ("source_corrected_logits", source_corrected_logits),
++        ):
++            tensor = _require_float_tensor(value, name=name, ndim=3)
++            if tensor.shape != base.shape or tensor.device != base.device:
++                raise ValueError(f"{name} does not match adapter-free logits")
++        batch, rows, _ = base.shape
++        _require_token_tensor(anchor_token_ids, name="anchor_token_ids", shape=(batch,))
++        _require_token_tensor(
++            sampled_token_ids,
++            name="sampled_token_ids",
++            shape=(batch, rows),
++        )
++        features = _require_float_tensor(
++            backbone_features, name="backbone_features", ndim=3
++        )
++        predecessor = _require_float_tensor(
++            predecessor_embeddings, name="predecessor_embeddings", ndim=3
++        )
++        source_w1 = _require_float_tensor(
++            source_markov_w1, name="source_markov_w1", ndim=2
++        )
++        if (
++            features.shape[:2] != (batch, rows)
++            or predecessor.shape[:2] != (batch, rows)
++            or features.shape[-1] < 1
++            or predecessor.shape[-1] < 1
++            or features.device != base.device
++            or predecessor.device != base.device
++            or source_w1.device != base.device
++            or source_w1.shape[1] != predecessor.shape[2]
++        ):
++            raise ValueError("backend features do not cover every proposal row")
++        predecessor_ids = torch.cat(
++            (anchor_token_ids[:, None], sampled_token_ids[:, :-1]), dim=1
++        )
++        if predecessor_ids.numel() and (
++            bool((predecessor_ids < 0).any())
++            or bool((predecessor_ids >= source_w1.shape[0]).any())
++        ):
++            raise ValueError("source predecessor lies outside the Markov vocabulary")
++        if not torch.allclose(
++            predecessor,
++            F.embedding(predecessor_ids, source_w1),
++            atol=0.0,
++            rtol=0.0,
++        ):
++            raise ValueError("source predecessor embedding is not the actual W1 row")
++        if confidence is not None:
++            confidence_tensor = _require_float_tensor(
++                confidence, name="confidence", ndim=2
++            )
++            if (
++                confidence_tensor.shape != (batch, rows)
++                or confidence_tensor.device != base.device
++                or bool((confidence_tensor < 0).any())
++                or bool((confidence_tensor > 1).any())
++            ):
++                raise ValueError("confidence must be a probability per proposal row")
++        if (
++            not isinstance(temperatures, torch.Tensor)
++            or temperatures.shape != (batch,)
++            or not temperatures.is_floating_point()
++            or temperatures.device != base.device
++            or not bool(torch.isfinite(temperatures).all())
++            or not bool((temperatures > 0).all())
++            or temperatures.requires_grad
++        ):
++            raise ValueError(
++                "temperatures must be positive finite frozen values per request"
++            )
++        if (
++            not isinstance(greedy_mask, torch.Tensor)
++            or greedy_mask.shape != (batch,)
++            or greedy_mask.dtype != torch.bool
++            or greedy_mask.device != base.device
++        ):
++            raise ValueError("greedy_mask must identify every request")
++        if (
++            not isinstance(valid_mask, torch.Tensor)
++            or valid_mask.shape != (batch, rows)
++            or valid_mask.dtype != torch.bool
++            or valid_mask.device != base.device
++        ):
++            raise ValueError("valid_mask must cover every proposal row")
++        proposal = _require_probability_rows(
++            source_sampling_probabilities,
++            name="source_sampling_probabilities",
++            shape=base.shape,
++            device=base.device,
++        )
++        teacher = _require_probability_rows(
++            teacher_probabilities,
++            name="teacher_probabilities",
++            shape=base.shape,
++            device=base.device,
++        )
++        expected_proposal = proposal_probabilities(
++            source_corrected_logits,
++            temperatures,
++            greedy_mask=greedy_mask,
++        )
++        if not torch.allclose(proposal, expected_proposal, atol=1e-6, rtol=1e-5):
++            raise ValueError(
++                "source sampling probabilities are not the deployed proposal"
++            )
++        if (
++            len(request_ids) != batch
++            or not all(isinstance(item, str) and item for item in request_ids)
++            or len(set(request_ids)) != batch
++        ):
++            raise ValueError("request IDs must be a unique non-empty batch identity")
++        if (
++            not isinstance(cohort_sha256, str)
++            or len(cohort_sha256) != 64
++            or any(character not in "0123456789abcdef" for character in cohort_sha256)
++        ):
++            raise ValueError("cohort_sha256 must be lower-case SHA-256")
++        if (
++            not isinstance(source_adapter_version, int)
++            or isinstance(source_adapter_version, bool)
++            or source_adapter_version < 0
++        ):
++            raise ValueError("source adapter version must be non-negative")
++        return cls(
++            base,
++            source_delta_logits,
++            source_corrected_logits,
++            proposal,
++            teacher,
++            features,
++            anchor_token_ids,
++            sampled_token_ids,
++            predecessor,
++            confidence,
++            temperatures,
++            greedy_mask,
++            valid_mask,
++            request_ids,
++            cohort_sha256,
++            source_adapter_version,
++        )
++
++    @property
++    def predecessor_token_ids(self) -> torch.Tensor:
++        return torch.cat(
++            (self.anchor_token_ids[:, None], self.sampled_token_ids[:, :-1]), dim=1
++        )
++
++
++def reconstruct_dspark_logits(
++    evidence: DSparkAdapterFreeEvidence,
++    *,
++    candidate_backbone_delta_logits: torch.Tensor,
++    markov_w1: torch.Tensor,
++    markov_w2: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Reconstruct q with actual sampled predecessors and one backbone delta."""
++
++    delta = _require_float_tensor(
++        candidate_backbone_delta_logits,
++        name="candidate_backbone_delta_logits",
++        ndim=3,
++    )
++    if delta.shape != evidence.adapter_free_logits.shape:
++        raise ValueError("candidate backbone delta has the wrong layout")
++    w1 = _require_float_tensor(markov_w1, name="markov_w1", ndim=2)
++    w2 = _require_float_tensor(markov_w2, name="markov_w2", ndim=2)
++    if w1.shape != w2.shape:
++        raise ValueError("DSpark W1 embedding and W2 projection layouts disagree")
++    predecessor = evidence.predecessor_token_ids
++    if predecessor.numel() and (
++        bool((predecessor < 0).any()) or bool((predecessor >= w1.shape[0]).any())
++    ):
++        raise ValueError("sampled predecessor lies outside the Markov vocabulary")
++    predecessor_embeddings = F.embedding(predecessor, w1)
++    markov_bias = F.linear(predecessor_embeddings, w2)
++    reconstructed = evidence.adapter_free_logits + delta + markov_bias
++    return reconstructed, predecessor_embeddings
++
++
++def proposal_probabilities(
++    corrected_logits: torch.Tensor,
++    temperatures: torch.Tensor,
++    *,
++    greedy_mask: torch.Tensor | None = None,
++) -> torch.Tensor:
++    logits = _require_float_tensor(corrected_logits, name="corrected_logits", ndim=3)
++    if temperatures.shape != (logits.shape[0],):
++        raise ValueError("proposal temperatures do not cover the batch")
++    if (
++        not temperatures.is_floating_point()
++        or temperatures.device != logits.device
++        or not bool(torch.isfinite(temperatures).all())
++        or not bool((temperatures > 0).all())
++        or temperatures.requires_grad
++    ):
++        raise ValueError(
++            "proposal temperatures must be positive, finite, frozen, and colocated"
++        )
++    probabilities = torch.softmax(
++        logits.to(torch.float32) / temperatures[:, None, None], dim=-1
++    )
++    if greedy_mask is None:
++        return probabilities
++    if (
++        greedy_mask.shape != (logits.shape[0],)
++        or greedy_mask.dtype != torch.bool
++        or greedy_mask.device != logits.device
++    ):
++        raise ValueError("proposal greedy mask does not cover the batch")
++    greedy = F.one_hot(logits.argmax(-1), num_classes=logits.shape[-1]).to(
++        probabilities.dtype
++    )
++    return torch.where(greedy_mask[:, None, None], greedy, probabilities)
++
++
++def _require_probability_rows(
++    value: object,
++    *,
++    name: str,
++    shape: tuple[int, ...],
++    device: torch.device,
++) -> torch.Tensor:
++    probabilities = _require_float_tensor(value, name=name, ndim=3)
++    if probabilities.shape != shape or probabilities.device != device:
++        raise ValueError(f"{name} does not cover the evidence rows")
++    if bool((probabilities < 0).any()) or not torch.allclose(
++        probabilities.sum(-1),
++        torch.ones_like(probabilities[..., 0]),
++        atol=1e-5,
++        rtol=1e-5,
++    ):
++        raise ValueError(f"{name} rows must be probability distributions")
++    return probabilities
++
++
++def reconstruct_confidence_logits(
++    *,
++    draft_hidden: torch.Tensor,
++    predecessor_embeddings: torch.Tensor,
++    confidence_weight: torch.Tensor,
++    confidence_bias: torch.Tensor | None,
++) -> torch.Tensor:
++    hidden = _require_float_tensor(draft_hidden, name="draft_hidden", ndim=3)
++    embeddings = _require_float_tensor(
++        predecessor_embeddings, name="predecessor_embeddings", ndim=3
++    )
++    if hidden.shape[:2] != embeddings.shape[:2]:
++        raise ValueError("confidence hidden and predecessor rows disagree")
++    weight = _require_float_tensor(
++        confidence_weight, name="confidence_weight", ndim=2
++    )
++    if weight.shape != (1, hidden.shape[-1] + embeddings.shape[-1]):
++        raise ValueError("confidence projection must consume hidden plus Markov W1")
++    if confidence_bias is not None:
++        bias = _require_float_tensor(confidence_bias, name="confidence_bias", ndim=1)
++        if bias.shape != (1,):
++            raise ValueError("confidence bias must be scalar-output")
++    else:
++        bias = None
++    features = torch.cat((hidden, embeddings.to(hidden.dtype)), dim=-1)
++    return F.linear(features, weight.to(features.dtype), bias).squeeze(-1)
++
++
++def conditional_survival_target(
++    *, target_probabilities: torch.Tensor, proposal_probabilities_: torch.Tensor
++) -> torch.Tensor:
++    target = _require_float_tensor(
++        target_probabilities, name="target_probabilities", ndim=3
++    )
++    proposal = _require_float_tensor(
++        proposal_probabilities_, name="proposal_probabilities", ndim=3
++    )
++    if target.shape != proposal.shape:
++        raise ValueError("target and proposal distributions disagree")
++    for name, value in (("target", target), ("proposal", proposal)):
++        if bool((value < 0).any()) or not torch.allclose(
++            value.sum(-1), torch.ones_like(value[..., 0]), atol=1e-5, rtol=1e-5
++        ):
++            raise ValueError(f"{name} rows must be probability distributions")
++    total_variation = 0.5 * (target - proposal).abs().sum(-1)
++    return (1.0 - total_variation).clamp(0.0, 1.0).detach()
++
++
++@dataclass(frozen=True)
++class DSparkCompositeLoss:
++    total: torch.Tensor
++    proposal: torch.Tensor
++    confidence: torch.Tensor | None
++    conditional_survival: torch.Tensor | None
++
++
++def dspark_composite_loss(
++    *,
++    target_probabilities: torch.Tensor,
++    corrected_proposal_logits: torch.Tensor,
++    temperatures: torch.Tensor,
++    valid_mask: torch.Tensor,
++    position_decay: float,
++    confidence_logits: torch.Tensor | None = None,
++    frozen_confidence_temperature: torch.Tensor | None = None,
++    confidence_loss_weight: float | None = None,
++    exact_proposal_probabilities: torch.Tensor | None = None,
++) -> DSparkCompositeLoss:
++    proposal_logits = _require_float_tensor(
++        corrected_proposal_logits, name="corrected_proposal_logits", ndim=3
++    )
++    target = _require_probability_rows(
++        target_probabilities,
++        name="target_probabilities",
++        shape=tuple(proposal_logits.shape),
++        device=proposal_logits.device,
++    )
++    if (
++        valid_mask.shape != target.shape[:2]
++        or valid_mask.dtype != torch.bool
++        or valid_mask.device != target.device
++    ):
++        raise ValueError("valid mask does not cover teacher rows")
++    if not isinstance(position_decay, (int, float)) or isinstance(position_decay, bool):
++        raise TypeError("position_decay must be numeric")
++    if not math.isfinite(position_decay) or not 0 < position_decay <= 1:
++        raise ValueError("position_decay must be in (0, 1]")
++    weights = float(position_decay) ** torch.arange(
++        target.shape[1], device=target.device, dtype=torch.float32
++    )
++    weights = weights[None, :] * valid_mask.to(torch.float32)
++    normalizer = weights.sum().clamp_min(1.0)
++    proposal_row_loss = F.kl_div(
++        torch.log_softmax(
++            proposal_logits.to(torch.float32) / temperatures[:, None, None],
++            dim=-1,
++        ),
++        target.to(torch.float32),
++        reduction="none",
++    ).sum(-1)
++    proposal_loss = (proposal_row_loss * weights).sum() / normalizer
++    if confidence_loss_weight is None:
++        if (
++            confidence_logits is not None
++            or frozen_confidence_temperature is not None
++            or exact_proposal_probabilities is not None
++        ):
++            raise ValueError("layer-only DSpark must not train confidence state")
++        return DSparkCompositeLoss(proposal_loss, proposal_loss, None, None)
++    if (
++        not isinstance(confidence_loss_weight, (int, float))
++        or isinstance(confidence_loss_weight, bool)
++        or not math.isfinite(confidence_loss_weight)
++        or confidence_loss_weight < 0
++    ):
++        raise ValueError("confidence loss weight must be finite and non-negative")
++    if (
++        confidence_logits is None
++        or frozen_confidence_temperature is None
++        or exact_proposal_probabilities is None
++    ):
++        raise ValueError(
++            "hybrid DSpark requires confidence logits, temperature, and exact proposal"
++        )
++    confidence = _require_float_tensor(
++        confidence_logits, name="confidence_logits", ndim=2
++    )
++    temperature = _require_float_tensor(
++        frozen_confidence_temperature,
++        name="frozen_confidence_temperature",
++        ndim=1,
++    )
++    if confidence.shape != target.shape[:2] or temperature.shape != (target.shape[1],):
++        raise ValueError("confidence rows or frozen temperatures are incomplete")
++    if not bool((temperature > 0).all()) or temperature.requires_grad:
++        raise ValueError("confidence temperatures must be positive and frozen")
++    exact_proposal = _require_probability_rows(
++        exact_proposal_probabilities,
++        name="exact_proposal_probabilities",
++        shape=tuple(target.shape),
++        device=target.device,
++    )
++    survival = conditional_survival_target(
++        target_probabilities=target,
++        proposal_probabilities_=exact_proposal,
++    )
++    confidence_rows = F.binary_cross_entropy_with_logits(
++        confidence.to(torch.float32) / temperature[None, :],
++        survival,
++        reduction="none",
++    )
++    confidence_loss = (confidence_rows * weights).sum() / normalizer
++    total = proposal_loss + float(confidence_loss_weight) * confidence_loss
++    return DSparkCompositeLoss(total, proposal_loss, confidence_loss, survival)
++
++
++@dataclass(frozen=True)
++class DSparkVerificationDecision:
++    mode: str
++    total_token_budget: int | None
++    additional_token_budget: int | None
++    native_scheduler_authoritative: bool
++    global_verify_all_override: bool = False
++
++
++def resolve_dspark_verification(
++    *,
++    mode: str,
++    batch_size: int,
++    verify_width: int,
++    fixed_total_token_budget: int | None,
++    native_total_token_budget: int | None,
++) -> DSparkVerificationDecision:
++    if (
++        not isinstance(batch_size, int)
++        or isinstance(batch_size, bool)
++        or batch_size < 1
++        or not isinstance(verify_width, int)
++        or isinstance(verify_width, bool)
++        or verify_width < 1
++    ):
++        raise ValueError("verification dimensions must be positive integers")
++    maximum = batch_size * verify_width
++    if mode == "fixed_budget":
++        if native_total_token_budget is not None:
++            raise ValueError("fixed verification cannot consume a native decision")
++        if (
++            not isinstance(fixed_total_token_budget, int)
++            or isinstance(fixed_total_token_budget, bool)
++            or not batch_size <= fixed_total_token_budget <= maximum
++        ):
++            raise ValueError("fixed verification budget lies outside the exact batch")
++        return DSparkVerificationDecision(
++            mode,
++            fixed_total_token_budget,
++            fixed_total_token_budget - batch_size,
++            False,
++        )
++    if mode != "native_scheduler":
++        raise ValueError("unknown DSpark verification mode")
++    if fixed_total_token_budget is not None:
++        raise ValueError("native verification cannot consume a fixed decision")
++    if native_total_token_budget is not None and (
++        not isinstance(native_total_token_budget, int)
++        or isinstance(native_total_token_budget, bool)
++        or not batch_size <= native_total_token_budget <= maximum
++    ):
++        raise ValueError("native verification decision lies outside the exact batch")
++    return DSparkVerificationDecision(
++        mode,
++        native_total_token_budget,
++        (
++            None
++            if native_total_token_budget is None
++            else native_total_token_budget - batch_size
++        ),
++        True,
++    )
++
++
++@dataclass(frozen=True)
++class DSparkCPUContract:
++    adaptation_config_sha256: str
++    verification_mode: str
++    protocol_sha256: str = DSPARK_CPU_ADAPTATION_PROTOCOL_SHA256
++    runtime_capability_authorized: bool = False
++
++
++def maybe_build_dspark_cpu_contract(
++    config: OnlineAdaptationConfig | None,
++) -> DSparkCPUContract | None:
++    """Return no object for Static/disabled paths and allocate no tensor state."""
++
++    if config is None:
++        return None
++    if config.algorithm != "DSPARK":
++        raise ValueError("DSpark CPU contract requires a DSpark configuration")
++    return DSparkCPUContract(config.sha256, config.verification_mode)
++
++
++__all__ = (
++    "DSPARK_CPU_ADAPTATION_PROTOCOL_SHA256",
++    "DSparkAdapterFreeEvidence",
++    "DSparkCPUContract",
++    "DSparkCompositeLoss",
++    "DSparkVerificationDecision",
++    "conditional_survival_target",
++    "dspark_composite_loss",
++    "maybe_build_dspark_cpu_contract",
++    "proposal_probabilities",
++    "reconstruct_confidence_logits",
++    "reconstruct_dspark_logits",
++    "resolve_dspark_verification",
++)
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
 index 4184fe4..ba7a039 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
@@ -7165,10 +7774,10 @@ index 0000000..78bc29c
 +        return payload
 diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
 new file mode 100644
-index 0000000..203c395
+index 0000000..b443931
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_parameter_plan.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,216 @@
 +"""Backend-native, deterministic LightCone trainable-parameter selectors."""
 +
 +from __future__ import annotations
@@ -7262,9 +7871,30 @@ index 0000000..203c395
 +            "DSpark selector requires one scalar-output acceptance projection"
 +        )
 +    by_name = dict(rows)
++    w1_weight = by_name[w1[0]]
++    w2_weight = by_name[w2[0]]
++    if (
++        w1_weight.ndim != 2
++        or w2_weight.ndim != 2
++        or w1_weight.shape != w2_weight.shape
++    ):
++        raise ValueError(
++            "DSpark W1 embedding and W2 projection must share [vocab, rank]"
++        )
 +    weight = by_name[acceptance_weights[0]]
-+    if weight.ndim != 2 or weight.shape[0] != 1:
-+        raise ValueError("DSpark acceptance projection must have one output")
++    if (
++        weight.ndim != 2
++        or weight.shape[0] != 1
++        or weight.shape[1] <= w1_weight.shape[1]
++    ):
++        raise ValueError(
++            "DSpark acceptance projection must consume hidden plus Markov W1"
++        )
++    acceptance_biases = [name for name in acceptance if name.endswith(".bias")]
++    if len(acceptance_biases) > 1:
++        raise ValueError("DSpark selector permits at most one acceptance bias")
++    if acceptance_biases and by_name[acceptance_biases[0]].shape != (1,):
++        raise ValueError("DSpark acceptance projection bias must be scalar-output")
 +    return tuple(sorted((*w1, *w2, *acceptance)))
 +
 +
@@ -9100,9 +9730,457 @@ index 0000000..f333274
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/test/registered/unit/spec/test_dspark_online_adaptation_contract.py b/test/registered/unit/spec/test_dspark_online_adaptation_contract.py
+new file mode 100644
+index 0000000..5d8a80a
+--- /dev/null
++++ b/test/registered/unit/spec/test_dspark_online_adaptation_contract.py
+@@ -0,0 +1,442 @@
++from __future__ import annotations
++
++import importlib.util
++import json
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from types import ModuleType
++from unittest.mock import patch
++
++import torch
++
++PYTHON_ROOT = Path(__file__).resolve().parents[4] / "python"
++SPECULATIVE_ROOT = PYTHON_ROOT / "sglang/srt/speculative"
++
++
++def _stub_package(name: str, path: Path) -> ModuleType:
++    package = ModuleType(name)
++    package.__package__ = name
++    package.__path__ = [str(path)]
++    sys.modules[name] = package
++    return package
++
++
++def _load_module(name: str, path: Path) -> ModuleType:
++    spec = importlib.util.spec_from_file_location(name, path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++SGLANG_PACKAGE = _stub_package("sglang", PYTHON_ROOT / "sglang")
++SRT_PACKAGE = _stub_package("sglang.srt", PYTHON_ROOT / "sglang/srt")
++SPECULATIVE_PACKAGE = _stub_package("sglang.srt.speculative", SPECULATIVE_ROOT)
++SGLANG_PACKAGE.srt = SRT_PACKAGE
++SRT_PACKAGE.speculative = SPECULATIVE_PACKAGE
++
++CONFIG_MODULE = _load_module(
++    "sglang.srt.speculative.online_adaptation_config",
++    SPECULATIVE_ROOT / "online_adaptation_config.py",
++)
++CONTRACT_MODULE = _load_module(
++    "sglang.srt.speculative.dspark_online_adaptation",
++    SPECULATIVE_ROOT / "dspark_online_adaptation.py",
++)
++PLAN_MODULE = _load_module(
++    "sglang.srt.speculative.online_parameter_plan",
++    SPECULATIVE_ROOT / "online_parameter_plan.py",
++)
++
++BACKEND_ADAPTATION_CAPABILITIES = CONFIG_MODULE.BACKEND_ADAPTATION_CAPABILITIES
++OnlineAdaptationConfig = CONFIG_MODULE.OnlineAdaptationConfig
++DSparkAdapterFreeEvidence = CONTRACT_MODULE.DSparkAdapterFreeEvidence
++conditional_survival_target = CONTRACT_MODULE.conditional_survival_target
++dspark_composite_loss = CONTRACT_MODULE.dspark_composite_loss
++maybe_build_dspark_cpu_contract = CONTRACT_MODULE.maybe_build_dspark_cpu_contract
++proposal_probabilities = CONTRACT_MODULE.proposal_probabilities
++reconstruct_confidence_logits = CONTRACT_MODULE.reconstruct_confidence_logits
++reconstruct_dspark_logits = CONTRACT_MODULE.reconstruct_dspark_logits
++resolve_dspark_verification = CONTRACT_MODULE.resolve_dspark_verification
++build_native_parameter_plan = PLAN_MODULE.build_native_parameter_plan
++
++
++def _payload(*, scope: str = "last3", mode: str = "lora") -> dict:
++    hybrid = scope.endswith("_native_heads")
++    return {
++        "schema_version": 3,
++        "method": "l0",
++        "algorithm": "DSPARK",
++        "weight_update_mode": mode,
++        "parameter_scope": scope,
++        "kv_history_policy": "frozen",
++        "adaptation_scope": "cohort",
++        "adaptation_group_id": "cohort-a",
++        "tenant_id": "research",
++        "optimizer": {
++            "name": "adamw",
++            "learning_rate": 1e-5,
++            "weight_decay": 0.01,
++            "beta1": 0.9,
++            "beta2": 0.999,
++            "epsilon": 1e-8,
++            "grad_clip": 1.0,
++            "momentum": None,
++            "muon_ns_steps": None,
++            "muon_auxiliary_learning_rate": None,
++            "muon_auxiliary_weight_decay": None,
++            "schedule": "constant",
++            "schedule_total_published_updates": None,
++        },
++        "rank": None if mode == "full" else 2,
++        "lora_alpha": None if mode == "full" else 2,
++        "lora_matrix_policy": "registered_matrices_v1",
++        "native_head_policy": "full" if hybrid else "frozen",
++        "stride": 10,
++        "max_in_flight": 1,
++        "canvas_tokens": 4,
++        "loss_position_decay": 1.0,
++        "extra_logical_delay": 0,
++        "teacher_row_policy": "update_round",
++        "verification_mode": "native_scheduler",
++        "fixed_verification_budget": None,
++        "confidence_loss_weight": 0.25 if hybrid else None,
++        "target_revision": "a" * 40,
++        "drafter_revision": "b" * 40,
++        "sampling_profile_sha256": "c" * 64,
++        "telemetry_detail": "profile",
++        "topology": {
++            "tensor_parallel_size": 1,
++            "data_parallel_size": 1,
++            "tp_rank": 0,
++            "dp_rank": 0,
++            "node_count": 1,
++            "node_rank": 0,
++            "device_identity": "gpu-uuid-0",
++            "rendezvous_identity": "local-rendezvous",
++            "router_identity": "single-replica",
++            "clock_identity": "locked-clock-profile",
++            "process_group_backend": "nccl",
++            "distributed_runtime_capability": "single_rank",
++            "distributed_capability_receipt_sha256": None,
++        },
++        "online_spec": None,
++    }
++
++
++def _load(value: dict) -> OnlineAdaptationConfig:
++    with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
++        json.dump(value, handle)
++        handle.flush()
++        return OnlineAdaptationConfig.load(handle.name)
++
++
++def _evidence(
++    sampled_token_ids: torch.Tensor | None = None,
++) -> DSparkAdapterFreeEvidence:
++    source_corrected_logits = torch.full((1, 3, 5), 11.0)
++    sampled = (
++        torch.tensor([[1, 2, 3]])
++        if sampled_token_ids is None
++        else sampled_token_ids
++    )
++    return DSparkAdapterFreeEvidence.capture(
++        adapter_free_logits=torch.zeros(1, 3, 5),
++        source_delta_logits=torch.full((1, 3, 5), 9.0),
++        source_corrected_logits=source_corrected_logits,
++        source_sampling_probabilities=torch.softmax(
++            source_corrected_logits, dim=-1
++        ),
++        teacher_probabilities=torch.softmax(torch.ones(1, 3, 5), dim=-1),
++        backbone_features=torch.ones(1, 3, 4),
++        anchor_token_ids=torch.tensor([4]),
++        sampled_token_ids=sampled,
++        predecessor_embeddings=torch.ones(1, 3, 2),
++        source_markov_w1=torch.ones(5, 2),
++        confidence=torch.full((1, 3), 0.5),
++        temperatures=torch.ones(1),
++        greedy_mask=torch.zeros(1, dtype=torch.bool),
++        valid_mask=torch.ones(1, 3, dtype=torch.bool),
++        request_ids=("request-0",),
++        cohort_sha256="d" * 64,
++        source_adapter_version=7,
++    )
++
++
++def _native_rows() -> list[tuple[str, torch.Tensor]]:
++    rows: list[tuple[str, torch.Tensor]] = []
++    for index in range(5):
++        rows.extend(
++            (
++                (f"layers.{index}.self_attn.q_proj.weight", torch.zeros(4, 4)),
++                (f"layers.{index}.input_layernorm.weight", torch.zeros(4)),
++            )
++        )
++    rows.extend(
++        (
++            ("markov_head.markov_w1.weight", torch.zeros(5, 2)),
++            ("markov_head.markov_w2.weight", torch.zeros(5, 2)),
++            ("confidence_head.proj.weight", torch.zeros(1, 6)),
++            ("confidence_head.proj.bias", torch.zeros(1)),
++        )
++    )
++    return rows
++
++
++class DSparkEvidenceAndReconstructionTests(unittest.TestCase):
++    def test_actual_sampled_predecessor_drives_markov_reconstruction(self):
++        evidence = _evidence()
++        w1 = torch.tensor(
++            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [2.0, 2.0], [3.0, 1.0]]
++        )
++        w2 = torch.tensor(
++            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 0.0], [0.0, -1.0]]
++        )
++        candidate_delta = torch.full((1, 3, 5), 2.0)
++        reconstructed, predecessor_embeddings = reconstruct_dspark_logits(
++            evidence,
++            candidate_backbone_delta_logits=candidate_delta,
++            markov_w1=w1,
++            markov_w2=w2,
++        )
++        self.assertEqual(evidence.predecessor_token_ids.tolist(), [[4, 1, 2]])
++        torch.testing.assert_close(
++            predecessor_embeddings,
++            w1[torch.tensor([[4, 1, 2]])],
++        )
++        expected = candidate_delta + torch.nn.functional.linear(
++            predecessor_embeddings, w2
++        )
++        torch.testing.assert_close(reconstructed, expected)
++
++        changed = _evidence(torch.tensor([[3, 2, 1]]))
++        changed_logits, _ = reconstruct_dspark_logits(
++            changed,
++            candidate_backbone_delta_logits=candidate_delta,
++            markov_w1=w1,
++            markov_w2=w2,
++        )
++        self.assertFalse(torch.equal(reconstructed[:, 1], changed_logits[:, 1]))
++
++    def test_candidate_replaces_source_delta_instead_of_double_counting_it(self):
++        evidence = _evidence()
++        zero_heads = torch.zeros(5, 2)
++        candidate_delta = torch.full((1, 3, 5), 2.0)
++        reconstructed, _ = reconstruct_dspark_logits(
++            evidence,
++            candidate_backbone_delta_logits=candidate_delta,
++            markov_w1=zero_heads,
++            markov_w2=zero_heads,
++        )
++        torch.testing.assert_close(reconstructed, candidate_delta)
++        self.assertFalse(
++            torch.equal(reconstructed, evidence.source_corrected_logits + candidate_delta)
++        )
++
++    def test_evidence_rejects_duplicate_request_identity(self):
++        with self.assertRaisesRegex(ValueError, "unique"):
++            DSparkAdapterFreeEvidence.capture(
++                adapter_free_logits=torch.zeros(2, 1, 3),
++                source_delta_logits=torch.zeros(2, 1, 3),
++                source_corrected_logits=torch.zeros(2, 1, 3),
++                source_sampling_probabilities=torch.full((2, 1, 3), 1 / 3),
++                teacher_probabilities=torch.full((2, 1, 3), 1 / 3),
++                backbone_features=torch.zeros(2, 1, 4),
++                anchor_token_ids=torch.tensor([0, 1]),
++                sampled_token_ids=torch.tensor([[1], [2]]),
++                predecessor_embeddings=torch.zeros(2, 1, 2),
++                source_markov_w1=torch.zeros(3, 2),
++                confidence=None,
++                temperatures=torch.ones(2),
++                greedy_mask=torch.zeros(2, dtype=torch.bool),
++                valid_mask=torch.ones(2, 1, dtype=torch.bool),
++                request_ids=("same", "same"),
++                cohort_sha256="d" * 64,
++                source_adapter_version=0,
++            )
++
++    def test_source_predecessor_embedding_and_sampling_distribution_are_exact(self):
++        with self.assertRaisesRegex(ValueError, "actual W1 row"):
++            DSparkAdapterFreeEvidence.capture(
++                adapter_free_logits=torch.zeros(1, 1, 3),
++                source_delta_logits=torch.zeros(1, 1, 3),
++                source_corrected_logits=torch.tensor([[[0.0, 1.0, 2.0]]]),
++                source_sampling_probabilities=torch.softmax(
++                    torch.tensor([[[0.0, 0.5, 1.0]]]), dim=-1
++                ),
++                teacher_probabilities=torch.full((1, 1, 3), 1 / 3),
++                backbone_features=torch.zeros(1, 1, 4),
++                anchor_token_ids=torch.tensor([2]),
++                sampled_token_ids=torch.tensor([[1]]),
++                predecessor_embeddings=torch.zeros(1, 1, 2),
++                source_markov_w1=torch.ones(3, 2),
++                confidence=None,
++                temperatures=torch.tensor([2.0]),
++                greedy_mask=torch.zeros(1, dtype=torch.bool),
++                valid_mask=torch.ones(1, 1, dtype=torch.bool),
++                request_ids=("request-0",),
++                cohort_sha256="d" * 64,
++                source_adapter_version=0,
++            )
++        self.assertEqual(
++            proposal_probabilities(
++                torch.tensor([[[0.0, 1.0, 2.0]]]),
++                torch.tensor([2.0]),
++                greedy_mask=torch.ones(1, dtype=torch.bool),
++            ).tolist(),
++            [[[0.0, 0.0, 1.0]]],
++        )
++
++
++class DSparkParameterPlanContractTests(unittest.TestCase):
++    def test_layer_only_freezes_heads_and_hybrid_keeps_them_full(self):
++        rows = _native_rows()
++        layer_only = build_native_parameter_plan(rows, _load(_payload()))
++        self.assertTrue(set(layer_only.native_head_names) <= set(layer_only.frozen_names))
++        self.assertFalse(set(layer_only.native_head_names) & set(layer_only.selected_names))
++
++        hybrid = build_native_parameter_plan(
++            rows, _load(_payload(scope="last3_native_heads"))
++        )
++        self.assertTrue(set(hybrid.native_head_names) <= set(hybrid.full_names))
++        self.assertFalse(set(hybrid.native_head_names) & set(hybrid.lora_names))
++
++    def test_missing_or_malformed_native_heads_fail_closed(self):
++        rows = _native_rows()
++        config = _load(_payload())
++        with self.assertRaisesRegex(ValueError, "exact Markov W1 and W2"):
++            build_native_parameter_plan(
++                [row for row in rows if "markov_w2" not in row[0]], config
++            )
++        malformed = [
++            (name, torch.zeros(4, 2) if "markov_w2" in name else tensor)
++            for name, tensor in rows
++        ]
++        with self.assertRaisesRegex(ValueError, r"share \[vocab, rank\]"):
++            build_native_parameter_plan(malformed, config)
++        wrong_confidence = [
++            (name, torch.zeros(2, 3) if name.endswith("proj.weight") else tensor)
++            for name, tensor in rows
++        ]
++        with self.assertRaisesRegex(ValueError, "consume hidden plus Markov W1"):
++            build_native_parameter_plan(wrong_confidence, config)
++        duplicate_bias = [
++            *rows,
++            ("alternate.confidence_head.proj.bias", torch.zeros(1)),
++        ]
++        with self.assertRaisesRegex(ValueError, "at most one acceptance bias"):
++            build_native_parameter_plan(duplicate_bias, config)
++
++
++class DSparkConfidenceLossTests(unittest.TestCase):
++    def test_survival_is_one_minus_tv_and_stop_gradient(self):
++        target = torch.tensor([[[0.75, 0.25]]])
++        proposal = torch.tensor([[[0.25, 0.75]]], requires_grad=True)
++        survival = conditional_survival_target(
++            target_probabilities=target,
++            proposal_probabilities_=proposal,
++        )
++        torch.testing.assert_close(survival, torch.tensor([[0.5]]))
++        self.assertFalse(survival.requires_grad)
++
++    def test_confidence_uses_real_w1_features_and_locked_bce(self):
++        hidden = torch.tensor([[[2.0, -1.0]]])
++        embeddings = torch.tensor([[[3.0, 4.0]]])
++        confidence_logits = reconstruct_confidence_logits(
++            draft_hidden=hidden,
++            predecessor_embeddings=embeddings,
++            confidence_weight=torch.tensor([[1.0, 0.0, 2.0, -1.0]]),
++            confidence_bias=torch.tensor([0.5]),
++        )
++        torch.testing.assert_close(confidence_logits, torch.tensor([[4.5]]))
++
++        target_probabilities = torch.tensor([[[0.75, 0.25]]])
++        proposal_logits = torch.log(torch.tensor([[[0.25, 0.75]]]))
++        result = dspark_composite_loss(
++            target_probabilities=target_probabilities,
++            corrected_proposal_logits=proposal_logits,
++            temperatures=torch.ones(1),
++            valid_mask=torch.ones(1, 1, dtype=torch.bool),
++            position_decay=1.0,
++            confidence_logits=torch.zeros(1, 1),
++            frozen_confidence_temperature=torch.ones(1),
++            confidence_loss_weight=0.25,
++            exact_proposal_probabilities=torch.tensor([[[0.25, 0.75]]]),
++        )
++        torch.testing.assert_close(result.conditional_survival, torch.tensor([[0.5]]))
++        torch.testing.assert_close(result.confidence, torch.tensor(0.6931472))
++        torch.testing.assert_close(
++            result.total, result.proposal + 0.25 * result.confidence
++        )
++
++    def test_layer_only_confidence_state_is_structurally_absent(self):
++        logits = torch.zeros(1, 1, 2)
++        result = dspark_composite_loss(
++            target_probabilities=torch.full_like(logits, 0.5),
++            corrected_proposal_logits=logits,
++            temperatures=torch.ones(1),
++            valid_mask=torch.ones(1, 1, dtype=torch.bool),
++            position_decay=1.0,
++        )
++        self.assertIsNone(result.confidence)
++        with self.assertRaisesRegex(ValueError, "must not train confidence"):
++            dspark_composite_loss(
++                target_probabilities=torch.full_like(logits, 0.5),
++                corrected_proposal_logits=logits,
++                temperatures=torch.ones(1),
++                valid_mask=torch.ones(1, 1, dtype=torch.bool),
++                position_decay=1.0,
++                confidence_logits=torch.zeros(1, 1),
++            )
++
++
++class DSparkVerificationAndAllocationTests(unittest.TestCase):
++    def test_fixed_budget_is_exact_total_not_native_or_verify_all(self):
++        fixed = resolve_dspark_verification(
++            mode="fixed_budget",
++            batch_size=3,
++            verify_width=5,
++            fixed_total_token_budget=9,
++            native_total_token_budget=None,
++        )
++        self.assertEqual((fixed.total_token_budget, fixed.additional_token_budget), (9, 6))
++        self.assertFalse(fixed.native_scheduler_authoritative)
++        self.assertFalse(fixed.global_verify_all_override)
++        with self.assertRaisesRegex(ValueError, "cannot consume a native"):
++            resolve_dspark_verification(
++                mode="fixed_budget",
++                batch_size=3,
++                verify_width=5,
++                fixed_total_token_budget=9,
++                native_total_token_budget=8,
++            )
++
++    def test_native_scheduler_decision_remains_authoritative(self):
++        native = resolve_dspark_verification(
++            mode="native_scheduler",
++            batch_size=3,
++            verify_width=5,
++            fixed_total_token_budget=None,
++            native_total_token_budget=8,
++        )
++        self.assertTrue(native.native_scheduler_authoritative)
++        self.assertEqual(native.additional_token_budget, 5)
++        self.assertFalse(native.global_verify_all_override)
++
++    def test_static_disabled_contract_allocates_nothing_and_gate_stays_closed(self):
++        with patch.object(torch, "empty", side_effect=AssertionError("allocated")):
++            self.assertIsNone(maybe_build_dspark_cpu_contract(None))
++        contract = maybe_build_dspark_cpu_contract(_load(_payload()))
++        self.assertIsNotNone(contract)
++        self.assertFalse(contract.runtime_capability_authorized)
++        self.assertEqual(
++            BACKEND_ADAPTATION_CAPABILITIES["DSPARK"],
++            "unavailable_native_update",
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/test/registered/unit/spec/test_online_adaptation_protocol.py b/test/registered/unit/spec/test_online_adaptation_protocol.py
 new file mode 100644
-index 0000000..00a4879
+index 0000000..9814a40
 --- /dev/null
 +++ b/test/registered/unit/spec/test_online_adaptation_protocol.py
 @@ -0,0 +1,787 @@
@@ -9542,7 +10620,7 @@ index 0000000..00a4879
 +        rows.extend(
 +            (
 +                ("markov_head.markov_w1.weight", torch.zeros(32, 4)),
-+                ("markov_head.markov_w2.weight", torch.zeros(4, 32)),
++                ("markov_head.markov_w2.weight", torch.zeros(32, 4)),
 +                ("confidence_head.proj.weight", torch.zeros(1, 8)),
 +                ("confidence_head.proj.bias", torch.zeros(1)),
 +            )
@@ -9566,7 +10644,7 @@ index 0000000..00a4879
 +        rows.extend(
 +            (
 +                ("markov_head.markov_w1.weight", torch.zeros(32, 4)),
-+                ("markov_head.markov_w2.weight", torch.zeros(4, 32)),
++                ("markov_head.markov_w2.weight", torch.zeros(32, 4)),
 +                ("confidence_head.proj.weight", torch.zeros(1, 8)),
 +            )
 +        )

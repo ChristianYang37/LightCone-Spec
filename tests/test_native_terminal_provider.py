@@ -983,8 +983,8 @@ def test_final_hook_patch_and_tree_are_exactly_pinned() -> None:
         "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
     )
     assert PINNED_SGLANG_PATCH_SHA256 == (
-        "3d29ea64ac1dc3d9ad2b869ba5ce685e60182f412d9346b5ed9a92ad99baba23"
+        "907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4"
     )
-    assert PINNED_SGLANG_TREE == "af7e3e052ffe3c646654a6789555549f052d5385"
+    assert PINNED_SGLANG_TREE == "c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4"
     assert canonical_sha256({"b": 2, "a": 1}) == canonical_sha256({"a": 1, "b": 2})
     assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'
