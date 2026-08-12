@@ -22,6 +22,7 @@ import stat
 import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -61,6 +62,12 @@ from lightcone_spec.experiments.gpu_pool import (
     _make_wave_execution_receipt,
     execute_dispatch_plan,
     validate_dispatch_resume,
+)
+from lightcone_spec.experiments.interference_authority import (
+    InterferenceCalibrationAuthority,
+    InterferenceCalibrationBlockedError,
+    InterferenceCalibrationSourceAuthority,
+    require_calibrated_interference_execution_authority,
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
 from lightcone_spec.experiments.planning import (
@@ -2217,6 +2224,141 @@ class BoundExecutionArtifact:
 
 
 @dataclass(frozen=True)
+class InterferenceCalibrationTerminalBundle:
+    """One calibration run reconstructed from its raw plan and terminal files."""
+
+    execution_bundle: BoundJsonSource
+    terminal_binding: AssignmentTerminalBinding
+
+    def __post_init__(self) -> None:
+        if type(self.execution_bundle) is not BoundJsonSource:
+            raise TypeError("calibration terminal requires an exact execution bundle")
+        if type(self.terminal_binding) is not AssignmentTerminalBinding:
+            raise TypeError("calibration terminal requires an exact terminal binding")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "execution_bundle": self.execution_bundle.to_dict(),
+            "terminal_binding": self.terminal_binding.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _strict_object(
+            "interference calibration terminal bundle",
+            value,
+            frozenset({"execution_bundle", "terminal_binding"}),
+        )
+        return cls(
+            execution_bundle=BoundJsonSource.from_dict(row["execution_bundle"]),
+            terminal_binding=AssignmentTerminalBinding.from_dict(
+                row["terminal_binding"]
+            ),
+        )
+
+    def reconstruct(self) -> AssignmentTerminalAuthority:
+        raw_bundle = IndustrialAssignmentExecutionBundle.load(
+            self.execution_bundle.path
+        )
+        if (
+            raw_bundle.sha256 != self.execution_bundle.semantic_sha256
+            or raw_bundle.sha256 != self.execution_bundle.canonical_sha256
+        ):
+            raise ValueError("calibration execution-bundle identity mismatch")
+        if (
+            raw_bundle.interference_calibration_authority is not None
+            or InterferenceEnvelope.from_dict(
+                raw_bundle.interference_envelope.load()
+            ).rules
+        ):
+            raise ValueError(
+                "calibration terminal execution must use the serial preflight path"
+            )
+        plan = raw_bundle.reconstruct_execution_plan()
+        return AssignmentTerminalAuthority.from_binding(
+            self.terminal_binding,
+            plan=plan,
+        )
+
+
+@dataclass(frozen=True)
+class InterferenceCalibrationExecutionAuthority:
+    """Path-bound raw calibration authority carried by a formal bundle."""
+
+    schema_version: int
+    kind: Literal["industrial_interference_calibration_execution_authority"]
+    source: InterferenceCalibrationSourceAuthority
+    terminals: tuple[InterferenceCalibrationTerminalBundle, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.kind != "industrial_interference_calibration_execution_authority"
+        ):
+            raise ValueError("calibration execution authority schema is unsupported")
+        if type(self.source) is not InterferenceCalibrationSourceAuthority:
+            raise TypeError("calibration execution authority requires raw sources")
+        if any(
+            type(terminal) is not InterferenceCalibrationTerminalBundle
+            for terminal in self.terminals
+        ):
+            raise TypeError("calibration execution authority has a wrong terminal")
+        identities = tuple(
+            terminal.terminal_binding.authority_sha256 for terminal in self.terminals
+        )
+        if not identities or identities != tuple(sorted(set(identities))):
+            raise ValueError(
+                "calibration execution terminals must be authority-sorted and unique"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "source": self.source.to_dict(),
+            "terminals": [terminal.to_dict() for terminal in self.terminals],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _strict_object(
+            "interference calibration execution authority",
+            value,
+            frozenset({"schema_version", "kind", "source", "terminals"}),
+        )
+        return cls(
+            schema_version=_strict_int(
+                "calibration execution authority schema", row["schema_version"]
+            ),
+            kind=_strict_text("calibration execution authority kind", row["kind"]),
+            source=InterferenceCalibrationSourceAuthority.from_dict(row["source"]),
+            terminals=tuple(
+                InterferenceCalibrationTerminalBundle.from_dict(item)
+                for item in _strict_list(
+                    "calibration execution terminals", row["terminals"]
+                )
+            ),
+        )
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self.to_dict())
+
+    def reconstruct(self) -> InterferenceCalibrationAuthority:
+        authorities = tuple(terminal.reconstruct() for terminal in self.terminals)
+        result = InterferenceCalibrationAuthority(
+            schema_version=1,
+            source=self.source,
+            terminal_authorities=authorities,
+        )
+        if tuple(authority.sha256 for authority in authorities) != tuple(
+            terminal.terminal_binding.authority_sha256 for terminal in self.terminals
+        ):
+            raise ValueError("calibration terminal binding identities changed")
+        return result
+
+
+@dataclass(frozen=True)
 class IndustrialExecutionPlanAudit:
     """Non-executable proof of raw component and scheduler replay only."""
 
@@ -2281,6 +2423,7 @@ class IndustrialAssignmentExecutionBundle:
     inventory: BoundJsonSource
     interference_envelope: BoundJsonSource
     interference_source_receipt: BoundJsonSource
+    interference_calibration_authority: InterferenceCalibrationExecutionAuthority | None
     budget_plan: BoundJsonSource
     budget_policy: BoundJsonSource
     budget_load_bindings: tuple[BoundJsonSource, ...]
@@ -2309,7 +2452,7 @@ class IndustrialAssignmentExecutionBundle:
     execution_policy: BoundJsonSource
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != _BUNDLE_KIND:
+        if self.schema_version != 2 or self.kind != _BUNDLE_KIND:
             raise ValueError("industrial execution-bundle schema is unsupported")
         for name in (
             "assignment_sha256",
@@ -2351,6 +2494,12 @@ class IndustrialAssignmentExecutionBundle:
         )
         if any(type(source) is not BoundJsonSource for source in sources):
             raise TypeError("execution bundle contains a non-exact JSON source")
+        if (
+            self.interference_calibration_authority is not None
+            and type(self.interference_calibration_authority)
+            is not InterferenceCalibrationExecutionAuthority
+        ):
+            raise TypeError("execution bundle has a wrong calibration authority")
         artifacts = (
             *self.dependency_artifacts,
             self.split_artifact,
@@ -2391,6 +2540,11 @@ class IndustrialAssignmentExecutionBundle:
             "inventory": self.inventory.to_dict(),
             "interference_envelope": self.interference_envelope.to_dict(),
             "interference_source_receipt": (self.interference_source_receipt.to_dict()),
+            "interference_calibration_authority": (
+                None
+                if self.interference_calibration_authority is None
+                else self.interference_calibration_authority.to_dict()
+            ),
             "budget_plan": self.budget_plan.to_dict(),
             "budget_policy": self.budget_policy.to_dict(),
             "budget_load_bindings": [
@@ -2446,6 +2600,7 @@ class IndustrialAssignmentExecutionBundle:
                 "inventory",
                 "interference_envelope",
                 "interference_source_receipt",
+                "interference_calibration_authority",
                 "budget_plan",
                 "budget_policy",
                 "budget_load_bindings",
@@ -2496,6 +2651,13 @@ class IndustrialAssignmentExecutionBundle:
             ),
             interference_source_receipt=BoundJsonSource.from_dict(
                 row["interference_source_receipt"]
+            ),
+            interference_calibration_authority=(
+                None
+                if row["interference_calibration_authority"] is None
+                else InterferenceCalibrationExecutionAuthority.from_dict(
+                    row["interference_calibration_authority"]
+                )
             ),
             budget_plan=BoundJsonSource.from_dict(row["budget_plan"]),
             budget_policy=BoundJsonSource.from_dict(row["budget_policy"]),
@@ -2601,11 +2763,12 @@ class IndustrialAssignmentExecutionBundle:
         if inventory.sha256 != self.inventory.semantic_sha256:
             raise ValueError("bundle inventory semantic identity mismatch")
         envelope = InterferenceEnvelope.from_dict(self.interference_envelope.load())
-        _validate_serial_interference_authority(
+        interference_calibration_authority = _replay_interference_authority(
             inventory=inventory,
             envelope=envelope,
             envelope_source=self.interference_envelope,
             receipt_source=self.interference_source_receipt,
+            calibration_source=self.interference_calibration_authority,
         )
         receipts = tuple(
             _receipt_from_dict(source.load()) for source in self.dependency_receipts
@@ -2682,8 +2845,13 @@ class IndustrialAssignmentExecutionBundle:
             expected_context_value = context.authority_dict()
             expected_context_value.update(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "kind": "gpu_dispatch_execution_context",
+                    "interference_calibration_authority_sha256": (
+                        None
+                        if interference_calibration_authority is None
+                        else interference_calibration_authority.sha256
+                    ),
                     "budget_plan_sha256": budget_plan.sha256,
                     "capacity_authority_sha256": capacity_authority.sha256,
                     "budget_materialization_authority_sha256": (
@@ -2710,6 +2878,7 @@ class IndustrialAssignmentExecutionBundle:
                 },
                 budget_plan=budget_plan,
                 budget_materialization_authority=(budget_materialization_authority),
+                interference_calibration_authority=(interference_calibration_authority),
                 completion_authorities=completion_authorities,
             )
             expected_context_value = context.authority_dict()
@@ -2980,31 +3149,47 @@ class IndustrialAssignmentExecutionBundle:
         return plan
 
 
-def _validate_serial_interference_authority(
+def _replay_interference_authority(
     *,
     inventory: GpuInventory,
     envelope: InterferenceEnvelope,
     envelope_source: BoundJsonSource,
     receipt_source: BoundJsonSource,
-) -> None:
-    """Replay the only current release interference policy from its receipt."""
+    calibration_source: InterferenceCalibrationExecutionAuthority | None,
+) -> InterferenceCalibrationAuthority | None:
+    """Replay serial or calibrated interference authority from raw files."""
 
-    # Rule-bearing envelopes require a separate path-bound calibration
-    # authority.  This bundle schema deliberately carries only the serial
-    # receipt; registered calibrated envelopes must use the formal raw
-    # calibration-authority path rather than a caller-controlled receipt.
-    from lightcone_spec.experiments.interference_authority import (
-        InterferenceCalibrationBlockedError,
-        require_calibrated_interference_execution_authority,
-    )
+    if envelope.rules:
+        if calibration_source is None:
+            raise ExecutionBundleBlockedError(
+                "calibrated_interference_raw_authority_required"
+            )
+        raw_manifest = calibration_source.source.manifest
+        if (
+            receipt_source.path != raw_manifest.path
+            or receipt_source.canonical_sha256 != raw_manifest.semantic_sha256
+            or receipt_source.semantic_sha256 != raw_manifest.semantic_sha256
+            or receipt_source.file_sha256 != raw_manifest.file_sha256
+            or receipt_source.sidecar_file_sha256 != raw_manifest.sidecar_file_sha256
+            or receipt_source.size != raw_manifest.size
+        ):
+            raise ValueError(
+                "calibrated interference source receipt must bind its raw manifest"
+            )
+        authority = calibration_source.reconstruct()
+        try:
+            require_calibrated_interference_execution_authority(
+                envelope,
+                authority=authority,
+            )
+        except InterferenceCalibrationBlockedError as exc:
+            raise ExecutionBundleBlockedError(exc.reason_code) from exc
+        if envelope.sha256 != envelope_source.semantic_sha256:
+            raise ValueError("calibrated interference envelope identity mismatch")
+        return authority
 
-    try:
-        require_calibrated_interference_execution_authority(
-            envelope,
-            authority=None,
-        )
-    except InterferenceCalibrationBlockedError as exc:
-        raise ExecutionBundleBlockedError(exc.reason_code) from exc
+    if calibration_source is not None:
+        raise ValueError("serial interference envelope cannot carry calibration")
 
     receipt = receipt_source.load()
     expected_envelope, expected_receipt = build_serial_interference_envelope(inventory)
@@ -3020,6 +3205,7 @@ def _validate_serial_interference_authority(
         or envelope.sha256 != envelope_source.semantic_sha256
     ):
         raise ValueError("interference envelope differs from its raw serial receipt")
+    return None
 
 
 def _rematerialize_budget_authority(
@@ -3222,6 +3408,7 @@ def _context_integer(source: BoundJsonSource, name: str) -> int:
                 "registry_sha256",
                 "inventory_sha256",
                 "interference_envelope_sha256",
+                "interference_calibration_authority_sha256",
                 "budget_sha256s",
                 "receipt_sha256s",
                 "completed_cell_ids",
@@ -3238,8 +3425,11 @@ def _context_integer(source: BoundJsonSource, name: str) -> int:
             }
         ),
     )
-    if value["schema_version"] != 3 or value["kind"] != _CONTEXT_KIND:
+    if value["schema_version"] != 4 or value["kind"] != _CONTEXT_KIND:
         raise ValueError("bundle requires an execution dispatch context")
+    calibration_sha256 = value["interference_calibration_authority_sha256"]
+    if calibration_sha256 is not None:
+        _require_sha256("dispatch context interference calibration", calibration_sha256)
     _require_sha256("dispatch context budget plan", value["budget_plan_sha256"])
     _require_sha256(
         "dispatch context capacity authority", value["capacity_authority_sha256"]

@@ -377,6 +377,45 @@ class RawInterferenceJsonBinding:
             "sidecar_size": self.sidecar_size,
         }
 
+    @classmethod
+    def from_dict(cls, value: object) -> RawInterferenceJsonBinding:
+        row = _strict_object(
+            "raw interference JSON binding",
+            value,
+            frozenset(
+                {
+                    "schema_version",
+                    "role",
+                    "path",
+                    "sidecar_path",
+                    "semantic_sha256",
+                    "file_sha256",
+                    "sidecar_file_sha256",
+                    "size",
+                    "sidecar_size",
+                }
+            ),
+        )
+        binding = cls(
+            schema_version=_strict_int("raw binding schema", row["schema_version"]),
+            role=_strict_text("raw binding role", row["role"]),
+            path=_strict_text("raw binding path", row["path"]),
+            sidecar_path=_strict_text("raw binding sidecar", row["sidecar_path"]),
+            semantic_sha256=_require_sha256(
+                "raw binding semantic SHA-256", row["semantic_sha256"]
+            ),
+            file_sha256=_require_sha256("raw binding file SHA-256", row["file_sha256"]),
+            sidecar_file_sha256=_require_sha256(
+                "raw binding sidecar SHA-256", row["sidecar_file_sha256"]
+            ),
+            size=_strict_int("raw binding size", row["size"], minimum=1),
+            sidecar_size=_strict_int(
+                "raw binding sidecar size", row["sidecar_size"], minimum=1
+            ),
+        )
+        binding.load()
+        return binding
+
     @cached_property
     def sha256(self) -> str:
         return content_sha256(self.to_dict())
@@ -1489,6 +1528,53 @@ class InterferenceCalibrationSourceAuthority:
             protocol=protocol,
             manifest=manifest,
         )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "interference_calibration_source_authority",
+            "inventory": self.inventory.to_dict(),
+            "inventory_source_receipt": self.inventory_source_receipt.to_dict(),
+            "hardware_envelope": self.hardware_envelope.to_dict(),
+            "protocol": self.protocol.to_dict(),
+            "manifest": self.manifest.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> InterferenceCalibrationSourceAuthority:
+        row = _strict_object(
+            "interference calibration source authority",
+            value,
+            frozenset(
+                {
+                    "schema_version",
+                    "kind",
+                    "inventory",
+                    "inventory_source_receipt",
+                    "hardware_envelope",
+                    "protocol",
+                    "manifest",
+                }
+            ),
+        )
+        if (
+            row["schema_version"] != 1
+            or row["kind"] != "interference_calibration_source_authority"
+        ):
+            raise ValueError("interference source authority schema is unsupported")
+        authority = cls(
+            inventory=RawInterferenceJsonBinding.from_dict(row["inventory"]),
+            inventory_source_receipt=RawInterferenceJsonBinding.from_dict(
+                row["inventory_source_receipt"]
+            ),
+            hardware_envelope=RawInterferenceJsonBinding.from_dict(
+                row["hardware_envelope"]
+            ),
+            protocol=RawInterferenceJsonBinding.from_dict(row["protocol"]),
+            manifest=RawInterferenceJsonBinding.from_dict(row["manifest"]),
+        )
+        authority.audit()
+        return authority
 
     @cached_property
     def sha256(self) -> str:

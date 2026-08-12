@@ -2832,6 +2832,7 @@ def _validate_alias_dispatch_authority(
             "registry_sha256",
             "inventory_sha256",
             "interference_envelope_sha256",
+            "interference_calibration_authority_sha256",
             "budget_sha256s",
             "receipt_sha256s",
             "completed_cell_ids",
@@ -2896,12 +2897,13 @@ def _validate_alias_dispatch_authority(
         or dispatch.get("inventory_sha256") != inventory.sha256
         or dispatch.get("completed_cell_ids") != list(completed_cell_ids)
         or plan.get("dispatch_plan_sha256") != content_sha256(dispatch)
-        or authority.get("schema_version") != 3
+        or authority.get("schema_version") != 4
         or authority.get("kind") != "gpu_dispatch_execution_context"
         or authority.get("registry_sha256") != registry.sha256
         or authority.get("inventory_sha256") != inventory.sha256
         or authority.get("interference_envelope_sha256")
         != dispatch.get("interference_envelope_sha256")
+        or authority.get("interference_calibration_authority_sha256") is not None
         or authority.get("seed") != dispatch.get("seed")
         or authority.get("completed_cell_ids") != list(completed_cell_ids)
         or authority.get("completion_authority_sha256s")

@@ -923,8 +923,9 @@ def _bundle_fixture(
     context_value = context.authority_dict()
     context_value.update(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "kind": "gpu_dispatch_execution_context",
+            "interference_calibration_authority_sha256": None,
             "budget_plan_sha256": budget_plan.sha256,
             "capacity_authority_sha256": capacity_authority.sha256,
             "budget_materialization_authority_sha256": (
@@ -997,7 +998,7 @@ def _bundle_fixture(
         semantic_sha256=inventory_receipt_sha256,
     )
     bundle = IndustrialAssignmentExecutionBundle(
-        schema_version=1,
+        schema_version=2,
         kind="industrial_assignment_execution_bundle",
         assignment_sha256=assignment.assignment_id,
         cell_id=cell.cell_id,
@@ -1013,6 +1014,7 @@ def _bundle_fixture(
             interference_receipt_path,
             semantic_sha256=interference_receipt["receipt_sha256"],
         ),
+        interference_calibration_authority=None,
         budget_plan=_source(budget_plan_path, semantic_sha256=budget_plan.sha256),
         budget_policy=_source(policy_path, semantic_sha256=policy.sha256),
         budget_load_bindings=budget_load_sources,
@@ -1500,6 +1502,24 @@ def test_bundle_loader_rejects_duplicate_json_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate JSON key"):
         IndustrialAssignmentExecutionBundle.load(path)
+
+
+def test_bundle_v2_requires_explicit_interference_authority_slot(
+    tmp_path: Path,
+) -> None:
+    bundle_path, _ = _bundle_fixture(tmp_path)
+    value = json.loads(bundle_path.read_text(encoding="utf-8"))
+    value.pop("interference_calibration_authority")
+
+    forged_path = _write_bound(tmp_path / "missing-calibration-authority.json", value)
+    with pytest.raises(ValueError, match="fields differ"):
+        IndustrialAssignmentExecutionBundle.load(forged_path)
+
+    value["interference_calibration_authority"] = None
+    value["schema_version"] = 1
+    legacy_path = _write_bound(tmp_path / "legacy-bundle.json", value)
+    with pytest.raises(ValueError, match="schema is unsupported"):
+        IndustrialAssignmentExecutionBundle.load(legacy_path)
 
 
 def test_release_authority_blocks_before_output_root_creation(tmp_path: Path) -> None:

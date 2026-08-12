@@ -31,6 +31,9 @@ if TYPE_CHECKING:
         AssignmentTerminalBinding,
         CompletedCellAuthority,
     )
+    from lightcone_spec.experiments.interference_authority import (
+        InterferenceCalibrationAuthority,
+    )
 
 from lightcone_spec.experiments.planning import (
     BudgetMaterializationAuthorityBinding,
@@ -2938,6 +2941,10 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
     budget_materialization_authority: BudgetMaterializationAuthorityBinding = field(
         kw_only=True
     )
+    interference_calibration_authority: InterferenceCalibrationAuthority | None = field(
+        kw_only=True,
+        default=None,
+    )
     completion_authorities: tuple[CompletedCellAuthority, ...] = ()
     # Resume authorities deliberately do not enter ``authority_dict``: adding
     # them after a failed attempt must not mutate the identity of the frozen
@@ -2949,17 +2956,20 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         super().__post_init__()
         # A rule-bearing interference envelope is only a compact scheduler
         # input.  It cannot authorize concurrent execution without replaying
-        # the release-owned raw calibration authority.  The current release
-        # deliberately has no registered acceptance threshold, so formal
-        # execution must stop here before scheduling or launch side effects.
+        # the release-owned raw calibration authority.
         from lightcone_spec.experiments.interference_authority import (
-            require_calibrated_interference_execution_authority,
+            InterferenceCalibrationAuthority,
         )
 
-        require_calibrated_interference_execution_authority(
-            self.interference_envelope,
-            authority=None,
-        )
+        if (
+            self.interference_calibration_authority is not None
+            and type(self.interference_calibration_authority)
+            is not InterferenceCalibrationAuthority
+        ):
+            raise TypeError(
+                "execution interference calibration requires an exact raw authority"
+            )
+        self._require_ready_interference_authority()
         self._validate_budget_plan_identity()
         self._revalidate_budget_materialization_authority()
         if self.completed_cell_ids:
@@ -3111,6 +3121,18 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
         )
         return result.budget_plan.budgets
 
+    def _require_ready_interference_authority(self) -> None:
+        """Reopen calibrated evidence immediately before every formal use."""
+
+        from lightcone_spec.experiments.interference_authority import (
+            require_calibrated_interference_execution_authority,
+        )
+
+        require_calibrated_interference_execution_authority(
+            self.interference_envelope,
+            authority=self.interference_calibration_authority,
+        )
+
     def _budget_activation_replay(self):
         """Reopen the tagged raw activation authority and compare context inputs."""
 
@@ -3175,6 +3197,7 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
     def issue_plan(self) -> GpuDispatchPlan:
         """Revalidate raw completion before sole-scheduler replay."""
 
+        self._require_ready_interference_authority()
         self.require_ready_budget_authority()
         scheduler = GpuPoolScheduler(
             registry=self.registry,
@@ -3198,13 +3221,19 @@ class GpuDispatchExecutionContext(GpuDispatchPlanningContext):
 
         self._validate_budget_plan_identity()
         self._revalidate_budget_materialization_authority()
+        self._require_ready_interference_authority()
         capacity_authority = self.budget_plan.capacity_authority
         if capacity_authority is None:  # pragma: no cover - constructor invariant
             raise RuntimeError("execution capacity authority disappeared")
         value = super().authority_dict()
         self._budget_activation_replay()
-        value["schema_version"] = 3
+        value["schema_version"] = 4
         value["kind"] = "gpu_dispatch_execution_context"
+        value["interference_calibration_authority_sha256"] = (
+            None
+            if self.interference_calibration_authority is None
+            else self.interference_calibration_authority.sha256
+        )
         value["budget_plan_sha256"] = self.budget_plan.sha256
         value["capacity_authority_sha256"] = capacity_authority.sha256
         value["budget_materialization_authority_sha256"] = (

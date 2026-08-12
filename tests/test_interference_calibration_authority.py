@@ -581,6 +581,23 @@ def test_bound_source_rejects_tamper_and_joint_rehash(tmp_path: Path) -> None:
         binding.load()
 
 
+def test_raw_source_and_source_authority_wire_round_trip_reopens_files(
+    tmp_path: Path,
+) -> None:
+    source, _ = _source_authority(tmp_path, count=2, cardinality=2)
+
+    assert (
+        RawInterferenceJsonBinding.from_dict(source.inventory.to_dict())
+        == source.inventory
+    )
+    assert InterferenceCalibrationSourceAuthority.from_dict(source.to_dict()) == source
+
+    manifest_path = Path(source.manifest.path)
+    _write_bound(manifest_path, {"jointly": "rewritten"})
+    with pytest.raises(RuntimeError, match="bytes or sidecar changed"):
+        InterferenceCalibrationSourceAuthority.from_dict(source.to_dict())
+
+
 def test_bound_source_rejects_symlink(tmp_path: Path) -> None:
     target = _write_bound(tmp_path / "target.json", {"value": 1})
     link = tmp_path / "link.json"
