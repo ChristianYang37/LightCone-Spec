@@ -49,6 +49,7 @@ from lightcone_spec.experiments.gpu_pool import (
 from lightcone_spec.experiments.industrial_analysis import (
     _DISABLED_SESSION_RUN_FIELDS,
     BoundArtifact,
+    E3bLongContextRawFamilyInput,
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
     RawEvidenceAliasManifest,
@@ -57,6 +58,7 @@ from lightcone_spec.experiments.industrial_analysis import (
     raw_evidence_alias_manifest_from_dict,
     reduce_confirmation_family_power,
     reduce_e2_stage_from_raw,
+    reduce_e3b_long_context_from_raw,
     reduce_evidence_alias,
     reduce_industrial_schema_v3,
 )
@@ -2056,6 +2058,109 @@ def _load_industrial_analysis_manifest(
     )
 
 
+def _load_e3b_long_context_analysis_manifest(
+    path: str | Path,
+) -> tuple[
+    ExperimentRegistry,
+    tuple[E3bLongContextRawFamilyInput, ...],
+    GpuInventory,
+    HardwareEnvelope,
+    int,
+    int,
+]:
+    """Reopen path-bound per-family manifests without accepting metric rows."""
+
+    manifest_path = Path(path)
+    manifest_sidecar = Path(f"{manifest_path}.sha256")
+    if (
+        manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or manifest_sidecar.is_symlink()
+        or not manifest_sidecar.is_file()
+    ):
+        raise ValueError("E3b long-context manifest must be a regular bound file")
+    value = _load_bound_json(manifest_path)
+    expected = {
+        "schema_version",
+        "kind",
+        "family_manifests",
+        "bootstrap",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("E3b long-context manifest fields do not match schema")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "industrial_e3b_long_context_analysis_manifest"
+    ):
+        raise ValueError("E3b long-context manifest identity mismatch")
+    raw_families = value.get("family_manifests")
+    if not isinstance(raw_families, list) or not raw_families:
+        raise ValueError("E3b long-context manifest requires raw family manifests")
+    family_paths = tuple(
+        Path(
+            os.path.abspath(
+                os.fspath(
+                    _analysis_bound_json_path(
+                        manifest_path,
+                        binding,
+                        label=f"E3b raw family manifest {index}",
+                    )
+                )
+            )
+        )
+        for index, binding in enumerate(raw_families)
+    )
+    if len(set(family_paths)) != len(family_paths):
+        raise ValueError("E3b long-context manifest duplicates a raw family path")
+    bootstrap = value.get("bootstrap")
+    if not isinstance(bootstrap, dict) or set(bootstrap) != {
+        "repetitions",
+        "seed",
+    }:
+        raise ValueError("E3b long-context bootstrap fields do not match schema")
+    repetitions = bootstrap.get("repetitions")
+    seed = bootstrap.get("seed")
+    if (
+        not isinstance(repetitions, int)
+        or isinstance(repetitions, bool)
+        or repetitions < 100
+        or not isinstance(seed, int)
+        or isinstance(seed, bool)
+        or not 0 <= seed < 2**64
+    ):
+        raise ValueError("E3b long-context bootstrap values are invalid")
+
+    loaded = tuple(_load_industrial_analysis_manifest(path) for path in family_paths)
+    registry = loaded[0][0]
+    inventory = loaded[0][4]
+    envelope = loaded[0][5]
+    if any(
+        row[0].sha256 != registry.sha256
+        or row[4] != inventory
+        or row[5] != envelope
+        or row[11] != repetitions
+        or row[12] != seed
+        for row in loaded
+    ):
+        raise ValueError(
+            "E3b raw families differ in registry, inventory, hardware, or bootstrap"
+        )
+    families = tuple(
+        E3bLongContextRawFamilyInput(
+            pilot_activation=row[1],
+            final_activation=row[2],
+            confirmation_reduction=row[3],
+            blocks=row[6],
+            evidence_alias_manifests=row[7],
+            evidence_dependence_map=row[8],
+            gpu_attestation=row[9],
+            doctor_report=row[10],
+        )
+        for row in loaded
+    )
+    return registry, families, inventory, envelope, repetitions, seed
+
+
 def _parse_locked_outputs(values: list[str]) -> dict[str, str]:
     return {
         name: _artifact_sha256(path)
@@ -2377,6 +2482,10 @@ def _parser() -> argparse.ArgumentParser:
     analyze_industrial = commands.add_parser("analyze-industrial")
     analyze_industrial.add_argument("--manifest", required=True)
     analyze_industrial.add_argument("--output", required=True)
+
+    analyze_e3b = commands.add_parser("analyze-e3b-long-context")
+    analyze_e3b.add_argument("--manifest", required=True)
+    analyze_e3b.add_argument("--output", required=True)
 
     build_online = commands.add_parser("build-onlinespec-study")
     build_online.add_argument("--output", required=True)
@@ -6692,6 +6801,28 @@ def _analyze_industrial(args: argparse.Namespace) -> int:
     return 42
 
 
+def _analyze_e3b_long_context(args: argparse.Namespace) -> int:
+    registry, families, inventory, envelope, repetitions, seed = (
+        _load_e3b_long_context_analysis_manifest(args.manifest)
+    )
+    artifact = reduce_e3b_long_context_from_raw(
+        registry=registry,
+        families=families,
+        hardware_envelope=envelope,
+        inventory=inventory,
+        bootstrap_repetitions=repetitions,
+        bootstrap_seed=seed,
+    )
+    payload = artifact.to_dict()
+    if _canonical_sha256(payload) != artifact.sha256:
+        raise RuntimeError("E3b long-context reducer digest is not canonical")
+    _write_json(args.output, payload)
+    if _artifact_sha256(args.output) != artifact.sha256:
+        raise RuntimeError("written E3b long-context reducer identity changed")
+    print(artifact.sha256)
+    return 42
+
+
 def _print_formal_workload_block(
     *,
     workload_id: str | None,
@@ -6838,6 +6969,8 @@ def main(argv: list[str] | None = None) -> int:
         return _build_evidence_dependence_map(args)
     if args.command == "analyze-industrial":
         return _analyze_industrial(args)
+    if args.command == "analyze-e3b-long-context":
+        return _analyze_e3b_long_context(args)
     if args.command == "build-onlinespec-study":
         manifest = OnlineSpecManifest.default()
         manifest.write(args.output)

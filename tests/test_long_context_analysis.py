@@ -493,5 +493,6 @@ def test_hierarchical_bootstrap_refits_every_replicate_and_is_seed_bound(
     repeated = reduce_e3b_long_context_pair(plan, rows)
     assert repeated == result
     assert repeated.sha256 == result.sha256
+    assert result.sha256 == content_sha256(result.to_dict())
     assert fit_calls == 4 * (plan.bootstrap_repetitions + 1)
     assert replace(plan, bootstrap_seed=74).sha256 != plan.sha256

@@ -7,6 +7,7 @@ from lightcone_spec.experiments import (
     completion_authority,
     gpu_pool,
     industrial_analysis,
+    long_context_analysis,
     planning,
     planning_artifacts,
 )
@@ -45,6 +46,21 @@ def test_experiment_public_api_exports_industrial_planning_and_pool() -> None:
                 industrial_analysis.reduce_confirmation_family_power
             ),
             "reduce_e2_stage_from_raw": industrial_analysis.reduce_e2_stage_from_raw,
+            "E3bLongContextAnalysisPlan": (
+                long_context_analysis.E3bLongContextAnalysisPlan
+            ),
+            "E3bLongContextRawFamilyInput": (
+                industrial_analysis.E3bLongContextRawFamilyInput
+            ),
+            "E3bLongContextStageArtifact": (
+                industrial_analysis.E3bLongContextStageArtifact
+            ),
+            "reduce_e3b_long_context_pair": (
+                long_context_analysis.reduce_e3b_long_context_pair
+            ),
+            "reduce_e3b_long_context_from_raw": (
+                industrial_analysis.reduce_e3b_long_context_from_raw
+            ),
         }
     )
 
