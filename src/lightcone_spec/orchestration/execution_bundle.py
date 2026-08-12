@@ -27,6 +27,15 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.adaptation.parameters import TrainablePlan
+from lightcone_spec.adaptation.plan_authority import (
+    TrainablePlanAuthorityBinding,
+    TrainablePlanRawJsonBinding,
+    audit_trainable_plan_authority_for_method,
+    require_trainable_plan_authority_for_method,
+    trainable_plan_authority_binding_from_dict,
+    trainable_plan_authority_binding_to_dict,
+)
 from lightcone_spec.config import load_run_config, run_config_sha256
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.budget_authority import (
@@ -95,12 +104,18 @@ from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.serving import PinnedBenchServingTransport
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
-    is_serving_interference_calibration_cell,
 )
 from lightcone_spec.locking.models import ModelLock
+from lightcone_spec.locking.prepared_models import (
+    PreparedModelContentAuthorityBlocked,
+    has_prepared_model_content_release_manifest_sha256,
+)
 from lightcone_spec.orchestration.executor import (
+    PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
+    TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON,
     ArtifactBinding,
     IndustrialExecutionPlan,
+    TrainablePlanExecutionBlockedError,
     build_industrial_execution_plan,
     execute_industrial_plan,
     industrial_execution_split_contract,
@@ -155,12 +170,6 @@ class ExecutionBundleBlockedError(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = _strict_text("bundle BLOCKED reason", reason_code)
         super().__init__(f"industrial execution bundle is BLOCKED: {reason_code}")
-
-
-def _is_interference_calibration_cell(cell: object) -> bool:
-    return type(cell) is ExperimentCell and is_serving_interference_calibration_cell(
-        cell
-    )
 
 
 def _absolute_lexical_path(path: str | Path) -> Path:
@@ -1601,6 +1610,59 @@ def _preflight_bundle_assignment_sources(
     preflight_compile_cache_launch(compile_plan)
 
 
+def _preflight_bundle_trainable_plan_release_trust(
+    bundle: IndustrialAssignmentExecutionBundle,
+) -> None:
+    """Reject absent adapted release trust before global wave mutation."""
+
+    method = _strict_object(
+        "bundle preflight RunConfig",
+        bundle.run_config.load(),
+        frozenset(
+            {
+                "schema_version",
+                "method",
+                "model",
+                "runtime",
+                "adaptation",
+                "online_spec",
+                "tenant_id",
+            }
+        ),
+    )["method"]
+    if method in {"target_only", "static"}:
+        if (
+            bundle.trainable_plan_authority is not None
+            or bundle.prepared_model_content_release_manifest_sha256 is not None
+        ):
+            raise ValueError(
+                "Target-only/Static bundle must not carry trainable-plan authority"
+            )
+        return
+    if method not in {"tts", "l0"}:
+        raise ExecutionBundleBlockedError(
+            "current_release_core_trainable_plan_method_required"
+        )
+    authority = bundle.trainable_plan_authority
+    if type(authority) is not TrainablePlanAuthorityBinding:
+        raise ExecutionBundleBlockedError(
+            TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON
+        )
+    claimed = bundle.prepared_model_content_release_manifest_sha256
+    if claimed is None:
+        raise ExecutionBundleBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    if not has_prepared_model_content_release_manifest_sha256(
+        model_lock_sha256=authority.model_lock_sha256,
+        prepared=authority.prepared_model_content_authority.prepared_model_set,
+        claimed_manifest_sha256=claimed,
+    ):
+        raise ExecutionBundleBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+
+
 def _declared_wave_assignment_ids(
     bundle: IndustrialAssignmentExecutionBundle,
     *,
@@ -1659,6 +1721,7 @@ async def execute_dispatch_wave_bundles(
     _require_shared_bundle_authority(bundles)
     for bundle in bundles:
         _preflight_bundle_assignment_sources(bundle)
+        _preflight_bundle_trainable_plan_release_trust(bundle)
 
     declared_wave_ids = _declared_wave_assignment_ids(
         bundles[0],
@@ -1695,15 +1758,12 @@ async def execute_dispatch_wave_bundles(
         if assignment is None or assignment.work_item.item_id != bundle.cell_id:
             raise ValueError("execution bundle names another dispatch assignment")
         cell = assignment.work_item.cell
-        calibration = _is_interference_calibration_cell(cell)
-        if (
-            cell.identity.method != "target_only" and not calibration
-        ) or cell.resources.workload_class in {
+        if cell.resources.workload_class in {
             WorkloadClass.COMPILE,
             WorkloadClass.DOWNLOAD,
         }:
             raise ExecutionBundleBlockedError(
-                "current_release_target_only_serving_bundle_required"
+                "current_release_serving_execution_bundle_required"
             )
         bundle_by_assignment[bundle.assignment_sha256] = bundle
     if set(bundle_by_assignment) != set(assignment_by_id):
@@ -2466,13 +2526,15 @@ class IndustrialAssignmentExecutionBundle:
     sampling_artifact: BoundExecutionArtifact
     model_lock_artifact: BoundExecutionArtifact
     prepared_models: BoundJsonSource
+    trainable_plan_authority: TrainablePlanAuthorityBinding | None
+    prepared_model_content_release_manifest_sha256: str | None
     compile_cache_plan: BoundJsonSource
     inventory_source_artifact: BoundExecutionArtifact
     runtime_envelope_artifact: BoundExecutionArtifact
     execution_policy: BoundJsonSource
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2 or self.kind != _BUNDLE_KIND:
+        if self.schema_version != 3 or self.kind != _BUNDLE_KIND:
             raise ValueError("industrial execution-bundle schema is unsupported")
         for name in (
             "assignment_sha256",
@@ -2520,6 +2582,16 @@ class IndustrialAssignmentExecutionBundle:
             is not InterferenceCalibrationExecutionAuthority
         ):
             raise TypeError("execution bundle has a wrong calibration authority")
+        if (
+            self.trainable_plan_authority is not None
+            and type(self.trainable_plan_authority) is not TrainablePlanAuthorityBinding
+        ):
+            raise TypeError("execution bundle has a wrong trainable-plan authority")
+        if self.prepared_model_content_release_manifest_sha256 is not None:
+            _require_sha256(
+                "bundle prepared model content release manifest",
+                self.prepared_model_content_release_manifest_sha256,
+            )
         artifacts = (
             *self.dependency_artifacts,
             self.split_artifact,
@@ -2595,6 +2667,16 @@ class IndustrialAssignmentExecutionBundle:
             "sampling_artifact": self.sampling_artifact.to_dict(),
             "model_lock_artifact": self.model_lock_artifact.to_dict(),
             "prepared_models": self.prepared_models.to_dict(),
+            "trainable_plan_authority": (
+                None
+                if self.trainable_plan_authority is None
+                else trainable_plan_authority_binding_to_dict(
+                    self.trainable_plan_authority
+                )
+            ),
+            "prepared_model_content_release_manifest_sha256": (
+                self.prepared_model_content_release_manifest_sha256
+            ),
             "compile_cache_plan": self.compile_cache_plan.to_dict(),
             "inventory_source_artifact": (self.inventory_source_artifact.to_dict()),
             "runtime_envelope_artifact": (self.runtime_envelope_artifact.to_dict()),
@@ -2643,6 +2725,8 @@ class IndustrialAssignmentExecutionBundle:
                 "sampling_artifact",
                 "model_lock_artifact",
                 "prepared_models",
+                "trainable_plan_authority",
+                "prepared_model_content_release_manifest_sha256",
                 "compile_cache_plan",
                 "inventory_source_artifact",
                 "runtime_envelope_artifact",
@@ -2726,6 +2810,21 @@ class IndustrialAssignmentExecutionBundle:
                 row["model_lock_artifact"]
             ),
             prepared_models=BoundJsonSource.from_dict(row["prepared_models"]),
+            trainable_plan_authority=(
+                None
+                if row["trainable_plan_authority"] is None
+                else trainable_plan_authority_binding_from_dict(
+                    row["trainable_plan_authority"]
+                )
+            ),
+            prepared_model_content_release_manifest_sha256=(
+                None
+                if row["prepared_model_content_release_manifest_sha256"] is None
+                else _require_sha256(
+                    "bundle prepared model content release manifest",
+                    row["prepared_model_content_release_manifest_sha256"],
+                )
+            ),
             compile_cache_plan=BoundJsonSource.from_dict(row["compile_cache_plan"]),
             inventory_source_artifact=BoundExecutionArtifact.from_dict(
                 row["inventory_source_artifact"]
@@ -2944,15 +3043,12 @@ class IndustrialAssignmentExecutionBundle:
         if assignment.work_item.item_id != self.cell_id:
             raise ValueError("execution bundle assignment names another cell")
         cell = assignment.work_item.cell
-        calibration = _is_interference_calibration_cell(cell)
-        if (
-            cell.identity.method != "target_only" and not calibration
-        ) or cell.resources.workload_class in {
+        if cell.resources.workload_class in {
             WorkloadClass.COMPILE,
             WorkloadClass.DOWNLOAD,
         }:
             raise ExecutionBundleBlockedError(
-                "current_release_target_only_serving_bundle_required"
+                "current_release_serving_execution_bundle_required"
             )
         budget = _one_budget(budgets, self.cell_id)
         run_config = load_run_config(self.run_config.path)
@@ -2978,22 +3074,6 @@ class IndustrialAssignmentExecutionBundle:
                 "topology/run config differs from the planned physical assignment"
             )
         runtime = None
-        if not diagnostic:
-            if type(context) is not GpuDispatchExecutionContext:  # pragma: no cover
-                raise RuntimeError("formal replay lost its execution context")
-            runtime = render_assigned_industrial_cell_runtime_plan(
-                registry=registry,
-                cell_id=self.cell_id,
-                assignment=assignment,
-                dispatch_plan=dispatch,
-                dispatch_context=context,
-                budget=budget,
-                inventory=inventory,
-                dispatch_inventory_sha256=inventory.sha256,
-                rank_configs=(run_config,),
-                topology_receipts=topology,
-                dependency_receipts=receipts,
-            )
         load = production_load_plan_from_dict(self.production_load.load())
         if load.paired_replay_sha256 != self.production_load.semantic_sha256:
             raise ValueError("production-load semantic identity mismatch")
@@ -3037,6 +3117,31 @@ class IndustrialAssignmentExecutionBundle:
             run_config=run_config,
             launch=launch,
         )
+        parameter_plan = _require_bundle_trainable_plan_authority(
+            bundle=self,
+            cell=cell,
+            run_config=run_config,
+            model_lock=model_lock,
+            prepared_models=prepared_models,
+            formal=not diagnostic,
+        )
+        if not diagnostic:
+            if type(context) is not GpuDispatchExecutionContext:  # pragma: no cover
+                raise RuntimeError("formal replay lost its execution context")
+            runtime = render_assigned_industrial_cell_runtime_plan(
+                registry=registry,
+                cell_id=self.cell_id,
+                assignment=assignment,
+                dispatch_plan=dispatch,
+                dispatch_context=context,
+                budget=budget,
+                inventory=inventory,
+                dispatch_inventory_sha256=inventory.sha256,
+                rank_configs=(run_config,),
+                topology_receipts=topology,
+                dependency_receipts=receipts,
+                parameter_plan=parameter_plan,
+            )
         writer_policy, startup, shutdown, abort, controlled_policy = (
             _execution_policy_from_dict(self.execution_policy.load())
         )
@@ -3129,6 +3234,17 @@ class IndustrialAssignmentExecutionBundle:
                     "sampling_sha256": sampling_binding.content_sha256,
                     "model_lock_sha256": model_lock_binding.content_sha256,
                     "prepared_models_sha256": content_sha256(prepared_models),
+                    "trainable_plan_authority_sha256": (
+                        None
+                        if self.trainable_plan_authority is None
+                        else self.trainable_plan_authority.sha256
+                    ),
+                    "prepared_model_content_release_manifest_sha256": (
+                        self.prepared_model_content_release_manifest_sha256
+                    ),
+                    "parameter_plan_sha256": (
+                        None if parameter_plan is None else parameter_plan.sha256
+                    ),
                     "compile_plan_sha256": compile_plan.sha256,
                     "inventory_source_sha256": inventory_source.content_sha256,
                     "runtime_envelope_sha256": runtime_envelope.content_sha256,
@@ -3161,28 +3277,35 @@ class IndustrialAssignmentExecutionBundle:
             raise RuntimeError("formal replay lost its execution context")
         if runtime is None:  # pragma: no cover
             raise RuntimeError("formal replay lost its physical runtime plan")
-        plan = build_industrial_execution_plan(
-            runtime_plan=runtime,
-            dispatch_plan=dispatch,
-            dispatch_context=context,
-            budget_plan=budget_plan,
-            budget=budget,
-            load_plan=load,
-            server_launch=launch,
-            dependency_receipts=receipts,
-            dependency_artifacts=dependency_artifacts,
-            split_artifact=split,
-            sampling_artifact=sampling_binding,
-            model_lock_artifact=model_lock_binding,
-            compile_cache_plan=compile_plan,
-            inventory_source_artifact=inventory_source,
-            runtime_envelope_artifact=runtime_envelope,
-            evidence_writer_policy=writer_policy,
-            trusted_attester_policy=RELEASE_TRUSTED_ATTESTER_POLICY,
-            startup_timeout_s=startup,
-            shutdown_timeout_s=shutdown,
-            abort_grace_s=abort,
-        )
+        try:
+            plan = build_industrial_execution_plan(
+                runtime_plan=runtime,
+                dispatch_plan=dispatch,
+                dispatch_context=context,
+                budget_plan=budget_plan,
+                budget=budget,
+                load_plan=load,
+                server_launch=launch,
+                dependency_receipts=receipts,
+                dependency_artifacts=dependency_artifacts,
+                split_artifact=split,
+                sampling_artifact=sampling_binding,
+                model_lock_artifact=model_lock_binding,
+                compile_cache_plan=compile_plan,
+                inventory_source_artifact=inventory_source,
+                runtime_envelope_artifact=runtime_envelope,
+                trainable_plan_authority=self.trainable_plan_authority,
+                prepared_model_content_release_manifest_sha256=(
+                    self.prepared_model_content_release_manifest_sha256
+                ),
+                evidence_writer_policy=writer_policy,
+                trusted_attester_policy=RELEASE_TRUSTED_ATTESTER_POLICY,
+                startup_timeout_s=startup,
+                shutdown_timeout_s=shutdown,
+                abort_grace_s=abort,
+            )
+        except TrainablePlanExecutionBlockedError as error:
+            raise ExecutionBundleBlockedError(error.reason_code) from error
         if (
             _canonical_bytes(summary) != _canonical_bytes(plan.to_dict())
             or self.execution_plan_summary.semantic_sha256 != plan.sha256
@@ -3841,6 +3964,132 @@ def prepared_models_to_dict(
         "model_lock_sha256": model_lock.sha256,
         "roots": canonical_roots,
     }
+
+
+def _require_trainable_raw_source_match(
+    binding: TrainablePlanRawJsonBinding,
+    source: BoundJsonSource,
+    *,
+    label: str,
+) -> None:
+    if (
+        binding.path != source.path
+        or binding.semantic_sha256 != source.canonical_sha256
+        or binding.semantic_sha256 != source.semantic_sha256
+        or binding.file_sha256 != source.file_sha256
+        or binding.sidecar_file_sha256 != source.sidecar_file_sha256
+        or binding.size != source.size
+    ):
+        raise ValueError(f"trainable-plan {label} differs from bundle raw source")
+
+
+def _require_bundle_trainable_plan_authority(
+    *,
+    bundle: IndustrialAssignmentExecutionBundle,
+    cell: ExperimentCell,
+    run_config,
+    model_lock: ModelLock,
+    prepared_models: object,
+    formal: bool,
+) -> TrainablePlan | None:
+    method = cell.identity.method
+    authority = bundle.trainable_plan_authority
+    release_pin = bundle.prepared_model_content_release_manifest_sha256
+    if method in {"target_only", "static"}:
+        if authority is not None or release_pin is not None:
+            raise ValueError(
+                "Target-only/Static bundle must not carry trainable-plan authority"
+            )
+        return None
+    if method not in {"tts", "l0"}:
+        raise ExecutionBundleBlockedError(
+            "current_release_core_trainable_plan_method_required"
+        )
+    if release_pin is None:
+        raise ExecutionBundleBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    if type(authority) is not TrainablePlanAuthorityBinding:
+        raise ExecutionBundleBlockedError(
+            TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON
+        )
+    if formal and not has_prepared_model_content_release_manifest_sha256(
+        model_lock_sha256=authority.model_lock_sha256,
+        prepared=authority.prepared_model_content_authority.prepared_model_set,
+        claimed_manifest_sha256=release_pin,
+    ):
+        raise ExecutionBundleBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    _require_trainable_raw_source_match(
+        authority.model_lock,
+        bundle.model_lock_artifact.source,
+        label="model lock",
+    )
+    _require_trainable_raw_source_match(
+        authority.run_config,
+        bundle.run_config,
+        label="RunConfig",
+    )
+    _require_trainable_raw_source_match(
+        authority.split,
+        bundle.split_artifact.source,
+        label="execution split",
+    )
+    prepared = _strict_object(
+        "prepared models",
+        prepared_models,
+        frozenset({"schema_version", "kind", "model_lock_sha256", "roots"}),
+    )
+    roots = prepared["roots"]
+    if type(roots) is not dict or any(
+        type(key) is not str or type(value) is not str for key, value in roots.items()
+    ):
+        raise TypeError("prepared-model roots must be a string mapping")
+    content_binding = authority.prepared_model_content_authority
+    content_roots = {
+        snapshot.model_id: snapshot.root
+        for snapshot in content_binding.prepared_model_set.snapshots
+    }
+    if (
+        prepared["model_lock_sha256"] != model_lock.sha256
+        or content_binding.model_lock_sha256 != model_lock.sha256
+        or content_roots != roots
+    ):
+        raise ValueError(
+            "trainable-plan prepared content differs from bundle model authority"
+        )
+    adaptation = run_config.adaptation
+    if adaptation is None:
+        raise ValueError("adapted bundle lacks an adaptation configuration")
+    gate = (
+        require_trainable_plan_authority_for_method
+        if formal
+        else audit_trainable_plan_authority_for_method
+    )
+    try:
+        return gate(
+            method,
+            authority,
+            expected_model_lock_sha256=model_lock.sha256,
+            expected_prepared_model_content_manifest_sha256=release_pin,
+            expected_run_config_sha256=run_config_sha256(run_config),
+            expected_split_sha256=bundle.split_artifact.source.semantic_sha256,
+            expected_cell_id=cell.cell_id,
+            expected_cell_declaration_sha256=cell.sha256,
+            expected_target_model_id=run_config.model.target,
+            expected_target_revision=run_config.model.target_revision,
+            expected_drafter_model_id=run_config.model.drafter,
+            expected_prepared_drafter_revision=run_config.model.drafter_revision,
+            expected_backend=run_config.model.algorithm,
+            expected_mode=adaptation.weight_update_mode,
+            expected_scope=adaptation.parameter_scope,
+            expected_optimizer=adaptation.optimizer.name,
+            expected_rank=adaptation.rank,
+            expected_lora_alpha=adaptation.lora_alpha,
+        )
+    except PreparedModelContentAuthorityBlocked as error:
+        raise ExecutionBundleBlockedError(error.code) from error
 
 
 def _validate_model_inputs(

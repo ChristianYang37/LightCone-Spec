@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from test_trainable_plan_authority import _inputs as _trainable_plan_inputs
 
 from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import main as cli_main
@@ -999,7 +1000,7 @@ def _bundle_fixture(
         semantic_sha256=inventory_receipt_sha256,
     )
     bundle = IndustrialAssignmentExecutionBundle(
-        schema_version=2,
+        schema_version=3,
         kind="industrial_assignment_execution_bundle",
         assignment_sha256=assignment.assignment_id,
         cell_id=cell.cell_id,
@@ -1050,6 +1051,8 @@ def _bundle_fixture(
         sampling_artifact=_artifact(sampling_binding),
         model_lock_artifact=_artifact(model_lock_binding),
         prepared_models=_source(prepared_path),
+        trainable_plan_authority=None,
+        prepared_model_content_release_manifest_sha256=None,
         compile_cache_plan=_source(
             compile_plan_path, semantic_sha256=compile_plan.sha256
         ),
@@ -1111,6 +1114,40 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         ),
     ):
         loaded.reconstruct_execution_plan()
+
+    assert loaded.to_dict()["schema_version"] == 3
+    assert loaded.trainable_plan_authority is None
+    assert loaded.prepared_model_content_release_manifest_sha256 is None
+    forged_baseline = replace(
+        loaded,
+        prepared_model_content_release_manifest_sha256="f" * 64,
+    )
+    with pytest.raises(ValueError, match="must not carry trainable-plan authority"):
+        bundle_module._preflight_bundle_trainable_plan_release_trust(forged_baseline)
+
+    adapted_inputs = _trainable_plan_inputs(tmp_path / "adapted-authority")
+    adapted_authority = adapted_inputs["binding"]
+    adapted_config = adapted_inputs["run_config"]
+    adapted_bundle = replace(
+        loaded,
+        run_config=_source(
+            adapted_inputs["run_config_path"],
+            semantic_sha256=run_config_sha256(adapted_config),
+        ),
+        trainable_plan_authority=adapted_authority,
+        prepared_model_content_release_manifest_sha256=(
+            adapted_authority.prepared_model_content_manifest_sha256
+        ),
+    )
+    adapted_round_trip = IndustrialAssignmentExecutionBundle.from_dict(
+        adapted_bundle.to_dict()
+    )
+    assert adapted_round_trip.trainable_plan_authority == adapted_authority
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="prepared_model_content_release_manifest_pin_unavailable",
+    ):
+        bundle_module._preflight_bundle_trainable_plan_release_trust(adapted_round_trip)
 
     # Exercise the future release group path without constructing authority:
     # every assignment has a bundle, but only the requested wave may ask the
@@ -1384,7 +1421,13 @@ def test_bundle_rejects_summary_and_raw_authority_swaps(tmp_path: Path) -> None:
         ),
         activation_runtime=copied_runtime,
     )
-    with pytest.raises(ValueError, match="exact bound runtime-envelope"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            "exact bound runtime-envelope|"
+            "dispatch-context summary differs from raw scheduler replay"
+        ),
+    ):
         copied_runtime_bundle.audit_execution_plan()
 
     interference_receipt = expected.interference_source_receipt.load()

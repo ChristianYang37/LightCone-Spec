@@ -83,9 +83,11 @@ from lightcone_spec.experiments.stage_activation import (
 )
 from lightcone_spec.orchestration.executor import (
     NATIVE_TERMINAL_EVIDENCE_HOOK,
+    PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
     ArtifactBinding,
     IndustrialExecutionPlan,
     NativeEvidenceUnavailableError,
+    TrainablePlanExecutionBlockedError,
     build_industrial_execution_plan,
     execute_industrial_plan,
     industrial_execution_split_contract,
@@ -2347,7 +2349,7 @@ def test_logical_runtime_plan_cannot_cross_the_execution_boundary(
         logical.validate()
 
 
-def test_execution_schema3_binds_the_exact_raw_budget_authority(
+def test_execution_schema4_binds_the_exact_raw_budget_authority(
     tmp_path: Path,
 ) -> None:
     plan = _execution_fixture(tmp_path, request_count=1).plan
@@ -2358,7 +2360,7 @@ def test_execution_schema3_binds_the_exact_raw_budget_authority(
     physical_wire = physical.to_dict()
     execution_wire = plan.to_dict()
     assert physical_wire["schema_version"] == 3
-    assert execution_wire["schema_version"] == 3
+    assert execution_wire["schema_version"] == 4
     assert physical_wire["budget_materialization_authority_sha256"] == (
         authority_sha256
     )
@@ -3600,6 +3602,74 @@ def test_adapted_native_evidence_preflight_requires_the_wire_provider() -> None:
         supported_methods=frozenset({"l0"}),
     )
     assert native_evidence_preflight(plan, forged_provider).status == "BLOCKED"
+
+
+def test_adapted_execution_blocks_without_source_owned_content_pin_before_mutation(
+    tmp_path: Path,
+) -> None:
+    baseline = _execution_fixture(tmp_path, request_count=1).plan
+    adapted_runtime = SimpleNamespace(
+        rank_configs=(SimpleNamespace(method="tts"),),
+        parameter_plan_sha256="1" * 64,
+    )
+    output_root = tmp_path / "must-not-exist"
+    launcher_called = False
+
+    async def launcher(_launch: ServerLaunch):
+        nonlocal launcher_called
+        launcher_called = True
+        raise AssertionError("launcher must not run before trainable-plan trust")
+
+    with pytest.raises(
+        TrainablePlanExecutionBlockedError,
+        match=PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                replace(
+                    baseline,
+                    runtime_plan=adapted_runtime,
+                    trainable_plan_authority=SimpleNamespace(),
+                    prepared_model_content_release_manifest_sha256=None,
+                ),
+                output_root=output_root,
+                run_nonce_sha256="f" * 64,
+                launch_server=launcher,
+                transport=_FakeTransport(),
+            )
+        )
+    assert not launcher_called
+    assert not output_root.exists()
+
+    render_root = tmp_path / "render-must-not-exist"
+    with pytest.raises(
+        TrainablePlanExecutionBlockedError,
+        match=PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
+    ):
+        render_industrial_execution_plan(
+            output_root=render_root,
+            runtime_plan=adapted_runtime,
+            dispatch_plan=baseline.dispatch_plan,
+            dispatch_context=baseline.dispatch_context,
+            budget_plan=baseline.budget_plan,
+            budget=baseline.budget,
+            load_plan=baseline.load_plan,
+            dependency_receipts=baseline.dispatch_context.receipts,
+            dependency_artifacts=baseline.dependency_artifacts,
+            split_artifact=baseline.split_artifact,
+            sampling_artifact=baseline.sampling_artifact,
+            model_lock_artifact=baseline.model_lock_artifact,
+            sglang_checkout=baseline.server_launch.argv[4],
+            compile_cache_plan_path=baseline.server_launch.compile_cache_plan or "",
+            inventory_source_artifact=baseline.inventory_source_artifact,
+            runtime_envelope_artifact=baseline.runtime_envelope_artifact,
+            model_roots={},
+            adaptation_reserve_mb=1,
+            mem_fraction_static=0.8,
+            trainable_plan_authority=SimpleNamespace(),
+            prepared_model_content_release_manifest_sha256=None,
+        )
+    assert not render_root.exists()
 
 
 def test_execution_plan_rejects_trace_semantics_from_another_registry_cell(

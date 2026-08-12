@@ -32,6 +32,13 @@ from urllib.request import Request, urlopen
 import pyarrow.parquet as pq
 
 from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
+from lightcone_spec.adaptation.plan_authority import (
+    TrainablePlanAuthorityBinding,
+    TrainablePlanRawJsonBinding,
+    require_trainable_plan_authority_for_method,
+    trainable_plan_authority_binding_to_dict,
+)
+from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.gpu_pool import (
@@ -74,6 +81,10 @@ from lightcone_spec.experiments.serving import (
 )
 from lightcone_spec.experiments.stage_activation import (
     is_serving_interference_calibration_cell,
+)
+from lightcone_spec.locking.prepared_models import (
+    PreparedModelContentAuthorityBlocked,
+    has_prepared_model_content_release_manifest_sha256,
 )
 from lightcone_spec.orchestration.industrial import (
     IndustrialPhysicalAssignment,
@@ -134,6 +145,12 @@ from lightcone_spec.telemetry.writer import (
 MISSING_NATIVE_EVIDENCE_REASON = "missing_content_bound_native_speculative_evidence"
 TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON = (
     "trusted_native_terminal_attester_unavailable"
+)
+PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON = (
+    "prepared_model_content_release_manifest_pin_unavailable"
+)
+TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON = (
+    "trainable_plan_raw_authority_unavailable"
 )
 MAX_IN_MEMORY_REQUEST_EXECUTIONS = 100_000
 
@@ -1448,6 +1465,254 @@ def _validate_runtime_dispatch_authority(
         )
 
 
+class TrainablePlanExecutionBlockedError(RuntimeError):
+    """A named pre-mutation failure of adapted execution authority."""
+
+    def __init__(self, reason_code: str) -> None:
+        if (
+            type(reason_code) is not str
+            or not reason_code
+            or reason_code.strip() != reason_code
+        ):
+            raise ValueError("trainable-plan BLOCKED reason must be canonical")
+        self.reason_code = reason_code
+        super().__init__(
+            f"industrial trainable-plan execution is BLOCKED: {reason_code}"
+        )
+
+
+def _require_trainable_raw_artifact_match(
+    source: TrainablePlanRawJsonBinding,
+    artifact: ArtifactBinding,
+    *,
+    label: str,
+) -> None:
+    artifact.assert_unchanged()
+    if (
+        source.path != artifact.path
+        or source.semantic_sha256 != artifact.content_sha256
+        or source.file_sha256 != artifact.file_sha256
+        or source.size != artifact.size
+    ):
+        raise ValueError(f"trainable-plan {label} differs from execution artifact")
+
+
+def _launch_model_root(launch: ServerLaunch, option: str) -> str:
+    try:
+        index = launch.argv.index(option)
+        root = launch.argv[index + 1]
+    except (ValueError, IndexError) as error:
+        raise ValueError(f"server launch lacks exact {option} authority") from error
+    path = Path(root)
+    if not path.is_absolute() or path.resolve() != path:
+        raise ValueError(f"server launch {option} root is not absolute and resolved")
+    return root
+
+
+def _require_execution_trainable_plan_authority(
+    plan: IndustrialExecutionPlan,
+) -> None:
+    """Replay adapted parameter authority before any executor-side mutation."""
+
+    config = plan.runtime_plan.rank_configs[0]
+    method = config.method
+    authority = plan.trainable_plan_authority
+    release_pin = plan.prepared_model_content_release_manifest_sha256
+    if method in {"target_only", "static"}:
+        if authority is not None or release_pin is not None:
+            raise ValueError(
+                "Target-only/Static execution must not carry trainable-plan authority"
+            )
+        if plan.runtime_plan.parameter_plan_sha256 is not None:
+            raise ValueError("Target-only/Static runtime carries a parameter-plan SHA")
+        return
+    if method not in {"tts", "l0"}:
+        raise ValueError("execution trainable-plan gate supports only core methods")
+    if release_pin is None:
+        raise TrainablePlanExecutionBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    if type(release_pin) is not str or not _is_sha256(release_pin):
+        raise ValueError("prepared model content release pin must be SHA-256")
+    if type(authority) is not TrainablePlanAuthorityBinding:
+        raise TrainablePlanExecutionBlockedError(
+            TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON
+        )
+    if not has_prepared_model_content_release_manifest_sha256(
+        model_lock_sha256=authority.model_lock_sha256,
+        prepared=authority.prepared_model_content_authority.prepared_model_set,
+        claimed_manifest_sha256=release_pin,
+    ):
+        raise TrainablePlanExecutionBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    _require_trainable_raw_artifact_match(
+        authority.model_lock,
+        plan.model_lock_artifact,
+        label="model lock",
+    )
+    _require_trainable_raw_artifact_match(
+        authority.split,
+        plan.split_artifact,
+        label="execution split",
+    )
+    if authority.run_config.semantic_sha256 != run_config_sha256(
+        config
+    ) or authority.run_config.load() != config.model_dump(mode="json"):
+        raise ValueError("trainable-plan RunConfig differs from execution plan")
+    prepared_roots = {
+        snapshot.model_id: snapshot.root
+        for snapshot in authority.prepared_model_content_authority.prepared_model_set.snapshots
+    }
+    if prepared_roots.get(config.model.target) != _launch_model_root(
+        plan.server_launch, "--model-path"
+    ) or prepared_roots.get(config.model.drafter) != _launch_model_root(
+        plan.server_launch, "--speculative-draft-model-path"
+    ):
+        raise ValueError("trainable-plan prepared roots differ from server launch")
+    adaptation = config.adaptation
+    if adaptation is None:  # pragma: no cover - RunConfig/cell invariant
+        raise RuntimeError("adapted execution lost its adaptation configuration")
+    try:
+        parameter_plan = require_trainable_plan_authority_for_method(
+            method,
+            authority,
+            expected_model_lock_sha256=plan.model_lock_artifact.content_sha256,
+            expected_prepared_model_content_manifest_sha256=release_pin,
+            expected_run_config_sha256=run_config_sha256(config),
+            expected_split_sha256=plan.split_artifact.content_sha256,
+            expected_cell_id=plan.runtime_plan.cell_id,
+            expected_cell_declaration_sha256=(
+                plan.runtime_plan.cell_declaration_sha256
+            ),
+            expected_target_model_id=config.model.target,
+            expected_target_revision=config.model.target_revision,
+            expected_drafter_model_id=config.model.drafter,
+            expected_prepared_drafter_revision=config.model.drafter_revision,
+            expected_backend=config.model.algorithm,
+            expected_mode=adaptation.weight_update_mode,
+            expected_scope=adaptation.parameter_scope,
+            expected_optimizer=adaptation.optimizer.name,
+            expected_rank=adaptation.rank,
+            expected_lora_alpha=adaptation.lora_alpha,
+        )
+    except PreparedModelContentAuthorityBlocked as error:
+        raise TrainablePlanExecutionBlockedError(error.code) from error
+    if (
+        parameter_plan is None  # pragma: no cover - adapted method postcondition
+        or parameter_plan.sha256 != plan.runtime_plan.parameter_plan_sha256
+        or parameter_plan.sha256 != authority.trainable_plan_sha256
+    ):
+        raise ValueError("runtime parameter plan differs from raw execution authority")
+
+
+def _require_render_trainable_plan_authority(
+    *,
+    runtime_plan: IndustrialRuntimePlan,
+    model_lock_artifact: ArtifactBinding,
+    split_artifact: ArtifactBinding,
+    model_roots: Mapping[str, str],
+    authority: TrainablePlanAuthorityBinding | None,
+    release_pin: str | None,
+) -> None:
+    """Replay adapted authority before rendering any runtime artifact."""
+
+    if len(runtime_plan.rank_configs) != 1:
+        raise ValueError("server rendering supports the released one-rank topology")
+    config = runtime_plan.rank_configs[0]
+    method = config.method
+    if method in {"target_only", "static"}:
+        if authority is not None or release_pin is not None:
+            raise ValueError(
+                "Target-only/Static rendering must not carry trainable-plan authority"
+            )
+        if runtime_plan.parameter_plan_sha256 is not None:
+            raise ValueError("Target-only/Static runtime carries a parameter-plan SHA")
+        return
+    if method not in {"tts", "l0"}:
+        raise ValueError("render trainable-plan gate supports only core methods")
+    if release_pin is None:
+        raise TrainablePlanExecutionBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+    if type(release_pin) is not str or not _is_sha256(release_pin):
+        raise ValueError("prepared model content release pin must be SHA-256")
+    if type(authority) is not TrainablePlanAuthorityBinding:
+        raise TrainablePlanExecutionBlockedError(
+            TRAINABLE_PLAN_RAW_AUTHORITY_UNAVAILABLE_REASON
+        )
+    if not has_prepared_model_content_release_manifest_sha256(
+        model_lock_sha256=authority.model_lock_sha256,
+        prepared=authority.prepared_model_content_authority.prepared_model_set,
+        claimed_manifest_sha256=release_pin,
+    ):
+        raise TrainablePlanExecutionBlockedError(
+            PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
+        )
+
+    _require_trainable_raw_artifact_match(
+        authority.model_lock,
+        model_lock_artifact,
+        label="model lock",
+    )
+    _require_trainable_raw_artifact_match(
+        authority.split,
+        split_artifact,
+        label="execution split",
+    )
+    if authority.run_config.semantic_sha256 != run_config_sha256(
+        config
+    ) or authority.run_config.load() != config.model_dump(mode="json"):
+        raise ValueError("trainable-plan RunConfig differs from rendered execution")
+    prepared_roots = {
+        snapshot.model_id: snapshot.root
+        for snapshot in authority.prepared_model_content_authority.prepared_model_set.snapshots
+    }
+    expected_roots: dict[str, str] = {}
+    for model_id in (config.model.target, config.model.drafter):
+        root = model_roots.get(model_id)
+        if type(root) is not str:
+            raise ValueError(f"verified local model root is missing: {model_id}")
+        expected_roots[model_id] = str(Path(root).resolve())
+    if any(
+        prepared_roots.get(model_id) != root
+        for model_id, root in expected_roots.items()
+    ):
+        raise ValueError("trainable-plan prepared roots differ from rendered roots")
+    adaptation = config.adaptation
+    if adaptation is None:  # pragma: no cover - RunConfig/cell invariant
+        raise RuntimeError("adapted rendering lost its adaptation configuration")
+    try:
+        parameter_plan = require_trainable_plan_authority_for_method(
+            method,
+            authority,
+            expected_model_lock_sha256=model_lock_artifact.content_sha256,
+            expected_prepared_model_content_manifest_sha256=release_pin,
+            expected_run_config_sha256=run_config_sha256(config),
+            expected_split_sha256=split_artifact.content_sha256,
+            expected_cell_id=runtime_plan.cell_id,
+            expected_cell_declaration_sha256=(runtime_plan.cell_declaration_sha256),
+            expected_target_model_id=config.model.target,
+            expected_target_revision=config.model.target_revision,
+            expected_drafter_model_id=config.model.drafter,
+            expected_prepared_drafter_revision=config.model.drafter_revision,
+            expected_backend=config.model.algorithm,
+            expected_mode=adaptation.weight_update_mode,
+            expected_scope=adaptation.parameter_scope,
+            expected_optimizer=adaptation.optimizer.name,
+            expected_rank=adaptation.rank,
+            expected_lora_alpha=adaptation.lora_alpha,
+        )
+    except PreparedModelContentAuthorityBlocked as error:
+        raise TrainablePlanExecutionBlockedError(error.code) from error
+    if (
+        parameter_plan is None  # pragma: no cover - adapted method postcondition
+        or parameter_plan.sha256 != runtime_plan.parameter_plan_sha256
+        or parameter_plan.sha256 != authority.trainable_plan_sha256
+    ):
+        raise ValueError("runtime parameter plan differs from raw render authority")
+
+
 @dataclass(frozen=True)
 class IndustrialExecutionPlan:
     """Immutable local plan for exactly one rank and one serving cell."""
@@ -1471,6 +1736,8 @@ class IndustrialExecutionPlan:
     warmup_requests: tuple[BoundServingRequest, ...]
     scored_requests: tuple[BoundServingRequest, ...]
     bench_argv: tuple[str, ...]
+    trainable_plan_authority: TrainablePlanAuthorityBinding | None = None
+    prepared_model_content_release_manifest_sha256: str | None = None
     evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY
     trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS
     patched_sglang_tree: str = PINNED_SGLANG_TREE
@@ -1603,6 +1870,7 @@ class IndustrialExecutionPlan:
         ):
             raise ValueError("a locked p99 anchor requires at least 10,000 completions")
         config = self.runtime_plan.rank_configs[0]
+        _require_execution_trainable_plan_authority(self)
         if config.runtime.max_running_requests != cell.identity.concurrency:
             raise ValueError("execution concurrency differs from the registry cell")
         if (
@@ -1735,7 +2003,7 @@ class IndustrialExecutionPlan:
             raise RuntimeError("execution capacity authority disappeared")
         hashes = self.load_plan.scored.hashes
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "runtime_plan_sha256": self.runtime_plan.sha256,
             "dispatch_plan_sha256": self.dispatch_plan.sha256,
             "dispatch_context_sha256": self.dispatch_context.sha256,
@@ -1791,6 +2059,16 @@ class IndustrialExecutionPlan:
                 self.runtime_plan.rank_configs[0].runtime.execution_policy_sha256
             ),
             "model_lock_artifact": self.model_lock_artifact.identity_dict(),
+            "trainable_plan_authority": (
+                None
+                if self.trainable_plan_authority is None
+                else trainable_plan_authority_binding_to_dict(
+                    self.trainable_plan_authority
+                )
+            ),
+            "prepared_model_content_release_manifest_sha256": (
+                self.prepared_model_content_release_manifest_sha256
+            ),
             "inventory_source_artifact": (
                 self.inventory_source_artifact.identity_dict()
             ),
@@ -2049,6 +2327,8 @@ def build_industrial_execution_plan(
     compile_cache_plan: CompileCacheLaunchPlan,
     inventory_source_artifact: ArtifactBinding,
     runtime_envelope_artifact: ArtifactBinding,
+    trainable_plan_authority: TrainablePlanAuthorityBinding | None = None,
+    prepared_model_content_release_manifest_sha256: str | None = None,
     evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY,
     trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
     startup_timeout_s: float = 300.0,
@@ -2097,6 +2377,10 @@ def build_industrial_execution_plan(
             concurrency=runtime_plan.rank_configs[0].runtime.max_running_requests,
             arrival_kind=load_plan.scored.source_kind,
         ),
+        trainable_plan_authority=trainable_plan_authority,
+        prepared_model_content_release_manifest_sha256=(
+            prepared_model_content_release_manifest_sha256
+        ),
         evidence_writer_policy=evidence_writer_policy,
         trusted_attester_policy=trusted_attester_policy,
         startup_timeout_s=startup_timeout_s,
@@ -2129,12 +2413,22 @@ def render_industrial_execution_plan(
     model_roots: Mapping[str, str],
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
+    trainable_plan_authority: TrainablePlanAuthorityBinding | None = None,
+    prepared_model_content_release_manifest_sha256: str | None = None,
     evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY,
     trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
     host: str = "127.0.0.1",
 ) -> IndustrialExecutionPlan:
     """Render one argv-only launch, then bind it to the execution plan."""
 
+    _require_render_trainable_plan_authority(
+        runtime_plan=runtime_plan,
+        model_lock_artifact=model_lock_artifact,
+        split_artifact=split_artifact,
+        model_roots=model_roots,
+        authority=trainable_plan_authority,
+        release_pin=prepared_model_content_release_manifest_sha256,
+    )
     _validate_runtime_dispatch_authority(
         runtime_plan=runtime_plan,
         dispatch_plan=dispatch_plan,
@@ -2142,8 +2436,6 @@ def render_industrial_execution_plan(
         budget_plan=budget_plan,
         budget=budget,
     )
-    if len(runtime_plan.rank_configs) != 1:
-        raise ValueError("server rendering supports the released one-rank topology")
     if not runtime_plan.physical_dispatch_ready:
         raise ValueError(
             "logical runtime plan cannot render a server; physical assignment required"
@@ -2203,6 +2495,10 @@ def render_industrial_execution_plan(
         compile_cache_plan=compile_cache_plan,
         inventory_source_artifact=inventory_source_artifact,
         runtime_envelope_artifact=runtime_envelope_artifact,
+        trainable_plan_authority=trainable_plan_authority,
+        prepared_model_content_release_manifest_sha256=(
+            prepared_model_content_release_manifest_sha256
+        ),
         evidence_writer_policy=evidence_writer_policy,
         trusted_attester_policy=trusted_attester_policy,
     )
@@ -4143,6 +4439,7 @@ async def execute_industrial_plan(
         or session_lifecycle is not None
     ):
         raise SharedSessionUnavailableError(SHARED_SESSION_UNAVAILABLE_REASON)
+    _require_execution_trainable_plan_authority(plan)
     plan.validate()
     observed_component_ms = _initial_budget_observations(plan)
     if launch_server is None:
