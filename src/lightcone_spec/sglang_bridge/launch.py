@@ -18,6 +18,10 @@ from lightcone_spec.runtime.compile_cache import (
     require_release_compile_only_assignment,
     start_compile_cache_launch,
 )
+from lightcone_spec.runtime.compile_runner import (
+    CompileRunnerBlocked,
+    require_release_compile_assignment_plan,
+)
 
 from .checkout import verify_patched_checkout
 
@@ -81,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--compile-cache-plan", required=True)
     parser.add_argument("--compile-only-assignment")
+    parser.add_argument("--compile-only-manifest")
+    parser.add_argument("--compile-result-pointer")
     parser.add_argument("server_argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     server_argv = list(args.server_argv)
@@ -95,11 +101,30 @@ def main(argv: list[str] | None = None) -> int:
     # verification, cache-plan loading, directory creation, model import, or GPU
     # mutation.  A future release must replace this gate only together with its
     # registered prewarm/finalization and atomic result-pointer implementation.
-    if args.compile_only_assignment is not None:
-        assignment = CompileOnlyAssignmentContract.load(
-            Path(args.compile_only_assignment)
-        )
-        require_release_compile_only_assignment(assignment)
+    compile_terminal_values = (
+        args.compile_only_assignment,
+        args.compile_only_manifest,
+        args.compile_result_pointer,
+    )
+    if all(value is not None for value in compile_terminal_values):
+        # The release-owned plan allowlist/actuator is empty today.  Preserve a
+        # named pre-side-effect BLOCK before opening caller paths.  Once that
+        # release authority exists, this gate is replaced atomically with
+        # CompileAssignmentPlan.load(...) and the first-party lifecycle runner.
+        require_release_compile_assignment_plan()
+    if any(value is not None for value in compile_terminal_values) and not all(
+        value is not None for value in compile_terminal_values
+    ):
+        if (
+            args.compile_only_assignment is not None
+            and args.compile_only_manifest is None
+            and args.compile_result_pointer is None
+        ):
+            assignment = CompileOnlyAssignmentContract.load(
+                Path(args.compile_only_assignment)
+            )
+            require_release_compile_only_assignment(assignment)
+        raise CompileRunnerBlocked("compile_assignment_cli_contract_incomplete")
     if compile_only_flag:
         require_release_compile_only_assignment()
     if not server_argv:
