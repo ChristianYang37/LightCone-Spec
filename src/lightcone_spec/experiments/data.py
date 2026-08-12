@@ -161,7 +161,13 @@ def load_natural_prompts(
     split: str,
     limit: int = 32,
 ) -> tuple[PromptSample, ...]:
-    """Load a locked natural side table; imports datasets only on this path."""
+    """Load the legacy 32-row preliminary side table.
+
+    This network-capable helper is retained only for historical schema-v2
+    diagnostics.  It is not a formal workload authority.  Formal experiments
+    use :mod:`lightcone_spec.experiments.workload_authority`, which is local,
+    path-bound, release-allowlisted, and selects every exact protocol match.
+    """
     specifications = {
         "livecodebench": (
             "livecodebench/code_generation_lite",
