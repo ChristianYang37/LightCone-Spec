@@ -194,6 +194,13 @@ class ExecutionBundleBlockedError(RuntimeError):
         super().__init__(f"industrial execution bundle is BLOCKED: {reason_code}")
 
 
+class _DispatchOutcomeUnknownError(RuntimeError):
+    """Execution crossed the mutation boundary without a durable receipt."""
+
+    def __init__(self) -> None:
+        super().__init__("dispatch outcome is unknown; exact journal recovery required")
+
+
 @dataclass(frozen=True)
 class AssignmentLaunchMaterializationPolicy:
     """Non-result inputs for the first-party server-launch renderer."""
@@ -544,14 +551,16 @@ def _load_dispatch_schedule_envelope(
     *,
     plan: GpuDispatchPlan,
     execution_context: GpuDispatchExecutionContext,
-) -> tuple[DispatchScheduleReceipt, DispatchAttemptJournalBinding | None]:
+) -> tuple[
+    DispatchScheduleReceipt,
+    DispatchAttemptJournalBinding | None,
+    str,
+]:
     """Reopen one envelope; its receipt is evidence, never resume authority."""
 
     output = _absolute_lexical_path(path)
-    decoded = _decode_json(
-        _read_regular_file(output, label="dispatch schedule receipt envelope"),
-        label="dispatch schedule receipt envelope",
-    )
+    body = _read_regular_file(output, label="dispatch schedule receipt envelope")
+    decoded = _decode_json(body, label="dispatch schedule receipt envelope")
     if type(decoded) is not dict:
         raise TypeError("dispatch schedule receipt envelope must be a JSON object")
     schema_version = decoded.get("schema_version")
@@ -577,7 +586,7 @@ def _load_dispatch_schedule_envelope(
         if schema_version == 1
         else DispatchAttemptJournalBinding.from_dict(envelope["attempt_journal"])
     )
-    return receipt, journal
+    return receipt, journal, hashlib.sha256(_canonical_bytes(envelope)).hexdigest()
 
 
 def load_dispatch_schedule_receipt(
@@ -588,7 +597,7 @@ def load_dispatch_schedule_receipt(
 ) -> DispatchScheduleReceipt:
     """Reopen the single authoritative envelope against the exact scheduler."""
 
-    receipt, _ = _load_dispatch_schedule_envelope(
+    receipt, _, _ = _load_dispatch_schedule_envelope(
         path,
         plan=plan,
         execution_context=execution_context,
@@ -743,6 +752,13 @@ class DispatchAttemptJournal:
         "industrial_dispatch_attempt_journal.wave_intent_finish_hash_chain."
         "execution_bundle_manifest_bound.v2"
     )
+    # These limits apply only when a coordinator reopens remote evidence.  They
+    # are deliberately much larger than an industrial 130-cell journal while
+    # still placing an exact ceiling on directory and file allocations.
+    _READ_ONLY_MANIFEST_MAX_BYTES = 64 * 1024
+    _READ_ONLY_MAX_EVENT_COUNT = 16_384
+    _READ_ONLY_EVENT_MAX_BYTES = 2 * 1024 * 1024
+    _READ_ONLY_EVENTS_MAX_BYTES = 256 * 1024 * 1024
 
     def __init__(
         self,
@@ -753,6 +769,7 @@ class DispatchAttemptJournal:
         manifest_sha256: str,
         event_names: tuple[str, ...],
         event_sha256s: tuple[str, ...],
+        read_only: bool = False,
     ) -> None:
         self.root = root
         self.events_path = root / "events"
@@ -761,11 +778,49 @@ class DispatchAttemptJournal:
         self.manifest_sha256 = manifest_sha256
         self._event_names = event_names
         self._event_sha256s = event_sha256s
+        self._read_only = read_only
         self._append_lock = asyncio.Lock()
         self._active_wave_event_sha256: str | None = None
         self._active_wave_payload: dict[str, object] | None = None
         self._open_tokens: dict[str, dict[str, object]] = {}
         self._preissued_assignment_tokens: dict[str, DispatchAttemptJournalToken] = {}
+
+    @classmethod
+    def _expected_manifest(
+        cls,
+        candidate: Path,
+        *,
+        plan: GpuDispatchPlan,
+        execution_context: GpuDispatchExecutionContext,
+        execution_bundle_manifest_sha256: str | None,
+    ) -> tuple[dict[str, object], bytes, frozenset[str]]:
+        if execution_bundle_manifest_sha256 is not None:
+            execution_bundle_manifest_sha256 = _require_sha256(
+                "execution-bundle publication manifest",
+                execution_bundle_manifest_sha256,
+            )
+        expected: dict[str, object] = {
+            "schema_version": (1 if execution_bundle_manifest_sha256 is None else 2),
+            "kind": _DISPATCH_ATTEMPT_JOURNAL_KIND,
+            "protocol_sha256": (
+                cls._PROTOCOL_SHA256
+                if execution_bundle_manifest_sha256 is None
+                else cls._PUBLICATION_PROTOCOL_SHA256
+            ),
+            "journal_path": str(candidate),
+            "events_path": str(candidate / "events"),
+            "plan_sha256": plan.sha256,
+            "execution_context_sha256": execution_context.sha256,
+            "inventory_sha256": execution_context.inventory.sha256,
+            "fixed_instance_gpu_count": len(execution_context.inventory.devices),
+        }
+        fields = cls._MANIFEST_FIELDS_V1
+        if execution_bundle_manifest_sha256 is not None:
+            expected["execution_bundle_manifest_sha256"] = (
+                execution_bundle_manifest_sha256
+            )
+            fields = cls._MANIFEST_FIELDS_V2
+        return expected, _canonical_bytes(expected) + b"\n", fields
 
     @classmethod
     def open_or_create(
@@ -781,31 +836,14 @@ class DispatchAttemptJournal:
         parent = candidate.parent
         if parent.is_symlink() or not parent.is_dir() or parent.resolve() != parent:
             raise ExecutionBundleBlockedError("dispatch_attempt_journal_parent_invalid")
-        if execution_bundle_manifest_sha256 is not None:
-            execution_bundle_manifest_sha256 = _require_sha256(
-                "execution-bundle publication manifest",
-                execution_bundle_manifest_sha256,
+        expected_manifest, expected_manifest_body, manifest_fields = (
+            cls._expected_manifest(
+                candidate,
+                plan=plan,
+                execution_context=execution_context,
+                execution_bundle_manifest_sha256=(execution_bundle_manifest_sha256),
             )
-        expected_manifest: dict[str, object] = {
-            "schema_version": (1 if execution_bundle_manifest_sha256 is None else 2),
-            "kind": _DISPATCH_ATTEMPT_JOURNAL_KIND,
-            "protocol_sha256": (
-                cls._PROTOCOL_SHA256
-                if execution_bundle_manifest_sha256 is None
-                else cls._PUBLICATION_PROTOCOL_SHA256
-            ),
-            "journal_path": str(candidate),
-            "events_path": str(candidate / "events"),
-            "plan_sha256": plan.sha256,
-            "execution_context_sha256": execution_context.sha256,
-            "inventory_sha256": execution_context.inventory.sha256,
-            "fixed_instance_gpu_count": len(execution_context.inventory.devices),
-        }
-        if execution_bundle_manifest_sha256 is not None:
-            expected_manifest["execution_bundle_manifest_sha256"] = (
-                execution_bundle_manifest_sha256
-            )
-        expected_manifest_body = _canonical_bytes(expected_manifest) + b"\n"
+        )
         if not candidate.exists() and not candidate.is_symlink():
             try:
                 os.mkdir(candidate, 0o700)
@@ -870,11 +908,7 @@ class DispatchAttemptJournal:
         manifest = _strict_object(
             "dispatch attempt journal manifest",
             _decode_json(manifest_body, label="dispatch attempt journal manifest"),
-            (
-                cls._MANIFEST_FIELDS_V1
-                if execution_bundle_manifest_sha256 is None
-                else cls._MANIFEST_FIELDS_V2
-            ),
+            manifest_fields,
         )
         if manifest != expected_manifest:
             raise ExecutionBundleBlockedError(
@@ -894,8 +928,98 @@ class DispatchAttemptJournal:
             journal._validate_expected_prefix(expected_prefix, snapshot=snapshot)
         return journal
 
+    @classmethod
+    def open_existing(
+        cls,
+        root: str | Path,
+        *,
+        plan: GpuDispatchPlan,
+        execution_context: GpuDispatchExecutionContext,
+        expected_prefix: DispatchAttemptJournalBinding | None = None,
+        execution_bundle_manifest_sha256: str | None = None,
+    ) -> DispatchAttemptJournal:
+        """Reopen one complete journal without repairing or writing any state."""
+
+        candidate = Path(os.path.abspath(os.fspath(root)))
+        parent = candidate.parent
+        if parent.is_symlink() or not parent.is_dir() or parent.resolve() != parent:
+            raise ExecutionBundleBlockedError("dispatch_attempt_journal_parent_invalid")
+        expected_manifest, expected_manifest_body, manifest_fields = (
+            cls._expected_manifest(
+                candidate,
+                plan=plan,
+                execution_context=execution_context,
+                execution_bundle_manifest_sha256=(execution_bundle_manifest_sha256),
+            )
+        )
+        _require_private_directory(candidate, label="dispatch_attempt_journal")
+        root_entries = cls._stable_directory_names(candidate, max_entries=2)
+        unknown_entries = set(root_entries) - {"events", "manifest.json"}
+        if unknown_entries:
+            raise ExecutionBundleBlockedError(
+                "dispatch_attempt_journal_contains_unknown_entry"
+            )
+        if root_entries != ("events", "manifest.json"):
+            raise ExecutionBundleBlockedError(
+                "dispatch_attempt_journal_initialization_prefix_invalid"
+            )
+        events_path = candidate / "events"
+        _require_private_directory(
+            events_path,
+            label="dispatch_attempt_journal_events",
+        )
+        names = cls._event_file_names(
+            events_path,
+            max_entries=cls._READ_ONLY_MAX_EVENT_COUNT,
+            max_file_bytes=cls._READ_ONLY_EVENT_MAX_BYTES,
+            max_total_bytes=cls._READ_ONLY_EVENTS_MAX_BYTES,
+        )
+        manifest_path = candidate / "manifest.json"
+        manifest_body = _read_regular_file(
+            manifest_path,
+            label="dispatch attempt journal manifest",
+            max_bytes=cls._READ_ONLY_MANIFEST_MAX_BYTES,
+            size_limit_reason=("dispatch_attempt_journal_manifest_size_limit_exceeded"),
+        )
+        metadata = manifest_path.stat(follow_symlinks=False)
+        if (
+            manifest_body != expected_manifest_body
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+        ):
+            raise ExecutionBundleBlockedError(
+                "dispatch_attempt_journal_manifest_identity_mismatch"
+            )
+        manifest = _strict_object(
+            "dispatch attempt journal manifest",
+            _decode_json(manifest_body, label="dispatch attempt journal manifest"),
+            manifest_fields,
+        )
+        if manifest != expected_manifest:
+            raise ExecutionBundleBlockedError(
+                "dispatch_attempt_journal_manifest_identity_mismatch"
+            )
+        journal = cls(
+            root=candidate,
+            plan=plan,
+            execution_context=execution_context,
+            manifest_sha256=hashlib.sha256(manifest_body).hexdigest(),
+            event_names=names,
+            event_sha256s=(),
+            read_only=True,
+        )
+        snapshot = journal.replay()
+        journal._event_sha256s = snapshot.event_sha256s
+        if expected_prefix is not None:
+            journal._validate_expected_prefix(expected_prefix, snapshot=snapshot)
+        return journal
+
     @staticmethod
-    def _stable_directory_names(path: Path) -> tuple[str, ...]:
+    def _stable_directory_names(
+        path: Path,
+        *,
+        max_entries: int | None = None,
+    ) -> tuple[str, ...]:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
@@ -918,8 +1042,16 @@ class DispatchAttemptJournal:
                 raise ExecutionBundleBlockedError(
                     "dispatch_attempt_journal_directory_changed"
                 )
-            before = tuple(sorted(os.listdir(descriptor)))
-            after = tuple(sorted(os.listdir(descriptor)))
+            before = DispatchAttemptJournal._directory_names(
+                descriptor,
+                max_entries=max_entries,
+                limit_reason="dispatch_attempt_journal_directory_entry_limit_exceeded",
+            )
+            after = DispatchAttemptJournal._directory_names(
+                descriptor,
+                max_entries=max_entries,
+                limit_reason="dispatch_attempt_journal_directory_entry_limit_exceeded",
+            )
             if before != after:
                 raise ExecutionBundleBlockedError(
                     "dispatch_attempt_journal_changed_during_enumeration"
@@ -927,6 +1059,21 @@ class DispatchAttemptJournal:
             return before
         finally:
             os.close(descriptor)
+
+    @staticmethod
+    def _directory_names(
+        descriptor: int,
+        *,
+        max_entries: int | None,
+        limit_reason: str,
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if max_entries is not None and len(names) >= max_entries:
+                    raise ExecutionBundleBlockedError(limit_reason)
+                names.append(entry.name)
+        return tuple(sorted(names))
 
     @staticmethod
     def _complete_manifest_prefix(
@@ -1029,7 +1176,13 @@ class DispatchAttemptJournal:
         return completed
 
     @staticmethod
-    def _event_file_names(events_path: Path) -> tuple[str, ...]:
+    def _event_file_names(
+        events_path: Path,
+        *,
+        max_entries: int | None = None,
+        max_file_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+    ) -> tuple[str, ...]:
         flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             flags |= os.O_DIRECTORY
@@ -1052,10 +1205,38 @@ class DispatchAttemptJournal:
                 raise ExecutionBundleBlockedError(
                     "dispatch_attempt_journal_events_changed"
                 )
-            before = tuple(sorted(os.listdir(descriptor)))
+            before = DispatchAttemptJournal._directory_names(
+                descriptor,
+                max_entries=max_entries,
+                limit_reason="dispatch_attempt_journal_event_count_limit_exceeded",
+            )
+            total_bytes = 0
             for name in before:
                 DispatchAttemptJournal._parse_event_file_name(name)
-            after = tuple(sorted(os.listdir(descriptor)))
+                if max_file_bytes is not None or max_total_bytes is not None:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise ExecutionBundleBlockedError(
+                            "dispatch_attempt_journal_event_file_invalid"
+                        )
+                    if max_file_bytes is not None and metadata.st_size > max_file_bytes:
+                        raise ExecutionBundleBlockedError(
+                            "dispatch_attempt_journal_event_size_limit_exceeded"
+                        )
+                    total_bytes += metadata.st_size
+                    if max_total_bytes is not None and total_bytes > max_total_bytes:
+                        raise ExecutionBundleBlockedError(
+                            "dispatch_attempt_journal_cumulative_size_limit_exceeded"
+                        )
+            after = DispatchAttemptJournal._directory_names(
+                descriptor,
+                max_entries=max_entries,
+                limit_reason="dispatch_attempt_journal_event_count_limit_exceeded",
+            )
             if before != after:
                 raise ExecutionBundleBlockedError(
                     "dispatch_attempt_journal_changed_during_enumeration"
@@ -1156,6 +1337,8 @@ class DispatchAttemptJournal:
                 )
 
     def _append_event(self, event: dict[str, object]) -> str:
+        if self._read_only:
+            raise ExecutionBundleBlockedError("dispatch_attempt_journal_read_only")
         self._verify_cached_head()
         body = _canonical_bytes(event) + b"\n"
         digest = hashlib.sha256(body).hexdigest()
@@ -1253,7 +1436,15 @@ class DispatchAttemptJournal:
     def replay(
         self, *, event_count: int | None = None
     ) -> DispatchAttemptJournalSnapshot:
-        all_names = self._event_file_names(self.events_path)
+        event_limit = self._READ_ONLY_MAX_EVENT_COUNT if self._read_only else None
+        per_event_limit = self._READ_ONLY_EVENT_MAX_BYTES if self._read_only else None
+        cumulative_limit = self._READ_ONLY_EVENTS_MAX_BYTES if self._read_only else None
+        all_names = self._event_file_names(
+            self.events_path,
+            max_entries=event_limit,
+            max_file_bytes=per_event_limit,
+            max_total_bytes=cumulative_limit,
+        )
         if event_count is None:
             names = all_names
         else:
@@ -1267,16 +1458,31 @@ class DispatchAttemptJournal:
         event_sha256s: list[str] = []
         previous: str | None = None
         last_finish_prior_schedule_sha256: str | None = None
+        replayed_bytes = 0
         for expected_sequence, name in enumerate(names):
             sequence, declared_digest = self._parse_event_file_name(name)
             if sequence != expected_sequence:
                 raise ExecutionBundleBlockedError(
                     "dispatch_attempt_journal_sequence_gap"
                 )
-            body = _read_regular_file(
-                self.events_path / name,
-                label="dispatch attempt journal event",
-            )
+            if cumulative_limit is None or per_event_limit is None:
+                body = _read_regular_file(
+                    self.events_path / name,
+                    label="dispatch attempt journal event",
+                )
+            else:
+                remaining_bytes = cumulative_limit - replayed_bytes
+                body = _read_regular_file(
+                    self.events_path / name,
+                    label="dispatch attempt journal event",
+                    max_bytes=min(per_event_limit, remaining_bytes),
+                    size_limit_reason=(
+                        "dispatch_attempt_journal_cumulative_size_limit_exceeded"
+                        if remaining_bytes < per_event_limit
+                        else "dispatch_attempt_journal_event_size_limit_exceeded"
+                    ),
+                )
+                replayed_bytes += len(body)
             actual_digest = hashlib.sha256(body).hexdigest()
             if actual_digest != declared_digest:
                 raise ExecutionBundleBlockedError(
@@ -1756,6 +1962,21 @@ def _preflight_bundle_assignment_sources(
     preflight_compile_cache_launch(compile_plan)
 
 
+def _preflight_all_bundle_sources(
+    bundle: IndustrialAssignmentExecutionBundle,
+) -> None:
+    """Reopen every bound source while retaining a verified plan snapshot."""
+
+    for name in _SHARED_BUNDLE_AUTHORITY_FIELDS:
+        value = getattr(bundle, name)
+        sources = value if type(value) is tuple else (value,)
+        for source in sources:
+            if type(source) is not BoundJsonSource:
+                raise TypeError("shared execution-bundle source has the wrong type")
+            source.load()
+    _preflight_bundle_assignment_sources(bundle)
+
+
 def _preflight_bundle_trainable_plan_release_trust(
     bundle: IndustrialAssignmentExecutionBundle,
 ) -> None:
@@ -1834,6 +2055,10 @@ async def execute_dispatch_wave_bundles(
     wave_index: int,
     receipt_output: str | Path,
     resume_receipt_path: str | Path | None = None,
+    expected_resume_receipt_sha256: str | None = None,
+    expected_resume_receipt_envelope_sha256: str | None = None,
+    _verified_publication: object | None = None,
+    _verified_plans: tuple[IndustrialExecutionPlan, ...] | None = None,
 ) -> DispatchScheduleReceipt:
     """Execute exactly one frozen wave through the first-party TaskGroup path.
 
@@ -1867,6 +2092,26 @@ async def execute_dispatch_wave_bundles(
         and Path(resume_receipt_path).resolve() == receipt_target
     ):
         raise ValueError("resume receipt and next-wave receipt output must differ")
+    if resume_receipt_path is None and (
+        expected_resume_receipt_sha256 is not None
+        or expected_resume_receipt_envelope_sha256 is not None
+    ):
+        raise ValueError(
+            "expected resume receipt identities require a resume receipt path"
+        )
+    if expected_resume_receipt_envelope_sha256 is not None and (
+        expected_resume_receipt_sha256 is None
+    ):
+        raise ValueError("expected resume envelope requires a receipt identity")
+    if expected_resume_receipt_sha256 is not None:
+        expected_resume_receipt_sha256 = _require_sha256(
+            "expected resume receipt", expected_resume_receipt_sha256
+        )
+    if expected_resume_receipt_envelope_sha256 is not None:
+        expected_resume_receipt_envelope_sha256 = _require_sha256(
+            "expected resume receipt envelope",
+            expected_resume_receipt_envelope_sha256,
+        )
     # Local import avoids making the source-owned materializer depend on an
     # executable bundle import cycle.  The manifest loader reopens every member
     # and its complete path-bound construction graph before returning here.
@@ -1874,16 +2119,56 @@ async def execute_dispatch_wave_bundles(
         load_materialized_dispatch_execution_bundle_publication,
     )
 
-    publication = load_materialized_dispatch_execution_bundle_publication(
-        unresolved_manifest
-    )
+    if (_verified_publication is None) != (_verified_plans is None):
+        raise TypeError("verified publication and plans must be supplied together")
+    if _verified_publication is None:
+        publication = load_materialized_dispatch_execution_bundle_publication(
+            unresolved_manifest
+        )
+        verified_plan_by_assignment: dict[str, IndustrialExecutionPlan] | None = None
+    else:
+        from lightcone_spec.orchestration.execution_bundle_materializer import (
+            MaterializedDispatchExecutionBundlePublication,
+        )
+
+        if (
+            type(_verified_publication)
+            is not MaterializedDispatchExecutionBundlePublication
+        ):
+            raise TypeError("verified publication has the wrong concrete type")
+        reopened_publication = load_materialized_dispatch_execution_bundle_publication(
+            unresolved_manifest
+        )
+        if reopened_publication != _verified_publication:
+            raise ValueError("verified publication differs from its source membership")
+        publication = reopened_publication
+        if _verified_plans is None:  # pragma: no cover - paired above
+            raise RuntimeError("verified execution plans disappeared")
+        if len(_verified_plans) != len(publication.bundles) or any(
+            type(plan) is not IndustrialExecutionPlan for plan in _verified_plans
+        ):
+            raise TypeError("verified execution plans do not cover the publication")
+        verified_plan_by_assignment = {}
+        for bundle, plan in zip(publication.bundles, _verified_plans, strict=True):
+            physical = plan.runtime_plan.physical_assignment
+            if (
+                physical is None
+                or physical.assignment_sha256 != bundle.assignment_sha256
+                or plan.sha256 != bundle.execution_plan_sha256
+                or bundle.assignment_sha256 in verified_plan_by_assignment
+            ):
+                raise ValueError("verified execution plans differ from the publication")
+            verified_plan_by_assignment[bundle.assignment_sha256] = plan
     if not publication.bundles:
         raise ExecutionBundleBlockedError("industrial_execution_bundle_missing")
 
     bundles = publication.bundles
     _require_shared_bundle_authority(bundles)
     for bundle in bundles:
-        _preflight_bundle_assignment_sources(bundle)
+        if verified_plan_by_assignment is None:
+            _preflight_bundle_assignment_sources(bundle)
+        else:
+            _preflight_all_bundle_sources(bundle)
         _preflight_bundle_trainable_plan_release_trust(bundle)
 
     declared_wave_ids = _declared_wave_assignment_ids(
@@ -1898,7 +2183,11 @@ async def execute_dispatch_wave_bundles(
         raise ExecutionBundleBlockedError(
             "industrial_execution_bundle_coverage_incomplete"
         )
-    representative_plan = representative.reconstruct_execution_plan()
+    representative_plan = (
+        representative.reconstruct_execution_plan()
+        if verified_plan_by_assignment is None
+        else verified_plan_by_assignment[representative.assignment_sha256]
+    )
     dispatch_plan = representative_plan.dispatch_plan
     base_context = representative_plan.dispatch_context
     if wave_index >= len(dispatch_plan.waves):
@@ -1940,11 +2229,13 @@ async def execute_dispatch_wave_bundles(
 
     def assignment_plan(assignment_sha256: str) -> IndustrialExecutionPlan:
         existing = plan_by_assignment.get(assignment_sha256)
-        plan = (
-            existing
-            if existing is not None
-            else bundle_by_assignment[assignment_sha256].reconstruct_execution_plan()
-        )
+        plan = existing
+        if plan is None:
+            plan = (
+                bundle_by_assignment[assignment_sha256].reconstruct_execution_plan()
+                if verified_plan_by_assignment is None
+                else verified_plan_by_assignment[assignment_sha256]
+            )
         if plan.dispatch_plan != dispatch_plan or plan.dispatch_context != base_context:
             raise ValueError("execution bundle differs from shared dispatch authority")
         physical = plan.runtime_plan.physical_assignment
@@ -1963,11 +2254,29 @@ async def execute_dispatch_wave_bundles(
     supplied_receipt: DispatchScheduleReceipt | None = None
     supplied_journal_binding: DispatchAttemptJournalBinding | None = None
     if resume_receipt_path is not None:
-        supplied_receipt, supplied_journal_binding = _load_dispatch_schedule_envelope(
+        (
+            supplied_receipt,
+            supplied_journal_binding,
+            supplied_envelope_sha256,
+        ) = _load_dispatch_schedule_envelope(
             resume_receipt_path,
             plan=dispatch_plan,
             execution_context=base_context,
         )
+        if (
+            expected_resume_receipt_sha256 is not None
+            and supplied_receipt.sha256 != expected_resume_receipt_sha256
+        ):
+            raise ExecutionBundleBlockedError(
+                "dispatch_resume_receipt_content_mismatch"
+            )
+        if (
+            expected_resume_receipt_envelope_sha256 is not None
+            and supplied_envelope_sha256 != expected_resume_receipt_envelope_sha256
+        ):
+            raise ExecutionBundleBlockedError(
+                "dispatch_resume_receipt_envelope_mismatch"
+            )
         if supplied_journal_binding is None:
             raise ExecutionBundleBlockedError(
                 "dispatch_resume_receipt_lacks_raw_attempt_journal"
@@ -2124,33 +2433,38 @@ async def execute_dispatch_wave_bundles(
             run_nonce_sha256=bundle.run_nonce_sha256,
         )
 
-    receipt = await execute_dispatch_plan(
-        dispatch_plan,
-        execution_context=execution_context,
-        runner=runner,
-        resume_receipt=resume_receipt,
-        attempt_journal=journal,
-        attempt_journal_replay=attempt_journal_replay,
-        stop_after_wave_index=wave_index,
-    )
-    final_snapshot = journal.replay()
-    final_snapshot.require_complete_cost_authority()
-    if final_snapshot.receipt != receipt or final_snapshot.binding is None:
-        raise RuntimeError("raw attempt journal differs from the execution receipt")
-    final_execution_context = context_from_snapshot(final_snapshot)
-    if final_snapshot.replay_authority is None:
-        raise RuntimeError("finished attempt journal lacks replay authority")
-    validate_dispatch_resume(
-        dispatch_plan,
-        receipt,
-        execution_context=final_execution_context,
-        attempt_journal_replay=final_snapshot.replay_authority,
-    )
-    publish_dispatch_schedule_receipt(
-        receipt_target,
-        receipt,
-        attempt_journal=final_snapshot.binding,
-    )
+    try:
+        receipt = await execute_dispatch_plan(
+            dispatch_plan,
+            execution_context=execution_context,
+            runner=runner,
+            resume_receipt=resume_receipt,
+            attempt_journal=journal,
+            attempt_journal_replay=attempt_journal_replay,
+            stop_after_wave_index=wave_index,
+        )
+        final_snapshot = journal.replay()
+        final_snapshot.require_complete_cost_authority()
+        if final_snapshot.receipt != receipt or final_snapshot.binding is None:
+            raise RuntimeError("raw attempt journal differs from the execution receipt")
+        final_execution_context = context_from_snapshot(final_snapshot)
+        if final_snapshot.replay_authority is None:
+            raise RuntimeError("finished attempt journal lacks replay authority")
+        validate_dispatch_resume(
+            dispatch_plan,
+            receipt,
+            execution_context=final_execution_context,
+            attempt_journal_replay=final_snapshot.replay_authority,
+        )
+        publish_dispatch_schedule_receipt(
+            receipt_target,
+            receipt,
+            attempt_journal=final_snapshot.binding,
+        )
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise _DispatchOutcomeUnknownError() from error
     return receipt
 
 
@@ -2237,9 +2551,19 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def _read_regular_file(path: Path, *, label: str) -> bytes:
+def _read_regular_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+    size_limit_reason: str | None = None,
+) -> bytes:
     if not path.is_absolute() or path.resolve() != path:
         raise ValueError(f"{label} path must be absolute and resolved")
+    if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+        raise ValueError(f"{label} byte limit must be a non-negative integer")
+    if size_limit_reason is not None and max_bytes is None:
+        raise ValueError(f"{label} size-limit reason requires a byte limit")
     directory_flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         directory_flags |= os.O_DIRECTORY
@@ -2272,8 +2596,16 @@ def _read_regular_file(path: Path, *, label: str) -> bytes:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise RuntimeError(f"{label} is not a regular file")
+        if max_bytes is not None and opened.st_size > max_bytes:
+            raise ExecutionBundleBlockedError(
+                size_limit_reason or f"{label} size limit exceeded"
+            )
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            body = handle.read()
+            body = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+        if max_bytes is not None and len(body) > max_bytes:
+            raise ExecutionBundleBlockedError(
+                size_limit_reason or f"{label} size limit exceeded"
+            )
         closed = os.fstat(descriptor)
         current = os.stat(
             path.name,

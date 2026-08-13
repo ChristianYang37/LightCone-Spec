@@ -168,6 +168,290 @@ def test_dispatch_attempt_journal_v2_binds_publication_manifest(
         )
 
 
+def _journal_tree_identity(root: Path) -> tuple[tuple[object, ...], ...]:
+    paths = (root, *sorted(root.rglob("*"))) if root.exists() else ()
+    rows = []
+    for path in paths:
+        metadata = path.lstat()
+        rows.append(
+            (
+                str(path.relative_to(root.parent)),
+                metadata.st_mode,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_nlink,
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+        )
+    return tuple(rows)
+
+
+def _journal_test_authority() -> tuple[object, object, str]:
+    inventory = SimpleNamespace(sha256="a" * 64, devices=())
+    context = SimpleNamespace(sha256="b" * 64, inventory=inventory)
+    plan = SimpleNamespace(sha256="c" * 64, waves=())
+    return plan, context, "d" * 64
+
+
+def test_dispatch_attempt_journal_open_existing_is_strictly_read_only(
+    tmp_path: Path,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "existing-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    before = _journal_tree_identity(root)
+
+    journal = DispatchAttemptJournal.open_existing(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+
+    assert journal.replay().event_sha256s == ()
+    assert _journal_tree_identity(root) == before
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_read_only",
+    ):
+        journal._append_event({})
+    assert _journal_tree_identity(root) == before
+
+
+@pytest.mark.parametrize("missing", ["root", "manifest", "events"])
+def test_dispatch_attempt_journal_open_existing_never_completes_missing_state(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / f"missing-{missing}"
+    if missing != "root":
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
+        if missing == "manifest":
+            (root / "events").mkdir(mode=0o700)
+            (root / "events").chmod(0o700)
+        else:
+            manifest = root / "manifest.json"
+            manifest.write_bytes(b"incomplete")
+            manifest.chmod(0o400)
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(ExecutionBundleBlockedError):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def test_dispatch_attempt_journal_open_existing_does_not_repair_corruption(
+    tmp_path: Path,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "corrupt-existing-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    manifest = root / "manifest.json"
+    manifest.chmod(0o600)
+    manifest.write_bytes(manifest.read_bytes()[:-1])
+    manifest.chmod(0o400)
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_manifest_identity_mismatch",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def _write_journal_event(root: Path, sequence: int, body: bytes) -> None:
+    digest = hashlib.sha256(body).hexdigest()
+    event = root / "events" / f"{sequence:012d}.{digest}.json"
+    event.write_bytes(body)
+    event.chmod(0o400)
+
+
+def test_dispatch_attempt_journal_open_existing_bounds_manifest_before_read(
+    tmp_path: Path,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "oversized-manifest-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    manifest = root / "manifest.json"
+    manifest.chmod(0o600)
+    manifest.write_bytes(
+        b"x" * (DispatchAttemptJournal._READ_ONLY_MANIFEST_MAX_BYTES + 1)
+    )
+    manifest.chmod(0o400)
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_manifest_size_limit_exceeded",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def test_dispatch_attempt_journal_open_existing_bounds_each_event_before_read(
+    tmp_path: Path,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "oversized-event-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    _write_journal_event(
+        root,
+        0,
+        b"x" * (DispatchAttemptJournal._READ_ONLY_EVENT_MAX_BYTES + 1),
+    )
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_event_size_limit_exceeded",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def test_dispatch_attempt_journal_open_existing_bounds_event_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "too-many-events-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    monkeypatch.setattr(DispatchAttemptJournal, "_READ_ONLY_MAX_EVENT_COUNT", 2)
+    for sequence in range(3):
+        _write_journal_event(root, sequence, b"{}\n")
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_event_count_limit_exceeded",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def test_dispatch_attempt_journal_open_existing_bounds_root_enumeration(
+    tmp_path: Path,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "too-many-root-entries-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    (root / "unexpected").write_bytes(b"unexpected")
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_directory_entry_limit_exceeded",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
+def test_dispatch_attempt_journal_open_existing_bounds_cumulative_event_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, context, publication_sha256 = _journal_test_authority()
+    root = tmp_path / "cumulative-event-journal"
+    DispatchAttemptJournal.open_or_create(
+        root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256=publication_sha256,
+    )
+    monkeypatch.setattr(DispatchAttemptJournal, "_READ_ONLY_EVENT_MAX_BYTES", 8)
+    monkeypatch.setattr(DispatchAttemptJournal, "_READ_ONLY_EVENTS_MAX_BYTES", 9)
+    _write_journal_event(root, 0, b"12345")
+    _write_journal_event(root, 1, b"67890")
+    before = _journal_tree_identity(root)
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_cumulative_size_limit_exceeded",
+    ):
+        DispatchAttemptJournal.open_existing(
+            root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256=publication_sha256,
+        )
+
+    assert _journal_tree_identity(root) == before
+
+
 def _ensure_bound(path: str | Path) -> None:
     source = Path(path)
     value = json.loads(source.read_text(encoding="utf-8"))
@@ -1500,7 +1784,10 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         "publish_dispatch_schedule_receipt",
         crash_before_envelope,
     )
-    with pytest.raises(RuntimeError, match="injected crash before schedule envelope"):
+    with pytest.raises(
+        bundle_module._DispatchOutcomeUnknownError,
+        match="dispatch outcome is unknown",
+    ):
         asyncio.run(
             bundle_module.execute_dispatch_wave_bundles(
                 manifest_path,
@@ -1923,6 +2210,252 @@ def test_missing_bundle_is_named_before_any_output_mutation(
             )
         )
     assert not receipt_output.exists()
+
+
+def test_verified_dispatch_rejects_reopened_publication_mismatch_before_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+    import lightcone_spec.orchestration.execution_bundle_materializer as materializer
+    from lightcone_spec.orchestration.execution_bundle_materializer import (
+        DispatchExecutionBundleManifest,
+        MaterializedAssignmentBundleReceipt,
+        MaterializedDispatchExecutionBundlePublication,
+    )
+
+    bundle_path, bundle = _bundle_fixture(tmp_path)
+    bundle_source = BoundJsonSource.bind(
+        bundle_path,
+        semantic_sha256=bundle.sha256,
+    )
+    member = MaterializedAssignmentBundleReceipt(
+        assignment_sha256=bundle.assignment_sha256,
+        cell_id=bundle.cell_id,
+        run_nonce_sha256=bundle.run_nonce_sha256,
+        execution_plan_sha256=bundle.execution_plan_sha256,
+        launch_policy=bundle.run_config,
+        run_nonce_receipt=bundle.run_config,
+        bundle=bundle_source,
+    )
+    manifest = DispatchExecutionBundleManifest(
+        schema_version=1,
+        kind="industrial_dispatch_execution_bundle_manifest",
+        bundle_schema_version=5,
+        materialization_inputs_sha256="a" * 64,
+        request=bundle.registry,
+        dispatch_plan=bundle.dispatch_plan,
+        assignments=(member,),
+    )
+    verified = MaterializedDispatchExecutionBundlePublication(
+        manifest=manifest,
+        bundles=(bundle,),
+    )
+    reopened = MaterializedDispatchExecutionBundlePublication(
+        manifest=replace(manifest, materialization_inputs_sha256="b" * 64),
+        bundles=(bundle,),
+    )
+    assert type(verified) is MaterializedDispatchExecutionBundlePublication
+    assert type(reopened) is MaterializedDispatchExecutionBundlePublication
+    assert reopened != verified
+
+    loader_calls: list[Path] = []
+
+    def reopen_another_publication(path: Path) -> object:
+        loader_calls.append(path)
+        return reopened
+
+    monkeypatch.setattr(
+        bundle_module,
+        "require_release_dispatch_execution_authority",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        materializer,
+        "load_materialized_dispatch_execution_bundle_publication",
+        reopen_another_publication,
+    )
+    journal_opened = False
+    transport_opened = False
+
+    def forbidden_journal(*args: object, **kwargs: object) -> object:
+        nonlocal journal_opened
+        journal_opened = True
+        raise AssertionError("publication mismatch reached the attempt journal")
+
+    def forbidden_transport(*args: object, **kwargs: object) -> object:
+        nonlocal transport_opened
+        transport_opened = True
+        raise AssertionError("publication mismatch reached serving transport")
+
+    monkeypatch.setattr(
+        bundle_module.DispatchAttemptJournal,
+        "open_or_create",
+        forbidden_journal,
+    )
+    monkeypatch.setattr(
+        bundle_module.PinnedBenchServingTransport,
+        "from_checkout",
+        forbidden_transport,
+    )
+    manifest_path = (tmp_path / "dispatch-manifest.json").resolve()
+
+    with pytest.raises(
+        ValueError,
+        match="verified publication differs from its source membership",
+    ):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                manifest_path,
+                wave_index=0,
+                receipt_output=tmp_path / "must-not-publish.json",
+                _verified_publication=verified,
+                _verified_plans=(object(),),  # type: ignore[arg-type]
+            )
+        )
+
+    assert loader_calls == [manifest_path]
+    assert not journal_opened
+    assert not transport_opened
+    assert not (tmp_path / "must-not-publish.json").exists()
+
+
+def test_dispatch_resume_requires_exact_expected_receipt_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+
+    monkeypatch.setattr(
+        bundle_module,
+        "require_release_dispatch_execution_authority",
+        lambda: None,
+    )
+    resume = (tmp_path / "resume.json").resolve()
+    resume.write_text("{}\n", encoding="utf-8")
+    receipt_output = (tmp_path / "next.json").resolve()
+
+    with pytest.raises(ValueError, match="require a resume receipt path"):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                (tmp_path / "manifest.json").resolve(),
+                wave_index=0,
+                receipt_output=receipt_output,
+                expected_resume_receipt_sha256="a" * 64,
+            )
+        )
+
+    receipt = SimpleNamespace(sha256="a" * 64)
+    envelope_sha256 = "f" * 64
+    monkeypatch.setattr(
+        bundle_module,
+        "_load_dispatch_schedule_envelope",
+        lambda *args, **kwargs: (receipt, object(), envelope_sha256),
+    )
+    # Reach the sole resume decoder without reconstructing the expensive
+    # source graph; the identity mismatch must still precede journal reopen.
+    assignment = SimpleNamespace(
+        assignment_id="c" * 64,
+        work_item=SimpleNamespace(
+            item_id="cell",
+            cell=SimpleNamespace(
+                resources=SimpleNamespace(
+                    workload_class=bundle_module.WorkloadClass.HEADLINE
+                )
+            ),
+        ),
+    )
+    wave = SimpleNamespace(assignments=(assignment,))
+    fake_plan = SimpleNamespace(waves=(wave,))
+    fake_context = SimpleNamespace(
+        inventory=SimpleNamespace(sha256="b" * 64),
+        budgets=(),
+        require_ready_budget_authority=lambda: (),
+    )
+    bundle = SimpleNamespace(
+        assignment_sha256=assignment.assignment_id,
+        cell_id="cell",
+        reconstruct_execution_plan=lambda: SimpleNamespace(
+            dispatch_plan=fake_plan,
+            dispatch_context=fake_context,
+            runtime_plan=SimpleNamespace(
+                physical_assignment=SimpleNamespace(
+                    assignment_sha256=assignment.assignment_id
+                )
+            ),
+        ),
+    )
+    publication = SimpleNamespace(
+        manifest=SimpleNamespace(sha256="d" * 64),
+        bundles=(bundle,),
+    )
+    import lightcone_spec.orchestration.execution_bundle_materializer as materializer
+
+    monkeypatch.setattr(
+        materializer,
+        "load_materialized_dispatch_execution_bundle_publication",
+        lambda _path: publication,
+    )
+    monkeypatch.setattr(
+        bundle_module, "_require_shared_bundle_authority", lambda _: None
+    )
+    monkeypatch.setattr(
+        bundle_module, "_preflight_bundle_assignment_sources", lambda _: None
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_preflight_bundle_trainable_plan_release_trust",
+        lambda _: None,
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "_declared_wave_assignment_ids",
+        lambda *args, **kwargs: (bundle.assignment_sha256,),
+    )
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_resume_receipt_content_mismatch",
+    ):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                (tmp_path / "manifest.json").resolve(),
+                wave_index=0,
+                receipt_output=receipt_output,
+                resume_receipt_path=resume,
+                expected_resume_receipt_sha256="e" * 64,
+            )
+        )
+    journal_opened = False
+
+    def forbidden_journal_open(*args, **kwargs):
+        nonlocal journal_opened
+        journal_opened = True
+        raise AssertionError("journal must not open after envelope mismatch")
+
+    monkeypatch.setattr(
+        bundle_module.DispatchAttemptJournal,
+        "open_or_create",
+        forbidden_journal_open,
+    )
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_resume_receipt_envelope_mismatch",
+    ):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                (tmp_path / "manifest.json").resolve(),
+                wave_index=0,
+                receipt_output=receipt_output,
+                resume_receipt_path=resume,
+                expected_resume_receipt_sha256=receipt.sha256,
+                expected_resume_receipt_envelope_sha256="e" * 64,
+            )
+        )
+    assert not journal_opened
 
 
 def test_formal_dispatch_entry_rejects_raw_bundle_paths_before_loading(
