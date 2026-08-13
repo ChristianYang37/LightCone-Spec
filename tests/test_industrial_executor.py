@@ -86,11 +86,9 @@ from lightcone_spec.experiments.stage_activation import (
 )
 from lightcone_spec.orchestration.executor import (
     NATIVE_TERMINAL_EVIDENCE_HOOK,
-    PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
     ArtifactBinding,
     IndustrialExecutionPlan,
     NativeEvidenceUnavailableError,
-    TrainablePlanExecutionBlockedError,
     build_industrial_execution_plan,
     execute_industrial_plan,
     industrial_execution_split_contract,
@@ -3627,7 +3625,7 @@ def test_adapted_native_evidence_preflight_requires_the_wire_provider() -> None:
     assert native_evidence_preflight(plan, forged_provider).status == "BLOCKED"
 
 
-def test_adapted_execution_blocks_without_source_owned_content_pin_before_mutation(
+def test_adapted_execution_rejects_noncanonical_runtime_before_mutation(
     tmp_path: Path,
 ) -> None:
     baseline = _execution_fixture(tmp_path, request_count=1).plan
@@ -3644,8 +3642,8 @@ def test_adapted_execution_blocks_without_source_owned_content_pin_before_mutati
         raise AssertionError("launcher must not run before trainable-plan trust")
 
     with pytest.raises(
-        TrainablePlanExecutionBlockedError,
-        match=PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
+        TypeError,
+        match="adapted execution semantics require an exact runtime plan",
     ):
         asyncio.run(
             execute_industrial_plan(
@@ -3666,8 +3664,8 @@ def test_adapted_execution_blocks_without_source_owned_content_pin_before_mutati
 
     render_root = tmp_path / "render-must-not-exist"
     with pytest.raises(
-        TrainablePlanExecutionBlockedError,
-        match=PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON,
+        TypeError,
+        match="adapted execution semantics require an exact runtime plan",
     ):
         render_industrial_execution_plan(
             output_root=render_root,

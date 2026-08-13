@@ -3856,6 +3856,7 @@ def _audit_alias_execution_candidate(
         "controlled_execution_policy_sha256",
         "model_lock_artifact",
         "trainable_plan_authority",
+        "failure_execution_authority",
         "prepared_model_content_release_manifest_sha256",
         "inventory_source_artifact",
         "runtime_envelope_artifact",
@@ -3883,6 +3884,8 @@ def _audit_alias_execution_candidate(
             "dependency_receipt_sha256s",
             "topology_receipt_sha256",
             "parameter_plan_sha256",
+            "execution_semantics_sha256",
+            "execution_semantics",
             "rank_config_sha256s",
             "rank_configs",
             "workload",
@@ -3897,7 +3900,7 @@ def _audit_alias_execution_candidate(
         label="alias runtime plan",
     )
     if (
-        runtime_plan.get("schema_version") != 2
+        runtime_plan.get("schema_version") != 3
         or runtime_plan.get("registry_sha256") != registry.sha256
         or plan.get("runtime_plan_sha256") != content_sha256(runtime_plan)
     ):
@@ -3915,6 +3918,14 @@ def _audit_alias_execution_candidate(
     if len(matches) != 1:
         raise ValueError("alias execution plan does not resolve one registry cell")
     cell = matches[0]
+    if (
+        runtime_plan.get("execution_semantics_sha256") is not None
+        or runtime_plan.get("execution_semantics") is not None
+    ):
+        raise ValueError(
+            "alias execution with cell semantics is BLOCKED: "
+            "current_release_semantic_alias_authority_unavailable"
+        )
     if cell.identity.method in {"tts", "l0"}:
         raise ValueError(
             "adapted alias execution is BLOCKED: "
@@ -3922,6 +3933,7 @@ def _audit_alias_execution_candidate(
         )
     if cell.identity.method in {"target_only", "static"} and (
         plan.get("trainable_plan_authority") is not None
+        or plan.get("failure_execution_authority") is not None
         or plan.get("prepared_model_content_release_manifest_sha256") is not None
     ):
         raise ValueError(

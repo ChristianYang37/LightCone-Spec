@@ -95,6 +95,7 @@ from lightcone_spec.locking.prepared_models import (
 from lightcone_spec.orchestration.industrial import (
     IndustrialPhysicalAssignment,
     IndustrialRuntimePlan,
+    validate_industrial_execution_semantics_authority,
 )
 from lightcone_spec.orchestration.native_terminal import (
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
@@ -1515,6 +1516,30 @@ def _launch_model_root(launch: ServerLaunch, option: str) -> str:
     return root
 
 
+def _require_adapted_execution_semantics_sha256(
+    runtime_plan: IndustrialRuntimePlan,
+) -> str:
+    """Return the exact E1 overlay digest or a stable scientific BLOCK."""
+
+    from lightcone_spec.experiments.execution_semantics import (
+        EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
+        EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+        CellExecutionSemantics,
+        CellExecutionSemanticsBlockedError,
+    )
+
+    if type(runtime_plan) is not IndustrialRuntimePlan:
+        raise TypeError("adapted execution semantics require an exact runtime plan")
+    semantics = runtime_plan.execution_semantics
+    if type(semantics) is not CellExecutionSemantics:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
+            if runtime_plan.cell.identity.experiment == "E1"
+            else EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
+    return semantics.sha256
+
+
 def _require_execution_trainable_plan_authority(
     plan: IndustrialExecutionPlan,
 ) -> None:
@@ -1534,6 +1559,9 @@ def _require_execution_trainable_plan_authority(
         return
     if method not in {"tts", "l0"}:
         raise ValueError("execution trainable-plan gate supports only core methods")
+    execution_semantics_sha256 = _require_adapted_execution_semantics_sha256(
+        plan.runtime_plan
+    )
     if release_pin is None:
         raise TrainablePlanExecutionBlockedError(
             PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
@@ -1591,6 +1619,7 @@ def _require_execution_trainable_plan_authority(
             expected_cell_declaration_sha256=(
                 plan.runtime_plan.cell_declaration_sha256
             ),
+            expected_execution_semantics_sha256=execution_semantics_sha256,
             expected_target_model_id=config.model.target,
             expected_target_revision=config.model.target_revision,
             expected_drafter_model_id=config.model.drafter,
@@ -1637,6 +1666,9 @@ def _require_render_trainable_plan_authority(
         return
     if method not in {"tts", "l0"}:
         raise ValueError("render trainable-plan gate supports only core methods")
+    execution_semantics_sha256 = _require_adapted_execution_semantics_sha256(
+        runtime_plan
+    )
     if release_pin is None:
         raise TrainablePlanExecutionBlockedError(
             PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_PIN_UNAVAILABLE_REASON
@@ -1698,6 +1730,7 @@ def _require_render_trainable_plan_authority(
             expected_split_sha256=split_artifact.content_sha256,
             expected_cell_id=runtime_plan.cell_id,
             expected_cell_declaration_sha256=(runtime_plan.cell_declaration_sha256),
+            expected_execution_semantics_sha256=execution_semantics_sha256,
             expected_target_model_id=config.model.target,
             expected_target_revision=config.model.target_revision,
             expected_drafter_model_id=config.model.drafter,
@@ -1753,6 +1786,15 @@ class IndustrialExecutionPlan:
     abort_grace_s: float = 30.0
 
     def validate(self) -> None:
+        # Scientific activation/load/config identity is allocation-free and
+        # must fail before any release trust or execution gate.  Rechecking
+        # here prevents a caller-authored/replaced runtime-plan overlay from
+        # bypassing the bundle's raw-authority replay.
+        validate_industrial_execution_semantics_authority(
+            runtime_plan=self.runtime_plan,
+            dispatch_context=self.dispatch_context,
+            registered_load=self.load_plan,
+        )
         if type(self.evidence_writer_policy) is not EvidenceWriterPolicy:
             raise TypeError("execution writer policy must be an exact policy")
         self.evidence_writer_policy.validate()

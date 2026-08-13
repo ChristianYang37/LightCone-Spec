@@ -2606,13 +2606,15 @@ class IndustrialExecutionPlanAudit:
     budget_materialization_authority_sha256: str
     component_replay_sha256: str
     dispatch_plan_sha256: str
+    execution_semantics_sha256: str | None
+    execution_semantics_authority: Literal["diagnostic_non_authority"]
     exact_dispatch_replay: Literal[True]
     execution_plan_sha256: None
     execution_plan_status: Literal["NOT_VALIDATED"]
     execution_plan_reason_code: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != "industrial_execution_plan_audit":
+        if self.schema_version != 2 or self.kind != "industrial_execution_plan_audit":
             raise ValueError("industrial execution-plan audit schema is unsupported")
         for name in (
             "bundle_sha256",
@@ -2626,6 +2628,13 @@ class IndustrialExecutionPlanAudit:
             _require_sha256(f"execution-plan audit {name}", getattr(self, name))
         if self.budget_plan_status not in {"READY", "UNRESOLVED"}:
             raise ValueError("execution-plan audit budget status is unsupported")
+        if self.execution_semantics_sha256 is not None:
+            _require_sha256(
+                "execution-plan audit execution semantics",
+                self.execution_semantics_sha256,
+            )
+        if self.execution_semantics_authority != "diagnostic_non_authority":
+            raise ValueError("execution semantics audit cannot claim launch authority")
         if self.exact_dispatch_replay is not True:
             raise ValueError("execution-plan audit must record exact dispatch replay")
         if self.execution_plan_sha256 is not None:
@@ -3340,6 +3349,13 @@ class IndustrialAssignmentExecutionBundle:
             raise ValueError(
                 "execution production load differs from the registered budget load"
             )
+        execution_semantics = _resolve_bundle_execution_semantics(
+            activation_replay=activation_replay,
+            load_binding=selected_load_bindings[0],
+            cell=cell,
+            run_config=run_config,
+            diagnostic=diagnostic,
+        )
         compile_plan = CompileCacheLaunchPlan.load(self.compile_cache_plan.path)
         self.compile_cache_plan.load()
         if compile_plan.sha256 != self.compile_cache_plan.semantic_sha256:
@@ -3360,6 +3376,7 @@ class IndustrialAssignmentExecutionBundle:
             run_config=run_config,
             model_lock=model_lock,
             prepared_models=prepared_models,
+            execution_semantics=execution_semantics,
             formal=not diagnostic,
         )
         if not diagnostic:
@@ -3378,6 +3395,7 @@ class IndustrialAssignmentExecutionBundle:
                 topology_receipts=topology,
                 dependency_receipts=receipts,
                 parameter_plan=parameter_plan,
+                execution_semantics=execution_semantics,
             )
         writer_policy, startup, shutdown, abort, controlled_policy = (
             _execution_policy_from_dict(self.execution_policy.load())
@@ -3590,6 +3608,12 @@ class IndustrialAssignmentExecutionBundle:
                     "assignment_sha256": assignment.assignment_id,
                     "topology_receipt_sha256": topology.receipt_sha256,
                     "production_load_sha256": load.paired_replay_sha256,
+                    "execution_semantics_authority": "diagnostic_non_authority",
+                    "execution_semantics_sha256": (
+                        None
+                        if execution_semantics is None
+                        else execution_semantics.sha256
+                    ),
                     "run_config_sha256": run_config_sha256(run_config),
                     "server_launch_sha256": content_sha256(
                         server_launch_to_dict(launch)
@@ -3622,7 +3646,7 @@ class IndustrialAssignmentExecutionBundle:
                 }
             )
             return IndustrialExecutionPlanAudit(
-                schema_version=1,
+                schema_version=2,
                 kind="industrial_execution_plan_audit",
                 bundle_sha256=self.sha256,
                 assignment_sha256=self.assignment_sha256,
@@ -3634,6 +3658,10 @@ class IndustrialAssignmentExecutionBundle:
                 ),
                 component_replay_sha256=component_replay_sha256,
                 dispatch_plan_sha256=dispatch.sha256,
+                execution_semantics_sha256=(
+                    None if execution_semantics is None else execution_semantics.sha256
+                ),
+                execution_semantics_authority="diagnostic_non_authority",
                 exact_dispatch_replay=True,
                 execution_plan_sha256=None,
                 execution_plan_status="NOT_VALIDATED",
@@ -3975,6 +4003,45 @@ def _rematerialize_budget_authority(
     ):
         raise ValueError("budget load cells differ from raw materialization authority")
     return budget_plan, budget_load_bindings, authority, activation_replay
+
+
+def _resolve_bundle_execution_semantics(
+    *,
+    activation_replay: object,
+    load_binding: object,
+    cell: ExperimentCell,
+    run_config: object,
+    diagnostic: bool,
+):
+    """Derive the E1 overlay only after caller-owned raw replay.
+
+    The returned value is scientific identity.  It is never a release token;
+    diagnostic callers additionally label it as non-authority in their audit.
+    Stages whose source-owned execution semantics are not implemented retain a
+    stable formal BLOCK instead of falling back to registry placeholders.
+    """
+
+    if cell.identity.experiment == "E1":
+        from lightcone_spec.experiments.execution_semantics import (
+            CellExecutionSemanticsBlockedError,
+            resolve_cell_execution_semantics,
+        )
+
+        try:
+            semantics = resolve_cell_execution_semantics(
+                activation=activation_replay,
+                load_binding=load_binding,
+                cell=cell,
+            )
+            semantics.validate_run_config(run_config)
+        except CellExecutionSemanticsBlockedError as error:
+            raise ExecutionBundleBlockedError(error.reason_code) from error
+        return semantics
+    if cell.identity.experiment in {"E2", "E3b", "E5"} and not diagnostic:
+        raise ExecutionBundleBlockedError(
+            "cell_execution_semantics_experiment_unsupported"
+        )
+    return None
 
 
 def _one_activation_raw_binding(
@@ -4449,6 +4516,7 @@ def _require_bundle_trainable_plan_authority(
     run_config,
     model_lock: ModelLock,
     prepared_models: object,
+    execution_semantics: object,
     formal: bool,
 ) -> TrainablePlan | None:
     method = cell.identity.method
@@ -4463,6 +4531,18 @@ def _require_bundle_trainable_plan_authority(
     if method not in {"tts", "l0"}:
         raise ExecutionBundleBlockedError(
             "current_release_core_trainable_plan_method_required"
+        )
+    from lightcone_spec.experiments.execution_semantics import (
+        EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
+        EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+        CellExecutionSemantics,
+    )
+
+    if type(execution_semantics) is not CellExecutionSemantics:
+        raise ExecutionBundleBlockedError(
+            EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
+            if cell.identity.experiment == "E1"
+            else EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
         )
     if release_pin is None:
         raise ExecutionBundleBlockedError(
@@ -4536,6 +4616,7 @@ def _require_bundle_trainable_plan_authority(
             expected_split_sha256=bundle.split_artifact.source.semantic_sha256,
             expected_cell_id=cell.cell_id,
             expected_cell_declaration_sha256=cell.sha256,
+            expected_execution_semantics_sha256=execution_semantics.sha256,
             expected_target_model_id=run_config.model.target,
             expected_target_revision=run_config.model.target_revision,
             expected_drafter_model_id=run_config.model.drafter,

@@ -690,6 +690,38 @@ def test_execution_candidate_is_rebuilt_from_current_raw_plan_and_locks(
     assert candidate.semantics.target_model == config.model.target
     assert candidate.semantics.model_lock_sha256 == model_lock.sha256
     assert candidate.budget_plan == plan.budget_plan
+    plan_wire = plan.to_dict()
+    assert plan_wire["runtime_plan"]["schema_version"] == 3
+    assert plan_wire["runtime_plan"]["execution_semantics_sha256"] is None
+    assert plan_wire["runtime_plan"]["execution_semantics"] is None
+
+    semantic_alias_tamper = deepcopy(plan_wire)
+    semantic_alias_tamper["runtime_plan"]["execution_semantics_sha256"] = _sha(
+        "caller-authored-alias-semantics"
+    )
+    semantic_alias_tamper["runtime_plan"]["execution_semantics"] = {
+        "schema_version": 1,
+        "sha256": semantic_alias_tamper["runtime_plan"]["execution_semantics_sha256"],
+    }
+    semantic_alias_tamper["runtime_plan_sha256"] = content_sha256(
+        semantic_alias_tamper["runtime_plan"]
+    )
+    with pytest.raises(
+        ValueError,
+        match="current_release_semantic_alias_authority_unavailable",
+    ):
+        _audit_alias_execution_candidate(
+            replace(
+                artifacts,
+                execution_plan=_write_json(
+                    root / "alias-plan-semantics-tamper.json",
+                    semantic_alias_tamper,
+                ),
+            ),
+            registry=registry,
+            hardware_envelope=envelope,
+            inventory=plan.dispatch_context.inventory,
+        )
 
     with pytest.raises(
         BudgetMaterializationBlockedError,
@@ -702,7 +734,6 @@ def test_execution_candidate_is_rebuilt_from_current_raw_plan_and_locks(
             inventory=plan.dispatch_context.inventory,
         )
 
-    plan_wire = plan.to_dict()
     for name, field, value in (
         ("trainable-authority", "trainable_plan_authority", {}),
         (

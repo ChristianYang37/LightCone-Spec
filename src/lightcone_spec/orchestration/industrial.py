@@ -10,7 +10,7 @@ rejects registry placeholders that still require an upstream locked output.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -35,6 +35,9 @@ from lightcone_spec.experiments.registry import (
     serving_cell_rejection_reason,
 )
 from lightcone_spec.runtime.distributed import TopologyReceiptSet
+
+if TYPE_CHECKING:
+    from lightcone_spec.experiments.execution_semantics import CellExecutionSemantics
 
 _TOPOLOGIES = {
     "tp1_dp1": (1, 1),
@@ -205,7 +208,52 @@ class IndustrialRuntimePlan:
     parameter_plan_sha256: str | None
     rank_configs: tuple[RunConfig, ...]
     cell: ExperimentCell
+    execution_semantics: CellExecutionSemantics | None = None
     physical_assignment: IndustrialPhysicalAssignment | None = None
+
+    def __post_init__(self) -> None:
+        if self.execution_semantics is None:
+            if (
+                self.physical_assignment is not None
+                and self.cell.identity.experiment == "E1"
+            ):
+                from lightcone_spec.experiments.execution_semantics import (
+                    EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
+                    CellExecutionSemanticsBlockedError,
+                )
+
+                raise CellExecutionSemanticsBlockedError(
+                    EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
+                )
+            return
+        from lightcone_spec.experiments.execution_semantics import (
+            EXECUTION_SEMANTICS_FOREIGN_CELL_REASON,
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+            CellExecutionSemantics,
+            CellExecutionSemanticsBlockedError,
+        )
+
+        if type(self.execution_semantics) is not CellExecutionSemantics:
+            raise TypeError("runtime plan requires exact execution semantics")
+        if self.cell.identity.experiment != "E1":
+            raise CellExecutionSemanticsBlockedError(
+                EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+            )
+        if (
+            self.execution_semantics.registry_sha256 != self.registry_sha256
+            or self.execution_semantics.cell_declaration != self.cell
+            or self.execution_semantics.cell_declaration_sha256
+            != self.cell_declaration_sha256
+        ):
+            raise CellExecutionSemanticsBlockedError(
+                EXECUTION_SEMANTICS_FOREIGN_CELL_REASON
+            )
+        for config in self.rank_configs:
+            _validate_execution_semantics_run_config(
+                cell=self.cell,
+                semantics=self.execution_semantics,
+                config=config,
+            )
 
     @property
     def physical_dispatch_ready(self) -> bool:
@@ -255,13 +303,23 @@ class IndustrialRuntimePlan:
             "exclusive": resources.exclusive,
         }
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "registry_sha256": self.registry_sha256,
             "cell_id": self.cell_id,
             "cell_declaration_sha256": self.cell_declaration_sha256,
             "dependency_receipt_sha256s": list(self.dependency_receipt_sha256s),
             "topology_receipt_sha256": self.topology_receipt_sha256,
             "parameter_plan_sha256": self.parameter_plan_sha256,
+            "execution_semantics_sha256": (
+                None
+                if self.execution_semantics is None
+                else self.execution_semantics.sha256
+            ),
+            "execution_semantics": (
+                None
+                if self.execution_semantics is None
+                else _execution_semantics_identity(self.execution_semantics)
+            ),
             "rank_config_sha256s": [
                 content_sha256(config.model_dump(mode="json"))
                 for config in self.rank_configs
@@ -404,10 +462,227 @@ def _locked_output(receipt: ExperimentReceipt, name: str) -> str:
     return matches[0]
 
 
-def _reject_unresolved_cell(cell: ExperimentCell) -> None:
+def _reject_unresolved_cell(
+    cell: ExperimentCell,
+    execution_semantics: CellExecutionSemantics | None = None,
+) -> None:
+    from lightcone_spec.experiments.execution_semantics import CellExecutionSemantics
+
     reason = serving_cell_rejection_reason(cell)
+    if reason is None:
+        return
+    if (
+        type(execution_semantics) is CellExecutionSemantics
+        and cell.identity.experiment == "E1"
+        and execution_semantics.cell_declaration == cell
+        and reason.startswith("cell contains unresolved semantic placeholder ")
+    ):
+        return
     if reason is not None:
         raise ValueError(reason)
+
+
+def _execution_semantics_identity(
+    semantics: CellExecutionSemantics,
+) -> dict[str, Any]:
+    """Serialize the complete replay identity without copying raw corpora."""
+
+    from lightcone_spec.experiments.execution_semantics import CellExecutionSemantics
+
+    if type(semantics) is not CellExecutionSemantics:
+        raise TypeError("runtime plan requires exact cell execution semantics")
+    return {
+        "schema_version": semantics.schema_version,
+        "sha256": semantics.sha256,
+        "registry_sha256": semantics.registry_sha256,
+        "cell_declaration_sha256": semantics.cell_declaration_sha256,
+        "activation_authority_binding_sha256": (
+            semantics.activation_authority_binding_sha256
+        ),
+        "activation_semantic_sha256": semantics.activation_semantic_sha256,
+        "e3a_selection_sha256": semantics.e3a_selection_sha256,
+        "load_binding_sha256": semantics.load_binding_sha256,
+        "registered_load_plan_sha256": semantics.registered_load_plan_sha256,
+        "registered_load_source_sha256": semantics.registered_load_source_sha256,
+        "registered_corpus_sha256": semantics.registered_corpus_sha256,
+        "registered_request_ids_sha256": semantics.registered_request_ids_sha256,
+        "registered_sampling_parameters_sha256": (
+            semantics.registered_sampling_parameters_sha256
+        ),
+        "registered_request_count": semantics.registered_request_count,
+        "adaptation_recipe_sha256": semantics.adaptation_recipe_sha256,
+        "expected": {
+            "method": semantics.expected_method,
+            "model": semantics.expected_model,
+            "backend": semantics.expected_backend,
+            "task": semantics.expected_task,
+            "model_max_context_length": (semantics.expected_model_max_context_length),
+            "runtime_context_length": semantics.expected_runtime_context_length,
+            "concurrency": semantics.expected_concurrency,
+            "draft_width": semantics.expected_draft_width,
+            "draft_depth": semantics.expected_draft_depth,
+            "speculation_enabled": semantics.expected_speculation_enabled,
+            "scope": semantics.expected_scope,
+            "parameterization": semantics.expected_parameterization,
+            "rank": semantics.expected_rank,
+            "optimizer": semantics.expected_optimizer,
+            "learning_rate": semantics.expected_learning_rate,
+            "schedule": semantics.expected_schedule,
+            "cohort": semantics.expected_cohort,
+            "cohort_count": semantics.expected_cohort_count,
+            "workload_seed": semantics.expected_workload_seed,
+            "runtime_random_seed": semantics.expected_runtime_random_seed,
+            "sampling_profile_sha256": (semantics.expected_sampling_profile_sha256),
+            "regime": semantics.expected_regime,
+            "arrival": semantics.expected_arrival,
+            "slo": semantics.expected_slo,
+            "topology": semantics.expected_topology,
+        },
+    }
+
+
+def _validate_execution_semantics_run_config(
+    *,
+    cell: ExperimentCell,
+    semantics: CellExecutionSemantics,
+    config: RunConfig,
+) -> None:
+    """Preserve renderer invariants while replacing unresolved placeholders."""
+
+    from lightcone_spec.experiments.execution_semantics import (
+        EXECUTION_SEMANTICS_RUN_CONFIG_MISMATCH_REASON,
+        CellExecutionSemantics,
+        CellExecutionSemanticsBlockedError,
+    )
+
+    if type(semantics) is not CellExecutionSemantics:
+        raise TypeError("runtime plan requires exact cell execution semantics")
+    semantics.validate_run_config(config)
+    expected_telemetry = (
+        "profile"
+        if cell.resources.workload_class is WorkloadClass.PROFILE
+        else "headline"
+    )
+    if config.runtime.telemetry_detail != expected_telemetry:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RUN_CONFIG_MISMATCH_REASON
+        )
+
+
+def _require_e1_execution_semantics(
+    *,
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+    dispatch_context: GpuDispatchExecutionContext,
+    execution_semantics: CellExecutionSemantics | None,
+) -> CellExecutionSemantics:
+    """Bind a resolver result back to the exact scheduler raw authority."""
+
+    from lightcone_spec.experiments.execution_semantics import (
+        EXECUTION_SEMANTICS_ACTIVATION_IDENTITY_MISMATCH_REASON,
+        EXECUTION_SEMANTICS_FOREIGN_CELL_REASON,
+        EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON,
+        EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
+        EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+        CellExecutionSemantics,
+        CellExecutionSemanticsBlockedError,
+    )
+    from lightcone_spec.experiments.planning import (
+        BudgetLoadRawBinding,
+        BudgetMaterializationAuthorityBinding,
+    )
+
+    if type(dispatch_context) is not GpuDispatchExecutionContext:
+        raise TypeError("execution semantics require an exact dispatch context")
+    if cell.identity.experiment != "E1":
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
+    if type(execution_semantics) is not CellExecutionSemantics:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
+        )
+    if (
+        execution_semantics.registry_sha256 != registry.sha256
+        or execution_semantics.cell_declaration != cell
+        or execution_semantics.cell_declaration_sha256 != cell.sha256
+    ):
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_FOREIGN_CELL_REASON
+        )
+    authority = dispatch_context.budget_materialization_authority
+    if type(authority) is not BudgetMaterializationAuthorityBinding or any(
+        type(binding) is not BudgetLoadRawBinding for binding in authority.load_bindings
+    ):
+        raise TypeError("execution semantics require exact raw budget authority")
+    if authority.activation != execution_semantics.activation_authority_binding:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_ACTIVATION_IDENTITY_MISMATCH_REASON
+        )
+    raw_loads = tuple(
+        binding
+        for binding in authority.load_bindings
+        if binding.cell_id == cell.cell_id
+        and binding.source.semantic_sha256 == execution_semantics.load_binding_sha256
+    )
+    if len(raw_loads) != 1:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON
+        )
+    return execution_semantics
+
+
+def validate_industrial_execution_semantics_authority(
+    *,
+    runtime_plan: IndustrialRuntimePlan,
+    dispatch_context: GpuDispatchExecutionContext,
+    registered_load: object,
+) -> None:
+    """Revalidate the runtime overlay at the final execution-plan boundary."""
+
+    if type(runtime_plan) is not IndustrialRuntimePlan:
+        raise TypeError("execution semantics require an exact runtime plan")
+    cell = runtime_plan.cell
+    semantics = runtime_plan.execution_semantics
+    if cell.identity.experiment == "E1":
+        from lightcone_spec.experiments.load import ProductionLoadPlan
+
+        if type(registered_load) is not ProductionLoadPlan:
+            raise TypeError("execution semantics require an exact production load")
+        bound = _require_e1_execution_semantics(
+            registry=dispatch_context.registry,
+            cell=cell,
+            dispatch_context=dispatch_context,
+            execution_semantics=semantics,
+        )
+        if (
+            registered_load != bound.load_binding.registered_load
+            or getattr(registered_load, "paired_replay_sha256", None)
+            != bound.registered_load_plan_sha256
+        ):
+            from lightcone_spec.experiments.execution_semantics import (
+                EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON,
+                CellExecutionSemanticsBlockedError,
+            )
+
+            raise CellExecutionSemanticsBlockedError(
+                EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON
+            )
+        for config in runtime_plan.rank_configs:
+            _validate_execution_semantics_run_config(
+                cell=cell,
+                semantics=bound,
+                config=config,
+            )
+    elif semantics is not None:
+        from lightcone_spec.experiments.execution_semantics import (
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+            CellExecutionSemanticsBlockedError,
+        )
+
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
 
 
 def bind_industrial_gpu_assignment(
@@ -421,6 +696,7 @@ def bind_industrial_gpu_assignment(
     inventory: GpuInventory,
     dispatch_inventory_sha256: str,
     topology_receipts: TopologyReceiptSet,
+    execution_semantics: CellExecutionSemantics | None = None,
 ) -> IndustrialPhysicalAssignment:
     """Validate and bind one scheduler assignment without allocating resources.
 
@@ -451,7 +727,23 @@ def bind_industrial_gpu_assignment(
         raise ValueError("physical dispatch requires one same-host inventory")
 
     cell = _cell_by_id(registry, cell_id)
-    _reject_unresolved_cell(cell)
+    if cell.identity.experiment == "E1":
+        execution_semantics = _require_e1_execution_semantics(
+            registry=registry,
+            cell=cell,
+            dispatch_context=dispatch_context,
+            execution_semantics=execution_semantics,
+        )
+    elif execution_semantics is not None:
+        from lightcone_spec.experiments.execution_semantics import (
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+            CellExecutionSemanticsBlockedError,
+        )
+
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
+    _reject_unresolved_cell(cell, execution_semantics)
     if (
         dispatch_plan.registry_sha256 != registry.sha256
         or dispatch_plan.inventory_sha256 != inventory.sha256
@@ -881,10 +1173,11 @@ def _render_industrial_runtime_plan(
     topology_receipts: TopologyReceiptSet,
     dependency_receipts: tuple[ExperimentReceipt, ...],
     parameter_plan: TrainablePlan | None,
+    execution_semantics: CellExecutionSemantics | None,
     physical_assignment: IndustrialPhysicalAssignment | None,
 ) -> IndustrialRuntimePlan:
     cell = _cell_by_id(registry, cell_id)
-    _reject_unresolved_cell(cell)
+    _reject_unresolved_cell(cell, execution_semantics)
     if not rank_configs:
         raise ValueError("at least one rank RunConfig is required")
     _validate_explicit_configs(rank_configs)
@@ -906,7 +1199,14 @@ def _render_industrial_runtime_plan(
         ),
     )
     for config in rank_configs:
-        _validate_cell_config(cell, config)
+        if execution_semantics is None:
+            _validate_cell_config(cell, config)
+        else:
+            _validate_execution_semantics_run_config(
+                cell=cell,
+                semantics=execution_semantics,
+                config=config,
+            )
     parameter_plan_sha256 = _validate_parameter_plan(
         cell,
         rank_configs[0],
@@ -921,6 +1221,7 @@ def _render_industrial_runtime_plan(
         parameter_plan_sha256=parameter_plan_sha256,
         rank_configs=rank_configs,
         cell=cell,
+        execution_semantics=execution_semantics,
         physical_assignment=physical_assignment,
     )
     # Force canonical serialization now so malformed future extensions fail at
@@ -953,6 +1254,7 @@ def render_industrial_cell_runtime_plan(
         topology_receipts=topology_receipts,
         dependency_receipts=dependency_receipts,
         parameter_plan=parameter_plan,
+        execution_semantics=None,
         physical_assignment=None,
     )
 
@@ -971,6 +1273,7 @@ def render_assigned_industrial_cell_runtime_plan(
     topology_receipts: TopologyReceiptSet,
     dependency_receipts: tuple[ExperimentReceipt, ...] = (),
     parameter_plan: TrainablePlan | None = None,
+    execution_semantics: CellExecutionSemantics | None = None,
 ) -> IndustrialRuntimePlan:
     """Render a registry cell against one exact physical GPU assignment.
 
@@ -989,6 +1292,7 @@ def render_assigned_industrial_cell_runtime_plan(
         inventory=inventory,
         dispatch_inventory_sha256=dispatch_inventory_sha256,
         topology_receipts=topology_receipts,
+        execution_semantics=execution_semantics,
     )
     return _render_industrial_runtime_plan(
         registry=registry,
@@ -997,5 +1301,6 @@ def render_assigned_industrial_cell_runtime_plan(
         topology_receipts=topology_receipts,
         dependency_receipts=dependency_receipts,
         parameter_plan=parameter_plan,
+        execution_semantics=execution_semantics,
         physical_assignment=physical_assignment,
     )

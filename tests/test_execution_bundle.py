@@ -1140,6 +1140,9 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     assert audit.execution_plan_sha256 is None
     assert audit.execution_plan_status == "NOT_VALIDATED"
     assert audit.exact_dispatch_replay is True
+    assert audit.schema_version == 2
+    assert audit.execution_semantics_sha256 is None
+    assert audit.execution_semantics_authority == "diagnostic_non_authority"
     assert audit.dispatch_plan_sha256 == expected.dispatch_plan.semantic_sha256
     assert audit.cell_id == expected.cell_id
     assert audit.budget_plan_status == "UNRESOLVED"
