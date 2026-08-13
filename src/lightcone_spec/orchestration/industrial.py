@@ -569,6 +569,84 @@ def _validate_execution_semantics_run_config(
         )
 
 
+def _require_registered_e1_execution_recipe(
+    *,
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+    execution_semantics: CellExecutionSemantics | None,
+) -> CellExecutionSemantics:
+    """Replay exact registry recipe membership without trusting caller digests."""
+
+    from lightcone_spec.experiments.execution_semantics import (
+        EXECUTION_SEMANTICS_FOREIGN_CELL_REASON,
+        EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
+        EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON,
+        EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
+        CellExecutionSemantics,
+        CellExecutionSemanticsBlockedError,
+    )
+    from lightcone_spec.experiments.registry import AdaptationRecipeDeclaration
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("execution recipe membership requires an exact registry")
+    if type(cell) is not ExperimentCell:
+        raise TypeError("execution recipe membership requires an exact cell")
+    if cell.identity.experiment != "E1":
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
+    if type(execution_semantics) is not CellExecutionSemantics:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
+        )
+    owned_cells = tuple(
+        candidate for candidate in registry.cells if candidate.cell_id == cell.cell_id
+    )
+    if (
+        owned_cells != (cell,)
+        or execution_semantics.registry_sha256 != registry.sha256
+        or execution_semantics.cell_declaration != cell
+        or execution_semantics.cell_declaration_sha256 != cell.sha256
+    ):
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_FOREIGN_CELL_REASON
+        )
+
+    recipe = execution_semantics.adaptation_recipe
+    recipe_sha256 = execution_semantics.adaptation_recipe_sha256
+    if cell.identity.method in {"target_only", "static"}:
+        if recipe is not None or recipe_sha256 is not None:
+            raise CellExecutionSemanticsBlockedError(
+                EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON
+            )
+        return execution_semantics
+    if cell.identity.method not in {"tts", "l0"}:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
+        )
+
+    try:
+        registered_recipe = registry.adaptation_recipe_for_cell(cell)
+    except (TypeError, ValueError) as error:
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON
+        ) from error
+    registered_sha256 = content_sha256(registered_recipe)
+    if (
+        type(registered_recipe) is not AdaptationRecipeDeclaration
+        or type(recipe) is not AdaptationRecipeDeclaration
+        or recipe != registered_recipe
+        or content_sha256(recipe) != registered_sha256
+        or registered_recipe.sha256 != registered_sha256
+        or recipe.sha256 != registered_sha256
+        or recipe_sha256 != registered_sha256
+    ):
+        raise CellExecutionSemanticsBlockedError(
+            EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON
+        )
+    return execution_semantics
+
+
 def _require_e1_execution_semantics(
     *,
     registry: ExperimentRegistry,
@@ -580,11 +658,7 @@ def _require_e1_execution_semantics(
 
     from lightcone_spec.experiments.execution_semantics import (
         EXECUTION_SEMANTICS_ACTIVATION_IDENTITY_MISMATCH_REASON,
-        EXECUTION_SEMANTICS_FOREIGN_CELL_REASON,
         EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON,
-        EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON,
-        EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
-        CellExecutionSemantics,
         CellExecutionSemanticsBlockedError,
     )
     from lightcone_spec.experiments.planning import (
@@ -594,22 +668,11 @@ def _require_e1_execution_semantics(
 
     if type(dispatch_context) is not GpuDispatchExecutionContext:
         raise TypeError("execution semantics require an exact dispatch context")
-    if cell.identity.experiment != "E1":
-        raise CellExecutionSemanticsBlockedError(
-            EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON
-        )
-    if type(execution_semantics) is not CellExecutionSemantics:
-        raise CellExecutionSemanticsBlockedError(
-            EXECUTION_SEMANTICS_RAW_ACTIVATION_UNAVAILABLE_REASON
-        )
-    if (
-        execution_semantics.registry_sha256 != registry.sha256
-        or execution_semantics.cell_declaration != cell
-        or execution_semantics.cell_declaration_sha256 != cell.sha256
-    ):
-        raise CellExecutionSemanticsBlockedError(
-            EXECUTION_SEMANTICS_FOREIGN_CELL_REASON
-        )
+    execution_semantics = _require_registered_e1_execution_recipe(
+        registry=registry,
+        cell=cell,
+        execution_semantics=execution_semantics,
+    )
     authority = dispatch_context.budget_materialization_authority
     if type(authority) is not BudgetMaterializationAuthorityBinding or any(
         type(binding) is not BudgetLoadRawBinding for binding in authority.load_bindings
@@ -1177,6 +1240,12 @@ def _render_industrial_runtime_plan(
     physical_assignment: IndustrialPhysicalAssignment | None,
 ) -> IndustrialRuntimePlan:
     cell = _cell_by_id(registry, cell_id)
+    if cell.identity.experiment == "E1" and execution_semantics is not None:
+        execution_semantics = _require_registered_e1_execution_recipe(
+            registry=registry,
+            cell=cell,
+            execution_semantics=execution_semantics,
+        )
     _reject_unresolved_cell(cell, execution_semantics)
     if not rank_configs:
         raise ValueError("at least one rank RunConfig is required")

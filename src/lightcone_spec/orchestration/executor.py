@@ -95,6 +95,7 @@ from lightcone_spec.locking.prepared_models import (
 from lightcone_spec.orchestration.industrial import (
     IndustrialPhysicalAssignment,
     IndustrialRuntimePlan,
+    _require_registered_e1_execution_recipe,
     validate_industrial_execution_semantics_authority,
 )
 from lightcone_spec.orchestration.native_terminal import (
@@ -1545,7 +1546,16 @@ def _require_execution_trainable_plan_authority(
 ) -> None:
     """Replay adapted parameter authority before any executor-side mutation."""
 
-    config = plan.runtime_plan.rank_configs[0]
+    runtime_plan = plan.runtime_plan
+    if type(runtime_plan) is not IndustrialRuntimePlan:
+        _require_adapted_execution_semantics_sha256(runtime_plan)
+    if runtime_plan.cell.identity.experiment == "E1":
+        _require_registered_e1_execution_recipe(
+            registry=plan.dispatch_context.registry,
+            cell=runtime_plan.cell,
+            execution_semantics=runtime_plan.execution_semantics,
+        )
+    config = runtime_plan.rank_configs[0]
     method = config.method
     authority = plan.trainable_plan_authority
     release_pin = plan.prepared_model_content_release_manifest_sha256
@@ -1554,13 +1564,13 @@ def _require_execution_trainable_plan_authority(
             raise ValueError(
                 "Target-only/Static execution must not carry trainable-plan authority"
             )
-        if plan.runtime_plan.parameter_plan_sha256 is not None:
+        if runtime_plan.parameter_plan_sha256 is not None:
             raise ValueError("Target-only/Static runtime carries a parameter-plan SHA")
         return
     if method not in {"tts", "l0"}:
         raise ValueError("execution trainable-plan gate supports only core methods")
     execution_semantics_sha256 = _require_adapted_execution_semantics_sha256(
-        plan.runtime_plan
+        runtime_plan
     )
     if release_pin is None:
         raise TrainablePlanExecutionBlockedError(
@@ -1615,7 +1625,7 @@ def _require_execution_trainable_plan_authority(
             expected_prepared_model_content_manifest_sha256=release_pin,
             expected_run_config_sha256=run_config_sha256(config),
             expected_split_sha256=plan.split_artifact.content_sha256,
-            expected_cell_id=plan.runtime_plan.cell_id,
+            expected_cell_id=runtime_plan.cell_id,
             expected_cell_declaration_sha256=(
                 plan.runtime_plan.cell_declaration_sha256
             ),
@@ -1635,7 +1645,7 @@ def _require_execution_trainable_plan_authority(
         raise TrainablePlanExecutionBlockedError(error.code) from error
     if (
         parameter_plan is None  # pragma: no cover - adapted method postcondition
-        or parameter_plan.sha256 != plan.runtime_plan.parameter_plan_sha256
+        or parameter_plan.sha256 != runtime_plan.parameter_plan_sha256
         or parameter_plan.sha256 != authority.trainable_plan_sha256
     ):
         raise ValueError("runtime parameter plan differs from raw execution authority")
@@ -2411,6 +2421,12 @@ def build_industrial_execution_plan(
 ) -> IndustrialExecutionPlan:
     """Bind a rendered runtime, exact trace, and content-locked artifacts."""
 
+    if runtime_plan.cell.identity.experiment == "E1":
+        _require_registered_e1_execution_recipe(
+            registry=dispatch_context.registry,
+            cell=runtime_plan.cell,
+            execution_semantics=runtime_plan.execution_semantics,
+        )
     receipt_sha256s = tuple(receipt.sha256 for receipt in dependency_receipts)
     if receipt_sha256s != runtime_plan.dependency_receipt_sha256s:
         raise ValueError("dependency receipt order differs from the runtime plan")
@@ -2496,6 +2512,17 @@ def render_industrial_execution_plan(
 ) -> IndustrialExecutionPlan:
     """Render one argv-only launch, then bind it to the execution plan."""
 
+    if type(runtime_plan) is not IndustrialRuntimePlan:
+        _require_adapted_execution_semantics_sha256(runtime_plan)
+    # Replay scientific identity before the trainable-plan gate or renderer can
+    # inspect/write any launch artifact.  ``IndustrialRuntimePlan`` is a public
+    # value object, so its caller may have replaced a recipe and recomputed all
+    # local digests after construction.
+    validate_industrial_execution_semantics_authority(
+        runtime_plan=runtime_plan,
+        dispatch_context=dispatch_context,
+        registered_load=load_plan,
+    )
     _require_render_trainable_plan_authority(
         runtime_plan=runtime_plan,
         model_lock_artifact=model_lock_artifact,

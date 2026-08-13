@@ -131,6 +131,7 @@ from lightcone_spec.orchestration.executor import (
     launch_server_subprocess,
 )
 from lightcone_spec.orchestration.industrial import (
+    _require_registered_e1_execution_recipe,
     render_assigned_industrial_cell_runtime_plan,
 )
 from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
@@ -3350,6 +3351,7 @@ class IndustrialAssignmentExecutionBundle:
                 "execution production load differs from the registered budget load"
             )
         execution_semantics = _resolve_bundle_execution_semantics(
+            registry=registry,
             activation_replay=activation_replay,
             load_binding=selected_load_bindings[0],
             cell=cell,
@@ -4007,6 +4009,7 @@ def _rematerialize_budget_authority(
 
 def _resolve_bundle_execution_semantics(
     *,
+    registry: ExperimentRegistry,
     activation_replay: object,
     load_binding: object,
     cell: ExperimentCell,
@@ -4032,6 +4035,11 @@ def _resolve_bundle_execution_semantics(
                 activation=activation_replay,
                 load_binding=load_binding,
                 cell=cell,
+            )
+            semantics = _require_registered_e1_execution_recipe(
+                registry=registry,
+                cell=cell,
+                execution_semantics=semantics,
             )
             semantics.validate_run_config(run_config)
         except CellExecutionSemanticsBlockedError as error:
