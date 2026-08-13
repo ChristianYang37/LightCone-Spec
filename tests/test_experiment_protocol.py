@@ -33,7 +33,6 @@ from lightcone_spec.experiments.evidence import (
     GpuEvidenceAttestation,
     GreedyTargetReference,
     TargetOutput,
-    evidence_files_sha256,
 )
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.experiments.protocol import (
@@ -60,7 +59,7 @@ from lightcone_spec.experiments.statistics import (
     evaluate_speed_gate,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
-from lightcone_spec.orchestration import SpeedStudyManifest
+from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
     render_runtime_plan,
     render_static_load_runtime_plan,
@@ -152,7 +151,7 @@ def test_tracked_controlled_profile_matches_registered_manifests() -> None:
     )
     assert profile == SamplingProfile()
     assert (
-        SpeedStudyManifest.load(
+        PreliminarySpeedStudyManifest.load(
             root / "manifests/speed-study/static_tts_l0_v2.json"
         ).sampling_profile_sha256
         == profile.sha256
@@ -166,14 +165,14 @@ def test_tracked_controlled_profile_matches_registered_manifests() -> None:
 
 
 def test_speed_manifest_is_immutable_and_hash_bound(tmp_path) -> None:
-    manifest = SpeedStudyManifest.default()
+    manifest = PreliminarySpeedStudyManifest.default()
     path = tmp_path / "speed-study.json"
     manifest.write(path)
-    assert SpeedStudyManifest.load(path) == manifest
+    assert PreliminarySpeedStudyManifest.load(path) == manifest
     assert manifest.confirmation_schedule_seed == 20260809
     path.write_text("{}", encoding="utf-8")
     with pytest.raises((TypeError, ValueError)):
-        SpeedStudyManifest.load(path)
+        PreliminarySpeedStudyManifest.load(path)
 
 
 def test_tuning_grid_is_complete_and_unique() -> None:
@@ -299,7 +298,7 @@ def test_static_load_selection_respects_latency_and_safety() -> None:
 
 
 def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None:
-    manifest = SpeedStudyManifest.default()
+    manifest = PreliminarySpeedStudyManifest.default()
     artifact = {
         "schema_version": 2,
         "phase": "static_load_screen",
@@ -320,7 +319,7 @@ def test_static_load_terminal_is_bound_to_manifest_sampling_and_window() -> None
 def test_tuning_stage_rejects_a_load_change_and_binds_its_predecessor(
     tmp_path,
 ) -> None:
-    manifest = SpeedStudyManifest.default()
+    manifest = PreliminarySpeedStudyManifest.default()
     manifest_path = tmp_path / "manifest.json"
     manifest.write(manifest_path)
     candidate = tuning_candidates()[0]
@@ -940,44 +939,15 @@ def test_speed_gate_rejects_incomplete_coverage() -> None:
         evaluate_speed_gate(short)
 
 
-def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
-    evidence = tmp_path / "performance.parquet"
-    evidence.write_bytes(b"parquet-evidence")
-    target_reference = GreedyTargetReference(
-        schema_version=2,
-        status="UNMEASURED",
-        model_lock_sha256="f" * 64,
-        target_model_id="Qwen/Qwen3-8B",
-        target_revision="c" * 40,
-        sampling_profile_sha256="1" * 64,
-        execution_policy_sha256=ControlledExecutionPolicy().sha256,
-        window_sha256="2" * 64,
-        runtime_config_sha256="3" * 64,
-        hardware_sha256="e" * 64,
-        patched_sglang_tree=PINNED_SGLANG_TREE,
-        concurrency=8,
-        context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
-        output_hash_format=OUTPUT_HASH_FORMAT,
-        outputs=tuple(
-            TargetOutput(
-                prompt_id=f"prompt-{index:02d}",
-                input_tokens=128,
-                output_tokens=DFLASH_SAFE_CONTEXT_LIMIT - 128,
-                output_sha256=f"{index:064x}",
-            )
-            for index in range(32)
-        ),
-    )
-    target_path = tmp_path / "target-reference.json"
-    target_reference.write(target_path)
+def test_legacy_gpu_attestation_api_is_categorically_disabled(tmp_path) -> None:
     attestation = GpuEvidenceAttestation(
         schema_version=2,
         status="MEASURED",
         manifest_sha256="a" * 64,
         selection_sha256="b" * 64,
         model_lock_sha256="f" * 64,
-        performance_sha256=evidence_files_sha256((evidence,)),
-        target_reference_sha256=target_reference.sha256,
+        performance_sha256="d" * 64,
+        target_reference_sha256="e" * 64,
         patched_sglang_tree=PINNED_SGLANG_TREE,
         target_revision="c" * 40,
         drafter_revision="d" * 40,
@@ -988,25 +958,21 @@ def test_gpu_attestation_binds_exact_performance_files(tmp_path) -> None:
         context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
     )
     path = tmp_path / "attestation.json"
-    attestation.write(path)
-    loaded = GpuEvidenceAttestation.load(path)
-    loaded.verify_performance((evidence,))
-    loaded.verify_target_reference(GreedyTargetReference.load(target_path))
-    evidence.write_bytes(b"tampered")
-    with pytest.raises(ValueError, match="does not bind"):
-        loaded.verify_performance((evidence,))
-    with pytest.raises(ValueError, match="context region"):
-        replace(loaded, context_limit=32768).validate()
-    with pytest.raises(ValueError, match="target reference"):
-        loaded.verify_target_reference(
-            replace(target_reference, runtime_config_sha256="4" * 64)
-        )
+    with pytest.raises(RuntimeError, match="legacy_gpu_attestation_api_disabled"):
+        attestation.write(path)
+    with pytest.raises(RuntimeError, match="legacy_gpu_attestation_api_disabled"):
+        _ = attestation.sha256
+    with pytest.raises(RuntimeError, match="legacy_gpu_attestation_api_disabled"):
+        attestation.verify_performance(())
+    with pytest.raises(RuntimeError, match="legacy_gpu_attestation_api_disabled"):
+        GpuEvidenceAttestation.load(tmp_path / "missing-attestation.json")
+    assert not path.exists()
 
 
 def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
     reference = GreedyTargetReference(
         schema_version=2,
-        status="UNMEASURED",
+        status="PRELIMINARY_DIAGNOSTIC_ONLY",
         model_lock_sha256="a" * 64,
         target_model_id="Qwen/Qwen3-8B",
         target_revision="b" * 40,
@@ -1040,7 +1006,7 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         window_sha256="d" * 64,
         concurrency=8,
     )
-    with pytest.raises(ValueError, match="different formal study"):
+    with pytest.raises(ValueError, match="different preliminary diagnostic study"):
         loaded.verify_study(
             model_lock_sha256="a" * 64,
             target_revision="b" * 40,
@@ -1051,8 +1017,33 @@ def test_target_reference_is_bound_and_matches_one_study(tmp_path) -> None:
         )
     with pytest.raises(ValueError, match="output hash format"):
         replace(reference, output_hash_format="decoded-text-sha256").validate()
-    with pytest.raises(ValueError, match="UNMEASURED"):
+    with pytest.raises(ValueError, match="PRELIMINARY_DIAGNOSTIC_ONLY"):
         replace(reference, status="MEASURED").validate()
+    canonical_body = path.read_text(encoding="utf-8")
+    duplicate_body = canonical_body.replace(
+        '"schema_version":2',
+        '"schema_version":false,"schema_version":2',
+        1,
+    )
+    assert duplicate_body != canonical_body
+    duplicate_path = tmp_path / "reference-duplicate.json"
+    duplicate_path.write_text(duplicate_body, encoding="utf-8")
+    Path(f"{duplicate_path}.sha256").write_text(
+        reference.sha256 + "\n",
+        encoding="ascii",
+    )
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        GreedyTargetReference.load(duplicate_path)
+
+    sidecar_path = tmp_path / "reference-sidecar.json"
+    reference.write(sidecar_path)
+    Path(f"{sidecar_path}.sha256").write_text(
+        f" {reference.sha256}\n",
+        encoding="ascii",
+    )
+    with pytest.raises(ValueError, match="sidecar"):
+        GreedyTargetReference.load(sidecar_path)
+
     value = json.loads(path.read_text())
     value["outputs"][0]["unexpected"] = True
     path.write_text(json.dumps(value))

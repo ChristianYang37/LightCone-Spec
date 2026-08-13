@@ -49,7 +49,7 @@ from lightcone_spec.experiments.selection import (
     SliceMeasurement,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
-from lightcone_spec.orchestration.manifest import SpeedStudyManifest
+from lightcone_spec.orchestration.manifest import PreliminarySpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
     render_onlinespec_runtime_plan,
     render_onlinespec_tuning_runtime_plan,
@@ -86,7 +86,7 @@ def test_onlinespec_manifest_pins_clean_room_provenance(tmp_path) -> None:
             onlinespec_tuning_stage(invalid_stage)
 
 
-def test_onlinespec_attestation_binds_target_reference(tmp_path) -> None:
+def test_onlinespec_attestation_api_is_categorically_disabled(tmp_path) -> None:
     artifact = OnlineSpecGpuAttestation(
         schema_version=2,
         status="MEASURED",
@@ -101,10 +101,11 @@ def test_onlinespec_attestation_binds_target_reference(tmp_path) -> None:
         repetitions=8,
     )
     path = tmp_path / "attestation.json"
-    artifact.write(path)
-    assert OnlineSpecGpuAttestation.load(path) == artifact
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(artifact, target_reference_sha256="invalid").validate()
+    with pytest.raises(RuntimeError, match="onlinespec_gpu_attestation_api_disabled"):
+        artifact.write(path)
+    with pytest.raises(RuntimeError, match="onlinespec_gpu_attestation_api_disabled"):
+        OnlineSpecGpuAttestation.load(tmp_path / "missing-attestation.json")
+    assert not path.exists()
 
 
 def test_onlinespec_source_checkout_is_content_verified_and_must_be_clean(
@@ -311,7 +312,7 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
     )
     lock_path = tmp_path / "models.json"
     lock.write(lock_path)
-    core_manifest = SpeedStudyManifest.default()
+    core_manifest = PreliminarySpeedStudyManifest.default()
     core_selection = SelectionArtifact(
         schema_version=2,
         candidate=tuning_candidates()[0],

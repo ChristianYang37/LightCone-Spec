@@ -35,28 +35,29 @@ industrial 命令包括：
 | `execute-dispatch-wave` | 重开一份已提交的 materialization manifest，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
 | `seal-industrial-stage` | 绑定 activated completion、disposition、budget、runtime、split、dependency 与 locked output |
 | `analyze-industrial` | 验证 schema-v3 terminal、budget、family-power 与 hardware evidence |
-| `build-speed-study` | 生成较小的核心源协议 |
+| `analyze-e3b-long-context` | 验证并归约隔离的 E3b long-context evidence family |
+| `build-preliminary-speed-study` | 生成历史 `PRELIMINARY_DIAGNOSTIC_ONLY` 协议；绝不构成 industrial authority |
 | `lock-models` | 把 model ID 解析为不可变 revision |
 | `prepare-models` | 下载或 offline 验证 locked snapshot |
-| `list-tuning-candidates` | 写入已注册 Full/LoRA tuning grid |
-| `render-target-only-runtime` | 渲染关闭 speculation 的 Target-only endpoint |
-| `render-static-load-runtime` | 渲染零 adaptation 分配的 Static endpoint |
-| `render-tuning-runtime` | 渲染 matched TTS/L0 tuning endpoint |
-| `run-controlled-slice` | 测量一个已注册 controlled slice |
-| `collect-static-load-screen` | 验证 Static load coverage 并选择 reference load |
-| `advance-tuning-stage` | 验证 halving stage 并封存 survivor |
-| `select-speed-config` | 应用 tuning-only 注册 selection rule |
-| `select-anchor-config` | 锁定 terminal registered anchor，但不声明 optimum |
-| `render-runtime` | 生成 matched sequential 核心 config 与 launch argv |
-| `build-confirmation-queue` | 生成 clean-server confirmation job |
-| `run-confirmation` | 执行一个 method/block confirmation slice |
-| `run-target-reference` | 捕获锁定的 Target-only greedy token-ID 轨迹诊断 |
-| `collect-speed-study` | 从 completed receipt-bound evidence 派生 table |
-| `render-replication-runtime` | 渲染 natural-task 或 profiler-only slice |
-| `run-natural-slice` | 运行一个 locked natural-task slice |
-| `build-profiler-plan` | 生成隔离 profile plan，并禁止 headline evidence |
-| `attest-speed-study` | 绑定 GPU、runtime、model、selection、trace 与 evidence identity |
-| `analyze-speed-study` | 评估已注册 paired gate |
+| `list-preliminary-tuning-candidates` | 写入历史 Full/LoRA 诊断 grid |
+| `render-preliminary-target-only-runtime` | 渲染诊断性、关闭 speculation 的 Target-only endpoint |
+| `render-preliminary-static-load-runtime` | 渲染诊断性、零 adaptation 分配的 Static endpoint |
+| `render-preliminary-tuning-runtime` | 渲染 matched preliminary TTS/L0 endpoint |
+| `run-preliminary-controlled-slice` | 测量一个 preliminary controlled slice |
+| `collect-preliminary-static-load-screen` | 验证 preliminary Static load coverage |
+| `advance-preliminary-tuning-stage` | 验证 preliminary halving stage |
+| `select-preliminary-speed-config` | 应用历史 tuning-only rule |
+| `select-preliminary-anchor-config` | 锁定 preliminary anchor，但不形成 claim |
+| `render-preliminary-runtime` | 生成 matched preliminary config 与 launch argv |
+| `build-preliminary-confirmation-queue` | 生成 clean-server 诊断 job |
+| `run-preliminary-confirmation` | 执行一个 preliminary method/block slice |
+| `run-preliminary-target-reference` | 捕获 preliminary Target-only token-ID 轨迹 |
+| `collect-preliminary-speed-study` | 派生 preliminary 诊断 table |
+| `render-preliminary-replication-runtime` | 渲染 preliminary natural-task 或 profiler slice |
+| `run-preliminary-natural-slice` | 运行一个 preliminary natural-task slice |
+| `build-preliminary-profiler-plan` | 生成隔离的诊断 profile plan |
+| `attest-preliminary-speed-study` | 输出确定性的 non-authority decision（退出 42） |
+| `analyze-preliminary-speed-study` | 只生成 preliminary 统计（退出 42） |
 
 隔离的 OnlineSPEC command family 为：
 
@@ -74,10 +75,16 @@ industrial 命令包括：
 | `build-onlinespec-queue` | 生成 randomized clean-server comparison job |
 | `run-onlinespec-confirmation` | 执行一个 learner/method block |
 | `collect-onlinespec-study` | 派生隔离 comparison table |
-| `attest-onlinespec-study` | 绑定 comparison evidence 与 source identity |
-| `analyze-onlinespec-study` | 生成 learner-versus-Static 诊断区间 |
+| `attest-onlinespec-study` | 输出确定性的 non-authority decision（退出 42） |
+| `analyze-onlinespec-study` | 只生成 learner-versus-Static 诊断区间（退出 42） |
 
-不存在 generic method override，也不存在把无 receipt 目录转换为 completed evidence 的命令。
+历史 speed-study manifest/API/CLI surface 被严格固定为
+`PRELIMINARY_DIAGNOSTIC_ONLY`。它不能消费 industrial registry、activation、budget、
+completion authority 或 materialized bundle；其 table 与 receipt 也绝不会被
+`analyze-industrial` 接受。历史 schema-v2 manifest 仍可在强制 preliminary scope 下读取，
+但不能改写或重新标成 formal。唯一 formal execution 命令是 `execute-dispatch-wave`；它会
+重开 materialized bundle 并进入 industrial executor。不存在 generic method override，
+也不存在把无 receipt 目录转换为 completed evidence 的命令。
 
 Bootstrap envelope 只授权生成八个已注册 Static calibration observation，不能授权
 headline co-tenancy 或更大 cardinality。`reduce-interference-calibration` 会在打开 caller
@@ -500,14 +507,16 @@ clean status、audited key-file hash 与 license inventory；checkout 保持在�
 
 Successive halving 在 OGD、optimistic OGD 与 ensemble 内独立运行。Selection 还绑定核心
 reference load，但不能改变该 load 或影响核心 gate。Anchor selection 标注
-`optimized_grid_claim=false`。OnlineSPEC 保持 TP1/DP1，并使用自己的 GPU attestation。
+`optimized_grid_claim=false`。OnlineSPEC 保持 TP1/DP1 且只能用于诊断；其 attestation
+命令只能输出 non-authority decision。
 
 ## 状态、Resume 与 Exit Code
 
-缺少 attestation 时，`analyze-speed-study` 可输出诊断，但状态为 `UNMEASURED` 且退出 42。
-提供有效 content-bound GPU evidence 后，只有完整注册 pass 才退出零；有效 evidence 未满足
-任一标准时为 `BLOCKED`，同样退出 42。Identity、schema、I/O、receipt 或 runtime 错误是
-普通 nonzero failure，不是科学结果。
+`analyze-preliminary-speed-study` 始终写入 `PRELIMINARY_DIAGNOSTIC_ONLY` 并退出
+42。即使未来配置 trusted attester，它也会拒绝全部 attestation。
+`attest-preliminary-speed-study` 与 `attest-onlinespec-study` 同样只输出确定性的
+non-authority decision 并退出 42。Identity、schema、I/O、receipt 或 runtime 错误是普通
+nonzero failure，不是科学结果。
 当前 release 没有 trusted hardware-attester identity，因此 supplied legacy attestation
 会被拒绝；即使 diagnostic JSON 内部一致，`analyze-industrial` 也不能生成 `MEASURED`，
 并会退出 42。
@@ -520,12 +529,11 @@ artifact 仅用于 regression，不能作为 schema-v3 stage receipt。
 
 ### Target-output Reference 诊断
 
-针对一个单独锁定的 Target-only server，`run-target-reference` 记录每个 prompt 的 token
+针对一个单独锁定的 Target-only server，`run-preliminary-target-reference` 记录每个 prompt 的 token
 数量，以及完整有序 output-token-ID 数组带格式标识的 SHA-256；它绝不会用 decoded-text
 digest 替代。Legacy collector 要求 `--target-reference`，任何 method/block 的轨迹不匹配
-reference 都会被拒绝；仅 speculative method 彼此一致不能证明 exactness。在本 release
-中，该结果仍只是 `UNMEASURED` 诊断，因为 Static/TTS/L0 execution 与 trusted hardware
-attestation 都处于 blocked 状态。
+reference 都会被拒绝；仅 speculative method 彼此一致不能证明 exactness。无论 hardware
+是否可用，该结果始终是 `PRELIMINARY_DIAGNOSTIC_ONLY`。
 
 ## Credential 与 Output Root
 

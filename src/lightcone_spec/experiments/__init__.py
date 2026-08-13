@@ -30,12 +30,7 @@ from .completion_authority import (
     DurableJsonArtifactBinding,
 )
 from .data import ControlledWindow, LongContinuationAdapter
-from .evidence import (
-    GpuEvidenceAttestation,
-    GreedyTargetReference,
-    TargetOutput,
-    evidence_files_sha256,
-)
+from .evidence import GreedyTargetReference, TargetOutput, evidence_files_sha256
 from .failure_authority import (
     FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
     FAILURE_INJECTION_RAW_RECEIPT_INCOMPLETE_REASON,
@@ -189,7 +184,6 @@ from .nonserving_authority import (
 from .onlinespec import (
     ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecCandidate,
-    OnlineSpecGpuAttestation,
     OnlineSpecManifest,
     OnlineSpecSelection,
     OnlineSpecTuningMeasurement,
@@ -698,7 +692,6 @@ __all__ = [
     "GpuDispatchPlan",
     "GpuDispatchPlanningContext",
     "GpuDispatchWave",
-    "GpuEvidenceAttestation",
     "GpuInventory",
     "GpuPoolScheduler",
     "GpuTopologyGroup",
@@ -720,7 +713,6 @@ __all__ = [
     "LongContinuationAdapter",
     "MultiplicityDecision",
     "OnlineSpecCandidate",
-    "OnlineSpecGpuAttestation",
     "OnlineSpecManifest",
     "OnlineSpecSelection",
     "OnlineSpecTuningMeasurement",

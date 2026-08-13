@@ -1,4 +1,10 @@
-"""GPU-ready confirmation driver with independent, attested measurements."""
+"""Historical preliminary diagnostic runner.
+
+Formal industrial execution belongs exclusively to the materialized dispatch
+bundle and :mod:`lightcone_spec.orchestration.executor` path.  The functions in
+this module preserve the earlier speed-study workflow for reproducible
+diagnostics; they never consume industrial authority or mint formal evidence.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ import json
 import math
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -46,14 +53,19 @@ from lightcone_spec.telemetry import (
 )
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
 
-_FORMAL_METHODS = {"static", "tts", "l0"}
+if TYPE_CHECKING:
+    from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
+    from lightcone_spec.orchestration.manifest import PreliminarySpeedStudyManifest
+
+
+_PRELIMINARY_METHODS = {"static", "tts", "l0"}
 _ONLINE_SPEC_METHODS = {
     "static",
     "onlinespec_ogd",
     "onlinespec_opt",
     "onlinespec_ens",
 }
-_EVIDENCE_METHODS = _FORMAL_METHODS | _ONLINE_SPEC_METHODS
+_EVIDENCE_METHODS = _PRELIMINARY_METHODS | _ONLINE_SPEC_METHODS
 _SAFETY_COUNTERS = (
     "exactness_violations",
     "version_mismatches",
@@ -64,6 +76,35 @@ _SAFETY_COUNTERS = (
 )
 _UPDATE_COUNTERS = ("updates_launched", "updates_published")
 _TIMING_LANES = ("training", "optimizer", "merge", "publish", "barrier")
+
+
+def _preliminary_manifest_sha256(manifest: object) -> str:
+    """Return an exact legacy manifest identity without accepting authority.
+
+    An industrial registry, activation, budget, completion receipt, or an
+    arbitrary object is intentionally not structurally interchangeable here.
+    This is a scope check, not an execution authorization mechanism.
+    """
+
+    from lightcone_spec.orchestration.manifest import PreliminarySpeedStudyManifest
+
+    if type(manifest) is not PreliminarySpeedStudyManifest:
+        raise TypeError("legacy runner requires an exact PreliminarySpeedStudyManifest")
+    manifest.validate()
+    if manifest.formal_execution_authorized is not False:
+        raise ValueError("preliminary manifest cannot authorize formal execution")
+    return manifest.sha256
+
+
+def _onlinespec_manifest_sha256(manifest: object) -> str:
+    """Bind the separate OnlineSPEC workflow to its exact manifest type."""
+
+    from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
+
+    if type(manifest) is not OnlineSpecManifest:
+        raise TypeError("OnlineSPEC runner requires an exact OnlineSpecManifest")
+    manifest.validate()
+    return manifest.sha256
 
 
 def _run_id(
@@ -1167,8 +1208,9 @@ def _target_runtime_identity(
     return hashlib.sha256(body.encode()).hexdigest()
 
 
-def run_greedy_target_reference(
+def run_preliminary_greedy_target_reference(
     *,
+    preliminary_manifest: PreliminarySpeedStudyManifest,
     client: SGLangHTTPClient,
     model_lock_sha256: str,
     target_revision: str,
@@ -1177,7 +1219,8 @@ def run_greedy_target_reference(
     sampling_profile: SamplingProfile,
     warmup: bool = True,
 ) -> GreedyTargetReference:
-    """Capture the target-only greedy trajectory required by formal gates."""
+    """Capture a target-only trajectory for preliminary diagnostics."""
+    _preliminary_manifest_sha256(preliminary_manifest)
     sampling_profile.validate()
     if (
         sampling_profile.purpose != "controlled"
@@ -1244,7 +1287,7 @@ def run_greedy_target_reference(
             or result.completion_tokens != expected_output
             or result.stop_reason != "length"
         ):
-            raise RuntimeError("target reference did not reproduce formal work")
+            raise RuntimeError("target reference did not reproduce diagnostic work")
         outputs.append(
             TargetOutput(
                 prompt_id=sample.sample_id,
@@ -1262,7 +1305,7 @@ def run_greedy_target_reference(
         raise RuntimeError("target reference runtime identity changed during capture")
     artifact = GreedyTargetReference(
         schema_version=2,
-        status="UNMEASURED",
+        status="PRELIMINARY_DIAGNOSTIC_ONLY",
         model_lock_sha256=model_lock_sha256,
         target_model_id="Qwen/Qwen3-8B",
         target_revision=target_revision,
@@ -1281,7 +1324,7 @@ def run_greedy_target_reference(
     return artifact
 
 
-def measure_controlled_slice(
+def _measure_controlled_slice(
     *,
     client: SGLangHTTPClient,
     method: str,
@@ -1302,7 +1345,7 @@ def measure_controlled_slice(
     """Measure one pre-confirmation slice at the highest registered batch."""
     allowed = {
         "static_load_screen": {"static"},
-        "shared_config_tuning": _FORMAL_METHODS,
+        "shared_config_tuning": _PRELIMINARY_METHODS,
         "onlinespec_tuning": _ONLINE_SPEC_METHODS,
     }
     if phase not in allowed:
@@ -1425,6 +1468,84 @@ def measure_controlled_slice(
     return measurement
 
 
+def measure_preliminary_controlled_slice(
+    *,
+    preliminary_manifest: PreliminarySpeedStudyManifest,
+    client: SGLangHTTPClient,
+    method: str,
+    samples: tuple[PromptSample, ...],
+    phase: str,
+    stage: int,
+    candidate_id: str | None,
+    config_sha256: str,
+    model_lock_sha256: str,
+    adaptation_config_sha256: str | None,
+    sampling_profile: SamplingProfile,
+    context_limit: int,
+    concurrency: int,
+    adaptation_group_id: str,
+    warmup: bool = True,
+) -> SliceMeasurement:
+    """Measure a legacy slice under an exact preliminary manifest."""
+
+    return _measure_controlled_slice(
+        client=client,
+        method=method,
+        samples=samples,
+        phase=phase,
+        stage=stage,
+        candidate_id=candidate_id,
+        manifest_sha256=_preliminary_manifest_sha256(preliminary_manifest),
+        config_sha256=config_sha256,
+        model_lock_sha256=model_lock_sha256,
+        adaptation_config_sha256=adaptation_config_sha256,
+        sampling_profile=sampling_profile,
+        context_limit=context_limit,
+        concurrency=concurrency,
+        adaptation_group_id=adaptation_group_id,
+        warmup=warmup,
+    )
+
+
+def measure_onlinespec_controlled_slice(
+    *,
+    onlinespec_manifest: OnlineSpecManifest,
+    client: SGLangHTTPClient,
+    method: str,
+    samples: tuple[PromptSample, ...],
+    phase: str,
+    stage: int,
+    candidate_id: str | None,
+    config_sha256: str,
+    model_lock_sha256: str,
+    adaptation_config_sha256: str | None,
+    sampling_profile: SamplingProfile,
+    context_limit: int,
+    concurrency: int,
+    adaptation_group_id: str,
+    warmup: bool = True,
+) -> SliceMeasurement:
+    """Measure the separately named OnlineSPEC comparison workflow."""
+
+    return _measure_controlled_slice(
+        client=client,
+        method=method,
+        samples=samples,
+        phase=phase,
+        stage=stage,
+        candidate_id=candidate_id,
+        manifest_sha256=_onlinespec_manifest_sha256(onlinespec_manifest),
+        config_sha256=config_sha256,
+        model_lock_sha256=model_lock_sha256,
+        adaptation_config_sha256=adaptation_config_sha256,
+        sampling_profile=sampling_profile,
+        context_limit=context_limit,
+        concurrency=concurrency,
+        adaptation_group_id=adaptation_group_id,
+        warmup=warmup,
+    )
+
+
 def _earlier_slices(
     *,
     method: str,
@@ -1475,7 +1596,7 @@ def _assert_prior_slices_complete(
             )
 
 
-def run_confirmation_slice(
+def _run_confirmation_slice(
     *,
     client: SGLangHTTPClient,
     method: str,
@@ -1494,22 +1615,24 @@ def run_confirmation_slice(
     study_methods: tuple[str, ...] = ("static", "tts", "l0"),
     namespace: str = "confirmation",
 ) -> tuple[Path, ...]:
-    """Run one exclusive-device method slice in registered random order."""
+    """Run one preliminary method slice in registered random order."""
     if frozenset(study_methods) not in {
-        frozenset(_FORMAL_METHODS),
+        frozenset(_PRELIMINARY_METHODS),
         frozenset(_ONLINE_SPEC_METHODS),
     }:
         raise ValueError("unknown paired study method set")
     if method not in study_methods:
         raise ValueError("method is outside the paired study")
     if block not in range(8):
-        raise ValueError("formal confirmation block must be in [0, 8)")
+        raise ValueError("preliminary confirmation block must be in [0, 8)")
     if concurrency < 1:
         raise ValueError("concurrency must be positive")
     if safe_context_limit != DFLASH_SAFE_CONTEXT_LIMIT:
-        raise ValueError("formal confirmation must end at the registered safe limit")
+        raise ValueError(
+            "preliminary confirmation must end at the registered safe limit"
+        )
     if not adaptation_group_id:
-        raise ValueError("formal adapted runs require a cohort group")
+        raise ValueError("preliminary adapted runs require a cohort group")
     samples = LongContinuationAdapter().window("confirm")
     budgets = _prompt_budgets(
         client,
@@ -1759,6 +1882,80 @@ def run_confirmation_slice(
         return tuple(writer.close().values())
 
 
+def run_preliminary_natural_replication_slice(
+    *,
+    preliminary_manifest: PreliminarySpeedStudyManifest,
+    client: SGLangHTTPClient,
+    method: str,
+    dataset_name: str,
+    samples: tuple[PromptSample, ...],
+    config_sha256: str,
+    adaptation_config_sha256: str | None,
+    output_root: str | Path,
+    concurrency: int,
+    safe_context_limit: int,
+    adaptation_group_id: str,
+    sampling_profile: SamplingProfile,
+    model_pair: str = "qwen3_8b_dflash16",
+    warmup: bool = True,
+) -> tuple[Path, ...]:
+    """Run a natural-EOS legacy diagnostic under the exact manifest."""
+
+    return _run_natural_replication_slice(
+        client=client,
+        method=method,
+        dataset_name=dataset_name,
+        samples=samples,
+        manifest_sha256=_preliminary_manifest_sha256(preliminary_manifest),
+        config_sha256=config_sha256,
+        adaptation_config_sha256=adaptation_config_sha256,
+        output_root=output_root,
+        concurrency=concurrency,
+        safe_context_limit=safe_context_limit,
+        adaptation_group_id=adaptation_group_id,
+        sampling_profile=sampling_profile,
+        model_pair=model_pair,
+        warmup=warmup,
+    )
+
+
+def run_preliminary_confirmation_slice(
+    *,
+    preliminary_manifest: PreliminarySpeedStudyManifest,
+    client: SGLangHTTPClient,
+    method: str,
+    block: int,
+    config_sha256: str,
+    adaptation_config_sha256: str | None,
+    output_root: str | Path,
+    concurrency: int,
+    safe_context_limit: int,
+    adaptation_group_id: str,
+    schedule_seed: int,
+    sampling_profile: SamplingProfile,
+    model_pair: str = "qwen3_8b_dflash16",
+    warmup: bool = True,
+) -> tuple[Path, ...]:
+    """Run a legacy confirmation slice under preliminary-only authority."""
+
+    return _run_confirmation_slice(
+        client=client,
+        method=method,
+        block=block,
+        manifest_sha256=_preliminary_manifest_sha256(preliminary_manifest),
+        config_sha256=config_sha256,
+        adaptation_config_sha256=adaptation_config_sha256,
+        output_root=output_root,
+        concurrency=concurrency,
+        safe_context_limit=safe_context_limit,
+        adaptation_group_id=adaptation_group_id,
+        schedule_seed=schedule_seed,
+        sampling_profile=sampling_profile,
+        model_pair=model_pair,
+        warmup=warmup,
+    )
+
+
 def _assert_paired_target_outputs(
     paired_outputs: dict[str, dict[str, tuple[int, int, str]]],
     target_outputs: dict[str, tuple[int, int, str]],
@@ -1941,7 +2138,7 @@ def _collect_paired_performance(
     return tuple(performance), evidence_files_sha256(all_evidence)
 
 
-def collect_confirmation_performance(
+def _collect_confirmation_performance(
     *,
     evidence_root: str | Path,
     manifest_sha256: str,
@@ -1953,7 +2150,7 @@ def collect_confirmation_performance(
     execution_policy_sha256: str,
     target_revision: str,
 ) -> tuple[tuple[Path, ...], str]:
-    """Collect exactly one completed, identity-matched formal shard per cell."""
+    """Collect one completed, identity-matched preliminary shard per cell."""
     return _collect_paired_performance(
         evidence_root=evidence_root,
         manifest_sha256=manifest_sha256,
@@ -1969,10 +2166,67 @@ def collect_confirmation_performance(
     )
 
 
-def run_onlinespec_confirmation_slice(**kwargs) -> tuple[Path, ...]:
+def collect_preliminary_confirmation_performance(
+    *,
+    preliminary_manifest: PreliminarySpeedStudyManifest,
+    evidence_root: str | Path,
+    config_sha256: dict[str, str],
+    concurrency: int,
+    target_reference: GreedyTargetReference,
+    model_lock_sha256: str,
+    sampling_profile_sha256: str,
+    execution_policy_sha256: str,
+    target_revision: str,
+) -> tuple[tuple[Path, ...], str]:
+    """Collect legacy evidence without accepting an industrial identity."""
+
+    return _collect_confirmation_performance(
+        evidence_root=evidence_root,
+        manifest_sha256=_preliminary_manifest_sha256(preliminary_manifest),
+        config_sha256=config_sha256,
+        concurrency=concurrency,
+        target_reference=target_reference,
+        model_lock_sha256=model_lock_sha256,
+        sampling_profile_sha256=sampling_profile_sha256,
+        execution_policy_sha256=execution_policy_sha256,
+        target_revision=target_revision,
+    )
+
+
+def run_onlinespec_confirmation_slice(
+    *,
+    onlinespec_manifest: OnlineSpecManifest,
+    client: SGLangHTTPClient,
+    method: str,
+    block: int,
+    config_sha256: str,
+    adaptation_config_sha256: str | None,
+    output_root: str | Path,
+    concurrency: int,
+    safe_context_limit: int,
+    adaptation_group_id: str,
+    schedule_seed: int,
+    sampling_profile: SamplingProfile,
+    model_pair: str = "qwen3_8b_dflash16",
+    warmup: bool = True,
+) -> tuple[Path, ...]:
     """Run one clean-room OnlineSPEC comparison slice on confirmation data."""
-    return run_confirmation_slice(
-        **kwargs,
+
+    return _run_confirmation_slice(
+        client=client,
+        method=method,
+        block=block,
+        manifest_sha256=_onlinespec_manifest_sha256(onlinespec_manifest),
+        config_sha256=config_sha256,
+        adaptation_config_sha256=adaptation_config_sha256,
+        output_root=output_root,
+        concurrency=concurrency,
+        safe_context_limit=safe_context_limit,
+        adaptation_group_id=adaptation_group_id,
+        schedule_seed=schedule_seed,
+        sampling_profile=sampling_profile,
+        model_pair=model_pair,
+        warmup=warmup,
         study_methods=(
             "static",
             "onlinespec_ogd",
@@ -1985,8 +2239,8 @@ def run_onlinespec_confirmation_slice(**kwargs) -> tuple[Path, ...]:
 
 def collect_onlinespec_performance(
     *,
+    onlinespec_manifest: OnlineSpecManifest,
     evidence_root: str | Path,
-    manifest_sha256: str,
     config_sha256: dict[str, str],
     concurrency: int,
     target_reference: GreedyTargetReference,
@@ -1997,7 +2251,7 @@ def collect_onlinespec_performance(
 ) -> tuple[tuple[Path, ...], str]:
     return _collect_paired_performance(
         evidence_root=evidence_root,
-        manifest_sha256=manifest_sha256,
+        manifest_sha256=_onlinespec_manifest_sha256(onlinespec_manifest),
         config_sha256=config_sha256,
         concurrency=concurrency,
         methods=(
@@ -2015,7 +2269,7 @@ def collect_onlinespec_performance(
     )
 
 
-def run_natural_replication_slice(
+def _run_natural_replication_slice(
     *,
     client: SGLangHTTPClient,
     method: str,
@@ -2032,8 +2286,8 @@ def run_natural_replication_slice(
     model_pair: str = "qwen3_8b_dflash16",
     warmup: bool = True,
 ) -> tuple[Path, ...]:
-    """Run one natural-EOS side-table slice; never enters the formal gate."""
-    if method not in _FORMAL_METHODS or dataset_name not in {
+    """Run one natural-EOS preliminary side-table slice."""
+    if method not in _PRELIMINARY_METHODS or dataset_name not in {
         "livecodebench",
         "math500",
     }:

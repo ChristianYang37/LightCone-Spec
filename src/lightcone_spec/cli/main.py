@@ -36,7 +36,6 @@ from lightcone_spec.experiments.data import (
     sample_set_sha256,
 )
 from lightcone_spec.experiments.evidence import (
-    GpuEvidenceAttestation,
     GreedyTargetReference,
     evidence_files_sha256,
 )
@@ -76,7 +75,6 @@ from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_STUDY_METHODS,
     ONLINE_SPEC_TUNING_STAGES,
     OnlineSpecCandidate,
-    OnlineSpecGpuAttestation,
     OnlineSpecManifest,
     OnlineSpecSelection,
     OnlineSpecTuningMeasurement,
@@ -148,13 +146,14 @@ from lightcone_spec.experiments.registry import (
     build_industrial_registry,
 )
 from lightcone_spec.experiments.runner import (
-    collect_confirmation_performance,
     collect_onlinespec_performance,
-    measure_controlled_slice,
-    run_confirmation_slice,
-    run_greedy_target_reference,
-    run_natural_replication_slice,
+    collect_preliminary_confirmation_performance,
+    measure_onlinespec_controlled_slice,
+    measure_preliminary_controlled_slice,
     run_onlinespec_confirmation_slice,
+    run_preliminary_confirmation_slice,
+    run_preliminary_greedy_target_reference,
+    run_preliminary_natural_replication_slice,
 )
 from lightcone_spec.experiments.runtime_metrics import (
     RuntimeMetricsAuthority,
@@ -196,7 +195,7 @@ from lightcone_spec.experiments.workload_authority import (
 )
 from lightcone_spec.locking import ModelLock, prepare_models, resolve_model_lock
 from lightcone_spec.orchestration import (
-    SpeedStudyManifest,
+    PreliminarySpeedStudyManifest,
     render_onlinespec_runtime_plan,
     render_onlinespec_tuning_runtime_plan,
     render_replication_runtime_plan,
@@ -211,6 +210,10 @@ from lightcone_spec.orchestration.execution_bundle import (
     execute_dispatch_wave_bundles,
 )
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
+from lightcone_spec.orchestration.manifest import (
+    PRELIMINARY_DIAGNOSTIC_ONLY,
+    PRELIMINARY_SPEED_STUDY_MANIFEST_KIND,
+)
 from lightcone_spec.sglang_bridge import (
     SGLangHTTPClient,
     sglang_adaptation_sha256,
@@ -2046,6 +2049,14 @@ def _load_industrial_analysis_manifest(
     ):
         raise ValueError("industrial analysis manifest must be a regular bound file")
     value = _load_bound_json(manifest_path)
+    if isinstance(value, dict) and (
+        value.get("kind") == PRELIMINARY_SPEED_STUDY_MANIFEST_KIND
+        or value.get("evidence_scope") == PRELIMINARY_DIAGNOSTIC_ONLY
+        or value.get("name") == "static-tts-l0-speed-study"
+    ):
+        raise ValueError(
+            "PRELIMINARY_DIAGNOSTIC_ONLY manifests cannot enter industrial analysis"
+        )
     expected = {
         "schema_version",
         "kind",
@@ -2066,7 +2077,8 @@ def _load_industrial_analysis_manifest(
     if not isinstance(value, dict) or set(value) not in allowed_fields:
         raise ValueError("industrial analysis manifest fields do not match schema")
     if (
-        value.get("schema_version") != 3
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 3
         or value.get("kind") != "industrial_analysis_manifest"
     ):
         raise ValueError("industrial analysis manifest identity mismatch")
@@ -2337,7 +2349,7 @@ def _parse_locked_output_paths(values: list[str]) -> dict[str, str]:
 def _static_load_rows(
     value: object,
     *,
-    manifest: SpeedStudyManifest,
+    manifest: PreliminarySpeedStudyManifest,
 ) -> list[dict]:
     if not isinstance(value, dict):
         raise TypeError("Static load screen must be a schema-v2 terminal artifact")
@@ -2362,9 +2374,9 @@ def _static_load_rows(
     return rows
 
 
-def _formal_table_metadata(
+def _preliminary_table_metadata(
     *,
-    manifest: SpeedStudyManifest,
+    manifest: PreliminarySpeedStudyManifest,
     selection: SelectionArtifact,
     model_lock: ModelLock,
     config_sha256: dict[str, str],
@@ -2373,6 +2385,9 @@ def _formal_table_metadata(
 ) -> dict[bytes, bytes]:
     return {
         b"lightcone_schema_version": b"2",
+        b"lightcone_manifest_kind": PRELIMINARY_SPEED_STUDY_MANIFEST_KIND.encode(),
+        b"lightcone_evidence_scope": PRELIMINARY_DIAGNOSTIC_ONLY.encode(),
+        b"lightcone_formal_execution_authorized": b"false",
         b"lightcone_manifest_sha256": manifest.sha256.encode(),
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": model_lock.sha256.encode(),
@@ -2389,10 +2404,10 @@ def _formal_table_metadata(
     }
 
 
-def _load_formal_table(
+def _load_preliminary_table(
     path: str | Path,
     *,
-    manifest: SpeedStudyManifest,
+    manifest: PreliminarySpeedStudyManifest,
     selection: SelectionArtifact,
     model_lock: ModelLock,
     target_reference: GreedyTargetReference,
@@ -2414,14 +2429,24 @@ def _load_formal_table(
         b"lightcone_target_reference_sha256": target_reference.sha256.encode(),
     }
     if any(metadata.get(key) != value for key, value in expected.items()):
-        raise ValueError("formal speed table identity metadata mismatch")
+        raise ValueError("preliminary speed table identity metadata mismatch")
+    scope_metadata = {
+        b"lightcone_manifest_kind": PRELIMINARY_SPEED_STUDY_MANIFEST_KIND.encode(),
+        b"lightcone_evidence_scope": PRELIMINARY_DIAGNOSTIC_ONLY.encode(),
+        b"lightcone_formal_execution_authorized": b"false",
+    }
+    present_scope_fields = set(scope_metadata) & set(metadata)
+    if present_scope_fields and any(
+        metadata.get(key) != value for key, value in scope_metadata.items()
+    ):
+        raise ValueError("preliminary speed table scope metadata is invalid")
     for key in (
         b"lightcone_config_set_sha256",
         b"lightcone_source_evidence_sha256",
     ):
         value = metadata.get(key, b"").decode(errors="ignore")
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError("formal speed table evidence metadata is invalid")
+            raise ValueError("preliminary speed table evidence metadata is invalid")
     return table
 
 
@@ -2446,7 +2471,7 @@ def _parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate-config")
     validate.add_argument("config")
 
-    build = commands.add_parser("build-speed-study")
+    build = commands.add_parser("build-preliminary-speed-study")
     build.add_argument("--output", required=True)
 
     bind_workload = commands.add_parser(
@@ -2688,7 +2713,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--offline", action="store_true")
 
-    select = commands.add_parser("select-speed-config")
+    select = commands.add_parser("select-preliminary-speed-config")
     select.add_argument("--measurements", required=True)
     select.add_argument("--static-load-screen", required=True)
     select.add_argument("--manifest", required=True)
@@ -2696,7 +2721,7 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--sampling-profile", required=True)
     select.add_argument("--output", required=True)
 
-    select_anchor = commands.add_parser("select-anchor-config")
+    select_anchor = commands.add_parser("select-preliminary-anchor-config")
     select_anchor.add_argument("--measurements", nargs=3, required=True)
     select_anchor.add_argument("--candidate-id", required=True)
     select_anchor.add_argument("--static-load-screen", required=True)
@@ -2705,7 +2730,7 @@ def _parser() -> argparse.ArgumentParser:
     select_anchor.add_argument("--sampling-profile", required=True)
     select_anchor.add_argument("--output", required=True)
 
-    render = commands.add_parser("render-runtime")
+    render = commands.add_parser("render-preliminary-runtime")
     render.add_argument("--selection", required=True)
     render.add_argument("--model-lock", required=True)
     render.add_argument("--model-roots", required=True)
@@ -2745,7 +2770,7 @@ def _parser() -> argparse.ArgumentParser:
     render_online_tune.add_argument("--host", default="127.0.0.1")
     render_online_tune.add_argument("--first-port", type=int, default=30000)
 
-    render_static = commands.add_parser("render-static-load-runtime")
+    render_static = commands.add_parser("render-preliminary-static-load-runtime")
     render_static.add_argument("--concurrency", type=int, required=True)
     render_static.add_argument("--model-lock", required=True)
     render_static.add_argument("--model-roots", required=True)
@@ -2756,7 +2781,7 @@ def _parser() -> argparse.ArgumentParser:
     render_static.add_argument("--host", default="127.0.0.1")
     render_static.add_argument("--first-port", type=int, default=30000)
 
-    render_target = commands.add_parser("render-target-only-runtime")
+    render_target = commands.add_parser("render-preliminary-target-only-runtime")
     render_target.add_argument("--concurrency", type=int, required=True)
     render_target.add_argument("--model-lock", required=True)
     render_target.add_argument("--model-roots", required=True)
@@ -2767,7 +2792,7 @@ def _parser() -> argparse.ArgumentParser:
     render_target.add_argument("--host", default="127.0.0.1")
     render_target.add_argument("--first-port", type=int, default=30000)
 
-    render_tuning = commands.add_parser("render-tuning-runtime")
+    render_tuning = commands.add_parser("render-preliminary-tuning-runtime")
     render_tuning.add_argument("--candidate-id", required=True)
     render_tuning.add_argument("--concurrency", type=int, required=True)
     render_tuning.add_argument("--model-lock", required=True)
@@ -2781,7 +2806,7 @@ def _parser() -> argparse.ArgumentParser:
     render_tuning.add_argument("--host", default="127.0.0.1")
     render_tuning.add_argument("--first-port", type=int, default=30000)
 
-    replication = commands.add_parser("render-replication-runtime")
+    replication = commands.add_parser("render-preliminary-replication-runtime")
     replication.add_argument("--phase", choices=("natural", "profile"), required=True)
     replication.add_argument("--selection", required=True)
     replication.add_argument("--model-lock", required=True)
@@ -2795,10 +2820,10 @@ def _parser() -> argparse.ArgumentParser:
     replication.add_argument("--host", default="127.0.0.1")
     replication.add_argument("--first-port", type=int, default=30000)
 
-    candidates = commands.add_parser("list-tuning-candidates")
+    candidates = commands.add_parser("list-preliminary-tuning-candidates")
     candidates.add_argument("--output", required=True)
 
-    controlled = commands.add_parser("run-controlled-slice")
+    controlled = commands.add_parser("run-preliminary-controlled-slice")
     controlled.add_argument("--manifest", required=True)
     controlled.add_argument("--model-lock", required=True)
     controlled.add_argument("--sampling-profile", required=True)
@@ -2827,7 +2852,7 @@ def _parser() -> argparse.ArgumentParser:
     controlled_online.add_argument("--output", required=True)
     controlled_online.add_argument("--no-warmup", action="store_true")
 
-    natural = commands.add_parser("run-natural-slice")
+    natural = commands.add_parser("run-preliminary-natural-slice")
     natural.add_argument("--manifest", required=True)
     natural.add_argument("--selection", required=True)
     natural.add_argument("--model-lock", required=True)
@@ -2843,19 +2868,19 @@ def _parser() -> argparse.ArgumentParser:
     natural.add_argument("--output-root", required=True)
     natural.add_argument("--no-warmup", action="store_true")
 
-    profiler = commands.add_parser("build-profiler-plan")
+    profiler = commands.add_parser("build-preliminary-profiler-plan")
     profiler.add_argument("--launch-plan", required=True)
     profiler.add_argument("--method", choices=("static", "tts", "l0"), required=True)
     profiler.add_argument("--trace-root", required=True)
     profiler.add_argument("--output", required=True)
     profiler.add_argument("workload_argv", nargs=argparse.REMAINDER)
 
-    load_collect = commands.add_parser("collect-static-load-screen")
+    load_collect = commands.add_parser("collect-preliminary-static-load-screen")
     load_collect.add_argument("--manifest", required=True)
     load_collect.add_argument("--measurements", nargs="+", required=True)
     load_collect.add_argument("--output", required=True)
 
-    advance = commands.add_parser("advance-tuning-stage")
+    advance = commands.add_parser("advance-preliminary-tuning-stage")
     advance.add_argument("--manifest", required=True)
     advance.add_argument("--stage", type=int, required=True)
     advance.add_argument("--measurements", nargs="+", required=True)
@@ -2869,7 +2894,7 @@ def _parser() -> argparse.ArgumentParser:
     advance_online.add_argument("--active-set")
     advance_online.add_argument("--output", required=True)
 
-    run = commands.add_parser("run-confirmation")
+    run = commands.add_parser("run-preliminary-confirmation")
     run.add_argument("--manifest", required=True)
     run.add_argument("--selection", required=True)
     run.add_argument("--model-lock", required=True)
@@ -2897,7 +2922,8 @@ def _parser() -> argparse.ArgumentParser:
     run_online.add_argument("--output-root", required=True)
     run_online.add_argument("--no-warmup", action="store_true")
 
-    target_reference = commands.add_parser("run-target-reference")
+    target_reference = commands.add_parser("run-preliminary-target-reference")
+    target_reference.add_argument("--manifest", required=True)
     target_reference.add_argument("--model-lock", required=True)
     target_reference.add_argument("--sampling-profile", required=True)
     target_reference.add_argument("--url", required=True)
@@ -2906,7 +2932,7 @@ def _parser() -> argparse.ArgumentParser:
     target_reference.add_argument("--output", required=True)
     target_reference.add_argument("--no-warmup", action="store_true")
 
-    collect = commands.add_parser("collect-speed-study")
+    collect = commands.add_parser("collect-preliminary-speed-study")
     collect.add_argument("--manifest", required=True)
     collect.add_argument("--selection", required=True)
     collect.add_argument("--model-lock", required=True)
@@ -2929,7 +2955,7 @@ def _parser() -> argparse.ArgumentParser:
     collect_online.add_argument("--target-reference", required=True)
     collect_online.add_argument("--output", required=True)
 
-    queue = commands.add_parser("build-confirmation-queue")
+    queue = commands.add_parser("build-preliminary-confirmation-queue")
     queue.add_argument("--manifest", required=True)
     queue.add_argument("--selection", required=True)
     queue.add_argument("--model-lock", required=True)
@@ -2947,31 +2973,20 @@ def _parser() -> argparse.ArgumentParser:
     queue_online.add_argument("--evidence-root", required=True)
     queue_online.add_argument("--output", required=True)
 
-    attest = commands.add_parser("attest-speed-study")
+    attest = commands.add_parser("attest-preliminary-speed-study")
     attest.add_argument("--manifest", required=True)
-    attest.add_argument("--selection", required=True)
-    attest.add_argument("--model-lock", required=True)
-    attest.add_argument("--performance", required=True)
-    attest.add_argument("--target-reference", required=True)
-    attest.add_argument("--doctor-json", required=True)
     attest.add_argument("--output", required=True)
 
     attest_online = commands.add_parser("attest-onlinespec-study")
     attest_online.add_argument("--manifest", required=True)
-    attest_online.add_argument("--selection", required=True)
-    attest_online.add_argument("--model-lock", required=True)
-    attest_online.add_argument("--performance", required=True)
-    attest_online.add_argument("--target-reference", required=True)
-    attest_online.add_argument("--doctor-json", required=True)
     attest_online.add_argument("--output", required=True)
 
-    analyze = commands.add_parser("analyze-speed-study")
+    analyze = commands.add_parser("analyze-preliminary-speed-study")
     analyze.add_argument("--performance", required=True)
     analyze.add_argument("--manifest", required=True)
     analyze.add_argument("--selection", required=True)
     analyze.add_argument("--model-lock", required=True)
     analyze.add_argument("--target-reference", required=True)
-    analyze.add_argument("--attestation")
     analyze.add_argument("--output", required=True)
     analyze.add_argument("--bootstrap-seed", type=int, default=0)
 
@@ -2981,14 +2996,13 @@ def _parser() -> argparse.ArgumentParser:
     analyze_online.add_argument("--selection", required=True)
     analyze_online.add_argument("--model-lock", required=True)
     analyze_online.add_argument("--target-reference", required=True)
-    analyze_online.add_argument("--attestation")
     analyze_online.add_argument("--output", required=True)
     analyze_online.add_argument("--bootstrap-seed", type=int, default=0)
     return parser
 
 
 def _select(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     sampling = SamplingProfile.load(args.sampling_profile)
     if sampling.sha256 != manifest.sampling_profile_sha256:
         raise ValueError("sampling profile belongs to a different manifest")
@@ -3053,7 +3067,7 @@ def _select(args: argparse.Namespace) -> int:
 
 
 def _select_anchor(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     sampling = SamplingProfile.load(args.sampling_profile)
     if sampling.sha256 != manifest.sampling_profile_sha256:
         raise ValueError("sampling profile belongs to a different manifest")
@@ -3117,7 +3131,7 @@ def _select_onlinespec(args: argparse.Namespace) -> int:
     if sampling.sha256 != manifest.sampling_profile_sha256:
         raise ValueError("OnlineSPEC manifest uses another sampling profile")
     if (
-        core_selection.manifest_sha256 != SpeedStudyManifest.default().sha256
+        core_selection.manifest_sha256 != PreliminarySpeedStudyManifest.default().sha256
         or core_selection.model_lock_sha256 != lock.sha256
         or core_selection.sampling_profile_sha256 != sampling.sha256
     ):
@@ -3169,7 +3183,7 @@ def _select_onlinespec_anchor(args: argparse.Namespace) -> int:
     if sampling.sha256 != manifest.sampling_profile_sha256:
         raise ValueError("OnlineSPEC manifest uses another sampling profile")
     if (
-        core_selection.manifest_sha256 != SpeedStudyManifest.default().sha256
+        core_selection.manifest_sha256 != PreliminarySpeedStudyManifest.default().sha256
         or core_selection.model_lock_sha256 != lock.sha256
         or core_selection.sampling_profile_sha256 != sampling.sha256
     ):
@@ -3255,8 +3269,8 @@ def _assert_onlinespec_study(
 
 def _study_inputs(
     args: argparse.Namespace,
-) -> tuple[SpeedStudyManifest, ModelLock, SamplingProfile]:
-    manifest = SpeedStudyManifest.load(args.manifest)
+) -> tuple[PreliminarySpeedStudyManifest, ModelLock, SamplingProfile]:
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     model_lock = ModelLock.load(args.model_lock)
     sampling = SamplingProfile.load(args.sampling_profile)
     if sampling.sha256 != manifest.sampling_profile_sha256:
@@ -3316,14 +3330,14 @@ def _run_controlled_slice(args: argparse.Namespace) -> int:
         if config.adaptation is None
         else config.adaptation.adaptation_group_id
     )
-    measurement = measure_controlled_slice(
+    measurement = measure_preliminary_controlled_slice(
+        preliminary_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         method=args.method,
         samples=samples,
         phase=phase,
         stage=args.stage,
         candidate_id=candidate_id,
-        manifest_sha256=manifest.sha256,
         config_sha256=run_config_sha256(config),
         model_lock_sha256=model_lock.sha256,
         adaptation_config_sha256=sglang_adaptation_sha256(config),
@@ -3339,7 +3353,7 @@ def _run_controlled_slice(args: argparse.Namespace) -> int:
 
 
 def _collect_static_load(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     measurements = [SliceMeasurement.load(path) for path in args.measurements]
     expected_window = LongContinuationAdapter().window_sha256("load")
     if len(measurements) != len(manifest.concurrency_grid):
@@ -3392,7 +3406,7 @@ def _collect_static_load(args: argparse.Namespace) -> int:
 
 
 def _advance_tuning(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     tuning_stage(args.stage)
     grid = {candidate.candidate_id: candidate for candidate in tuning_candidates()}
     prior = None
@@ -3501,8 +3515,13 @@ def _list_onlinespec_candidates(args: argparse.Namespace) -> int:
 
 def _confirmation_inputs(
     args: argparse.Namespace,
-) -> tuple[SpeedStudyManifest, SelectionArtifact, ModelLock, SamplingProfile]:
-    manifest = SpeedStudyManifest.load(args.manifest)
+) -> tuple[
+    PreliminarySpeedStudyManifest,
+    SelectionArtifact,
+    ModelLock,
+    SamplingProfile,
+]:
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     selection = SelectionArtifact.load(args.selection)
     _assert_selection_study(selection, manifest)
     model_lock = ModelLock.load(args.model_lock)
@@ -3521,7 +3540,7 @@ def _confirmation_inputs(
 
 
 def _assert_selection_study(
-    selection: SelectionArtifact, manifest: SpeedStudyManifest
+    selection: SelectionArtifact, manifest: PreliminarySpeedStudyManifest
 ) -> None:
     if (
         selection.manifest_sha256 != manifest.sha256
@@ -3616,11 +3635,11 @@ def _run_confirmation(args: argparse.Namespace) -> int:
         and config.adaptation.adaptation_group_id != args.adaptation_group_id
     ):
         raise ValueError("run argument and config adaptation groups differ")
-    written = run_confirmation_slice(
+    written = run_preliminary_confirmation_slice(
+        preliminary_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         method=args.method,
         block=args.block,
-        manifest_sha256=manifest.sha256,
         config_sha256=run_config_sha256(config),
         adaptation_config_sha256=sglang_adaptation_sha256(config),
         output_root=args.output_root,
@@ -3634,7 +3653,10 @@ def _run_confirmation(args: argparse.Namespace) -> int:
     )
     if not written:
         raise RuntimeError("confirmation slice produced no completed evidence")
-    print(f"completed {args.block}/{args.method}: {len(written)} files")
+    print(
+        f"{PRELIMINARY_DIAGNOSTIC_ONLY} "
+        f"{args.block}/{args.method}: {len(written)} diagnostic files"
+    )
     return 0
 
 
@@ -3752,14 +3774,14 @@ def _run_onlinespec_tuning_slice(args: argparse.Namespace) -> int:
         if config.adaptation is None
         else config.adaptation.adaptation_group_id
     )
-    measurement = measure_controlled_slice(
+    measurement = measure_onlinespec_controlled_slice(
+        onlinespec_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         method=args.method,
         samples=samples,
         phase="onlinespec_tuning",
         stage=args.stage,
         candidate_id=(None if candidate is None else candidate.candidate_id),
-        manifest_sha256=manifest.sha256,
         config_sha256=run_config_sha256(config),
         model_lock_sha256=lock.sha256,
         adaptation_config_sha256=sglang_adaptation_sha256(config),
@@ -3876,10 +3898,10 @@ def _run_onlinespec_confirmation(args: argparse.Namespace) -> int:
     ):
         raise ValueError("OnlineSPEC adaptation group mismatch")
     written = run_onlinespec_confirmation_slice(
+        onlinespec_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         method=args.method,
         block=args.block,
-        manifest_sha256=manifest.sha256,
         config_sha256=run_config_sha256(config),
         adaptation_config_sha256=sglang_adaptation_sha256(config),
         output_root=args.output_root,
@@ -3897,6 +3919,7 @@ def _run_onlinespec_confirmation(args: argparse.Namespace) -> int:
 
 
 def _run_target_reference(args: argparse.Namespace) -> int:
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     lock = ModelLock.load(args.model_lock)
     sampling = SamplingProfile.load(args.sampling_profile)
     hardware = _load_patched_gpu_doctor(
@@ -3906,8 +3929,9 @@ def _run_target_reference(args: argparse.Namespace) -> int:
     revisions = {model.model_id: model.revision for model in lock.models}
     target_revision = revisions.get("Qwen/Qwen3-8B")
     if target_revision is None:
-        raise ValueError("model lock lacks the formal Qwen3-8B target")
-    artifact = run_greedy_target_reference(
+        raise ValueError("model lock lacks the preliminary Qwen3-8B target")
+    artifact = run_preliminary_greedy_target_reference(
+        preliminary_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         model_lock_sha256=lock.sha256,
         target_revision=target_revision,
@@ -3952,7 +3976,7 @@ def _concat_evidence_tables(paths: tuple[Path, ...]) -> pa.Table:
 
 
 def _collect_speed_study(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     selection = SelectionArtifact.load(args.selection)
     _assert_selection_study(selection, manifest)
     model_lock = ModelLock.load(args.model_lock)
@@ -3986,9 +4010,9 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
         for model in model_lock.models
         if model.model_id == "Qwen/Qwen3-8B"
     )
-    performance, source_evidence_sha256 = collect_confirmation_performance(
+    performance, source_evidence_sha256 = collect_preliminary_confirmation_performance(
+        preliminary_manifest=manifest,
         evidence_root=args.evidence_root,
-        manifest_sha256=manifest.sha256,
         config_sha256={
             method: run_config_sha256(config) for method, config in configs.items()
         },
@@ -4001,7 +4025,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
     )
     table = _concat_evidence_tables(performance)
     table = table.replace_schema_metadata(
-        _formal_table_metadata(
+        _preliminary_table_metadata(
             manifest=manifest,
             selection=selection,
             model_lock=model_lock,
@@ -4014,7 +4038,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
     )
     output = Path(args.output)
     if output.exists():
-        existing = _load_formal_table(
+        existing = _load_preliminary_table(
             output,
             manifest=manifest,
             selection=selection,
@@ -4069,8 +4093,8 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
         model.revision for model in lock.models if model.model_id == "Qwen/Qwen3-8B"
     )
     performance, evidence_sha256 = collect_onlinespec_performance(
+        onlinespec_manifest=manifest,
         evidence_root=args.evidence_root,
-        manifest_sha256=manifest.sha256,
         config_sha256=config_hashes,
         concurrency=selection.selected_concurrency,
         target_reference=target_reference,
@@ -4083,6 +4107,9 @@ def _collect_onlinespec_study(args: argparse.Namespace) -> int:
     metadata = {
         b"lightcone_schema_version": b"2",
         b"lightcone_study": b"onlinespec-clean-room-baseline",
+        b"lightcone_manifest_kind": manifest.kind.encode(),
+        b"lightcone_evidence_scope": manifest.evidence_scope.encode(),
+        b"lightcone_formal_execution_authorized": b"false",
         b"lightcone_manifest_sha256": manifest.sha256.encode(),
         b"lightcone_selection_sha256": selection.sha256.encode(),
         b"lightcone_model_lock_sha256": lock.sha256.encode(),
@@ -4310,7 +4337,7 @@ def _render_replication_runtime(args: argparse.Namespace) -> int:
 
 
 def _run_natural_slice(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
     selection = SelectionArtifact.load(args.selection)
     _assert_selection_study(selection, manifest)
     model_lock = ModelLock.load(args.model_lock)
@@ -4342,12 +4369,12 @@ def _run_natural_slice(args: argparse.Namespace) -> int:
         if config.adaptation is None
         else config.adaptation.adaptation_group_id
     )
-    paths = run_natural_replication_slice(
+    paths = run_preliminary_natural_replication_slice(
+        preliminary_manifest=manifest,
         client=SGLangHTTPClient(args.url),
         method=args.method,
         dataset_name=args.dataset,
         samples=samples,
-        manifest_sha256=manifest.sha256,
         config_sha256=run_config_sha256(config),
         adaptation_config_sha256=sglang_adaptation_sha256(config),
         output_root=args.output_root,
@@ -4499,7 +4526,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
                     "launch_argv": server["argv"],
                     "run_argv": [
                         "lightcone-spec",
-                        "run-confirmation",
+                        "run-preliminary-confirmation",
                         *common,
                         "--config",
                         server["run_config"],
@@ -4780,58 +4807,22 @@ def _validate_attestation_doctor(hardware: object, *, label: str) -> dict:
 
 
 def _attest(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
-    selection = SelectionArtifact.load(args.selection)
-    _assert_selection_study(selection, manifest)
-    model_lock = ModelLock.load(args.model_lock)
-    if selection.model_lock_sha256 != model_lock.sha256:
-        raise ValueError("selection artifact belongs to a different model lock")
-    revisions = {model.model_id: model.revision for model in model_lock.models}
-    target_revision = revisions.get("Qwen/Qwen3-8B")
-    drafter_revision = revisions.get("z-lab/Qwen3-8B-DFlash-b16")
-    if target_revision is None or drafter_revision is None:
-        raise ValueError("model lock lacks the formal Qwen3-8B/DFlash pair")
-    hardware = _validate_attestation_doctor(
-        json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
-        label="GPU",
-    )
-    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
-        raise _trusted_attester_unavailable("legacy GPU attestation")
-    target_reference = _load_target_reference(
-        args.target_reference,
-        model_lock=model_lock,
-        sampling_profile_sha256=manifest.sampling_profile_sha256,
-        concurrency=selection.selected_concurrency,
-    )
-    _load_formal_table(
-        args.performance,
-        manifest=manifest,
-        selection=selection,
-        model_lock=model_lock,
-        target_reference=target_reference,
-    )
-    if target_reference.hardware_sha256 != _canonical_sha256(hardware):
-        raise ValueError("target reference belongs to a different GPU report")
-    attestation = GpuEvidenceAttestation(
-        schema_version=2,
-        status="MEASURED",
-        manifest_sha256=manifest.sha256,
-        selection_sha256=selection.sha256,
-        model_lock_sha256=model_lock.sha256,
-        performance_sha256=evidence_files_sha256((args.performance,)),
-        target_reference_sha256=target_reference.sha256,
-        patched_sglang_tree=PINNED_SGLANG_TREE,
-        target_revision=target_revision,
-        drafter_revision=drafter_revision,
-        hardware_sha256=_canonical_sha256(hardware),
-        methods=manifest.methods,
-        repetitions=manifest.confirmation_repetitions,
-        context_start=manifest.formal_context_start,
-        context_limit=manifest.safe_context_limit,
-    )
-    attestation.write(args.output)
-    print(attestation.sha256)
-    return 0
+    """Categorically refuse to turn legacy diagnostics into attestation."""
+
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
+    decision = {
+        "schema_version": 1,
+        "kind": "preliminary_speed_study_attestation_decision",
+        "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+        "reason_code": "legacy_speed_study_has_no_formal_attestation_path",
+        "manifest_kind": manifest.kind,
+        "manifest_sha256": manifest.sha256,
+        "formal_execution_authorized": False,
+        "industrial_evidence_receipt": None,
+    }
+    _write_json(args.output, decision)
+    print(_canonical_sha256(decision))
+    return 42
 
 
 def _onlinespec_table(
@@ -4859,120 +4850,141 @@ def _onlinespec_table(
     }
     if any(metadata.get(key) != value for key, value in expected.items()):
         raise ValueError("OnlineSPEC table identity metadata mismatch")
+    scope_metadata = {
+        b"lightcone_manifest_kind": manifest.kind.encode(),
+        b"lightcone_evidence_scope": manifest.evidence_scope.encode(),
+        b"lightcone_formal_execution_authorized": b"false",
+    }
+    present_scope_fields = set(scope_metadata) & set(metadata)
+    if present_scope_fields and any(
+        metadata.get(key) != value for key, value in scope_metadata.items()
+    ):
+        raise ValueError("OnlineSPEC table scope metadata is invalid")
     return table
 
 
 def _attest_onlinespec(args: argparse.Namespace) -> int:
+    """Refuse to mint claim authority for the separate comparison workflow."""
+
     manifest = OnlineSpecManifest.load(args.manifest)
-    selection = OnlineSpecSelection.load(args.selection)
-    lock = ModelLock.load(args.model_lock)
-    _assert_onlinespec_study(manifest, selection, lock)
-    hardware = _validate_attestation_doctor(
-        json.loads(Path(args.doctor_json).read_text(encoding="utf-8")),
-        label="OnlineSPEC GPU",
+    decision = {
+        "schema_version": 1,
+        "kind": "onlinespec_diagnostic_attestation_decision",
+        "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+        "reason_code": "onlinespec_comparison_has_no_formal_attestation_path",
+        "manifest_sha256": manifest.sha256,
+        "formal_execution_authorized": False,
+        "core_speed_gate_affected": False,
+    }
+    _write_json(args.output, decision)
+    print(_canonical_sha256(decision))
+    return 42
+
+
+def _preliminary_method_statistics(value: object) -> dict[str, object]:
+    """Copy only non-authoritative method diagnostics from a reducer row."""
+
+    raw = value if isinstance(value, dict) else asdict(value)
+    fields = (
+        "method",
+        "mean_speedup",
+        "ci_lower",
+        "ci_upper",
+        "safety_pass",
+        "acceleration_pass",
     )
-    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
-        raise _trusted_attester_unavailable("legacy OnlineSPEC GPU attestation")
-    target_reference = _load_target_reference(
-        args.target_reference,
-        model_lock=lock,
-        sampling_profile_sha256=selection.sampling_profile_sha256,
-        concurrency=selection.selected_concurrency,
+    if not isinstance(raw, dict) or any(field not in raw for field in fields):
+        raise TypeError("preliminary method statistics are incomplete")
+    return {field: raw[field] for field in fields}
+
+
+def _preliminary_gate_statistics(gate: object) -> dict[str, object]:
+    """Whitelist diagnostic fields and categorically erase claim authority."""
+
+    raw = asdict(gate)
+    pair_fields = (
+        "numerator_method",
+        "denominator_method",
+        "mean_speedup",
+        "ci_lower",
+        "ci_upper",
+        "no_worse_pass",
     )
-    _onlinespec_table(
-        args.performance,
-        manifest=manifest,
-        selection=selection,
-        lock=lock,
-        target_reference=target_reference,
-    )
-    if target_reference.hardware_sha256 != _canonical_sha256(hardware):
-        raise ValueError("target reference belongs to a different GPU report")
-    attestation = OnlineSpecGpuAttestation(
-        schema_version=2,
-        status="MEASURED",
-        manifest_sha256=manifest.sha256,
-        selection_sha256=selection.sha256,
-        model_lock_sha256=lock.sha256,
-        performance_sha256=evidence_files_sha256((args.performance,)),
-        target_reference_sha256=target_reference.sha256,
-        patched_sglang_tree=PINNED_SGLANG_TREE,
-        hardware_sha256=_canonical_sha256(hardware),
-        methods=manifest.methods,
-        repetitions=manifest.confirmation_repetitions,
-    )
-    attestation.write(args.output)
-    print(attestation.sha256)
-    return 0
+    pair = raw.get("l0_vs_tts")
+    if not isinstance(pair, dict) or any(field not in pair for field in pair_fields):
+        raise TypeError("preliminary pairwise statistics are incomplete")
+    return {
+        "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+        "gpu_evidence": PRELIMINARY_DIAGNOSTIC_ONLY,
+        "evidence_sha256": None,
+        "tts": _preliminary_method_statistics(raw.get("tts")),
+        "l0": _preliminary_method_statistics(raw.get("l0")),
+        "l0_vs_tts": {field: pair[field] for field in pair_fields},
+    }
 
 
 def _analyze(args: argparse.Namespace) -> int:
-    manifest = SpeedStudyManifest.load(args.manifest)
+    manifest = PreliminarySpeedStudyManifest.load(args.manifest)
+    if getattr(args, "attestation", None):
+        raise ValueError(
+            "preliminary analysis cannot consume any attestation; use "
+            "analyze-industrial with raw industrial authority"
+        )
     selection = SelectionArtifact.load(args.selection)
     _assert_selection_study(selection, manifest)
     model_lock = ModelLock.load(args.model_lock)
     if selection.model_lock_sha256 != model_lock.sha256:
         raise ValueError("selection artifact belongs to a different model lock")
-    if args.attestation and _TRUSTED_HARDWARE_ATTESTER_ID is None:
-        raise _trusted_attester_unavailable("legacy analysis attestation")
     target_reference = _load_target_reference(
         args.target_reference,
         model_lock=model_lock,
         sampling_profile_sha256=manifest.sampling_profile_sha256,
         concurrency=selection.selected_concurrency,
     )
-    table = _load_formal_table(
+    table = _load_preliminary_table(
         args.performance,
         manifest=manifest,
         selection=selection,
         model_lock=model_lock,
         target_reference=target_reference,
     )
-    evidence_state = "UNMEASURED"
-    evidence_sha256 = None
-    if args.attestation:
-        attestation = GpuEvidenceAttestation.load(args.attestation)
-        attestation.verify_performance((args.performance,))
-        attestation.verify_target_reference(target_reference)
-        if attestation.manifest_sha256 != manifest.sha256:
-            raise ValueError("attestation manifest identity mismatch")
-        if attestation.selection_sha256 != selection.sha256:
-            raise ValueError("attestation selection identity mismatch")
-        if attestation.model_lock_sha256 != model_lock.sha256:
-            raise ValueError("attestation model-lock identity mismatch")
-        revisions = {model.model_id: model.revision for model in model_lock.models}
-        if attestation.target_revision != revisions.get(
-            "Qwen/Qwen3-8B"
-        ) or attestation.drafter_revision != revisions.get("z-lab/Qwen3-8B-DFlash-b16"):
-            raise ValueError("attestation model revisions mismatch")
-        evidence_state = "MEASURED"
-        evidence_sha256 = attestation.sha256
     gate = evaluate_speed_gate(
         table.to_pylist(),
         seed=args.bootstrap_seed,
-        gpu_evidence=evidence_state,
-        evidence_sha256=evidence_sha256,
+        gpu_evidence="UNMEASURED",
+        evidence_sha256=None,
     )
+    diagnostic_statistics = _preliminary_gate_statistics(gate)
     _write_json(
         args.output,
         {
-            **asdict(gate),
+            "schema_version": 1,
+            "kind": "preliminary_speed_study_analysis",
+            "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+            "manifest_kind": manifest.kind,
+            "manifest_sha256": manifest.sha256,
+            "formal_execution_authorized": False,
+            "industrial_evidence_receipt": None,
+            "diagnostic_statistics": diagnostic_statistics,
             "selection_protocol": selection.selection_protocol,
             "optimized_grid_claim": (
                 selection.selection_protocol == "successive_halving"
             ),
         },
     )
-    return 0 if gate.passed else 42
+    return 42
 
 
 def _analyze_onlinespec(args: argparse.Namespace) -> int:
     manifest = OnlineSpecManifest.load(args.manifest)
+    if getattr(args, "attestation", None):
+        raise ValueError(
+            "OnlineSPEC comparison analysis cannot consume attestation or enter "
+            "the core industrial gate"
+        )
     selection = OnlineSpecSelection.load(args.selection)
     lock = ModelLock.load(args.model_lock)
     _assert_onlinespec_study(manifest, selection, lock)
-    if args.attestation and _TRUSTED_HARDWARE_ATTESTER_ID is None:
-        raise _trusted_attester_unavailable("legacy OnlineSPEC analysis attestation")
     target_reference = _load_target_reference(
         args.target_reference,
         model_lock=lock,
@@ -4986,39 +4998,19 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
         lock=lock,
         target_reference=target_reference,
     )
-    evidence = "UNMEASURED"
-    attestation_sha256 = None
-    if args.attestation:
-        attestation = OnlineSpecGpuAttestation.load(args.attestation)
-        if (
-            attestation.manifest_sha256 != manifest.sha256
-            or attestation.selection_sha256 != selection.sha256
-            or attestation.model_lock_sha256 != lock.sha256
-            or attestation.performance_sha256
-            != evidence_files_sha256((args.performance,))
-            or attestation.target_reference_sha256 != target_reference.sha256
-        ):
-            raise ValueError("OnlineSPEC attestation does not bind this table")
-        evidence = "MEASURED"
-        attestation_sha256 = attestation.sha256
     comparisons = compare_onlinespec(table.to_pylist(), seed=args.bootstrap_seed)
     safety_pass = all(comparison.safety_pass for comparison in comparisons)
     acceleration_pass = any(comparison.acceleration_pass for comparison in comparisons)
-    status = (
-        "UNMEASURED"
-        if evidence == "UNMEASURED"
-        else "PASS"
-        if safety_pass and acceleration_pass
-        else "BLOCKED"
-    )
     _write_json(
         args.output,
         {
             "schema_version": 2,
             "study": "onlinespec-clean-room-baseline",
-            "gpu_evidence": evidence,
-            "status": status,
-            "attestation_sha256": attestation_sha256,
+            "gpu_evidence": PRELIMINARY_DIAGNOSTIC_ONLY,
+            "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+            "attestation_sha256": None,
+            "formal_execution_authorized": False,
+            "industrial_evidence_receipt": None,
             "core_speed_gate_affected": False,
             "safety_pass": safety_pass,
             "at_least_one_acceleration_pass": acceleration_pass,
@@ -5029,10 +5021,10 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
             "optimized_grid_claim": (
                 selection.selection_protocol == "successive_halving"
             ),
-            "comparisons": [asdict(row) for row in comparisons],
+            "comparisons": [_preliminary_method_statistics(row) for row in comparisons],
         },
     )
-    return 0 if status == "PASS" else 42
+    return 42
 
 
 def _build_industrial_registry(args: argparse.Namespace) -> int:
@@ -7114,8 +7106,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load_run_config(args.config)
         print(config.model_dump_json(indent=2))
         return 0
-    if args.command == "build-speed-study":
-        manifest = SpeedStudyManifest.default()
+    if args.command == "build-preliminary-speed-study":
+        manifest = PreliminarySpeedStudyManifest.default()
         manifest.write(args.output)
         print(manifest.sha256)
         return 0
@@ -7203,63 +7195,63 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         return 0
-    if args.command == "select-speed-config":
+    if args.command == "select-preliminary-speed-config":
         return _select(args)
-    if args.command == "select-anchor-config":
+    if args.command == "select-preliminary-anchor-config":
         return _select_anchor(args)
     if args.command == "select-onlinespec-config":
         return _select_onlinespec(args)
     if args.command == "select-onlinespec-anchor-config":
         return _select_onlinespec_anchor(args)
-    if args.command == "render-runtime":
+    if args.command == "render-preliminary-runtime":
         return _render_runtime(args)
     if args.command == "render-onlinespec-runtime":
         return _render_onlinespec_runtime(args)
     if args.command == "render-onlinespec-tuning-runtime":
         return _render_onlinespec_tuning_runtime(args)
-    if args.command == "render-static-load-runtime":
+    if args.command == "render-preliminary-static-load-runtime":
         return _render_static_load_runtime(args)
-    if args.command == "render-target-only-runtime":
+    if args.command == "render-preliminary-target-only-runtime":
         return _render_target_only_runtime(args)
-    if args.command == "render-tuning-runtime":
+    if args.command == "render-preliminary-tuning-runtime":
         return _render_tuning_runtime(args)
-    if args.command == "render-replication-runtime":
+    if args.command == "render-preliminary-replication-runtime":
         return _render_replication_runtime(args)
-    if args.command == "list-tuning-candidates":
+    if args.command == "list-preliminary-tuning-candidates":
         return _list_tuning_candidates(args)
-    if args.command == "run-controlled-slice":
+    if args.command == "run-preliminary-controlled-slice":
         return _run_controlled_slice(args)
     if args.command == "run-onlinespec-tuning-slice":
         return _run_onlinespec_tuning_slice(args)
-    if args.command == "run-natural-slice":
+    if args.command == "run-preliminary-natural-slice":
         return _run_natural_slice(args)
-    if args.command == "build-profiler-plan":
+    if args.command == "build-preliminary-profiler-plan":
         return _build_profiler_plan(args)
-    if args.command == "collect-static-load-screen":
+    if args.command == "collect-preliminary-static-load-screen":
         return _collect_static_load(args)
-    if args.command == "advance-tuning-stage":
+    if args.command == "advance-preliminary-tuning-stage":
         return _advance_tuning(args)
     if args.command == "advance-onlinespec-tuning-stage":
         return _advance_onlinespec_tuning(args)
-    if args.command == "run-confirmation":
+    if args.command == "run-preliminary-confirmation":
         return _run_confirmation(args)
     if args.command == "run-onlinespec-confirmation":
         return _run_onlinespec_confirmation(args)
-    if args.command == "run-target-reference":
+    if args.command == "run-preliminary-target-reference":
         return _run_target_reference(args)
-    if args.command == "collect-speed-study":
+    if args.command == "collect-preliminary-speed-study":
         return _collect_speed_study(args)
     if args.command == "collect-onlinespec-study":
         return _collect_onlinespec_study(args)
-    if args.command == "build-confirmation-queue":
+    if args.command == "build-preliminary-confirmation-queue":
         return _build_confirmation_queue(args)
     if args.command == "build-onlinespec-queue":
         return _build_onlinespec_queue(args)
-    if args.command == "attest-speed-study":
+    if args.command == "attest-preliminary-speed-study":
         return _attest(args)
     if args.command == "attest-onlinespec-study":
         return _attest_onlinespec(args)
-    if args.command == "analyze-speed-study":
+    if args.command == "analyze-preliminary-speed-study":
         return _analyze(args)
     if args.command == "analyze-onlinespec-study":
         return _analyze_onlinespec(args)

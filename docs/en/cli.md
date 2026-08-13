@@ -35,28 +35,29 @@ authority. The schema-v3 and industrial commands are:
 | `execute-dispatch-wave` | Reopen one committed materialization manifest and execute one receipt-bounded frozen wave when all release authorities are available |
 | `seal-industrial-stage` | Bind activated completion, dispositions, budgets, runtime, split, dependencies, and locked outputs |
 | `analyze-industrial` | Validate schema-v3 terminal, budget, family-power, and hardware evidence |
-| `build-speed-study` | Materialize the smaller core source protocol |
+| `analyze-e3b-long-context` | Validate and reduce the isolated E3b long-context evidence family |
+| `build-preliminary-speed-study` | Materialize the historical `PRELIMINARY_DIAGNOSTIC_ONLY` protocol; never industrial authority |
 | `lock-models` | Resolve model IDs to immutable revisions |
 | `prepare-models` | Download or offline-verify locked snapshots |
-| `list-tuning-candidates` | Write the registered Full/LoRA tuning grid |
-| `render-target-only-runtime` | Render a speculation-disabled Target-only endpoint |
-| `render-static-load-runtime` | Render an allocation-free Static endpoint |
-| `render-tuning-runtime` | Render matched TTS/L0 tuning endpoints |
-| `run-controlled-slice` | Measure one registered controlled slice |
-| `collect-static-load-screen` | Validate Static load coverage and select the reference load |
-| `advance-tuning-stage` | Validate a halving stage and seal survivors |
-| `select-speed-config` | Apply the tuning-only registered selection rule |
-| `select-anchor-config` | Lock a terminal registered anchor without an optimum claim |
-| `render-runtime` | Emit matched sequential core configs and launch argv |
-| `build-confirmation-queue` | Materialize clean-server confirmation jobs |
-| `run-confirmation` | Execute one method/block confirmation slice |
-| `run-target-reference` | Capture a locked Target-only greedy token-ID trajectory diagnostic |
-| `collect-speed-study` | Derive a table from completed receipt-bound evidence |
-| `render-replication-runtime` | Render natural-task or profiler-only slices |
-| `run-natural-slice` | Run one locked natural-task slice |
-| `build-profiler-plan` | Build an isolated profile plan with headline evidence forbidden |
-| `attest-speed-study` | Bind GPU, runtime, model, selection, trace, and evidence identities |
-| `analyze-speed-study` | Evaluate the registered paired gate |
+| `list-preliminary-tuning-candidates` | Write the historical Full/LoRA diagnostic grid |
+| `render-preliminary-target-only-runtime` | Render a diagnostic speculation-disabled Target-only endpoint |
+| `render-preliminary-static-load-runtime` | Render a diagnostic allocation-free Static endpoint |
+| `render-preliminary-tuning-runtime` | Render matched preliminary TTS/L0 endpoints |
+| `run-preliminary-controlled-slice` | Measure one preliminary controlled slice |
+| `collect-preliminary-static-load-screen` | Validate preliminary Static load coverage |
+| `advance-preliminary-tuning-stage` | Validate a preliminary halving stage |
+| `select-preliminary-speed-config` | Apply the historical tuning-only rule |
+| `select-preliminary-anchor-config` | Lock a preliminary anchor without a claim |
+| `render-preliminary-runtime` | Emit matched preliminary configs and launch argv |
+| `build-preliminary-confirmation-queue` | Materialize clean-server diagnostic jobs |
+| `run-preliminary-confirmation` | Execute one preliminary method/block slice |
+| `run-preliminary-target-reference` | Capture a preliminary Target-only token-ID trajectory |
+| `collect-preliminary-speed-study` | Derive a preliminary diagnostic table |
+| `render-preliminary-replication-runtime` | Render preliminary natural-task or profiler slices |
+| `run-preliminary-natural-slice` | Run one preliminary natural-task slice |
+| `build-preliminary-profiler-plan` | Build an isolated diagnostic profile plan |
+| `attest-preliminary-speed-study` | Emit a categorical non-authority decision (exit 42) |
+| `analyze-preliminary-speed-study` | Produce preliminary statistics only (exit 42) |
 
 The separate OnlineSPEC family is unchanged in isolation:
 
@@ -74,11 +75,18 @@ The separate OnlineSPEC family is unchanged in isolation:
 | `build-onlinespec-queue` | Materialize randomized clean-server comparison jobs |
 | `run-onlinespec-confirmation` | Execute one learner/method block |
 | `collect-onlinespec-study` | Derive the isolated comparison table |
-| `attest-onlinespec-study` | Bind comparison evidence and source identities |
-| `analyze-onlinespec-study` | Produce diagnostic learner-versus-Static intervals |
+| `attest-onlinespec-study` | Emit a categorical non-authority decision (exit 42) |
+| `analyze-onlinespec-study` | Produce diagnostic learner-versus-Static intervals only (exit 42) |
 
-There is no generic method override or command that converts an unreceipted
-directory into completed evidence.
+The historical speed-study manifest/API/CLI surface is strictly
+`PRELIMINARY_DIAGNOSTIC_ONLY`. It cannot consume an industrial registry,
+activation, budget, completion authority, or materialized bundle, and its
+tables and receipts are never accepted by `analyze-industrial`. Historical
+schema-v2 manifests remain readable under this forced scope; they cannot be
+rewritten or relabelled as formal. The only formal execution command is
+`execute-dispatch-wave`, which reopens a materialized bundle and enters the
+industrial executor. There is no generic method override or command that
+converts an unreceipted directory into completed evidence.
 
 The bootstrap envelope is permission to generate only the eight registered
 Static calibration observations. It cannot authorize headline co-tenancy or a
@@ -561,16 +569,17 @@ hashes, and license inventory. The checkout stays outside this repository.
 Successive halving runs independently inside OGD, optimistic OGD, and the
 ensemble. Selection also binds the core reference load, but it cannot change
 that load or affect the core gate. An anchor selection labels
-`optimized_grid_claim=false`. OnlineSPEC remains TP1/DP1 and uses its own GPU
-attestation.
+`optimized_grid_claim=false`. OnlineSPEC remains TP1/DP1 and diagnostic-only;
+its attestation command can only emit a non-authority decision.
 
 ## Status, resume, and exit codes
 
-`analyze-speed-study` may produce diagnostics without attestation, but status is
-`UNMEASURED` and the process exits 42. With valid content-bound GPU evidence it
-exits zero only for a complete registered pass. Valid evidence that misses a
-criterion is `BLOCKED` and also exits 42. Identity, schema, I/O, receipt, or
-runtime errors are ordinary nonzero failures, not scientific outcomes.
+`analyze-preliminary-speed-study` always writes
+`PRELIMINARY_DIAGNOSTIC_ONLY` and exits 42. It rejects every attestation, even
+if a future trusted attester is configured. `attest-preliminary-speed-study`
+and `attest-onlinespec-study` likewise emit categorical non-authority decisions
+and exit 42. Identity, schema, I/O, receipt, or runtime errors are ordinary
+nonzero failures, not scientific outcomes.
 The current release has no trusted hardware-attester identity, so a supplied
 legacy attestation is rejected and `analyze-industrial` cannot emit `MEASURED`;
 it exits 42 even for otherwise self-consistent diagnostic JSON.
@@ -584,14 +593,14 @@ are regression-only and cannot be supplied as schema-v3 stage receipts.
 
 ### Target-output reference diagnostic
 
-Against a separate locked Target-only server, `run-target-reference` records
+Against a separate locked Target-only server,
+`run-preliminary-target-reference` records
 per-prompt token counts and format-tagged SHA-256 values of complete ordered
 output-token-ID arrays. It never substitutes a decoded-text digest. Legacy
 collectors require `--target-reference` and reject a method/block unless its
 trajectory matches the reference; agreement among speculative methods alone is
-not an exactness proof. In this release the result remains an `UNMEASURED`
-diagnostic because Static/TTS/L0 execution and trusted hardware attestation are
-both blocked.
+not an exactness proof. The result remains
+`PRELIMINARY_DIAGNOSTIC_ONLY` regardless of hardware availability.
 
 ## Credentials and output roots
 

@@ -7,8 +7,9 @@ import json
 import math
 import subprocess
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 import numpy as np
 
@@ -38,6 +39,8 @@ ONLINE_SPEC_SOURCE_AUDIT_SHA256 = (
 ONLINE_SPEC_CLAIM_SCOPE = (
     "clean-room-online-learner-equation-complete-not-official-system-reproduction"
 )
+ONLINE_SPEC_MANIFEST_KIND = "preliminary_diagnostic_onlinespec_manifest"
+ONLINE_SPEC_EVIDENCE_SCOPE = "PRELIMINARY_DIAGNOSTIC_ONLY"
 ONLINE_SPEC_METHODS = (
     "onlinespec_ogd",
     "onlinespec_opt",
@@ -97,12 +100,67 @@ def _write_bound(path: str | Path, value: object) -> None:
 
 def _load_bound(path: str | Path) -> dict:
     source = Path(path)
-    value = json.loads(source.read_text(encoding="utf-8"))
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"bound artifact must be a regular file: {source}")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"bound artifact contains duplicate JSON key {key!r}")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> NoReturn:
+        raise ValueError(f"bound artifact contains non-finite JSON constant {value!r}")
+
+    try:
+        value = json.loads(
+            source.read_bytes().decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"bound artifact is not strict UTF-8 JSON: {source}"
+        ) from error
+
+    def reject_nonfinite(item: object) -> None:
+        if type(item) is float and not math.isfinite(item):
+            raise ValueError("bound artifact contains a non-finite JSON number")
+        if type(item) is dict:
+            for nested in item.values():
+                reject_nonfinite(nested)
+        elif type(item) is list:
+            for nested in item:
+                reject_nonfinite(nested)
+
+    reject_nonfinite(value)
     sidecar = Path(f"{source}.sha256")
-    if not sidecar.is_file() or sidecar.read_text().strip() != _sha256_value(value):
+    expected_sidecar = f"{_sha256_value(value)}\n".encode("ascii")
+    if (
+        sidecar.is_symlink()
+        or not sidecar.is_file()
+        or sidecar.read_bytes() != expected_sidecar
+    ):
         raise ValueError(f"artifact sidecar is missing or invalid: {source}")
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         raise TypeError("bound artifact must be an object")
+    return value
+
+
+def _historical_onlinespec_payload(current: dict[str, object]) -> dict[str, object]:
+    value = current.copy()
+    for field_name in (
+        "kind",
+        "evidence_scope",
+        "formal_execution_authorized",
+        "industrial_authority_consumption",
+    ):
+        value.pop(field_name)
+    value["name"] = "onlinespec-clean-room-baseline"
+    value["formal_context_start"] = value.pop("diagnostic_context_start")
+    value["gpu_evidence"] = "UNMEASURED"
     return value
 
 
@@ -340,7 +398,11 @@ def onlinespec_candidates() -> tuple[OnlineSpecCandidate, ...]:
 @dataclass(frozen=True)
 class OnlineSpecManifest:
     schema_version: int
+    kind: str
     name: str
+    evidence_scope: str
+    formal_execution_authorized: bool
+    industrial_authority_consumption: str
     methods: tuple[str, ...]
     phases: tuple[str, ...]
     official_repository: str
@@ -361,16 +423,25 @@ class OnlineSpecManifest:
     request_scheduling: str
     headline_timing_unit: str
     inference_cluster_unit: str
-    formal_context_start: int
+    diagnostic_context_start: int
     safe_context_limit: int
     gpu_evidence: str
+    _historical_source_sha256: str | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def default(cls) -> OnlineSpecManifest:
         data = LongContinuationAdapter()
         return cls(
             schema_version=2,
-            name="onlinespec-clean-room-baseline",
+            kind=ONLINE_SPEC_MANIFEST_KIND,
+            name="preliminary-diagnostic-onlinespec-clean-room-baseline",
+            evidence_scope=ONLINE_SPEC_EVIDENCE_SCOPE,
+            formal_execution_authorized=False,
+            industrial_authority_consumption="FORBIDDEN",
             methods=ONLINE_SPEC_STUDY_METHODS,
             phases=(
                 "tuning_only_selection",
@@ -397,38 +468,118 @@ class OnlineSpecManifest:
             request_scheduling="ordered_native_batch_cohort_queue",
             headline_timing_unit="method_repetition_batch",
             inference_cluster_unit="repetition_block",
-            formal_context_start=16384,
+            diagnostic_context_start=16384,
             safe_context_limit=DFLASH_SAFE_CONTEXT_LIMIT,
-            gpu_evidence="UNMEASURED",
+            gpu_evidence=ONLINE_SPEC_EVIDENCE_SCOPE,
         )
 
     def validate(self) -> None:
-        if self != type(self).default():
+        if type(self.schema_version) is not int:
+            raise TypeError("OnlineSPEC schema version must be an exact integer")
+        if self.formal_execution_authorized is not False:
+            raise ValueError("OnlineSPEC diagnostics cannot authorize formal execution")
+        exact_integer_fields = (
+            self.confirmation_repetitions,
+            self.confirmation_schedule_seed,
+            self.diagnostic_context_start,
+            self.safe_context_limit,
+        )
+        if any(type(value) is not int for value in exact_integer_fields):
+            raise TypeError("OnlineSPEC scalar identities must be exact integers")
+        if type(self.tuning_stages) is not tuple or any(
+            type(stage) is not tuple
+            or len(stage) != 2
+            or any(type(value) is not int for value in stage)
+            for stage in self.tuning_stages
+        ):
+            raise TypeError("OnlineSPEC tuning stages must contain exact integer pairs")
+        if self._payload() != type(self).default()._payload():
             raise ValueError(
                 "OnlineSPEC source manifest differs from the registered protocol"
             )
+        if self._historical_source_sha256 is not None:
+            expected_historical_sha256 = _sha256_value(
+                _historical_onlinespec_payload(self._payload())
+            )
+            if self._historical_source_sha256 != expected_historical_sha256:
+                raise ValueError("historical OnlineSPEC source identity mismatch")
+
+    def _payload(self) -> dict:
+        value = asdict(self)
+        value.pop("_historical_source_sha256")
+        return value
 
     @property
     def sha256(self) -> str:
         self.validate()
-        return _sha256_value(asdict(self))
+        return self._historical_source_sha256 or _sha256_value(self._payload())
 
     def write(self, path: str | Path) -> None:
         self.validate()
-        _write_bound(path, asdict(self))
+        if self._historical_source_sha256 is not None:
+            raise ValueError(
+                "historical OnlineSPEC manifests are read-only preliminary evidence"
+            )
+        _write_bound(path, self._payload())
 
     @classmethod
     def load(cls, path: str | Path) -> OnlineSpecManifest:
         value = _load_bound(path)
+        source_sha256 = _sha256_value(value)
+        current_fields = set(cls.default()._payload())
+        historical_fields = set(
+            _historical_onlinespec_payload(cls.default()._payload())
+        )
+        if set(value) == current_fields:
+            historical = False
+        elif set(value) == historical_fields:
+            historical = True
+        else:
+            raise ValueError("OnlineSPEC manifest fields do not match schema")
+        if historical and not (
+            type(value.get("schema_version")) is int
+            and value.get("schema_version") == 2
+            and value.get("name") == "onlinespec-clean-room-baseline"
+            and value.get("gpu_evidence") == "UNMEASURED"
+            and "kind" not in value
+            and "evidence_scope" not in value
+            and "formal_execution_authorized" not in value
+            and "industrial_authority_consumption" not in value
+            and "formal_context_start" in value
+            and "diagnostic_context_start" not in value
+        ):
+            raise ValueError("historical OnlineSPEC manifest identity mismatch")
+        for field_name in ("methods", "phases", "tuning_stages"):
+            if type(value[field_name]) is not list:
+                raise TypeError(
+                    "OnlineSPEC manifest sequence fields must be JSON arrays"
+                )
+        if any(
+            type(stage) is not list or len(stage) != 2
+            for stage in value["tuning_stages"]
+        ):
+            raise TypeError("OnlineSPEC tuning stages must be two-element JSON arrays")
+        if historical:
+            value = {
+                **value,
+                "kind": ONLINE_SPEC_MANIFEST_KIND,
+                "name": "preliminary-diagnostic-onlinespec-clean-room-baseline",
+                "evidence_scope": ONLINE_SPEC_EVIDENCE_SCOPE,
+                "formal_execution_authorized": False,
+                "industrial_authority_consumption": "FORBIDDEN",
+                "diagnostic_context_start": value["formal_context_start"],
+                "gpu_evidence": ONLINE_SPEC_EVIDENCE_SCOPE,
+            }
+            value.pop("formal_context_start")
         artifact = cls(
             **{
                 **value,
                 "methods": tuple(value["methods"]),
                 "phases": tuple(value["phases"]),
                 "tuning_stages": tuple(
-                    tuple(int(item) for item in stage)
-                    for stage in value["tuning_stages"]
+                    tuple(stage) for stage in value["tuning_stages"]
                 ),
+                "_historical_source_sha256": (source_sha256 if historical else None),
             }
         )
         artifact.validate()
@@ -795,6 +946,8 @@ class OnlineSpecComparison:
 
 @dataclass(frozen=True)
 class OnlineSpecGpuAttestation:
+    """Disabled legacy attestation schema retained only for clear rejection."""
+
     schema_version: int
     status: str
     manifest_sha256: str
@@ -808,24 +961,10 @@ class OnlineSpecGpuAttestation:
     repetitions: int
 
     def validate(self) -> None:
-        if self.schema_version != 2 or self.status != "MEASURED":
-            raise ValueError("OnlineSPEC GPU attestation must be schema-v2 MEASURED")
-        if self.methods != ONLINE_SPEC_STUDY_METHODS or self.repetitions != 8:
-            raise ValueError("OnlineSPEC attestation coverage is invalid")
-        if self.patched_sglang_tree != PINNED_SGLANG_TREE:
-            raise ValueError("OnlineSPEC attestation uses the wrong runtime tree")
-        for value in (
-            self.manifest_sha256,
-            self.selection_sha256,
-            self.model_lock_sha256,
-            self.performance_sha256,
-            self.target_reference_sha256,
-            self.hardware_sha256,
-        ):
-            if len(value) != 64 or any(
-                char not in "0123456789abcdef" for char in value
-            ):
-                raise ValueError("OnlineSPEC attestation identity must be a SHA-256")
+        raise RuntimeError(
+            "onlinespec_gpu_attestation_api_disabled: comparison evidence cannot "
+            "enter the core industrial gate"
+        )
 
     @property
     def sha256(self) -> str:
@@ -838,10 +977,11 @@ class OnlineSpecGpuAttestation:
 
     @classmethod
     def load(cls, path: str | Path) -> OnlineSpecGpuAttestation:
-        value = _load_bound(path)
-        artifact = cls(**{**value, "methods": tuple(value["methods"])})
-        artifact.validate()
-        return artifact
+        del path
+        raise RuntimeError(
+            "onlinespec_gpu_attestation_api_disabled: comparison evidence cannot "
+            "enter the core industrial gate"
+        )
 
 
 def compare_onlinespec(

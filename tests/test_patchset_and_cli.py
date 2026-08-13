@@ -18,7 +18,7 @@ from lightcone_spec import (
 from lightcone_spec.cli.main import main
 from lightcone_spec.doctor import _command, doctor_report
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
-from lightcone_spec.orchestration import SpeedStudyManifest
+from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 from lightcone_spec.sglang_bridge import verify_patched_checkout
 from lightcone_spec.sglang_bridge.launch import (
     _bind_interpreter_tools,
@@ -49,8 +49,8 @@ def test_cli_exposes_content_bound_onlinespec_source_verifier(capsys) -> None:
 
 def test_tracked_speed_manifest_matches_the_registered_protocol() -> None:
     path = ROOT / "manifests" / "speed-study" / "static_tts_l0_v2.json"
-    manifest = SpeedStudyManifest.load(path)
-    assert manifest == SpeedStudyManifest.default()
+    manifest = PreliminarySpeedStudyManifest.load(path)
+    assert manifest == PreliminarySpeedStudyManifest.default()
     assert Path(f"{path}.sha256").read_text().strip() == manifest.sha256
 
 
@@ -338,9 +338,10 @@ def test_patchset_applies_only_to_explicit_checkout() -> None:
 
 def test_cli_builds_and_validates_immutable_manifest(tmp_path, capsys) -> None:
     output = tmp_path / "study.json"
-    assert main(["build-speed-study", "--output", str(output)]) == 0
-    manifest = SpeedStudyManifest.load(output)
-    assert manifest.gpu_evidence == "UNMEASURED"
+    assert main(["build-preliminary-speed-study", "--output", str(output)]) == 0
+    manifest = PreliminarySpeedStudyManifest.load(output)
+    assert manifest.gpu_evidence == "PRELIMINARY_DIAGNOSTIC_ONLY"
+    assert manifest.formal_execution_authorized is False
     assert manifest.methods == ("static", "tts", "l0")
     assert capsys.readouterr().out.strip() == manifest.sha256
 
@@ -350,16 +351,16 @@ def test_cli_help_contains_only_focused_workflow(capsys) -> None:
         main(["--help"])
     assert error.value.code == 0
     output = capsys.readouterr().out
-    assert "run-confirmation" in output
-    assert "collect-speed-study" in output
-    assert "run-controlled-slice" in output
-    assert "render-static-load-runtime" in output
-    assert "advance-tuning-stage" in output
-    assert "run-natural-slice" in output
-    assert "build-profiler-plan" in output
-    assert "select-speed-config" in output
-    assert "select-anchor-config" in output
-    assert "attest-speed-study" in output
+    assert "run-preliminary-confirmation" in output
+    assert "collect-preliminary-speed-study" in output
+    assert "run-preliminary-controlled-slice" in output
+    assert "render-preliminary-static-load-runtime" in output
+    assert "advance-preliminary-tuning-stage" in output
+    assert "run-preliminary-natural-slice" in output
+    assert "build-preliminary-profiler-plan" in output
+    assert "select-preliminary-speed-config" in output
+    assert "select-preliminary-anchor-config" in output
+    assert "attest-preliminary-speed-study" in output
     assert "run-onlinespec-tuning-slice" in output
     assert "advance-onlinespec-tuning-stage" in output
     assert "select-onlinespec-anchor-config" in output

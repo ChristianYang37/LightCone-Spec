@@ -31,7 +31,7 @@ from .industrial import (
     render_assigned_industrial_cell_runtime_plan,
     render_industrial_cell_runtime_plan,
 )
-from .manifest import SpeedStudyManifest
+from .manifest import PreliminarySpeedStudyManifest
 from .native_terminal import (
     CAPABILITY_PATH,
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
@@ -117,13 +117,13 @@ __all__ = [
     "NativeTerminalProvider",
     "NativeTerminalResetReceipt",
     "NativeTerminalRunBinding",
+    "PreliminarySpeedStudyManifest",
     "ServerHandle",
     "ServerLaunch",
     "ServerLauncher",
     "SessionBoundaryState",
     "SharedSessionUnavailableError",
     "SignatureVerifier",
-    "SpeedStudyManifest",
     "TerminalRequestExpectation",
     "ValidatedNativeTerminalEvidence",
     "bind_industrial_gpu_assignment",

@@ -30,10 +30,11 @@ from lightcone_spec.experiments.runner import (
     _round_records,
     _target_runtime_identity,
     _write_updates,
-    measure_controlled_slice,
-    run_greedy_target_reference,
+    measure_preliminary_controlled_slice,
+    run_preliminary_greedy_target_reference,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
+from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 from lightcone_spec.sglang_bridge.client import (
     GenerationResult,
     MethodRun,
@@ -606,7 +607,8 @@ class TargetReferenceClient:
 
 def test_target_reference_requires_target_only_server_and_full_coverage() -> None:
     client = TargetReferenceClient()
-    artifact = run_greedy_target_reference(
+    artifact = run_preliminary_greedy_target_reference(
+        preliminary_manifest=PreliminarySpeedStudyManifest.default(),
         client=client,
         model_lock_sha256="b" * 64,
         target_revision="a" * 40,
@@ -615,7 +617,7 @@ def test_target_reference_requires_target_only_server_and_full_coverage() -> Non
         sampling_profile=SamplingProfile(),
     )
     assert artifact.patched_sglang_tree == PINNED_SGLANG_TREE
-    assert artifact.status == "UNMEASURED"
+    assert artifact.status == "PRELIMINARY_DIAGNOSTIC_ONLY"
     assert artifact.window_sha256 == LongContinuationAdapter().window_sha256("confirm")
     assert len(artifact.outputs) == 32
     assert all(
@@ -628,7 +630,8 @@ def test_target_reference_requires_target_only_server_and_full_coverage() -> Non
         server_updates={"speculative_algorithm": "DFLASH"}
     )
     with pytest.raises(RuntimeError, match="unexpectedly enables speculation"):
-        run_greedy_target_reference(
+        run_preliminary_greedy_target_reference(
+            preliminary_manifest=PreliminarySpeedStudyManifest.default(),
             client=speculative,
             model_lock_sha256="b" * 64,
             target_revision="a" * 40,
@@ -795,14 +798,15 @@ def test_controlled_slice_executes_one_continuous_batch(monkeypatch) -> None:
     monkeypatch.setattr(
         "lightcone_spec.experiments.runner.independent_method_run", run_once
     )
-    measurement = measure_controlled_slice(
+    preliminary_manifest = PreliminarySpeedStudyManifest.default()
+    measurement = measure_preliminary_controlled_slice(
+        preliminary_manifest=preliminary_manifest,
         client=Tokenizer(),
         method="static",
         samples=samples,
         phase="static_load_screen",
         stage=0,
         candidate_id=None,
-        manifest_sha256="a" * 64,
         config_sha256="b" * 64,
         model_lock_sha256="c" * 64,
         adaptation_config_sha256=None,

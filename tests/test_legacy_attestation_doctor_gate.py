@@ -4,7 +4,6 @@ import argparse
 import copy
 import importlib
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +12,8 @@ from lightcone_spec import (
     PINNED_SGLANG_PATCH_COUNT,
     PINNED_SGLANG_TREE,
 )
+from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
+from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 
 cli = importlib.import_module("lightcone_spec.cli.main")
 
@@ -128,195 +129,91 @@ def test_legacy_attestation_rejects_any_nonpass_doctor_check(status: str) -> Non
         cli._validate_attestation_doctor(report, label="GPU")
 
 
-def _patch_common_attestation_inputs(monkeypatch) -> None:
-    manifest = SimpleNamespace(
-        sha256="1" * 64,
-        methods=("static", "tts", "l0"),
-        confirmation_repetitions=8,
-        formal_context_start=16384,
-        safe_context_limit=40960,
-    )
-    selection = SimpleNamespace(sha256="2" * 64, model_lock_sha256="3" * 64)
-    lock = SimpleNamespace(
-        sha256="3" * 64,
-        models=(
-            SimpleNamespace(model_id="Qwen/Qwen3-8B", revision="4" * 40),
-            SimpleNamespace(model_id="z-lab/Qwen3-8B-DFlash-b16", revision="5" * 40),
-        ),
-    )
-    monkeypatch.setattr(
-        cli, "SpeedStudyManifest", SimpleNamespace(load=lambda _path: manifest)
-    )
-    monkeypatch.setattr(
-        cli, "SelectionArtifact", SimpleNamespace(load=lambda _path: selection)
-    )
-    monkeypatch.setattr(cli, "ModelLock", SimpleNamespace(load=lambda _path: lock))
-    monkeypatch.setattr(cli, "_assert_selection_study", lambda *_args: None)
-    monkeypatch.setattr(cli, "_load_formal_table", lambda *_args, **_kwargs: None)
+def _preliminary_manifest(tmp_path) -> str:
+    path = tmp_path / "preliminary-manifest.json"
+    PreliminarySpeedStudyManifest.default().write(path)
+    return str(path)
 
 
-def test_speed_attester_uses_complete_doctor_gate(monkeypatch, tmp_path) -> None:
-    _patch_common_attestation_inputs(monkeypatch)
-    doctor = tmp_path / "doctor.json"
-    doctor.write_text(
-        json.dumps(_replace(_passing_doctor(), ("status",), "FAIL")),
-        encoding="utf-8",
-    )
+def test_speed_attester_is_categorically_preliminary(capsys, tmp_path) -> None:
+    output = tmp_path / "attestation-decision.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
-        doctor_json=str(doctor),
-        output=str(tmp_path / "attestation.json"),
+        manifest=_preliminary_manifest(tmp_path),
+        output=str(output),
     )
-    with pytest.raises(ValueError, match="top-level readiness is not PASS"):
-        cli._attest(args)
+    assert cli._attest(args) == 42
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["status"] == "PRELIMINARY_DIAGNOSTIC_ONLY"
+    assert decision["formal_execution_authorized"] is False
+    assert decision["industrial_evidence_receipt"] is None
+    assert capsys.readouterr().out.strip() == cli._canonical_sha256(decision)
 
 
 def test_matching_cpu_doctor_cannot_mint_legacy_measured_attestation(
     monkeypatch, tmp_path
 ) -> None:
-    _patch_common_attestation_inputs(monkeypatch)
-    doctor = tmp_path / "doctor.json"
-    doctor.write_text(json.dumps(_passing_doctor()), encoding="utf-8")
+    monkeypatch.setattr(cli, "_TRUSTED_HARDWARE_ATTESTER_ID", "future-attester")
     output = tmp_path / "attestation.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
-        doctor_json=str(doctor),
+        manifest=_preliminary_manifest(tmp_path),
         output=str(output),
     )
-    with pytest.raises(RuntimeError, match="trusted_hardware_attester_unavailable"):
-        cli._attest(args)
-    assert not output.exists()
+    assert cli._attest(args) == 42
+    assert "MEASURED" not in output.read_text(encoding="utf-8")
 
 
 def test_hand_authored_legacy_attestation_cannot_enter_analysis(
-    monkeypatch, tmp_path
+    tmp_path,
 ) -> None:
-    _patch_common_attestation_inputs(monkeypatch)
-    monkeypatch.setattr(
-        cli.GpuEvidenceAttestation,
-        "load",
-        lambda _path: pytest.fail("untrusted attestation loader was reached"),
-    )
     output = tmp_path / "analysis.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
+        manifest=_preliminary_manifest(tmp_path),
         attestation="hand-authored-attestation.json",
-        bootstrap_seed=1,
         output=str(output),
     )
-    with pytest.raises(RuntimeError, match="trusted_hardware_attester_unavailable"):
+    with pytest.raises(ValueError, match="cannot consume any attestation"):
         cli._analyze(args)
     assert not output.exists()
 
 
-def test_onlinespec_attester_uses_complete_doctor_gate(monkeypatch, tmp_path) -> None:
-    manifest = SimpleNamespace(
-        sha256="1" * 64,
-        methods=("static", "online_lr", "opt_hydra", "ens_eagle"),
-        confirmation_repetitions=8,
-    )
-    selection = SimpleNamespace(sha256="2" * 64)
-    lock = SimpleNamespace(sha256="3" * 64)
-    monkeypatch.setattr(
-        cli, "OnlineSpecManifest", SimpleNamespace(load=lambda _path: manifest)
-    )
-    monkeypatch.setattr(
-        cli, "OnlineSpecSelection", SimpleNamespace(load=lambda _path: selection)
-    )
-    monkeypatch.setattr(cli, "ModelLock", SimpleNamespace(load=lambda _path: lock))
-    monkeypatch.setattr(cli, "_assert_onlinespec_study", lambda *_args: None)
-    monkeypatch.setattr(cli, "_onlinespec_table", lambda *_args, **_kwargs: None)
-    doctor = tmp_path / "doctor.json"
-    doctor.write_text(
-        json.dumps(_replace(_passing_doctor(), ("compatibility", "status"), "FAIL")),
-        encoding="utf-8",
-    )
+def _onlinespec_manifest(tmp_path) -> str:
+    path = tmp_path / "onlinespec-manifest.json"
+    OnlineSpecManifest.default().write(path)
+    return str(path)
+
+
+def test_onlinespec_attester_is_categorically_diagnostic(tmp_path) -> None:
+    output = tmp_path / "attestation.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
-        doctor_json=str(doctor),
-        output=str(tmp_path / "attestation.json"),
+        manifest=_onlinespec_manifest(tmp_path),
+        output=str(output),
     )
-    with pytest.raises(ValueError, match="compatibility.status is not PASS"):
-        cli._attest_onlinespec(args)
+    assert cli._attest_onlinespec(args) == 42
+    decision = json.loads(output.read_text(encoding="utf-8"))
+    assert decision["status"] == "PRELIMINARY_DIAGNOSTIC_ONLY"
+    assert decision["formal_execution_authorized"] is False
 
 
 def test_matching_cpu_doctor_cannot_mint_onlinespec_measured_attestation(
     monkeypatch, tmp_path
 ) -> None:
-    manifest = SimpleNamespace(
-        sha256="1" * 64,
-        methods=("static", "online_lr", "opt_hydra", "ens_eagle"),
-        confirmation_repetitions=8,
-    )
-    selection = SimpleNamespace(sha256="2" * 64)
-    lock = SimpleNamespace(sha256="3" * 64)
-    monkeypatch.setattr(
-        cli, "OnlineSpecManifest", SimpleNamespace(load=lambda _path: manifest)
-    )
-    monkeypatch.setattr(
-        cli, "OnlineSpecSelection", SimpleNamespace(load=lambda _path: selection)
-    )
-    monkeypatch.setattr(cli, "ModelLock", SimpleNamespace(load=lambda _path: lock))
-    monkeypatch.setattr(cli, "_assert_onlinespec_study", lambda *_args: None)
-    monkeypatch.setattr(cli, "_onlinespec_table", lambda *_args, **_kwargs: None)
-    doctor = tmp_path / "doctor.json"
-    doctor.write_text(json.dumps(_passing_doctor()), encoding="utf-8")
+    monkeypatch.setattr(cli, "_TRUSTED_HARDWARE_ATTESTER_ID", "future-attester")
     output = tmp_path / "attestation.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
-        doctor_json=str(doctor),
+        manifest=_onlinespec_manifest(tmp_path),
         output=str(output),
     )
-    with pytest.raises(RuntimeError, match="trusted_hardware_attester_unavailable"):
-        cli._attest_onlinespec(args)
-    assert not output.exists()
+    assert cli._attest_onlinespec(args) == 42
+    assert "MEASURED" not in output.read_text(encoding="utf-8")
 
 
-def test_hand_authored_onlinespec_attestation_cannot_enter_analysis(
-    monkeypatch, tmp_path
-) -> None:
-    manifest = SimpleNamespace(sha256="1" * 64)
-    selection = SimpleNamespace(sha256="2" * 64)
-    lock = SimpleNamespace(sha256="3" * 64)
-    monkeypatch.setattr(
-        cli, "OnlineSpecManifest", SimpleNamespace(load=lambda _path: manifest)
-    )
-    monkeypatch.setattr(
-        cli, "OnlineSpecSelection", SimpleNamespace(load=lambda _path: selection)
-    )
-    monkeypatch.setattr(cli, "ModelLock", SimpleNamespace(load=lambda _path: lock))
-    monkeypatch.setattr(cli, "_assert_onlinespec_study", lambda *_args: None)
-    monkeypatch.setattr(cli, "_onlinespec_table", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        cli.OnlineSpecGpuAttestation,
-        "load",
-        lambda _path: pytest.fail("untrusted attestation loader was reached"),
-    )
+def test_hand_authored_onlinespec_attestation_cannot_enter_analysis(tmp_path) -> None:
     output = tmp_path / "analysis.json"
     args = argparse.Namespace(
-        manifest="manifest.json",
-        selection="selection.json",
-        model_lock="model-lock.json",
-        performance="performance.parquet",
+        manifest=_onlinespec_manifest(tmp_path),
         attestation="hand-authored-attestation.json",
-        bootstrap_seed=1,
         output=str(output),
     )
-    with pytest.raises(RuntimeError, match="trusted_hardware_attester_unavailable"):
+    with pytest.raises(ValueError, match="cannot consume attestation"):
         cli._analyze_onlinespec(args)
     assert not output.exists()
