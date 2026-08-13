@@ -15,8 +15,10 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuTopologyGroup,
 )
 from lightcone_spec.experiments.planning import (
+    _E2_PROMOTION_MINIMA,
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
+    E2_PROMOTION_MINIMA_AUTHORITY_SHA256,
     BudgetInventoryIdentity,
     BudgetJobKind,
     BudgetObservationReceipt,
@@ -27,6 +29,8 @@ from lightcone_spec.experiments.planning import (
     E2CandidateEvaluation,
     E2CandidateIdentity,
     E2StageEvidenceArtifact,
+    E2StageReductionArtifact,
+    E2SurvivorReceipt,
     EvidenceAliasCandidate,
     EvidenceAliasReceipt,
     ExactScenarioHours,
@@ -517,6 +521,7 @@ def _e2_evaluations(
             hbm_bytes=1_000 + index,
             p99_itl_us=10_000 + index,
             exposed_update_us=100 + index,
+            minimum_launched_updates=1,
             minimum_published_updates=1,
             safety_reason_codes=(),
         )
@@ -552,7 +557,7 @@ def _stage_evidence(
         for index, (cell_id, method) in enumerate(zip(completed, methods, strict=True))
     )
     return E2StageEvidenceArtifact(
-        schema_version=3,
+        schema_version=4,
         registry_sha256=activation.plan.registry_sha256,
         runtime_sha256=activation.plan.runtime_sha256,
         split_sha256=activation.plan.split_sha256,
@@ -862,7 +867,7 @@ def test_e2_final_seal_revalidates_recipe_and_raw_completion_receipts(
         )
 
 
-def test_e2_activation_seals_named_block_when_recipe_authority_is_incomplete(
+def test_e2_activation_seals_named_block_until_promotion_minima_are_registered(
     registry: ExperimentRegistry,
 ) -> None:
     pareto, receipt = _e1_pareto_and_receipt(registry)
@@ -874,7 +879,16 @@ def test_e2_activation_seals_named_block_when_recipe_authority_is_incomplete(
     )
     assert activation.plan.status == "BLOCKED"
     assert activation.plan.activated_cell_ids == ()
-    assert activation.plan.reason_code == "e2_adaptation_recipe_authority_blocked"
+    assert activation.plan.reason_code == "e2_promotion_minima_unregistered"
+    assert len(_E2_PROMOTION_MINIMA) == 4
+    assert all(
+        row.stage_index == stage_index
+        and row.minimum_launched_updates_per_adapted_method is None
+        and row.minimum_published_updates_per_adapted_method is None
+        and row.blocker_reason_code == "e2_promotion_minima_unregistered"
+        for stage_index, row in enumerate(_E2_PROMOTION_MINIMA)
+    )
+    assert len(E2_PROMOTION_MINIMA_AUTHORITY_SHA256) == 64
     assert activation.plan.blocked_cell_ids
     assert {
         row.reason_code
@@ -884,6 +898,90 @@ def test_e2_activation_seals_named_block_when_recipe_authority_is_incomplete(
         "adaptation_recipe_values_unregistered",
         "optimizer_equation_unresolved",
     }
+
+
+@pytest.mark.parametrize(
+    ("stage_index", "status"),
+    ((0, "SURVIVORS"), (1, "SURVIVORS"), (2, "SURVIVORS"), (3, "FINAL_RECIPE")),
+)
+def test_e2_unregistered_promotion_minima_reject_forged_survivor_receipt(
+    stage_index: int,
+    status: str,
+) -> None:
+    candidate_id = _sha(f"forged-e2-survivor-{stage_index}")
+    completed_cell_id = _sha(f"forged-e2-completed-cell-{stage_index}")
+    with pytest.raises(
+        ValueError,
+        match="unregistered E2 promotion minima categorically forbid survivors",
+    ):
+        E2SurvivorReceipt(
+            schema_version=2,
+            registry_sha256=_sha("e2-registry"),
+            runtime_sha256=_sha("e2-runtime"),
+            split_sha256=_sha("e2-split"),
+            halving_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
+            stage_index=stage_index,
+            source_activation_sha256=_sha("e2-activation"),
+            prior_stage_reduction_sha256=(
+                None if stage_index == 0 else _sha(f"e2-prior-stage-{stage_index}")
+            ),
+            completed_cells_sha256=content_sha256((completed_cell_id,)),
+            completed_stage_cell_ids=(completed_cell_id,),
+            completed_lineage_cell_ids=(completed_cell_id,),
+            tuning_evidence_sha256=_sha("e2-tuning-evidence"),
+            source_candidate_ids=(candidate_id,),
+            survivor_candidate_ids=(candidate_id,),
+            final_recipe_candidate_id=(
+                candidate_id if status == "FINAL_RECIPE" else None
+            ),
+            status=status,
+            reason_code=(
+                "registered_final_recipe_locked"
+                if status == "FINAL_RECIPE"
+                else "registered_quarter_retention_with_family_floor"
+            ),
+            selection_state="sealed_before_next_stage_unblinding",
+        )
+
+
+def test_e2_final_materializer_replays_minima_after_memory_mutation(
+    registry: ExperimentRegistry,
+) -> None:
+    candidate = next(
+        cell
+        for cell in registry.cells_for("E2")
+        if cell.identity.method == "tts" and "halving_stage=3:" in cell.identity.variant
+    )
+    candidate_id = _sha("mutated-final-candidate")
+    receipt = E2SurvivorReceipt(
+        schema_version=2,
+        registry_sha256=registry.sha256,
+        runtime_sha256=_sha("mutated-final-runtime"),
+        split_sha256=_sha("mutated-final-split"),
+        halving_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
+        stage_index=3,
+        source_activation_sha256=_sha("mutated-final-activation"),
+        prior_stage_reduction_sha256=_sha("mutated-final-prior"),
+        completed_cells_sha256=content_sha256((candidate.cell_id,)),
+        completed_stage_cell_ids=(candidate.cell_id,),
+        completed_lineage_cell_ids=(candidate.cell_id,),
+        tuning_evidence_sha256=_sha("mutated-final-evidence"),
+        source_candidate_ids=(candidate_id,),
+        survivor_candidate_ids=(),
+        final_recipe_candidate_id=None,
+        status="BLOCKED",
+        reason_code="e2_promotion_minima_unregistered",
+        selection_state="sealed_before_next_stage_unblinding",
+    )
+    object.__setattr__(receipt, "status", "FINAL_RECIPE")
+    object.__setattr__(receipt, "survivor_candidate_ids", (candidate_id,))
+    object.__setattr__(receipt, "final_recipe_candidate_id", candidate_id)
+    object.__setattr__(receipt, "reason_code", "registered_final_recipe_locked")
+    fake_reduction = object.__new__(E2StageReductionArtifact)
+    object.__setattr__(fake_reduction, "schema_version", 1)
+    object.__setattr__(fake_reduction, "survivor_receipt", receipt)
+    with pytest.raises(ValueError, match="e2_promotion_minima_unregistered"):
+        materialize_e2_final_recipe(registry, fake_reduction)
 
 
 def _family(registry: ExperimentRegistry, *, context: int):

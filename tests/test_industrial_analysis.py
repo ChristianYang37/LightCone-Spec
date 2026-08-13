@@ -2721,6 +2721,7 @@ def test_e2_stage_reducer_rebuilds_metrics_and_rejects_bare_prior(
         and row.hbm_bytes == 1_000
         and row.p99_itl_us == 1_000
         and row.exposed_update_us == 1_000
+        and row.minimum_launched_updates == 1
         and row.minimum_published_updates == 1
         for row in reduction.stage_evidence.evaluations
     )
@@ -2740,6 +2741,54 @@ def test_e2_stage_reducer_rebuilds_metrics_and_rejects_bare_prior(
             stage_index=0,
             cells=cells[:-1],
             hardware_envelope=envelope,
+            inventory=_gpu_inventory(),
+            confirmation_data_visible=False,
+        )
+
+
+def test_e2_raw_stage_reducer_stops_at_unregistered_promotion_minima() -> None:
+    registry = build_industrial_registry()
+    seed_cell = next(
+        cell
+        for cell in registry.cells_for("E2")
+        if cell.identity.method == "tts" and "halving_stage=0:" in cell.identity.variant
+    )
+    runtime_sha256 = content_sha256({"runtime": "e2-minima-block"})
+    split_sha256 = content_sha256({"split": "e2-minima-block"})
+    pareto = E1ParetoArtifact(
+        schema_version=1,
+        registry_sha256=registry.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        e1_activation_sha256=content_sha256({"e1": "activation"}),
+        reducer_evidence_sha256=content_sha256({"e1": "raw-evidence"}),
+        common_load_sha256=content_sha256({"e1": "common-load"}),
+        surviving_geometries=(E1GeometryIdentity.from_cell(seed_cell),),
+        selection_state="sealed_before_e2_unblinding",
+    )
+    receipt = ExperimentReceipt(
+        experiment="E1",
+        registry_sha256=registry.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        completed_cells_sha256=content_sha256({"E1": "completed"}),
+        dependency_receipts=(LockedOutput("E3a", content_sha256({"E3a": "receipt"})),),
+        outputs=(
+            LockedOutput("common_downstream_load", pareto.common_load_sha256),
+            LockedOutput("dflash_pareto_set", pareto.sha256),
+        ),
+    )
+    with pytest.raises(
+        ValueError,
+        match="E2 raw stage reduction is BLOCKED: e2_promotion_minima_unregistered",
+    ):
+        reduce_e2_stage_from_raw(
+            registry=registry,
+            e1_receipt=receipt,
+            pareto=pareto,
+            stage_index=0,
+            cells=(),
+            hardware_envelope=_hardware_envelope(),
             inventory=_gpu_inventory(),
             confirmation_data_visible=False,
         )

@@ -5588,7 +5588,7 @@ def _required_nonnegative_number(value: object, *, label: str) -> float:
     return float(value)
 
 
-def _e2_update_summary(cell: _LoadedCell) -> tuple[int, int]:
+def _e2_update_summary(cell: _LoadedCell) -> tuple[int, int, int]:
     update_rows = cell.update_rows_by_rank[0]
     statuses = tuple(row.get("candidate_status") for row in update_rows)
     if any(not isinstance(status, str) or not status for status in statuses):
@@ -5611,9 +5611,17 @@ def _e2_update_summary(cell: _LoadedCell) -> tuple[int, int]:
     if len(aggregate_rows) != 1:
         raise ValueError("E2 update reduction requires one aggregate performance row")
     aggregate = aggregate_rows[0]
-    if aggregate.get("updates_launched") != len(update_rows) or aggregate.get(
-        "updates_published"
-    ) != len(published_rows):
+    aggregate_launched = aggregate.get("updates_launched")
+    aggregate_published = aggregate.get("updates_published")
+    if (
+        type(aggregate_launched) is not int
+        or type(aggregate_published) is not int
+        or aggregate_launched < 0
+        or aggregate_published < 0
+        or aggregate_published > aggregate_launched
+        or aggregate_launched != len(update_rows)
+        or aggregate_published != len(published_rows)
+    ):
         raise ValueError("E2 raw update rows disagree with aggregate counters")
     if published_rows:
         observed_exposed_ms = max(exposed_values)
@@ -5635,7 +5643,7 @@ def _e2_update_summary(cell: _LoadedCell) -> tuple[int, int]:
     exposed_update_us = (
         0 if not exposed_values else math.ceil(max(exposed_values) * 1_000.0)
     )
-    return len(published_rows), exposed_update_us
+    return len(update_rows), len(published_rows), exposed_update_us
 
 
 def _mark_e2_confidence_pareto(
@@ -5711,6 +5719,10 @@ def reduce_e2_stage_from_raw(
         stage_index=stage_index,
         prior_reduction=prior_stage_reduction,
     )
+    if activation.plan.status == "BLOCKED":
+        raise ValueError(
+            f"E2 raw stage reduction is BLOCKED: {activation.plan.reason_code}"
+        )
     references = tuple(cells)
     reference_ids = tuple(row.cell_id for row in references)
     if len(reference_ids) != len(set(reference_ids)) or set(reference_ids) != set(
@@ -5821,6 +5833,7 @@ def reduce_e2_stage_from_raw(
         method_metrics: dict[str, tuple[_RequestMetric, ...]] = {}
         reasons: set[str] = set()
         hbm_values: list[int] = []
+        launched_counts: list[int] = []
         published_counts: list[int] = []
         exposed_update_us: list[int] = []
         p99_itl_ms: list[float] = []
@@ -5867,11 +5880,10 @@ def reduce_e2_stage_from_raw(
             for identity, status, _ in cell.hardware_validity:
                 if status != "VALID":
                     reasons.add(f"{method}:hardware:{identity}")
-            published, exposed = _e2_update_summary(cell)
+            launched, published, exposed = _e2_update_summary(cell)
+            launched_counts.append(launched)
             published_counts.append(published)
             exposed_update_us.append(exposed)
-            if published < 1:
-                reasons.add(f"{method}:no_published_update")
         goodput_ratios = tuple(
             _raw_request_goodput(pair[method].request_rows, method_metrics[method])
             / static_goodput
@@ -5932,6 +5944,7 @@ def reduce_e2_stage_from_raw(
                 hbm_bytes=max(hbm_values),
                 p99_itl_us=math.ceil(max(p99_itl_ms) * 1_000.0),
                 exposed_update_us=max(exposed_update_us),
+                minimum_launched_updates=min(launched_counts),
                 minimum_published_updates=min(published_counts),
                 safety_reason_codes=tuple(sorted(reasons)),
             )
@@ -5948,7 +5961,7 @@ def reduce_e2_stage_from_raw(
         for row in ordered_loaded
     )
     stage_evidence = E2StageEvidenceArtifact(
-        schema_version=3,
+        schema_version=4,
         registry_sha256=registry.sha256,
         runtime_sha256=activation.plan.runtime_sha256,
         split_sha256=activation.plan.split_sha256,

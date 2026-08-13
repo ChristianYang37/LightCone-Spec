@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cached_property
 from itertools import pairwise
@@ -57,6 +57,68 @@ _E1_SLICE_CELLS = 130
 _E2_RETENTION_NUMERATOR = 1
 _E2_RETENTION_DENOMINATOR = 4
 _E2_FAMILY_FLOOR = 1
+_E2_PROMOTION_MINIMA_BLOCKER = "e2_promotion_minima_unregistered"
+
+
+@dataclass(frozen=True)
+class _E2PromotionMinimumAuthority:
+    """Source-owned per-stage gate; callers can observe but never supply it."""
+
+    stage_index: int
+    minimum_launched_updates_per_adapted_method: int | None
+    minimum_published_updates_per_adapted_method: int | None
+    blocker_reason_code: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.stage_index) is not int or self.stage_index < 0:
+            raise ValueError("E2 promotion-minimum stage must be non-negative")
+        launched = self.minimum_launched_updates_per_adapted_method
+        published = self.minimum_published_updates_per_adapted_method
+        if launched is None or published is None:
+            if launched is not None or published is not None:
+                raise ValueError("E2 promotion minima cannot be partially registered")
+            if self.blocker_reason_code != _E2_PROMOTION_MINIMA_BLOCKER:
+                raise ValueError("unregistered E2 promotion minima require the blocker")
+            return
+        if (
+            type(launched) is not int
+            or type(published) is not int
+            or launched < 1
+            or published < 1
+            or published > launched
+        ):
+            raise ValueError(
+                "registered E2 promotion minima must be positive integer counts "
+                "with published no greater than launched"
+            )
+        if self.blocker_reason_code is not None:
+            raise ValueError("registered E2 promotion minima cannot retain a blocker")
+
+    @property
+    def registered(self) -> bool:
+        return self.minimum_launched_updates_per_adapted_method is not None
+
+
+# The specifications require these values to be registered before E2, but do
+# not provide them.  Keeping every stage explicit prevents stage zero (or a
+# later round replay) from inheriting an invented default such as one update.
+_E2_PROMOTION_MINIMA = tuple(
+    _E2PromotionMinimumAuthority(
+        stage_index=stage_index,
+        minimum_launched_updates_per_adapted_method=None,
+        minimum_published_updates_per_adapted_method=None,
+        blocker_reason_code=_E2_PROMOTION_MINIMA_BLOCKER,
+    )
+    for stage_index in range(len(E2_HALVING_STAGES))
+)
+E2_PROMOTION_MINIMA_AUTHORITY_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "e2_source_owned_promotion_minima",
+        "stages": _E2_PROMOTION_MINIMA,
+        "caller_override": "forbidden",
+    }
+)
 E3A_RAW_SELECTION_PROTOCOL_SHA256 = content_sha256(
     {
         "schema_version": 1,
@@ -99,7 +161,7 @@ E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
 )
 E2_HALVING_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "e2_successive_halving_protocol",
         "stages": E2_HALVING_STAGES,
         "draft_width_authority": E2_DRAFT_WIDTH_SELECTOR,
@@ -107,7 +169,7 @@ E2_HALVING_PROTOCOL_SHA256 = content_sha256(
         "retention_numerator": _E2_RETENTION_NUMERATOR,
         "retention_denominator": _E2_RETENTION_DENOMINATOR,
         "optimizer_schedule_family_floor": _E2_FAMILY_FLOOR,
-        "minimum_published_updates_per_adapted_method": 1,
+        "promotion_minima_authority_sha256": (E2_PROMOTION_MINIMA_AUTHORITY_SHA256),
         "confidence_goodput": ("paired_request_log_ratio_normal_95pct_lower_bound_v1"),
         "confidence_pareto": (
             "non_dominated_confidence_lower_goodput_hbm_p99_exposed_update_v1"
@@ -290,6 +352,29 @@ def _require_text(name: str, value: object) -> None:
 def _require_nonnegative_int(name: str, value: object) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+
+
+def _e2_promotion_minimum(stage_index: int) -> _E2PromotionMinimumAuthority:
+    if type(stage_index) is not int or stage_index not in range(len(E2_HALVING_STAGES)):
+        raise ValueError("E2 promotion-minimum stage is outside the registered grid")
+    authority = _E2_PROMOTION_MINIMA[stage_index]
+    if authority.stage_index != stage_index:
+        raise RuntimeError("E2 source-owned promotion-minimum table is misordered")
+    return authority
+
+
+def _require_e2_promotion_authority(
+    *, stage_index: int, status: str, reason_code: str
+) -> _E2PromotionMinimumAuthority:
+    authority = _e2_promotion_minimum(stage_index)
+    if not authority.registered and (
+        status != "BLOCKED" or reason_code != authority.blocker_reason_code
+    ):
+        raise ValueError(
+            f"{_E2_PROMOTION_MINIMA_BLOCKER}: unregistered E2 promotion minima "
+            "categorically forbid survivors"
+        )
+    return authority
 
 
 def _receipt_outputs(receipt: ExperimentReceipt) -> dict[str, str]:
@@ -3639,6 +3724,11 @@ class E2SurvivorReceipt:
         else:
             raise ValueError("invalid E2 survivor status")
         _require_text("E2 survivor reason_code", self.reason_code)
+        _require_e2_promotion_authority(
+            stage_index=self.stage_index,
+            status=self.status,
+            reason_code=self.reason_code,
+        )
         if self.selection_state != "sealed_before_next_stage_unblinding":
             raise ValueError("E2 survivor selection must precede next-stage unblinding")
 
@@ -3679,9 +3769,17 @@ def reduce_e2_activation(
         selected_candidate_ids: set[str] | None = None
         source_selection_sha256 = pareto.sha256
     else:
-        if not isinstance(prior_reduction, E2StageReductionArtifact):
+        if type(prior_reduction) is not E2StageReductionArtifact:
             raise TypeError("later E2 stages require the prior raw reduction")
         prior_survivors = prior_reduction.survivor_receipt
+        if type(prior_survivors) is not E2SurvivorReceipt:
+            raise TypeError("later E2 stages require an exact survivor receipt")
+        replace(prior_survivors)
+        _require_e2_promotion_authority(
+            stage_index=prior_survivors.stage_index,
+            status=prior_survivors.status,
+            reason_code=prior_survivors.reason_code,
+        )
         if (
             prior_reduction.registry_sha256 != registry.sha256
             or prior_reduction.runtime_sha256 != pareto.runtime_sha256
@@ -3700,6 +3798,52 @@ def reduce_e2_activation(
         source_selection_sha256 = prior_reduction.sha256
 
     cells = registry.cells_for("E2")
+    promotion_minimum = _e2_promotion_minimum(stage_index)
+    if not promotion_minimum.registered:
+        reason_code = promotion_minimum.blocker_reason_code
+        if reason_code is None:
+            raise RuntimeError("unregistered E2 promotion minima lost their blocker")
+        prior_completed = (
+            set()
+            if prior_survivors is None
+            else set(prior_survivors.completed_lineage_cell_ids)
+        )
+        blocked_rows: list[CellDisposition] = []
+        for cell in cells:
+            cell_stage = _e2_stage(cell)
+            if not cell.runnable:
+                status = (
+                    DispositionStatus.NOT_APPLICABLE
+                    if cell.status is CellStatus.NOT_APPLICABLE
+                    else DispositionStatus.BLOCKED
+                )
+                reason = cell.reason_code
+            elif cell_stage < stage_index:
+                if cell.cell_id in prior_completed:
+                    status = DispositionStatus.COMPLETED_PRIOR_ROUND
+                    reason = "completed_prior_halving_round"
+                else:
+                    status = DispositionStatus.NOT_APPLICABLE
+                    reason = "not_selected_in_prior_halving_round"
+            elif cell_stage == stage_index:
+                status = DispositionStatus.BLOCKED
+                reason = reason_code
+            else:
+                status = DispositionStatus.DEFERRED
+                reason = "awaiting_registered_e2_promotion_minima"
+            blocked_rows.append(CellDisposition(cell.cell_id, status, reason))
+        return _make_activation(
+            registry=registry,
+            experiment="E2",
+            dependency_receipt=e1_receipt,
+            runtime_sha256=pareto.runtime_sha256,
+            split_sha256=pareto.split_sha256,
+            source_selection_sha256=source_selection_sha256,
+            activation_round=f"halving_{stage_index}",
+            rows=blocked_rows,
+            reason_code=reason_code,
+            reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
+        )
     current = tuple(cell for cell in cells if _e2_stage(cell) == stage_index)
     current_runnable = tuple(cell for cell in current if cell.runnable)
     pairs = _e2_candidate_pairs(current_runnable)
@@ -3859,6 +4003,7 @@ class E2CandidateEvaluation:
     hbm_bytes: int
     p99_itl_us: int
     exposed_update_us: int
+    minimum_launched_updates: int
     minimum_published_updates: int
     safety_reason_codes: tuple[str, ...]
 
@@ -3882,6 +4027,7 @@ class E2CandidateEvaluation:
             "hbm_bytes",
             "p99_itl_us",
             "exposed_update_us",
+            "minimum_launched_updates",
             "minimum_published_updates",
         ):
             _require_nonnegative_int(name, getattr(self, name))
@@ -3891,8 +4037,8 @@ class E2CandidateEvaluation:
             raise ValueError("safe E2 evaluations cannot carry failure reasons")
         if not self.safety_passed and not self.safety_reason_codes:
             raise ValueError("unsafe E2 evaluations require a reason")
-        if self.safety_passed and self.minimum_published_updates < 1:
-            raise ValueError("safe E2 evaluations require a published update")
+        if self.minimum_published_updates > self.minimum_launched_updates:
+            raise ValueError("E2 published updates cannot exceed launched updates")
 
 
 @dataclass(frozen=True)
@@ -4045,8 +4191,8 @@ class E2StageEvidenceArtifact:
     confirmation_data_visible: bool
 
     def __post_init__(self) -> None:
-        if self.schema_version != 3:
-            raise ValueError("only E2 stage-evidence schema version 3 is supported")
+        if self.schema_version != 4:
+            raise ValueError("only E2 stage-evidence schema version 4 is supported")
         for name in (
             "registry_sha256",
             "runtime_sha256",
@@ -4180,6 +4326,18 @@ class E2StageReductionArtifact:
         evidence = self.stage_evidence
         receipt = self.survivor_receipt
         if (
+            type(activation) is not ReducerActivationArtifact
+            or type(evidence) is not E2StageEvidenceArtifact
+            or type(receipt) is not E2SurvivorReceipt
+        ):
+            raise TypeError("E2 stage reduction requires exact nested artifacts")
+        replace(receipt)
+        _require_e2_promotion_authority(
+            stage_index=receipt.stage_index,
+            status=receipt.status,
+            reason_code=receipt.reason_code,
+        )
+        if (
             activation.plan.experiment != "E2"
             or activation.reducer_protocol_sha256 != E2_HALVING_PROTOCOL_SHA256
             or activation.plan.registry_sha256 != evidence.registry_sha256
@@ -4275,9 +4433,17 @@ def materialize_e2_final_recipe(
 ) -> E2FinalRecipeArtifact:
     """Rebuild the exact recipe output authorized by raw final-stage evidence."""
 
-    if not isinstance(reduction, E2StageReductionArtifact):
+    if type(reduction) is not E2StageReductionArtifact:
         raise TypeError("E2 final recipe requires an exact stage reduction")
     receipt = reduction.survivor_receipt
+    if type(receipt) is not E2SurvivorReceipt:
+        raise TypeError("E2 final recipe requires an exact survivor receipt")
+    replace(receipt)
+    _require_e2_promotion_authority(
+        stage_index=receipt.stage_index,
+        status=receipt.status,
+        reason_code=receipt.reason_code,
+    )
     final_stage = len(E2_HALVING_STAGES) - 1
     if (
         reduction.registry_sha256 != registry.sha256
@@ -4353,11 +4519,24 @@ def _reduce_e2_successive_halving(
     by_candidate = {row.candidate_id: row for row in stage_evidence.evaluations}
     if set(by_candidate) != set(source_ids):
         raise ValueError("E2 evaluations must exactly cover activated candidates")
-    eligible = tuple(
-        row
-        for row in by_candidate.values()
-        if row.safety_passed and row.confidence_pareto
-    )
+    promotion_minimum = _e2_promotion_minimum(stage_index)
+    if promotion_minimum.registered:
+        minimum_launched = promotion_minimum.minimum_launched_updates_per_adapted_method
+        minimum_published = (
+            promotion_minimum.minimum_published_updates_per_adapted_method
+        )
+        if minimum_launched is None or minimum_published is None:
+            raise RuntimeError("registered E2 promotion minima are incomplete")
+        eligible = tuple(
+            row
+            for row in by_candidate.values()
+            if row.safety_passed
+            and row.confidence_pareto
+            and row.minimum_launched_updates >= minimum_launched
+            and row.minimum_published_updates >= minimum_published
+        )
+    else:
+        eligible = ()
     families = {
         candidate.family
         for candidate, _ in (pairs[candidate_id] for candidate_id in source_ids)
@@ -4403,6 +4582,19 @@ def _reduce_e2_successive_halving(
             survivor_receipt=receipt,
         )
 
+    if not promotion_minimum.registered:
+        reason_code = promotion_minimum.blocker_reason_code
+        if reason_code is None:
+            raise RuntimeError("unregistered E2 promotion minima lost their blocker")
+        return finish(
+            E2SurvivorReceipt(
+                **common,
+                survivor_candidate_ids=(),
+                final_recipe_candidate_id=None,
+                status="BLOCKED",
+                reason_code=reason_code,
+            )
+        )
     if missing_families:
         return finish(
             E2SurvivorReceipt(

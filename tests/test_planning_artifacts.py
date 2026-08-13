@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -394,11 +395,12 @@ def _e2_stage_evidence() -> E2StageEvidenceArtifact:
         hbm_bytes=100,
         p99_itl_us=200,
         exposed_update_us=300,
+        minimum_launched_updates=1,
         minimum_published_updates=1,
         safety_reason_codes=(),
     )
     return E2StageEvidenceArtifact(
-        schema_version=3,
+        schema_version=4,
         registry_sha256=_sha("registry"),
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
@@ -449,10 +451,10 @@ def _e2_survivor() -> E2SurvivorReceipt:
         completed_lineage_cell_ids=stage_cells,
         tuning_evidence_sha256=_e2_stage_evidence().sha256,
         source_candidate_ids=(candidate,),
-        survivor_candidate_ids=(candidate,),
+        survivor_candidate_ids=(),
         final_recipe_candidate_id=None,
-        status="SURVIVORS",
-        reason_code="registered_quarter_retention_with_family_floor",
+        status="BLOCKED",
+        reason_code="e2_promotion_minima_unregistered",
         selection_state="sealed_before_next_stage_unblinding",
     )
 
@@ -822,6 +824,16 @@ def test_unknown_missing_enum_and_scalar_type_confusion_fail_closed() -> None:
     with pytest.raises(TypeError, match="floating-point"):
         e1_pareto_artifact_from_dict(integer_float)
 
+    e2_evidence = e2_stage_evidence_artifact_to_dict(_e2_stage_evidence())
+    del e2_evidence["evaluations"][0]["minimum_launched_updates"]
+    with pytest.raises(ValueError, match="fields differ"):
+        e2_stage_evidence_artifact_from_dict(e2_evidence)
+
+    forged_counts = e2_stage_evidence_artifact_to_dict(_e2_stage_evidence())
+    forged_counts["evaluations"][0]["minimum_launched_updates"] = 0
+    with pytest.raises(ValueError, match="cannot exceed launched"):
+        e2_stage_evidence_artifact_from_dict(forged_counts)
+
 
 def test_nonfinite_nested_numbers_and_redundant_digests_fail_closed() -> None:
     evidence_wire = e2_stage_evidence_artifact_to_dict(_e2_stage_evidence())
@@ -853,6 +865,30 @@ def test_e2_final_recipe_rejects_bare_summary_and_forged_candidate() -> None:
     wire["candidate"]["learning_rate"] = 0.002
     with pytest.raises(ValueError, match="candidate identity"):
         e2_final_recipe_artifact_from_dict(wire)
+
+
+def test_e2_reduction_replays_minima_after_nested_receipt_memory_mutation() -> None:
+    survivor = _e2_survivor()
+    object.__setattr__(survivor, "status", "SURVIVORS")
+    object.__setattr__(
+        survivor, "survivor_candidate_ids", survivor.source_candidate_ids
+    )
+    object.__setattr__(
+        survivor,
+        "reason_code",
+        "registered_quarter_retention_with_family_floor",
+    )
+    with pytest.raises(ValueError, match="e2_promotion_minima_unregistered"):
+        replace(_e2_reduction(), survivor_receipt=survivor)
+
+    blocked_with_cargo = _e2_survivor()
+    object.__setattr__(
+        blocked_with_cargo,
+        "survivor_candidate_ids",
+        blocked_with_cargo.source_candidate_ids,
+    )
+    with pytest.raises(ValueError, match="blocked E2 receipts cannot promote"):
+        replace(_e2_reduction(), survivor_receipt=blocked_with_cargo)
 
 
 def test_nested_activation_and_budget_report_structure_is_revalidated() -> None:
