@@ -1260,16 +1260,39 @@ def _bind_dependency_completion(
         record.authority.inventory != inventory for record in nested_records
     ):
         raise ValueError("dependency completion prefix swaps the full GPU inventory")
-    output_bindings: list[DependencyLockedOutputAuthorityBinding] = []
-    output_sha256s: dict[str, str] = {}
-    for item in _strict_list(
-        "dependency completion locked outputs", spec["locked_outputs"]
-    ):
-        output = _strict_object(
+    locked_output_specs = tuple(
+        _strict_object(
             "dependency completion locked output",
             item,
             _DEPENDENCY_LOCKED_OUTPUT_FIELDS,
         )
+        for item in _strict_list(
+            "dependency completion locked outputs", spec["locked_outputs"]
+        )
+    )
+    locked_output_names = tuple(
+        _strict_text("dependency completion locked-output name", row["name"])
+        for row in locked_output_specs
+    )
+    if len(locked_output_names) != len(definition.locked_outputs) or set(
+        locked_output_names
+    ) != set(definition.locked_outputs):
+        raise ValueError(
+            "dependency completion locked outputs are incomplete, duplicated, or extra"
+        )
+    if receipt.experiment == "E3a":
+        from lightcone_spec.experiments.selection_authority import (
+            SelectionReductionAuthorityUnavailableError,
+            require_e3a_locked_output_reduction_authority,
+        )
+
+        try:
+            require_e3a_locked_output_reduction_authority()
+        except SelectionReductionAuthorityUnavailableError as error:
+            raise BudgetMaterializationBlockedError(error.reason_code) from error
+    output_bindings: list[DependencyLockedOutputAuthorityBinding] = []
+    output_sha256s: dict[str, str] = {}
+    for output in locked_output_specs:
         name = _strict_text("dependency completion locked-output name", output["name"])
         path = Path(
             _strict_text("dependency completion locked-output path", output["artifact"])
@@ -1283,8 +1306,6 @@ def _bind_dependency_completion(
             DependencyLockedOutputAuthorityBinding(name=name, artifact=source)
         )
         output_sha256s[name] = source.semantic_sha256
-    if set(output_sha256s) != set(definition.locked_outputs):
-        raise ValueError("dependency completion locked outputs are incomplete")
 
     expected_receipt = registry.make_receipt(
         receipt.experiment,

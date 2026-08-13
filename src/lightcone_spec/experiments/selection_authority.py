@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, Literal
 from lightcone_spec.experiments.gpu_pool import GpuInventory
 from lightcone_spec.experiments.planning import (
     E1_RAW_PARETO_PROTOCOL_SHA256,
-    E3A_RAW_SELECTION_PROTOCOL_SHA256,
     E1GeometryIdentity,
     E1ParetoArtifact,
     ReducerActivationArtifact,
@@ -56,14 +55,49 @@ if TYPE_CHECKING:
     )
 
 _SHA256_LENGTH = 64
-_E3A_PRIMARY_CONTEXT_FLOOR = 4096
-_E3A_REFERENCE_LOAD_FRACTION = 0.90
 _NORMAL_95_LOWER_Z = 1.959963984540054
 _E1_ACTIVATED_CELL_COUNT = 130
+E3A_SELECTION_POLICY_UNREGISTERED_REASON = "e3a_selection_policy_unregistered"
+E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON = (
+    "e3a_locked_output_typed_reduction_unregistered"
+)
+E3A_CAPACITY_SURFACE_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "e3a_raw_capacity_surface_reduction_protocol",
+        "inputs": (
+            "exact_runnable_e3a_terminal_evidence",
+            "source_owned_trusted_native_terminal_authority",
+            "exact_static_target_request_and_token_pairing",
+        ),
+        "outputs": (
+            "per_cell_raw_goodput_tps",
+            "per_cell_peak_hbm_bytes",
+            "per_static_cell_target_goodput_ratio",
+        ),
+        "scientific_selection": "forbidden",
+    }
+)
+E3A_SCIENTIFIC_SELECTION_AUTHORITY_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "e3a_source_owned_scientific_selection_authority_protocol",
+        "capacity_input": E3A_CAPACITY_SURFACE_PROTOCOL_SHA256,
+        "policy": "source_owned_typed_policy_without_caller_override",
+        "unregistered_policy": E3A_SELECTION_POLICY_UNREGISTERED_REASON,
+        "locked_outputs": "separate_typed_first_party_reduction_required",
+    }
+)
 
 
 class SelectionReductionAuthorityUnavailableError(RuntimeError):
     """Raw evidence is bound but cannot be trusted by this source release."""
+
+    def __init__(self, reason_code: str) -> None:
+        if type(reason_code) is not str or not reason_code:
+            raise ValueError("selection authority reason code must be text")
+        self.reason_code = reason_code
+        super().__init__(f"selection reduction is BLOCKED: {reason_code}")
 
 
 def _is_sha256(value: object) -> bool:
@@ -78,6 +112,235 @@ def _require_sha256(label: str, value: object) -> str:
     if not _is_sha256(value):
         raise ValueError(f"{label} must be a lower-case SHA-256")
     return value
+
+
+@dataclass(frozen=True)
+class E3aScientificSelectionPolicy:
+    """Source-owned, reviewable scientific choices for one E3a selection.
+
+    The reducer supports this one explicit rule vocabulary, but this release
+    deliberately registers no instance.  In particular, neither a context
+    floor, a goodput fraction, nor a tie-break is a default.
+    """
+
+    schema_version: int
+    source_authority: str
+    source_authority_sha256: str
+    primary_contexts: tuple[int, ...]
+    reference_load_goodput_fraction: float
+    reference_load_statistic: Literal["maximum_width_median_static_goodput"]
+    reference_load_choice: Literal["smallest_concurrency_reaching_registered_fraction"]
+    width_primary_objective: Literal["maximum_worst_static_target_goodput_ratio"]
+    width_secondary_objective: Literal["maximum_median_static_goodput"]
+    width_final_tiebreak: Literal["smallest_width"]
+    locked_output_reducer_protocol_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only E3a scientific-selection policy schema 1 works")
+        if (
+            type(self.source_authority) is not str
+            or not self.source_authority
+            or "\n" in self.source_authority
+            or "\r" in self.source_authority
+        ):
+            raise ValueError("E3a policy source authority must be single-line text")
+        _require_sha256("E3a policy source authority", self.source_authority_sha256)
+        _require_sha256(
+            "E3a locked-output reducer protocol",
+            self.locked_output_reducer_protocol_sha256,
+        )
+        if (
+            not self.primary_contexts
+            or self.primary_contexts != tuple(sorted(set(self.primary_contexts)))
+            or any(
+                type(value) is not int or value < 1 for value in self.primary_contexts
+            )
+        ):
+            raise ValueError("E3a policy primary contexts must be sorted unique ints")
+        fraction = self.reference_load_goodput_fraction
+        if (
+            not isinstance(fraction, (int, float))
+            or isinstance(fraction, bool)
+            or not math.isfinite(float(fraction))
+            or not 0.0 < float(fraction) <= 1.0
+        ):
+            raise ValueError("E3a reference-load fraction must lie in (0, 1]")
+        expected = {
+            "reference_load_statistic": "maximum_width_median_static_goodput",
+            "reference_load_choice": (
+                "smallest_concurrency_reaching_registered_fraction"
+            ),
+            "width_primary_objective": ("maximum_worst_static_target_goodput_ratio"),
+            "width_secondary_objective": "maximum_median_static_goodput",
+            "width_final_tiebreak": "smallest_width",
+        }
+        if any(getattr(self, name) != value for name, value in expected.items()):
+            raise ValueError("E3a scientific-selection rule vocabulary is unsupported")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+# Scientific defaults are forbidden.  A future release must replace this
+# source-owned constant with one reviewed typed policy and implement the
+# independently registered six-output reducer before completion can proceed.
+RELEASE_E3A_SCIENTIFIC_SELECTION_POLICY: E3aScientificSelectionPolicy | None = None
+
+
+@dataclass(frozen=True)
+class E3aCapacityObservation:
+    """One policy-free E3a capacity observation derived from raw evidence."""
+
+    cell_id: str
+    method: Literal["target_only", "static"]
+    context: int
+    regime: str
+    concurrency: int
+    width: int | None
+    raw_goodput_tps: float
+    peak_hbm_bytes: int
+    static_target_goodput_ratio: float | None
+    terminal_rank_count: int
+    raw_run_binding_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_sha256("E3a capacity cell", self.cell_id)
+        if self.method not in {"target_only", "static"}:
+            raise ValueError("E3a capacity method must be Target-only or Static")
+        if type(self.context) is not int or self.context < 1:
+            raise ValueError("E3a capacity context must be a positive integer")
+        if type(self.regime) is not str or not self.regime:
+            raise ValueError("E3a capacity regime must be text")
+        if type(self.concurrency) is not int or self.concurrency < 1:
+            raise ValueError("E3a capacity concurrency must be a positive integer")
+        if (
+            not isinstance(self.raw_goodput_tps, (int, float))
+            or isinstance(self.raw_goodput_tps, bool)
+            or not math.isfinite(float(self.raw_goodput_tps))
+            or float(self.raw_goodput_tps) <= 0.0
+        ):
+            raise ValueError("E3a raw goodput must be finite and positive")
+        if type(self.peak_hbm_bytes) is not int or self.peak_hbm_bytes < 0:
+            raise ValueError("E3a peak HBM must be a nonnegative integer")
+        if type(self.terminal_rank_count) is not int or self.terminal_rank_count < 1:
+            raise ValueError("E3a capacity must bind every terminal rank")
+        _require_sha256("E3a capacity raw-run binding", self.raw_run_binding_sha256)
+        if self.method == "target_only":
+            if self.width is not None or self.static_target_goodput_ratio is not None:
+                raise ValueError("E3a Target-only capacity cannot claim Static fields")
+        else:
+            ratio = self.static_target_goodput_ratio
+            if self.width not in DRAFT_WIDTHS:
+                raise ValueError("E3a Static capacity width is outside the grid")
+            if (
+                not isinstance(ratio, (int, float))
+                or isinstance(ratio, bool)
+                or not math.isfinite(float(ratio))
+                or float(ratio) <= 0.0
+            ):
+                raise ValueError("E3a Static/Target ratio must be finite and positive")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+@dataclass(frozen=True)
+class E3aNativeTerminalLineage:
+    """One exact cell/rank native-terminal binding in a capacity surface."""
+
+    cell_id: str
+    rank: int
+    binding_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_sha256("E3a native-terminal cell", self.cell_id)
+        if type(self.rank) is not int or self.rank < 0:
+            raise ValueError("E3a native-terminal rank must be nonnegative")
+        _require_sha256("E3a native-terminal binding", self.binding_sha256)
+
+
+@dataclass(frozen=True)
+class E3aCapacitySurface:
+    """Complete policy-free E3a capacity facts and their raw lineage."""
+
+    schema_version: int
+    registry_sha256: str
+    runtime_sha256: str
+    split_sha256: str
+    inventory_sha256: str
+    inventory_source_receipt_sha256: str
+    hardware_envelope_sha256: str
+    raw_manifest_sha256: str
+    observations: tuple[E3aCapacityObservation, ...]
+    native_terminal_lineage: tuple[E3aNativeTerminalLineage, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only E3a capacity-surface schema 1 is supported")
+        for name in (
+            "registry_sha256",
+            "runtime_sha256",
+            "split_sha256",
+            "inventory_sha256",
+            "inventory_source_receipt_sha256",
+            "hardware_envelope_sha256",
+            "raw_manifest_sha256",
+        ):
+            _require_sha256(f"E3a capacity {name}", getattr(self, name))
+        if (
+            not self.observations
+            or any(type(row) is not E3aCapacityObservation for row in self.observations)
+            or tuple(row.cell_id for row in self.observations)
+            != tuple(sorted({row.cell_id for row in self.observations}))
+        ):
+            raise ValueError("E3a capacity observations must be cell-sorted and unique")
+        if any(
+            type(row) is not E3aNativeTerminalLineage
+            for row in self.native_terminal_lineage
+        ):
+            raise TypeError("E3a native-terminal lineage must be typed")
+        actual_ranks = tuple(
+            (row.cell_id, row.rank) for row in self.native_terminal_lineage
+        )
+        expected_ranks = tuple(
+            (observation.cell_id, rank)
+            for observation in self.observations
+            for rank in range(observation.terminal_rank_count)
+        )
+        if actual_ranks != expected_ranks:
+            raise ValueError(
+                "E3a native-terminal lineage must exactly cover every cell/rank"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+def _require_e3a_scientific_selection_policy() -> E3aScientificSelectionPolicy:
+    policy = RELEASE_E3A_SCIENTIFIC_SELECTION_POLICY
+    if type(policy) is not E3aScientificSelectionPolicy:
+        raise SelectionReductionAuthorityUnavailableError(
+            E3A_SELECTION_POLICY_UNREGISTERED_REASON
+        )
+    policy.__post_init__()
+    return policy
+
+
+def require_e3a_locked_output_reduction_authority() -> None:
+    """Fail closed until all six E3a outputs have one typed raw replay.
+
+    Registering a width/load selection policy alone must never make opaque
+    caller-authored JSON eligible for an E3a completion receipt.
+    """
+
+    _require_e3a_scientific_selection_policy()
+    raise SelectionReductionAuthorityUnavailableError(
+        E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON
+    )
 
 
 @dataclass(frozen=True)
@@ -144,7 +407,7 @@ def _validate_native_terminal_authority(
     policy = RELEASE_TRUSTED_ATTESTER_POLICY
     if not policy.release_ready:
         raise SelectionReductionAuthorityUnavailableError(
-            "selection reduction is BLOCKED: trusted_hardware_attester_unavailable"
+            "trusted_hardware_attester_unavailable"
         )
     analysis = _analysis_api()
     references_by_id = {reference.cell_id: reference for reference in references}
@@ -607,7 +870,7 @@ def _common_run_fields(
     return expected
 
 
-def reduce_e3a_selection_from_raw(
+def reduce_e3a_capacity_surface_from_raw(
     *,
     registry: ExperimentRegistry,
     manifest: RawE3aSelectionEvidenceManifest,
@@ -616,11 +879,13 @@ def reduce_e3a_selection_from_raw(
     runtime_sha256: str,
     split_sha256: str,
     confirmation_data_visible: bool,
-) -> SealedE3aSelection:
-    """Recompute the unique E3a load/width choice from raw terminal evidence.
+) -> E3aCapacitySurface:
+    """Reduce exact E3a terminal evidence to policy-free capacity facts.
 
     A formal caller must source the typed registry/inventory/runtime/split from
-    path-bound release authorities before invoking this reducer.
+    path-bound release authorities before invoking this reducer.  This function
+    never chooses a context subset, reference load, width, crossover, or drift
+    rule.
     """
 
     analysis = _analysis_api()
@@ -667,6 +932,7 @@ def reduce_e3a_selection_from_raw(
     metrics: dict[str, tuple[_RequestMetric, ...]] = {}
     tokens: dict[str, dict[str, tuple[int, ...]]] = {}
     goodput: dict[str, float] = {}
+    peak_hbm: dict[str, int] = {}
     target_by_slice: dict[tuple[int, str, int], _LoadedCell] = {}
     static_by_slice: dict[tuple[int, str, int, int], _LoadedCell] = {}
     for cell_id in sorted(loaded):
@@ -675,6 +941,7 @@ def reduce_e3a_selection_from_raw(
         metrics[cell_id] = _metrics(row)
         tokens[cell_id] = _tokens(row)
         goodput[cell_id] = _raw_goodput(row.request_rows, metrics[cell_id])
+        peak_hbm[cell_id] = _peak_hbm(row)
         identity = row.cell.identity
         if identity.context is None or identity.concurrency is None:
             raise ValueError("E3a registry cell lacks context/load identity")
@@ -724,16 +991,103 @@ def reduce_e3a_selection_from_raw(
     ):
         raise ValueError("E3a Target-only evidence lacks a Static comparison")
 
+    run_bindings = _raw_run_bindings(
+        loaded,
+        scientific_unit="e3a_capacity",
+        lineage_runtime_sha256=runtime_sha256,
+        lineage_split_sha256=split_sha256,
+    )
+    run_binding_by_cell = {
+        cell_id: binding
+        for cell_id, binding in zip(sorted(loaded), run_bindings, strict=True)
+    }
+    if any(
+        binding.cell_id != cell_id
+        or binding.rank_count != len(loaded[cell_id].run_rows)
+        for cell_id, binding in run_binding_by_cell.items()
+    ):
+        raise ValueError("E3a raw-run lineage differs from exact cell/rank coverage")
+    observations: list[E3aCapacityObservation] = []
+    for cell_id in sorted(loaded):
+        row = loaded[cell_id]
+        identity = row.cell.identity
+        ratio = None
+        if identity.method == "static":
+            target = target_by_slice[
+                (identity.context, identity.regime, identity.concurrency)
+            ]
+            ratio = goodput[cell_id] / goodput[target.cell.cell_id]
+            if not math.isfinite(ratio) or ratio <= 0.0:
+                raise ValueError("E3a Static/Target goodput ratio is invalid")
+        observations.append(
+            E3aCapacityObservation(
+                cell_id=cell_id,
+                method=identity.method,
+                context=identity.context,
+                regime=identity.regime,
+                concurrency=identity.concurrency,
+                width=identity.width,
+                raw_goodput_tps=goodput[cell_id],
+                peak_hbm_bytes=peak_hbm[cell_id],
+                static_target_goodput_ratio=ratio,
+                terminal_rank_count=len(row.run_rows),
+                raw_run_binding_sha256=run_binding_by_cell[cell_id].sha256,
+            )
+        )
+    native_lineage: list[E3aNativeTerminalLineage] = []
+    for binding in native_bindings:
+        cell_id = binding.get("cell_id")
+        rank = binding.get("rank")
+        if type(cell_id) is not str or type(rank) is not int:
+            raise ValueError("E3a native-terminal binding lost cell/rank identity")
+        native_lineage.append(
+            E3aNativeTerminalLineage(
+                cell_id=cell_id,
+                rank=rank,
+                binding_sha256=content_sha256(binding),
+            )
+        )
+    return E3aCapacitySurface(
+        schema_version=1,
+        registry_sha256=registry.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        inventory_sha256=inventory.sha256,
+        inventory_source_receipt_sha256=inventory.source_receipt_sha256,
+        hardware_envelope_sha256=content_sha256(hardware_envelope),
+        raw_manifest_sha256=manifest.sha256,
+        observations=tuple(observations),
+        native_terminal_lineage=tuple(native_lineage),
+    )
+
+
+def _select_e3a_capacity_surface(
+    surface: E3aCapacitySurface,
+    policy: E3aScientificSelectionPolicy,
+) -> SealedE3aSelection:
+    """Apply only the exact source-owned typed policy to one capacity surface."""
+
+    if type(surface) is not E3aCapacitySurface:
+        raise TypeError("E3a selection requires an exact capacity surface")
+    if type(policy) is not E3aScientificSelectionPolicy:
+        raise TypeError("E3a selection requires its source-owned typed policy")
+    observed_contexts = {
+        row.context for row in surface.observations if row.method == "static"
+    }
+    if not set(policy.primary_contexts) <= observed_contexts:
+        raise ValueError("E3a policy names a context absent from the capacity surface")
     primary_static = tuple(
-        (key, row)
-        for key, row in static_by_slice.items()
-        if key[0] >= _E3A_PRIMARY_CONTEXT_FLOOR
+        row
+        for row in surface.observations
+        if row.method == "static" and row.context in policy.primary_contexts
     )
     if not primary_static:
         raise ValueError("E3a has no registered primary-context Static evidence")
     by_width_load: dict[tuple[int, int], list[float]] = defaultdict(list)
-    for key, row in primary_static:
-        by_width_load[(key[3], key[2])].append(goodput[row.cell.cell_id])
+    for row in primary_static:
+        if row.width is None:  # pragma: no cover - guarded by the typed row
+            raise ValueError("E3a Static capacity row lost its width")
+        by_width_load[(row.width, row.concurrency)].append(row.raw_goodput_tps)
     median_by_width_load = {
         key: statistics.median(values) for key, values in by_width_load.items()
     }
@@ -744,7 +1098,7 @@ def reduce_e3a_selection_from_raw(
         concurrency: max(values) for concurrency, values in by_load.items()
     }
     maximum = max(best_median_by_load.values())
-    threshold = _E3A_REFERENCE_LOAD_FRACTION * maximum
+    threshold = float(policy.reference_load_goodput_fraction) * maximum
     eligible_loads = tuple(
         concurrency
         for concurrency, value in sorted(best_median_by_load.items())
@@ -757,20 +1111,25 @@ def reduce_e3a_selection_from_raw(
     width_scores: list[tuple[float, float, int]] = []
     for width in DRAFT_WIDTHS:
         rows = tuple(
-            (key, row)
-            for key, row in primary_static
-            if key[2] == selected_concurrency and key[3] == width
+            row
+            for row in primary_static
+            if row.concurrency == selected_concurrency and row.width == width
         )
         if not rows:
             continue
-        ratios = tuple(
-            goodput[row.cell.cell_id] / goodput[target_by_slice[key[:3]].cell.cell_id]
-            for key, row in rows
-        )
-        static_goodputs = tuple(goodput[row.cell.cell_id] for _, row in rows)
-        if any(not math.isfinite(value) or value <= 0 for value in ratios):
+        ratios = tuple(row.static_target_goodput_ratio for row in rows)
+        static_goodputs = tuple(row.raw_goodput_tps for row in rows)
+        if any(
+            value is None or not math.isfinite(value) or value <= 0 for value in ratios
+        ):
             raise ValueError("E3a Static/Target goodput ratio is invalid")
-        width_scores.append((min(ratios), statistics.median(static_goodputs), width))
+        width_scores.append(
+            (
+                min(value for value in ratios if value is not None),
+                statistics.median(static_goodputs),
+                width,
+            )
+        )
     if not width_scores:
         raise ValueError("E3a selected load has no registered width evidence")
     _, _, selected_width = max(
@@ -778,27 +1137,15 @@ def reduce_e3a_selection_from_raw(
         key=lambda row: (row[0], row[1], -row[2]),
     )
 
-    run_bindings = _raw_run_bindings(
-        loaded,
-        scientific_unit="e3a_capacity",
-        lineage_runtime_sha256=runtime_sha256,
-        lineage_split_sha256=split_sha256,
-    )
     evidence_sha256 = content_sha256(
         {
-            "schema_version": 1,
-            "kind": "e3a_raw_selection_reduction_evidence",
-            "reducer_protocol_sha256": E3A_RAW_SELECTION_PROTOCOL_SHA256,
-            "registry_sha256": registry.sha256,
-            "runtime_sha256": runtime_sha256,
-            "split_sha256": split_sha256,
-            "inventory_sha256": inventory.sha256,
-            "inventory_source_receipt_sha256": inventory.source_receipt_sha256,
-            "fixed_instance_gpu_count": len(inventory.devices),
-            "hardware_envelope_sha256": content_sha256(hardware_envelope),
-            "raw_manifest_sha256": manifest.sha256,
-            "primary_context_floor": _E3A_PRIMARY_CONTEXT_FLOOR,
-            "reference_load_fraction": _E3A_REFERENCE_LOAD_FRACTION,
+            "schema_version": 2,
+            "kind": "e3a_scientific_selection_reduction_evidence",
+            "authority_protocol_sha256": (
+                E3A_SCIENTIFIC_SELECTION_AUTHORITY_PROTOCOL_SHA256
+            ),
+            "capacity_surface_sha256": surface.sha256,
+            "selection_policy_sha256": policy.sha256,
             "median_static_goodput_by_width_load": [
                 {
                     "width": width,
@@ -817,19 +1164,44 @@ def reduce_e3a_selection_from_raw(
             ],
             "selected_width": selected_width,
             "selected_concurrency": selected_concurrency,
-            "raw_run_binding_sha256s": [row.sha256 for row in run_bindings],
-            "native_terminal_bindings": list(native_bindings),
         }
     )
     return SealedE3aSelection(
         schema_version=1,
-        registry_sha256=registry.sha256,
-        runtime_sha256=runtime_sha256,
-        split_sha256=split_sha256,
+        registry_sha256=surface.registry_sha256,
+        runtime_sha256=surface.runtime_sha256,
+        split_sha256=surface.split_sha256,
         width=selected_width,
         concurrency=selected_concurrency,
         reducer_evidence_sha256=evidence_sha256,
     )
+
+
+def reduce_e3a_selection_from_raw(
+    *,
+    registry: ExperimentRegistry,
+    manifest: RawE3aSelectionEvidenceManifest,
+    hardware_envelope: HardwareEnvelope,
+    inventory: GpuInventory,
+    runtime_sha256: str,
+    split_sha256: str,
+    confirmation_data_visible: bool,
+) -> SealedE3aSelection:
+    """Apply the source-owned E3a policy to a separate raw capacity surface."""
+
+    # Policy registration is checked before reopening the large evidence set.
+    # Callers that only need descriptive capacity facts use the surface reducer.
+    policy = _require_e3a_scientific_selection_policy()
+    surface = reduce_e3a_capacity_surface_from_raw(
+        registry=registry,
+        manifest=manifest,
+        hardware_envelope=hardware_envelope,
+        inventory=inventory,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        confirmation_data_visible=confirmation_data_visible,
+    )
+    return _select_e3a_capacity_surface(surface, policy)
 
 
 @dataclass(frozen=True)
@@ -1159,6 +1531,7 @@ class E3aSelectionReductionAuthority:
     inventory: GpuInventory
     runtime_sha256: str
     split_sha256: str
+    selection_policy_sha256: str
     selection_sha256: str
 
     def __post_init__(self) -> None:
@@ -1174,9 +1547,13 @@ class E3aSelectionReductionAuthority:
             runtime_sha256=self.runtime_sha256,
             split_sha256=self.split_sha256,
         )
+        _require_sha256("E3a authority policy", self.selection_policy_sha256)
         _require_sha256("E3a authority selection", self.selection_sha256)
 
     def revalidate(self) -> SealedE3aSelection:
+        policy = _require_e3a_scientific_selection_policy()
+        if policy.sha256 != self.selection_policy_sha256:
+            raise RuntimeError("E3a source-owned selection policy changed")
         _analysis_api().validate_raw_evidence_manifest_sidecars(self.manifest)
         selection = reduce_e3a_selection_from_raw(
             registry=self.registry,
@@ -1206,8 +1583,11 @@ class E3aSelectionReductionAuthority:
                 ),
                 "runtime_sha256": self.runtime_sha256,
                 "split_sha256": self.split_sha256,
+                "selection_policy_sha256": self.selection_policy_sha256,
                 "selection_sha256": self.selection_sha256,
-                "reducer_protocol_sha256": E3A_RAW_SELECTION_PROTOCOL_SHA256,
+                "reducer_protocol_sha256": (
+                    E3A_SCIENTIFIC_SELECTION_AUTHORITY_PROTOCOL_SHA256
+                ),
             }
         )
 
@@ -1304,6 +1684,7 @@ def bind_e3a_selection_reduction_authority(
     runtime_sha256: str,
     split_sha256: str,
 ) -> E3aSelectionReductionAuthority:
+    policy = _require_e3a_scientific_selection_policy()
     _analysis_api().validate_raw_evidence_manifest_sidecars(manifest)
     selection = reduce_e3a_selection_from_raw(
         registry=registry,
@@ -1322,6 +1703,7 @@ def bind_e3a_selection_reduction_authority(
         inventory=inventory,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
+        selection_policy_sha256=policy.sha256,
         selection_sha256=selection.sha256,
     )
     authority.revalidate()
@@ -1368,11 +1750,22 @@ def bind_e1_pareto_reduction_authority(
 
 
 __all__ = [
+    "E3A_CAPACITY_SURFACE_PROTOCOL_SHA256",
+    "E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON",
+    "E3A_SCIENTIFIC_SELECTION_AUTHORITY_PROTOCOL_SHA256",
+    "E3A_SELECTION_POLICY_UNREGISTERED_REASON",
+    "RELEASE_E3A_SCIENTIFIC_SELECTION_POLICY",
     "E1ParetoReductionAuthority",
+    "E3aCapacityObservation",
+    "E3aCapacitySurface",
+    "E3aNativeTerminalLineage",
+    "E3aScientificSelectionPolicy",
     "E3aSelectionReductionAuthority",
     "SelectionReductionAuthorityUnavailableError",
     "bind_e1_pareto_reduction_authority",
     "bind_e3a_selection_reduction_authority",
     "reduce_e1_pareto_from_raw",
+    "reduce_e3a_capacity_surface_from_raw",
     "reduce_e3a_selection_from_raw",
+    "require_e3a_locked_output_reduction_authority",
 ]

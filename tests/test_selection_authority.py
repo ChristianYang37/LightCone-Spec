@@ -37,11 +37,15 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.selection_authority import (
+    E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON,
+    E3A_SELECTION_POLICY_UNREGISTERED_REASON,
     SelectionReductionAuthorityUnavailableError,
     bind_e1_pareto_reduction_authority,
     bind_e3a_selection_reduction_authority,
     reduce_e1_pareto_from_raw,
+    reduce_e3a_capacity_surface_from_raw,
     reduce_e3a_selection_from_raw,
+    require_e3a_locked_output_reduction_authority,
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
@@ -254,7 +258,15 @@ def _patch_loader(
         monkeypatch.setattr(
             selection_authority,
             "_validate_native_terminal_authority",
-            lambda *_args, **_kwargs: (),
+            lambda *_args, **_kwargs: tuple(
+                {
+                    "cell_id": cell_id,
+                    "rank": rank,
+                    "test_native_terminal": _sha(f"{cell_id}-{rank}"),
+                }
+                for cell_id in sorted(loaded)
+                for rank in range(len(loaded[cell_id].run_rows))
+            ),
         )
 
 
@@ -303,7 +315,7 @@ def _e3a_fixture(
     return manifest, loaded, runtime_sha256, split_sha256
 
 
-def test_e3a_reducer_recomputes_90pct_load_and_width_tiebreak(
+def test_e3a_capacity_surface_is_policy_free_and_selection_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     registry: ExperimentRegistry,
@@ -312,7 +324,7 @@ def test_e3a_reducer_recomputes_90pct_load_and_width_tiebreak(
 ) -> None:
     manifest, loaded, runtime_sha256, split_sha256 = _e3a_fixture(tmp_path, registry)
     _patch_loader(monkeypatch, loaded)
-    selection = reduce_e3a_selection_from_raw(
+    surface = reduce_e3a_capacity_surface_from_raw(
         registry=registry,
         manifest=manifest,
         hardware_envelope=hardware_envelope,
@@ -321,18 +333,69 @@ def test_e3a_reducer_recomputes_90pct_load_and_width_tiebreak(
         split_sha256=split_sha256,
         confirmation_data_visible=False,
     )
-    assert selection.concurrency == 4
-    assert selection.width == 8
-    authority = bind_e3a_selection_reduction_authority(
-        registry=registry,
-        manifest=manifest,
-        hardware_envelope=hardware_envelope,
-        inventory=inventory,
-        runtime_sha256=runtime_sha256,
-        split_sha256=split_sha256,
+    assert tuple(row.cell_id for row in surface.observations) == tuple(sorted(loaded))
+    assert {(row.cell_id, row.rank) for row in surface.native_terminal_lineage} == {
+        (cell_id, rank)
+        for cell_id, cell in loaded.items()
+        for rank in range(len(cell.run_rows))
+    }
+    assert all(row.raw_run_binding_sha256 for row in surface.observations)
+    static = next(row for row in surface.observations if row.method == "static")
+    assert static.static_target_goodput_ratio == pytest.approx(
+        static.raw_goodput_tps / 200.0
     )
-    assert authority.revalidate() == selection
-    assert authority.selection_sha256 == selection.sha256
+
+    kwargs = {
+        "registry": registry,
+        "manifest": manifest,
+        "hardware_envelope": hardware_envelope,
+        "inventory": inventory,
+        "runtime_sha256": runtime_sha256,
+        "split_sha256": split_sha256,
+    }
+    with pytest.raises(SelectionReductionAuthorityUnavailableError) as blocked:
+        reduce_e3a_selection_from_raw(
+            **kwargs,
+            confirmation_data_visible=False,
+        )
+    assert blocked.value.reason_code == E3A_SELECTION_POLICY_UNREGISTERED_REASON
+    with pytest.raises(SelectionReductionAuthorityUnavailableError) as blocked:
+        bind_e3a_selection_reduction_authority(**kwargs)
+    assert blocked.value.reason_code == E3A_SELECTION_POLICY_UNREGISTERED_REASON
+
+
+def test_e3a_locked_outputs_require_a_separate_typed_first_party_reducer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(SelectionReductionAuthorityUnavailableError) as blocked:
+        require_e3a_locked_output_reduction_authority()
+    assert blocked.value.reason_code == E3A_SELECTION_POLICY_UNREGISTERED_REASON
+
+    from lightcone_spec.experiments import selection_authority
+
+    policy = selection_authority.E3aScientificSelectionPolicy(
+        schema_version=1,
+        source_authority="test-explicit-policy",
+        source_authority_sha256=_sha("test-explicit-policy"),
+        primary_contexts=(1,),
+        reference_load_goodput_fraction=0.5,
+        reference_load_statistic="maximum_width_median_static_goodput",
+        reference_load_choice=("smallest_concurrency_reaching_registered_fraction"),
+        width_primary_objective="maximum_worst_static_target_goodput_ratio",
+        width_secondary_objective="maximum_median_static_goodput",
+        width_final_tiebreak="smallest_width",
+        locked_output_reducer_protocol_sha256=_sha("locked-output-reducer"),
+    )
+    monkeypatch.setattr(
+        selection_authority,
+        "RELEASE_E3A_SCIENTIFIC_SELECTION_POLICY",
+        policy,
+    )
+    with pytest.raises(SelectionReductionAuthorityUnavailableError) as blocked:
+        require_e3a_locked_output_reduction_authority()
+    assert blocked.value.reason_code == (
+        E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON
+    )
 
 
 def test_e3a_formal_reduction_blocks_without_release_trusted_native_attester(
@@ -348,7 +411,7 @@ def test_e3a_formal_reduction_blocks_without_release_trusted_native_attester(
         SelectionReductionAuthorityUnavailableError,
         match="trusted_hardware_attester_unavailable",
     ):
-        reduce_e3a_selection_from_raw(
+        reduce_e3a_capacity_surface_from_raw(
             registry=registry,
             manifest=manifest,
             hardware_envelope=hardware_envelope,
@@ -486,13 +549,13 @@ def test_e3a_reducer_rejects_coverage_confirmation_and_token_tamper(
         "split_sha256": split_sha256,
     }
     with pytest.raises(ValueError, match="confirmation"):
-        reduce_e3a_selection_from_raw(**kwargs, confirmation_data_visible=True)
+        reduce_e3a_capacity_surface_from_raw(**kwargs, confirmation_data_visible=True)
     incomplete = RawE3aSelectionEvidenceManifest(
         schema_version=2,
         cells=manifest.cells[:-1],
     )
     with pytest.raises(ValueError, match="exactly cover"):
-        reduce_e3a_selection_from_raw(
+        reduce_e3a_capacity_surface_from_raw(
             **{**kwargs, "manifest": incomplete},
             confirmation_data_visible=False,
         )
@@ -511,7 +574,7 @@ def test_e3a_reducer_rejects_coverage_confirmation_and_token_tamper(
         ),
     )
     with pytest.raises(ValueError, match="token trajectories"):
-        reduce_e3a_selection_from_raw(**kwargs, confirmation_data_visible=False)
+        reduce_e3a_capacity_surface_from_raw(**kwargs, confirmation_data_visible=False)
 
 
 def _e3a_selection_and_receipt(
