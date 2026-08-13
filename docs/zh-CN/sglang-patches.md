@@ -53,8 +53,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`，final tree 为
-`c6accb514b9d10ee95e704e69aa11e058adbe77a`；manifest 仍是 authority。Lifecycle 绑定
+`05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`，final tree 为
+`fae3c1538ed4934fb3b47c7ebc82393306c43f06`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
@@ -105,6 +105,16 @@ warm-up 与独立 scored-clock receipt，最后用 lifecycle-terminal receipt �
 chain。Close receipt 明确写入 `transport_close_pending=true`：携带该 receipt 的 HTTP response
 不可能已经真实观测到自身的 `connection_lost`。Caller 仍须关闭 pool 并终止 process。Durable
 live-process reuse、formal GPU reset semantics 与 GPU validation 仍未实现，并保持 `BLOCKED`。
+
+第五个 patch 增加 source-owned
+`sglang.schema_v3.source_owned_compile_cache_lifecycle.v1` producer 与专用
+begin/finalize endpoint。Scheduler 绑定准确的 plan、cache key、model lock、sampling
+profile、prewarm manifest、physical assignment、budget、inventory、patched tree、process、
+drained boundary 与有序 request terminal。Host consumer 复用同一个 pinned official bench
+pool；submitter 返回值不会被当作 evidence。该链路严格标为 `CPU_CONTRACT_ONLY`。JIT time、
+cache hit/miss/write 与 CUDA Graph capture/replay counter 均保持 `null`，并带
+`gpu_compile_semantics_unavailable`；formal plan/source allowlist 与独立 GPU-vetted source
+registry 继续为空，因此 COMPILE 在 mutation 前仍为 `BLOCKED`。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
 底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的

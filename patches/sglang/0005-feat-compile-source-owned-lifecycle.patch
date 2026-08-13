@@ -1,0 +1,860 @@
+From 1a07fa0b59da7e41ffa8acadf844bd9745c7f047 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 16:00:35 +0800
+Subject: [PATCH] feat(compile): add source-owned lifecycle evidence
+
+---
+ python/sglang/srt/entrypoints/http_server.py  |  61 +++
+ python/sglang/srt/managers/io_struct.py       |   2 +
+ python/sglang/srt/managers/scheduler.py       | 102 +++++
+ .../srt/speculative/compile_cache_evidence.py | 378 ++++++++++++++++++
+ .../unit/spec/test_compile_cache_evidence.py  | 215 ++++++++++
+ 5 files changed, 758 insertions(+)
+ create mode 100644 python/sglang/srt/speculative/compile_cache_evidence.py
+ create mode 100644 test/registered/unit/spec/test_compile_cache_evidence.py
+
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index a803264..a784ed4 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -170,6 +170,10 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
+ from sglang.srt.parser.template_manager import TemplateManager
+ from sglang.srt.server_args import PortArgs, ServerArgs
+ from sglang.srt.speculative.online_adaptation_config import load_online_adaptation
++from sglang.srt.speculative.compile_cache_evidence import (
++    SOURCE_OWNED_COMPILE_ACTIONS,
++    SOURCE_OWNED_COMPILE_HOOK,
++)
+ from sglang.srt.speculative.session_reset_evidence import (
+     SOURCE_OWNED_SESSION_ACTIONS,
+     SOURCE_OWNED_SESSION_HOOK,
+@@ -835,6 +839,11 @@ async def terminal_speculative_evidence(
+             status_code=422,
+             detail="source-owned session actions require their dedicated endpoint",
+         )
++    if obj.action in SOURCE_OWNED_COMPILE_ACTIONS:
++        raise HTTPException(
++            status_code=422,
++            detail="source-owned compile actions require their dedicated endpoint",
++        )
+     return await _send_terminal_speculative_evidence_transition(obj)
+ 
+ 
+@@ -905,6 +914,58 @@ async def _source_owned_session_transition(
+     )
+ 
+ 
++async def _source_owned_compile_transition(
++    *, action: str, payload: Dict[str, Any]
++) -> Dict[str, Any]:
++    responses = await _global_state.tokenizer_manager.terminal_speculative_evidence(
++        TerminalSpeculativeEvidenceReq(
++            action=action,
++            payload={"hook": SOURCE_OWNED_COMPILE_HOOK, **payload},
++        )
++    )
++    if len(responses) != 1:
++        raise HTTPException(
++            status_code=409,
++            detail="source-owned compile requires exactly one TP1/DP1 scheduler",
++        )
++    response = responses[0]
++    if not response.success:
++        raise HTTPException(status_code=409, detail=response.message)
++    return msgspec_to_builtins(response.payload)
++
++
++@app.post("/v1/lightcone-spec/compile-cache-evidence/begin")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_compile_begin(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    if set(obj) != {
++        "assignment_plan_sha256",
++        "compile_key_sha256",
++        "model_lock_sha256",
++        "sampling_profile_sha256",
++        "physical_assignment_sha256",
++        "experiment_budget_sha256",
++        "inventory_sha256",
++        "prewarm_manifest_sha256",
++        "prewarm",
++    }:
++        raise HTTPException(status_code=422, detail="compile begin fields are incomplete")
++    return await _source_owned_compile_transition(action="compile_begin", payload=obj)
++
++
++@app.post("/v1/lightcone-spec/compile-cache-evidence/finalize")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_compile_finalize(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    if set(obj) != {"begin_sha256"}:
++        raise HTTPException(status_code=422, detail="compile begin identity is required")
++    return await _source_owned_compile_transition(
++        action="compile_finalize", payload=obj
++    )
++
++
+ @app.post("/v1/lightcone-spec/session-reset/capability")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def source_owned_session_capability(
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 4181695..73fa6a2 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1900,6 +1900,8 @@ class TerminalSpeculativeEvidenceReq(BaseReq, kw_only=True):
+         "session_trace_ready",
+         "session_trace_finalized",
+         "session_close_terminal",
++        "compile_begin",
++        "compile_finalize",
+     ]
+     payload: Dict[str, Any]
+ 
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index ef68218..9ba0df6 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -256,6 +256,10 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.server_args import PortArgs, ServerArgs
+ from sglang.srt.session.session_controller import SessionController
++from sglang.srt.speculative.compile_cache_evidence import (
++    SOURCE_OWNED_COMPILE_HOOK,
++    SourceOwnedCompileCacheProducer,
++)
+ from sglang.srt.speculative.dflash_utils import validate_dflash_request
+ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+@@ -1126,6 +1130,7 @@ class Scheduler(
+         self._session_warmup_completed_ns = None
+         self._session_scored_started_ns = None
+         self._session_last_terminal = None
++        self.source_owned_compile_cache = None
+         self.terminal_speculative_evidence = None
+         if not self.server_args.speculative_speed_study_metrics:
+             return
+@@ -1161,6 +1166,26 @@ class Scheduler(
+         return getattr(self.draft_worker, "_online_drafter_adapter", None)
+ 
+     def _record_terminal_request(self, req: Req) -> None:
++        compile_producer = self.source_owned_compile_cache
++        if compile_producer is not None and compile_producer.phase == "PREWARM":
++            try:
++                compile_producer.note_request_terminal(
++                    request_id=req.rid,
++                    input_token_ids=tuple(int(token) for token in req.origin_input_ids),
++                    output_token_ids=tuple(
++                        int(token) for token in req.output_ids_through_stop
++                    ),
++                    requested_output_tokens=req.sampling_params.max_new_tokens,
++                    sampling_seed=req.sampling_params.sampling_seed,
++                    terminal_status=(
++                        "aborted"
++                        if isinstance(req.finished_reason, FINISH_ABORT)
++                        else "completed"
++                    ),
++                    terminal_reason=type(req.finished_reason).__name__,
++                )
++            except Exception:
++                logger.exception("Source-owned compile lifecycle failed closed")
+         lifecycle = self.terminal_speculative_evidence
+         if lifecycle is None or lifecycle.phase not in {"WARMUP", "SCORED"}:
+             return
+@@ -1176,6 +1201,25 @@ class Scheduler(
+             terminal_reason=reason,
+         )
+ 
++    def _source_owned_compile_scheduler_state(self) -> dict[str, int]:
++        running_batches = (
++            getattr(self, "running_batch", None),
++            getattr(self, "last_batch", None),
++        )
++        active_request_ids = {
++            req.rid
++            for batch in running_batches
++            if batch is not None
++            for req in batch.reqs
++            if not req.finished()
++        }
++        if self.chunked_req is not None and not self.chunked_req.finished():
++            active_request_ids.add(self.chunked_req.rid)
++        return {
++            "active_requests": len(active_request_ids),
++            "queued_requests": len(self.waiting_queue),
++        }
++
+     def _terminal_state_snapshot(self) -> dict[str, object]:
+         self._terminal_completion_generation += 1
+         if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+@@ -1739,6 +1783,64 @@ class Scheduler(
+         self, recv_req: TerminalSpeculativeEvidenceReq
+     ) -> TerminalSpeculativeEvidenceReqOutput:
+         lifecycle = self.terminal_speculative_evidence
++        if recv_req.action in {"compile_begin", "compile_finalize"}:
++            try:
++                payload = recv_req.payload
++                if recv_req.action == "compile_begin":
++                    expected = {
++                        "hook",
++                        "assignment_plan_sha256",
++                        "compile_key_sha256",
++                        "model_lock_sha256",
++                        "sampling_profile_sha256",
++                        "physical_assignment_sha256",
++                        "experiment_budget_sha256",
++                        "inventory_sha256",
++                        "prewarm_manifest_sha256",
++                        "prewarm",
++                    }
++                    if set(payload) != expected:
++                        raise ValueError("source-owned compile fields are incomplete")
++                    if payload["hook"] != SOURCE_OWNED_COMPILE_HOOK:
++                        raise ValueError("source-owned compile hook mismatch")
++                    if self.ps.tp_size != 1 or self.ps.dp_size != 1 or self.ps.pp_size != 1:
++                        raise RuntimeError("source-owned compile requires TP1/DP1/PP1")
++                    if self.source_owned_compile_cache is not None:
++                        raise RuntimeError("source-owned compile is already opened")
++                    producer = SourceOwnedCompileCacheProducer(
++                        process_started_ns=self.server_process_started_ns
++                    )
++                    self.source_owned_compile_cache = producer
++                    result = producer.begin(
++                        {key: value for key, value in payload.items() if key != "hook"},
++                        scheduler_state=self._source_owned_compile_scheduler_state(),
++                    )
++                else:
++                    if set(payload) != {"hook", "begin_sha256"}:
++                        raise ValueError("source-owned compile finalize fields differ")
++                    if (
++                        payload["hook"] != SOURCE_OWNED_COMPILE_HOOK
++                        or self.source_owned_compile_cache is None
++                    ):
++                        raise ValueError("source-owned compile hook mismatch")
++                    result = self.source_owned_compile_cache.finalize(
++                        begin_sha256=payload["begin_sha256"],
++                        scheduler_state=self._source_owned_compile_scheduler_state(),
++                    )
++                return TerminalSpeculativeEvidenceReqOutput(
++                    success=True, message="", payload=result
++                )
++            except Exception as error:
++                if self.source_owned_compile_cache is not None:
++                    self.source_owned_compile_cache.fail_closed()
++                logger.exception("Source-owned compile lifecycle failed closed")
++                return TerminalSpeculativeEvidenceReqOutput(
++                    success=False,
++                    message=(
++                        f"fresh_compile_process_required:{type(error).__name__}: {error}"
++                    ),
++                    payload={},
++                )
+         if recv_req.action.startswith("session_"):
+             try:
+                 payload = recv_req.payload
+diff --git a/python/sglang/srt/speculative/compile_cache_evidence.py b/python/sglang/srt/speculative/compile_cache_evidence.py
+new file mode 100644
+index 0000000..21497fb
+--- /dev/null
++++ b/python/sglang/srt/speculative/compile_cache_evidence.py
+@@ -0,0 +1,378 @@
++"""Source-owned CPU contract for one ordered compile/prewarm lifecycle.
++
++The producer observes terminal requests inside the scheduler.  It does not
++accept runtime counters, cache digests, JIT durations, or CUDA Graph claims
++from the caller.  Those GPU semantics remain explicitly pending until a
++separate GPU qualification binds this exact patched tree.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import subprocess
++from pathlib import Path
++
++SOURCE_OWNED_COMPILE_HOOK = (
++    "sglang.schema_v3.source_owned_compile_cache_lifecycle.v1"
++)
++SOURCE_OWNED_COMPILE_ACTIONS = frozenset({"compile_begin", "compile_finalize"})
++SOURCE_OWNED_COMPILE_RELEASE_STATUS = "CPU_CONTRACT_ONLY"
++GPU_COMPILE_SEMANTICS = "PENDING"
++GPU_COMPILE_REASON = "gpu_compile_semantics_unavailable"
++
++_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
++_GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
++_PLAN_KEYS = {
++    "assignment_plan_sha256",
++    "compile_key_sha256",
++    "model_lock_sha256",
++    "sampling_profile_sha256",
++    "physical_assignment_sha256",
++    "experiment_budget_sha256",
++    "inventory_sha256",
++    "prewarm_manifest_sha256",
++    "prewarm",
++}
++_PREWARM_KEYS = {
++    "graph_bucket",
++    "request_id",
++    "input_token_ids_sha256",
++    "requested_output_tokens",
++    "sampling_seed",
++}
++_STATE_KEYS = {"active_requests", "queued_requests"}
++_UNAVAILABLE_GPU_MEASUREMENTS = (
++    "cache_hits",
++    "cache_misses",
++    "jit_time_ns",
++    "graph_capture_count",
++    "graph_replay_count",
++    "cache_write_count",
++)
++
++
++def content_sha256(value: object) -> str:
++    encoded = json.dumps(
++        value,
++        sort_keys=True,
++        separators=(",", ":"),
++        ensure_ascii=False,
++        allow_nan=False,
++    ).encode()
++    return hashlib.sha256(encoded).hexdigest()
++
++
++SOURCE_OWNED_COMPILE_PROTOCOL_SHA256 = content_sha256(
++    {
++        "schema_version": 1,
++        "hook": SOURCE_OWNED_COMPILE_HOOK,
++        "release_status": SOURCE_OWNED_COMPILE_RELEASE_STATUS,
++        "lifecycle": ("begin", "ordered_request_terminals", "finalize"),
++        "source_owned": (
++            "patched_tree",
++            "process_identity",
++            "process_start",
++            "request_terminals",
++            "begin_and_final_scheduler_state",
++        ),
++        "caller_runtime_counters_forbidden": True,
++        "gpu_compile_semantics": GPU_COMPILE_SEMANTICS,
++        "gpu_measurements": {
++            name: None for name in _UNAVAILABLE_GPU_MEASUREMENTS
++        },
++    }
++)
++
++
++def _sha256(value: object, name: str) -> str:
++    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
++        raise ValueError(f"{name} must be a lowercase SHA-256")
++    return value
++
++
++def _text(value: object, name: str) -> str:
++    if (
++        not isinstance(value, str)
++        or not value
++        or "\n" in value
++        or "\r" in value
++    ):
++        raise ValueError(f"{name} must be non-empty single-line text")
++    return value
++
++
++def _integer(value: object, name: str, *, positive: bool = False) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise ValueError(f"{name} must be an integer")
++    minimum = 1 if positive else 0
++    if value < minimum:
++        raise ValueError(f"{name} must be at least {minimum}")
++    return value
++
++
++def resolve_patched_sglang_tree() -> str:
++    """Read the running checkout tree; never trust an HTTP field for it."""
++
++    source = Path(__file__).resolve()
++    for parent in source.parents:
++        if not (parent / ".git").exists():
++            continue
++        completed = subprocess.run(
++            ["git", "rev-parse", "HEAD^{tree}"],
++            cwd=parent,
++            check=True,
++            text=True,
++            capture_output=True,
++        )
++        tree = completed.stdout.strip()
++        if _GIT_OBJECT.fullmatch(tree) is not None:
++            return tree
++        break
++    raise RuntimeError("source-owned compile requires a verifiable patched checkout")
++
++
++def _scheduler_state(value: object) -> dict[str, int]:
++    if not isinstance(value, dict) or set(value) != _STATE_KEYS:
++        raise ValueError("compile scheduler state fields are incomplete")
++    state = {
++        name: _integer(value[name], f"compile {name}") for name in _STATE_KEYS
++    }
++    if state["active_requests"] or state["queued_requests"]:
++        raise RuntimeError("compile lifecycle boundary requires a drained scheduler")
++    return state
++
++
++def _prewarm_plan(value: object) -> tuple[dict[str, object], ...]:
++    if not isinstance(value, list) or not value:
++        raise ValueError("compile prewarm plan must be a non-empty array")
++    rows: list[dict[str, object]] = []
++    request_ids: set[str] = set()
++    prior_bucket = 0
++    for raw in value:
++        if not isinstance(raw, dict) or set(raw) != _PREWARM_KEYS:
++            raise ValueError("compile prewarm row fields are incomplete")
++        request_id = _text(raw["request_id"], "compile prewarm request ID")
++        bucket = _integer(
++            raw["graph_bucket"], "compile graph bucket", positive=True
++        )
++        input_sha256 = _sha256(
++            raw["input_token_ids_sha256"], "compile prewarm input token IDs"
++        )
++        requested_output_tokens = _integer(
++            raw["requested_output_tokens"],
++            "compile requested output tokens",
++            positive=True,
++        )
++        sampling_seed = _integer(raw["sampling_seed"], "compile sampling seed")
++        if request_id in request_ids:
++            raise ValueError("compile prewarm request IDs must be unique")
++        if bucket < prior_bucket:
++            raise ValueError("compile graph buckets must be ordered")
++        request_ids.add(request_id)
++        prior_bucket = bucket
++        rows.append(
++            {
++                "graph_bucket": bucket,
++                "request_id": request_id,
++                "input_token_ids_sha256": input_sha256,
++                "requested_output_tokens": requested_output_tokens,
++                "sampling_seed": sampling_seed,
++            }
++        )
++    return tuple(rows)
++
++
++class SourceOwnedCompileCacheProducer:
++    """One-shot source producer for begin -> ordered terminals -> finalize."""
++
++    def __init__(
++        self,
++        *,
++        process_started_ns: int,
++        patched_sglang_tree: str | None = None,
++    ) -> None:
++        self.process_id = os.getpid()
++        self.process_started_ns = _integer(
++            process_started_ns, "compile process start", positive=True
++        )
++        tree = patched_sglang_tree or resolve_patched_sglang_tree()
++        if _GIT_OBJECT.fullmatch(tree) is None:
++            raise ValueError("compile patched SGLang tree must be a Git object")
++        self.patched_sglang_tree = tree
++        self.phase = "IDLE"
++        self.failed = False
++        self.plan: dict[str, object] | None = None
++        self.prewarm: tuple[dict[str, object], ...] = ()
++        self.terminals: list[dict[str, object]] = []
++        self.begin_receipt: dict[str, object] | None = None
++
++    def fail_closed(self) -> None:
++        self.failed = True
++        self.phase = "FAILED"
++
++    def begin(
++        self, payload: object, *, scheduler_state: object
++    ) -> dict[str, object]:
++        if self.phase != "IDLE" or self.failed:
++            raise RuntimeError("compile lifecycle has already started")
++        if not isinstance(payload, dict) or set(payload) != _PLAN_KEYS:
++            raise ValueError("compile begin fields are incomplete")
++        plan = dict(payload)
++        for name in _PLAN_KEYS - {"prewarm"}:
++            _sha256(plan[name], f"compile {name}")
++        prewarm = _prewarm_plan(plan.pop("prewarm"))
++        begin_state = _scheduler_state(scheduler_state)
++        identity = {
++            **plan,
++            "prewarm_sha256": content_sha256(list(prewarm)),
++        }
++        receipt = {
++            "schema_version": 1,
++            "hook": SOURCE_OWNED_COMPILE_HOOK,
++            "protocol_sha256": SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
++            "release_status": SOURCE_OWNED_COMPILE_RELEASE_STATUS,
++            "gpu_compile_semantics": GPU_COMPILE_SEMANTICS,
++            "gpu_compile_reason": GPU_COMPILE_REASON,
++            "patched_sglang_tree": self.patched_sglang_tree,
++            "process_id": self.process_id,
++            "process_started_ns": self.process_started_ns,
++            **identity,
++            "ordered_prewarm": list(prewarm),
++            "begin_state": begin_state,
++        }
++        receipt["begin_sha256"] = content_sha256(receipt)
++        self.plan = identity
++        self.prewarm = prewarm
++        self.begin_receipt = receipt
++        self.phase = "PREWARM"
++        return receipt
++
++    def note_request_terminal(
++        self,
++        *,
++        request_id: object,
++        input_token_ids: object,
++        output_token_ids: object,
++        requested_output_tokens: object,
++        sampling_seed: object,
++        terminal_status: object,
++        terminal_reason: object,
++    ) -> None:
++        if self.phase != "PREWARM" or self.failed:
++            return
++        index = len(self.terminals)
++        try:
++            if index >= len(self.prewarm):
++                raise RuntimeError("compile observed an unregistered terminal request")
++            expected = self.prewarm[index]
++            observed_request_id = _text(request_id, "compile terminal request ID")
++            if observed_request_id != expected["request_id"]:
++                raise RuntimeError("compile terminal request order differs from plan")
++            if not isinstance(input_token_ids, tuple) or any(
++                isinstance(token, bool) or not isinstance(token, int)
++                for token in input_token_ids
++            ):
++                raise ValueError("compile terminal input token IDs are invalid")
++            if not isinstance(output_token_ids, tuple) or any(
++                isinstance(token, bool) or not isinstance(token, int)
++                for token in output_token_ids
++            ):
++                raise ValueError("compile terminal output token IDs are invalid")
++            input_sha256 = content_sha256(list(input_token_ids))
++            if input_sha256 != expected["input_token_ids_sha256"]:
++                raise RuntimeError("compile terminal input differs from prewarm plan")
++            observed_requested_output_tokens = _integer(
++                requested_output_tokens,
++                "compile terminal requested output tokens",
++                positive=True,
++            )
++            observed_sampling_seed = _integer(
++                sampling_seed, "compile terminal sampling seed"
++            )
++            if (
++                observed_requested_output_tokens
++                != expected["requested_output_tokens"]
++                or observed_sampling_seed != expected["sampling_seed"]
++            ):
++                raise RuntimeError("compile terminal sampling differs from plan")
++            status = _text(terminal_status, "compile terminal status")
++            reason = _text(terminal_reason, "compile terminal reason")
++            if status != "completed":
++                raise RuntimeError("compile prewarm request did not complete")
++            row = {
++                "sequence": index,
++                "graph_bucket": expected["graph_bucket"],
++                "request_id": observed_request_id,
++                "input_token_count": len(input_token_ids),
++                "input_token_ids_sha256": input_sha256,
++                "output_token_count": len(output_token_ids),
++                "output_token_ids_sha256": content_sha256(list(output_token_ids)),
++                "requested_output_tokens": observed_requested_output_tokens,
++                "sampling_seed": observed_sampling_seed,
++                "terminal_status": status,
++                "terminal_reason": reason,
++            }
++            row["terminal_sha256"] = content_sha256(row)
++            self.terminals.append(row)
++        except Exception:
++            self.fail_closed()
++            raise
++
++    def finalize(
++        self,
++        *,
++        begin_sha256: object,
++        scheduler_state: object,
++    ) -> dict[str, object]:
++        if self.failed or self.phase != "PREWARM":
++            raise RuntimeError("compile lifecycle is not finalizable")
++        if self.begin_receipt is None or self.plan is None:
++            raise RuntimeError("compile lifecycle lacks its begin receipt")
++        if _sha256(begin_sha256, "compile begin receipt") != self.begin_receipt[
++            "begin_sha256"
++        ]:
++            raise ValueError("compile finalize names another begin receipt")
++        if len(self.terminals) != len(self.prewarm):
++            raise RuntimeError("compile prewarm terminal coverage is incomplete")
++        final_state = _scheduler_state(scheduler_state)
++        unavailable = {
++            name: {"value": None, "reason": GPU_COMPILE_REASON}
++            for name in _UNAVAILABLE_GPU_MEASUREMENTS
++        }
++        receipt = {
++            "schema_version": 1,
++            "hook": SOURCE_OWNED_COMPILE_HOOK,
++            "protocol_sha256": SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
++            "release_status": SOURCE_OWNED_COMPILE_RELEASE_STATUS,
++            "gpu_compile_semantics": GPU_COMPILE_SEMANTICS,
++            "gpu_compile_reason": GPU_COMPILE_REASON,
++            "patched_sglang_tree": self.patched_sglang_tree,
++            "process_id": self.process_id,
++            "process_started_ns": self.process_started_ns,
++            **self.plan,
++            "begin_sha256": self.begin_receipt["begin_sha256"],
++            "begin_state": self.begin_receipt["begin_state"],
++            "ordered_terminals": list(self.terminals),
++            "final_state": final_state,
++            "gpu_measurements": unavailable,
++            "completion_marker": "COMPILE_CPU_CONTRACT_COMPLETE",
++        }
++        receipt["compile_receipt_sha256"] = content_sha256(receipt)
++        self.phase = "FINALIZED"
++        return receipt
++
++
++__all__ = [
++    "GPU_COMPILE_REASON",
++    "GPU_COMPILE_SEMANTICS",
++    "SOURCE_OWNED_COMPILE_ACTIONS",
++    "SOURCE_OWNED_COMPILE_HOOK",
++    "SOURCE_OWNED_COMPILE_PROTOCOL_SHA256",
++    "SOURCE_OWNED_COMPILE_RELEASE_STATUS",
++    "SourceOwnedCompileCacheProducer",
++    "content_sha256",
++    "resolve_patched_sglang_tree",
++]
+diff --git a/test/registered/unit/spec/test_compile_cache_evidence.py b/test/registered/unit/spec/test_compile_cache_evidence.py
+new file mode 100644
+index 0000000..bb6446a
+--- /dev/null
++++ b/test/registered/unit/spec/test_compile_cache_evidence.py
+@@ -0,0 +1,215 @@
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++MODULE_PATH = (
++    Path(__file__).resolve().parents[4]
++    / "python/sglang/srt/speculative/compile_cache_evidence.py"
++)
++SPEC = importlib.util.spec_from_file_location("compile_cache_evidence", MODULE_PATH)
++assert SPEC is not None and SPEC.loader is not None
++MODULE = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++GPU_COMPILE_REASON = MODULE.GPU_COMPILE_REASON
++GPU_COMPILE_SEMANTICS = MODULE.GPU_COMPILE_SEMANTICS
++SOURCE_OWNED_COMPILE_ACTIONS = MODULE.SOURCE_OWNED_COMPILE_ACTIONS
++SOURCE_OWNED_COMPILE_HOOK = MODULE.SOURCE_OWNED_COMPILE_HOOK
++SOURCE_OWNED_COMPILE_RELEASE_STATUS = MODULE.SOURCE_OWNED_COMPILE_RELEASE_STATUS
++SourceOwnedCompileCacheProducer = MODULE.SourceOwnedCompileCacheProducer
++content_sha256 = MODULE.content_sha256
++
++
++def _sha(label: str) -> str:
++    return hashlib.sha256(label.encode()).hexdigest()
++
++
++def _payload() -> dict[str, object]:
++    return {
++        "assignment_plan_sha256": _sha("plan"),
++        "compile_key_sha256": _sha("key"),
++        "model_lock_sha256": _sha("model"),
++        "sampling_profile_sha256": _sha("sampling"),
++        "physical_assignment_sha256": _sha("assignment"),
++        "experiment_budget_sha256": _sha("budget"),
++        "inventory_sha256": _sha("inventory"),
++        "prewarm_manifest_sha256": _sha("prewarm-manifest"),
++        "prewarm": [
++            {
++                "graph_bucket": 1,
++                "request_id": "compile-bucket-1",
++                "input_token_ids_sha256": content_sha256([1, 2]),
++                "requested_output_tokens": 1,
++                "sampling_seed": 11,
++            },
++            {
++                "graph_bucket": 2,
++                "request_id": "compile-bucket-2",
++                "input_token_ids_sha256": content_sha256([3, 4]),
++                "requested_output_tokens": 2,
++                "sampling_seed": 22,
++            },
++        ],
++    }
++
++
++def _producer() -> SourceOwnedCompileCacheProducer:
++    return SourceOwnedCompileCacheProducer(
++        process_started_ns=9,
++        patched_sglang_tree="a" * 40,
++    )
++
++
++def _drained() -> dict[str, int]:
++    return {"active_requests": 0, "queued_requests": 0}
++
++
++def test_compile_action_set_and_cpu_only_capability_are_exact() -> None:
++    assert SOURCE_OWNED_COMPILE_ACTIONS == frozenset(
++        {"compile_begin", "compile_finalize"}
++    )
++    producer = _producer()
++    begin = producer.begin(_payload(), scheduler_state=_drained())
++    assert begin["hook"] == SOURCE_OWNED_COMPILE_HOOK
++    assert begin["release_status"] == "CPU_CONTRACT_ONLY"
++    assert begin["gpu_compile_semantics"] == "PENDING"
++    assert begin["gpu_compile_reason"] == GPU_COMPILE_REASON
++    assert begin["patched_sglang_tree"] == "a" * 40
++    assert begin["ordered_prewarm"] == _payload()["prewarm"]
++
++
++def test_source_owned_ordered_terminals_finalize_without_invented_gpu_values() -> None:
++    producer = _producer()
++    begin = producer.begin(_payload(), scheduler_state=_drained())
++    producer.note_request_terminal(
++        request_id="compile-bucket-1",
++        input_token_ids=(1, 2),
++        output_token_ids=(7,),
++        requested_output_tokens=1,
++        sampling_seed=11,
++        terminal_status="completed",
++        terminal_reason="FINISH_LENGTH",
++    )
++    producer.note_request_terminal(
++        request_id="compile-bucket-2",
++        input_token_ids=(3, 4),
++        output_token_ids=(8, 9),
++        requested_output_tokens=2,
++        sampling_seed=22,
++        terminal_status="completed",
++        terminal_reason="FINISH_LENGTH",
++    )
++    receipt = producer.finalize(
++        begin_sha256=begin["begin_sha256"], scheduler_state=_drained()
++    )
++
++    assert receipt["release_status"] == SOURCE_OWNED_COMPILE_RELEASE_STATUS
++    assert receipt["gpu_compile_semantics"] == GPU_COMPILE_SEMANTICS
++    assert receipt["completion_marker"] == "COMPILE_CPU_CONTRACT_COMPLETE"
++    assert [row["graph_bucket"] for row in receipt["ordered_terminals"]] == [1, 2]
++    assert [row["request_id"] for row in receipt["ordered_terminals"]] == [
++        "compile-bucket-1",
++        "compile-bucket-2",
++    ]
++    assert all(
++        measurement == {"value": None, "reason": GPU_COMPILE_REASON}
++        for measurement in receipt["gpu_measurements"].values()
++    )
++    assert receipt["compile_receipt_sha256"] == content_sha256(
++        {
++            key: value
++            for key, value in receipt.items()
++            if key != "compile_receipt_sha256"
++        }
++    )
++
++
++@pytest.mark.parametrize(
++    "extra_field",
++    (
++        "cache_hits",
++        "cache_misses",
++        "jit_time_ns",
++        "graph_capture_count",
++        "cache_write_count",
++    ),
++)
++def test_begin_rejects_caller_authored_runtime_measurements(extra_field: str) -> None:
++    payload = _payload()
++    payload[extra_field] = 0
++    with pytest.raises(ValueError, match="begin fields"):
++        _producer().begin(payload, scheduler_state=_drained())
++
++
++def test_request_order_and_input_identity_fail_closed() -> None:
++    producer = _producer()
++    begin = producer.begin(_payload(), scheduler_state=_drained())
++    with pytest.raises(RuntimeError, match="order differs"):
++        producer.note_request_terminal(
++            request_id="compile-bucket-2",
++            input_token_ids=(3, 4),
++            output_token_ids=(8,),
++            requested_output_tokens=2,
++            sampling_seed=22,
++            terminal_status="completed",
++            terminal_reason="FINISH_LENGTH",
++        )
++    with pytest.raises(RuntimeError, match="not finalizable"):
++        producer.finalize(
++            begin_sha256=begin["begin_sha256"], scheduler_state=_drained()
++        )
++
++    second = _producer()
++    second.begin(_payload(), scheduler_state=_drained())
++    with pytest.raises(RuntimeError, match="input differs"):
++        second.note_request_terminal(
++            request_id="compile-bucket-1",
++            input_token_ids=(99,),
++            output_token_ids=(8,),
++            requested_output_tokens=1,
++            sampling_seed=11,
++            terminal_status="completed",
++            terminal_reason="FINISH_LENGTH",
++        )
++
++
++def test_incomplete_coverage_and_non_drained_boundaries_are_rejected() -> None:
++    with pytest.raises(RuntimeError, match="drained scheduler"):
++        _producer().begin(
++            _payload(), scheduler_state={"active_requests": 1, "queued_requests": 0}
++        )
++    producer = _producer()
++    begin = producer.begin(_payload(), scheduler_state=_drained())
++    with pytest.raises(RuntimeError, match="coverage is incomplete"):
++        producer.finalize(
++            begin_sha256=begin["begin_sha256"], scheduler_state=_drained()
++        )
++
++
++def test_http_surface_never_accepts_runtime_measurements_or_generic_actions() -> None:
++    root = Path(__file__).resolve().parents[4]
++    server = (root / "python/sglang/srt/entrypoints/http_server.py").read_text()
++    generic = server.split(
++        "async def terminal_speculative_evidence(", maxsplit=1
++    )[1].split(
++        "async def _send_terminal_speculative_evidence_transition(", maxsplit=1
++    )[0]
++    assert "SOURCE_OWNED_COMPILE_ACTIONS" in generic
++    begin = server.split("async def source_owned_compile_begin(", maxsplit=1)[1].split(
++        '@app.post("/v1/lightcone-spec/compile-cache-evidence/finalize")',
++        maxsplit=1,
++    )[0]
++    for forbidden in (
++        "cache_hits",
++        "cache_misses",
++        "jit_time_ns",
++        "graph_capture_count",
++        "cache_write_count",
++    ):
++        assert forbidden not in begin

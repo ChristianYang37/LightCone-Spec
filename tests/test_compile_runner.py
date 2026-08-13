@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.experiments.serving import PinnedBenchServingTransport
 from lightcone_spec.runtime.compile_cache import (
     COMPILE_ONLY_ASSIGNMENT_PROTOCOL_SHA256,
     COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256,
@@ -22,9 +24,11 @@ from lightcone_spec.runtime.compile_cache import (
     CompileOnlyAssignmentContract,
     CompileOnlyPrewarmManifest,
     CompileOnlyPrewarmPayload,
+    _content_sha256,
 )
 from lightcone_spec.runtime.compile_runner import (
     COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+    RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY,
     RELEASE_COMPILE_RUNNER_UNAVAILABLE,
     RELEASE_COMPILE_SUBPROCESSES,
     RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S,
@@ -34,11 +38,21 @@ from lightcone_spec.runtime.compile_runner import (
     CompileRunnerBlocked,
     CompileShutdownObservation,
     CompileSubprocessLifecycleReceipt,
+    CompileWorkerSourceDescriptor,
+    ReleaseCompileSubprocess,
     execute_compile_assignment_for_cpu_test,
     execute_compile_assignment_subprocess_for_cpu_test,
     execute_release_compile_assignment_plan,
     require_release_compile_assignment_plan,
     write_compile_prewarm_manifest,
+)
+from lightcone_spec.sglang_bridge.compile_worker import (
+    GPU_COMPILE_REASON,
+    NATIVE_COMPILE_BEGIN_PATH,
+    NATIVE_COMPILE_FINALIZE_PATH,
+    SOURCE_OWNED_COMPILE_HOOK,
+    SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+    PinnedCompileLifecycleWorker,
 )
 from lightcone_spec.sglang_bridge.launch import main as launch_main
 
@@ -612,3 +626,135 @@ def test_launcher_accepts_exact_compile_flags_but_blocks_before_path_access(
         )
     assert blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
     assert not result_path.exists()
+
+
+class _NativeCompileTransport(PinnedBenchServingTransport):
+    def __init__(self) -> None:
+        self.begin: dict[str, object] | None = None
+        self.submitted: list[CompileOnlyPrewarmPayload] = []
+
+    async def post_json(self, path: str, body: dict[str, object], /) -> object:
+        if path == NATIVE_COMPILE_BEGIN_PATH:
+            assert self.begin is None
+            identity = {key: value for key, value in body.items() if key != "prewarm"}
+            receipt = {
+                "schema_version": 1,
+                "hook": SOURCE_OWNED_COMPILE_HOOK,
+                "protocol_sha256": SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+                "release_status": "CPU_CONTRACT_ONLY",
+                "gpu_compile_semantics": "PENDING",
+                "gpu_compile_reason": GPU_COMPILE_REASON,
+                "patched_sglang_tree": PINNED_SGLANG_TREE,
+                "process_id": 4242,
+                "process_started_ns": 9,
+                **identity,
+                "prewarm_sha256": _content_sha256(body["prewarm"]),
+                "ordered_prewarm": body["prewarm"],
+                "begin_state": {"active_requests": 0, "queued_requests": 0},
+            }
+            receipt["begin_sha256"] = _content_sha256(receipt)
+            self.begin = receipt
+            return receipt
+        if path != NATIVE_COMPILE_FINALIZE_PATH or self.begin is None:
+            raise AssertionError(path)
+        assert body == {"begin_sha256": self.begin["begin_sha256"]}
+        terminals = []
+        for index, payload in enumerate(self.submitted):
+            row = {
+                "sequence": index,
+                "graph_bucket": payload.graph_bucket,
+                "request_id": payload.request_id,
+                "input_token_count": len(payload.input_token_ids),
+                "input_token_ids_sha256": _content_sha256(
+                    list(payload.input_token_ids)
+                ),
+                "requested_output_tokens": payload.requested_output_tokens,
+                "sampling_seed": payload.sampling_seed,
+                "output_token_count": 1,
+                "output_token_ids_sha256": _content_sha256([100 + index]),
+                "terminal_status": "completed",
+                "terminal_reason": "FINISH_LENGTH",
+            }
+            row["terminal_sha256"] = _content_sha256(row)
+            terminals.append(row)
+        final = {
+            key: value
+            for key, value in self.begin.items()
+            if key not in {"ordered_prewarm", "begin_sha256"}
+        }
+        final.update(
+            {
+                "begin_sha256": self.begin["begin_sha256"],
+                "begin_state": self.begin["begin_state"],
+                "ordered_terminals": terminals,
+                "final_state": {"active_requests": 0, "queued_requests": 0},
+                "gpu_measurements": {
+                    name: {"value": None, "reason": GPU_COMPILE_REASON}
+                    for name in (
+                        "cache_hits",
+                        "cache_misses",
+                        "jit_time_ns",
+                        "graph_capture_count",
+                        "graph_replay_count",
+                        "cache_write_count",
+                    )
+                },
+                "completion_marker": "COMPILE_CPU_CONTRACT_COMPLETE",
+            }
+        )
+        final["compile_receipt_sha256"] = _content_sha256(final)
+        return final
+
+
+def test_pinned_compile_worker_consumes_only_native_source_receipts(
+    tmp_path: Path,
+) -> None:
+    plan, _result_path = _inputs(tmp_path)
+    transport = _NativeCompileTransport()
+    worker = PinnedCompileLifecycleWorker(transport)
+
+    async def submit(payload: CompileOnlyPrewarmPayload) -> object:
+        transport.submitted.append(payload)
+        return {"caller_summary": "ignored"}
+
+    result = asyncio.run(worker.execute(plan, submit_prewarm=submit))
+    assert result.release_status == "CPU_CONTRACT_ONLY"
+    assert result.gpu_compile_semantics == "PENDING"
+    assert result.formal_execution_authorized is False
+    assert len(result.ordered_terminal_sha256s) == len(
+        CompileOnlyPrewarmManifest.from_dict(
+            json.loads(Path(plan.prewarm_manifest_path).read_text())
+        ).payloads
+    )
+    with pytest.raises(RuntimeError, match="one-shot"):
+        asyncio.run(worker.execute(plan, submit_prewarm=submit))
+
+
+def test_monkeypatched_compile_allowlists_still_hit_gpu_source_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.runtime.compile_runner as runner
+
+    plan, _result_path = _inputs(tmp_path)
+    checkout = (tmp_path / "patched-sglang").resolve()
+    checkout.mkdir()
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.checkout.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    descriptor = CompileWorkerSourceDescriptor.issue(patched_sglang_checkout=checkout)
+    source = ReleaseCompileSubprocess(
+        argv=(descriptor.interpreter_path, descriptor.helper_path),
+        worker=descriptor,
+        protocol_sha256=COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+        gpu_qualification_sha256=_sha("gpu-qualification"),
+    )
+    monkeypatch.setattr(runner, "RELEASE_COMPILE_SUBPROCESSES", (source,))
+    monkeypatch.setattr(
+        runner, "RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S", (plan.sha256,)
+    )
+    assert runner.RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S == ()
+    with pytest.raises(CompileRunnerBlocked) as blocked:
+        require_release_compile_assignment_plan(plan)
+    assert blocked.value.reason_code == RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY

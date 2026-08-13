@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e
-  Expected final tree: c6accb514b9d10ee95e704e69aa11e058adbe77a
+  Latest semantic patch SHA-256: 05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12
+  Expected final tree: fae3c1538ed4934fb3b47c7ebc82393306c43f06
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -36,6 +36,11 @@ native digest chain with a lifecycle-terminal receipt. That receipt truthfully
 marks transport close as pending because its own HTTP response connection has
 not yet emitted `connection_lost`. GPU reset semantics and live reuse remain
 explicitly PENDING/BLOCKED.
+The fifth patch adds a source-owned ordered compile/prewarm lifecycle. Its
+native scheduler receipts bind the plan, cache/model/sampling/assignment/
+budget/inventory identities and observed request terminals. It is strictly a
+`CPU_CONTRACT_ONLY`: GPU JIT, graph, and cache counters remain null with a
+named unavailable reason, and no formal compile source is release-authorized.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

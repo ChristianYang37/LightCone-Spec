@@ -2,3 +2,4 @@
 0002-feat-spec-add-cpu-native-token-observations.patch
 0003-feat-session-account-source-owned-http-connections.patch
 0004-feat-session-bind-native-trace-lifecycle.patch
+0005-feat-compile-source-owned-lifecycle.patch

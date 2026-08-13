@@ -414,6 +414,84 @@ def _verify_cpu_native_token_observation_contract(checkout: Path) -> None:
             raise SystemExit("serving benchmark can fabricate or sparsely reduce ITL")
 
 
+def _verify_source_owned_compile_contract(checkout: Path) -> None:
+    source = (
+        checkout / "python/sglang/srt/speculative/compile_cache_evidence.py"
+    ).read_text(encoding="utf-8")
+    for symbol in (
+        "sglang.schema_v3.source_owned_compile_cache_lifecycle.v1",
+        'SOURCE_OWNED_COMPILE_RELEASE_STATUS = "CPU_CONTRACT_ONLY"',
+        'GPU_COMPILE_SEMANTICS = "PENDING"',
+        'GPU_COMPILE_REASON = "gpu_compile_semantics_unavailable"',
+        "class SourceOwnedCompileCacheProducer",
+        "def begin(",
+        "def note_request_terminal(",
+        "def finalize(",
+        '"patched_sglang_tree"',
+        '"assignment_plan_sha256"',
+        '"compile_key_sha256"',
+        '"model_lock_sha256"',
+        '"sampling_profile_sha256"',
+        '"prewarm_manifest_sha256"',
+        '"physical_assignment_sha256"',
+        '"experiment_budget_sha256"',
+        '"inventory_sha256"',
+        '"ordered_terminals"',
+        '"begin_state"',
+        '"final_state"',
+        '"value": None',
+    ):
+        if symbol not in source:
+            raise SystemExit("source-owned compile producer contract is incomplete")
+
+    server = (checkout / "python/sglang/srt/entrypoints/http_server.py").read_text(
+        encoding="utf-8"
+    )
+    for endpoint in (
+        '"/v1/lightcone-spec/compile-cache-evidence/begin"',
+        '"/v1/lightcone-spec/compile-cache-evidence/finalize"',
+    ):
+        if endpoint not in server:
+            raise SystemExit("source-owned compile endpoint is missing")
+    generic = server.split("async def terminal_speculative_evidence(", maxsplit=1)[
+        1
+    ].split("async def _send_terminal_speculative_evidence_transition(", maxsplit=1)[0]
+    if "SOURCE_OWNED_COMPILE_ACTIONS" not in generic:
+        raise SystemExit("generic terminal route accepts reserved compile actions")
+    begin = server.split("async def source_owned_compile_begin(", maxsplit=1)[1].split(
+        '@app.post("/v1/lightcone-spec/compile-cache-evidence/finalize")',
+        maxsplit=1,
+    )[0]
+    for forbidden in (
+        "cache_hits",
+        "cache_misses",
+        "jit_time_ns",
+        "graph_capture_count",
+        "graph_replay_count",
+        "cache_write_count",
+        "active_requests",
+        "queued_requests",
+        "completed",
+    ):
+        if forbidden in begin:
+            raise SystemExit("compile begin accepts caller-authored source state")
+
+    scheduler = (checkout / "python/sglang/srt/managers/scheduler.py").read_text(
+        encoding="utf-8"
+    )
+    for symbol in (
+        "def _source_owned_compile_scheduler_state(",
+        "compile_producer.note_request_terminal(",
+        "requested_output_tokens=req.sampling_params.max_new_tokens",
+        "sampling_seed=req.sampling_params.sampling_seed",
+        'recv_req.action in {"compile_begin", "compile_finalize"}',
+        "SourceOwnedCompileCacheProducer(",
+        "self._source_owned_compile_scheduler_state()",
+    ):
+        if symbol not in scheduler:
+            raise SystemExit("native scheduler compile integration is incomplete")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream-checkout", type=Path, required=True)
@@ -499,6 +577,7 @@ def main() -> int:
         _verify_native_terminal_contract(checkout, changed_python)
         _verify_source_owned_session_reset_contract(checkout)
         _verify_cpu_native_token_observation_contract(checkout)
+        _verify_source_owned_compile_contract(checkout)
         subprocess.run(
             [
                 os.fspath(Path(os.sys.executable)),
@@ -508,6 +587,7 @@ def main() -> int:
                 "test/registered/unit/spec/test_session_reset_evidence.py",
                 "test/registered/unit/spec/test_source_owned_http_accounting.py",
                 "test/registered/unit/spec/test_terminal_speculative_evidence.py",
+                "test/registered/unit/spec/test_compile_cache_evidence.py",
             ],
             cwd=checkout,
             env=env,

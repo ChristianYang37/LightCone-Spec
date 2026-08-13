@@ -117,8 +117,8 @@
   "release_version": "0.3.0",
   "schema_version": 1,
   "sglang": {
-    "expected_patch_count": 4,
-    "expected_tree": "c6accb514b9d10ee95e704e69aa11e058adbe77a",
+    "expected_patch_count": 5,
+    "expected_tree": "fae3c1538ed4934fb3b47c7ebc82393306c43f06",
     "patches": [
       {
         "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -135,6 +135,10 @@
       {
         "file": "0004-feat-session-bind-native-trace-lifecycle.patch",
         "sha256": "d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e"
+      },
+      {
+        "file": "0005-feat-compile-source-owned-lifecycle.patch",
+        "sha256": "05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12"
       }
     ],
     "repository": "https://github.com/sgl-project/sglang.git",

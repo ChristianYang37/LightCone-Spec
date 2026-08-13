@@ -75,6 +75,16 @@ class SessionLiveStepBinding:
         )
 
 
+class SessionLiveEvidenceSink(Protocol):
+    """Internal sink for crash-durable raw lifecycle publication."""
+
+    def record_step(self, step: SessionLiveStepBinding) -> None: ...
+
+    def finalize(self, result: SessionLiveContractResult) -> None: ...
+
+    def close_partial(self) -> None: ...
+
+
 class SessionLiveTraceDriver(Protocol):
     """Execute one trace's warm-up and scored requests on the shared pool."""
 
@@ -440,8 +450,20 @@ def _combined_response(value: str, *, action: str) -> dict[str, object]:
 class SessionLivePinnedBenchTransport(PinnedBenchServingTransport):
     """Pinned transport with only atomic session-terminal request routing added."""
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(
+        self,
+        *,
+        evidence_sink: SessionLiveEvidenceSink | None = None,
+        **kwargs: object,
+    ) -> None:
         super().__init__(**kwargs)
+        if evidence_sink is not None and (
+            not callable(getattr(evidence_sink, "record_step", None))
+            or not callable(getattr(evidence_sink, "finalize", None))
+            or not callable(getattr(evidence_sink, "close_partial", None))
+        ):
+            raise TypeError("live session evidence sink is incomplete")
+        self._evidence_sink = evidence_sink
         self._live_capability_sha256: str | None = None
         self._live_execution_plan_sha256: str | None = None
         self._live_source_responses: dict[str, object] = {}
@@ -485,13 +507,14 @@ class SessionLivePinnedBenchTransport(PinnedBenchServingTransport):
         *,
         execution_plan_sha256: str | None = None,
     ) -> None:
-        self._live_steps.append(
-            SessionLiveStepBinding.capture(
-                step=step,
-                value=value,
-                execution_plan_sha256=execution_plan_sha256,
-            )
+        binding = SessionLiveStepBinding.capture(
+            step=step,
+            value=value,
+            execution_plan_sha256=execution_plan_sha256,
         )
+        self._live_steps.append(binding)
+        if self._evidence_sink is not None:
+            self._evidence_sink.record_step(binding)
 
     async def get_json(self, path: str, /) -> object:
         value = await super().get_json(path)
@@ -860,6 +883,11 @@ async def run_session_live_contract(
             await asyncio.shield(runtime.force_close())
         except BaseException as force_error:  # noqa: BLE001 - preserve root failure
             cleanup_errors.append(force_error)
+        if transport._evidence_sink is not None:
+            try:
+                transport._evidence_sink.close_partial()
+            except BaseException as sink_error:  # noqa: BLE001 - preserve root failure
+                cleanup_errors.append(sink_error)
         for cleanup_error in cleanup_errors:
             error.add_note(
                 "live session cleanup failed: "
@@ -877,11 +905,18 @@ async def run_session_live_contract(
         process_force_closed=runtime.force_closed,
     )
     value.validate()
+    if transport._evidence_sink is not None:
+        try:
+            transport._evidence_sink.finalize(value)
+        except BaseException:
+            transport._evidence_sink.close_partial()
+            raise
     return value
 
 
 __all__ = (
     "SessionLiveContractResult",
+    "SessionLiveEvidenceSink",
     "SessionLivePinnedBenchTransport",
     "SessionLiveProcessOwner",
     "SessionLiveStepBinding",

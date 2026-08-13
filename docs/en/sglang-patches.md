@@ -66,8 +66,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`
-and the final tree is `c6accb514b9d10ee95e704e69aa11e058adbe77a`; the manifest remains the
+`05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`
+and the final tree is `fae3c1538ed4934fb3b47c7ebc82393306c43f06`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -132,6 +132,19 @@ with a lifecycle-terminal receipt. The close receipt explicitly reports
 truthfully have observed its own `connection_lost` yet. The caller must still
 close the pool and terminate the process. Durable live-process reuse, formal
 GPU reset semantics, and GPU validation remain absent and `BLOCKED`.
+
+The fifth patch adds the source-owned
+`sglang.schema_v3.source_owned_compile_cache_lifecycle.v1` producer and its
+dedicated begin/finalize endpoints. The scheduler binds the exact plan, cache
+key, model lock, sampling profile, prewarm manifest, physical assignment,
+budget, inventory, patched tree, process, drained boundaries, and ordered
+request terminals. The host consumer reuses the same pinned official bench
+pool; a submitter response is never accepted as evidence. This is strictly a
+`CPU_CONTRACT_ONLY`. JIT time, cache hit/miss/write counts, and CUDA Graph
+capture/replay counts remain `null` with
+`gpu_compile_semantics_unavailable`; the formal plan/source allowlists and the
+independent GPU-vetted source registry remain empty, so COMPILE stays
+`BLOCKED` before mutation.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
 `UNMEASURED` runnable work. The lower-level DFlash implementation and valid

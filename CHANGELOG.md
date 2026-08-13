@@ -51,12 +51,15 @@ yet been declared.
 - Added an opt-in, CPU-only committed-token host-observation contract and
   removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
   latest patch identity is
-  `d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`
-  with final tree `c6accb514b9d10ee95e704e69aa11e058adbe77a`. The formal ITL
+  `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`
+  with final tree `fae3c1538ed4934fb3b47c7ebc82393306c43f06`. The formal ITL
   producer allowlist remains empty; CPU observations cannot establish p99 ITL.
   The official benchmark reports exact expected/observed/coalesced/missing
   client-interval coverage and emits null aggregate ITL statistics whenever
   coverage is incomplete instead of reducing a sparse subset.
+- Added the source-owned ordered compile/prewarm CPU lifecycle and a pinned
+  host consumer. GPU JIT, CUDA Graph, and cache measurements remain null and
+  the independent formal GPU-vetted compile-source registry remains empty.
 
 ### Evidence status
 

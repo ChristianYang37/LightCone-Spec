@@ -11,12 +11,14 @@ than trusted as serialized summaries.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -110,19 +112,167 @@ COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256 = _content_sha256(
         "cpu_diagnostic_cannot_authorize_formal_execution": True,
     }
 )
+COMPILE_WORKER_IMPORT_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "first_party_compile_worker_imports",
+        "module": "lightcone_spec.sglang_bridge.compile_worker",
+        "required_imports": (
+            "lightcone_spec.experiments.serving.PinnedBenchServingTransport",
+            "lightcone_spec.runtime.compile_cache.CompileOnlyPrewarmPayload",
+            "lightcone_spec.runtime.compile_runner.CompileAssignmentPlan",
+        ),
+        "native_transport": "same_pinned_official_bench_pool",
+    }
+)
+RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY = (
+    "release_compile_gpu_vetted_source_registry_empty"
+)
+RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED = "release_compile_source_not_gpu_vetted"
+RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S: tuple[str, ...] = ()
 
 _MAX_SUBPROCESS_MESSAGE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
-class ReleaseCompileSubprocess:
-    """One source-owned command permitted to execute formal COMPILE work."""
+class CompileWorkerSourceDescriptor:
+    """Reopenable first-party helper, interpreter, and patched checkout."""
 
-    argv: tuple[str, ...]
-    executable_raw_sha256: str
+    schema_version: int
+    kind: str
+    helper_module: str
+    helper_path: str
+    helper_raw_sha256: str
+    helper_size: int
+    helper_import_protocol_sha256: str
+    interpreter_path: str
+    interpreter_raw_sha256: str
+    interpreter_size: int
+    patched_sglang_checkout: str
     patched_sglang_tree: str
     compile_source_sha256: str
+    native_protocol_sha256: str
+
+    @classmethod
+    def issue(
+        cls,
+        *,
+        patched_sglang_checkout: str | Path,
+        interpreter_path: str | Path | None = None,
+    ) -> Self:
+        from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
+        from lightcone_spec.sglang_bridge.compile_worker import (
+            SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+        )
+
+        checkout = verify_patched_checkout(patched_sglang_checkout)
+        specification = importlib.util.find_spec(
+            "lightcone_spec.sglang_bridge.compile_worker"
+        )
+        if specification is None or specification.origin is None:
+            raise RuntimeError("compile worker helper module cannot be resolved")
+        helper = Path(specification.origin).resolve()
+        interpreter = Path(interpreter_path or sys.executable).resolve()
+        helper_digest, helper_size = _raw_sha256(helper, label="compile worker helper")
+        interpreter_digest, interpreter_size = _raw_sha256(
+            interpreter, label="compile worker interpreter"
+        )
+        value = cls(
+            schema_version=1,
+            kind="first_party_compile_worker_source",
+            helper_module="lightcone_spec.sglang_bridge.compile_worker",
+            helper_path=str(helper),
+            helper_raw_sha256=helper_digest,
+            helper_size=helper_size,
+            helper_import_protocol_sha256=COMPILE_WORKER_IMPORT_PROTOCOL_SHA256,
+            interpreter_path=str(interpreter),
+            interpreter_raw_sha256=interpreter_digest,
+            interpreter_size=interpreter_size,
+            patched_sglang_checkout=str(checkout),
+            patched_sglang_tree=PINNED_SGLANG_TREE,
+            compile_source_sha256=PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+            native_protocol_sha256=SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+        )
+        value.validate(reopen_sources=True)
+        return value
+
+    def validate(self, *, reopen_sources: bool) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != "first_party_compile_worker_source"
+            or self.helper_module != "lightcone_spec.sglang_bridge.compile_worker"
+        ):
+            raise ValueError("compile worker source schema is unsupported")
+        helper = _absolute_path("compile worker helper", self.helper_path)
+        interpreter = _absolute_path(
+            "compile worker interpreter", self.interpreter_path
+        )
+        checkout = _absolute_path(
+            "compile worker patched checkout", self.patched_sglang_checkout
+        )
+        for label, digest in (
+            ("compile worker helper", self.helper_raw_sha256),
+            ("compile worker imports", self.helper_import_protocol_sha256),
+            ("compile worker interpreter", self.interpreter_raw_sha256),
+            ("compile worker source", self.compile_source_sha256),
+            ("compile worker native protocol", self.native_protocol_sha256),
+        ):
+            _require_sha256(label, digest)
+        for label, size in (
+            ("compile worker helper", self.helper_size),
+            ("compile worker interpreter", self.interpreter_size),
+        ):
+            if type(size) is not int or size < 1:
+                raise ValueError(f"{label} size is invalid")
+        if (
+            self.helper_import_protocol_sha256 != COMPILE_WORKER_IMPORT_PROTOCOL_SHA256
+            or self.patched_sglang_tree != PINNED_SGLANG_TREE
+            or self.compile_source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256
+        ):
+            raise ValueError("compile worker source identity differs from release")
+        if not reopen_sources:
+            return
+        helper_digest, helper_size = _raw_sha256(helper, label="compile worker helper")
+        interpreter_digest, interpreter_size = _raw_sha256(
+            interpreter, label="compile worker interpreter"
+        )
+        if (
+            helper_digest != self.helper_raw_sha256
+            or helper_size != self.helper_size
+            or interpreter_digest != self.interpreter_raw_sha256
+            or interpreter_size != self.interpreter_size
+        ):
+            raise ValueError("compile worker helper or interpreter changed")
+        specification = importlib.util.find_spec(self.helper_module)
+        if specification is None or specification.origin is None:
+            raise RuntimeError("compile worker helper module cannot be resolved")
+        if Path(specification.origin).resolve() != helper:
+            raise ValueError("compile worker module resolves to another helper")
+        from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
+        from lightcone_spec.sglang_bridge.compile_worker import (
+            SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+        )
+
+        if verify_patched_checkout(checkout) != checkout:
+            raise ValueError("compile worker checkout identity differs")
+        if SOURCE_OWNED_COMPILE_PROTOCOL_SHA256 != self.native_protocol_sha256:
+            raise ValueError("compile worker native protocol changed")
+
+    @property
+    def sha256(self) -> str:
+        self.validate(reopen_sources=False)
+        return _content_sha256(asdict(self))
+
+
+@dataclass(frozen=True)
+class ReleaseCompileSubprocess:
+    """One GPU-vetted source-owned command for future formal COMPILE work."""
+
+    argv: tuple[str, ...]
+    worker: CompileWorkerSourceDescriptor
     protocol_sha256: str
+    gpu_qualification_sha256: str
 
     def validate(self, *, reopen_executable: bool) -> None:
         if type(self.argv) is not tuple or not self.argv:
@@ -130,18 +280,19 @@ class ReleaseCompileSubprocess:
         for argument in self.argv:
             if type(argument) is not str or not argument or "\x00" in argument:
                 raise ValueError("release compile subprocess argv contains NUL")
-        executable = _absolute_path("release compile executable", self.argv[0])
-        _require_sha256("release compile executable", self.executable_raw_sha256)
-        if self.patched_sglang_tree != PINNED_SGLANG_TREE:
-            raise ValueError("release compile subprocess uses another patched tree")
-        if self.compile_source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256:
-            raise ValueError("release compile subprocess uses another compile source")
+        if type(self.worker) is not CompileWorkerSourceDescriptor:
+            raise TypeError("release compile subprocess lacks an exact worker source")
+        self.worker.validate(reopen_sources=reopen_executable)
+        if self.argv[:2] != (
+            self.worker.interpreter_path,
+            self.worker.helper_path,
+        ):
+            raise ValueError("release compile argv does not execute the bound helper")
         if self.protocol_sha256 != COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256:
             raise ValueError("release compile subprocess uses another protocol")
-        if reopen_executable:
-            digest, _size = _raw_sha256(executable, label="release compile executable")
-            if digest != self.executable_raw_sha256:
-                raise ValueError("release compile executable differs from source pin")
+        _require_sha256(
+            "release compile GPU qualification", self.gpu_qualification_sha256
+        )
 
     @property
     def sha256(self) -> str:
@@ -180,11 +331,17 @@ def _require_formal_compile_receipt_authority(
         raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED)
     source = RELEASE_COMPILE_SUBPROCESSES[0]
     source.validate(reopen_executable=reopen_executable)
-    expected_executable = _absolute_path("release compile executable", source.argv[0])
+    if not RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY)
+    if source.sha256 not in RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED)
+    expected_executable = _absolute_path(
+        "release compile executable", source.worker.interpreter_path
+    )
     if (
         source_authority_sha256 != source.sha256
         or Path(executable_path) != expected_executable
-        or executable_raw_sha256 != source.executable_raw_sha256
+        or executable_raw_sha256 != source.worker.interpreter_raw_sha256
         or argv_sha256 != _content_sha256({"argv": list(source.argv)})
     ):
         raise ValueError("formal compile receipt differs from source authority")
@@ -560,6 +717,12 @@ def require_release_compile_assignment_plan(
         raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
     if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
         raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
+    command = RELEASE_COMPILE_SUBPROCESSES[0]
+    command.validate(reopen_executable=True)
+    if not RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY)
+    if command.sha256 not in RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED)
     if plan is None:
         raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE)
     if type(plan) is not CompileAssignmentPlan:
@@ -567,8 +730,6 @@ def require_release_compile_assignment_plan(
     plan.validate()
     if plan.sha256 not in RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
         raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED)
-    command = RELEASE_COMPILE_SUBPROCESSES[0]
-    command.validate(reopen_executable=True)
     return command
 
 
@@ -1767,6 +1928,12 @@ def execute_release_compile_assignment_plan(
         raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
     if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
         raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
+    source = RELEASE_COMPILE_SUBPROCESSES[0]
+    source.validate(reopen_executable=True)
+    if not RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY)
+    if source.sha256 not in RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED)
     plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
     plan = CompileAssignmentPlan.load(plan_path)
     source = require_release_compile_assignment_plan(plan)
@@ -1782,10 +1949,14 @@ def execute_release_compile_assignment_plan(
 __all__ = [
     "COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256",
     "COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256",
+    "COMPILE_WORKER_IMPORT_PROTOCOL_SHA256",
     "RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY",
     "RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED",
+    "RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY",
+    "RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED",
     "RELEASE_COMPILE_RUNNER_UNAVAILABLE",
     "RELEASE_COMPILE_SUBPROCESSES",
+    "RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S",
     "RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S",
     "CompileAssignmentPlan",
     "CompileLifecycleDriver",
@@ -1796,6 +1967,7 @@ __all__ = [
     "CompileShutdownObservation",
     "CompileSubprocessEvent",
     "CompileSubprocessLifecycleReceipt",
+    "CompileWorkerSourceDescriptor",
     "ReleaseCompileSubprocess",
     "execute_compile_assignment_for_cpu_test",
     "execute_compile_assignment_subprocess_for_cpu_test",
