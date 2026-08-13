@@ -11,6 +11,8 @@ import pytest
 from lightcone_spec.orchestration.native_terminal import canonical_json_bytes
 from lightcone_spec.orchestration.session_live_evidence import (
     SESSION_LIVE_CLOSE_MANIFEST,
+    SESSION_LIVE_STEP_PREFIX,
+    IncrementalSessionLiveEvidenceSink,
     publish_session_live_evidence,
     reopen_session_live_evidence,
 )
@@ -229,3 +231,41 @@ def test_replace_and_rehash_cannot_reorder_or_self_authorize(
             output_dir=tmp_path.resolve(),
             expected_result=result,
         )
+
+
+def test_incremental_sink_persists_each_step_and_binds_final_manifest(
+    tmp_path: Path,
+) -> None:
+    sink = IncrementalSessionLiveEvidenceSink(tmp_path.resolve())
+    resources = _LIVE._resources(evidence_sink=sink)
+    result, _owner, _backend, _events = _LIVE._run(resources)
+
+    publication = sink.publication
+    assert publication is not None and publication.committed
+    assert len(sink.step_artifacts) == len(result.steps)
+    step_paths = sorted(tmp_path.glob(f"{SESSION_LIVE_STEP_PREFIX}*.json"))
+    assert len(step_paths) == len(result.steps)
+    manifest = json.loads((tmp_path / SESSION_LIVE_CLOSE_MANIFEST).read_bytes())
+    assert len(manifest["incremental_step_artifacts"]) == len(result.steps)
+    assert reopen_session_live_evidence(
+        output_dir=tmp_path.resolve(),
+        expected_result=result,
+    ) == publication
+
+
+def test_incremental_sink_failure_retains_steps_without_close_marker(
+    tmp_path: Path,
+) -> None:
+    sink = IncrementalSessionLiveEvidenceSink(tmp_path.resolve())
+    resources = _LIVE._resources(malformed_clock=True, evidence_sink=sink)
+
+    result, _owner, _backend, _events = _LIVE._run(resources)
+
+    assert result.audit.status == "FRESH_PROCESS_REQUIRED"
+    assert sink.publication is not None
+    assert not sink.publication.committed
+    assert sink.step_artifacts
+    assert list(tmp_path.glob(f"{SESSION_LIVE_STEP_PREFIX}*.json"))
+    assert not (tmp_path / SESSION_LIVE_CLOSE_MANIFEST).exists()
+    with pytest.raises(RuntimeError, match="closed"):
+        sink.record_step(sink.step_artifacts[0])

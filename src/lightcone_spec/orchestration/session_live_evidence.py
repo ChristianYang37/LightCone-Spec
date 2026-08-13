@@ -28,6 +28,7 @@ from lightcone_spec.orchestration.session_live_runtime import (
 SESSION_LIVE_EVIDENCE_LEVEL = "CPU_CONTRACT_ONLY"
 SESSION_LIVE_GPU_RESET_SEMANTICS = "PENDING"
 SESSION_LIVE_CLOSE_MANIFEST = "session-close-manifest.json"
+SESSION_LIVE_STEP_PREFIX = "live-step-"
 
 _TRACE_ARTIFACT_KIND = "lightcone_session_live_trace_evidence"
 _CLOSE_MANIFEST_KIND = "lightcone_session_live_close_manifest"
@@ -42,6 +43,22 @@ class SessionLiveTraceArtifactBinding:
     size: int
     raw_sha256: str
     complete: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SessionLiveStepArtifactBinding:
+    """One raw source response durably retained before the next live action."""
+
+    sequence: int
+    step: str
+    execution_plan_sha256: str | None
+    content_sha256: str
+    filename: str
+    size: int
+    raw_sha256: str
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -205,6 +222,8 @@ def _global_steps(result: SessionLiveContractResult) -> list[dict[str, object]]:
 def _close_manifest(
     result: SessionLiveContractResult,
     bindings: tuple[SessionLiveTraceArtifactBinding, ...],
+    *,
+    incremental_steps: tuple[SessionLiveStepArtifactBinding, ...] = (),
 ) -> dict[str, object]:
     if result.audit.status != "CPU_CONTRACT_ONLY":
         raise ValueError("failed session evidence cannot produce a close manifest")
@@ -221,6 +240,9 @@ def _close_manifest(
         "audit_sha256": result.audit.sha256,
         "execution_plan_sha256s": list(result.execution_plan_sha256s),
         "global_steps": _global_steps(result),
+        "incremental_step_artifacts": [
+            binding.to_dict() for binding in incremental_steps
+        ],
         "trace_artifacts": [binding.to_dict() for binding in bindings],
         "native_terminal_sha256s": [
             terminal.terminal_sha256 for terminal in result.native_terminals
@@ -357,6 +379,146 @@ def _trace_filename(index: int, execution_plan_sha256: str) -> str:
     return f"trace-{index:04d}-{execution_plan_sha256}.json"
 
 
+def _step_filename(sequence: int, content_sha256: str) -> str:
+    return f"{SESSION_LIVE_STEP_PREFIX}{sequence:06d}-{content_sha256}.json"
+
+
+def _step_artifact(sequence: int, step: SessionLiveStepBinding) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "artifact_kind": "lightcone_session_live_incremental_step",
+        "evidence_level": SESSION_LIVE_EVIDENCE_LEVEL,
+        "gpu_reset_semantics": SESSION_LIVE_GPU_RESET_SEMANTICS,
+        "reuse_authorized": False,
+        "sequence": sequence,
+        "step_binding": _step_dict(step),
+    }
+
+
+def _validate_incremental_steps(
+    *,
+    directory_fd: int,
+    result: SessionLiveContractResult,
+    bindings: tuple[SessionLiveStepArtifactBinding, ...],
+) -> None:
+    if len(bindings) != len(result.steps):
+        raise RuntimeError("incremental live-step coverage is incomplete")
+    for sequence, (binding, step) in enumerate(zip(bindings, result.steps, strict=True)):
+        expected = canonical_json_bytes(_step_artifact(sequence, step))
+        if (
+            binding.sequence != sequence
+            or binding.step != step.step
+            or binding.execution_plan_sha256 != step.execution_plan_sha256
+            or binding.content_sha256 != step.content_sha256
+            or binding.filename != _step_filename(sequence, step.content_sha256)
+            or binding.size != len(expected)
+            or binding.raw_sha256 != hashlib.sha256(expected).hexdigest()
+        ):
+            raise RuntimeError("incremental live-step binding changed")
+        observed = _read_bound_at(
+            directory_fd,
+            filename=binding.filename,
+            label="incremental live-step artifact",
+        )
+        _strict_json(observed, label="incremental live-step artifact")
+        if observed != expected:
+            raise RuntimeError("incremental live-step artifact changed")
+
+
+class IncrementalSessionLiveEvidenceSink:
+    """Crash-durable diagnostic sink for the live source-response chain.
+
+    Each step is published exclusively and fsynced before control returns to the
+    runtime.  A failure or cancellation only closes this sink and deliberately
+    leaves no session close manifest.  Successful finalization reopens every
+    step, validates it against the typed terminal result, and then uses the
+    normal trace-first/manifest-last publication path.
+    """
+
+    def __init__(self, output_dir: str | Path) -> None:
+        self._directory = _resolved_directory(output_dir)
+        opened = os.stat(self._directory, follow_symlinks=False)
+        self._directory_identity = (opened.st_dev, opened.st_ino)
+        self._bindings: list[SessionLiveStepArtifactBinding] = []
+        self._closed = False
+        self._publication: SessionLiveEvidencePublication | None = None
+
+    def _open(self) -> int:
+        descriptor = _open_directory(self._directory)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != self._directory_identity:
+            os.close(descriptor)
+            raise RuntimeError("session live evidence directory identity changed")
+        return descriptor
+
+    @property
+    def publication(self) -> SessionLiveEvidencePublication | None:
+        return self._publication
+
+    @property
+    def step_artifacts(self) -> tuple[SessionLiveStepArtifactBinding, ...]:
+        return tuple(self._bindings)
+
+    def record_step(self, step: SessionLiveStepBinding) -> None:
+        if self._closed:
+            raise RuntimeError("session live evidence sink is closed")
+        if type(step) is not SessionLiveStepBinding:
+            raise TypeError("session live evidence sink requires exact step bindings")
+        sequence = len(self._bindings)
+        body = canonical_json_bytes(_step_artifact(sequence, step))
+        filename = _step_filename(sequence, step.content_sha256)
+        descriptor = self._open()
+        try:
+            if _exists_at(descriptor, SESSION_LIVE_CLOSE_MANIFEST):
+                raise FileExistsError("session live close manifest already exists")
+            _publish_exclusive_at(
+                descriptor,
+                filename=filename,
+                body=body,
+                label="incremental live-step artifact",
+            )
+            _require_same_directory(descriptor, self._directory)
+        finally:
+            os.close(descriptor)
+        self._bindings.append(
+            SessionLiveStepArtifactBinding(
+                sequence=sequence,
+                step=step.step,
+                execution_plan_sha256=step.execution_plan_sha256,
+                content_sha256=step.content_sha256,
+                filename=filename,
+                size=len(body),
+                raw_sha256=hashlib.sha256(body).hexdigest(),
+            )
+        )
+
+    def finalize(self, result: SessionLiveContractResult) -> None:
+        if self._closed:
+            raise RuntimeError("session live evidence sink is closed")
+        if type(result) is not SessionLiveContractResult:
+            raise TypeError("session evidence requires an exact live contract result")
+        result.validate()
+        bindings = tuple(self._bindings)
+        descriptor = self._open()
+        try:
+            _validate_incremental_steps(
+                directory_fd=descriptor,
+                result=result,
+                bindings=bindings,
+            )
+        finally:
+            os.close(descriptor)
+        self._publication = publish_session_live_evidence(
+            output_dir=self._directory,
+            result=result,
+            _incremental_steps=bindings,
+        )
+        self._closed = True
+
+    def close_partial(self) -> None:
+        self._closed = True
+
+
 def _exists_at(directory_fd: int, filename: str) -> bool:
     try:
         os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
@@ -369,6 +531,7 @@ def publish_session_live_evidence(
     *,
     output_dir: str | Path,
     result: SessionLiveContractResult,
+    _incremental_steps: tuple[SessionLiveStepArtifactBinding, ...] = (),
 ) -> SessionLiveEvidencePublication:
     """Publish trace evidence and, only on complete success, a manifest last."""
 
@@ -381,6 +544,12 @@ def publish_session_live_evidence(
     try:
         if _exists_at(descriptor, SESSION_LIVE_CLOSE_MANIFEST):
             raise FileExistsError("session live close manifest already exists")
+        if _incremental_steps:
+            _validate_incremental_steps(
+                directory_fd=descriptor,
+                result=result,
+                bindings=_incremental_steps,
+            )
         for index, plan in enumerate(result.execution_plan_sha256s):
             artifact = _trace_artifact(
                 result,
@@ -415,7 +584,11 @@ def publish_session_live_evidence(
                 binding.complete for binding in binding_values
             ):
                 raise RuntimeError("complete session lost trace evidence coverage")
-            manifest = _close_manifest(result, binding_values)
+            manifest = _close_manifest(
+                result,
+                binding_values,
+                incremental_steps=_incremental_steps,
+            )
             body = canonical_json_bytes(manifest)
             _publish_exclusive_at(
                 descriptor,
@@ -460,6 +633,38 @@ def reopen_session_live_evidence(
     descriptor = _open_directory(directory)
     bindings: list[SessionLiveTraceArtifactBinding] = []
     try:
+        observed_step_names = {
+            name
+            for name in os.listdir(descriptor)
+            if name.startswith(SESSION_LIVE_STEP_PREFIX) and name.endswith(".json")
+        }
+        incremental_steps: tuple[SessionLiveStepArtifactBinding, ...] = ()
+        if observed_step_names:
+            rebuilt: list[SessionLiveStepArtifactBinding] = []
+            for sequence, step in enumerate(expected_result.steps):
+                expected = canonical_json_bytes(_step_artifact(sequence, step))
+                filename = _step_filename(sequence, step.content_sha256)
+                rebuilt.append(
+                    SessionLiveStepArtifactBinding(
+                        sequence=sequence,
+                        step=step.step,
+                        execution_plan_sha256=step.execution_plan_sha256,
+                        content_sha256=step.content_sha256,
+                        filename=filename,
+                        size=len(expected),
+                        raw_sha256=hashlib.sha256(expected).hexdigest(),
+                    )
+                )
+            incremental_steps = tuple(rebuilt)
+            if observed_step_names != {
+                binding.filename for binding in incremental_steps
+            }:
+                raise RuntimeError("incremental live-step artifact coverage changed")
+            _validate_incremental_steps(
+                directory_fd=descriptor,
+                result=expected_result,
+                bindings=incremental_steps,
+            )
         for index, plan in enumerate(expected_result.execution_plan_sha256s):
             expected_artifact = _trace_artifact(
                 expected_result,
@@ -500,7 +705,11 @@ def reopen_session_live_evidence(
         if expected_result.audit.status == "CPU_CONTRACT_ONLY":
             if len(binding_values) != len(expected_result.execution_plan_sha256s):
                 raise RuntimeError("expected live result lacks trace evidence")
-            expected_manifest = _close_manifest(expected_result, binding_values)
+            expected_manifest = _close_manifest(
+                expected_result,
+                binding_values,
+                incremental_steps=incremental_steps,
+            )
             observed_manifest = _read_bound_at(
                 descriptor,
                 filename=SESSION_LIVE_CLOSE_MANIFEST,
@@ -538,7 +747,10 @@ __all__ = (
     "SESSION_LIVE_CLOSE_MANIFEST",
     "SESSION_LIVE_EVIDENCE_LEVEL",
     "SESSION_LIVE_GPU_RESET_SEMANTICS",
+    "SESSION_LIVE_STEP_PREFIX",
+    "IncrementalSessionLiveEvidenceSink",
     "SessionLiveEvidencePublication",
+    "SessionLiveStepArtifactBinding",
     "SessionLiveTraceArtifactBinding",
     "publish_session_live_evidence",
     "reopen_session_live_evidence",

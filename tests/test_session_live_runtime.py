@@ -258,7 +258,12 @@ class _TraceConfig:
         return None
 
 
-def _resources(*, malformed_clock: bool = False, drop_source: bool = False):
+def _resources(
+    *,
+    malformed_clock: bool = False,
+    drop_source: bool = False,
+    evidence_sink=None,
+):
     plan = _sha("plan")
     trace = _sha("trace")
     warmup = (_request("warm-0", 1),)
@@ -299,6 +304,7 @@ def _resources(*, malformed_clock: bool = False, drop_source: bool = False):
         raise AssertionError("driver fixture does not abort")
 
     transport = SessionLivePinnedBenchTransport(
+        evidence_sink=evidence_sink,
         request_type=SimpleNamespace,
         request_callable=request,
         abort_callable=abort,
