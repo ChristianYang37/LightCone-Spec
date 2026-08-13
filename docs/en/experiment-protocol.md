@@ -273,11 +273,16 @@ The pinned source now produces content-bound all-reset capability, initial
 state, and boundary receipts. The receipt proves the registered drain,
 KV/prefix, RNG/counter, scheduler/telemetry, adaptation-state, allocator/HBM,
 and completion-event predicates at the CPU contract boundary. Its GPU reset
-semantics remain `PENDING`. Continuous HTTP connection accounting is explicitly
-unavailable (`false` capability and `null` state), so this is not a complete
-CPU session contract. The receipt is not yet durably bound into the
-terminal envelope or continuous launch-to-termination inventory accounting.
-All live reuse entry points therefore remain blocked and fall back to a
+semantics remain `PENDING`. On the supported single-tokenizer HTTP/1.1 uvicorn
+paths, continuous HTTP accounting comes from real protocol connection creation/
+closure events and remains bound to one HTTP process generation with monotonic,
+conserved totals; request counters and client fields are rejected as
+substitutes. Granian HTTP/2 and multiple-tokenizer HTTP-process paths fail
+closed before producing this capability. The receipt is not yet durably bound
+into the terminal envelope or continuous launch-to-termination inventory accounting.
+The source patch covers reset-state accounting only and does not yet produce
+native warm-up, trace, or close receipts. All live GPU reuse entry points
+therefore remain blocked and fall back to a
 distinct clean process and HTTP pool per trace; no reset or startup-saving
 claim is recorded. Within each supported single-trace path, submit and abort
 share that official HTTP pool, with timeouts bound to the request deadline and

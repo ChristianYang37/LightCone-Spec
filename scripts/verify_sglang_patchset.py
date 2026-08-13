@@ -150,24 +150,41 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
     ).read_text(encoding="utf-8")
     required_reset_symbols = (
         hook,
+        "SOURCE_OWNED_SESSION_ACTIONS = frozenset(",
+        '"session_capability"',
+        '"session_initial_state"',
+        '"session_reset_prepare"',
+        '"session_reset_finalize"',
         'GPU_RESET_SEMANTICS = "PENDING"',
-        "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = False",
+        "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = True",
         "class SourceOwnedAllResetSessionProducer",
         "def open(",
         "def validate_session_plan_sha256(",
         "def validate_reset_request(",
         "def validate_before_state(",
         "def initial_state_receipt(",
+        'finalized_state["connection_accounting"] = accounting',
+        "self.initial_state_receipt_value is not None",
+        "self.initial_state_receipt_value = initial_receipt",
+        "def prepare_reset(",
+        "def finalize_reset(",
         "def reset_receipt(",
         '"initial_state_receipt_sha256"',
         '"reset request breaks the source-owned trace chain"',
         '"pre-reset generation breaks the source-owned chain"',
+        '"reset transition mismatch"',
+        'post["connection_accounting"] = validate_connection_accounting(',
         '"fresh_process_per_trace"',
         '"disabled method allocated adaptation state"',
         '"all-reset did not restore the process baseline"',
     )
     if any(symbol not in reset_source for symbol in required_reset_symbols):
         raise SystemExit("source-owned all-reset producer contract is incomplete")
+    open_branch = reset_source.split("    def open(", maxsplit=1)[1].split(
+        "    def initial_state_receipt(", maxsplit=1
+    )[0]
+    if "initial_state_receipt_sha256" in open_branch:
+        raise SystemExit("capability snapshot prematurely mints the initial receipt")
 
     scheduler = (checkout / "python/sglang/srt/managers/scheduler.py").read_text(
         encoding="utf-8"
@@ -177,20 +194,21 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         "def _source_owned_session_state(",
         'recv_req.action == "session_capability"',
         'recv_req.action == "session_initial_state"',
-        'recv_req.action == "session_reset"',
+        'recv_req.action == "session_reset_prepare"',
+        'recv_req.action == "session_reset_finalize"',
         "prior_plan, next_plan = (",
         "before = self.source_owned_session_reset.validate_before_state(",
-        '"connection_accounting": None',
+        '"connection_accounting": connection_accounting',
         'f"fresh_process_required:',
     )
     if any(symbol not in scheduler for symbol in required_scheduler_symbols):
         raise SystemExit("native scheduler all-reset integration is incomplete")
-    reset_branch = scheduler.split(
-        'elif recv_req.action == "session_reset":', maxsplit=1
-    )[1].split("else:", maxsplit=1)[0]
-    if reset_branch.index("validate_before_state(") > reset_branch.index(
-        "_reset_terminal_server_state("
-    ):
+    reset_prepare_branch = scheduler.split(
+        'elif recv_req.action == "session_reset_prepare":', maxsplit=1
+    )[1].split('elif recv_req.action == "session_reset_finalize":', maxsplit=1)[0]
+    prevalidation_index = reset_prepare_branch.index("validate_before_state(")
+    mutation_index = reset_prepare_branch.index("_reset_terminal_server_state(")
+    if prevalidation_index > mutation_index:
         raise SystemExit("native reset mutates state before structural prevalidation")
     if "_session_reset_request_count" in scheduler:
         raise SystemExit("scheduler counters impersonate HTTP connection accounting")
@@ -224,6 +242,30 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
     server = (checkout / "python/sglang/srt/entrypoints/http_server.py").read_text(
         encoding="utf-8"
     )
+    generic_handler = server.split(
+        "async def terminal_speculative_evidence(", maxsplit=1
+    )[1].split("async def _send_source_owned_session_transition(", maxsplit=1)[0]
+    generic_guard = "if obj.action in SOURCE_OWNED_SESSION_ACTIONS:"
+    generic_dispatch = "tokenizer_manager.terminal_speculative_evidence(obj)"
+    if (
+        generic_guard not in generic_handler
+        or generic_dispatch not in generic_handler
+        or generic_handler.index(generic_guard)
+        > generic_handler.index(generic_dispatch)
+    ):
+        raise SystemExit("generic terminal route can inject reserved session actions")
+    reset_endpoint = server.split("async def source_owned_session_reset(", maxsplit=1)[
+        1
+    ].split('@app.get("/get_load")', maxsplit=1)[0]
+    for symbol in (
+        'action="session_reset_prepare"',
+        'action="session_reset_finalize"',
+        '"reset_transition_sha256"',
+    ):
+        if symbol not in reset_endpoint:
+            raise SystemExit("HTTP reset lacks two-phase accounting finalization")
+    if reset_endpoint.count("_source_owned_http_snapshot()") != 2:
+        raise SystemExit("HTTP reset must sample distinct pre/post lifecycle states")
     for endpoint in (
         '"/v1/lightcone-spec/session-reset/capability"',
         '"/v1/lightcone-spec/session-reset/initial-state"',
@@ -231,6 +273,52 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
     ):
         if endpoint not in server:
             raise SystemExit("source-owned session reset endpoint is missing")
+    setup = server.split("def _setup_and_run_http_server(", maxsplit=1)[1].split(
+        "def _start_native_grpc_server_for_runtime(", maxsplit=1
+    )[0]
+    initializer = "initialize_source_owned_http_connection_accounting()"
+    if setup.count(initializer) != 1:
+        raise SystemExit("HTTP connection accounting lacks one startup initializer")
+    if setup.index(initializer) > setup.index("set_global_state("):
+        raise SystemExit("HTTP connection accounting initializes after server state")
+    if server.count("http=source_owned_uvicorn_http_protocol()") != 2:
+        raise SystemExit("single-process uvicorn paths lack lifecycle instrumentation")
+
+    accounting = (
+        checkout / "python/sglang/srt/entrypoints/source_owned_http_accounting.py"
+    ).read_text(encoding="utf-8")
+    for symbol in (
+        "class SourceOwnedHttpConnectionAccounting",
+        "def connection_made(",
+        "def connection_lost(",
+        "def initialize_source_owned_http_connection_accounting(",
+        "def _require_initialized_accounting(",
+        '"process_id"',
+        '"generation"',
+        '"connections_created"',
+        '"connections_closed"',
+        '"connections_current"',
+        "source_owned_uvicorn_http_protocol",
+    ):
+        if symbol not in accounting:
+            raise SystemExit("source-owned HTTP lifecycle accounting is incomplete")
+    accounting_tree = ast.parse(accounting)
+    global_initializers = [
+        node
+        for node in accounting_tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "SOURCE_OWNED_HTTP_CONNECTION_ACCOUNTING"
+    ]
+    if (
+        len(global_initializers) != 1
+        or not isinstance(global_initializers[0].value, ast.Constant)
+        or global_initializers[0].value.value is not None
+    ):
+        raise SystemExit("HTTP accounting must not capture a PID at module import")
+    for forbidden in ("request.headers", "submitted_requests", "request_count"):
+        if forbidden in accounting:
+            raise SystemExit("HTTP lifecycle authority depends on request metadata")
 
 
 def _verify_cpu_native_token_observation_contract(checkout: Path) -> None:
@@ -366,6 +454,7 @@ def main() -> int:
                 "pytest",
                 "-q",
                 "test/registered/unit/spec/test_session_reset_evidence.py",
+                "test/registered/unit/spec/test_source_owned_http_accounting.py",
             ],
             cwd=checkout,
             env=env,

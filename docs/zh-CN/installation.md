@@ -121,8 +121,11 @@ process 使用唯一 evidence prefix。中断 WAL 保留用于审计，但没有
 Compile cache 必须构建为 verified content-addressed immutable base，并为每个 process 提供
 private writable overlay。不要共享 writable cache，也不要在 process/device 之间移动 captured
 CUDA Graph。Immutable session key 与 boundary receipt schema 现已有 first-party source
-producer，但其 GPU semantics 仍为 `PENDING`，且明确声明连续 HTTP connection accounting
-不可用。在 GPU reset validation、durable session
+producer；在支持的 single-tokenizer HTTP/1.1 uvicorn 路径上，连续 HTTP accounting 来自真实
+protocol lifecycle，并绑定一个 process generation；Granian HTTP/2 与 multiple-tokenizer
+HTTP-process 路径会在生成该 capability 前 fail closed。它只覆盖 reset-state accounting，尚无
+native warm-up/trace/close receipt，且 GPU semantics 仍为 `PENDING`。在 GPU reset validation、
+durable session
 receipt binding 和连续 whole-inventory 计费可用之前，shared-session execution 会在 mutation
 前被阻止。高层 block executor 会先
 验证完整 block，再对每个 logical trace 使用独立 clean process、official HTTP pool 与 native

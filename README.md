@@ -32,9 +32,9 @@ an experiment, and a historical measurement does not become a formal result.
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `81a86871d01dcf19853612da3d8eb63faa812013` | Full Git tree expected after applying the current patch series. |
-| `current_patch_payload_sha256` | `8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31` | SHA-256 of the latest semantic mail-patch bytes. |
-| `current_patch_manifest_sha256` | `046bde6c6671ce490939515d06d5a38bb92dd3058e010f782e7d22269b2ace85` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `fabb129063c36e9dde9a0d8b434df2f7a292c06d` | Full Git tree expected after applying the current patch series. |
+| `current_patch_payload_sha256` | `fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde` | SHA-256 of the latest semantic mail-patch bytes. |
+| `current_patch_manifest_sha256` | `6460c61112158aad0e2ec8172d5b6f51e5fea716cf93949755689543462b206a` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -138,12 +138,16 @@ GPU-time receipts are all content-bound. The pinned patch now ships a
 first-party all-reset producer for source-owned capability, initial-state, and
 reset receipts. It covers drain, KV/prefix, RNG/counters, scheduler/telemetry,
 adaptation state, allocator/HBM, and a completion event. Its GPU reset semantics
-remain explicitly `PENDING`. Because the scheduler does not own the HTTP
-connector, `continuous_connection_accounting` is explicitly `false` and the
-state field is `null`, never a local-counter substitute. The receipts are not
-yet durably integrated with terminal and whole-inventory accounting. Live reuse
-therefore remains blocked and falls back to one clean process and HTTP pool per
-logical trace.
+remain explicitly `PENDING`. On the supported single-tokenizer HTTP/1.1 uvicorn
+paths, the HTTP process counts real protocol `connection_made`/
+`connection_lost` events and injects cumulative process, generation, created,
+closed, and current totals into reset state; scheduler request counters and
+client fields cannot substitute. Granian HTTP/2 and multiple-tokenizer HTTP-
+process paths fail closed before producing this capability. The receipts are
+not yet durably integrated with terminal and whole-inventory accounting, and
+native warm-up/trace/close receipts are not part of this reset-state slice.
+Live GPU reuse therefore remains blocked and falls back to one clean process
+and HTTP pool per logical trace.
 
 The target schema and CPU coordinator vocabulary define one-node TP2 and
 sticky-replica DP2 identities, inference-sharded TP state, replica-local DP
@@ -269,13 +273,13 @@ Local mocks, historical v2 evidence, or positive arithmetic remain
 attester: caller-authored doctor/attestation JSON is rejected, and no analyzer
 can emit a new `MEASURED` GPU outcome.
 
-For exactness diagnostics, `run-target-reference` can capture a locked
-Target-only greedy reference whose per-prompt outputs are format-tagged hashes
-of complete ordered token-ID trajectories. Legacy collectors require every
-method/block to match that reference; decoded-text agreement or agreement only
-among speculative methods is insufficient. The reference strengthens an
-`UNMEASURED` diagnostic only: it does not make Static/TTS/L0 executable and
-cannot substitute for the absent trusted attester.
+For preliminary exactness diagnostics, `run-preliminary-target-reference` can
+capture a locked Target-only greedy reference whose per-prompt outputs are
+format-tagged hashes of complete ordered token-ID trajectories. Legacy
+collectors require every method/block to match that reference; decoded-text
+agreement or agreement only among speculative methods is insufficient. The
+reference remains `PRELIMINARY_DIAGNOSTIC_ONLY`: it does not make Static/TTS/L0
+formally executable and cannot substitute for industrial authority.
 
 ## Historical preliminary mechanism snapshot
 

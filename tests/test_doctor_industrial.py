@@ -259,6 +259,14 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                     "8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31"
                 ),
             },
+            {
+                "file": (
+                    "0003-feat-session-account-source-owned-http-connections.patch"
+                ),
+                "sha256": (
+                    "fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,

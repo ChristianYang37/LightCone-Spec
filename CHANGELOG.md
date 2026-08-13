@@ -26,11 +26,13 @@ yet been declared.
   begin/reset/finalize hook and a strict host validator. Static retains zero
   detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
   evidence on the supported TP1/DP1 DFlash boundary.
-- Added a partial source-owned all-reset producer with content-bound initial
-  and boundary receipts, mutation-before-reset prevalidation, and exact trace/
-  generation chaining. GPU semantics remain `PENDING`; continuous HTTP
-  accounting is explicitly unavailable rather than synthesized, so live reuse
-  remains blocked.
+- Extended the partial source-owned all-reset producer with real protocol
+  connection create/close events on the supported single-tokenizer HTTP/1.1
+  uvicorn paths, providing conserved, monotonic HTTP process-generation
+  accounting without scheduler counters or caller fields. Granian HTTP/2 and
+  multiple-tokenizer HTTP-process paths fail closed before producing this
+  capability. This remains a reset-state CPU-contract slice; GPU semantics
+  remain `PENDING`, so live GPU reuse remains blocked.
 - Added a CPU-only DSpark native adaptation contract covering adapter-free
   reconstruction with actual sampled predecessors and W1 features, exact
   proposal/teacher distributions, layer-only/hybrid selector invariants,
@@ -48,8 +50,8 @@ yet been declared.
 - Added an opt-in, CPU-only committed-token host-observation contract and
   removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
   latest patch identity is
-  `8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`
-  with final tree `81a86871d01dcf19853612da3d8eb63faa812013`. The formal ITL
+  `fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`
+  with final tree `fabb129063c36e9dde9a0d8b434df2f7a292c06d`. The formal ITL
   producer allowlist remains empty; CPU observations cannot establish p99 ITL.
   The official benchmark reports exact expected/observed/coalesced/missing
   client-interval coverage and emits null aggregate ITL statistics whenever

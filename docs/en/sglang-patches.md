@@ -66,8 +66,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`
-and the final tree is `81a86871d01dcf19853612da3d8eb63faa812013`; the manifest remains the
+`fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`
+and the final tree is `fabb129063c36e9dde9a0d8b434df2f7a292c06d`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -107,10 +107,24 @@ endpoints for capability, initial-state, and reset receipts. It requires a
 drained scheduler and cleared KV/prefix state, restores DFlash adaptation via
 the native cache-reset path, and binds RNG/counters, scheduler/telemetry,
 weights/master/moments/candidate/cohort/update state, allocator/HBM, and the
-completion event. GPU reset semantics remain `PENDING`; CPU-valid receipts do
-not authorize GPU reuse. HTTP connection accounting remains explicitly
-unavailable (`false`/`null`) rather than being synthesized from scheduler
-counters, and every failed transition requires a fresh process.
+completion event. The third patch adds source-owned HTTP accounting at the
+protocol boundary of the supported single-tokenizer HTTP/1.1 uvicorn paths:
+actual `connection_made`/`connection_lost` events produce cumulative process/
+generation/created/closed/current snapshots that the HTTP process injects and
+the producer checks for conservation and monotonic continuity. Granian HTTP/2
+and multiple-tokenizer HTTP-process paths fail closed before producing this
+capability. The accumulator is initialized explicitly at the actual HTTP
+serving-process startup boundary: duplicate initialization in one PID is
+rejected, while a forked child replaces inherited ownership with its own
+generation. Request counters, headers, and caller payloads cannot substitute.
+The initial-state endpoint finalizes exactly once and content-binds its own
+post-capability snapshot; it cannot return a stale provisional snapshot. The
+generic terminal-evidence route rejects all reserved session actions before
+manager dispatch, so only the dedicated HTTP wrappers can inject accounting.
+GPU reset semantics remain `PENDING`; CPU-valid receipts do not authorize GPU
+reuse, and every failed transition requires a fresh process. This patch closes
+only the reset-state accounting slice; native warm-up/trace/close receipts and
+durable whole-session binding remain absent.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
 `UNMEASURED` runnable work. The lower-level DFlash implementation and valid

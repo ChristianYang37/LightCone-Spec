@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: 8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31
-  Expected final tree: 81a86871d01dcf19853612da3d8eb63faa812013
+  Latest semantic patch SHA-256: fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde
+  Expected final tree: fabb129063c36e9dde9a0d8b434df2f7a292c06d
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -24,8 +24,11 @@ HTTP session, and implements the content-bound begin/reset/finalize terminal
 evidence hook for the limited TP1/DP1 DFlash surface. It also adds a
 source-owned all-reset capability/state/receipt producer whose GPU semantics
 remain explicitly PENDING and whose failures require a fresh process. The
-scheduler does not claim HTTP connector accounting: the capability advertises
-that authority as unavailable and emits null rather than fabricated counters.
+third patch counts actual protocol connection create/close events on the
+supported single-tokenizer HTTP/1.1 uvicorn paths, binds cumulative process/
+generation/created/closed/current totals, and rejects scheduler counters,
+headers, or caller-authored substitutes. Granian HTTP/2 and multiple-tokenizer
+HTTP-process paths fail closed before this capability can be produced.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

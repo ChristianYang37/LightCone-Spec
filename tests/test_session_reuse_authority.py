@@ -10,6 +10,7 @@ import pytest
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.orchestration.session_reuse_authority import (
     CONNECTION_ACCOUNTING_BLOCK_REASON,
+    CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE,
     FRESH_PROCESS_FALLBACK_MODE,
     GPU_RESET_SEMANTICS,
     OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE,
@@ -51,11 +52,11 @@ class _FakeSourceRuntime:
         self.session_epoch = 2
         self.reset_generation = 0
         self.clock_generation = 0
+        self.connection_process_id = 29
+        self.connection_generation = 4
         self.connections_created = 1
         self.connections_closed = 0
-        self.submitted_requests = 0
-        self.reused_requests = 0
-        self.abort_requests = 0
+        self.connections_current = 1
         self.last_warmup: dict[str, object] | None = None
         self.last_clock: dict[str, object] | None = None
         self.close_calls = 0
@@ -72,12 +73,11 @@ class _FakeSourceRuntime:
 
     def _accounting(self) -> dict[str, int]:
         return {
-            "generation": 4,
+            "process_id": self.connection_process_id,
+            "generation": self.connection_generation,
             "connections_created": self.connections_created,
             "connections_closed": self.connections_closed,
-            "submitted_requests": self.submitted_requests,
-            "reused_requests": self.reused_requests,
-            "abort_requests": self.abort_requests,
+            "connections_current": self.connections_current,
         }
 
     def _state(self, *, generation: int, clean: bool) -> dict[str, object]:
@@ -188,8 +188,6 @@ class _FakeSourceRuntime:
         return _bind(value, "reset_receipt_sha256")
 
     async def excluded_warmup(self, *, execution_plan_sha256: str) -> object:
-        self.submitted_requests += 1
-        self.reused_requests += 1
         value: dict[str, object] = {
             "schema_version": 1,
             "execution_plan_sha256": execution_plan_sha256,
@@ -221,8 +219,6 @@ class _FakeSourceRuntime:
 
     async def finish_trace(self, *, execution_plan_sha256: str) -> object:
         assert self.last_clock is not None
-        self.submitted_requests += 2
-        self.reused_requests += 2
         value: dict[str, object] = {
             "schema_version": 1,
             "execution_plan_sha256": execution_plan_sha256,
@@ -239,6 +235,7 @@ class _FakeSourceRuntime:
         assert len(capability_sha256) == 64
         self.close_calls += 1
         self.connections_closed = self.connections_created
+        self.connections_current = 0
         value: dict[str, object] = {
             "schema_version": 1,
             "process_identity": self.process_identity,
@@ -272,6 +269,7 @@ def test_complete_source_owned_lifecycle_stays_cpu_only_and_formally_blocked() -
     result = _audit(runtime)
     assert OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE
     assert not OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE
+    assert CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE
     assert result.status == "CPU_CONTRACT_ONLY"
     assert result.reason == SESSION_REUSE_BLOCK_REASON
     assert not result.reuse_authorized
@@ -440,7 +438,6 @@ def test_abort_closes_source_and_never_reuses_the_process() -> None:
 
     def abort(value: dict[str, object]) -> None:
         value["aborted"] = True
-        runtime.abort_requests = 1
         value["connection_accounting"] = runtime._accounting()
 
     runtime.mutate_trace = abort
@@ -462,8 +459,8 @@ def test_connection_accounting_must_be_continuous_and_source_closed() -> None:
     def move_backwards(value: dict[str, object]) -> None:
         accounting = deepcopy(value["connection_accounting"])
         assert isinstance(accounting, dict)
-        accounting["submitted_requests"] = 0
-        accounting["reused_requests"] = 0
+        accounting["connections_created"] = 0
+        accounting["connections_current"] = 0
         value["connection_accounting"] = accounting
 
     runtime.mutate_trace = move_backwards
@@ -471,6 +468,137 @@ def test_connection_accounting_must_be_continuous_and_source_closed() -> None:
     assert result.status == "FRESH_PROCESS_REQUIRED"
     assert "connection accounting moved backwards" in result.reason
     assert runtime.close_calls == 1
+
+
+@pytest.mark.parametrize("mutation", ("missing", "inconsistent"))
+def test_initial_connection_producer_must_be_complete_and_conserved(
+    mutation: str,
+) -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def break_accounting(value: dict[str, object]) -> None:
+        state = value["state"]
+        assert isinstance(state, dict)
+        accounting = deepcopy(state["connection_accounting"])
+        assert isinstance(accounting, dict)
+        if mutation == "missing":
+            accounting.pop("connections_current")
+        else:
+            accounting["connections_current"] = 7
+        state["connection_accounting"] = accounting
+
+    runtime.mutate_initial = break_accounting
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert (
+        "fields are incomplete" in result.reason
+        or "lifecycle totals are inconsistent" in result.reason
+    )
+    assert runtime.force_close_calls == 1
+
+
+def test_reset_cannot_replay_a_snapshot_older_than_finalized_initial_receipt() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def finalize_newer_initial_snapshot(value: dict[str, object]) -> None:
+        state = value["state"]
+        assert isinstance(state, dict)
+        state["connection_accounting"] = {
+            "process_id": runtime.connection_process_id,
+            "generation": runtime.connection_generation,
+            "connections_created": 2,
+            "connections_closed": 1,
+            "connections_current": 1,
+        }
+
+    # The finalized receipt is source-bound to the newer snapshot, while the
+    # fake reset deliberately replays its older private value.  The host must
+    # compare against receipt evidence rather than trusting producer memory.
+    runtime.mutate_initial = finalize_newer_initial_snapshot
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "connection accounting moved backwards" in result.reason
+    assert runtime.close_calls == 1
+
+
+def test_reset_accepts_monotonic_connection_events_observed_during_boundary() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def observe_concurrent_events(after: dict[str, object]) -> None:
+        runtime.connections_created = 2
+        runtime.connections_closed = 1
+        runtime.connections_current = 1
+        after["connection_accounting"] = runtime._accounting()
+
+    runtime.mutate_after = observe_concurrent_events
+    result = _audit(runtime)
+    assert result.status == "CPU_CONTRACT_ONLY"
+    assert result.reason == SESSION_REUSE_BLOCK_REASON
+    assert result.close_receipt_sha256 is not None
+
+
+def test_reset_accepts_zero_current_after_monotonic_connection_close() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def close_observed_connection(after: dict[str, object]) -> None:
+        runtime.connections_closed = 1
+        runtime.connections_current = 0
+        after["connection_accounting"] = runtime._accounting()
+
+    runtime.mutate_after = close_observed_connection
+    result = _audit(runtime)
+    assert result.status == "CPU_CONTRACT_ONLY"
+    assert result.reason == SESSION_REUSE_BLOCK_REASON
+
+
+@pytest.mark.parametrize("field", ("process_id", "generation"))
+def test_connection_process_generation_cannot_change(field: str) -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def replace_identity(after: dict[str, object]) -> None:
+        accounting = deepcopy(after["connection_accounting"])
+        assert isinstance(accounting, dict)
+        accounting[field] += 1
+        after["connection_accounting"] = accounting
+
+    runtime.mutate_after = replace_identity
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "process/generation changed" in result.reason
+
+
+def test_source_close_receipt_cannot_leave_a_conserved_open_connection() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def leave_connection_open(value: dict[str, object]) -> None:
+        accounting = deepcopy(value["connection_accounting"])
+        assert isinstance(accounting, dict)
+        accounting["connections_closed"] = 0
+        accounting["connections_current"] = 1
+        value["connection_accounting"] = accounting
+
+    runtime.mutate_close = leave_connection_open
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "source close left HTTP connections open" in result.reason
 
 
 def test_fault_injection_defaults_to_fresh_process() -> None:

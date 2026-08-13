@@ -156,13 +156,16 @@ publication、performance 与 safety row。signer 不可用时，release verifie
 仓库为相邻且兼容的 trace 定义了 immutable session key 及 reset/finalize receipt 数据
 契约；完整 key 包含 source/capability、RunConfig、model/drafter revision、method/backend、
 topology 与 physical GPU UUID、memory/graph/telemetry 配置、compile-cache identity 和 port。
-固定 SGLang source 现已实现 all-reset capability/state/receipt producer，但其 GPU semantics
-仍为 `PENDING`，并明确声明连续 HTTP connection accounting 不可用；它也缺少 session
-receipt 的 durable terminal binding 与从 launch 到 terminate 的连续 whole-inventory 计费。
+固定 SGLang source 现已实现 all-reset capability/state/receipt producer。在支持的 single-
+tokenizer HTTP/1.1 uvicorn 路径上，它会在真实 transport lifecycle 上绑定累计 HTTP process/
+generation/created/closed/current；Granian HTTP/2 与 multiple-tokenizer HTTP-process 路径会在
+生成该 capability 前 fail closed。其 GPU semantics 仍为 `PENDING`，且仍缺少 session receipt
+的 durable terminal binding 与从 launch 到 terminate 的连续 whole-inventory 计费。这只关闭
+reset-state accounting slice；patch 尚不生成 native warm-up、trace 或 close receipt。
 因此当前 release **不会执行或声明** shared server session；
 所有 shared-session mutation 入口都会在 launch、network、reset
 及 evidence-root 创建之前以
-`shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable` 失败。
+`shared_session_gpu_reset_and_durable_terminal_authority_unavailable` 失败。
 高层 block executor 会先验证全部成员，再为每条 trace 使用独立 clean process、HTTP pool、
 native lifecycle、terminal receipt 与 budget observation；该路径不声明 reuse。当前唯一可
 声明的 Target-only 路径仍是 single-trace execution。

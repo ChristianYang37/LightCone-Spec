@@ -27,9 +27,9 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `81a86871d01dcf19853612da3d8eb63faa812013` | 应用当前 patch series 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `046bde6c6671ce490939515d06d5a38bb92dd3058e010f782e7d22269b2ace85` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `fabb129063c36e9dde9a0d8b434df2f7a292c06d` | 应用当前 patch series 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `6460c61112158aad0e2ec8172d5b6f51e5fea716cf93949755689543462b206a` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
@@ -114,9 +114,13 @@ terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容�
 现已包含 first-party all-reset producer，可生成 source-owned capability、initial-state 与 reset
 receipt，覆盖 drain、KV/prefix、RNG/counter、scheduler/telemetry、adaptation state、allocator/HBM
 和 completion event。其 GPU reset semantics 仍明确为 `PENDING`，receipt 尚未 durable 接入
-terminal 与 whole-inventory accounting。由于 scheduler 不拥有 HTTP connector，
-`continuous_connection_accounting` 明确为 `false`，相应 state field 为 `null`，绝不用本地
-counter 冒充。因此 live reuse 继续阻止并回退到每条 trace 一个 clean process 与 HTTP pool。
+terminal 与 whole-inventory accounting。在支持的 single-tokenizer HTTP/1.1 uvicorn 路径上，
+HTTP process 会在真实 protocol `connection_made`/`connection_lost` lifecycle 上累计 process、
+generation、created、closed、current；scheduler request counter 与 client field 都不能替代。
+Granian HTTP/2 与 multiple-tokenizer HTTP-process 路径会在生成该 capability 前 fail closed。
+故 live GPU reuse 继续阻止；该 patch 只关闭 reset-state accounting slice，尚无 native warm-up/
+trace/close receipt 与 durable terminal/whole-inventory binding；因此回退到每条 trace 一个
+clean process 与 HTTP pool。
 
 目标 schema 与 CPU coordinator vocabulary 定义单节点 TP2、sticky-replica DP2 identity、
 inference-sharded TP state、replica-local DP cohort，以及 all-rank prepare/decision/
@@ -224,11 +228,12 @@ Parquet 输入时，gate 才可能返回 `PASS`。本地 mock、历史 v2 eviden
 `UNMEASURED`。本 release 故意未配置 trusted hardware attester；caller-authored
 doctor/attestation JSON 会被拒绝，任何 analyzer 都不能产生新的 `MEASURED` GPU outcome。
 
-对于 exactness 诊断，`run-target-reference` 可以捕获一份锁定的 Target-only greedy
-reference；每个 prompt 的 output 是完整有序 token-ID 轨迹带格式标识的 hash。Legacy
-collector 要求每种 method 的每个 block 都匹配该 reference；解码文本一致或仅 speculative
-method 彼此一致都不充分。该 reference 只能增强 `UNMEASURED` 诊断：它不会让
-Static/TTS/L0 变得可执行，也不能替代缺失的 trusted attester。
+对于 preliminary exactness 诊断，`run-preliminary-target-reference` 可以捕获一份锁定的
+Target-only greedy reference；每个 prompt 的 output 是完整有序 token-ID 轨迹带格式标识的
+hash。Legacy collector 要求每种 method 的每个 block 都匹配该 reference；解码文本一致或
+仅 speculative method 彼此一致都不充分。该 reference 始终为
+`PRELIMINARY_DIAGNOSTIC_ONLY`：它不能让 Static/TTS/L0 获得 formal execution authority，
+也不能替代 industrial authority。
 
 ## 历史 preliminary 机制 snapshot
 

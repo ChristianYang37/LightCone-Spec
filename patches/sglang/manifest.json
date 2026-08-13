@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "81a86871d01dcf19853612da3d8eb63faa812013",
+  "expected_tree": "fabb129063c36e9dde9a0d8b434df2f7a292c06d",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -64,6 +64,19 @@
         "python/sglang/srt/managers/tokenizer_manager.py",
         "test/registered/unit/benchmark/test_native_token_timestamps.py",
         "test/registered/unit/benchmark/test_serving_output_token_ids.py"
+      ]
+    },
+    {
+      "file": "0003-feat-session-account-source-owned-http-connections.patch",
+      "sha256": "fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde",
+      "files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/entrypoints/source_owned_http_accounting.py",
+        "python/sglang/srt/managers/io_struct.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/speculative/session_reset_evidence.py",
+        "test/registered/unit/spec/test_session_reset_evidence.py",
+        "test/registered/unit/spec/test_source_owned_http_accounting.py"
       ]
     }
   ]

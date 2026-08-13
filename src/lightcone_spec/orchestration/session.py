@@ -6,9 +6,12 @@ unit.  A reset receipt must prove that server state returned to the exact clean
 state attested when the process opened; otherwise the process cannot be reused.
 
 The current release exposes the immutable planning and receipt data contracts
-for audit, but deliberately blocks every live shared-session mutation.  A
-release-owned native boundary, durable session-receipt bundle, and exact
-continuous whole-inventory accounting authority are not yet available.
+for audit and now has source-owned HTTP connection accounting for reset-state
+receipts on the supported single-tokenizer HTTP/1.1 uvicorn paths.  Other HTTP
+server topologies fail closed before producing that capability, and every live
+shared-session mutation remains blocked.  GPU reset semantics, a durable
+session-receipt bundle, and exact continuous whole-inventory authority are not
+yet available.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
 
 SHARED_SESSION_UNAVAILABLE_REASON = (
-    "shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable"
+    "shared_session_gpu_reset_and_durable_terminal_authority_unavailable"
 )
 SHARED_SESSION_FALLBACK_MODE = "fresh_process_per_trace"
 

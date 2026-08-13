@@ -53,8 +53,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`，final tree 为
-`81a86871d01dcf19853612da3d8eb63faa812013`；manifest 仍是 authority。Lifecycle 绑定
+`fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`，final tree 为
+`fabb129063c36e9dde9a0d8b434df2f7a292c06d`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
@@ -86,9 +86,20 @@ TP1/DP1 DFlash TTS/L0 现在会执行 constant、按 published update 的 invers
 `sglang.schema_v3.source_owned_all_reset_session.v1` producer，以及 capability、initial-state、
 reset admin endpoint。它要求 scheduler 已 drain 且 KV/prefix 已清空，通过 native cache-reset
 路径恢复 DFlash adaptation，并绑定 RNG/counter、scheduler/telemetry、weights/master/moments/
-candidate/cohort/update state、allocator/HBM 与 completion event。GPU reset semantics 仍为
-`PENDING`；CPU-valid receipt 不授权 GPU reuse，任何 transition 失败都要求 fresh process。
-HTTP connection accounting 明确保持不可用（`false`/`null`），不会由 scheduler counter 合成。
+candidate/cohort/update state、allocator/HBM 与 completion event。第三个 patch 在支持的
+single-tokenizer HTTP/1.1 uvicorn protocol boundary 增加 source-owned HTTP accounting：真实
+`connection_made`/`connection_lost` event 产生累计 process/generation/created/closed/current
+snapshot，由 HTTP process 注入，并验证守恒与单调连续性。Granian HTTP/2 与 multiple-
+tokenizer HTTP-process 路径会在生成该 capability 前 fail closed。Accumulator 在实际 HTTP
+serving process 的启动
+boundary 显式初始化：同一 PID 的重复初始化会被拒绝，fork child 则以自己的 generation
+替换继承的 owner。Request counter、header 与 caller payload 均不能替代。
+Initial-state endpoint 只 finalize 一次，并内容绑定它自己的 post-capability snapshot，不能
+返回 provisional stale snapshot；generic terminal-evidence route 会在 manager dispatch 前拒绝
+全部 reserved session action，故只有专用 HTTP wrapper 能注入 accounting。GPU reset semantics
+仍为 `PENDING`；CPU-valid receipt 不授权 GPU reuse，任何
+transition 失败都要求 fresh process。该 patch 只关闭 reset-state accounting slice；native
+warm-up/trace/close receipt 与 durable whole-session binding 仍未实现。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
 底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的

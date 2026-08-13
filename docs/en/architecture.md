@@ -199,14 +199,18 @@ contracts for compatible adjacent traces. The complete key includes
 source/capability, run configuration, model/drafter revisions, method/backend,
 topology and physical GPU UUIDs, memory/graph/telemetry configuration,
 compile-cache identity, and ports. The pinned SGLang source now implements the
-all-reset capability/state/receipt producer, but its GPU semantics remain
-`PENDING`; it explicitly advertises continuous HTTP connection accounting as
-unavailable and lacks durable terminal binding and continuous whole-inventory
-accounting from launch through termination. This release therefore does
-**not** execute or claim a shared server session. Every shared-session
+all-reset capability/state/receipt producer. On the supported single-tokenizer
+HTTP/1.1 uvicorn paths, it now binds cumulative HTTP process/generation/
+created/closed/current totals measured at the real transport lifecycle;
+Granian HTTP/2 and multiple-tokenizer HTTP-process paths fail closed before
+producing that capability. Its GPU semantics remain `PENDING`, and durable
+terminal plus continuous whole-inventory accounting from launch through
+termination are absent. This is a reset-state accounting slice only; the patch
+does not produce native warm-up, trace, or close receipts. This release
+therefore does **not** execute or claim a shared server session. Every shared-session
 mutation entry point therefore fails before launch, network access, reset, or
 evidence-root creation with
-`shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable`.
+`shared_session_gpu_reset_and_durable_terminal_authority_unavailable`.
 The high-level block executor handles this state by validating all members and
 then using one clean process, HTTP pool, native lifecycle, terminal receipt, and
 budget observation per trace. It does not claim reuse. Single-trace execution

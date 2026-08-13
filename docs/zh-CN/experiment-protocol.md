@@ -226,10 +226,14 @@ policy digest。
 固定 source 现在会生成 content-bound all-reset capability、initial-state 与 boundary receipt。
 该 receipt 在 CPU contract boundary 证明已注册的 drain、KV/prefix、RNG/counter、scheduler/
 telemetry、adaptation state、allocator/HBM 与 completion-event predicate。其 GPU reset
-semantics 仍为 `PENDING`。连续 HTTP connection accounting 明确不可用（capability 为
-`false`、state 为 `null`），因此这不是完整 CPU session contract。receipt 尚未 durable
-绑定进 terminal envelope，连续 launch-to-terminate inventory accounting 也未完成。因此
-所有 live reuse 入口继续阻止，并为每条 trace
+semantics 仍为 `PENDING`。在支持的 single-tokenizer HTTP/1.1 uvicorn 路径上，连续 HTTP
+accounting 来自真实 protocol connection create/close event，并以同一 HTTP process/
+generation、单调且守恒的累计值绑定；request counter 与 client field 不能替代。Granian
+HTTP/2 与 multiple-tokenizer HTTP-process 路径会在生成该 capability 前 fail closed。receipt
+尚未 durable
+绑定进 terminal envelope，连续 launch-to-terminate inventory accounting 也未完成。Source
+patch 只覆盖 reset-state accounting，尚不生成 native warm-up、trace 或 close receipt。因此
+所有 live GPU reuse 入口继续阻止，并为每条 trace
 回退到独立 clean process 与 HTTP pool；该路径不声明 reset 或 startup saving。每个支持的
 single-trace 路径中，submit/abort 共用 official HTTP pool，timeout 绑定 registered request
 deadline 与 abort grace。Immutable

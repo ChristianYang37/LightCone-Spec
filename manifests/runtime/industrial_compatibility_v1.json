@@ -117,8 +117,8 @@
   "release_version": "0.3.0",
   "schema_version": 1,
   "sglang": {
-    "expected_patch_count": 2,
-    "expected_tree": "81a86871d01dcf19853612da3d8eb63faa812013",
+    "expected_patch_count": 3,
+    "expected_tree": "fabb129063c36e9dde9a0d8b434df2f7a292c06d",
     "patches": [
       {
         "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -127,6 +127,10 @@
       {
         "file": "0002-feat-spec-add-cpu-native-token-observations.patch",
         "sha256": "8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31"
+      },
+      {
+        "file": "0003-feat-session-account-source-owned-http-connections.patch",
+        "sha256": "fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde"
       }
     ],
     "repository": "https://github.com/sgl-project/sglang.git",

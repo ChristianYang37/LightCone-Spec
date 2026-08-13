@@ -1,10 +1,12 @@
 """Fail-closed authority for auditing a source-owned shared-session reset.
 
-The pinned server now produces content-bound reset-state receipts, but it does
-not own the HTTP connector lifecycle and the release has not established its
-CUDA/HBM/graph reset semantics on the pinned GPU.  The partial producer is
-therefore non-authorizing.  Missing cross-layer accounting must stay missing;
-local scheduler counters may never impersonate connection-pool evidence.
+The pinned server now produces content-bound reset-state receipts and owns
+continuous HTTP connection accounting at the transport lifecycle on supported
+single-tokenizer HTTP/1.1 uvicorn paths.  Unsupported HTTP server topologies
+fail closed before capability production.  The release has not established
+CUDA/HBM/graph reset semantics on the pinned GPU, so this CPU contract remains
+non-authorizing.  Scheduler/request counters and client headers may never
+impersonate connection-pool evidence.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from lightcone_spec import PINNED_SGLANG_TREE
 SOURCE_OWNED_SESSION_HOOK = "sglang.schema_v3.source_owned_all_reset_session.v1"
 OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE = True
 OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE = False
-CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = False
+CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = True
 GPU_RESET_SEMANTICS = "PENDING"
 SESSION_REUSE_BLOCK_REASON = "native_all_reset_gpu_semantics_pending"
 CONNECTION_ACCOUNTING_BLOCK_REASON = (
@@ -104,12 +106,11 @@ def _validate_bound_sha256(raw: Mapping[str, object], field: str) -> None:
 class ConnectionAccounting:
     """Server-owned cumulative HTTP accounting for one process generation."""
 
+    process_id: int
     generation: int
     connections_created: int
     connections_closed: int
-    submitted_requests: int
-    reused_requests: int
-    abort_requests: int
+    connections_current: int
 
     @classmethod
     def parse(cls, value: object) -> Self:
@@ -122,25 +123,21 @@ class ConnectionAccounting:
                 for name in cls.__dataclass_fields__
             }
         )
-        if result.connections_closed > result.connections_created:
-            raise ValueError("closed connections exceed created connections")
-        if result.reused_requests > result.submitted_requests:
-            raise ValueError("reused requests exceed submitted requests")
-        if result.abort_requests > result.submitted_requests:
-            raise ValueError("abort requests exceed submitted requests")
+        if (
+            result.connections_created - result.connections_closed
+            != result.connections_current
+        ):
+            raise ValueError("connection lifecycle totals are inconsistent")
         return result
 
     def require_continuation(self, prior: ConnectionAccounting) -> None:
-        if self.generation != prior.generation:
+        if self.process_id != prior.process_id or self.generation != prior.generation:
             raise ValueError(
-                "connection-accounting generation changed inside a session"
+                "connection-accounting process/generation changed inside a session"
             )
         for name in (
             "connections_created",
             "connections_closed",
-            "submitted_requests",
-            "reused_requests",
-            "abort_requests",
         ):
             if getattr(self, name) < getattr(prior, name):
                 raise ValueError(f"connection accounting moved backwards: {name}")
@@ -497,11 +494,6 @@ class SourceOwnedResetReceipt:
         result.after.connection_accounting.require_continuation(
             result.before.connection_accounting
         )
-        if (
-            result.after.connection_accounting.connections_closed
-            != result.before.connection_accounting.connections_closed
-        ):
-            raise ValueError("shared HTTP pool closed during a reset boundary")
         return result
 
 
@@ -672,7 +664,10 @@ class SourceOwnedCloseReceipt:
         ):
             raise ValueError("source did not close the exact shared process")
         accounting.require_continuation(prior_accounting)
-        if accounting.connections_closed != accounting.connections_created:
+        if (
+            accounting.connections_current != 0
+            or accounting.connections_closed != accounting.connections_created
+        ):
             raise ValueError("source close left HTTP connections open")
         return result
 

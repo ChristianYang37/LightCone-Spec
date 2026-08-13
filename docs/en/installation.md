@@ -141,9 +141,13 @@ exclusive terminal receipt.
 Build compile caches as verified content-addressed immutable bases and give
 each process a private writable overlay. Do not share a writable cache or move
 a captured CUDA Graph between processes or devices. The immutable session-key
-and boundary-receipt schemas now have a first-party source producer, but its
-GPU semantics remain `PENDING` and continuous HTTP connection accounting is
-explicitly unavailable. Shared-session execution is blocked before
+and boundary-receipt schemas now have a first-party source producer. On the
+supported single-tokenizer HTTP/1.1 uvicorn paths, continuous HTTP accounting
+is measured at the real protocol lifecycle and bound to one process generation;
+Granian HTTP/2 and multiple-tokenizer HTTP-process paths fail closed before
+producing that capability. This covers reset-state accounting only; native
+warm-up/trace/close receipts are absent and GPU semantics remain `PENDING`.
+Shared-session execution is blocked before
 mutation until GPU reset validation, durable session receipt binding, and
 continuous whole-inventory accounting are available. The high-level block
 executor uses a validated clean-process
