@@ -9,6 +9,7 @@ import json
 import math
 import os
 import stat
+import sys
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +39,11 @@ from lightcone_spec.experiments.data import (
 from lightcone_spec.experiments.evidence import (
     GreedyTargetReference,
     evidence_files_sha256,
+)
+from lightcone_spec.experiments.gpu_fleet import (
+    GpuFleetInventory,
+    HostInventoryBinding,
+    assemble_gpu_fleet_inventory,
 )
 from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchPlan,
@@ -213,6 +219,10 @@ from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.orchestration.manifest import (
     PRELIMINARY_DIAGNOSTIC_ONLY,
     PRELIMINARY_SPEED_STUDY_MANIFEST_KIND,
+)
+from lightcone_spec.orchestration.remote_dispatch import (
+    MAX_REQUEST_BYTES,
+    execute_host_local_wave_request,
 )
 from lightcone_spec.sglang_bridge import (
     SGLangHTTPClient,
@@ -628,6 +638,14 @@ def _load_interference_envelope(path: str | Path) -> InterferenceEnvelope:
     if envelope.sha256 != _canonical_sha256(envelope.to_dict()):
         raise ValueError("interference envelope canonical identity mismatch")
     return envelope
+
+
+def _load_gpu_fleet_inventory(path: str | Path) -> GpuFleetInventory:
+    value = _load_bound_json(path)
+    fleet = GpuFleetInventory.from_dict(value)
+    if fleet.sha256 != _canonical_sha256(fleet.to_dict()):
+        raise ValueError("GPU fleet inventory canonical identity mismatch")
+    return fleet
 
 
 def _load_budget_plan(path: str | Path) -> BudgetPlan:
@@ -2531,6 +2549,26 @@ def _parser() -> argparse.ArgumentParser:
     collect_inventory.add_argument("--receipt-output", required=True)
     collect_inventory.add_argument("--output", required=True)
 
+    assemble_fleet = commands.add_parser(
+        "assemble-gpu-fleet-inventory",
+        allow_abbrev=False,
+    )
+    assemble_fleet.add_argument(
+        "--inventory",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help=("repeat once per host with a content-bound single-host GPU inventory"),
+    )
+    assemble_fleet.add_argument(
+        "--interference-envelope",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="repeat in the same host order as --inventory",
+    )
+    assemble_fleet.add_argument("--output", required=True)
+
     build_interference = commands.add_parser("build-interference-envelope")
     build_interference.add_argument("--inventory", required=True)
     build_interference.add_argument("--receipt-output", required=True)
@@ -2592,10 +2630,11 @@ def _parser() -> argparse.ArgumentParser:
     materialize_dispatch.add_argument("--output-directory", required=True)
 
     execute_wave = commands.add_parser("execute-dispatch-wave", allow_abbrev=False)
-    execute_wave.add_argument("--materialization-manifest", required=True)
-    execute_wave.add_argument("--wave-index", type=int, required=True)
+    execute_wave.add_argument("--host-request-stdin", action="store_true")
+    execute_wave.add_argument("--materialization-manifest")
+    execute_wave.add_argument("--wave-index", type=int)
     execute_wave.add_argument("--resume-receipt")
-    execute_wave.add_argument("--receipt-output", required=True)
+    execute_wave.add_argument("--receipt-output")
 
     materialize_budget = commands.add_parser("materialize-industrial-budgets")
     materialize_budget.add_argument("--registry", required=True)
@@ -6570,6 +6609,36 @@ def _collect_gpu_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
+def _assemble_gpu_fleet_inventory(args: argparse.Namespace) -> int:
+    if len(args.inventory) != len(args.interference_envelope):
+        raise ValueError(
+            "fleet assembly requires one --interference-envelope per --inventory"
+        )
+    bindings: list[HostInventoryBinding] = []
+    for inventory_path, envelope_path in zip(
+        args.inventory,
+        args.interference_envelope,
+        strict=True,
+    ):
+        inventory = _load_gpu_inventory(inventory_path)
+        if len(inventory.host_ids) != 1:
+            raise ValueError("fleet host inventory must contain exactly one host")
+        bindings.append(
+            HostInventoryBinding(
+                schema_version=1,
+                host_id=inventory.host_ids[0],
+                inventory=inventory,
+                interference_envelope=_load_interference_envelope(envelope_path),
+            )
+        )
+    fleet = assemble_gpu_fleet_inventory(bindings)
+    _write_json(args.output, fleet.to_dict())
+    if _load_gpu_fleet_inventory(args.output) != fleet:
+        raise RuntimeError("written GPU fleet inventory changed identity")
+    print(fleet.sha256)
+    return 0
+
+
 def _build_interference_envelope(args: argparse.Namespace) -> int:
     inventory = _load_gpu_inventory(args.inventory)
     envelope, receipt = build_serial_interference_envelope(inventory)
@@ -6883,6 +6952,45 @@ def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
 def _execute_dispatch_wave(args: argparse.Namespace) -> int:
     """Run one receipt-bounded wave, or report an immutable prelaunch block."""
 
+    local_arguments = {
+        "--materialization-manifest": args.materialization_manifest,
+        "--wave-index": args.wave_index,
+        "--resume-receipt": args.resume_receipt,
+        "--receipt-output": args.receipt_output,
+    }
+    if args.host_request_stdin:
+        if any(value is not None for value in local_arguments.values()):
+            raise ValueError(
+                "--host-request-stdin is mutually exclusive with host-local "
+                "dispatch arguments"
+            )
+        stdin = getattr(sys.stdin, "buffer", None)
+        stdout = getattr(sys.stdout, "buffer", None)
+        if stdin is None or stdout is None:
+            raise RuntimeError("remote host-wave mode requires binary stdin/stdout")
+        request = stdin.read(MAX_REQUEST_BYTES + 1)
+        if len(request) > MAX_REQUEST_BYTES:
+            return 42
+        try:
+            exit_code, response = asyncio.run(execute_host_local_wave_request(request))
+        except (TypeError, ValueError):
+            return 42
+        stdout.write(response)
+        stdout.flush()
+        return exit_code
+
+    missing = tuple(
+        option
+        for option in (
+            "--materialization-manifest",
+            "--wave-index",
+            "--receipt-output",
+        )
+        if local_arguments[option] is None
+    )
+    if missing:
+        raise ValueError("execute-dispatch-wave requires " + ", ".join(missing))
+
     try:
         receipt = asyncio.run(
             execute_dispatch_wave_bundles(
@@ -7138,6 +7246,8 @@ def main(argv: list[str] | None = None) -> int:
         return _build_industrial_registry(args)
     if args.command == "collect-gpu-inventory":
         return _collect_gpu_inventory(args)
+    if args.command == "assemble-gpu-fleet-inventory":
+        return _assemble_gpu_fleet_inventory(args)
     if args.command == "build-interference-envelope":
         return _build_interference_envelope(args)
     if args.command == "materialize-interference-calibration-bootstrap":

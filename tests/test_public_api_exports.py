@@ -5,6 +5,7 @@ from types import ModuleType
 from lightcone_spec import experiments, orchestration
 from lightcone_spec.experiments import (
     completion_authority,
+    gpu_fleet,
     gpu_pool,
     industrial_analysis,
     long_context_analysis,
@@ -16,6 +17,7 @@ from lightcone_spec.orchestration import (
     executor,
     industrial,
     native_terminal,
+    remote_dispatch,
     session,
 )
 
@@ -42,6 +44,13 @@ def test_experiment_public_api_exports_industrial_planning_and_pool() -> None:
             "BudgetGroupTotal": planning.BudgetGroupTotal,
             "DispatchExecutionState": gpu_pool.DispatchExecutionState,
             "GpuPoolScheduler": gpu_pool.GpuPoolScheduler,
+            "GpuFleetInventory": gpu_fleet.GpuFleetInventory,
+            "GpuFleetScheduler": gpu_fleet.GpuFleetScheduler,
+            "GpuFleetDispatchPlan": gpu_fleet.GpuFleetDispatchPlan,
+            "HostInventoryBinding": gpu_fleet.HostInventoryBinding,
+            "HostExecutionBinding": gpu_fleet.HostExecutionBinding,
+            "FleetWaveReceipt": gpu_fleet.FleetWaveReceipt,
+            "assemble_gpu_fleet_inventory": (gpu_fleet.assemble_gpu_fleet_inventory),
             "reduce_confirmation_family_power": (
                 industrial_analysis.reduce_confirmation_family_power
             ),
@@ -79,6 +88,10 @@ def test_orchestration_public_api_exports_assignment_and_native_hook() -> None:
             executor.IndustrialExecutionTerminalBinding
         ),
         "IndustrialServerBlockResult": session.IndustrialServerBlockResult,
+        "RemoteFleetWaveReceipt": remote_dispatch.RemoteFleetWaveReceipt,
+        "RemoteHostExecutionBinding": (remote_dispatch.RemoteHostExecutionBinding),
+        "RemoteHostWaveRequest": remote_dispatch.RemoteHostWaveRequest,
+        "SshHostRoute": remote_dispatch.SshHostRoute,
         "NativeTerminalAttestation": native_terminal.NativeTerminalAttestation,
         "NativeTerminalBeginReceipt": native_terminal.NativeTerminalBeginReceipt,
         "NativeTerminalCapability": native_terminal.NativeTerminalCapability,
@@ -96,6 +109,11 @@ def test_orchestration_public_api_exports_assignment_and_native_hook() -> None:
         "execute_industrial_server_session": (
             session.execute_industrial_server_session
         ),
+        "execute_fleet_wave": remote_dispatch.execute_fleet_wave,
+        "execute_host_local_wave_request": (
+            remote_dispatch.execute_host_local_wave_request
+        ),
+        "execute_remote_host_wave": remote_dispatch.execute_remote_host_wave,
         "render_assigned_industrial_cell_runtime_plan": (
             industrial.render_assigned_industrial_cell_runtime_plan
         ),
