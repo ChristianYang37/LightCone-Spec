@@ -26,13 +26,14 @@ yet been declared.
   begin/reset/finalize hook and a strict host validator. Static retains zero
   detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
   evidence on the supported TP1/DP1 DFlash boundary.
-- Extended the partial source-owned all-reset producer with real protocol
-  connection create/close events on the supported single-tokenizer HTTP/1.1
-  uvicorn paths, providing conserved, monotonic HTTP process-generation
-  accounting without scheduler counters or caller fields. Granian HTTP/2 and
-  multiple-tokenizer HTTP-process paths fail closed before producing this
-  capability. This remains a reset-state CPU-contract slice; GPU semantics
-  remain `PENDING`, so live GPU reuse remains blocked.
+- Extended the source-owned all-reset producer with real protocol connection
+  create/close events on the supported single-tokenizer HTTP/1.1 uvicorn paths,
+  then bound its ordered resets to the native terminal begin/reset/finalize
+  lifecycle, excluded warm-up, independent scored clocks, and one complete
+  terminal digest chain. The close receipt truthfully marks transport close as
+  pending while its own HTTP response is in flight. Granian HTTP/2 and multiple-
+  tokenizer HTTP-process paths fail closed before producing this capability.
+  GPU reset semantics and durable live-process reuse remain `PENDING`/`BLOCKED`.
 - Added a CPU-only DSpark native adaptation contract covering adapter-free
   reconstruction with actual sampled predecessors and W1 features, exact
   proposal/teacher distributions, layer-only/hybrid selector invariants,
@@ -50,8 +51,8 @@ yet been declared.
 - Added an opt-in, CPU-only committed-token host-observation contract and
   removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
   latest patch identity is
-  `fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`
-  with final tree `fabb129063c36e9dde9a0d8b434df2f7a292c06d`. The formal ITL
+  `d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`
+  with final tree `c6accb514b9d10ee95e704e69aa11e058adbe77a`. The formal ITL
   producer allowlist remains empty; CPU observations cannot establish p99 ITL.
   The official benchmark reports exact expected/observed/coalesced/missing
   client-interval coverage and emits null aggregate ITL statistics whenever

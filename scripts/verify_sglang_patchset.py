@@ -155,6 +155,10 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         '"session_initial_state"',
         '"session_reset_prepare"',
         '"session_reset_finalize"',
+        '"session_trace_begin"',
+        '"session_trace_ready"',
+        '"session_trace_finalized"',
+        '"session_close_terminal"',
         'GPU_RESET_SEMANTICS = "PENDING"',
         "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = True",
         "class SourceOwnedAllResetSessionProducer",
@@ -169,6 +173,18 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         "def prepare_reset(",
         "def finalize_reset(",
         "def reset_receipt(",
+        "def bind_terminal_begin(",
+        "def bind_terminal_reset(",
+        "def bind_terminal_finalize(",
+        "def close_terminal(",
+        '"execution_plan_sha256s"',
+        '"native_reset_sha256"',
+        '"terminal_receipt_sha256"',
+        "source_reset_receipt_sha256 = self.last_reset_receipt_sha256",
+        "self.last_reset_receipt_sha256 = None",
+        'raise RuntimeError("prior registered trace lifecycle is incomplete")',
+        '"lifecycle_closed": True',
+        '"transport_close_pending": True',
         '"initial_state_receipt_sha256"',
         '"reset request breaks the source-owned trace chain"',
         '"pre-reset generation breaks the source-owned chain"',
@@ -196,9 +212,15 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         'recv_req.action == "session_initial_state"',
         'recv_req.action == "session_reset_prepare"',
         'recv_req.action == "session_reset_finalize"',
+        'recv_req.action == "session_trace_begin"',
+        'recv_req.action == "session_trace_ready"',
+        'recv_req.action == "session_trace_finalized"',
+        'recv_req.action == "session_close_terminal"',
         "prior_plan, next_plan = (",
         "before = self.source_owned_session_reset.validate_before_state(",
         '"connection_accounting": connection_accounting',
+        'native_reset_sha256=lifecycle.reset_receipt["reset_sha256"]',
+        "terminal_receipt_sha256=self._session_last_terminal[",
         'f"fresh_process_required:',
     )
     if any(symbol not in scheduler for symbol in required_scheduler_symbols):
@@ -212,6 +234,16 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         raise SystemExit("native reset mutates state before structural prevalidation")
     if "_session_reset_request_count" in scheduler:
         raise SystemExit("scheduler counters impersonate HTTP connection accounting")
+    close_branch = reset_source.split("    def close_terminal(", maxsplit=1)[1].split(
+        "\n\n\n__all__", maxsplit=1
+    )[0]
+    if (
+        '"lifecycle_closed": True' not in close_branch
+        or '"transport_close_pending": True' not in close_branch
+        or '"connections_current": 0' in close_branch
+        or 'accounting["connections_current"] < 1' not in close_branch
+    ):
+        raise SystemExit("session close receipt fabricates transport termination")
 
     dflash = (checkout / "python/sglang/srt/speculative/dflash_worker_v2.py").read_text(
         encoding="utf-8"
@@ -270,9 +302,29 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
         '"/v1/lightcone-spec/session-reset/capability"',
         '"/v1/lightcone-spec/session-reset/initial-state"',
         '"/v1/lightcone-spec/session-reset"',
+        '"/v1/lightcone-spec/session-reset/trace/begin"',
+        '"/v1/lightcone-spec/session-reset/trace/reset"',
+        '"/v1/lightcone-spec/session-reset/trace/finalize"',
+        '"/v1/lightcone-spec/session-reset/close-terminal"',
     ):
         if endpoint not in server:
             raise SystemExit("source-owned session reset endpoint is missing")
+    trace_helper = server.split(
+        "async def _source_owned_session_trace_transition(", maxsplit=1
+    )[1].split('@app.post("/v1/lightcone-spec/session-reset/trace/begin")', maxsplit=1)[
+        0
+    ]
+    terminal_dispatch = "await _send_terminal_speculative_evidence_transition("
+    source_bridge = "await _source_owned_session_transition("
+    if (
+        terminal_dispatch not in trace_helper
+        or source_bridge not in trace_helper
+        or trace_helper.index(terminal_dispatch) > trace_helper.index(source_bridge)
+        or 'payload={"capability_sha256": obj["capability_sha256"]}' not in trace_helper
+        or "terminal_sha256" in trace_helper
+        or "reset_sha256" in trace_helper
+    ):
+        raise SystemExit("HTTP trace bridge accepts caller-authored native evidence")
     setup = server.split("def _setup_and_run_http_server(", maxsplit=1)[1].split(
         "def _start_native_grpc_server_for_runtime(", maxsplit=1
     )[0]
@@ -455,6 +507,7 @@ def main() -> int:
                 "-q",
                 "test/registered/unit/spec/test_session_reset_evidence.py",
                 "test/registered/unit/spec/test_source_owned_http_accounting.py",
+                "test/registered/unit/spec/test_terminal_speculative_evidence.py",
             ],
             cwd=checkout,
             env=env,
@@ -471,7 +524,6 @@ def main() -> int:
                     "test/registered/unit/benchmark/test_native_token_timestamps.py",
                     "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
                     "test/registered/unit/spec/test_online_adaptation_protocol.py",
-                    "test/registered/unit/spec/test_terminal_speculative_evidence.py",
                 ],
                 cwd=checkout,
                 env=env,

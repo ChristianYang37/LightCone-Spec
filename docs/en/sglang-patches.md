@@ -66,8 +66,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`
-and the final tree is `fabb129063c36e9dde9a0d8b434df2f7a292c06d`; the manifest remains the
+`d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`
+and the final tree is `c6accb514b9d10ee95e704e69aa11e058adbe77a`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -123,8 +123,15 @@ generic terminal-evidence route rejects all reserved session actions before
 manager dispatch, so only the dedicated HTTP wrappers can inject accounting.
 GPU reset semantics remain `PENDING`; CPU-valid receipts do not authorize GPU
 reuse, and every failed transition requires a fresh process. This patch closes
-only the reset-state accounting slice; native warm-up/trace/close receipts and
-durable whole-session binding remain absent.
+the reset-state accounting slice. The fourth patch registers the exact ordered
+trace members, binds each reset to the existing native terminal begin/reset/
+finalize lifecycle, derives excluded-warm-up and independent scored-clock
+receipts from scheduler-owned state, and seals the complete native digest chain
+with a lifecycle-terminal receipt. The close receipt explicitly reports
+`transport_close_pending=true`: the HTTP response that carries it cannot
+truthfully have observed its own `connection_lost` yet. The caller must still
+close the pool and terminate the process. Durable live-process reuse, formal
+GPU reset semantics, and GPU validation remain absent and `BLOCKED`.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
 `UNMEASURED` runnable work. The lower-level DFlash implementation and valid

@@ -1,3 +1,4 @@
 0001-feat-spec-add-schema-v3-native-online-adaptation.patch
 0002-feat-spec-add-cpu-native-token-observations.patch
 0003-feat-session-account-source-owned-http-connections.patch
+0004-feat-session-bind-native-trace-lifecycle.patch

@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde
-  Expected final tree: fabb129063c36e9dde9a0d8b434df2f7a292c06d
+  Latest semantic patch SHA-256: d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e
+  Expected final tree: c6accb514b9d10ee95e704e69aa11e058adbe77a
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -29,6 +29,13 @@ supported single-tokenizer HTTP/1.1 uvicorn paths, binds cumulative process/
 generation/created/closed/current totals, and rejects scheduler counters,
 headers, or caller-authored substitutes. Granian HTTP/2 and multiple-tokenizer
 HTTP-process paths fail closed before this capability can be produced.
+The fourth patch binds each ordered reset to the existing native terminal
+begin/reset/finalize lifecycle, mints excluded-warm-up and independent scored-
+clock receipts from scheduler-owned monotonic state, and seals the complete
+native digest chain with a lifecycle-terminal receipt. That receipt truthfully
+marks transport close as pending because its own HTTP response connection has
+not yet emitted `connection_lost`. GPU reset semantics and live reuse remain
+explicitly PENDING/BLOCKED.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

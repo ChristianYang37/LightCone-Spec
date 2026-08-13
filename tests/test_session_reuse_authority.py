@@ -62,6 +62,11 @@ class _FakeSourceRuntime:
         self.close_calls = 0
         self.force_close_calls = 0
         self.initial_receipt_sha256: str | None = None
+        self.reset_receipt_sha256s: list[str] = []
+        self.warmup_receipt_sha256s: list[str] = []
+        self.clock_receipt_sha256s: list[str] = []
+        self.trace_receipt_sha256s: list[str] = []
+        self.terminal_receipt_sha256s: list[str] = []
         self.mutate_capability = None
         self.mutate_initial = None
         self.mutate_reset = None
@@ -118,14 +123,21 @@ class _FakeSourceRuntime:
             "connection_accounting": self._accounting(),
         }
 
-    async def capability(self, *, session_plan_sha256: str) -> object:
+    async def capability(
+        self,
+        *,
+        session_plan_sha256: str,
+        execution_plan_sha256s: tuple[str, ...],
+    ) -> object:
         assert session_plan_sha256 == self.session_plan_sha256
+        assert execution_plan_sha256s == self.traces
         value: dict[str, object] = {
             "schema_version": 1,
             "hook": SOURCE_OWNED_SESSION_HOOK,
             "producer": "native_server",
             "patched_sglang_tree": PINNED_SGLANG_TREE,
             "session_plan_sha256": self.session_plan_sha256,
+            "execution_plan_sha256s": list(self.traces),
             "process_identity": self.process_identity,
             "process_started_ns": 100,
             "session_epoch": self.session_epoch,
@@ -185,7 +197,9 @@ class _FakeSourceRuntime:
         }
         if self.mutate_reset is not None:
             self.mutate_reset(value)
-        return _bind(value, "reset_receipt_sha256")
+        receipt = _bind(value, "reset_receipt_sha256")
+        self.reset_receipt_sha256s.append(receipt["reset_receipt_sha256"])  # type: ignore[arg-type]
+        return receipt
 
     async def excluded_warmup(self, *, execution_plan_sha256: str) -> object:
         value: dict[str, object] = {
@@ -200,6 +214,9 @@ class _FakeSourceRuntime:
         if self.mutate_warmup is not None:
             self.mutate_warmup(value)
         self.last_warmup = _bind(value, "warmup_receipt_sha256")
+        self.warmup_receipt_sha256s.append(
+            self.last_warmup["warmup_receipt_sha256"]  # type: ignore[arg-type]
+        )
         return self.last_warmup
 
     async def start_scored_clock(self, *, execution_plan_sha256: str) -> object:
@@ -211,35 +228,69 @@ class _FakeSourceRuntime:
             "warmup_receipt_sha256": self.last_warmup["warmup_receipt_sha256"],
             "clock_generation": self.clock_generation,
             "scored_started_ns": self.last_warmup["completed_ns"],
+            "native_reset_sha256": _sha(f"native-reset-{execution_plan_sha256}"),
         }
         if self.mutate_clock is not None:
             self.mutate_clock(value)
         self.last_clock = _bind(value, "clock_receipt_sha256")
+        self.clock_receipt_sha256s.append(
+            self.last_clock["clock_receipt_sha256"]  # type: ignore[arg-type]
+        )
         return self.last_clock
 
     async def finish_trace(self, *, execution_plan_sha256: str) -> object:
         assert self.last_clock is not None
+        terminal_receipt_sha256 = _sha(f"terminal-{execution_plan_sha256}")
         value: dict[str, object] = {
             "schema_version": 1,
             "execution_plan_sha256": execution_plan_sha256,
             "clock_receipt_sha256": self.last_clock["clock_receipt_sha256"],
-            "terminal_receipt_sha256": _sha(f"terminal-{execution_plan_sha256}"),
+            "terminal_receipt_sha256": terminal_receipt_sha256,
             "aborted": False,
             "connection_accounting": self._accounting(),
         }
         if self.mutate_trace is not None:
             self.mutate_trace(value)
-        return _bind(value, "trace_receipt_sha256")
+        receipt = _bind(value, "trace_receipt_sha256")
+        self.trace_receipt_sha256s.append(receipt["trace_receipt_sha256"])  # type: ignore[arg-type]
+        self.terminal_receipt_sha256s.append(terminal_receipt_sha256)
+        return receipt
 
     async def close(self, *, capability_sha256: str) -> object:
         assert len(capability_sha256) == 64
         self.close_calls += 1
-        self.connections_closed = self.connections_created
-        self.connections_current = 0
         value: dict[str, object] = {
             "schema_version": 1,
+            "hook": SOURCE_OWNED_SESSION_HOOK,
+            "capability_sha256": capability_sha256,
+            "initial_state_receipt_sha256": self.initial_receipt_sha256,
+            "session_plan_sha256": self.session_plan_sha256,
             "process_identity": self.process_identity,
-            "closed": True,
+            "session_epoch": self.session_epoch,
+            "execution_plan_sha256s": list(self.traces),
+            "trace_chain": [
+                {
+                    "execution_plan_sha256": execution_plan_sha256,
+                    "reset_receipt_sha256": self.reset_receipt_sha256s[index],
+                    "warmup_receipt_sha256": self.warmup_receipt_sha256s[index],
+                    "clock_receipt_sha256": self.clock_receipt_sha256s[index],
+                    "trace_receipt_sha256": self.trace_receipt_sha256s[index],
+                    "terminal_receipt_sha256": self.terminal_receipt_sha256s[index],
+                }
+                for index, execution_plan_sha256 in enumerate(
+                    self.traces[
+                        : min(
+                            len(self.reset_receipt_sha256s),
+                            len(self.warmup_receipt_sha256s),
+                            len(self.clock_receipt_sha256s),
+                            len(self.trace_receipt_sha256s),
+                            len(self.terminal_receipt_sha256s),
+                        )
+                    ]
+                )
+            ],
+            "lifecycle_closed": True,
+            "transport_close_pending": True,
             "connection_accounting": self._accounting(),
         }
         if self.mutate_close is not None:
@@ -268,7 +319,7 @@ def test_complete_source_owned_lifecycle_stays_cpu_only_and_formally_blocked() -
     )
     result = _audit(runtime)
     assert OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE
-    assert not OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE
+    assert OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE
     assert CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE
     assert result.status == "CPU_CONTRACT_ONLY"
     assert result.reason == SESSION_REUSE_BLOCK_REASON
@@ -349,6 +400,29 @@ def test_boolean_schema_versions_are_rejected(mutation: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    ("initial_epoch", "reset_epoch", "reset_state_epoch", "clock_generation"),
+)
+def test_boolean_epoch_and_generation_fields_are_rejected(mutation: str) -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    runtime.session_epoch = 1
+    if mutation == "initial_epoch":
+        runtime.mutate_initial = lambda value: value.__setitem__("session_epoch", True)
+    elif mutation == "reset_epoch":
+        runtime.mutate_reset = lambda value: value.__setitem__("session_epoch", True)
+    elif mutation == "reset_state_epoch":
+        runtime.mutate_after = lambda value: value.__setitem__("session_epoch", True)
+    else:
+        runtime.mutate_clock = lambda value: value.__setitem__("clock_generation", True)
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "non-negative integer" in result.reason
+
+
+@pytest.mark.parametrize(
     ("field", "value", "message"),
     (
         ("active_requests", 1, "drain all live"),
@@ -374,8 +448,10 @@ def test_incomplete_native_reset_closes_and_requires_fresh_process(
     result = _audit(runtime)
     assert result.status == "FRESH_PROCESS_REQUIRED"
     assert message in result.reason
-    assert result.close_receipt_sha256 is not None
+    assert "shared_session_close_failed" in result.reason
+    assert result.close_receipt_sha256 is None
     assert runtime.close_calls == 1
+    assert runtime.force_close_calls == 1
 
 
 def test_reset_generation_cannot_skip_the_source_owned_chain() -> None:
@@ -413,6 +489,43 @@ def test_client_style_or_incomplete_capability_cannot_unlock_native_reuse() -> N
     assert not result.reuse_authorized
 
 
+@pytest.mark.parametrize("mutation", ("reverse", "replace", "short"))
+def test_capability_cannot_change_the_ordered_execution_plan_authority(
+    mutation: str,
+) -> None:
+    first, second = _sha("trace-1"), _sha("trace-2")
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(first, second),
+    )
+
+    def change_members(value: dict[str, object]) -> None:
+        if mutation == "reverse":
+            value["execution_plan_sha256s"] = [second, first]
+        elif mutation == "replace":
+            value["execution_plan_sha256s"] = [first, _sha("foreign")]
+        else:
+            value["execution_plan_sha256s"] = [first]
+
+    runtime.mutate_capability = change_members
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "ordered trace authority" in result.reason
+    assert runtime.force_close_calls == 1
+
+
+def test_duplicate_execution_plan_replay_is_rejected_before_runtime_contact() -> None:
+    trace = _sha("trace")
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(trace, trace),
+    )
+    with pytest.raises(ValueError, match="unique ordered logical traces"):
+        _audit(runtime)
+    assert runtime.close_calls == 0
+    assert runtime.force_close_calls == 0
+
+
 @pytest.mark.parametrize("mutation", ("warmup", "clock"))
 def test_every_trace_requires_excluded_warmup_then_new_scored_clock(
     mutation: str,
@@ -441,16 +554,17 @@ def test_abort_closes_source_and_never_reuses_the_process() -> None:
         value["connection_accounting"] = runtime._accounting()
 
     runtime.mutate_trace = abort
-    runtime.mutate_close = lambda value: value.__setitem__("closed", False)
+    runtime.mutate_close = lambda value: value.__setitem__("lifecycle_closed", False)
     result = _audit(runtime)
     assert result.status == "FRESH_PROCESS_REQUIRED"
     assert "source_trace_aborted" in result.reason
     assert "shared_session_close_failed" in result.reason
     assert len(result.trace_receipt_sha256s) == 1
     assert runtime.close_calls == 1
+    assert runtime.force_close_calls == 1
 
 
-def test_connection_accounting_must_be_continuous_and_source_closed() -> None:
+def test_connection_accounting_must_be_continuous_through_terminal_receipt() -> None:
     runtime = _FakeSourceRuntime(
         session_plan_sha256=_sha("session-plan"),
         traces=(_sha("trace-1"),),
@@ -557,7 +671,13 @@ def test_reset_accepts_zero_current_after_monotonic_connection_close() -> None:
         runtime.connections_current = 0
         after["connection_accounting"] = runtime._accounting()
 
+    def observe_close_request(value: dict[str, object]) -> None:
+        runtime.connections_created = 2
+        runtime.connections_current = 1
+        value["connection_accounting"] = runtime._accounting()
+
     runtime.mutate_after = close_observed_connection
+    runtime.mutate_close = observe_close_request
     result = _audit(runtime)
     assert result.status == "CPU_CONTRACT_ONLY"
     assert result.reason == SESSION_REUSE_BLOCK_REASON
@@ -582,23 +702,89 @@ def test_connection_process_generation_cannot_change(field: str) -> None:
     assert "process/generation changed" in result.reason
 
 
-def test_source_close_receipt_cannot_leave_a_conserved_open_connection() -> None:
+def test_source_close_receipt_truthfully_leaves_response_transport_pending() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    result = _audit(runtime)
+    assert result.status == "CPU_CONTRACT_ONLY"
+    assert result.close_receipt_sha256 is not None
+    assert runtime.connections_current == 1
+    assert runtime.connections_closed == 0
+
+
+def test_source_close_receipt_must_keep_transport_close_pending() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    runtime.mutate_close = lambda value: value.__setitem__(
+        "transport_close_pending", False
+    )
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "terminally seal" in result.reason
+    assert result.close_receipt_sha256 is None
+    assert runtime.force_close_calls == 1
+
+
+def test_source_close_receipt_cannot_claim_its_response_transport_already_closed() -> (
+    None
+):
     runtime = _FakeSourceRuntime(
         session_plan_sha256=_sha("session-plan"),
         traces=(_sha("trace-1"),),
     )
 
-    def leave_connection_open(value: dict[str, object]) -> None:
+    def close_response_transport(value: dict[str, object]) -> None:
         accounting = deepcopy(value["connection_accounting"])
         assert isinstance(accounting, dict)
-        accounting["connections_closed"] = 0
-        accounting["connections_current"] = 1
+        accounting["connections_closed"] = accounting["connections_created"]
+        accounting["connections_current"] = 0
         value["connection_accounting"] = accounting
 
-    runtime.mutate_close = leave_connection_open
+    runtime.mutate_close = close_response_transport
     result = _audit(runtime)
     assert result.status == "FRESH_PROCESS_REQUIRED"
-    assert "source close left HTTP connections open" in result.reason
+    assert "cannot predate its response transport close" in result.reason
+    assert result.close_receipt_sha256 is None
+    assert runtime.force_close_calls == 1
+
+
+def test_source_close_receipt_rejects_boolean_session_epoch() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    runtime.session_epoch = 1
+    runtime.mutate_close = lambda value: value.__setitem__("session_epoch", True)
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "non-negative integer" in result.reason
+    assert result.close_receipt_sha256 is None
+    assert runtime.force_close_calls == 1
+
+
+def test_source_close_receipt_cannot_rewrite_native_trace_chain() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def rewrite_terminal(value: dict[str, object]) -> None:
+        chain = value["trace_chain"]
+        assert isinstance(chain, list)
+        row = chain[0]
+        assert isinstance(row, dict)
+        row["terminal_receipt_sha256"] = _sha("foreign-terminal")
+
+    runtime.mutate_close = rewrite_terminal
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "differs from native evidence" in result.reason
+    assert result.close_receipt_sha256 is None
+    assert runtime.force_close_calls == 1
 
 
 def test_fault_injection_defaults_to_fresh_process() -> None:

@@ -53,8 +53,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde`，final tree 为
-`fabb129063c36e9dde9a0d8b434df2f7a292c06d`；manifest 仍是 authority。Lifecycle 绑定
+`d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e`，final tree 为
+`c6accb514b9d10ee95e704e69aa11e058adbe77a`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
@@ -98,8 +98,13 @@ Initial-state endpoint 只 finalize 一次，并内容绑定它自己的 post-ca
 返回 provisional stale snapshot；generic terminal-evidence route 会在 manager dispatch 前拒绝
 全部 reserved session action，故只有专用 HTTP wrapper 能注入 accounting。GPU reset semantics
 仍为 `PENDING`；CPU-valid receipt 不授权 GPU reuse，任何
-transition 失败都要求 fresh process。该 patch 只关闭 reset-state accounting slice；native
-warm-up/trace/close receipt 与 durable whole-session binding 仍未实现。
+transition 失败都要求 fresh process。第三个 patch 只关闭 reset-state accounting slice。
+第四个 patch 注册准确的有序 trace member，把每次 reset 与现有
+native terminal begin/reset/finalize lifecycle 绑定，并从 scheduler-owned state 生成排除
+warm-up 与独立 scored-clock receipt，最后用 lifecycle-terminal receipt 封存完整 native digest
+chain。Close receipt 明确写入 `transport_close_pending=true`：携带该 receipt 的 HTTP response
+不可能已经真实观测到自身的 `connection_lost`。Caller 仍须关闭 pool 并终止 process。Durable
+live-process reuse、formal GPU reset semantics 与 GPU validation 仍未实现，并保持 `BLOCKED`。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
 底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的

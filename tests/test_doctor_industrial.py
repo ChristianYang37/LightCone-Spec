@@ -267,6 +267,12 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                     "fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde"
                 ),
             },
+            {
+                "file": ("0004-feat-session-bind-native-trace-lifecycle.patch"),
+                "sha256": (
+                    "d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,

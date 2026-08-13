@@ -1,0 +1,1214 @@
+From 7638eeaa36874b133006e54dcffebed06ace87b5 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 13:29:00 +0800
+Subject: [PATCH] feat(session): bind native trace lifecycle receipts
+
+---
+ python/sglang/srt/entrypoints/http_server.py  |  91 +++++-
+ python/sglang/srt/managers/io_struct.py       |   4 +
+ python/sglang/srt/managers/scheduler.py       | 118 ++++++++
+ .../srt/speculative/session_reset_evidence.py | 288 ++++++++++++++++++++-
+ .../unit/spec/test_session_reset_evidence.py  | 180 ++++++++++++-
+ .../spec/test_source_owned_http_accounting.py |  31 ++
+ .../test_terminal_speculative_evidence.py     | 157 ++++++++++
+ 7 files changed, 863 insertions(+), 6 deletions(-)
+
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 3202d14..a803264 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -835,6 +835,12 @@ async def terminal_speculative_evidence(
+             status_code=422,
+             detail="source-owned session actions require their dedicated endpoint",
+         )
++    return await _send_terminal_speculative_evidence_transition(obj)
++
++
++async def _send_terminal_speculative_evidence_transition(
++    obj: TerminalSpeculativeEvidenceReq,
++) -> Dict[str, Any]:
+     responses = await _global_state.tokenizer_manager.terminal_speculative_evidence(obj)
+     if len(responses) != 1:
+         raise HTTPException(
+@@ -904,8 +910,11 @@ async def _source_owned_session_transition(
+ async def source_owned_session_capability(
+     obj: Annotated[Dict[str, Any], Body()], request: Request
+ ):
+-    if set(obj) != {"session_plan_sha256"}:
+-        raise HTTPException(status_code=422, detail="session plan identity is required")
++    if set(obj) != {"session_plan_sha256", "execution_plan_sha256s"}:
++        raise HTTPException(
++            status_code=422,
++            detail="session plan and ordered trace identities are required",
++        )
+     return await _source_owned_session_transition(
+         action="session_capability", payload=obj
+     )
+@@ -962,6 +971,84 @@ async def source_owned_session_reset(
+     )
+ 
+ 
++async def _source_owned_session_trace_transition(
++    *,
++    action: str,
++    bridge_action: str,
++    obj: Dict[str, Any],
++) -> Dict[str, Any]:
++    if set(obj) != {"capability_sha256", "terminal_payload"} or not isinstance(
++        obj["terminal_payload"], dict
++    ):
++        raise HTTPException(
++            status_code=422,
++            detail="session trace capability/terminal payload is incomplete",
++        )
++    terminal = await _send_terminal_speculative_evidence_transition(
++        TerminalSpeculativeEvidenceReq(
++            action=action,
++            payload=obj["terminal_payload"],
++        )
++    )
++    source = await _source_owned_session_transition(
++        action=bridge_action,
++        payload={"capability_sha256": obj["capability_sha256"]},
++    )
++    return {
++        "schema_version": 1,
++        "terminal": terminal,
++        "source_owned_session": source,
++    }
++
++
++@app.post("/v1/lightcone-spec/session-reset/trace/begin")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_session_trace_begin(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    return await _source_owned_session_trace_transition(
++        action="begin",
++        bridge_action="session_trace_begin",
++        obj=obj,
++    )
++
++
++@app.post("/v1/lightcone-spec/session-reset/trace/reset")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_session_trace_reset(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    return await _source_owned_session_trace_transition(
++        action="reset",
++        bridge_action="session_trace_ready",
++        obj=obj,
++    )
++
++
++@app.post("/v1/lightcone-spec/session-reset/trace/finalize")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_session_trace_finalize(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    return await _source_owned_session_trace_transition(
++        action="finalize",
++        bridge_action="session_trace_finalized",
++        obj=obj,
++    )
++
++
++@app.post("/v1/lightcone-spec/session-reset/close-terminal")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def source_owned_session_close_terminal(
++    obj: Annotated[Dict[str, Any], Body()], request: Request
++):
++    if set(obj) != {"capability_sha256"}:
++        raise HTTPException(status_code=422, detail="capability identity is required")
++    return await _source_owned_session_transition(
++        action="session_close_terminal", payload=obj
++    )
++
++
+ @app.get("/get_load")
+ async def get_load():
+     """Get load metrics (deprecated - use /v1/loads instead).
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 11499a8..4181695 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1896,6 +1896,10 @@ class TerminalSpeculativeEvidenceReq(BaseReq, kw_only=True):
+         "session_initial_state",
+         "session_reset_prepare",
+         "session_reset_finalize",
++        "session_trace_begin",
++        "session_trace_ready",
++        "session_trace_finalized",
++        "session_close_terminal",
+     ]
+     payload: Dict[str, Any]
+ 
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index aa19402..ef68218 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1122,6 +1122,10 @@ class Scheduler(
+         self._session_reset_generation = 0
+         self._source_owned_session_method = None
+         self.source_owned_session_reset = None
++        self._session_warmup_started_ns = None
++        self._session_warmup_completed_ns = None
++        self._session_scored_started_ns = None
++        self._session_last_terminal = None
+         self.terminal_speculative_evidence = None
+         if not self.server_args.speculative_speed_study_metrics:
+             return
+@@ -1742,6 +1746,7 @@ class Scheduler(
+                     if set(payload) != {
+                         "hook",
+                         "session_plan_sha256",
++                        "execution_plan_sha256s",
+                         "connection_accounting",
+                     }:
+                         raise ValueError(
+@@ -1773,6 +1778,7 @@ class Scheduler(
+                     )
+                     result = producer.open(
+                         session_plan_sha256=session_plan_sha256,
++                        execution_plan_sha256s=payload["execution_plan_sha256s"],
+                         initial_state=self._source_owned_session_state(
+                             connection_accounting=connection_accounting
+                         ),
+@@ -1863,6 +1869,111 @@ class Scheduler(
+                         ],
+                         connection_accounting=payload["connection_accounting"],
+                     )
++                elif recv_req.action == "session_trace_begin":
++                    if set(payload) != {
++                        "hook",
++                        "capability_sha256",
++                        "connection_accounting",
++                    }:
++                        raise ValueError(
++                            "source-owned trace-begin fields are incomplete"
++                        )
++                    if (
++                        payload["hook"] != SOURCE_OWNED_SESSION_HOOK
++                        or self.source_owned_session_reset is None
++                        or lifecycle is None
++                        or lifecycle.phase != "WARMUP"
++                        or lifecycle.identity is None
++                        or lifecycle.begin_receipt is None
++                        or self._session_warmup_started_ns is None
++                    ):
++                        raise ValueError("source-owned trace begin is not ready")
++                    result = self.source_owned_session_reset.bind_terminal_begin(
++                        capability_sha256=payload["capability_sha256"],
++                        execution_plan_sha256=(
++                            lifecycle.identity.execution_plan_sha256
++                        ),
++                        run_id=lifecycle.identity.run_id,
++                        begin_sha256=lifecycle.begin_receipt["begin_sha256"],
++                        warmup_request_ids_sha256=lifecycle.begin_receipt[
++                            "warmup_request_ids_sha256"
++                        ],
++                        warmup_started_ns=self._session_warmup_started_ns,
++                    )
++                elif recv_req.action == "session_trace_ready":
++                    if set(payload) != {
++                        "hook",
++                        "capability_sha256",
++                        "connection_accounting",
++                    }:
++                        raise ValueError(
++                            "source-owned trace-ready fields are incomplete"
++                        )
++                    if (
++                        payload["hook"] != SOURCE_OWNED_SESSION_HOOK
++                        or self.source_owned_session_reset is None
++                        or lifecycle is None
++                        or lifecycle.phase != "SCORED"
++                        or lifecycle.identity is None
++                        or lifecycle.reset_receipt is None
++                        or self._session_warmup_completed_ns is None
++                        or self._session_scored_started_ns is None
++                    ):
++                        raise ValueError("source-owned scored trace is not ready")
++                    result = self.source_owned_session_reset.bind_terminal_reset(
++                        capability_sha256=payload["capability_sha256"],
++                        run_id=lifecycle.identity.run_id,
++                        native_reset_sha256=lifecycle.reset_receipt["reset_sha256"],
++                        warmup_completed_ns=self._session_warmup_completed_ns,
++                        scored_started_ns=self._session_scored_started_ns,
++                        connection_accounting=payload["connection_accounting"],
++                    )
++                elif recv_req.action == "session_trace_finalized":
++                    if set(payload) != {
++                        "hook",
++                        "capability_sha256",
++                        "connection_accounting",
++                    }:
++                        raise ValueError(
++                            "source-owned trace-finalize fields are incomplete"
++                        )
++                    if (
++                        payload["hook"] != SOURCE_OWNED_SESSION_HOOK
++                        or self.source_owned_session_reset is None
++                        or lifecycle is None
++                        or lifecycle.phase != "FINALIZED"
++                        or lifecycle.identity is None
++                        or not isinstance(self._session_last_terminal, dict)
++                    ):
++                        raise ValueError("source-owned terminal trace is not ready")
++                    result = self.source_owned_session_reset.bind_terminal_finalize(
++                        capability_sha256=payload["capability_sha256"],
++                        run_id=lifecycle.identity.run_id,
++                        terminal_receipt_sha256=self._session_last_terminal[
++                            "terminal_sha256"
++                        ],
++                        connection_accounting=payload["connection_accounting"],
++                    )
++                elif recv_req.action == "session_close_terminal":
++                    if set(payload) != {
++                        "hook",
++                        "capability_sha256",
++                        "connection_accounting",
++                    }:
++                        raise ValueError(
++                            "source-owned close-terminal fields are incomplete"
++                        )
++                    if (
++                        payload["hook"] != SOURCE_OWNED_SESSION_HOOK
++                        or self.source_owned_session_reset is None
++                        or lifecycle is None
++                        or lifecycle.phase != "FINALIZED"
++                    ):
++                        raise ValueError("source-owned session close is not ready")
++                    result = self.source_owned_session_reset.close_terminal(
++                        capability_sha256=payload["capability_sha256"],
++                        connection_accounting=payload["connection_accounting"],
++                    )
+                 else:
+                     raise ValueError("source-owned session action is unsupported")
+                 return TerminalSpeculativeEvidenceReqOutput(
+@@ -1901,6 +2012,10 @@ class Scheduler(
+                 result = lifecycle.begin(
+                     payload, prior_state=prior_state, reset_state=reset_state
+                 )
++                self._session_warmup_started_ns = time.monotonic_ns()
++                self._session_warmup_completed_ns = None
++                self._session_scored_started_ns = None
++                self._session_last_terminal = None
+             elif recv_req.action == "reset":
+                 if set(payload) != {"hook", "run_id", "begin_sha256"}:
+                     raise ValueError("terminal reset payload fields are incomplete")
+@@ -1910,6 +2025,7 @@ class Scheduler(
+                     or payload["run_id"] != lifecycle.identity.run_id
+                 ):
+                     raise ValueError("terminal reset identity mismatch")
++                self._session_warmup_completed_ns = time.monotonic_ns()
+                 diagnostics = self._terminal_native_diagnostics()
+                 performance = self._terminal_performance_counters(diagnostics)
+                 warmup_state = self._terminal_state_snapshot()
+@@ -1924,6 +2040,7 @@ class Scheduler(
+                     warmup_state=warmup_state,
+                     reset_state=reset_state,
+                 )
++                self._session_scored_started_ns = time.monotonic_ns()
+             elif recv_req.action == "finalize":
+                 if set(payload) != {
+                     "hook",
+@@ -1950,6 +2067,7 @@ class Scheduler(
+                     client_terminal_rows=payload["client_terminal_rows"],
+                     final_state=self._terminal_state_snapshot(),
+                 )
++                self._session_last_terminal = result
+             else:
+                 raise ValueError("terminal evidence action is unsupported")
+             return TerminalSpeculativeEvidenceReqOutput(
+diff --git a/python/sglang/srt/speculative/session_reset_evidence.py b/python/sglang/srt/speculative/session_reset_evidence.py
+index 4710e5f..8c2934b 100644
+--- a/python/sglang/srt/speculative/session_reset_evidence.py
++++ b/python/sglang/srt/speculative/session_reset_evidence.py
+@@ -22,6 +22,10 @@ SOURCE_OWNED_SESSION_ACTIONS = frozenset(
+         "session_initial_state",
+         "session_reset_prepare",
+         "session_reset_finalize",
++        "session_trace_begin",
++        "session_trace_ready",
++        "session_trace_finalized",
++        "session_close_terminal",
+     }
+ )
+ GPU_RESET_SEMANTICS = "PENDING"
+@@ -284,6 +288,7 @@ class SourceOwnedAllResetSessionProducer:
+             raise ValueError("patched SGLang tree must be a git tree")
+         self.patched_sglang_tree = tree
+         self.session_plan_sha256: str | None = None
++        self.execution_plan_sha256s: tuple[str, ...] = ()
+         self.capability_receipt: dict[str, object] | None = None
+         self.initial_state: dict[str, object] | None = None
+         self.initial_clean_state_sha256: str | None = None
+@@ -291,7 +296,12 @@ class SourceOwnedAllResetSessionProducer:
+         self.last_execution_plan_sha256: str | None = None
+         self.last_reset_generation: int | None = None
+         self.last_connection_accounting: dict[str, int] | None = None
++        self.last_reset_receipt_sha256: str | None = None
+         self.pending_reset: dict[str, object] | None = None
++        self.current_trace: dict[str, object] | None = None
++        self.clock_generation = 0
++        self.completed_traces: list[dict[str, object]] = []
++        self.close_terminal_receipt: dict[str, object] | None = None
+         self.failed = False
+ 
+     @staticmethod
+@@ -317,11 +327,23 @@ class SourceOwnedAllResetSessionProducer:
+         ):
+             raise RuntimeError("reset capability mismatch")
++        if self.last_reset_receipt_sha256 is not None or self.current_trace is not None:
++            raise RuntimeError("prior registered trace lifecycle is incomplete")
+         prior = None
+         if prior_execution_plan_sha256 is not None:
+             prior = _sha256(prior_execution_plan_sha256, "prior_execution_plan_sha256")
+         next_plan = _sha256(next_execution_plan_sha256, "next_execution_plan_sha256")
+         if prior != self.last_execution_plan_sha256:
+             raise RuntimeError("reset request breaks the source-owned trace chain")
++        expected_index = (
++            0
++            if self.last_execution_plan_sha256 is None
++            else self.execution_plan_sha256s.index(self.last_execution_plan_sha256) + 1
++        )
++        if (
++            expected_index >= len(self.execution_plan_sha256s)
++            or next_plan != self.execution_plan_sha256s[expected_index]
++        ):
++            raise RuntimeError("reset request names an unregistered next trace")
+         return prior, next_plan
+ 
+     def validate_before_state(self, value: object) -> dict[str, object]:
+@@ -348,12 +370,24 @@ class SourceOwnedAllResetSessionProducer:
+         return state
+ 
+     def open(
+-        self, *, session_plan_sha256: str, initial_state: object
++        self,
++        *,
++        session_plan_sha256: str,
++        execution_plan_sha256s: object,
++        initial_state: object,
+     ) -> dict[str, object]:
+         try:
+             if self.failed or self.capability_receipt is not None:
+                 raise RuntimeError("source-owned session is already opened or failed")
+             plan = self.validate_session_plan_sha256(session_plan_sha256)
++            if not isinstance(execution_plan_sha256s, list):
++                raise ValueError("session members must be one ordered JSON list")
++            members = tuple(
++                _sha256(value, "execution_plan_sha256")
++                for value in execution_plan_sha256s
++            )
++            if not members or len(members) != len(set(members)):
++                raise ValueError("session members must be non-empty and unique")
+             initial = validate_reset_state(
+                 initial_state,
+                 process_identity=self.process_identity,
+@@ -372,6 +406,7 @@ class SourceOwnedAllResetSessionProducer:
+                 "producer": "native_server",
+                 "patched_sglang_tree": self.patched_sglang_tree,
+                 "session_plan_sha256": plan,
++                "execution_plan_sha256s": list(members),
+                 "process_identity": self.process_identity,
+                 "process_started_ns": self.process_started_ns,
+                 "session_epoch": self.session_epoch,
+@@ -386,6 +421,7 @@ class SourceOwnedAllResetSessionProducer:
+             }
+             capability["capability_sha256"] = content_sha256(capability)
+             self.session_plan_sha256 = plan
++            self.execution_plan_sha256s = members
+             self.capability_receipt = capability
+             self.initial_state = initial
+             self.initial_clean_state_sha256 = _clean_state_sha256(initial)
+@@ -574,6 +610,7 @@ class SourceOwnedAllResetSessionProducer:
+             self.last_execution_plan_sha256 = pending["next_execution_plan_sha256"]
+             self.last_reset_generation = int(post["reset_generation"])
+             self.last_connection_accounting = dict(post["connection_accounting"])
++            self.last_reset_receipt_sha256 = receipt["reset_receipt_sha256"]
+             self.pending_reset = None
+             return receipt
+         except Exception:
+@@ -609,6 +646,255 @@ class SourceOwnedAllResetSessionProducer:
+             connection_accounting=after.get("connection_accounting"),
+         )
+ 
++    def bind_terminal_begin(
++        self,
++        *,
++        capability_sha256: str,
++        execution_plan_sha256: str,
++        run_id: str,
++        begin_sha256: str,
++        warmup_request_ids_sha256: str,
++        warmup_started_ns: int,
++    ) -> dict[str, object]:
++        """Bind the existing native terminal begin to the last clean reset."""
++
++        try:
++            if (
++                self.failed
++                or self.capability_receipt is None
++                or self.initial_state_receipt_value is None
++                or self.pending_reset is not None
++                or self.current_trace is not None
++                or self.close_terminal_receipt is not None
++                or self.last_reset_receipt_sha256 is None
++                or capability_sha256 != self.capability_receipt["capability_sha256"]
++            ):
++                raise RuntimeError("terminal begin capability mismatch")
++            plan = _sha256(execution_plan_sha256, "execution_plan_sha256")
++            if plan != self.last_execution_plan_sha256:
++                raise RuntimeError("terminal begin is not bound to the clean reset")
++            if not isinstance(run_id, str) or not run_id or "\n" in run_id:
++                raise ValueError("terminal run ID must be non-empty single-line text")
++            begin = _sha256(begin_sha256, "begin_sha256")
++            warmup = _sha256(warmup_request_ids_sha256, "warmup_request_ids_sha256")
++            started = _integer(warmup_started_ns, "warmup_started_ns")
++            source_reset_receipt_sha256 = self.last_reset_receipt_sha256
++            self.last_reset_receipt_sha256 = None
++            self.current_trace = {
++                "execution_plan_sha256": plan,
++                "run_id": run_id,
++                "begin_sha256": begin,
++                "warmup_request_ids_sha256": warmup,
++                "warmup_started_ns": started,
++                "source_reset_receipt_sha256": source_reset_receipt_sha256,
++            }
++            result = {
++                "schema_version": 1,
++                "hook": SOURCE_OWNED_SESSION_HOOK,
++                "capability_sha256": capability_sha256,
++                "execution_plan_sha256": plan,
++                "begin_sha256": begin,
++            }
++            result["session_begin_sha256"] = content_sha256(result)
++            return result
++        except Exception:
++            self.failed = True
++            raise
++
++    def bind_terminal_reset(
++        self,
++        *,
++        capability_sha256: str,
++        run_id: str,
++        native_reset_sha256: str,
++        warmup_completed_ns: int,
++        scored_started_ns: int,
++        connection_accounting: object,
++    ) -> dict[str, object]:
++        """Mint warm-up and scored-clock receipts from one native reset."""
++
++        try:
++            if (
++                self.failed
++                or self.capability_receipt is None
++                or self.current_trace is None
++                or self.current_trace.get("warmup_receipt") is not None
++                or capability_sha256 != self.capability_receipt["capability_sha256"]
++                or run_id != self.current_trace["run_id"]
++            ):
++                raise RuntimeError("terminal reset capability mismatch")
++            native_reset = _sha256(native_reset_sha256, "native_reset_sha256")
++            completed = _integer(warmup_completed_ns, "warmup_completed_ns")
++            scored = _integer(scored_started_ns, "scored_started_ns")
++            started = int(self.current_trace["warmup_started_ns"])
++            if completed < started or scored < completed:
++                raise RuntimeError("warm-up/scored monotonic interval is invalid")
++            accounting = validate_connection_accounting(connection_accounting)
++            assert self.last_connection_accounting is not None
++            _require_accounting_continuation(
++                accounting, self.last_connection_accounting
++            )
++            plan = str(self.current_trace["execution_plan_sha256"])
++            warmup = {
++                "schema_version": 1,
++                "execution_plan_sha256": plan,
++                # The terminal begin receipt already binds this digest to the
++                # exact ordered warm-up request IDs accepted by the scheduler.
++                "request_pool_sha256": self.current_trace["warmup_request_ids_sha256"],
++                "excluded": True,
++                "started_ns": started,
++                "completed_ns": completed,
++                "connection_accounting": accounting,
++            }
++            warmup["warmup_receipt_sha256"] = content_sha256(warmup)
++            self.clock_generation += 1
++            clock = {
++                "schema_version": 1,
++                "execution_plan_sha256": plan,
++                "warmup_receipt_sha256": warmup["warmup_receipt_sha256"],
++                "clock_generation": self.clock_generation,
++                "scored_started_ns": scored,
++                "native_reset_sha256": native_reset,
++            }
++            clock["clock_receipt_sha256"] = content_sha256(clock)
++            self.current_trace["warmup_receipt"] = warmup
++            self.current_trace["clock_receipt"] = clock
++            self.last_connection_accounting = accounting
++            result = {
++                "schema_version": 1,
++                "hook": SOURCE_OWNED_SESSION_HOOK,
++                "capability_sha256": capability_sha256,
++                "warmup_receipt": warmup,
++                "clock_receipt": clock,
++            }
++            result["trace_ready_sha256"] = content_sha256(result)
++            return result
++        except Exception:
++            self.failed = True
++            raise
++
++    def bind_terminal_finalize(
++        self,
++        *,
++        capability_sha256: str,
++        run_id: str,
++        terminal_receipt_sha256: str,
++        connection_accounting: object,
++    ) -> dict[str, object]:
++        """Bind one native terminal envelope to its independent scored clock."""
++
++        try:
++            if (
++                self.failed
++                or self.capability_receipt is None
++                or self.current_trace is None
++                or self.current_trace.get("warmup_receipt") is None
++                or self.current_trace.get("clock_receipt") is None
++                or capability_sha256 != self.capability_receipt["capability_sha256"]
++                or run_id != self.current_trace["run_id"]
++            ):
++                raise RuntimeError("terminal finalize capability mismatch")
++            terminal = _sha256(terminal_receipt_sha256, "terminal_receipt_sha256")
++            accounting = validate_connection_accounting(connection_accounting)
++            assert self.last_connection_accounting is not None
++            _require_accounting_continuation(
++                accounting, self.last_connection_accounting
++            )
++            warmup = self.current_trace["warmup_receipt"]
++            clock = self.current_trace["clock_receipt"]
++            assert isinstance(warmup, dict) and isinstance(clock, dict)
++            receipt = {
++                "schema_version": 1,
++                "execution_plan_sha256": self.current_trace["execution_plan_sha256"],
++                "clock_receipt_sha256": clock["clock_receipt_sha256"],
++                "terminal_receipt_sha256": terminal,
++                "aborted": False,
++                "connection_accounting": accounting,
++            }
++            receipt["trace_receipt_sha256"] = content_sha256(receipt)
++            self.completed_traces.append(
++                {
++                    "execution_plan_sha256": self.current_trace[
++                        "execution_plan_sha256"
++                    ],
++                    "reset_receipt_sha256": self.current_trace[
++                        "source_reset_receipt_sha256"
++                    ],
++                    "warmup_receipt_sha256": warmup["warmup_receipt_sha256"],
++                    "clock_receipt_sha256": clock["clock_receipt_sha256"],
++                    "trace_receipt_sha256": receipt["trace_receipt_sha256"],
++                    "terminal_receipt_sha256": terminal,
++                }
++            )
++            self.last_connection_accounting = accounting
++            self.current_trace = None
++            return receipt
++        except Exception:
++            self.failed = True
++            raise
++
++    def close_terminal(
++        self,
++        *,
++        capability_sha256: str,
++        connection_accounting: object,
++    ) -> dict[str, object]:
++        """Seal the whole native trace chain before transport/process close.
++
++        The HTTP connection carrying this receipt cannot already have emitted
++        ``connection_lost``.  The receipt therefore states that transport close
++        is pending instead of fabricating a zero-current connection snapshot.
++        The caller must close the pool and terminate this process afterwards.
++        """
++
++        try:
++            if (
++                self.failed
++                or self.capability_receipt is None
++                or self.initial_state_receipt_value is None
++                or self.pending_reset is not None
++                or self.current_trace is not None
++                or not self.completed_traces
++                or self.close_terminal_receipt is not None
++                or capability_sha256 != self.capability_receipt["capability_sha256"]
++            ):
++                raise RuntimeError("session close capability mismatch")
++            accounting = validate_connection_accounting(connection_accounting)
++            assert self.last_connection_accounting is not None
++            _require_accounting_continuation(
++                accounting, self.last_connection_accounting
++            )
++            if accounting["connections_current"] < 1:
++                raise RuntimeError(
++                    "session close response transport is already closed"
++                )
++            plans = [row["execution_plan_sha256"] for row in self.completed_traces]
++            if tuple(plans) != self.execution_plan_sha256s:
++                raise RuntimeError("session close trace chain is incomplete")
++            receipt = {
++                "schema_version": 1,
++                "hook": SOURCE_OWNED_SESSION_HOOK,
++                "capability_sha256": capability_sha256,
++                "initial_state_receipt_sha256": self.initial_state_receipt_value[
++                    "initial_state_receipt_sha256"
++                ],
++                "session_plan_sha256": self.session_plan_sha256,
++                "process_identity": self.process_identity,
++                "session_epoch": self.session_epoch,
++                "execution_plan_sha256s": plans,
++                "trace_chain": [dict(row) for row in self.completed_traces],
++                "lifecycle_closed": True,
++                "transport_close_pending": True,
++                "connection_accounting": accounting,
++            }
++            receipt["close_receipt_sha256"] = content_sha256(receipt)
++            self.close_terminal_receipt = receipt
++            self.last_connection_accounting = accounting
++            return dict(receipt)
++        except Exception:
++            self.failed = True
++            raise
++
+ 
+ __all__ = (
+     "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE",
+diff --git a/test/registered/unit/spec/test_session_reset_evidence.py b/test/registered/unit/spec/test_session_reset_evidence.py
+index 240e6c4..4bc488e 100644
+--- a/test/registered/unit/spec/test_session_reset_evidence.py
++++ b/test/registered/unit/spec/test_session_reset_evidence.py
+@@ -99,6 +99,10 @@ def test_source_owned_session_action_set_is_exact_and_reserved() -> None:
+             "session_initial_state",
+             "session_reset_prepare",
+             "session_reset_finalize",
++            "session_trace_begin",
++            "session_trace_ready",
++            "session_trace_finalized",
++            "session_close_terminal",
+         }
+     )
+ 
+@@ -119,6 +123,7 @@ def test_native_producer_binds_complete_reset_and_keeps_gpu_pending(
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=adapted, clean=True),
+     )
+     assert capability["gpu_reset_semantics"] == GPU_RESET_SEMANTICS
+@@ -126,6 +131,7 @@ def test_native_producer_binds_complete_reset_and_keeps_gpu_pending(
+     assert capability["continuous_connection_accounting"] is True
+     assert capability["reset_state_fields"] == list(RESET_STATE_FIELDS)
+     assert capability["adapted_method"] is adapted
++    assert capability["execution_plan_sha256s"] == [_sha("trace")]
+     initial = producer.initial_state_receipt(
+         capability_sha256=capability["capability_sha256"],
+         connection_accounting=_accounting(),
+@@ -165,7 +171,11 @@ def test_disabled_path_rejects_any_adaptation_allocation() -> None:
+     state = _state(0, adapted=False, clean=True)
+     state["candidate_buffers_sha256"] = _sha("illegal")
+     with pytest.raises(RuntimeError, match="allocated adaptation"):
+-        producer.open(session_plan_sha256=_sha("session"), initial_state=state)
++        producer.open(
++            session_plan_sha256=_sha("session"),
++            execution_plan_sha256s=[_sha("trace")],
++            initial_state=state,
++        )
+ 
+ 
+ def test_incomplete_connection_lifecycle_accounting_fails_closed() -> None:
+@@ -184,7 +194,11 @@ def test_incomplete_connection_lifecycle_accounting_fails_closed() -> None:
+         "connections_closed": 0,
+     }
+     with pytest.raises(ValueError, match="fields are incomplete"):
+-        producer.open(session_plan_sha256=_sha("session"), initial_state=state)
++        producer.open(
++            session_plan_sha256=_sha("session"),
++            execution_plan_sha256s=[_sha("trace")],
++            initial_state=state,
++        )
+ 
+ 
+ def test_connection_process_or_generation_cannot_change_during_session() -> None:
+@@ -197,6 +211,7 @@ def test_connection_process_or_generation_cannot_change_during_session() -> None
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     with pytest.raises(ValueError, match="process/generation changed"):
+@@ -216,6 +231,7 @@ def test_initial_receipt_finalizes_and_freezes_the_second_http_snapshot() -> Non
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     finalized_accounting = _accounting(created=2, closed=1)
+@@ -248,6 +264,7 @@ def test_reset_receipt_binds_distinct_pre_and_post_http_snapshots() -> None:
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     producer.initial_state_receipt(
+@@ -284,6 +301,7 @@ def test_unfinalized_reset_transition_blocks_another_reset() -> None:
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     producer.initial_state_receipt(
+@@ -319,6 +337,7 @@ def test_reset_lineage_can_be_validated_before_native_mutation() -> None:
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     with pytest.raises(ValueError, match="next_execution_plan_sha256"):
+@@ -329,6 +348,158 @@ def test_reset_lineage_can_be_validated_before_native_mutation() -> None:
+         )
+ 
+ 
++def test_reset_rejects_an_out_of_order_registered_trace_before_mutation() -> None:
++    producer = SourceOwnedAllResetSessionProducer(
++        process_identity="scheduler:17",
++        process_started_ns=9,
++        session_epoch=4,
++        method="static",
++        patched_sglang_tree="a" * 40,
++    )
++    first, second = _sha("first"), _sha("second")
++    capability = producer.open(
++        session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[first, second],
++        initial_state=_state(0, adapted=False, clean=True),
++    )
++    with pytest.raises(RuntimeError, match="unregistered next trace"):
++        producer.validate_reset_request(
++            capability_sha256=capability["capability_sha256"],
++            prior_execution_plan_sha256=None,
++            next_execution_plan_sha256=second,
++        )
++
++
++def test_next_reset_rejects_an_unexecuted_prior_trace_before_mutation() -> None:
++    producer = SourceOwnedAllResetSessionProducer(
++        process_identity="scheduler:17",
++        process_started_ns=9,
++        session_epoch=4,
++        method="static",
++        patched_sglang_tree="a" * 40,
++    )
++    first, second = _sha("first"), _sha("second")
++    capability = producer.open(
++        session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[first, second],
++        initial_state=_state(0, adapted=False, clean=True),
++    )
++    producer.initial_state_receipt(
++        capability_sha256=capability["capability_sha256"],
++        connection_accounting=_accounting(),
++    )
++    producer.reset_receipt(
++        capability_sha256=capability["capability_sha256"],
++        prior_execution_plan_sha256=None,
++        next_execution_plan_sha256=first,
++        before=_state(0, adapted=False, clean=False),
++        after=_state(1, adapted=False, clean=True),
++        reset_duration_ns=7,
++    )
++
++    with pytest.raises(RuntimeError, match="prior registered trace lifecycle"):
++        producer.validate_reset_request(
++            capability_sha256=capability["capability_sha256"],
++            prior_execution_plan_sha256=first,
++            next_execution_plan_sha256=second,
++        )
++
++
++def test_close_terminal_cannot_claim_its_response_transport_already_closed() -> None:
++    producer = SourceOwnedAllResetSessionProducer(
++        process_identity="scheduler:17",
++        process_started_ns=9,
++        session_epoch=4,
++        method="static",
++        patched_sglang_tree="a" * 40,
++    )
++    trace = _sha("trace")
++    capability = producer.open(
++        session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[trace],
++        initial_state=_state(0, adapted=False, clean=True),
++    )
++    producer.initial_state_receipt(
++        capability_sha256=capability["capability_sha256"],
++        connection_accounting=_accounting(),
++    )
++    producer.completed_traces.append(
++        {
++            "execution_plan_sha256": trace,
++            "reset_receipt_sha256": _sha("reset"),
++            "warmup_receipt_sha256": _sha("warmup"),
++            "clock_receipt_sha256": _sha("clock"),
++            "trace_receipt_sha256": _sha("trace-receipt"),
++            "terminal_receipt_sha256": _sha("terminal"),
++        }
++    )
++    with pytest.raises(RuntimeError, match="response transport is already closed"):
++        producer.close_terminal(
++            capability_sha256=capability["capability_sha256"],
++            connection_accounting=_accounting(created=1, closed=1),
++        )
++
++
++def test_completed_trace_cannot_replay_the_consumed_reset_receipt() -> None:
++    producer = SourceOwnedAllResetSessionProducer(
++        process_identity="scheduler:17",
++        process_started_ns=9,
++        session_epoch=4,
++        method="static",
++        patched_sglang_tree="a" * 40,
++    )
++    trace = _sha("trace")
++    capability = producer.open(
++        session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[trace],
++        initial_state=_state(0, adapted=False, clean=True),
++    )
++    producer.initial_state_receipt(
++        capability_sha256=capability["capability_sha256"],
++        connection_accounting=_accounting(),
++    )
++    producer.reset_receipt(
++        capability_sha256=capability["capability_sha256"],
++        prior_execution_plan_sha256=None,
++        next_execution_plan_sha256=trace,
++        before=_state(0, adapted=False, clean=False),
++        after=_state(1, adapted=False, clean=True),
++        reset_duration_ns=7,
++    )
++    producer.bind_terminal_begin(
++        capability_sha256=capability["capability_sha256"],
++        execution_plan_sha256=trace,
++        run_id="run-1",
++        begin_sha256=_sha("begin-1"),
++        warmup_request_ids_sha256=_sha("warmup-ids-1"),
++        warmup_started_ns=10,
++    )
++    producer.bind_terminal_reset(
++        capability_sha256=capability["capability_sha256"],
++        run_id="run-1",
++        native_reset_sha256=_sha("native-reset-1"),
++        warmup_completed_ns=20,
++        scored_started_ns=21,
++        connection_accounting=_accounting(),
++    )
++    producer.bind_terminal_finalize(
++        capability_sha256=capability["capability_sha256"],
++        run_id="run-1",
++        terminal_receipt_sha256=_sha("terminal-1"),
++        connection_accounting=_accounting(),
++    )
++
++    with pytest.raises(RuntimeError, match="terminal begin capability mismatch"):
++        producer.bind_terminal_begin(
++            capability_sha256=capability["capability_sha256"],
++            execution_plan_sha256=trace,
++            run_id="run-2",
++            begin_sha256=_sha("begin-2"),
++            warmup_request_ids_sha256=_sha("warmup-ids-2"),
++            warmup_started_ns=30,
++        )
++
++
+ def test_source_owned_trace_and_generation_chain_cannot_be_skipped() -> None:
+     producer = SourceOwnedAllResetSessionProducer(
+         process_identity="scheduler:17",
+@@ -339,6 +510,7 @@ def test_source_owned_trace_and_generation_chain_cannot_be_skipped() -> None:
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("first")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     first_trace = _sha("first")
+@@ -354,7 +526,7 @@ def test_source_owned_trace_and_generation_chain_cannot_be_skipped() -> None:
+         after=_state(1, adapted=False, clean=True),
+         reset_duration_ns=7,
+     )
+-    with pytest.raises(RuntimeError, match="trace chain"):
++    with pytest.raises(RuntimeError, match="trace lifecycle"):
+         producer.validate_reset_request(
+             capability_sha256=capability["capability_sha256"],
+             prior_execution_plan_sha256=None,
+@@ -370,6 +542,7 @@ def test_source_owned_trace_and_generation_chain_cannot_be_skipped() -> None:
+     )
+     fresh.open(
+         session_plan_sha256=_sha("another-session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=False, clean=True),
+     )
+     with pytest.raises(RuntimeError, match="pre-reset generation"):
+@@ -399,6 +572,7 @@ def test_incomplete_reset_is_terminal_and_requires_fresh_process(
+     )
+     capability = producer.open(
+         session_plan_sha256=_sha("session"),
++        execution_plan_sha256s=[_sha("trace")],
+         initial_state=_state(0, adapted=True, clean=True),
+     )
+     producer.initial_state_receipt(
+diff --git a/test/registered/unit/spec/test_source_owned_http_accounting.py b/test/registered/unit/spec/test_source_owned_http_accounting.py
+index 977d273..1762ab9 100644
+--- a/test/registered/unit/spec/test_source_owned_http_accounting.py
++++ b/test/registered/unit/spec/test_source_owned_http_accounting.py
+@@ -173,6 +173,37 @@ def test_dedicated_session_helper_overrides_any_payload_accounting() -> None:
+     assert helper.index(payload_expansion) < helper.index(source_injection)
+ 
+ 
++def test_composite_trace_endpoint_bridges_only_scheduler_owned_terminal_output() -> (
++    None
++):
++    source = HTTP_SERVER_PATH.read_text(encoding="utf-8")
++    helper = source.split(
++        "async def _source_owned_session_trace_transition(", maxsplit=1
++    )[1].split('@app.post("/v1/lightcone-spec/session-reset/trace/begin")', maxsplit=1)[
++        0
++    ]
++    terminal_dispatch = "await _send_terminal_speculative_evidence_transition("
++    source_bridge = "await _source_owned_session_transition("
++    assert terminal_dispatch in helper
++    assert source_bridge in helper
++    assert helper.index(terminal_dispatch) < helper.index(source_bridge)
++    assert 'payload={"capability_sha256": obj["capability_sha256"]}' in helper
++    assert "terminal_sha256" not in helper
++    assert "reset_sha256" not in helper
++
++
++def test_close_endpoint_is_terminal_only_and_never_claims_socket_close() -> None:
++    reset_source = MODULE_PATH.parents[1] / "speculative/session_reset_evidence.py"
++    source = reset_source.read_text(encoding="utf-8")
++    close = source.split("    def close_terminal(", maxsplit=1)[1].split(
++        "\n\n\n__all__", maxsplit=1
++    )[0]
++    assert '"lifecycle_closed": True' in close
++    assert '"transport_close_pending": True' in close
++    assert '"connections_current": 0' not in close
++    assert "connection_lost" in close
++
++
+ @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+ def test_http_process_initialization_rebuilds_in_forked_child() -> None:
+     parent_accounting = initialize_source_owned_http_connection_accounting()
+diff --git a/test/registered/unit/spec/test_terminal_speculative_evidence.py b/test/registered/unit/spec/test_terminal_speculative_evidence.py
+index abe5cb2..48129c1 100644
+--- a/test/registered/unit/spec/test_terminal_speculative_evidence.py
++++ b/test/registered/unit/spec/test_terminal_speculative_evidence.py
+@@ -11,6 +11,7 @@ MODULE_PATH = (
+     Path(__file__).resolve().parents[4]
+     / "python/sglang/srt/speculative/terminal_speculative_evidence.py"
+ )
++SESSION_MODULE_PATH = MODULE_PATH.with_name("session_reset_evidence.py")
+ SPEC = importlib.util.spec_from_file_location(
+     "terminal_speculative_evidence", MODULE_PATH
+ )
+@@ -19,10 +20,20 @@ MODULE = importlib.util.module_from_spec(SPEC)
+ sys.modules[SPEC.name] = MODULE
+ SPEC.loader.exec_module(MODULE)
+ 
++SESSION_SPEC = importlib.util.spec_from_file_location(
++    "session_reset_evidence_for_terminal_test", SESSION_MODULE_PATH
++)
++assert SESSION_SPEC is not None and SESSION_SPEC.loader is not None
++SESSION_MODULE = importlib.util.module_from_spec(SESSION_SPEC)
++sys.modules[SESSION_SPEC.name] = SESSION_MODULE
++SESSION_SPEC.loader.exec_module(SESSION_MODULE)
++
+ NATIVE_TERMINAL_EVIDENCE_HOOK = MODULE.NATIVE_TERMINAL_EVIDENCE_HOOK
+ TerminalSpeculativeEvidenceLifecycle = MODULE.TerminalSpeculativeEvidenceLifecycle
+ content_sha256 = MODULE.content_sha256
+ verify_terminal_attestation = MODULE.verify_terminal_attestation
++SourceOwnedAllResetSessionProducer = SESSION_MODULE.SourceOwnedAllResetSessionProducer
++GPU_RESET_SEMANTICS = SESSION_MODULE.GPU_RESET_SEMANTICS
+ 
+ 
+ def _state(
+@@ -164,6 +175,50 @@ def _client_terminal(payload: dict, request_id: str, status: str) -> dict:
+     return row
+ 
+ 
++def _connection_accounting(*, created: int = 1, closed: int = 0) -> dict[str, int]:
++    return {
++        "process_id": 123,
++        "generation": 456,
++        "connections_created": created,
++        "connections_closed": closed,
++        "connections_current": created - closed,
++    }
++
++
++def _session_state(generation: int, *, clean: bool) -> dict[str, object]:
++    return {
++        "process_identity": "scheduler:123",
++        "session_epoch": 0,
++        "reset_generation": generation,
++        "active_requests": 0 if clean else 1,
++        "queued_requests": 0,
++        "request_kv_entries": 0 if clean else 8,
++        "prefix_entries": 0,
++        "prefix_policy": "clear",
++        "registered_prefix_sha256": None,
++        "rng_sha256": content_sha256("rng"),
++        "counters_sha256": content_sha256("counters"),
++        "cuda_peaks_sha256": content_sha256("peaks"),
++        "scheduler_statistics_sha256": content_sha256("scheduler"),
++        "telemetry_sha256": content_sha256("telemetry"),
++        "inference_weights_sha256": content_sha256("weights"),
++        "fp32_master_sha256": None,
++        "optimizer_moments_sha256": None,
++        "candidate_buffers_sha256": None,
++        "adapter_version": 0,
++        "optimizer_generation": 0,
++        "cohort_state_sha256": None,
++        "update_counter": 0,
++        "allocator_allocated_bytes": 10,
++        "allocator_reserved_bytes": 20,
++        "hbm_state_sha256": content_sha256("hbm"),
++        "completion_event_generation": generation,
++        "completion_event_complete": clean,
++        "completion_event_sha256": content_sha256(["event", generation]),
++        "connection_accounting": _connection_accounting(),
++    }
++
++
+ def _start_scored(lifecycle, payload: dict) -> tuple[dict, dict]:
+     begin = lifecycle.begin(
+         payload,
+@@ -182,6 +237,108 @@ def _start_scored(lifecycle, payload: dict) -> tuple[dict, dict]:
+ 
+ 
+ class TerminalLifecycleTests(unittest.TestCase):
++    def test_source_owned_session_binds_real_terminal_lifecycle_and_truthful_close(
++        self,
++    ):
++        source = SourceOwnedAllResetSessionProducer(
++            process_identity="scheduler:123",
++            process_started_ns=456,
++            session_epoch=0,
++            method="target_only",
++            patched_sglang_tree="a" * 40,
++        )
++        capability = source.open(
++            session_plan_sha256="9" * 64,
++            execution_plan_sha256s=["2" * 64],
++            initial_state=_session_state(0, clean=True),
++        )
++        source.initial_state_receipt(
++            capability_sha256=capability["capability_sha256"],
++            connection_accounting=_connection_accounting(),
++        )
++        source_reset = source.reset_receipt(
++            capability_sha256=capability["capability_sha256"],
++            prior_execution_plan_sha256=None,
++            next_execution_plan_sha256="2" * 64,
++            before=_session_state(0, clean=False),
++            after=_session_state(1, clean=True),
++            reset_duration_ns=7,
++        )
++
++        lifecycle = TerminalSpeculativeEvidenceLifecycle(
++            server_process_id=123,
++            server_process_started_ns=456,
++            method="target_only",
++        )
++        payload = _begin_payload(method="target_only")
++        begin = lifecycle.begin(
++            payload,
++            prior_state=_state(1, clean=False),
++            reset_state=_state(2),
++        )
++        source.bind_terminal_begin(
++            capability_sha256=capability["capability_sha256"],
++            execution_plan_sha256=payload["execution_plan_sha256"],
++            run_id=payload["run_id"],
++            begin_sha256=begin["begin_sha256"],
++            warmup_request_ids_sha256=begin["warmup_request_ids_sha256"],
++            warmup_started_ns=100,
++        )
++        _record(lifecycle, payload["warmup_request_ids"][0], (5,))
++        reset = lifecycle.reset(
++            begin_sha256=begin["begin_sha256"],
++            discarded_native_sha256=content_sha256({"warmup": "excluded"}),
++            warmup_performance_counters=_performance("target_only"),
++            warmup_state=_state(3, clean=False),
++            reset_state=_state(4),
++        )
++        ready = source.bind_terminal_reset(
++            capability_sha256=capability["capability_sha256"],
++            run_id=payload["run_id"],
++            native_reset_sha256=reset["reset_sha256"],
++            warmup_completed_ns=150,
++            scored_started_ns=160,
++            connection_accounting=_connection_accounting(),
++        )
++        for request_id in payload["scored_request_ids"]:
++            _record(lifecycle, request_id)
++        terminal = lifecycle.finalize(
++            reset_sha256=reset["reset_sha256"],
++            round_rows=[],
++            update_rows=[],
++            performance_counters=_performance("target_only"),
++            historical_kv_source_versions={},
++            client_terminal_rows=[],
++            final_state=_state(5, clean=False),
++        )
++        trace = source.bind_terminal_finalize(
++            capability_sha256=capability["capability_sha256"],
++            run_id=payload["run_id"],
++            terminal_receipt_sha256=terminal["terminal_sha256"],
++            connection_accounting=_connection_accounting(),
++        )
++        close = source.close_terminal(
++            capability_sha256=capability["capability_sha256"],
++            connection_accounting=_connection_accounting(),
++        )
++
++        self.assertEqual(
++            ready["warmup_receipt"]["request_pool_sha256"],
++            begin["warmup_request_ids_sha256"],
++        )
++        self.assertEqual(
++            ready["clock_receipt"]["native_reset_sha256"], reset["reset_sha256"]
++        )
++        self.assertEqual(trace["terminal_receipt_sha256"], terminal["terminal_sha256"])
++        self.assertEqual(
++            close["trace_chain"][0]["reset_receipt_sha256"],
++            source_reset["reset_receipt_sha256"],
++        )
++        self.assertTrue(close["lifecycle_closed"])
++        self.assertTrue(close["transport_close_pending"])
++        self.assertEqual(close["connection_accounting"]["connections_current"], 1)
++        self.assertEqual(GPU_RESET_SEMANTICS, "PENDING")
++
+     def test_target_only_uses_structural_null_speculative_safety_counters(self):
+         lifecycle = TerminalSpeculativeEvidenceLifecycle(
+             server_process_id=123,

@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "fabb129063c36e9dde9a0d8b434df2f7a292c06d",
+  "expected_tree": "c6accb514b9d10ee95e704e69aa11e058adbe77a",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -77,6 +77,19 @@
         "python/sglang/srt/speculative/session_reset_evidence.py",
         "test/registered/unit/spec/test_session_reset_evidence.py",
         "test/registered/unit/spec/test_source_owned_http_accounting.py"
+      ]
+    },
+    {
+      "file": "0004-feat-session-bind-native-trace-lifecycle.patch",
+      "sha256": "d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e",
+      "files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/managers/io_struct.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/speculative/session_reset_evidence.py",
+        "test/registered/unit/spec/test_session_reset_evidence.py",
+        "test/registered/unit/spec/test_source_owned_http_accounting.py",
+        "test/registered/unit/spec/test_terminal_speculative_evidence.py"
       ]
     }
   ]

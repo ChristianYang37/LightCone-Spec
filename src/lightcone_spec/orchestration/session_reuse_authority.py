@@ -1,12 +1,14 @@
 """Fail-closed authority for auditing a source-owned shared-session reset.
 
-The pinned server now produces content-bound reset-state receipts and owns
-continuous HTTP connection accounting at the transport lifecycle on supported
-single-tokenizer HTTP/1.1 uvicorn paths.  Unsupported HTTP server topologies
-fail closed before capability production.  The release has not established
-CUDA/HBM/graph reset semantics on the pinned GPU, so this CPU contract remains
-non-authorizing.  Scheduler/request counters and client headers may never
-impersonate connection-pool evidence.
+The pinned server now produces content-bound reset-state receipts, binds the
+ordered native terminal begin/reset/finalize chain, and owns continuous HTTP
+connection accounting at the transport lifecycle on supported single-tokenizer
+HTTP/1.1 uvicorn paths.  Its terminal receipt truthfully leaves transport close
+pending until the caller closes the pool and terminates the process. Unsupported
+HTTP server topologies fail closed before capability production. The release
+has not established CUDA/HBM/graph reset semantics on the pinned GPU, so this
+CPU contract remains non-authorizing. Scheduler/request counters and client
+headers may never impersonate connection-pool evidence.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from lightcone_spec import PINNED_SGLANG_TREE
 
 SOURCE_OWNED_SESSION_HOOK = "sglang.schema_v3.source_owned_all_reset_session.v1"
 OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE = True
-OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE = False
+OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE = True
 CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = True
 GPU_RESET_SEMANTICS = "PENDING"
 SESSION_REUSE_BLOCK_REASON = "native_all_reset_gpu_semantics_pending"
@@ -150,6 +152,7 @@ class SourceOwnedSessionCapability:
     producer: str
     patched_sglang_tree: str
     session_plan_sha256: str
+    execution_plan_sha256s: tuple[str, ...]
     process_identity: str
     process_started_ns: int
     session_epoch: int
@@ -162,18 +165,28 @@ class SourceOwnedSessionCapability:
     capability_sha256: str
 
     @classmethod
-    def parse(cls, value: object, *, session_plan_sha256: str) -> Self:
+    def parse(
+        cls,
+        value: object,
+        *,
+        session_plan_sha256: str,
+        execution_plan_sha256s: Sequence[str],
+    ) -> Self:
         raw = _exact_mapping(value, set(cls.__dataclass_fields__), "session capability")
         _validate_bound_sha256(raw, "capability_sha256")
         reset_fields = raw["reset_state_fields"]
         if not isinstance(reset_fields, list):
             raise TypeError("reset_state_fields must be one ordered JSON list")
+        execution_plans = raw["execution_plan_sha256s"]
+        if not isinstance(execution_plans, list):
+            raise TypeError("execution_plan_sha256s must be one ordered JSON list")
         result = cls(
             schema_version=raw["schema_version"],
             hook=raw["hook"],
             producer=raw["producer"],
             patched_sglang_tree=raw["patched_sglang_tree"],
             session_plan_sha256=raw["session_plan_sha256"],
+            execution_plan_sha256s=tuple(execution_plans),
             process_identity=raw["process_identity"],
             process_started_ns=raw["process_started_ns"],
             session_epoch=raw["session_epoch"],
@@ -200,6 +213,13 @@ class SourceOwnedSessionCapability:
             "session_plan_sha256", session_plan_sha256
         ):
             raise ValueError("session capability belongs to another session plan")
+        expected_plans = tuple(execution_plan_sha256s)
+        if not expected_plans or len(expected_plans) != len(set(expected_plans)):
+            raise ValueError("session capability requires unique ordered traces")
+        for execution_plan_sha256 in expected_plans:
+            _require_sha256("execution_plan_sha256", execution_plan_sha256)
+        if result.execution_plan_sha256s != expected_plans:
+            raise ValueError("session capability changed the ordered trace authority")
         _require_text("process_identity", result.process_identity)
         _nonnegative_integer("process_started_ns", result.process_started_ns)
         _nonnegative_integer("session_epoch", result.session_epoch)
@@ -275,6 +295,7 @@ class SourceOwnedResetState:
         ):
             raise ValueError("reset state belongs to another process/session")
         for name in (
+            "session_epoch",
             "reset_generation",
             "active_requests",
             "queued_requests",
@@ -407,6 +428,7 @@ class SourceOwnedInitialStateReceipt:
             }
         )
         _require_schema_one("source-owned initial state", result.schema_version)
+        _nonnegative_integer("initial state session_epoch", result.session_epoch)
         if result.hook != SOURCE_OWNED_SESSION_HOOK:
             raise ValueError("source-owned initial state hook mismatch")
         if (
@@ -464,6 +486,7 @@ class SourceOwnedResetReceipt:
             }
         )
         _require_schema_one("source-owned reset receipt", result.schema_version)
+        _nonnegative_integer("reset receipt session_epoch", result.session_epoch)
         if result.hook != SOURCE_OWNED_SESSION_HOOK:
             raise ValueError("source-owned reset receipt schema/hook mismatch")
         if (
@@ -550,6 +573,7 @@ class SourceOwnedScoredClockReceipt:
     warmup_receipt_sha256: str
     clock_generation: int
     scored_started_ns: int
+    native_reset_sha256: str
     clock_receipt_sha256: str
 
     @classmethod
@@ -572,6 +596,8 @@ class SourceOwnedScoredClockReceipt:
             or result.warmup_receipt_sha256 != warmup.warmup_receipt_sha256
         ):
             raise ValueError("scored clock is not bound to this trace warm-up")
+        _require_sha256("native_reset_sha256", result.native_reset_sha256)
+        _nonnegative_integer("clock_generation", result.clock_generation)
         if result.clock_generation != prior_clock_generation + 1:
             raise ValueError("logical traces do not have independent scored clocks")
         if (
@@ -632,8 +658,16 @@ class SourceOwnedTraceReceipt:
 @dataclass(frozen=True)
 class SourceOwnedCloseReceipt:
     schema_version: int
+    hook: str
+    capability_sha256: str
+    initial_state_receipt_sha256: str
+    session_plan_sha256: str
     process_identity: str
-    closed: bool
+    session_epoch: int
+    execution_plan_sha256s: tuple[str, ...]
+    trace_chain: tuple[Mapping[str, object], ...]
+    lifecycle_closed: bool
+    transport_close_pending: bool
     connection_accounting: ConnectionAccounting
     close_receipt_sha256: str
 
@@ -644,36 +678,109 @@ class SourceOwnedCloseReceipt:
         *,
         capability: SourceOwnedSessionCapability,
         prior_accounting: ConnectionAccounting,
+        initial_state_receipt_sha256: str,
+        execution_plan_sha256s: Sequence[str],
+        reset_receipt_sha256s: Sequence[str],
+        warmup_receipt_sha256s: Sequence[str],
+        clock_receipt_sha256s: Sequence[str],
+        trace_receipt_sha256s: Sequence[str],
+        terminal_receipt_sha256s: Sequence[str],
     ) -> Self:
         raw = _exact_mapping(
             value, set(cls.__dataclass_fields__), "session close receipt"
         )
         _validate_bound_sha256(raw, "close_receipt_sha256")
         accounting = ConnectionAccounting.parse(raw["connection_accounting"])
+        plans = raw["execution_plan_sha256s"]
+        chain = raw["trace_chain"]
+        if not isinstance(plans, list) or not isinstance(chain, list):
+            raise TypeError("session close trace authority must be ordered JSON lists")
         result = cls(
             schema_version=raw["schema_version"],
+            hook=raw["hook"],
+            capability_sha256=raw["capability_sha256"],
+            initial_state_receipt_sha256=raw["initial_state_receipt_sha256"],
+            session_plan_sha256=raw["session_plan_sha256"],
             process_identity=raw["process_identity"],
-            closed=raw["closed"],
+            session_epoch=raw["session_epoch"],
+            execution_plan_sha256s=tuple(plans),
+            trace_chain=tuple(chain),
+            lifecycle_closed=raw["lifecycle_closed"],
+            transport_close_pending=raw["transport_close_pending"],
             connection_accounting=accounting,
             close_receipt_sha256=raw["close_receipt_sha256"],
         )
         _require_schema_one("source close receipt", result.schema_version)
+        _nonnegative_integer("source close session_epoch", result.session_epoch)
         if (
-            result.process_identity != capability.process_identity
-            or result.closed is not True
+            result.hook != SOURCE_OWNED_SESSION_HOOK
+            or result.capability_sha256 != capability.capability_sha256
+            or result.initial_state_receipt_sha256
+            != _require_sha256(
+                "initial_state_receipt_sha256", initial_state_receipt_sha256
+            )
+            or result.session_plan_sha256 != capability.session_plan_sha256
+            or result.process_identity != capability.process_identity
+            or result.session_epoch != capability.session_epoch
+            or result.lifecycle_closed is not True
+            or result.transport_close_pending is not True
         ):
-            raise ValueError("source did not close the exact shared process")
+            raise ValueError("source did not terminally seal the exact shared process")
+        expected_plans = tuple(execution_plan_sha256s)
+        if result.execution_plan_sha256s != expected_plans:
+            raise ValueError("session close changed the ordered trace authority")
+        expected_columns = tuple(
+            tuple(column)
+            for column in (
+                reset_receipt_sha256s,
+                warmup_receipt_sha256s,
+                clock_receipt_sha256s,
+                trace_receipt_sha256s,
+                terminal_receipt_sha256s,
+            )
+        )
+        if any(len(column) != len(expected_plans) for column in expected_columns):
+            raise ValueError("session close expected receipt coverage is incomplete")
+        keys = {
+            "execution_plan_sha256",
+            "reset_receipt_sha256",
+            "warmup_receipt_sha256",
+            "clock_receipt_sha256",
+            "trace_receipt_sha256",
+            "terminal_receipt_sha256",
+        }
+        expected_chain = []
+        for index, execution_plan_sha256 in enumerate(expected_plans):
+            row = {
+                "execution_plan_sha256": execution_plan_sha256,
+                "reset_receipt_sha256": expected_columns[0][index],
+                "warmup_receipt_sha256": expected_columns[1][index],
+                "clock_receipt_sha256": expected_columns[2][index],
+                "trace_receipt_sha256": expected_columns[3][index],
+                "terminal_receipt_sha256": expected_columns[4][index],
+            }
+            for name, digest in row.items():
+                _require_sha256(name, digest)
+            expected_chain.append(row)
+        for row in result.trace_chain:
+            _exact_mapping(row, keys, "session close trace chain")
+        if result.trace_chain != tuple(expected_chain):
+            raise ValueError("session close receipt chain differs from native evidence")
         accounting.require_continuation(prior_accounting)
-        if (
-            accounting.connections_current != 0
-            or accounting.connections_closed != accounting.connections_created
-        ):
-            raise ValueError("source close left HTTP connections open")
+        if accounting.connections_current < 1:
+            raise ValueError(
+                "session close receipt cannot predate its response transport close"
+            )
         return result
 
 
 class SourceOwnedSessionAuditRuntime(Protocol):
-    async def capability(self, *, session_plan_sha256: str) -> object: ...
+    async def capability(
+        self,
+        *,
+        session_plan_sha256: str,
+        execution_plan_sha256s: Sequence[str],
+    ) -> object: ...
 
     async def initial_state(self, *, capability_sha256: str) -> object: ...
 
@@ -747,13 +854,18 @@ async def audit_source_owned_reuse_contract(
     warmup_receipts: list[str] = []
     clock_receipts: list[str] = []
     trace_receipts: list[str] = []
+    terminal_receipts: list[str] = []
     close_sha: str | None = None
     failure_reason = SESSION_REUSE_BLOCK_REASON
 
     try:
         capability = SourceOwnedSessionCapability.parse(
-            await runtime.capability(session_plan_sha256=plan_sha),
+            await runtime.capability(
+                session_plan_sha256=plan_sha,
+                execution_plan_sha256s=trace_shas,
+            ),
             session_plan_sha256=plan_sha,
+            execution_plan_sha256s=trace_shas,
         )
         if not capability.continuous_connection_accounting:
             raise RuntimeError(CONNECTION_ACCOUNTING_BLOCK_REASON)
@@ -811,18 +923,32 @@ async def audit_source_owned_reuse_contract(
             )
             accounting = trace.connection_accounting
             trace_receipts.append(trace.trace_receipt_sha256)
+            terminal_receipts.append(trace.terminal_receipt_sha256)
             if trace.aborted:
                 raise RuntimeError("source_trace_aborted")
             prior_trace = trace_sha
     except Exception as error:  # noqa: BLE001 - source failure must trigger close
         failure_reason = f"shared_session_audit_failed:{type(error).__name__}:{error}"
     finally:
-        if capability is not None and accounting is not None:
+        if (
+            capability is not None
+            and initial_receipt is not None
+            and accounting is not None
+        ):
             try:
                 close = SourceOwnedCloseReceipt.parse(
                     await runtime.close(capability_sha256=capability.capability_sha256),
                     capability=capability,
                     prior_accounting=accounting,
+                    initial_state_receipt_sha256=(
+                        initial_receipt.initial_state_receipt_sha256
+                    ),
+                    execution_plan_sha256s=trace_shas,
+                    reset_receipt_sha256s=reset_receipts,
+                    warmup_receipt_sha256s=warmup_receipts,
+                    clock_receipt_sha256s=clock_receipts,
+                    trace_receipt_sha256s=trace_receipts,
+                    terminal_receipt_sha256s=terminal_receipts,
                 )
                 close_sha = close.close_receipt_sha256
             except Exception as close_error:  # noqa: BLE001 - close is evidence
@@ -834,6 +960,13 @@ async def audit_source_owned_reuse_contract(
                     failure_reason = f"{failure_reason};{close_failure}"
                 else:
                     failure_reason = close_failure
+                try:
+                    await runtime.force_close()
+                except Exception as force_error:  # noqa: BLE001 - owner kill is safety
+                    failure_reason = (
+                        f"{failure_reason};shared_session_force_close_failed:"
+                        f"{type(force_error).__name__}:{force_error}"
+                    )
         elif failure_reason.startswith("shared_session_audit_failed:"):
             try:
                 await runtime.force_close()

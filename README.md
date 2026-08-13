@@ -32,9 +32,9 @@ an experiment, and a historical measurement does not become a formal result.
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `fabb129063c36e9dde9a0d8b434df2f7a292c06d` | Full Git tree expected after applying the current patch series. |
-| `current_patch_payload_sha256` | `fa723d63c031ce01f7354dfeda7b89dd4e7fa06d6fea0ceb81864918fdec1fde` | SHA-256 of the latest semantic mail-patch bytes. |
-| `current_patch_manifest_sha256` | `6460c61112158aad0e2ec8172d5b6f51e5fea716cf93949755689543462b206a` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `c6accb514b9d10ee95e704e69aa11e058adbe77a` | Full Git tree expected after applying the current patch series. |
+| `current_patch_payload_sha256` | `d640d5fe0ac55cb542d0b885fac51d64dc6a83a142ac52480cbfc99d9b866b6e` | SHA-256 of the latest semantic mail-patch bytes. |
+| `current_patch_manifest_sha256` | `dfa7256fed0335331643a6930e473130f85494ce2f89df8355202474d1e06d69` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
