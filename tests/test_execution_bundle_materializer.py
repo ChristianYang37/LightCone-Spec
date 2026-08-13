@@ -13,6 +13,10 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchWave,
     registry_pool_work_item,
 )
+from lightcone_spec.experiments.itl_authority import (
+    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    release_e2_itl_timestamp_plan,
+)
 from lightcone_spec.experiments.registry import (
     build_industrial_registry,
     content_sha256,
@@ -258,6 +262,52 @@ def test_rejects_missing_release_runtime_role_with_named_block(tmp_path: Path) -
         match="bundle_runtime_launch_policy_source_missing",
     ):
         DispatchBundleMaterializationRequest.from_dict(value)
+
+
+def test_e2_provisional_materialization_blocks_empty_producer_before_runtime_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.orchestration.execution_bundle_materializer as module
+
+    registry = build_industrial_registry(
+        cache_root=str(tmp_path / "cache"),
+        evidence_root=str(tmp_path / "evidence"),
+    )
+    cell = registry.cells_for("E2")[0]
+    plan = release_e2_itl_timestamp_plan(registry, cell)
+    plan_path = _write_bound(tmp_path / "e2-itl-plan.json", plan.to_dict()).resolve()
+    plan_source = module.BoundJsonSource.bind(
+        plan_path,
+        semantic_sha256=plan.sha256,
+    )
+    assignment = SimpleNamespace(
+        assignment_id="a" * 64,
+        work_item=SimpleNamespace(item_id=cell.cell_id, cell=cell),
+    )
+    bound_assignment = SimpleNamespace(
+        assignment_sha256=assignment.assignment_id,
+        cell_id=cell.cell_id,
+        sources=(("itl_timestamp_authority_plan", plan_source),),
+    )
+    authority = SimpleNamespace(registry=registry)
+    monkeypatch.setattr(
+        module.AssignmentLaunchMaterializationPolicy,
+        "from_dict",
+        lambda _value: pytest.fail("launch-policy read was reached"),
+    )
+
+    with pytest.raises(
+        DispatchBundleMaterializationBlocked,
+        match=ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    ):
+        module._materialize_assignment_provisional(
+            assignment=assignment,
+            bound_assignment=bound_assignment,
+            authority=authority,
+        )
+
+    assert not Path(cell.resources.evidence_root).exists()
 
 
 def test_rejects_caller_execution_summary_and_hash(tmp_path: Path) -> None:
@@ -519,7 +569,7 @@ def test_manifest_loader_rejects_missing_commit_marker_and_symlink_path(
         load_materialized_dispatch_execution_bundle_publication(link)
 
 
-def test_schema_v4_manifest_binds_request_nonce_policy_and_bundle_member(
+def test_schema_v5_manifest_binds_request_nonce_policy_and_bundle_member(
     tmp_path: Path,
 ) -> None:
     value, _, dispatch = _request_value(tmp_path)
@@ -539,7 +589,7 @@ def test_schema_v4_manifest_binds_request_nonce_policy_and_bundle_member(
     manifest = DispatchExecutionBundleManifest(
         schema_version=1,
         kind="industrial_dispatch_execution_bundle_manifest",
-        bundle_schema_version=4,
+        bundle_schema_version=5,
         materialization_inputs_sha256=bound.sha256,
         request=bound.request,
         dispatch_plan=bound.dispatch_plan,
@@ -549,7 +599,7 @@ def test_schema_v4_manifest_binds_request_nonce_policy_and_bundle_member(
     assert DispatchExecutionBundleManifest.from_dict(manifest.to_dict()) == manifest
     assert manifest.dispatch_plan.semantic_sha256 == dispatch.sha256
     forged = manifest.to_dict()
-    forged["bundle_schema_version"] = 3
+    forged["bundle_schema_version"] = 4
     with pytest.raises(ValueError, match="manifest is unsupported"):
         DispatchExecutionBundleManifest.from_dict(forged)
 
@@ -557,3 +607,25 @@ def test_schema_v4_manifest_binds_request_nonce_policy_and_bundle_member(
     forged["bundle_schema_version"] = True
     with pytest.raises(TypeError, match="bundle schema.*integer"):
         DispatchExecutionBundleManifest.from_dict(forged)
+
+
+def test_itl_construction_source_requires_the_exact_request_path(
+    tmp_path: Path,
+) -> None:
+    import lightcone_spec.orchestration.execution_bundle_materializer as module
+    from lightcone_spec.orchestration.execution_bundle import BoundJsonSource
+
+    original = _write_bound(tmp_path / "requested-itl-plan.json", {"plan": "same"})
+    alternate = _write_bound(tmp_path / "alternate-itl-plan.json", {"plan": "same"})
+    original_source = BoundJsonSource.bind(original)
+    alternate_source = BoundJsonSource.bind(alternate)
+
+    assert original_source.canonical_sha256 == alternate_source.canonical_sha256
+    assert original_source.file_sha256 == alternate_source.file_sha256
+    assert original_source != alternate_source
+    published_bundle = SimpleNamespace(itl_timestamp_plan=alternate_source)
+    with pytest.raises(ValueError, match="swapped its path-bound ITL"):
+        module._require_published_bundle_itl_source(
+            published_bundle,
+            {"itl_timestamp_authority_plan": original_source},
+        )

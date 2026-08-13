@@ -43,6 +43,10 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuInventory,
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
+from lightcone_spec.experiments.itl_authority import (
+    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    release_e2_itl_timestamp_plan,
+)
 from lightcone_spec.experiments.load import (
     FrozenSamplingParameters,
     ProductionLoadPlan,
@@ -1040,7 +1044,7 @@ def _bundle_fixture(
         semantic_sha256=inventory_receipt_sha256,
     )
     bundle = IndustrialAssignmentExecutionBundle(
-        schema_version=4,
+        schema_version=5,
         kind="industrial_assignment_execution_bundle",
         assignment_sha256=assignment.assignment_id,
         cell_id=cell.cell_id,
@@ -1081,6 +1085,9 @@ def _bundle_fixture(
             topology_path, semantic_sha256=topology.receipt_sha256
         ),
         production_load=_source(load_path, semantic_sha256=load.paired_replay_sha256),
+        itl_timestamp_plan=None,
+        itl_timestamp_plan_sha256=None,
+        itl_timestamp_producer_sha256=None,
         run_config=_source(run_config_path, semantic_sha256=run_config_sha256(config)),
         server_launch=_source(launch_path),
         execution_plan_summary=_source(
@@ -1103,6 +1110,100 @@ def _bundle_fixture(
     )
     bundle_path = _write_bound(tmp_path / "execution-bundle.json", bundle.to_dict())
     return bundle_path, bundle
+
+
+def test_e2_bundle_blocks_empty_release_producer_before_downstream_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+
+    _, baseline = _bundle_fixture(tmp_path)
+    registry = bundle_module._load_registry(baseline.registry.load())
+    cell = registry.cells_for("E2")[0]
+    plan = release_e2_itl_timestamp_plan(registry, cell)
+    plan_path = _write_bound(tmp_path / "e2-itl-plan.json", plan.to_dict())
+    bundle = replace(
+        baseline,
+        cell_id=cell.cell_id,
+        itl_timestamp_plan=_source(plan_path, semantic_sha256=plan.sha256),
+        itl_timestamp_plan_sha256=plan.sha256,
+        itl_timestamp_producer_sha256=None,
+    )
+    inventory_reads = 0
+    original_load = bundle_module.BoundJsonSource.load
+
+    def track_load(source):
+        nonlocal inventory_reads
+        if source == bundle.inventory:
+            inventory_reads += 1
+        return original_load(source)
+
+    monkeypatch.setattr(bundle_module.BoundJsonSource, "load", track_load)
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match=ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    ):
+        bundle.reconstruct_execution_plan()
+
+    assert inventory_reads == 0
+    assert not Path(bundle.output_root).exists()
+
+
+def test_all_wave_preflight_rejects_later_itl_source_tamper_before_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+    import lightcone_spec.orchestration.execution_bundle_materializer as materializer
+
+    _, first = _bundle_fixture(tmp_path)
+    itl_path = _write_bound(tmp_path / "later-wave-itl-plan.json", {"plan": "bound"})
+    itl_source = _source(itl_path)
+    later = replace(
+        first,
+        assignment_sha256="f" * 64,
+        itl_timestamp_plan=itl_source,
+        itl_timestamp_plan_sha256=itl_source.semantic_sha256,
+        itl_timestamp_producer_sha256=None,
+    )
+    itl_path.write_text('{"plan":"tampered"}\n', encoding="utf-8")
+    manifest_path = (tmp_path / "all-wave-manifest.json").resolve()
+    publication = SimpleNamespace(
+        manifest=SimpleNamespace(sha256="9" * 64, assignments=()),
+        bundles=(first, later),
+    )
+    monkeypatch.setattr(
+        bundle_module,
+        "require_release_dispatch_execution_authority",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        bundle_module, "preflight_compile_cache_launch", lambda _plan: None
+    )
+    monkeypatch.setattr(
+        materializer,
+        "load_materialized_dispatch_execution_bundle_publication",
+        lambda _path: publication,
+    )
+    monkeypatch.setattr(
+        bundle_module.IndustrialAssignmentExecutionBundle,
+        "reconstruct_execution_plan",
+        lambda _self: pytest.fail("assignment reconstruction was reached"),
+    )
+
+    with pytest.raises(RuntimeError, match="bound bundle source or sidecar changed"):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                manifest_path,
+                wave_index=0,
+                receipt_output=tmp_path / "must-not-publish.json",
+            )
+        )
+
+    assert not (tmp_path / "must-not-publish.json").exists()
 
 
 def test_bundle_audits_raw_components_without_minting_a_plan(
@@ -1140,12 +1241,14 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     assert audit.execution_plan_sha256 is None
     assert audit.execution_plan_status == "NOT_VALIDATED"
     assert audit.exact_dispatch_replay is True
-    assert audit.schema_version == 2
+    assert audit.schema_version == 3
     assert audit.execution_semantics_sha256 is None
     assert audit.execution_semantics_authority == "diagnostic_non_authority"
     assert audit.dispatch_plan_sha256 == expected.dispatch_plan.semantic_sha256
     assert audit.cell_id == expected.cell_id
     assert audit.budget_plan_status == "UNRESOLVED"
+    with pytest.raises(ValueError, match="audit schema is unsupported"):
+        replace(audit, schema_version=3.0)
     assert (
         audit.budget_materialization_authority_sha256
         == expected.dispatch_context.load()["budget_materialization_authority_sha256"]
@@ -1159,7 +1262,9 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     ):
         loaded.reconstruct_execution_plan()
 
-    assert loaded.to_dict()["schema_version"] == 4
+    assert loaded.to_dict()["schema_version"] == 5
+    with pytest.raises(ValueError, match="bundle schema is unsupported"):
+        replace(loaded, schema_version=5.0)
     assert loaded.trainable_plan_authority is None
     assert loaded.prepared_model_content_release_manifest_sha256 is None
     forged_baseline = replace(

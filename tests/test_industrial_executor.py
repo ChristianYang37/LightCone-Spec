@@ -101,6 +101,7 @@ from lightcone_spec.orchestration.executor import (
     revalidate_industrial_execution_result,
 )
 from lightcone_spec.orchestration.industrial import (
+    IndustrialRuntimePlan,
     render_assigned_industrial_cell_runtime_plan,
 )
 from lightcone_spec.orchestration.native_terminal import (
@@ -142,6 +143,42 @@ class _FakeTraceConfig:
 
     def freeze(self) -> None:
         self.frozen = True
+
+
+def test_itl_gate_rejects_context_subclass_and_class_spoof_before_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.orchestration.executor as executor_module
+
+    registry = build_industrial_registry()
+    cell = registry.cells_for("E2")[0]
+    runtime_plan = object.__new__(IndustrialRuntimePlan)
+    object.__setattr__(runtime_plan, "cell", cell)
+
+    class DispatchContextSubclass(GpuDispatchExecutionContext):
+        pass
+
+    subclass = object.__new__(DispatchContextSubclass)
+
+    class DispatchContextSpoof:
+        @property
+        def __class__(self):
+            return GpuDispatchExecutionContext
+
+    spoof = DispatchContextSpoof()
+    assert spoof.__class__ is GpuDispatchExecutionContext
+    monkeypatch.setattr(
+        executor_module,
+        "release_e2_itl_timestamp_plan",
+        lambda *_args: pytest.fail("ITL plan replay was reached"),
+    )
+
+    for context in (subclass, spoof):
+        with pytest.raises(TypeError, match="exact execution context"):
+            executor_module._require_execution_itl_timestamp_authority(
+                runtime_plan=runtime_plan,
+                dispatch_context=context,
+            )
 
 
 def _official_session_lifecycle(session):
@@ -2353,7 +2390,7 @@ def test_logical_runtime_plan_cannot_cross_the_execution_boundary(
         logical.validate()
 
 
-def test_execution_schema4_binds_the_exact_raw_budget_authority(
+def test_execution_schema5_binds_the_exact_raw_budget_authority(
     tmp_path: Path,
 ) -> None:
     plan = _execution_fixture(tmp_path, request_count=1).plan
@@ -2364,7 +2401,7 @@ def test_execution_schema4_binds_the_exact_raw_budget_authority(
     physical_wire = physical.to_dict()
     execution_wire = plan.to_dict()
     assert physical_wire["schema_version"] == 3
-    assert execution_wire["schema_version"] == 4
+    assert execution_wire["schema_version"] == 5
     assert physical_wire["budget_materialization_authority_sha256"] == (
         authority_sha256
     )

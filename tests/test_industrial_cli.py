@@ -10,7 +10,12 @@ from test_evidence_alias_authority import _alias_artifact
 from test_evidence_alias_authority import _manifest as _raw_alias_manifest
 
 from lightcone_spec import PINNED_SGLANG_TREE
-from lightcone_spec.cli.main import _load_stage_activation_plan, main
+from lightcone_spec.cli.main import (
+    _analysis_cells,
+    _load_e2_stage_manifest,
+    _load_stage_activation_plan,
+    main,
+)
 from lightcone_spec.experiments.evidence import evidence_files_sha256
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
@@ -768,6 +773,45 @@ def test_e2_cli_rejects_serialized_summary_without_raw_stage_manifest(
     )
     with pytest.raises(ValueError, match="bound raw activation manifest"):
         _load_stage_activation_plan(str(activation_path))
+
+
+def test_e2_cli_rejects_old_schema_and_requires_path_only_itl_authority(
+    tmp_path: Path,
+) -> None:
+    old_manifest = tmp_path / "old-e2-stage.json"
+    _write_bound(
+        old_manifest,
+        {
+            "schema_version": 2,
+            "kind": "industrial_e2_stage_reduction_manifest",
+            "registry_artifact": None,
+            "e1_receipt": None,
+            "pareto": None,
+            "stage_index": 0,
+            "prior_stage_manifest": None,
+            "gpu_inventory": None,
+            "hardware_envelope": {},
+            "cells": [],
+        },
+    )
+    with pytest.raises(ValueError, match="identity is invalid"):
+        _load_e2_stage_manifest(old_manifest)
+
+    float_manifest = tmp_path / "float-e2-stage.json"
+    float_value = json.loads(old_manifest.read_text(encoding="utf-8"))
+    float_value["schema_version"] = 3.0
+    _write_bound(float_manifest, float_value)
+    with pytest.raises(ValueError, match="identity is invalid"):
+        _load_e2_stage_manifest(float_manifest)
+
+    legacy_cell = {
+        "cell_id": _sha("legacy-e2-cell"),
+        "terminal_receipts": [],
+        "hardware_receipt": {},
+        "budget_observation": {},
+    }
+    with pytest.raises(ValueError, match="cell fields do not match schema"):
+        _analysis_cells(old_manifest.resolve(), [legacy_cell])
 
 
 def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(

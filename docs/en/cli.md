@@ -31,7 +31,7 @@ authority. The schema-v3 and industrial commands are:
 | `bind-industrial-budget-authority` | Bind a declared `BudgetPlan` to its complete tagged raw activation/load/capacity closure |
 | `estimate-industrial-budget` | Replay one ready `BudgetPlan` on an exact physical inventory and interference envelope |
 | `plan-industrial-dispatch` | Freeze deterministic topology-aware GPU-pool waves and physical assignments |
-| `materialize-dispatch-execution-bundles` | Bind one path-only raw input graph and publish a complete schema-v4 assignment-bundle set after all-assignment preflight |
+| `materialize-dispatch-execution-bundles` | Bind one path-only raw input graph and publish a complete schema-v5 assignment-bundle set after all-assignment preflight |
 | `execute-dispatch-wave` | Reopen one committed materialization manifest and execute one receipt-bounded frozen wave when all release authorities are available |
 | `seal-industrial-stage` | Bind activated completion, dispositions, budgets, runtime, split, dependencies, and locked outputs |
 | `analyze-industrial` | Validate schema-v3 terminal, budget, family-power, and hardware evidence |
@@ -266,7 +266,7 @@ assignment-runtime path set for every dispatch cell. It deliberately contains
 no caller-supplied assignment SHA, execution-plan SHA or summary, output root,
 or semantic hash. The reducer reopens the request and every sidecar, derives
 the assignments from the frozen dispatch plan, and requires an exact one-to-one
-assignment cover before it can construct schema-v4 bundles.
+assignment cover before it can construct schema-v5 bundles.
 
 Every assignment's raw activation/completion, budget, capacity, interference,
 topology, runtime, sampling, model, compile, nonce, launch-policy, and optional
@@ -283,7 +283,7 @@ self-consistent planner or execution summary cannot authorize itself.
 
 The output path must be absolute, resolved, absent, and below a stable
 owner-private parent. After all-assignment preflight succeeds, the command
-creates a private `0700` directory, writes each schema-v4 bundle and adjacent
+creates a private `0700` directory, writes each schema-v5 bundle and adjacent
 sidecars exclusively, and writes
 `dispatch-execution-bundle-manifest.json` plus its sidecar last as the commit
 marker. An interrupted partial directory is retained but has no consumable
@@ -299,7 +299,7 @@ lightcone-spec materialize-dispatch-execution-bundles \
 `IndustrialExecutionPlan.to_dict()` summary, or raw bundle paths as launch
 authority. It accepts exactly one required `--materialization-manifest`. After
 the release dispatch trust gate, the loader reopens the manifest, its request
-and dispatch plan, every schema-v4 member, and the complete path-bound
+and dispatch plan, every schema-v5 member, and the complete path-bound
 construction graph. It rejects changed input bytes, swapped membership,
 incomplete assignment coverage, or bundles outside the manifest directory.
 Only then does execution replay the shared scheduler authority and construct

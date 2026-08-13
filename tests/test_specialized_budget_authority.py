@@ -137,7 +137,15 @@ def test_raw_selection_manifests_round_trip_and_require_exact_sidecars(
     )
     e3a = RawE3aSelectionEvidenceManifest(schema_version=2, cells=(cell,))
     e1 = RawE1ParetoEvidenceManifest(schema_version=2, cells=(cell,))
-    e2 = RawE2StageEvidenceManifest(schema_version=2, stage_index=0, cells=(cell,))
+    e2_cell = replace(
+        cell,
+        itl_timestamp_authority_path=(tmp_path / "itl-authority.json").resolve(),
+    )
+    e2 = RawE2StageEvidenceManifest(
+        schema_version=3,
+        stage_index=0,
+        cells=(e2_cell,),
+    )
 
     assert (
         raw_e3a_selection_manifest_from_dict(raw_e3a_selection_manifest_to_dict(e3a))
@@ -145,6 +153,20 @@ def test_raw_selection_manifests_round_trip_and_require_exact_sidecars(
     )
     assert raw_e1_pareto_manifest_from_dict(raw_e1_pareto_manifest_to_dict(e1)) == e1
     assert raw_e2_stage_manifest_from_dict(raw_e2_stage_manifest_to_dict(e2)) == e2
+    old_e2 = raw_e2_stage_manifest_to_dict(e2)
+    old_e2["schema_version"] = 2
+    with pytest.raises(ValueError, match="identity is invalid"):
+        raw_e2_stage_manifest_from_dict(old_e2)
+    float_e2 = raw_e2_stage_manifest_to_dict(e2)
+    float_e2["schema_version"] = 3.0
+    with pytest.raises(ValueError, match="identity is invalid"):
+        raw_e2_stage_manifest_from_dict(float_e2)
+    with pytest.raises(ValueError, match="path-only ITL timestamp authority"):
+        RawE2StageEvidenceManifest(
+            schema_version=3,
+            stage_index=0,
+            cells=(cell,),
+        )
     validate_raw_evidence_manifest_sidecars(e3a)
 
     Path(f"{cell.hardware_receipt.path}.sha256").write_text(

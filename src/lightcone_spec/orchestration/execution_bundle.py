@@ -87,6 +87,12 @@ from lightcone_spec.experiments.interference_authority import (
     require_calibrated_interference_execution_authority,
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
+from lightcone_spec.experiments.itl_authority import (
+    E2ItlTimestampPlan,
+    ItlTimestampAuthorityBlocked,
+    replay_e2_itl_timestamp_plan,
+    require_e2_itl_timestamp_prelaunch,
+)
 from lightcone_spec.experiments.planning import (
     BudgetMaterializationAuthorityBinding,
     BudgetPlan,
@@ -1721,7 +1727,7 @@ def _preflight_bundle_assignment_sources(
 ) -> None:
     """Hash every assignment-local raw source without constructing a plan."""
 
-    for source in (
+    sources = (
         bundle.topology_receipts,
         bundle.production_load,
         bundle.run_config,
@@ -1730,7 +1736,10 @@ def _preflight_bundle_assignment_sources(
         bundle.prepared_models,
         bundle.compile_cache_plan,
         bundle.execution_policy,
-    ):
+    )
+    if bundle.itl_timestamp_plan is not None:
+        sources = (*sources, bundle.itl_timestamp_plan)
+    for source in sources:
         source.load()
     for artifact in (
         *bundle.dependency_artifacts,
@@ -2607,6 +2616,8 @@ class IndustrialExecutionPlanAudit:
     budget_materialization_authority_sha256: str
     component_replay_sha256: str
     dispatch_plan_sha256: str
+    itl_timestamp_plan_sha256: str | None
+    itl_timestamp_producer_sha256: str | None
     execution_semantics_sha256: str | None
     execution_semantics_authority: Literal["diagnostic_non_authority"]
     exact_dispatch_replay: Literal[True]
@@ -2615,7 +2626,11 @@ class IndustrialExecutionPlanAudit:
     execution_plan_reason_code: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2 or self.kind != "industrial_execution_plan_audit":
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 3
+            or self.kind != "industrial_execution_plan_audit"
+        ):
             raise ValueError("industrial execution-plan audit schema is unsupported")
         for name in (
             "bundle_sha256",
@@ -2634,6 +2649,18 @@ class IndustrialExecutionPlanAudit:
                 "execution-plan audit execution semantics",
                 self.execution_semantics_sha256,
             )
+        if self.itl_timestamp_plan_sha256 is None:
+            if self.itl_timestamp_producer_sha256 is not None:
+                raise ValueError("ITL producer digest requires one ITL plan")
+        else:
+            _require_sha256(
+                "execution-plan audit ITL plan", self.itl_timestamp_plan_sha256
+            )
+            if self.itl_timestamp_producer_sha256 is not None:
+                _require_sha256(
+                    "execution-plan audit ITL producer",
+                    self.itl_timestamp_producer_sha256,
+                )
         if self.execution_semantics_authority != "diagnostic_non_authority":
             raise ValueError("execution semantics audit cannot claim launch authority")
         if self.exact_dispatch_replay is not True:
@@ -2682,6 +2709,9 @@ class IndustrialAssignmentExecutionBundle:
     dispatch_plan: BoundJsonSource
     topology_receipts: BoundJsonSource
     production_load: BoundJsonSource
+    itl_timestamp_plan: BoundJsonSource | None
+    itl_timestamp_plan_sha256: str | None
+    itl_timestamp_producer_sha256: str | None
     run_config: BoundJsonSource
     server_launch: BoundJsonSource
     execution_plan_summary: BoundJsonSource
@@ -2699,7 +2729,11 @@ class IndustrialAssignmentExecutionBundle:
     execution_policy: BoundJsonSource
 
     def __post_init__(self) -> None:
-        if self.schema_version != 4 or self.kind != _BUNDLE_KIND:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 5
+            or self.kind != _BUNDLE_KIND
+        ):
             raise ValueError("industrial execution-bundle schema is unsupported")
         for name in (
             "assignment_sha256",
@@ -2739,6 +2773,8 @@ class IndustrialAssignmentExecutionBundle:
             self.compile_cache_plan,
             self.execution_policy,
         )
+        if self.itl_timestamp_plan is not None:
+            sources = (*sources, self.itl_timestamp_plan)
         if any(type(source) is not BoundJsonSource for source in sources):
             raise TypeError("execution bundle contains a non-exact JSON source")
         if (
@@ -2758,6 +2794,20 @@ class IndustrialAssignmentExecutionBundle:
             is not FailureInjectionAuthorityBinding
         ):
             raise TypeError("execution bundle has a wrong failure authority")
+        if self.itl_timestamp_plan is None:
+            if (
+                self.itl_timestamp_plan_sha256 is not None
+                or self.itl_timestamp_producer_sha256 is not None
+            ):
+                raise ValueError("ITL digests require one raw ITL plan source")
+        else:
+            if type(self.itl_timestamp_plan) is not BoundJsonSource:
+                raise TypeError("execution bundle has a wrong ITL plan source")
+            _require_sha256("bundle ITL plan", self.itl_timestamp_plan_sha256)
+            if self.itl_timestamp_producer_sha256 is not None:
+                _require_sha256(
+                    "bundle ITL producer", self.itl_timestamp_producer_sha256
+                )
         if self.prepared_model_content_release_manifest_sha256 is not None:
             _require_sha256(
                 "bundle prepared model content release manifest",
@@ -2828,6 +2878,13 @@ class IndustrialAssignmentExecutionBundle:
             "dispatch_plan": self.dispatch_plan.to_dict(),
             "topology_receipts": self.topology_receipts.to_dict(),
             "production_load": self.production_load.to_dict(),
+            "itl_timestamp_plan": (
+                None
+                if self.itl_timestamp_plan is None
+                else self.itl_timestamp_plan.to_dict()
+            ),
+            "itl_timestamp_plan_sha256": self.itl_timestamp_plan_sha256,
+            "itl_timestamp_producer_sha256": self.itl_timestamp_producer_sha256,
             "run_config": self.run_config.to_dict(),
             "server_launch": self.server_launch.to_dict(),
             "execution_plan_summary": self.execution_plan_summary.to_dict(),
@@ -2893,6 +2950,9 @@ class IndustrialAssignmentExecutionBundle:
                 "dispatch_plan",
                 "topology_receipts",
                 "production_load",
+                "itl_timestamp_plan",
+                "itl_timestamp_plan_sha256",
+                "itl_timestamp_producer_sha256",
                 "run_config",
                 "server_launch",
                 "execution_plan_summary",
@@ -2968,6 +3028,25 @@ class IndustrialAssignmentExecutionBundle:
             dispatch_plan=BoundJsonSource.from_dict(row["dispatch_plan"]),
             topology_receipts=BoundJsonSource.from_dict(row["topology_receipts"]),
             production_load=BoundJsonSource.from_dict(row["production_load"]),
+            itl_timestamp_plan=(
+                None
+                if row["itl_timestamp_plan"] is None
+                else BoundJsonSource.from_dict(row["itl_timestamp_plan"])
+            ),
+            itl_timestamp_plan_sha256=(
+                None
+                if row["itl_timestamp_plan_sha256"] is None
+                else _require_sha256(
+                    "bundle ITL plan", row["itl_timestamp_plan_sha256"]
+                )
+            ),
+            itl_timestamp_producer_sha256=(
+                None
+                if row["itl_timestamp_producer_sha256"] is None
+                else _require_sha256(
+                    "bundle ITL producer", row["itl_timestamp_producer_sha256"]
+                )
+            ),
             run_config=BoundJsonSource.from_dict(row["run_config"]),
             server_launch=BoundJsonSource.from_dict(row["server_launch"]),
             execution_plan_summary=BoundJsonSource.from_dict(
@@ -3129,6 +3208,18 @@ class IndustrialAssignmentExecutionBundle:
         registry = _load_registry(self.registry.load())
         if registry.sha256 != self.registry.semantic_sha256:
             raise ValueError("bundle registry semantic identity mismatch")
+        registry_cells = tuple(
+            cell for cell in registry.cells if cell.cell_id == self.cell_id
+        )
+        if len(registry_cells) != 1:
+            raise ValueError("execution bundle cell is not unique in its registry")
+        registry_cell = registry_cells[0]
+        preflight_itl_timestamp_plan = _replay_bundle_itl_timestamp_plan(
+            bundle=self,
+            registry=registry,
+            cell=registry_cell,
+            require_release=not diagnostic,
+        )
         inventory = GpuInventory.from_dict(self.inventory.load())
         if inventory.sha256 != self.inventory.semantic_sha256:
             raise ValueError("bundle inventory semantic identity mismatch")
@@ -3294,6 +3385,16 @@ class IndustrialAssignmentExecutionBundle:
         if assignment.work_item.item_id != self.cell_id:
             raise ValueError("execution bundle assignment names another cell")
         cell = assignment.work_item.cell
+        if cell != registry_cell:
+            raise ValueError("execution bundle assignment changed its registry cell")
+        itl_timestamp_plan = _replay_bundle_itl_timestamp_plan(
+            bundle=self,
+            registry=registry,
+            cell=cell,
+            require_release=not diagnostic,
+        )
+        if itl_timestamp_plan != preflight_itl_timestamp_plan:
+            raise ValueError("execution bundle ITL plan changed during replay")
         if cell.resources.workload_class in {
             WorkloadClass.COMPILE,
             WorkloadClass.DOWNLOAD,
@@ -3616,6 +3717,17 @@ class IndustrialAssignmentExecutionBundle:
                         if execution_semantics is None
                         else execution_semantics.sha256
                     ),
+                    "itl_timestamp_plan_sha256": (
+                        None
+                        if itl_timestamp_plan is None
+                        else itl_timestamp_plan.sha256
+                    ),
+                    "itl_timestamp_producer_sha256": (
+                        None
+                        if itl_timestamp_plan is None
+                        or itl_timestamp_plan.producer is None
+                        else itl_timestamp_plan.producer.sha256
+                    ),
                     "run_config_sha256": run_config_sha256(run_config),
                     "server_launch_sha256": content_sha256(
                         server_launch_to_dict(launch)
@@ -3648,7 +3760,7 @@ class IndustrialAssignmentExecutionBundle:
                 }
             )
             return IndustrialExecutionPlanAudit(
-                schema_version=2,
+                schema_version=3,
                 kind="industrial_execution_plan_audit",
                 bundle_sha256=self.sha256,
                 assignment_sha256=self.assignment_sha256,
@@ -3660,6 +3772,14 @@ class IndustrialAssignmentExecutionBundle:
                 ),
                 component_replay_sha256=component_replay_sha256,
                 dispatch_plan_sha256=dispatch.sha256,
+                itl_timestamp_plan_sha256=(
+                    None if itl_timestamp_plan is None else itl_timestamp_plan.sha256
+                ),
+                itl_timestamp_producer_sha256=(
+                    None
+                    if itl_timestamp_plan is None or itl_timestamp_plan.producer is None
+                    else itl_timestamp_plan.producer.sha256
+                ),
                 execution_semantics_sha256=(
                     None if execution_semantics is None else execution_semantics.sha256
                 ),
@@ -3732,7 +3852,7 @@ def finalize_materialized_execution_bundle(
     The plan is reconstructed from the provisional bundle's raw sources; the
     supplied summary path is accepted only when its complete JSON body equals
     that newly constructed plan.  A second ordinary bundle replay then proves
-    the final schema-v4 object is load-equivalent to its source construction.
+    the final schema-v5 object is load-equivalent to its source construction.
     """
 
     if type(provisional) is not IndustrialAssignmentExecutionBundle:
@@ -3768,6 +3888,43 @@ def finalize_materialized_execution_bundle(
     if final.reconstruct_execution_plan() != plan:
         raise RuntimeError("finalized execution bundle changed its reconstructed plan")
     return final
+
+
+def _replay_bundle_itl_timestamp_plan(
+    *,
+    bundle: IndustrialAssignmentExecutionBundle,
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+    require_release: bool,
+) -> E2ItlTimestampPlan | None:
+    """Reopen one path-bound E2 plan and apply its source-owned release gate."""
+
+    is_e2 = cell.identity.experiment == "E2"
+    source = bundle.itl_timestamp_plan
+    if not is_e2:
+        if (
+            source is not None
+            or bundle.itl_timestamp_plan_sha256 is not None
+            or bundle.itl_timestamp_producer_sha256 is not None
+        ):
+            raise ValueError("non-E2 execution bundle cannot carry ITL authority")
+        return None
+    if source is None:
+        raise ExecutionBundleBlockedError("e2_itl_timestamp_plan_path_required")
+    plan = replay_e2_itl_timestamp_plan(registry, cell, source.load())
+    producer_sha256 = None if plan.producer is None else plan.producer.sha256
+    if (
+        source.semantic_sha256 != plan.sha256
+        or bundle.itl_timestamp_plan_sha256 != plan.sha256
+        or bundle.itl_timestamp_producer_sha256 != producer_sha256
+    ):
+        raise ValueError("execution bundle ITL digests differ from raw plan replay")
+    if require_release:
+        try:
+            require_e2_itl_timestamp_prelaunch(plan)
+        except ItlTimestampAuthorityBlocked as error:
+            raise ExecutionBundleBlockedError(error.reason) from error
+    return plan
 
 
 def _replay_interference_authority(

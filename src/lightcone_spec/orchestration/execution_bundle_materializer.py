@@ -48,6 +48,11 @@ from lightcone_spec.experiments.gpu_pool import (
     InterferenceEnvelope,
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
+from lightcone_spec.experiments.itl_authority import (
+    ItlTimestampAuthorityBlocked,
+    replay_e2_itl_timestamp_plan,
+    require_e2_itl_timestamp_prelaunch,
+)
 from lightcone_spec.experiments.planning import (
     BudgetActivationAuthorityBinding,
     BudgetRawJsonBinding,
@@ -117,6 +122,7 @@ _ASSIGNMENT_REQUIRED_SINGLE_ROLES = (
 _ASSIGNMENT_OPTIONAL_SINGLE_ROLES = (
     "trainable_plan_authority_binding",
     "failure_injection_authority_plan",
+    "itl_timestamp_authority_plan",
     "prepared_model_content_release_manifest",
 )
 _MANIFEST_KIND = "industrial_dispatch_execution_bundle_manifest"
@@ -694,7 +700,7 @@ class BoundDispatchBundleMaterializationInputs:
 
 @dataclass(frozen=True)
 class MaterializedAssignmentBundleReceipt:
-    """Manifest membership for one source-constructed schema-v4 bundle."""
+    """Manifest membership for one source-constructed schema-v5 bundle."""
 
     assignment_sha256: str
     cell_id: str
@@ -772,7 +778,7 @@ class DispatchExecutionBundleManifest:
 
     schema_version: int
     kind: Literal["industrial_dispatch_execution_bundle_manifest"]
-    bundle_schema_version: Literal[4]
+    bundle_schema_version: Literal[5]
     materialization_inputs_sha256: str
     request: BoundJsonSource
     dispatch_plan: BoundJsonSource
@@ -784,7 +790,7 @@ class DispatchExecutionBundleManifest:
             or self.schema_version != 1
             or self.kind != _MANIFEST_KIND
             or type(self.bundle_schema_version) is not int
-            or self.bundle_schema_version != 4
+            or self.bundle_schema_version != 5
         ):
             raise ValueError("dispatch execution-bundle manifest is unsupported")
         if len(self.materialization_inputs_sha256) != 64 or any(
@@ -858,7 +864,7 @@ class DispatchExecutionBundleManifest:
 
 @dataclass(frozen=True)
 class MaterializedDispatchExecutionBundlePublication:
-    """A committed manifest together with its exact schema-v4 members."""
+    """A committed manifest together with its exact schema-v5 members."""
 
     manifest: DispatchExecutionBundleManifest
     bundles: tuple[IndustrialAssignmentExecutionBundle, ...]
@@ -1019,6 +1025,14 @@ def bind_dispatch_bundle_materialization_inputs(
             )
         if not failure_cell and failure_source:
             raise ValueError("non-failure assignment cannot carry failure authority")
+        e2_cell = assignment.work_item.cell.identity.experiment == "E2"
+        has_itl_plan = "itl_timestamp_authority_plan" in roles
+        if e2_cell and not has_itl_plan:
+            raise DispatchBundleMaterializationBlocked(
+                "e2_itl_timestamp_plan_path_required"
+            )
+        if not e2_cell and has_itl_plan:
+            raise ValueError("non-E2 assignment cannot carry an ITL authority plan")
         has_trainable = "trainable_plan_authority_binding" in roles
         has_prepared_release = "prepared_model_content_release_manifest" in roles
         if method in {"target_only", "static"}:
@@ -1401,7 +1415,7 @@ def _reconstruct_materialization_authority(
             raise ValueError("serial interference raw authority differs")
         receipt_semantic = expected_receipt["receipt_sha256"]
     else:
-        # The schema-v4 replay will accept only the registered bootstrap receipt
+        # The schema-v5 replay will accept only the registered bootstrap receipt
         # for this case; no caller-produced summary is treated as calibration.
         receipt_value = raw_interference_receipt.load()
         if (
@@ -1469,6 +1483,33 @@ def _materialize_assignment_provisional(
         or bound_assignment.cell_id != cell_id
     ):
         raise ValueError("bound assignment identity changed before reduction")
+
+    itl_timestamp_plan_source = None
+    itl_timestamp_plan_sha256 = None
+    itl_timestamp_producer_sha256 = None
+    raw_itl_plan_source = roles.get("itl_timestamp_authority_plan")
+    if assignment.work_item.cell.identity.experiment == "E2":
+        if raw_itl_plan_source is None:
+            raise DispatchBundleMaterializationBlocked(
+                "e2_itl_timestamp_plan_path_required"
+            )
+        itl_timestamp_plan = replay_e2_itl_timestamp_plan(
+            authority.registry,
+            assignment.work_item.cell,
+            raw_itl_plan_source.load(),
+        )
+        try:
+            producer = require_e2_itl_timestamp_prelaunch(itl_timestamp_plan)
+        except ItlTimestampAuthorityBlocked as error:
+            raise DispatchBundleMaterializationBlocked(error.reason) from error
+        itl_timestamp_plan_source = BoundJsonSource.bind(
+            raw_itl_plan_source.path,
+            semantic_sha256=itl_timestamp_plan.sha256,
+        )
+        itl_timestamp_plan_sha256 = itl_timestamp_plan.sha256
+        itl_timestamp_producer_sha256 = producer.sha256
+    elif raw_itl_plan_source is not None:
+        raise ValueError("non-E2 materialization cannot carry ITL authority")
 
     launch_policy_source = roles["launch_policy"]
     launch_policy = AssignmentLaunchMaterializationPolicy.from_dict(
@@ -1667,7 +1708,7 @@ def _materialize_assignment_provisional(
         }
     )
     provisional = IndustrialAssignmentExecutionBundle(
-        schema_version=4,
+        schema_version=5,
         kind="industrial_assignment_execution_bundle",
         assignment_sha256=assignment.assignment_id,
         cell_id=cell_id,
@@ -1695,6 +1736,9 @@ def _materialize_assignment_provisional(
         dispatch_plan=authority.dispatch_plan_source,
         topology_receipts=topology_source,
         production_load=production_load_source,
+        itl_timestamp_plan=itl_timestamp_plan_source,
+        itl_timestamp_plan_sha256=itl_timestamp_plan_sha256,
+        itl_timestamp_producer_sha256=itl_timestamp_producer_sha256,
         run_config=run_config_source,
         server_launch=nonce_source,
         execution_plan_summary=nonce_source,
@@ -1868,7 +1912,7 @@ def materialize_dispatch_execution_bundles(
     *,
     output_directory: str | Path,
 ) -> Path:
-    """Construct and publish a complete schema-v4 bundle set manifest-last."""
+    """Construct and publish a complete schema-v5 bundle set manifest-last."""
 
     output = _preflight_publication_directory(output_directory)
     bound = bind_dispatch_bundle_materialization_inputs(request_path)
@@ -2007,7 +2051,7 @@ def materialize_dispatch_execution_bundles(
     manifest = DispatchExecutionBundleManifest(
         schema_version=1,
         kind=_MANIFEST_KIND,
-        bundle_schema_version=4,
+        bundle_schema_version=5,
         materialization_inputs_sha256=bound.sha256,
         request=bound.request,
         dispatch_plan=authority.dispatch_plan_source,
@@ -2087,6 +2131,7 @@ def load_materialized_dispatch_execution_bundle_publication(
         ):
             raise ValueError("published bundle is outside its manifest directory")
         bundle = IndustrialAssignmentExecutionBundle.load(receipt.bundle.path)
+        _require_published_bundle_itl_source(bundle, source_by_role)
         if (
             Path(bundle.server_launch.path).parent != publication_root
             or Path(bundle.server_launch.path).name
@@ -2114,6 +2159,18 @@ def load_materialized_dispatch_execution_bundle_publication(
         manifest=manifest,
         bundles=tuple(bundles),
     )
+
+
+def _require_published_bundle_itl_source(
+    bundle: IndustrialAssignmentExecutionBundle,
+    source_by_role: dict[str, BoundJsonSource],
+) -> None:
+    """Bind the published optional ITL source to its exact request path."""
+
+    if bundle.itl_timestamp_plan != source_by_role.get("itl_timestamp_authority_plan"):
+        raise ValueError(
+            "published bundle swapped its path-bound ITL construction source"
+        )
 
 
 def load_materialized_dispatch_execution_bundles(

@@ -38,6 +38,15 @@ from lightcone_spec.experiments.budget_authority import (
     revalidate_budget_materialization_authority_binding,
 )
 from lightcone_spec.experiments.gpu_pool import GpuInventory
+from lightcone_spec.experiments.itl_authority import (
+    ItlRequestExpectation,
+    ItlTimestampAuthorityBlocked,
+    PathBoundItlTimestampAuthority,
+    load_path_bound_itl_timestamp_authority,
+    release_e2_itl_timestamp_plan,
+    require_e2_itl_timestamp_prelaunch,
+    revalidate_path_bound_itl_timestamp_authority,
+)
 from lightcone_spec.experiments.long_context_analysis import (
     E3B_CONTEXT_GRID,
     E3B_LONG_CONTEXT_PROTOCOL_SHA256,
@@ -406,6 +415,7 @@ class IndustrialCellEvidence:
     budget_observation: BoundArtifact
     completion_contract: BoundArtifact | None = None
     diagnostic_lineage_identity: bool = False
+    itl_timestamp_authority_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not _is_sha256(self.cell_id):
@@ -424,6 +434,17 @@ class IndustrialCellEvidence:
             raise ValueError(
                 "cell evidence cannot mix completion and diagnostic identities"
             )
+        if self.itl_timestamp_authority_path is not None:
+            if not isinstance(self.itl_timestamp_authority_path, Path):
+                raise TypeError("ITL timestamp authority path must be pathlib.Path")
+            if (
+                not self.itl_timestamp_authority_path.is_absolute()
+                or self.itl_timestamp_authority_path.resolve()
+                != self.itl_timestamp_authority_path
+            ):
+                raise ValueError(
+                    "ITL timestamp authority path must be absolute and resolved"
+                )
 
 
 @dataclass(frozen=True)
@@ -780,14 +801,20 @@ def _raw_evidence_reference_from_dict(value: object, *, label: str) -> BoundArti
     return BoundArtifact(path=Path(path), sha256=str(digest))
 
 
-def _raw_cell_to_dict(cell: IndustrialCellEvidence) -> dict[str, object]:
+def _raw_cell_to_dict(
+    cell: IndustrialCellEvidence,
+    *,
+    require_itl_authority: bool = False,
+) -> dict[str, object]:
     if type(cell) is not IndustrialCellEvidence:
         raise TypeError("raw cell evidence must be exact")
     if cell.completion_contract is None or cell.diagnostic_lineage_identity:
         raise ValueError(
             "formal raw cell evidence requires its schema-v4 completion contract"
         )
-    return {
+    if require_itl_authority and cell.itl_timestamp_authority_path is None:
+        raise ValueError("raw E2 cell lacks its ITL timestamp authority path")
+    result: dict[str, object] = {
         "cell_id": cell.cell_id,
         "terminal_receipts": [
             _raw_evidence_reference_to_dict(reference)
@@ -799,22 +826,39 @@ def _raw_cell_to_dict(cell: IndustrialCellEvidence) -> dict[str, object]:
             cell.completion_contract
         ),
     }
+    if require_itl_authority:
+        result["itl_timestamp_authority_path"] = str(cell.itl_timestamp_authority_path)
+    return result
 
 
-def _raw_cell_from_dict(value: object, *, label: str) -> IndustrialCellEvidence:
-    if type(value) is not dict or set(value) != {
+def _raw_cell_from_dict(
+    value: object,
+    *,
+    label: str,
+    require_itl_authority: bool = False,
+) -> IndustrialCellEvidence:
+    fields = {
         "cell_id",
         "terminal_receipts",
         "hardware_receipt",
         "budget_observation",
         "completion_contract",
-    }:
+    }
+    if require_itl_authority:
+        fields.add("itl_timestamp_authority_path")
+    if type(value) is not dict or set(value) != fields:
         raise ValueError(f"{label} fields differ from the raw cell schema")
     terminals = value.get("terminal_receipts")
     if type(terminals) is not list or not terminals:
         raise ValueError(f"{label} requires terminal receipts")
+    cell_id = value.get("cell_id")
+    if type(cell_id) is not str:
+        raise TypeError(f"{label}.cell_id must be an exact string")
+    itl_path_value = value.get("itl_timestamp_authority_path")
+    if require_itl_authority and type(itl_path_value) is not str:
+        raise TypeError(f"{label}.itl_timestamp_authority_path must be an exact string")
     return IndustrialCellEvidence(
-        cell_id=str(value.get("cell_id")),
+        cell_id=cell_id,
         terminal_receipts=tuple(
             _raw_evidence_reference_from_dict(
                 reference,
@@ -830,6 +874,9 @@ def _raw_cell_from_dict(value: object, *, label: str) -> IndustrialCellEvidence:
         ),
         completion_contract=_raw_evidence_reference_from_dict(
             value.get("completion_contract"), label=f"{label}.completion_contract"
+        ),
+        itl_timestamp_authority_path=(
+            None if not require_itl_authority else Path(itl_path_value)
         ),
     )
 
@@ -915,13 +962,17 @@ class RawE2StageEvidenceManifest:
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 2:
-            raise ValueError("only raw E2 stage manifest schema 2 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 3:
+            raise ValueError("only raw E2 stage manifest schema 3 is supported")
         if type(self.stage_index) is not int or self.stage_index not in range(4):
             raise ValueError("raw E2 stage index is invalid")
         ids = tuple(cell.cell_id for cell in self.cells)
         if not ids or ids != tuple(sorted(set(ids))):
             raise ValueError("raw E2 cells must be cell-sorted and unique")
+        if any(cell.itl_timestamp_authority_path is None for cell in self.cells):
+            raise ValueError(
+                "raw E2 cells require one path-only ITL timestamp authority"
+            )
 
     @property
     def sha256(self) -> str:
@@ -1034,7 +1085,13 @@ def _raw_cell_manifest_to_dict(
     value: dict[str, object] = {
         "schema_version": schema_version,
         "kind": kind,
-        "cells": [_raw_cell_to_dict(cell) for cell in cells],
+        "cells": [
+            _raw_cell_to_dict(
+                cell,
+                require_itl_authority=(kind == "raw_e2_stage_evidence_manifest"),
+            )
+            for cell in cells
+        ],
     }
     if stage_index is not None:
         value["stage_index"] = stage_index
@@ -1111,20 +1168,32 @@ def _raw_cell_manifest_from_dict(
         fields.add("stage_index")
     if type(value) is not dict or set(value) != fields:
         raise ValueError(f"{kind} fields differ from the strict schema")
-    if value.get("schema_version") != 2 or value.get("kind") != kind:
+    expected_schema = 3 if kind == "raw_e2_stage_evidence_manifest" else 2
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != expected_schema
+        or type(value.get("kind")) is not str
+        or value.get("kind") != kind
+    ):
         raise ValueError(f"{kind} identity is invalid")
     cells = value.get("cells")
     if type(cells) is not list or not cells:
         raise ValueError(f"{kind} requires raw cell evidence")
     parsed = tuple(
-        _raw_cell_from_dict(cell, label=f"{kind}.cells[{index}]")
+        _raw_cell_from_dict(
+            cell,
+            label=f"{kind}.cells[{index}]",
+            require_itl_authority=(kind == "raw_e2_stage_evidence_manifest"),
+        )
         for index, cell in enumerate(cells)
     )
-    return (
-        value.get("stage_index") if stage_index else None,
-        parsed,
-        str(value.get("artifact_sha256")),
-    )
+    raw_stage_index = value.get("stage_index") if stage_index else None
+    if stage_index and type(raw_stage_index) is not int:
+        raise ValueError(f"{kind} stage index must be an exact integer")
+    artifact_sha256 = value.get("artifact_sha256")
+    if type(artifact_sha256) is not str or not _is_sha256(artifact_sha256):
+        raise ValueError(f"{kind} artifact SHA-256 is invalid")
+    return raw_stage_index, parsed, artifact_sha256
 
 
 def raw_e3a_selection_manifest_from_dict(
@@ -1162,7 +1231,7 @@ def raw_e2_stage_manifest_from_dict(value: object) -> RawE2StageEvidenceManifest
         stage_index=True,
     )
     manifest = RawE2StageEvidenceManifest(
-        schema_version=2,
+        schema_version=3,
         stage_index=stage_index,  # type: ignore[arg-type]
         cells=cells,
     )
@@ -1418,6 +1487,7 @@ class _LoadedCell:
     physical_host_id: str
     budget_observation_sha256: str
     hardware_validity: tuple[tuple[str, str, tuple[str, ...]], ...]
+    itl_timestamp_authority_path: Path | None
     observed_budget: ExperimentBudget | None = None
     analysis_budget: ExperimentBudget | None = None
     round_rows_by_rank: tuple[tuple[dict[str, Any], ...], ...] = ()
@@ -2182,7 +2252,11 @@ def _parse_itl(value: object, row: Mapping[str, Any]) -> float | None:
     return float(np.quantile(raw_intervals, 0.99)) if raw_intervals.size else None
 
 
-def _request_metric(row: Mapping[str, Any]) -> _RequestMetric:
+def _request_metric(
+    row: Mapping[str, Any],
+    *,
+    authoritative_token_timestamps_ns: tuple[int, ...] | None = None,
+) -> _RequestMetric:
     request_id = row.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("request evidence lacks a request_id")
@@ -2237,13 +2311,36 @@ def _request_metric(row: Mapping[str, Any]) -> _RequestMetric:
     if finished != (outcome_status == "completed"):
         raise ValueError("request finished flag disagrees with terminal outcome")
     error = outcome_status != "completed"
+    if authoritative_token_timestamps_ns is None:
+        within_request_p99_itl_ms = _parse_itl(row.get("inter_token_ms"), row)
+    else:
+        if len(authoritative_token_timestamps_ns) != output_tokens:
+            raise ValueError(
+                "formal ITL authority does not cover the terminal output tokens"
+            )
+        authoritative_intervals = (
+            np.diff(
+                np.asarray(authoritative_token_timestamps_ns, dtype=np.int64)
+            ).astype(np.float64)
+            / 1_000_000.0
+        )
+        if (
+            authoritative_intervals.size == 0
+            or not np.isfinite(authoritative_intervals).all()
+            or np.any(authoritative_intervals <= 0.0)
+        ):
+            raise ValueError("formal ITL authority has no positive token intervals")
+        # Parquet request rows may retain diagnostic client/SSE timing, but it
+        # is never consulted for formal E2 selection.  Only the recursively
+        # replayed release-producer receipt above supplies this statistic.
+        within_request_p99_itl_ms = float(np.quantile(authoritative_intervals, 0.99))
     return _RequestMetric(
         request_id=request_id,
         output_tokens=output_tokens,
         completed=finished,
         error=error,
         ttft_ms=observed_ttft,
-        within_request_p99_itl_ms=_parse_itl(row.get("inter_token_ms"), row),
+        within_request_p99_itl_ms=within_request_p99_itl_ms,
         latency_ms=(terminal - arrival) / 1_000_000.0,
     )
 
@@ -3110,6 +3207,7 @@ def _load_cell(
         fixed_instance_gpu_count=len(inventory.devices),
         physical_host_id=physical_host_id,
         budget_observation_sha256=budget_observation_sha256,
+        itl_timestamp_authority_path=reference.itl_timestamp_authority_path,
         observed_budget=observed_budget,
         analysis_budget=observed_budget,
         hardware_validity=hardware_validity,
@@ -5456,6 +5554,155 @@ def _validate_industrial_gpu_attestation(
         )
 
 
+def _e2_itl_request_expectations(
+    cell: _LoadedCell,
+) -> tuple[ItlRequestExpectation, ...]:
+    """Derive timestamp expectations only from terminal request evidence."""
+
+    rows = tuple(sorted(cell.request_rows, key=lambda row: str(row.get("request_id"))))
+    request_ids = tuple(row.get("request_id") for row in rows)
+    if (
+        not rows
+        or any(
+            not isinstance(request_id, str) or not request_id
+            for request_id in request_ids
+        )
+        or request_ids != tuple(sorted(set(request_ids)))
+    ):
+        raise ValueError("E2 terminal requests must be sorted, non-empty, and unique")
+    expectations: list[ItlRequestExpectation] = []
+    for row in rows:
+        if row.get("outcome_status") != "completed" or row.get("finished") is not True:
+            raise ValueError("E2 formal ITL authority requires completed requests")
+        arrival_ns = row.get("arrival_ns")
+        terminal_ns = row.get("completed_ns")
+        if (
+            type(arrival_ns) is not int
+            or type(terminal_ns) is not int
+            or terminal_ns < arrival_ns
+        ):
+            raise ValueError("E2 terminal request lifetime is unavailable")
+        expectations.append(
+            ItlRequestExpectation(
+                request_id=str(row["request_id"]),
+                output_token_ids=_parse_output_token_ids(row),
+                terminal_status="completed",
+            )
+        )
+    return tuple(expectations)
+
+
+def _load_e2_itl_timestamp_authorities(
+    *,
+    registry: ExperimentRegistry,
+    loaded: Mapping[str, _LoadedCell],
+) -> dict[str, PathBoundItlTimestampAuthority]:
+    """Load exactly one path-only formal ITL authority for every E2 cell."""
+
+    authority_paths = tuple(row.itl_timestamp_authority_path for row in loaded.values())
+    if any(path is None for path in authority_paths):
+        raise ValueError(
+            "E2 raw stage reduction is BLOCKED: "
+            "per_cell_itl_timestamp_authority_path_required"
+        )
+    concrete_paths = tuple(path for path in authority_paths if path is not None)
+    if len(concrete_paths) != len(set(concrete_paths)):
+        raise ValueError("E2 ITL authority paths must be unique per logical cell")
+    result: dict[str, PathBoundItlTimestampAuthority] = {}
+    for cell_id, row in sorted(loaded.items()):
+        authority_path = row.itl_timestamp_authority_path
+        if authority_path is None:  # pragma: no cover - complete check above
+            raise RuntimeError("E2 ITL authority path disappeared")
+        evidence_root = Path(row.cell.resources.evidence_root).resolve()
+        if authority_path.parent != evidence_root:
+            raise ValueError("E2 ITL authority must live in its registry evidence root")
+        result[cell_id] = load_path_bound_itl_timestamp_authority(
+            authority_path,
+            registry=registry,
+            cell=row.cell,
+            expected_requests=_e2_itl_request_expectations(row),
+        )
+    if set(result) != set(loaded):  # pragma: no cover - construction invariant
+        raise RuntimeError("E2 ITL authority coverage changed during binding")
+    return result
+
+
+def _preflight_e2_itl_timestamp_authorities(
+    *,
+    registry: ExperimentRegistry,
+    references: Sequence[IndustrialCellEvidence],
+    cells_by_id: Mapping[str, ExperimentCell],
+) -> None:
+    """Apply the release gate before opening terminal/raw evidence files."""
+
+    paths = tuple(reference.itl_timestamp_authority_path for reference in references)
+    if any(path is None for path in paths):
+        raise ValueError(
+            "E2 raw stage reduction is BLOCKED: "
+            "per_cell_itl_timestamp_authority_path_required"
+        )
+    concrete_paths = tuple(path for path in paths if path is not None)
+    if len(concrete_paths) != len(set(concrete_paths)):
+        raise ValueError("E2 ITL authority paths must be unique per logical cell")
+    for reference in references:
+        cell = cells_by_id.get(reference.cell_id)
+        if cell is None:
+            raise ValueError("E2 ITL preflight names a foreign registry cell")
+        authority_path = reference.itl_timestamp_authority_path
+        if authority_path is None:  # pragma: no cover - complete check above
+            raise RuntimeError("E2 ITL authority path disappeared")
+        if authority_path.parent != Path(cell.resources.evidence_root).resolve():
+            raise ValueError("E2 ITL authority must live in its registry evidence root")
+        try:
+            require_e2_itl_timestamp_prelaunch(
+                release_e2_itl_timestamp_plan(registry, cell)
+            )
+        except ItlTimestampAuthorityBlocked as error:
+            raise ValueError(
+                f"E2 raw stage reduction is BLOCKED: {error.reason}"
+            ) from error
+
+
+def _e2_request_metrics_from_itl_authority(
+    cell: _LoadedCell,
+    binding: PathBoundItlTimestampAuthority,
+) -> tuple[_RequestMetric, ...]:
+    timestamps_by_request = {
+        row.request_id: row.token_observed_ns for row in binding.authority.requests
+    }
+    terminal_ids = tuple(str(row.get("request_id")) for row in cell.request_rows)
+    if set(timestamps_by_request) != set(terminal_ids):
+        raise ValueError("E2 ITL authority request coverage is incomplete")
+    return tuple(
+        _request_metric(
+            row,
+            authoritative_token_timestamps_ns=timestamps_by_request[
+                str(row["request_id"])
+            ],
+        )
+        for row in cell.request_rows
+    )
+
+
+def _revalidate_e2_itl_timestamp_authorities(
+    *,
+    registry: ExperimentRegistry,
+    loaded: Mapping[str, _LoadedCell],
+    authorities: Mapping[str, PathBoundItlTimestampAuthority],
+) -> None:
+    if set(authorities) != set(loaded):
+        raise ValueError("E2 ITL authority coverage is incomplete")
+    for cell_id in sorted(loaded):
+        rebound = revalidate_path_bound_itl_timestamp_authority(
+            authorities[cell_id],
+            registry=registry,
+            cell=loaded[cell_id].cell,
+            expected_requests=_e2_itl_request_expectations(loaded[cell_id]),
+        )
+        if rebound != authorities[cell_id]:
+            raise ValueError("E2 ITL authority changed during stage reduction")
+
+
 def _e2_evidence_manifest_sha256(
     *,
     registry: ExperimentRegistry,
@@ -5466,10 +5713,11 @@ def _e2_evidence_manifest_sha256(
     hardware_envelope: HardwareEnvelope,
     inventory: GpuInventory,
     cells: Sequence[IndustrialCellEvidence],
+    itl_authorities: Mapping[str, PathBoundItlTimestampAuthority],
 ) -> str:
     return content_sha256(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "industrial_e2_raw_stage_evidence",
             "registry_sha256": registry.sha256,
             "e1_receipt_sha256": e1_receipt.sha256,
@@ -5491,6 +5739,9 @@ def _e2_evidence_manifest_sha256(
                     ],
                     "hardware_receipt_sha256": cell.hardware_receipt.sha256,
                     "budget_observation_sha256": cell.budget_observation.sha256,
+                    "itl_timestamp_authority_sha256": (
+                        itl_authorities[cell.cell_id].sha256
+                    ),
                 }
                 for cell in sorted(cells, key=lambda row: row.cell_id)
             ],
@@ -5730,6 +5981,11 @@ def reduce_e2_stage_from_raw(
     ):
         raise ValueError("E2 raw evidence must exactly cover the activated stage")
     cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("E2")}
+    _preflight_e2_itl_timestamp_authorities(
+        registry=registry,
+        references=references,
+        cells_by_id=cells_by_id,
+    )
     run_identity = _E2RunIdentity(
         experiment="E2",
         runtime_sha256=activation.plan.runtime_sha256,
@@ -5746,6 +6002,10 @@ def reduce_e2_stage_from_raw(
         )
         for reference in references
     }
+    itl_authorities = _load_e2_itl_timestamp_authorities(
+        registry=registry,
+        loaded=loaded,
+    )
     run_ids = [str(row.run_rows[0]["run_id"]) for row in loaded.values()]
     nonces = [str(row.run_rows[0]["run_nonce_sha256"]) for row in loaded.values()]
     if len(run_ids) != len(set(run_ids)) or len(nonces) != len(set(nonces)):
@@ -5780,8 +6040,14 @@ def reduce_e2_stage_from_raw(
         )
     target = by_method["target_only"][0]
     static = by_method["static"][0]
-    target_metrics = tuple(_request_metric(row) for row in target.request_rows)
-    static_metrics = tuple(_request_metric(row) for row in static.request_rows)
+    target_metrics = _e2_request_metrics_from_itl_authority(
+        target,
+        itl_authorities[target.cell.cell_id],
+    )
+    static_metrics = _e2_request_metrics_from_itl_authority(
+        static,
+        itl_authorities[static.cell.cell_id],
+    )
     if any(
         not row.completed or row.error for row in (*target_metrics, *static_metrics)
     ):
@@ -5839,7 +6105,10 @@ def reduce_e2_stage_from_raw(
         p99_itl_ms: list[float] = []
         for method in ("tts", "l0"):
             cell = pair[method]
-            metrics = tuple(_request_metric(row) for row in cell.request_rows)
+            metrics = _e2_request_metrics_from_itl_authority(
+                cell,
+                itl_authorities[cell.cell.cell_id],
+            )
             method_metrics[method] = metrics
             if any(not row.completed or row.error for row in metrics):
                 reasons.add(f"{method}:incomplete_request")
@@ -5922,6 +6191,10 @@ def reduce_e2_stage_from_raw(
                     row.budget_observation_sha256
                     for row in (target, static, *pair.values())
                 ),
+                "itl_timestamp_authority_sha256s": sorted(
+                    itl_authorities[row.cell.cell_id].sha256
+                    for row in (target, static, *pair.values())
+                ),
                 "run_binding_sha256s": sorted(
                     _loaded_cell_raw_run_binding(
                         row,
@@ -5983,6 +6256,7 @@ def reduce_e2_stage_from_raw(
             hardware_envelope=hardware_envelope,
             inventory=inventory,
             cells=references,
+            itl_authorities=itl_authorities,
         ),
         completed_cell_ids=tuple(sorted(loaded)),
         terminal_receipt_sha256s=tuple(
@@ -6004,11 +6278,17 @@ def reduce_e2_stage_from_raw(
         data_source="tuning_only",
         confirmation_data_visible=False,
     )
-    return _reduce_e2_successive_halving(
+    reduction = _reduce_e2_successive_halving(
         activation,
         registry=registry,
         stage_evidence=stage_evidence,
     )
+    _revalidate_e2_itl_timestamp_authorities(
+        registry=registry,
+        loaded=loaded,
+        authorities=itl_authorities,
+    )
+    return reduction
 
 
 def reduce_confirmation_family_power(

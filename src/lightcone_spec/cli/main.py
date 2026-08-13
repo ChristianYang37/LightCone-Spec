@@ -1706,7 +1706,7 @@ def _analysis_blocks(
     manifest_path: Path,
     value: object,
 ) -> tuple[IndustrialBlockEvidence, ...]:
-    if not isinstance(value, list) or not value:
+    if type(value) is not list or not value:
         raise ValueError("industrial analysis manifest requires block evidence")
     blocks: list[IndustrialBlockEvidence] = []
     for raw_block in value:
@@ -1788,16 +1788,21 @@ def _analysis_cells(
         raise ValueError("E2 raw manifest requires cell evidence")
     cells: list[IndustrialCellEvidence] = []
     for raw_cell in value:
-        if not isinstance(raw_cell, dict) or set(raw_cell) != {
+        if type(raw_cell) is not dict or set(raw_cell) != {
             "cell_id",
             "terminal_receipts",
             "hardware_receipt",
             "budget_observation",
+            "completion_contract",
+            "itl_timestamp_authority_path",
         }:
             raise ValueError("E2 raw cell fields do not match schema")
         terminal = raw_cell.get("terminal_receipts")
-        if not isinstance(terminal, list) or not terminal:
+        if type(terminal) is not list or not terminal:
             raise ValueError("E2 raw cell requires terminal rank receipts")
+        authority_path = raw_cell.get("itl_timestamp_authority_path")
+        if type(authority_path) is not str:
+            raise TypeError("E2 ITL timestamp authority path must be an exact string")
         cells.append(
             IndustrialCellEvidence(
                 cell_id=raw_cell.get("cell_id"),
@@ -1818,6 +1823,20 @@ def _analysis_cells(
                     manifest_path,
                     raw_cell.get("budget_observation"),
                     label="E2 budget observation",
+                ),
+                completion_contract=_analysis_file_binding(
+                    manifest_path,
+                    raw_cell.get("completion_contract"),
+                    label="E2 schema-v4 completion contract",
+                ),
+                itl_timestamp_authority_path=Path(
+                    os.path.abspath(
+                        _analysis_manifest_path(
+                            manifest_path,
+                            authority_path,
+                            label="E2 ITL timestamp authority",
+                        )
+                    )
                 ),
             )
         )
@@ -1845,14 +1864,14 @@ def _load_e2_stage_manifest(
         "hardware_envelope",
         "cells",
     }
-    if not isinstance(value, dict) or set(value) != expected:
+    if type(value) is not dict or set(value) != expected:
         raise ValueError("E2 raw stage manifest fields do not match schema")
     stage_index = value.get("stage_index")
     if (
-        value.get("schema_version") != 2
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 3
         or value.get("kind") != "industrial_e2_stage_reduction_manifest"
-        or not isinstance(stage_index, int)
-        or isinstance(stage_index, bool)
+        or type(stage_index) is not int
     ):
         raise ValueError("E2 raw stage manifest identity is invalid")
     registry_path = _analysis_bound_json_path(
@@ -7035,7 +7054,7 @@ def _bind_formal_workload_cli(args: argparse.Namespace) -> int:
 
 
 def _materialize_dispatch_execution_bundles_cli(args: argparse.Namespace) -> int:
-    """Atomically publish source-owned schema-v4 bundles and their manifest."""
+    """Atomically publish source-owned schema-v5 bundles and their manifest."""
 
     from lightcone_spec.orchestration.execution_bundle_materializer import (
         DispatchBundleMaterializationBlocked,

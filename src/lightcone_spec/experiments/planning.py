@@ -20,6 +20,9 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from lightcone_spec.experiments.gpu_pool import GpuInventory, InterferenceEnvelope
 
+from lightcone_spec.experiments.itl_authority import (
+    ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256,
+)
 from lightcone_spec.experiments.load import ProductionLoadPlan
 from lightcone_spec.experiments.registry import (
     CORE_METHODS,
@@ -163,7 +166,7 @@ E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
 )
 E2_HALVING_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 6,
+        "schema_version": 7,
         "kind": "e2_successive_halving_protocol",
         "stages": E2_HALVING_STAGES,
         "draft_width_authority": E2_DRAFT_WIDTH_SELECTOR,
@@ -190,6 +193,15 @@ E2_HALVING_PROTOCOL_SHA256 = content_sha256(
         "inventory_authority": (
             "content_bound_gpu_inventory_sha_source_receipt_count_host_v1"
         ),
+        "formal_itl_timestamp_authority_protocol_sha256": (
+            ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256
+        ),
+        "formal_itl_timestamp_source": (
+            "source_owned_result_pointer_then_path_bound_raw_receipt_full_coverage_v1"
+        ),
+        "current_release_itl_result_pointer": "BLOCKED_unavailable",
+        "cpu_contract_only_itl": "BLOCKED",
+        "sse_chunk_gap_interpolation": "forbidden",
     }
 )
 CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256 = content_sha256(

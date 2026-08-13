@@ -53,6 +53,11 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuInventory,
     validate_dispatch_plan_for_execution,
 )
+from lightcone_spec.experiments.itl_authority import (
+    E2ItlTimestampPlan,
+    release_e2_itl_timestamp_plan,
+    require_e2_itl_timestamp_prelaunch,
+)
 from lightcone_spec.experiments.load import (
     LoadAccounting,
     ProductionLoadPlan,
@@ -1762,6 +1767,27 @@ def _require_render_trainable_plan_authority(
         raise ValueError("runtime parameter plan differs from raw render authority")
 
 
+def _require_execution_itl_timestamp_authority(
+    *,
+    runtime_plan: IndustrialRuntimePlan,
+    dispatch_context: GpuDispatchExecutionContext,
+) -> E2ItlTimestampPlan | None:
+    """Replay the release-owned E2 timing gate before execution mutation."""
+
+    if type(runtime_plan) is not IndustrialRuntimePlan:
+        raise TypeError("ITL execution gate requires an exact runtime plan")
+    if runtime_plan.cell.identity.experiment != "E2":
+        return None
+    if type(dispatch_context) is not GpuDispatchExecutionContext:
+        raise TypeError("ITL execution gate requires an exact execution context")
+    plan = release_e2_itl_timestamp_plan(
+        dispatch_context.registry,
+        runtime_plan.cell,
+    )
+    require_e2_itl_timestamp_prelaunch(plan)
+    return plan
+
+
 @dataclass(frozen=True)
 class IndustrialExecutionPlan:
     """Immutable local plan for exactly one rank and one serving cell."""
@@ -1804,6 +1830,10 @@ class IndustrialExecutionPlan:
             runtime_plan=self.runtime_plan,
             dispatch_context=self.dispatch_context,
             registered_load=self.load_plan,
+        )
+        _require_execution_itl_timestamp_authority(
+            runtime_plan=self.runtime_plan,
+            dispatch_context=self.dispatch_context,
         )
         if type(self.evidence_writer_policy) is not EvidenceWriterPolicy:
             raise TypeError("execution writer policy must be an exact policy")
@@ -2093,8 +2123,12 @@ class IndustrialExecutionPlan:
         if capacity_authority is None:  # pragma: no cover - validation invariant
             raise RuntimeError("execution capacity authority disappeared")
         hashes = self.load_plan.scored.hashes
+        itl_plan = _require_execution_itl_timestamp_authority(
+            runtime_plan=self.runtime_plan,
+            dispatch_context=self.dispatch_context,
+        )
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "runtime_plan_sha256": self.runtime_plan.sha256,
             "dispatch_plan_sha256": self.dispatch_plan.sha256,
             "dispatch_context_sha256": self.dispatch_context.sha256,
@@ -2110,6 +2144,17 @@ class IndustrialExecutionPlan:
             "topology_sha256": self.topology_sha256,
             "topology_receipt_sha256": self.runtime_plan.topology_receipt_sha256,
             "runtime_plan": self.runtime_plan.to_dict(),
+            "itl_timestamp_authority": (
+                None
+                if itl_plan is None
+                else {
+                    "plan_sha256": itl_plan.sha256,
+                    "producer_sha256": (
+                        None if itl_plan.producer is None else itl_plan.producer.sha256
+                    ),
+                    "protocol_sha256": itl_plan.protocol_sha256,
+                }
+            ),
             "load": {
                 "paired_replay_sha256": self.load_plan.paired_replay_sha256,
                 "warmup_corpus_sha256": (
@@ -2440,6 +2485,10 @@ def build_industrial_execution_plan(
             cell=runtime_plan.cell,
             execution_semantics=runtime_plan.execution_semantics,
         )
+    _require_execution_itl_timestamp_authority(
+        runtime_plan=runtime_plan,
+        dispatch_context=dispatch_context,
+    )
     receipt_sha256s = tuple(receipt.sha256 for receipt in dependency_receipts)
     if receipt_sha256s != runtime_plan.dependency_receipt_sha256s:
         raise ValueError("dependency receipt order differs from the runtime plan")
@@ -2535,6 +2584,10 @@ def render_industrial_execution_plan(
         runtime_plan=runtime_plan,
         dispatch_context=dispatch_context,
         registered_load=load_plan,
+    )
+    _require_execution_itl_timestamp_authority(
+        runtime_plan=runtime_plan,
+        dispatch_context=dispatch_context,
     )
     _require_render_trainable_plan_authority(
         runtime_plan=runtime_plan,
@@ -4554,8 +4607,8 @@ async def execute_industrial_plan(
         or session_lifecycle is not None
     ):
         raise SharedSessionUnavailableError(SHARED_SESSION_UNAVAILABLE_REASON)
-    _require_execution_trainable_plan_authority(plan)
     plan.validate()
+    _require_execution_trainable_plan_authority(plan)
     observed_component_ms = _initial_budget_observations(plan)
     if launch_server is None:
         raise ValueError("standalone execution requires a server launcher")

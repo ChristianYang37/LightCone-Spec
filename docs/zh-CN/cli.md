@@ -31,7 +31,7 @@ industrial 命令包括：
 | `bind-industrial-budget-authority` | 把声明的 `BudgetPlan` 绑定到完整 tagged raw activation/load/capacity 闭包 |
 | `estimate-industrial-budget` | 在准确 physical inventory 与 interference envelope 上重放 ready `BudgetPlan` |
 | `plan-industrial-dispatch` | 冻结确定性、topology-aware GPU-pool wave 与 physical assignment |
-| `materialize-dispatch-execution-bundles` | 绑定一份 path-only raw input graph，并在全 assignment 预检后发布完整 schema-v4 assignment-bundle set |
+| `materialize-dispatch-execution-bundles` | 绑定一份 path-only raw input graph，并在全 assignment 预检后发布完整 schema-v5 assignment-bundle set |
 | `execute-dispatch-wave` | 重开一份已提交的 materialization manifest，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
 | `seal-industrial-stage` | 绑定 activated completion、disposition、budget、runtime、split、dependency 与 locked output |
 | `analyze-industrial` | 验证 schema-v3 terminal、budget、family-power 与 hardware evidence |
@@ -242,7 +242,7 @@ evidence 与 trusted hardware binding。
 以及 dispatch 中每个 cell 各一组 assignment-runtime path；刻意不接受 caller-supplied
 assignment SHA、execution-plan SHA/summary、output root 或 semantic hash。Reducer 会重开 request
 及每一份 sidecar，从 frozen dispatch plan 现场派生 assignment，并要求准确的一一 assignment
-覆盖，之后才能构造 schema-v4 bundle。
+覆盖，之后才能构造 schema-v5 bundle。
 
 创建 fresh publication directory 或任何 renderer artifact 之前，命令会预检全部 assignment
 的 raw activation/completion、budget、capacity、interference、topology、runtime、sampling、
@@ -256,7 +256,7 @@ reconstruction 还必须取得 live `READY` `BudgetPlan` 及其 path-bound mater
 
 Output path 必须为 absolute、resolved、尚不存在，并位于稳定且 owner-private 的 parent 之下。
 全 assignment 预检通过后，命令创建 private `0700` directory，以 exclusive write 写入每个
-schema-v4 bundle 与相邻 sidecar，最后写入 `dispatch-execution-bundle-manifest.json` 及其
+schema-v5 bundle 与相邻 sidecar，最后写入 `dispatch-execution-bundle-manifest.json` 及其
 sidecar 作为 commit marker。中断留下的 partial directory 会被保留，但因没有可消费 manifest
 而不构成 publication；重试必须使用另一 fresh directory，不能通过删除 evidence 恢复。
 
@@ -269,7 +269,7 @@ lightcone-spec materialize-dispatch-execution-bundles \
 `execute-dispatch-wave` 绝不会把 planner JSON、
 `IndustrialExecutionPlan.to_dict()` summary 或 raw bundle path 当作 launch authority。它只接受
 一份必需的 `--materialization-manifest`。通过 release dispatch trust gate 后，loader 会重开
-manifest、对应 request 与 dispatch plan、每个 schema-v4 member，以及完整 path-bound
+manifest、对应 request 与 dispatch plan、每个 schema-v5 member，以及完整 path-bound
 construction graph；input byte 变化、member 被替换、assignment coverage 不完整或 bundle
 位于 manifest directory 外都会被拒绝。之后 execution 才会重放共享 scheduler authority，
 并构造所请求 wave 的 physical plan（及 resume receipt 实际引用的历史 plan）。Compile/download
