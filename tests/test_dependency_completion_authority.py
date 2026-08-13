@@ -24,6 +24,7 @@ from lightcone_spec.experiments.planning_artifacts import (
 )
 from lightcone_spec.experiments.registry import ExperimentRegistry, content_sha256
 from lightcone_spec.experiments.selection_authority import (
+    E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
     E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON,
     E3A_SELECTION_POLICY_UNREGISTERED_REASON,
 )
@@ -429,4 +430,90 @@ def test_e3a_dependency_completion_calls_typed_locked_output_gate(
     assert blocked.value.reason_code == (
         E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON
     )
+    assert "dependency_locked_output" not in bound_roles
+
+
+def test_e1_dependency_completion_blocks_before_opening_opaque_common_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightcone_spec.experiments import budget_authority
+
+    registry = budget_authority.build_industrial_registry()
+    runtime_sha256 = content_sha256("e1-completion-runtime")
+    split_sha256 = content_sha256("e1-completion-split")
+    receipt = SimpleNamespace(
+        experiment="E1",
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        completed_cells_sha256=content_sha256("e1-completed"),
+    )
+    receipt_source = SimpleNamespace(role="activation_dependency_receipt")
+    completed_source = SimpleNamespace(
+        role="dependency_completed_cells",
+        semantic_sha256=receipt.completed_cells_sha256,
+    )
+    inventory = object()
+    prior_receipts = (object(), object())
+    prior_records = tuple(
+        SimpleNamespace(
+            binding=object(),
+            receipt=prior_receipt,
+            authority=SimpleNamespace(inventory=inventory),
+        )
+        for prior_receipt in prior_receipts
+    )
+    replay = SimpleNamespace(
+        binding=object(),
+        registry=registry,
+        dependency_records=prior_records,
+        dependency_receipts=prior_receipts,
+        experiment="E1",
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        family_activations=(),
+    )
+    bound_roles: list[str] = []
+
+    def bind_source(_path: object, *, role: str):
+        bound_roles.append(role)
+        return (
+            receipt_source
+            if role == "activation_dependency_receipt"
+            else completed_source
+        )
+
+    monkeypatch.setattr(budget_authority, "bind_budget_raw_json", bind_source)
+    monkeypatch.setattr(budget_authority, "load_budget_raw_json", lambda _row: {})
+    monkeypatch.setattr(budget_authority, "_receipt_from_value", lambda _row: receipt)
+    monkeypatch.setattr(
+        budget_authority,
+        "_bind_stage_activation_authority",
+        lambda *_args, **_kwargs: replay,
+    )
+    monkeypatch.setattr(
+        budget_authority,
+        "_dependency_inventory_authority",
+        lambda **_kwargs: (object(), inventory),
+    )
+    locked_outputs = [
+        {"name": name, "artifact": f"/{name}.json"}
+        for name in sorted(registry.definition("E1").locked_outputs)
+    ]
+    spec = {
+        "receipt_artifact": "/e1-receipt.json",
+        "completed_cells_artifact": "/e1-completed.json",
+        "activation_manifest": "/e1-activation.json",
+        "inventory_artifact": "/inventory.json",
+        "inventory_source_receipt": "/inventory-source.json",
+        "locked_outputs": locked_outputs,
+    }
+    with pytest.raises(BudgetMaterializationBlockedError) as blocked:
+        budget_authority._bind_dependency_completion(
+            spec,
+            expected_receipt_source=receipt_source,
+            expected_registry=registry,
+            earlier_records=None,
+            manifest_stack=(),
+        )
+    assert blocked.value.reason_code == E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
     assert "dependency_locked_output" not in bound_roles

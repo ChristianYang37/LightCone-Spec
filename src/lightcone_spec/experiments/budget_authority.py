@@ -1290,6 +1290,16 @@ def _bind_dependency_completion(
             require_e3a_locked_output_reduction_authority()
         except SelectionReductionAuthorityUnavailableError as error:
             raise BudgetMaterializationBlockedError(error.reason_code) from error
+    elif receipt.experiment == "E1":
+        from lightcone_spec.experiments.selection_authority import (
+            SelectionReductionAuthorityUnavailableError,
+            require_e1_common_load_reduction_authority,
+        )
+
+        try:
+            require_e1_common_load_reduction_authority()
+        except SelectionReductionAuthorityUnavailableError as error:
+            raise BudgetMaterializationBlockedError(error.reason_code) from error
     output_bindings: list[DependencyLockedOutputAuthorityBinding] = []
     output_sha256s: dict[str, str] = {}
     for output in locked_output_specs:
@@ -1699,6 +1709,7 @@ def _bind_e2_activation_authority(
     from lightcone_spec.experiments.selection_authority import (
         SelectionReductionAuthorityUnavailableError,
         reduce_e1_pareto_from_raw,
+        require_e1_common_load_reduction_authority,
     )
 
     raw_pareto = raw_e1_pareto_manifest_from_dict(load_budget_raw_json(pareto_source))
@@ -1725,12 +1736,13 @@ def _bind_e2_activation_authority(
         or split.canonical_sha256 != pareto.split_sha256
     ):
         raise ValueError("E2 runtime/split differs from the raw E1 Pareto lineage")
+    try:
+        require_e1_common_load_reduction_authority()
+    except SelectionReductionAuthorityUnavailableError as error:
+        raise BudgetMaterializationBlockedError(error.reason_code) from error
     e1_outputs = {output.name: output.content_sha256 for output in receipt.outputs}
-    if (
-        e1_outputs.get("dflash_pareto_set") != pareto.sha256
-        or e1_outputs.get("common_downstream_load") != pareto.common_load_sha256
-    ):
-        raise ValueError("E1 receipt does not bind the raw Pareto/load replay")
+    if e1_outputs.get("dflash_pareto_set") != pareto.sha256:
+        raise ValueError("E1 receipt does not bind the raw Pareto replay")
     prior_paths = _strict_path_list(
         row["prior_stage_manifests"], label="E2 prior stage manifests"
     )

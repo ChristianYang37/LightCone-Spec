@@ -17,6 +17,7 @@ from lightcone_spec.experiments.gpu_pool import (
 from lightcone_spec.experiments.planning import (
     _E2_PROMOTION_MINIMA,
     CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
+    E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
     E2_HALVING_PROTOCOL_SHA256,
     E2_PROMOTION_MINIMA_AUTHORITY_SHA256,
     BudgetInventoryIdentity,
@@ -456,21 +457,19 @@ def _e1_pareto_and_receipt(
         and "halving_stage=0:" in cell.identity.variant
     )
     geometry = E1GeometryIdentity.from_cell(cell)
-    common_load_sha256 = _sha("common-load")
     pareto = E1ParetoArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=registry.sha256,
         runtime_sha256=_sha("e2-runtime"),
         split_sha256=_sha("e1-selection-split"),
         e1_activation_sha256=_sha("e1-activation"),
         reducer_evidence_sha256=_sha("e1-pareto-evidence"),
-        common_load_sha256=common_load_sha256,
         surviving_geometries=(geometry,),
         selection_state="sealed_before_e2_unblinding",
     )
     outputs = {
         "dflash_pareto_set": pareto.sha256,
-        "common_downstream_load": common_load_sha256,
+        "common_downstream_load": _sha("untrusted-common-load"),
     }
     receipt = _direct_receipt(
         registry,
@@ -480,6 +479,16 @@ def _e1_pareto_and_receipt(
         split_sha256=pareto.split_sha256,
     )
     return pareto, receipt
+
+
+@pytest.mark.parametrize("wrong_schema", (True, 1.0))
+def test_e1_pareto_schema_version_is_an_exact_integer(
+    registry: ExperimentRegistry,
+    wrong_schema: object,
+) -> None:
+    pareto, _ = _e1_pareto_and_receipt(registry)
+    with pytest.raises(ValueError, match="Pareto schema version 2"):
+        replace(pareto, schema_version=wrong_schema)
 
 
 def _require_executable_e2_recipe_authority(registry: ExperimentRegistry) -> None:
@@ -867,7 +876,7 @@ def test_e2_final_seal_revalidates_recipe_and_raw_completion_receipts(
         )
 
 
-def test_e2_activation_seals_named_block_until_promotion_minima_are_registered(
+def test_e2_activation_blocks_before_minima_on_missing_common_load_authority(
     registry: ExperimentRegistry,
 ) -> None:
     pareto, receipt = _e1_pareto_and_receipt(registry)
@@ -879,7 +888,16 @@ def test_e2_activation_seals_named_block_until_promotion_minima_are_registered(
     )
     assert activation.plan.status == "BLOCKED"
     assert activation.plan.activated_cell_ids == ()
-    assert activation.plan.reason_code == "e2_promotion_minima_unregistered"
+    assert activation.plan.reason_code == E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
+    assert activation.plan.blocked_cell_ids
+    assert E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON in {
+        row.reason_code
+        for row in activation.dispositions
+        if row.status is DispositionStatus.BLOCKED
+    }
+
+    # Common-load authority is the earlier unresolved dependency; promotion
+    # minima cannot become the observable blocker until that reducer exists.
     assert len(_E2_PROMOTION_MINIMA) == 4
     assert all(
         row.stage_index == stage_index
@@ -889,15 +907,37 @@ def test_e2_activation_seals_named_block_until_promotion_minima_are_registered(
         for stage_index, row in enumerate(_E2_PROMOTION_MINIMA)
     )
     assert len(E2_PROMOTION_MINIMA_AUTHORITY_SHA256) == 64
-    assert activation.plan.blocked_cell_ids
-    assert {
-        row.reason_code
-        for row in activation.dispositions
-        if row.status is DispositionStatus.BLOCKED
-    } >= {
-        "adaptation_recipe_values_unregistered",
-        "optimizer_equation_unresolved",
-    }
+
+
+def test_e2_common_load_block_precedes_untrusted_later_stage_cargo(
+    registry: ExperimentRegistry,
+) -> None:
+    pareto, receipt = _e1_pareto_and_receipt(registry)
+    activation = reduce_e2_activation(
+        registry,
+        e1_receipt=receipt,
+        pareto=pareto,
+        stage_index=3,
+        prior_reduction=object(),  # type: ignore[arg-type]
+    )
+    assert activation.plan.status == "BLOCKED"
+    assert activation.plan.reason_code == E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
+    assert activation.plan.activated_cell_ids == ()
+
+
+def test_e2_common_load_block_rebuilds_mutated_pareto_before_use(
+    registry: ExperimentRegistry,
+) -> None:
+    pareto, receipt = _e1_pareto_and_receipt(registry)
+    _ = pareto.sha256
+    object.__setattr__(pareto, "schema_version", 1)
+    with pytest.raises(ValueError, match="Pareto schema version 2"):
+        reduce_e2_activation(
+            registry,
+            e1_receipt=receipt,
+            pareto=pareto,
+            stage_index=0,
+        )
 
 
 @pytest.mark.parametrize(

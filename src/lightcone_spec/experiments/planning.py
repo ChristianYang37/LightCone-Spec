@@ -58,6 +58,7 @@ _E2_RETENTION_NUMERATOR = 1
 _E2_RETENTION_DENOMINATOR = 4
 _E2_FAMILY_FLOOR = 1
 _E2_PROMOTION_MINIMA_BLOCKER = "e2_promotion_minima_unregistered"
+E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON = "e1_common_load_authority_unregistered"
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,7 @@ E3A_RAW_SELECTION_PROTOCOL_SHA256 = content_sha256(
 )
 E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "e1_raw_geometry_pareto_protocol",
         "coverage": "exact_reducer_activated_130_cell_slice",
         "pairing": "tts_l0_across_both_registered_optimizer_anchors",
@@ -156,16 +157,18 @@ E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
             "minimize_exposed_update",
         ),
         "terminal_hardware_budget_evidence_required": True,
+        "common_load_selection": "forbidden_separate_typed_authority_required",
         "e2_data_forbidden": True,
     }
 )
 E2_HALVING_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 5,
+        "schema_version": 6,
         "kind": "e2_successive_halving_protocol",
         "stages": E2_HALVING_STAGES,
         "draft_width_authority": E2_DRAFT_WIDTH_SELECTOR,
         "adaptation_recipe_authority": "registry_declaration_schema_v1",
+        "common_load_authority": E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
         "retention_numerator": _E2_RETENTION_NUMERATOR,
         "retention_denominator": _E2_RETENTION_DENOMINATOR,
         "optimizer_schedule_family_floor": _E2_FAMILY_FLOOR,
@@ -3495,20 +3498,18 @@ class E1ParetoArtifact:
     split_sha256: str
     e1_activation_sha256: str
     reducer_evidence_sha256: str
-    common_load_sha256: str
     surviving_geometries: tuple[E1GeometryIdentity, ...]
     selection_state: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only E1 Pareto schema version 1 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only E1 Pareto schema version 2 is supported")
         for name in (
             "registry_sha256",
             "runtime_sha256",
             "split_sha256",
             "e1_activation_sha256",
             "reducer_evidence_sha256",
-            "common_load_sha256",
         ):
             _require_sha256(name, getattr(self, name))
         if not self.surviving_geometries:
@@ -3749,7 +3750,12 @@ def reduce_e2_activation(
 
     if stage_index not in range(len(E2_HALVING_STAGES)):
         raise ValueError("E2 activation stage is outside the registered grid")
+    if type(e1_receipt) is not ExperimentReceipt:
+        raise TypeError("E2 activation requires an exact E1 receipt")
     _validate_direct_receipt(registry, e1_receipt, "E1")
+    if type(pareto) is not E1ParetoArtifact:
+        raise TypeError("E2 activation requires an exact E1 Pareto artifact")
+    pareto = replace(pareto)
     if (
         pareto.registry_sha256 != registry.sha256
         or pareto.runtime_sha256 != e1_receipt.runtime_sha256
@@ -3759,175 +3765,8 @@ def reduce_e2_activation(
     outputs = _receipt_outputs(e1_receipt)
     if outputs.get("dflash_pareto_set") != pareto.sha256:
         raise ValueError("E1 receipt does not bind the supplied Pareto artifact")
-    if outputs.get("common_downstream_load") != pareto.common_load_sha256:
-        raise ValueError("E1 receipt does not bind the E2 common load")
-    prior_survivors: E2SurvivorReceipt | None = None
-    if stage_index == 0:
-        if prior_reduction is not None:
-            raise ValueError("E2 stage zero cannot consume a prior raw reduction")
-        geometry_ids = {row.sha256 for row in pareto.surviving_geometries}
-        selected_candidate_ids: set[str] | None = None
-        source_selection_sha256 = pareto.sha256
-    else:
-        if type(prior_reduction) is not E2StageReductionArtifact:
-            raise TypeError("later E2 stages require the prior raw reduction")
-        prior_survivors = prior_reduction.survivor_receipt
-        if type(prior_survivors) is not E2SurvivorReceipt:
-            raise TypeError("later E2 stages require an exact survivor receipt")
-        replace(prior_survivors)
-        _require_e2_promotion_authority(
-            stage_index=prior_survivors.stage_index,
-            status=prior_survivors.status,
-            reason_code=prior_survivors.reason_code,
-        )
-        if (
-            prior_reduction.registry_sha256 != registry.sha256
-            or prior_reduction.runtime_sha256 != pareto.runtime_sha256
-            or prior_reduction.split_sha256 != pareto.split_sha256
-            or prior_reduction.stage_index != stage_index - 1
-            or prior_reduction.reducer_protocol_sha256 != E2_HALVING_PROTOCOL_SHA256
-            or prior_survivors.registry_sha256 != registry.sha256
-            or prior_survivors.runtime_sha256 != pareto.runtime_sha256
-            or prior_survivors.split_sha256 != pareto.split_sha256
-            or prior_survivors.stage_index != stage_index - 1
-            or prior_survivors.status != "SURVIVORS"
-        ):
-            raise ValueError("E2 prior raw reduction has wrong lineage or round")
-        geometry_ids = set()
-        selected_candidate_ids = set(prior_survivors.survivor_candidate_ids)
-        source_selection_sha256 = prior_reduction.sha256
-
     cells = registry.cells_for("E2")
-    promotion_minimum = _e2_promotion_minimum(stage_index)
-    if not promotion_minimum.registered:
-        reason_code = promotion_minimum.blocker_reason_code
-        if reason_code is None:
-            raise RuntimeError("unregistered E2 promotion minima lost their blocker")
-        prior_completed = (
-            set()
-            if prior_survivors is None
-            else set(prior_survivors.completed_lineage_cell_ids)
-        )
-        blocked_rows: list[CellDisposition] = []
-        for cell in cells:
-            cell_stage = _e2_stage(cell)
-            if not cell.runnable:
-                status = (
-                    DispositionStatus.NOT_APPLICABLE
-                    if cell.status is CellStatus.NOT_APPLICABLE
-                    else DispositionStatus.BLOCKED
-                )
-                reason = cell.reason_code
-            elif cell_stage < stage_index:
-                if cell.cell_id in prior_completed:
-                    status = DispositionStatus.COMPLETED_PRIOR_ROUND
-                    reason = "completed_prior_halving_round"
-                else:
-                    status = DispositionStatus.NOT_APPLICABLE
-                    reason = "not_selected_in_prior_halving_round"
-            elif cell_stage == stage_index:
-                status = DispositionStatus.BLOCKED
-                reason = reason_code
-            else:
-                status = DispositionStatus.DEFERRED
-                reason = "awaiting_registered_e2_promotion_minima"
-            blocked_rows.append(CellDisposition(cell.cell_id, status, reason))
-        return _make_activation(
-            registry=registry,
-            experiment="E2",
-            dependency_receipt=e1_receipt,
-            runtime_sha256=pareto.runtime_sha256,
-            split_sha256=pareto.split_sha256,
-            source_selection_sha256=source_selection_sha256,
-            activation_round=f"halving_{stage_index}",
-            rows=blocked_rows,
-            reason_code=reason_code,
-            reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
-        )
-    current = tuple(cell for cell in cells if _e2_stage(cell) == stage_index)
-    current_runnable = tuple(cell for cell in current if cell.runnable)
-    pairs = _e2_candidate_pairs(current_runnable)
-    if not pairs:
-        rows = tuple(
-            CellDisposition(
-                cell.cell_id,
-                (
-                    DispositionStatus.NOT_APPLICABLE
-                    if cell.status is CellStatus.NOT_APPLICABLE
-                    else (
-                        DispositionStatus.BLOCKED
-                        if not cell.runnable
-                        else DispositionStatus.DEFERRED
-                    )
-                ),
-                (
-                    cell.reason_code
-                    if not cell.runnable
-                    else "awaiting_complete_adaptation_recipe_declaration"
-                ),
-            )
-            for cell in cells
-        )
-        return _make_activation(
-            registry=registry,
-            experiment="E2",
-            dependency_receipt=e1_receipt,
-            runtime_sha256=pareto.runtime_sha256,
-            split_sha256=pareto.split_sha256,
-            source_selection_sha256=source_selection_sha256,
-            activation_round=f"halving_{stage_index}",
-            rows=rows,
-            reason_code="e2_adaptation_recipe_authority_blocked",
-            reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
-        )
-    selected_cells: set[str] = {
-        cell.cell_id
-        for cell in current_runnable
-        if cell.identity.method in {"target_only", "static"}
-    }
-    if stage_index == 0:
-        available_geometry_ids = {
-            E1GeometryIdentity(
-                candidate.scope,
-                candidate.parameterization,
-                candidate.rank,
-                candidate.alpha_over_rank,
-            ).sha256
-            for candidate, _ in pairs.values()
-        }
-        if not geometry_ids <= available_geometry_ids:
-            raise ValueError("E1 Pareto geometry is absent from the runnable E2 grid")
-        selected_pair_ids = {
-            candidate_id
-            for candidate_id, (candidate, _) in pairs.items()
-            if E1GeometryIdentity(
-                candidate.scope,
-                candidate.parameterization,
-                candidate.rank,
-                candidate.alpha_over_rank,
-            ).sha256
-            in geometry_ids
-        }
-    else:
-        if selected_candidate_ids is None:
-            raise ValueError("later E2 activation lost its survivor identities")
-        if not selected_candidate_ids <= pairs.keys():
-            raise ValueError("prior E2 survivors are absent from the next-stage grid")
-        selected_pair_ids = selected_candidate_ids
-    for candidate_id in selected_pair_ids:
-        selected_cells.update(cell.cell_id for cell in pairs[candidate_id][1])
-    if not selected_pair_ids:
-        raise ValueError("E2 activation cannot materialize an empty adaptive stage")
-    reference_methods = {
-        cell.identity.method
-        for cell in current_runnable
-        if cell.cell_id in selected_cells
-        and cell.identity.method in {"target_only", "static"}
-    }
-    if reference_methods != {"target_only", "static"}:
-        raise ValueError("E2 activation requires both registered reference baselines")
-
-    rows: list[CellDisposition] = []
+    blocked_rows: list[CellDisposition] = []
     for cell in cells:
         cell_stage = _e2_stage(cell)
         if not cell.runnable:
@@ -3937,35 +3776,23 @@ def reduce_e2_activation(
                 else DispositionStatus.BLOCKED
             )
             reason = cell.reason_code
-        elif cell.cell_id in selected_cells:
-            status = DispositionStatus.ACTIVATED
-            reason = f"halving_stage_{stage_index}_selected"
-        elif cell_stage < stage_index:
-            if prior_reduction is None:
-                raise ValueError("prior E2 completion lineage is missing")
-            if cell.cell_id in set(prior_survivors.completed_lineage_cell_ids):
-                status = DispositionStatus.COMPLETED_PRIOR_ROUND
-                reason = "completed_prior_halving_round"
-            else:
-                status = DispositionStatus.NOT_APPLICABLE
-                reason = "not_selected_in_prior_halving_round"
-        elif cell_stage > stage_index:
-            status = DispositionStatus.DEFERRED
-            reason = "awaiting_prior_survivor_receipt"
+        elif cell_stage == stage_index:
+            status = DispositionStatus.BLOCKED
+            reason = E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
         else:
-            status = DispositionStatus.NOT_APPLICABLE
-            reason = "not_selected_by_e1_or_prior_halving_round"
-        rows.append(CellDisposition(cell.cell_id, status, reason))
+            status = DispositionStatus.DEFERRED
+            reason = "awaiting_registered_e1_common_load_authority"
+        blocked_rows.append(CellDisposition(cell.cell_id, status, reason))
     return _make_activation(
         registry=registry,
         experiment="E2",
         dependency_receipt=e1_receipt,
         runtime_sha256=pareto.runtime_sha256,
         split_sha256=pareto.split_sha256,
-        source_selection_sha256=source_selection_sha256,
+        source_selection_sha256=pareto.sha256,
         activation_round=f"halving_{stage_index}",
-        rows=rows,
-        reason_code="successive_halving_reducer_activation",
+        rows=blocked_rows,
+        reason_code=E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
         reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
     )
 

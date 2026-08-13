@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from lightcone_spec.experiments.gpu_pool import GpuInventory
 from lightcone_spec.experiments.planning import (
+    E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
     E1_RAW_PARETO_PROTOCOL_SHA256,
     E1GeometryIdentity,
     E1ParetoArtifact,
@@ -340,6 +341,20 @@ def require_e3a_locked_output_reduction_authority() -> None:
     _require_e3a_scientific_selection_policy()
     raise SelectionReductionAuthorityUnavailableError(
         E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON
+    )
+
+
+def require_e1_common_load_reduction_authority() -> None:
+    """Block until a source-owned policy and complete capacity ledger exist.
+
+    The E1 Pareto screen observes only the E3a-selected moderate reference
+    slice.  It therefore cannot establish the highest load jointly feasible
+    for Target-only, Static, and every Pareto survivor.  No caller-authored
+    digest or typed value may fill that missing scientific authority.
+    """
+
+    raise SelectionReductionAuthorityUnavailableError(
+        E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
     )
 
 
@@ -1324,7 +1339,7 @@ def reduce_e1_pareto_from_raw(
     native_bindings = _validate_native_terminal_authority(
         loaded, references=manifest.cells
     )
-    common = _common_run_fields(
+    _common_run_fields(
         loaded,
         (
             "model_pair",
@@ -1461,21 +1476,6 @@ def reduce_e1_pareto_from_raw(
     if not survivors:
         raise ValueError("E1 has no safe non-dominated geometry")
 
-    common_load_sha256 = content_sha256(
-        {
-            "schema_version": 1,
-            "kind": "e1_common_downstream_load",
-            "width": e3a_selection.width,
-            "concurrency": e3a_selection.concurrency,
-            "runtime_sha256": runtime_sha256,
-            "split_sha256": split_sha256,
-            "corpus_sha256": common["corpus_sha256"],
-            "arrival_trace_sha256": common["arrival_trace_sha256"],
-            "request_ids_sha256": common["request_ids_sha256"],
-            "sampling_profile_sha256": common["sampling_profile_sha256"],
-            "model_lock_sha256": common["model_lock_sha256"],
-        }
-    )
     run_bindings = _raw_run_bindings(
         loaded,
         scientific_unit="e1_geometry_screen",
@@ -1499,7 +1499,7 @@ def reduce_e1_pareto_from_raw(
             "fixed_instance_gpu_count": len(inventory.devices),
             "hardware_envelope_sha256": content_sha256(hardware_envelope),
             "raw_manifest_sha256": manifest.sha256,
-            "common_load_sha256": common_load_sha256,
+            "common_load_authority": "separate_typed_reduction_required",
             "geometry_dispositions": geometry_dispositions,
             "geometry_evaluation_sha256s": [row.sha256 for row in evaluations],
             "surviving_geometry_sha256s": [row.geometry.sha256 for row in survivors],
@@ -1508,13 +1508,12 @@ def reduce_e1_pareto_from_raw(
         }
     )
     return E1ParetoArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=registry.sha256,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         e1_activation_sha256=activation.sha256,
         reducer_evidence_sha256=reducer_evidence_sha256,
-        common_load_sha256=common_load_sha256,
         surviving_geometries=tuple(row.geometry for row in survivors),
         selection_state="sealed_before_e2_unblinding",
     )
@@ -1750,6 +1749,7 @@ def bind_e1_pareto_reduction_authority(
 
 
 __all__ = [
+    "E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON",
     "E3A_CAPACITY_SURFACE_PROTOCOL_SHA256",
     "E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON",
     "E3A_SCIENTIFIC_SELECTION_AUTHORITY_PROTOCOL_SHA256",
@@ -1767,5 +1767,6 @@ __all__ = [
     "reduce_e1_pareto_from_raw",
     "reduce_e3a_capacity_surface_from_raw",
     "reduce_e3a_selection_from_raw",
+    "require_e1_common_load_reduction_authority",
     "require_e3a_locked_output_reduction_authority",
 ]

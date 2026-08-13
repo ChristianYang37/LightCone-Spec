@@ -37,6 +37,7 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.selection_authority import (
+    E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
     E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON,
     E3A_SELECTION_POLICY_UNREGISTERED_REASON,
     SelectionReductionAuthorityUnavailableError,
@@ -45,6 +46,7 @@ from lightcone_spec.experiments.selection_authority import (
     reduce_e1_pareto_from_raw,
     reduce_e3a_capacity_surface_from_raw,
     reduce_e3a_selection_from_raw,
+    require_e1_common_load_reduction_authority,
     require_e3a_locked_output_reduction_authority,
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
@@ -711,6 +713,7 @@ def test_e1_reducer_replays_activation_and_computes_four_objective_pareto(
         winner_sha256,
     )
     assert artifact.e1_activation_sha256 == activation.sha256
+    assert not hasattr(artifact, "common_load_sha256")
     authority = bind_e1_pareto_reduction_authority(
         registry=registry,
         activation=activation,
@@ -723,6 +726,12 @@ def test_e1_reducer_replays_activation_and_computes_four_objective_pareto(
     )
     assert authority.revalidate() == artifact
     assert authority.pareto_sha256 == artifact.sha256
+
+
+def test_e1_common_load_requires_a_separate_registered_capacity_reducer() -> None:
+    with pytest.raises(SelectionReductionAuthorityUnavailableError) as blocked:
+        require_e1_common_load_reduction_authority()
+    assert blocked.value.reason_code == E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
 
 
 def test_e1_unsafe_adaptive_geometry_is_negative_not_global_failure(

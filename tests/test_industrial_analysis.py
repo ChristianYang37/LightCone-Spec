@@ -1394,13 +1394,12 @@ def _build_e2_stage_evidence(
     runtime_sha256 = content_sha256({"runtime": "e2-raw-test"})
     split_sha256 = content_sha256({"split": "e2-raw-test"})
     pareto = E1ParetoArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=registry.sha256,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         e1_activation_sha256=content_sha256({"e1": "activation"}),
         reducer_evidence_sha256=content_sha256({"e1": "raw-evidence"}),
-        common_load_sha256=content_sha256({"e1": "common-load"}),
         surviving_geometries=(E1GeometryIdentity.from_cell(seed_cell),),
         selection_state="sealed_before_e2_unblinding",
     )
@@ -1412,7 +1411,10 @@ def _build_e2_stage_evidence(
         completed_cells_sha256=content_sha256({"E1": "completed"}),
         dependency_receipts=(LockedOutput("E3a", content_sha256({"E3a": "receipt"})),),
         outputs=(
-            LockedOutput("common_downstream_load", pareto.common_load_sha256),
+            LockedOutput(
+                "common_downstream_load",
+                content_sha256({"e1": "untrusted-common-load"}),
+            ),
             LockedOutput("dflash_pareto_set", pareto.sha256),
         ),
     )
@@ -2746,7 +2748,7 @@ def test_e2_stage_reducer_rebuilds_metrics_and_rejects_bare_prior(
         )
 
 
-def test_e2_raw_stage_reducer_stops_at_unregistered_promotion_minima() -> None:
+def test_e2_raw_stage_reducer_stops_at_unregistered_common_load_authority() -> None:
     registry = build_industrial_registry()
     seed_cell = next(
         cell
@@ -2756,13 +2758,12 @@ def test_e2_raw_stage_reducer_stops_at_unregistered_promotion_minima() -> None:
     runtime_sha256 = content_sha256({"runtime": "e2-minima-block"})
     split_sha256 = content_sha256({"split": "e2-minima-block"})
     pareto = E1ParetoArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=registry.sha256,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         e1_activation_sha256=content_sha256({"e1": "activation"}),
         reducer_evidence_sha256=content_sha256({"e1": "raw-evidence"}),
-        common_load_sha256=content_sha256({"e1": "common-load"}),
         surviving_geometries=(E1GeometryIdentity.from_cell(seed_cell),),
         selection_state="sealed_before_e2_unblinding",
     )
@@ -2774,13 +2775,16 @@ def test_e2_raw_stage_reducer_stops_at_unregistered_promotion_minima() -> None:
         completed_cells_sha256=content_sha256({"E1": "completed"}),
         dependency_receipts=(LockedOutput("E3a", content_sha256({"E3a": "receipt"})),),
         outputs=(
-            LockedOutput("common_downstream_load", pareto.common_load_sha256),
+            LockedOutput(
+                "common_downstream_load",
+                content_sha256({"e1": "untrusted-common-load"}),
+            ),
             LockedOutput("dflash_pareto_set", pareto.sha256),
         ),
     )
     with pytest.raises(
         ValueError,
-        match="E2 raw stage reduction is BLOCKED: e2_promotion_minima_unregistered",
+        match="E2 raw stage reduction is BLOCKED: e1_common_load_authority_unregistered",
     ):
         reduce_e2_stage_from_raw(
             registry=registry,

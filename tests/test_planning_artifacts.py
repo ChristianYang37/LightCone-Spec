@@ -350,13 +350,12 @@ def _activation() -> ReducerActivationArtifact:
 
 def _pareto() -> E1ParetoArtifact:
     return E1ParetoArtifact(
-        schema_version=1,
+        schema_version=2,
         registry_sha256=_sha("registry"),
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
         e1_activation_sha256=_sha("e1-activation"),
         reducer_evidence_sha256=_sha("e1-evidence"),
-        common_load_sha256=_sha("common-load"),
         surviving_geometries=(
             E1GeometryIdentity(
                 scope="native_heads",
@@ -823,6 +822,17 @@ def test_unknown_missing_enum_and_scalar_type_confusion_fail_closed() -> None:
     integer_float["surviving_geometries"][0]["alpha_over_rank"] = 1
     with pytest.raises(TypeError, match="floating-point"):
         e1_pareto_artifact_from_dict(integer_float)
+
+    legacy_pareto = e1_pareto_artifact_to_dict(_pareto())
+    legacy_pareto["schema_version"] = 1
+    legacy_pareto["common_load_sha256"] = _sha("legacy-minted-common-load")
+    with pytest.raises(ValueError, match="fields differ"):
+        e1_pareto_artifact_from_dict(legacy_pareto)
+
+    wrong_schema_pareto = e1_pareto_artifact_to_dict(_pareto())
+    wrong_schema_pareto["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema version 2"):
+        e1_pareto_artifact_from_dict(wrong_schema_pareto)
 
     e2_evidence = e2_stage_evidence_artifact_to_dict(_e2_stage_evidence())
     del e2_evidence["evaluations"][0]["minimum_launched_updates"]
