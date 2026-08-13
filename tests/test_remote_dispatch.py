@@ -11,6 +11,13 @@ from pathlib import Path
 import pytest
 
 import lightcone_spec.orchestration.remote_dispatch as remote_dispatch_module
+from lightcone_spec.experiments.gpu_pool import (
+    AssignmentExecutionReceipt,
+    AssignmentExecutionStatus,
+    DispatchExecutionPhase,
+    DispatchScheduleReceipt,
+    DispatchWaveExecutionReceipt,
+)
 from lightcone_spec.orchestration.remote_dispatch import (
     CrossHostCollectivesUnvalidated,
     FleetWaveOutcome,
@@ -356,6 +363,77 @@ def test_host_worker_rejects_leaf_replacement_during_read(
     assert response.reason_code == "remote_host_manifest_invalid"
     assert replaced
     assert not called
+
+
+def test_host_worker_preserves_failed_schedule_receipt(tmp_path: Path) -> None:
+    manifest = (tmp_path / "dispatch-execution-bundle-manifest.json").resolve()
+    manifest_value = {"kind": "test-host-manifest", "schema_version": 1}
+    manifest.write_bytes(canonical_json_bytes(manifest_value) + b"\n")
+    request = _request("host-a")
+    binding = replace(
+        request.binding,
+        wave_index=0,
+        wave_sha256=_digest("wave-0"),
+        execution_bundle_manifest_path=str(manifest),
+        execution_bundle_manifest_sha256=canonical_sha256(manifest_value),
+        receipt_output_path=str((tmp_path / "receipt.json").resolve()),
+    )
+    request = replace(request, binding=binding)
+    assignment_receipt = AssignmentExecutionReceipt(
+        plan_sha256=binding.dispatch_plan_sha256,
+        wave_sha256=binding.wave_sha256,
+        assignment_sha256=binding.assignment_sha256[0],
+        budget_sha256=_digest("budget"),
+        attempt=1,
+        status=AssignmentExecutionStatus.FAILED,
+        terminal_receipt_sha256=None,
+        terminal_binding=None,
+        failure_sha256=_digest("failure"),
+        prior_attempt_receipt_sha256=None,
+        gpu_count=1,
+        fixed_instance_gpu_count=1,
+        attempt_intervals_monotonic_ns=((10, 20),),
+        attributed_gpu_ns=10,
+        attributed_fixed_instance_gpu_ns=10,
+    )
+    wave_receipt = DispatchWaveExecutionReceipt(
+        plan_sha256=binding.dispatch_plan_sha256,
+        wave_index=0,
+        wave_sha256=binding.wave_sha256,
+        assignment_receipts=(assignment_receipt,),
+        inventory_sha256=binding.host_inventory_sha256,
+        fixed_instance_gpu_count=1,
+        active_intervals_monotonic_ns=((10, 20),),
+        fixed_instance_actual_billed_gpu_ns=10,
+        per_assignment_attributed_gpu_ns=10,
+        per_assignment_attributed_fixed_instance_gpu_ns=10,
+    )
+    schedule_receipt = DispatchScheduleReceipt(
+        plan_sha256=binding.dispatch_plan_sha256,
+        phase=DispatchExecutionPhase.FAILED,
+        wave_receipts=(wave_receipt,),
+        inventory_sha256=binding.host_inventory_sha256,
+        fixed_instance_gpu_count=1,
+        active_intervals_monotonic_ns=((10, 20),),
+        fixed_instance_actual_billed_gpu_ns=10,
+        per_assignment_attributed_gpu_ns=10,
+        per_assignment_attributed_fixed_instance_gpu_ns=10,
+    )
+
+    async def fake_execute(*args: object, **kwargs: object) -> object:
+        return schedule_receipt
+
+    exit_code, stdout = asyncio.run(
+        execute_host_local_wave_request(
+            request.canonical_stdin(), execute_wave=fake_execute
+        )
+    )
+    response = RemoteHostWaveResponse.from_dict(json.loads(stdout))
+    assert exit_code == 42
+    assert response.status is RemoteWorkerStatus.FAILED
+    assert response.dispatch_schedule_receipt_sha256 == schedule_receipt.sha256
+    assert response.completed_assignment_sha256 == ()
+    assert response.failed_assignment_sha256 == binding.assignment_sha256
 
 
 def test_execute_remote_wave_uses_canonical_stdin_and_safe_receipt(
