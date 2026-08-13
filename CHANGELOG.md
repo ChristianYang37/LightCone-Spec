@@ -26,6 +26,11 @@ yet been declared.
   begin/reset/finalize hook and a strict host validator. Static retains zero
   detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
   evidence on the supported TP1/DP1 DFlash boundary.
+- Added a partial source-owned all-reset producer with content-bound initial
+  and boundary receipts, mutation-before-reset prevalidation, and exact trace/
+  generation chaining. GPU semantics remain `PENDING`; continuous HTTP
+  accounting is explicitly unavailable rather than synthesized, so live reuse
+  remains blocked.
 - Added a CPU-only DSpark native adaptation contract covering adapter-free
   reconstruction with actual sampled predecessors and W1 features, exact
   proposal/teacher distributions, layer-only/hybrid selector invariants,
@@ -42,8 +47,8 @@ yet been declared.
   Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
 - Made the SGLang adaptation-protocol patch test hermetic by loading only its
   config, runtime, and parameter-plan modules. The resulting patch identity is
-  `907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4`
-  with final tree `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4`.
+  `091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0`
+  with final tree `971cba382edf7035e6b957283cfca9c5f41f31d1`.
 
 ### Evidence status
 

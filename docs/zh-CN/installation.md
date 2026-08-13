@@ -120,9 +120,11 @@ process 使用唯一 evidence prefix。中断 WAL 保留用于审计，但没有
 
 Compile cache 必须构建为 verified content-addressed immutable base，并为每个 process 提供
 private writable overlay。不要共享 writable cache，也不要在 process/device 之间移动 captured
-CUDA Graph。当前 release 中 immutable session key 与 boundary receipt schema 仅用于审计；
-在 release-owned trusted boundary、durable session receipt binding 和连续 whole-inventory
-计费可用之前，shared-session execution 会在 mutation 前被阻止。高层 block executor 会先
+CUDA Graph。Immutable session key 与 boundary receipt schema 现已有 first-party source
+producer，但其 GPU semantics 仍为 `PENDING`，且明确声明连续 HTTP connection accounting
+不可用。在 GPU reset validation、durable session
+receipt binding 和连续 whole-inventory 计费可用之前，shared-session execution 会在 mutation
+前被阻止。高层 block executor 会先
 验证完整 block，再对每个 logical trace 使用独立 clean process、official HTTP pool 与 native
 provider；HTTP pool 只会在该 single-trace server execution 内复用。
 

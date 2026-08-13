@@ -223,14 +223,16 @@ attempt 保持可审计，但其 row 被排除。Resume 只跳过一个完整身
 directory fsync gate。checkpoint、prepared receipt、terminal receipt 与 resume 必须认可同一
 policy digest。
 
-Immutable session key 与 reset/finalize receipt schema 描述未来 compatible method/block
-server reuse 路径所需的 evidence。当前 release 不提供 live shared-session execution：没有
-release-owned trusted boundary 可证明 drain/reset/finalize，session receipt 尚未 durable 绑定
-进 terminal envelope，whole-inventory accounting 也未覆盖连续的 launch-to-terminate 区间。
-因此所有 reuse mutation 入口都会在 launch 或 evidence 创建前失败。高层 block executor
-先验证每条 trace 与 native provider，再为每条 trace 使用独立 clean process 与 HTTP pool；
-该路径不声明 reset 或 startup saving。每个支持的 single-trace 路径中，submit/abort 共用该
-official HTTP pool，timeout 绑定 registered request deadline 与 abort grace。Immutable
+固定 source 现在会生成 content-bound all-reset capability、initial-state 与 boundary receipt。
+该 receipt 在 CPU contract boundary 证明已注册的 drain、KV/prefix、RNG/counter、scheduler/
+telemetry、adaptation state、allocator/HBM 与 completion-event predicate。其 GPU reset
+semantics 仍为 `PENDING`。连续 HTTP connection accounting 明确不可用（capability 为
+`false`、state 为 `null`），因此这不是完整 CPU session contract。receipt 尚未 durable
+绑定进 terminal envelope，连续 launch-to-terminate inventory accounting 也未完成。因此
+所有 live reuse 入口继续阻止，并为每条 trace
+回退到独立 clean process 与 HTTP pool；该路径不声明 reset 或 startup saving。每个支持的
+single-trace 路径中，submit/abort 共用 official HTTP pool，timeout 绑定 registered request
+deadline 与 abort grace。Immutable
 compile-cache base 仍按内容寻址并验证，每个
 process 都有 private writable overlay，CUDA Graph 绝不跨 process 或 GPU。当前 release 的
 fault-injection cell 始终使用 fresh process。

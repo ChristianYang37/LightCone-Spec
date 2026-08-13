@@ -1,10 +1,10 @@
 """Fail-closed authority for auditing a source-owned shared-session reset.
 
-The pinned server does not yet produce this contract.  The code in this module
-can validate an exact native lifecycle with CPU fakes, but it cannot authorize
-formal process reuse.  Callers cannot replace native state with local counters:
-every capability, state snapshot, reset, warm-up, clock, trace, and close row is
-obtained from one source-owned runtime and content-bound to one process.
+The pinned server now produces content-bound reset-state receipts, but it does
+not own the HTTP connector lifecycle and the release has not established its
+CUDA/HBM/graph reset semantics on the pinned GPU.  The partial producer is
+therefore non-authorizing.  Missing cross-layer accounting must stay missing;
+local scheduler counters may never impersonate connection-pool evidence.
 """
 
 from __future__ import annotations
@@ -19,8 +19,14 @@ from typing import Protocol, Self
 from lightcone_spec import PINNED_SGLANG_TREE
 
 SOURCE_OWNED_SESSION_HOOK = "sglang.schema_v3.source_owned_all_reset_session.v1"
+OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE = True
 OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE = False
-SESSION_REUSE_BLOCK_REASON = "official_source_owned_all_reset_producer_unavailable"
+CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = False
+GPU_RESET_SEMANTICS = "PENDING"
+SESSION_REUSE_BLOCK_REASON = "native_all_reset_gpu_semantics_pending"
+CONNECTION_ACCOUNTING_BLOCK_REASON = (
+    "official_source_owned_continuous_connection_accounting_unavailable"
+)
 FRESH_PROCESS_FALLBACK_MODE = "fresh_process_per_trace"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -73,6 +79,11 @@ def _nonnegative_integer(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return value
+
+
+def _require_schema_one(name: str, value: object) -> None:
+    if type(value) is not int or value != 1:
+        raise ValueError(f"{name} schema is unsupported")
 
 
 def _exact_mapping(value: object, keys: set[str], name: str) -> Mapping[str, object]:
@@ -149,6 +160,8 @@ class SourceOwnedSessionCapability:
     reset_state_fields: tuple[str, ...]
     continuous_connection_accounting: bool
     fault_reset_supported: bool
+    gpu_reset_semantics: str
+    fallback_mode: str
     capability_sha256: str
 
     @classmethod
@@ -171,9 +184,12 @@ class SourceOwnedSessionCapability:
             reset_state_fields=tuple(reset_fields),
             continuous_connection_accounting=raw["continuous_connection_accounting"],
             fault_reset_supported=raw["fault_reset_supported"],
+            gpu_reset_semantics=raw["gpu_reset_semantics"],
+            fallback_mode=raw["fallback_mode"],
             capability_sha256=raw["capability_sha256"],
         )
-        if result.schema_version != 1 or result.hook != SOURCE_OWNED_SESSION_HOOK:
+        _require_schema_one("source-owned session capability", result.schema_version)
+        if result.hook != SOURCE_OWNED_SESSION_HOOK:
             raise ValueError("source-owned session capability schema/hook mismatch")
         if result.producer != "native_server":
             raise ValueError("session capability is not source-owned")
@@ -196,12 +212,14 @@ class SourceOwnedSessionCapability:
             raise ValueError(
                 "session capability does not cover the exact all-reset state"
             )
-        if result.continuous_connection_accounting is not True:
-            raise ValueError(
-                "session capability lacks continuous connection accounting"
-            )
+        if type(result.continuous_connection_accounting) is not bool:
+            raise ValueError("continuous connection accounting flag must be boolean")
         if type(result.fault_reset_supported) is not bool:
             raise ValueError("fault_reset_supported must be boolean")
+        if result.gpu_reset_semantics != GPU_RESET_SEMANTICS:
+            raise ValueError("GPU reset semantics are not release-pending")
+        if result.fallback_mode != FRESH_PROCESS_FALLBACK_MODE:
+            raise ValueError("session capability lacks the fresh-process fallback")
         return result
 
 
@@ -359,10 +377,60 @@ class SourceOwnedResetState:
 
 
 @dataclass(frozen=True)
+class SourceOwnedInitialStateReceipt:
+    schema_version: int
+    hook: str
+    capability_sha256: str
+    session_plan_sha256: str
+    process_identity: str
+    session_epoch: int
+    state: SourceOwnedResetState
+    initial_state_receipt_sha256: str
+
+    @classmethod
+    def parse(
+        cls,
+        value: object,
+        *,
+        capability: SourceOwnedSessionCapability,
+    ) -> Self:
+        raw = _exact_mapping(
+            value, set(cls.__dataclass_fields__), "source-owned initial state receipt"
+        )
+        _validate_bound_sha256(raw, "initial_state_receipt_sha256")
+        state = SourceOwnedResetState.parse(raw["state"], capability=capability)
+        result = cls(
+            **{
+                **{
+                    name: raw[name]
+                    for name in cls.__dataclass_fields__
+                    if name != "state"
+                },
+                "state": state,
+            }
+        )
+        _require_schema_one("source-owned initial state", result.schema_version)
+        if result.hook != SOURCE_OWNED_SESSION_HOOK:
+            raise ValueError("source-owned initial state hook mismatch")
+        if (
+            result.capability_sha256 != capability.capability_sha256
+            or result.session_plan_sha256 != capability.session_plan_sha256
+            or result.process_identity != capability.process_identity
+            or result.session_epoch != capability.session_epoch
+        ):
+            raise ValueError("initial state belongs to another capability/process")
+        if result.state.reset_generation != 0:
+            raise ValueError("initial reset generation must be zero")
+        result.state.require_clean(capability=capability)
+        return result
+
+
+@dataclass(frozen=True)
 class SourceOwnedResetReceipt:
     schema_version: int
     hook: str
     capability_sha256: str
+    initial_state_receipt_sha256: str
     session_plan_sha256: str
     process_identity: str
     session_epoch: int
@@ -381,7 +449,9 @@ class SourceOwnedResetReceipt:
         capability: SourceOwnedSessionCapability,
         prior_execution_plan_sha256: str | None,
         next_execution_plan_sha256: str,
+        initial_state_receipt_sha256: str,
         clean_state_sha256: str,
+        expected_reset_generation: int,
         prior_accounting: ConnectionAccounting,
     ) -> Self:
         keys = set(cls.__dataclass_fields__)
@@ -396,10 +466,12 @@ class SourceOwnedResetReceipt:
                 "after": after,
             }
         )
-        if result.schema_version != 1 or result.hook != SOURCE_OWNED_SESSION_HOOK:
+        _require_schema_one("source-owned reset receipt", result.schema_version)
+        if result.hook != SOURCE_OWNED_SESSION_HOOK:
             raise ValueError("source-owned reset receipt schema/hook mismatch")
         if (
             result.capability_sha256 != capability.capability_sha256
+            or result.initial_state_receipt_sha256 != initial_state_receipt_sha256
             or result.session_plan_sha256 != capability.session_plan_sha256
             or result.process_identity != capability.process_identity
             or result.session_epoch != capability.session_epoch
@@ -414,6 +486,8 @@ class SourceOwnedResetReceipt:
             _require_sha256("prior execution plan", result.prior_execution_plan_sha256)
         _require_sha256("next execution plan", result.next_execution_plan_sha256)
         _nonnegative_integer("reset_duration_ns", result.reset_duration_ns)
+        if result.before.reset_generation != expected_reset_generation:
+            raise ValueError("pre-reset generation breaks the source-owned chain")
         if result.after.reset_generation != result.before.reset_generation + 1:
             raise ValueError("reset generation did not advance exactly once")
         result.after.require_clean(capability=capability)
@@ -463,7 +537,8 @@ class SourceOwnedWarmupReceipt:
                 "connection_accounting": accounting,
             }
         )
-        if result.schema_version != 1 or result.excluded is not True:
+        _require_schema_one("warm-up receipt", result.schema_version)
+        if result.excluded is not True:
             raise ValueError("trace warm-up is not explicitly excluded")
         if result.execution_plan_sha256 != execution_plan_sha256:
             raise ValueError("warm-up belongs to another logical trace")
@@ -499,8 +574,7 @@ class SourceOwnedScoredClockReceipt:
         )
         _validate_bound_sha256(raw, "clock_receipt_sha256")
         result = cls(**raw)
-        if result.schema_version != 1:
-            raise ValueError("scored clock schema is unsupported")
+        _require_schema_one("scored clock receipt", result.schema_version)
         if (
             result.execution_plan_sha256 != execution_plan_sha256
             or result.warmup_receipt_sha256 != warmup.warmup_receipt_sha256
@@ -550,8 +624,7 @@ class SourceOwnedTraceReceipt:
                 "connection_accounting": accounting,
             }
         )
-        if result.schema_version != 1:
-            raise ValueError("source trace schema is unsupported")
+        _require_schema_one("source trace receipt", result.schema_version)
         if (
             result.execution_plan_sha256 != execution_plan_sha256
             or result.clock_receipt_sha256 != clock.clock_receipt_sha256
@@ -592,9 +665,9 @@ class SourceOwnedCloseReceipt:
             connection_accounting=accounting,
             close_receipt_sha256=raw["close_receipt_sha256"],
         )
+        _require_schema_one("source close receipt", result.schema_version)
         if (
-            result.schema_version != 1
-            or result.process_identity != capability.process_identity
+            result.process_identity != capability.process_identity
             or result.closed is not True
         ):
             raise ValueError("source did not close the exact shared process")
@@ -625,6 +698,10 @@ class SourceOwnedSessionAuditRuntime(Protocol):
 
     async def close(self, *, capability_sha256: str) -> object: ...
 
+    async def force_close(self) -> None:
+        """Terminate an untrusted/partially opened process without reusing it."""
+        ...
+
 
 @dataclass(frozen=True)
 class SessionReuseAuditResult:
@@ -632,6 +709,7 @@ class SessionReuseAuditResult:
     reason: str
     session_plan_sha256: str
     capability_sha256: str | None
+    initial_state_receipt_sha256: str | None
     reset_receipt_sha256s: tuple[str, ...]
     warmup_receipt_sha256s: tuple[str, ...]
     clock_receipt_sha256s: tuple[str, ...]
@@ -652,11 +730,12 @@ async def audit_source_owned_reuse_contract(
     runtime: SourceOwnedSessionAuditRuntime,
     fault_injection: bool = False,
 ) -> SessionReuseAuditResult:
-    """Exercise the exact CPU/native lifecycle without authorizing reuse.
+    """Exercise the exact CPU/native lifecycle without authorizing GPU reuse.
 
-    Any failure or aborted trace closes the source process and requires the
-    existing fresh-process-per-trace fallback.  A successful audit is still
-    BLOCKED until the pinned patch ships the official producer.
+    A failure after trusted identity requires a content-bound close receipt;
+    an earlier failure invokes the process owner's force-close contract.  No
+    failed process may be reused.  A successful audit is still BLOCKED until
+    the GPU-marked reset contracts pass on the pinned runtime.
     """
 
     plan_sha = _require_sha256("session_plan_sha256", session_plan_sha256)
@@ -667,6 +746,7 @@ async def audit_source_owned_reuse_contract(
         _require_sha256("execution_plan_sha256", trace_sha)
 
     capability: SourceOwnedSessionCapability | None = None
+    initial_receipt: SourceOwnedInitialStateReceipt | None = None
     accounting: ConnectionAccounting | None = None
     reset_receipts: list[str] = []
     warmup_receipts: list[str] = []
@@ -680,15 +760,18 @@ async def audit_source_owned_reuse_contract(
             await runtime.capability(session_plan_sha256=plan_sha),
             session_plan_sha256=plan_sha,
         )
-        initial = SourceOwnedResetState.parse(
+        if not capability.continuous_connection_accounting:
+            raise RuntimeError(CONNECTION_ACCOUNTING_BLOCK_REASON)
+        initial_receipt = SourceOwnedInitialStateReceipt.parse(
             await runtime.initial_state(capability_sha256=capability.capability_sha256),
             capability=capability,
         )
-        initial.require_clean(capability=capability)
+        initial = initial_receipt.state
         accounting = initial.connection_accounting
         if fault_injection and not capability.fault_reset_supported:
             raise RuntimeError("fault_injection_requires_fresh_process")
         prior_trace: str | None = None
+        reset_generation = initial.reset_generation
         clock_generation = 0
         for trace_sha in trace_shas:
             reset = SourceOwnedResetReceipt.parse(
@@ -700,9 +783,14 @@ async def audit_source_owned_reuse_contract(
                 capability=capability,
                 prior_execution_plan_sha256=prior_trace,
                 next_execution_plan_sha256=trace_sha,
+                initial_state_receipt_sha256=(
+                    initial_receipt.initial_state_receipt_sha256
+                ),
                 clean_state_sha256=initial.clean_state_sha256,
+                expected_reset_generation=reset_generation,
                 prior_accounting=accounting,
             )
+            reset_generation = reset.after.reset_generation
             accounting = reset.after.connection_accounting
             reset_receipts.append(reset.reset_receipt_sha256)
             warmup = SourceOwnedWarmupReceipt.parse(
@@ -751,6 +839,14 @@ async def audit_source_owned_reuse_contract(
                     failure_reason = f"{failure_reason};{close_failure}"
                 else:
                     failure_reason = close_failure
+        elif failure_reason.startswith("shared_session_audit_failed:"):
+            try:
+                await runtime.force_close()
+            except Exception as close_error:  # noqa: BLE001 - owner kill is safety
+                failure_reason = (
+                    f"{failure_reason};shared_session_force_close_failed:"
+                    f"{type(close_error).__name__}:{close_error}"
+                )
 
     status = (
         "CPU_CONTRACT_ONLY"
@@ -758,9 +854,10 @@ async def audit_source_owned_reuse_contract(
         and not failure_reason.startswith("shared_session_")
         else "FRESH_PROCESS_REQUIRED"
     )
-    # The current pinned patch has no all-reset producer.  Even a complete CPU
-    # audit therefore stays non-executable and names the safe fallback.
-    if not OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE and status == "CPU_CONTRACT_ONLY":
+    # The source producer is present, but CUDA/HBM/graph behavior remains
+    # PENDING.  A complete CPU audit therefore stays non-executable and names
+    # the safe fresh-process fallback.
+    if status == "CPU_CONTRACT_ONLY":
         failure_reason = SESSION_REUSE_BLOCK_REASON
     return SessionReuseAuditResult(
         status=status,
@@ -768,6 +865,11 @@ async def audit_source_owned_reuse_contract(
         session_plan_sha256=plan_sha,
         capability_sha256=(
             None if capability is None else capability.capability_sha256
+        ),
+        initial_state_receipt_sha256=(
+            None
+            if initial_receipt is None
+            else initial_receipt.initial_state_receipt_sha256
         ),
         reset_receipt_sha256s=tuple(reset_receipts),
         warmup_receipt_sha256s=tuple(warmup_receipts),
@@ -780,13 +882,18 @@ async def audit_source_owned_reuse_contract(
 
 
 __all__ = (
+    "CONNECTION_ACCOUNTING_BLOCK_REASON",
+    "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE",
     "FRESH_PROCESS_FALLBACK_MODE",
+    "GPU_RESET_SEMANTICS",
     "OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE",
+    "OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE",
     "RESET_STATE_FIELDS",
     "SESSION_REUSE_BLOCK_REASON",
     "SOURCE_OWNED_SESSION_HOOK",
     "ConnectionAccounting",
     "SessionReuseAuditResult",
+    "SourceOwnedInitialStateReceipt",
     "SourceOwnedSessionAuditRuntime",
     "audit_source_owned_reuse_contract",
 )

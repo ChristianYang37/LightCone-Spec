@@ -66,8 +66,8 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
-`907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4`
-and final tree `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4`; the manifest remains the
+`091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0`
+and final tree `971cba382edf7035e6b957283cfca9c5f41f31d1`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
@@ -87,6 +87,17 @@ update, and finite-horizon cosine schedules. They also record intrinsic
 readiness and apply non-negative logical delay without changing the TTS
 fixed-boundary versus L0 first-ready publication distinction. These CPU/native
 contracts do not claim CUDA performance evidence.
+
+The same patch now provides the first-party
+`sglang.schema_v3.source_owned_all_reset_session.v1` producer and admin
+endpoints for capability, initial-state, and reset receipts. It requires a
+drained scheduler and cleared KV/prefix state, restores DFlash adaptation via
+the native cache-reset path, and binds RNG/counters, scheduler/telemetry,
+weights/master/moments/candidate/cohort/update state, allocator/HBM, and the
+completion event. GPU reset semantics remain `PENDING`; CPU-valid receipts do
+not authorize GPU reuse. HTTP connection accounting remains explicitly
+unavailable (`false`/`null`) rather than being synthesized from scheduler
+counters, and every failed transition requires a fresh process.
 
 Those rows remain `BLOCKED`, not simulated through DFlash or reported as
 `UNMEASURED` runnable work. The lower-level DFlash implementation and valid

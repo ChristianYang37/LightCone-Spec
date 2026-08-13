@@ -143,6 +143,96 @@ def _verify_native_terminal_contract(checkout: Path, changed_python: list[str]) 
             )
 
 
+def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
+    hook = "sglang.schema_v3.source_owned_all_reset_session.v1"
+    reset_source = (
+        checkout / "python/sglang/srt/speculative/session_reset_evidence.py"
+    ).read_text(encoding="utf-8")
+    required_reset_symbols = (
+        hook,
+        'GPU_RESET_SEMANTICS = "PENDING"',
+        "CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = False",
+        "class SourceOwnedAllResetSessionProducer",
+        "def open(",
+        "def validate_session_plan_sha256(",
+        "def validate_reset_request(",
+        "def validate_before_state(",
+        "def initial_state_receipt(",
+        "def reset_receipt(",
+        '"initial_state_receipt_sha256"',
+        '"reset request breaks the source-owned trace chain"',
+        '"pre-reset generation breaks the source-owned chain"',
+        '"fresh_process_per_trace"',
+        '"disabled method allocated adaptation state"',
+        '"all-reset did not restore the process baseline"',
+    )
+    if any(symbol not in reset_source for symbol in required_reset_symbols):
+        raise SystemExit("source-owned all-reset producer contract is incomplete")
+
+    scheduler = (checkout / "python/sglang/srt/managers/scheduler.py").read_text(
+        encoding="utf-8"
+    )
+    required_scheduler_symbols = (
+        "whose DFlash\n        # implementation restores the adapter",
+        "def _source_owned_session_state(",
+        'recv_req.action == "session_capability"',
+        'recv_req.action == "session_initial_state"',
+        'recv_req.action == "session_reset"',
+        "prior_plan, next_plan = (",
+        "before = self.source_owned_session_reset.validate_before_state(",
+        '"connection_accounting": None',
+        'f"fresh_process_required:',
+    )
+    if any(symbol not in scheduler for symbol in required_scheduler_symbols):
+        raise SystemExit("native scheduler all-reset integration is incomplete")
+    reset_branch = scheduler.split(
+        'elif recv_req.action == "session_reset":', maxsplit=1
+    )[1].split("else:", maxsplit=1)[0]
+    if reset_branch.index("validate_before_state(") > reset_branch.index(
+        "_reset_terminal_server_state("
+    ):
+        raise SystemExit("native reset mutates state before structural prevalidation")
+    if "_session_reset_request_count" in scheduler:
+        raise SystemExit("scheduler counters impersonate HTTP connection accounting")
+
+    dflash = (checkout / "python/sglang/srt/speculative/dflash_worker_v2.py").read_text(
+        encoding="utf-8"
+    )
+    if (
+        "adapter.reset()" not in dflash
+        or "_terminal_static_safety[field] = 0" not in dflash
+    ):
+        raise SystemExit("native DFlash reset does not restore adapted/Static state")
+    adaptation = (
+        checkout / "python/sglang/srt/speculative/dflash_online_adaptation.py"
+    ).read_text(encoding="utf-8")
+    for symbol in (
+        "self.runtime.reset()",
+        "self.optimizer.reset(self.initial_trainable)",
+        "self.inference.stage(",
+        "self.inference.publish()",
+        "def reset_receipt_state(",
+        '"master_reset": master_reset',
+        '"optimizer_reset": optimizer_reset',
+        '"inference_reset": inference_reset',
+        '"runtime_reset": runtime_reset',
+        '"captured_state_empty": captured_state_empty',
+    ):
+        if symbol not in adaptation:
+            raise SystemExit("native DFlash all-reset coverage is incomplete")
+
+    server = (checkout / "python/sglang/srt/entrypoints/http_server.py").read_text(
+        encoding="utf-8"
+    )
+    for endpoint in (
+        '"/v1/lightcone-spec/session-reset/capability"',
+        '"/v1/lightcone-spec/session-reset/initial-state"',
+        '"/v1/lightcone-spec/session-reset"',
+    ):
+        if endpoint not in server:
+            raise SystemExit("source-owned session reset endpoint is missing")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream-checkout", type=Path, required=True)
@@ -226,6 +316,19 @@ def main() -> int:
             check=True,
         )
         _verify_native_terminal_contract(checkout, changed_python)
+        _verify_source_owned_session_reset_contract(checkout)
+        subprocess.run(
+            [
+                os.fspath(Path(os.sys.executable)),
+                "-m",
+                "pytest",
+                "-q",
+                "test/registered/unit/spec/test_session_reset_evidence.py",
+            ],
+            cwd=checkout,
+            env=env,
+            check=True,
+        )
         if not args.compile_only:
             subprocess.run(
                 [

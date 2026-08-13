@@ -195,13 +195,15 @@ rows. The release verifier still blocks all three methods before mutation when
 the signer is unavailable.
 
 The repository defines immutable session-key and reset/finalize receipt data
-contracts for future compatible adjacent traces. The complete key includes
+contracts for compatible adjacent traces. The complete key includes
 source/capability, run configuration, model/drafter revisions, method/backend,
 topology and physical GPU UUIDs, memory/graph/telemetry configuration,
-compile-cache identity, and ports. This release does **not** execute or claim a
-shared server session: it has no release-owned trusted boundary implementation,
-durable terminal binding for the session receipts, or continuous
-whole-inventory accounting from launch through termination. Every shared-session
+compile-cache identity, and ports. The pinned SGLang source now implements the
+all-reset capability/state/receipt producer, but its GPU semantics remain
+`PENDING`; it explicitly advertises continuous HTTP connection accounting as
+unavailable and lacks durable terminal binding and continuous whole-inventory
+accounting from launch through termination. This release therefore does
+**not** execute or claim a shared server session. Every shared-session
 mutation entry point therefore fails before launch, network access, reset, or
 evidence-root creation with
 `shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable`.

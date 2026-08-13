@@ -141,10 +141,12 @@ exclusive terminal receipt.
 Build compile caches as verified content-addressed immutable bases and give
 each process a private writable overlay. Do not share a writable cache or move
 a captured CUDA Graph between processes or devices. The immutable session-key
-and boundary-receipt schemas are audit-only in this release: shared-session
-execution is blocked before mutation until a release-owned trusted boundary,
-durable session receipt binding, and continuous whole-inventory accounting are
-available. The high-level block executor uses a validated clean-process
+and boundary-receipt schemas now have a first-party source producer, but its
+GPU semantics remain `PENDING` and continuous HTTP connection accounting is
+explicitly unavailable. Shared-session execution is blocked before
+mutation until GPU reset validation, durable session receipt binding, and
+continuous whole-inventory accounting are available. The high-level block
+executor uses a validated clean-process
 fallback, with a distinct official HTTP pool and native provider for every
 logical trace. The pool is reused only within that one single-trace execution.
 

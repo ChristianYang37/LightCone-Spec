@@ -27,9 +27,9 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4` | 应用当前 patch 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4` | 当前 mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `cc0b09eb93f8a4b341fcd00c61162ef695b81bed37b514c674b37efa37aaa0d9` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `971cba382edf7035e6b957283cfca9c5f41f31d1` | 应用当前 patch 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0` | 当前 mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `8496ad2a82fd0991409a49004dedfb77f85344350b8de243728c39c5d2f5ec49` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
@@ -110,9 +110,13 @@ contract，也没有 first-party download terminal receipt contract。
 Reducer-owned E1 activation 会从 2,730-cell envelope 只物化一个 130-cell width/load slice；
 E2 只物化当前 quarter-retention successive-halving round。每个 family 的四个 pilot 会在
 confirmation 前锁定 12--20 final prefix 或 `UNDERPOWERED`。Per-cell budget、物理 assignment、
-terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容绑定。Shared-session
-key/reset/finalize schema 在当前 release 仅供审计；由于没有 trusted durable boundary 与连续
-计费 authority，所有 live reuse 入口都会在 mutation 前被阻止。
+terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容绑定。固定 patch
+现已包含 first-party all-reset producer，可生成 source-owned capability、initial-state 与 reset
+receipt，覆盖 drain、KV/prefix、RNG/counter、scheduler/telemetry、adaptation state、allocator/HBM
+和 completion event。其 GPU reset semantics 仍明确为 `PENDING`，receipt 尚未 durable 接入
+terminal 与 whole-inventory accounting。由于 scheduler 不拥有 HTTP connector，
+`continuous_connection_accounting` 明确为 `false`，相应 state field 为 `null`，绝不用本地
+counter 冒充。因此 live reuse 继续阻止并回退到每条 trace 一个 clean process 与 HTTP pool。
 
 目标 schema 与 CPU coordinator vocabulary 定义单节点 TP2、sticky-replica DP2 identity、
 inference-sharded TP state、replica-local DP cohort，以及 all-rank prepare/decision/

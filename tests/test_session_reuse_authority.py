@@ -9,7 +9,11 @@ import pytest
 
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.orchestration.session_reuse_authority import (
+    CONNECTION_ACCOUNTING_BLOCK_REASON,
     FRESH_PROCESS_FALLBACK_MODE,
+    GPU_RESET_SEMANTICS,
+    OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE,
+    OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE,
     RESET_STATE_FIELDS,
     SESSION_REUSE_BLOCK_REASON,
     SOURCE_OWNED_SESSION_HOOK,
@@ -36,11 +40,13 @@ class _FakeSourceRuntime:
         traces: tuple[str, ...],
         adapted: bool = True,
         fault_reset_supported: bool = False,
+        continuous_connection_accounting: bool = True,
     ) -> None:
         self.session_plan_sha256 = session_plan_sha256
         self.traces = traces
         self.adapted = adapted
         self.fault_reset_supported = fault_reset_supported
+        self.continuous_connection_accounting = continuous_connection_accounting
         self.process_identity = "native-process-17"
         self.session_epoch = 2
         self.reset_generation = 0
@@ -53,7 +59,11 @@ class _FakeSourceRuntime:
         self.last_warmup: dict[str, object] | None = None
         self.last_clock: dict[str, object] | None = None
         self.close_calls = 0
+        self.force_close_calls = 0
+        self.initial_receipt_sha256: str | None = None
         self.mutate_capability = None
+        self.mutate_initial = None
+        self.mutate_reset = None
         self.mutate_after = None
         self.mutate_warmup = None
         self.mutate_clock = None
@@ -121,8 +131,10 @@ class _FakeSourceRuntime:
             "session_epoch": self.session_epoch,
             "adapted_method": self.adapted,
             "reset_state_fields": list(RESET_STATE_FIELDS),
-            "continuous_connection_accounting": True,
+            "continuous_connection_accounting": self.continuous_connection_accounting,
             "fault_reset_supported": self.fault_reset_supported,
+            "gpu_reset_semantics": GPU_RESET_SEMANTICS,
+            "fallback_mode": FRESH_PROCESS_FALLBACK_MODE,
         }
         if self.mutate_capability is not None:
             self.mutate_capability(value)
@@ -130,7 +142,20 @@ class _FakeSourceRuntime:
 
     async def initial_state(self, *, capability_sha256: str) -> object:
         assert len(capability_sha256) == 64
-        return self._state(generation=0, clean=True)
+        value: dict[str, object] = {
+            "schema_version": 1,
+            "hook": SOURCE_OWNED_SESSION_HOOK,
+            "capability_sha256": capability_sha256,
+            "session_plan_sha256": self.session_plan_sha256,
+            "process_identity": self.process_identity,
+            "session_epoch": self.session_epoch,
+            "state": self._state(generation=0, clean=True),
+        }
+        if self.mutate_initial is not None:
+            self.mutate_initial(value)
+        receipt = _bind(value, "initial_state_receipt_sha256")
+        self.initial_receipt_sha256 = receipt["initial_state_receipt_sha256"]  # type: ignore[assignment]
+        return receipt
 
     async def reset_boundary(
         self,
@@ -148,6 +173,7 @@ class _FakeSourceRuntime:
             "schema_version": 1,
             "hook": SOURCE_OWNED_SESSION_HOOK,
             "capability_sha256": capability_sha256,
+            "initial_state_receipt_sha256": self.initial_receipt_sha256,
             "session_plan_sha256": self.session_plan_sha256,
             "process_identity": self.process_identity,
             "session_epoch": self.session_epoch,
@@ -157,6 +183,8 @@ class _FakeSourceRuntime:
             "after": after,
             "reset_duration_ns": 500,
         }
+        if self.mutate_reset is not None:
+            self.mutate_reset(value)
         return _bind(value, "reset_receipt_sha256")
 
     async def excluded_warmup(self, *, execution_plan_sha256: str) -> object:
@@ -221,6 +249,9 @@ class _FakeSourceRuntime:
             self.mutate_close(value)
         return _bind(value, "close_receipt_sha256")
 
+    async def force_close(self) -> None:
+        self.force_close_calls += 1
+
 
 def _audit(runtime: _FakeSourceRuntime, *, fault_injection: bool = False):
     return asyncio.run(
@@ -239,17 +270,84 @@ def test_complete_source_owned_lifecycle_stays_cpu_only_and_formally_blocked() -
         traces=(_sha("trace-1"), _sha("trace-2")),
     )
     result = _audit(runtime)
+    assert OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE
+    assert not OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE
     assert result.status == "CPU_CONTRACT_ONLY"
     assert result.reason == SESSION_REUSE_BLOCK_REASON
     assert not result.reuse_authorized
     assert result.fallback_mode == FRESH_PROCESS_FALLBACK_MODE
     assert len(result.reset_receipt_sha256s) == 2
+    assert result.initial_state_receipt_sha256 is not None
     assert len(result.warmup_receipt_sha256s) == 2
     assert len(result.clock_receipt_sha256s) == 2
     assert len(result.trace_receipt_sha256s) == 2
     assert result.close_receipt_sha256 is not None
     assert runtime.close_calls == 1
     assert runtime.clock_generation == 2
+
+
+def test_capability_cannot_promote_pending_gpu_semantics() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    runtime.mutate_capability = lambda value: value.__setitem__(
+        "gpu_reset_semantics", "MEASURED"
+    )
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "not release-pending" in result.reason
+    assert not result.reuse_authorized
+    assert runtime.close_calls == 0
+    assert runtime.force_close_calls == 1
+
+
+def test_native_partial_producer_names_missing_connection_authority() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+        continuous_connection_accounting=False,
+    )
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert CONNECTION_ACCOUNTING_BLOCK_REASON in result.reason
+    assert result.initial_state_receipt_sha256 is None
+    assert runtime.force_close_calls == 1
+    assert not result.reuse_authorized
+
+
+def test_initial_state_receipt_is_content_bound_to_capability() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    runtime.mutate_initial = lambda value: value.__setitem__(
+        "capability_sha256", _sha("foreign-capability")
+    )
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "another capability" in result.reason
+    assert runtime.force_close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("capability", "initial", "reset", "warmup", "clock", "trace", "close"),
+)
+def test_boolean_schema_versions_are_rejected(mutation: str) -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+    setattr(
+        runtime,
+        f"mutate_{mutation}",
+        lambda value: value.__setitem__("schema_version", True),
+    )
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "schema is unsupported" in result.reason
+    assert not result.reuse_authorized
 
 
 @pytest.mark.parametrize(
@@ -279,6 +377,26 @@ def test_incomplete_native_reset_closes_and_requires_fresh_process(
     assert result.status == "FRESH_PROCESS_REQUIRED"
     assert message in result.reason
     assert result.close_receipt_sha256 is not None
+    assert runtime.close_calls == 1
+
+
+def test_reset_generation_cannot_skip_the_source_owned_chain() -> None:
+    runtime = _FakeSourceRuntime(
+        session_plan_sha256=_sha("session-plan"),
+        traces=(_sha("trace-1"),),
+    )
+
+    def skip_generation(value: dict[str, object]) -> None:
+        before = value["before"]
+        after = value["after"]
+        assert isinstance(before, dict) and isinstance(after, dict)
+        before["reset_generation"] = 7
+        after["reset_generation"] = 8
+
+    runtime.mutate_reset = skip_generation
+    result = _audit(runtime)
+    assert result.status == "FRESH_PROCESS_REQUIRED"
+    assert "pre-reset generation" in result.reason
     assert runtime.close_calls == 1
 
 

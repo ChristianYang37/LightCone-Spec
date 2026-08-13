@@ -153,12 +153,14 @@ rank identity 及准确 ordered token ID。Static 保持 round/update 详细 tra
 publication、performance 与 safety row。signer 不可用时，release verifier 仍在 mutation 前
 阻止这三种方法。
 
-仓库为未来相邻且兼容的 trace 定义了 immutable session key 及 reset/finalize receipt 数据
+仓库为相邻且兼容的 trace 定义了 immutable session key 及 reset/finalize receipt 数据
 契约；完整 key 包含 source/capability、RunConfig、model/drafter revision、method/backend、
 topology 与 physical GPU UUID、memory/graph/telemetry 配置、compile-cache identity 和 port。
-但当前 release **不会执行或声明** shared server session：尚无 release-owned trusted boundary
-实现、session receipt 的 durable terminal binding，以及从 launch 到 terminate 的连续
-whole-inventory 计费。因此所有 shared-session mutation 入口都会在 launch、network、reset
+固定 SGLang source 现已实现 all-reset capability/state/receipt producer，但其 GPU semantics
+仍为 `PENDING`，并明确声明连续 HTTP connection accounting 不可用；它也缺少 session
+receipt 的 durable terminal binding 与从 launch 到 terminate 的连续 whole-inventory 计费。
+因此当前 release **不会执行或声明** shared server session；
+所有 shared-session mutation 入口都会在 launch、network、reset
 及 evidence-root 创建之前以
 `shared_session_trusted_durable_boundary_and_continuous_accounting_unavailable` 失败。
 高层 block executor 会先验证全部成员，再为每条 trace 使用独立 clean process、HTTP pool、

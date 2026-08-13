@@ -269,16 +269,17 @@ queue and Parquet row-group limits, checkpoint interval, overflow mode, SQLite
 WAL/FULL settings, and file/checkpoint/directory fsync gates. The checkpoint,
 prepared receipt, terminal receipt, and resume path must agree on that policy.
 
-The immutable session-key and reset/finalize receipt schemas describe the
-evidence a future compatible method/block server reuse path would need. Live
-shared-session execution is unavailable in this release: no release-owned
-trusted boundary can prove drain/reset/finalize, the session receipts are not
-durably bound into a terminal envelope, and whole-inventory accounting does not
-yet cover the continuous launch-to-termination interval. All reuse mutation
-entry points therefore fail before launch or evidence creation. The high-level
-block executor first validates every trace and native provider, then falls back
-to a distinct clean process and HTTP pool per trace; it records no reset or
-startup-saving claim. Within each supported single-trace path, submit and abort
+The pinned source now produces content-bound all-reset capability, initial
+state, and boundary receipts. The receipt proves the registered drain,
+KV/prefix, RNG/counter, scheduler/telemetry, adaptation-state, allocator/HBM,
+and completion-event predicates at the CPU contract boundary. Its GPU reset
+semantics remain `PENDING`. Continuous HTTP connection accounting is explicitly
+unavailable (`false` capability and `null` state), so this is not a complete
+CPU session contract. The receipt is not yet durably bound into the
+terminal envelope or continuous launch-to-termination inventory accounting.
+All live reuse entry points therefore remain blocked and fall back to a
+distinct clean process and HTTP pool per trace; no reset or startup-saving
+claim is recorded. Within each supported single-trace path, submit and abort
 share that official HTTP pool, with timeouts bound to the request deadline and
 abort grace.
 Immutable compile-cache bases remain content-addressed and verified, each

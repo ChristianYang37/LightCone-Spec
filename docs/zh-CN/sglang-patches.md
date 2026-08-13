@@ -53,8 +53,8 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前准确 identity 为 patch SHA-256
-`907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4` 和 final tree
-`c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4`；manifest 仍是 authority。Lifecycle 绑定
+`091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0` 和 final tree
+`971cba382edf7035e6b957283cfca9c5f41f31d1`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
@@ -71,6 +71,14 @@ TP1/DP1 DFlash TTS/L0 现在会执行 constant、按 published update 的 invers
 以及有限 horizon cosine schedule，也会记录 intrinsic readiness 并应用非负 logical delay，
 同时保持 TTS fixed-boundary 与 L0 first-ready 的 publication 区别。这些 CPU/native contract
 不构成 CUDA 性能证据。
+
+同一个 patch 现在还提供 first-party
+`sglang.schema_v3.source_owned_all_reset_session.v1` producer，以及 capability、initial-state、
+reset admin endpoint。它要求 scheduler 已 drain 且 KV/prefix 已清空，通过 native cache-reset
+路径恢复 DFlash adaptation，并绑定 RNG/counter、scheduler/telemetry、weights/master/moments/
+candidate/cohort/update state、allocator/HBM 与 completion event。GPU reset semantics 仍为
+`PENDING`；CPU-valid receipt 不授权 GPU reuse，任何 transition 失败都要求 fresh process。
+HTTP connection accounting 明确保持不可用（`false`/`null`），不会由 scheduler counter 合成。
 
 这些 row 保持 `BLOCKED`，不会伪装成 DFlash，也不会作为可运行 `UNMEASURED` work 上报。
 底层 DFlash implementation 与有效 terminal envelope 没有绑定固定 tree/challenge 的

@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Semantic patch SHA-256: 907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4
-  Expected final tree: c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4
+  Semantic patch SHA-256: 091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0
+  Expected final tree: 971cba382edf7035e6b957283cfca9c5f41f31d1
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -21,9 +21,13 @@ Static/TTS/L0 target study and isolated OnlineSPEC comparison. It also carries
 the server-provided ordered output token IDs through SGLang's official serving
 benchmark adapter without retokenizing generated text, supports a caller-owned
 HTTP session, and implements the content-bound begin/reset/finalize terminal
-evidence hook for the limited TP1/DP1 DFlash surface. Its focused protocol test
-loads only the patched modules and does not import unrelated SGLang optional
-dependencies. The hook has no bundled
+evidence hook for the limited TP1/DP1 DFlash surface. It also adds a
+source-owned all-reset capability/state/receipt producer whose GPU semantics
+remain explicitly PENDING and whose failures require a fresh process. The
+scheduler does not claim HTTP connector accounting: the capability advertises
+that authority as unavailable and emits null rather than fabricated counters.
+Its focused protocol test loads only the patched modules and does not import
+unrelated SGLang optional dependencies. The hook has no bundled
 trusted hardware signer. The release verifier therefore keeps Static/TTS/L0
 non-claimable and only Target-only release-supported. DSpark, EAGLE/EAGLE3,
 NEXTN, and all TP2/DP2 execution fail before model loading. The patch includes

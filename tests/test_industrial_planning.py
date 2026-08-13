@@ -1064,7 +1064,7 @@ def _semantics(**changes: object) -> ExecutionSemanticsIdentity:
         "target_model": "Qwen/Qwen3-8B",
         "target_revision": "revision-1",
         "runtime_sha256": _sha("alias-runtime"),
-        "patched_tree_identity": "c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4",
+        "patched_tree_identity": "971cba382edf7035e6b957283cfca9c5f41f31d1",
         "sampling_sha256": _sha("alias-sampling"),
         "seed": 7,
         "request_corpus_sha256": _sha("alias-corpus"),

@@ -32,9 +32,9 @@ an experiment, and a historical measurement does not become a formal result.
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `c6070bbf97711a01dc9ab01a0e9b3ee3c2d48cb4` | Full Git tree expected after applying the current patch. |
-| `current_patch_payload_sha256` | `907c8ecc8fdf970a585c359d902777cca3bd08b11ae2342a68cf33016f5272f4` | SHA-256 of the current mail-patch bytes. |
-| `current_patch_manifest_sha256` | `cc0b09eb93f8a4b341fcd00c61162ef695b81bed37b514c674b37efa37aaa0d9` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `971cba382edf7035e6b957283cfca9c5f41f31d1` | Full Git tree expected after applying the current patch. |
+| `current_patch_payload_sha256` | `091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0` | SHA-256 of the current mail-patch bytes. |
+| `current_patch_manifest_sha256` | `8496ad2a82fd0991409a49004dedfb77f85344350b8de243728c39c5d2f5ec49` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -134,13 +134,16 @@ the 2,730-cell envelope. E2 materializes only the current quarter-retention
 successive-halving round. Family-specific four-pilot evidence fixes either a
 12--20 final prefix or `UNDERPOWERED` before confirmation. Per-cell budgets,
 physical assignments, terminal evidence, and observed-versus-registered
-GPU-time receipts are all content-bound. Shared-session key/reset/finalize
-schemas are audit-only in this release; every live reuse entry point is blocked
-before mutation because no trusted durable boundary and continuous accounting
-authority ships. The high-level block executor therefore validates the whole
-block first and falls back to one clean process, HTTP pool, native lifecycle,
-terminal receipt, and budget observation per logical trace; it never labels
-that path as session reuse.
+GPU-time receipts are all content-bound. The pinned patch now ships a
+first-party all-reset producer for source-owned capability, initial-state, and
+reset receipts. It covers drain, KV/prefix, RNG/counters, scheduler/telemetry,
+adaptation state, allocator/HBM, and a completion event. Its GPU reset semantics
+remain explicitly `PENDING`. Because the scheduler does not own the HTTP
+connector, `continuous_connection_accounting` is explicitly `false` and the
+state field is `null`, never a local-counter substitute. The receipts are not
+yet durably integrated with terminal and whole-inventory accounting. Live reuse
+therefore remains blocked and falls back to one clean process and HTTP pool per
+logical trace.
 
 The target schema and CPU coordinator vocabulary define one-node TP2 and
 sticky-replica DP2 identities, inference-sharded TP state, replica-local DP
