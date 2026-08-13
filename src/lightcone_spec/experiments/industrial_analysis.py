@@ -3942,6 +3942,7 @@ def _audit_alias_execution_candidate(
         "topology_sha256",
         "topology_receipt_sha256",
         "runtime_plan",
+        "itl_timestamp_authority",
         "load",
         "server_launch",
         "compile_cache",
@@ -3970,8 +3971,8 @@ def _audit_alias_execution_candidate(
         "abort_grace_s",
     }
     _exact_object(plan, fields=plan_fields, label="industrial execution plan")
-    if plan.get("schema_version") != 4:
-        raise ValueError("alias requires industrial execution plan schema 4")
+    if type(plan.get("schema_version")) is not int or plan.get("schema_version") != 5:
+        raise ValueError("alias requires industrial execution plan schema 5")
     runtime_plan = _exact_object(
         plan.get("runtime_plan"),
         fields={
@@ -4003,6 +4004,38 @@ def _audit_alias_execution_candidate(
         or plan.get("runtime_plan_sha256") != content_sha256(runtime_plan)
     ):
         raise ValueError("alias runtime plan differs from its registry authority")
+    cell_id = runtime_plan.get("cell_id")
+    matches = tuple(cell for cell in registry.cells if cell.cell_id == cell_id)
+    if len(matches) != 1:
+        raise ValueError("alias execution plan does not resolve one registry cell")
+    cell = matches[0]
+    itl_timestamp_authority = plan.get("itl_timestamp_authority")
+    if cell.identity.experiment != "E2":
+        if itl_timestamp_authority is not None:
+            raise ValueError(
+                "non-E2 alias execution must not carry ITL timestamp authority"
+            )
+    else:
+        itl_row = _exact_object(
+            itl_timestamp_authority,
+            fields={"plan_sha256", "producer_sha256", "protocol_sha256"},
+            label="alias E2 ITL timestamp authority",
+        )
+        expected_itl_plan = release_e2_itl_timestamp_plan(registry, cell)
+        expected_itl_row = {
+            "plan_sha256": expected_itl_plan.sha256,
+            "producer_sha256": (
+                None
+                if expected_itl_plan.producer is None
+                else expected_itl_plan.producer.sha256
+            ),
+            "protocol_sha256": expected_itl_plan.protocol_sha256,
+        }
+        if itl_row != expected_itl_row:
+            raise ValueError(
+                "alias E2 ITL timestamp authority differs from the release plan"
+            )
+        require_e2_itl_timestamp_prelaunch(expected_itl_plan)
     budget_materialization_authority = _load_alias_budget_materialization_authority(
         artifacts
     )
@@ -4011,11 +4044,6 @@ def _audit_alias_execution_candidate(
         runtime_plan=runtime_plan,
         authority=budget_materialization_authority,
     )
-    cell_id = runtime_plan.get("cell_id")
-    matches = tuple(cell for cell in registry.cells if cell.cell_id == cell_id)
-    if len(matches) != 1:
-        raise ValueError("alias execution plan does not resolve one registry cell")
-    cell = matches[0]
     if (
         runtime_plan.get("execution_semantics_sha256") is not None
         or runtime_plan.get("execution_semantics") is not None

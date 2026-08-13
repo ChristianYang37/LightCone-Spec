@@ -25,6 +25,10 @@ from lightcone_spec.experiments.industrial_analysis import (
     raw_evidence_alias_manifest_from_dict,
     raw_evidence_alias_manifest_to_dict,
 )
+from lightcone_spec.experiments.itl_authority import (
+    ItlTimestampAuthorityBlocked,
+    release_e2_itl_timestamp_plan,
+)
 from lightcone_spec.experiments.planning import (
     EVIDENCE_ALIAS_REDUCER_PROTOCOL_SHA256,
     EvidenceAliasReductionArtifact,
@@ -694,6 +698,100 @@ def test_execution_candidate_is_rebuilt_from_current_raw_plan_and_locks(
     assert plan_wire["runtime_plan"]["schema_version"] == 3
     assert plan_wire["runtime_plan"]["execution_semantics_sha256"] is None
     assert plan_wire["runtime_plan"]["execution_semantics"] is None
+    assert plan_wire["schema_version"] == 5
+    assert plan_wire["itl_timestamp_authority"] is None
+
+    old_schema = deepcopy(plan_wire)
+    old_schema["schema_version"] = 4
+    with pytest.raises(ValueError, match="execution plan schema 5"):
+        _audit_alias_execution_candidate(
+            replace(
+                artifacts,
+                execution_plan=_write_json(
+                    root / "alias-plan-old-schema.json",
+                    old_schema,
+                ),
+            ),
+            registry=registry,
+            hardware_envelope=envelope,
+            inventory=plan.dispatch_context.inventory,
+        )
+
+    non_e2_itl = deepcopy(plan_wire)
+    non_e2_itl["itl_timestamp_authority"] = {
+        "plan_sha256": _sha("caller-itl-plan"),
+        "producer_sha256": _sha("caller-itl-producer"),
+        "protocol_sha256": _sha("caller-itl-protocol"),
+    }
+    with pytest.raises(ValueError, match="non-E2 alias execution must not carry ITL"):
+        _audit_alias_execution_candidate(
+            replace(
+                artifacts,
+                execution_plan=_write_json(
+                    root / "alias-plan-non-e2-itl.json",
+                    non_e2_itl,
+                ),
+            ),
+            registry=registry,
+            hardware_envelope=envelope,
+            inventory=plan.dispatch_context.inventory,
+        )
+
+    e2_cell = next(cell for cell in registry.cells if cell.identity.experiment == "E2")
+    foreign_e2_itl = deepcopy(plan_wire)
+    foreign_e2_itl["runtime_plan"]["cell_id"] = e2_cell.cell_id
+    foreign_e2_itl["runtime_plan"]["cell_declaration_sha256"] = e2_cell.sha256
+    foreign_e2_itl["runtime_plan_sha256"] = content_sha256(
+        foreign_e2_itl["runtime_plan"]
+    )
+    foreign_e2_itl["itl_timestamp_authority"] = {
+        "plan_sha256": _sha("foreign-e2-itl-plan"),
+        "producer_sha256": None,
+        "protocol_sha256": _sha("foreign-e2-itl-protocol"),
+    }
+    with pytest.raises(ValueError, match="differs from the release plan"):
+        _audit_alias_execution_candidate(
+            replace(
+                artifacts,
+                execution_plan=_write_json(
+                    root / "alias-plan-foreign-e2-itl.json",
+                    foreign_e2_itl,
+                ),
+            ),
+            registry=registry,
+            hardware_envelope=envelope,
+            inventory=plan.dispatch_context.inventory,
+        )
+
+    expected_e2_itl = deepcopy(foreign_e2_itl)
+    expected_e2_itl_plan = release_e2_itl_timestamp_plan(registry, e2_cell)
+    expected_e2_itl["itl_timestamp_authority"] = {
+        "plan_sha256": expected_e2_itl_plan.sha256,
+        "producer_sha256": (
+            None
+            if expected_e2_itl_plan.producer is None
+            else expected_e2_itl_plan.producer.sha256
+        ),
+        "protocol_sha256": expected_e2_itl_plan.protocol_sha256,
+    }
+    missing_budget_authority = BoundArtifact(
+        (root / "missing-budget-materialization-authority.json").resolve(),
+        _sha("missing-budget-materialization-authority"),
+    )
+    with pytest.raises(ItlTimestampAuthorityBlocked):
+        _audit_alias_execution_candidate(
+            replace(
+                artifacts,
+                execution_plan=_write_json(
+                    root / "alias-plan-release-e2-itl.json",
+                    expected_e2_itl,
+                ),
+                budget_materialization_authority=missing_budget_authority,
+            ),
+            registry=registry,
+            hardware_envelope=envelope,
+            inventory=plan.dispatch_context.inventory,
+        )
 
     semantic_alias_tamper = deepcopy(plan_wire)
     semantic_alias_tamper["runtime_plan"]["execution_semantics_sha256"] = _sha(
