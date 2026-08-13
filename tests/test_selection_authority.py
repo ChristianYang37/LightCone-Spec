@@ -236,6 +236,7 @@ def _loaded(
         physical_host_id="selection-host",
         budget_observation_sha256=_sha(f"observation-{index}"),
         hardware_validity=((f"hardware-{index}", "VALID", ()),),
+        itl_timestamp_authority_path=None,
     )
 
 

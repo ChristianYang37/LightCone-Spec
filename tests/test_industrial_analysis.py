@@ -1916,6 +1916,7 @@ def _synthetic_e3b_loaded_reduction(
                 physical_host_id="analysis-host",
                 budget_observation_sha256=digest,
                 hardware_validity=(),
+                itl_timestamp_authority_path=None,
                 round_rows_by_rank=(rounds,),
             )
         blocks.append(

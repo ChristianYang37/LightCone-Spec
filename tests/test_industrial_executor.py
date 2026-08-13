@@ -3842,7 +3842,7 @@ def test_adapted_execution_rejects_noncanonical_runtime_before_mutation(
 
     with pytest.raises(
         TypeError,
-        match="adapted execution semantics require an exact runtime plan",
+        match="execution semantics require an exact runtime plan",
     ):
         asyncio.run(
             execute_industrial_plan(
