@@ -52,14 +52,24 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
-begin/reset/finalize endpoint。当前准确 identity 为 patch SHA-256
-`091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0` 和 final tree
-`971cba382edf7035e6b957283cfca9c5f41f31d1`；manifest 仍是 authority。Lifecycle 绑定
+begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
+`8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`，final tree 为
+`81a86871d01dcf19853612da3d8eb63faa812013`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
 executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0。下列 execution
-contract 也尚未实现，因此会在 model loading 前拒绝：
+contract 也尚未实现。
+
+第二个 patch 还提供 opt-in native committed-token observation contract。每个 timestamp
+是在 stop handling 后，streamer 枚举已经 committed 的最终 token prefix 时由 CPU 采样；它
+既不是 decode production time，也不是 CUDA event。因此 producer 明确标为
+`CPU_CONTRACT_ONLY`，formal release allowlist 继续为空，这些 event 不能支持 E2 p99 ITL。
+Coalesced SSE chunk 也不再被等分成虚构 ITL。Benchmark 会准确输出 expected、observed、
+coalesced、missing client interval 与 coverage；coverage 不完整时，包含 p99 在内的全部
+aggregate ITL statistic 都明确为 `UNSUPPORTED`/`null`，不会把稀疏子集升级为 distribution。
+
+下列 execution contract 会在 model loading 前拒绝：
 
 - DSpark、EAGLE、EAGLE3 与 NEXTN adaptation；
 - 全部 TP2 或 DP2 run；

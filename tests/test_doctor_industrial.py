@@ -252,7 +252,13 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                 "sha256": (
                     "091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0"
                 ),
-            }
+            },
+            {
+                "file": ("0002-feat-spec-add-cpu-native-token-observations.patch"),
+                "sha256": (
+                    "8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,

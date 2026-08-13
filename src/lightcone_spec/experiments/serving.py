@@ -5,10 +5,11 @@ semantics.  This module deliberately reuses SGLang's official asynchronous
 session open/close, generate, and abort functions with one caller-owned pool.
 It does not reproduce the upstream HTTP client or its benchmark metric reducer.
 
-Upstream's request result reports ITLs after distributing one SSE chunk gap
-over every token in that chunk.  Those values are unsuitable for a p99 claim.
-The adapter therefore retains only a conservative coalesced chunk observation;
-it never turns the upstream distributed values into token timestamps.
+The pinned upstream patch reports exact expected, observed, coalesced, and
+missing client-interval coverage and refuses aggregate ITL statistics when
+that coverage is incomplete.  This adapter remains deliberately conservative:
+it retains only a coalesced chunk observation and never promotes the optional
+CPU-only committed-token host observations to formal token timestamps.
 """
 
 from __future__ import annotations

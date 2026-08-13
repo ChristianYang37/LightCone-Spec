@@ -67,10 +67,10 @@ def _release_identities() -> dict[str, str]:
     manifest_path = ROOT / "patches" / "sglang" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     patches = manifest["patches"]
-    assert len(patches) == 1, "README truth schema requires one patch payload"
-    patch_path = manifest_path.parent / patches[0]["file"]
+    assert patches, "README truth schema requires a patch payload"
+    patch_path = manifest_path.parent / patches[-1]["file"]
     patch_sha256 = hashlib.sha256(patch_path.read_bytes()).hexdigest()
-    assert patch_sha256 == patches[0]["sha256"]
+    assert patch_sha256 == patches[-1]["sha256"]
     return {
         "current_sglang_upstream_commit": manifest["upstream"]["commit"],
         "current_patched_sglang_tree": manifest["expected_tree"],

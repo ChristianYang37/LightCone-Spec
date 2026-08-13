@@ -65,16 +65,29 @@ connection pool without duplicating the official request parser.
 
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
-and begin/reset/finalize endpoints. The exact current identity is patch SHA-256
-`091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0`
-and final tree `971cba382edf7035e6b957283cfca9c5f41f31d1`; the manifest remains the
+and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
+`8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`
+and the final tree is `81a86871d01dcf19853612da3d8eb63faa812013`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
 It exposes a signer plugin boundary but bundles no trusted hardware key or
 release signer. The executor therefore still runs only Target-only end to end
-and blocks Static/TTS/L0 before mutation. It also rejects the following before
-model loading because their execution contracts are not implemented:
+and blocks Static/TTS/L0 before mutation.
+
+The second patch exposes an opt-in native committed-token observation
+contract. Each timestamp is sampled by the CPU while the streamer enumerates
+an already-committed final token prefix after stop handling; it is not a decode
+production time or CUDA event. The producer is explicitly
+`CPU_CONTRACT_ONLY`, the formal release allowlist remains empty, and these
+events cannot support E2 p99 ITL. Coalesced SSE chunks are no longer divided
+into invented equal ITLs. The benchmark now reports expected, observed,
+coalesced, and missing client intervals plus exact coverage. Any incomplete
+coverage makes every aggregate ITL statistic, including p99, explicitly
+`UNSUPPORTED`/`null`; a sparse subset is never promoted to a distribution.
+
+The executor also rejects the following before model loading because their
+execution contracts are not implemented:
 
 - DSpark, EAGLE, EAGLE3, and NEXTN adaptation;
 - every TP2 or DP2 run;

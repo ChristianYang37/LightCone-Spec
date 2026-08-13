@@ -233,6 +233,47 @@ def _verify_source_owned_session_reset_contract(checkout: Path) -> None:
             raise SystemExit("source-owned session reset endpoint is missing")
 
 
+def _verify_cpu_native_token_observation_contract(checkout: Path) -> None:
+    hook = checkout / "python/sglang/srt/managers/native_token_timestamps.py"
+    source = hook.read_text(encoding="utf-8")
+    for symbol in (
+        "sglang.schema_v3.native_per_token_timestamp.v1",
+        "cpu_committed_token_observed_at_streamer_v1",
+        'NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_CONTRACT_ONLY"',
+        "not a CUDA event",
+        "req.output_ids_through_stop",
+        "time.monotonic_ns",
+    ):
+        if symbol not in source:
+            raise SystemExit("CPU-only native token observation contract is incomplete")
+    serving = (checkout / "python/sglang/benchmark/serving.py").read_text(
+        encoding="utf-8"
+    )
+    for symbol in (
+        "_merge_sglang_native_token_timestamp_events",
+        "_summarize_sglang_client_itl_coverage",
+        '"supported_values": None if unsupported_reason is not None else values',
+        "incomplete_client_interval_coverage",
+        "itl_expected_intervals",
+        "itl_observed_intervals",
+        "itl_coalesced_intervals",
+        "itl_missing_intervals",
+        "itl_coverage",
+        "itl_unsupported_reason",
+        "mean_itl_ms=mean_itl_ms",
+        "p99_itl_ms=p99_itl_ms",
+    ):
+        if symbol not in serving:
+            raise SystemExit("serving benchmark lacks exact ITL coverage semantics")
+    for forbidden in (
+        "adjust_itl = chunk_gap / num_new_tokens",
+        "mean_itl_ms=np.mean(itls or 0)",
+        "p99_itl_ms=np.percentile(itls or 0, 99)",
+    ):
+        if forbidden in serving:
+            raise SystemExit("serving benchmark can fabricate or sparsely reduce ITL")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--upstream-checkout", type=Path, required=True)
@@ -317,6 +358,7 @@ def main() -> int:
         )
         _verify_native_terminal_contract(checkout, changed_python)
         _verify_source_owned_session_reset_contract(checkout)
+        _verify_cpu_native_token_observation_contract(checkout)
         subprocess.run(
             [
                 os.fspath(Path(os.sys.executable)),
@@ -337,6 +379,7 @@ def main() -> int:
                     "pytest",
                     "-q",
                     "test/registered/unit/benchmark/test_serving_output_token_ids.py",
+                    "test/registered/unit/benchmark/test_native_token_timestamps.py",
                     "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
                     "test/registered/unit/spec/test_online_adaptation_protocol.py",
                     "test/registered/unit/spec/test_terminal_speculative_evidence.py",

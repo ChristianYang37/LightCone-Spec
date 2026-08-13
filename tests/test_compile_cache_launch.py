@@ -187,7 +187,7 @@ def test_release_compile_identity_matches_registered_manifest_and_patch(
 ) -> None:
     manifest_path = ROOT / "patches" / "sglang" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    patch = manifest_path.parent / manifest["patches"][0]["file"]
+    patch = manifest_path.parent / manifest["patches"][-1]["file"]
     assert _canonical_sha256(manifest) == PINNED_SGLANG_PATCH_MANIFEST_SHA256
     assert hashlib.sha256(patch.read_bytes()).hexdigest() == PINNED_SGLANG_PATCH_SHA256
     assert PINNED_SGLANG_COMPILE_SOURCE_SHA256 == _canonical_sha256(

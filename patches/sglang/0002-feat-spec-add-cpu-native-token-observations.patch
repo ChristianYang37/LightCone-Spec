@@ -1,0 +1,1300 @@
+From 74ae981f2862e0854bf6998fa617afda37bc9531 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 08:55:50 +0800
+Subject: [PATCH] feat(spec): add CPU-only native token observations
+
+---
+ python/sglang/benchmark/serving.py            | 428 ++++++++++++++++--
+ .../srt/managers/detokenizer_manager.py       |   1 +
+ python/sglang/srt/managers/io_struct.py       |  19 +
+ .../srt/managers/multi_tokenizer_mixin.py     |   6 +
+ .../srt/managers/native_token_timestamps.py   |  61 +++
+ python/sglang/srt/managers/schedule_batch.py  |   3 +
+ python/sglang/srt/managers/scheduler.py       |   1 +
+ .../scheduler_components/output_streamer.py   |  20 +
+ .../sglang/srt/managers/tokenizer_manager.py  |  58 +++
+ .../benchmark/test_native_token_timestamps.py | 158 +++++++
+ .../test_serving_output_token_ids.py          | 133 ++++++
+ 11 files changed, 858 insertions(+), 30 deletions(-)
+ create mode 100644 python/sglang/srt/managers/native_token_timestamps.py
+ create mode 100644 test/registered/unit/benchmark/test_native_token_timestamps.py
+
+diff --git a/python/sglang/benchmark/serving.py b/python/sglang/benchmark/serving.py
+index f8742d8..0337ceb 100644
+--- a/python/sglang/benchmark/serving.py
++++ b/python/sglang/benchmark/serving.py
+@@ -52,6 +52,9 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
+ 
+ _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
+ 
++_SGLANG_ITL_INCOMPLETE_REASON = "incomplete_client_interval_coverage"
++_SGLANG_ITL_NO_INTERVALS_REASON = "no_client_inter_token_intervals"
++
+ _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+ 
+ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
+@@ -118,10 +121,18 @@ class RequestFuncInput:
+ class RequestFuncOutput:
+     generated_text: str = ""
+     generated_token_ids: Optional[List[int]] = None
++    native_token_timestamp_events: Optional[List[Dict[str, int]]] = None
+     success: bool = False
+     latency: float = 0.0
+     ttft: float = 0.0  # Time to first token
+     itl: List[float] = field(default_factory=list)  # List of inter-token latencies
++    itl_expected_intervals: Optional[int] = None
++    itl_observed_intervals: Optional[int] = None
++    itl_coalesced_chunks: Optional[int] = None
++    itl_coalesced_intervals: Optional[int] = None
++    itl_missing_intervals: Optional[int] = None
++    itl_coverage: Optional[float] = None
++    itl_unsupported_reason: Optional[str] = None
+     text_chunks: List[str] = field(default_factory=list)
+     prompt_len: int = 0
+     error: str = ""
+@@ -174,6 +185,225 @@ def _merge_sglang_generated_token_ids(
+     raise ValueError("SGLang output_ids do not cover the reported completion tokens")
+ 
+ 
++def _merge_sglang_native_token_timestamp_events(
++    accumulated: Optional[List[Dict[str, int]]],
++    response_events: Any,
++) -> List[Dict[str, int]]:
++    """Merge exact native events; never infer timestamps from SSE chunks.
++
++    Streaming metadata can carry either the complete cumulative event prefix or
++    the next absolute-indexed delta.  Supporting both forms does not turn SSE
++    chunk timing into token timing: every accepted timestamp is still an
++    explicit native event emitted by the server.
++    """
++
++    if not isinstance(response_events, list):
++        raise TypeError("SGLang native token timestamp events must be a list")
++    merged = [] if accumulated is None else [dict(event) for event in accumulated]
++    if not response_events:
++        return merged
++
++    first = response_events[0]
++    if not isinstance(first, dict):
++        raise ValueError("SGLang native token timestamp event is malformed")
++    first_index = first.get("token_index")
++    if first_index == 0:
++        base_index = 0
++    elif merged and first_index == len(merged):
++        base_index = len(merged)
++    else:
++        raise ValueError("SGLang native token timestamp coverage is invalid")
++
++    parsed: List[Dict[str, int]] = []
++    for raw in response_events:
++        if not isinstance(raw, dict) or set(raw) != {
++            "token_index",
++            "token_id",
++            "observed_ns",
++        }:
++            raise ValueError("SGLang native token timestamp event is malformed")
++        if any(
++            isinstance(value, bool) or not isinstance(value, int)
++            for value in raw.values()
++        ):
++            raise ValueError("SGLang native token timestamp fields must be integers")
++        index = raw["token_index"]
++        token_id = raw["token_id"]
++        observed_ns = raw["observed_ns"]
++        if index != base_index + len(parsed) or token_id < 0 or observed_ns < 0:
++            raise ValueError("SGLang native token timestamp coverage is invalid")
++        if parsed and observed_ns <= parsed[-1]["observed_ns"]:
++            raise ValueError("SGLang native token timestamps are not increasing")
++        parsed.append(
++            {"token_index": index, "token_id": token_id, "observed_ns": observed_ns}
++        )
++    if base_index:
++        if merged and parsed[0]["observed_ns"] <= merged[-1]["observed_ns"]:
++            raise ValueError("SGLang native token timestamps are not increasing")
++        return [*merged, *parsed]
++    if not merged:
++        return parsed
++    if len(parsed) >= len(merged) and parsed[: len(merged)] == merged:
++        return parsed
++    raise ValueError("SGLang native token timestamp prefix changed")
++
++
++def _finalize_sglang_client_itl_coverage(
++    output: RequestFuncOutput,
++    *,
++    output_len: int,
++    coalesced_chunks: int,
++    coalesced_intervals: int,
++) -> None:
++    """Bind exact client-observed interval coverage without filling gaps."""
++
++    for label, value in (
++        ("output length", output_len),
++        ("coalesced chunk count", coalesced_chunks),
++        ("coalesced interval count", coalesced_intervals),
++    ):
++        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++            raise ValueError(f"SGLang ITL {label} must be a non-negative integer")
++    if any(
++        isinstance(value, bool)
++        or not isinstance(value, (int, float))
++        or not math.isfinite(float(value))
++        or value < 0
++        for value in output.itl
++    ):
++        raise ValueError(
++            "SGLang client ITL observations must be finite and non-negative"
++        )
++
++    expected = max(output_len - 1, 0)
++    observed = len(output.itl)
++    if observed > expected:
++        raise ValueError("SGLang client ITL observations exceed expected coverage")
++    missing = expected - observed
++    if coalesced_intervals > missing or coalesced_chunks > coalesced_intervals:
++        raise ValueError("SGLang coalesced ITL accounting is inconsistent")
++
++    output.itl_expected_intervals = expected
++    output.itl_observed_intervals = observed
++    output.itl_coalesced_chunks = coalesced_chunks
++    output.itl_coalesced_intervals = coalesced_intervals
++    output.itl_missing_intervals = missing
++    output.itl_coverage = 1.0 if expected == 0 else observed / expected
++    if missing:
++        output.itl_unsupported_reason = _SGLANG_ITL_INCOMPLETE_REASON
++    elif expected == 0:
++        output.itl_unsupported_reason = _SGLANG_ITL_NO_INTERVALS_REASON
++    else:
++        output.itl_unsupported_reason = None
++
++
++def _summarize_sglang_client_itl_coverage(
++    outputs: List[RequestFuncOutput],
++) -> Dict[str, Any]:
++    """Return all-or-none aggregate ITLs plus explicit coverage accounting."""
++
++    expected_total = 0
++    observed_total = 0
++    coalesced_chunks_total = 0
++    coalesced_intervals_total = 0
++    missing_total = 0
++    values: List[float] = []
++    for output in outputs:
++        if not output.success:
++            continue
++        counts = (
++            output.itl_expected_intervals,
++            output.itl_observed_intervals,
++            output.itl_coalesced_chunks,
++            output.itl_coalesced_intervals,
++            output.itl_missing_intervals,
++        )
++        if any(
++            isinstance(value, bool) or not isinstance(value, int) or value < 0
++            for value in counts
++        ):
++            raise ValueError("SGLang request lacks exact client ITL coverage")
++        expected, observed, coalesced_chunks, coalesced_intervals, missing = counts
++        if (
++            expected != max(output.output_len - 1, 0)
++            or observed != len(output.itl)
++            or missing != expected - observed
++            or coalesced_intervals > missing
++            or coalesced_chunks > coalesced_intervals
++        ):
++            raise ValueError("SGLang request client ITL coverage is inconsistent")
++        expected_coverage = 1.0 if expected == 0 else observed / expected
++        if (
++            not isinstance(output.itl_coverage, float)
++            or not math.isfinite(output.itl_coverage)
++            or not math.isclose(
++                output.itl_coverage,
++                expected_coverage,
++                rel_tol=0.0,
++                abs_tol=1e-12,
++            )
++        ):
++            raise ValueError("SGLang request client ITL coverage ratio changed")
++        expected_reason = (
++            _SGLANG_ITL_INCOMPLETE_REASON
++            if missing
++            else (_SGLANG_ITL_NO_INTERVALS_REASON if expected == 0 else None)
++        )
++        if output.itl_unsupported_reason != expected_reason:
++            raise ValueError("SGLang request client ITL support status changed")
++        expected_total += expected
++        observed_total += observed
++        coalesced_chunks_total += coalesced_chunks
++        coalesced_intervals_total += coalesced_intervals
++        missing_total += missing
++        values.extend(float(value) for value in output.itl)
++
++    coverage = 1.0 if expected_total == 0 else observed_total / expected_total
++    unsupported_reason = (
++        _SGLANG_ITL_INCOMPLETE_REASON
++        if missing_total
++        else (_SGLANG_ITL_NO_INTERVALS_REASON if expected_total == 0 else None)
++    )
++    return {
++        "expected_intervals": expected_total,
++        "observed_intervals": observed_total,
++        "coalesced_chunks": coalesced_chunks_total,
++        "coalesced_intervals": coalesced_intervals_total,
++        "missing_intervals": missing_total,
++        "coverage": coverage,
++        "unsupported_reason": unsupported_reason,
++        # Never expose a selected sparse subset as an aggregate distribution.
++        "supported_values": None if unsupported_reason is not None else values,
++    }
++
++
++def _itl_statistics_ms(
++    values: Optional[List[float]],
++) -> Tuple[
++    Optional[float],
++    Optional[float],
++    Optional[float],
++    Optional[float],
++    Optional[float],
++    Optional[float],
++    Optional[float],
++]:
++    """Return aggregate ITL statistics, or all ``None`` when unsupported."""
++
++    if values is None:
++        return (None, None, None, None, None, None, None)
++    samples = values or 0
++    return (
++        float(np.mean(samples) * 1000),
++        float(np.median(samples) * 1000),
++        float(np.std(samples) * 1000),
++        float(np.percentile(samples, 90) * 1000),
++        float(np.percentile(samples, 95) * 1000),
++        float(np.percentile(samples, 99) * 1000),
++        float(np.max(samples) * 1000),
++    )
++
++
+ def get_auth_headers() -> Dict[str, str]:
+     openai_api_key = os.environ.get("OPENAI_API_KEY")
+     if openai_api_key:
+@@ -740,6 +970,11 @@ async def async_request_sglang_generate(
+             "lora_path": request_func_input.lora_name,
+             "return_logprob": args.return_logprob,
+             "return_routed_experts": args.return_routed_experts,
++            "return_native_token_timestamps": bool(
++                request_func_input.extra_request_body.get(
++                    "return_native_token_timestamps", False
++                )
++            ),
+             "logprob_start_len": args.logprob_start_len,
+             **request_func_input.extra_request_body,
+         }
+@@ -760,12 +995,15 @@ async def async_request_sglang_generate(
+ 
+         generated_text = ""
+         generated_token_ids: Optional[List[int]] = None
++        native_token_timestamp_events: Optional[List[Dict[str, int]]] = None
+         output_len = request_func_input.output_len
+         ttft = 0.0
+         st = time.perf_counter()
+         output.start_time = st
+         most_recent_timestamp = st
+         last_output_len = 0
++        coalesced_chunks = 0
++        coalesced_intervals = 0
+         try:
+             request_options = {"url": api_url, "json": payload, "headers": headers}
+             if timeout_s is not None:
+@@ -794,6 +1032,30 @@ async def async_request_sglang_generate(
+                                     data["output_ids"],
+                                     completion_tokens,
+                                 )
++                            native_events = _meta_info.get(
++                                "native_token_timestamp_events"
++                            )
++                            if native_events is not None:
++                                if (
++                                    _meta_info.get("native_token_timestamp_hook")
++                                    != "sglang.schema_v3.native_per_token_timestamp.v1"
++                                    or _meta_info.get(
++                                        "native_token_timestamp_semantics"
++                                    )
++                                    != "cpu_committed_token_observed_at_streamer_v1"
++                                    or _meta_info.get(
++                                        "native_token_timestamp_release_status"
++                                    )
++                                    != "CPU_CONTRACT_ONLY"
++                                ):
++                                    raise ValueError(
++                                        "SGLang native token timestamp identity changed"
++                                    )
++                                native_token_timestamp_events = (
++                                    _merge_sglang_native_token_timestamp_events(
++                                        native_token_timestamp_events, native_events
++                                    )
++                                )
+                             if _meta_info.get("spec_accept_length") is not None:
+                                 output.spec_accept_length = _meta_info[
+                                     "spec_accept_length"
+@@ -813,26 +1075,44 @@ async def async_request_sglang_generate(
+                                 timestamp = time.perf_counter()
+                                 generated_text = data["text"]
+                                 output_len = data["meta_info"]["completion_tokens"]
++                                num_new_tokens = output_len - last_output_len
++                                if num_new_tokens < 0:
++                                    raise ValueError(
++                                        "SGLang completion-token coverage moved backwards"
++                                    )
++                                first_observed_chunk = ttft == 0.0
++                                if num_new_tokens > 1:
++                                    coalesced_chunks += 1
++                                    coalesced_intervals += num_new_tokens - (
++                                        1 if first_observed_chunk else 0
++                                    )
+ 
+                                 # First token
+-                                if ttft == 0.0:
++                                if first_observed_chunk:
+                                     ttft = time.perf_counter() - st
+                                     output.ttft = ttft
+ 
+                                 # Decoding phase
+                                 else:
+-                                    num_new_tokens = output_len - last_output_len
+                                     if num_new_tokens == 0:
+                                         continue
+-                                    chunk_gap = timestamp - most_recent_timestamp
+-                                    adjust_itl = chunk_gap / num_new_tokens
+-                                    output.itl.extend([adjust_itl] * num_new_tokens)
++                                    if num_new_tokens == 1:
++                                        output.itl.append(
++                                            timestamp - most_recent_timestamp
++                                        )
+ 
+                                 most_recent_timestamp = timestamp
+                                 last_output_len = output_len
+ 
+                     output.generated_text = generated_text
+                     output.generated_token_ids = generated_token_ids
++                    output.native_token_timestamp_events = native_token_timestamp_events
++                    _finalize_sglang_client_itl_coverage(
++                        output,
++                        output_len=output_len,
++                        coalesced_chunks=coalesced_chunks,
++                        coalesced_intervals=coalesced_intervals,
++                    )
+                     output.success = True
+                     output.latency = latency
+                     output.output_len = output_len
+@@ -1131,13 +1411,20 @@ class BenchmarkMetrics:
+     p99_tpot_ms: float
+ 
+     # ITL - Inter-Token Latency (ms)
+-    mean_itl_ms: float
+-    median_itl_ms: float
+-    std_itl_ms: float
+-    p90_itl_ms: float
+-    p95_itl_ms: float
+-    p99_itl_ms: float
+-    max_itl_ms: float
++    mean_itl_ms: Optional[float]
++    median_itl_ms: Optional[float]
++    std_itl_ms: Optional[float]
++    p90_itl_ms: Optional[float]
++    p95_itl_ms: Optional[float]
++    p99_itl_ms: Optional[float]
++    max_itl_ms: Optional[float]
++    itl_expected_intervals: int
++    itl_observed_intervals: int
++    itl_coalesced_chunks: int
++    itl_coalesced_intervals: int
++    itl_missing_intervals: int
++    itl_coverage: Optional[float]
++    itl_unsupported_reason: Optional[str]
+ 
+     # E2E - End-to-End request latency (ms)
+     mean_e2e_latency_ms: float
+@@ -1326,6 +1613,28 @@ def calculate_metrics(
+                 print("tip: install termplotlib and gnuplot to plot the metrics")
+ 
+     itls = retokenized_itls if use_retokenized_itl else itls
++    if backend == "sglang":
++        itl_summary = _summarize_sglang_client_itl_coverage(outputs)
++    else:
++        itl_summary = {
++            "expected_intervals": len(itls),
++            "observed_intervals": len(itls),
++            "coalesced_chunks": 0,
++            "coalesced_intervals": 0,
++            "missing_intervals": 0,
++            "coverage": 1.0 if itls else None,
++            "unsupported_reason": None,
++            "supported_values": itls,
++        }
++    (
++        mean_itl_ms,
++        median_itl_ms,
++        std_itl_ms,
++        p90_itl_ms,
++        p95_itl_ms,
++        p99_itl_ms,
++        max_itl_ms,
++    ) = _itl_statistics_ms(itl_summary["supported_values"])
+     metrics = BenchmarkMetrics(
+         completed=completed,
+         total_input=total_input,
+@@ -1353,13 +1662,20 @@ def calculate_metrics(
+         p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
+         p95_tpot_ms=np.percentile(tpots or 0, 95) * 1000,
+         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
+-        mean_itl_ms=np.mean(itls or 0) * 1000,
+-        median_itl_ms=np.median(itls or 0) * 1000,
+-        std_itl_ms=np.std(itls or 0) * 1000,
+-        p90_itl_ms=np.percentile(itls or 0, 90) * 1000,
+-        p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
+-        p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
+-        max_itl_ms=np.max(itls or 0) * 1000,
++        mean_itl_ms=mean_itl_ms,
++        median_itl_ms=median_itl_ms,
++        std_itl_ms=std_itl_ms,
++        p90_itl_ms=p90_itl_ms,
++        p95_itl_ms=p95_itl_ms,
++        p99_itl_ms=p99_itl_ms,
++        max_itl_ms=max_itl_ms,
++        itl_expected_intervals=itl_summary["expected_intervals"],
++        itl_observed_intervals=itl_summary["observed_intervals"],
++        itl_coalesced_chunks=itl_summary["coalesced_chunks"],
++        itl_coalesced_intervals=itl_summary["coalesced_intervals"],
++        itl_missing_intervals=itl_summary["missing_intervals"],
++        itl_coverage=itl_summary["coverage"],
++        itl_unsupported_reason=itl_summary["unsupported_reason"],
+         mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
+         median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
+         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
+@@ -1816,12 +2132,41 @@ async def benchmark(
+         print("{:<40} {:<10.2f}".format("P95 TPOT (ms):", metrics.p95_tpot_ms))
+         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
+         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+-        print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
+-        print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+-        print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
+-        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
+-        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+-        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
++        coverage = (
++            "N/A" if metrics.itl_coverage is None else f"{metrics.itl_coverage:.6f}"
++        )
++        print(
++            "{:<40} {:<10}".format(
++                "Observed/expected ITL intervals:",
++                f"{metrics.itl_observed_intervals}/{metrics.itl_expected_intervals}",
++            )
++        )
++        print("{:<40} {:<10}".format("ITL interval coverage:", coverage))
++        print(
++            "{:<40} {:<10}".format(
++                "Coalesced SSE chunks:", metrics.itl_coalesced_chunks
++            )
++        )
++        print(
++            "{:<40} {:<10}".format(
++                "Coalesced/missing intervals:",
++                f"{metrics.itl_coalesced_intervals}/{metrics.itl_missing_intervals}",
++            )
++        )
++        if metrics.itl_unsupported_reason is not None:
++            print(
++                "{:<40} {:<10}".format(
++                    "ITL aggregate:",
++                    f"UNSUPPORTED ({metrics.itl_unsupported_reason})",
++                )
++            )
++        else:
++            print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
++            print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
++            print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
++            print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
++            print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
++            print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+     if args.cache_report:
+         total_prompt_tokens = 0
+         total_cached = 0
+@@ -1879,11 +2224,7 @@ async def benchmark(
+     resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
+     server_info = resp.json() if resp.status_code == 200 else None
+ 
+-    if (
+-        metrics.median_ttft_ms is not None
+-        and metrics.mean_itl_ms is not None
+-        and metrics.output_throughput is not None
+-    ):
++    if metrics.median_ttft_ms is not None and metrics.output_throughput is not None:
+         result = {
+             # Arguments
+             "tag": getattr(args, "tag", None),
+@@ -1933,6 +2274,14 @@ async def benchmark(
+             "p90_itl_ms": metrics.p90_itl_ms,
+             "p95_itl_ms": metrics.p95_itl_ms,
+             "p99_itl_ms": metrics.p99_itl_ms,
++            "max_itl_ms": metrics.max_itl_ms,
++            "itl_expected_intervals": metrics.itl_expected_intervals,
++            "itl_observed_intervals": metrics.itl_observed_intervals,
++            "itl_coalesced_chunks": metrics.itl_coalesced_chunks,
++            "itl_coalesced_intervals": metrics.itl_coalesced_intervals,
++            "itl_missing_intervals": metrics.itl_missing_intervals,
++            "itl_coverage": metrics.itl_coverage,
++            "itl_unsupported_reason": metrics.itl_unsupported_reason,
+             "concurrency": metrics.concurrency,
+             "accept_length": accept_length,
+             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+@@ -1976,6 +2325,25 @@ async def benchmark(
+         "output_lens": output_lens,
+         "ttfts": [output.ttft for output in outputs],
+         "itls": [output.itl for output in outputs],
++        "itl_expected_intervals_by_request": [
++            output.itl_expected_intervals for output in outputs
++        ],
++        "itl_observed_intervals_by_request": [
++            output.itl_observed_intervals for output in outputs
++        ],
++        "itl_coalesced_chunks_by_request": [
++            output.itl_coalesced_chunks for output in outputs
++        ],
++        "itl_coalesced_intervals_by_request": [
++            output.itl_coalesced_intervals for output in outputs
++        ],
++        "itl_missing_intervals_by_request": [
++            output.itl_missing_intervals for output in outputs
++        ],
++        "itl_coverage_by_request": [output.itl_coverage for output in outputs],
++        "itl_unsupported_reason_by_request": [
++            output.itl_unsupported_reason for output in outputs
++        ],
+         "generated_texts": [output.generated_text for output in outputs],
+         "errors": [output.error for output in outputs],
+     }
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index 7b3ca52..598f700 100644
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -442,6 +442,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             finished_reasons=recv_obj.finished_reasons,
+             output_strs=output_strs,
+             output_ids=recv_obj.output_ids,
++            native_token_timestamp_events=recv_obj.native_token_timestamp_events,
+             prompt_tokens=recv_obj.prompt_tokens,
+             reasoning_tokens=recv_obj.reasoning_tokens,
+             completion_tokens=recv_obj.completion_tokens,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index e72e6d4..d02a080 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -215,6 +215,8 @@ class GenerateReqInput:
+     return_flat_raw_top_logprobs_b64: bool = False
+     # Whether to stream output.
+     stream: bool = False
++    # CPU-only LightCone contract: committed-token observations at the streamer.
++    return_native_token_timestamps: bool = False
+     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+     log_metrics: bool = True
+     # Whether to return hidden states
+@@ -364,6 +366,8 @@ class GenerateReqInput:
+ 
+     def _validate_inputs(self):
+         """Validate that the input configuration is valid."""
++        if type(self.return_native_token_timestamps) is not bool:
++            raise ValueError("return_native_token_timestamps must be a boolean")
+         if (
+             self.text is None and self.input_ids is None and self.input_embeds is None
+         ) or (
+@@ -744,6 +748,7 @@ class GenerateReqInput:
+             top_logprobs_num=self.top_logprobs_num[i],
+             token_ids_logprob=self.token_ids_logprob[i],
+             return_sampling_mask=self.return_sampling_mask[i],
++            return_native_token_timestamps=self.return_native_token_timestamps,
+             return_text_in_logprobs=self.return_text_in_logprobs,
+             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+@@ -829,6 +834,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     token_ids_logprob: Optional[List[int]]
+     # Whether to stream output
+     stream: bool
++    # CPU-only committed-token host observation contract.
++    return_native_token_timestamps: bool = False
+     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
+     return_sampling_mask: bool = False
+ 
+@@ -1287,6 +1294,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
+ 
++    # CPU-only host observations for opt-in requests. Kept optional so existing
++    # internal constructors retain their wire-compatible defaults.
++    native_token_timestamp_events: Optional[
++        List[Optional[List[Dict[str, int]]]]
++    ] = None
++
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
+@@ -1369,6 +1382,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
+     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
+ 
++    # CPU-only host observations for opt-in requests. Kept optional so existing
++    # internal constructors retain their wire-compatible defaults.
++    native_token_timestamp_events: Optional[
++        List[Optional[List[Dict[str, int]]]]
++    ] = None
++
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
+diff --git a/python/sglang/srt/managers/multi_tokenizer_mixin.py b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+index dcd88eb..84a3e65 100644
+--- a/python/sglang/srt/managers/multi_tokenizer_mixin.py
++++ b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+@@ -176,6 +176,9 @@ def _handle_output_by_index(output, i):
+             decode_ids=_extract_field_by_index(output, "decode_ids", i),
+             read_offsets=_extract_field_by_index(output, "read_offsets", i),
+             output_ids=_extract_field_by_index(output, "output_ids", i),
++            native_token_timestamp_events=_extract_field_by_index(
++                output, "native_token_timestamp_events", i, check_length=False
++            ),
+             skip_special_tokens=_extract_field_by_index(
+                 output, "skip_special_tokens", i
+             ),
+@@ -291,6 +294,9 @@ def _handle_output_by_index(output, i):
+             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+             output_strs=_extract_field_by_index(output, "output_strs", i),
+             output_ids=_extract_field_by_index(output, "output_ids", i),
++            native_token_timestamp_events=_extract_field_by_index(
++                output, "native_token_timestamp_events", i, check_length=False
++            ),
+             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
+diff --git a/python/sglang/srt/managers/native_token_timestamps.py b/python/sglang/srt/managers/native_token_timestamps.py
+new file mode 100644
+index 0000000..1293035
+--- /dev/null
++++ b/python/sglang/srt/managers/native_token_timestamps.py
+@@ -0,0 +1,61 @@
++"""CPU-only native observation contract for committed output tokens.
++
++This hook records host observation time after stop handling, when
++``Req.output_ids_through_stop`` is authoritative. It is not a CUDA event and
++must never be described as the token's device production time.
++"""
++
++from __future__ import annotations
++
++import time
++from typing import Any, Callable, Optional, Sequence
++
++
++NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
++NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "cpu_committed_token_observed_at_streamer_v1"
++NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_CONTRACT_ONLY"
++
++
++def observe_committed_output_tokens(
++    req: Any,
++    *,
++    clock: Callable[[], int] = time.monotonic_ns,
++) -> None:
++    """Append one ordered host observation for every newly committed token."""
++
++    if not getattr(req, "return_native_token_timestamps", False):
++        return
++    output_ids = tuple(int(token) for token in req.output_ids_through_stop)
++    events = req.native_token_timestamp_events
++    if len(output_ids) < len(events):
++        raise RuntimeError("committed output-token coverage moved backwards")
++    if tuple(event[0] for event in events) != output_ids[: len(events)]:
++        raise RuntimeError("committed output-token prefix changed after observation")
++    for token_id in output_ids[len(events) :]:
++        observed_ns = int(clock())
++        if observed_ns < 0 or (events and observed_ns <= events[-1][1]):
++            raise RuntimeError("native token timestamps must be strictly increasing")
++        events.append((token_id, observed_ns))
++
++
++def slice_native_token_timestamp_events(
++    events: Sequence[tuple[int, int]],
++    *,
++    start: int,
++    output_ids: Sequence[int],
++) -> Optional[list[dict[str, int]]]:
++    """Return exact delta events aligned to the streamer's output-token slice."""
++
++    if not events:
++        return None
++    selected = events[start : start + len(output_ids)]
++    if tuple(event[0] for event in selected) != tuple(int(v) for v in output_ids):
++        raise RuntimeError("native token timestamps differ from streamed output IDs")
++    return [
++        {
++            "token_index": start + offset,
++            "token_id": int(token_id),
++            "observed_ns": int(observed_ns),
++        }
++        for offset, (token_id, observed_ns) in enumerate(selected)
++    ]
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 4b3548d..8b6b80a 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -724,6 +724,7 @@ class Req(ReqDllmMixin):
+         dllm_config: Optional[DllmConfig] = None,
+         token_ids_logprob: List[int] = None,
+         return_sampling_mask: bool = False,
++        return_native_token_timestamps: bool = False,
+         stream: bool = False,
+         origin_input_ids_unpadded: Optional[array[int]] = None,
+         lora_id: Optional[str] = None,
+@@ -771,6 +772,8 @@ class Req(ReqDllmMixin):
+         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+         # that preserve length would silently corrupt fill_ids.
+         self.output_ids = array("q")
++        self.return_native_token_timestamps = return_native_token_timestamps
++        self.native_token_timestamp_events: list[tuple[int, int]] = []
+         # Full untruncated sequence: origin + output (+ DLLM mask block).
+         # Kept in sync by _refresh_fill_ids; admission only updates
+         # extend_range, never mutates this array's length.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 204fe4d..1dd6442 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3027,6 +3027,7 @@ class Scheduler(
+                 top_logprobs_num=recv_req.top_logprobs_num,
+                 token_ids_logprob=recv_req.token_ids_logprob,
+                 return_sampling_mask=recv_req.return_sampling_mask,
++                return_native_token_timestamps=recv_req.return_native_token_timestamps,
+                 stream=recv_req.stream,
+                 lora_id=recv_req.lora_id,
+                 session_id=recv_req.session_id,
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index 278ccf4..e77ed70 100644
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -21,6 +21,10 @@ from sglang.srt.managers.io_struct import (
+     CachedTokensDetails,
+     wrap_as_pickle,
+ )
++from sglang.srt.managers.native_token_timestamps import (
++    observe_committed_output_tokens,
++    slice_native_token_timestamp_events,
++)
+ from sglang.srt.managers.schedule_batch import (
+     BaseFinishReason,
+     Req,
+@@ -268,6 +272,7 @@ class _GenerationStreamAccumulator:
+     decode_ids_list: list = field(default_factory=list)
+     read_offsets: list = field(default_factory=list)
+     output_ids: list = field(default_factory=list)
++    native_token_timestamp_events: list = field(default_factory=list)
+     skip_special_tokens: list = field(default_factory=list)
+     spaces_between_special_tokens: list = field(default_factory=list)
+     no_stop_trim: list = field(default_factory=list)
+@@ -334,6 +339,9 @@ class _GenerationStreamAccumulator:
+             self.output_token_sampling_logprobs = []
+ 
+     def accept(self, *, req: Req) -> None:
++        # Observe after finish/stop handling has made output_ids_through_stop
++        # authoritative, even when this scheduler step is not emitted as SSE.
++        observe_committed_output_tokens(req)
+         if req.finished():
+             assert not req.finished_output
+             req.finished_output = True
+@@ -382,6 +390,13 @@ class _GenerationStreamAccumulator:
+         req.send_decode_id_offset = len(decode_ids)
+         self.read_offsets.append(read_offset)
+         self.output_ids.append(output_ids_[send_token_offset:])
++        self.native_token_timestamp_events.append(
++            slice_native_token_timestamp_events(
++                req.native_token_timestamp_events,
++                start=send_token_offset,
++                output_ids=self.output_ids[-1],
++            )
++        )
+         req.send_token_offset = len(output_ids_)
+         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+         self.spaces_between_special_tokens.append(
+@@ -573,6 +588,11 @@ class _GenerationStreamAccumulator:
+             decode_ids=self.decode_ids_list,
+             read_offsets=self.read_offsets,
+             output_ids=self.output_ids,
++            native_token_timestamp_events=(
++                self.native_token_timestamp_events
++                if any(self.native_token_timestamp_events)
++                else None
++            ),
+             skip_special_tokens=self.skip_special_tokens,
+             spaces_between_special_tokens=self.spaces_between_special_tokens,
+             no_stop_trim=self.no_stop_trim,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index c8934b2..63e77ce 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -166,6 +166,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
+     "output_token_ids_logprobs",
+     "output_token_sampling_mask",
+     "output_token_sampling_logprobs",
++    "native_token_timestamp_events",
+ )
+ 
+ 
+@@ -226,6 +227,10 @@ class ReqState:
+     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+     output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+     output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
++    native_token_timestamp_events: List[Dict[str, int]] = dataclasses.field(
++        default_factory=list
++    )
++    native_token_timestamp_request_started_ns: Optional[int] = None
+ 
+     # Cached flat-format prompt top logprob fields; rebuilt only when more
+     # prefill chunks arrive, so streaming decode chunks reuse the payload.
+@@ -1273,6 +1278,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 top_logprobs_num=obj.top_logprobs_num,
+                 token_ids_logprob=obj.token_ids_logprob,
+                 return_sampling_mask=obj.return_sampling_mask,
++                return_native_token_timestamps=obj.return_native_token_timestamps,
+                 stream=obj.stream,
+                 rid=obj.rid,
+                 http_worker_ipc=obj.http_worker_ipc,
+@@ -2057,6 +2063,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         "cached_tokens": recv_obj.cached_tokens[i],
+                     }
+                 )
++                if state.native_token_timestamp_request_started_ns is not None:
++                    meta_info.update(
++                        {
++                            "native_token_timestamp_hook": (
++                                "sglang.schema_v3.native_per_token_timestamp.v1"
++                            ),
++                            "native_token_timestamp_semantics": (
++                                "cpu_committed_token_observed_at_streamer_v1"
++                            ),
++                            "native_token_timestamp_release_status": (
++                                "CPU_CONTRACT_ONLY"
++                            ),
++                            "native_token_timestamp_request_id": recv_obj.rids[i],
++                            "native_token_timestamp_request_started_ns": (
++                                state.native_token_timestamp_request_started_ns
++                            ),
++                        }
++                    )
++                native_events = getattr(
++                    recv_obj, "native_token_timestamp_events", None
++                )
++                if native_events is not None and native_events[i] is not None:
++                    expected_index = len(state.native_token_timestamp_events)
++                    for event in native_events[i]:
++                        if event.get("token_index") != expected_index:
++                            raise RuntimeError(
++                                "native token timestamp stream coverage is invalid"
++                            )
++                        state.native_token_timestamp_events.append(event)
++                        expected_index += 1
++                    meta_info["native_token_timestamp_events"] = (
++                        state.native_token_timestamp_events
++                    )
+                 # Add detailed cache breakdown if available
+                 if (
+                     hasattr(recv_obj, "cached_tokens_details")
+@@ -2106,6 +2145,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+ 
+             state.finished = recv_obj.finished_reasons[i] is not None
++            if (
++                state.finished
++                and state.native_token_timestamp_request_started_ns is not None
++            ):
++                finish_reason = recv_obj.finished_reasons[i]
++                reason_type = finish_reason.get("type", "unknown")
++                meta_info.update(
++                    {
++                        "native_token_timestamp_request_terminal_ns": (
++                            time.monotonic_ns()
++                        ),
++                        "native_token_timestamp_terminal_status": (
++                            "aborted" if reason_type == "abort" else "completed"
++                        ),
++                        "native_token_timestamp_terminal_reason": reason_type,
++                    }
++                )
+             if isinstance(recv_obj, BatchStrOutput):
+                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+                 is_stream = getattr(state.obj, "stream", False)
+@@ -3141,6 +3197,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 raise ValueError(f"Duplicate request ID detected: {rid}")
+             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
++            if getattr(sub_obj, "return_native_token_timestamps", False):
++                state.native_token_timestamp_request_started_ns = time.monotonic_ns()
+             self.rid_to_state[rid] = state
+             if self.enable_trace:
+                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
+diff --git a/test/registered/unit/benchmark/test_native_token_timestamps.py b/test/registered/unit/benchmark/test_native_token_timestamps.py
+new file mode 100644
+index 0000000..9bd2ca8
+--- /dev/null
++++ b/test/registered/unit/benchmark/test_native_token_timestamps.py
+@@ -0,0 +1,158 @@
++from __future__ import annotations
++
++import ast
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++ROOT = Path(__file__).resolve().parents[4]
++HOOK_PATH = ROOT / "python/sglang/srt/managers/native_token_timestamps.py"
++SERVING_PATH = ROOT / "python/sglang/benchmark/serving.py"
++TOKENIZER_MANAGER_PATH = ROOT / "python/sglang/srt/managers/tokenizer_manager.py"
++
++
++def _load_functions(path: Path, names: set[str], namespace: dict | None = None):
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    selected = [
++        node
++        for node in tree.body
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
++        and node.name in names
++    ]
++    scope = {} if namespace is None else dict(namespace)
++    exec(compile(ast.Module(body=selected, type_ignores=[]), path, "exec"), scope)
++    return tuple(scope[name] for name in names)
++
++
++class NativeTokenTimestampTests(unittest.TestCase):
++    def test_records_only_final_committed_prefix_with_explicit_cpu_semantics(self):
++        source = HOOK_PATH.read_text(encoding="utf-8")
++        self.assertIn("cpu_committed_token_observed_at_streamer_v1", source)
++        self.assertIn(
++            'NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_CONTRACT_ONLY"', source
++        )
++        (observe,) = _load_functions(
++            HOOK_PATH,
++            {"observe_committed_output_tokens"},
++            {
++                "Any": object,
++                "Callable": object,
++                "time": SimpleNamespace(monotonic_ns=lambda: 0),
++            },
++        )
++        req = SimpleNamespace(
++            return_native_token_timestamps=True,
++            output_ids_through_stop=[10, 11],
++            native_token_timestamp_events=[],
++        )
++        times = iter((100, 120, 140))
++        observe(req, clock=lambda: next(times))
++        self.assertEqual(req.native_token_timestamp_events, [(10, 100), (11, 120)])
++        req.output_ids_through_stop = [10, 11, 12]
++        observe(req, clock=lambda: next(times))
++        self.assertEqual(req.native_token_timestamp_events[-1], (12, 140))
++
++    def test_wire_metadata_binds_request_lifecycle_even_without_token_events(self):
++        source = TOKENIZER_MANAGER_PATH.read_text(encoding="utf-8")
++        for field in (
++            "native_token_timestamp_request_id",
++            "native_token_timestamp_request_started_ns",
++            "native_token_timestamp_request_terminal_ns",
++            "native_token_timestamp_terminal_status",
++            "native_token_timestamp_terminal_reason",
++        ):
++            self.assertIn(field, source)
++        base_metadata = source.index('"native_token_timestamp_request_id"')
++        event_branch = source.index("native_events = getattr")
++        self.assertLess(base_metadata, event_branch)
++
++    def test_one_streamer_observation_enumerates_an_already_committed_batch(self):
++        source = HOOK_PATH.read_text(encoding="utf-8")
++        self.assertIn("not a CUDA event", source)
++        self.assertIn("host observation", source)
++        (observe,) = _load_functions(
++            HOOK_PATH,
++            {"observe_committed_output_tokens"},
++            {
++                "Any": object,
++                "Callable": object,
++                "time": SimpleNamespace(monotonic_ns=lambda: 0),
++            },
++        )
++        req = SimpleNamespace(
++            return_native_token_timestamps=True,
++            output_ids_through_stop=[10, 11, 12],
++            native_token_timestamp_events=[],
++        )
++        times = iter((100, 101, 102))
++        observe(req, clock=lambda: next(times))
++        self.assertEqual(
++            req.native_token_timestamp_events,
++            [(10, 100), (11, 101), (12, 102)],
++        )
++
++    def test_rejects_mutated_or_retracted_committed_prefix(self):
++        (observe,) = _load_functions(
++            HOOK_PATH,
++            {"observe_committed_output_tokens"},
++            {
++                "Any": object,
++                "Callable": object,
++                "time": SimpleNamespace(monotonic_ns=lambda: 0),
++            },
++        )
++        for output_ids in ([10], [99, 11]):
++            req = SimpleNamespace(
++                return_native_token_timestamps=True,
++                output_ids_through_stop=output_ids,
++                native_token_timestamp_events=[(10, 100), (11, 120)],
++            )
++            with self.assertRaises(RuntimeError):
++                observe(req, clock=lambda: 140)
++
++    def test_benchmark_merges_native_events_and_has_no_chunk_interpolation(self):
++        source = SERVING_PATH.read_text(encoding="utf-8")
++        self.assertNotIn("adjust_itl = chunk_gap / num_new_tokens", source)
++        for field in (
++            "itl_expected_intervals",
++            "itl_observed_intervals",
++            "itl_coalesced_intervals",
++            "itl_missing_intervals",
++            "itl_coverage",
++            "itl_unsupported_reason",
++            "incomplete_client_interval_coverage",
++        ):
++            self.assertIn(field, source)
++        (merge,) = _load_functions(
++            SERVING_PATH,
++            {"_merge_sglang_native_token_timestamp_events"},
++            {"Any": object, "Dict": dict, "List": list, "Optional": object},
++        )
++        events = merge(None, [{"token_index": 0, "token_id": 10, "observed_ns": 100}])
++        events = merge(
++            events,
++            [
++                {"token_index": 0, "token_id": 10, "observed_ns": 100},
++                {"token_index": 1, "token_id": 11, "observed_ns": 120},
++            ],
++        )
++        self.assertEqual([event["token_id"] for event in events], [10, 11])
++        events = merge(
++            events,
++            [{"token_index": 2, "token_id": 12, "observed_ns": 140}],
++        )
++        self.assertEqual([event["token_id"] for event in events], [10, 11, 12])
++        with self.assertRaises(ValueError):
++            merge(
++                events,
++                [
++                    {"token_index": 0, "token_id": 10, "observed_ns": 100},
++                    {"token_index": 1, "token_id": 11, "observed_ns": 120},
++                    {"token_index": 2, "token_id": 12, "observed_ns": 140},
++                    {"token_index": 3, "token_id": 13, "observed_ns": 140},
++                ],
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/benchmark/test_serving_output_token_ids.py b/test/registered/unit/benchmark/test_serving_output_token_ids.py
+index f333274..3b6854f 100644
+--- a/test/registered/unit/benchmark/test_serving_output_token_ids.py
++++ b/test/registered/unit/benchmark/test_serving_output_token_ids.py
+@@ -7,6 +7,7 @@ import sys
+ import time
+ import traceback
+ import unittest
++import warnings
+ from pathlib import Path
+ from types import SimpleNamespace
+ from typing import Any, List, Optional
+@@ -36,6 +37,57 @@ def _load_merge_function():
+     return namespace[node.name]
+ 
+ 
++def _load_itl_helpers():
++    names = {
++        "_finalize_sglang_client_itl_coverage",
++        "_summarize_sglang_client_itl_coverage",
++        "_itl_statistics_ms",
++    }
++    nodes = [_function(name) for name in names]
++    namespace = {
++        "Any": Any,
++        "List": List,
++        "Optional": Optional,
++        "RequestFuncOutput": object,
++        "_SGLANG_ITL_INCOMPLETE_REASON": "incomplete_client_interval_coverage",
++        "_SGLANG_ITL_NO_INTERVALS_REASON": "no_client_inter_token_intervals",
++        "math": __import__("math"),
++        "np": __import__("numpy"),
++    }
++    exec(
++        compile(ast.Module(body=nodes, type_ignores=[]), SERVING_PATH, "exec"),
++        namespace,
++    )
++    return SimpleNamespace(**{name: namespace[name] for name in names})
++
++
++def _load_calculate_metrics():
++    names = {
++        "_summarize_sglang_client_itl_coverage",
++        "_itl_statistics_ms",
++        "calculate_metrics",
++    }
++    nodes = [_function(name) for name in names]
++    namespace = {
++        "Any": Any,
++        "List": List,
++        "Optional": Optional,
++        "RequestFuncOutput": object,
++        "BenchmarkMetrics": lambda **values: SimpleNamespace(**values),
++        "_SGLANG_ITL_INCOMPLETE_REASON": "incomplete_client_interval_coverage",
++        "_SGLANG_ITL_NO_INTERVALS_REASON": "no_client_inter_token_intervals",
++        "TERM_PLOTLIB_AVAILABLE": False,
++        "math": __import__("math"),
++        "np": __import__("numpy"),
++        "warnings": warnings,
++    }
++    exec(
++        compile(ast.Module(body=nodes, type_ignores=[]), SERVING_PATH, "exec"),
++        namespace,
++    )
++    return namespace["calculate_metrics"]
++
++
+ class _ResponseContent:
+     def __init__(self, chunks: list[bytes]):
+         self.chunks = chunks
+@@ -103,6 +155,13 @@ class _Output:
+             latency=0.0,
+             ttft=0.0,
+             itl=[],
++            itl_expected_intervals=None,
++            itl_observed_intervals=None,
++            itl_coalesced_chunks=None,
++            itl_coalesced_intervals=None,
++            itl_missing_intervals=None,
++            itl_coverage=None,
++            itl_unsupported_reason=None,
+             output_len=0,
+             error="",
+             cached_tokens=0,
+@@ -118,6 +177,7 @@ def _run_request(
+     client_session: _Session | None = None,
+ ):
+     merge = _load_merge_function()
++    itl_helpers = _load_itl_helpers()
+     request_node = _function("async_request_sglang_generate")
+     assert isinstance(request_node, ast.AsyncFunctionDef)
+     chunks = []
+@@ -132,6 +192,9 @@ def _run_request(
+         "_ROUTING_KEY_HEADER": "X-SMG-Routing-Key",
+         "_create_bench_client_session": lambda: _Session(chunks),
+         "_merge_sglang_generated_token_ids": merge,
++        "_finalize_sglang_client_itl_coverage": (
++            itl_helpers._finalize_sglang_client_itl_coverage
++        ),
+         "aiohttp": SimpleNamespace(
+             ClientSession=object,
+             ClientTimeout=lambda **kwargs: kwargs,
+@@ -226,6 +289,11 @@ class ServingOutputTokenIdsTests(unittest.TestCase):
+         )
+         self.assertTrue(output.success, output.error)
+         self.assertEqual(output.generated_token_ids, [11, 12])
++        self.assertEqual(output.itl_expected_intervals, 1)
++        self.assertEqual(output.itl_observed_intervals, 1)
++        self.assertEqual(output.itl_missing_intervals, 0)
++        self.assertEqual(output.itl_coverage, 1.0)
++        self.assertIsNone(output.itl_unsupported_reason)
+ 
+     def test_request_collects_streaming_delta_ids(self):
+         output = _run_request(
+@@ -246,6 +314,68 @@ class ServingOutputTokenIdsTests(unittest.TestCase):
+         self.assertTrue(output.success, output.error)
+         self.assertEqual(output.generated_token_ids, [11, 12])
+ 
++    def test_mixed_single_and_coalesced_chunks_make_itl_unsupported(self):
++        output = _run_request(
++            [
++                {
++                    "text": "A",
++                    "output_ids": [11],
++                    "meta_info": {"completion_tokens": 1},
++                },
++                {
++                    "text": "AB",
++                    "output_ids": [11, 12],
++                    "meta_info": {"completion_tokens": 2},
++                },
++                {
++                    "text": "ABCD",
++                    "output_ids": [11, 12, 13, 14],
++                    "meta_info": {"completion_tokens": 4},
++                },
++            ],
++            disable_stream=False,
++        )
++        self.assertTrue(output.success, output.error)
++        self.assertEqual(len(output.itl), 1)
++        self.assertEqual(output.itl_expected_intervals, 3)
++        self.assertEqual(output.itl_observed_intervals, 1)
++        self.assertEqual(output.itl_coalesced_chunks, 1)
++        self.assertEqual(output.itl_coalesced_intervals, 2)
++        self.assertEqual(output.itl_missing_intervals, 2)
++        self.assertAlmostEqual(output.itl_coverage, 1 / 3)
++        self.assertEqual(
++            output.itl_unsupported_reason,
++            "incomplete_client_interval_coverage",
++        )
++
++        helpers = _load_itl_helpers()
++        summary = helpers._summarize_sglang_client_itl_coverage([output])
++        self.assertEqual(summary["expected_intervals"], 3)
++        self.assertEqual(summary["observed_intervals"], 1)
++        self.assertEqual(summary["missing_intervals"], 2)
++        self.assertIsNone(summary["supported_values"])
++        self.assertEqual(
++            helpers._itl_statistics_ms(summary["supported_values"]),
++            (None, None, None, None, None, None, None),
++        )
++        calculate_metrics = _load_calculate_metrics()
++        metrics, _ = calculate_metrics(
++            input_requests=None,
++            outputs=[output],
++            dur_s=1.0,
++            tokenizer=SimpleNamespace(
++                encode=lambda text, add_special_tokens=False: list(range(len(text)))
++            ),
++            backend="sglang",
++        )
++        self.assertIsNone(metrics.mean_itl_ms)
++        self.assertIsNone(metrics.p99_itl_ms)
++        self.assertEqual(metrics.itl_missing_intervals, 2)
++        self.assertEqual(
++            metrics.itl_unsupported_reason,
++            "incomplete_client_interval_coverage",
++        )
++
+     def test_request_collects_non_streaming_ids(self):
+         output = _run_request(
+             [
+@@ -353,6 +483,9 @@ class ServingOutputTokenIdsTests(unittest.TestCase):
+             "_ROUTING_KEY_HEADER": "X-SMG-Routing-Key",
+             "_create_bench_client_session": create_session,
+             "_merge_sglang_generated_token_ids": merge,
++            "_finalize_sglang_client_itl_coverage": (
++                _load_itl_helpers()._finalize_sglang_client_itl_coverage
++            ),
+             "aiohttp": SimpleNamespace(
+                 ClientSession=object,
+                 ClientTimeout=lambda **kwargs: kwargs,
+-- 
+2.55.0
+

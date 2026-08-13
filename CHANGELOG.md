@@ -45,10 +45,15 @@ yet been declared.
 - Restricted release-supported publication methods to Target-only. The native
   terminal hook has no bundled trusted hardware signer, so content-valid
   Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
-- Made the SGLang adaptation-protocol patch test hermetic by loading only its
-  config, runtime, and parameter-plan modules. The resulting patch identity is
-  `091c8a164007691a171a449552a98ff6d68039cf868721bb24480e3ead4018e0`
-  with final tree `971cba382edf7035e6b957283cfca9c5f41f31d1`.
+- Added an opt-in, CPU-only committed-token host-observation contract and
+  removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
+  latest patch identity is
+  `8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31`
+  with final tree `81a86871d01dcf19853612da3d8eb63faa812013`. The formal ITL
+  producer allowlist remains empty; CPU observations cannot establish p99 ITL.
+  The official benchmark reports exact expected/observed/coalesced/missing
+  client-interval coverage and emits null aggregate ITL statistics whenever
+  coverage is incomplete instead of reducing a sparse subset.
 
 ### Evidence status
 

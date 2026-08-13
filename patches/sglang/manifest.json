@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "971cba382edf7035e6b957283cfca9c5f41f31d1",
+  "expected_tree": "81a86871d01dcf19853612da3d8eb63faa812013",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -47,6 +47,23 @@
         "test/registered/unit/spec/test_online_adaptation_protocol.py",
         "test/registered/unit/spec/test_session_reset_evidence.py",
         "test/registered/unit/spec/test_terminal_speculative_evidence.py"
+      ]
+    },
+    {
+      "file": "0002-feat-spec-add-cpu-native-token-observations.patch",
+      "sha256": "8b9cf1f19277c765482eb0afe6b31a76f4aa8bd93e6cf29fd0e019a01011ac31",
+      "files": [
+        "python/sglang/benchmark/serving.py",
+        "python/sglang/srt/managers/detokenizer_manager.py",
+        "python/sglang/srt/managers/io_struct.py",
+        "python/sglang/srt/managers/multi_tokenizer_mixin.py",
+        "python/sglang/srt/managers/native_token_timestamps.py",
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/output_streamer.py",
+        "python/sglang/srt/managers/tokenizer_manager.py",
+        "test/registered/unit/benchmark/test_native_token_timestamps.py",
+        "test/registered/unit/benchmark/test_serving_output_token_ids.py"
       ]
     }
   ]

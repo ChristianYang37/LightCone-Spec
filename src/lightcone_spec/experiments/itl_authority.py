@@ -7,10 +7,14 @@ distribution.  Formal ITL evidence therefore has exactly two future source
 modes: a native per-token timestamp hook, or raw SSE frame observations that
 prove every frame contributes exactly one new token.
 
-The pinned runtime exposes neither source today and this release has an empty
-producer allowlist.  E2 prelaunch is consequently named ``BLOCKED`` before a
-raw receipt path is opened.  The frozen reducer contract below exists so a
-future first-party producer can be added without weakening that gate.
+The pinned runtime exposes a CPU-only committed-token observation hook for
+contract testing.  Its timestamps are host observations made while enumerating
+tokens that are already committed; they are neither decode-production nor CUDA
+event times and cannot support a formal p99 claim.  This release therefore
+keeps the formal producer allowlist empty.  E2 prelaunch is named ``BLOCKED``
+before a raw receipt path is opened.  The frozen reducer contract below exists
+so a future GPU-validated first-party producer can be added without weakening
+that gate.
 """
 
 from __future__ import annotations
@@ -48,6 +52,10 @@ _MAX_RAW_RECEIPT_BYTES = 64 * 1024 * 1024
 ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON = (
     "release_per_token_timestamp_producer_unavailable"
 )
+ITL_CPU_CONTRACT_ONLY_REASON = "cpu_contract_only_not_formal_itl_authority"
+SGLANG_CPU_ITL_CONTRACT_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
+SGLANG_CPU_ITL_CONTRACT_SEMANTICS = "cpu_committed_token_observed_at_streamer_v1"
+SGLANG_CPU_ITL_CONTRACT_RELEASE_STATUS = "CPU_CONTRACT_ONLY"
 ITL_COALESCED_CHUNK_UNPROVEN_REASON = "coalesced_sse_chunk_has_no_token_timestamps"
 ITL_RAW_RECEIPT_MISSING_REASON = "per_token_timestamp_raw_receipt_missing"
 ITL_RAW_REQUEST_COVERAGE_INCOMPLETE_REASON = (
@@ -82,6 +90,27 @@ class ItlTimestampAuthorityBlocked(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(f"formal ITL timestamp authority is BLOCKED: {reason}")
         self.reason = reason
+
+
+def reject_cpu_contract_only_itl_metadata(metadata: Mapping[str, object]) -> None:
+    """Reject CPU observation metadata before any formal raw receipt is opened."""
+
+    value = _strict_mapping("CPU ITL metadata", metadata)
+    if any(
+        value.get(field) == expected
+        for field, expected in (
+            ("native_token_timestamp_hook", SGLANG_CPU_ITL_CONTRACT_HOOK),
+            (
+                "native_token_timestamp_semantics",
+                SGLANG_CPU_ITL_CONTRACT_SEMANTICS,
+            ),
+            (
+                "native_token_timestamp_release_status",
+                SGLANG_CPU_ITL_CONTRACT_RELEASE_STATUS,
+            ),
+        )
+    ):
+        raise ItlTimestampAuthorityBlocked(ITL_CPU_CONTRACT_ONLY_REASON)
 
 
 def _require_sha256(label: str, value: object) -> str:
@@ -198,7 +227,9 @@ class E2ItlTimestampPlan:
     protocol_sha256: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != "e2_itl_timestamp_plan":
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("E2 ITL timestamp plan schema is unsupported")
+        if self.kind != "e2_itl_timestamp_plan":
             raise ValueError("E2 ITL timestamp plan schema is unsupported")
         for label, value in (
             ("ITL registry", self.registry_sha256),
@@ -438,7 +469,9 @@ class BoundItlTimestampAuthority:
     requests: tuple[ItlRequestTimestamps, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != "bound_itl_timestamp_authority":
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("bound ITL timestamp authority schema is unsupported")
+        if self.kind != "bound_itl_timestamp_authority":
             raise ValueError("bound ITL timestamp authority schema is unsupported")
         if type(self.plan) is not E2ItlTimestampPlan:
             raise TypeError("bound ITL authority requires an exact E2 plan")
@@ -703,7 +736,8 @@ def bind_itl_timestamp_authority(
         },
     )
     if (
-        receipt["schema_version"] != 1
+        type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != 1
         or receipt["kind"] != "formal_itl_timestamp_raw_receipt"
         or receipt["plan_sha256"] != plan.sha256
         or receipt["producer_id"] != producer.producer_id
@@ -786,11 +820,15 @@ def assess_serving_chunks_for_formal_itl(
 
 __all__ = [
     "ITL_COALESCED_CHUNK_UNPROVEN_REASON",
+    "ITL_CPU_CONTRACT_ONLY_REASON",
     "ITL_RAW_RECEIPT_MISSING_REASON",
     "ITL_RAW_REQUEST_COVERAGE_INCOMPLETE_REASON",
     "ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256",
     "ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON",
     "RELEASE_ITL_TIMESTAMP_PRODUCERS",
+    "SGLANG_CPU_ITL_CONTRACT_HOOK",
+    "SGLANG_CPU_ITL_CONTRACT_RELEASE_STATUS",
+    "SGLANG_CPU_ITL_CONTRACT_SEMANTICS",
     "BoundItlTimestampAuthority",
     "E2ItlTimestampPlan",
     "ItlRequestExpectation",
@@ -802,6 +840,7 @@ __all__ = [
     "bind_itl_timestamp_authority",
     "evaluate_e2_itl_timestamp_activation",
     "itl_request_expectations_sha256",
+    "reject_cpu_contract_only_itl_metadata",
     "release_e2_itl_timestamp_plan",
     "require_e2_itl_timestamp_prelaunch",
     "revalidate_itl_timestamp_authority",

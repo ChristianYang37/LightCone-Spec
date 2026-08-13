@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments import itl_authority
 from lightcone_spec.experiments.itl_authority import (
     ITL_COALESCED_CHUNK_UNPROVEN_REASON,
+    ITL_CPU_CONTRACT_ONLY_REASON,
     ITL_RAW_RECEIPT_MISSING_REASON,
     ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256,
     ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
@@ -19,6 +21,7 @@ from lightcone_spec.experiments.itl_authority import (
     assess_serving_chunks_for_formal_itl,
     bind_itl_timestamp_authority,
     evaluate_e2_itl_timestamp_activation,
+    reject_cpu_contract_only_itl_metadata,
     release_e2_itl_timestamp_plan,
     require_e2_itl_timestamp_prelaunch,
     revalidate_itl_timestamp_authority,
@@ -137,6 +140,51 @@ def test_current_release_blocks_e2_before_raw_path_is_inspected(tmp_path: Path) 
         bind_itl_timestamp_authority(plan, missing, expected_requests=_expected())
     assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
     assert not missing.parent.exists()
+
+
+def test_external_itl_schema_versions_reject_boolean_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, cell = _registry_and_cell()
+    plan = release_e2_itl_timestamp_plan(registry, cell)
+    with pytest.raises(ValueError, match="plan schema is unsupported"):
+        replace(plan, schema_version=True)
+
+    ready_plan, producer = _ready_plan(monkeypatch, "native_per_token_timestamp_hook")
+    receipt = _receipt(ready_plan, producer)
+    receipt["schema_version"] = True
+    path = _write(tmp_path / "bool-schema.json", receipt).resolve()
+    with pytest.raises(ValueError, match="differs from its release plan"):
+        bind_itl_timestamp_authority(ready_plan, path, expected_requests=_expected())
+
+    valid_path = _write(
+        tmp_path / "valid-schema.json", _receipt(ready_plan, producer)
+    ).resolve()
+    authority = bind_itl_timestamp_authority(
+        ready_plan, valid_path, expected_requests=_expected()
+    )
+    with pytest.raises(ValueError, match="bound ITL timestamp authority schema"):
+        replace(authority, schema_version=True)
+
+
+def test_cpu_contract_only_events_cannot_enter_formal_itl_or_p99() -> None:
+    metadata = {
+        "native_token_timestamp_hook": (
+            "sglang.schema_v3.native_per_token_timestamp.v1"
+        ),
+        "native_token_timestamp_semantics": (
+            "cpu_committed_token_observed_at_streamer_v1"
+        ),
+        "native_token_timestamp_release_status": "CPU_CONTRACT_ONLY",
+        "native_token_timestamp_events": [
+            {"token_index": 0, "token_id": 10, "observed_ns": 100},
+            {"token_index": 1, "token_id": 11, "observed_ns": 101},
+        ],
+    }
+    with pytest.raises(ItlTimestampAuthorityBlocked) as error:
+        reject_cpu_contract_only_itl_metadata(metadata)
+    assert error.value.reason == ITL_CPU_CONTRACT_ONLY_REASON
 
 
 def test_serving_chunks_never_average_a_coalesced_gap() -> None:
