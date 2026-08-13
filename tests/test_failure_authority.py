@@ -7,11 +7,15 @@ from pathlib import Path
 import pytest
 
 from lightcone_spec.experiments.failure_authority import (
+    FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON,
     FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
+    FailureExecutionAuthorityToken,
+    FailureInjectionAuthorityBinding,
     FailureInjectionAuthorityBlocked,
     bind_failure_injection_authority,
     reduce_failure_actuation_receipt,
     release_failure_plan_for_cell,
+    require_failure_execution_lifecycle,
     require_failure_injection_authority,
     revalidate_failure_injection_authority,
 )
@@ -131,6 +135,60 @@ def test_bind_revalidates_raw_plan_and_blocks_before_execution(tmp_path: Path) -
         captured.value.reason
         == FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
     )
+
+
+def test_failure_binding_wire_round_trip_is_path_and_content_bound(
+    tmp_path: Path,
+) -> None:
+    registry, _, plan_path, binding = _bound_plan(tmp_path)
+
+    restored = FailureInjectionAuthorityBinding.from_dict(binding.to_dict())
+
+    assert restored == binding
+    assert restored.plan_path == str(plan_path.resolve())
+    assert (
+        revalidate_failure_injection_authority(
+            restored,
+            registry=registry,
+        ).binding.sha256
+        == binding.sha256
+    )
+    foreign = binding.to_dict()
+    foreign["cell_id"] = "0" * 64
+    with pytest.raises(ValueError, match="fresh raw replay"):
+        revalidate_failure_injection_authority(
+            FailureInjectionAuthorityBinding.from_dict(foreign),
+            registry=registry,
+        )
+
+    boolean_schema = binding.to_dict()
+    boolean_schema["schema_version"] = True
+    with pytest.raises(ValueError, match="schema is unsupported"):
+        FailureInjectionAuthorityBinding.from_dict(boolean_schema)
+
+
+def test_allowlist_token_cannot_bypass_missing_execution_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.experiments.failure_authority as module
+
+    actuator = ("release-actuator", "1" * 64)
+    monkeypatch.setattr(module, "RELEASE_FAILURE_ACTUATORS", (actuator,))
+    token = FailureExecutionAuthorityToken(
+        authority_sha256="2" * 64,
+        plan_sha256="3" * 64,
+        registry_sha256="4" * 64,
+        cell_id="5" * 64,
+        scenario="queue_saturation",
+        actuator_id=actuator[0],
+        actuator_version_sha256=actuator[1],
+    )
+
+    with pytest.raises(
+        FailureInjectionAuthorityBlocked,
+        match=FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON,
+    ):
+        require_failure_execution_lifecycle(token)
 
 
 @pytest.mark.parametrize(

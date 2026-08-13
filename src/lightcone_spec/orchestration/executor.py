@@ -41,6 +41,12 @@ from lightcone_spec.adaptation.plan_authority import (
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.experiments.failure_authority import (
+    FAILURE_INJECTION_RAW_PLAN_AUTHORITY_REQUIRED_REASON,
+    FailureExecutionAuthorityToken,
+    FailureInjectionAuthorityBlocked,
+    require_failure_execution_lifecycle,
+)
 from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchExecutionContext,
     GpuDispatchPlan,
@@ -1737,6 +1743,7 @@ class IndustrialExecutionPlan:
     scored_requests: tuple[BoundServingRequest, ...]
     bench_argv: tuple[str, ...]
     trainable_plan_authority: TrainablePlanAuthorityBinding | None = None
+    failure_execution_authority: FailureExecutionAuthorityToken | None = None
     prepared_model_content_release_manifest_sha256: str | None = None
     evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY
     trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS
@@ -1775,6 +1782,29 @@ class IndustrialExecutionPlan:
             }
         ):
             raise ValueError("non-serving/preflight cells cannot enter this executor")
+        if self.budget.job_kind is BudgetJobKind.FAILURE:
+            authority = self.failure_execution_authority
+            if authority is None:
+                raise FailureInjectionAuthorityBlocked(
+                    FAILURE_INJECTION_RAW_PLAN_AUTHORITY_REQUIRED_REASON
+                )
+            expected_scenario = cell.identity.arrival.removeprefix("failure:")
+            if (
+                type(authority) is not FailureExecutionAuthorityToken
+                or authority.registry_sha256 != self.runtime_plan.registry_sha256
+                or authority.cell_id != cell.cell_id
+                or authority.scenario != expected_scenario
+            ):
+                raise ValueError(
+                    "failure execution authority differs from its runtime cell"
+                )
+            # A signed plan/token cannot silently degrade into an ordinary
+            # serving run.  This release has no source-owned arm/trigger/
+            # recover/terminal implementation, so validation remains blocked
+            # even if an actuator allowlist entry is added in isolation.
+            require_failure_execution_lifecycle(authority)
+        elif self.failure_execution_authority is not None:
+            raise ValueError("non-failure execution cannot carry failure authority")
         if len(self.runtime_plan.rank_configs) != 1:
             raise ValueError(
                 "the current strict RunConfig exposes only one-rank serving execution"
@@ -1848,10 +1878,6 @@ class IndustrialExecutionPlan:
         ):
             raise ValueError(
                 "non-job scored duration components must be registered as zero"
-            )
-        if budget.job_kind is BudgetJobKind.FAILURE:
-            raise ValueError(
-                "failure-injection execution is BLOCKED without an internal fault actuator"
             )
         if budget.excluded_warmup_requests.maximum != len(self.warmup_requests):
             raise ValueError("ExperimentBudget differs from the warm-up request pool")
@@ -2065,6 +2091,11 @@ class IndustrialExecutionPlan:
                 else trainable_plan_authority_binding_to_dict(
                     self.trainable_plan_authority
                 )
+            ),
+            "failure_execution_authority": (
+                None
+                if self.failure_execution_authority is None
+                else self.failure_execution_authority.to_dict()
             ),
             "prepared_model_content_release_manifest_sha256": (
                 self.prepared_model_content_release_manifest_sha256
@@ -2328,6 +2359,7 @@ def build_industrial_execution_plan(
     inventory_source_artifact: ArtifactBinding,
     runtime_envelope_artifact: ArtifactBinding,
     trainable_plan_authority: TrainablePlanAuthorityBinding | None = None,
+    failure_execution_authority: FailureExecutionAuthorityToken | None = None,
     prepared_model_content_release_manifest_sha256: str | None = None,
     evidence_writer_policy: EvidenceWriterPolicy = DEFAULT_EVIDENCE_WRITER_POLICY,
     trusted_attester_policy: TrustedAttesterPolicy = NO_TRUSTED_ATTESTERS,
@@ -2378,6 +2410,7 @@ def build_industrial_execution_plan(
             arrival_kind=load_plan.scored.source_kind,
         ),
         trainable_plan_authority=trainable_plan_authority,
+        failure_execution_authority=failure_execution_authority,
         prepared_model_content_release_manifest_sha256=(
             prepared_model_content_release_manifest_sha256
         ),

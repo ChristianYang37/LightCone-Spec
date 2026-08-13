@@ -35,6 +35,9 @@ from lightcone_spec.experiments.completion_authority import (
     AssignmentTerminalBinding,
     CompletionAuthorityUnavailableError,
 )
+from lightcone_spec.experiments.failure_authority import (
+    FailureInjectionAuthorityBlocked,
+)
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
     GpuDevice,
@@ -2597,7 +2600,10 @@ def test_failure_and_profiler_jobs_fail_closed_without_their_runtime_contract(
             failure_injection=budget.scored_arrival,
         )
 
-    with pytest.raises(ValueError, match="fault actuator"):
+    with pytest.raises(
+        FailureInjectionAuthorityBlocked,
+        match="failure_injection_raw_plan_authority_required",
+    ):
         _execution_fixture(
             tmp_path / "failure",
             request_count=1,
