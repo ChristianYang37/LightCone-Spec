@@ -15,6 +15,7 @@ authority. The schema-v3 and industrial commands are:
 | `revalidate-formal-workload-authority` | Reopen a diagnostic workload binding and replay its path, revision, bytes, and complete selection |
 | `build-industrial-registry` | Bind one or more stable logical rank slots and materialize the immutable experiment DAG |
 | `collect-gpu-inventory` | Collect a nonce-bound physical GPU/topology inventory and raw probe receipt |
+| `assemble-gpu-fleet-inventory` | Join repeated single-host inventory/interference pairs into one content-bound fleet inventory |
 | `build-interference-envelope` | Derive the current serial interference envelope and its inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | Derive the calibration-only two-way execution envelope from a raw preflight activation and exact inventory |
 | `reduce-interference-calibration` | Reopen path-bound execution bundles and terminal authority, then reduce raw isolated/simultaneous evidence into exact-cardinality rules |
@@ -32,7 +33,7 @@ authority. The schema-v3 and industrial commands are:
 | `estimate-industrial-budget` | Replay one ready `BudgetPlan` on an exact physical inventory and interference envelope |
 | `plan-industrial-dispatch` | Freeze deterministic topology-aware GPU-pool waves and physical assignments |
 | `materialize-dispatch-execution-bundles` | Bind one path-only raw input graph and publish a complete schema-v5 assignment-bundle set after all-assignment preflight |
-| `execute-dispatch-wave` | Reopen one committed materialization manifest and execute one receipt-bounded frozen wave when all release authorities are available |
+| `execute-dispatch-wave` | Reopen one committed host-local manifest for a receipt-bounded wave; `--host-request-stdin` is the noninteractive remote-worker protocol |
 | `seal-industrial-stage` | Bind activated completion, dispositions, budgets, runtime, split, dependencies, and locked outputs |
 | `analyze-industrial` | Validate schema-v3 terminal, budget, family-power, and hardware evidence |
 | `analyze-e3b-long-context` | Validate and reduce the isolated E3b long-context evidence family |
@@ -465,6 +466,76 @@ canonical blocked preflight disposition; it does not create a compile runner,
 execution authority, or performance claim. Static/TTS/L0 remain blocked without
 their validated native capability and trusted signer. The CLI does not silently
 provision hardware or start a GPU.
+
+## Fleet inventory and remote host waves
+
+Fleet assembly consumes one `--inventory PATH` and one
+`--interference-envelope PATH` per host. Both options are repeated, and their
+positions form the pairs; mismatched counts are rejected. Every input inventory
+must describe exactly one host, and every envelope remains bound to that host's
+hardware identities.
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory /external/host-a/inventory.json \
+  --interference-envelope /external/host-a/interference.json \
+  --inventory /external/host-b/inventory.json \
+  --interference-envelope /external/host-b/interference.json \
+  --output /external/fleet/inventory.json
+```
+
+`GpuFleetInventory`, `GpuFleetScheduler`, and `GpuFleetDispatchPlan` are the
+Python control-plane API for distributing independent assignments.
+`GpuFleetScheduler` only selects a host and serial partition; every child plan
+is issued by the sole same-host `GpuPoolScheduler` and binds `host_id`, the host
+inventory digest, physical GPU UUIDs, and port/cache/evidence/contention
+resources that are collision-free within that host. Literal resource values may
+repeat on different hosts. The separate remote execution binding fixes the
+host-local execution manifest. A complete gang, paired
+TTS/L0 assignment, and confirmation block stay on one host. A gang that would
+span hosts is rejected with `cross_host_collectives_unvalidated`; fleet
+composition never creates a cross-host rendezvous.
+
+Remote orchestration is also currently a Python-library coordinator API. It uses
+coordinator-local `SshHostRoute` values and `execute_fleet_wave`; there is no
+public fleet-coordinator CLI. Routes require an SSH agent and a fixed
+`known_hosts` file. A path-free route-authority digest binds the destination,
+port, and exact known-host bytes to the attempt. Address, user, agent socket,
+known-hosts path/key bytes, and raw stdout/stderr remain outside serialized
+requests and receipts. Passwords,
+tokens, private keys, and provider credentials must not be placed in argv,
+stdin, artifacts, or logs.
+
+The remote node exposes exactly one worker entry point:
+
+```bash
+lightcone-spec execute-dispatch-wave --host-request-stdin
+```
+
+This mode is for the coordinator, not an interactive shell. It is mutually
+exclusive with `--materialization-manifest`, `--wave-index`,
+`--resume-receipt`, and `--receipt-output`; it reads one size-bounded canonical
+request from standard input. The worker reopens the declared absolute
+host-local manifest and writes one bounded canonical response to standard
+output. A local pre-dispatch rejection is a failed transport outcome. Once
+dispatch may have occurred, timeout, connection loss, truncated or invalid
+output, and missing authority all produce `REMOTE_OUTCOME_UNKNOWN`; none can be
+interpreted as completion or retried directly.
+
+A failed host does not invalidate already completed receipts from other hosts.
+An unknown outcome is reconciled only by an independent fetch under the exact
+original destination, port, and known-host-key authority. The exact receipt and
+evidence bytes are then content-validated locally; missing, forged, incomplete,
+or oversized input remains unknown.
+Only a terminal-negative result may create a new receipt-bound attempt for that
+same host. Download, compile, profiler, and shared-I/O contention remain
+host-exclusive, headline concurrency never exceeds that host's calibrated
+envelope, and fleet SSH concurrency is bounded separately.
+
+No command accepts a caller-selected trusted-attester bundle as release
+authority. Public `TrustedAttesterPolicyBundle` loading is anchored by external
+operator/source configuration; the source-release anchor is currently absent,
+so formal dispatch remains fail-closed.
 
 ## Identity and topology flow
 

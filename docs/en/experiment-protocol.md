@@ -156,6 +156,15 @@ valid topology group, rejects partial gangs and cross-host placement, rotates
 independent blocks over eligible UUIDs, and prevents overlap in GPU, port,
 cache writer, evidence root, and exclusive resources.
 
+`GpuFleetInventory` composes multiple independently verified hosts above that
+same-host scheduler. It balances independent cells and whole confirmation
+blocks across eligible hosts while preserving host-local inventory,
+interference, port, cache, evidence, and materialization identities. Paired
+TTS/L0 work stays on one host/GPU. A host's concurrent headline work is limited
+only by that host's calibrated envelope; heterogeneous hardware envelopes do
+not enter one family. Cross-host gangs are rejected with
+`cross_host_collectives_unvalidated`.
+
 Before concurrent work, preflight records clocks, temperature, power state,
 background processes, driver/runtime identity, topology, per-rank HBM, and an
 exact `InterferenceEnvelope`. The envelope is keyed by hardware, workload,
@@ -190,9 +199,16 @@ prepare/decide/apply/receipt evidence for one publication identity. The current
 `RunConfig` rejects every TP2/DP2 cell before model loading; the CPU `gloo`
 harness is only a state-machine test and cannot enable those cells.
 
-No stage claims multi-node, an executable TP2/DP2 path, Kubernetes scheduling,
-elastic membership, or automatic failover. Larger inventory support means more
-independent TP1/DP1 work, not release support for larger rank groups.
+Multi-host control distributes independent host-local work through
+content-bound requests and receipts. No stage claims cross-host collectives,
+an executable TP2/DP2 path, Kubernetes scheduling, elastic membership, or
+automatic failover. Fleet SSH transport concurrency is explicitly bounded. A
+failed host preserves completed peer receipts. Any post-dispatch loss of
+authority is `REMOTE_OUTCOME_UNKNOWN` and requires an independent
+content-addressed reconcile over the exact original destination, port, and
+known-host-key authority; endpoint values, key bytes, and credentials are not
+persisted. Only a terminal-negative outcome may create a new same-host
+receipt-bound attempt. An in-flight attempt cannot migrate silently.
 
 ## Production metrics and safety
 
@@ -311,3 +327,16 @@ No trusted hardware-attester identity is configured in this release. Therefore
 content-consistent caller-authored attestation files cannot promote either the
 industrial or legacy analyzers to `MEASURED`, and Static/TTS/L0 stay blocked
 before mutation despite the implemented hook.
+
+The external `TrustedAttesterPolicyBundle` format binds public verification
+keys, nonce freshness/replay policy, hardware-envelope allowlists, and validity
+to a separately provisioned anchor. Private signing material never belongs in
+the repository or experiment artifacts. The source-release anchor is currently
+unconfigured, so loading an operator bundle cannot by itself authorize the
+formal DAG.
+
+The protocol labels code-only closure `CPU_READY`, a prepared but unexecuted
+device check `GPU_SMOKE_READY`, and only qualifying attested terminal evidence
+`MEASURED`. These labels are not successive claims: a CPU or diagnostic smoke
+success remains non-measured. See the [engineering readiness matrix and SSH
+runbook](engineering-readiness.md) for the exact order and current blockers.

@@ -34,7 +34,7 @@ an experiment, and a historical measurement does not become a formal result.
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
 | `current_patched_sglang_tree` | `fae3c1538ed4934fb3b47c7ebc82393306c43f06` | Full Git tree expected after applying the current patch series. |
 | `current_patch_payload_sha256` | `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12` | SHA-256 of the latest semantic mail-patch bytes. |
-| `current_patch_manifest_sha256` | `699a6df3b805c14244fce62a2fe28fb41c697acec893ee4eabfd7a264c78852c` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patch_manifest_sha256` | `e5e681024fa48a9b0b5cb3e9a04771242c4949b0bad2f47f9610ef5f5f52ee52` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -160,6 +160,46 @@ The real CPU `gloo` harness tests collective state-machine behavior only. It
 does not attest NCCL, CUDA streams, graph boundaries, device copies, throughput,
 or two-GPU correctness.
 
+## Deployment scale and readiness
+
+The resource-pool control plane has two independent scale dimensions. A single
+host may expose any number of GPUs. `GpuFleetScheduler` is only the host-affinity
+and serial-partitioning layer; after it selects a host, the sole
+`GpuPoolScheduler` performs every child placement against that host's topology
+and interference envelope. A `GpuFleetInventory` may combine multiple such
+hosts and distribute independent cells or complete confirmation blocks between
+them. It does not turn the fleet into one model-parallel rank group. Every
+TP/DP gang remains inside one host, and a placement that would require a
+cross-host collective is rejected with `cross_host_collectives_unvalidated`.
+
+Each host retains its own content-bound inventory digest, physical GPU UUIDs,
+interference envelope, ports, cache namespace, evidence namespace, and
+host-local materialization manifest. Remote waves use an SSH agent, a fixed
+known-hosts file, and canonical JSON on standard input; routing data and
+credentials are coordinator-local and are never copied into artifacts or logs.
+A host failure preserves completed receipts and leaves in-flight work on that
+host. Once a request may have reached the worker, loss of an authoritative
+response is `REMOTE_OUTCOME_UNKNOWN`: it cannot be retried until an independent
+content-addressed receipt/evidence fetch over the exact original destination,
+port, and known-host-key authority reconciles the attempt. Endpoint values,
+host-key bytes, and credentials are not persisted in requests, receipts,
+evidence, or logs. Only a terminal-negative result may create a new
+receipt-bound attempt, and fleet transport concurrency is explicitly bounded.
+
+Readiness labels are deliberately not performance claims:
+
+- `CPU_READY` means non-GPU schemas, scheduling, identity, failure, and receipt
+  contracts passed CPU/mock gates.
+- `GPU_SMOKE_READY` means the exact device path and external inputs are assembled
+  for a bounded smoke; it does not mean that smoke passed or that a formal cell
+  is authorized.
+- `MEASURED` requires completed registered GPU evidence and the release-owned
+  attestation chain. Neither of the first two labels may be reported as
+  `MEASURED`.
+
+The exact implementation, smoke, and external-gate split is maintained in the
+[engineering readiness matrix](docs/en/engineering-readiness.md).
+
 ## Memory, traces, and evidence
 
 HBM admission is governed by the least-feasible rank. The ledger separately
@@ -239,6 +279,23 @@ lightcone-spec plan-industrial-dispatch \
   --activation-plan artifacts/industrial/stage-activation-manifest.json \
   --output artifacts/industrial/dispatch.json
 ```
+
+For a fleet, collect and calibrate each host separately, then assemble the
+content-bound host pairs in matching repeated-argument order:
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory artifacts/host-a/inventory.json \
+  --interference-envelope artifacts/host-a/interference.json \
+  --inventory artifacts/host-b/inventory.json \
+  --interference-envelope artifacts/host-b/interference.json \
+  --output artifacts/fleet/inventory.json
+```
+
+The remote coordinator is currently a Python-library API. The only remote
+worker CLI entry point is `lightcone-spec execute-dispatch-wave
+--host-request-stdin`; it accepts the canonical coordination request on standard
+input and is not an interactive operator command.
 
 This command materializes target declarations only. It does not bypass the
 executor's native-evidence preflight or make a speculative or multi-rank cell
@@ -342,6 +399,7 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
 - [Experiment protocol](docs/en/experiment-protocol.md)
 - [OnlineSPEC baseline](docs/en/onlinespec-baseline.md)
 - [Troubleshooting](docs/en/troubleshooting.md)
+- [Engineering readiness and SSH runbook](docs/en/engineering-readiness.md)
 
 ## Limitations
 
@@ -350,8 +408,9 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
   credentials, resolved model/data/trace locks, and registered hardware.
 - The current end-to-end industrial execution surface is Target-only at
   TP1/DP1. TP2/DP2 appear only in target registry/coordinator contracts and are
-  rejected by this release. There is no multi-node, Kubernetes,
-  elastic-cluster, remote-object-store, or automatic failover claim.
+  rejected by this release. Multi-host control distributes independent work;
+  it does not authorize cross-host TP/DP collectives, Kubernetes, elastic
+  membership, remote-object-store evidence, or automatic failover.
 - The CPU `gloo` contract is not GPU/NCCL evidence. A topology configuration is
   only target vocabulary; this release rejects TP2/DP2 regardless of any
   caller-supplied capability receipt.

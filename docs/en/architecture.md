@@ -151,6 +151,51 @@ admission, and requires an explicit same-topology restart.
 machine. It intentionally rejects NCCL and cannot validate CUDA events, graph
 capture, fixed-address device copies, GPU numerics, performance, or contention.
 
+## Fleet control plane and release states
+
+`GpuFleetScheduler` is only a host-affinity and serial-partitioning control
+layer. Every child placement is delegated to the sole same-host
+`GpuPoolScheduler`; fleet composition does not add a second placement
+algorithm. A `HostInventoryBinding` joins exactly one host's content-bound
+`GpuInventory`
+and `InterferenceEnvelope`. `GpuFleetInventory` sorts and deduplicates those
+bindings, while each `HostExecutionBinding` assigns port, cache, evidence, and
+contention namespaces that are collision-free within that host; literal values
+may repeat on different hosts. The remote execution binding then fixes the
+host-local materialization manifest. Independent cells are balanced over
+eligible hosts, paired TTS/L0 work and a complete confirmation block remain on
+one host/GPU, and heterogeneous hardware envelopes are never pooled into one
+statistical family.
+
+Gang placement is still topology-aware and atomic inside one host. A requested
+shape that can be satisfied only by combining hosts fails before dispatch with
+`cross_host_collectives_unvalidated`. This is a hard capability boundary:
+multi-host inventory and SSH dispatch are not evidence for cross-host NCCL,
+TP/DP rendezvous, or model-parallel execution.
+
+The coordinator transmits a canonical, content-bound host request to
+`execute-dispatch-wave --host-request-stdin`. `SshHostRoute` remains local and
+nonserializable; OpenSSH uses an agent, batch public-key authentication, strict
+host-key checking against a fixed file, no forwarding, and bounded stdout,
+stderr, and runtime. The worker reopens a host-local materialization manifest
+and returns a content-bound response without routing data or raw logs. If a
+request may have reached the worker but no authoritative response returns, its
+outcome is `REMOTE_OUTCOME_UNKNOWN`, never a retryable failure. Reconciliation
+uses the exact original destination, port, and known-host-key authority to
+independently fetch the exact receipt envelope and evidence bytes, recomputes
+every content identity in memory under strict size bounds, and publishes only a
+path-free digest projection. Endpoint values, host-key bytes, and credentials
+are never persisted in requests, receipts, evidence, or logs. Completed receipts
+stay in the fleet receipt; an in-flight attempt cannot move to another host
+under the same identity. A bounded semaphore limits fleet transport concurrency.
+
+The architecture uses three noninterchangeable labels. `CPU_READY` covers
+non-device contract validation. `GPU_SMOKE_READY` only marks a bounded device
+check as prepared. `MEASURED` requires the registered workload, complete
+terminal evidence, hardware envelope, and release-owned attestation. The
+[engineering readiness matrix](engineering-readiness.md) records the current
+label and remaining gate for each path.
+
 ## HBM and cohort governance
 
 The HBM ledger charges active/base state, FP32 masters, gradients, allocated
@@ -276,6 +321,7 @@ target declarations do not override release preflight: Static/TTS/L0 remain
 `BLOCKED` on the trusted signer; all TP2/DP2 and unsupported adaptive backends
 remain `BLOCKED` on their separate implementation gates.
 
-This release claims no speculative industrial execution, multi-rank execution,
-multi-node execution, Kubernetes scheduling, elastic membership, remote
-evidence storage, or automatic failover. It contains no new GPU result.
+This release claims no speculative industrial execution, multi-rank model
+execution, cross-host collective, Kubernetes scheduling, elastic membership,
+remote evidence storage, or automatic failover. Its multi-host control plane
+distributes independent host-local work only. It contains no new GPU result.

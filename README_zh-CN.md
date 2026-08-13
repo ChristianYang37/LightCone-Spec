@@ -29,7 +29,7 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
 | `current_patched_sglang_tree` | `fae3c1538ed4934fb3b47c7ebc82393306c43f06` | 应用当前 patch series 后预期的完整 Git tree。 |
 | `current_patch_payload_sha256` | `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `699a6df3b805c14244fce62a2fe28fb41c697acec893ee4eabfd7a264c78852c` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patch_manifest_sha256` | `e5e681024fa48a9b0b5cb3e9a04771242c4949b0bad2f47f9610ef5f5f52ee52` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
@@ -131,6 +131,39 @@ application/receipt transition；这些定义不会让 topology 变得可执行�
 真实 CPU `gloo` harness 只验证 collective state-machine 行为。它不能 attest NCCL、CUDA
 stream、graph boundary、device copy、throughput 或双 GPU 正确性。
 
+## 部署规模与就绪状态
+
+资源池 control plane 有两个相互独立的扩展维度。单台主机可暴露任意数量 GPU。
+`GpuFleetScheduler` 只负责 host affinity 与 serial partition；它选定 host 后，每个 child
+placement 都继续由唯一的 `GpuPoolScheduler` 按该主机 topology 与 interference envelope
+完成。`GpuFleetInventory` 还可组合多台这样的主机，在主机间分发 independent cell 或完整
+confirmation block；这不会把 fleet 变成一个 model-parallel rank group。所有 TP/DP gang
+必须完整留在一台主机内；若 placement 需要跨主机 collective，会固定以
+`cross_host_collectives_unvalidated` 拒绝。
+
+每台主机都保留自己的 content-bound inventory digest、physical GPU UUID、interference
+envelope、port、cache namespace、evidence namespace 与 host-local materialization manifest。
+Remote wave 使用 SSH agent、固定 known-hosts file 和 stdin 上的 canonical JSON；routing 数据与
+credential 只存在于 coordinator 本地，绝不复制到 artifact 或日志。主机失败时保留已完成
+receipt，in-flight work 仍属于原主机。一旦 request 可能已到达 worker，权威 response 丢失必须
+标记为 `REMOTE_OUTCOME_UNKNOWN`；只有通过准确原始 destination、port 与 known-host-key
+authority 独立、内容寻址地取回并验证该 attempt 的 receipt/evidence 后才能 reconcile，不能
+直接重试。Endpoint value、host-key bytes 与 credential 都不会持久化到 request、receipt、
+evidence 或 log。只有 terminal-negative result 才能创建新的 receipt-bound attempt，fleet
+transport concurrency 也必须显式有界。
+
+就绪标签刻意不表示性能结论：
+
+- `CPU_READY` 表示非 GPU schema、scheduling、identity、failure 与 receipt contract 已通过
+  CPU/mock gate；
+- `GPU_SMOKE_READY` 表示准确 device path 与外部输入已组装好，可进行有界 smoke；它不表示
+  smoke 已通过，也不表示 formal cell 已获授权；
+- `MEASURED` 必须取得完整注册 GPU evidence 与 release-owned attestation chain。前两个标签
+  都不得报告为 `MEASURED`。
+
+准确的 implementation、smoke 与 external-gate 拆分见
+[工程就绪矩阵](docs/zh-CN/engineering-readiness.md)。
+
 ## 显存、Trace 与证据
 
 HBM admission 由最不可行 rank 决定。账本分别计费 model/KV、FP32 master、gradient、
@@ -200,6 +233,22 @@ lightcone-spec plan-industrial-dispatch \
   --activation-plan artifacts/industrial/stage-activation-manifest.json \
   --output artifacts/industrial/dispatch.json
 ```
+
+Fleet 使用时，必须在每台主机分别收集 inventory 与 calibration，再按相同的 repeated-argument
+顺序组装 content-bound host pair：
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory artifacts/host-a/inventory.json \
+  --interference-envelope artifacts/host-a/interference.json \
+  --inventory artifacts/host-b/inventory.json \
+  --interference-envelope artifacts/host-b/interference.json \
+  --output artifacts/fleet/inventory.json
+```
+
+Remote coordinator 当前只提供 Python library API。唯一 remote worker CLI 入口是
+`lightcone-spec execute-dispatch-wave --host-request-stdin`；它从 stdin 接收 canonical
+coordination request，不是 interactive operator command。
 
 该命令只生成目标 declaration，不会绕过 executor 的 native-evidence preflight，也不会让
 speculative 或 multi-rank cell 变得可运行。
@@ -287,6 +336,7 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
 - [实验协议](docs/zh-CN/experiment-protocol.md)
 - [OnlineSPEC baseline](docs/zh-CN/onlinespec-baseline.md)
 - [故障排查](docs/zh-CN/troubleshooting.md)
+- [工程就绪与 SSH runbook](docs/zh-CN/engineering-readiness.md)
 
 ## 限制
 
@@ -294,8 +344,9 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
   hardware signer、provider credential、已解析 model/data/trace lock 与已注册硬件而保持
   `BLOCKED`；
 - 当前端到端 industrial execution surface 只有 TP1/DP1 Target-only。TP2/DP2 仅存在于
-  目标 registry/coordinator contract，本 release 会拒绝它们。不声明 multi-node、
-  Kubernetes、elastic cluster、remote object store 或自动 failover；
+  目标 registry/coordinator contract，本 release 会拒绝它们。Multi-host control 只分发
+  independent work；它不授权跨主机 TP/DP collective，也不声明 Kubernetes、elastic
+  membership、remote-object-store evidence 或自动 failover；
 - CPU `gloo` 合同不是 GPU/NCCL 证据。Topology config 只是目标 vocabulary；无论 caller
   是否提供 patched-runtime capability receipt，本
   release 都会拒绝 TP2/DP2；

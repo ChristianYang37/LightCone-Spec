@@ -79,6 +79,41 @@ HBM preflight 必须测量每个 rank，并由最不可行 rank 决定。Adaptat
 safety margin、固定 cohort-slab capacity 与 telemetry queue bound 都来自已注册 memory ledger。
 绝不能通过静默改变 Full/LoRA、precision、scope、optimizer 或 context 来让 run 勉强可用。
 
+## Multi-host 准备
+
+每台主机都必须作为独立 security 与 contention domain 准备。Fleet assembly 前，在每台主机
+分别运行 `doctor`、收集 nonce-bound single-host `GpuInventory`，并派生或校准该主机自己的
+`InterferenceEnvelope`。即使 GPU 型号相同，也不能复用其他主机的 envelope。Port、compile-
+cache overlay、evidence root 与 materialization manifest 必须在各自主机的 resource domain
+内无冲突；不同主机可以重复使用相同 literal value。
+
+Repeated inventory 与 envelope argument 必须按同一顺序成对出现：
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory /external/host-a/inventory.json \
+  --interference-envelope /external/host-a/interference.json \
+  --inventory /external/host-b/inventory.json \
+  --interference-envelope /external/host-b/interference.json \
+  --output /external/fleet/inventory.json
+```
+
+该 artifact 只启用 independent host-local cell 的 scheduling，不授权跨主机 gang。TP/DP gang
+必须能在一台主机内完整放置；否则 planning 返回
+`cross_host_collectives_unvalidated`。异构 hardware envelope 在 analysis 中保持分离。
+
+Remote wave 需要 coordinator-local SSH agent socket 以及 absolute、固定、不可写的
+`known_hosts` file。Transport 禁用 password/interactive authentication、agent forwarding、
+port forwarding 与 user SSH configuration。Host address、user、agent socket 与 host-key path
+属于 routing state，不得进入 manifest 或 evidence。Coordinator 当前只提供 Python library
+API，不得虚构 fleet execution CLI。Remote worker command 准确为
+`lightcone-spec execute-dispatch-wave --host-request-stdin`，只从 stdin 接收 canonical JSON。
+Fleet transport concurrency 必须显式有界。一旦 request 可能已到达 worker，任何 timeout、
+connection loss、截断 response 或缺失 authority 都是不可直接重试的
+`REMOTE_OUTCOME_UNKNOWN`。只有绑定准确原始 destination、port 与 known-host key 的独立
+fetch 严格重开并验证准确 receipt 与 evidence bytes 后才能 reconcile；endpoint value、
+host-key bytes 与 credential 不会持久化。否则 attempt 必须保持 unknown。
+
 ## Provider Staging
 
 仓库刻意不提供一键 cloud installer。Provider image、driver、mount 与 firewall behavior 属于
@@ -93,6 +128,25 @@ lock 以及已注册 hardware/interference envelope 均不可用而 `BLOCKED`。
 TP1/DP1 Target-only；Static/TTS/L0 会在任何 mutation 前 fail preflight。仅获得硬件或 test
 signer 也不能解除 speculative blocker。DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部
 TP2/DP2 工作还需要其他实现，保持 blocked。
+
+## Trusted Attester Bundle
+
+可信 verification material 以 canonical `TrustedAttesterPolicyBundle` 及相邻 semantic SHA-256
+sidecar 的形式，在仓库外 provision。Public bundle 包含 Ed25519 public key 与 attester
+allowlist、challenge-nonce lifetime 与 external single-use replay policy、hardware-envelope
+digest allowlist 及 validity interval；绝不能包含 private key、signing seed、test identity、
+credential 或 host routing detail。
+
+信任来自另行 provision 的 `TrustedAttesterAnchorDescriptor`；它固定 bundle 的 absolute
+normalized path、semantic digest、validity 与 authority。Loader 会拒绝 symlink、hard link、
+重复 JSON key、非 canonical byte、读取中变化的文件、expired policy、未 allowlist hardware，
+以及 replayed 或未绑定 challenge。Caller 自选 path 加 digest 不构成 trust root。
+
+本 source release 的 `SOURCE_RELEASE_TRUSTED_ATTESTER_ANCHOR` 刻意未配置。因此，即使 operator
+能为 diagnostic deployment 加载 public verification material，formal release 仍会 fail
+closed。未来经过 review 的 release 必须先在 out-of-band source authority 中 anchor public
+bundle，formal DAG 才可能输出 `MEASURED`；signing key 始终留在外部 attester，绝不提交或
+放入 command argument。
 
 ## Model 与数据准备
 

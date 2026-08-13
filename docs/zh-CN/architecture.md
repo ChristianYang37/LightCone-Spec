@@ -119,6 +119,40 @@ decision 失败会令 service unready、停止新 admission，并要求同 topol
 `GlooPublicationTransport` 是该状态机的真实双进程 CPU harness。它刻意拒绝 NCCL，
 不能验证 CUDA event、graph capture、固定地址 device copy、GPU 数值、性能或资源竞争。
 
+## Fleet Control Plane 与 Release 状态
+
+`GpuFleetScheduler` 只负责 host affinity 与 serial partition 的 control-plane 工作；每个
+child placement 都委托给唯一的 same-host `GpuPoolScheduler`，因此 fleet composition 不会
+引入第二套 placement algorithm。`HostInventoryBinding` 把准确一台主机的 content-bound
+`GpuInventory` 与 `InterferenceEnvelope` 结合；`GpuFleetInventory` 对这些 binding 排序并去重，
+每个 `HostExecutionBinding` 分配的 port、cache、evidence 与 contention namespace 必须在该
+host 内无冲突，不同 host 可以重复 literal value。Remote execution binding 再固定 host-local
+materialization manifest。Independent cell 在 eligible host 间均衡；paired TTS/L0 work 与完整
+confirmation block 始终留在同一 host/GPU；异构 hardware envelope 绝不混入同一个
+statistical family。
+
+Gang placement 仍只在一台主机内 topology-aware、atomic。若请求 shape 只能通过组合多台主机
+满足，会在 dispatch 前固定以 `cross_host_collectives_unvalidated` 失败。这是硬 capability
+边界：multi-host inventory 与 SSH dispatch 不构成 cross-host NCCL、TP/DP rendezvous 或
+model-parallel execution 的证据。
+
+Coordinator 向 `execute-dispatch-wave --host-request-stdin` 发送 canonical、content-bound host
+request。`SshHostRoute` 只存在于本地且不可序列化；OpenSSH 使用 agent、batch public-key
+authentication、基于固定文件的 strict host-key checking、禁用 forwarding，并限制 stdout、
+stderr 与运行时间。Worker 重开 host-local materialization manifest，返回不含 routing data 或
+raw log 的 content-bound response。若 request 可能已到达 worker 却没有权威 response 返回，
+outcome 必须是不可直接重试的 `REMOTE_OUTCOME_UNKNOWN`。Reconcile 通过准确原始
+destination、port 与 known-host-key authority 独立取回准确 receipt envelope 与 evidence
+bytes，在严格 size bound 下于内存重算全部 content identity，最终只发布不含 path 的 digest
+projection。Endpoint value、host-key bytes 与 credential 都不会持久化到 request、receipt、
+evidence 或 log。已完成 receipt 保留在 fleet receipt 中，in-flight attempt 不能用同一
+identity 迁移到其他主机；有界 semaphore 限制 fleet transport concurrency。
+
+架构使用三个不可互换的标签。`CPU_READY` 只覆盖非 device contract validation；
+`GPU_SMOKE_READY` 只表示有界 device check 已准备；`MEASURED` 必须取得已注册 workload、完整
+terminal evidence、hardware envelope 与 release-owned attestation。
+[工程就绪矩阵](engineering-readiness.md)记录每条 path 的当前标签与剩余 gate。
+
 ## HBM 与 Cohort 治理
 
 HBM ledger 分别计费 active/base state、FP32 master、gradient、实际 optimizer moment、
@@ -218,6 +252,7 @@ Registry 与 pool planning 都不分配 device state，也不产生实证结论�
 不会绕过 release preflight：Static/TTS/L0 因 trusted signer 保持 `BLOCKED`；全部 TP2/DP2
 和不受支持的 adaptive backend 仍受各自 implementation gate 阻止。
 
-本 release 不声明 speculative industrial execution、multi-rank execution、multi-node
-execution、Kubernetes scheduling、elastic membership、remote evidence storage 或
-automatic failover，也不包含任何新 GPU 结果。
+本 release 不声明 speculative industrial execution、multi-rank model execution、跨主机
+collective、Kubernetes scheduling、elastic membership、remote evidence storage 或 automatic
+failover。Multi-host control plane 只分发 independent host-local work，也不包含任何新 GPU
+结果。

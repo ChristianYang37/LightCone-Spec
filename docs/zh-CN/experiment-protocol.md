@@ -130,6 +130,13 @@ Registry 使用两个 logical rank slot；physical device 只来自 content-boun
 TP/DP shape，拒绝 partial gang 与 cross-host placement，在 eligible UUID 之间轮换 independent
 block，并阻止 GPU、port、cache writer、evidence root 与 exclusive resource 重叠。
 
+`GpuFleetInventory` 在该 same-host scheduler 之上组合多台 independently verified host。
+它在 eligible host 间均衡 independent cell 与完整 confirmation block，同时保留 host-local
+inventory、interference、port、cache、evidence 与 materialization identity。Paired TTS/L0
+work 留在同一 host/GPU。每台主机的 headline concurrency 只由该主机已校准 envelope 限制；
+异构 hardware envelope 不进入同一 family。跨主机 gang 以
+`cross_host_collectives_unvalidated` 拒绝。
+
 并行工作前，preflight 记录 clock、temperature、power state、background process、driver/
 runtime identity、topology、per-rank HBM 与准确 `InterferenceEnvelope`。Envelope 按 hardware、
 workload、co-run signature/count、gang shape、thermal/power/load state 与 host contention
@@ -157,9 +164,14 @@ patched-runtime capability receipt，并由全部 rank 为同一 publication ide
 prepare/decide/apply/receipt evidence。当前 `RunConfig` 会在 model loading 前拒绝全部
 TP2/DP2 cell；CPU `gloo` harness 只是状态机测试，不能启用这些 cell。
 
-任何 stage 都不声明 multi-node、可执行 TP2/DP2 path、Kubernetes scheduling、elastic
-membership 或 automatic failover。较大 inventory 只表示更多 independent TP1/DP1 work，
-不表示 release 支持较大的 rank group。
+Multi-host control 通过 content-bound request/receipt 分发 independent host-local work。
+任何 stage 都不声明跨主机 collective、可执行 TP2/DP2 path、Kubernetes scheduling、elastic
+membership 或 automatic failover。Fleet SSH transport concurrency 必须显式有界。一台主机
+失败时保留其他主机已完成 receipt。任何 post-dispatch authority 丢失都必须标记为
+`REMOTE_OUTCOME_UNKNOWN`，并通过准确原始 destination、port 与 known-host-key authority
+独立、内容寻址地 fetch/reconcile；endpoint value、key bytes 与 credential 不会持久化。只有
+terminal-negative outcome 才能创建新的同主机 receipt-bound attempt，不能静默迁移
+in-flight attempt。
 
 ## Production 指标与安全
 
@@ -255,3 +267,13 @@ reference、hardware/power report 及每个 final Parquet digest。缺少它时�
 本 release 未配置 trusted hardware-attester identity，因此内容自洽但由 caller 编写的
 attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`；即使 hook 已实现，
 Static/TTS/L0 仍在 mutation 前保持 blocked。
+
+外部 `TrustedAttesterPolicyBundle` format 把 public verification key、nonce freshness/replay
+policy、hardware-envelope allowlist 与 validity 绑定到另行 provision 的 anchor。Private signing
+material 绝不能进入仓库或 experiment artifact。当前 source-release anchor 未配置，因此加载
+operator bundle 本身不能授权 formal DAG。
+
+协议把纯代码收口标为 `CPU_READY`，把已准备但尚未执行的 device check 标为
+`GPU_SMOKE_READY`，只有合格 attested terminal evidence 才能标为 `MEASURED`。这些标签不是
+递进结论：CPU 或 diagnostic smoke 成功仍然 non-measured。准确顺序与当前 blocker 见
+[工程就绪矩阵及 SSH runbook](engineering-readiness.md)。

@@ -93,6 +93,47 @@ adaptation reserve, KV pool, safety margin, fixed cohort-slab capacity, and
 telemetry queue bounds from the registered memory ledger. Never make a run fit
 by silently changing Full to LoRA, precision, scope, optimizer, or context.
 
+## Multi-host preparation
+
+Prepare every host as a separate security and contention domain. Run `doctor`,
+collect a nonce-bound single-host `GpuInventory`, and derive or calibrate that
+host's own `InterferenceEnvelope` before fleet assembly. Do not reuse another
+host's envelope, even for the same GPU model. Ports, compile-cache overlays,
+evidence roots, and materialization manifests must be collision-free within
+each host's resource domain. Their literal values may repeat on different hosts.
+
+Pair repeated inventory and envelope arguments in the same order:
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory /external/host-a/inventory.json \
+  --interference-envelope /external/host-a/interference.json \
+  --inventory /external/host-b/inventory.json \
+  --interference-envelope /external/host-b/interference.json \
+  --output /external/fleet/inventory.json
+```
+
+This artifact enables scheduling of independent host-local cells. It does not
+authorize a gang across hosts. TP/DP gangs must fit one host; otherwise planning
+returns `cross_host_collectives_unvalidated`. Heterogeneous hardware envelopes
+remain separate for analysis.
+
+For remote waves, provision a coordinator-local SSH agent socket and an
+absolute, fixed, non-writable `known_hosts` file. The transport disables
+password and interactive authentication, agent forwarding, port forwarding,
+and user SSH configuration. Host address, user, agent socket, and host-key path
+are routing state and must not appear in manifests or evidence. The coordinator
+is currently a Python-library API; do not invent a fleet execution CLI. The
+remote worker command is exactly `lightcone-spec execute-dispatch-wave
+--host-request-stdin` and receives canonical JSON only on standard input.
+Fleet transport concurrency is explicitly bounded. Once a request may have
+reached the worker, any timeout, connection loss, truncated response, or missing
+authority is `REMOTE_OUTCOME_UNKNOWN` and must not be retried. Reconcile it only
+through the independent fetch bound to the exact original destination, port,
+and known-host key; it reopens and validates the exact receipt and evidence
+bytes. Endpoint values, host-key bytes, and credentials are not persisted.
+Otherwise leave the attempt unknown.
+
 ## Provider staging
 
 The repository deliberately has no one-command cloud installer. Provider
@@ -111,6 +152,29 @@ executor can release-run only TP1/DP1 Target-only; Static/TTS/L0 fail preflight
 before mutation. Hardware access or a test signer alone does not unblock
 speculative work. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
 additional implementations and remain blocked.
+
+## Trusted attester bundle
+
+Trusted verification material is provisioned outside the repository as a
+canonical `TrustedAttesterPolicyBundle` plus an adjacent semantic SHA-256
+sidecar. The public bundle contains Ed25519 public keys and attester allowlists,
+challenge-nonce lifetime and external single-use replay policy, an allowlist of
+hardware-envelope digests, and a validity interval. It must never contain a
+private key, signing seed, test identity, credential, or host routing detail.
+
+Trust comes from a separately provisioned `TrustedAttesterAnchorDescriptor`
+that fixes the bundle's absolute normalized path, semantic digest, validity,
+and authority. The loader rejects symlinks, hard links, duplicate JSON keys,
+noncanonical bytes, changed files, expired policy, unallowlisted hardware, and
+replayed or unbound challenges. A caller-selected path and digest are not a
+trust root.
+
+`SOURCE_RELEASE_TRUSTED_ATTESTER_ANCHOR` is intentionally unconfigured in this
+source release. Consequently, the formal release remains fail-closed even when
+an operator can load public verification material for a diagnostic deployment.
+A reviewed future release must anchor the public bundle out of band before any
+formal DAG can emit `MEASURED`; signing keys always remain in the external
+attester and are never committed or passed in command arguments.
 
 ## Model and data preparation
 

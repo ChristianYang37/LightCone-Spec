@@ -15,6 +15,7 @@ industrial 命令包括：
 | `revalidate-formal-workload-authority` | 重开诊断性 workload binding，并重放其 path、revision、raw bytes 与完整筛选结果 |
 | `build-industrial-registry` | 绑定一个或更多稳定 logical rank slot 并生成不可变实验 DAG |
 | `collect-gpu-inventory` | 收集 nonce-bound physical GPU/topology inventory 与 raw probe receipt |
+| `assemble-gpu-fleet-inventory` | 把重复传入的 single-host inventory/interference pair 组合成 content-bound fleet inventory |
 | `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | 从 raw preflight activation 与准确 inventory 派生仅供校准的 two-way execution envelope |
 | `reduce-interference-calibration` | 重开 path-bound execution bundle 与 terminal authority，把 raw isolated/simultaneous evidence 归约为准确 cardinality rule |
@@ -32,7 +33,7 @@ industrial 命令包括：
 | `estimate-industrial-budget` | 在准确 physical inventory 与 interference envelope 上重放 ready `BudgetPlan` |
 | `plan-industrial-dispatch` | 冻结确定性、topology-aware GPU-pool wave 与 physical assignment |
 | `materialize-dispatch-execution-bundles` | 绑定一份 path-only raw input graph，并在全 assignment 预检后发布完整 schema-v5 assignment-bundle set |
-| `execute-dispatch-wave` | 重开一份已提交的 materialization manifest，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
+| `execute-dispatch-wave` | 重开一份已提交的 host-local manifest 来执行 receipt-bounded wave；`--host-request-stdin` 是 noninteractive remote-worker protocol |
 | `seal-industrial-stage` | 绑定 activated completion、disposition、budget、runtime、split、dependency 与 locked output |
 | `analyze-industrial` | 验证 schema-v3 terminal、budget、family-power 与 hardware evidence |
 | `analyze-e3b-long-context` | 验证并归约隔离的 E3b long-context evidence family |
@@ -414,6 +415,63 @@ hook，但没有配置 trusted hardware signer。Generic activation 只记录 ca
 preflight disposition；它不会创造 compile runner、execution authority 或 performance claim。
 Static/TTS/L0 在缺少 validated native capability 与 trusted signer 时仍被阻止。CLI 不会
 静默 provision hardware，也不会启动 GPU。
+
+## Fleet Inventory 与 Remote Host Wave
+
+Fleet assembly 为每台主机消费一个 `--inventory PATH` 和一个
+`--interference-envelope PATH`。两个 option 都要重复传入，其位置构成配对；数量不一致会被
+拒绝。每个 input inventory 必须准确描述一台主机，每个 envelope 继续绑定该主机的 hardware
+identity。
+
+```bash
+lightcone-spec assemble-gpu-fleet-inventory \
+  --inventory /external/host-a/inventory.json \
+  --interference-envelope /external/host-a/interference.json \
+  --inventory /external/host-b/inventory.json \
+  --interference-envelope /external/host-b/interference.json \
+  --output /external/fleet/inventory.json
+```
+
+`GpuFleetInventory`、`GpuFleetScheduler` 与 `GpuFleetDispatchPlan` 是分发 independent
+assignment 的 Python control-plane API。`GpuFleetScheduler` 只选择 host 与 serial
+partition；每个 child plan 仍由唯一的 same-host `GpuPoolScheduler` 签发，并绑定 `host_id`、
+host inventory digest、physical GPU UUID，以及在该 host 内无冲突的 port/cache/evidence/
+contention resource；不同 host 可以重复 literal resource value。独立 remote execution
+binding 再固定 host-local execution manifest。完整 gang、paired TTS/L0 assignment 和
+confirmation block 留在一台主机。若 gang 需要跨主机，会以
+`cross_host_collectives_unvalidated` 拒绝；fleet composition 绝不创建 cross-host rendezvous。
+
+Remote orchestration 当前同样只提供 Python-library coordinator API。它使用 coordinator-local
+`SshHostRoute` 与 `execute_fleet_wave`；不存在 public fleet-coordinator CLI。Route 强制使用
+SSH agent 与固定 `known_hosts` file。不含 path 的 route-authority digest 把 destination、port
+与准确 known-host bytes 绑定到 attempt。Address、user、agent socket、known-hosts path/key
+bytes 与 raw stdout/stderr 都留在 serialized request/receipt 之外。Password、token、private
+key 与 provider credential 不得放入 argv、stdin、artifact 或日志。
+
+Remote node 只暴露一个 worker entry point：
+
+```bash
+lightcone-spec execute-dispatch-wave --host-request-stdin
+```
+
+该 mode 供 coordinator 使用，不是 interactive shell；它与 `--materialization-manifest`、
+`--wave-index`、`--resume-receipt`、`--receipt-output` 互斥，并从 stdin 读取一份有 size bound 的
+canonical request。Worker 重开声明的 absolute host-local manifest，再向 stdout 写一份有界
+canonical response。本地 pre-dispatch 拒绝形成 failed transport outcome；一旦 dispatch 可能
+已经发生，timeout、connection loss、截断或 invalid output 以及缺失 authority 都必须形成
+`REMOTE_OUTCOME_UNKNOWN`，既不能解释为 completion receipt，也不能直接重试。
+
+一台主机失败不会使其他主机已完成的 receipt 失效。Unknown outcome 只能通过准确原始
+destination、port 与 known-host-key authority 下的独立 fetch reconcile；取回的准确
+receipt/evidence bytes 会在本地重算 content identity，缺失、伪造、不完整或超限 input 都继续
+保持 unknown。只有 terminal-negative result 才能为同一 host
+创建新的 receipt-bound attempt。Download、compile、profiler 与 shared-I/O contention 继续
+保持 host-exclusive；headline concurrency 绝不超过该主机自己的 calibrated envelope，fleet
+SSH concurrency 另有独立上限。
+
+没有任何 command 接受 caller-selected trusted-attester bundle 作为 release authority。Public
+`TrustedAttesterPolicyBundle` 由外部 operator/source configuration anchor；当前 source-release
+anchor 不存在，因此 formal dispatch 继续 fail closed。
 
 ## 身份与 Topology 链
 
