@@ -11,15 +11,24 @@ than trusted as serialized summaries.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import selectors
+import signal
 import stat
+import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import NoReturn, Protocol, Self
+from typing import Protocol, Self
 
+from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.runtime.compile_cache import (
+    COMPILE_CACHE_ENVIRONMENT_VARIABLES,
     COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256,
     COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256,
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
     RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     CompileCacheAttemptReceipt,
     CompileCacheLaunchPlan,
@@ -33,6 +42,8 @@ from lightcone_spec.runtime.compile_cache import (
     _publish_json,
     _publish_text,
     _stable_regular_file_bytes,
+    _strict_json_object,
+    preflight_compile_cache_launch,
     start_compile_cache_launch,
 )
 
@@ -64,13 +75,119 @@ COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256 = _content_sha256(
     }
 )
 RELEASE_COMPILE_RUNNER_UNAVAILABLE = "release_first_party_compile_runner_unavailable"
+RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY = (
+    "release_compile_assignment_plan_allowlist_empty"
+)
+RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED = (
+    "release_compile_assignment_plan_not_allowlisted"
+)
 RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S: tuple[str, ...] = ()
+
+COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "first_party_compile_subprocess_lifecycle",
+        "transport": "canonical_json_lines_over_private_stdin_stdout",
+        "child_must_delay_model_and_gpu_initialization_until_start": True,
+        "ordered_messages": (
+            "ready",
+            "start_with_private_compile_environment",
+            "started",
+            "one_prewarm_request_and_completion_per_manifest_payload",
+            "drain_and_shutdown",
+            "drained",
+            "parent_observed_zero_exit",
+        ),
+        "limits": {
+            "maximum_message_bytes": 1024 * 1024,
+            "bounded_deadline": True,
+            "unexpected_stdout_forbidden": True,
+        },
+        "formal_authority": (
+            "source_owned_exact_command_and_executable_digest",
+            "source_owned_exact_assignment_plan_sha256",
+        ),
+        "cpu_diagnostic_cannot_authorize_formal_execution": True,
+    }
+)
+
+_MAX_SUBPROCESS_MESSAGE_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ReleaseCompileSubprocess:
+    """One source-owned command permitted to execute formal COMPILE work."""
+
+    argv: tuple[str, ...]
+    executable_raw_sha256: str
+    patched_sglang_tree: str
+    compile_source_sha256: str
+    protocol_sha256: str
+
+    def validate(self, *, reopen_executable: bool) -> None:
+        if type(self.argv) is not tuple or not self.argv:
+            raise TypeError("release compile subprocess argv must be a non-empty tuple")
+        for argument in self.argv:
+            if type(argument) is not str or not argument or "\x00" in argument:
+                raise ValueError("release compile subprocess argv contains NUL")
+        executable = _absolute_path("release compile executable", self.argv[0])
+        _require_sha256("release compile executable", self.executable_raw_sha256)
+        if self.patched_sglang_tree != PINNED_SGLANG_TREE:
+            raise ValueError("release compile subprocess uses another patched tree")
+        if self.compile_source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256:
+            raise ValueError("release compile subprocess uses another compile source")
+        if self.protocol_sha256 != COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256:
+            raise ValueError("release compile subprocess uses another protocol")
+        if reopen_executable:
+            digest, _size = _raw_sha256(executable, label="release compile executable")
+            if digest != self.executable_raw_sha256:
+                raise ValueError("release compile executable differs from source pin")
+
+    @property
+    def sha256(self) -> str:
+        self.validate(reopen_executable=False)
+        return _content_sha256(asdict(self))
+
+
+# A future reviewed release must add exactly one command together with its
+# executable digest and GPU-marked lifecycle tests.  Caller data cannot extend
+# either this allowlist or the assignment-plan allowlist above.
+RELEASE_COMPILE_SUBPROCESSES: tuple[ReleaseCompileSubprocess, ...] = ()
 
 
 class CompileRunnerBlocked(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(f"COMPILE execution is BLOCKED: {reason_code}")
         self.reason_code = reason_code
+
+
+def _require_formal_compile_receipt_authority(
+    *,
+    assignment_plan_sha256: str,
+    executable_path: str,
+    executable_raw_sha256: str,
+    argv_sha256: str,
+    source_authority_sha256: str | None,
+    reopen_executable: bool,
+) -> None:
+    """Reopen source-owned authority before accepting formal raw evidence."""
+
+    if len(RELEASE_COMPILE_SUBPROCESSES) != 1:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
+    if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
+    if assignment_plan_sha256 not in RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED)
+    source = RELEASE_COMPILE_SUBPROCESSES[0]
+    source.validate(reopen_executable=reopen_executable)
+    expected_executable = _absolute_path("release compile executable", source.argv[0])
+    if (
+        source_authority_sha256 != source.sha256
+        or Path(executable_path) != expected_executable
+        or executable_raw_sha256 != source.executable_raw_sha256
+        or argv_sha256 != _content_sha256({"argv": list(source.argv)})
+    ):
+        raise ValueError("formal compile receipt differs from source authority")
 
 
 def _require_sha256(label: str, value: object) -> str:
@@ -398,6 +515,13 @@ class CompileAssignmentPlan:
         ):
             raise ValueError("compile inputs no longer agree with assignment authority")
         key = cache_plan.key
+        covered_graph_buckets = tuple(
+            sorted({payload.graph_bucket for payload in prewarm.payloads})
+        )
+        if covered_graph_buckets != key.graph_buckets:
+            raise ValueError(
+                "compile prewarm manifest does not cover every registered graph bucket"
+            )
         if (
             key.sha256 != self.compile_key_sha256
             or key.target_revision != self.target_revision
@@ -424,16 +548,28 @@ class CompileAssignmentPlan:
 
 def require_release_compile_assignment_plan(
     plan: CompileAssignmentPlan | None = None,
-) -> NoReturn:
-    """Block before reading paths or creating cache/GPU state in this release."""
+) -> ReleaseCompileSubprocess:
+    """Return exact source authority or block before cache/process mutation.
 
-    if plan is not None:
-        if type(plan) is not CompileAssignmentPlan:
-            raise TypeError("release compile runner requires an exact assignment plan")
-        plan.validate()
-    if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+    The empty subprocess and plan allowlists are checked before any serialized
+    plan path needs to be opened.  This ordering is deliberate: a diagnostic
+    plan, however complete, cannot become formal launch authority.
+    """
+
+    if len(RELEASE_COMPILE_SUBPROCESSES) != 1:
         raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
-    raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE)
+    if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
+    if plan is None:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE)
+    if type(plan) is not CompileAssignmentPlan:
+        raise TypeError("release compile runner requires an exact assignment plan")
+    plan.validate()
+    if plan.sha256 not in RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED)
+    command = RELEASE_COMPILE_SUBPROCESSES[0]
+    command.validate(reopen_executable=True)
+    return command
 
 
 @dataclass(frozen=True)
@@ -496,6 +632,607 @@ class CompileLifecycleDriver(Protocol):
 
 
 @dataclass(frozen=True)
+class CompileSubprocessEvent:
+    sequence: int
+    direction: str
+    canonical_json: str
+    raw_sha256: str
+
+    def validate(self) -> None:
+        if type(self.sequence) is not int or self.sequence < 0:
+            raise ValueError("compile subprocess event sequence is invalid")
+        if self.direction not in {"parent_to_child", "child_to_parent"}:
+            raise ValueError("compile subprocess event direction is invalid")
+        if type(self.canonical_json) is not str or "\n" in self.canonical_json:
+            raise ValueError("compile subprocess event must be one JSON line")
+        raw = f"{self.canonical_json}\n".encode()
+        _strict_json_object(raw, label="compile subprocess event")
+        if hashlib.sha256(raw).hexdigest() != self.raw_sha256:
+            raise ValueError("compile subprocess event raw SHA-256 differs")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            "sequence",
+            "direction",
+            "canonical_json",
+            "raw_sha256",
+        }:
+            raise ValueError("compile subprocess event fields differ from schema")
+        value = cls(**raw)
+        value.validate()
+        return value
+
+
+@dataclass(frozen=True)
+class CompileSubprocessLifecycleReceipt:
+    schema_version: int
+    kind: str
+    protocol_sha256: str
+    assignment_plan_sha256: str
+    executable_path: str
+    executable_raw_sha256: str
+    executable_size: int
+    argv_sha256: str
+    source_authority_sha256: str | None
+    process_id: int
+    process_started_ns: int
+    process_exited_ns: int
+    exit_code: int
+    events: tuple[CompileSubprocessEvent, ...]
+    formal_execution_authorized: bool
+
+    def validate(self, *, reopen_executable: bool) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != "compile_subprocess_lifecycle_raw_receipt"
+        ):
+            raise ValueError("compile subprocess receipt schema is unsupported")
+        if self.protocol_sha256 != COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256:
+            raise ValueError("compile subprocess receipt uses another protocol")
+        _require_sha256("compile subprocess plan", self.assignment_plan_sha256)
+        executable = _absolute_path(
+            "compile subprocess executable", self.executable_path
+        )
+        _require_sha256("compile subprocess executable", self.executable_raw_sha256)
+        if type(self.executable_size) is not int or self.executable_size <= 0:
+            raise ValueError("compile subprocess executable size is invalid")
+        _require_sha256("compile subprocess argv", self.argv_sha256)
+        if self.source_authority_sha256 is not None:
+            _require_sha256(
+                "compile subprocess source authority", self.source_authority_sha256
+            )
+        for label, value in (
+            ("process ID", self.process_id),
+            ("process start", self.process_started_ns),
+            ("process exit", self.process_exited_ns),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"compile subprocess {label} is invalid")
+        if self.process_exited_ns < self.process_started_ns:
+            raise ValueError("compile subprocess receipt time order is invalid")
+        if type(self.exit_code) is not int or self.exit_code != 0:
+            raise ValueError("compile subprocess receipt requires zero exit")
+        if type(self.events) is not tuple or not self.events:
+            raise TypeError("compile subprocess receipt requires exact events")
+        for event in self.events:
+            if type(event) is not CompileSubprocessEvent:
+                raise TypeError("compile subprocess receipt event type is invalid")
+            event.validate()
+        if tuple(event.sequence for event in self.events) != tuple(
+            range(len(self.events))
+        ):
+            raise ValueError("compile subprocess receipt event sequence is incomplete")
+        event_rows = tuple(json.loads(event.canonical_json) for event in self.events)
+        event_kinds = tuple(row.get("kind") for row in event_rows)
+        if event_kinds[:3] != (
+            "compile_subprocess_ready",
+            "compile_subprocess_start",
+            "compile_subprocess_started",
+        ) or event_kinds[-2:] != (
+            "compile_subprocess_shutdown",
+            "compile_subprocess_drained",
+        ):
+            raise ValueError("compile subprocess receipt lifecycle is incomplete")
+        if tuple(event.direction for event in self.events[:3]) != (
+            "child_to_parent",
+            "parent_to_child",
+            "child_to_parent",
+        ) or tuple(event.direction for event in self.events[-2:]) != (
+            "parent_to_child",
+            "child_to_parent",
+        ):
+            raise ValueError("compile subprocess receipt lifecycle direction differs")
+        middle = self.events[3:-2]
+        if not middle or len(middle) % 2:
+            raise ValueError(
+                "compile subprocess receipt prewarm exchange is incomplete"
+            )
+        for request, response in zip(middle[::2], middle[1::2], strict=True):
+            if request.direction != "parent_to_child" or response.direction != (
+                "child_to_parent"
+            ):
+                raise ValueError("compile subprocess prewarm direction differs")
+            request_row = json.loads(request.canonical_json)
+            response_row = json.loads(response.canonical_json)
+            if (
+                request_row.get("kind") != "compile_subprocess_prewarm"
+                or response_row.get("kind") != "compile_subprocess_prewarm_complete"
+                or request_row.get("request_id") != response_row.get("request_id")
+                or request_row.get("graph_bucket") != response_row.get("graph_bucket")
+            ):
+                raise ValueError("compile subprocess prewarm exchange differs")
+        if self.formal_execution_authorized is True:
+            if self.source_authority_sha256 is None:
+                raise ValueError("formal compile receipt lacks source authority")
+            _require_formal_compile_receipt_authority(
+                assignment_plan_sha256=self.assignment_plan_sha256,
+                executable_path=self.executable_path,
+                executable_raw_sha256=self.executable_raw_sha256,
+                argv_sha256=self.argv_sha256,
+                source_authority_sha256=self.source_authority_sha256,
+                reopen_executable=reopen_executable,
+            )
+        elif self.formal_execution_authorized is not False:
+            raise TypeError("compile subprocess formal flag must be boolean")
+        elif self.source_authority_sha256 is not None:
+            raise ValueError("diagnostic compile receipt cannot claim source authority")
+        start_row = event_rows[1]
+        start_environment = start_row.get("cache_environment")
+        if (
+            type(start_environment) is not dict
+            or set(start_environment) != set(COMPILE_CACHE_ENVIRONMENT_VARIABLES)
+            or any(
+                type(value) is not str
+                or not Path(value).is_absolute()
+                or Path(value) != Path(value).resolve(strict=False)
+                for value in start_environment.values()
+            )
+        ):
+            raise ValueError("compile subprocess receipt cache environment differs")
+        if reopen_executable:
+            digest, size = _raw_sha256(
+                executable, label="compile subprocess executable"
+            )
+            if digest != self.executable_raw_sha256 or size != self.executable_size:
+                raise ValueError(
+                    "compile subprocess executable changed after execution"
+                )
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate(reopen_executable=False)
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "protocol_sha256": self.protocol_sha256,
+            "assignment_plan_sha256": self.assignment_plan_sha256,
+            "executable_path": self.executable_path,
+            "executable_raw_sha256": self.executable_raw_sha256,
+            "executable_size": self.executable_size,
+            "argv_sha256": self.argv_sha256,
+            "source_authority_sha256": self.source_authority_sha256,
+            "process_id": self.process_id,
+            "process_started_ns": self.process_started_ns,
+            "process_exited_ns": self.process_exited_ns,
+            "exit_code": self.exit_code,
+            "events": [event.to_dict() for event in self.events],
+            "formal_execution_authorized": self.formal_execution_authorized,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        expected = {
+            "schema_version",
+            "kind",
+            "protocol_sha256",
+            "assignment_plan_sha256",
+            "executable_path",
+            "executable_raw_sha256",
+            "executable_size",
+            "argv_sha256",
+            "source_authority_sha256",
+            "process_id",
+            "process_started_ns",
+            "process_exited_ns",
+            "exit_code",
+            "events",
+            "formal_execution_authorized",
+        }
+        if type(raw) is not dict or set(raw) != expected:
+            raise ValueError("compile subprocess receipt fields differ from schema")
+        payload = dict(raw)
+        events = payload.pop("events")
+        if type(events) is not list:
+            raise TypeError("compile subprocess receipt events must be a JSON array")
+        value = cls(
+            **payload,
+            events=tuple(CompileSubprocessEvent.from_dict(event) for event in events),
+        )
+        value.validate(reopen_executable=False)
+        return value
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        source = _absolute_path("compile subprocess receipt", str(path))
+        raw, semantic_sha256 = _load_canonical_json_with_sidecar(
+            source,
+            label="compile subprocess receipt",
+        )
+        value = cls.from_dict(raw)
+        if semantic_sha256 != value.sha256:
+            raise ValueError("compile subprocess receipt semantic digest differs")
+        value.validate(reopen_executable=True)
+        return value
+
+
+class _CompileSubprocessDriver:
+    """Bounded JSON-lines client for the first-party compile wrapper."""
+
+    def __init__(
+        self,
+        *,
+        argv: tuple[str, ...],
+        assignment_plan_sha256: str,
+        timeout_seconds: float,
+        source_authority_sha256: str | None,
+        formal_execution_authorized: bool,
+    ) -> None:
+        if type(argv) is not tuple or not argv:
+            raise TypeError("compile subprocess argv must be a non-empty tuple")
+        for argument in argv:
+            if type(argument) is not str or not argument or "\x00" in argument:
+                raise ValueError("compile subprocess argument contains NUL")
+        executable = _absolute_path("compile subprocess executable", argv[0])
+        digest, size = _raw_sha256(executable, label="compile subprocess executable")
+        _require_sha256("compile subprocess plan", assignment_plan_sha256)
+        if (
+            type(timeout_seconds) not in {int, float}
+            or isinstance(timeout_seconds, bool)
+            or not (0 < float(timeout_seconds) <= 600)
+        ):
+            raise ValueError("compile subprocess timeout must be in (0, 600] seconds")
+        if formal_execution_authorized is True:
+            if source_authority_sha256 is None:
+                raise ValueError("formal compile subprocess lacks source authority")
+            _require_sha256(
+                "compile subprocess source authority", source_authority_sha256
+            )
+        elif formal_execution_authorized is not False:
+            raise TypeError("compile subprocess formal flag must be boolean")
+        elif source_authority_sha256 is not None:
+            raise ValueError("diagnostic compile subprocess cannot claim authority")
+        self.argv = argv
+        self.assignment_plan_sha256 = assignment_plan_sha256
+        self.timeout_seconds = float(timeout_seconds)
+        self.executable_path = executable
+        self.executable_raw_sha256 = digest
+        self.executable_size = size
+        self.argv_sha256 = _content_sha256({"argv": list(argv)})
+        self.source_authority_sha256 = source_authority_sha256
+        self.formal_execution_authorized = formal_execution_authorized
+        self._process: subprocess.Popen[bytes] | None = None
+        self._stdout_buffer = b""
+        self._events: list[CompileSubprocessEvent] = []
+        self._process_started_ns: int | None = None
+        self._process_exited_ns: int | None = None
+        self._exit_code: int | None = None
+
+    @property
+    def process_id(self) -> int:
+        if self._process is None or self._process.pid is None:
+            raise RuntimeError("compile subprocess has not been spawned")
+        return self._process.pid
+
+    @staticmethod
+    def _encoded_message(value: Mapping[str, object]) -> bytes:
+        return (
+            json.dumps(
+                dict(value),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+    def _record(self, direction: str, encoded: bytes) -> None:
+        if len(encoded) > _MAX_SUBPROCESS_MESSAGE_BYTES:
+            raise ValueError("compile subprocess protocol message is too large")
+        row = _strict_json_object(encoded, label="compile subprocess protocol message")
+        canonical_json = encoded[:-1].decode("utf-8")
+        if row.get("protocol_sha256") != COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256:
+            raise ValueError("compile subprocess message uses another protocol")
+        if row.get("assignment_plan_sha256") != self.assignment_plan_sha256:
+            raise ValueError("compile subprocess message names another plan")
+        event = CompileSubprocessEvent(
+            sequence=len(self._events),
+            direction=direction,
+            canonical_json=canonical_json,
+            raw_sha256=hashlib.sha256(encoded).hexdigest(),
+        )
+        event.validate()
+        self._events.append(event)
+
+    def _send(self, value: Mapping[str, object]) -> None:
+        if self._process is None or self._process.stdin is None:
+            raise RuntimeError("compile subprocess stdin is unavailable")
+        encoded = self._encoded_message(value)
+        self._record("parent_to_child", encoded)
+        try:
+            self._process.stdin.write(encoded)
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise RuntimeError(
+                "compile subprocess closed its command channel"
+            ) from error
+
+    def _read_line(self) -> bytes:
+        if self._process is None or self._process.stdout is None:
+            raise RuntimeError("compile subprocess stdout is unavailable")
+        deadline = time.monotonic() + self.timeout_seconds
+        descriptor = self._process.stdout.fileno()
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while b"\n" not in self._stdout_buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise TimeoutError("compile subprocess protocol response timed out")
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    raise RuntimeError(
+                        "compile subprocess exited before its protocol response"
+                    )
+                self._stdout_buffer += chunk
+                if len(self._stdout_buffer) > _MAX_SUBPROCESS_MESSAGE_BYTES:
+                    raise ValueError(
+                        "compile subprocess protocol response is too large"
+                    )
+        encoded, self._stdout_buffer = self._stdout_buffer.split(b"\n", 1)
+        encoded += b"\n"
+        self._record("child_to_parent", encoded)
+        return encoded
+
+    def _receive(self, *, kind: str, fields: set[str]) -> dict[str, object]:
+        encoded = self._read_line()
+        row = _strict_json_object(encoded, label="compile subprocess response")
+        expected = {
+            "kind",
+            "protocol_sha256",
+            "assignment_plan_sha256",
+            *fields,
+        }
+        if set(row) != expected:
+            raise ValueError("compile subprocess response fields differ from protocol")
+        if row["kind"] != kind:
+            raise ValueError("compile subprocess response kind is out of order")
+        return row
+
+    def spawn(self) -> None:
+        if self._process is not None:
+            raise RuntimeError("compile subprocess was already spawned")
+        # Never pass caller credentials, provider tokens, Python injection,
+        # or unregistered cache paths into the compile child.  A future GPU
+        # command needing another variable must bind it in source policy.
+        environment = {
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+        self._process_started_ns = time.monotonic_ns()
+        try:
+            self._process = subprocess.Popen(
+                self.argv,
+                executable=str(self.executable_path),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                bufsize=0,
+                close_fds=True,
+                start_new_session=True,
+            )
+            ready = self._receive(
+                kind="compile_subprocess_ready", fields={"process_id"}
+            )
+            if type(ready["process_id"]) is not int or ready["process_id"] != (
+                self.process_id
+            ):
+                raise ValueError(
+                    "compile subprocess ready message names another process"
+                )
+        except BaseException:
+            self.abort()
+            raise
+
+    def start(self, environment: Mapping[str, str]) -> None:
+        cache_environment: dict[str, str] = {}
+        for name in COMPILE_CACHE_ENVIRONMENT_VARIABLES:
+            value = environment.get(name)
+            if type(value) is not str:
+                raise ValueError("compile subprocess lacks private cache environment")
+            path = _absolute_path(f"compile subprocess {name}", value)
+            cache_environment[name] = str(path)
+        self._send(
+            {
+                "kind": "compile_subprocess_start",
+                "protocol_sha256": COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+                "assignment_plan_sha256": self.assignment_plan_sha256,
+                "cache_environment": cache_environment,
+            }
+        )
+        started = self._receive(
+            kind="compile_subprocess_started", fields={"process_id"}
+        )
+        if type(started["process_id"]) is not int or started["process_id"] != (
+            self.process_id
+        ):
+            raise ValueError(
+                "compile subprocess start acknowledgement names another process"
+            )
+
+    def prewarm(self, payload: CompileOnlyPrewarmPayload) -> CompilePrewarmObservation:
+        payload.validate()
+        self._send(
+            {
+                "kind": "compile_subprocess_prewarm",
+                "protocol_sha256": COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+                "assignment_plan_sha256": self.assignment_plan_sha256,
+                **payload.to_dict(),
+            }
+        )
+        response = self._receive(
+            kind="compile_subprocess_prewarm_complete",
+            fields={
+                "request_id",
+                "graph_bucket",
+                "completed",
+                "provider_receipt_sha256",
+            },
+        )
+        observation = CompilePrewarmObservation(
+            request_id=response["request_id"],
+            graph_bucket=response["graph_bucket"],
+            completed=response["completed"],
+            provider_receipt_sha256=response["provider_receipt_sha256"],
+        )
+        observation.validate()
+        return observation
+
+    def _assert_stdout_exhausted(self) -> None:
+        if self._process is None or self._process.stdout is None:
+            raise RuntimeError("compile subprocess stdout is unavailable")
+        remainder = self._stdout_buffer + self._process.stdout.read()
+        self._stdout_buffer = b""
+        if remainder:
+            raise ValueError(
+                "compile subprocess emitted output after drain acknowledgement"
+            )
+
+    def graceful_shutdown(self) -> CompileShutdownObservation:
+        if self._process is None:
+            raise RuntimeError("compile subprocess was not spawned")
+        requested_ns = time.monotonic_ns()
+        self._send(
+            {
+                "kind": "compile_subprocess_shutdown",
+                "protocol_sha256": COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+                "assignment_plan_sha256": self.assignment_plan_sha256,
+            }
+        )
+        response = self._receive(
+            kind="compile_subprocess_drained",
+            fields={"active_requests", "queued_requests", "provider_ack_sha256"},
+        )
+        try:
+            exit_code = self._process.wait(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("compile subprocess did not exit after drain") from error
+        self._process_exited_ns = time.monotonic_ns()
+        self._exit_code = exit_code
+        self._assert_stdout_exhausted()
+        try:
+            os.killpg(self.process_id, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            self.abort()
+            raise ValueError("compile subprocess left a live child process group")
+        observation = CompileShutdownObservation(
+            process_id=self.process_id,
+            shutdown_requested_ns=requested_ns,
+            process_exited_ns=self._process_exited_ns,
+            exit_code=exit_code,
+            active_requests=response["active_requests"],
+            queued_requests=response["queued_requests"],
+            provider_ack_sha256=response["provider_ack_sha256"],
+        )
+        observation.validate()
+        return observation
+
+    def receipt(self) -> CompileSubprocessLifecycleReceipt:
+        if (
+            self._process is None
+            or self._process_started_ns is None
+            or self._process_exited_ns is None
+            or self._exit_code is None
+        ):
+            raise RuntimeError("compile subprocess is not terminal")
+        receipt = CompileSubprocessLifecycleReceipt(
+            schema_version=1,
+            kind="compile_subprocess_lifecycle_raw_receipt",
+            protocol_sha256=COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+            assignment_plan_sha256=self.assignment_plan_sha256,
+            executable_path=str(self.executable_path),
+            executable_raw_sha256=self.executable_raw_sha256,
+            executable_size=self.executable_size,
+            argv_sha256=self.argv_sha256,
+            source_authority_sha256=self.source_authority_sha256,
+            process_id=self.process_id,
+            process_started_ns=self._process_started_ns,
+            process_exited_ns=self._process_exited_ns,
+            exit_code=self._exit_code,
+            events=tuple(self._events),
+            formal_execution_authorized=self.formal_execution_authorized,
+        )
+        receipt.validate(reopen_executable=True)
+        return receipt
+
+    def abort(self) -> None:
+        process = self._process
+        if process is None:
+            return
+
+        def group_exists() -> bool:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        def wait_for_group(deadline: float) -> bool:
+            while group_exists():
+                process.poll()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.01, remaining))
+            process.poll()
+            return True
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            process.poll()
+            return
+        except OSError:
+            pass
+        term_deadline = time.monotonic() + min(self.timeout_seconds, 2.0)
+        if wait_for_group(term_deadline):
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            process.poll()
+            return
+        kill_deadline = time.monotonic() + 2.0
+        if not wait_for_group(kill_deadline):
+            raise RuntimeError("compile subprocess process group survived SIGKILL")
+
+
+@dataclass(frozen=True)
 class CompileResultBinding:
     absolute_path: str
     raw_sha256: str
@@ -544,9 +1281,15 @@ class CompileResultPointer:
     final_cache_receipt: CompileResultBinding
     immutable_cache_object_manifest: CompileResultBinding
     formal_execution_authorized: bool
+    assignment_plan_source: CompileResultBinding | None = None
+    subprocess_lifecycle_receipt: CompileResultBinding | None = None
 
     def validate(self) -> None:
-        if self.schema_version != 1 or self.kind != "compile_atomic_result_pointer":
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version not in {1, 2}
+            or self.kind != "compile_atomic_result_pointer"
+        ):
             raise ValueError("compile result pointer schema is unsupported")
         if (
             self.result_pointer_protocol_sha256
@@ -554,9 +1297,24 @@ class CompileResultPointer:
         ):
             raise ValueError("compile result pointer uses another protocol")
         _require_sha256("compile result assignment plan", self.assignment_plan_sha256)
-        if self.formal_execution_authorized is not False:
+        if self.schema_version == 1:
+            if (
+                self.assignment_plan_source is not None
+                or self.subprocess_lifecycle_receipt is not None
+            ):
+                raise ValueError(
+                    "legacy compile pointer cannot claim subprocess evidence"
+                )
+        elif (
+            type(self.assignment_plan_source) is not CompileResultBinding
+            or type(self.subprocess_lifecycle_receipt) is not CompileResultBinding
+        ):
+            raise TypeError("subprocess compile pointer lacks path-bound raw evidence")
+        if type(self.formal_execution_authorized) is not bool:
+            raise TypeError("compile result formal flag must be boolean")
+        if self.formal_execution_authorized is True and self.schema_version != 2:
             raise ValueError(
-                "CPU compile lifecycle evidence cannot authorize formal execution"
+                "formal compile execution requires subprocess lifecycle evidence"
             )
         for label, binding in self.bindings().items():
             if type(binding) is not CompileResultBinding:
@@ -567,7 +1325,7 @@ class CompileResultPointer:
                 raise ValueError(f"compile result {label} size is invalid")
 
     def bindings(self) -> dict[str, CompileResultBinding]:
-        return {
+        bindings = {
             "assignment_manifest": self.assignment_manifest,
             "compile_cache_plan": self.compile_cache_plan,
             "prewarm_manifest": self.prewarm_manifest,
@@ -576,10 +1334,15 @@ class CompileResultPointer:
             "final_cache_receipt": self.final_cache_receipt,
             "immutable_cache_object_manifest": self.immutable_cache_object_manifest,
         }
+        if self.assignment_plan_source is not None:
+            bindings["assignment_plan_source"] = self.assignment_plan_source
+        if self.subprocess_lifecycle_receipt is not None:
+            bindings["subprocess_lifecycle_receipt"] = self.subprocess_lifecycle_receipt
+        return bindings
 
     def to_dict(self) -> dict[str, object]:
         self.validate()
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "result_pointer_protocol_sha256": self.result_pointer_protocol_sha256,
@@ -587,6 +1350,7 @@ class CompileResultPointer:
             "formal_execution_authorized": self.formal_execution_authorized,
             **{label: asdict(binding) for label, binding in self.bindings().items()},
         }
+        return payload
 
     @property
     def sha256(self) -> str:
@@ -596,10 +1360,27 @@ class CompileResultPointer:
         self.validate()
         for label, binding in self.bindings().items():
             binding.reopen(label=f"compile result {label}")
+        if self.schema_version == 2:
+            if self.assignment_plan_source is None:
+                raise AssertionError("validated subprocess pointer lost its plan")
+            if self.subprocess_lifecycle_receipt is None:
+                raise AssertionError("validated subprocess pointer lost its receipt")
+            plan = CompileAssignmentPlan.load(self.assignment_plan_source.absolute_path)
+            if plan.sha256 != self.assignment_plan_sha256:
+                raise ValueError("compile pointer assignment-plan binding differs")
+            receipt = CompileSubprocessLifecycleReceipt.load(
+                self.subprocess_lifecycle_receipt.absolute_path
+            )
+            if (
+                receipt.assignment_plan_sha256 != self.assignment_plan_sha256
+                or receipt.formal_execution_authorized
+                is not self.formal_execution_authorized
+            ):
+                raise ValueError("compile pointer subprocess receipt differs")
 
     @classmethod
     def from_dict(cls, raw: object) -> Self:
-        binding_names = {
+        legacy_binding_names = {
             "assignment_manifest",
             "compile_cache_plan",
             "prewarm_manifest",
@@ -608,15 +1389,25 @@ class CompileResultPointer:
             "final_cache_receipt",
             "immutable_cache_object_manifest",
         }
-        expected = {
+        common = {
             "schema_version",
             "kind",
             "result_pointer_protocol_sha256",
             "assignment_plan_sha256",
             "formal_execution_authorized",
-            *binding_names,
+            *legacy_binding_names,
         }
-        if type(raw) is not dict or set(raw) != expected:
+        if type(raw) is not dict:
+            raise TypeError("compile result pointer must be a JSON object")
+        schema_version = raw.get("schema_version")
+        binding_names = set(legacy_binding_names)
+        expected = set(common)
+        if schema_version == 2:
+            binding_names.update(
+                {"assignment_plan_source", "subprocess_lifecycle_receipt"}
+            )
+            expected.update({"assignment_plan_source", "subprocess_lifecycle_receipt"})
+        if set(raw) != expected:
             raise ValueError("compile result pointer fields differ from schema")
         scalar = {
             name: value for name, value in raw.items() if name not in binding_names
@@ -642,6 +1433,14 @@ class CompileResultPointer:
         if semantic_sha256 != value.sha256:
             raise ValueError("compile result pointer semantic digest differs")
         value.reopen()
+        if value.schema_version == 2:
+            if value.assignment_plan_source is None:
+                raise AssertionError("validated subprocess pointer lost its plan")
+            plan = CompileAssignmentPlan.load(
+                value.assignment_plan_source.absolute_path
+            )
+            if Path(plan.result_pointer_path) != source:
+                raise ValueError("compile pointer was loaded from an unbound path")
         return value
 
 
@@ -659,19 +1458,26 @@ def _publish_terminal(path: Path, value: object) -> Path:
     return path
 
 
-def execute_compile_assignment_for_cpu_test(
+def _execute_compile_assignment(
     plan: CompileAssignmentPlan,
     driver: CompileLifecycleDriver,
     *,
-    materialize_cache_files: Callable[[Path], None],
+    materialize_cache_files: Callable[[Path], None] | None,
+    assignment_plan_source: Path | None,
+    subprocess_driver: _CompileSubprocessDriver | None,
+    formal_execution_authorized: bool,
 ) -> CompileResultPointer:
-    """Exercise the frozen lifecycle with a CPU fake; never formal authority."""
-
     if type(plan) is not CompileAssignmentPlan:
-        raise TypeError("compile CPU lifecycle requires an exact assignment plan")
+        raise TypeError("compile lifecycle requires an exact assignment plan")
     _, cache_plan, manifest = plan.revalidate()
+    preflight_compile_cache_launch(cache_plan)
     if type(driver.process_id) is not int or driver.process_id < 1:
         raise ValueError("compile lifecycle driver process ID is invalid")
+    if formal_execution_authorized is True:
+        if subprocess_driver is None or assignment_plan_source is None:
+            raise ValueError("formal compile lifecycle requires path-bound subprocess")
+    elif formal_execution_authorized is not False:
+        raise TypeError("compile lifecycle formal flag must be boolean")
     session = start_compile_cache_launch(
         cache_plan,
         process_id=driver.process_id,
@@ -691,11 +1497,12 @@ def execute_compile_assignment_for_cpu_test(
             raise ValueError(
                 "compile prewarm observations do not exactly cover the manifest"
             )
+        if materialize_cache_files is not None:
+            materialize_cache_files(session.overlay.path)
         shutdown = driver.graceful_shutdown()
         shutdown.validate()
         if shutdown.process_id != driver.process_id:
             raise ValueError("compile shutdown acknowledgement names another process")
-        materialize_cache_files(session.overlay.path)
         object_path, receipt_path, attempt_path = session.complete()
     except BaseException as error:
         if not session._terminal:
@@ -709,6 +1516,7 @@ def execute_compile_assignment_for_cpu_test(
         or receipt.key_sha256 != plan.compile_key_sha256
         or attempt.plan_sha256 != cache_plan.sha256
         or attempt.result_receipt_sha256 != receipt.receipt_sha256
+        or attempt.base_receipt_sha256 != cache_plan.base_receipt_sha256
     ):
         raise ValueError("compile terminal receipts differ from the assignment plan")
     cache = ImmutableCompileCache._open_existing_read_only(cache_plan.cache_root)
@@ -716,6 +1524,23 @@ def execute_compile_assignment_for_cpu_test(
         raise ValueError("compile immutable object path differs from cache receipt")
 
     terminal_root = Path(cache_plan.cache_root)
+    subprocess_receipt_path: Path | None = None
+    subprocess_receipt: CompileSubprocessLifecycleReceipt | None = None
+    if subprocess_driver is not None:
+        subprocess_receipt = subprocess_driver.receipt()
+        if (
+            subprocess_receipt.assignment_plan_sha256 != plan.sha256
+            or subprocess_receipt.formal_execution_authorized
+            is not formal_execution_authorized
+        ):
+            raise ValueError("compile subprocess receipt differs from execution")
+        subprocess_receipt_path = _publish_terminal(
+            _terminal_path(
+                terminal_root,
+                f"subprocess-{plan.attempt_id}-{subprocess_receipt.sha256}.json",
+            ),
+            subprocess_receipt.to_dict(),
+        )
     shutdown_path = _publish_terminal(
         _terminal_path(terminal_root, f"shutdown-{plan.attempt_id}.json"),
         {
@@ -735,7 +1560,10 @@ def execute_compile_assignment_for_cpu_test(
             "provider_ack_sha256": shutdown.provider_ack_sha256,
             "final_cache_receipt_sha256": receipt.receipt_sha256,
             "prewarm_observations": [asdict(row) for row in observations],
-            "formal_execution_authorized": False,
+            "subprocess_lifecycle_receipt_sha256": (
+                None if subprocess_receipt is None else subprocess_receipt.sha256
+            ),
+            "formal_execution_authorized": formal_execution_authorized,
         },
     )
     object_manifest_path = _publish_terminal(
@@ -748,10 +1576,14 @@ def execute_compile_assignment_for_cpu_test(
             "content_sha256": receipt.content_sha256,
             "object_path": str(object_path),
             "files": [asdict(value) for value in receipt.files],
+            "formal_execution_authorized": formal_execution_authorized,
         },
     )
+    schema_version = 2 if subprocess_receipt_path is not None else 1
+    if schema_version == 2 and assignment_plan_source is None:
+        raise AssertionError("subprocess execution lost its path-bound plan")
     pointer = CompileResultPointer(
-        schema_version=1,
+        schema_version=schema_version,
         kind="compile_atomic_result_pointer",
         result_pointer_protocol_sha256=COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256,
         assignment_plan_sha256=plan.sha256,
@@ -776,7 +1608,22 @@ def execute_compile_assignment_for_cpu_test(
         immutable_cache_object_manifest=CompileResultBinding.bind(
             object_manifest_path, label="immutable object manifest"
         ),
-        formal_execution_authorized=False,
+        formal_execution_authorized=formal_execution_authorized,
+        assignment_plan_source=(
+            None
+            if assignment_plan_source is None
+            else CompileResultBinding.bind(
+                assignment_plan_source, label="compile assignment plan source"
+            )
+        ),
+        subprocess_lifecycle_receipt=(
+            None
+            if subprocess_receipt_path is None
+            else CompileResultBinding.bind(
+                subprocess_receipt_path,
+                label="compile subprocess lifecycle receipt",
+            )
+        ),
     )
     pointer.validate()
     result_path = Path(plan.result_pointer_path)
@@ -788,9 +1635,157 @@ def execute_compile_assignment_for_cpu_test(
     return pointer
 
 
+def execute_compile_assignment_for_cpu_test(
+    plan: CompileAssignmentPlan,
+    driver: CompileLifecycleDriver,
+    *,
+    materialize_cache_files: Callable[[Path], None],
+) -> CompileResultPointer:
+    """Exercise the lifecycle with a CPU fake; never formal authority."""
+
+    return _execute_compile_assignment(
+        plan,
+        driver,
+        materialize_cache_files=materialize_cache_files,
+        assignment_plan_source=None,
+        subprocess_driver=None,
+        formal_execution_authorized=False,
+    )
+
+
+def _preflight_subprocess_result(
+    plan: CompileAssignmentPlan,
+    *,
+    assignment_plan_source: Path,
+    formal_execution_authorized: bool,
+    source_authority_sha256: str | None,
+    argv_sha256: str,
+) -> CompileResultPointer | None:
+    result_path = Path(plan.result_pointer_path)
+    sidecar = Path(f"{result_path}.sha256")
+    if result_path.exists() or sidecar.exists():
+        if not result_path.is_file() or result_path.is_symlink():
+            raise ValueError("compile result pointer is an incomplete prior attempt")
+        if not sidecar.is_file() or sidecar.is_symlink():
+            raise ValueError("compile result pointer commit marker is incomplete")
+        pointer = CompileResultPointer.load(result_path)
+        if (
+            pointer.schema_version != 2
+            or pointer.assignment_plan_sha256 != plan.sha256
+            or pointer.formal_execution_authorized is not formal_execution_authorized
+            or pointer.assignment_plan_source is None
+            or Path(pointer.assignment_plan_source.absolute_path)
+            != assignment_plan_source
+        ):
+            raise ValueError("compile result pointer belongs to another execution")
+        if pointer.subprocess_lifecycle_receipt is None:
+            raise AssertionError("validated subprocess pointer lost its receipt")
+        receipt = CompileSubprocessLifecycleReceipt.load(
+            pointer.subprocess_lifecycle_receipt.absolute_path
+        )
+        if (
+            receipt.source_authority_sha256 != source_authority_sha256
+            or receipt.argv_sha256 != argv_sha256
+        ):
+            raise ValueError("compile result pointer uses another subprocess authority")
+        return pointer
+    parent = result_path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError("compile result pointer parent must be a regular directory")
+    return None
+
+
+def _execute_compile_assignment_subprocess_path(
+    assignment_plan_path: str | Path,
+    *,
+    argv: tuple[str, ...],
+    timeout_seconds: float,
+    source_authority_sha256: str | None,
+    formal_execution_authorized: bool,
+) -> CompileResultPointer:
+    plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
+    plan = CompileAssignmentPlan.load(plan_path)
+    _assignment, cache_plan, _manifest = plan.revalidate()
+    preflight_compile_cache_launch(cache_plan)
+    argv_sha256 = _content_sha256({"argv": list(argv)})
+    resumed = _preflight_subprocess_result(
+        plan,
+        assignment_plan_source=plan_path,
+        formal_execution_authorized=formal_execution_authorized,
+        source_authority_sha256=source_authority_sha256,
+        argv_sha256=argv_sha256,
+    )
+    if resumed is not None:
+        return resumed
+    driver = _CompileSubprocessDriver(
+        argv=argv,
+        assignment_plan_sha256=plan.sha256,
+        timeout_seconds=timeout_seconds,
+        source_authority_sha256=source_authority_sha256,
+        formal_execution_authorized=formal_execution_authorized,
+    )
+    driver.spawn()
+    try:
+        return _execute_compile_assignment(
+            plan,
+            driver,
+            materialize_cache_files=None,
+            assignment_plan_source=plan_path,
+            subprocess_driver=driver,
+            formal_execution_authorized=formal_execution_authorized,
+        )
+    finally:
+        driver.abort()
+
+
+def execute_compile_assignment_subprocess_for_cpu_test(
+    assignment_plan_path: str | Path,
+    argv: tuple[str, ...],
+    *,
+    timeout_seconds: float = 30.0,
+) -> CompileResultPointer:
+    """Run a real diagnostic child process without granting formal authority."""
+
+    return _execute_compile_assignment_subprocess_path(
+        assignment_plan_path,
+        argv=argv,
+        timeout_seconds=timeout_seconds,
+        source_authority_sha256=None,
+        formal_execution_authorized=False,
+    )
+
+
+def execute_release_compile_assignment_plan(
+    assignment_plan_path: str | Path,
+    *,
+    timeout_seconds: float = 600.0,
+) -> CompileResultPointer:
+    """Execute a path-bound formal plan only under exact source allowlists."""
+
+    # Both empty policies are checked before opening the caller-named plan path.
+    if len(RELEASE_COMPILE_SUBPROCESSES) != 1:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
+    if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
+        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
+    plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
+    plan = CompileAssignmentPlan.load(plan_path)
+    source = require_release_compile_assignment_plan(plan)
+    return _execute_compile_assignment_subprocess_path(
+        plan_path,
+        argv=source.argv,
+        timeout_seconds=timeout_seconds,
+        source_authority_sha256=source.sha256,
+        formal_execution_authorized=True,
+    )
+
+
 __all__ = [
     "COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256",
+    "COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256",
+    "RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY",
+    "RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED",
     "RELEASE_COMPILE_RUNNER_UNAVAILABLE",
+    "RELEASE_COMPILE_SUBPROCESSES",
     "RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S",
     "CompileAssignmentPlan",
     "CompileLifecycleDriver",
@@ -799,7 +1794,12 @@ __all__ = [
     "CompileResultPointer",
     "CompileRunnerBlocked",
     "CompileShutdownObservation",
+    "CompileSubprocessEvent",
+    "CompileSubprocessLifecycleReceipt",
+    "ReleaseCompileSubprocess",
     "execute_compile_assignment_for_cpu_test",
+    "execute_compile_assignment_subprocess_for_cpu_test",
+    "execute_release_compile_assignment_plan",
     "load_compile_prewarm_manifest",
     "require_release_compile_assignment_plan",
     "write_compile_prewarm_manifest",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,14 +24,19 @@ from lightcone_spec.runtime.compile_cache import (
     CompileOnlyPrewarmPayload,
 )
 from lightcone_spec.runtime.compile_runner import (
+    COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
     RELEASE_COMPILE_RUNNER_UNAVAILABLE,
+    RELEASE_COMPILE_SUBPROCESSES,
     RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S,
     CompileAssignmentPlan,
     CompilePrewarmObservation,
     CompileResultPointer,
     CompileRunnerBlocked,
     CompileShutdownObservation,
+    CompileSubprocessLifecycleReceipt,
     execute_compile_assignment_for_cpu_test,
+    execute_compile_assignment_subprocess_for_cpu_test,
+    execute_release_compile_assignment_plan,
     require_release_compile_assignment_plan,
     write_compile_prewarm_manifest,
 )
@@ -171,6 +178,134 @@ def _materialize(overlay: Path) -> None:
     target.write_bytes(b"compiled-kernel")
 
 
+_CHILD = r"""
+import hashlib
+import json
+import os
+import sys
+
+protocol = os.environ["TEST_COMPILE_PROTOCOL"]
+plan = os.environ["TEST_COMPILE_PLAN"]
+bad_request = os.environ.get("TEST_COMPILE_BAD_REQUEST")
+stubborn_pidfile = os.environ.get("TEST_COMPILE_STUBBORN_PIDFILE")
+assert "TEST_COMPILE_SECRET_SENTINEL" not in os.environ
+
+
+def send(kind, **values):
+    row = {
+        "kind": kind,
+        "protocol_sha256": protocol,
+        "assignment_plan_sha256": plan,
+        **values,
+    }
+    sys.stdout.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def receive():
+    row = json.loads(sys.stdin.readline())
+    assert row["protocol_sha256"] == protocol
+    assert row["assignment_plan_sha256"] == plan
+    return row
+
+
+send("compile_subprocess_ready", process_id=os.getpid())
+start = receive()
+assert start["kind"] == "compile_subprocess_start"
+for path in start["cache_environment"].values():
+    assert os.path.isabs(path)
+    assert os.path.isdir(path)
+send("compile_subprocess_started", process_id=os.getpid())
+while True:
+    row = receive()
+    if row["kind"] == "compile_subprocess_shutdown":
+        if stubborn_pidfile:
+            import signal
+            import subprocess
+            import time
+
+            code = (
+                "import os,signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                f"open({stubborn_pidfile!r},'w').write(str(os.getpid()));"
+                "time.sleep(300)"
+            )
+            subprocess.Popen(
+                [sys.executable, "-c", code],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            for _ in range(100):
+                if os.path.exists(stubborn_pidfile):
+                    break
+                time.sleep(0.01)
+        send(
+            "compile_subprocess_drained",
+            active_requests=0,
+            queued_requests=0,
+            provider_ack_sha256=hashlib.sha256(b"drained").hexdigest(),
+        )
+        break
+    assert row["kind"] == "compile_subprocess_prewarm"
+    cache = start["cache_environment"]["TRITON_CACHE_DIR"]
+    os.makedirs(cache, exist_ok=True)
+    with open(os.path.join(cache, f"bucket-{row['graph_bucket']}.bin"), "wb") as handle:
+        handle.write(str(row["graph_bucket"]).encode())
+    request_id = row["request_id"]
+    if bad_request and row["graph_bucket"] == 2:
+        request_id = "wrong-request"
+    send(
+        "compile_subprocess_prewarm_complete",
+        request_id=request_id,
+        graph_bucket=row["graph_bucket"],
+        completed=True,
+        provider_receipt_sha256=hashlib.sha256(
+            f"prewarm:{row['request_id']}".encode()
+        ).hexdigest(),
+    )
+"""
+
+
+def _subprocess_argv(
+    plan: CompileAssignmentPlan,
+    *,
+    bad_request: bool = False,
+    stubborn_pidfile: Path | None = None,
+) -> tuple[str, ...]:
+    executable = str(Path(os.sys.executable).resolve())
+    environment_prefix = (
+        "import os;"
+        f"os.environ['TEST_COMPILE_PROTOCOL']={COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256!r};"
+        f"os.environ['TEST_COMPILE_PLAN']={plan.sha256!r};"
+    )
+    if bad_request:
+        environment_prefix += "os.environ['TEST_COMPILE_BAD_REQUEST']='1';"
+    if stubborn_pidfile is not None:
+        environment_prefix += (
+            f"os.environ['TEST_COMPILE_STUBBORN_PIDFILE']={str(stubborn_pidfile)!r};"
+        )
+    return (executable, "-c", environment_prefix + _CHILD)
+
+
+def _rewrite_canonical_json(path: Path, value: object) -> bytes:
+    canonical = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    body = canonical + b"\n"
+    path.write_bytes(body)
+    Path(f"{path}.sha256").write_text(
+        f"{hashlib.sha256(canonical).hexdigest()}\n",
+        encoding="ascii",
+    )
+    return body
+
+
 def test_cpu_fake_lifecycle_requires_exact_prewarm_shutdown_and_terminal_pointer(
     tmp_path: Path,
 ) -> None:
@@ -198,6 +333,147 @@ def test_cpu_fake_lifecycle_requires_exact_prewarm_shutdown_and_terminal_pointer
     }
     pointer.reopen()
     assert CompileResultPointer.load(result_path) == pointer
+
+
+def test_real_subprocess_lifecycle_publishes_raw_receipt_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_COMPILE_SECRET_SENTINEL", "must-not-reach-child")
+    plan, result_path = _inputs(tmp_path)
+    plan_path = plan.write((tmp_path / "compile-assignment-plan.json").resolve())
+
+    pointer = execute_compile_assignment_subprocess_for_cpu_test(
+        plan_path,
+        _subprocess_argv(plan),
+    )
+
+    assert pointer.schema_version == 2
+    assert pointer.formal_execution_authorized is False
+    assert pointer.assignment_plan_source is not None
+    assert pointer.subprocess_lifecycle_receipt is not None
+    receipt = CompileSubprocessLifecycleReceipt.load(
+        pointer.subprocess_lifecycle_receipt.absolute_path
+    )
+    assert receipt.assignment_plan_sha256 == plan.sha256
+    assert receipt.formal_execution_authorized is False
+    rows = [json.loads(event.canonical_json) for event in receipt.events]
+    assert [row["kind"] for row in rows] == [
+        "compile_subprocess_ready",
+        "compile_subprocess_start",
+        "compile_subprocess_started",
+        "compile_subprocess_prewarm",
+        "compile_subprocess_prewarm_complete",
+        "compile_subprocess_prewarm",
+        "compile_subprocess_prewarm_complete",
+        "compile_subprocess_shutdown",
+        "compile_subprocess_drained",
+    ]
+    assert CompileResultPointer.load(result_path) == pointer
+
+    # A valid terminal pointer is the sole resume authority.  No second cache
+    # attempt or child transcript is created on exact replay.
+    attempts_before = tuple(sorted((tmp_path / "cache" / "attempts").glob("*.json")))
+    assert (
+        execute_compile_assignment_subprocess_for_cpu_test(
+            plan_path,
+            _subprocess_argv(plan),
+        )
+        == pointer
+    )
+    assert (
+        tuple(sorted((tmp_path / "cache" / "attempts").glob("*.json")))
+        == attempts_before
+    )
+
+
+def test_real_subprocess_protocol_failure_retains_attempt_without_result_pointer(
+    tmp_path: Path,
+) -> None:
+    plan, result_path = _inputs(tmp_path)
+    plan_path = plan.write((tmp_path / "compile-assignment-plan.json").resolve())
+
+    with pytest.raises(ValueError, match="differs|cover"):
+        execute_compile_assignment_subprocess_for_cpu_test(
+            plan_path,
+            _subprocess_argv(plan, bad_request=True),
+        )
+
+    assert not result_path.exists()
+    assert not Path(f"{result_path}.sha256").exists()
+    attempts = tuple((tmp_path / "cache" / "attempts").glob("*.json"))
+    assert attempts
+    assert any(json.loads(path.read_text())["state"] == "failed" for path in attempts)
+
+
+def test_real_subprocess_failure_kills_stubborn_process_group(
+    tmp_path: Path,
+) -> None:
+    plan, result_path = _inputs(tmp_path)
+    plan_path = plan.write((tmp_path / "compile-assignment-plan.json").resolve())
+    pidfile = (tmp_path / "stubborn-grandchild.pid").resolve()
+
+    with pytest.raises(ValueError, match="left a live child process group"):
+        execute_compile_assignment_subprocess_for_cpu_test(
+            plan_path,
+            _subprocess_argv(plan, stubborn_pidfile=pidfile),
+            timeout_seconds=3.0,
+        )
+
+    grandchild_pid = int(pidfile.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
+    assert not result_path.exists()
+    assert not Path(f"{result_path}.sha256").exists()
+
+
+def test_coordinated_rehash_cannot_promote_diagnostic_receipt_or_pointer(
+    tmp_path: Path,
+) -> None:
+    plan, result_path = _inputs(tmp_path)
+    plan_path = plan.write((tmp_path / "compile-assignment-plan.json").resolve())
+    pointer = execute_compile_assignment_subprocess_for_cpu_test(
+        plan_path,
+        _subprocess_argv(plan),
+    )
+    assert pointer.subprocess_lifecycle_receipt is not None
+    receipt_path = Path(pointer.subprocess_lifecycle_receipt.absolute_path)
+
+    receipt_row = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt_row["formal_execution_authorized"] = True
+    receipt_row["source_authority_sha256"] = "f" * 64
+    receipt_body = _rewrite_canonical_json(receipt_path, receipt_row)
+    with pytest.raises(CompileRunnerBlocked) as receipt_blocked:
+        CompileSubprocessLifecycleReceipt.load(receipt_path)
+    assert receipt_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
+
+    pointer_row = json.loads(result_path.read_text(encoding="utf-8"))
+    pointer_row["formal_execution_authorized"] = True
+    pointer_row["subprocess_lifecycle_receipt"]["raw_sha256"] = hashlib.sha256(
+        receipt_body
+    ).hexdigest()
+    pointer_row["subprocess_lifecycle_receipt"]["size"] = len(receipt_body)
+    _rewrite_canonical_json(result_path, pointer_row)
+    forged_pointer = CompileResultPointer.from_dict(pointer_row)
+    with pytest.raises(CompileRunnerBlocked) as reopen_blocked:
+        forged_pointer.reopen()
+    assert reopen_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
+    with pytest.raises(CompileRunnerBlocked) as pointer_blocked:
+        CompileResultPointer.load(result_path)
+    assert pointer_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
+
+
+def test_formal_subprocess_gate_blocks_before_path_or_process_access(
+    tmp_path: Path,
+) -> None:
+    assert RELEASE_COMPILE_SUBPROCESSES == ()
+    assert RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S == ()
+    missing = (tmp_path / "missing-plan.json").resolve()
+    with pytest.raises(CompileRunnerBlocked) as blocked:
+        execute_release_compile_assignment_plan(missing)
+    assert blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
+    assert not missing.exists()
+    assert not (tmp_path / "cache").exists()
 
 
 @pytest.mark.parametrize(
