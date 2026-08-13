@@ -17,7 +17,10 @@ import math
 import os
 import re
 import stat
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, is_dataclass
+from dataclasses import fields as dataclass_fields
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -152,6 +155,136 @@ _CELL_IDENTITY_FIELDS = frozenset(
         "cohort_count",
     }
 )
+_EXECUTION_SEMANTICS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_semantics_sha256",
+        "registry_sha256",
+        "cell_declaration_sha256",
+        "activation_authority_binding_sha256",
+        "activation_semantic_sha256",
+        "e3a_selection_sha256",
+        "load_binding_sha256",
+        "registered_load_plan_sha256",
+        "registered_load_source_sha256",
+        "registered_corpus_sha256",
+        "registered_request_ids_sha256",
+        "registered_sampling_parameters_sha256",
+        "registered_request_count",
+        "adaptation_recipe_sha256",
+        "registered_learning_rate",
+        "expected_method",
+        "expected_model",
+        "expected_backend",
+        "expected_task",
+        "expected_model_max_context_length",
+        "expected_runtime_context_length",
+        "expected_concurrency",
+        "expected_draft_width",
+        "expected_draft_depth",
+        "expected_speculation_enabled",
+        "expected_scope",
+        "expected_parameterization",
+        "expected_rank",
+        "expected_optimizer",
+        "expected_learning_rate",
+        "expected_schedule",
+        "expected_cohort",
+        "expected_cohort_count",
+        "expected_workload_seed",
+        "expected_runtime_random_seed",
+        "expected_sampling_profile_sha256",
+        "expected_regime",
+        "expected_arrival",
+        "expected_slo",
+        "expected_topology",
+        "expected_adaptation_config",
+    }
+)
+_EXECUTION_SEMANTICS_PAYLOAD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "registry_sha256",
+        "cell_declaration",
+        "cell_declaration_sha256",
+        "activation_authority_binding",
+        "activation_authority_binding_sha256",
+        "activation_semantic_sha256",
+        "e3a_selection",
+        "e3a_selection_sha256",
+        "load_binding",
+        "load_binding_sha256",
+        "registered_load_plan_sha256",
+        "registered_load_source_sha256",
+        "registered_corpus_sha256",
+        "registered_request_ids_sha256",
+        "registered_sampling_parameters_sha256",
+        "registered_request_count",
+        "adaptation_recipe",
+        "adaptation_recipe_sha256",
+        "expected_method",
+        "expected_model",
+        "expected_backend",
+        "expected_task",
+        "expected_model_max_context_length",
+        "expected_runtime_context_length",
+        "expected_concurrency",
+        "expected_draft_width",
+        "expected_draft_depth",
+        "expected_speculation_enabled",
+        "expected_scope",
+        "expected_parameterization",
+        "expected_rank",
+        "expected_optimizer",
+        "expected_learning_rate",
+        "expected_schedule",
+        "expected_cohort",
+        "expected_cohort_count",
+        "expected_workload_seed",
+        "expected_runtime_random_seed",
+        "expected_sampling_profile_sha256",
+        "expected_regime",
+        "expected_arrival",
+        "expected_slo",
+        "expected_topology",
+    }
+)
+_ADAPTATION_CONFIG_FIELDS = (
+    "weight_update_mode",
+    "parameter_scope",
+    "kv_history_policy",
+    "adaptation_scope",
+    "adaptation_group_id",
+    "optimizer",
+    "rank",
+    "lora_alpha",
+    "lora_matrix_policy",
+    "native_head_policy",
+    "stride",
+    "max_in_flight",
+    "canvas_tokens",
+    "loss_position_decay",
+    "extra_logical_delay",
+    "teacher_row_policy",
+    "verification_mode",
+    "fixed_verification_budget",
+    "confidence_loss_weight",
+)
+_OPTIMIZER_CONFIG_FIELDS = (
+    "name",
+    "learning_rate",
+    "weight_decay",
+    "beta1",
+    "beta2",
+    "epsilon",
+    "grad_clip",
+    "momentum",
+    "muon_ns_steps",
+    "muon_auxiliary_learning_rate",
+    "muon_auxiliary_weight_decay",
+    "schedule",
+    "schedule_total_published_updates",
+)
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -170,6 +303,10 @@ _MANIFEST_FIELDS = frozenset(
         "split_sha256",
         "cell_id",
         "cell_declaration_sha256",
+        "execution_semantics",
+        "execution_semantics_payload",
+        "execution_semantics_sha256",
+        "execution_semantics_identity_sha256",
         "target_model_id",
         "target_revision",
         "drafter_model_id",
@@ -214,6 +351,8 @@ _AUTHORITY_FIELDS = frozenset(
         "split_sha256",
         "cell_id",
         "cell_declaration_sha256",
+        "execution_semantics_sha256",
+        "execution_semantics_identity_sha256",
         "target_model_id",
         "target_revision",
         "drafter_model_id",
@@ -726,6 +865,237 @@ class PreparedDrafterParameterInventory:
         return _content_sha256(self.to_dict())
 
 
+def _validate_execution_semantics_identity(value: object) -> dict[str, Any]:
+    row = _strict_object(
+        "trainable-plan execution semantics", value, _EXECUTION_SEMANTICS_FIELDS
+    )
+    if type(row["schema_version"]) is not int or row["schema_version"] != 1:
+        raise ValueError("trainable-plan execution semantics must use schema v1")
+    for name in (
+        "execution_semantics_sha256",
+        "registry_sha256",
+        "cell_declaration_sha256",
+        "activation_authority_binding_sha256",
+        "activation_semantic_sha256",
+        "e3a_selection_sha256",
+        "load_binding_sha256",
+        "registered_load_plan_sha256",
+        "registered_load_source_sha256",
+        "registered_corpus_sha256",
+        "registered_request_ids_sha256",
+        "registered_sampling_parameters_sha256",
+        "expected_sampling_profile_sha256",
+    ):
+        _require_sha256(f"execution semantics {name}", row[name])
+    _require_sha256(
+        "execution semantics adaptation recipe", row["adaptation_recipe_sha256"]
+    )
+    for name in (
+        "registered_request_count",
+        "expected_model_max_context_length",
+        "expected_runtime_context_length",
+        "expected_concurrency",
+        "expected_cohort_count",
+    ):
+        _positive_int(f"execution semantics {name}", row[name])
+    for name in ("expected_workload_seed", "expected_runtime_random_seed"):
+        _nonnegative_int(f"execution semantics {name}", row[name])
+    for name in ("expected_draft_width", "expected_draft_depth", "expected_rank"):
+        _nullable_int(f"execution semantics {name}", row[name])
+    _nullable_positive_float(
+        "execution semantics expected_learning_rate", row["expected_learning_rate"]
+    )
+    _nullable_positive_float(
+        "execution semantics registered_learning_rate", row["registered_learning_rate"]
+    )
+    for name in (
+        "expected_method",
+        "expected_model",
+        "expected_backend",
+        "expected_task",
+        "expected_parameterization",
+        "expected_cohort",
+        "expected_regime",
+        "expected_arrival",
+        "expected_slo",
+        "expected_topology",
+    ):
+        _strict_text(f"execution semantics {name}", row[name])
+    for name in ("expected_scope", "expected_optimizer", "expected_schedule"):
+        _strict_text(f"execution semantics {name}", row[name])
+    if type(row["expected_speculation_enabled"]) is not bool:
+        raise ValueError("execution semantics speculation flag must be boolean")
+    if row["expected_method"] not in {"tts", "l0"}:
+        raise ValueError("trainable-plan execution semantics must be adaptive E1")
+    if type(row["expected_adaptation_config"]) is not dict:
+        raise TypeError("adaptive execution semantics require a full adaptation config")
+    _validate_json_value(row["expected_adaptation_config"])
+    return row
+
+
+def _execution_semantics_identity(value: object) -> dict[str, Any]:
+    # Import lazily: execution_semantics imports RunConfig, whose schema imports
+    # adaptation.parameters while this package is initialized.
+    from lightcone_spec.experiments.execution_semantics import (
+        CellExecutionSemantics,
+    )
+
+    if type(value) is not CellExecutionSemantics:
+        raise ValueError(
+            "adapted E1 authority requires onsite-reduced execution semantics"
+        )
+    recipe = value.adaptation_recipe
+    if recipe is None:
+        raise ValueError("adaptive E1 execution semantics lack a registered recipe")
+    return _validate_execution_semantics_identity(
+        {
+            "schema_version": 1,
+            "execution_semantics_sha256": value.sha256,
+            "registry_sha256": value.registry_sha256,
+            "cell_declaration_sha256": value.cell_declaration_sha256,
+            "activation_authority_binding_sha256": (
+                value.activation_authority_binding_sha256
+            ),
+            "activation_semantic_sha256": value.activation_semantic_sha256,
+            "e3a_selection_sha256": value.e3a_selection_sha256,
+            "load_binding_sha256": value.load_binding_sha256,
+            "registered_load_plan_sha256": value.registered_load_plan_sha256,
+            "registered_load_source_sha256": value.registered_load_source_sha256,
+            "registered_corpus_sha256": value.registered_corpus_sha256,
+            "registered_request_ids_sha256": value.registered_request_ids_sha256,
+            "registered_sampling_parameters_sha256": (
+                value.registered_sampling_parameters_sha256
+            ),
+            "registered_request_count": value.registered_request_count,
+            "adaptation_recipe_sha256": value.adaptation_recipe_sha256,
+            "registered_learning_rate": value.cell_declaration.identity.learning_rate,
+            "expected_method": value.expected_method,
+            "expected_model": value.expected_model,
+            "expected_backend": value.expected_backend,
+            "expected_task": value.expected_task,
+            "expected_model_max_context_length": (
+                value.expected_model_max_context_length
+            ),
+            "expected_runtime_context_length": value.expected_runtime_context_length,
+            "expected_concurrency": value.expected_concurrency,
+            "expected_draft_width": value.expected_draft_width,
+            "expected_draft_depth": value.expected_draft_depth,
+            "expected_speculation_enabled": value.expected_speculation_enabled,
+            "expected_scope": value.expected_scope,
+            "expected_parameterization": value.expected_parameterization,
+            "expected_rank": value.expected_rank,
+            "expected_optimizer": value.expected_optimizer,
+            "expected_learning_rate": value.expected_learning_rate,
+            "expected_schedule": value.expected_schedule,
+            "expected_cohort": value.expected_cohort,
+            "expected_cohort_count": value.expected_cohort_count,
+            "expected_workload_seed": value.expected_workload_seed,
+            "expected_runtime_random_seed": value.expected_runtime_random_seed,
+            "expected_sampling_profile_sha256": (
+                value.expected_sampling_profile_sha256
+            ),
+            "expected_regime": value.expected_regime,
+            "expected_arrival": value.expected_arrival,
+            "expected_slo": value.expected_slo,
+            "expected_topology": value.expected_topology,
+            "expected_adaptation_config": recipe.to_adaptation_config().model_dump(
+                mode="json"
+            ),
+        }
+    )
+
+
+def _canonical_semantics_value(value: object) -> object:
+    if isinstance(value, Enum):
+        return _canonical_semantics_value(value.value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _canonical_semantics_value(getattr(value, field.name))
+            for field in dataclass_fields(value)
+        }
+    if isinstance(value, Mapping):
+        if not all(type(key) is str for key in value):
+            raise TypeError("execution semantics mappings require string keys")
+        return {key: _canonical_semantics_value(value[key]) for key in sorted(value)}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_semantics_value(item) for item in value]
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("execution semantics cannot contain non-finite numbers")
+        return 0.0 if value == 0 else value
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    raise TypeError(f"unsupported execution semantics value {type(value).__name__}")
+
+
+def _execution_semantics_payload(value: object) -> dict[str, Any]:
+    payload = _canonical_semantics_value(value)
+    if type(payload) is not dict:
+        raise TypeError("execution semantics must canonicalize to a JSON object")
+    return payload
+
+
+def _validate_execution_semantics_payload(
+    value: object,
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _strict_object(
+        "trainable-plan execution semantics payload",
+        value,
+        _EXECUTION_SEMANTICS_PAYLOAD_FIELDS,
+    )
+    _validate_json_value(payload)
+    if _content_sha256(payload) != identity["execution_semantics_sha256"]:
+        raise ValueError(
+            "execution semantics payload differs from the expected semantic digest"
+        )
+    direct_fields = _EXECUTION_SEMANTICS_FIELDS - {
+        "execution_semantics_sha256",
+        "registered_learning_rate",
+        "expected_adaptation_config",
+    }
+    if any(
+        payload[name] != identity[name]
+        or type(payload[name]) is not type(identity[name])
+        for name in direct_fields
+    ):
+        raise ValueError(
+            "execution semantics identity differs from its canonical payload"
+        )
+    cell = payload["cell_declaration"]
+    cell_identity = cell.get("identity") if type(cell) is dict else None
+    if (
+        type(cell_identity) is not dict
+        or cell_identity.get("learning_rate") != identity["registered_learning_rate"]
+        or type(cell_identity.get("learning_rate"))
+        is not type(identity["registered_learning_rate"])
+    ):
+        raise ValueError(
+            "registered learning-rate domain differs from the cell declaration"
+        )
+    recipe = payload["adaptation_recipe"]
+    optimizer = recipe.get("optimizer") if type(recipe) is dict else None
+    if type(recipe) is not dict or type(optimizer) is not dict:
+        raise TypeError("execution semantics recipe payload is invalid")
+    try:
+        expected_adaptation = {
+            name: (
+                {field: optimizer[field] for field in _OPTIMIZER_CONFIG_FIELDS}
+                if name == "optimizer"
+                else recipe[name]
+            )
+            for name in _ADAPTATION_CONFIG_FIELDS
+        }
+    except KeyError as error:
+        raise ValueError("execution semantics recipe payload is incomplete") from error
+    if expected_adaptation != identity["expected_adaptation_config"]:
+        raise ValueError(
+            "execution adaptation config differs from the registered recipe payload"
+        )
+    return payload
+
+
 @dataclass(frozen=True)
 class _MetadataTensor:
     shape: tuple[int, ...]
@@ -762,6 +1132,10 @@ class _ExecutionIdentity:
     split_sha256: str
     cell_id: str
     cell_declaration_sha256: str
+    execution_semantics: dict[str, Any]
+    execution_semantics_payload: dict[str, Any]
+    execution_semantics_sha256: str
+    execution_semantics_identity_sha256: str
 
 
 def _execution_identity(
@@ -769,17 +1143,44 @@ def _execution_identity(
     run_config: TrainablePlanRawJsonBinding,
     split: TrainablePlanRawJsonBinding,
     cell: TrainablePlanRawJsonBinding,
+    execution_semantics: object,
+    serialized_execution_semantics_payload: object = None,
 ) -> _ExecutionIdentity:
     # Import lazily: config.schema imports adaptation.parameters while the
     # adaptation package is initialized.
     from lightcone_spec.config import run_config_sha256
     from lightcone_spec.config.schema import RunConfig
+    from lightcone_spec.experiments.execution_semantics import (
+        CellExecutionSemantics,
+    )
     from lightcone_spec.experiments.registry import (
         CellIdentity,
         CellStatus,
         ExperimentCell,
         ResourceClaim,
         WorkloadClass,
+    )
+
+    semantic_authority = (
+        execution_semantics
+        if type(execution_semantics) is CellExecutionSemantics
+        else None
+    )
+    if semantic_authority is not None:
+        semantics = _execution_semantics_identity(semantic_authority)
+    elif serialized_execution_semantics_payload is not None:
+        semantics = _validate_execution_semantics_identity(execution_semantics)
+    else:
+        raise ValueError(
+            "adapted E1 authority requires onsite-reduced execution semantics"
+        )
+    semantics_payload = _validate_execution_semantics_payload(
+        (
+            _execution_semantics_payload(semantic_authority)
+            if semantic_authority is not None
+            else serialized_execution_semantics_payload
+        ),
+        identity=semantics,
     )
 
     raw_config = run_config.load()
@@ -881,28 +1282,107 @@ def _execution_identity(
         raise ValueError("trainable-plan cell declaration is not canonical")
     if not registered_cell.runnable:
         raise ValueError("trainable-plan authority requires a runnable registry cell")
+    if identity["experiment"] != "E1":
+        raise ValueError(
+            "trainable-plan execution semantics support only activated E1 cells"
+        )
+    if semantics["cell_declaration_sha256"] != registered_cell.sha256 or (
+        semantic_authority is not None
+        and semantic_authority.cell_declaration != registered_cell
+    ):
+        raise ValueError("registry cell differs from onsite execution semantics")
+
     expected_alpha_over_rank = (
         None
         if adaptation.weight_update_mode == "full"
         else adaptation.lora_alpha / adaptation.rank
     )
-    if (
-        identity["method"] != config.method
-        or identity["model"] != config.model.target
-        or identity["backend"] != config.model.algorithm
-        or identity["scope"] != adaptation.parameter_scope
-        or identity["rank"] != adaptation.rank
-        or identity["alpha_over_rank"] != expected_alpha_over_rank
-        or identity["optimizer"] != optimizer
-        or identity["learning_rate"] != adaptation.optimizer.learning_rate
-        or identity["schedule"] != adaptation.optimizer.schedule
-        or identity["context"] != config.runtime.context_length
-        or identity["width"] != config.runtime.speculative_num_draft_tokens
-        or identity["seed"] != config.runtime.random_seed
-        or identity["concurrency"] != config.runtime.max_running_requests
-        or identity["parameterization"] != adaptation.weight_update_mode
+    scientific_actual = (
+        identity["method"],
+        identity["model"],
+        identity["backend"],
+        identity["task"],
+        identity["context"],
+        identity["concurrency"],
+        identity["width"],
+        identity["scope"],
+        identity["parameterization"],
+        identity["rank"],
+        identity["alpha_over_rank"],
+        identity["optimizer"],
+        identity["learning_rate"],
+        identity["schedule"],
+        identity["cohort"],
+        identity["cohort_count"],
+        identity["seed"],
+        identity["regime"],
+        identity["arrival"],
+        identity["slo"],
+        identity["topology"],
+    )
+    scientific_expected = (
+        semantics["expected_method"],
+        semantics["expected_model"],
+        semantics["expected_backend"],
+        semantics["expected_task"],
+        semantics["expected_model_max_context_length"],
+        semantics["expected_concurrency"],
+        semantics["expected_draft_width"],
+        semantics["expected_scope"],
+        semantics["expected_parameterization"],
+        semantics["expected_rank"],
+        expected_alpha_over_rank,
+        semantics["expected_optimizer"],
+        semantics["registered_learning_rate"],
+        semantics["expected_schedule"],
+        semantics["expected_cohort"],
+        semantics["expected_cohort_count"],
+        semantics["expected_workload_seed"],
+        semantics["expected_regime"],
+        semantics["expected_arrival"],
+        semantics["expected_slo"],
+        semantics["expected_topology"],
+    )
+    if scientific_actual != scientific_expected or any(
+        type(actual) is not type(expected)
+        for actual, expected in zip(scientific_actual, scientific_expected, strict=True)
     ):
-        raise ValueError("registry cell differs from its exact adaptive run config")
+        raise ValueError("registry cell differs from onsite execution semantics")
+
+    expected_adaptation = semantics["expected_adaptation_config"]
+    if (
+        config.method != semantics["expected_method"]
+        or config.model.target != semantics["expected_model"]
+        or config.model.algorithm != semantics["expected_backend"]
+        or config.model.max_context_length
+        != semantics["expected_model_max_context_length"]
+        or config.model.draft_depth != semantics["expected_draft_depth"]
+        or config.runtime.context_length != semantics["expected_runtime_context_length"]
+        or config.runtime.max_running_requests != semantics["expected_concurrency"]
+        or config.runtime.speculative_num_draft_tokens
+        != semantics["expected_draft_width"]
+        or config.runtime.speculation_enabled
+        is not semantics["expected_speculation_enabled"]
+        or config.runtime.random_seed != semantics["expected_runtime_random_seed"]
+        or config.runtime.sampling_profile_sha256
+        != semantics["expected_sampling_profile_sha256"]
+        or raw_config["adaptation"] != expected_adaptation
+        or adaptation.parameter_scope != semantics["expected_scope"]
+        or adaptation.weight_update_mode != semantics["expected_parameterization"]
+        or adaptation.rank != semantics["expected_rank"]
+        or optimizer != semantics["expected_optimizer"]
+        or adaptation.optimizer.learning_rate != semantics["expected_learning_rate"]
+        or adaptation.optimizer.schedule != semantics["expected_schedule"]
+        or adaptation.adaptation_group_id != semantics["expected_cohort"]
+    ):
+        raise ValueError("RunConfig differs from onsite execution semantics")
+    if semantic_authority is not None:
+        try:
+            semantic_authority.validate_run_config(config)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "RunConfig differs from onsite execution semantics"
+            ) from error
     # Force the split through the strict raw loader even though its scientific
     # schema remains owned by the execution bundle.
     split.load()
@@ -922,6 +1402,10 @@ def _execution_identity(
         split_sha256=split.semantic_sha256,
         cell_id=registered_cell.cell_id,
         cell_declaration_sha256=registered_cell.sha256,
+        execution_semantics=semantics,
+        execution_semantics_payload=semantics_payload,
+        execution_semantics_sha256=semantics["execution_semantics_sha256"],
+        execution_semantics_identity_sha256=_content_sha256(semantics),
     )
 
 
@@ -1173,7 +1657,7 @@ def _manifest_value(
         **plan.predict_memory(execution.optimizer).to_dict(),
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "trainable_plan_authority_manifest",
         "reducer_protocol_sha256": TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256,
         "model_lock_artifact": model_lock.path,
@@ -1191,6 +1675,12 @@ def _manifest_value(
         "split_sha256": execution.split_sha256,
         "cell_id": execution.cell_id,
         "cell_declaration_sha256": execution.cell_declaration_sha256,
+        "execution_semantics": execution.execution_semantics,
+        "execution_semantics_payload": execution.execution_semantics_payload,
+        "execution_semantics_sha256": execution.execution_semantics_sha256,
+        "execution_semantics_identity_sha256": (
+            execution.execution_semantics_identity_sha256
+        ),
         "target_model_id": execution.target_model_id,
         "target_revision": execution.target_revision,
         "drafter_model_id": inventory.drafter_model_id,
@@ -1225,7 +1715,7 @@ def _selector_from_manifest(
     row = _strict_object("trainable-plan authority manifest", value, _MANIFEST_FIELDS)
     if (
         type(row["schema_version"]) is not int
-        or row["schema_version"] != 1
+        or row["schema_version"] != 2
         or type(row["kind"]) is not str
         or row["kind"] != "trainable_plan_authority_manifest"
         or row["reducer_protocol_sha256"] != TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256
@@ -1240,6 +1730,8 @@ def _selector_from_manifest(
         "split_sha256",
         "cell_id",
         "cell_declaration_sha256",
+        "execution_semantics_sha256",
+        "execution_semantics_identity_sha256",
         "entries_sha256",
         "frozen_names_sha256",
         "state_layout_sha256",
@@ -1248,6 +1740,16 @@ def _selector_from_manifest(
         "trainable_plan_sha256",
     ):
         _require_sha256(f"manifest {name}", row[name])
+    semantics = _validate_execution_semantics_identity(row["execution_semantics"])
+    _validate_execution_semantics_payload(
+        row["execution_semantics_payload"], identity=semantics
+    )
+    if row["execution_semantics_sha256"] != semantics[
+        "execution_semantics_sha256"
+    ] or row["execution_semantics_identity_sha256"] != _content_sha256(semantics):
+        raise ValueError(
+            "manifest execution semantics differ from their bound identities"
+        )
     _strict_text("manifest backend", row["backend"])
     _strict_text("manifest mode", row["mode"])
     _strict_text("manifest scope", row["scope"])
@@ -1301,6 +1803,7 @@ def materialize_trainable_plan_authority_manifest(
     prepared_model_content_authority: (
         PreparedModelContentAuthorityBinding | None
     ) = None,
+    execution_semantics: object = None,
 ) -> dict[str, object]:
     """Derive the canonical manifest; callers still publish it immutably."""
 
@@ -1321,7 +1824,12 @@ def materialize_trainable_plan_authority_manifest(
         cell_artifact, role="trainable_plan_cell"
     )
     serialized_inventory = PreparedDrafterParameterInventory.from_dict(prepared.load())
-    execution = _execution_identity(run_config=run_config, split=split, cell=cell)
+    execution = _execution_identity(
+        run_config=run_config,
+        split=split,
+        cell=cell,
+        execution_semantics=execution_semantics,
+    )
     locked = _validate_model_lock(
         model_lock.load(),
         source=model_lock,
@@ -1387,6 +1895,8 @@ class TrainablePlanAuthorityBinding:
     split_sha256: str
     cell_id: str
     cell_declaration_sha256: str
+    execution_semantics_sha256: str
+    execution_semantics_identity_sha256: str
     target_model_id: str
     target_revision: str
     drafter_model_id: str
@@ -1409,7 +1919,7 @@ class TrainablePlanAuthorityBinding:
     def __post_init__(self) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version != 1
+            or self.schema_version != 2
             or type(self.kind) is not str
             or self.kind != "trainable_plan_authority_binding"
         ):
@@ -1441,6 +1951,8 @@ class TrainablePlanAuthorityBinding:
             "split_sha256",
             "cell_id",
             "cell_declaration_sha256",
+            "execution_semantics_sha256",
+            "execution_semantics_identity_sha256",
             "entries_sha256",
             "frozen_names_sha256",
             "state_layout_sha256",
@@ -1520,6 +2032,10 @@ class TrainablePlanAuthorityBinding:
             "split_sha256": self.split_sha256,
             "cell_id": self.cell_id,
             "cell_declaration_sha256": self.cell_declaration_sha256,
+            "execution_semantics_sha256": self.execution_semantics_sha256,
+            "execution_semantics_identity_sha256": (
+                self.execution_semantics_identity_sha256
+            ),
             "target_model_id": self.target_model_id,
             "target_revision": self.target_revision,
             "drafter_model_id": self.drafter_model_id,
@@ -1575,6 +2091,10 @@ class TrainablePlanAuthorityBinding:
             split_sha256=row["split_sha256"],
             cell_id=row["cell_id"],
             cell_declaration_sha256=row["cell_declaration_sha256"],
+            execution_semantics_sha256=row["execution_semantics_sha256"],
+            execution_semantics_identity_sha256=row[
+                "execution_semantics_identity_sha256"
+            ],
             target_model_id=row["target_model_id"],
             target_revision=row["target_revision"],
             drafter_model_id=row["drafter_model_id"],
@@ -1660,7 +2180,7 @@ def _binding_from_replay(
         **plan.predict_memory(execution.optimizer).to_dict(),
     }
     return TrainablePlanAuthorityBinding(
-        schema_version=1,
+        schema_version=2,
         kind="trainable_plan_authority_binding",
         manifest=manifest,
         model_lock=model_lock,
@@ -1679,6 +2199,10 @@ def _binding_from_replay(
         split_sha256=execution.split_sha256,
         cell_id=execution.cell_id,
         cell_declaration_sha256=execution.cell_declaration_sha256,
+        execution_semantics_sha256=execution.execution_semantics_sha256,
+        execution_semantics_identity_sha256=(
+            execution.execution_semantics_identity_sha256
+        ),
         target_model_id=execution.target_model_id,
         target_revision=execution.target_revision,
         drafter_model_id=inventory.drafter_model_id,
@@ -1723,7 +2247,15 @@ def _replay(
     serialized_inventory = PreparedDrafterParameterInventory.from_dict(
         prepared_drafter.load()
     )
-    execution = _execution_identity(run_config=run_config, split=split, cell=cell)
+    execution = _execution_identity(
+        run_config=run_config,
+        split=split,
+        cell=cell,
+        execution_semantics=manifest_row["execution_semantics"],
+        serialized_execution_semantics_payload=manifest_row[
+            "execution_semantics_payload"
+        ],
+    )
     locked = _validate_model_lock(
         model_lock.load(),
         source=model_lock,
@@ -1797,6 +2329,7 @@ def bind_trainable_plan_authority(
     prepared_model_content_authority: (
         PreparedModelContentAuthorityBinding | None
     ) = None,
+    expected_execution_semantics_sha256: str | None = None,
 ) -> TrainablePlanAuthorityBinding:
     """Bind and replay a path manifest before returning formal authority."""
 
@@ -1804,6 +2337,15 @@ def bind_trainable_plan_authority(
         manifest_path, role="trainable_plan_authority_manifest"
     )
     row, _ = _selector_from_manifest(manifest.load())
+    if expected_execution_semantics_sha256 is None:
+        raise ValueError(
+            "expected execution semantics SHA-256 is required for adapted execution"
+        )
+    _require_sha256("expected execution semantics", expected_execution_semantics_sha256)
+    if row["execution_semantics_sha256"] != expected_execution_semantics_sha256:
+        raise ValueError(
+            "trainable-plan manifest differs from expected execution semantics"
+        )
     model_lock = TrainablePlanRawJsonBinding.from_path(
         _resolved_absolute_path(
             row["model_lock_artifact"], label="manifest model lock"
@@ -1885,6 +2427,7 @@ def audit_trainable_plan_authority_for_method(
     expected_split_sha256: str | None = None,
     expected_cell_id: str | None = None,
     expected_cell_declaration_sha256: str | None = None,
+    expected_execution_semantics_sha256: str | None = None,
     expected_target_model_id: str | None = None,
     expected_target_revision: str | None = None,
     expected_drafter_model_id: str | None = None,
@@ -1901,8 +2444,10 @@ def audit_trainable_plan_authority_for_method(
     if type(method) is not str:
         raise TypeError("trainable-plan method must be a string")
     if method in {"target_only", "static"}:
-        if authority is not None:
-            raise ValueError(f"{method} must not carry trainable-plan authority")
+        if authority is not None or expected_execution_semantics_sha256 is not None:
+            raise ValueError(
+                f"{method} must not carry trainable-plan or execution-semantics authority"
+            )
         return None
     if method not in {"tts", "l0"}:
         raise ValueError("trainable-plan authority supports only core TTS/L0 methods")
@@ -1918,6 +2463,7 @@ def audit_trainable_plan_authority_for_method(
         ("expected split", expected_split_sha256),
         ("expected cell ID", expected_cell_id),
         ("expected cell declaration", expected_cell_declaration_sha256),
+        ("expected execution semantics", expected_execution_semantics_sha256),
         ("expected target model ID", expected_target_model_id),
         ("expected target revision", expected_target_revision),
         ("expected drafter model ID", expected_drafter_model_id),
@@ -1938,6 +2484,7 @@ def audit_trainable_plan_authority_for_method(
     _require_sha256("expected split", expected_split_sha256)
     _require_sha256("expected cell ID", expected_cell_id)
     _require_sha256("expected cell declaration", expected_cell_declaration_sha256)
+    _require_sha256("expected execution semantics", expected_execution_semantics_sha256)
     _require_revision("expected target revision", expected_target_revision)
     _require_revision(
         "expected prepared drafter revision", expected_prepared_drafter_revision
@@ -1950,6 +2497,7 @@ def audit_trainable_plan_authority_for_method(
         result.binding.split_sha256,
         result.binding.cell_id,
         result.binding.cell_declaration_sha256,
+        result.binding.execution_semantics_sha256,
         result.binding.target_model_id,
         result.binding.target_revision,
         result.binding.drafter_model_id,
@@ -1969,6 +2517,7 @@ def audit_trainable_plan_authority_for_method(
         expected_split_sha256,
         expected_cell_id,
         expected_cell_declaration_sha256,
+        expected_execution_semantics_sha256,
         expected_target_model_id,
         expected_target_revision,
         expected_drafter_model_id,
@@ -1996,6 +2545,7 @@ def require_trainable_plan_authority_for_method(
     expected_split_sha256: str | None = None,
     expected_cell_id: str | None = None,
     expected_cell_declaration_sha256: str | None = None,
+    expected_execution_semantics_sha256: str | None = None,
     expected_target_model_id: str | None = None,
     expected_target_revision: str | None = None,
     expected_drafter_model_id: str | None = None,
@@ -2010,7 +2560,11 @@ def require_trainable_plan_authority_for_method(
     """Require a source-owned release pin before returning an executable plan."""
 
     if method in {"target_only", "static"}:
-        return audit_trainable_plan_authority_for_method(method, authority)
+        return audit_trainable_plan_authority_for_method(
+            method,
+            authority,
+            expected_execution_semantics_sha256=(expected_execution_semantics_sha256),
+        )
     if method not in {"tts", "l0"}:
         raise ValueError("trainable-plan authority supports only core TTS/L0 methods")
     if type(authority) is not TrainablePlanAuthorityBinding:
@@ -2036,6 +2590,7 @@ def require_trainable_plan_authority_for_method(
         expected_split_sha256=expected_split_sha256,
         expected_cell_id=expected_cell_id,
         expected_cell_declaration_sha256=expected_cell_declaration_sha256,
+        expected_execution_semantics_sha256=(expected_execution_semantics_sha256),
         expected_target_model_id=expected_target_model_id,
         expected_target_revision=expected_target_revision,
         expected_drafter_model_id=expected_drafter_model_id,

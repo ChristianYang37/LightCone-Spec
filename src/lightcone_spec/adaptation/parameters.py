@@ -46,12 +46,12 @@ def _content_sha256(value: object) -> str:
 
 TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256 = _content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "trainable_parameter_plan_reducer_protocol",
         "sources": (
             "path_bound_model_lock_first_party_prepared_snapshot_content_"
             "authority_safetensors_index_headers_run_config_split_and_"
-            "registry_cell_v2"
+            "registry_cell_plus_onsite_reduced_e1_execution_semantics_v2"
         ),
         "selectors": {
             "DFLASH": "owned_floating_contiguous_registered_layer_scope_v1",
@@ -79,7 +79,8 @@ TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256 = _content_sha256(
         ),
         "identity": (
             "exact_cell_method_backend_scope_rank_alpha_optimizer_target_and_"
-            "drafter_revisions_cross_checked_against_run_config_and_model_lock"
+            "drafter_revisions_cross_checked_against_run_config_model_lock_and_"
+            "separate_registry_workload_runtime_sampling_and_recipe_domains"
         ),
         "allocation": "metadata_only_no_tensor_allocation",
     }

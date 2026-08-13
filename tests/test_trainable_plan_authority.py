@@ -4,9 +4,16 @@ import hashlib
 import json
 import os
 import struct
+from dataclasses import replace
+from functools import cache
 from pathlib import Path
 
 import pytest
+from test_execution_semantics import (
+    _activation_authority,
+    _e3a_selection_and_receipt,
+    _load_binding,
+)
 
 from lightcone_spec.adaptation import (
     TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256,
@@ -23,18 +30,18 @@ from lightcone_spec.adaptation import (
 from lightcone_spec.adaptation.parameters import DFlashParameterPlan, ParameterEntry
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import (
-    AdaptationConfig,
     ModelPair,
-    OptimizerConfig,
     RunConfig,
     RuntimeConfig,
 )
+from lightcone_spec.experiments.execution_semantics import (
+    CellExecutionSemantics,
+    resolve_cell_execution_semantics,
+)
+from lightcone_spec.experiments.planning import reduce_e1_activation
 from lightcone_spec.experiments.registry import (
-    CellIdentity,
-    CellStatus,
     ExperimentCell,
-    ResourceClaim,
-    WorkloadClass,
+    build_industrial_registry,
     content_sha256,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
@@ -125,6 +132,34 @@ def _cell_to_dict(cell: ExperimentCell) -> dict[str, object]:
     }
 
 
+@cache
+def _e1_execution_semantics(method: str, mode: str) -> CellExecutionSemantics:
+    registry = build_industrial_registry()
+    selection, receipt = _e3a_selection_and_receipt(registry)
+    activation = reduce_e1_activation(
+        registry,
+        e3a_receipt=receipt,
+        selection=selection,
+    )
+    authority = _activation_authority(registry, selection, activation)
+    expected_rank = 2 if mode == "lora" else None
+    cell = next(
+        candidate
+        for candidate in registry.cells_for("E1")
+        if candidate.identity.method == method
+        and candidate.identity.scope == "last1"
+        and candidate.identity.parameterization == mode
+        and candidate.identity.rank == expected_rank
+        and candidate.identity.optimizer == "adamw"
+        and "width=8:concurrency=4" in candidate.identity.variant
+    )
+    return resolve_cell_execution_semantics(
+        activation=authority,
+        load_binding=_load_binding(cell),
+        cell=cell,
+    )
+
+
 def _inputs(
     tmp_path: Path,
     *,
@@ -136,6 +171,11 @@ def _inputs(
     drafter_revision: str = "2" * 40,
 ) -> dict[str, object]:
     tmp_path.mkdir(parents=True, exist_ok=True)
+    execution_semantics = _e1_execution_semantics(method, mode)
+    if target_id != execution_semantics.expected_model:
+        raise ValueError("test model differs from registered E1 execution semantics")
+    recipe = execution_semantics.adaptation_recipe
+    assert recipe is not None
     model_lock = ModelLock(
         schema_version=2,
         models=(
@@ -213,73 +253,26 @@ def _inputs(
             drafter=drafter_id,
             target_revision=target_revision,
             drafter_revision=drafter_revision,
-            algorithm="DFLASH",
-            max_context_length=40960,
-            draft_depth=15,
+            algorithm=execution_semantics.expected_backend,
+            max_context_length=(execution_semantics.expected_model_max_context_length),
+            draft_depth=execution_semantics.expected_draft_depth,
         ),
         runtime=RuntimeConfig(
-            sampling_profile_sha256="3" * 64,
-            speculation_enabled=True,
-            speculative_num_draft_tokens=16,
-            max_running_requests=1,
-        ),
-        adaptation=AdaptationConfig(
-            weight_update_mode=mode,
-            parameter_scope="last1",
-            adaptation_group_id="authority-cohort",
-            optimizer=OptimizerConfig(
-                name="adamw",
-                learning_rate=1e-4,
-                weight_decay=0.01,
+            context_length=execution_semantics.expected_runtime_context_length,
+            random_seed=execution_semantics.expected_runtime_random_seed,
+            sampling_profile_sha256=(
+                execution_semantics.expected_sampling_profile_sha256
             ),
-            rank=2 if mode == "lora" else None,
-            lora_alpha=2 if mode == "lora" else None,
-            stride=10,
-            canvas_tokens=16,
+            speculation_enabled=(execution_semantics.expected_speculation_enabled),
+            speculative_num_draft_tokens=(execution_semantics.expected_draft_width),
+            max_running_requests=execution_semantics.expected_concurrency,
         ),
+        adaptation=recipe.to_adaptation_config(),
     )
     run_config_path = (tmp_path / "run-config.json").resolve()
     _write_bound_json(run_config_path, config.model_dump(mode="json"))
 
-    identity = CellIdentity(
-        experiment="E1",
-        model=target_id,
-        backend="DFLASH",
-        task="GSM8K",
-        method=method,
-        scope="last1",
-        rank=2 if mode == "lora" else None,
-        alpha_over_rank=1.0 if mode == "lora" else None,
-        optimizer="adamw",
-        learning_rate=1e-4,
-        schedule="constant",
-        context=40960,
-        regime="latency_sensitive",
-        width=16,
-        arrival="closed_loop",
-        slo="registered",
-        cohort="K=1:uniform",
-        topology="tp1_dp1",
-        seed=1,
-        block=0,
-        gpu_uuids=("GPU-authority",),
-        parameterization=mode,
-        variant="authority-test",
-        concurrency=1,
-    )
-    cell = ExperimentCell(
-        identity=identity,
-        resources=ResourceClaim(
-            gpu_uuids=identity.gpu_uuids,
-            ports=(31000,),
-            cache_root="authority-cache",
-            evidence_root="authority-evidence",
-            workload_class=WorkloadClass.HEADLINE,
-        ),
-        status=CellStatus.UNMEASURED,
-        reason_code="awaiting_registered_measurement",
-        reason="No complete content-bound measurement exists.",
-    )
+    cell = execution_semantics.cell_declaration
     cell_path = (tmp_path / "cell.json").resolve()
     _write_bound_json(cell_path, _cell_to_dict(cell))
 
@@ -325,12 +318,14 @@ def _inputs(
         split_artifact=split_path,
         cell_artifact=cell_path,
         prepared_model_content_authority=content_authority,
+        execution_semantics=execution_semantics,
     )
     manifest_path = (tmp_path / "trainable-plan-authority.json").resolve()
     _write_bound_json(manifest_path, manifest)
     binding = bind_trainable_plan_authority(
         manifest_path,
         prepared_model_content_authority=content_authority,
+        expected_execution_semantics_sha256=execution_semantics.sha256,
     )
     return {
         "binding": binding,
@@ -348,6 +343,7 @@ def _inputs(
         "split_path": split_path,
         "cell": cell,
         "cell_path": cell_path,
+        "execution_semantics": execution_semantics,
     }
 
 
@@ -361,6 +357,7 @@ def _expected(binding: TrainablePlanAuthorityBinding) -> dict[str, object]:
         "expected_split_sha256": binding.split_sha256,
         "expected_cell_id": binding.cell_id,
         "expected_cell_declaration_sha256": binding.cell_declaration_sha256,
+        "expected_execution_semantics_sha256": (binding.execution_semantics_sha256),
         "expected_target_model_id": binding.target_model_id,
         "expected_target_revision": binding.target_revision,
         "expected_drafter_model_id": binding.drafter_model_id,
@@ -385,6 +382,18 @@ def test_raw_authority_replays_selector_state_memory_and_strict_codec(
     assert binding.prepared_model_content_manifest_sha256 == (
         values["prepared_model_content_authority"].release_manifest_sha256
     )
+    semantics = values["execution_semantics"]
+    assert isinstance(semantics, CellExecutionSemantics)
+    assert binding.schema_version == 2
+    assert binding.execution_semantics_sha256 == semantics.sha256
+    assert values["cell"].identity.learning_rate is None
+    assert values["run_config"].adaptation.optimizer.learning_rate == (
+        semantics.expected_learning_rate
+    )
+    assert values["cell"].identity.context != (
+        values["run_config"].runtime.context_length
+    )
+    assert values["cell"].identity.seed != values["run_config"].runtime.random_seed
     assert result.plan.sha256 == binding.trainable_plan_sha256
     assert result.plan.state_layout_sha256 == binding.state_layout_sha256
     assert result.plan.allocation_memory_sha256 == binding.allocation_memory_sha256
@@ -397,6 +406,11 @@ def test_raw_authority_replays_selector_state_memory_and_strict_codec(
     assert PreparedDrafterParameterInventory.from_dict(values["prepared"]) == (
         result.prepared_drafter
     )
+    with pytest.raises(ValueError, match="expected execution semantics"):
+        bind_trainable_plan_authority(
+            values["manifest_path"],
+            prepared_model_content_authority=values["prepared_model_content_authority"],
+        )
     encoded = trainable_plan_authority_binding_to_dict(binding)
     assert trainable_plan_authority_binding_from_dict(encoded) == binding
     with pytest.raises(ValueError, match="fields differ"):
@@ -426,8 +440,33 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
         assert require_trainable_plan_authority_for_method(method, None) is None
         with pytest.raises(ValueError, match="must not carry"):
             require_trainable_plan_authority_for_method(method, binding)
+        with pytest.raises(ValueError, match="must not carry"):
+            require_trainable_plan_authority_for_method(
+                method,
+                None,
+                expected_execution_semantics_sha256=binding.execution_semantics_sha256,
+            )
     with pytest.raises(ValueError, match="requires exact path-bound"):
         require_trainable_plan_authority_for_method("l0", None)
+    with pytest.raises(ValueError, match="expected execution semantics"):
+        audit_trainable_plan_authority_for_method(
+            "tts",
+            binding,
+            **{
+                key: value
+                for key, value in _expected(binding).items()
+                if key != "expected_execution_semantics_sha256"
+            },
+        )
+    with pytest.raises(ValueError, match="differs"):
+        audit_trainable_plan_authority_for_method(
+            "tts",
+            binding,
+            **{
+                **_expected(binding),
+                "expected_execution_semantics_sha256": "f" * 64,
+            },
+        )
     with pytest.raises(ValueError, match="differs"):
         audit_trainable_plan_authority_for_method(
             "tts",
@@ -461,6 +500,7 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
             run_config_artifact=values["run_config_path"],
             split_artifact=values["split_path"],
             cell_artifact=values["cell_path"],
+            execution_semantics=values["execution_semantics"],
         )
 
     unavailable = _inputs(tmp_path / "unavailable-extractor")
@@ -479,6 +519,121 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
     ):
         audit_trainable_plan_authority_for_method(
             "tts", unavailable_binding, **_expected(unavailable_binding)
+        )
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ("context", "seed", "sampling", "learning_rate"),
+)
+def test_rehashed_scientific_domain_swaps_do_not_replace_e1_semantics(
+    tmp_path: Path,
+    domain: str,
+) -> None:
+    values = _inputs(tmp_path)
+    semantics = values["execution_semantics"]
+    config = values["run_config"]
+    cell = values["cell"]
+    assert isinstance(semantics, CellExecutionSemantics)
+    assert isinstance(config, RunConfig)
+    assert isinstance(cell, ExperimentCell)
+
+    if domain == "context":
+        cell = replace(
+            cell,
+            identity=replace(
+                cell.identity,
+                context=config.runtime.context_length,
+            ),
+        )
+    elif domain == "seed":
+        cell = replace(
+            cell,
+            identity=replace(
+                cell.identity,
+                seed=config.runtime.random_seed,
+            ),
+        )
+    elif domain == "learning_rate":
+        assert config.adaptation is not None
+        cell = replace(
+            cell,
+            identity=replace(
+                cell.identity,
+                learning_rate=config.adaptation.optimizer.learning_rate,
+            ),
+        )
+    else:
+        raw_config = config.model_dump(mode="json")
+        raw_config["runtime"]["sampling_profile_sha256"] = (
+            semantics.registered_sampling_parameters_sha256
+        )
+        config = RunConfig.model_validate(raw_config)
+
+    _write_bound_json(values["cell_path"], _cell_to_dict(cell))
+    _write_bound_json(
+        values["run_config_path"],
+        config.model_dump(mode="json"),
+    )
+    split = dict(values["split"])
+    split["cell_id"] = cell.cell_id
+    split["run_config_sha256"] = run_config_sha256(config)
+    _write_bound_json(values["split_path"], split)
+
+    with pytest.raises(ValueError, match="onsite execution semantics"):
+        materialize_trainable_plan_authority_manifest(
+            model_lock_artifact=values["model_lock_path"],
+            prepared_drafter_artifact=values["prepared_path"],
+            run_config_artifact=values["run_config_path"],
+            split_artifact=values["split_path"],
+            cell_artifact=values["cell_path"],
+            prepared_model_content_authority=values["prepared_model_content_authority"],
+            execution_semantics=semantics,
+        )
+
+
+def test_jointly_rehashed_semantics_payload_cannot_replace_onsite_digest(
+    tmp_path: Path,
+) -> None:
+    values = _inputs(tmp_path)
+    semantics = values["execution_semantics"]
+    assert isinstance(semantics, CellExecutionSemantics)
+    manifest = json.loads(json.dumps(values["manifest"]))
+    forged_payload = manifest["execution_semantics_payload"]
+    forged_identity = manifest["execution_semantics"]
+    forged_payload["expected_sampling_profile_sha256"] = "e" * 64
+    forged_sha256 = content_sha256(forged_payload)
+    forged_identity["expected_sampling_profile_sha256"] = "e" * 64
+    forged_identity["execution_semantics_sha256"] = forged_sha256
+    manifest["execution_semantics_sha256"] = forged_sha256
+    manifest["execution_semantics_identity_sha256"] = content_sha256(forged_identity)
+    _write_bound_json(values["manifest_path"], manifest)
+
+    with pytest.raises(ValueError, match="expected execution semantics"):
+        bind_trainable_plan_authority(
+            values["manifest_path"],
+            prepared_model_content_authority=values["prepared_model_content_authority"],
+            expected_execution_semantics_sha256=semantics.sha256,
+        )
+
+
+def test_e2_without_execution_semantics_remains_blocked(tmp_path: Path) -> None:
+    values = _inputs(tmp_path)
+    cell = values["cell"]
+    assert isinstance(cell, ExperimentCell)
+    e2_cell = replace(
+        cell,
+        identity=replace(cell.identity, experiment="E2"),
+    )
+    _write_bound_json(values["cell_path"], _cell_to_dict(e2_cell))
+    with pytest.raises(ValueError, match="onsite-reduced execution semantics"):
+        materialize_trainable_plan_authority_manifest(
+            model_lock_artifact=values["model_lock_path"],
+            prepared_drafter_artifact=values["prepared_path"],
+            run_config_artifact=values["run_config_path"],
+            split_artifact=values["split_path"],
+            cell_artifact=values["cell_path"],
+            prepared_model_content_authority=values["prepared_model_content_authority"],
         )
 
 
@@ -541,6 +696,7 @@ def test_jointly_rehashed_serialized_plan_cannot_replace_raw_reducer(
         bind_trainable_plan_authority(
             values["manifest_path"],
             prepared_model_content_authority=values["prepared_model_content_authority"],
+            expected_execution_semantics_sha256=values["execution_semantics"].sha256,
         )
 
     forged_source = _inputs(tmp_path / "caller-inventory")
@@ -567,6 +723,7 @@ def test_jointly_rehashed_serialized_plan_cannot_replace_raw_reducer(
             prepared_model_content_authority=forged_source[
                 "prepared_model_content_authority"
             ],
+            execution_semantics=forged_source["execution_semantics"],
         )
 
 
@@ -586,7 +743,10 @@ def test_model_revision_swap_and_raw_source_replacement_fail_closed(
     run_config = other["run_config"].model_dump(mode="json")
     run_config["model"]["target"] = "foreign/target"
     _write_bound_json(other["run_config_path"], run_config)
-    with pytest.raises(ValueError, match="run config is invalid|registry cell differs"):
+    with pytest.raises(
+        ValueError,
+        match="run config is invalid|registry cell differs|RunConfig differs",
+    ):
         materialize_trainable_plan_authority_manifest(
             model_lock_artifact=other["model_lock_path"],
             prepared_drafter_artifact=other["prepared_path"],
@@ -594,6 +754,7 @@ def test_model_revision_swap_and_raw_source_replacement_fail_closed(
             split_artifact=other["split_path"],
             cell_artifact=other["cell_path"],
             prepared_model_content_authority=other["prepared_model_content_authority"],
+            execution_semantics=other["execution_semantics"],
         )
 
     swapped = _inputs(
