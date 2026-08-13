@@ -196,6 +196,11 @@ def _require_text(name: str, value: str) -> None:
         raise ValueError(f"{name} must be non-empty single-line text")
 
 
+def _require_exact_text(name: str, value: object) -> None:
+    if type(value) is not str or not value.strip() or "\n" in value or "\r" in value:
+        raise ValueError(f"{name} must be exact non-empty single-line text")
+
+
 class CellStatus(str, Enum):
     """Truthful source-registry state; no status implies a measured value."""
 
@@ -675,7 +680,19 @@ class AdaptationRecipeLookupKey:
             "schedule",
             "cohort",
         ):
-            _require_text(f"adaptation recipe {name}", getattr(self, name))
+            _require_exact_text(f"adaptation recipe {name}", getattr(self, name))
+        for name in ("rank", "draft_width"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not int:
+                raise TypeError(f"adaptation recipe {name} must be an exact integer")
+        if self.alpha_over_rank is not None and type(self.alpha_over_rank) is not float:
+            raise TypeError("adaptation recipe alpha_over_rank must be an exact float")
+        if self.learning_rate is not None and type(self.learning_rate) is not float:
+            raise TypeError("adaptation recipe learning_rate must be an exact float")
+        if self.draft_width_selector is not None:
+            _require_exact_text(
+                "adaptation recipe draft-width selector", self.draft_width_selector
+            )
         if self.experiment not in {"E1", "E2"}:
             raise ValueError("adaptation recipes are registered only for E1/E2")
         if self.backend != "DFLASH":
@@ -765,6 +782,47 @@ _OPTIMIZER_RECIPE_FIELDS = frozenset(
     }
 )
 
+_E2_RECIPE_BLOCKER_FIELD_BY_CODE = {
+    "chronobelief_equation_unregistered": "optimizer.equation",
+    "e2_beta1_unregistered": "optimizer.beta1",
+    "e2_beta2_unregistered": "optimizer.beta2",
+    "e2_cosine_horizon_unregistered": ("optimizer.schedule_total_published_updates"),
+    "e2_epsilon_unregistered": "optimizer.epsilon",
+    "e2_extra_logical_delay_unregistered": "extra_logical_delay",
+    "e2_fixed_verification_budget_unregistered": "fixed_verification_budget",
+    "e2_grad_clip_unregistered": "optimizer.grad_clip",
+    "e2_learning_rate_unregistered": "optimizer.learning_rate",
+    "e2_momentum_unregistered": "optimizer.momentum",
+    "e2_muon_auxiliary_learning_rate_unregistered": (
+        "optimizer.muon_auxiliary_learning_rate"
+    ),
+    "e2_muon_auxiliary_weight_decay_unregistered": (
+        "optimizer.muon_auxiliary_weight_decay"
+    ),
+    "e2_muon_ns_steps_unregistered": "optimizer.muon_ns_steps",
+    "e2_teacher_row_policy_unregistered": "teacher_row_policy",
+    "e2_update_stride_unregistered": "stride",
+    "e2_verification_mode_unregistered": "verification_mode",
+    "e2_weight_decay_unregistered": "optimizer.weight_decay",
+}
+
+
+@dataclass(frozen=True)
+class AdaptationRecipeBlocker:
+    """One missing source-owned value in a blocked recipe declaration."""
+
+    field: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        _require_exact_text("adaptation recipe blocker field", self.field)
+        if type(self.reason_code) is not str or not _REASON_CODE(self.reason_code):
+            raise ValueError("adaptation recipe blocker reason code is invalid")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
 
 @dataclass(frozen=True)
 class OptimizerRecipeDeclaration:
@@ -786,10 +844,16 @@ class OptimizerRecipeDeclaration:
     unresolved_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        _require_text("optimizer recipe name", self.name)
-        _require_text("optimizer recipe schedule", self.schedule)
+        _require_exact_text("optimizer recipe name", self.name)
+        _require_exact_text("optimizer recipe schedule", self.schedule)
+        if self.name not in E2_OPTIMIZERS:
+            raise ValueError("optimizer recipe name is outside the registry")
         if self.schedule not in E2_SCHEDULES:
             raise ValueError("optimizer recipe schedule is outside the registry")
+        if type(self.unresolved_fields) is not tuple or any(
+            type(value) is not str for value in self.unresolved_fields
+        ):
+            raise TypeError("optimizer unresolved fields must be exact text tuples")
         if self.unresolved_fields != tuple(sorted(set(self.unresolved_fields))):
             raise ValueError("optimizer unresolved fields must be sorted and unique")
         if not set(self.unresolved_fields) <= _OPTIMIZER_RECIPE_FIELDS:
@@ -806,8 +870,15 @@ class OptimizerRecipeDeclaration:
             "muon_auxiliary_weight_decay",
         ):
             value = getattr(self, name)
-            if value is not None and not math.isfinite(value):
-                raise ValueError(f"optimizer recipe {name} must be finite")
+            if value is not None:
+                if type(value) is not float:
+                    raise TypeError(f"optimizer recipe {name} must be an exact float")
+                if not math.isfinite(value):
+                    raise ValueError(f"optimizer recipe {name} must be finite")
+        for name in ("muon_ns_steps", "schedule_total_published_updates"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not int:
+                raise TypeError(f"optimizer recipe {name} must be an exact integer")
         if self.learning_rate is not None and self.learning_rate <= 0:
             raise ValueError("optimizer recipe learning rate must be positive")
         if self.weight_decay is not None and self.weight_decay < 0:
@@ -870,8 +941,56 @@ class OptimizerRecipeDeclaration:
 
 
 _ADAPTATION_RECIPE_FIELDS = frozenset(
-    {"stride", "canvas_tokens", "extra_logical_delay"}
+    {
+        "stride",
+        "canvas_tokens",
+        "extra_logical_delay",
+        "teacher_row_policy",
+        "verification_mode",
+        "fixed_verification_budget",
+    }
 )
+
+_E2_REQUIRED_ADAPTATION_UNRESOLVED_FIELDS = frozenset(
+    {
+        "stride",
+        "extra_logical_delay",
+        "teacher_row_policy",
+        "verification_mode",
+        "fixed_verification_budget",
+    }
+)
+
+
+def _e2_required_optimizer_unresolved_fields(
+    *, optimizer: str, schedule: str
+) -> frozenset[str]:
+    fields = {
+        "learning_rate",
+        "weight_decay",
+        "beta1",
+        "beta2",
+        "epsilon",
+        "grad_clip",
+    }
+    if optimizer == "chronobelief":
+        fields.update(_OPTIMIZER_RECIPE_FIELDS)
+        if schedule != "cosine_to_zero":
+            fields.discard("schedule_total_published_updates")
+        return frozenset(fields)
+    if optimizer in {"sgdm", "nag", "muon"}:
+        fields.add("momentum")
+    if optimizer == "muon":
+        fields.update(
+            {
+                "muon_ns_steps",
+                "muon_auxiliary_learning_rate",
+                "muon_auxiliary_weight_decay",
+            }
+        )
+    if schedule == "cosine_to_zero":
+        fields.add("schedule_total_published_updates")
+    return frozenset(fields)
 
 
 @dataclass(frozen=True)
@@ -897,8 +1016,8 @@ class AdaptationRecipeDeclaration:
     canvas_tokens: int | None
     loss_position_decay: float
     extra_logical_delay: int | None
-    teacher_row_policy: str
-    verification_mode: str
+    teacher_row_policy: str | None
+    verification_mode: str | None
     fixed_verification_budget: int | None
     confidence_loss_weight: float | None
     status: str
@@ -906,8 +1025,12 @@ class AdaptationRecipeDeclaration:
     unresolved_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("only adaptation recipe declaration schema 1 is supported")
+        if type(self.lookup_key) is not AdaptationRecipeLookupKey:
+            raise TypeError("adaptation recipe requires an exact lookup key")
+        if type(self.optimizer) is not OptimizerRecipeDeclaration:
+            raise TypeError("adaptation recipe requires an exact optimizer declaration")
         for name in (
             "source_authority",
             "weight_update_mode",
@@ -917,12 +1040,45 @@ class AdaptationRecipeDeclaration:
             "adaptation_group_id",
             "lora_matrix_policy",
             "native_head_policy",
-            "teacher_row_policy",
-            "verification_mode",
         ):
-            _require_text(f"adaptation recipe {name}", getattr(self, name))
-        if not _LOWER_SHA256(self.source_authority_sha256):
+            _require_exact_text(f"adaptation recipe {name}", getattr(self, name))
+        for name in ("teacher_row_policy", "verification_mode"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_exact_text(f"adaptation recipe {name}", value)
+        if type(self.source_authority_sha256) is not str or not _LOWER_SHA256(
+            self.source_authority_sha256
+        ):
             raise ValueError("recipe source authority must be content-bound")
+        for name in (
+            "rank",
+            "lora_alpha",
+            "stride",
+            "max_in_flight",
+            "canvas_tokens",
+            "extra_logical_delay",
+            "fixed_verification_budget",
+        ):
+            value = getattr(self, name)
+            if value is not None and type(value) is not int:
+                raise TypeError(f"adaptation recipe {name} must be an exact integer")
+        if type(self.loss_position_decay) is not float:
+            raise TypeError(
+                "adaptation recipe loss_position_decay must be an exact float"
+            )
+        if (
+            self.confidence_loss_weight is not None
+            and type(self.confidence_loss_weight) is not float
+        ):
+            raise TypeError(
+                "adaptation recipe confidence_loss_weight must be an exact float"
+            )
+        if type(self.status) is not str:
+            raise TypeError("adaptation recipe status must be exact text")
+        for name in ("blocker_codes", "unresolved_fields"):
+            value = getattr(self, name)
+            if type(value) is not tuple or any(type(item) is not str for item in value):
+                raise TypeError(f"adaptation recipe {name} must be exact text tuples")
         if self.lookup_key.scope != self.parameter_scope:
             raise ValueError("recipe scope differs from its lookup key")
         if self.lookup_key.parameterization != self.weight_update_mode:
@@ -937,6 +1093,9 @@ class AdaptationRecipeDeclaration:
         if self.lookup_key.experiment == "E1":
             if self.lookup_key.learning_rate is not None:
                 raise ValueError("E1 anchor LR belongs to the recipe declaration")
+        elif "learning_rate" in self.optimizer.unresolved_fields:
+            if self.optimizer.learning_rate is not None:
+                raise ValueError("unregistered E2 learning rate must remain null")
         elif self.lookup_key.learning_rate != self.optimizer.learning_rate:
             raise ValueError("recipe learning rate differs from its lookup key")
         if self.lookup_key.schedule != self.optimizer.schedule:
@@ -946,11 +1105,8 @@ class AdaptationRecipeDeclaration:
         if self.lookup_key.draft_width is not None:
             if self.canvas_tokens != self.lookup_key.draft_width:
                 raise ValueError("exact-width recipe canvas differs from its key")
-        elif (
-            self.canvas_tokens is not None
-            or "canvas_tokens" not in self.unresolved_fields
-        ):
-            raise ValueError("selected-width recipes must retain a null canvas slot")
+        elif self.canvas_tokens is not None:
+            raise ValueError("selected-width recipe declarations retain a null canvas")
         if self.unresolved_fields != tuple(sorted(set(self.unresolved_fields))):
             raise ValueError("adaptation unresolved fields must be sorted and unique")
         if not set(self.unresolved_fields) <= _ADAPTATION_RECIPE_FIELDS:
@@ -973,8 +1129,11 @@ class AdaptationRecipeDeclaration:
                 or self.optimizer.unresolved_fields
             ):
                 raise ValueError("AVAILABLE recipes cannot retain unresolved semantics")
-            # This is deliberately an all-fields call.  It proves that no
-            # Pydantic default is needed to turn a declaration into a config.
+            if self.lookup_key.draft_width is None:
+                raise ValueError("AVAILABLE recipes require an exact canvas authority")
+            # This deliberately validates every config field.  No selector or
+            # Pydantic default can turn a blocked template into an executable
+            # recipe.
             self.to_adaptation_config()
         elif self.status == "BLOCKED":
             if not self.blocker_codes:
@@ -985,9 +1144,44 @@ class AdaptationRecipeDeclaration:
             not _REASON_CODE(code) for code in self.blocker_codes
         ):
             raise ValueError("recipe blocker codes must be sorted stable tokens")
+        if self.lookup_key.experiment == "E2":
+            required_optimizer_fields = _e2_required_optimizer_unresolved_fields(
+                optimizer=self.optimizer.name,
+                schedule=self.optimizer.schedule,
+            )
+            if set(self.optimizer.unresolved_fields) != required_optimizer_fields:
+                raise ValueError(
+                    "E2 optimizer unresolved fields differ from source protocol"
+                )
+            if set(self.unresolved_fields) != (
+                _E2_REQUIRED_ADAPTATION_UNRESOLVED_FIELDS
+            ):
+                raise ValueError(
+                    "E2 adaptation unresolved fields differ from source protocol"
+                )
+            try:
+                blocker_fields = tuple(
+                    _E2_RECIPE_BLOCKER_FIELD_BY_CODE[code]
+                    for code in self.blocker_codes
+                )
+            except KeyError as error:
+                raise ValueError("E2 recipe blocker lacks a field mapping") from error
+            expected_fields = {
+                *(f"optimizer.{field}" for field in self.optimizer.unresolved_fields),
+                *self.unresolved_fields,
+            }
+            if self.optimizer.name == "chronobelief":
+                expected_fields.add("optimizer.equation")
+            if (
+                len(blocker_fields) != len(set(blocker_fields))
+                or set(blocker_fields) != expected_fields
+            ):
+                raise ValueError(
+                    "E2 recipe blockers differ from its unresolved field set"
+                )
 
     def to_adaptation_config(self):
-        """Materialize an available declaration with no implicit field values."""
+        """Materialize an exact-width declaration with no implicit values."""
 
         if self.status != "AVAILABLE":
             raise ValueError(
@@ -998,6 +1192,8 @@ class AdaptationRecipeDeclaration:
             or self.stride is None
             or self.canvas_tokens is None
             or self.extra_logical_delay is None
+            or self.teacher_row_policy is None
+            or self.verification_mode is None
         ):
             raise ValueError("adaptation recipe is not fully declared")
         from lightcone_spec.config.schema import AdaptationConfig
@@ -1023,6 +1219,24 @@ class AdaptationRecipeDeclaration:
             fixed_verification_budget=self.fixed_verification_budget,
             confidence_loss_weight=self.confidence_loss_weight,
         )
+
+    @cached_property
+    def blocker_matrix(self) -> tuple[AdaptationRecipeBlocker, ...]:
+        """Return every unresolved E2 value as one stable field/code row."""
+
+        if self.lookup_key.experiment != "E2":
+            return ()
+        try:
+            rows = tuple(
+                AdaptationRecipeBlocker(
+                    field=_E2_RECIPE_BLOCKER_FIELD_BY_CODE[reason_code],
+                    reason_code=reason_code,
+                )
+                for reason_code in self.blocker_codes
+            )
+        except KeyError as error:  # pragma: no cover - declaration invariant
+            raise ValueError("E2 recipe blocker lacks a field mapping") from error
+        return tuple(sorted(rows, key=lambda row: (row.field, row.reason_code)))
 
     @cached_property
     def sha256(self) -> str:
@@ -1053,13 +1267,17 @@ def _e1_recipe_declaration(
     candidate = matches[0]
     if key.learning_rate is not None or key.schedule != candidate.schedule:
         raise ValueError("E1 cell identity conflicts with its registered anchor")
+    # TuningCandidate predates the explicit recipe codec and therefore does not
+    # carry this canonical OptimizerConfig field.  Bind it here as source
+    # semantics instead of silently inheriting the Pydantic default.
+    optimizer_epsilon = 1e-8
     optimizer = OptimizerRecipeDeclaration(
         name=candidate.optimizer,
         learning_rate=candidate.learning_rate,
         weight_decay=candidate.weight_decay,
         beta1=candidate.beta1,
         beta2=candidate.beta2,
-        epsilon=1e-8,
+        epsilon=optimizer_epsilon,
         grad_clip=candidate.grad_clip,
         momentum=candidate.momentum,
         muon_ns_steps=candidate.muon_ns_steps,
@@ -1080,6 +1298,7 @@ def _e1_recipe_declaration(
         "verification_mode": "native_scheduler",
         "fixed_verification_budget": None,
         "confidence_loss_weight": None,
+        "optimizer_epsilon": optimizer_epsilon,
     }
     return AdaptationRecipeDeclaration(
         schema_version=1,
@@ -1120,6 +1339,7 @@ def _e2_optimizer_declaration(
 ) -> tuple[OptimizerRecipeDeclaration, tuple[str, ...]]:
     optimizer = key.optimizer
     unresolved: set[str] = {
+        "learning_rate",
         "weight_decay",
         "beta1",
         "beta2",
@@ -1127,8 +1347,10 @@ def _e2_optimizer_declaration(
         "grad_clip",
     }
     blockers: set[str] = {
+        "e2_learning_rate_unregistered",
         "e2_weight_decay_unregistered",
-        "e2_beta_values_unregistered",
+        "e2_beta1_unregistered",
+        "e2_beta2_unregistered",
         "e2_epsilon_unregistered",
         "e2_grad_clip_unregistered",
     }
@@ -1143,7 +1365,20 @@ def _e2_optimizer_declaration(
 
     if optimizer == "chronobelief":
         unresolved.update(_OPTIMIZER_RECIPE_FIELDS)
-        blockers.add("chronobelief_equation_unregistered")
+        blockers.update(
+            {
+                "chronobelief_equation_unregistered",
+                "e2_learning_rate_unregistered",
+                "e2_momentum_unregistered",
+                "e2_muon_ns_steps_unregistered",
+                "e2_muon_auxiliary_learning_rate_unregistered",
+                "e2_muon_auxiliary_weight_decay_unregistered",
+            }
+        )
+        if key.schedule != "cosine_to_zero":
+            unresolved.discard("schedule_total_published_updates")
+        else:
+            blockers.add("e2_cosine_horizon_unregistered")
     else:
         if optimizer in {"sgdm", "nag", "muon"}:
             unresolved.add("momentum")
@@ -1156,13 +1391,21 @@ def _e2_optimizer_declaration(
                     "muon_auxiliary_weight_decay",
                 }
             )
-            blockers.add("e2_muon_parameters_unregistered")
+            blockers.update(
+                {
+                    "e2_muon_ns_steps_unregistered",
+                    "e2_muon_auxiliary_learning_rate_unregistered",
+                    "e2_muon_auxiliary_weight_decay_unregistered",
+                }
+            )
         if key.schedule == "cosine_to_zero":
             unresolved.add("schedule_total_published_updates")
             blockers.add("e2_cosine_horizon_unregistered")
     values = {
         "name": optimizer,
-        "learning_rate": key.learning_rate,
+        # The numeric cell axis describes the intended logarithmic template,
+        # but neither specification fixes its endpoints as execution authority.
+        "learning_rate": None,
         "weight_decay": weight_decay,
         "beta1": beta1,
         "beta2": beta2,
@@ -1175,10 +1418,6 @@ def _e2_optimizer_declaration(
         "schedule": key.schedule,
         "schedule_total_published_updates": None,
     }
-    # ChronoBelief has no registered LR grid.  Other E2 keys must already bind
-    # the exact optimizer-specific logarithmic value from the registry.
-    if optimizer == "chronobelief":
-        values["learning_rate"] = None
     return (
         OptimizerRecipeDeclaration(
             **values,
@@ -1198,9 +1437,11 @@ def _e2_recipe_declaration(
         sorted(
             {
                 *optimizer_blockers,
-                "e2_draft_width_selector_unresolved",
                 "e2_extra_logical_delay_unregistered",
+                "e2_fixed_verification_budget_unregistered",
+                "e2_teacher_row_policy_unregistered",
                 "e2_update_stride_unregistered",
+                "e2_verification_mode_unregistered",
             }
         )
     )
@@ -1231,13 +1472,19 @@ def _e2_recipe_declaration(
         canvas_tokens=None,
         loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
         extra_logical_delay=None,
-        teacher_row_policy="update_round",
-        verification_mode="native_scheduler",
+        teacher_row_policy=None,
+        verification_mode=None,
         fixed_verification_budget=None,
         confidence_loss_weight=None,
         status="BLOCKED",
         blocker_codes=blockers,
-        unresolved_fields=("canvas_tokens", "extra_logical_delay", "stride"),
+        unresolved_fields=(
+            "extra_logical_delay",
+            "fixed_verification_budget",
+            "stride",
+            "teacher_row_policy",
+            "verification_mode",
+        ),
     )
 
 
@@ -1484,7 +1731,7 @@ class ExperimentRegistry:
     cells: tuple[ExperimentCell, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError("only industrial registry schema version 2 is supported")
         _require_text("registry name", self.name)
         if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
@@ -1591,14 +1838,14 @@ class ExperimentRegistry:
     ) -> AdaptationRecipeDeclaration:
         """Resolve only a cell owned by this registry to one exact declaration."""
 
-        if isinstance(cell_or_id, str):
+        if type(cell_or_id) is str:
             matches = tuple(cell for cell in self.cells if cell.cell_id == cell_or_id)
             if len(matches) != 1:
                 raise ValueError(
                     "adaptation recipe cell ID is absent from the registry"
                 )
             cell = matches[0]
-        elif isinstance(cell_or_id, ExperimentCell):
+        elif type(cell_or_id) is ExperimentCell:
             matches = tuple(
                 candidate
                 for candidate in self.cells

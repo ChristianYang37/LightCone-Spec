@@ -9,6 +9,7 @@ from lightcone_spec.experiments.planning import E2CandidateIdentity
 from lightcone_spec.experiments.registry import (
     E2_DRAFT_WIDTH_SELECTOR,
     E2_HALVING_STAGES,
+    AdaptationRecipeBlocker,
     CellStatus,
     ExperimentRegistry,
     build_industrial_registry,
@@ -100,7 +101,55 @@ def test_e1_full_and_momentum_anchor_values_come_from_registered_grid(
     assert full_sgdm.optimizer.momentum == lora_sgdm.optimizer.momentum == 0.9
 
 
-def test_e2_is_one_selected_width_template_and_every_recipe_is_blocked(
+def test_e1_source_authority_binds_explicit_canonical_epsilon(
+    registry: ExperimentRegistry,
+) -> None:
+    declaration = next(
+        row
+        for row in registry.adaptation_recipe_declarations
+        if row.lookup_key.experiment == "E1"
+        and row.lookup_key.scope == "last1"
+        and row.lookup_key.parameterization == "full"
+        and row.lookup_key.optimizer == "adamw"
+    )
+    from lightcone_spec.experiments.protocol import (
+        DFLASH_LOSS_POSITION_DECAY,
+        tuning_candidates,
+    )
+
+    candidate = next(
+        row
+        for row in tuning_candidates()
+        if (
+            row.parameter_scope,
+            row.weight_update_mode,
+            row.rank,
+            row.optimizer,
+        )
+        == ("last1", "full", None, "adamw")
+    )
+    assert declaration.source_authority_sha256 == content_sha256(
+        {
+            "candidate_id": candidate.candidate_id,
+            "fixed_semantics": {
+                "kv_history_policy": "frozen",
+                "adaptation_scope": "cohort",
+                "lora_matrix_policy": "registered_matrices_v1",
+                "native_head_policy": "frozen",
+                "max_in_flight": 1,
+                "loss_position_decay": DFLASH_LOSS_POSITION_DECAY,
+                "extra_logical_delay": 0,
+                "teacher_row_policy": "update_round",
+                "verification_mode": "native_scheduler",
+                "fixed_verification_budget": None,
+                "confidence_loss_weight": None,
+                "optimizer_epsilon": 1e-8,
+            },
+        }
+    )
+
+
+def test_e2_selected_width_is_dependency_owned_and_source_values_stay_blocked(
     registry: ExperimentRegistry,
 ) -> None:
     cells = _adaptive_cells(registry, "E2")
@@ -118,19 +167,37 @@ def test_e2_is_one_selected_width_template_and_every_recipe_is_blocked(
     assert {row.lookup_key.draft_width_selector for row in declarations} == {
         E2_DRAFT_WIDTH_SELECTOR
     }
-    assert all("canvas_tokens" in row.unresolved_fields for row in declarations)
+    assert all(row.canvas_tokens is None for row in declarations)
+    assert all("canvas_tokens" not in row.unresolved_fields for row in declarations)
     assert all("extra_logical_delay" in row.unresolved_fields for row in declarations)
     assert all("stride" in row.unresolved_fields for row in declarations)
     assert all(
+        "learning_rate" in row.optimizer.unresolved_fields for row in declarations
+    )
+    assert all(row.optimizer.learning_rate is None for row in declarations)
+    assert all("teacher_row_policy" in row.unresolved_fields for row in declarations)
+    assert all("verification_mode" in row.unresolved_fields for row in declarations)
+    assert all(
+        "fixed_verification_budget" in row.unresolved_fields for row in declarations
+    )
+    assert all(
         {
             "e2_weight_decay_unregistered",
-            "e2_beta_values_unregistered",
+            "e2_beta1_unregistered",
+            "e2_beta2_unregistered",
             "e2_epsilon_unregistered",
             "e2_grad_clip_unregistered",
         }
         <= set(row.blocker_codes)
         for row in declarations
     )
+    assert all(
+        "e2_draft_width_selector_unresolved" not in row.blocker_codes
+        for row in declarations
+    )
+    assert all(row.teacher_row_policy is None for row in declarations)
+    assert all(row.verification_mode is None for row in declarations)
+    assert all(row.fixed_verification_budget is None for row in declarations)
     with pytest.raises(ValueError, match="adaptation recipe is BLOCKED"):
         declarations[0].to_adaptation_config()
 
@@ -155,21 +222,43 @@ def test_e2_missing_optimizer_semantics_have_named_blockers(
     adamw = one("adamw")
     assert {
         "e2_weight_decay_unregistered",
-        "e2_beta_values_unregistered",
+        "e2_beta1_unregistered",
+        "e2_beta2_unregistered",
         "e2_epsilon_unregistered",
         "e2_grad_clip_unregistered",
+        "e2_learning_rate_unregistered",
         "e2_update_stride_unregistered",
-        "e2_draft_width_selector_unresolved",
         "e2_extra_logical_delay_unregistered",
     } <= set(adamw.blocker_codes)
+    assert {
+        ("optimizer.weight_decay", "e2_weight_decay_unregistered"),
+        ("optimizer.beta1", "e2_beta1_unregistered"),
+        ("optimizer.beta2", "e2_beta2_unregistered"),
+        ("optimizer.epsilon", "e2_epsilon_unregistered"),
+        ("optimizer.grad_clip", "e2_grad_clip_unregistered"),
+        ("optimizer.learning_rate", "e2_learning_rate_unregistered"),
+        ("stride", "e2_update_stride_unregistered"),
+        ("extra_logical_delay", "e2_extra_logical_delay_unregistered"),
+        ("teacher_row_policy", "e2_teacher_row_policy_unregistered"),
+        ("verification_mode", "e2_verification_mode_unregistered"),
+        (
+            "fixed_verification_budget",
+            "e2_fixed_verification_budget_unregistered",
+        ),
+    } <= {(row.field, row.reason_code) for row in adamw.blocker_matrix}
     assert "schedule_total_published_updates" not in (adamw.optimizer.unresolved_fields)
+    assert adamw.optimizer.learning_rate is None
 
     sgdm = one("sgdm")
     assert "e2_momentum_unregistered" in sgdm.blocker_codes
     assert "momentum" in sgdm.optimizer.unresolved_fields
 
     muon = one("muon")
-    assert "e2_muon_parameters_unregistered" in muon.blocker_codes
+    assert {
+        "e2_muon_ns_steps_unregistered",
+        "e2_muon_auxiliary_learning_rate_unregistered",
+        "e2_muon_auxiliary_weight_decay_unregistered",
+    } <= set(muon.blocker_codes)
     assert {
         "muon_ns_steps",
         "muon_auxiliary_learning_rate",
@@ -182,6 +271,7 @@ def test_e2_missing_optimizer_semantics_have_named_blockers(
 
     chronobelief = one("chronobelief")
     assert "chronobelief_equation_unregistered" in chronobelief.blocker_codes
+    assert "e2_learning_rate_unregistered" in chronobelief.blocker_codes
     assert chronobelief.optimizer.learning_rate is None
 
 
@@ -210,7 +300,6 @@ def test_registry_digest_binds_recipe_declarations_and_rejects_fixed_e2_width(
     assert len(payload["adaptation_recipe_declarations"]) == len(
         registry.adaptation_recipe_declarations
     )
-
     source = next(
         cell
         for cell in _adaptive_cells(registry, "E2")
@@ -229,3 +318,81 @@ def test_lookup_rejects_non_registry_owned_cell(registry: ExperimentRegistry) ->
     edited = replace(source, reason="caller-edited declaration source")
     with pytest.raises(ValueError, match="not registry-owned"):
         registry.adaptation_recipe_for_cell(edited)
+
+
+def test_recipe_protocol_values_reject_bool_and_text_subclasses(
+    registry: ExperimentRegistry,
+) -> None:
+    recipe = next(
+        row
+        for row in registry.adaptation_recipe_declarations
+        if row.lookup_key.experiment == "E2" and row.lookup_key.optimizer == "adamw"
+    )
+    with pytest.raises(ValueError, match="schema 1"):
+        replace(recipe, schema_version=True)
+    with pytest.raises(TypeError, match="exact float"):
+        replace(recipe.optimizer, beta1=True)
+
+    class CallerText(str):
+        pass
+
+    with pytest.raises(ValueError, match="exact non-empty"):
+        AdaptationRecipeBlocker(
+            field=CallerText("optimizer.beta1"),
+            reason_code="e2_beta1_unregistered",
+        )
+    with pytest.raises(ValueError, match="reason code"):
+        AdaptationRecipeBlocker(
+            field="optimizer.beta1",
+            reason_code=CallerText("e2_beta1_unregistered"),
+        )
+
+
+def test_e2_blockers_exactly_cover_every_unresolved_field(
+    registry: ExperimentRegistry,
+) -> None:
+    recipe = next(
+        row
+        for row in registry.adaptation_recipe_declarations
+        if row.lookup_key.experiment == "E2" and row.lookup_key.optimizer == "adamw"
+    )
+    with pytest.raises(ValueError, match="unresolved field set"):
+        replace(recipe, blocker_codes=("e2_learning_rate_unregistered",))
+    with pytest.raises(ValueError, match="lacks a field mapping"):
+        replace(recipe, blocker_codes=("caller_invented_blocker",))
+
+    forged_optimizer = replace(
+        recipe.optimizer,
+        learning_rate=recipe.lookup_key.learning_rate,
+        unresolved_fields=tuple(
+            field
+            for field in recipe.optimizer.unresolved_fields
+            if field != "learning_rate"
+        ),
+    )
+    with pytest.raises(ValueError, match="optimizer unresolved fields"):
+        replace(
+            recipe,
+            optimizer=forged_optimizer,
+            blocker_codes=tuple(
+                code
+                for code in recipe.blocker_codes
+                if code != "e2_learning_rate_unregistered"
+            ),
+        )
+
+    with pytest.raises(ValueError, match="adaptation unresolved fields"):
+        replace(
+            recipe,
+            teacher_row_policy="update_round",
+            unresolved_fields=tuple(
+                field
+                for field in recipe.unresolved_fields
+                if field != "teacher_row_policy"
+            ),
+            blocker_codes=tuple(
+                code
+                for code in recipe.blocker_codes
+                if code != "e2_teacher_row_policy_unregistered"
+            ),
+        )
