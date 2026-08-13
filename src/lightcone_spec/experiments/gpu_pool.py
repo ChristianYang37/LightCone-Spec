@@ -541,6 +541,12 @@ class GpuInventory:
         ):
             raise TypeError("inventory topology groups must be declarations")
         uuids = tuple(device.uuid for device in self.devices)
+        host_ids = {device.host_id for device in self.devices}
+        if len(host_ids) != 1:
+            raise ValueError(
+                "one GPU inventory must describe exactly one host; use a fleet "
+                "inventory to aggregate hosts"
+            )
         if len(uuids) != len(set(uuids)):
             raise ValueError("GPU inventory contains duplicate UUIDs")
         if tuple(sorted(uuids)) != uuids:
