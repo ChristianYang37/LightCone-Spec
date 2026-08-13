@@ -7,6 +7,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -28,6 +29,10 @@ from lightcone_spec.experiments.capacity_authority import (
     build_capacity_verification_payload,
     capacity_source_receipt_sha256_from_paths,
     capacity_verification_receipt_template,
+)
+from lightcone_spec.experiments.failure_authority import (
+    bind_failure_injection_authority,
+    release_failure_plan_for_cell,
 )
 from lightcone_spec.experiments.gpu_pool import (
     DispatchExecutionPhase,
@@ -81,6 +86,7 @@ from lightcone_spec.locking.models import LockedModel, ModelLock
 from lightcone_spec.orchestration.execution_bundle import (
     BoundExecutionArtifact,
     BoundJsonSource,
+    DispatchAttemptJournal,
     ExecutionBundleBlockedError,
     IndustrialAssignmentExecutionBundle,
     IndustrialExecutionPlanAudit,
@@ -122,6 +128,40 @@ def _write_bound(path: Path, value: object) -> Path:
     digest = content_sha256(value)
     Path(f"{path}.sha256").write_text(digest + "\n", encoding="utf-8")
     return path
+
+
+def test_dispatch_attempt_journal_v2_binds_publication_manifest(
+    tmp_path: Path,
+) -> None:
+    inventory = SimpleNamespace(sha256="1" * 64, devices=())
+    context = SimpleNamespace(sha256="2" * 64, inventory=inventory)
+    plan = SimpleNamespace(sha256="3" * 64, waves=())
+    journal_root = tmp_path / "publication-bound-journal"
+
+    journal = DispatchAttemptJournal.open_or_create(
+        journal_root,
+        plan=plan,
+        execution_context=context,
+        execution_bundle_manifest_sha256="4" * 64,
+    )
+    manifest = json.loads((journal_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["execution_bundle_manifest_sha256"] == "4" * 64
+    assert (
+        journal.manifest_sha256
+        == hashlib.sha256((journal_root / "manifest.json").read_bytes()).hexdigest()
+    )
+
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="dispatch_attempt_journal_manifest_identity_mismatch",
+    ):
+        DispatchAttemptJournal.open_or_create(
+            journal_root,
+            plan=plan,
+            execution_context=context,
+            execution_bundle_manifest_sha256="5" * 64,
+        )
 
 
 def _ensure_bound(path: str | Path) -> None:
@@ -1000,7 +1040,7 @@ def _bundle_fixture(
         semantic_sha256=inventory_receipt_sha256,
     )
     bundle = IndustrialAssignmentExecutionBundle(
-        schema_version=3,
+        schema_version=4,
         kind="industrial_assignment_execution_bundle",
         assignment_sha256=assignment.assignment_id,
         cell_id=cell.cell_id,
@@ -1052,6 +1092,7 @@ def _bundle_fixture(
         model_lock_artifact=_artifact(model_lock_binding),
         prepared_models=_source(prepared_path),
         trainable_plan_authority=None,
+        failure_injection_authority=None,
         prepared_model_content_release_manifest_sha256=None,
         compile_cache_plan=_source(
             compile_plan_path, semantic_sha256=compile_plan.sha256
@@ -1115,7 +1156,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     ):
         loaded.reconstruct_execution_plan()
 
-    assert loaded.to_dict()["schema_version"] == 3
+    assert loaded.to_dict()["schema_version"] == 4
     assert loaded.trainable_plan_authority is None
     assert loaded.prepared_model_content_release_manifest_sha256 is None
     forged_baseline = replace(
@@ -1153,7 +1194,6 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     # every assignment has a bundle, but only the requested wave may ask the
     # strict per-assignment plan builder to run.
     import asyncio
-    from types import SimpleNamespace
 
     waves = tuple(
         bundle_module.GpuDispatchWave.from_dict(value)
@@ -1175,7 +1215,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         )
         for assignment in all_assignments
     )
-    bundle_by_path = dict(zip(paths, group_bundles, strict=True))
+    manifest_path = (tmp_path / "dispatch-execution-bundle-manifest.json").resolve()
 
     @dataclass(frozen=True)
     class FakeContext:
@@ -1259,10 +1299,23 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         "require_release_dispatch_execution_authority",
         lambda: None,
     )
+    import lightcone_spec.orchestration.execution_bundle_materializer as materializer
+
+    publication_state = {
+        "value": SimpleNamespace(
+            manifest=SimpleNamespace(
+                sha256="9" * 64,
+                assignments=tuple(
+                    SimpleNamespace(bundle=SimpleNamespace(path=path)) for path in paths
+                ),
+            ),
+            bundles=group_bundles,
+        )
+    }
     monkeypatch.setattr(
-        bundle_module.IndustrialAssignmentExecutionBundle,
-        "load",
-        classmethod(lambda _cls, path: bundle_by_path[str(path)]),
+        materializer,
+        "load_materialized_dispatch_execution_bundle_publication",
+        lambda path: publication_state["value"],
     )
     monkeypatch.setattr(
         bundle_module.IndustrialAssignmentExecutionBundle,
@@ -1285,10 +1338,16 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         staticmethod(lambda _checkout: object()),
     )
     monkeypatch.setattr(bundle_module, "execute_dispatch_plan", execute_group_plan)
+    journal_open_kwargs = []
+
+    def open_fake_journal(_cls, *args, **kwargs):
+        journal_open_kwargs.append(kwargs)
+        return fake_journal
+
     monkeypatch.setattr(
         bundle_module.DispatchAttemptJournal,
         "open_or_create",
-        classmethod(lambda _cls, *args, **kwargs: fake_journal),
+        classmethod(open_fake_journal),
     )
     monkeypatch.setattr(bundle_module, "validate_dispatch_resume", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -1299,7 +1358,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
 
     result = asyncio.run(
         bundle_module.execute_dispatch_wave_bundles(
-            paths,
+            manifest_path,
             wave_index=0,
             receipt_output=tmp_path / "group-receipt.json",
         )
@@ -1312,6 +1371,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     assert len(reconstruct_calls) == len(expected_current_ids)
     assert execute_calls == 1
     assert published == [(tmp_path / "group-receipt.json", receipt)]
+    assert journal_open_kwargs[-1]["execution_bundle_manifest_sha256"] == "9" * 64
 
     # Inject a coordinator crash after every FINISH is durable but before the
     # canonical schedule envelope is published.  Re-entering with receipt-only
@@ -1335,7 +1395,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     with pytest.raises(RuntimeError, match="injected crash before schedule envelope"):
         asyncio.run(
             bundle_module.execute_dispatch_wave_bundles(
-                paths,
+                manifest_path,
                 wave_index=0,
                 receipt_output=crash_target,
             )
@@ -1344,7 +1404,7 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     assert execute_calls == 2
     recovered = asyncio.run(
         bundle_module.execute_dispatch_wave_bundles(
-            paths,
+            manifest_path,
             wave_index=0,
             receipt_output=crash_target,
         )
@@ -1353,13 +1413,17 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
     assert execute_calls == 2
     assert published[-1] == (crash_target, receipt)
 
+    publication_state["value"] = SimpleNamespace(
+        manifest=publication_state["value"].manifest,
+        bundles=group_bundles[:-1],
+    )
     with pytest.raises(
         ExecutionBundleBlockedError,
         match="industrial_execution_bundle_coverage_incomplete",
     ):
         asyncio.run(
             bundle_module.execute_dispatch_wave_bundles(
-                paths[:-1],
+                manifest_path,
                 wave_index=0,
                 receipt_output=tmp_path / "incomplete-group-receipt.json",
             )
@@ -1368,6 +1432,69 @@ def test_bundle_audits_raw_components_without_minting_a_plan(
         (tmp_path / "group-receipt.json", receipt),
         (crash_target, receipt),
     ]
+
+
+def test_bundle_rejects_failure_authority_on_nonfailure_assignment(
+    tmp_path: Path,
+) -> None:
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+
+    registry = build_industrial_registry(
+        gpu_uuids=("GPU-logical-a", "GPU-logical-b"),
+        cache_root=str(tmp_path / "cache"),
+        evidence_root=str(tmp_path / "evidence"),
+        base_port=28_000,
+    )
+    failure_cell = next(
+        row
+        for row in registry.cells_for("E5")
+        if row.identity.task == "failure_injection"
+    )
+    nonfailure_cell = next(
+        row
+        for row in registry.cells_for("E3a")
+        if row.identity.task != "failure_injection"
+    )
+    plan = release_failure_plan_for_cell(registry, failure_cell)
+    plan_path = _write_bound(tmp_path / "failure-plan.json", plan.to_dict())
+    binding = bind_failure_injection_authority(plan_path, registry=registry)
+    diagnostic_sha256, token = (
+        bundle_module._require_bundle_failure_injection_authority(
+            registry=registry,
+            cell=failure_cell,
+            binding=binding,
+            diagnostic=True,
+        )
+    )
+    assert diagnostic_sha256 == binding.sha256
+    assert token is None
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="failure_injection_first_party_actuator_unavailable",
+    ):
+        bundle_module._require_bundle_failure_injection_authority(
+            registry=registry,
+            cell=failure_cell,
+            binding=binding,
+            diagnostic=False,
+        )
+    with pytest.raises(
+        ExecutionBundleBlockedError,
+        match="failure_injection_raw_plan_authority_required",
+    ):
+        bundle_module._require_bundle_failure_injection_authority(
+            registry=registry,
+            cell=failure_cell,
+            binding=None,
+            diagnostic=False,
+        )
+    with pytest.raises(ValueError, match="non-failure bundle"):
+        bundle_module._require_bundle_failure_injection_authority(
+            registry=registry,
+            cell=nonfailure_cell,
+            binding=binding,
+            diagnostic=True,
+        )
 
 
 def test_bundle_rejects_summary_and_raw_authority_swaps(tmp_path: Path) -> None:
@@ -1646,8 +1773,8 @@ def test_execute_cli_blocks_before_bundle_read_or_output_mutation(
     result = cli_main(
         [
             "execute-dispatch-wave",
-            "--bundle",
-            str(tmp_path / "missing-bundle.json"),
+            "--materialization-manifest",
+            str(tmp_path / "missing-manifest.json"),
             "--wave-index",
             "0",
             "--receipt-output",
@@ -1675,16 +1802,54 @@ def test_missing_bundle_is_named_before_any_output_mutation(
     )
     receipt_output = tmp_path / "receipt.json"
     with pytest.raises(
-        ExecutionBundleBlockedError,
-        match="industrial_execution_bundle_missing",
+        RuntimeError,
+        match="readable regular file",
     ):
         import asyncio
 
         asyncio.run(
             bundle_module.execute_dispatch_wave_bundles(
-                (),
+                tmp_path / "missing-manifest.json",
                 wave_index=0,
                 receipt_output=receipt_output,
             )
         )
     assert not receipt_output.exists()
+
+
+def test_formal_dispatch_entry_rejects_raw_bundle_paths_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import lightcone_spec.orchestration.execution_bundle as bundle_module
+    import lightcone_spec.orchestration.execution_bundle_materializer as materializer
+
+    monkeypatch.setattr(
+        bundle_module,
+        "require_release_dispatch_execution_authority",
+        lambda: None,
+    )
+    loaded = False
+
+    def forbidden_loader(path):
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("raw bundle input reached the manifest loader")
+
+    monkeypatch.setattr(
+        materializer,
+        "load_materialized_dispatch_execution_bundle_publication",
+        forbidden_loader,
+    )
+    with pytest.raises(TypeError, match="one manifest path"):
+        asyncio.run(
+            bundle_module.execute_dispatch_wave_bundles(
+                (str(tmp_path / "raw-bundle.json"),),  # type: ignore[arg-type]
+                wave_index=0,
+                receipt_output=tmp_path / "receipt.json",
+            )
+        )
+    assert not loaded
+    assert not (tmp_path / "receipt.json").exists()

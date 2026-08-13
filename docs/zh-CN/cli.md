@@ -31,7 +31,8 @@ industrial 命令包括：
 | `bind-industrial-budget-authority` | 把声明的 `BudgetPlan` 绑定到完整 tagged raw activation/load/capacity 闭包 |
 | `estimate-industrial-budget` | 在准确 physical inventory 与 interference envelope 上重放 ready `BudgetPlan` |
 | `plan-industrial-dispatch` | 冻结确定性、topology-aware GPU-pool wave 与 physical assignment |
-| `execute-dispatch-wave` | 重放 path-bound assignment bundle，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
+| `materialize-dispatch-execution-bundles` | 绑定一份 path-only raw input graph，并在全 assignment 预检后发布完整 schema-v4 assignment-bundle set |
+| `execute-dispatch-wave` | 重开一份已提交的 materialization manifest，并在 release authority 完整时执行一个 receipt-bounded frozen wave |
 | `seal-industrial-stage` | 绑定 activated completion、disposition、budget、runtime、split、dependency 与 locked output |
 | `analyze-industrial` | 验证 schema-v3 terminal、budget、family-power 与 hardware evidence |
 | `build-speed-study` | 生成较小的核心源协议 |
@@ -229,30 +230,44 @@ co-run class，因此八块空闲 GPU 不表示可以执行八路 headline concu
 structural loading 不能证明 calibration；formal timing 仍要求 raw isolated/co-run
 evidence 与 trusted hardware binding。
 
-`execute-dispatch-wave` 绝不会把 planner JSON 或
-`IndustrialExecutionPlan.to_dict()` summary 当作 launch authority。Frozen dispatch plan 中的
-每个 assignment 都必须重复传入一次 `--bundle`。Schema-v1 bundle 用 absolute resolved path、
-raw/canonical/semantic/file identity 与相邻 sidecar 绑定 registry/inventory、serial
-interference raw receipt、budget policy/load/capacity input、tagged raw activation
-manifest 及其准确 runtime envelope/split/receipt chain、context/dispatch、topology/load/config/
-launch、sampling/model lock/prepared root、compile plan，以及 inventory/runtime evidence。
-Generic、E1、E2、confirmation pilot/final 与 stage-aggregate manifest 都会从完整 path closure
-现场重放。Final prefix 的 prior pilot completion 只能由 schema-v4/native completion authority
-派生，bare completed-cell IDs 会被拒绝。E3b/E5 stage receipt 使用独立、按 family SHA 排序的
-aggregate；E5 还必须为 264 个非 family failure-injection cells 提供 deterministic auxiliary
-activation/completion，且 family 与 auxiliary disposition 必须构成 registry stage 的准确不交并集。
-只读 audit 会重跑 raw reducer 与准确的 planning scheduler，但会把 execution-plan SHA
-明确报告为 `null`/`NOT_VALIDATED`；自洽的 serialized plan summary 不能自我授权。
-Formal reconstruction 必须先现场取得 `READY` `BudgetPlan`，并 path-bound 重验其 policy、
-load、activation、inventory 与 capacity source 的 budget materialization authority；之后
-才可构造 physical plan 并与冗余 summary 做准确比较。当前 execution slice 只接受同时通过
-release capability、raw activation/completion、capacity、interference 与 trusted-attestation
-边界的 Target-only serving assignment；compile/download 以及任何 unsupported serving assignment
-仍明确 `BLOCKED`。
-Launch 前，命令会线性检查每个 assignment-local source，并要求 bundle 完整覆盖且共享同一个
-准确的 schema-v3 dispatch context/raw budget authority。共享 scheduler authority 以 group
-为单位重放；之后只构造请求 wave 的 physical plan（以及 resume receipt 实际引用的历史
-plan），而每个可能真实 launch 的 plan 仍必须通过完整 public validation boundary。
+`materialize-dispatch-execution-bundles` 闭合 frozen planner output 与 formal execution 之间的
+结构边界。它的 schema-v1 request 只包含 absolute resolved raw-artifact path、对应 source role，
+以及 dispatch 中每个 cell 各一组 assignment-runtime path；刻意不接受 caller-supplied
+assignment SHA、execution-plan SHA/summary、output root 或 semantic hash。Reducer 会重开 request
+及每一份 sidecar，从 frozen dispatch plan 现场派生 assignment，并要求准确的一一 assignment
+覆盖，之后才能构造 schema-v4 bundle。
+
+创建 fresh publication directory 或任何 renderer artifact 之前，命令会预检全部 assignment
+的 raw activation/completion、budget、capacity、interference、topology、runtime、sampling、
+model、compile、nonce、launch-policy，以及可选 trainable/failure authority。Tagged generic、E1、
+E2、confirmation-pilot、confirmation-final 与 stage-aggregate activation authority 都会从完整
+path closure 现场重放。Final prefix 只使用 schema-v4/native completion authority；bare
+completed-cell ID 会被拒绝。E3b/E5 family aggregate 仍保持独立；E5 还要求为其 264 个非 family
+failure-injection cell 提供 deterministic auxiliary activation/completion 准确覆盖。Formal
+reconstruction 还必须取得 live `READY` `BudgetPlan` 及其 path-bound materialization authority；
+自洽的 planner 或 execution summary 不能自我授权。
+
+Output path 必须为 absolute、resolved、尚不存在，并位于稳定且 owner-private 的 parent 之下。
+全 assignment 预检通过后，命令创建 private `0700` directory，以 exclusive write 写入每个
+schema-v4 bundle 与相邻 sidecar，最后写入 `dispatch-execution-bundle-manifest.json` 及其
+sidecar 作为 commit marker。中断留下的 partial directory 会被保留，但因没有可消费 manifest
+而不构成 publication；重试必须使用另一 fresh directory，不能通过删除 evidence 恢复。
+
+```bash
+lightcone-spec materialize-dispatch-execution-bundles \
+  --request /absolute/path/to/dispatch-bundle-request.json \
+  --output-directory /absolute/private/path/dispatch-bundles-attempt-0001
+```
+
+`execute-dispatch-wave` 绝不会把 planner JSON、
+`IndustrialExecutionPlan.to_dict()` summary 或 raw bundle path 当作 launch authority。它只接受
+一份必需的 `--materialization-manifest`。通过 release dispatch trust gate 后，loader 会重开
+manifest、对应 request 与 dispatch plan、每个 schema-v4 member，以及完整 path-bound
+construction graph；input byte 变化、member 被替换、assignment coverage 不完整或 bundle
+位于 manifest directory 外都会被拒绝。之后 execution 才会重放共享 scheduler authority，
+并构造所请求 wave 的 physical plan（及 resume receipt 实际引用的历史 plan）。Compile/download
+和 unsupported serving assignment 仍明确 `BLOCKED`，每个可能真实 launch 的 plan 也仍必须
+通过完整 public validation boundary。
 
 每次命令只执行一个 `--wave-index`。Wave 0 不带 resume input；成功 prefix 的下一波必须传
 上一轮 `--resume-receipt`，failed wave 则在同一 index resume。任何 sibling runner 启动前，
@@ -261,6 +276,10 @@ per-assignment intent；每次 terminal 或 failure 返回后再 append finish�
 与累计 monotonic cost。因此 partial wave 会保留成功 sibling，只重跑失败 sibling。若 intent
 没有 finish，成本无法确认，会以
 `dispatch_attempt_intent_without_finish_cost_unresolved` 阻断。
+
+Formal manifest-based dispatch 使用 schema-v2 attempt-journal manifest，并绑定准确的
+materialization-manifest SHA-256。因此，即使 dispatch plan 没有变化，使用另一份 bundle
+publication 重开同一个 journal 也会产生 identity mismatch。
 
 `--receipt-output` 是 schema-v2 canonical immutable envelope，同时内嵌 receipt、structured
 sidecar 与准确 journal manifest/head/event-count prefix。Resume 只把 caller receipt 当作
@@ -275,21 +294,23 @@ anchor：授权来自 raw journal 重放及每个成功 `AssignmentTerminalAutho
 
 ```bash
 lightcone-spec execute-dispatch-wave \
-  --bundle artifacts/industrial/bundles/assignment-000.json \
-  --bundle artifacts/industrial/bundles/assignment-001.json \
+  --materialization-manifest \
+    /absolute/private/path/dispatch-bundles-attempt-0001/dispatch-execution-bundle-manifest.json \
   --wave-index 0 \
   --receipt-output artifacts/industrial/dispatch-wave-0.json
 ```
 
 当前 source release 的 release-owned trust policy 没有 trusted hardware attester。即使
 caller/test signer 的签名在密码学上有效，也不能解锁 formal execution；bare
-`CapacityEnvelope` 同样不能授予 execution authority。因此命令会在读取 bundle、
-创建 receipt parent/evidence root、导入 serving client 或启动 process 之前返回
-`BLOCKED`/42。缺失 bundle 同样不会回退到 planner summary。Fresh execution 会拒绝未被
-journal 授权的已有 per-plan trace file；resume 必须同时重放 raw append-only attempt chain
-并现场重验 structured terminal binding。Bare terminal digest 或 caller 联合重哈希的
-schedule JSON 都不能跳过 work。若 coordinator 在 durable intent 后、durable finish 前
-崩溃，则保持 `BLOCKED`，绝不伪造 monotonic cost。
+`CapacityEnvelope` 同样不能授予 execution authority。因此，即使 request 在其他方面完整，
+materialization 也会在全 assignment 的 release preflight 处返回 `BLOCKED`/42，且不会创建
+publication directory。Formal execution 则会独立地在 entry trust gate 返回 `BLOCKED`/42，
+发生在读取 materialization manifest、创建 receipt parent/evidence root、导入 serving client
+或启动 process 之前。Bundle publication 只是 structural authority，不是 GPU attestation 或
+execution permission。Fresh execution 会拒绝未被 journal 授权的已有 per-plan trace file；
+resume 必须同时重放 raw append-only attempt chain 并现场重验 structured terminal binding。
+Bare terminal digest 或 caller 联合重哈希的 schedule JSON 都不能跳过 work。若 coordinator
+在 durable intent 后、durable finish 前崩溃，则保持 `BLOCKED`，绝不伪造 monotonic cost。
 
 Dispatch 前要对同一个 activated set 估算。每个 budget field 都是显式值；report 会分别列出
 optimistic、registered 与 quota-envelope scenario 的 wall、compute、reserved 与

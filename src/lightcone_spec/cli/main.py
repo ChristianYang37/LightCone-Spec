@@ -2540,8 +2540,15 @@ def _parser() -> argparse.ArgumentParser:
     plan_industrial.add_argument("--family-power-plan", action="append", default=[])
     plan_industrial.add_argument("--output", required=True)
 
+    materialize_dispatch = commands.add_parser(
+        "materialize-dispatch-execution-bundles",
+        allow_abbrev=False,
+    )
+    materialize_dispatch.add_argument("--request", required=True)
+    materialize_dispatch.add_argument("--output-directory", required=True)
+
     execute_wave = commands.add_parser("execute-dispatch-wave", allow_abbrev=False)
-    execute_wave.add_argument("--bundle", action="append", default=[])
+    execute_wave.add_argument("--materialization-manifest", required=True)
     execute_wave.add_argument("--wave-index", type=int, required=True)
     execute_wave.add_argument("--resume-receipt")
     execute_wave.add_argument("--receipt-output", required=True)
@@ -6868,7 +6875,7 @@ def _execute_dispatch_wave(args: argparse.Namespace) -> int:
     try:
         receipt = asyncio.run(
             execute_dispatch_wave_bundles(
-                tuple(args.bundle),
+                args.materialization_manifest,
                 wave_index=args.wave_index,
                 receipt_output=args.receipt_output,
                 resume_receipt_path=args.resume_receipt,
@@ -6883,7 +6890,7 @@ def _execute_dispatch_wave(args: argparse.Namespace) -> int:
                     "status": "BLOCKED",
                     "reason_code": error.reason_code,
                     "wave_index": args.wave_index,
-                    "bundle_count": len(args.bundle),
+                    "materialization_manifest": args.materialization_manifest,
                 },
                 sort_keys=True,
             )
@@ -6898,7 +6905,7 @@ def _execute_dispatch_wave(args: argparse.Namespace) -> int:
                     "status": "BLOCKED",
                     "reason_code": "industrial_execution_bundle_or_resume_invalid",
                     "wave_index": args.wave_index,
-                    "bundle_count": len(args.bundle),
+                    "materialization_manifest": args.materialization_manifest,
                     "failure_sha256": _canonical_sha256(
                         {
                             "exception_type": type(error).__qualname__,
@@ -7035,6 +7042,37 @@ def _bind_formal_workload_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _materialize_dispatch_execution_bundles_cli(args: argparse.Namespace) -> int:
+    """Atomically publish source-owned schema-v4 bundles and their manifest."""
+
+    from lightcone_spec.orchestration.execution_bundle_materializer import (
+        DispatchBundleMaterializationBlocked,
+        materialize_dispatch_execution_bundles,
+    )
+
+    try:
+        manifest = materialize_dispatch_execution_bundles(
+            args.request,
+            output_directory=args.output_directory,
+        )
+    except (DispatchBundleMaterializationBlocked, ExecutionBundleBlockedError) as error:
+        reason_code = getattr(error, "reason_code", None)
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "industrial_dispatch_bundle_materialization_decision",
+                    "status": "BLOCKED",
+                    "reason_code": reason_code,
+                },
+                sort_keys=True,
+            )
+        )
+        return 42
+    print(str(manifest))
+    return 0
+
+
 def _revalidate_formal_workload_cli(args: argparse.Namespace) -> int:
     authority = _formal_workload_authority_from_cli_artifact(
         _load_bound_json(args.authority)
@@ -7099,6 +7137,8 @@ def main(argv: list[str] | None = None) -> int:
         return _seal_industrial_stage(args)
     if args.command == "plan-industrial-dispatch":
         return _plan_industrial_dispatch(args)
+    if args.command == "materialize-dispatch-execution-bundles":
+        return _materialize_dispatch_execution_bundles_cli(args)
     if args.command == "execute-dispatch-wave":
         return _execute_dispatch_wave(args)
     if args.command == "materialize-industrial-budgets":

@@ -53,6 +53,13 @@ from lightcone_spec.experiments.completion_authority import (
     AssignmentTerminalAuthority,
     AssignmentTerminalBinding,
 )
+from lightcone_spec.experiments.failure_authority import (
+    FailureExecutionAuthorityToken,
+    FailureInjectionAuthorityBinding,
+    FailureInjectionAuthorityBlocked,
+    require_failure_injection_authority,
+    revalidate_failure_injection_authority,
+)
 from lightcone_spec.experiments.gpu_pool import (
     AssignmentExecutionReceipt,
     AssignmentExecutionStatus,
@@ -85,6 +92,7 @@ from lightcone_spec.experiments.planning import (
     BudgetPlan,
     BudgetRawJsonBinding,
     ExperimentBudget,
+    _budget_activation_raw_sources,
     budget_inventory_identity_from_gpu_inventory,
 )
 from lightcone_spec.experiments.planning_artifacts import (
@@ -126,7 +134,12 @@ from lightcone_spec.orchestration.industrial import (
     render_assigned_industrial_cell_runtime_plan,
 )
 from lightcone_spec.orchestration.native_terminal import NativeTerminalProvider
-from lightcone_spec.orchestration.runtime import ServerLaunch
+from lightcone_spec.orchestration.runtime import (
+    ServerLaunch,
+    _execution_argv,
+    _execution_role,
+    _render_server,
+)
 from lightcone_spec.runtime.attestation import RELEASE_TRUSTED_ATTESTER_POLICY
 from lightcone_spec.runtime.compile_cache import (
     CompileCacheLaunchPlan,
@@ -137,6 +150,8 @@ from lightcone_spec.runtime.distributed import (
     TopologyIdentity,
     TopologyReceiptSet,
 )
+from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
+from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 from lightcone_spec.telemetry.writer import EvidenceWriterPolicy
 
 _REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v2"
@@ -172,6 +187,94 @@ class ExecutionBundleBlockedError(RuntimeError):
         super().__init__(f"industrial execution bundle is BLOCKED: {reason_code}")
 
 
+@dataclass(frozen=True)
+class AssignmentLaunchMaterializationPolicy:
+    """Non-result inputs for the first-party server-launch renderer."""
+
+    schema_version: int
+    kind: Literal["industrial_server_launch_materialization_policy"]
+    patched_sglang_checkout: str
+    adaptation_reserve_mb: int
+    mem_fraction_static: float
+    host: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != ("industrial_server_launch_materialization_policy")
+        ):
+            raise ValueError("server-launch materialization policy is unsupported")
+        checkout = Path(self.patched_sglang_checkout)
+        if (
+            not checkout.is_absolute()
+            or checkout.resolve() != checkout
+            or not checkout.is_dir()
+        ):
+            raise ValueError(
+                "patched SGLang checkout must be an existing resolved directory"
+            )
+        if (
+            isinstance(self.adaptation_reserve_mb, bool)
+            or not isinstance(self.adaptation_reserve_mb, int)
+            or self.adaptation_reserve_mb < 0
+        ):
+            raise ValueError("adaptation reserve must be a non-negative integer")
+        if (
+            isinstance(self.mem_fraction_static, bool)
+            or not isinstance(self.mem_fraction_static, (int, float))
+            or not math.isfinite(float(self.mem_fraction_static))
+            or not 0.0 < float(self.mem_fraction_static) < 1.0
+        ):
+            raise ValueError("static memory fraction must lie in (0, 1)")
+        _strict_text("server launch host", self.host)
+        if self.host not in {"127.0.0.1", "localhost"}:
+            raise ValueError("server launch materialization requires a loopback host")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "patched_sglang_checkout": self.patched_sglang_checkout,
+            "adaptation_reserve_mb": self.adaptation_reserve_mb,
+            "mem_fraction_static": float(self.mem_fraction_static),
+            "host": self.host,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _strict_object(
+            "server-launch materialization policy",
+            value,
+            frozenset(
+                {
+                    "schema_version",
+                    "kind",
+                    "patched_sglang_checkout",
+                    "adaptation_reserve_mb",
+                    "mem_fraction_static",
+                    "host",
+                }
+            ),
+        )
+        return cls(
+            schema_version=_strict_int(
+                "server-launch policy schema", row["schema_version"]
+            ),
+            kind=_strict_text("server-launch policy kind", row["kind"]),
+            patched_sglang_checkout=_strict_text(
+                "patched SGLang checkout", row["patched_sglang_checkout"]
+            ),
+            adaptation_reserve_mb=_strict_int(
+                "adaptation reserve", row["adaptation_reserve_mb"], minimum=0
+            ),
+            mem_fraction_static=_strict_float(
+                "static memory fraction", row["mem_fraction_static"]
+            ),
+            host=_strict_text("server launch host", row["host"]),
+        )
+
+
 def _absolute_lexical_path(path: str | Path) -> Path:
     """Make a path absolute without following its leaf symlink."""
 
@@ -179,7 +282,12 @@ def _absolute_lexical_path(path: str | Path) -> Path:
 
 
 def require_release_dispatch_execution_authority() -> None:
-    """Fail before bundle reads or allocation when no release signer exists."""
+    """Fail before execution mutation when no release signer exists.
+
+    Dispatch-group entrypoints invoke this before bundle reads; the
+    plan-materialization seam invokes it after read-only replay and immediately
+    before its first renderer write.
+    """
 
     RELEASE_TRUSTED_ATTESTER_POLICY.validate()
     if not RELEASE_TRUSTED_ATTESTER_POLICY.release_ready:
@@ -575,7 +683,7 @@ class DispatchAttemptJournal:
     guessed from wall time and blocks all further dispatch from this journal.
     """
 
-    _MANIFEST_FIELDS = frozenset(
+    _MANIFEST_FIELDS_V1 = frozenset(
         {
             "schema_version",
             "kind",
@@ -588,6 +696,12 @@ class DispatchAttemptJournal:
             "fixed_instance_gpu_count",
         }
     )
+    _MANIFEST_FIELDS_V2 = _MANIFEST_FIELDS_V1 | frozenset(
+        {"execution_bundle_manifest_sha256"}
+    )
+    # Retain the v1 name for diagnostic callers/tests that deliberately build
+    # an unbound journal. Formal dispatch always uses the v2 authority below.
+    _MANIFEST_FIELDS = _MANIFEST_FIELDS_V1
     _EVENT_FIELDS = frozenset(
         {
             "schema_version",
@@ -617,6 +731,10 @@ class DispatchAttemptJournal:
     )
     _PROTOCOL_SHA256 = content_sha256(
         "industrial_dispatch_attempt_journal.wave_intent_finish_hash_chain.v1"
+    )
+    _PUBLICATION_PROTOCOL_SHA256 = content_sha256(
+        "industrial_dispatch_attempt_journal.wave_intent_finish_hash_chain."
+        "execution_bundle_manifest_bound.v2"
     )
 
     def __init__(
@@ -650,15 +768,25 @@ class DispatchAttemptJournal:
         plan: GpuDispatchPlan,
         execution_context: GpuDispatchExecutionContext,
         expected_prefix: DispatchAttemptJournalBinding | None = None,
+        execution_bundle_manifest_sha256: str | None = None,
     ) -> DispatchAttemptJournal:
         candidate = Path(os.path.abspath(os.fspath(root)))
         parent = candidate.parent
         if parent.is_symlink() or not parent.is_dir() or parent.resolve() != parent:
             raise ExecutionBundleBlockedError("dispatch_attempt_journal_parent_invalid")
-        expected_manifest = {
-            "schema_version": 1,
+        if execution_bundle_manifest_sha256 is not None:
+            execution_bundle_manifest_sha256 = _require_sha256(
+                "execution-bundle publication manifest",
+                execution_bundle_manifest_sha256,
+            )
+        expected_manifest: dict[str, object] = {
+            "schema_version": (1 if execution_bundle_manifest_sha256 is None else 2),
             "kind": _DISPATCH_ATTEMPT_JOURNAL_KIND,
-            "protocol_sha256": cls._PROTOCOL_SHA256,
+            "protocol_sha256": (
+                cls._PROTOCOL_SHA256
+                if execution_bundle_manifest_sha256 is None
+                else cls._PUBLICATION_PROTOCOL_SHA256
+            ),
             "journal_path": str(candidate),
             "events_path": str(candidate / "events"),
             "plan_sha256": plan.sha256,
@@ -666,6 +794,10 @@ class DispatchAttemptJournal:
             "inventory_sha256": execution_context.inventory.sha256,
             "fixed_instance_gpu_count": len(execution_context.inventory.devices),
         }
+        if execution_bundle_manifest_sha256 is not None:
+            expected_manifest["execution_bundle_manifest_sha256"] = (
+                execution_bundle_manifest_sha256
+            )
         expected_manifest_body = _canonical_bytes(expected_manifest) + b"\n"
         if not candidate.exists() and not candidate.is_symlink():
             try:
@@ -731,7 +863,11 @@ class DispatchAttemptJournal:
         manifest = _strict_object(
             "dispatch attempt journal manifest",
             _decode_json(manifest_body, label="dispatch attempt journal manifest"),
-            cls._MANIFEST_FIELDS,
+            (
+                cls._MANIFEST_FIELDS_V1
+                if execution_bundle_manifest_sha256 is None
+                else cls._MANIFEST_FIELDS_V2
+            ),
         )
         if manifest != expected_manifest:
             raise ExecutionBundleBlockedError(
@@ -1683,7 +1819,7 @@ def _declared_wave_assignment_ids(
 
 
 async def execute_dispatch_wave_bundles(
-    bundle_paths: tuple[str, ...],
+    materialization_manifest_path: str | Path,
     *,
     wave_index: int,
     receipt_output: str | Path,
@@ -1697,11 +1833,18 @@ async def execute_dispatch_wave_bundles(
     this function is CPU-testable without ever reaching a GPU.
     """
 
+    if not isinstance(materialization_manifest_path, (str, Path)):
+        raise TypeError("formal dispatch execution requires one manifest path")
+    unresolved_manifest = _absolute_lexical_path(materialization_manifest_path)
+    if (
+        not unresolved_manifest.is_absolute()
+        or unresolved_manifest.is_symlink()
+        or unresolved_manifest.resolve() != unresolved_manifest
+    ):
+        raise ExecutionBundleBlockedError(
+            "industrial_dispatch_bundle_materialization_manifest_invalid"
+        )
     require_release_dispatch_execution_authority()
-    if not bundle_paths:
-        raise ExecutionBundleBlockedError("industrial_execution_bundle_missing")
-    if len(set(bundle_paths)) != len(bundle_paths):
-        raise ValueError("execution bundle paths are duplicated")
     if (
         isinstance(wave_index, bool)
         or not isinstance(wave_index, int)
@@ -1714,10 +1857,20 @@ async def execute_dispatch_wave_bundles(
         and Path(resume_receipt_path).resolve() == receipt_target
     ):
         raise ValueError("resume receipt and next-wave receipt output must differ")
-
-    bundles = tuple(
-        IndustrialAssignmentExecutionBundle.load(path) for path in bundle_paths
+    # Local import avoids making the source-owned materializer depend on an
+    # executable bundle import cycle.  The manifest loader reopens every member
+    # and its complete path-bound construction graph before returning here.
+    from lightcone_spec.orchestration.execution_bundle_materializer import (
+        load_materialized_dispatch_execution_bundle_publication,
     )
+
+    publication = load_materialized_dispatch_execution_bundle_publication(
+        unresolved_manifest
+    )
+    if not publication.bundles:
+        raise ExecutionBundleBlockedError("industrial_execution_bundle_missing")
+
+    bundles = publication.bundles
     _require_shared_bundle_authority(bundles)
     for bundle in bundles:
         _preflight_bundle_assignment_sources(bundle)
@@ -1818,6 +1971,7 @@ async def execute_dispatch_wave_bundles(
         plan=dispatch_plan,
         execution_context=base_context,
         expected_prefix=supplied_journal_binding,
+        execution_bundle_manifest_sha256=publication.manifest.sha256,
     )
     snapshot = journal.replay()
     snapshot.require_complete_cost_authority()
@@ -2527,6 +2681,7 @@ class IndustrialAssignmentExecutionBundle:
     model_lock_artifact: BoundExecutionArtifact
     prepared_models: BoundJsonSource
     trainable_plan_authority: TrainablePlanAuthorityBinding | None
+    failure_injection_authority: FailureInjectionAuthorityBinding | None
     prepared_model_content_release_manifest_sha256: str | None
     compile_cache_plan: BoundJsonSource
     inventory_source_artifact: BoundExecutionArtifact
@@ -2534,7 +2689,7 @@ class IndustrialAssignmentExecutionBundle:
     execution_policy: BoundJsonSource
 
     def __post_init__(self) -> None:
-        if self.schema_version != 3 or self.kind != _BUNDLE_KIND:
+        if self.schema_version != 4 or self.kind != _BUNDLE_KIND:
             raise ValueError("industrial execution-bundle schema is unsupported")
         for name in (
             "assignment_sha256",
@@ -2587,6 +2742,12 @@ class IndustrialAssignmentExecutionBundle:
             and type(self.trainable_plan_authority) is not TrainablePlanAuthorityBinding
         ):
             raise TypeError("execution bundle has a wrong trainable-plan authority")
+        if (
+            self.failure_injection_authority is not None
+            and type(self.failure_injection_authority)
+            is not FailureInjectionAuthorityBinding
+        ):
+            raise TypeError("execution bundle has a wrong failure authority")
         if self.prepared_model_content_release_manifest_sha256 is not None:
             _require_sha256(
                 "bundle prepared model content release manifest",
@@ -2674,6 +2835,11 @@ class IndustrialAssignmentExecutionBundle:
                     self.trainable_plan_authority
                 )
             ),
+            "failure_injection_authority": (
+                None
+                if self.failure_injection_authority is None
+                else self.failure_injection_authority.to_dict()
+            ),
             "prepared_model_content_release_manifest_sha256": (
                 self.prepared_model_content_release_manifest_sha256
             ),
@@ -2726,6 +2892,7 @@ class IndustrialAssignmentExecutionBundle:
                 "model_lock_artifact",
                 "prepared_models",
                 "trainable_plan_authority",
+                "failure_injection_authority",
                 "prepared_model_content_release_manifest_sha256",
                 "compile_cache_plan",
                 "inventory_source_artifact",
@@ -2817,6 +2984,13 @@ class IndustrialAssignmentExecutionBundle:
                     row["trainable_plan_authority"]
                 )
             ),
+            failure_injection_authority=(
+                None
+                if row["failure_injection_authority"] is None
+                else FailureInjectionAuthorityBinding.from_dict(
+                    row["failure_injection_authority"]
+                )
+            ),
             prepared_model_content_release_manifest_sha256=(
                 None
                 if row["prepared_model_content_release_manifest_sha256"] is None
@@ -2868,12 +3042,79 @@ class IndustrialAssignmentExecutionBundle:
             raise RuntimeError("formal replay returned an audit-only result")
         return result
 
+    def reconstruct_execution_plan_for_materialization(
+        self,
+        launch_policy: AssignmentLaunchMaterializationPolicy,
+        *,
+        render_root: str | Path,
+    ) -> IndustrialExecutionPlan:
+        """Build the plan before its reducer-owned summary exists.
+
+        This is the sole plan-to-bundle construction seam.  Every raw source,
+        scheduler replay, release gate, and execution-plan validator remains
+        active; only comparison with ``execution_plan_summary`` is deferred
+        until the caller serializes the returned plan and constructs the final
+        bundle.  Loaded bundles must continue to use
+        :meth:`reconstruct_execution_plan`, which always checks that summary.
+        """
+
+        if type(launch_policy) is not AssignmentLaunchMaterializationPolicy:
+            raise TypeError("materialization requires an exact launch policy")
+        result = self._replay_execution_plan(
+            diagnostic=False,
+            verify_declared_summary=False,
+            launch_materialization_policy=launch_policy,
+            launch_materialization_root=render_root,
+        )
+        if type(result) is not IndustrialExecutionPlan:  # pragma: no cover
+            raise RuntimeError("materialization replay returned an audit-only result")
+        return result
+
+    def preflight_execution_plan_materialization(
+        self,
+        launch_policy: AssignmentLaunchMaterializationPolicy,
+        *,
+        render_root: str | Path,
+    ) -> None:
+        """Replay every raw/source gate without writing renderer artifacts."""
+
+        if type(launch_policy) is not AssignmentLaunchMaterializationPolicy:
+            raise TypeError("materialization preflight requires an exact launch policy")
+        result = self._replay_execution_plan(
+            diagnostic=False,
+            verify_declared_summary=False,
+            launch_materialization_policy=launch_policy,
+            launch_materialization_root=render_root,
+            materialization_preflight_only=True,
+        )
+        if result is not None:  # pragma: no cover - private replay postcondition
+            raise RuntimeError("materialization preflight returned an execution plan")
+
     def _replay_execution_plan(
         self,
         *,
         diagnostic: bool,
-    ) -> IndustrialExecutionPlan | IndustrialExecutionPlanAudit:
+        verify_declared_summary: bool = True,
+        launch_materialization_policy: (
+            AssignmentLaunchMaterializationPolicy | None
+        ) = None,
+        launch_materialization_root: str | Path | None = None,
+        materialization_preflight_only: bool = False,
+    ) -> IndustrialExecutionPlan | IndustrialExecutionPlanAudit | None:
         """Replay planning inputs; create physical authority only when READY."""
+
+        if diagnostic and not verify_declared_summary:
+            raise ValueError("diagnostic replay cannot omit the declared summary")
+        if diagnostic and launch_materialization_policy is not None:
+            raise ValueError("diagnostic replay cannot materialize a server launch")
+        if verify_declared_summary and launch_materialization_policy is not None:
+            raise ValueError("loaded-bundle replay cannot replace its server launch")
+        if (launch_materialization_policy is None) != (
+            launch_materialization_root is None
+        ):
+            raise ValueError("materialization policy and render root must be paired")
+        if materialization_preflight_only and launch_materialization_policy is None:
+            raise ValueError("materialization preflight requires a launch policy")
 
         registry = _load_registry(self.registry.load())
         if registry.sha256 != self.registry.semantic_sha256:
@@ -3050,6 +3291,14 @@ class IndustrialAssignmentExecutionBundle:
             raise ExecutionBundleBlockedError(
                 "current_release_serving_execution_bundle_required"
             )
+        failure_authority_sha256, failure_execution_authority = (
+            _require_bundle_failure_injection_authority(
+                registry=registry,
+                cell=cell,
+                binding=self.failure_injection_authority,
+                diagnostic=diagnostic,
+            )
+        )
         budget = _one_budget(budgets, self.cell_id)
         run_config = load_run_config(self.run_config.path)
         self.run_config.load()
@@ -3091,16 +3340,10 @@ class IndustrialAssignmentExecutionBundle:
             raise ValueError(
                 "execution production load differs from the registered budget load"
             )
-        launch = _server_launch_from_dict(self.server_launch.load())
-        if launch.run_config != self.run_config.path:
-            raise ValueError("server launch does not use the bound run config")
         compile_plan = CompileCacheLaunchPlan.load(self.compile_cache_plan.path)
         self.compile_cache_plan.load()
-        if (
-            compile_plan.sha256 != self.compile_cache_plan.semantic_sha256
-            or launch.compile_cache_plan != self.compile_cache_plan.path
-        ):
-            raise ValueError("server launch swapped its compile-cache plan")
+        if compile_plan.sha256 != self.compile_cache_plan.semantic_sha256:
+            raise ValueError("compile-cache plan semantic identity mismatch")
         preflight_compile_cache_launch(compile_plan)
         sampling = SamplingProfile.load(self.sampling_artifact.source.path)
         self.sampling_artifact.source.load()
@@ -3111,12 +3354,6 @@ class IndustrialAssignmentExecutionBundle:
         if model_lock.sha256 != self.model_lock_artifact.source.semantic_sha256:
             raise ValueError("model-lock semantic identity mismatch")
         prepared_models = self.prepared_models.load()
-        _validate_model_inputs(
-            model_lock=model_lock,
-            prepared=prepared_models,
-            run_config=run_config,
-            launch=launch,
-        )
         parameter_plan = _require_bundle_trainable_plan_authority(
             bundle=self,
             cell=cell,
@@ -3195,16 +3432,146 @@ class IndustrialAssignmentExecutionBundle:
             raise ValueError(
                 "inventory source artifact differs from the physical inventory"
             )
-        summary = self.execution_plan_summary.load()
-        summary_sha256 = hashlib.sha256(_canonical_bytes(summary)).hexdigest()
-        if (
-            summary_sha256 != self.execution_plan_sha256
-            or self.execution_plan_summary.semantic_sha256 != self.execution_plan_sha256
-        ):
-            raise ValueError("declared execution-plan summary identity is inconsistent")
+        summary = None
+        if verify_declared_summary:
+            summary = self.execution_plan_summary.load()
+            summary_sha256 = hashlib.sha256(_canonical_bytes(summary)).hexdigest()
+            if (
+                summary_sha256 != self.execution_plan_sha256
+                or self.execution_plan_summary.semantic_sha256
+                != self.execution_plan_sha256
+            ):
+                raise ValueError(
+                    "declared execution-plan summary identity is inconsistent"
+                )
         expected_root = Path(cell.resources.evidence_root).resolve()
         if Path(self.output_root) != expected_root:
             raise ValueError("bundle output root differs from registry reservation")
+        if launch_materialization_policy is None:
+            launch = _server_launch_from_dict(self.server_launch.load())
+        else:
+            if launch_materialization_root is None:  # pragma: no cover - paired above
+                raise RuntimeError("materialization render root disappeared")
+            render_root = Path(launch_materialization_root)
+            render_root_parent = render_root.parent
+            if (
+                not render_root.is_absolute()
+                or render_root.resolve() != render_root
+                or render_root.is_symlink()
+                or render_root == expected_root
+                or render_root.is_relative_to(expected_root)
+                or expected_root.is_relative_to(render_root)
+            ):
+                raise ValueError(
+                    "materialization render root must be a separate resolved directory"
+                )
+            if materialization_preflight_only:
+                # The publication and assignment roots are intentionally absent
+                # during the all-assignment preflight.  Validate their nearest
+                # existing owner-private ancestor and require both future path
+                # components to be fresh, including broken symlinks.
+                if os.path.lexists(render_root) or os.path.lexists(render_root_parent):
+                    raise ValueError(
+                        "materialization render root must belong to a fresh publication"
+                    )
+                publication_parent = render_root_parent.parent
+                if (
+                    publication_parent.is_symlink()
+                    or not publication_parent.is_dir()
+                    or publication_parent.resolve() != publication_parent
+                ):
+                    raise ValueError(
+                        "materialization publication parent must be resolved"
+                    )
+                publication_parent_metadata = publication_parent.stat(
+                    follow_symlinks=False
+                )
+                if (
+                    publication_parent_metadata.st_uid != os.geteuid()
+                    or publication_parent_metadata.st_mode & 0o077
+                ):
+                    raise ValueError(
+                        "materialization publication parent must be release-private"
+                    )
+            else:
+                if (
+                    not render_root.is_dir()
+                    or render_root_parent.is_symlink()
+                    or render_root_parent.resolve() != render_root_parent
+                    or not render_root_parent.is_dir()
+                ):
+                    raise ValueError(
+                        "materialization render root must be a separate resolved directory"
+                    )
+                render_metadata = render_root.stat(follow_symlinks=False)
+                parent_metadata = render_root_parent.stat(follow_symlinks=False)
+                if (
+                    render_metadata.st_uid != os.geteuid()
+                    or render_metadata.st_mode & 0o077
+                    or parent_metadata.st_uid != os.geteuid()
+                    or parent_metadata.st_mode & 0o077
+                ):
+                    raise ValueError(
+                        "materialization render root must be release-private"
+                    )
+            roots = _validate_prepared_model_sources(
+                model_lock=model_lock,
+                prepared=prepared_models,
+                run_config=run_config,
+            )
+            # This is the first filesystem-mutating step: the renderer writes
+            # RunConfig/adaptation files.  All raw replay above and the
+            # source-owned release trust gate must therefore pass first.
+            adapted = run_config.method not in {"target_only", "static"}
+            if adapted != (launch_materialization_policy.adaptation_reserve_mb > 0):
+                raise ValueError(
+                    "adaptation reserve must be positive exactly for adapted methods"
+                )
+            adaptation_payload = sglang_adaptation_payload(run_config)
+            if adapted != (adaptation_payload is not None):
+                raise ValueError(
+                    "RunConfig method and rendered adaptation payload differ"
+                )
+            # These pure reducers cover every method/controlled-policy branch
+            # that the renderer will use after its first immutable write.
+            execution_role = _execution_role(run_config.method)
+            _execution_argv(run_config.runtime, role=execution_role)
+            verified_checkout = verify_patched_checkout(
+                launch_materialization_policy.patched_sglang_checkout
+            )
+            require_release_dispatch_execution_authority()
+            if materialization_preflight_only:
+                # Renderer I/O and validations of those freshly rendered files
+                # are the only intentionally deferred operations.
+                return None
+            launch = _render_server(
+                output=render_root,
+                method=run_config.method,
+                config=run_config,
+                verified_checkout=verified_checkout,
+                roots=roots,
+                target_id=run_config.model.target,
+                drafter_id=run_config.model.drafter,
+                adaptation_reserve_mb=(
+                    launch_materialization_policy.adaptation_reserve_mb
+                ),
+                mem_fraction_static=(launch_materialization_policy.mem_fraction_static),
+                host=launch_materialization_policy.host,
+                port=assignment.ports[0],
+                compile_cache_plan_path=self.compile_cache_plan.path,
+            )
+            launch = replace(launch, run_config=self.run_config.path)
+        if (
+            launch.run_config != self.run_config.path
+            or launch.compile_cache_plan != self.compile_cache_plan.path
+        ):
+            raise ValueError("server launch swapped a bound execution source")
+        _validate_model_inputs(
+            model_lock=model_lock,
+            prepared=prepared_models,
+            run_config=run_config,
+            launch=launch,
+        )
         if diagnostic:
             component_replay_sha256 = content_sha256(
                 {
@@ -3239,6 +3606,7 @@ class IndustrialAssignmentExecutionBundle:
                         if self.trainable_plan_authority is None
                         else self.trainable_plan_authority.sha256
                     ),
+                    "failure_injection_authority_sha256": (failure_authority_sha256),
                     "prepared_model_content_release_manifest_sha256": (
                         self.prepared_model_content_release_manifest_sha256
                     ),
@@ -3295,6 +3663,7 @@ class IndustrialAssignmentExecutionBundle:
                 inventory_source_artifact=inventory_source,
                 runtime_envelope_artifact=runtime_envelope,
                 trainable_plan_authority=self.trainable_plan_authority,
+                failure_execution_authority=failure_execution_authority,
                 prepared_model_content_release_manifest_sha256=(
                     self.prepared_model_content_release_manifest_sha256
                 ),
@@ -3306,15 +3675,69 @@ class IndustrialAssignmentExecutionBundle:
             )
         except TrainablePlanExecutionBlockedError as error:
             raise ExecutionBundleBlockedError(error.reason_code) from error
-        if (
-            _canonical_bytes(summary) != _canonical_bytes(plan.to_dict())
-            or self.execution_plan_summary.semantic_sha256 != plan.sha256
-            or plan.sha256 != self.execution_plan_sha256
-        ):
-            raise ValueError(
-                "declared execution-plan summary differs from raw artifact replay"
-            )
+        if verify_declared_summary:
+            if summary is None:  # pragma: no cover - guarded above
+                raise RuntimeError("declared execution summary disappeared")
+            if (
+                _canonical_bytes(summary) != _canonical_bytes(plan.to_dict())
+                or self.execution_plan_summary.semantic_sha256 != plan.sha256
+                or plan.sha256 != self.execution_plan_sha256
+            ):
+                raise ValueError(
+                    "declared execution-plan summary differs from raw artifact replay"
+                )
         return plan
+
+
+def finalize_materialized_execution_bundle(
+    provisional: IndustrialAssignmentExecutionBundle,
+    *,
+    launch_policy: AssignmentLaunchMaterializationPolicy,
+    render_root: str | Path,
+    server_launch: BoundJsonSource,
+    execution_plan_summary: BoundJsonSource,
+) -> IndustrialAssignmentExecutionBundle:
+    """Replace the construction placeholder with the reducer-owned plan.
+
+    The plan is reconstructed from the provisional bundle's raw sources; the
+    supplied summary path is accepted only when its complete JSON body equals
+    that newly constructed plan.  A second ordinary bundle replay then proves
+    the final schema-v4 object is load-equivalent to its source construction.
+    """
+
+    if type(provisional) is not IndustrialAssignmentExecutionBundle:
+        raise TypeError("bundle finalization requires an exact provisional bundle")
+    if type(launch_policy) is not AssignmentLaunchMaterializationPolicy:
+        raise TypeError("bundle finalization requires an exact launch policy")
+    if type(server_launch) is not BoundJsonSource:
+        raise TypeError("bundle finalization requires an exact server-launch source")
+    if type(execution_plan_summary) is not BoundJsonSource:
+        raise TypeError("bundle finalization requires an exact summary source")
+    plan = provisional.reconstruct_execution_plan_for_materialization(
+        launch_policy,
+        render_root=render_root,
+    )
+    launch_value = server_launch.load()
+    if launch_value != server_launch_to_dict(
+        plan.server_launch
+    ) or server_launch.canonical_sha256 != content_sha256(launch_value):
+        raise ValueError("materialized server launch differs from raw replay")
+    summary = execution_plan_summary.load()
+    if (
+        summary != plan.to_dict()
+        or execution_plan_summary.canonical_sha256 != plan.sha256
+        or execution_plan_summary.semantic_sha256 != plan.sha256
+    ):
+        raise ValueError("materialized execution-plan summary differs from raw replay")
+    final = replace(
+        provisional,
+        execution_plan_sha256=plan.sha256,
+        server_launch=server_launch,
+        execution_plan_summary=execution_plan_summary,
+    )
+    if final.reconstruct_execution_plan() != plan:
+        raise RuntimeError("finalized execution bundle changed its reconstructed plan")
+    return final
 
 
 def _replay_interference_authority(
@@ -3487,17 +3910,37 @@ def _rematerialize_budget_authority(
     )
     for label, source, binding in raw_pairs:
         _compare_budget_raw_binding(label, source, binding)
-    if (
-        activation_runtime_source.semantic_sha256 != activation_replay.runtime_sha256
-        or activation_split_source.semantic_sha256 != activation_replay.split_sha256
-    ):
-        raise ValueError(
-            "bundle runtime/split differs from tagged activation authority"
-        )
-    if tuple(source.semantic_sha256 for source in dependency_receipt_sources) != tuple(
-        receipt.sha256 for receipt in activation_replay.dependency_receipts
-    ):
+    runtime_binding = _one_activation_raw_binding(
+        authority,
+        role="activation_runtime",
+        semantic_sha256=activation_replay.runtime_sha256,
+    )
+    split_binding = _one_activation_raw_binding(
+        authority,
+        role="activation_split",
+        semantic_sha256=activation_replay.split_sha256,
+    )
+    _compare_budget_raw_binding(
+        "activation runtime", activation_runtime_source, runtime_binding
+    )
+    _compare_budget_raw_binding(
+        "activation split", activation_split_source, split_binding
+    )
+    if len(dependency_receipt_sources) != len(activation_replay.dependency_receipts):
         raise ValueError("budget activation dependency raw coverage differs")
+    for source, receipt in zip(
+        dependency_receipt_sources,
+        activation_replay.dependency_receipts,
+        strict=True,
+    ):
+        receipt_binding = _one_activation_raw_binding(
+            authority,
+            role="activation_dependency_receipt",
+            semantic_sha256=receipt.sha256,
+        )
+        _compare_budget_raw_binding(
+            "activation dependency receipt", source, receipt_binding
+        )
     if len(load_sources) != len(authority.load_bindings):
         raise ValueError("budget load-binding raw authority coverage differs")
     for source, binding in zip(
@@ -3532,6 +3975,22 @@ def _rematerialize_budget_authority(
     ):
         raise ValueError("budget load cells differ from raw materialization authority")
     return budget_plan, budget_load_bindings, authority, activation_replay
+
+
+def _one_activation_raw_binding(
+    authority: BudgetMaterializationAuthorityBinding,
+    *,
+    role: str,
+    semantic_sha256: str,
+) -> BudgetRawJsonBinding:
+    matches = tuple(
+        source
+        for source in _budget_activation_raw_sources(authority.activation)
+        if source.role == role and source.semantic_sha256 == semantic_sha256
+    )
+    if len(matches) != 1:
+        raise ValueError(f"activation raw {role} binding is absent or path-ambiguous")
+    return matches[0]
 
 
 def _compare_budget_raw_binding(
@@ -4099,6 +4558,29 @@ def _validate_model_inputs(
     run_config,
     launch: ServerLaunch,
 ) -> None:
+    roots = _validate_prepared_model_sources(
+        model_lock=model_lock,
+        prepared=prepared,
+        run_config=run_config,
+    )
+    target = run_config.model.target
+    try:
+        model_path_index = launch.argv.index("--model-path") + 1
+        launched_root = launch.argv[model_path_index]
+    except (ValueError, IndexError) as error:
+        raise ValueError("server launch lacks one target model path") from error
+    if launched_root != roots[target]:
+        raise ValueError("server launch target root differs from prepared models")
+
+
+def _validate_prepared_model_sources(
+    *,
+    model_lock: ModelLock,
+    prepared: object,
+    run_config,
+) -> dict[str, str]:
+    """Validate every model input before a renderer can create runtime files."""
+
     row = _strict_object(
         "prepared models",
         prepared,
@@ -4111,12 +4593,15 @@ def _validate_model_inputs(
     ):
         raise ValueError("prepared-model identity mismatch")
     roots = row["roots"]
-    if type(roots) is not dict or any(type(key) is not str for key in roots):
+    if type(roots) is not dict or any(
+        type(key) is not str or type(value) is not str for key, value in roots.items()
+    ):
         raise TypeError("prepared-model roots must be a JSON object")
     expected = {model.model_id: model.revision for model in model_lock.models}
     if set(roots) != set(expected):
         raise ValueError("prepared-model roots do not cover the lock exactly")
-    for root_value in roots.values():
+    validated_roots: dict[str, str] = {}
+    for model_id, root_value in roots.items():
         root = Path(_strict_text("prepared model root", root_value))
         if not root.is_absolute() or root.resolve() != root or not root.is_dir():
             raise ValueError(
@@ -4124,16 +4609,14 @@ def _validate_model_inputs(
             )
         if root.is_symlink():
             raise ValueError("prepared model root cannot be a symlink")
+        validated_roots[model_id] = str(root)
     target = run_config.model.target
     if expected.get(target) != run_config.model.target_revision:
         raise ValueError("run config target revision differs from model lock")
-    try:
-        model_path_index = launch.argv.index("--model-path") + 1
-        launched_root = launch.argv[model_path_index]
-    except (ValueError, IndexError) as error:
-        raise ValueError("server launch lacks one target model path") from error
-    if launched_root != roots[target]:
-        raise ValueError("server launch target root differs from prepared models")
+    drafter = run_config.model.drafter
+    if expected.get(drafter) != run_config.model.drafter_revision:
+        raise ValueError("run config drafter revision differs from model lock")
+    return validated_roots
 
 
 def _one_assignment(plan: GpuDispatchPlan, assignment_sha256: str) -> GpuAssignment:
@@ -4146,6 +4629,42 @@ def _one_assignment(plan: GpuDispatchPlan, assignment_sha256: str) -> GpuAssignm
     if len(matches) != 1:
         raise ValueError("bundle assignment is absent or duplicated in dispatch plan")
     return matches[0]
+
+
+def _require_bundle_failure_injection_authority(
+    *,
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+    binding: FailureInjectionAuthorityBinding | None,
+    diagnostic: bool,
+) -> tuple[str | None, FailureExecutionAuthorityToken | None]:
+    """Revalidate the E5 plan and mint a token only at the formal boundary."""
+
+    failure_cell = cell.identity.task == "failure_injection"
+    if failure_cell != (binding is not None):
+        if failure_cell:
+            raise ExecutionBundleBlockedError(
+                "failure_injection_raw_plan_authority_required"
+            )
+        raise ValueError("non-failure bundle cannot carry failure authority")
+    if binding is None:
+        return None, None
+    replayed = revalidate_failure_injection_authority(binding, registry=registry)
+    if (
+        replayed.plan.cell_id != cell.cell_id
+        or replayed.binding.registry_sha256 != registry.sha256
+    ):
+        raise ValueError("failure authority names another assignment cell")
+    if diagnostic:
+        return replayed.binding.sha256, None
+    try:
+        token = require_failure_injection_authority(
+            replayed.binding,
+            registry=registry,
+        )
+    except FailureInjectionAuthorityBlocked as error:
+        raise ExecutionBundleBlockedError(error.reason) from error
+    return replayed.binding.sha256, token
 
 
 def _one_budget(
@@ -4168,6 +4687,7 @@ __all__ = [
     "dispatch_receipt_sidecar_path",
     "execute_dispatch_wave_bundles",
     "execution_policy_to_dict",
+    "finalize_materialized_execution_bundle",
     "load_dispatch_schedule_receipt",
     "preflight_dispatch_receipt_output",
     "preflight_fresh_assignment_trace",

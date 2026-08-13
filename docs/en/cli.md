@@ -31,7 +31,8 @@ authority. The schema-v3 and industrial commands are:
 | `bind-industrial-budget-authority` | Bind a declared `BudgetPlan` to its complete tagged raw activation/load/capacity closure |
 | `estimate-industrial-budget` | Replay one ready `BudgetPlan` on an exact physical inventory and interference envelope |
 | `plan-industrial-dispatch` | Freeze deterministic topology-aware GPU-pool waves and physical assignments |
-| `execute-dispatch-wave` | Replay path-bound assignment bundles and execute one receipt-bounded frozen wave when all release authorities are available |
+| `materialize-dispatch-execution-bundles` | Bind one path-only raw input graph and publish a complete schema-v4 assignment-bundle set after all-assignment preflight |
+| `execute-dispatch-wave` | Reopen one committed materialization manifest and execute one receipt-bounded frozen wave when all release authorities are available |
 | `seal-industrial-stage` | Bind activated completion, dispositions, budgets, runtime, split, dependencies, and locked outputs |
 | `analyze-industrial` | Validate schema-v3 terminal, budget, family-power, and hardware evidence |
 | `build-speed-study` | Materialize the smaller core source protocol |
@@ -250,39 +251,54 @@ execution. Structural loading of an envelope does not prove its calibration;
 formal timing still requires raw isolated/co-run evidence and trusted hardware
 binding.
 
-`execute-dispatch-wave` never treats the planner JSON or an
-`IndustrialExecutionPlan.to_dict()` summary as launch authority. Repeat
-`--bundle` for every assignment in the frozen dispatch plan. Each schema-v1
-bundle binds absolute resolved paths, raw/canonical/semantic/file identities,
-and adjacent sidecars for the registry and inventory, serial-interference raw
-receipt, budget policy/load/capacity inputs, raw generic-stage activation
-manifest and its exact runtime envelope/split/receipt chain, context and
-dispatch, topology/load/config/launch, sampling/model lock/prepared roots,
-compile plan, and inventory/runtime evidence. Activation is a tagged raw
-authority: generic, E1, E2, confirmation-pilot, confirmation-final, and
-stage-aggregate manifests are replayed from their complete path closure. A
-final prefix derives prior pilot completion only from schema-v4/native
-completion authority; bare completed-cell IDs are rejected. E3b/E5 stage
-receipts use a separate family-SHA-sorted aggregate. The E5 aggregate also
-requires deterministic auxiliary activation/completion for its 264 non-family
-failure-injection cells, and the family plus auxiliary dispositions must form
-an exact disjoint cover of the registry stage. Its read-only audit reruns the
-raw reducers and exact planning scheduler, but deliberately reports the
-execution-plan SHA as `null`/`NOT_VALIDATED`; a self-consistent serialized plan
-summary cannot authorize itself. Formal reconstruction first requires a live
-`READY` `BudgetPlan` plus path-bound budget materialization authority for its
-policy, loads, activation, inventory, and capacity sources. Only then can it
-build the physical plan and compare the redundant summary exactly. This
-initial execution slice accepts only those Target-only serving assignments
-that pass the release capability, raw activation/completion, capacity,
-interference, and trusted-attestation boundaries. Compile/download and every
-unsupported serving assignment remain explicitly blocked.
-Before launch, the command linearly checks every assignment-local source and
-requires complete bundle coverage plus one exact shared schema-v3 dispatch
-context/raw budget authority. It replays that shared scheduler authority as a
-group, then constructs only the requested wave's physical plans (and any prior
-plans named by a resume receipt); each plan that can actually launch still
-runs the full public validation boundary.
+`materialize-dispatch-execution-bundles` closes the structural boundary between
+the frozen planner output and formal execution. Its schema-v1 request contains
+only absolute resolved raw-artifact paths, their source roles, and one
+assignment-runtime path set for every dispatch cell. It deliberately contains
+no caller-supplied assignment SHA, execution-plan SHA or summary, output root,
+or semantic hash. The reducer reopens the request and every sidecar, derives
+the assignments from the frozen dispatch plan, and requires an exact one-to-one
+assignment cover before it can construct schema-v4 bundles.
+
+Every assignment's raw activation/completion, budget, capacity, interference,
+topology, runtime, sampling, model, compile, nonce, launch-policy, and optional
+trainable/failure authority is preflighted before the fresh publication
+directory or any renderer artifact is created. Tagged generic, E1, E2,
+confirmation-pilot, confirmation-final, and stage-aggregate activation
+authorities are replayed from their complete path closure. Final prefixes use
+only schema-v4/native completion authority; bare completed-cell IDs are
+rejected. E3b/E5 family aggregates remain separate, and E5 additionally
+requires the deterministic auxiliary activation/completion cover for its 264
+non-family failure-injection cells. Formal reconstruction also requires a live
+`READY` `BudgetPlan` and its path-bound materialization authority; a
+self-consistent planner or execution summary cannot authorize itself.
+
+The output path must be absolute, resolved, absent, and below a stable
+owner-private parent. After all-assignment preflight succeeds, the command
+creates a private `0700` directory, writes each schema-v4 bundle and adjacent
+sidecars exclusively, and writes
+`dispatch-execution-bundle-manifest.json` plus its sidecar last as the commit
+marker. An interrupted partial directory is retained but has no consumable
+manifest; retry uses a different fresh directory rather than deleting evidence.
+
+```bash
+lightcone-spec materialize-dispatch-execution-bundles \
+  --request /absolute/path/to/dispatch-bundle-request.json \
+  --output-directory /absolute/private/path/dispatch-bundles-attempt-0001
+```
+
+`execute-dispatch-wave` never treats the planner JSON, an
+`IndustrialExecutionPlan.to_dict()` summary, or raw bundle paths as launch
+authority. It accepts exactly one required `--materialization-manifest`. After
+the release dispatch trust gate, the loader reopens the manifest, its request
+and dispatch plan, every schema-v4 member, and the complete path-bound
+construction graph. It rejects changed input bytes, swapped membership,
+incomplete assignment coverage, or bundles outside the manifest directory.
+Only then does execution replay the shared scheduler authority and construct
+the requested wave's physical plans (plus prior plans named by a resume
+receipt). Compile/download and unsupported serving assignments remain
+explicitly blocked, and every potentially launchable plan still crosses the
+full public validation boundary.
 
 The command executes exactly one `--wave-index`. Wave zero has no resume input;
 a successful prefix requires the previous `--resume-receipt`, while a failed
@@ -293,6 +309,11 @@ exact retry identity, and cumulative monotonic cost. A partial wave therefore
 keeps successful siblings and retries only failed siblings. An intent without
 a finish has unknowable cost and blocks under
 `dispatch_attempt_intent_without_finish_cost_unresolved`.
+
+The attempt-journal manifest is schema-v2 for formal manifest-based dispatch
+and binds the exact materialization-manifest SHA-256. Reopening the same journal
+through a different bundle publication is therefore an identity mismatch, even
+if the dispatch plan is otherwise unchanged.
 
 The immutable file at `--receipt-output` is one canonical schema-v2 envelope
 containing the receipt, its structured sidecar, and the exact journal
@@ -312,8 +333,8 @@ claims still require the release-owned trusted attester below.
 
 ```bash
 lightcone-spec execute-dispatch-wave \
-  --bundle artifacts/industrial/bundles/assignment-000.json \
-  --bundle artifacts/industrial/bundles/assignment-001.json \
+  --materialization-manifest \
+    /absolute/private/path/dispatch-bundles-attempt-0001/dispatch-execution-bundle-manifest.json \
   --wave-index 0 \
   --receipt-output artifacts/industrial/dispatch-wave-0.json
 ```
@@ -321,15 +342,18 @@ lightcone-spec execute-dispatch-wave \
 The source release has no trusted hardware attester in its release-owned trust
 policy. A caller or test signer cannot unlock formal execution, even with a
 cryptographically valid signature, and a bare `CapacityEnvelope` cannot grant
-execution authority. It therefore returns `BLOCKED`/42 before reading a bundle,
-creating the receipt parent or evidence root, importing the serving client, or
-launching a process. A missing bundle is likewise never converted into a
-planner-summary fallback. Fresh execution rejects unjournaled pre-existing
-per-plan trace files. Resume requires the raw append-only attempt chain plus
-revalidated structured terminal bindings; neither a bare terminal digest nor a
-caller-rehashed schedule JSON can skip work. If a coordinator dies after
-durable intent but before durable finish, execution remains blocked rather than
-inventing a monotonic cost.
+execution authority. Given an otherwise complete request, materialization
+therefore returns `BLOCKED`/42 at the all-assignment release preflight before
+creating its publication directory. Formal execution independently returns
+`BLOCKED`/42 at its entry trust gate before reading the materialization
+manifest, creating the receipt parent or evidence root, importing the serving
+client, or launching a process. A bundle publication is structural authority,
+not GPU attestation or permission to execute. Fresh execution rejects
+unjournaled pre-existing per-plan trace files. Resume requires the raw
+append-only attempt chain plus revalidated structured terminal bindings;
+neither a bare terminal digest nor a caller-rehashed schedule JSON can skip
+work. If a coordinator dies after durable intent but before durable finish,
+execution remains blocked rather than inventing a monotonic cost.
 
 Estimate the same activated set before dispatch. Every budget field is
 explicit; the report separates wall, compute, reserved, and whole-instance
