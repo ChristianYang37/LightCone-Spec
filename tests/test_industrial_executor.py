@@ -3581,11 +3581,28 @@ def test_async_evidence_sink_batches_without_empty_queue_fsync(
 def test_static_execution_is_blocked_without_a_trusted_terminal_provider(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(
-        ValueError,
-        match="no exact scheduler-issued physical assignment",
-    ):
-        _execution_fixture(tmp_path, method="static", request_count=1)
+    plan = _execution_fixture(tmp_path, method="static", request_count=1).plan
+    output = Path(plan.runtime_plan.cell.resources.evidence_root)
+    launcher_called = False
+
+    async def launch(_server: ServerLaunch) -> _FakeHandle:
+        nonlocal launcher_called
+        launcher_called = True
+        raise AssertionError("launcher must not run before native evidence preflight")
+
+    with pytest.raises(NativeEvidenceUnavailableError):
+        asyncio.run(
+            execute_industrial_plan(
+                plan,
+                output_root=output,
+                run_nonce_sha256="d" * 64,
+                launch_server=launch,
+                transport=_FakeTransport(plan=plan),
+            )
+        )
+
+    assert not launcher_called
+    assert not output.exists()
 
 
 def test_adapted_native_evidence_preflight_requires_the_wire_provider() -> None:
