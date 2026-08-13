@@ -1759,11 +1759,3 @@ class FleetWaveReceipt:
 
     def sidecar(self) -> ArtifactSidecar:
         return ArtifactSidecar(1, "fleet_wave_receipt.v1", self.sha256)
-
-
-# Compact compatibility spellings for callers that lead with ``Fleet``.
-FleetGpuAssignment = GpuFleetAssignment
-FleetAssignment = GpuFleetAssignment
-FleetDispatchPlan = GpuFleetDispatchPlan
-FleetGpuDispatchPlan = GpuFleetDispatchPlan
-FleetGpuDispatchWave = GpuFleetDispatchWave
