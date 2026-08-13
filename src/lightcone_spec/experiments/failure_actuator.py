@@ -19,7 +19,7 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, Protocol
@@ -46,9 +46,59 @@ FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON = (
     "failure_actuator_release_capability_unavailable"
 )
 
-# Source-owned.  A future release may add one exact implementation identity
-# only together with GPU/device tests and the trusted terminal signer.
-RELEASE_FAILURE_ACTUATOR_CAPABILITIES: tuple[tuple[str, str], ...] = ()
+# This is the sole release-owned failure-actuator registry.  A reviewed future
+# release may add an entry only together with its concrete factory, GPU/device
+# tests, executor lifecycle wiring, and trusted terminal signer.  Keeping the
+# callable beside its identity prevents two independent allowlists from
+# unlocking each other accidentally.
+type FailureActuatorFactory = Callable[[], "FirstPartyFailureActuator"]
+
+
+@dataclass(frozen=True)
+class ReleaseFailureActuatorCapability:
+    actuator_id: str
+    actuator_version_sha256: str
+    factory_module: str
+    factory_qualname: str
+    factory: FailureActuatorFactory
+
+    def __post_init__(self) -> None:
+        _require_safe("release failure actuator", self.actuator_id)
+        if self.actuator_id.lower().startswith(("cpu", "test", "fixture")):
+            raise ValueError("diagnostic actuator identities cannot enter release")
+        _require_sha256(
+            "release failure actuator version", self.actuator_version_sha256
+        )
+        _require_safe("release failure actuator factory module", self.factory_module)
+        _require_safe(
+            "release failure actuator factory qualname", self.factory_qualname
+        )
+        if not callable(self.factory):
+            raise TypeError("release failure actuator factory must be callable")
+        if not self.factory_module.startswith("lightcone_spec."):
+            raise ValueError("release failure actuator factory is not source-owned")
+        if (
+            getattr(self.factory, "__module__", None) != self.factory_module
+            or getattr(self.factory, "__qualname__", None) != self.factory_qualname
+        ):
+            raise ValueError("release failure actuator factory identity differs")
+
+    @property
+    def sha256(self) -> str:
+        self.__post_init__()
+        return content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "release_failure_actuator_capability",
+                "actuator_id": self.actuator_id,
+                "actuator_version_sha256": self.actuator_version_sha256,
+                "factory_module": self.factory_module,
+                "factory_qualname": self.factory_qualname,
+            }
+        )
+
+
+RELEASE_FAILURE_ACTUATOR_CAPABILITIES: tuple[ReleaseFailureActuatorCapability, ...] = ()
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -59,6 +109,25 @@ class FailureActuatorBlocked(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(f"E5 first-party fault actuation is BLOCKED: {reason}")
         self.reason = reason
+
+
+def release_failure_actuator_capability() -> ReleaseFailureActuatorCapability:
+    """Resolve the one source-owned identity and callable as one capability."""
+
+    if (
+        len(RELEASE_FAILURE_ACTUATOR_CAPABILITIES) != 1
+        or type(RELEASE_FAILURE_ACTUATOR_CAPABILITIES[0])
+        is not ReleaseFailureActuatorCapability
+    ):
+        raise FailureActuatorBlocked(FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON)
+    capability = RELEASE_FAILURE_ACTUATOR_CAPABILITIES[0]
+    try:
+        capability.__post_init__()
+    except (TypeError, ValueError) as error:
+        raise FailureActuatorBlocked(
+            FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON
+        ) from error
+    return capability
 
 
 def _require_sha256(label: str, value: object) -> str:
@@ -435,8 +504,7 @@ def require_release_failure_actuator(
         if type(authority) is not FailureInjectionAuthorityResult:
             raise TypeError("fault actuator gate requires an exact authority result")
         authority.plan.__post_init__()
-    if not RELEASE_FAILURE_ACTUATOR_CAPABILITIES:
-        raise FailureActuatorBlocked(FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON)
+    release_failure_actuator_capability()
     raise FailureActuatorBlocked("failure_actuator_trusted_signer_unavailable")
 
 
@@ -866,9 +934,11 @@ __all__ = [
     "FailureScenarioSemantics",
     "FailureTerminalObservation",
     "FirstPartyFailureActuator",
+    "ReleaseFailureActuatorCapability",
     "execute_failure_actuator_for_cpu_test",
     "failure_phase_observation_sha256",
     "failure_semantics",
+    "release_failure_actuator_capability",
     "require_release_failure_actuator",
     "validate_failure_recovery_receipt",
 ]

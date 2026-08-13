@@ -1823,18 +1823,16 @@ class IndustrialExecutionPlan:
                 "logical runtime plan cannot be launched; a physical assignment is required"
             )
         cell = self.runtime_plan.cell
-        if not cell.runnable or cell.status is not CellStatus.UNMEASURED:
-            raise ValueError("execution plan requires one runnable UNMEASURED cell")
-        calibration = is_serving_interference_calibration_cell(cell)
-        if (cell.identity.experiment == "preflight" and not calibration) or (
-            cell.resources.workload_class
-            in {
-                WorkloadClass.DOWNLOAD,
-                WorkloadClass.COMPILE,
-            }
-        ):
-            raise ValueError("non-serving/preflight cells cannot enter this executor")
-        if self.budget.job_kind is BudgetJobKind.FAILURE:
+        failure_cell = cell.identity.task == "failure_injection"
+        failure_budget = (
+            type(self.budget) is ExperimentBudget
+            and self.budget.job_kind is BudgetJobKind.FAILURE
+        )
+        if failure_cell != failure_budget:
+            raise ValueError(
+                "failure-injection cell and FAILURE budget job kind must match exactly"
+            )
+        if failure_cell:
             authority = self.failure_execution_authority
             if authority is None:
                 raise FailureInjectionAuthorityBlocked(
@@ -1853,10 +1851,25 @@ class IndustrialExecutionPlan:
             # A signed plan/token cannot silently degrade into an ordinary
             # serving run.  This release has no source-owned arm/trigger/
             # recover/terminal implementation, so validation remains blocked
-            # even if an actuator allowlist entry is added in isolation.
-            require_failure_execution_lifecycle(authority)
+            # even if a callable capability entry is added in isolation.
+            require_failure_execution_lifecycle(
+                authority,
+                cell=cell,
+                expected_registry_sha256=self.runtime_plan.registry_sha256,
+            )
         elif self.failure_execution_authority is not None:
             raise ValueError("non-failure execution cannot carry failure authority")
+        if not cell.runnable or cell.status is not CellStatus.UNMEASURED:
+            raise ValueError("execution plan requires one runnable UNMEASURED cell")
+        calibration = is_serving_interference_calibration_cell(cell)
+        if (cell.identity.experiment == "preflight" and not calibration) or (
+            cell.resources.workload_class
+            in {
+                WorkloadClass.DOWNLOAD,
+                WorkloadClass.COMPILE,
+            }
+        ):
+            raise ValueError("non-serving/preflight cells cannot enter this executor")
         if len(self.runtime_plan.rank_configs) != 1:
             raise ValueError(
                 "the current strict RunConfig exposes only one-rank serving execution"

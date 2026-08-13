@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from itertools import pairwise
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from lightcone_spec.experiments.registry import (
     E5_FAILURES,
@@ -37,6 +37,11 @@ from lightcone_spec.runtime.attestation import (
     RELEASE_TRUSTED_ATTESTER_POLICY,
     require_release_trusted_attester_policy,
 )
+
+if TYPE_CHECKING:
+    from lightcone_spec.experiments.failure_actuator import (
+        ReleaseFailureActuatorCapability,
+    )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -57,11 +62,6 @@ FAILURE_INJECTION_RAW_PLAN_AUTHORITY_REQUIRED_REASON = (
 FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON = (
     "failure_injection_first_party_execution_lifecycle_unavailable"
 )
-
-# This is a source-owned execution allowlist, not a caller parameter.  A future
-# reviewed release may add an exact ``(actuator_id, version_sha256)`` pair only
-# together with its first-party implementation and device-level tests.
-RELEASE_FAILURE_ACTUATORS: tuple[tuple[str, str], ...] = ()
 
 FAILURE_INJECTION_REDUCER_PROTOCOL_SHA256 = content_sha256(
     {
@@ -178,8 +178,8 @@ def _load_raw_json(path: Path, *, label: str) -> tuple[Mapping[str, object], str
         raise ValueError(f"{label} cannot be opened safely") from error
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{label} must be a regular file")
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"{label} must be a single-link regular file")
         if before.st_size <= 0 or before.st_size > _MAX_JSON_BYTES:
             raise ValueError(f"{label} has an invalid size")
         chunks: list[bytes] = []
@@ -197,12 +197,14 @@ def _load_raw_json(path: Path, *, label: str) -> tuple[Mapping[str, object], str
         identity = lambda row: (
             row.st_dev,
             row.st_ino,
+            row.st_nlink,
             row.st_size,
             row.st_mtime_ns,
             row.st_ctime_ns,
         )
         if (
             not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
             or identity(before) != identity(after)
             or identity(after) != identity(current)
         ):
@@ -375,21 +377,16 @@ class ReleaseFailurePlan:
         return content_sha256(self.to_dict())
 
 
-def release_failure_plan_for_cell(
-    registry: ExperimentRegistry,
+def _release_failure_plan_for_cell_identity(
+    *,
+    registry_sha256: str,
     cell: ExperimentCell,
 ) -> ReleaseFailurePlan:
-    """Derive the only release plan for an exact registry-owned E5 cell."""
+    """Derive the plan from one exact cell and its enclosing registry identity."""
 
-    if type(registry) is not ExperimentRegistry:
-        raise TypeError("failure planning requires an exact ExperimentRegistry")
+    _require_sha256("failure registry", registry_sha256)
     if type(cell) is not ExperimentCell:
         raise TypeError("failure planning requires an exact ExperimentCell")
-    matches = tuple(
-        row for row in registry.cells_for("E5") if row.cell_id == cell.cell_id
-    )
-    if len(matches) != 1 or matches[0] != cell:
-        raise ValueError("failure planning rejects caller-selected foreign cell IDs")
     identity = cell.identity
     if (
         identity.task != "failure_injection"
@@ -415,7 +412,7 @@ def release_failure_plan_for_cell(
     return ReleaseFailurePlan(
         schema_version=1,
         kind="e5_release_failure_plan",
-        registry_sha256=registry.sha256,
+        registry_sha256=registry_sha256,
         cell_id=cell.cell_id,
         cell_declaration_sha256=cell.sha256,
         scenario=scenario,
@@ -434,6 +431,27 @@ def release_failure_plan_for_cell(
         expected_counters=tuple(sorted(counters, key=lambda row: row.name)),
         reducer_protocol_sha256=FAILURE_INJECTION_REDUCER_PROTOCOL_SHA256,
         correctness_only=True,
+    )
+
+
+def release_failure_plan_for_cell(
+    registry: ExperimentRegistry,
+    cell: ExperimentCell,
+) -> ReleaseFailurePlan:
+    """Derive the only release plan for an exact registry-owned E5 cell."""
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("failure planning requires an exact ExperimentRegistry")
+    if type(cell) is not ExperimentCell:
+        raise TypeError("failure planning requires an exact ExperimentCell")
+    matches = tuple(
+        row for row in registry.cells_for("E5") if row.cell_id == cell.cell_id
+    )
+    if len(matches) != 1 or matches[0] != cell:
+        raise ValueError("failure planning rejects caller-selected foreign cell IDs")
+    return _release_failure_plan_for_cell_identity(
+        registry_sha256=registry.sha256,
+        cell=cell,
     )
 
 
@@ -692,6 +710,7 @@ def revalidate_failure_injection_authority(
 
 @dataclass(frozen=True)
 class FailureExecutionAuthorityToken:
+    binding: FailureInjectionAuthorityBinding
     authority_sha256: str
     plan_sha256: str
     registry_sha256: str
@@ -699,28 +718,30 @@ class FailureExecutionAuthorityToken:
     scenario: str
     actuator_id: str
     actuator_version_sha256: str
+    actuator_capability_sha256: str
 
     def __post_init__(self) -> None:
+        if type(self.binding) is not FailureInjectionAuthorityBinding:
+            raise TypeError("failure execution token requires an exact raw binding")
+        self.binding.__post_init__()
         for label, value in (
             ("failure execution authority", self.authority_sha256),
             ("failure execution plan", self.plan_sha256),
             ("failure execution registry", self.registry_sha256),
             ("failure execution cell", self.cell_id),
             ("failure actuator version", self.actuator_version_sha256),
+            ("failure actuator capability", self.actuator_capability_sha256),
         ):
             _require_sha256(label, value)
         if self.scenario not in E5_FAILURES:
             raise ValueError("failure execution scenario is unregistered")
         _require_safe_id("failure actuator", self.actuator_id)
-        if (self.actuator_id, self.actuator_version_sha256) not in (
-            RELEASE_FAILURE_ACTUATORS
-        ):
-            raise ValueError("failure execution token is not release-authorized")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": 1,
             "kind": "failure_execution_authority_token",
+            "binding": self.binding.to_dict(),
             "authority_sha256": self.authority_sha256,
             "plan_sha256": self.plan_sha256,
             "registry_sha256": self.registry_sha256,
@@ -728,7 +749,85 @@ class FailureExecutionAuthorityToken:
             "scenario": self.scenario,
             "actuator_id": self.actuator_id,
             "actuator_version_sha256": self.actuator_version_sha256,
+            "actuator_capability_sha256": self.actuator_capability_sha256,
         }
+
+
+def _require_release_failure_actuator_capability() -> ReleaseFailureActuatorCapability:
+    # Local import keeps the actuator's diagnostic harness layered below this
+    # raw-plan module while still making its callable registry the sole source
+    # of formal implementation authority.
+    from lightcone_spec.experiments.failure_actuator import (
+        FailureActuatorBlocked,
+        release_failure_actuator_capability,
+    )
+
+    try:
+        return release_failure_actuator_capability()
+    except FailureActuatorBlocked as error:
+        raise FailureInjectionAuthorityBlocked(
+            FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
+        ) from error
+
+
+def revalidate_failure_execution_authority(
+    token: FailureExecutionAuthorityToken,
+    *,
+    cell: ExperimentCell,
+    expected_registry_sha256: str,
+) -> FailureInjectionAuthorityResult:
+    """Replay raw plan and source capability at every formal executor boundary."""
+
+    if type(token) is not FailureExecutionAuthorityToken:
+        raise TypeError("failure execution replay requires an exact token")
+    token.__post_init__()
+    _require_sha256("failure execution registry", expected_registry_sha256)
+    if type(cell) is not ExperimentCell:
+        raise TypeError("failure execution replay requires an exact cell")
+    binding = token.binding
+    path = _resolved_regular_path(binding.plan_path, label="failure plan")
+    row, raw_sha256 = _load_raw_json(path, label="failure plan")
+    plan = _plan_from_dict(row)
+    expected_plan = _release_failure_plan_for_cell_identity(
+        registry_sha256=expected_registry_sha256,
+        cell=cell,
+    )
+    if plan != expected_plan:
+        raise ValueError("failure execution raw plan differs from its runtime cell")
+    replayed_binding = FailureInjectionAuthorityBinding(
+        plan_path=str(path),
+        plan_raw_sha256=raw_sha256,
+        plan_sha256=plan.sha256,
+        registry_sha256=expected_registry_sha256,
+        cell_id=plan.cell_id,
+        scenario=plan.scenario,
+        reducer_protocol_sha256=plan.reducer_protocol_sha256,
+    )
+    if binding != replayed_binding:
+        raise ValueError("failure execution authority differs from fresh raw replay")
+    if (
+        token.authority_sha256 != replayed_binding.sha256
+        or token.plan_sha256 != plan.sha256
+        or token.registry_sha256 != expected_registry_sha256
+        or token.cell_id != cell.cell_id
+        or token.scenario != plan.scenario
+    ):
+        raise ValueError("failure execution token differs from fresh raw replay")
+    capability = _require_release_failure_actuator_capability()
+    if (
+        token.actuator_id != capability.actuator_id
+        or token.actuator_version_sha256 != capability.actuator_version_sha256
+        or token.actuator_capability_sha256 != capability.sha256
+    ):
+        raise FailureInjectionAuthorityBlocked(
+            FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
+        )
+    policy = require_release_trusted_attester_policy(RELEASE_TRUSTED_ATTESTER_POLICY)
+    if not policy.release_ready:
+        raise FailureInjectionAuthorityBlocked(
+            FAILURE_INJECTION_TRUSTED_SIGNER_UNAVAILABLE_REASON
+        )
+    return FailureInjectionAuthorityResult(binding=replayed_binding, plan=plan)
 
 
 def require_failure_injection_authority(
@@ -739,41 +838,45 @@ def require_failure_injection_authority(
     """Fail closed before actuation unless this release owns actuator and signer."""
 
     result = revalidate_failure_injection_authority(binding, registry=registry)
-    if len(RELEASE_FAILURE_ACTUATORS) != 1:
-        raise FailureInjectionAuthorityBlocked(
-            FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
-        )
+    capability = _require_release_failure_actuator_capability()
     policy = require_release_trusted_attester_policy(RELEASE_TRUSTED_ATTESTER_POLICY)
     if not policy.release_ready:
         raise FailureInjectionAuthorityBlocked(
             FAILURE_INJECTION_TRUSTED_SIGNER_UNAVAILABLE_REASON
         )
-    actuator_id, actuator_version_sha256 = RELEASE_FAILURE_ACTUATORS[0]
     return FailureExecutionAuthorityToken(
+        binding=result.binding,
         authority_sha256=result.binding.sha256,
         plan_sha256=result.plan.sha256,
         registry_sha256=result.plan.registry_sha256,
         cell_id=result.plan.cell_id,
         scenario=result.plan.scenario,
-        actuator_id=actuator_id,
-        actuator_version_sha256=actuator_version_sha256,
+        actuator_id=capability.actuator_id,
+        actuator_version_sha256=capability.actuator_version_sha256,
+        actuator_capability_sha256=capability.sha256,
     )
 
 
 def require_failure_execution_lifecycle(
     token: FailureExecutionAuthorityToken,
+    *,
+    cell: ExperimentCell,
+    expected_registry_sha256: str,
 ) -> None:
     """Keep failure jobs blocked until the actuator lifecycle is wired.
 
-    A release allowlist entry and a signed raw plan are necessary but not
+    A release capability entry and a signed raw plan are necessary but not
     sufficient: the executor must also own and invoke arm, trigger, recovery,
     and terminal-proof operations.  That implementation does not exist in
-    this release, so merely adding an allowlist tuple must never turn a
-    failure cell into an ordinary serving launch.
+    this release, so merely adding a capability must never turn a failure cell
+    into an ordinary serving launch.
     """
 
-    if type(token) is not FailureExecutionAuthorityToken:
-        raise TypeError("failure execution lifecycle requires an exact token")
+    revalidate_failure_execution_authority(
+        token,
+        cell=cell,
+        expected_registry_sha256=expected_registry_sha256,
+    )
     raise FailureInjectionAuthorityBlocked(
         FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON
     )
@@ -1155,10 +1258,21 @@ def reduce_failure_actuation_receipt(
     row, raw_sha256 = _load_raw_json(path, label="failure receipt")
     receipt = _receipt_from_dict(row)
     _validate_receipt_against_plan(receipt, result)
+    try:
+        capability = _require_release_failure_actuator_capability()
+    except FailureInjectionAuthorityBlocked:
+        return FailureReceiptReduction(
+            status="BLOCKED",
+            reason=FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
+            authority_sha256=binding.sha256,
+            plan_sha256=result.plan.sha256,
+            raw_receipt_sha256=raw_sha256,
+            payload_sha256=receipt.payload_sha256,
+            topology_failure_surface_sha256=None,
+        )
     if (
-        len(RELEASE_FAILURE_ACTUATORS) != 1
-        or (receipt.actuator_id, receipt.actuator_version_sha256)
-        != RELEASE_FAILURE_ACTUATORS[0]
+        receipt.actuator_id != capability.actuator_id
+        or receipt.actuator_version_sha256 != capability.actuator_version_sha256
     ):
         return FailureReceiptReduction(
             status="BLOCKED",
@@ -1234,5 +1348,6 @@ __all__ = [
     "release_failure_plan_for_cell",
     "require_failure_execution_lifecycle",
     "require_failure_injection_authority",
+    "revalidate_failure_execution_authority",
     "revalidate_failure_injection_authority",
 ]

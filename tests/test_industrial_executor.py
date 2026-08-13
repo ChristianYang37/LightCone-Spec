@@ -36,7 +36,10 @@ from lightcone_spec.experiments.completion_authority import (
     CompletionAuthorityUnavailableError,
 )
 from lightcone_spec.experiments.failure_authority import (
+    FailureExecutionAuthorityToken,
     FailureInjectionAuthorityBlocked,
+    bind_failure_injection_authority,
+    release_failure_plan_for_cell,
 )
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
@@ -2599,8 +2602,8 @@ def test_failure_and_profiler_jobs_fail_closed_without_their_runtime_contract(
         )
 
     with pytest.raises(
-        FailureInjectionAuthorityBlocked,
-        match="failure_injection_raw_plan_authority_required",
+        ValueError,
+        match="failure-injection cell and FAILURE budget job kind must match",
     ):
         _execution_fixture(
             tmp_path / "failure",
@@ -2622,6 +2625,165 @@ def test_failure_and_profiler_jobs_fail_closed_without_their_runtime_contract(
             request_count=1,
             budget_mutator=register_profiler,
         )
+
+
+def test_true_e5_failure_identity_blocks_mismatched_budget_and_raw_authority_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    registry = fixture.plan.dispatch_context.registry
+    failure_cell = next(
+        row
+        for row in registry.cells_for("E5")
+        if row.identity.task == "failure_injection"
+    )
+    raw_plan = release_failure_plan_for_cell(registry, failure_cell)
+    raw_path = tmp_path / "failure-authority.json"
+    raw_path.write_text(
+        json.dumps(raw_plan.to_dict(), sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    binding = bind_failure_injection_authority(raw_path, registry=registry)
+    token = FailureExecutionAuthorityToken(
+        binding=binding,
+        authority_sha256=binding.sha256,
+        plan_sha256=raw_plan.sha256,
+        registry_sha256=registry.sha256,
+        cell_id=raw_plan.cell_id,
+        scenario=raw_plan.scenario,
+        actuator_id="caller.forged_actuator",
+        actuator_version_sha256="6" * 64,
+        actuator_capability_sha256="7" * 64,
+    )
+    registered_duration = fixture.plan.budget.scored_arrival
+    zero = ScenarioMilliseconds(0, 0, 0)
+    common_budget = {
+        "cell_id": failure_cell.cell_id,
+        "experiment": failure_cell.identity.experiment,
+        "method": failure_cell.identity.method,
+        "workload_class": failure_cell.resources.workload_class,
+        "gpu_count": failure_cell.resources.gpu_count,
+        "topology": failure_cell.identity.topology,
+        "reserved_gpu_ms": fixture.plan.budget.wall_time.scale(
+            failure_cell.resources.gpu_count
+        ),
+    }
+    wrong_budget = replace(fixture.plan.budget, **common_budget)
+    failure_budget = replace(
+        fixture.plan.budget,
+        **common_budget,
+        job_kind=BudgetJobKind.FAILURE,
+        scored_arrival=zero,
+        failure_injection=registered_duration,
+    )
+    physical = fixture.plan.runtime_plan.physical_assignment
+    assert physical is not None
+    failure_runtime = replace(
+        fixture.plan.runtime_plan,
+        cell_id=failure_cell.cell_id,
+        cell_declaration_sha256=failure_cell.sha256,
+        parameter_plan_sha256=None,
+        cell=failure_cell,
+        execution_semantics=None,
+        physical_assignment=replace(
+            physical,
+            experiment_budget_sha256=failure_budget.sha256,
+        ),
+    )
+    failure_plan = replace(
+        fixture.plan,
+        runtime_plan=failure_runtime,
+        budget=failure_budget,
+        failure_execution_authority=token,
+    )
+    output = Path(failure_cell.resources.evidence_root)
+    launched = False
+
+    async def launch_server(_server: ServerLaunch) -> _FakeHandle:
+        nonlocal launched
+        launched = True
+        return _FakeHandle()
+
+    # This seam isolates the executor's final failure gate while retaining an
+    # actual registry-owned E5 cell.  Scheduler replay has its own exhaustive
+    # tests and would otherwise reject the deliberately crossed test fixture
+    # before this invariant can be exercised.
+    monkeypatch.setattr(
+        executor_module,
+        "_validate_runtime_dispatch_authority",
+        lambda **_kwargs: None,
+    )
+    transport = _FakeTransport(plan=failure_plan)
+
+    wrong_budget_plan = replace(failure_plan, budget=wrong_budget)
+    with pytest.raises(
+        ValueError,
+        match="failure-injection cell and FAILURE budget job kind must match",
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                wrong_budget_plan,
+                output_root=output,
+                run_nonce_sha256=hashlib.sha256(b"forged-failure").hexdigest(),
+                launch_server=launch_server,
+                transport=transport,
+            )
+        )
+    without_authority = replace(failure_plan, failure_execution_authority=None)
+    with pytest.raises(
+        FailureInjectionAuthorityBlocked,
+        match="failure_injection_raw_plan_authority_required",
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                without_authority,
+                output_root=output,
+                run_nonce_sha256=hashlib.sha256(b"missing-failure").hexdigest(),
+                launch_server=launch_server,
+                transport=transport,
+            )
+        )
+    with pytest.raises(
+        FailureInjectionAuthorityBlocked,
+        match="failure_injection_first_party_actuator_unavailable",
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                failure_plan,
+                output_root=output,
+                run_nonce_sha256=hashlib.sha256(b"forged-failure").hexdigest(),
+                launch_server=launch_server,
+                transport=transport,
+            )
+        )
+    assert not output.exists()
+    assert not launched
+    assert transport.opened == 0
+    assert transport.closed == 0
+    assert transport.requests == []
+    assert transport.aborts == []
+
+    nonfailure_plan = replace(
+        fixture.plan,
+        failure_execution_authority=token,
+    )
+    with pytest.raises(
+        ValueError,
+        match="non-failure execution cannot carry failure authority",
+    ):
+        asyncio.run(
+            execute_industrial_plan(
+                nonfailure_plan,
+                output_root=output,
+                run_nonce_sha256=hashlib.sha256(b"crossed-failure").hexdigest(),
+                launch_server=launch_server,
+                transport=transport,
+            )
+        )
+    assert not output.exists()
+    assert not launched
+    assert transport.opened == 0
 
 
 def test_resume_requires_immutable_budget_observation(tmp_path: Path) -> None:

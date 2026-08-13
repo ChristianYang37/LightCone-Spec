@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+from lightcone_spec.experiments.failure_actuator import (
+    ReleaseFailureActuatorCapability,
+)
 from lightcone_spec.experiments.failure_authority import (
     FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON,
     FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
@@ -17,9 +23,11 @@ from lightcone_spec.experiments.failure_authority import (
     release_failure_plan_for_cell,
     require_failure_execution_lifecycle,
     require_failure_injection_authority,
+    revalidate_failure_execution_authority,
     revalidate_failure_injection_authority,
 )
 from lightcone_spec.experiments.registry import E5_FAILURES, build_industrial_registry
+from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
 
 
 def _registry_and_cell():
@@ -47,6 +55,51 @@ def _bound_plan(tmp_path: Path):
     path = _write_json(tmp_path / "failure-plan.json", plan.to_dict())
     binding = bind_failure_injection_authority(path, registry=registry)
     return registry, plan, path, binding
+
+
+def _release_capability() -> ReleaseFailureActuatorCapability:
+    def release_failure_actuator_factory():
+        return object()
+
+    release_failure_actuator_factory.__module__ = (
+        "lightcone_spec.experiments.failure_actuator"
+    )
+    release_failure_actuator_factory.__qualname__ = "release_failure_actuator_factory"
+    return ReleaseFailureActuatorCapability(
+        actuator_id="release.first_party_fault_actuator.v1",
+        actuator_version_sha256="1" * 64,
+        factory_module=release_failure_actuator_factory.__module__,
+        factory_qualname=release_failure_actuator_factory.__qualname__,
+        factory=release_failure_actuator_factory,
+    )
+
+
+def _release_policy() -> TrustedAttesterPolicy:
+    public_key = b"failure-release-public-key-32b"[:32].ljust(32, b"-")
+    public_key_sha256 = hashlib.sha256(public_key).hexdigest()
+    return TrustedAttesterPolicy(
+        policy_id="release-failure-attester-policy",
+        trusted_attesters=(
+            ("release-failure-attester", "release-failure-key", public_key_sha256),
+        ),
+        public_keys=(
+            (public_key_sha256, base64.b64encode(public_key).decode("ascii")),
+        ),
+    )
+
+
+def _caller_token(plan, binding) -> FailureExecutionAuthorityToken:
+    return FailureExecutionAuthorityToken(
+        binding=binding,
+        authority_sha256=binding.sha256,
+        plan_sha256=plan.sha256,
+        registry_sha256=plan.registry_sha256,
+        cell_id=plan.cell_id,
+        scenario=plan.scenario,
+        actuator_id="caller.forged_actuator",
+        actuator_version_sha256="6" * 64,
+        actuator_capability_sha256="7" * 64,
+    )
 
 
 def _receipt(plan, binding) -> dict[str, object]:
@@ -169,26 +222,82 @@ def test_failure_binding_wire_round_trip_is_path_and_content_bound(
 
 def test_allowlist_token_cannot_bypass_missing_execution_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    import lightcone_spec.experiments.failure_authority as module
+    import lightcone_spec.experiments.failure_actuator as actuator_module
+    import lightcone_spec.experiments.failure_authority as authority_module
+    import lightcone_spec.runtime.attestation as attestation_module
 
-    actuator = ("release-actuator", "1" * 64)
-    monkeypatch.setattr(module, "RELEASE_FAILURE_ACTUATORS", (actuator,))
-    token = FailureExecutionAuthorityToken(
-        authority_sha256="2" * 64,
-        plan_sha256="3" * 64,
-        registry_sha256="4" * 64,
-        cell_id="5" * 64,
-        scenario="queue_saturation",
-        actuator_id=actuator[0],
-        actuator_version_sha256=actuator[1],
+    registry, plan, _, binding = _bound_plan(tmp_path)
+    capability = _release_capability()
+    policy = _release_policy()
+    monkeypatch.setattr(
+        actuator_module,
+        "RELEASE_FAILURE_ACTUATOR_CAPABILITIES",
+        (capability,),
     )
+    monkeypatch.setattr(authority_module, "RELEASE_TRUSTED_ATTESTER_POLICY", policy)
+    monkeypatch.setattr(attestation_module, "RELEASE_TRUSTED_ATTESTER_POLICY", policy)
+    token = require_failure_injection_authority(binding, registry=registry)
 
     with pytest.raises(
         FailureInjectionAuthorityBlocked,
         match=FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON,
     ):
-        require_failure_execution_lifecycle(token)
+        require_failure_execution_lifecycle(
+            token,
+            cell=next(
+                row for row in registry.cells_for("E5") if row.cell_id == plan.cell_id
+            ),
+            expected_registry_sha256=registry.sha256,
+        )
+
+
+def test_public_token_constructor_cannot_replace_source_capability(
+    tmp_path: Path,
+) -> None:
+    import lightcone_spec.experiments.failure_authority as authority_module
+
+    assert not hasattr(authority_module, "RELEASE_FAILURE_ACTUATORS")
+    registry, plan, _, binding = _bound_plan(tmp_path)
+    cell = next(row for row in registry.cells_for("E5") if row.cell_id == plan.cell_id)
+    token = _caller_token(plan, binding)
+
+    with pytest.raises(
+        FailureInjectionAuthorityBlocked,
+        match=FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
+    ):
+        revalidate_failure_execution_authority(
+            token,
+            cell=cell,
+            expected_registry_sha256=registry.sha256,
+        )
+
+
+def test_joint_raw_plan_and_token_rehash_cannot_change_runtime_cell(
+    tmp_path: Path,
+) -> None:
+    registry, original_plan, plan_path, _ = _bound_plan(tmp_path)
+    original_cell = next(
+        row for row in registry.cells_for("E5") if row.cell_id == original_plan.cell_id
+    )
+    foreign_cell = next(
+        row
+        for row in registry.cells_for("E5")
+        if row.identity.arrival == "failure:queue_saturation"
+        and row.identity.block == original_cell.identity.block
+    )
+    foreign_plan = release_failure_plan_for_cell(registry, foreign_cell)
+    _write_json(plan_path, foreign_plan.to_dict())
+    foreign_binding = bind_failure_injection_authority(plan_path, registry=registry)
+    forged = _caller_token(foreign_plan, foreign_binding)
+
+    with pytest.raises(ValueError, match="differs from its runtime cell"):
+        revalidate_failure_execution_authority(
+            forged,
+            cell=original_cell,
+            expected_registry_sha256=registry.sha256,
+        )
 
 
 @pytest.mark.parametrize(
@@ -233,6 +342,12 @@ def test_bind_rejects_symlink_and_revalidation_rejects_rehash(
     link.symlink_to(source)
     with pytest.raises(ValueError, match="resolved and non-symlink"):
         bind_failure_injection_authority(link, registry=registry)
+
+    hardlink = tmp_path / "hardlink.json"
+    os.link(source, hardlink)
+    with pytest.raises(ValueError, match="single-link regular file"):
+        bind_failure_injection_authority(hardlink, registry=registry)
+    hardlink.unlink()
 
     binding = bind_failure_injection_authority(source, registry=registry)
     source.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")

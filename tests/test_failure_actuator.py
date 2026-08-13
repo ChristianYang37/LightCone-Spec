@@ -17,9 +17,11 @@ from lightcone_spec.experiments.failure_actuator import (
     FailurePhaseObservation,
     FailureScenarioSemantics,
     FailureTerminalObservation,
+    ReleaseFailureActuatorCapability,
     execute_failure_actuator_for_cpu_test,
     failure_phase_observation_sha256,
     failure_semantics,
+    release_failure_actuator_capability,
     require_release_failure_actuator,
     validate_failure_recovery_receipt,
 )
@@ -309,6 +311,72 @@ def test_release_capability_is_named_block_before_actuator_or_output(
         require_release_failure_actuator()
     assert blocked.value.reason == FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON
     assert not output.exists()
+
+
+def test_release_registry_binds_callable_and_identity_as_one_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lightcone_spec.experiments.failure_actuator as module
+
+    def release_failure_actuator_factory():
+        return _FakeActuator()
+
+    release_failure_actuator_factory.__module__ = (
+        "lightcone_spec.experiments.failure_actuator"
+    )
+    release_failure_actuator_factory.__qualname__ = "release_failure_actuator_factory"
+    capability = ReleaseFailureActuatorCapability(
+        actuator_id="release.first_party_fault_actuator.v1",
+        actuator_version_sha256=_sha("release-actuator-version"),
+        factory_module=release_failure_actuator_factory.__module__,
+        factory_qualname=release_failure_actuator_factory.__qualname__,
+        factory=release_failure_actuator_factory,
+    )
+    monkeypatch.setattr(
+        module,
+        "RELEASE_FAILURE_ACTUATOR_CAPABILITIES",
+        (capability,),
+    )
+    assert release_failure_actuator_capability() == capability
+    assert capability.sha256 == content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "release_failure_actuator_capability",
+            "actuator_id": capability.actuator_id,
+            "actuator_version_sha256": capability.actuator_version_sha256,
+            "factory_module": capability.factory_module,
+            "factory_qualname": capability.factory_qualname,
+        }
+    )
+    release_failure_actuator_factory.__qualname__ = "replaced_factory"
+    with pytest.raises(FailureActuatorBlocked) as replaced:
+        release_failure_actuator_capability()
+    assert replaced.value.reason == FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON
+
+    monkeypatch.setattr(
+        module,
+        "RELEASE_FAILURE_ACTUATOR_CAPABILITIES",
+        ((capability.actuator_id, capability.actuator_version_sha256),),
+    )
+    with pytest.raises(FailureActuatorBlocked) as blocked:
+        release_failure_actuator_capability()
+    assert blocked.value.reason == FAILURE_ACTUATOR_RELEASE_UNAVAILABLE_REASON
+
+
+def test_cpu_diagnostic_actuator_cannot_be_registered_for_release() -> None:
+    def source_factory():
+        return _FakeActuator()
+
+    source_factory.__module__ = "lightcone_spec.experiments.failure_actuator"
+    source_factory.__qualname__ = "source_factory"
+    with pytest.raises(ValueError, match="diagnostic actuator identities"):
+        ReleaseFailureActuatorCapability(
+            actuator_id=_FakeActuator.actuator_id,
+            actuator_version_sha256=_FakeActuator.actuator_version_sha256,
+            factory_module=source_factory.__module__,
+            factory_qualname=source_factory.__qualname__,
+            factory=source_factory,
+        )
 
 
 def test_scenario_semantics_cannot_be_posthoc_substituted(
