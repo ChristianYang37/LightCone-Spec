@@ -403,7 +403,9 @@ def _validate_incremental_steps(
 ) -> None:
     if len(bindings) != len(result.steps):
         raise RuntimeError("incremental live-step coverage is incomplete")
-    for sequence, (binding, step) in enumerate(zip(bindings, result.steps, strict=True)):
+    for sequence, (binding, step) in enumerate(
+        zip(bindings, result.steps, strict=True)
+    ):
         expected = canonical_json_bytes(_step_artifact(sequence, step))
         if (
             binding.sequence != sequence

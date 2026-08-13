@@ -247,10 +247,13 @@ def test_incremental_sink_persists_each_step_and_binds_final_manifest(
     assert len(step_paths) == len(result.steps)
     manifest = json.loads((tmp_path / SESSION_LIVE_CLOSE_MANIFEST).read_bytes())
     assert len(manifest["incremental_step_artifacts"]) == len(result.steps)
-    assert reopen_session_live_evidence(
-        output_dir=tmp_path.resolve(),
-        expected_result=result,
-    ) == publication
+    assert (
+        reopen_session_live_evidence(
+            output_dir=tmp_path.resolve(),
+            expected_result=result,
+        )
+        == publication
+    )
 
 
 def test_incremental_sink_failure_retains_steps_without_close_marker(
