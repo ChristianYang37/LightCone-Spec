@@ -93,6 +93,66 @@ path 前先检查 release trust root；因此当前无 signer 的 release 只写
 不会生成 calibrated envelope。Preflight stage 只有在重开同一份 raw execution authority
 后才能封存 `runtime_envelope=PATH`，绝不接受手写 rule list 或 bare digest。
 
+## Compile-cache plan 绑定
+
+所有 preliminary 与 OnlineSPEC runtime render 命令都要求
+`--compile-cache-plan /absolute/path/to/plan.json`。它只是 diagnostic launch
+authority，不是 attestation，也不授权进入 formal DAG。`CompileCacheKey` 必须由通过的
+`doctor` 报告、准确 model lock 与已渲染 RunConfig 以程序方式派生；不得凭记忆手填预期
+host 值。当前 diagnostic launcher 只接受 `bfloat16`、`cuda_malloc_async`、graph bucket
+`(1,)` 与空 caller build flags。创建 cache attempt 前，它会重新观测 Python、Torch、
+Triton、Torch CUDA build、`nvcc`、driver、所选 GPU model 与 SM，并在导入 Torch 前应用
+allocator 环境。
+
+通过 source API 派生 key，并签发不可变的 diagnostic build plan：
+
+```python
+import json
+from pathlib import Path
+
+from lightcone_spec.config import load_run_config
+from lightcone_spec.locking.models import ModelLock
+from lightcone_spec.orchestration.runtime import derive_diagnostic_compile_cache_key
+from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
+
+doctor = json.loads(Path("/absolute/runtime/doctor.json").read_text())
+model_lock = ModelLock.load("/absolute/runtime/model-lock.json")
+config = load_run_config("/absolute/runtime/rendered-run-config.json")
+key = derive_diagnostic_compile_cache_key(
+    doctor_report=doctor,
+    model_lock=model_lock,
+    config=config,
+)
+cache_root = Path("/absolute/runtime/compile-cache")
+build = CompileCacheLaunchPlan.issue(
+    key=key,
+    cache_root=cache_root,
+    cache_mode="build",
+)
+build_path = build.write(Path("/absolute/runtime/build-plan.json"))
+```
+
+把 `build_path` 传给 render 命令必需的 `--compile-cache-plan`，例如：
+
+```bash
+lightcone-spec render-preliminary-target-only-runtime \
+  ... \
+  --compile-cache-plan /absolute/runtime/build-plan.json
+```
+
+Renderer 会把预期 plan、key 与 RunConfig SHA-256 写入 child argv。Child 会稳定重开两份
+canonical artifact 及 sidecar，从 RunConfig 派生准确 algorithm 与 draft width，并在 cache、
+model 或 GPU mutation 前拒绝 identity/argv 变化。它还要求 Torch 能看到准确一张可用 CUDA
+设备，并拒绝在 Torch 已导入后再初始化 allocator。Render 后不得编辑、重新生成、移动或
+替换 artifact。
+
+Preliminary model root 只绑定 locked revision path，并不携带 formal
+`PreparedModelContentAuthority` replay。因此 launcher 只接受 build mode，且把 cache receipt
+封存为 unattributed；它不能授权 reuse、formal execution、attestation 或 `MEASURED`。Source
+API 虽可针对同一 key/cache root 的已完成 release-builder receipt 签发 reuse plan，但任何
+preliminary receipt 都不满足该条件。在 formal content-authority execution path 提供此 receipt
+之前，应签发新的 build plan。
+
 ## Formal external workload authority
 
 这些命令绝不会下载 formal benchmark 数据。Bind 命令只接受

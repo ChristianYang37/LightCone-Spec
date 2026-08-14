@@ -61,7 +61,7 @@ def _sha(label: str) -> str:
     return hashlib.sha256(f"compile-runner:{label}".encode()).hexdigest()
 
 
-def _key(*, target_revision: str = "target-revision") -> CompileCacheKey:
+def _key(*, target_revision: str = "a" * 40) -> CompileCacheKey:
     return CompileCacheKey(
         patched_sglang_tree=PINNED_SGLANG_TREE,
         patch_manifest_sha256=PINNED_SGLANG_PATCH_MANIFEST_SHA256,
@@ -76,7 +76,7 @@ def _key(*, target_revision: str = "target-revision") -> CompileCacheKey:
         gpu_model="RTX PRO 6000 Blackwell Server Edition",
         dtype="bfloat16",
         target_revision=target_revision,
-        drafter_revision="drafter-revision",
+        drafter_revision="b" * 40,
         tensor_parallel_size=2,
         context_limit=4096,
         max_running_requests=2,
@@ -518,7 +518,7 @@ def test_assignment_plan_rejects_caller_key_and_revalidation_tamper(
     plan, _ = _inputs(tmp_path)
     foreign = replace(
         CompileCacheLaunchPlan.load(plan.compile_cache_plan_path),
-        key=_key(target_revision="caller-selected-revision"),
+        key=_key(target_revision="c" * 40),
     )
     foreign_path = foreign.write((tmp_path / "foreign-plan.json").resolve())
     with pytest.raises(ValueError, match="differs from assignment"):
@@ -615,6 +615,14 @@ def test_launcher_accepts_exact_compile_flags_but_blocks_before_path_access(
                 str((tmp_path / "missing-checkout").resolve()),
                 "--compile-cache-plan",
                 str((tmp_path / "missing-cache-plan").resolve()),
+                "--compile-cache-plan-sha256",
+                "0" * 64,
+                "--compile-cache-key-sha256",
+                "0" * 64,
+                "--run-config",
+                str((tmp_path / "missing-run-config").resolve()),
+                "--run-config-sha256",
+                "0" * 64,
                 "--compile-only-assignment",
                 str((tmp_path / "missing-assignment").resolve()),
                 "--compile-only-manifest",

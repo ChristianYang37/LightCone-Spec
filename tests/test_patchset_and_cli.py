@@ -20,10 +20,7 @@ from lightcone_spec.doctor import _command, doctor_report
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 from lightcone_spec.sglang_bridge import verify_patched_checkout
-from lightcone_spec.sglang_bridge.launch import (
-    _bind_interpreter_tools,
-    _validate_blackwell_jit_toolchain,
-)
+from lightcone_spec.sglang_bridge.launch import _bind_interpreter_tools
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_ROOT = ROOT / "patches" / "sglang"
@@ -233,44 +230,6 @@ def test_runtime_launcher_exposes_tools_from_its_interpreter(
     entries = os.environ["PATH"].split(os.pathsep)
     assert entries[0] == str(interpreter_bin.resolve())
     assert entries.count(str(interpreter_bin.resolve())) == 1
-
-
-@pytest.mark.parametrize("release", ("12.9", "13.0"))
-def test_runtime_launcher_accepts_blackwell_jit_toolkit(
-    monkeypatch, release: str
-) -> None:
-    responses = {
-        "nvidia-smi": "12.0\n",
-        "nvcc": f"Cuda compilation tools, release {release}, V{release}.0\n",
-    }
-    monkeypatch.setattr(
-        "lightcone_spec.sglang_bridge.launch._command_output",
-        lambda executable, *_arguments: responses.get(executable),
-    )
-    _validate_blackwell_jit_toolchain()
-
-
-@pytest.mark.parametrize("nvcc", (None, "Cuda compilation tools, release 12.8"))
-def test_runtime_launcher_rejects_missing_blackwell_jit_toolkit(
-    monkeypatch, nvcc: str | None
-) -> None:
-    responses = {"nvidia-smi": "12.0\n", "nvcc": nvcc}
-    monkeypatch.setattr(
-        "lightcone_spec.sglang_bridge.launch._command_output",
-        lambda executable, *_arguments: responses.get(executable),
-    )
-    with pytest.raises(RuntimeError, match="CUDA toolkit >= 12.9"):
-        _validate_blackwell_jit_toolchain()
-
-
-def test_runtime_launcher_does_not_require_nvcc_for_pre_blackwell(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        "lightcone_spec.sglang_bridge.launch._command_output",
-        lambda executable, *_arguments: "9.0\n" if executable == "nvidia-smi" else None,
-    )
-    _validate_blackwell_jit_toolchain()
 
 
 def test_doctor_records_actual_source_tree_identity(tmp_path) -> None:

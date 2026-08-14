@@ -435,6 +435,10 @@ class ServingGangLaunch:
         )
         if self.supervisor_environment != expected_environment:
             raise ValueError("supervisor environment differs from ordered rank GPUs")
+        raise NativeTerminalGangAuthorityBlocked(
+            "diagnostic_serving_gang_compile_authority_unavailable",
+            "TP2/DP2 supervisor launch lacks per-gang compile/model content authority",
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {

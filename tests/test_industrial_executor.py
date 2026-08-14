@@ -28,6 +28,7 @@ import lightcone_spec.orchestration.executor as executor_module
 import lightcone_spec.orchestration.session as session_module
 import lightcone_spec.telemetry.writer as writer_module
 from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
+from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.completion_authority import (
@@ -924,6 +925,14 @@ def _execution_fixture(
         str(checkout),
         "--compile-cache-plan",
         str(compile_plan_path),
+        "--compile-cache-plan-sha256",
+        compile_plan.sha256,
+        "--compile-cache-key-sha256",
+        compile_plan.key.sha256,
+        "--run-config",
+        str(config_path),
+        "--run-config-sha256",
+        run_config_sha256(config),
         "--",
         "--model-path",
         str(target_root),
@@ -933,6 +942,8 @@ def _execution_fixture(
         "0.8",
         "--tp-size",
         "1",
+        "--dtype",
+        compile_plan.key.dtype,
         "--host",
         "127.0.0.1",
         "--port",
@@ -1000,6 +1011,22 @@ def _execution_fixture(
     return _Fixture(plan=plan, dependency_artifacts=tuple(dependencies))
 
 
+def _replace_compile_plan_argv(
+    launch: ServerLaunch,
+    plan: CompileCacheLaunchPlan,
+    path: Path,
+) -> tuple[str, ...]:
+    return (
+        *launch.argv[:6],
+        str(path),
+        "--compile-cache-plan-sha256",
+        plan.sha256,
+        "--compile-cache-key-sha256",
+        plan.key.sha256,
+        *launch.argv[11:],
+    )
+
+
 def _with_compile_key(
     fixture: _Fixture,
     tmp_path: Path,
@@ -1016,7 +1043,7 @@ def _with_compile_key(
     path = tmp_path / f"compile-cache-plan-{label}.json"
     compile_plan.write(path)
     launch = fixture.plan.server_launch
-    argv = (*launch.argv[:6], str(path), *launch.argv[7:])
+    argv = _replace_compile_plan_argv(launch, compile_plan, path)
     return replace(
         fixture.plan,
         compile_cache_plan=compile_plan,
@@ -4036,7 +4063,7 @@ def test_missing_compile_cache_plan_fails_before_server_launch(tmp_path: Path) -
         launched = True
         return _FakeHandle()
 
-    with pytest.raises(ValueError, match="plan must be a regular file"):
+    with pytest.raises(ValueError, match="plan must be a readable regular file"):
         asyncio.run(
             execute_industrial_plan(
                 fixture.plan,
@@ -4086,7 +4113,7 @@ def test_reuse_base_is_reverified_before_output_or_server_launch(
         compile_cache_plan=reuse_plan,
         server_launch=replace(
             launch,
-            argv=(*launch.argv[:6], str(reuse_plan_path), *launch.argv[7:]),
+            argv=_replace_compile_plan_argv(launch, reuse_plan, reuse_plan_path),
             compile_cache_plan=str(reuse_plan_path),
             compile_cache_plan_sha256=reuse_plan.sha256,
             compile_cache_key_sha256=reuse_plan.key.sha256,
@@ -4201,7 +4228,7 @@ def test_foreign_compile_cache_plan_cannot_replace_bound_identity(
     ("field", "value", "message"),
     (
         ("driver_version", "foreign-driver", "runtime toolchain"),
-        ("gpu_model", "foreign-gpu", "assigned GPU model/SM"),
+        ("gpu_model", "foreign-gpu", "runtime toolchain"),
         ("target_revision", "3" * 40, "exact RunConfig"),
         ("tensor_parallel_size", 2, "exact RunConfig"),
     ),
@@ -4226,15 +4253,24 @@ def test_compile_cache_key_must_match_driver_model_revision_and_tp(
 def test_server_argv_is_part_of_the_validated_immutable_plan(tmp_path: Path) -> None:
     fixture = _execution_fixture(tmp_path, request_count=1)
     launch = fixture.plan.server_launch
-    assert launch.argv[5:7] == (
+    assert launch.argv[5:11] == (
         "--compile-cache-plan",
         launch.compile_cache_plan,
+        "--compile-cache-plan-sha256",
+        launch.compile_cache_plan_sha256,
+        "--compile-cache-key-sha256",
+        launch.compile_cache_key_sha256,
     )
+    max_running_index = launch.argv.index("--max-running-requests") + 1
     tampered = replace(
         fixture.plan,
         server_launch=replace(
             launch,
-            argv=(*launch.argv[:11], "2", *launch.argv[12:]),
+            argv=(
+                *launch.argv[:max_running_index],
+                "2",
+                *launch.argv[max_running_index + 1 :],
+            ),
         ),
     )
     with pytest.raises(ValueError, match="base argv differs"):
@@ -4248,6 +4284,7 @@ def test_industrial_renderer_carries_the_exact_compile_plan_argv(
     fixture = _execution_fixture(tmp_path, request_count=1)
     source = fixture.plan
     checkout = Path(source.server_launch.argv[4])
+    model_path_index = source.server_launch.argv.index("--model-path") + 1
     monkeypatch.setattr(
         executor_module,
         "verify_patched_checkout",
@@ -4272,16 +4309,20 @@ def test_industrial_renderer_carries_the_exact_compile_plan_argv(
         runtime_envelope_artifact=source.runtime_envelope_artifact,
         model_roots={
             source.runtime_plan.rank_configs[0].model.target: source.server_launch.argv[
-                9
+                model_path_index
             ]
         },
         adaptation_reserve_mb=0,
         mem_fraction_static=0.8,
     )
     assert rendered.compile_cache_plan == source.compile_cache_plan
-    assert rendered.server_launch.argv[5:7] == (
+    assert rendered.server_launch.argv[5:11] == (
         "--compile-cache-plan",
         source.server_launch.compile_cache_plan,
+        "--compile-cache-plan-sha256",
+        source.server_launch.compile_cache_plan_sha256,
+        "--compile-cache-key-sha256",
+        source.server_launch.compile_cache_key_sha256,
     )
 
 
@@ -4314,6 +4355,32 @@ def test_opt_in_subprocess_launcher_binds_the_exact_gpu_uuid_without_launching(
     assert isinstance(environment, dict)
     assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
     assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-physical-executor"
+
+
+@pytest.mark.parametrize("digest_index", (8, 10))
+def test_subprocess_launcher_rejects_mutated_compile_identity_argv_before_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    digest_index: int,
+) -> None:
+    fixture = _execution_fixture(tmp_path, request_count=1)
+    launch = fixture.plan.server_launch
+    argv = (*launch.argv[:digest_index], "0" * 64, *launch.argv[digest_index + 1 :])
+    monkeypatch.setattr(
+        executor_module,
+        "preflight_compile_cache_launch",
+        lambda _plan: pytest.fail("argv mismatch must precede cache preflight"),
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        lambda *_args, **_kwargs: pytest.fail(
+            "argv mismatch must precede subprocess creation"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exact compile-cache argv"):
+        asyncio.run(launch_server_subprocess(replace(launch, argv=argv)))
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,16 @@ yet been declared.
 
 ### Changed
 
+- Required every preliminary and OnlineSPEC server launch to bind an exact
+  compile-cache plan in both its API and CLI, and reject a plan whose source,
+  model, TP, context, or concurrency identity differs from the RunConfig. The
+  child launcher now stably reopens the plan and RunConfig sidecars against
+  parent-bound digests, re-observes the exact toolchain and selected GPU, and
+  applies the fixed allocator contract before importing Torch or creating a
+  cache attempt. Preliminary cache receipts remain unattributed and
+  non-reusable without prepared-model content authority; TP2/DP2 diagnostic
+  construction likewise remains fail-closed without coherent gang compile
+  authority.
 - Consolidated core publication semantics and registered OnlineSPEC comparison
   learners under the single `lightcone_spec.methods` package. The former
   `baselines` package was removed, and all public method symbols now share one

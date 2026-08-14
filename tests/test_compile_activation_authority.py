@@ -71,7 +71,7 @@ def _write_plan(
         sm_architecture="sm_120",
         gpu_model="RTX PRO 6000 Blackwell Server Edition",
         dtype="bfloat16",
-        target_revision="target-revision",
+        target_revision="a" * 40,
         drafter_revision=None,
         tensor_parallel_size=len(gpu_uuids),
         context_limit=4096,

@@ -132,9 +132,10 @@ from lightcone_spec.runtime.attestation import (
     require_release_trusted_attester_policy,
 )
 from lightcone_spec.runtime.compile_cache import (
-    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
     CompileCacheLaunchPlan,
     preflight_compile_cache_launch,
+    validate_compile_key_for_run_config,
+    validate_compile_runtime_toolchain,
 )
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
@@ -976,27 +977,6 @@ def _validate_inventory_source_artifact(
     return next(iter(drivers))
 
 
-def _validate_compile_key_for_run_config(
-    plan: CompileCacheLaunchPlan,
-    *,
-    config: RunConfig,
-) -> None:
-    plan.validate()
-    key = plan.key
-    expected_drafter = (
-        None if config.method == "target_only" else config.model.drafter_revision
-    )
-    if (
-        key.source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256
-        or key.target_revision != config.model.target_revision
-        or key.drafter_revision != expected_drafter
-        or key.tensor_parallel_size != config.runtime.tensor_parallel_size
-        or key.context_limit != config.runtime.context_length
-        or key.max_running_requests != config.runtime.max_running_requests
-    ):
-        raise ValueError("compile-cache key differs from the exact RunConfig")
-
-
 def _validate_runtime_envelope_artifact(
     binding: ArtifactBinding,
     *,
@@ -1095,24 +1075,27 @@ def _validate_runtime_envelope_artifact(
         torch_runtime.get("importable") is not True
         or torch_runtime.get("cuda_available") is not True
         or torch_runtime.get("device_count") != len(devices)
-        or key.python_version != python.get("version")
-        or key.torch_version != torch_runtime.get("version")
         or packages.get("torch")
         != str(torch_runtime.get("version", "")).partition("+")[0]
-        or key.triton_version != packages.get("triton")
-        or key.cuda_version != torch_runtime.get("cuda_build")
         or nvcc_match is None
-        or key.cuda_version != nvcc_match.group(1)
-        or key.driver_version != inventory_driver
     ):
         raise ValueError("compile-cache key differs from exact runtime toolchain")
     assigned = devices.get(assigned_gpu_uuid)
     if assigned is None:
         raise ValueError("compile-cache launch lacks its assigned GPU authority")
     expected_sm = "sm_" + "".join(str(value) for value in assigned.compute_capability)
-    if key.gpu_model != assigned.model or key.sm_architecture != expected_sm:
-        raise ValueError("compile-cache key differs from assigned GPU model/SM")
-    _validate_compile_key_for_run_config(compile_plan, config=config)
+    validate_compile_runtime_toolchain(
+        key,
+        python_version=python.get("version"),
+        torch_version=torch_runtime.get("version"),
+        triton_version=packages.get("triton"),
+        torch_cuda_version=torch_runtime.get("cuda_build"),
+        nvcc_cuda_version=nvcc_match.group(1),
+        driver_version=inventory_driver,
+        gpu_model=assigned.model,
+        sm_architecture=expected_sm,
+    )
+    validate_compile_key_for_run_config(compile_plan, config=config)
 
 
 def _load_server_compile_plan(launch: ServerLaunch) -> CompileCacheLaunchPlan:
@@ -2321,9 +2304,9 @@ def _validate_server_launch(
     ):
         raise ValueError("server adaptation artifacts differ from the method contract")
     compile_plan = _load_server_compile_plan(launch)
-    _validate_compile_key_for_run_config(compile_plan, config=config)
+    validate_compile_key_for_run_config(compile_plan, config=config)
     argv = launch.argv
-    if len(argv) < 20 or argv[:4] != (
+    if len(argv) < 30 or argv[:4] != (
         sys.executable,
         "-m",
         "lightcone_spec.sglang_bridge.launch",
@@ -2335,17 +2318,26 @@ def _validate_server_launch(
         not checkout.is_dir()
         or argv[5] != "--compile-cache-plan"
         or argv[6] != launch.compile_cache_plan
-        or argv[7] != "--"
+        or argv[7] != "--compile-cache-plan-sha256"
+        or argv[8] != launch.compile_cache_plan_sha256
+        or argv[9] != "--compile-cache-key-sha256"
+        or argv[10] != launch.compile_cache_key_sha256
+        or argv[11] != "--run-config"
+        or argv[12] != launch.run_config
+        or argv[13] != "--run-config-sha256"
+        or argv[14] != run_config_sha256(config)
+        or argv[15] != "--"
     ):
         raise ValueError(
             "server argv lacks its checkout/compile-cache launch authority"
         )
-    base = argv[8:20]
+    base = argv[16:30]
     expected_keys = (
         "--model-path",
         "--max-running-requests",
         "--mem-fraction-static",
         "--tp-size",
+        "--dtype",
         "--host",
         "--port",
     )
@@ -2358,7 +2350,7 @@ def _validate_server_launch(
         max_running = int(base[3])
         mem_fraction = float(base[5])
         tp_size = int(base[7])
-        port = int(base[11])
+        port = int(base[13])
     except ValueError as error:
         raise ValueError("server base argv values are malformed") from error
     if (
@@ -2366,11 +2358,12 @@ def _validate_server_launch(
         or not math.isfinite(mem_fraction)
         or not 0 < mem_fraction < 1
         or tp_size != config.runtime.tensor_parallel_size
-        or base[9] != parsed.hostname
+        or base[9] != compile_plan.key.dtype
+        or base[11] != parsed.hostname
         or port != parsed.port
     ):
         raise ValueError("server base argv differs from the RunConfig/base URL")
-    remainder = argv[20:]
+    remainder = argv[30:]
     role = _execution_role(config.method)
     execution_argv = tuple(_execution_argv(config.runtime, role=role))
     if remainder[: len(execution_argv)] != execution_argv:
@@ -3030,11 +3023,18 @@ async def launch_server_subprocess(launch: ServerLaunch) -> ServerHandle:
     ):
         raise ValueError("subprocess launch requires the registered loopback launcher")
     if (
-        len(launch.argv) < 8
+        len(launch.argv) < 16
         or launch.argv[3] != "--checkout"
         or launch.argv[5] != "--compile-cache-plan"
         or launch.argv[6] != launch.compile_cache_plan
-        or launch.argv[7] != "--"
+        or launch.argv[7] != "--compile-cache-plan-sha256"
+        or launch.argv[8] != launch.compile_cache_plan_sha256
+        or launch.argv[9] != "--compile-cache-key-sha256"
+        or launch.argv[10] != launch.compile_cache_key_sha256
+        or launch.argv[11] != "--run-config"
+        or launch.argv[12] != launch.run_config
+        or launch.argv[13] != "--run-config-sha256"
+        or launch.argv[15] != "--"
     ):
         raise ValueError("subprocess launch lacks its exact compile-cache argv")
     compile_plan = _load_server_compile_plan(launch)
@@ -3046,7 +3046,9 @@ async def launch_server_subprocess(launch: ServerLaunch) -> ServerHandle:
         raise ValueError("subprocess launch lacks a device-bound RunConfig") from error
     if launch.method != config.method:
         raise ValueError("subprocess launch method differs from its RunConfig")
-    _validate_compile_key_for_run_config(compile_plan, config=config)
+    if launch.argv[14] != run_config_sha256(config):
+        raise ValueError("subprocess launch run-config digest differs from content")
+    validate_compile_key_for_run_config(compile_plan, config=config)
     verify_patched_checkout(launch.argv[4])
     device_identity = config.runtime.device_identity
     if (

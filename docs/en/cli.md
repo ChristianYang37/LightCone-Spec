@@ -97,6 +97,72 @@ writes a `BLOCKED` decision and no calibrated envelope. A preflight stage can
 seal `runtime_envelope=PATH` only by reopening that same raw execution
 authority, never from a hand-authored rule list or digest.
 
+## Compile-cache plan binding
+
+Every preliminary and OnlineSPEC runtime-render command requires
+`--compile-cache-plan /absolute/path/to/plan.json`. This is diagnostic launch
+authority, not attestation or permission to enter the formal DAG. Derive its
+`CompileCacheKey` programmatically from a passing `doctor` report, the exact
+model lock, and the rendered RunConfig; do not type expected host values from
+memory. The current diagnostic launcher accepts only `bfloat16`,
+`cuda_malloc_async`, graph buckets `(1,)`, and no caller build flags. It
+re-observes Python, Torch, Triton, the Torch CUDA build, `nvcc`, driver, selected
+GPU model, and SM before creating a cache attempt, and applies the allocator
+environment before importing Torch.
+
+Derive the key and issue an immutable diagnostic build plan with the source API:
+
+```python
+import json
+from pathlib import Path
+
+from lightcone_spec.config import load_run_config
+from lightcone_spec.locking.models import ModelLock
+from lightcone_spec.orchestration.runtime import derive_diagnostic_compile_cache_key
+from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
+
+doctor = json.loads(Path("/absolute/runtime/doctor.json").read_text())
+model_lock = ModelLock.load("/absolute/runtime/model-lock.json")
+config = load_run_config("/absolute/runtime/rendered-run-config.json")
+key = derive_diagnostic_compile_cache_key(
+    doctor_report=doctor,
+    model_lock=model_lock,
+    config=config,
+)
+cache_root = Path("/absolute/runtime/compile-cache")
+build = CompileCacheLaunchPlan.issue(
+    key=key,
+    cache_root=cache_root,
+    cache_mode="build",
+)
+build_path = build.write(Path("/absolute/runtime/build-plan.json"))
+```
+
+Pass `build_path` to the render command's required `--compile-cache-plan`; the
+renderer embeds the expected plan, key, and RunConfig SHA-256 values in the
+child argv. For example:
+
+```bash
+lightcone-spec render-preliminary-target-only-runtime \
+  ... \
+  --compile-cache-plan /absolute/runtime/build-plan.json
+```
+
+The child stably reopens both canonical artifacts and their sidecars, derives
+the exact algorithm and draft width from the RunConfig, and rejects identity or
+argv changes before cache, model, or GPU mutation. It also requires exactly one
+usable Torch CUDA device and refuses to initialize the allocator after Torch
+was imported. Do not edit, regenerate, move, or replace an artifact after
+rendering.
+
+Preliminary model roots bind locked revision paths, but do not carry the formal
+`PreparedModelContentAuthority` replay. The launcher therefore accepts build
+mode only and seals its cache receipt as unattributed: it cannot authorize
+reuse, formal execution, attestation, or `MEASURED`. Although the source API
+supports a reuse plan for a completed release-builder receipt with the same key
+and cache root, no preliminary receipt qualifies. Derive a new build plan until
+the formal content-authority execution path supplies that receipt.
+
 ## Formal external workload authority
 
 Formal benchmark data is never downloaded by these commands. The bind command

@@ -12,6 +12,8 @@ from lightcone_spec.orchestration.gang_execution import (
     ServingGangAttemptFailed,
     ServingGangAttemptReceipt,
     ServingGangLaunch,
+    ServingGangPortPlan,
+    ServingGangRankLaunchBinding,
     bind_diagnostic_gang_run_record,
     build_diagnostic_serving_gang_launch,
     execute_formal_serving_gang,
@@ -206,12 +208,55 @@ def _argv(*, tp: int, dp: int) -> tuple[str, ...]:
 def _launch(*, mode: str) -> tuple[ServingGangLaunch, NativeTerminalGangBinding]:
     binding = _gang_binding(mode=mode)
     tp, dp = (2, 1) if mode == "tp2" else (1, 2)
-    launch = build_diagnostic_serving_gang_launch(
-        gang_binding=binding,
-        assignment=_assignment(tp=tp, dp=dp),
-        supervisor_argv=_argv(tp=tp, dp=dp),
-    )
+    assignment = _assignment(tp=tp, dp=dp)
+    launch = object.__new__(ServingGangLaunch)
+    values = {
+        "mode": "tp2_dp1" if tp == 2 else "two_replica_tp1_dp2",
+        "method": binding.ranks[0].run.method,
+        "run_id": binding.ranks[0].run.run_id,
+        "gang_binding_sha256": binding.sha256,
+        "topology_sha256": binding.topology_sha256,
+        "topology_receipt_set_sha256": canonical_sha256(
+            [rank.topology_receipt_sha256 for rank in binding.ranks]
+        ),
+        "rank_config_set_sha256": binding.rank_config_set_sha256,
+        "physical_assignment_sha256": assignment.sha256,
+        "scheduler_assignment_sha256": assignment.assignment_sha256,
+        "host_id": assignment.host_id,
+        "fixed_instance_gpu_count": assignment.fixed_instance_gpu_count,
+        "ports": ServingGangPortPlan(*assignment.ports),
+        "ranks": tuple(
+            ServingGangRankLaunchBinding(
+                global_rank=rank.global_rank,
+                tensor_parallel_rank=rank.tensor_parallel_rank,
+                data_parallel_rank=rank.data_parallel_rank,
+                local_rank=rank.global_rank,
+                gpu_uuid=assignment.gpu_uuids[rank.global_rank],
+                rank_config_sha256=rank.run.rank_config_sha256,
+                topology_receipt_sha256=rank.topology_receipt_sha256,
+            )
+            for rank in binding.ranks
+        ),
+        "base_url": "http://127.0.0.1:30000",
+        "supervisor_argv": _argv(tp=tp, dp=dp),
+        "supervisor_environment": (
+            ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
+            ("CUDA_VISIBLE_DEVICES", "GPU-0,GPU-1"),
+        ),
+        "route_plan_sha256": binding.route_plan_sha256,
+    }
+    for name, value in values.items():
+        object.__setattr__(launch, name, value)
     return launch, binding
+
+
+def _unsafe_replace_launch(
+    launch: ServingGangLaunch, **updates: object
+) -> ServingGangLaunch:
+    result = object.__new__(ServingGangLaunch)
+    for name in ServingGangLaunch.__dataclass_fields__:
+        object.__setattr__(result, name, updates.get(name, getattr(launch, name)))
+    return result
 
 
 def test_tp2_launch_is_one_supervisor_with_exact_ports_ranks_and_codec() -> None:
@@ -225,7 +270,11 @@ def test_tp2_launch_is_one_supervisor_with_exact_ports_ranks_and_codec() -> None
         "GPU-0,GPU-1",
     )
     assert launch.supervisor_argv.count("--") == 1
-    assert ServingGangLaunch.from_dict(launch.to_dict()) == launch
+    with pytest.raises(NativeTerminalGangAuthorityBlocked) as blocked:
+        ServingGangLaunch.from_dict(launch.to_dict())
+    assert blocked.value.code == (
+        "diagnostic_serving_gang_compile_authority_unavailable"
+    )
 
     unknown = launch.to_dict()
     unknown["second_server"] = True
@@ -235,6 +284,18 @@ def test_tp2_launch_is_one_supervisor_with_exact_ports_ranks_and_codec() -> None
     tampered["rank_config_set_sha256"] = SHA_A
     with pytest.raises(ValueError, match="rank-config set differs"):
         ServingGangLaunch.from_dict(tampered)
+
+
+def test_valid_gang_supervisor_is_explicitly_blocked_before_construction() -> None:
+    with pytest.raises(NativeTerminalGangAuthorityBlocked) as blocked:
+        build_diagnostic_serving_gang_launch(
+            gang_binding=_gang_binding(mode="tp2"),
+            assignment=_assignment(tp=2, dp=1),
+            supervisor_argv=_argv(tp=2, dp=1),
+        )
+    assert blocked.value.code == (
+        "diagnostic_serving_gang_compile_authority_unavailable"
+    )
 
 
 def test_launch_rejects_multinode_duplicate_flags_and_live_reserved_port() -> None:
@@ -493,7 +554,7 @@ def test_failure_poison_requires_exact_lineage_and_new_supervisor() -> None:
                 workload=succeed,
             )
         )
-    foreign_launch = replace(launch, physical_assignment_sha256=SHA_A)
+    foreign_launch = _unsafe_replace_launch(launch, physical_assignment_sha256=SHA_A)
     with pytest.raises(ValueError, match="changed the serving-gang launch"):
         asyncio.run(
             executor.execute_fresh(

@@ -54,6 +54,49 @@ from lightcone_spec.orchestration.runtime import (
     render_onlinespec_runtime_plan,
     render_onlinespec_tuning_runtime_plan,
 )
+from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+    PINNED_SGLANG_PATCH_SHA256,
+    CompileCacheKey,
+    CompileCacheLaunchPlan,
+)
+
+
+def _compile_cache_plan(
+    tmp_path: Path,
+    lock: ModelLock,
+    *,
+    max_running_requests: int,
+) -> Path:
+    revisions = {model.model_id: model.revision for model in lock.models}
+    plan = CompileCacheLaunchPlan.issue(
+        key=CompileCacheKey(
+            patched_sglang_tree=PINNED_SGLANG_TREE,
+            patch_manifest_sha256=PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+            patch_sha256=PINNED_SGLANG_PATCH_SHA256,
+            source_sha256=PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+            python_version="3.12.11",
+            torch_version="2.11.0+cu130",
+            triton_version="3.6.0",
+            cuda_version="13.0",
+            driver_version="580.65.06",
+            sm_architecture="sm_120",
+            gpu_model="RTX PRO 6000 Blackwell Server Edition",
+            dtype="bfloat16",
+            target_revision=revisions["Qwen/Qwen3-8B"],
+            drafter_revision=revisions["z-lab/Qwen3-8B-DFlash-b16"],
+            tensor_parallel_size=1,
+            context_limit=40960,
+            max_running_requests=max_running_requests,
+            graph_buckets=(1,),
+            allocator="cuda_malloc_async",
+            build_flags=(),
+        ),
+        cache_root=tmp_path / "compile-cache",
+        cache_mode="build",
+    )
+    return plan.write(tmp_path / "compile-cache-plan.json")
 
 
 def test_onlinespec_manifest_pins_clean_room_provenance(tmp_path) -> None:
@@ -740,6 +783,11 @@ def test_onlinespec_renderer_creates_four_sequential_servers(
         reference_core_selection_sha256="e" * 64,
         patched_sglang_tree=PINNED_SGLANG_TREE,
     )
+    compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+    )
     launches = render_onlinespec_runtime_plan(
         output_root=tmp_path / "runtime",
         selection=selection,
@@ -754,6 +802,7 @@ def test_onlinespec_renderer_creates_four_sequential_servers(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         adaptation_group_id="onlinespec-study",
         adaptation_reserve_mb=4096,
         mem_fraction_static=0.7,
@@ -790,6 +839,11 @@ def test_onlinespec_tuning_renderer_pairs_candidate_with_static(
         ),
     )
     candidate = onlinespec_candidates()[0]
+    compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+    )
     launches = render_onlinespec_tuning_runtime_plan(
         output_root=tmp_path / "tune-runtime",
         candidate=candidate,
@@ -805,6 +859,7 @@ def test_onlinespec_tuning_renderer_pairs_candidate_with_static(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         adaptation_group_id="candidate-isolated",
         adaptation_reserve_mb=4096,
         mem_fraction_static=0.7,

@@ -20,20 +20,6 @@ from .attester_bundle import (
     load_source_release_trusted_attester_policy_bundle,
     load_trusted_attester_policy_bundle,
 )
-from .backend import (
-    BackendContract,
-    BackendPayload,
-    BackendRegistry,
-    DFlashBackendContract,
-    DSparkBackendContract,
-    EagleBackendContract,
-    FunctionalBackendContract,
-    NextNBackendContract,
-    ProposalEvidence,
-    Reconstruction,
-    dspark_composite_loss,
-    dspark_conditional_survival_target,
-)
 from .compile_cache import (
     COMPILE_CACHE_ENVIRONMENT_VARIABLES,
     PINNED_SGLANG_COMPILE_SOURCE_SHA256,
@@ -51,33 +37,6 @@ from .compile_cache import (
     preflight_compile_cache_launch,
     start_compile_cache_launch,
 )
-from .dflash_canvas import (
-    CanvasReconstruction,
-    DifferentiableCanvasContract,
-    position_weighted_kl,
-)
-from .distributed import (
-    AllRankPublicationCoordinator,
-    CohortRouteIdentity,
-    GlooPublicationTransport,
-    InferenceParameterOwnership,
-    ParameterOwnership,
-    PrepareDisposition,
-    PreparedPublication,
-    PublicationCandidate,
-    PublicationDecision,
-    PublicationOutcome,
-    RankDecisionReceipt,
-    RankPrepare,
-    RankTopologyReceipt,
-    ReplicaLocalRouter,
-    TopologyIdentity,
-    TopologyReceiptSet,
-    UpdateIdentity,
-    validate_decision_receipts,
-)
-from .exactness import rejection_sample
-from .publication import CudaPublicationCoordinator
 
 __all__ = [
     "COMPILE_CACHE_ENVIRONMENT_VARIABLES",
@@ -147,3 +106,66 @@ __all__ = [
     "validate_decision_receipts",
     "verify_attestation_signature",
 ]
+
+
+def __getattr__(name: str) -> object:
+    backend_exports = {
+        "BackendContract",
+        "BackendPayload",
+        "BackendRegistry",
+        "DFlashBackendContract",
+        "DSparkBackendContract",
+        "EagleBackendContract",
+        "FunctionalBackendContract",
+        "NextNBackendContract",
+        "ProposalEvidence",
+        "Reconstruction",
+        "dspark_composite_loss",
+        "dspark_conditional_survival_target",
+    }
+    canvas_exports = {
+        "CanvasReconstruction",
+        "DifferentiableCanvasContract",
+        "position_weighted_kl",
+    }
+    distributed_exports = {
+        "AllRankPublicationCoordinator",
+        "CohortRouteIdentity",
+        "GlooPublicationTransport",
+        "InferenceParameterOwnership",
+        "ParameterOwnership",
+        "PrepareDisposition",
+        "PreparedPublication",
+        "PublicationCandidate",
+        "PublicationDecision",
+        "PublicationOutcome",
+        "RankDecisionReceipt",
+        "RankPrepare",
+        "RankTopologyReceipt",
+        "ReplicaLocalRouter",
+        "TopologyIdentity",
+        "TopologyReceiptSet",
+        "UpdateIdentity",
+        "validate_decision_receipts",
+    }
+    if name in backend_exports:
+        from . import backend
+
+        return getattr(backend, name)
+    if name in canvas_exports:
+        from . import dflash_canvas
+
+        return getattr(dflash_canvas, name)
+    if name in distributed_exports:
+        from . import distributed
+
+        return getattr(distributed, name)
+    if name == "rejection_sample":
+        from .exactness import rejection_sample
+
+        return rejection_sample
+    if name == "CudaPublicationCoordinator":
+        from .publication import CudaPublicationCoordinator
+
+        return CudaPublicationCoordinator
+    raise AttributeError(name)

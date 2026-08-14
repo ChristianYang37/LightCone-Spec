@@ -2794,6 +2794,7 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument("--model-roots", required=True)
     render.add_argument("--sglang-checkout", required=True)
     render.add_argument("--sampling-profile", required=True)
+    render.add_argument("--compile-cache-plan", required=True)
     render.add_argument("--adaptation-group-id", required=True)
     render.add_argument("--adaptation-reserve-mb", type=int, required=True)
     render.add_argument("--mem-fraction-static", type=float, required=True)
@@ -2807,6 +2808,7 @@ def _parser() -> argparse.ArgumentParser:
     render_online.add_argument("--model-roots", required=True)
     render_online.add_argument("--sglang-checkout", required=True)
     render_online.add_argument("--sampling-profile", required=True)
+    render_online.add_argument("--compile-cache-plan", required=True)
     render_online.add_argument("--adaptation-group-id", required=True)
     render_online.add_argument("--adaptation-reserve-mb", type=int, required=True)
     render_online.add_argument("--mem-fraction-static", type=float, required=True)
@@ -2821,6 +2823,7 @@ def _parser() -> argparse.ArgumentParser:
     render_online_tune.add_argument("--model-roots", required=True)
     render_online_tune.add_argument("--sglang-checkout", required=True)
     render_online_tune.add_argument("--sampling-profile", required=True)
+    render_online_tune.add_argument("--compile-cache-plan", required=True)
     render_online_tune.add_argument("--adaptation-group-id", required=True)
     render_online_tune.add_argument("--adaptation-reserve-mb", type=int, required=True)
     render_online_tune.add_argument("--mem-fraction-static", type=float, required=True)
@@ -2834,6 +2837,7 @@ def _parser() -> argparse.ArgumentParser:
     render_static.add_argument("--model-roots", required=True)
     render_static.add_argument("--sglang-checkout", required=True)
     render_static.add_argument("--sampling-profile", required=True)
+    render_static.add_argument("--compile-cache-plan", required=True)
     render_static.add_argument("--mem-fraction-static", type=float, required=True)
     render_static.add_argument("--output-root", required=True)
     render_static.add_argument("--host", default="127.0.0.1")
@@ -2845,6 +2849,7 @@ def _parser() -> argparse.ArgumentParser:
     render_target.add_argument("--model-roots", required=True)
     render_target.add_argument("--sglang-checkout", required=True)
     render_target.add_argument("--sampling-profile", required=True)
+    render_target.add_argument("--compile-cache-plan", required=True)
     render_target.add_argument("--mem-fraction-static", type=float, required=True)
     render_target.add_argument("--output-root", required=True)
     render_target.add_argument("--host", default="127.0.0.1")
@@ -2857,6 +2862,7 @@ def _parser() -> argparse.ArgumentParser:
     render_tuning.add_argument("--model-roots", required=True)
     render_tuning.add_argument("--sglang-checkout", required=True)
     render_tuning.add_argument("--sampling-profile", required=True)
+    render_tuning.add_argument("--compile-cache-plan", required=True)
     render_tuning.add_argument("--adaptation-group-id", required=True)
     render_tuning.add_argument("--adaptation-reserve-mb", type=int, required=True)
     render_tuning.add_argument("--mem-fraction-static", type=float, required=True)
@@ -2871,6 +2877,7 @@ def _parser() -> argparse.ArgumentParser:
     replication.add_argument("--model-roots", required=True)
     replication.add_argument("--sglang-checkout", required=True)
     replication.add_argument("--sampling-profile", required=True)
+    replication.add_argument("--compile-cache-plan", required=True)
     replication.add_argument("--adaptation-group-id", required=True)
     replication.add_argument("--adaptation-reserve-mb", type=int, required=True)
     replication.add_argument("--mem-fraction-static", type=float, required=True)
@@ -4208,6 +4215,7 @@ def _render_runtime(args: argparse.Namespace) -> int:
         model_roots=roots,
         sampling_profile=sampling,
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         adaptation_group_id=args.adaptation_group_id,
         adaptation_reserve_mb=args.adaptation_reserve_mb,
         mem_fraction_static=args.mem_fraction_static,
@@ -4233,6 +4241,7 @@ def _render_onlinespec_runtime(args: argparse.Namespace) -> int:
         model_roots=_load_bound_json(args.model_roots),
         sampling_profile=SamplingProfile.load(args.sampling_profile),
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         adaptation_group_id=args.adaptation_group_id,
         adaptation_reserve_mb=args.adaptation_reserve_mb,
         mem_fraction_static=args.mem_fraction_static,
@@ -4258,6 +4267,7 @@ def _render_onlinespec_tuning_runtime(args: argparse.Namespace) -> int:
         model_roots=_load_bound_json(args.model_roots),
         sampling_profile=SamplingProfile.load(args.sampling_profile),
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         adaptation_group_id=args.adaptation_group_id,
         adaptation_reserve_mb=args.adaptation_reserve_mb,
         mem_fraction_static=args.mem_fraction_static,
@@ -4285,6 +4295,7 @@ def _render_static_load_runtime(args: argparse.Namespace) -> int:
         model_roots=roots,
         sampling_profile=sampling,
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         mem_fraction_static=args.mem_fraction_static,
         host=args.host,
         first_port=args.first_port,
@@ -4311,6 +4322,7 @@ def _render_target_only_runtime(args: argparse.Namespace) -> int:
         model_roots=_load_bound_json(args.model_roots),
         sampling_profile=SamplingProfile.load(args.sampling_profile),
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         mem_fraction_static=args.mem_fraction_static,
         host=args.host,
         first_port=args.first_port,
@@ -4320,8 +4332,10 @@ def _render_target_only_runtime(args: argparse.Namespace) -> int:
         launch.method != "target_only"
         or launch.adaptation_config is not None
         or launch.telemetry_path is not None
-        or any("speculative" in argument for argument in launch.argv)
+        or "--speculative-algorithm" in launch.argv
+        or "--speculative-draft-model-path" in launch.argv
         or any("draft" in argument for argument in launch.argv)
+        or any("adaptation" in argument for argument in launch.argv)
     ):
         raise AssertionError("Target-only renderer allocated speculative state")
     print(Path(args.output_root).resolve() / "launch-plan.json")
@@ -4346,6 +4360,7 @@ def _render_tuning_runtime(args: argparse.Namespace) -> int:
         model_roots=roots,
         sampling_profile=sampling,
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         adaptation_group_id=args.adaptation_group_id,
         adaptation_reserve_mb=args.adaptation_reserve_mb,
         mem_fraction_static=args.mem_fraction_static,
@@ -4381,6 +4396,7 @@ def _render_replication_runtime(args: argparse.Namespace) -> int:
         model_roots=roots,
         sampling_profile=sampling,
         sglang_checkout=args.sglang_checkout,
+        compile_cache_plan_path=args.compile_cache_plan,
         adaptation_group_id=args.adaptation_group_id,
         adaptation_reserve_mb=args.adaptation_reserve_mb,
         mem_fraction_static=args.mem_fraction_static,

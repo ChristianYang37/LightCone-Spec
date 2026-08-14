@@ -383,8 +383,12 @@ class CompileCacheKey:
             "allocator",
         ):
             _require_text(name, getattr(self, name))
-        if self.drafter_revision is not None:
-            _require_text("drafter_revision", self.drafter_revision)
+        if self.drafter_revision is not None and not _GIT_OBJECT.fullmatch(
+            self.drafter_revision
+        ):
+            raise ValueError("drafter_revision must be an immutable Git SHA")
+        if not _GIT_OBJECT.fullmatch(self.target_revision):
+            raise ValueError("target_revision must be an immutable Git SHA")
         for name in (
             "tensor_parallel_size",
             "context_limit",
@@ -457,6 +461,72 @@ class CompileCacheKey:
         )
         value.validate()
         return value
+
+
+def validate_compile_runtime_toolchain(
+    key: CompileCacheKey,
+    *,
+    python_version: object,
+    torch_version: object,
+    triton_version: object,
+    torch_cuda_version: object,
+    nvcc_cuda_version: object,
+    driver_version: object,
+    gpu_model: object,
+    sm_architecture: object,
+) -> None:
+    """Match one observed launch environment to its compile-cache key."""
+
+    key.validate()
+    observed = (
+        python_version,
+        torch_version,
+        triton_version,
+        torch_cuda_version,
+        nvcc_cuda_version,
+        driver_version,
+        gpu_model,
+        sm_architecture,
+    )
+    expected = (
+        key.python_version,
+        key.torch_version,
+        key.triton_version,
+        key.cuda_version,
+        key.cuda_version,
+        key.driver_version,
+        key.gpu_model,
+        key.sm_architecture,
+    )
+    if observed != expected:
+        raise ValueError("compile-cache key differs from exact runtime toolchain")
+
+
+def validate_compile_key_for_run_config(
+    plan: CompileCacheLaunchPlan,
+    *,
+    config: object,
+) -> None:
+    """Bind one cache identity to an exact strict RunConfig without orchestration."""
+
+    from lightcone_spec.config.schema import RunConfig
+
+    if type(plan) is not CompileCacheLaunchPlan or type(config) is not RunConfig:
+        raise TypeError("compile-cache binding requires exact plan and RunConfig")
+    plan.validate()
+    expected_drafter = (
+        None if config.method == "target_only" else config.model.drafter_revision
+    )
+    key = plan.key
+    if (
+        key.source_sha256 != PINNED_SGLANG_COMPILE_SOURCE_SHA256
+        or key.target_revision != config.model.target_revision
+        or key.drafter_revision != expected_drafter
+        or key.tensor_parallel_size != config.runtime.tensor_parallel_size
+        or key.context_limit != config.runtime.context_length
+        or key.max_running_requests != config.runtime.max_running_requests
+    ):
+        raise ValueError("compile-cache key differs from the exact RunConfig")
 
 
 @dataclass(frozen=True)
@@ -735,16 +805,17 @@ class CompileCacheLaunchPlan:
 
     @classmethod
     def load(cls, path: str | Path) -> Self:
-        resolved = Path(path)
-        if resolved.is_symlink() or not resolved.is_file():
-            raise ValueError("compile-cache plan must be a regular file")
-        raw = json.loads(resolved.read_text(encoding="utf-8"))
+        requested = Path(path)
+        if requested.is_symlink():
+            raise ValueError("compile-cache plan cannot be a symlink")
+        resolved = requested.resolve(strict=False)
+        raw, semantic_sha256 = _load_canonical_json_with_sidecar(
+            resolved,
+            label="compile-cache plan",
+        )
         value = cls.from_dict(raw)
-        sidecar = resolved.with_name(f"{resolved.name}.sha256")
-        if sidecar.is_symlink() or not sidecar.is_file():
-            raise ValueError("compile-cache plan sidecar is missing")
-        if sidecar.read_text(encoding="utf-8").strip() != value.sha256:
-            raise ValueError("compile-cache plan sidecar differs from content")
+        if semantic_sha256 != value.sha256:
+            raise ValueError("compile-cache plan semantic identity differs")
         return value
 
 
@@ -1686,11 +1757,13 @@ class CompileCacheLaunchSession:
         cache: ImmutableCompileCache,
         overlay: CompileCacheOverlay,
         base_receipt_sha256: str | None,
+        release_builder_receipt: bool,
     ) -> None:
         self.plan = plan
         self.cache = cache
         self.overlay = overlay
         self.base_receipt_sha256 = base_receipt_sha256
+        self._release_builder_receipt = release_builder_receipt
         self._terminal = False
 
     def _attempt(
@@ -1742,10 +1815,13 @@ class CompileCacheLaunchSession:
         if self._terminal:
             raise RuntimeError("compile-cache launch session is already terminal")
         try:
-            object_path, receipt_path = self.cache.seal_launch_overlay(
-                self.overlay,
-                plan=self.plan,
-            )
+            if self._release_builder_receipt:
+                object_path, receipt_path = self.cache.seal_launch_overlay(
+                    self.overlay,
+                    plan=self.plan,
+                )
+            else:
+                object_path, receipt_path = self.cache.seal_overlay(self.overlay)
             receipt = CompileCacheReceipt.load(receipt_path)
             attempt_path = self.cache.write_attempt(
                 self._attempt(
@@ -1860,10 +1936,13 @@ def start_compile_cache_launch(
     *,
     process_id: int | None = None,
     attempt_id: str | None = None,
+    _release_builder_receipt: bool = True,
 ) -> CompileCacheLaunchSession:
     """Verify a plan/base and create a private overlay before SGLang import."""
 
     plan.validate()
+    if not isinstance(_release_builder_receipt, bool):
+        raise TypeError("compile-cache receipt attribution selector must be boolean")
     cache = ImmutableCompileCache(plan.cache_root)
     selected_process_id = os.getpid() if process_id is None else process_id
     selected_attempt_id = (
@@ -1879,6 +1958,7 @@ def start_compile_cache_launch(
         cache=cache,
         overlay=overlay,
         base_receipt_sha256=plan.base_receipt_sha256,
+        release_builder_receipt=_release_builder_receipt,
     )
     cache.write_attempt(session._attempt(state="started", finished_ns=None))
     try:

@@ -53,8 +53,8 @@ def _key() -> CompileCacheKey:
         sm_architecture="sm_120",
         gpu_model="RTX PRO 6000 Blackwell Server Edition",
         dtype="bfloat16",
-        target_revision="target-revision",
-        drafter_revision="drafter-revision",
+        target_revision="a" * 40,
+        drafter_revision="b" * 40,
         tensor_parallel_size=2,
         context_limit=4096,
         max_running_requests=2,
@@ -229,8 +229,10 @@ def test_sglang_launcher_blocks_compile_only_before_checkout_or_cache_mutation(
         lambda _plan: pytest.fail("compile-only must block before cache mutation"),
     )
     monkeypatch.setattr(
-        "lightcone_spec.sglang_bridge.launch._validate_blackwell_jit_toolchain",
-        lambda: pytest.fail("compile-only must block before GPU/toolchain probing"),
+        "lightcone_spec.sglang_bridge.launch._validate_compile_runtime_environment",
+        lambda _plan, _config, _argv: pytest.fail(
+            "compile-only must block before GPU/toolchain probing"
+        ),
     )
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.launch.runpy.run_module",
@@ -243,6 +245,14 @@ def test_sglang_launcher_blocks_compile_only_before_checkout_or_cache_mutation(
         str((tmp_path / "checkout").resolve()),
         "--compile-cache-plan",
         str((tmp_path / "missing-plan.json").resolve()),
+        "--compile-cache-plan-sha256",
+        contract.compile_cache_plan.sha256,
+        "--compile-cache-key-sha256",
+        contract.compile_cache_plan.key.sha256,
+        "--run-config",
+        str((tmp_path / "missing-run-config.json").resolve()),
+        "--run-config-sha256",
+        "0" * 64,
     ]
     if mode == "assignment":
         arguments.extend(("--compile-only-assignment", str(assignment_path), "--"))

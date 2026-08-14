@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.config.loader import run_config_sha256
 from lightcone_spec.config.schema import (
     AdaptationConfig,
     ModelPair,
@@ -17,6 +19,7 @@ from lightcone_spec.config.schema import (
     RunConfig,
     RuntimeConfig,
 )
+from lightcone_spec.doctor import _nvcc_release
 from lightcone_spec.execution import ControlledExecutionPolicy, ExecutionRole
 from lightcone_spec.experiments.onlinespec import (
     OnlineSpecCandidate,
@@ -30,7 +33,14 @@ from lightcone_spec.experiments.protocol import (
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.selection import SelectionArtifact
 from lightcone_spec.locking.models import ModelLock
-from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
+from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+    PINNED_SGLANG_PATCH_SHA256,
+    CompileCacheKey,
+    CompileCacheLaunchPlan,
+    validate_compile_key_for_run_config,
+)
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 
@@ -113,6 +123,123 @@ def _runtime_execution_policy(runtime: RuntimeConfig) -> ControlledExecutionPoli
     return policy
 
 
+def derive_diagnostic_compile_cache_key(
+    *,
+    doctor_report: Mapping[str, object],
+    model_lock: ModelLock,
+    config: RunConfig,
+    gpu_uuid: str | None = None,
+) -> CompileCacheKey:
+    """Derive, never hand-author, one preliminary single-GPU cache key."""
+
+    if not isinstance(doctor_report, Mapping):
+        raise TypeError("compile-cache key derivation requires one doctor report")
+    if type(model_lock) is not ModelLock or type(config) is not RunConfig:
+        raise TypeError("compile-cache key derivation requires exact locked inputs")
+    model_lock.validate()
+    readiness = doctor_report.get("readiness")
+    checks = doctor_report.get("checks")
+    if (
+        doctor_report.get("schema_version") != 1
+        or doctor_report.get("status") != "PASS"
+        or not isinstance(readiness, Mapping)
+        or readiness.get("status") != "PASS"
+        or readiness.get("fail_count") != 0
+        or readiness.get("unknown_count") != 0
+        or not isinstance(checks, Mapping)
+        or not checks
+        or any(
+            not isinstance(check, Mapping) or check.get("status") != "PASS"
+            for check in checks.values()
+        )
+        or readiness.get("pass_count") != len(checks)
+    ):
+        raise ValueError("compile-cache key requires one complete PASS doctor report")
+
+    locked_revisions = {model.model_id: model.revision for model in model_lock.models}
+    if (
+        locked_revisions.get(config.model.target) != config.model.target_revision
+        or locked_revisions.get(config.model.drafter) != config.model.drafter_revision
+    ):
+        raise ValueError("RunConfig model revisions differ from the exact model lock")
+
+    python = doctor_report.get("python")
+    gpu = doctor_report.get("gpu")
+    commands = doctor_report.get("commands")
+    packages = doctor_report.get("packages")
+    if not all(
+        isinstance(value, Mapping) for value in (python, gpu, commands, packages)
+    ):
+        raise TypeError("PASS doctor report lacks compile toolchain sections")
+    assert isinstance(python, Mapping)
+    assert isinstance(gpu, Mapping)
+    assert isinstance(commands, Mapping)
+    assert isinstance(packages, Mapping)
+    torch_runtime = gpu.get("torch")
+    parsed_inventory = gpu.get("parsed_inventory")
+    if not isinstance(torch_runtime, Mapping) or not isinstance(
+        parsed_inventory, Mapping
+    ):
+        raise TypeError("PASS doctor report lacks Torch or GPU inventory facts")
+    devices = parsed_inventory.get("devices")
+    if (
+        torch_runtime.get("importable") is not True
+        or torch_runtime.get("cuda_available") is not True
+        or not isinstance(devices, list)
+        or not devices
+        or parsed_inventory.get("parse_error") is not None
+        or torch_runtime.get("device_count") != len(devices)
+    ):
+        raise ValueError("PASS doctor report lacks usable exact CUDA visibility")
+    selected_uuid = config.runtime.device_identity if gpu_uuid is None else gpu_uuid
+    matches = [
+        device
+        for device in devices
+        if isinstance(device, Mapping) and device.get("uuid") == selected_uuid
+    ]
+    if len(matches) != 1:
+        raise ValueError("RunConfig/GPU selector does not identify one doctor GPU")
+    selected = matches[0]
+    capability = selected.get("compute_capability")
+    if not isinstance(capability, str):
+        raise TypeError("selected doctor GPU lacks compute capability")
+    components = capability.split(".")
+    if len(components) != 2 or any(
+        not component.isdecimal() for component in components
+    ):
+        raise ValueError("selected doctor GPU has invalid compute capability")
+    cuda_version = _nvcc_release(commands.get("nvcc"))
+    if cuda_version is None or torch_runtime.get("cuda_build") != cuda_version:
+        raise ValueError("PASS doctor report lacks one exact Torch/nvcc CUDA release")
+
+    key = CompileCacheKey(
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        patch_manifest_sha256=PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+        patch_sha256=PINNED_SGLANG_PATCH_SHA256,
+        source_sha256=PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+        python_version=python.get("version"),
+        torch_version=torch_runtime.get("version"),
+        triton_version=packages.get("triton"),
+        cuda_version=cuda_version,
+        driver_version=selected.get("driver_version"),
+        sm_architecture="sm_" + "".join(components),
+        gpu_model=selected.get("name"),
+        dtype="bfloat16",
+        target_revision=config.model.target_revision,
+        drafter_revision=(
+            None if config.method == "target_only" else config.model.drafter_revision
+        ),
+        tensor_parallel_size=config.runtime.tensor_parallel_size,
+        context_limit=config.runtime.context_length,
+        max_running_requests=config.runtime.max_running_requests,
+        graph_buckets=(1,),
+        allocator="cuda_malloc_async",
+        build_flags=(),
+    )
+    key.validate()
+    return key
+
+
 def _execution_argv(runtime: RuntimeConfig, *, role: ExecutionRole) -> list[str]:
     """Render only the exact flags represented by the registered policy."""
 
@@ -149,10 +276,16 @@ def _render_server(
     mem_fraction_static: float,
     host: str,
     port: int,
-    compile_cache_plan_path: str | Path | None = None,
+    compile_cache_plan_path: str | Path,
 ) -> ServerLaunch:
     if method != config.method:
         raise ValueError("rendered method differs from the RunConfig")
+    unresolved_plan = Path(compile_cache_plan_path)
+    if unresolved_plan.is_symlink():
+        raise ValueError("compile-cache plan cannot be a symlink")
+    compile_plan_path = unresolved_plan.resolve()
+    compile_plan = CompileCacheLaunchPlan.load(compile_plan_path)
+    validate_compile_key_for_run_config(compile_plan, config=config)
     method_root = output / method
     config_path = method_root / "run-config.json"
     _immutable_json(config_path, config.model_dump(mode="json"))
@@ -165,23 +298,23 @@ def _render_server(
             raise AssertionError("adapted config produced no payload")
         _immutable_json(adaptation_path, payload)
         telemetry_path = method_root / "adaptation-telemetry.json"
-    compile_plan_path: Path | None = None
-    compile_plan: CompileCacheLaunchPlan | None = None
-    if compile_cache_plan_path is not None:
-        unresolved_plan = Path(compile_cache_plan_path)
-        if unresolved_plan.is_symlink():
-            raise ValueError("compile-cache plan cannot be a symlink")
-        compile_plan_path = unresolved_plan.resolve()
-        compile_plan = CompileCacheLaunchPlan.load(compile_plan_path)
     argv = [
         sys.executable,
         "-m",
         "lightcone_spec.sglang_bridge.launch",
         "--checkout",
         str(verified_checkout),
+        "--compile-cache-plan",
+        str(compile_plan_path),
+        "--compile-cache-plan-sha256",
+        compile_plan.sha256,
+        "--compile-cache-key-sha256",
+        compile_plan.key.sha256,
+        "--run-config",
+        str(config_path),
+        "--run-config-sha256",
+        run_config_sha256(config),
     ]
-    if compile_plan_path is not None:
-        argv.extend(("--compile-cache-plan", str(compile_plan_path)))
     argv.extend(
         (
             "--",
@@ -193,6 +326,8 @@ def _render_server(
             str(mem_fraction_static),
             "--tp-size",
             str(config.runtime.tensor_parallel_size),
+            "--dtype",
+            compile_plan.key.dtype,
             "--host",
             host,
             "--port",
@@ -241,15 +376,9 @@ def _render_server(
         adaptation_config=None if adaptation_path is None else str(adaptation_path),
         telemetry_path=None if telemetry_path is None else str(telemetry_path),
         argv=tuple(argv),
-        compile_cache_plan=(
-            None if compile_plan_path is None else str(compile_plan_path)
-        ),
-        compile_cache_plan_sha256=(
-            None if compile_plan is None else compile_plan.sha256
-        ),
-        compile_cache_key_sha256=(
-            None if compile_plan is None else compile_plan.key.sha256
-        ),
+        compile_cache_plan=str(compile_plan_path),
+        compile_cache_plan_sha256=compile_plan.sha256,
+        compile_cache_key_sha256=compile_plan.key.sha256,
     )
 
 
@@ -261,6 +390,7 @@ def _render_choice_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str | None,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -392,6 +522,7 @@ def _render_choice_plan(
                 mem_fraction_static=mem_fraction_static,
                 host=host,
                 port=first_port,
+                compile_cache_plan_path=compile_cache_plan_path,
             )
         )
     _immutable_json(
@@ -421,6 +552,7 @@ def render_static_load_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     mem_fraction_static: float,
     host: str = "127.0.0.1",
     first_port: int = 30000,
@@ -438,6 +570,7 @@ def render_static_load_runtime_plan(
         model_roots=model_roots,
         sampling_profile=sampling_profile,
         sglang_checkout=sglang_checkout,
+        compile_cache_plan_path=compile_cache_plan_path,
         adaptation_group_id=None,
         adaptation_reserve_mb=0,
         mem_fraction_static=mem_fraction_static,
@@ -454,6 +587,7 @@ def render_target_only_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     mem_fraction_static: float,
     host: str = "127.0.0.1",
     first_port: int = 30000,
@@ -505,6 +639,7 @@ def render_target_only_runtime_plan(
         mem_fraction_static=mem_fraction_static,
         host=host,
         port=first_port,
+        compile_cache_plan_path=compile_cache_plan_path,
     )
     _immutable_json(
         output / "launch-plan.json",
@@ -531,6 +666,7 @@ def render_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -551,6 +687,7 @@ def render_runtime_plan(
         model_roots=model_roots,
         sampling_profile=sampling_profile,
         sglang_checkout=sglang_checkout,
+        compile_cache_plan_path=compile_cache_plan_path,
         adaptation_group_id=adaptation_group_id,
         adaptation_reserve_mb=adaptation_reserve_mb,
         mem_fraction_static=mem_fraction_static,
@@ -568,6 +705,7 @@ def render_tuning_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -586,6 +724,7 @@ def render_tuning_runtime_plan(
         model_roots=model_roots,
         sampling_profile=sampling_profile,
         sglang_checkout=sglang_checkout,
+        compile_cache_plan_path=compile_cache_plan_path,
         adaptation_group_id=adaptation_group_id,
         adaptation_reserve_mb=adaptation_reserve_mb,
         mem_fraction_static=mem_fraction_static,
@@ -603,6 +742,7 @@ def render_replication_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -626,6 +766,7 @@ def render_replication_runtime_plan(
         model_roots=model_roots,
         sampling_profile=sampling_profile,
         sglang_checkout=sglang_checkout,
+        compile_cache_plan_path=compile_cache_plan_path,
         adaptation_group_id=adaptation_group_id,
         adaptation_reserve_mb=adaptation_reserve_mb,
         mem_fraction_static=mem_fraction_static,
@@ -719,6 +860,7 @@ def render_onlinespec_tuning_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -773,6 +915,7 @@ def render_onlinespec_tuning_runtime_plan(
             mem_fraction_static=mem_fraction_static,
             host=host,
             port=first_port,
+            compile_cache_plan_path=compile_cache_plan_path,
         )
         for method in ("static", candidate.method)
     )
@@ -802,6 +945,7 @@ def render_onlinespec_runtime_plan(
     model_roots: dict,
     sampling_profile: SamplingProfile,
     sglang_checkout: str | Path,
+    compile_cache_plan_path: str | Path,
     adaptation_group_id: str,
     adaptation_reserve_mb: int,
     mem_fraction_static: float,
@@ -859,6 +1003,7 @@ def render_onlinespec_runtime_plan(
             mem_fraction_static=mem_fraction_static,
             host=host,
             port=first_port,
+            compile_cache_plan_path=compile_cache_plan_path,
         )
         for method in (
             "static",

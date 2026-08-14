@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,9 +17,11 @@ from lightcone_spec.cli.main import (
     _advance_tuning,
     _concat_evidence_tables,
     _load_patched_gpu_doctor,
+    _parser,
     _static_load_rows,
     _write_json,
 )
+from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.data import (
@@ -61,12 +64,176 @@ from lightcone_spec.experiments.statistics import (
 from lightcone_spec.locking.models import LockedModel, ModelLock
 from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 from lightcone_spec.orchestration.runtime import (
+    derive_diagnostic_compile_cache_key,
     render_runtime_plan,
     render_static_load_runtime_plan,
     render_target_only_runtime_plan,
     render_tuning_runtime_plan,
 )
+from lightcone_spec.runtime.compile_cache import (
+    PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+    PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+    PINNED_SGLANG_PATCH_SHA256,
+    CompileCacheKey,
+    CompileCacheLaunchPlan,
+)
+from lightcone_spec.sglang_bridge.launch import main as launch_sglang
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "render-preliminary-runtime",
+        "render-preliminary-static-load-runtime",
+        "render-preliminary-target-only-runtime",
+        "render-preliminary-tuning-runtime",
+        "render-preliminary-replication-runtime",
+        "render-onlinespec-runtime",
+        "render-onlinespec-tuning-runtime",
+    ),
+)
+def test_runtime_render_cli_requires_compile_cache_plan(command: str) -> None:
+    commands = _parser()._subparsers._group_actions[0].choices
+    action = next(
+        action
+        for action in commands[command]._actions
+        if action.dest == "compile_cache_plan"
+    )
+    assert action.required
+    assert "--compile-cache-plan" in commands[command].format_help()
+
+
+def _compile_cache_plan(
+    tmp_path: Path,
+    lock: ModelLock,
+    *,
+    max_running_requests: int,
+    target_only: bool = False,
+) -> tuple[CompileCacheLaunchPlan, Path]:
+    revisions = {model.model_id: model.revision for model in lock.models}
+    key = CompileCacheKey(
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        patch_manifest_sha256=PINNED_SGLANG_PATCH_MANIFEST_SHA256,
+        patch_sha256=PINNED_SGLANG_PATCH_SHA256,
+        source_sha256=PINNED_SGLANG_COMPILE_SOURCE_SHA256,
+        python_version="3.12.11",
+        torch_version="2.11.0+cu130",
+        triton_version="3.6.0",
+        cuda_version="13.0",
+        driver_version="580.65.06",
+        sm_architecture="sm_120",
+        gpu_model="RTX PRO 6000 Blackwell Server Edition",
+        dtype="bfloat16",
+        target_revision=revisions["Qwen/Qwen3-8B"],
+        drafter_revision=(
+            None if target_only else revisions["z-lab/Qwen3-8B-DFlash-b16"]
+        ),
+        tensor_parallel_size=1,
+        context_limit=40960,
+        max_running_requests=max_running_requests,
+        graph_buckets=(1,),
+        allocator="cuda_malloc_async",
+        build_flags=(),
+    )
+    plan = CompileCacheLaunchPlan.issue(
+        key=key,
+        cache_root=tmp_path / "compile-cache",
+        cache_mode="build",
+    )
+    path = plan.write(tmp_path / "compile-cache-plan.json")
+    return plan, path
+
+
+def _passing_compile_doctor() -> dict[str, object]:
+    checks = {"runtime": {"status": "PASS"}}
+    return {
+        "schema_version": 1,
+        "status": "PASS",
+        "readiness": {
+            "status": "PASS",
+            "pass_count": len(checks),
+            "fail_count": 0,
+            "unknown_count": 0,
+        },
+        "checks": checks,
+        "python": {"version": "3.12.11"},
+        "packages": {"triton": "3.6.0"},
+        "commands": {"nvcc": "Cuda compilation tools, release 13.0, V13.0.0"},
+        "gpu": {
+            "torch": {
+                "importable": True,
+                "version": "2.11.0+cu130",
+                "cuda_build": "13.0",
+                "cuda_available": True,
+                "device_count": 1,
+            },
+            "parsed_inventory": {
+                "parse_error": None,
+                "devices": [
+                    {
+                        "uuid": "GPU-test",
+                        "name": "RTX PRO 6000 Blackwell Server Edition",
+                        "driver_version": "580.65.06",
+                        "compute_capability": "12.0",
+                    }
+                ],
+            },
+        },
+    }
+
+
+def test_diagnostic_compile_key_is_derived_from_doctor_lock_and_run_config() -> None:
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    raw_config = config_value("static")
+    raw_config["runtime"]["device_identity"] = "GPU-test"
+    config = RunConfig.model_validate(raw_config)
+
+    key = derive_diagnostic_compile_cache_key(
+        doctor_report=_passing_compile_doctor(),
+        model_lock=lock,
+        config=config,
+    )
+
+    assert key.python_version == "3.12.11"
+    assert key.torch_version == "2.11.0+cu130"
+    assert key.triton_version == "3.6.0"
+    assert key.cuda_version == "13.0"
+    assert key.gpu_model == "RTX PRO 6000 Blackwell Server Edition"
+    assert key.sm_architecture == "sm_120"
+    assert key.target_revision == "a" * 40
+    assert key.drafter_revision == "b" * 40
+    assert key.graph_buckets == (1,)
+    assert key.allocator == "cuda_malloc_async"
+    assert key.build_flags == ()
+
+    incomplete = _passing_compile_doctor()
+    incomplete["status"] = "UNKNOWN"
+    with pytest.raises(ValueError, match="complete PASS doctor"):
+        derive_diagnostic_compile_cache_key(
+            doctor_report=incomplete,
+            model_lock=lock,
+            config=config,
+        )
+    foreign_lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "c" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    with pytest.raises(ValueError, match="exact model lock"):
+        derive_diagnostic_compile_cache_key(
+            doctor_report=_passing_compile_doctor(),
+            model_lock=foreign_lock,
+            config=config,
+        )
 
 
 def test_controlled_windows_are_sized_unique_and_content_disjoint() -> None:
@@ -1107,6 +1274,11 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
         patched_sglang_tree=PINNED_SGLANG_TREE,
         tuning_evidence_sha256="e" * 64,
     )
+    _plan, compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+    )
     launches = render_runtime_plan(
         output_root=tmp_path / "runtime",
         selection=selection,
@@ -1121,6 +1293,7 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         adaptation_group_id="study-a",
         adaptation_reserve_mb=1024,
         mem_fraction_static=0.7,
@@ -1179,6 +1352,11 @@ def test_static_load_renderer_has_no_adaptation_identity_or_allocation(
             LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
         ),
     )
+    _plan, compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=48,
+    )
     launches = render_static_load_runtime_plan(
         output_root=tmp_path / "static-c48",
         concurrency=48,
@@ -1193,6 +1371,7 @@ def test_static_load_renderer_has_no_adaptation_identity_or_allocation(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         mem_fraction_static=0.7,
     )
     assert len(launches) == 1
@@ -1229,6 +1408,12 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
             LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
         ),
     )
+    plan, compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+        target_only=True,
+    )
     launches = render_target_only_runtime_plan(
         output_root=tmp_path / "target-only",
         concurrency=8,
@@ -1240,6 +1425,7 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         mem_fraction_static=0.7,
     )
     launch = launches[0]
@@ -1256,6 +1442,115 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
     assert "--disable-radix-cache" in launch.argv
     assert "--disable-cuda-graph" in launch.argv
     assert "--disable-overlap-schedule" in launch.argv
+    rendered_config = RunConfig.model_validate_json(Path(launch.run_config).read_text())
+    assert launch.argv[3:16] == (
+        "--checkout",
+        str((tmp_path / "patched-sglang").resolve()),
+        "--compile-cache-plan",
+        str(compile_plan_path.resolve()),
+        "--compile-cache-plan-sha256",
+        plan.sha256,
+        "--compile-cache-key-sha256",
+        plan.key.sha256,
+        "--run-config",
+        launch.run_config,
+        "--run-config-sha256",
+        run_config_sha256(rendered_config),
+        "--",
+    )
+    assert launch.compile_cache_plan == str(compile_plan_path.resolve())
+    assert launch.compile_cache_plan_sha256 == plan.sha256
+    assert launch.compile_cache_key_sha256 == plan.key.sha256
+
+    events: list[str] = []
+
+    class _Session:
+        def environment(self, environment: dict[str, str]) -> dict[str, str]:
+            return dict(environment)
+
+        def complete(self) -> None:
+            events.append("complete")
+
+        def fail(self, _error: BaseException, *, reason_code: str) -> None:
+            pytest.fail(f"unexpected launch failure: {reason_code}")
+
+    def start(
+        loaded: CompileCacheLaunchPlan, *, _release_builder_receipt: bool
+    ) -> _Session:
+        assert loaded == plan
+        assert _release_builder_receipt is False
+        events.append("plan-loaded")
+        return _Session()
+
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch.start_compile_cache_launch", start
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch._validate_compile_runtime_environment",
+        lambda _plan, _config, _argv: None,
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch.runpy.run_module",
+        lambda name, *, run_name: events.append(f"{name}:{run_name}"),
+    )
+    original_path = os.environ.get("PATH")
+    assert launch_sglang(list(launch.argv[3:])) == 0
+    assert events == ["plan-loaded", "sglang.launch_server:__main__", "complete"]
+    assert os.environ.get("PATH") == original_path
+
+
+def test_runtime_renderer_rejects_foreign_compile_identity_before_materialization(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "lightcone_spec.orchestration.runtime.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    plan, _path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+        target_only=True,
+    )
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    foreign = CompileCacheLaunchPlan.issue(
+        key=replace(plan.key, max_running_requests=7),
+        cache_root=foreign_root / "cache",
+        cache_mode="build",
+    )
+    foreign_path = foreign.write(foreign_root / "plan.json")
+    output = tmp_path / "runtime"
+
+    with pytest.raises(ValueError, match="exact RunConfig"):
+        render_target_only_runtime_plan(
+            output_root=output,
+            concurrency=8,
+            model_lock=lock,
+            model_roots={
+                "schema_version": 2,
+                "lock_sha256": lock.sha256,
+                "roots": {"Qwen/Qwen3-8B": str(target)},
+            },
+            sampling_profile=SamplingProfile(),
+            sglang_checkout=tmp_path / "patched-sglang",
+            compile_cache_plan_path=foreign_path,
+            mem_fraction_static=0.7,
+        )
+    assert not output.exists()
 
 
 def test_tuning_renderer_cannot_duplicate_static_baseline(
@@ -1276,6 +1571,11 @@ def test_tuning_renderer_cannot_duplicate_static_baseline(
             LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
         ),
     )
+    _plan, compile_plan_path = _compile_cache_plan(
+        tmp_path,
+        lock,
+        max_running_requests=8,
+    )
     launches = render_tuning_runtime_plan(
         output_root=tmp_path / "tuning",
         candidate=tuning_candidates()[0],
@@ -1291,6 +1591,7 @@ def test_tuning_renderer_cannot_duplicate_static_baseline(
         },
         sampling_profile=SamplingProfile(),
         sglang_checkout=tmp_path / "patched-sglang",
+        compile_cache_plan_path=compile_plan_path,
         adaptation_group_id="tuning-a",
         adaptation_reserve_mb=1024,
         mem_fraction_static=0.7,
