@@ -4,7 +4,8 @@ import pytest
 import torch
 from pydantic import ValidationError
 
-from lightcone_spec.baselines import (
+from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.methods import (
     OnlineSpecHedge,
     OnlineSpecOGD,
     OnlineSpecOptimistic,
@@ -12,7 +13,6 @@ from lightcone_spec.baselines import (
     ogd_update,
     project_l2_ball,
 )
-from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 
 

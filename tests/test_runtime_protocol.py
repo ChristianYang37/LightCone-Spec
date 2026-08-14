@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import lightcone_spec.methods as method_module
 from lightcone_spec.adaptation.cohort import (
     CohortIdentity,
     CohortRuntime,
@@ -12,7 +13,7 @@ from lightcone_spec.adaptation.cohort import (
     SupervisionSignal,
 )
 from lightcone_spec.adaptation.kv_history import FrozenKVHistory, KVSegment
-from lightcone_spec.methods.core import (
+from lightcone_spec.methods import (
     CandidateUpdate,
     MethodPolicy,
     assert_candidate_equivalence,
@@ -20,6 +21,53 @@ from lightcone_spec.methods.core import (
     publication_round,
 )
 from lightcone_spec.runtime.publication import CudaPublicationCoordinator
+
+
+def test_all_methods_share_one_package_surface() -> None:
+    assert method_module.__name__ == "lightcone_spec.methods"
+    assert hasattr(method_module, "__path__")
+    assert tuple(method_module.__all__) == (
+        "CandidateTermination",
+        "CandidateUpdate",
+        "MethodPolicy",
+        "OnlineSpecHedge",
+        "OnlineSpecOGD",
+        "OnlineSpecOptimistic",
+        "OnlineSpecProposal",
+        "PublicationDelay",
+        "assert_candidate_equivalence",
+        "ogd_update",
+        "policy_for",
+        "project_l2_ball",
+        "publication_delay",
+        "publication_round",
+    )
+    core_members = (
+        "CandidateTermination",
+        "CandidateUpdate",
+        "MethodPolicy",
+        "PublicationDelay",
+        "assert_candidate_equivalence",
+        "policy_for",
+        "publication_delay",
+        "publication_round",
+    )
+    onlinespec_members = (
+        "OnlineSpecHedge",
+        "OnlineSpecOGD",
+        "OnlineSpecOptimistic",
+        "OnlineSpecProposal",
+        "ogd_update",
+        "project_l2_ball",
+    )
+    assert all(
+        getattr(method_module, name).__module__ == "lightcone_spec.methods.core"
+        for name in core_members
+    )
+    assert all(
+        getattr(method_module, name).__module__ == "lightcone_spec.methods.onlinespec"
+        for name in onlinespec_members
+    )
 
 
 def candidate(**updates) -> CandidateUpdate:

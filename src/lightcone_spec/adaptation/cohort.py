@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from lightcone_spec.methods.core import (
+from lightcone_spec.methods import (
     CandidateTermination,
     CandidateUpdate,
     MethodPolicy,

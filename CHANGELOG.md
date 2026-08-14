@@ -42,6 +42,11 @@ yet been declared.
 
 ### Changed
 
+- Consolidated core publication semantics and registered OnlineSPEC comparison
+  learners under the single `lightcone_spec.methods` package. The former
+  `baselines` package was removed, and all public method symbols now share one
+  package facade; comparison learners remain isolated from core selection,
+  evidence, and attestation.
 - Replaced registry physical-device placeholders with logical rank slots;
   physical GPU UUIDs, ranks, ports, topology, dispatch-plan identity, and exact
   budget identity now enter only through a frozen pool assignment.
