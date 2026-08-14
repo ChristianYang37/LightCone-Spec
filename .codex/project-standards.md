@@ -7,19 +7,43 @@ change. `AGENTS.md` points here so there is one normative list.
 
 1. Apply Occam's razor. Prefer the smallest abstraction that preserves the
    invariant; reuse one lifecycle, optimizer, publication, and evidence path.
-2. The formal research surface is Static, TTS, and L0. TTS and L0 share one
-   candidate implementation and differ only in publication timing. Registered
-   OnlineSPEC learners are important comparisons, but use separate tuning,
-   evidence, attestation, and analysis and can never influence the core
-   selection or gate.
+2. Update recipe and publication policy are orthogonal scientific identities.
+   Sharing runtime, reconstruction, evidence, or publication machinery never
+   implies that methods share configs, evidence rows, candidates, optimizer
+   states, or tuning authority. Registered OnlineSPEC learners are important
+   comparisons, but use separate tuning, evidence, attestation, and analysis
+   and can never influence the core selection or gate.
 3. Fail closed before expensive allocation whenever identity, compatibility,
    exactness, memory capacity, or evidence completeness cannot be established.
-4. Static and every disabled path must preserve upstream behavior and allocate
-   no adaptation, optimizer, gradient, candidate, or trace state.
+4. Target-only, Static, and every disabled path must preserve upstream behavior
+   and allocate no adaptation, optimizer, gradient, candidate, or adaptation-
+   telemetry state.
 5. Historical drafter KV is frozen and versioned. Rebuilding or differentiating
    old KV is a new algorithm and requires a separate proposal and protocol.
 6. Never replace a missing measurement with zero, copy run-level metrics into
    buckets, or synchronize the headline CUDA hot path to simplify telemetry.
+
+## Scientific method identity
+
+1. TTS uses a frozen, primary-source-bound TTS update recipe and the TTS fixed-
+   barrier publication policy. It must never inherit an E1/E2 winner, a schema
+   default, or a historical AdamW recipe.
+2. L0-naive uses that same frozen TTS recipe with first-ready publication at a
+   safe boundary. Recipe identity is shared; live candidate, optimizer, state,
+   and evidence identity is not.
+3. LightCone candidates use the L0 first-ready publication policy with
+   registered E1/E2 recipe candidates. E1/E2 tune only these candidates.
+4. Only the tuning-sealed E2 winner may be materialized or reported as
+   `LightCone`. An L0-policy run without the exact sealed final-recipe receipt
+   is never LightCone.
+5. Candidate equivalence is required only for a controlled mechanism replay
+   with identical source-state and proposal-evidence digests. Live TTS and
+   L0-naive histories may diverge after different publication decisions and
+   must not be required to produce byte-identical future candidates.
+6. Formal method rows are distinct identities: Target-only, Static, TTS,
+   L0-naive, and LightCone. Historical matched-recipe publication-policy runs
+   remain diagnostics and cannot establish TTS reproduction, tune LightCone,
+   or satisfy formal gates.
 
 ## SGLang boundary
 
