@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -70,6 +71,31 @@ _EXCLUSIVE_HOST_CLASSES = frozenset(
     {WorkloadClass.PROFILE, WorkloadClass.DOWNLOAD, WorkloadClass.COMPILE}
 )
 _SUPPORTED_POOL_SIZES = frozenset({1, 2, 4, 8, 16})
+_PCI_QUERY_BDF = re.compile(
+    r"(?P<domain>[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
+    r"(?P<bus>[0-9a-fA-F]{2}):(?P<device>[0-9a-fA-F]{2})\."
+    r"(?P<function>[0-7])"
+)
+
+
+def _canonical_pci_bus_id(pci_bus_id: object) -> str:
+    if not isinstance(pci_bus_id, str):
+        raise TypeError("GPU PCI bus identity must be a string")
+    normalized = pci_bus_id.lower()
+    match = _PCI_QUERY_BDF.fullmatch(normalized)
+    if match is None or int(match.group("device"), 16) > 0x1F:
+        raise ValueError("GPU PCI bus identity is invalid")
+    query_domain = match.group("domain")
+    if len(query_domain) == 8:
+        if not query_domain.startswith("0000"):
+            raise ValueError("GPU PCI bus identity is invalid")
+        sysfs_domain = query_domain[4:]
+    else:
+        sysfs_domain = query_domain
+    return (
+        f"{sysfs_domain}:{match.group('bus')}:"
+        f"{match.group('device')}.{match.group('function')}"
+    )
 
 
 def _strict_object(
@@ -297,6 +323,8 @@ class GpuDevice:
             "clock_policy",
         ):
             _require_text(name, getattr(self, name))
+        if self.pci_bus_id != _canonical_pci_bus_id(self.pci_bus_id):
+            raise ValueError("pci_bus_id must be a canonical lower-case PCI BDF")
         if (
             isinstance(self.memory_bytes, bool)
             or not isinstance(self.memory_bytes, int)
@@ -549,6 +577,9 @@ class GpuInventory:
             )
         if len(uuids) != len(set(uuids)):
             raise ValueError("GPU inventory contains duplicate UUIDs")
+        pci_bus_ids = tuple(device.pci_bus_id for device in self.devices)
+        if len(pci_bus_ids) != len(set(pci_bus_ids)):
+            raise ValueError("GPU inventory contains duplicate PCI bus identities")
         if tuple(sorted(uuids)) != uuids:
             raise ValueError("GPU inventory devices must be sorted by UUID")
         group_ids = tuple(group.group_id for group in self.topology_groups)

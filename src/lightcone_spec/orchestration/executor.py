@@ -51,6 +51,7 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchExecutionContext,
     GpuDispatchPlan,
     GpuInventory,
+    _canonical_pci_bus_id,
     validate_dispatch_plan_for_execution,
 )
 from lightcone_spec.experiments.itl_authority import (
@@ -936,7 +937,7 @@ def _validate_inventory_source_artifact(
             or device.model != model
             or device.memory_bytes != memory_bytes
             or device.compute_capability != compute
-            or device.pci_bus_id.lower() != pci_bus_id.lower()
+            or device.pci_bus_id != _canonical_pci_bus_id(pci_bus_id)
             or device.power_limit_watts != power_watts
             or device.thermal_limit_celsius != thermal_celsius
             or device.clock_policy
@@ -1056,7 +1057,7 @@ def _validate_runtime_envelope_artifact(
             or raw.get("memory_total_mib") != expected_memory_mib
             or raw.get("compute_capability")
             != ".".join(str(value) for value in device.compute_capability)
-            or str(raw.get("pci_bus_id", "")).lower() != device.pci_bus_id.lower()
+            or _canonical_pci_bus_id(raw.get("pci_bus_id")) != device.pci_bus_id
             or not isinstance(raw.get("driver_version"), str)
         ):
             raise ValueError("runtime envelope GPU row differs from scheduler hardware")

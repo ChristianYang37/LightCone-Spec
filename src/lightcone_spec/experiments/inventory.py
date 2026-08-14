@@ -19,11 +19,12 @@ from lightcone_spec.experiments.gpu_pool import (
     GpuInventory,
     GpuTopologyGroup,
     InterferenceEnvelope,
+    _canonical_pci_bus_id,
     content_sha256,
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-_PCI_BDF = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
+_PCI_SYSFS_BDF = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 _GPU_QUERY = (
     "index,uuid,name,memory.total,driver_version,compute_cap,pci.bus_id,"
     "power.limit,temperature.gpu.tlimit,clocks.max.sm,persistence_mode"
@@ -71,10 +72,8 @@ def _strict_csv_rows(
 
 
 def _pci_locality(pci_bus_id: str, *, sysfs_root: Path) -> tuple[str, int]:
-    normalized = pci_bus_id.lower()
-    if _PCI_BDF.fullmatch(normalized) is None:
-        raise ValueError("GPU PCI bus identity is invalid")
-    device_path = sysfs_root / "bus" / "pci" / "devices" / normalized
+    canonical_bus_id = _canonical_pci_bus_id(pci_bus_id)
+    device_path = sysfs_root / "bus" / "pci" / "devices" / canonical_bus_id
     try:
         resolved = device_path.resolve(strict=True)
         numa_node = int((device_path / "numa_node").read_text(encoding="utf-8").strip())
@@ -82,7 +81,7 @@ def _pci_locality(pci_bus_id: str, *, sysfs_root: Path) -> tuple[str, int]:
         raise ValueError("GPU PCI/NUMA locality is unavailable") from error
     if numa_node < 0:
         raise ValueError("GPU NUMA locality is unresolved")
-    roots = tuple(part for part in resolved.parts if _PCI_BDF.fullmatch(part))
+    roots = tuple(part for part in resolved.parts if _PCI_SYSFS_BDF.fullmatch(part))
     if not roots:
         raise ValueError("GPU PCI root cannot be derived from sysfs")
     return roots[0].lower(), numa_node
@@ -216,12 +215,15 @@ def collect_gpu_inventory(
             raise ValueError("GPU numeric inventory fields are invalid") from error
         if len(compute) != 2 or max_sm_mhz <= 0:
             raise ValueError("GPU compute capability or clock is invalid")
-        pci_root, numa_node = _pci_locality(pci_bus_id, sysfs_root=Path(sysfs_root))
+        canonical_pci_bus_id = _canonical_pci_bus_id(pci_bus_id)
+        pci_root, numa_node = _pci_locality(
+            canonical_pci_bus_id, sysfs_root=Path(sysfs_root)
+        )
         locality_rows.append(
             {
                 "index": int(index),
                 "uuid": uuid,
-                "pci_bus_id": pci_bus_id.lower(),
+                "pci_bus_id": canonical_pci_bus_id,
                 "pci_root": pci_root,
                 "numa_node": numa_node,
             }
@@ -240,7 +242,7 @@ def collect_gpu_inventory(
                 "memory_bytes": memory_bytes,
                 "driver_version": driver_version,
                 "compute_capability": compute,
-                "pci_bus_id": pci_bus_id.lower(),
+                "pci_bus_id": canonical_pci_bus_id,
                 "pci_root": pci_root,
                 "numa_node": numa_node,
                 "interconnects": tuple(link_types or ("NONE_SINGLE_GPU",)),

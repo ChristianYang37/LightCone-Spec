@@ -2871,6 +2871,30 @@ def test_industrial_attestation_contract_binds_doctor_gpu_and_run_chain(
         inventory_authority=_gpu_inventory(),
     )
 
+    extended_pci_doctor = json.loads(json.dumps(doctor_value))
+    for rows in (
+        extended_pci_doctor["gpu"]["parsed_inventory"]["devices"],
+        extended_pci_doctor["checks"]["gpu_identity"]["observed"],
+    ):
+        for row in rows:
+            row["pci_bus_id"] = ("0000" + row["pci_bus_id"]).upper()
+    _validate_industrial_doctor(
+        _write_json(tmp_path / "doctor-extended-pci.json", extended_pci_doctor),
+        inventory_authority=_gpu_inventory(),
+    )
+
+    aliased_pci_doctor = json.loads(json.dumps(extended_pci_doctor))
+    for rows in (
+        aliased_pci_doctor["gpu"]["parsed_inventory"]["devices"],
+        aliased_pci_doctor["checks"]["gpu_identity"]["observed"],
+    ):
+        rows[1]["pci_bus_id"] = "0000:01:00.0"
+    with pytest.raises(ValueError, match="complete GPU inventory"):
+        _validate_industrial_doctor(
+            _write_json(tmp_path / "doctor-aliased-pci.json", aliased_pci_doctor),
+            inventory_authority=_gpu_inventory(),
+        )
+
     mismatched_manifest = json.loads(json.dumps(doctor_value))
     mismatched_manifest["compatibility"]["manifest_sha256"] = "c" * 64
     with pytest.raises(ValueError, match="runtime-manifest digests"):

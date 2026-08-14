@@ -37,7 +37,7 @@ from lightcone_spec.experiments.budget_authority import (
     require_ready_budget_materialization_authority_binding,
     revalidate_budget_materialization_authority_binding,
 )
-from lightcone_spec.experiments.gpu_pool import GpuInventory
+from lightcone_spec.experiments.gpu_pool import GpuInventory, _canonical_pci_bus_id
 from lightcone_spec.experiments.itl_authority import (
     ItlRequestExpectation,
     ItlTimestampAuthorityBlocked,
@@ -5436,8 +5436,18 @@ def _validate_industrial_doctor(
             for device in devices
         )
         or {device["uuid"] for device in devices} != set(expected_devices)
-        or len({device["pci_bus_id"] for device in devices}) != len(devices)
     ):
+        raise ValueError("industrial doctor does not bind the complete GPU inventory")
+    try:
+        observed_pci_bus_ids = {
+            str(device["uuid"]): _canonical_pci_bus_id(device["pci_bus_id"])
+            for device in devices
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "industrial doctor does not bind the complete GPU inventory"
+        ) from error
+    if len(set(observed_pci_bus_ids.values())) != len(devices):
         raise ValueError("industrial doctor does not bind the complete GPU inventory")
     for observed in devices:
         expected = expected_devices[str(observed["uuid"])]
@@ -5448,7 +5458,7 @@ def _validate_industrial_doctor(
             observed["name"] != expected.model
             or observed["memory_total_mib"] * 1024 * 1024 != expected.memory_bytes
             or observed["compute_capability"] != expected_compute_capability
-            or observed["pci_bus_id"] != expected.pci_bus_id
+            or observed_pci_bus_ids[str(observed["uuid"])] != expected.pci_bus_id
         ):
             raise ValueError(
                 "industrial doctor device identity differs from the GPU inventory"

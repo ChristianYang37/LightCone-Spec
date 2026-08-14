@@ -107,6 +107,98 @@ def test_inventory_marks_reserved_process_without_hiding_it(tmp_path: Path) -> N
     assert "GPU-1, 31415, python-worker" in receipt["commands"]["processes"]["stdout"]
 
 
+def test_inventory_binds_extended_pci_domain_to_canonical_sysfs_bdf(
+    tmp_path: Path,
+) -> None:
+    sysfs, machine_id = _probe_environment(tmp_path, gpu_count=1)
+    devices = sysfs / "bus" / "pci" / "devices"
+    old_device = devices / "0000:01:00.0"
+    (old_device / "numa_node").unlink()
+    old_device.rmdir()
+    resolved_device = sysfs / "devices" / "pci0000:a7" / "0000:a7:01.0" / "0000:a8:00.0"
+    resolved_device.mkdir(parents=True)
+    (resolved_device / "numa_node").write_text("1", encoding="utf-8")
+    (devices / "0000:a8:00.0").symlink_to(resolved_device, target_is_directory=True)
+    outputs = _outputs(gpu_count=1)
+    outputs["--query-gpu"] = outputs["--query-gpu"].replace(
+        "0000:01:00.0", "00000000:A8:00.0"
+    )
+
+    inventory, receipt = collect_gpu_inventory(
+        challenge_nonce_sha256="c" * 64,
+        command_runner=_runner(outputs),
+        sysfs_root=sysfs,
+        machine_id_path=machine_id,
+        hostname="same-host",
+    )
+
+    assert inventory.devices[0].pci_bus_id == "0000:a8:00.0"
+    assert inventory.devices[0].pci_root == "0000:a7:01.0"
+    assert "00000000:A8:00.0" in receipt["commands"]["gpu"]["stdout"]
+    assert receipt["pci_locality"] == [
+        {
+            "index": 0,
+            "uuid": "GPU-0",
+            "pci_bus_id": "0000:a8:00.0",
+            "pci_root": "0000:a7:01.0",
+            "numa_node": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "pci_bus_id",
+    (
+        "0000000:01:00.0",
+        "000000000:01:00.0",
+        "00000000:1:00.0",
+        "00000000:01:000.0",
+        "00000000:01:20.0",
+        "00000000:01:00.8",
+        "00000000:01:00.0/..",
+        "00010000:01:00.0",
+    ),
+)
+def test_inventory_rejects_malformed_extended_pci_bus_ids(
+    tmp_path: Path,
+    pci_bus_id: str,
+) -> None:
+    sysfs, machine_id = _probe_environment(tmp_path, gpu_count=1)
+    outputs = _outputs(gpu_count=1)
+    outputs["--query-gpu"] = outputs["--query-gpu"].replace("0000:01:00.0", pci_bus_id)
+
+    with pytest.raises(ValueError, match="PCI bus identity is invalid"):
+        collect_gpu_inventory(
+            challenge_nonce_sha256="d" * 64,
+            command_runner=_runner(outputs),
+            sysfs_root=sysfs,
+            machine_id_path=machine_id,
+            hostname="same-host",
+        )
+
+
+def test_inventory_rejects_mixed_width_aliases_for_one_physical_bdf(
+    tmp_path: Path,
+) -> None:
+    sysfs, machine_id = _probe_environment(tmp_path, gpu_count=2)
+    outputs = _outputs(gpu_count=2)
+    outputs["--query-gpu"] = outputs["--query-gpu"].replace(
+        "0000:01:00.0", "00000000:01:00.0"
+    )
+    outputs["--query-gpu"] = outputs["--query-gpu"].replace(
+        "0000:02:00.0", "0000:01:00.0"
+    )
+
+    with pytest.raises(ValueError, match="duplicate PCI bus identities"):
+        collect_gpu_inventory(
+            challenge_nonce_sha256="e" * 64,
+            command_runner=_runner(outputs),
+            sysfs_root=sysfs,
+            machine_id_path=machine_id,
+            hostname="same-host",
+        )
+
+
 def test_inventory_rejects_incomplete_or_asymmetric_topology(tmp_path: Path) -> None:
     sysfs, machine_id = _probe_environment(tmp_path, gpu_count=2)
     outputs = _outputs(gpu_count=2)

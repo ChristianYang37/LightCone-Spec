@@ -2201,6 +2201,32 @@ def test_empty_planning_plan_cannot_mint_an_execution_receipt(
         )
 
 
+@pytest.mark.parametrize(
+    "pci_bus_id",
+    (
+        "00000000:01:00.0",
+        "0000:0A:00.0",
+        "0000:01:20.0",
+    ),
+)
+def test_gpu_inventory_from_dict_rejects_noncanonical_pci_bdf(
+    pci_bus_id: str,
+) -> None:
+    value = _inventory(1).to_dict()
+    value["devices"][0]["pci_bus_id"] = pci_bus_id
+
+    with pytest.raises(ValueError, match="PCI bus identity|pci_bus_id"):
+        GpuInventory.from_dict(value)
+
+
+def test_gpu_inventory_from_dict_rejects_duplicate_physical_bdf() -> None:
+    value = _inventory(2).to_dict()
+    value["devices"][1]["pci_bus_id"] = value["devices"][0]["pci_bus_id"]
+
+    with pytest.raises(ValueError, match="duplicate PCI bus identities"):
+        GpuInventory.from_dict(value)
+
+
 def test_cli_artifacts_round_trip_full_content_and_reject_tampering(
     registry: ExperimentRegistry,
 ) -> None:

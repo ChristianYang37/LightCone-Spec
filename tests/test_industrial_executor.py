@@ -589,7 +589,7 @@ def _execution_fixture(
             str(memory_mib),
             driver_version,
             "9.0",
-            "0000:01:00.0",
+            "00000000:01:00.0",
             "700.0",
             "83.0",
             "1500",
@@ -602,7 +602,7 @@ def _execution_fixture(
             str(memory_mib),
             driver_version,
             "9.0",
-            "0000:02:00.0",
+            "00000000:02:00.0",
             "700.0",
             "83.0",
             "1500",
@@ -648,7 +648,7 @@ def _execution_fixture(
             {
                 "index": index,
                 "uuid": row[1],
-                "pci_bus_id": row[6],
+                "pci_bus_id": f"0000:{index + 1:02x}:00.0",
                 "pci_root": "executor-root",
                 "numa_node": 0,
             }
@@ -2415,6 +2415,26 @@ def test_logical_runtime_plan_cannot_cross_the_execution_boundary(
     )
     with pytest.raises(ValueError, match="physical scheduler assignment"):
         logical.validate()
+
+
+def test_execution_authority_replays_extended_nvml_pci_alias_as_canonical(
+    tmp_path: Path,
+) -> None:
+    plan = _execution_fixture(tmp_path, request_count=1).plan
+    devices = plan.dispatch_context.inventory.devices
+    receipt = json.loads(
+        Path(plan.inventory_source_artifact.path).read_text(encoding="utf-8")
+    )
+
+    assert tuple(device.pci_bus_id for device in devices) == (
+        "0000:01:00.0",
+        "0000:02:00.0",
+    )
+    assert "00000000:01:00.0" in receipt["commands"]["gpu"]["stdout"]
+    assert [row["pci_bus_id"] for row in receipt["pci_locality"]] == [
+        "0000:01:00.0",
+        "0000:02:00.0",
+    ]
 
 
 def test_execution_schema5_binds_the_exact_raw_budget_authority(
