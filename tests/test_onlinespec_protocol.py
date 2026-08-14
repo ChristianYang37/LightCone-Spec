@@ -357,7 +357,7 @@ def test_onlinespec_cli_inherits_and_binds_the_core_static_load(tmp_path) -> Non
     lock.write(lock_path)
     core_manifest = PreliminarySpeedStudyManifest.default()
     core_selection = SelectionArtifact(
-        schema_version=2,
+        schema_version=3,
         candidate=tuning_candidates()[0],
         selected_concurrency=8,
         minimum_goodput_ratio=1.0,

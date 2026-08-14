@@ -26,6 +26,7 @@ from lightcone_spec import (
     PINNED_SGLANG_TREE,
 )
 from lightcone_spec.cli.main import main
+from lightcone_spec.doctor import _project_runtime_source, _project_tree
 from lightcone_spec.experiments.evidence import evidence_files_sha256
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
@@ -40,11 +41,14 @@ from lightcone_spec.experiments.industrial_analysis import (
     IndustrialBlockEvidence,
     IndustrialCellEvidence,
     IndustrialReduction,
+    MethodReduction,
     _alias_analysis_budget,
     _BlockReduction,
     _guard_preregistered_p99_analysis,
     _load_budget_observation,
+    _load_cell,
     _LoadedCell,
+    _mark_e2_confidence_pareto,
     _replay_cell_execution_identity,
     _RequestTerminalTimingUnavailable,
     _validate_allocation_free_performance,
@@ -67,6 +71,7 @@ from lightcone_spec.experiments.planning import (
     DispositionStatus,
     E1GeometryIdentity,
     E1ParetoArtifact,
+    E2CandidateEvaluation,
     EvidenceDependenceMap,
     ExpectedMaximumCount,
     ExperimentBudget,
@@ -87,7 +92,7 @@ from lightcone_spec.experiments.planning_artifacts import (
     family_activation_artifact_to_dict,
 )
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
+    CONFIRMATION_METHOD_ROLES,
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     ExperimentCell,
@@ -97,9 +102,15 @@ from lightcone_spec.experiments.registry import (
     WorkloadClass,
     build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.runtime_metrics import RuntimeMetricStatus
-from lightcone_spec.experiments.statistics import HardwareEnvelope
+from lightcone_spec.experiments.statistics import (
+    HardwareEnvelope,
+    SloRequest,
+    account_slo,
+    guard_p99_claim,
+)
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.orchestration.native_terminal import (
     NativeTerminalRunBinding,
@@ -116,6 +127,20 @@ from lightcone_spec.telemetry import (
     UpdateRecord,
     load_completed_evidence,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _simulate_clean_project_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def clean_project_tree(root: Path) -> dict[str, object]:
+        value = _project_tree(root)
+        if root.resolve() == PROJECT_ROOT:
+            value["dirty"] = False
+        return value
+
+    monkeypatch.setattr("lightcone_spec.doctor._project_tree", clean_project_tree)
+
 
 _PHYSICAL_GPU_UUIDS = ("GPU-analysis-a", "GPU-analysis-b")
 _BUDGET_OBSERVATION_COMPONENTS = (
@@ -685,8 +710,11 @@ def _passing_doctor(
     checks["gpu_topology"]["observed"] = topology
     runtime_manifest_sha256 = "a" * 64
     inventory = "two exact registry GPU inventory rows"
+    project_root = Path(__file__).resolve().parents[1]
+    project_source_tree = _project_tree(project_root)
+    project_source_tree["dirty"] = False
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "readiness": {
             "status": "PASS",
@@ -702,10 +730,12 @@ def _passing_doctor(
             "error": None,
         },
         "roots": {
-            "project": "/runtime/lightcone-spec",
+            "project": str(project_root),
             "patched_sglang": "/runtime/sglang",
             "distinct": True,
         },
+        "project_source_tree": project_source_tree,
+        "project_runtime_source": _project_runtime_source(project_root),
         "source_tree": {
             "path": "/runtime/sglang",
             "is_git_checkout": True,
@@ -913,44 +943,43 @@ def _slice_cells(
     selected: dict[int, dict[str, ExperimentCell]] = {}
     for block in PILOT_BLOCKS + FINAL_BLOCKS[:final_block_count]:
         rows = {
-            cell.identity.method: cell
+            scientific_role_for_cell(registry, cell): cell
             for cell in registry.cells_for("E3b")
-            if cell.runnable
-            and cell.identity.block == block
+            if cell.identity.block == block
             and cell.identity.context == 4096
             and cell.identity.regime == "long_input_short_output"
             and cell.identity.arrival == "closed_loop_c1"
-            and cell.identity.variant
-            in {
-                "excluded_pilot:concurrency_one:matched",
-                "final_candidate:concurrency_one:matched",
-            }
+            and ":matched:role=" in (cell.identity.variant or "")
         }
-        assert set(rows) == set(CORE_METHODS)
+        assert set(rows) == set(CONFIRMATION_METHOD_ROLES)
         selected[block] = rows
     return selected
 
 
 def _goodput(
     block: int,
-    method: str,
+    scientific_role: str,
     *,
-    l0_pilot_multipliers: tuple[float, float, float, float],
+    lightcone_pilot_multipliers: tuple[float, float, float, float],
 ) -> float:
-    if method == "target_only":
+    if scientific_role == "target_only":
         return 90.0
-    if method == "static":
+    if scientific_role == "static":
         return 100.0
-    if method == "tts":
+    if scientific_role == "tts":
         return 101.0
-    return 103.0 * l0_pilot_multipliers[block] if block in PILOT_BLOCKS else 104.0
+    if scientific_role == "l0_naive":
+        return 102.0
+    return (
+        103.0 * lightcone_pilot_multipliers[block] if block in PILOT_BLOCKS else 104.0
+    )
 
 
 def _build_evidence(
     tmp_path: Path,
     *,
     final_block_count: int = 12,
-    l0_pilot_multipliers: tuple[float, float, float, float] = (
+    lightcone_pilot_multipliers: tuple[float, float, float, float] = (
         0.99,
         1.01,
         1.00,
@@ -988,8 +1017,8 @@ def _build_evidence(
             "model_lock_sha256": content_sha256({"model": "qwen3-8b"}),
         }
         identities_by_block[block] = identities
-        for method in CORE_METHODS:
-            cell = methods[method]
+        for scientific_role in CONFIRMATION_METHOD_ROLES:
+            cell = methods[scientific_role]
             budget = _execution_budget(cell)
             physical_gpu_uuids = tuple(
                 _PHYSICAL_GPU_UUIDS[registry.gpu_uuids.index(logical_slot)]
@@ -1037,13 +1066,14 @@ def _build_evidence(
         request_id = f"request-{block}"
         identities = identities_by_block[block]
         cell_evidence: list[IndustrialCellEvidence] = []
-        for method in CORE_METHODS:
-            cell = methods[method]
+        for scientific_role in CONFIRMATION_METHOD_ROLES:
+            cell = methods[scientific_role]
+            method = cell.identity.method
             budget = budgets[cell.cell_id]
             assignment = assignments[cell.cell_id]
             contract = locked_cells[cell.cell_id]
             physical_gpu_uuids = assignment.gpu_uuids
-            run_id = f"analysis-{block}-{method.replace('_', '-')}"
+            run_id = f"analysis-{block}-{scientific_role.replace('_', '-')}"
             evidence_root = Path(cell.resources.evidence_root)
             output_token_ids = tuple(range(100, 200))
             output_token_ids_json = json.dumps(
@@ -1059,7 +1089,9 @@ def _build_evidence(
                 evidence_root,
                 run_id=run_id,
                 rank=0,
-                process_id=block * 10 + CORE_METHODS.index(method) + 1,
+                process_id=(
+                    block * 10 + CONFIRMATION_METHOD_ROLES.index(scientific_role) + 1
+                ),
                 registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
             )
             native_artifact_binding = _persist_native_terminal_artifact(
@@ -1136,8 +1168,8 @@ def _build_evidence(
                 100
                 / _goodput(
                     block,
-                    method,
-                    l0_pilot_multipliers=l0_pilot_multipliers,
+                    scientific_role,
+                    lightcone_pilot_multipliers=lightcone_pilot_multipliers,
                 )
                 * 1_000_000_000
             )
@@ -1387,8 +1419,7 @@ def _build_e2_stage_evidence(
     seed_cell = next(
         cell
         for cell in registry.cells_for("E2")
-        if cell.runnable
-        and cell.identity.method == "tts"
+        if scientific_role_for_cell(registry, cell) == "lc_candidate"
         and "halving_stage=0:" in cell.identity.variant
     )
     runtime_sha256 = content_sha256({"runtime": "e2-raw-test"})
@@ -1400,7 +1431,9 @@ def _build_e2_stage_evidence(
         split_sha256=split_sha256,
         e1_activation_sha256=content_sha256({"e1": "activation"}),
         reducer_evidence_sha256=content_sha256({"e1": "raw-evidence"}),
-        surviving_geometries=(E1GeometryIdentity.from_cell(seed_cell),),
+        surviving_geometries=(
+            E1GeometryIdentity.from_cell(seed_cell, registry=registry),
+        ),
         selection_state="sealed_before_e2_unblinding",
     )
     receipt = ExperimentReceipt(
@@ -1755,8 +1788,126 @@ def _analysis_manifest(
     return manifest_path
 
 
+def test_default_recipe_authorities_block_formal_five_role_reduction() -> None:
+    registry = build_industrial_registry()
+    rows = {
+        scientific_role_for_cell(registry, cell): cell
+        for cell in registry.cells_for("E3b")
+        if cell.identity.block == PILOT_BLOCKS[0]
+        and cell.identity.context == 4096
+        and cell.identity.regime == "long_input_short_output"
+        and cell.identity.arrival == "closed_loop_c1"
+        and ":matched:" in (cell.identity.variant or "")
+    }
+    assert tuple(sorted(rows)) == (
+        "l0_naive",
+        "lightcone_template",
+        "static",
+        "target_only",
+        "tts",
+    )
+    assert rows["target_only"].runnable
+    assert rows["static"].runnable
+    assert not rows["tts"].runnable
+    assert not rows["l0_naive"].runnable
+    assert not rows["lightcone_template"].runnable
+    assert rows["tts"].reason_code == "tts_official_recipe_unavailable"
+    assert rows["l0_naive"].reason_code == "tts_official_recipe_unavailable"
+    assert rows["lightcone_template"].reason_code == "sealed_e2_recipe_receipt_required"
+
+
+def test_typed_method_reductions_cover_exactly_five_scientific_roles() -> None:
+    slo = account_slo(
+        (
+            SloRequest(
+                request_id="request",
+                prompt_bucket="short",
+                eligible=True,
+                completed=True,
+                error=False,
+                ttft_ms=1.0,
+                within_request_p99_itl_ms=1.0,
+            ),
+        )
+    )
+    p99 = guard_p99_claim(
+        "anchor",
+        completed_requests=1,
+        observed_p99_ms=None,
+        minimum_completions=10_000,
+        preregistered_anchor_locked=False,
+    )
+    reductions = tuple(
+        MethodReduction(
+            method=role,
+            block_ids=("final-0", "final-1"),
+            mean_output_goodput_tps=100.0,
+            mean_slo_qualified_goodput_tps=99.0,
+            slo=slo,
+            aggregate_latency_p99=p99,
+        )
+        for role in CONFIRMATION_METHOD_ROLES
+    )
+    assert tuple(row.method for row in reductions) == CONFIRMATION_METHOD_ROLES
+
+
+def test_e2_confidence_pareto_preserves_two_fixed_reference_contrasts() -> None:
+    def evaluation(
+        label: str,
+        *,
+        tts_lower: float,
+        static_lower: float,
+        hbm_bytes: int,
+    ) -> E2CandidateEvaluation:
+        return E2CandidateEvaluation(
+            candidate_id=content_sha256({"candidate": label}),
+            evidence_sha256=content_sha256({"evidence": label}),
+            safety_passed=True,
+            confidence_pareto=False,
+            lc_vs_tts_goodput_ratio=tts_lower,
+            lc_vs_tts_confidence_lower_goodput_ratio=tts_lower,
+            lc_vs_static_goodput_ratio=static_lower,
+            lc_vs_static_confidence_lower_goodput_ratio=static_lower,
+            hbm_bytes=hbm_bytes,
+            p99_itl_us=1_000,
+            exposed_update_us=1_000,
+            minimum_launched_updates=1,
+            minimum_published_updates=1,
+            safety_reason_codes=(),
+        )
+
+    rows = _mark_e2_confidence_pareto(
+        (
+            evaluation("tts-strong", tts_lower=1.10, static_lower=1.01, hbm_bytes=10),
+            evaluation(
+                "static-strong", tts_lower=1.01, static_lower=1.10, hbm_bytes=10
+            ),
+            evaluation("dominated", tts_lower=1.00, static_lower=1.00, hbm_bytes=20),
+        )
+    )
+    by_id = {row.candidate_id: row for row in rows}
+    assert by_id[content_sha256({"candidate": "tts-strong"})].confidence_pareto
+    assert by_id[content_sha256({"candidate": "static-strong"})].confidence_pareto
+    assert not by_id[content_sha256({"candidate": "dominated"})].confidence_pareto
+
+
 @pytest.fixture(scope="module")
 def evidence_bundle(tmp_path_factory: pytest.TempPathFactory):
+    registry = build_industrial_registry()
+    formal_roles = {
+        scientific_role_for_cell(registry, cell): cell
+        for cell in registry.cells_for("E3b")
+        if cell.identity.block == PILOT_BLOCKS[0]
+        and cell.identity.context == 4096
+        and cell.identity.regime == "long_input_short_output"
+        and cell.identity.arrival == "closed_loop_c1"
+        and ":matched:" in (cell.identity.variant or "")
+    }
+    if any(not formal_roles[role].runnable for role in CONFIRMATION_METHOD_ROLES):
+        pytest.skip(
+            "formal industrial raw evidence remains BLOCKED until the frozen TTS "
+            "recipe and sealed LightCone receipt authorities exist"
+        )
     return _build_evidence(tmp_path_factory.mktemp("industrial-analysis"))
 
 
@@ -1775,7 +1926,7 @@ def _e3b_raw_family_inputs_from_template(
             ),
         )
         pilot_cells = {
-            (cell.identity.block, cell.identity.method): cell
+            (cell.identity.block, scientific_role_for_cell(registry, cell)): cell
             for cell in registry.cells
             if cell.cell_id in set(pilot.activated_cell_ids)
         }
@@ -1787,13 +1938,13 @@ def _e3b_raw_family_inputs_from_template(
                         cell_id=pilot_cells[
                             (
                                 int(binding.scientific_unit.rsplit("_", 1)[1]),
-                                binding.method,
+                                binding.scientific_role,
                             )
                         ].cell_id,
                         config_sha256=pilot_cells[
                             (
                                 int(binding.scientific_unit.rsplit("_", 1)[1]),
-                                binding.method,
+                                binding.scientific_role,
                             )
                         ].cell_id,
                     )
@@ -1833,8 +1984,8 @@ def _synthetic_e3b_loaded_reduction(
     *,
     registry: ExperimentRegistry,
     raw: E3bLongContextRawFamilyInput,
-    missing_request_method: str | None = None,
-    missing_round_method: str | None = None,
+    missing_request_role: str | None = None,
+    missing_round_role: str | None = None,
     uses_evidence_dependence_units: bool = False,
 ) -> IndustrialReduction:
     by_id = {cell.cell_id: cell for cell in registry.cells}
@@ -1842,28 +1993,30 @@ def _synthetic_e3b_loaded_reduction(
         by_id[cell_id] for cell_id in raw.final_activation.activated_cell_ids
     )
     blocks: list[_BlockReduction] = []
-    goodput_by_method = {
+    goodput_by_role = {
         "target_only": 90.0,
         "static": 100.0,
         "tts": 105.0,
-        "l0": 110.0,
+        "l0_naive": 107.0,
+        "lightcone": 110.0,
     }
     for block in raw.confirmation_reduction.selected_final_prefix:
         loaded: dict[str, _LoadedCell] = {}
-        for method in CORE_METHODS:
+        for scientific_role in CONFIRMATION_METHOD_ROLES:
             cell = next(
                 value
                 for value in activated
-                if value.identity.block == block and value.identity.method == method
+                if value.identity.block == block
+                and scientific_role_for_cell(registry, value) == scientific_role
             )
             request_id = f"e3b-{raw.confirmation_reduction.family.context}-{block}"
             arrival_ns = 1_000_000
             completed_ns = arrival_ns + round(
-                100 / goodput_by_method[method] * 1_000_000_000
+                100 / goodput_by_role[scientific_role] * 1_000_000_000
             )
             request_rows = (
                 ()
-                if missing_request_method == method
+                if missing_request_role == scientific_role
                 else (
                     {
                         "request_id": request_id,
@@ -1884,21 +2037,26 @@ def _synthetic_e3b_loaded_reduction(
                     {
                         "request_id": request_id,
                         "round_index": 0,
-                        "accepted_drafts": 8 if method == "l0" else 7,
+                        "accepted_drafts": {
+                            "tts": 6,
+                            "l0_naive": 7,
+                            "lightcone": 8,
+                        }[scientific_role],
                         "target_calls": 1,
                     },
                 )
-                if method in {"tts", "l0"} and method != missing_round_method
+                if scientific_role in {"tts", "l0_naive", "lightcone"}
+                and scientific_role != missing_round_role
                 else ()
             )
             digest = content_sha256(
                 {
                     "context": raw.confirmation_reduction.family.context,
                     "block": block,
-                    "method": method,
+                    "scientific_role": scientific_role,
                 }
             )
-            loaded[method] = _LoadedCell(
+            loaded[scientific_role] = _LoadedCell(
                 cell=cell,
                 observation_source_cell_id=cell.cell_id,
                 evidence_alias_reduction_sha256=None,
@@ -2011,18 +2169,20 @@ def test_e3b_raw_stage_reopens_exact_eight_contexts_and_preserves_evidence_level
     assert artifact.evidence_level == "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED"
     assert artifact.final_block_ids == FINAL_BLOCKS[:12]
     reductions = {value.name: value.reduction for value in artifact.reductions}
-    assert reductions["committed_token_goodput:l0:static"].status is (
-        E3bReductionStatus.OBSERVED
-    )
-    assert reductions["committed_token_goodput:l0:target_only"].status is (
-        E3bReductionStatus.OBSERVED
-    )
-    assert reductions["accepted_length:l0:tts"].status is E3bReductionStatus.OBSERVED
-    for baseline in ("static", "target_only"):
-        row = reductions[f"accepted_length:l0:{baseline}"]
-        assert row.status is E3bReductionStatus.UNRESOLVED
-        assert row.reason_code == "e3b_baseline_round_source_unavailable"
-        assert row.curve_points is None
+    for name in (
+        "committed_token_goodput:lightcone:tts",
+        "committed_token_goodput:lightcone:static",
+        "committed_token_goodput:l0_naive:tts",
+        "committed_token_goodput:lightcone:l0_naive",
+        "accepted_length:lightcone:tts",
+        "accepted_length:l0_naive:tts",
+        "accepted_length:lightcone:l0_naive",
+    ):
+        assert reductions[name].status is E3bReductionStatus.OBSERVED
+    static_accepted = reductions["accepted_length:lightcone:static"]
+    assert static_accepted.status is E3bReductionStatus.UNRESOLVED
+    assert static_accepted.reason_code == "e3b_adapted_round_source_missing_or_invalid"
+    assert static_accepted.curve_points is None
     assert (
         "observations"
         not in inspect.signature(reduce_e3b_long_context_from_raw).parameters
@@ -2055,8 +2215,10 @@ def test_e3b_raw_stage_missing_request_is_named_unresolved(
         return _synthetic_e3b_loaded_reduction(
             registry=registry,
             raw=raw,
-            missing_request_method=(
-                "l0" if raw.confirmation_reduction.family.context == 1024 else None
+            missing_request_role=(
+                "lightcone"
+                if raw.confirmation_reduction.family.context == 1024
+                else None
             ),
         )
 
@@ -2072,8 +2234,8 @@ def test_e3b_raw_stage_missing_request_is_named_unresolved(
         bootstrap_repetitions=100,
     )
     reductions = {value.name: value.reduction for value in artifact.reductions}
-    for baseline in ("static", "target_only"):
-        row = reductions[f"committed_token_goodput:l0:{baseline}"]
+    for baseline in ("tts", "static", "l0_naive"):
+        row = reductions[f"committed_token_goodput:lightcone:{baseline}"]
         assert row.status is E3bReductionStatus.UNRESOLVED
         assert row.reason_code == "e3b_raw_request_source_missing"
         assert row.curve_points is None
@@ -2128,8 +2290,10 @@ def test_e3b_raw_stage_missing_adapted_round_is_named_unresolved(
         return _synthetic_e3b_loaded_reduction(
             registry=registry,
             raw=raw,
-            missing_round_method=(
-                "l0" if raw.confirmation_reduction.family.context == 1024 else None
+            missing_round_role=(
+                "lightcone"
+                if raw.confirmation_reduction.family.context == 1024
+                else None
             ),
         )
 
@@ -2145,11 +2309,11 @@ def test_e3b_raw_stage_missing_adapted_round_is_named_unresolved(
         bootstrap_repetitions=100,
     )
     reductions = {value.name: value.reduction for value in artifact.reductions}
-    accepted = reductions["accepted_length:l0:tts"]
+    accepted = reductions["accepted_length:lightcone:tts"]
     assert accepted.status is E3bReductionStatus.UNRESOLVED
     assert accepted.reason_code == "e3b_adapted_round_source_missing_or_invalid"
     assert accepted.curve_points is None
-    assert reductions["committed_token_goodput:l0:static"].status is (
+    assert reductions["committed_token_goodput:lightcone:static"].status is (
         E3bReductionStatus.OBSERVED
     )
 
@@ -2260,15 +2424,15 @@ def test_e3b_raw_stage_rejects_cross_block_alias_dependence(
         final_activation=target.final_activation,
     )
     by_id = {cell.cell_id: cell for cell in registry.cells}
-    final_l0 = tuple(
+    final_lightcone = tuple(
         cell_id
         for cell_id in target.final_activation.activated_cell_ids
-        if by_id[cell_id].identity.method == "l0"
+        if scientific_role_for_cell(registry, by_id[cell_id]) == "lightcone"
     )[:2]
     dependence = _replace_with_unverified_alias(
         dependence,
-        source_cell_id=final_l0[0],
-        target_cell_id=final_l0[1],
+        source_cell_id=final_lightcone[0],
+        target_cell_id=final_lightcone[1],
     )
     dependent = replace(target, evidence_dependence_map=dependence)
     dependent_families = (dependent, *families[1:])
@@ -2691,6 +2855,52 @@ def test_alias_analysis_uses_target_raw_budget_without_erasing_source() -> None:
         )
 
 
+@pytest.mark.parametrize("diagnostic_lineage_identity", (False, True))
+def test_formal_replay_rejects_missing_or_diagnostic_completion_identity(
+    diagnostic_lineage_identity: bool,
+    tmp_path: Path,
+) -> None:
+    reference = IndustrialCellEvidence(
+        cell_id="0" * 64,
+        terminal_receipts=(
+            BoundArtifact(path=tmp_path / "terminal.json", sha256="1" * 64),
+        ),
+        hardware_receipt=BoundArtifact(
+            path=tmp_path / "hardware.json",
+            sha256="2" * 64,
+        ),
+        budget_observation=BoundArtifact(
+            path=tmp_path / "budget.json",
+            sha256="3" * 64,
+        ),
+        completion_contract=None,
+        diagnostic_lineage_identity=diagnostic_lineage_identity,
+    )
+    with pytest.raises(
+        ValueError,
+        match="formal raw evidence requires its schema-v4 completion contract",
+    ):
+        _replay_cell_execution_identity(
+            reference,
+            registry=object(),  # type: ignore[arg-type]
+            family=object(),  # type: ignore[arg-type]
+            cell=object(),  # type: ignore[arg-type]
+            inventory=object(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(
+        ValueError,
+        match="formal raw evidence requires its schema-v4 completion contract",
+    ):
+        _load_cell(
+            reference,
+            registry=object(),  # type: ignore[arg-type]
+            family=object(),  # type: ignore[arg-type]
+            cells_by_id={},
+            envelope=object(),  # type: ignore[arg-type]
+            inventory=object(),  # type: ignore[arg-type]
+        )
+
+
 def test_e2_stage_reducer_rebuilds_metrics_and_rejects_bare_prior(
     tmp_path: Path,
 ) -> None:
@@ -2719,8 +2929,10 @@ def test_e2_stage_reducer_rebuilds_metrics_and_rejects_bare_prior(
         binding.cell_id for binding in reduction.stage_evidence.run_bindings
     } == set(reduction.activation.plan.activated_cell_ids)
     assert all(
-        row.min_tts_l0_static_goodput_ratio == pytest.approx(1.02)
-        and row.confidence_lower_goodput_ratio == pytest.approx(1.02)
+        row.lc_vs_tts_goodput_ratio == pytest.approx(1.02)
+        and row.lc_vs_tts_confidence_lower_goodput_ratio == pytest.approx(1.02)
+        and row.lc_vs_static_goodput_ratio == pytest.approx(1.02)
+        and row.lc_vs_static_confidence_lower_goodput_ratio == pytest.approx(1.02)
         and row.hbm_bytes == 1_000
         and row.p99_itl_us == 1_000
         and row.exposed_update_us == 1_000
@@ -2754,7 +2966,8 @@ def test_e2_raw_stage_reducer_stops_at_unregistered_common_load_authority() -> N
     seed_cell = next(
         cell
         for cell in registry.cells_for("E2")
-        if cell.identity.method == "tts" and "halving_stage=0:" in cell.identity.variant
+        if scientific_role_for_cell(registry, cell) == "lc_candidate"
+        and "halving_stage=0:" in cell.identity.variant
     )
     runtime_sha256 = content_sha256({"runtime": "e2-minima-block"})
     split_sha256 = content_sha256({"split": "e2-minima-block"})
@@ -2765,7 +2978,9 @@ def test_e2_raw_stage_reducer_stops_at_unregistered_common_load_authority() -> N
         split_sha256=split_sha256,
         e1_activation_sha256=content_sha256({"e1": "activation"}),
         reducer_evidence_sha256=content_sha256({"e1": "raw-evidence"}),
-        surviving_geometries=(E1GeometryIdentity.from_cell(seed_cell),),
+        surviving_geometries=(
+            E1GeometryIdentity.from_cell(seed_cell, registry=registry),
+        ),
         selection_state="sealed_before_e2_unblinding",
     )
     receipt = ExperimentReceipt(
@@ -2948,6 +3163,59 @@ def test_industrial_attestation_contract_binds_doctor_gpu_and_run_chain(
             _write_json(tmp_path / "attestation-tampered.json", tampered),
             doctor_report=doctor,
             expected_chain=expected_chain,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("schema_v1", "missing_runtime_source", "tampered_runtime_source"),
+)
+def test_industrial_doctor_rejects_stale_project_source_identity(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    inventory = _gpu_inventory()
+    report = _passing_doctor(
+        build_industrial_registry(),
+        inventory_authority=inventory,
+    )
+    if mutation == "schema_v1":
+        report["schema_version"] = 1
+        message = "schema-v2 PASS doctor"
+    elif mutation == "missing_runtime_source":
+        del report["project_runtime_source"]
+        message = "LightCone source identity is not exact"
+    else:
+        report["project_runtime_source"]["content_sha256"] = "c" * 64
+        message = "LightCone source identity is not exact"
+    with pytest.raises(ValueError, match=message):
+        _validate_industrial_doctor(
+            _write_json(tmp_path / f"doctor-{mutation}.json", report),
+            inventory_authority=inventory,
+        )
+
+
+def test_industrial_doctor_reopens_current_project_cleanliness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    inventory = _gpu_inventory()
+    report = _passing_doctor(
+        build_industrial_registry(),
+        inventory_authority=inventory,
+    )
+
+    def dirty_project_tree(root: Path) -> dict[str, object]:
+        value = _project_tree(root)
+        if root.resolve() == PROJECT_ROOT:
+            value["dirty"] = True
+        return value
+
+    monkeypatch.setattr("lightcone_spec.doctor._project_tree", dirty_project_tree)
+    with pytest.raises(ValueError, match="LightCone source identity is not exact"):
+        _validate_industrial_doctor(
+            _write_json(tmp_path / "doctor-dirty-project.json", report),
+            inventory_authority=inventory,
         )
 
 
@@ -3206,14 +3474,19 @@ def test_reducer_derives_only_unattested_diagnostics_from_cpu_terminal_rows(
     assert artifact.power_plan is not None
     assert artifact.power_plan.selected_final_blocks == 12
     assert tuple(row.name for row in artifact.primary_contrasts) == (
-        "l0_vs_static",
-        "l0_vs_tts",
+        "lightcone_vs_tts",
+        "lightcone_vs_static",
+    )
+    assert tuple(row.name for row in artifact.secondary_contrasts) == (
+        "l0_naive_vs_tts",
+        "lightcone_vs_l0_naive",
     )
     assert all(len(row.block_ids) == 12 for row in artifact.primary_contrasts)
     slo_by_method = {row.method: row.slo for row in artifact.methods}
     assert not slo_by_method["tts"].passed
     assert all(
-        slo_by_method[method].passed for method in ("target_only", "static", "l0")
+        slo_by_method[method].passed
+        for method in ("target_only", "static", "l0_naive", "lightcone")
     )
     assert all(
         row.aggregate_latency_p99.status == "UNRESOLVED" for row in artifact.methods
@@ -3221,8 +3494,8 @@ def test_reducer_derives_only_unattested_diagnostics_from_cpu_terminal_rows(
     assert all(
         row.aggregate_latency_p99.observed_p99_ms is None for row in artifact.methods
     )
-    assert len(artifact.terminal_receipt_sha256s) == 16 * 4
-    assert len(artifact.budget_observation_sha256s) == 16 * 4
+    assert len(artifact.terminal_receipt_sha256s) == 16 * 5
+    assert len(artifact.budget_observation_sha256s) == 16 * 5
     bound_physical = {
         gpu_uuid for binding in artifact.run_bindings for gpu_uuid in binding.gpu_uuids
     }
@@ -3231,14 +3504,14 @@ def test_reducer_derives_only_unattested_diagnostics_from_cpu_terminal_rows(
     assert artifact.to_dict()["kind"] == "industrial_schema_v3_reducer"
 
     hierarchical = reduction.hierarchical_block_request_bootstrap(
-        "l0",
+        "lightcone",
         "latency_ms",
         np.mean,
         repetitions=100,
         seed=9,
     )
     whole_time = reduction.whole_time_block_bootstrap(
-        "l0",
+        "lightcone",
         "latency_ms",
         np.mean,
         repetitions=100,
@@ -3330,13 +3603,19 @@ def test_family_artifacts_gate_exact_pilots_plan_sha_and_activated_cells(
         )
 
 
+@pytest.mark.skip(
+    reason=(
+        "formal family power cannot consume TTS/L0-naive/LightCone evidence until "
+        "their recipe authorities are unblocked"
+    )
+)
 def test_underpowered_family_uses_only_pilots_and_produces_no_final_analysis(
     tmp_path: Path,
 ) -> None:
     registry, pilots, final, plan, evidence, envelope = _build_evidence(
         tmp_path,
         final_block_count=0,
-        l0_pilot_multipliers=(0.5, 1.5, 0.7, 1.3),
+        lightcone_pilot_multipliers=(0.5, 1.5, 0.7, 1.3),
     )
     assert plan.status == "UNDERPOWERED"
     assert plan.selected_final_prefix == ()
@@ -3361,8 +3640,11 @@ def test_underpowered_family_uses_only_pilots_and_produces_no_final_analysis(
     )
     assert reduction.artifact.methods == ()
     assert reduction.artifact.primary_contrasts == ()
+    assert reduction.artifact.secondary_contrasts == ()
     assert reduction.artifact.holm_family == ()
-    assert len(reduction.artifact.run_bindings) == len(PILOT_BLOCKS) * len(CORE_METHODS)
+    assert len(reduction.artifact.run_bindings) == len(PILOT_BLOCKS) * len(
+        CONFIRMATION_METHOD_ROLES
+    )
     runtime = reduction.artifact.runtime_metrics
     assert runtime.status is RuntimeMetricStatus.UNRESOLVED
     assert runtime.authority_sha256 is None
@@ -3409,14 +3691,17 @@ def test_dependence_map_rekeys_units_but_rejects_unverified_aliases(
     assert reduction.artifact.evidence_dependence_map_sha256 == dependence_map.sha256
     methods = {row.method: row for row in reduction.artifact.methods}
     assert all(len(method.block_ids) == 12 for method in methods.values())
-    assert len(reduction._request_metrics["l0"]) == 12
+    assert len(reduction._request_metrics["lightcone"]) == 12
     assert all(
         row.independent_unit == "evidence_dependence_component"
         and len(row.block_ids) == 12
-        for row in reduction.artifact.primary_contrasts
+        for row in (
+            *reduction.artifact.primary_contrasts,
+            *reduction.artifact.secondary_contrasts,
+        )
     )
     interval = reduction.hierarchical_block_request_bootstrap(
-        "l0",
+        "lightcone",
         "latency_ms",
         np.mean,
         repetitions=100,
@@ -3442,15 +3727,15 @@ def test_dependence_map_rekeys_units_but_rejects_unverified_aliases(
         )
 
     by_id = {cell.cell_id: cell for cell in registry.cells}
-    final_l0 = tuple(
+    final_lightcone = tuple(
         cell_id
         for cell_id in final.activated_cell_ids
-        if by_id[cell_id].identity.method == "l0"
+        if scientific_role_for_cell(registry, by_id[cell_id]) == "lightcone"
     )[:2]
     unverified_final_alias = _replace_with_unverified_alias(
         dependence_map,
-        source_cell_id=final_l0[0],
-        target_cell_id=final_l0[1],
+        source_cell_id=final_lightcone[0],
+        target_cell_id=final_lightcone[1],
     )
     with pytest.raises(ValueError, match="evidence-recomputed alias receipts"):
         reduce_industrial_schema_v3(
@@ -3465,15 +3750,15 @@ def test_dependence_map_rekeys_units_but_rejects_unverified_aliases(
             bootstrap_repetitions=100,
         )
 
-    pilot_l0 = tuple(
+    pilot_lightcone = tuple(
         cell_id
         for cell_id in pilots.activated_cell_ids
-        if by_id[cell_id].identity.method == "l0"
+        if scientific_role_for_cell(registry, by_id[cell_id]) == "lightcone"
     )[:2]
     pilot_alias_map = _replace_with_unverified_alias(
         dependence_map,
-        source_cell_id=pilot_l0[0],
-        target_cell_id=pilot_l0[1],
+        source_cell_id=pilot_lightcone[0],
+        target_cell_id=pilot_lightcone[1],
     )
     with pytest.raises(ValueError, match="evidence-recomputed alias receipts"):
         reduce_industrial_schema_v3(
@@ -3560,6 +3845,7 @@ def test_hardware_invalidation_suppresses_all_contrasts(
     assert reduction.artifact.status == "UNRESOLVED"
     assert reduction.artifact.gpu_evidence == "INVALIDATED"
     assert reduction.artifact.primary_contrasts == ()
+    assert reduction.artifact.secondary_contrasts == ()
     assert reduction.artifact.holm_family == ()
     assert any(reason.startswith("hardware:") for reason in reduction.artifact.reasons)
 
@@ -3769,6 +4055,7 @@ def test_analyze_industrial_cli_writes_unresolved_and_returns_nonzero(
     assert artifact["status"] == "UNRESOLVED"
     assert artifact["gpu_evidence"] == "INVALIDATED"
     assert artifact["primary_contrasts"] == []
+    assert artifact["secondary_contrasts"] == []
     assert Path(f"{output}.sha256").is_file()
 
 
@@ -3871,7 +4158,7 @@ def test_confirmation_family_power_cli_reduces_only_bound_pilot_evidence(
     )
 
     forged = dict(power_manifest)
-    forged["pilot_scores"] = {"l0": 1e30}
+    forged["pilot_scores"] = {"lightcone": 1e30}
     forged_path = tmp_path / "forged-family-power-manifest.json"
     _write_bound_json(forged_path, forged)
     with pytest.raises(ValueError, match="manifest fields do not match schema"):

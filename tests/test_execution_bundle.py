@@ -18,6 +18,7 @@ from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.cli.main import main as cli_main
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
+from lightcone_spec.doctor import _project_runtime_source, _project_tree
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.budget_authority import (
     bind_budget_materialization_authority,
@@ -124,6 +125,19 @@ from lightcone_spec.runtime.distributed import (
     TopologyReceiptSet,
 )
 from lightcone_spec.telemetry.writer import DEFAULT_EVIDENCE_WRITER_POLICY
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _simulate_clean_project_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def clean_project_tree(root: Path) -> dict[str, object]:
+        value = _project_tree(root)
+        if root.resolve() == PROJECT_ROOT:
+            value["dirty"] = False
+        return value
+
+    monkeypatch.setattr("lightcone_spec.doctor._project_tree", clean_project_tree)
 
 
 def _write_bound(path: Path, value: object) -> Path:
@@ -931,8 +945,11 @@ def _bundle_fixture(
     drafter_root = tmp_path / "drafter-model"
     drafter_root.mkdir()
     manifest_sha256 = content_sha256({"runtime-manifest": "bundle"})
+    project_root = Path(__file__).resolve().parents[1]
+    project_source_tree = _project_tree(project_root)
+    project_source_tree["dirty"] = False
     runtime_envelope = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "readiness": {
             "status": "PASS",
@@ -941,10 +958,12 @@ def _bundle_fixture(
             "unknown_count": 0,
         },
         "roots": {
-            "project": str(tmp_path.resolve()),
+            "project": str(project_root),
             "patched_sglang": str(checkout.resolve()),
             "distinct": True,
         },
+        "project_source_tree": project_source_tree,
+        "project_runtime_source": _project_runtime_source(project_root),
         "runtime_manifest": {
             "valid": True,
             "sha256": manifest_sha256,
@@ -1028,9 +1047,9 @@ def _bundle_fixture(
     registry_path = _write_bound(
         tmp_path / "registry.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "generator": (
-                "lightcone_spec.experiments.registry.build_industrial_registry:v2"
+                "lightcone_spec.experiments.registry.build_industrial_registry:v3"
             ),
             "parameters": {
                 "logical_gpu_slots": list(registry.gpu_uuids),

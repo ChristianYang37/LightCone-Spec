@@ -12,7 +12,7 @@ CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UN
 industrial executor 只支持 TP1/DP1 Target-only。固定 patch 现已实现准确的
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
 begin/reset/finalize hook，host 会验证其内容，而不信任 provider attribute。但本 release
-没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0 仍在任何 mutation 前
+没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0-naive/LightCone 仍在任何 mutation 前
 fail closed。实证 Stage B 还会因 immutable model/data/trace 输入、provider access、已注册
 硬件与 interference evidence，以及 trusted signer 尚不可用而 `BLOCKED`。历史 v2
 evidence 仅可用于 regression/debugging，不能支撑新结论。
@@ -24,9 +24,10 @@ Target-only 关闭 speculation，是 industrial executor 当前唯一可完成�
 terminal attestation 可用前阻止它。两者的 schema contract 都不导入 adaptation state，也不分配
 optimizer、gradient、candidate 或 adaptation trace。
 
-目标 TTS/L0 contract 共用一个 candidate 生命周期；固定 patch 只为 TP1/DP1 DFlash 实现
-底层路径与 native terminal lifecycle；没有 trusted signer 时仍不构成 release-executable
-support：
+TTS、L0-naive 与 LC-candidate 复用一个有界 candidate-lifecycle 实现；固定 patch 只为
+TP1/DP1 DFlash 实现底层路径与 native terminal lifecycle。Recipe authority 与 publication
+policy 保持正交，共享 machinery 不会合并 live candidate、optimizer state、config 或 evidence；
+没有 trusted signer 时仍不构成 release-executable support：
 
 1. Verification 为实际被采样的 proposal 生成一个 `ProposalEvidence` envelope；
 2. Cohort 只保留每个请求最新的合法 supervision row，并把 batch 绑定到 cohort、epoch、
@@ -37,12 +38,15 @@ support：
 4. Device check 覆盖 finiteness、reconstruction 与 supervision validity。三 byte receipt
    会异步复制到 pinned host memory，并且只在 nonblocking ready-event query 确认完成后、
    measured update timing 之外读取；ready event 身份与预留 scratch byte 属于 candidate；
-5. TTS 等待下一个固定更新边界；L0 在同一个 candidate ready 后的首个合法 graph 边界发布；
+5. TTS 等待固定 update barrier；L0-naive、LC-candidate 与 LightCone 在 ready 后首个合法
+   safe graph boundary 发布；
 6. Commit 把完整 candidate 恰好一次复制到固定地址 inference storage。Stale、duplicate、
    cancelled、generation mismatch、non-finite 或 conflicting candidate 都带终止原因被丢弃。
 
 Candidate 创建、commit、discard、cancellation、reset 与 disable 各自只有一个终止转移。
 每个 cohort 最多一个 in-flight candidate，因此 side-stream 工作与 scratch memory 有界。
+Candidate equality 只在 source-state 与 proposal-evidence digest 完全相同的受控 replay 中
+检查；TTS 与 L0-naive 的 publication decision 分叉后，live history 可以继续分叉。
 
 ## 公共 Backend 证据与重建
 
@@ -127,7 +131,7 @@ child placement 都委托给唯一的 same-host `GpuPoolScheduler`，因此 flee
 `GpuInventory` 与 `InterferenceEnvelope` 结合；`GpuFleetInventory` 对这些 binding 排序并去重，
 每个 `HostExecutionBinding` 分配的 port、cache、evidence 与 contention namespace 必须在该
 host 内无冲突，不同 host 可以重复 literal value。Remote execution binding 再固定 host-local
-materialization manifest。Independent cell 在 eligible host 间均衡；paired TTS/L0 work 与完整
+materialization manifest。Independent cell 在 eligible host 间均衡；matched-geometry baseline anchor 与完整
 confirmation block 始终留在同一 host/GPU；异构 hardware envelope 绝不混入同一个
 statistical family。
 
@@ -184,7 +188,7 @@ Durable index 拒绝重复 primary identity。周期或容量触发的 flush 会
 segment 与 checkpoint；backpressure 与任何显式 drop 都有计数。Native terminal lifecycle
 把 capability、begin、reset 与 finalize receipt 绑定到同一个 process/session/run/nonce/plan/
 rank identity 及准确 ordered token ID。Static 保持 round/update 详细 trace 零分配，只生成
-所需汇总 speculative safety/accounting；TTS/L0 还绑定 request、round、update、KV version、
+所需汇总 speculative safety/accounting；adaptive scientific role 还绑定 request、round、update、KV version、
 publication、performance 与 safety row。signer 不可用时，release verifier 仍在 mutation 前
 阻止这三种方法。
 
@@ -233,8 +237,11 @@ resume 也绝不从目录存在推断完成。Dispatch 会在每个 runner 前�
 WAVE/INTENT/FINISH hash chain；partial sibling failure 会保留成功 raw terminal authority，
 未完成 intent 则阻断，而不是伪造 retry cost。
 
-Reducer-owned activation artifact 只 materialize E1 的一个 130-cell slice 与 E2 每个
-successive-halving round，并为每个未激活 template 记录 immutable disposition。Confirmation
+Reducer-owned activation artifact 从 1,428 个 template 中只 materialize E1 的一个 68-cell
+slice：两个 fixed reference、32 geometry 下共 64 个 L0-policy LC-candidate，以及 stage-level
+的一个 frozen-TTS anchor 与一个 frozen-L0-naive anchor。E2 在四个 successive-halving round
+中有 11,920 个 template，只调优 LC-candidate，并为每个 stage 各带一次 frozen baseline。
+只有准确 sealed E2 final-recipe receipt 才能产生 LightCone role。Confirmation
 planning 以 family 为局部单位：恰好四个 excluded pilot 会在 confirmation 可见前选择
 `POWERED` 的 12--20-block final prefix，或选择 `UNDERPOWERED`。合法 Target-only 复用必须
 使用 byte-equivalent、content-bound evidence alias；analysis 会保留其 dependence unit，
@@ -250,7 +257,7 @@ caller-owned HTTP pool，evidence writer 批量写 durable WAL row group，同�
 fsync 与 coverage check。
 
 Registry 与 pool planning 都不分配 device state，也不产生实证结论。其 target declaration
-不会绕过 release preflight：Static/TTS/L0 因 trusted signer 保持 `BLOCKED`；全部 TP2/DP2
+不会绕过 release preflight：Static/TTS/L0-naive/LightCone 因 trusted signer 保持 `BLOCKED`；全部 TP2/DP2
 和不受支持的 adaptive backend 仍受各自 implementation gate 阻止。
 
 本 release 不声明 speculative industrial execution、multi-rank model execution、跨主机

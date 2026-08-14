@@ -10,11 +10,13 @@ import numpy as np
 from scipy.stats import nct, norm, t
 
 from lightcone_spec.experiments.data import DFLASH_SAFE_CONTEXT_LIMIT
+from lightcone_spec.experiments.protocol import HISTORICAL_EVIDENCE_CLASSIFICATION
 
 PILOT_BLOCK_COUNT = 4
 MINIMUM_FINAL_BLOCKS = 12
 MAXIMUM_FINAL_BLOCKS = 20
-PRIMARY_CONTRASTS = ("l0_vs_static", "l0_vs_tts")
+PRIMARY_CONTRASTS = ("lightcone_vs_tts", "lightcone_vs_static")
+SECONDARY_CONTRASTS = ("l0_naive_vs_tts", "lightcone_vs_l0_naive")
 PRIMARY_FAMILY_ALPHA = 0.05
 PRIMARY_MINIMUM_RELATIVE_EFFECT = 0.03
 PRIMARY_TARGET_POWER = 0.80
@@ -98,7 +100,7 @@ class PilotBlock:
     block_id: str
     static_goodput: float
     tts_goodput: float
-    l0_goodput: float
+    lightcone_goodput: float
 
 
 @dataclass(frozen=True)
@@ -218,9 +220,12 @@ def preregister_power_sizing(
             field="pilot Static goodput",
         )
         tts = _finite_positive(block.tts_goodput, field="pilot TTS goodput")
-        l0 = _finite_positive(block.l0_goodput, field="pilot L0 goodput")
-        effects["l0_vs_static"].append(float(np.log(l0 / static)))
-        effects["l0_vs_tts"].append(float(np.log(l0 / tts)))
+        lightcone = _finite_positive(
+            block.lightcone_goodput,
+            field="pilot LightCone goodput",
+        )
+        effects["lightcone_vs_tts"].append(float(np.log(lightcone / tts)))
+        effects["lightcone_vs_static"].append(float(np.log(lightcone / static)))
 
     standard_deviations: dict[str, float] = {}
     for contrast, values in effects.items():
@@ -404,9 +409,9 @@ def holm_primary_contrasts(
     *,
     alpha: float = PRIMARY_FAMILY_ALPHA,
 ) -> tuple[MultiplicityDecision, ...]:
-    """Holm-adjust exactly L0--Static and L0--TTS."""
+    """Holm-adjust exactly LightCone--TTS and LightCone--Static."""
     if set(contrasts) != set(PRIMARY_CONTRASTS):
-        raise ValueError("primary family requires L0--Static and L0--TTS")
+        raise ValueError("primary family requires LightCone--TTS and LightCone--Static")
     if any(name != contrast.name for name, contrast in contrasts.items()):
         raise ValueError("primary contrast keys and names must agree")
     if not 0.0 < alpha < 1.0:
@@ -1007,22 +1012,30 @@ class PairwiseSpeedGate:
 
 @dataclass(frozen=True)
 class SpeedGate:
+    """Historical matched-recipe diagnostic; never formal method authority."""
+
     status: str
     tts: MethodSpeedGate
     l0: MethodSpeedGate
     l0_vs_tts: PairwiseSpeedGate
     gpu_evidence: str
     evidence_sha256: str | None
+    evidence_classification: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.status != "UNMEASURED"
+            or self.gpu_evidence != "UNMEASURED"
+            or self.evidence_sha256 is not None
+            or self.evidence_classification != HISTORICAL_EVIDENCE_CLASSIFICATION
+        ):
+            raise ValueError(
+                "historical matched-recipe diagnostics cannot carry formal authority"
+            )
 
     @property
     def passed(self) -> bool:
-        return (
-            self.gpu_evidence == "MEASURED"
-            and self.evidence_sha256 is not None
-            and self.tts.passed
-            and self.l0.passed
-            and self.l0_vs_tts.passed
-        )
+        return False
 
 
 def _validate_coverage(
@@ -1030,7 +1043,7 @@ def _validate_coverage(
 ) -> tuple[dict[int, dict[str, dict]], dict[int, dict[str, dict]]]:
     required_methods = {"static", "tts", "l0"}
     if {str(row["method"]) for row in rows} != required_methods:
-        raise ValueError("formal gate requires exactly Static, TTS, and L0")
+        raise ValueError("historical diagnostic requires exactly Static, TTS, and L0")
     filtered = [row for row in rows if str(row.get("region")) == "long_region"]
     by_key: dict[int, dict[str, dict]] = {}
     for row in filtered:
@@ -1047,14 +1060,16 @@ def _validate_coverage(
     }
     blocks = set(by_key)
     if len(prompt_batches) != 1 or not next(iter(prompt_batches)).startswith("batch-"):
-        raise ValueError("formal gate requires one jointly timed confirmation batch")
+        raise ValueError(
+            "historical diagnostic requires one jointly timed confirmation batch"
+        )
     if blocks != set(range(8)):
         raise ValueError("formal gate requires eight independent blocks")
     concurrencies = {
         int(row["concurrency"]) for group in by_key.values() for row in group.values()
     }
     if len(concurrencies) != 1 or next(iter(concurrencies)) < 1:
-        raise ValueError("formal methods must share one positive load")
+        raise ValueError("historical diagnostic methods must share one positive load")
     long_ends = {
         int(row["generated_bucket_end"])
         for group in by_key.values()
@@ -1109,7 +1124,7 @@ def evaluate_speed_gate(
     gpu_evidence: str = "UNMEASURED",
     evidence_sha256: str | None = None,
 ) -> SpeedGate:
-    """Evaluate 16K-to-limit paired goodput with strict safety counters."""
+    """Evaluate an old matched-recipe smoke diagnostic without claim authority."""
     if minimum_speedup < 0:
         raise ValueError("minimum speedup cannot be negative")
     if gpu_evidence not in {"UNMEASURED", "MEASURED"}:
@@ -1185,4 +1200,5 @@ def evaluate_speed_gate(
         l0_vs_tts=l0_vs_tts,
         gpu_evidence="UNMEASURED",
         evidence_sha256=None,
+        evidence_classification=HISTORICAL_EVIDENCE_CLASSIFICATION,
     )

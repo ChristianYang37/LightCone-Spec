@@ -25,20 +25,24 @@ from lightcone_spec.experiments.itl_authority import (
 )
 from lightcone_spec.experiments.load import ProductionLoadPlan
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
+    CONFIRMATION_METHOD_ROLES,
     DRAFT_WIDTHS,
+    E0_METHOD_ROLES,
     E2_DRAFT_WIDTH_SELECTOR,
     E2_HALVING_STAGES,
     FINAL_BLOCKS,
     INDUSTRIAL_EXPERIMENT_ORDER,
     PILOT_BLOCKS,
+    AdaptationRecipeDeclaration,
     CellStatus,
     ExperimentCell,
     ExperimentReceipt,
     ExperimentRegistry,
+    ScientificMethodRole,
     StageActivationPlan,
     WorkloadClass,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
@@ -56,7 +60,7 @@ from lightcone_spec.experiments.statistics import (
 )
 
 _SHA256_LENGTH = 64
-_E1_SLICE_CELLS = 130
+_E1_SLICE_CELLS = 68
 _E2_RETENTION_NUMERATOR = 1
 _E2_RETENTION_DENOMINATOR = 4
 _E2_FAMILY_FLOOR = 1
@@ -142,19 +146,23 @@ E3A_RAW_SELECTION_PROTOCOL_SHA256 = content_sha256(
 )
 E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 2,
+        "schema_version": 4,
         "kind": "e1_raw_geometry_pareto_protocol",
-        "coverage": "exact_reducer_activated_130_cell_slice",
-        "pairing": "tts_l0_across_both_registered_optimizer_anchors",
+        "coverage": "exact_67_cell_selection_subset_of_68_cell_mechanism_slice",
+        "candidate_grid": "two_l0_policy_lc_optimizer_anchors_per_geometry",
+        "fixed_references": "one_target_one_static_one_frozen_tts_shared_per_slice",
+        "mechanism_anchor": (
+            "one_l0_naive_shared_per_slice_excluded_from_selection_evidence"
+        ),
         "reference_safety": (
-            "target_static_invalid_or_incomplete_blocks_the_reduction"
+            "target_static_or_frozen_tts_invalid_or_incomplete_blocks_the_slice"
         ),
         "adaptive_safety": (
-            "any_tts_l0_anchor_safety_hardware_token_completion_or_zero_publish_"
-            "failure_excludes_the_complete_four_cell_geometry"
+            "any_lc_candidate_safety_hardware_token_completion_or_zero_publish_"
+            "failure_excludes_the_candidate_geometry"
         ),
         "objectives": (
-            "maximize_worst_paired_confidence_lower_static_goodput_ratio",
+            "maximize_worst_lc_confidence_lower_static_and_frozen_tts_goodput_ratio",
             "minimize_peak_hbm",
             "minimize_p99_itl",
             "minimize_exposed_update",
@@ -166,7 +174,7 @@ E1_RAW_PARETO_PROTOCOL_SHA256 = content_sha256(
 )
 E2_HALVING_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 7,
+        "schema_version": 8,
         "kind": "e2_successive_halving_protocol",
         "stages": E2_HALVING_STAGES,
         "draft_width_authority": E2_DRAFT_WIDTH_SELECTOR,
@@ -176,14 +184,22 @@ E2_HALVING_PROTOCOL_SHA256 = content_sha256(
         "retention_denominator": _E2_RETENTION_DENOMINATOR,
         "optimizer_schedule_family_floor": _E2_FAMILY_FLOOR,
         "promotion_minima_authority_sha256": (E2_PROMOTION_MINIMA_AUTHORITY_SHA256),
-        "confidence_goodput": ("paired_request_log_ratio_normal_95pct_lower_bound_v1"),
+        "confidence_goodput": (
+            "lc_vs_frozen_tts_and_static_paired_request_log_ratio_normal_"
+            "95pct_lower_bounds_v1"
+        ),
         "confidence_pareto": (
             "non_dominated_confidence_lower_goodput_hbm_p99_exposed_update_v1"
         ),
+        "selection_references": ("target_only", "static", "frozen_tts"),
+        "l0_naive_anchor": "mechanism_only_excluded_from_selection_evidence",
+        "raw_run_binding_schema": 3,
+        "stage_evidence_schema": 5,
         "ranking": (
             "safety_gate",
             "confidence_pareto",
-            "descending_min_tts_l0_static_goodput_ratio",
+            "descending_lc_vs_frozen_tts_confidence_lower_goodput_ratio",
+            "descending_lc_vs_static_confidence_lower_goodput_ratio",
             "ascending_hbm_bytes",
             "ascending_p99_itl_us",
             "ascending_exposed_update_us",
@@ -206,14 +222,20 @@ E2_HALVING_PROTOCOL_SHA256 = content_sha256(
 )
 CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "confirmation_family_power_raw_reducer",
         "inputs": (
-            "schema_v3_terminal_receipts",
+            "schema_v4_native_completion_receipts",
             "hardware_receipts",
             "budget_observations",
             "qualification_locks",
             "content_bound_gpu_inventory",
+        ),
+        "scientific_roles": CONFIRMATION_METHOD_ROLES,
+        "primary_contrasts": ("lightcone_vs_tts", "lightcone_vs_static"),
+        "secondary_contrasts": (
+            "l0_naive_vs_tts",
+            "lightcone_vs_l0_naive",
         ),
         "pilot_blocks": PILOT_BLOCKS,
         "confirmation_data_forbidden": True,
@@ -295,7 +317,7 @@ BUDGET_MATERIALIZATION_AUTHORITY_PROTOCOL_SHA256 = content_sha256(
         "activation_authority": (
             "strict_path_bound_tagged_union_with_recursive_completion_sources_v3"
         ),
-        "registry_authority": "generated_registry_replay_v2",
+        "registry_authority": "generated_registry_replay_v3",
         "policy_authority": "path_bound_budget_policy_v1",
         "load_authority": "path_bound_cell_sorted_budget_load_bindings_v1",
         "capacity_authority": "path_bound_capacity_authority_v1",
@@ -3386,7 +3408,7 @@ def reduce_e1_activation(
     e3a_receipt: ExperimentReceipt,
     selection: SealedE3aSelection,
 ) -> ReducerActivationArtifact:
-    """Materialize the one sealed 130-cell E1 width/load slice."""
+    """Materialize the one sealed 68-cell E1 width/load slice."""
 
     _validate_direct_receipt(registry, e3a_receipt, "E3a")
     if (
@@ -3403,11 +3425,26 @@ def reduce_e1_activation(
     tag = f"width={selection.width}:concurrency={selection.concurrency}"
     cells = registry.cells_for("E1")
     selected = {cell.cell_id for cell in cells if tag in cell.identity.variant}
-    if len(cells) != 2730 or len(selected) != _E1_SLICE_CELLS:
-        raise ValueError("registered E1 envelope must reduce from 2,730 to 130 cells")
-    methods = {cell.identity.method for cell in cells if cell.cell_id in selected}
-    if methods != set(CORE_METHODS):
-        raise ValueError("E1 slice must retain Target-only, Static, TTS, and L0")
+    if len(cells) != 1428 or len(selected) != _E1_SLICE_CELLS:
+        raise ValueError("registered E1 envelope must reduce from 1,428 to 68 cells")
+    selected_cells = tuple(cell for cell in cells if cell.cell_id in selected)
+    role_counts = {
+        role: sum(
+            scientific_role_for_cell(registry, cell) == role for cell in selected_cells
+        )
+        for role in ("target_only", "static", "tts", "l0_naive", "lc_candidate")
+    }
+    if role_counts != {
+        "target_only": 1,
+        "static": 1,
+        "tts": 1,
+        "l0_naive": 1,
+        "lc_candidate": 64,
+    }:
+        raise ValueError(
+            "E1 slice must retain two LC candidates per search geometry and one "
+            "frozen TTS/L0-naive reference pair"
+        )
     rows: list[CellDisposition] = []
     for cell in cells:
         if not cell.runnable:
@@ -3428,7 +3465,7 @@ def reduce_e1_activation(
         {
             "schema_version": 1,
             "kind": "e1_single_slice_reducer",
-            "declared_cells": 2730,
+            "declared_cells": 1428,
             "activated_cells": _E1_SLICE_CELLS,
             "source": "sealed_e3a_selection",
         }
@@ -3484,10 +3521,12 @@ class E1GeometryIdentity:
             raise ValueError("E1 geometry parameterization must be full or lora")
 
     @classmethod
-    def from_cell(cls, cell: ExperimentCell) -> E1GeometryIdentity:
+    def from_cell(
+        cls, cell: ExperimentCell, *, registry: ExperimentRegistry
+    ) -> E1GeometryIdentity:
         identity = cell.identity
-        if identity.method not in {"tts", "l0"}:
-            raise ValueError("E1 geometry can be derived only from TTS/L0")
+        if scientific_role_for_cell(registry, cell) != "lc_candidate":
+            raise ValueError("E1 geometry can be derived only from LC-candidates")
         if identity.scope is None:
             raise ValueError("adaptive E1 geometry requires an exact scope")
         return cls(
@@ -3578,10 +3617,18 @@ class E2CandidateIdentity:
             raise ValueError("E2 template requires the sealed E3a width selector")
 
     @classmethod
-    def from_cell(cls, cell: ExperimentCell) -> E2CandidateIdentity:
+    def from_cell(
+        cls, cell: ExperimentCell, *, registry: ExperimentRegistry
+    ) -> E2CandidateIdentity:
         identity = cell.identity
-        if identity.experiment != "E2" or identity.method not in {"tts", "l0"}:
-            raise ValueError("E2 candidates can be derived only from E2 TTS/L0 cells")
+        if (
+            identity.experiment != "E2"
+            or identity.method != "l0"
+            or scientific_role_for_cell(registry, cell) != "lc_candidate"
+        ):
+            raise ValueError(
+                "E2 candidates can be derived only from E2 LC-candidate cells"
+            )
         if (
             identity.scope is None
             or identity.optimizer is None
@@ -3622,27 +3669,28 @@ def _e2_stage(cell: ExperimentCell) -> int:
     raise ValueError("E2 cell does not identify a registered halving stage")
 
 
-def _e2_candidate_pairs(
+def _e2_candidates(
+    registry: ExperimentRegistry,
     cells: Sequence[ExperimentCell],
-) -> dict[str, tuple[E2CandidateIdentity, tuple[ExperimentCell, ...]]]:
-    grouped: dict[str, tuple[E2CandidateIdentity, list[ExperimentCell]]] = {}
+) -> dict[str, tuple[E2CandidateIdentity, ExperimentCell]]:
+    result: dict[str, tuple[E2CandidateIdentity, ExperimentCell]] = {}
     for cell in cells:
-        if cell.identity.method not in {"tts", "l0"}:
+        if scientific_role_for_cell(registry, cell) != "lc_candidate":
             continue
-        candidate = E2CandidateIdentity.from_cell(cell)
-        current = grouped.setdefault(candidate.sha256, (candidate, []))
-        current[1].append(cell)
-    result: dict[str, tuple[E2CandidateIdentity, tuple[ExperimentCell, ...]]] = {}
-    for candidate_id, (candidate, members) in grouped.items():
-        if {member.identity.method for member in members} != {"tts", "l0"} or len(
-            members
-        ) != 2:
-            raise ValueError("every E2 candidate requires one matched TTS/L0 pair")
-        if len({member.resources.gpu_uuids for member in members}) != 1:
-            raise ValueError("E2 TTS/L0 candidate pair must use the same GPU")
-        if len({member.identity.block for member in members}) != 1:
-            raise ValueError("E2 TTS/L0 candidate pair must use one scientific block")
-        result[candidate_id] = (candidate, tuple(members))
+        identity = cell.identity
+        if (
+            identity.scope is None
+            or identity.optimizer is None
+            or identity.learning_rate is None
+            or identity.schedule is None
+        ):
+            if cell.runnable:
+                raise ValueError("runnable E2 LC-candidate has unresolved identity")
+            continue
+        candidate = E2CandidateIdentity.from_cell(cell, registry=registry)
+        if candidate.sha256 in result:
+            raise ValueError("E2 repeats one LC-candidate identity")
+        result[candidate.sha256] = (candidate, cell)
     return result
 
 
@@ -3777,33 +3825,114 @@ def reduce_e2_activation(
     outputs = _receipt_outputs(e1_receipt)
     if outputs.get("dflash_pareto_set") != pareto.sha256:
         raise ValueError("E1 receipt does not bind the supplied Pareto artifact")
+    if stage_index == 0:
+        if prior_reduction is not None:
+            raise ValueError("E2 stage zero cannot consume a prior reduction")
+        source_candidate_ids: set[str] | None = None
+        prior_completed: set[str] = set()
+        source_selection_sha256 = pareto.sha256
+    else:
+        if (
+            type(prior_reduction) is not E2StageReductionArtifact
+            or prior_reduction.registry_sha256 != registry.sha256
+            or prior_reduction.runtime_sha256 != pareto.runtime_sha256
+            or prior_reduction.split_sha256 != pareto.split_sha256
+            or prior_reduction.stage_index != stage_index - 1
+            or prior_reduction.survivor_receipt.status != "SURVIVORS"
+        ):
+            raise ValueError("E2 prior reduction has the wrong lineage or round")
+        source_candidate_ids = set(
+            prior_reduction.survivor_receipt.survivor_candidate_ids
+        )
+        prior_completed = set(
+            prior_reduction.survivor_receipt.completed_lineage_cell_ids
+        )
+        source_selection_sha256 = prior_reduction.sha256
+
     cells = registry.cells_for("E2")
-    blocked_rows: list[CellDisposition] = []
+    pareto_geometry_ids = {geometry.sha256 for geometry in pareto.surviving_geometries}
+    rows: list[CellDisposition] = []
     for cell in cells:
         cell_stage = _e2_stage(cell)
-        if not cell.runnable:
+        role = scientific_role_for_cell(registry, cell)
+        if cell.cell_id in prior_completed:
+            status = DispositionStatus.COMPLETED_PRIOR_ROUND
+            reason = "completed_prior_halving_round"
+        elif cell_stage != stage_index:
+            status = DispositionStatus.DEFERRED
+            reason = "awaiting_registered_e2_halving_round"
+        elif role == "lc_candidate":
+            identity = cell.identity
+            if identity.scope is None:
+                raise ValueError("E2 LC-candidate lacks a geometry")
+            cell_geometry = E1GeometryIdentity(
+                scope=identity.scope,
+                parameterization=identity.parameterization,
+                rank=identity.rank,
+                alpha_over_rank=identity.alpha_over_rank,
+            )
+            exact_candidate = not any(
+                value is None
+                for value in (
+                    identity.optimizer,
+                    identity.learning_rate,
+                    identity.schedule,
+                )
+            )
+            candidate_id = (
+                E2CandidateIdentity.from_cell(cell, registry=registry).sha256
+                if exact_candidate
+                else None
+            )
+            selected_for_round = cell_geometry.sha256 in pareto_geometry_ids and (
+                source_candidate_ids is None or candidate_id in source_candidate_ids
+            )
+            if not selected_for_round:
+                status = DispositionStatus.DEFERRED
+                reason = "outside_e1_pareto_or_prior_survivor_set"
+            elif not cell.runnable:
+                status = (
+                    DispositionStatus.NOT_APPLICABLE
+                    if cell.status is CellStatus.NOT_APPLICABLE
+                    else DispositionStatus.BLOCKED
+                )
+                reason = cell.reason_code
+            else:
+                status = DispositionStatus.BLOCKED
+                reason = E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
+        elif role in {"tts", "l0_naive"}:
+            if not cell.runnable:
+                status = (
+                    DispositionStatus.NOT_APPLICABLE
+                    if cell.status is CellStatus.NOT_APPLICABLE
+                    else DispositionStatus.BLOCKED
+                )
+                reason = cell.reason_code
+            else:
+                status = DispositionStatus.BLOCKED
+                reason = E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
+        elif role in {"target_only", "static"} and not cell.runnable:
             status = (
                 DispositionStatus.NOT_APPLICABLE
                 if cell.status is CellStatus.NOT_APPLICABLE
                 else DispositionStatus.BLOCKED
             )
             reason = cell.reason_code
-        elif cell_stage == stage_index:
+        elif role in {"target_only", "static"}:
             status = DispositionStatus.BLOCKED
             reason = E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON
         else:
-            status = DispositionStatus.DEFERRED
-            reason = "awaiting_registered_e1_common_load_authority"
-        blocked_rows.append(CellDisposition(cell.cell_id, status, reason))
+            raise ValueError("E2 registry contains an unsupported scientific role")
+        rows.append(CellDisposition(cell.cell_id, status, reason))
     return _make_activation(
         registry=registry,
         experiment="E2",
         dependency_receipt=e1_receipt,
         runtime_sha256=pareto.runtime_sha256,
         split_sha256=pareto.split_sha256,
-        source_selection_sha256=pareto.sha256,
+        source_selection_sha256=source_selection_sha256,
         activation_round=f"halving_{stage_index}",
-        rows=blocked_rows,
+        rows=rows,
         reason_code=E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
         reducer_protocol_sha256=E2_HALVING_PROTOCOL_SHA256,
     )
@@ -3837,8 +3966,10 @@ class E2CandidateEvaluation:
     evidence_sha256: str
     safety_passed: bool
     confidence_pareto: bool
-    min_tts_l0_static_goodput_ratio: float
-    confidence_lower_goodput_ratio: float
+    lc_vs_tts_goodput_ratio: float
+    lc_vs_tts_confidence_lower_goodput_ratio: float
+    lc_vs_static_goodput_ratio: float
+    lc_vs_static_confidence_lower_goodput_ratio: float
     hbm_bytes: int
     p99_itl_us: int
     exposed_update_us: int
@@ -3853,15 +3984,20 @@ class E2CandidateEvaluation:
             self.confidence_pareto, bool
         ):
             raise TypeError("E2 safety and Pareto flags must be booleans")
-        if (
-            not math.isfinite(self.min_tts_l0_static_goodput_ratio)
-            or self.min_tts_l0_static_goodput_ratio <= 0
-            or not math.isfinite(self.confidence_lower_goodput_ratio)
-            or self.confidence_lower_goodput_ratio <= 0
-            or self.confidence_lower_goodput_ratio
-            > self.min_tts_l0_static_goodput_ratio
-        ):
-            raise ValueError("E2 goodput ratios must be finite, positive, and ordered")
+        for reference in ("tts", "static"):
+            point = getattr(self, f"lc_vs_{reference}_goodput_ratio")
+            lower = getattr(self, f"lc_vs_{reference}_confidence_lower_goodput_ratio")
+            if (
+                not math.isfinite(point)
+                or point <= 0
+                or not math.isfinite(lower)
+                or lower <= 0
+                or lower > point
+            ):
+                raise ValueError(
+                    "E2 LC/reference goodput ratios must be finite, positive, "
+                    "and confidence-ordered"
+                )
         for name in (
             "hbm_bytes",
             "p99_itl_us",
@@ -3896,6 +4032,7 @@ class RawEvidenceRunBinding:
     cell_id: str
     experiment: str
     method: str
+    scientific_role: str
     scientific_unit: str
     config_sha256: str
     rank_config_sha256s: tuple[str, ...]
@@ -3921,32 +4058,44 @@ class RawEvidenceRunBinding:
     execution_split_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version not in {1, 2}:
-            raise ValueError("only raw run-binding schema versions 1--2 are supported")
-        if self.schema_version == 1:
-            if (
-                self.execution_plan_sha256 is None
-                and self.execution_split_sha256 is None
-            ):
-                # Compatibility for in-process diagnostic constructors.  The
-                # strict JSON codec now requires both explicit fields, so the
-                # old mixed-domain wire schema remains unparseable as formal
-                # input.
-                object.__setattr__(self, "execution_plan_sha256", self.runtime_sha256)
-                object.__setattr__(self, "execution_split_sha256", self.split_sha256)
-            elif (
-                self.execution_plan_sha256 != self.runtime_sha256
-                or self.execution_split_sha256 != self.split_sha256
-            ):
-                raise ValueError(
-                    "legacy raw run bindings cannot claim separate execution identity"
-                )
-        elif self.execution_plan_sha256 is None or self.execution_split_sha256 is None:
+        if self.schema_version != 3:
             raise ValueError(
-                "raw run-binding schema version 2 requires per-cell execution identity"
+                "only formal raw run-binding schema version 3 is supported"
             )
-        for name in ("experiment", "method", "scientific_unit", "run_id", "model_pair"):
+        if self.execution_plan_sha256 is None or self.execution_split_sha256 is None:
+            raise ValueError(
+                "raw run-binding schema version 3 requires per-cell execution identity"
+            )
+        for name in (
+            "experiment",
+            "method",
+            "scientific_role",
+            "scientific_unit",
+            "run_id",
+            "model_pair",
+        ):
             _require_text(f"raw run {name}", getattr(self, name))
+        allowed_roles = {*E0_METHOD_ROLES, "lc_candidate"}
+        if self.scientific_role not in allowed_roles:
+            raise ValueError("raw run scientific role is outside the registry")
+        if self.scientific_role == "lightcone":
+            raise ValueError(
+                "formal LightCone run bindings require a path-replayed E2 seal "
+                "authority, which is unavailable in this release"
+            )
+        expected_runtime_method = {
+            "target_only": "target_only",
+            "static": "static",
+            "tts": "tts",
+            "l0_naive": "l0",
+            "lc_candidate": "l0",
+            "lightcone": "l0",
+            "onlinespec_ogd": "onlinespec_ogd",
+            "onlinespec_opt": "onlinespec_opt",
+            "onlinespec_ens": "onlinespec_ens",
+        }[self.scientific_role]
+        if self.method != expected_runtime_method:
+            raise ValueError("raw run method differs from its scientific role")
         for name in (
             "cell_id",
             "config_sha256",
@@ -4019,6 +4168,7 @@ class E2StageEvidenceArtifact:
     stage_index: int
     prior_stage_reduction_sha256: str | None
     raw_evidence_manifest_sha256: str
+    excluded_mechanism_anchor_cell_ids: tuple[str, ...]
     completed_cell_ids: tuple[str, ...]
     terminal_receipt_sha256s: tuple[str, ...]
     hardware_receipt_sha256s: tuple[str, ...]
@@ -4030,8 +4180,8 @@ class E2StageEvidenceArtifact:
     confirmation_data_visible: bool
 
     def __post_init__(self) -> None:
-        if self.schema_version != 4:
-            raise ValueError("only E2 stage-evidence schema version 4 is supported")
+        if self.schema_version != 5:
+            raise ValueError("only E2 stage-evidence schema version 5 is supported")
         for name in (
             "registry_sha256",
             "runtime_sha256",
@@ -4063,6 +4213,7 @@ class E2StageEvidenceArtifact:
                 self.prior_stage_reduction_sha256,
             )
         for name, values in (
+            ("excluded mechanism anchors", self.excluded_mechanism_anchor_cell_ids),
             ("completed cells", self.completed_cell_ids),
             ("terminal receipts", self.terminal_receipt_sha256s),
             ("hardware receipts", self.hardware_receipt_sha256s),
@@ -4074,6 +4225,10 @@ class E2StageEvidenceArtifact:
                 raise ValueError(f"E2 {name} must be sorted unique SHA-256")
             if not values:
                 raise ValueError(f"E2 stage evidence requires {name}")
+        if len(self.excluded_mechanism_anchor_cell_ids) != 1:
+            raise ValueError("E2 stage evidence requires one excluded L0-naive anchor")
+        if set(self.excluded_mechanism_anchor_cell_ids) & set(self.completed_cell_ids):
+            raise ValueError("E2 mechanism anchor cannot enter selection evidence")
         if len(self.hardware_receipt_sha256s) != len(self.completed_cell_ids) or len(
             self.budget_observation_sha256s
         ) != len(self.completed_cell_ids):
@@ -4083,15 +4238,17 @@ class E2StageEvidenceArtifact:
         if len(self.run_bindings) != len(self.completed_cell_ids):
             raise ValueError("E2 run bindings must cover every completed cell")
         evaluation_count = len(self.evaluations)
-        expected_method_counts = {
+        role_counts = {
+            role: sum(binding.scientific_role == role for binding in self.run_bindings)
+            for role in ("target_only", "static", "tts", "l0_naive", "lc_candidate")
+        }
+        frozen_anchor_count = role_counts["tts"]
+        expected_role_counts = {
             "target_only": 1,
             "static": 1,
-            "tts": evaluation_count,
-            "l0": evaluation_count,
-        }
-        observed_method_counts = {
-            method: sum(binding.method == method for binding in self.run_bindings)
-            for method in expected_method_counts
+            "tts": frozen_anchor_count,
+            "l0_naive": 0,
+            "lc_candidate": evaluation_count,
         }
         if (
             tuple(binding.cell_id for binding in self.run_bindings)
@@ -4103,7 +4260,9 @@ class E2StageEvidenceArtifact:
             or len({binding.run_nonce_sha256 for binding in self.run_bindings})
             != len(self.run_bindings)
             or evaluation_count < 1
-            or observed_method_counts != expected_method_counts
+            or frozen_anchor_count < 1
+            or role_counts != expected_role_counts
+            or sum(role_counts.values()) != len(self.run_bindings)
             or any(
                 binding.experiment != "E2"
                 or binding.runtime_sha256 != self.runtime_sha256
@@ -4185,7 +4344,14 @@ class E2StageReductionArtifact:
             or activation.sha256 != evidence.activation_sha256
             or activation.plan.activation_round != f"halving_{evidence.stage_index}"
             or tuple(sorted(activation.plan.activated_cell_ids))
-            != evidence.completed_cell_ids
+            != tuple(
+                sorted(
+                    (
+                        *evidence.completed_cell_ids,
+                        *evidence.excluded_mechanism_anchor_cell_ids,
+                    )
+                )
+            )
             or (
                 evidence.stage_index > 0
                 and activation.plan.source_selection_sha256
@@ -4242,11 +4408,13 @@ class E2FinalRecipeArtifact:
     source_activation_sha256: str
     candidate_id: str
     candidate: E2CandidateIdentity
+    recipe_sha256: str
+    recipe: AdaptationRecipeDeclaration
     selection_state: Literal["locked_from_raw_halving_3"]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 2:
-            raise ValueError("only E2 final-recipe schema version 2 is supported")
+        if self.schema_version != 3:
+            raise ValueError("only E2 final-recipe schema version 3 is supported")
         for name in (
             "registry_sha256",
             "runtime_sha256",
@@ -4254,10 +4422,33 @@ class E2FinalRecipeArtifact:
             "final_stage_reduction_sha256",
             "source_activation_sha256",
             "candidate_id",
+            "recipe_sha256",
         ):
             _require_sha256(name, getattr(self, name))
         if self.candidate.sha256 != self.candidate_id:
             raise ValueError("E2 final recipe candidate identity is inconsistent")
+        if type(self.recipe) is not AdaptationRecipeDeclaration:
+            raise TypeError("E2 final recipe requires its exact registry declaration")
+        if self.recipe.sha256 != self.recipe_sha256:
+            raise ValueError("E2 final recipe declaration identity is inconsistent")
+        key = self.recipe.lookup_key
+        candidate = self.candidate
+        if (
+            key.experiment != "E2"
+            or key.backend != candidate.backend
+            or key.scope != candidate.scope
+            or key.parameterization != candidate.parameterization
+            or key.rank != candidate.rank
+            or key.alpha_over_rank != candidate.alpha_over_rank
+            or key.optimizer != candidate.optimizer
+            or key.learning_rate != candidate.learning_rate
+            or key.schedule != candidate.schedule
+            or key.draft_width != candidate.width
+            or key.draft_width_selector != candidate.draft_width_selector
+        ):
+            raise ValueError(
+                "E2 final recipe declaration differs from its candidate identity"
+            )
         if self.selection_state != "locked_from_raw_halving_3":
             raise ValueError("E2 final recipe must be locked from raw halving_3")
 
@@ -4296,18 +4487,19 @@ def materialize_e2_final_recipe(
         for cell in registry.cells_for("E2")
         if cell.cell_id in set(reduction.activation.plan.activated_cell_ids)
     }
-    pairs = _e2_candidate_pairs(tuple(active.values()))
+    candidates = _e2_candidates(registry, tuple(active.values()))
     candidate_id = receipt.final_recipe_candidate_id
     try:
-        candidate, _ = pairs[candidate_id]
+        candidate, candidate_cell = candidates[candidate_id]
     except KeyError as exc:
         raise ValueError(
             "E2 final candidate is absent from the activated stage"
         ) from exc
     if receipt.survivor_candidate_ids != (candidate_id,):
         raise ValueError("E2 final reduction does not lock exactly one candidate")
+    recipe = registry.adaptation_recipe_for_cell(candidate_cell)
     return E2FinalRecipeArtifact(
-        schema_version=2,
+        schema_version=3,
         registry_sha256=registry.sha256,
         runtime_sha256=reduction.runtime_sha256,
         split_sha256=reduction.split_sha256,
@@ -4315,6 +4507,8 @@ def materialize_e2_final_recipe(
         source_activation_sha256=reduction.activation.sha256,
         candidate_id=candidate_id,
         candidate=candidate,
+        recipe_sha256=recipe.sha256,
+        recipe=recipe,
         selection_state="locked_from_raw_halving_3",
     )
 
@@ -4349,12 +4543,20 @@ def _reduce_e2_successive_halving(
         raise ValueError("E2 raw-evidence reduction has wrong activation lineage")
     active_ids = set(activation.plan.activated_cell_ids)
     completed = stage_evidence.completed_cell_ids
-    if len(completed) != len(set(completed)) or set(completed) != active_ids:
-        raise ValueError("E2 sealing requires exact completion of every activated cell")
+    excluded_mechanism_ids = stage_evidence.excluded_mechanism_anchor_cell_ids
+    if (
+        len(completed) != len(set(completed))
+        or set(completed) & set(excluded_mechanism_ids)
+        or set(completed) | set(excluded_mechanism_ids) != active_ids
+    ):
+        raise ValueError(
+            "E2 selection sealing requires exact selection evidence and one "
+            "separately planned mechanism anchor"
+        )
     known = {cell.cell_id: cell for cell in registry.cells_for("E2")}
     active_cells = tuple(known[cell_id] for cell_id in active_ids)
-    pairs = _e2_candidate_pairs(active_cells)
-    source_ids = tuple(sorted(pairs))
+    candidates = _e2_candidates(registry, active_cells)
+    source_ids = tuple(sorted(candidates))
     by_candidate = {row.candidate_id: row for row in stage_evidence.evaluations}
     if set(by_candidate) != set(source_ids):
         raise ValueError("E2 evaluations must exactly cover activated candidates")
@@ -4378,13 +4580,13 @@ def _reduce_e2_successive_halving(
         eligible = ()
     families = {
         candidate.family
-        for candidate, _ in (pairs[candidate_id] for candidate_id in source_ids)
+        for candidate, _ in (candidates[candidate_id] for candidate_id in source_ids)
     }
     eligible_by_family: dict[tuple[str, str], list[E2CandidateEvaluation]] = {
         family: [] for family in families
     }
     for row in eligible:
-        eligible_by_family[pairs[row.candidate_id][0].family].append(row)
+        eligible_by_family[candidates[row.candidate_id][0].family].append(row)
     missing_families = tuple(
         sorted(family for family, rows in eligible_by_family.items() if not rows)
     )
@@ -4445,7 +4647,8 @@ def _reduce_e2_successive_halving(
             )
         )
     ranking = lambda row: (
-        -row.min_tts_l0_static_goodput_ratio,
+        -row.lc_vs_tts_confidence_lower_goodput_ratio,
+        -row.lc_vs_static_confidence_lower_goodput_ratio,
         row.hbm_bytes,
         row.p99_itl_us,
         row.exposed_update_us,
@@ -4504,7 +4707,12 @@ def reduce_e2_successive_halving(
 def _without_block_phase(variant: str) -> str:
     for prefix in ("excluded_pilot:", "final_candidate:"):
         if variant.startswith(prefix):
-            return variant.removeprefix(prefix)
+            parts = tuple(
+                part
+                for part in variant.removeprefix(prefix).split(":")
+                if not part.startswith("role=")
+            )
+            return ":".join(parts)
     raise ValueError("confirmation cell variant lacks a block phase")
 
 
@@ -4532,11 +4740,38 @@ def _confirmation_load_sha256(cell: ExperimentCell) -> str:
 def _width_panel(cell: ExperimentCell) -> str:
     variant = _without_block_phase(cell.identity.variant)
     if cell.identity.experiment == "E3b":
-        panel = variant.rsplit(":", maxsplit=1)[-1]
-        if panel not in {"matched", "deployment_optimal"}:
+        panels = {
+            part
+            for part in variant.split(":")
+            if part in {"matched", "deployment_optimal"}
+        }
+        if len(panels) != 1:
             raise ValueError("E3b cell has an invalid width panel")
-        return panel
+        return panels.pop()
     return "not_applicable"
+
+
+def _confirmation_structural_role(
+    registry: ExperimentRegistry, cell: ExperimentCell
+) -> str:
+    """Map an unmaterialized LightCone template to its paired-family slot.
+
+    A template completes the *registered structure* of a confirmation block,
+    but it is not a reportable LightCone run.  The registry owns the exact E2
+    seal/materialization boundary; planning may therefore use this mapping
+    only to check paired coverage.  Activation continues to use ``runnable``
+    and cannot enable the template.
+    """
+
+    role = scientific_role_for_cell(registry, cell)
+    if role != ScientificMethodRole.LIGHTCONE_TEMPLATE.value:
+        return role
+    if (
+        cell.status is not CellStatus.BLOCKED
+        or cell.reason_code != "sealed_e2_recipe_receipt_required"
+    ):
+        raise ValueError("unmaterialized LightCone template lacks its E2-seal block")
+    return ScientificMethodRole.LIGHTCONE.value
 
 
 @dataclass(frozen=True)
@@ -4600,9 +4835,9 @@ class ConfirmationFamilyIdentity:
             or self.cohort_count < 1
         ):
             raise ValueError("confirmation cohort_count must be positive")
-        if self.method_family != CORE_METHODS:
+        if self.method_family != CONFIRMATION_METHOD_ROLES:
             raise ValueError(
-                "primary confirmation family must bind all four core methods"
+                "primary confirmation family must bind all five scientific roles"
             )
 
     @cached_property
@@ -4645,7 +4880,7 @@ def derive_confirmation_family(
         topology=identity.topology,
         cohort_family=identity.cohort,
         cohort_count=identity.cohort_count,
-        method_family=CORE_METHODS,
+        method_family=CONFIRMATION_METHOD_ROLES,
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         trace_sha256=trace_sha256,
@@ -4674,19 +4909,21 @@ def _family_cells(
             and cell.identity.topology == family.topology
             and cell.identity.cohort == family.cohort_family
             and cell.identity.cohort_count == family.cohort_count
-            and cell.identity.method in family.method_family
+            and _confirmation_structural_role(registry, cell) in family.method_family
         )
     )
-    expected = len(PILOT_BLOCKS + FINAL_BLOCKS) * len(CORE_METHODS)
+    expected = len(PILOT_BLOCKS + FINAL_BLOCKS) * len(CONFIRMATION_METHOD_ROLES)
     if len(matches) != expected:
         raise ValueError(
             "confirmation family must contain every method in every registered block"
         )
     for block in PILOT_BLOCKS + FINAL_BLOCKS:
         methods = {
-            cell.identity.method for cell in matches if cell.identity.block == block
+            _confirmation_structural_role(registry, cell)
+            for cell in matches
+            if cell.identity.block == block
         }
-        if methods != set(CORE_METHODS):
+        if methods != set(CONFIRMATION_METHOD_ROLES):
             raise ValueError(
                 "confirmation family block is not a complete paired method set"
             )
@@ -4821,7 +5058,7 @@ def materialize_confirmation_pilots(
         power_plan_sha256=None,
         dispositions=tuple(sorted(rows, key=lambda row: row.cell_id)),
     )
-    expected = len(PILOT_BLOCKS) * len(CORE_METHODS)
+    expected = len(PILOT_BLOCKS) * len(CONFIRMATION_METHOD_ROLES)
     if len(artifact.activated_cell_ids) not in {0, expected}:
         raise ValueError("family pilot activation must be empty or four paired blocks")
     return artifact
@@ -4952,7 +5189,7 @@ class ConfirmationFamilyPowerReductionArtifact:
             != CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256
         ):
             raise ValueError("family power reduction uses an unregistered protocol")
-        expected_cells = len(PILOT_BLOCKS) * len(CORE_METHODS)
+        expected_cells = len(PILOT_BLOCKS) * len(CONFIRMATION_METHOD_ROLES)
         for name, values in (
             ("terminal receipts", self.terminal_receipt_sha256s),
             ("hardware receipts", self.hardware_receipt_sha256s),
@@ -4982,13 +5219,13 @@ class ConfirmationFamilyPowerReductionArtifact:
             or content_sha256(tuple(binding.cell_id for binding in self.run_bindings))
             != self.plan.completed_pilot_cells_sha256
             or {
-                (binding.scientific_unit, binding.method)
+                (binding.scientific_unit, binding.scientific_role)
                 for binding in self.run_bindings
             }
             != {
                 (f"excluded_pilot_{block}", method)
                 for block in PILOT_BLOCKS
-                for method in CORE_METHODS
+                for method in CONFIRMATION_METHOD_ROLES
             }
             or any(
                 binding.experiment != self.family.experiment
@@ -5134,7 +5371,7 @@ def _seal_confirmation_family_power(
     ):
         raise ValueError("family power plan requires its own pilot activation")
     if len(pilot_activation.activated_cell_ids) != len(PILOT_BLOCKS) * len(
-        CORE_METHODS
+        CONFIRMATION_METHOD_ROLES
     ):
         raise ValueError("a blocked family cannot enter power sizing")
     completed = tuple(completed_pilot_cell_ids)
@@ -5265,7 +5502,7 @@ def materialize_confirmation_prefix(
     expected = (
         0
         if plan.selected_final_blocks is None
-        else plan.selected_final_blocks * len(CORE_METHODS)
+        else plan.selected_final_blocks * len(CONFIRMATION_METHOD_ROLES)
     )
     if len(artifact.activated_cell_ids) != expected:
         raise ValueError("family final activation is not the exact selected prefix")
@@ -6066,7 +6303,7 @@ class EvidenceAliasReceipt:
             raise ValueError("evidence alias must be sealed before analysis")
         if self.source.semantics != self.target.semantics:
             raise ValueError(
-                "evidence alias execution semantics are not byte-equivalent"
+                "evidence alias execution semantics are not content-identical"
             )
         source_axes = {axis.name: axis.value for axis in self.source.presentation_axes}
         target_axes = {axis.name: axis.value for axis in self.target.presentation_axes}

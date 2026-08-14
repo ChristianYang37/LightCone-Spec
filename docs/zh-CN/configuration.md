@@ -4,8 +4,11 @@
 
 ## Schema 身份
 
-Run config 使用 schema version 3，验证后不可变，并拒绝未知字段。核心方法为
-`target_only`、`static`、`tts` 与 `l0`。隔离的 OnlineSPEC 对比另有
+Run config 使用 schema version 3，验证后不可变，并拒绝未知字段。Runtime method 为
+`target_only`、`static`、`tts` 与 `l0`。Recipe authority 从中派生五种科学角色：Target-only、
+Static、TTS（`tts` 加 frozen TTS authority）、L0-naive（`l0` 加同一个 authority）与
+LightCone（`l0` 加准确 sealed E2 recipe receipt）。E1/E2 search 中的 `l0` declaration 是
+LC-candidate。隔离的 OnlineSPEC 对比另有
 `onlinespec_ogd`、`onlinespec_opt` 与 `onlinespec_ens`；它使用独立 selection 与证据
 身份，不能替换核心方法。
 
@@ -15,9 +18,9 @@ SGLang commit、sampling-profile SHA-256、tenant 与 runtime topology。Target-
 draft depth 加一。未知 schema 与已退役 adaptation 字段会在加载模型前失败。
 
 这些名称包含目标 protocol vocabulary，不承诺每个合法 scientific declaration 都可执行。
-当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0 会在任何
+当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0-naive/LightCone 会在任何
 mutation 前被阻止，因为固定 native begin/reset/finalize hook 没有配置 trusted hardware
-signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash；TTS/L0 会执行
+signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash；adaptive runtime 会执行
 已注册 constant、按 published update 的 inverse-square-root 与有限 horizon cosine schedule，
 也会执行非负 logical publication delay。`quota_shadow` 可以声明，但 DFlash 当前只提供
 update-round teacher acquisition，因此真实缺 row 时会 fail closed。
@@ -38,8 +41,12 @@ Target-only 启动无 speculation 的 target path；Static 描述原生 speculat
 content-bound request、performance 与汇总 speculative safety evidence，所以无法通过
 trusted-signer release preflight。
 
-移除 method 字段后，TTS 与 L0 的 model、runtime、adaptation、sampling 与 load 身份必须
-逐字节相同。二者使用一个 candidate 实现，只能在发布时间上不同。必须使用准确
+Recipe 与 publication identity 正交。TTS 使用 frozen、primary-source-bound recipe 与 fixed
+barrier；L0-naive 使用同一个 frozen recipe authority 与 first-ready safe-boundary
+publication。LC-candidate 与 LightCone 都使用 L0 policy，但 recipe 分别是已注册 E1/E2
+search recipe 与准确 sealed E2 winner。共享 reconstruction、candidate lifecycle 或 evidence
+代码不代表 live config、candidate、optimizer state 或 row 相同。只有受控 replay 的
+source-state 与 proposal-evidence digest 都相同时才比较 candidate byte。必须使用准确
 full-vocabulary rejection sampling；注册 kernel 不存在时必须报错，不能静默退回 greedy。
 
 ## Adaptation 对象
@@ -92,9 +99,15 @@ scope，各自交叉 Full 加七个 LoRA rank。
 
 ## Optimizer 合同
 
-目标 TTS/L0 optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与 `lion`。它们生成
-functional parameter/state proposal，只有 commit 时才修改 active state。Plain `sgd` 只
-用于 OnlineSPEC。
+E1/E2 **LC-candidate** optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与
+`lion`。它们生成 functional parameter/state proposal，只有 commit 时才修改 active state。
+TTS 不搜索该 registry：paper-bound authority 指定 Adam 与一次 step，但 numeric learning
+rate/schedule、beta、epsilon、optimizer-state reset、weight decay/clip、position weight、
+proximal coefficient、loss normalization/precision/temperature、准确 trainable-parameter
+manifest、stride-selection rule 与官方 implementation commit 尚未解析。因此
+`TTS-paper-reconstruction` 与 L0-naive
+保持 `BLOCKED`；二者不能继承 schema default、历史 AdamW recipe 或 E1/E2 selection。Plain
+`sgd` 只用于 OnlineSPEC。
 
 | Optimizer | 必需身份 | 常驻 moment 规则 |
 |---|---|---|

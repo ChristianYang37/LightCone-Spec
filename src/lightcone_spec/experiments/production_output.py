@@ -45,12 +45,17 @@ from lightcone_spec.experiments.planning import (
     ConfirmationFamilyPowerReductionArtifact,
     RawEvidenceRunBinding,
 )
-from lightcone_spec.experiments.registry import CORE_METHODS, content_sha256
+from lightcone_spec.experiments.registry import (
+    CONFIRMATION_METHOD_ROLES,
+    PILOT_BLOCKS,
+    content_sha256,
+)
 from lightcone_spec.experiments.statistics import (
     P99_MINIMUM_COMPLETIONS,
     PRIMARY_CONTRASTS,
     PRIMARY_TARGET_POWER,
     REGISTERED_CONFIDENCE,
+    SECONDARY_CONTRASTS,
     ContrastPower,
     MultiplicityDecision,
     P99ClaimGuard,
@@ -76,9 +81,35 @@ class OutputStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+CROSS_FAMILY_INTERACTION_AXES = (
+    "method_by_model",
+    "method_by_context",
+    "method_by_load",
+)
+
+
+CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 2,
+        "kind": "lightcone_cross_family_interaction_input_shape_contract",
+        "roles": CONFIRMATION_METHOD_ROLES,
+        "axes": CROSS_FAMILY_INTERACTION_AXES,
+        "e0_repetition_shape": "at_least_two_levels_per_declared_axis",
+        "formal_authorities": (
+            "registry_owned_cells_typed_e2_seal_and_native_completion_absent"
+        ),
+        "lightcone": "sealed_e2_recipe_receipt_required",
+        "lightcone_template": "structural_slot_not_formal_interaction_input",
+        "input": "self_consistent_content_bound_structural_bindings_only",
+        "numeric_policy": "unresolved_until_complete_formal_reduction",
+        "serialization": "canonical_content_sha256",
+    }
+)
+
+
 PRODUCTION_OUTPUT_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 3,
         "kind": "lightcone_figure_table_production_output_protocol",
         "inputs": (
             "exact_e3b_long_context_stage_reducer",
@@ -96,6 +127,14 @@ PRODUCTION_OUTPUT_PROTOCOL_SHA256 = content_sha256(
         "p99": "count_gate_separate_from_formal_claim_status",
         "power": "four_excluded_pilots_registered_12_through_20_grid",
         "power_output_role": "preregistered_planning_only_not_formal_result",
+        "scientific_roles": CONFIRMATION_METHOD_ROLES,
+        "primary_contrasts": ("lightcone_vs_tts", "lightcone_vs_static"),
+        "secondary_contrasts": (
+            "l0_naive_vs_tts",
+            "lightcone_vs_l0_naive",
+        ),
+        "interaction_axes": ("method_by_model", "method_by_context", "method_by_load"),
+        "interaction_input": "nonformal_cross_family_input_shape_contract",
         "serialization": "canonical_json_sort_keys_ascii_no_nan",
     }
 )
@@ -103,18 +142,37 @@ PRODUCTION_OUTPUT_PROTOCOL_SHA256 = content_sha256(
 _E3B_PANELS = tuple(
     sorted(
         (
-            (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0, E3bMethod.STATIC),
-            (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0, E3bMethod.TARGET_ONLY),
-            (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0, E3bMethod.TTS),
+            (
+                E3bMetric.ACCEPTED_LENGTH,
+                E3bMethod.LIGHTCONE,
+                E3bMethod.STATIC,
+            ),
+            (E3bMetric.ACCEPTED_LENGTH, E3bMethod.LIGHTCONE, E3bMethod.TTS),
+            (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0_NAIVE, E3bMethod.TTS),
+            (
+                E3bMetric.ACCEPTED_LENGTH,
+                E3bMethod.LIGHTCONE,
+                E3bMethod.L0_NAIVE,
+            ),
             (
                 E3bMetric.COMMITTED_TOKEN_GOODPUT,
-                E3bMethod.L0,
+                E3bMethod.LIGHTCONE,
                 E3bMethod.STATIC,
             ),
             (
                 E3bMetric.COMMITTED_TOKEN_GOODPUT,
-                E3bMethod.L0,
-                E3bMethod.TARGET_ONLY,
+                E3bMethod.LIGHTCONE,
+                E3bMethod.TTS,
+            ),
+            (
+                E3bMetric.COMMITTED_TOKEN_GOODPUT,
+                E3bMethod.L0_NAIVE,
+                E3bMethod.TTS,
+            ),
+            (
+                E3bMetric.COMMITTED_TOKEN_GOODPUT,
+                E3bMethod.LIGHTCONE,
+                E3bMethod.L0_NAIVE,
             ),
         ),
         key=lambda value: ":".join(item.value for item in value),
@@ -337,6 +395,197 @@ def _revalidate_power_source(
     source.__post_init__()
     _require_current_sha256(
         "family-power source",
+        sealed_sha256=source.sha256,
+        current_sha256=content_sha256(source),
+    )
+
+
+@dataclass(frozen=True)
+class CrossFamilyInteractionBinding:
+    """One receipt-bound formal role observation for an interaction reducer.
+
+    This is deliberately an input binding rather than a metric row: the
+    presentation layer must not invent an interaction estimate before the
+    registered reducer has complete formal evidence.  A LightCone binding is
+    valid only after the E2 recipe seal; ``lightcone_template`` is not a role
+    accepted by this type.
+    """
+
+    schema_version: int
+    cell_id: str
+    scientific_role: str
+    role_authority_sha256: str | None
+    sealed_e2_recipe_receipt_sha256: str | None
+    model: str
+    context: int
+    load: str
+    block: int
+    block_phase: str
+    paired_block_sha256: str
+    evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("interaction binding schema is unsupported")
+        if not _is_sha256(self.cell_id):
+            raise ValueError("interaction cell ID must be a SHA-256")
+        for label, value in (
+            ("interaction model", self.model),
+            ("interaction load", self.load),
+        ):
+            _require_text(label, value)
+        if self.scientific_role not in CONFIRMATION_METHOD_ROLES:
+            raise ValueError("interaction binding has no formal scientific role")
+        if type(self.context) is not int or self.context < 1:
+            raise ValueError("interaction context must be positive")
+        if type(self.block) is not int or self.block in PILOT_BLOCKS or self.block < 0:
+            raise ValueError("formal interaction bindings require a final paired block")
+        if self.block_phase != "final_candidate":
+            raise ValueError(
+                "formal interaction bindings require final_candidate phase"
+            )
+        for label, value in (
+            ("interaction paired-block", self.paired_block_sha256),
+            ("interaction evidence", self.evidence_sha256),
+        ):
+            if not _is_sha256(value):
+                raise ValueError(f"{label} SHA-256 is invalid")
+        adaptive = self.scientific_role in {"tts", "l0_naive", "lightcone"}
+        if adaptive != (self.role_authority_sha256 is not None):
+            raise ValueError("interaction role authority coverage is invalid")
+        if self.role_authority_sha256 is not None and not _is_sha256(
+            self.role_authority_sha256
+        ):
+            raise ValueError("interaction role authority SHA-256 is invalid")
+        if self.scientific_role == "lightcone":
+            if not _is_sha256(self.sealed_e2_recipe_receipt_sha256):
+                raise ValueError(
+                    "LightCone interaction input requires sealed E2 receipt"
+                )
+        elif self.sealed_e2_recipe_receipt_sha256 is not None:
+            raise ValueError("only LightCone interaction inputs carry an E2 receipt")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+@dataclass(frozen=True)
+class CrossFamilyInteractionReducerArtifact:
+    """Content-bound, non-formal input-shape contract for interactions.
+
+    It records a bounded structural example of role/axis bindings, but does not
+    prove registry-owned final-block coverage, a typed E2 seal, native
+    completion evidence, or full factorial coverage.  A later formal binder
+    must establish those authorities.  Its only truthful status is
+    ``UNRESOLVED`` and it carries no numerical estimate.
+    """
+
+    schema_version: int
+    protocol_sha256: str
+    status: str
+    registry_sha256: str
+    e0_repetition_authority_sha256: str
+    runtime_sha256: str
+    split_sha256: str
+    bindings: tuple[CrossFamilyInteractionBinding, ...]
+    input_manifest_sha256: str
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("interaction reducer schema is unsupported")
+        if self.protocol_sha256 != CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256:
+            raise ValueError("interaction reducer protocol differs from registration")
+        if self.status != "UNRESOLVED":
+            raise ValueError("interaction reducer cannot claim a formal result")
+        for label, value in (
+            ("interaction registry", self.registry_sha256),
+            ("E0 repetition authority", self.e0_repetition_authority_sha256),
+            ("interaction runtime", self.runtime_sha256),
+            ("interaction split", self.split_sha256),
+            ("interaction input manifest", self.input_manifest_sha256),
+        ):
+            if not _is_sha256(value):
+                raise ValueError(f"{label} SHA-256 is invalid")
+        if self.e0_repetition_authority_sha256 != self.registry_sha256:
+            raise ValueError("E0 repetition authority must bind the exact registry")
+        if (
+            type(self.bindings) is not tuple
+            or not self.bindings
+            or any(
+                type(row) is not CrossFamilyInteractionBinding for row in self.bindings
+            )
+        ):
+            raise TypeError("interaction bindings must be a non-empty exact tuple")
+        for row in self.bindings:
+            row.__post_init__()
+        if tuple(sorted(row.sha256 for row in self.bindings)) != tuple(
+            row.sha256 for row in self.bindings
+        ):
+            raise ValueError(
+                "interaction bindings must be canonical by content SHA-256"
+            )
+        if len({row.cell_id for row in self.bindings}) != len(self.bindings):
+            raise ValueError("interaction bindings cannot reuse a cell")
+        if self.input_manifest_sha256 != content_sha256(
+            tuple(row.sha256 for row in self.bindings)
+        ):
+            raise ValueError("interaction input manifest differs from bindings")
+        if self.reason_codes != _canonical_reasons(self.reason_codes):
+            raise ValueError("interaction reducer reasons are not canonical")
+        if not self.reason_codes:
+            raise ValueError("unresolved interaction reducer needs a named reason")
+
+        for level in (
+            lambda row: row.model,
+            lambda row: str(row.context),
+            lambda row: row.load,
+        ):
+            groups: dict[tuple[str, int], list[CrossFamilyInteractionBinding]] = {}
+            for row in self.bindings:
+                groups.setdefault((level(row), row.block), []).append(row)
+            if len({key[0] for key in groups}) < 2:
+                raise ValueError(
+                    "interaction reducer needs at least two registered levels"
+                )
+            for rows in groups.values():
+                if {row.scientific_role for row in rows} != set(
+                    CONFIRMATION_METHOD_ROLES
+                ) or len(rows) != len(CONFIRMATION_METHOD_ROLES):
+                    raise ValueError(
+                        "interaction reducer requires one formal role per paired block"
+                    )
+                if len({row.paired_block_sha256 for row in rows}) != 1:
+                    raise ValueError(
+                        "interaction roles must share one paired-block receipt"
+                    )
+                by_role = {row.scientific_role: row for row in rows}
+                if (
+                    by_role["tts"].role_authority_sha256
+                    != by_role["l0_naive"].role_authority_sha256
+                ):
+                    raise ValueError(
+                        "TTS and L0-naive interaction inputs must share one frozen recipe authority"
+                    )
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+def _revalidate_interaction_source(
+    source: CrossFamilyInteractionReducerArtifact,
+) -> None:
+    source.__post_init__()
+    for binding in source.bindings:
+        _require_current_sha256(
+            "interaction binding",
+            sealed_sha256=binding.sha256,
+            current_sha256=content_sha256(binding),
+        )
+    _require_current_sha256(
+        "interaction reducer source",
         sealed_sha256=source.sha256,
         current_sha256=content_sha256(source),
     )
@@ -696,6 +945,9 @@ def _validate_claim_specification(
                 "uncertainty",
                 "p99_rows",
                 "primary_rows",
+                "secondary_rows",
+                "interaction_reducer_status",
+                "interaction_rows",
             }
         ),
         label="formal claim table specification",
@@ -716,14 +968,16 @@ def _validate_claim_specification(
         "adjusted_p_value": "lower",
     } or value["uncertainty"] != {
         "primary": "paired_BCa_95_percent",
+        "secondary": "paired_BCa_95_percent_descriptive",
+        "interactions": "registered_cross_family_reducer_required",
         "p99": "time_block_bootstrap_95_percent_when_registered",
     }:
         raise ValueError("formal claim table changes registered semantics")
 
     p99_rows = _exact_list(value["p99_rows"], label="p99 claim rows")
-    if len(p99_rows) != len(CORE_METHODS):
+    if len(p99_rows) != len(CONFIRMATION_METHOD_ROLES):
         raise ValueError("p99 claim rows do not cover core methods")
-    for raw_row, method in zip(p99_rows, CORE_METHODS, strict=True):
+    for raw_row, method in zip(p99_rows, CONFIRMATION_METHOD_ROLES, strict=True):
         row = _exact_fields(
             raw_row,
             fields=frozenset(
@@ -813,6 +1067,97 @@ def _validate_claim_specification(
             or row["adjustment_procedure"] is not None
         ):
             raise ValueError("missing reducer cannot expose primary source metadata")
+
+    secondary_rows = _exact_list(value["secondary_rows"], label="secondary claim rows")
+    if len(secondary_rows) != len(SECONDARY_CONTRASTS):
+        raise ValueError("secondary claim rows do not cover the registered family")
+    secondary_numeric_fields = (
+        "mean_relative_gain",
+        "ci_lower_relative_gain",
+        "ci_upper_relative_gain",
+        "raw_p_value",
+    )
+    for raw_row, contrast in zip(secondary_rows, SECONDARY_CONTRASTS, strict=True):
+        row = _exact_fields(
+            raw_row,
+            fields=frozenset(
+                {
+                    "contrast",
+                    "formal_claim_status",
+                    *secondary_numeric_fields,
+                    "independent_unit",
+                    "multiplicity_role",
+                    "reason_codes",
+                }
+            ),
+            label="secondary claim row",
+        )
+        if (
+            row["contrast"] != contrast
+            or row["formal_claim_status"] != "UNRESOLVED"
+            or any(row[field] is not None for field in secondary_numeric_fields)
+            or row["independent_unit"] not in {None, "paired_block"}
+            or row["multiplicity_role"] != "descriptive_secondary_not_in_holm_family"
+            or not _reason_list(row["reason_codes"], label="secondary claim reasons")
+        ):
+            raise ValueError("unresolved secondary statistics are invalid")
+        if reducer_status == "MISSING" and row["independent_unit"] is not None:
+            raise ValueError("missing reducer cannot expose secondary source metadata")
+
+    interaction_reducer_status = value["interaction_reducer_status"]
+    if interaction_reducer_status not in {"MISSING", "UNRESOLVED"}:
+        raise ValueError("interaction reducer status is unsupported")
+    interaction_rows = _exact_list(
+        value["interaction_rows"], label="interaction claim rows"
+    )
+    expected_interactions = CROSS_FAMILY_INTERACTION_AXES
+    if len(interaction_rows) != len(expected_interactions):
+        raise ValueError("interaction rows do not cover the registered axes")
+    for raw_row, axis in zip(interaction_rows, expected_interactions, strict=True):
+        row = _exact_fields(
+            raw_row,
+            fields=frozenset(
+                {
+                    "axis",
+                    "formal_claim_status",
+                    "estimate",
+                    "ci_lower",
+                    "ci_upper",
+                    "independent_unit",
+                    "reducer_protocol_sha256",
+                    "source_sha256",
+                    "input_manifest_sha256",
+                    "reason_codes",
+                }
+            ),
+            label="interaction claim row",
+        )
+        if (
+            row["axis"] != axis
+            or row["formal_claim_status"] != "UNRESOLVED"
+            or any(
+                row[field] is not None for field in ("estimate", "ci_lower", "ci_upper")
+            )
+            or row["reducer_protocol_sha256"]
+            != CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256
+            or not _reason_list(row["reason_codes"], label="interaction claim reasons")
+        ):
+            raise ValueError("unresolved interaction statistics must remain null")
+        if interaction_reducer_status == "MISSING":
+            if (
+                row["independent_unit"] is not None
+                or row["source_sha256"] is not None
+                or row["input_manifest_sha256"] is not None
+            ):
+                raise ValueError(
+                    "missing interaction reducer cannot expose source metadata"
+                )
+        elif (
+            row["independent_unit"] != "paired_block"
+            or not _is_sha256(row["source_sha256"])
+            or not _is_sha256(row["input_manifest_sha256"])
+        ):
+            raise ValueError("interaction reducer source metadata is invalid")
 
 
 def _validate_specification_payload(
@@ -905,7 +1250,7 @@ class ProductionOutputArtifact:
     tables: tuple[MachineReadableSpecification, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 3:
             raise ValueError("production output artifact schema is unsupported")
         if self.protocol_sha256 != PRODUCTION_OUTPUT_PROTOCOL_SHA256:
             raise ValueError("production output artifact changes its protocol")
@@ -1088,6 +1433,7 @@ def production_output_artifact_from_json_bytes(
     e3b_stage: E3bLongContextStageArtifact | None,
     industrial_reduction: IndustrialReducerArtifact | None,
     family_power_reduction: ConfirmationFamilyPowerReductionArtifact | None,
+    interaction_reduction: CrossFamilyInteractionReducerArtifact | None = None,
 ) -> ProductionOutputArtifact:
     """Strictly reopen the canonical output document.
 
@@ -1144,6 +1490,7 @@ def production_output_artifact_from_json_bytes(
         e3b_stage=e3b_stage,
         industrial_reduction=industrial_reduction,
         family_power_reduction=family_power_reduction,
+        interaction_reduction=interaction_reduction,
     )
     if artifact.to_dict() != expected.to_dict():
         raise ValueError("production output differs from exact typed source replay")
@@ -1348,11 +1695,13 @@ def _power_table(
 
 def _claim_table(
     source: IndustrialReducerArtifact | None,
+    interaction_source: CrossFamilyInteractionReducerArtifact | None,
 ) -> MachineReadableSpecification:
     if source is None:
         reasons = ("industrial_reducer_artifact_missing",)
         methods: dict[str, Any] = {}
         contrasts: dict[str, Any] = {}
+        secondary_contrasts: dict[str, Any] = {}
         decisions: dict[str, Any] = {}
     else:
         reasons = _canonical_reasons(
@@ -1360,10 +1709,13 @@ def _claim_table(
         )
         methods = {value.method: value for value in source.methods}
         contrasts = {value.name: value for value in source.primary_contrasts}
+        secondary_contrasts = {
+            value.name: value for value in source.secondary_contrasts
+        }
         decisions = {value.name: value for value in source.holm_family}
 
     p99_rows: list[dict[str, object]] = []
-    for method in CORE_METHODS:
+    for method in CONFIRMATION_METHOD_ROLES:
         reduction = methods.get(method)
         guard = None if reduction is None else reduction.aggregate_latency_p99
         row_reasons = set(reasons)
@@ -1411,6 +1763,65 @@ def _claim_table(
                 "reason_codes": sorted(row_reasons),
             }
         )
+    secondary_rows: list[dict[str, object]] = []
+    for name in SECONDARY_CONTRASTS:
+        contrast = secondary_contrasts.get(name)
+        row_reasons = set(reasons)
+        if contrast is None:
+            row_reasons.add("industrial_secondary_contrast_unavailable")
+        secondary_rows.append(
+            {
+                "contrast": name,
+                "formal_claim_status": "UNRESOLVED",
+                "mean_relative_gain": None,
+                "ci_lower_relative_gain": None,
+                "ci_upper_relative_gain": None,
+                "raw_p_value": None,
+                "independent_unit": (
+                    None if contrast is None else contrast.independent_unit
+                ),
+                "multiplicity_role": "descriptive_secondary_not_in_holm_family",
+                "reason_codes": sorted(row_reasons),
+            }
+        )
+    interaction_reasons = (
+        ("cross_family_interaction_reducer_artifact_missing",)
+        if interaction_source is None
+        else _canonical_reasons(
+            (
+                "cross_family_interaction_formal_status_unresolved",
+                *interaction_source.reason_codes,
+            )
+        )
+    )
+    interaction_rows = [
+        {
+            "axis": axis,
+            "formal_claim_status": "UNRESOLVED",
+            "estimate": None,
+            "ci_lower": None,
+            "ci_upper": None,
+            "independent_unit": (
+                None if interaction_source is None else "paired_block"
+            ),
+            "reducer_protocol_sha256": CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256,
+            "source_sha256": None
+            if interaction_source is None
+            else interaction_source.sha256,
+            "input_manifest_sha256": (
+                None
+                if interaction_source is None
+                else interaction_source.input_manifest_sha256
+            ),
+            "reason_codes": sorted(
+                {
+                    *reasons,
+                    *interaction_reasons,
+                }
+            ),
+        }
+        for axis in CROSS_FAMILY_INTERACTION_AXES
+    ]
     return _specification(
         spec_id="tab:formal-claim-status",
         kind="formal_claim_status",
@@ -1427,10 +1838,17 @@ def _claim_table(
             },
             "uncertainty": {
                 "primary": "paired_BCa_95_percent",
+                "secondary": "paired_BCa_95_percent_descriptive",
+                "interactions": "registered_cross_family_reducer_required",
                 "p99": "time_block_bootstrap_95_percent_when_registered",
             },
             "p99_rows": p99_rows,
             "primary_rows": primary_rows,
+            "secondary_rows": secondary_rows,
+            "interaction_reducer_status": (
+                "MISSING" if interaction_source is None else interaction_source.status
+            ),
+            "interaction_rows": interaction_rows,
         },
     )
 
@@ -1440,6 +1858,7 @@ def build_production_output_artifact(
     e3b_stage: E3bLongContextStageArtifact | None,
     industrial_reduction: IndustrialReducerArtifact | None,
     family_power_reduction: ConfirmationFamilyPowerReductionArtifact | None,
+    interaction_reduction: CrossFamilyInteractionReducerArtifact | None = None,
 ) -> ProductionOutputArtifact:
     """Build paper-output specs without accepting summaries or raw rows.
 
@@ -1468,6 +1887,7 @@ def build_production_output_artifact(
             for values in (
                 industrial_reduction.methods,
                 industrial_reduction.primary_contrasts,
+                industrial_reduction.secondary_contrasts,
                 industrial_reduction.holm_family,
             )
         ):
@@ -1505,6 +1925,11 @@ def build_production_output_artifact(
         ):
             raise TypeError("industrial primary contrasts must be exact")
         if any(
+            type(value) is not PairedBcaContrast
+            for value in industrial_reduction.secondary_contrasts
+        ):
+            raise TypeError("industrial secondary contrasts must be exact")
+        if any(
             type(value) is not MultiplicityDecision
             for value in industrial_reduction.holm_family
         ):
@@ -1515,6 +1940,14 @@ def build_production_output_artifact(
             for value in industrial_reduction.primary_contrasts
         ):
             raise ValueError("industrial primary contrast semantics are not canonical")
+        if any(
+            value.confidence != REGISTERED_CONFIDENCE
+            or value.independent_unit != "paired_block"
+            for value in industrial_reduction.secondary_contrasts
+        ):
+            raise ValueError(
+                "industrial secondary contrast semantics are not canonical"
+            )
         if any(value.procedure != "holm" for value in industrial_reduction.holm_family):
             raise ValueError("industrial multiplicity semantics are not canonical")
         if type(
@@ -1527,17 +1960,26 @@ def build_production_output_artifact(
         contrasts = tuple(
             value.name for value in industrial_reduction.primary_contrasts
         )
+        secondary_contrasts = tuple(
+            value.name for value in industrial_reduction.secondary_contrasts
+        )
         decisions = tuple(value.name for value in industrial_reduction.holm_family)
-        if methods and methods != CORE_METHODS:
+        if methods and methods != CONFIRMATION_METHOD_ROLES:
             raise ValueError("industrial method reductions are not canonical")
         if contrasts and contrasts != PRIMARY_CONTRASTS:
             raise ValueError("industrial primary contrasts are not canonical")
+        if secondary_contrasts and secondary_contrasts != SECONDARY_CONTRASTS:
+            raise ValueError("industrial secondary contrasts are not canonical")
         if decisions and decisions != PRIMARY_CONTRASTS:
             raise ValueError("industrial Holm family is not canonical")
     if family_power_reduction is not None:
         if type(family_power_reduction) is not ConfirmationFamilyPowerReductionArtifact:
             raise TypeError("power output requires an exact family-power reduction")
         _revalidate_power_source(family_power_reduction)
+    if interaction_reduction is not None:
+        if type(interaction_reduction) is not CrossFamilyInteractionReducerArtifact:
+            raise TypeError("interaction output requires an exact interaction reducer")
+        _revalidate_interaction_source(interaction_reduction)
 
     registry_sha256s = {
         value
@@ -1552,6 +1994,11 @@ def build_production_output_artifact(
                 None
                 if family_power_reduction is None
                 else family_power_reduction.family.registry_sha256
+            ),
+            (
+                None
+                if interaction_reduction is None
+                else interaction_reduction.registry_sha256
             ),
         )
         if value is not None
@@ -1589,6 +2036,26 @@ def build_production_output_artifact(
             != family_power_reduction.plan.power_sizing
         ):
             raise ValueError("industrial and family-power output sources differ")
+    if (
+        interaction_reduction is not None
+        and industrial_reduction is not None
+        and (
+            interaction_reduction.runtime_sha256 != industrial_reduction.runtime_sha256
+            or interaction_reduction.split_sha256 != industrial_reduction.split_sha256
+        )
+    ):
+        raise ValueError("interaction and industrial output sources differ")
+    if (
+        interaction_reduction is not None
+        and family_power_reduction is not None
+        and (
+            interaction_reduction.runtime_sha256
+            != family_power_reduction.family.runtime_sha256
+            or interaction_reduction.split_sha256
+            != family_power_reduction.family.split_sha256
+        )
+    ):
+        raise ValueError("interaction and family-power output sources differ")
     if (
         e3b_stage is not None
         and family_power_reduction is not None
@@ -1657,7 +2124,7 @@ def build_production_output_artifact(
         blockers.add("confirmation_family_underpowered")
 
     return ProductionOutputArtifact(
-        schema_version=1,
+        schema_version=3,
         protocol_sha256=PRODUCTION_OUTPUT_PROTOCOL_SHA256,
         status=OutputStatus.BLOCKED,
         blocker_codes=tuple(sorted(blockers)),
@@ -1665,13 +2132,17 @@ def build_production_output_artifact(
         figure=_e3b_figure(e3b_stage),
         tables=(
             _power_table(family_power_reduction),
-            _claim_table(industrial_reduction),
+            _claim_table(industrial_reduction, interaction_reduction),
         ),
     )
 
 
 __all__ = [
+    "CROSS_FAMILY_INTERACTION_AXES",
+    "CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256",
     "PRODUCTION_OUTPUT_PROTOCOL_SHA256",
+    "CrossFamilyInteractionBinding",
+    "CrossFamilyInteractionReducerArtifact",
     "MachineReadableSpecification",
     "OutputStatus",
     "ProductionOutputArtifact",

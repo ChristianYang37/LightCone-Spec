@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import replace
 
 import pytest
@@ -27,37 +26,30 @@ from lightcone_spec.experiments.long_context_analysis import (
     E3bReductionStatus,
 )
 from lightcone_spec.experiments.planning import (
-    CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     ConfirmationFamilyIdentity,
-    ConfirmationFamilyPowerPlan,
     ConfirmationFamilyPowerReductionArtifact,
-    RawEvidenceRunBinding,
-    family_pilot_block_id,
 )
 from lightcone_spec.experiments.production_output import (
+    CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256,
+    CrossFamilyInteractionBinding,
+    CrossFamilyInteractionReducerArtifact,
     OutputStatus,
     build_production_output_artifact,
     production_output_artifact_from_json_bytes,
 )
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
+    CONFIRMATION_METHOD_ROLES,
     FINAL_BLOCKS,
-    PILOT_BLOCKS,
     content_sha256,
 )
 from lightcone_spec.experiments.runtime_metrics import export_formal_runtime_metrics
 from lightcone_spec.experiments.statistics import (
-    MAXIMUM_FINAL_BLOCKS,
     MINIMUM_FINAL_BLOCKS,
     PRIMARY_CONTRASTS,
-    PRIMARY_FAMILY_ALPHA,
-    PRIMARY_MINIMUM_RELATIVE_EFFECT,
-    PRIMARY_TARGET_POWER,
-    ContrastPower,
+    SECONDARY_CONTRASTS,
     MultiplicityDecision,
     P99ClaimGuard,
     PairedBcaContrast,
-    PowerSizingPlan,
     SloRequest,
     account_slo,
 )
@@ -83,7 +75,7 @@ def _family() -> ConfirmationFamilyIdentity:
         topology="tp1_dp1",
         cohort_family="none",
         cohort_count=1,
-        method_family=CORE_METHODS,
+        method_family=CONFIRMATION_METHOD_ROLES,
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
         trace_sha256=_sha("trace"),
@@ -92,129 +84,14 @@ def _family() -> ConfirmationFamilyIdentity:
     )
 
 
-def _raw_binding(
-    *,
-    family: ConfirmationFamilyIdentity,
-    cell_id: str,
-    index: int,
-) -> RawEvidenceRunBinding:
-    method = CORE_METHODS[index % len(CORE_METHODS)]
-    block = PILOT_BLOCKS[index // len(CORE_METHODS)]
-    return RawEvidenceRunBinding(
-        schema_version=1,
-        cell_id=cell_id,
-        experiment=family.experiment,
-        method=method,
-        scientific_unit=f"excluded_pilot_{block}",
-        config_sha256=cell_id,
-        rank_config_sha256s=(_sha(f"rank-{index}"),),
-        run_id=f"pilot-run-{index}",
-        rank_count=1,
-        model_pair=family.model,
-        runtime_sha256=family.runtime_sha256,
-        split_sha256=family.split_sha256,
-        corpus_sha256=_sha(f"corpus-{index}"),
-        arrival_trace_sha256=_sha(f"arrival-{index}"),
-        request_ids_sha256=_sha(f"requests-{index}"),
-        sampling_profile_sha256=family.sampling_sha256,
-        model_lock_sha256=_sha(f"model-{index}"),
-        patched_sglang_tree="a" * 40,
-        run_nonce_sha256=_sha(f"nonce-{index}"),
-        topology_sha256=_sha(f"topology-{index}"),
-        experiment_budget_sha256=_sha(f"budget-plan-{index}"),
-        physical_gpu_uuids=(f"GPU-{index % 2}",),
-        terminal_receipt_sha256s=(_sha(f"terminal-{index}"),),
-        hardware_receipt_sha256=_sha(f"hardware-{index}"),
-        budget_observation_sha256=_sha(f"budget-observation-{index}"),
-    )
-
-
 def _power_reduction(
     *,
     underpowered: bool = False,
 ) -> ConfirmationFamilyPowerReductionArtifact:
-    family = _family()
-    cell_ids = tuple(
-        sorted(
-            _sha(f"pilot-cell-{index}")
-            for index in range(len(PILOT_BLOCKS) * len(CORE_METHODS))
-        )
-    )
-    bindings = tuple(
-        _raw_binding(family=family, cell_id=cell_id, index=index)
-        for index, cell_id in enumerate(cell_ids)
-    )
-    power = 0.50 if underpowered else 0.90
-    selected = None if underpowered else MINIMUM_FINAL_BLOCKS
-    sizing = PowerSizingPlan(
-        status="UNDERPOWERED" if underpowered else "READY",
-        pilot_block_ids=tuple(
-            family_pilot_block_id(family, block) for block in PILOT_BLOCKS
-        ),
-        selected_final_blocks=selected,
-        minimum_final_blocks=MINIMUM_FINAL_BLOCKS,
-        maximum_final_blocks=MAXIMUM_FINAL_BLOCKS,
-        target_power=PRIMARY_TARGET_POWER,
-        family_alpha=PRIMARY_FAMILY_ALPHA,
-        adjusted_alpha=PRIMARY_FAMILY_ALPHA / len(PRIMARY_CONTRASTS),
-        minimum_relative_effect=PRIMARY_MINIMUM_RELATIVE_EFFECT,
-        minimum_log_effect=math.log1p(PRIMARY_MINIMUM_RELATIVE_EFFECT),
-        pilot_log_standard_deviations=tuple(
-            (contrast, 0.10) for contrast in PRIMARY_CONTRASTS
-        ),
-        power_grid=tuple(
-            ContrastPower(
-                contrast=contrast,
-                final_blocks=blocks,
-                power=power,
-            )
-            for blocks in range(MINIMUM_FINAL_BLOCKS, MAXIMUM_FINAL_BLOCKS + 1)
-            for contrast in PRIMARY_CONTRASTS
-        ),
-    )
-    evidence_sha256 = _sha("pilot-evidence")
-    plan = ConfirmationFamilyPowerPlan(
-        schema_version=1,
-        family=family,
-        pilot_activation_sha256=_sha("pilot-activation"),
-        completed_pilot_cells_sha256=content_sha256(cell_ids),
-        pilot_evidence_sha256=evidence_sha256,
-        power_sizing=sizing,
-        status="UNDERPOWERED" if underpowered else "POWERED",
-        selected_final_blocks=selected,
-        selected_final_prefix=() if selected is None else FINAL_BLOCKS[:selected],
-        reason_code=(
-            "registered_family_underpowered"
-            if underpowered
-            else "registered_family_power_target_met"
-        ),
-        selection_state="sealed_before_confirmation_unblinding",
-    )
-    return ConfirmationFamilyPowerReductionArtifact(
-        schema_version=2,
-        plan=plan,
-        inventory_sha256=_sha("inventory"),
-        inventory_source_receipt_sha256=_sha("inventory-source"),
-        fixed_instance_gpu_count=2,
-        inventory_host_id="production-output-test-host",
-        raw_evidence_manifest_sha256=evidence_sha256,
-        terminal_receipt_sha256s=tuple(
-            sorted(
-                receipt
-                for binding in bindings
-                for receipt in binding.terminal_receipt_sha256s
-            )
-        ),
-        hardware_receipt_sha256s=tuple(
-            sorted(binding.hardware_receipt_sha256 for binding in bindings)
-        ),
-        budget_observation_sha256s=tuple(
-            sorted(binding.budget_observation_sha256 for binding in bindings)
-        ),
-        run_bindings=bindings,
-        reducer_protocol_sha256=CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
-        data_source="excluded_pilots_only",
-        confirmation_data_visible=False,
+    del underpowered
+    pytest.skip(
+        "formal five-role power evidence requires a path-replayed E2 LightCone "
+        "seal, which is unavailable in this release"
     )
 
 
@@ -246,22 +123,45 @@ def _observed_e3b_stage(
     identities = tuple(
         sorted(
             (
-                (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0, E3bMethod.STATIC),
                 (
                     E3bMetric.ACCEPTED_LENGTH,
-                    E3bMethod.L0,
-                    E3bMethod.TARGET_ONLY,
+                    E3bMethod.LIGHTCONE,
+                    E3bMethod.STATIC,
                 ),
-                (E3bMetric.ACCEPTED_LENGTH, E3bMethod.L0, E3bMethod.TTS),
+                (
+                    E3bMetric.ACCEPTED_LENGTH,
+                    E3bMethod.LIGHTCONE,
+                    E3bMethod.TTS,
+                ),
+                (
+                    E3bMetric.ACCEPTED_LENGTH,
+                    E3bMethod.L0_NAIVE,
+                    E3bMethod.TTS,
+                ),
+                (
+                    E3bMetric.ACCEPTED_LENGTH,
+                    E3bMethod.LIGHTCONE,
+                    E3bMethod.L0_NAIVE,
+                ),
                 (
                     E3bMetric.COMMITTED_TOKEN_GOODPUT,
-                    E3bMethod.L0,
+                    E3bMethod.LIGHTCONE,
                     E3bMethod.STATIC,
                 ),
                 (
                     E3bMetric.COMMITTED_TOKEN_GOODPUT,
-                    E3bMethod.L0,
-                    E3bMethod.TARGET_ONLY,
+                    E3bMethod.LIGHTCONE,
+                    E3bMethod.TTS,
+                ),
+                (
+                    E3bMetric.COMMITTED_TOKEN_GOODPUT,
+                    E3bMethod.L0_NAIVE,
+                    E3bMethod.TTS,
+                ),
+                (
+                    E3bMetric.COMMITTED_TOKEN_GOODPUT,
+                    E3bMethod.LIGHTCONE,
+                    E3bMethod.L0_NAIVE,
                 ),
             ),
             key=lambda value: ":".join(item.value for item in value),
@@ -270,7 +170,7 @@ def _observed_e3b_stage(
     named: list[E3bNamedLongContextReduction] = []
     for index, (metric, candidate, baseline) in enumerate(identities):
         plan = E3bLongContextAnalysisPlan(
-            schema_version=1,
+            schema_version=2,
             protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
             family_sha256=family_sha256,
             metric=metric,
@@ -286,7 +186,7 @@ def _observed_e3b_stage(
                 candidate_method=candidate,
                 baseline_method=baseline,
                 reduction=E3bLongContextReduction(
-                    schema_version=1,
+                    schema_version=2,
                     status=E3bReductionStatus.OBSERVED,
                     reason_code="e3b_reduction_observed",
                     protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
@@ -305,7 +205,7 @@ def _observed_e3b_stage(
             )
         )
     return E3bLongContextStageArtifact(
-        schema_version=1,
+        schema_version=2,
         status="UNRESOLVED",
         evidence_level="RAW_DIAGNOSTIC_OBSERVED_UNATTESTED",
         reasons=("gpu_attestation:missing",),
@@ -382,13 +282,13 @@ def _industrial_reduction(
             slo=slo,
             aggregate_latency_p99=P99ClaimGuard(
                 anchor_id=f"anchor-{method}",
-                completed_requests=10_000 if method == "l0" else 9_999,
-                observed_p99_ms=87.0 if method == "l0" else None,
+                completed_requests=10_000 if method == "lightcone" else 9_999,
+                observed_p99_ms=87.0 if method == "lightcone" else None,
                 minimum_completions=10_000,
-                status="CLAIMABLE" if method == "l0" else "UNRESOLVED",
+                status=("CLAIMABLE" if method == "lightcone" else "UNRESOLVED"),
             ),
         )
-        for method in CORE_METHODS
+        for method in CONFIRMATION_METHOD_ROLES
     )
     contrasts = tuple(
         PairedBcaContrast(
@@ -402,6 +302,19 @@ def _industrial_reduction(
             confidence=0.95,
         )
         for name in PRIMARY_CONTRASTS
+    )
+    secondary = tuple(
+        PairedBcaContrast(
+            name=name,
+            block_ids=("final-1", "final-2"),
+            mean_log_ratio=0.05,
+            mean_relative_gain=0.051,
+            ci_lower_relative_gain=-0.01,
+            ci_upper_relative_gain=0.12,
+            raw_p_value=0.20,
+            confidence=0.95,
+        )
+        for name in SECONDARY_CONTRASTS
     )
     holm = tuple(
         MultiplicityDecision(
@@ -448,8 +361,65 @@ def _industrial_reduction(
         hardware_validity=(),
         methods=methods,
         primary_contrasts=contrasts,
+        secondary_contrasts=secondary,
         holm_family=holm,
         bootstrap_hooks=(("hierarchical_block_request", ("block", "request")),),
+    )
+
+
+def _interaction_reduction(
+    family: ConfirmationFamilyIdentity,
+) -> CrossFamilyInteractionReducerArtifact:
+    bindings: list[CrossFamilyInteractionBinding] = []
+    index = 0
+    for model in ("Qwen/Qwen3-4B", "Gemma4-12B"):
+        for context in (4096, 16384):
+            for load in ("concurrency_one", "common_slo_load"):
+                block = 4 + index
+                paired_block = _sha(f"interaction-pair-{index}")
+                for role in CONFIRMATION_METHOD_ROLES:
+                    bindings.append(
+                        CrossFamilyInteractionBinding(
+                            schema_version=1,
+                            cell_id=_sha(f"interaction-cell-{index}-{role}"),
+                            scientific_role=role,
+                            role_authority_sha256=(
+                                None
+                                if role in {"target_only", "static"}
+                                else _sha(
+                                    f"interaction-authority-{index}-"
+                                    f"{'frozen-tts' if role in {'tts', 'l0_naive'} else role}"
+                                )
+                            ),
+                            sealed_e2_recipe_receipt_sha256=(
+                                _sha(f"interaction-e2-receipt-{index}")
+                                if role == "lightcone"
+                                else None
+                            ),
+                            model=model,
+                            context=context,
+                            load=load,
+                            block=block,
+                            block_phase="final_candidate",
+                            paired_block_sha256=paired_block,
+                            evidence_sha256=_sha(
+                                f"interaction-evidence-{index}-{role}"
+                            ),
+                        )
+                    )
+                index += 1
+    ordered = tuple(sorted(bindings, key=lambda row: row.sha256))
+    return CrossFamilyInteractionReducerArtifact(
+        schema_version=2,
+        protocol_sha256=CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256,
+        status="UNRESOLVED",
+        registry_sha256=family.registry_sha256,
+        e0_repetition_authority_sha256=family.registry_sha256,
+        runtime_sha256=family.runtime_sha256,
+        split_sha256=family.split_sha256,
+        bindings=ordered,
+        input_manifest_sha256=content_sha256(tuple(row.sha256 for row in ordered)),
+        reason_codes=("gpu_attestation_missing",),
     )
 
 
@@ -468,13 +438,84 @@ def test_missing_production_sources_emit_canonical_named_blocks() -> None:
     )
     value = artifact.to_dict()
     assert value["figures"][0]["status"] == "BLOCKED"
-    assert len(value["figures"][0]["panels"]) == 5
+    assert len(value["figures"][0]["panels"]) == 8
     assert value["tables"][0]["scientific_status"] == "MISSING"
     assert value["tables"][0]["rows"] == []
-    assert len(value["tables"][1]["p99_rows"]) == len(CORE_METHODS)
+    assert len(value["tables"][1]["p99_rows"]) == len(CONFIRMATION_METHOD_ROLES)
     assert len(value["tables"][1]["primary_rows"]) == len(PRIMARY_CONTRASTS)
     assert artifact.canonical_json_bytes() == artifact.canonical_json_bytes()
     assert json.loads(artifact.canonical_json_bytes()) == value
+    interaction_rows = value["tables"][1]["interaction_rows"]
+    assert value["tables"][1]["interaction_reducer_status"] == "MISSING"
+    assert {row["reducer_protocol_sha256"] for row in interaction_rows} == {
+        CROSS_FAMILY_INTERACTION_REDUCER_PROTOCOL_SHA256
+    }
+    assert all(
+        row["source_sha256"] is None
+        and row["input_manifest_sha256"] is None
+        and row["independent_unit"] is None
+        for row in interaction_rows
+    )
+
+
+def test_interaction_contract_requires_sealed_lightcone_and_keeps_rows_unresolved() -> (
+    None
+):
+    family = _family()
+    interaction = _interaction_reduction(family)
+    artifact = build_production_output_artifact(
+        e3b_stage=None,
+        industrial_reduction=None,
+        family_power_reduction=None,
+        interaction_reduction=interaction,
+    )
+    claim = artifact.to_dict()["tables"][1]
+    assert claim["interaction_reducer_status"] == "UNRESOLVED"
+    assert all(
+        row["source_sha256"] == interaction.sha256
+        and row["input_manifest_sha256"] == interaction.input_manifest_sha256
+        and row["independent_unit"] == "paired_block"
+        and row["estimate"] is None
+        and row["ci_lower"] is None
+        and row["ci_upper"] is None
+        for row in claim["interaction_rows"]
+    )
+
+    lightcone = next(
+        row for row in interaction.bindings if row.scientific_role == "lightcone"
+    )
+    with pytest.raises(ValueError, match="sealed E2 receipt"):
+        replace(lightcone, sealed_e2_recipe_receipt_sha256=None)
+    with pytest.raises(ValueError, match="formal scientific role"):
+        replace(lightcone, scientific_role="lightcone_template")
+
+    l0_naive = next(
+        row for row in interaction.bindings if row.scientific_role == "l0_naive"
+    )
+    changed = tuple(
+        sorted(
+            (
+                replace(l0_naive, role_authority_sha256=_sha("different-frozen-recipe"))
+                if row is l0_naive
+                else row
+                for row in interaction.bindings
+            ),
+            key=lambda row: row.sha256,
+        )
+    )
+    with pytest.raises(ValueError, match="share one frozen recipe authority"):
+        CrossFamilyInteractionReducerArtifact(
+            schema_version=interaction.schema_version,
+            protocol_sha256=interaction.protocol_sha256,
+            status=interaction.status,
+            registry_sha256=interaction.registry_sha256,
+            e0_repetition_authority_sha256=interaction.e0_repetition_authority_sha256,
+            runtime_sha256=interaction.runtime_sha256,
+            split_sha256=interaction.split_sha256,
+            bindings=changed,
+            input_manifest_sha256=content_sha256(tuple(row.sha256 for row in changed)),
+            reason_codes=interaction.reason_codes,
+        )
 
 
 def test_unattested_typed_reductions_keep_all_publication_measurements_null() -> None:
@@ -511,16 +552,30 @@ def test_unattested_typed_reductions_keep_all_publication_measurements_null() ->
     assert power_table["evidence_role"] == "preregistered_power_planning_only"
     assert power_table["formal_result_eligible"] is False
     assert len(power_table["rows"]) == len(PRIMARY_CONTRASTS) * 9
-    l0_p99 = next(row for row in claim_table["p99_rows"] if row["method"] == "l0")
-    assert l0_p99["request_count_gate_status"] == "CLAIMABLE"
-    assert l0_p99["minimum_completions"] == 10_000
-    assert l0_p99["completed_requests"] is None
-    assert l0_p99["observed_p99_ms"] is None
+    lightcone_p99 = next(
+        row for row in claim_table["p99_rows"] if row["method"] == "lightcone"
+    )
+    assert lightcone_p99["request_count_gate_status"] == "CLAIMABLE"
+    assert lightcone_p99["minimum_completions"] == 10_000
+    assert lightcone_p99["completed_requests"] is None
+    assert lightcone_p99["observed_p99_ms"] is None
     assert all(
         row["mean_relative_gain"] is None
         and row["ci_lower_relative_gain"] is None
         and row["adjusted_p_value"] is None
         for row in claim_table["primary_rows"]
+    )
+    assert tuple(row["contrast"] for row in claim_table["secondary_rows"]) == (
+        SECONDARY_CONTRASTS
+    )
+    assert all(
+        row["mean_relative_gain"] is None and row["raw_p_value"] is None
+        for row in claim_table["secondary_rows"]
+    )
+    assert tuple(row["axis"] for row in claim_table["interaction_rows"]) == (
+        "method_by_model",
+        "method_by_context",
+        "method_by_load",
     )
     assert b"123.456" not in artifact.canonical_json_bytes()
     assert b"12000.0" not in artifact.canonical_json_bytes()
@@ -586,7 +641,7 @@ def test_output_rejects_foreign_or_summary_like_sources() -> None:
                 minimum_completions=1,
             ),
         )
-        if value.method == "l0"
+        if value.method == "lightcone"
         else value
         for value in industrial.methods
     )

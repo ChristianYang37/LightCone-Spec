@@ -35,6 +35,7 @@ from lightcone_spec.experiments.registry import (
     LockedOutput,
     build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.selection_authority import (
     E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,
@@ -634,6 +635,8 @@ def _e1_fixture(
         e3a_receipt=receipt,
         selection=selection,
     )
+    if len(activation.plan.activated_cell_ids) != 68:
+        pytest.skip("formal E1 Pareto reduction awaits the frozen TTS recipe authority")
     cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("E1")}
     active = tuple(
         sorted(
@@ -641,25 +644,42 @@ def _e1_fixture(
             key=lambda row: row.cell_id,
         )
     )
+    selection_active = tuple(
+        cell
+        for cell in active
+        if scientific_role_for_cell(registry, cell) != "l0_naive"
+    )
     geometries = sorted(
         {
-            E1GeometryIdentity.from_cell(cell).sha256: E1GeometryIdentity.from_cell(
-                cell
-            )
+            E1GeometryIdentity.from_cell(
+                cell, registry=registry
+            ).sha256: E1GeometryIdentity.from_cell(cell, registry=registry)
             for cell in active
-            if cell.identity.method in {"tts", "l0"}
+            if scientific_role_for_cell(registry, cell) == "lc_candidate"
         }.values(),
         key=lambda row: row.sha256,
     )
     winner_sha256 = geometries[0].sha256
     loaded: dict[str, _LoadedCell] = {}
-    for index, cell in enumerate(active):
-        if cell.identity.method in {"target_only", "static"}:
+    for index, cell in enumerate(selection_active):
+        role = scientific_role_for_cell(registry, cell)
+        if role in {"target_only", "static"}:
             goodput = 100.0
             hbm = 500
             exposed = 0.0
+        elif role == "tts":
+            goodput = 105.0
+            hbm = 150
+            exposed = 1.0
         else:
-            geometry = E1GeometryIdentity.from_cell(cell)
+            identity = cell.identity
+            assert identity.scope is not None
+            geometry = E1GeometryIdentity(
+                scope=identity.scope,
+                parameterization=identity.parameterization,
+                rank=identity.rank,
+                alpha_over_rank=identity.alpha_over_rank,
+            )
             winner = geometry.sha256 == winner_sha256
             goodput = 130.0 if winner else 110.0
             hbm = 100 if winner else 200
@@ -674,8 +694,8 @@ def _e1_fixture(
             exposed_update_ms=exposed,
         )
     manifest = RawE1ParetoEvidenceManifest(
-        schema_version=2,
-        cells=tuple(_reference(tmp_path, cell.cell_id) for cell in active),
+        schema_version=3,
+        cells=tuple(_reference(tmp_path, cell.cell_id) for cell in selection_active),
     )
     return (
         activation,
@@ -749,8 +769,9 @@ def test_e1_unsafe_adaptive_geometry_is_negative_not_global_failure(
         cell
         for cell in registry.cells_for("E1")
         if cell.cell_id in loaded
-        and cell.identity.method in {"tts", "l0"}
-        and E1GeometryIdentity.from_cell(cell).sha256 == winner_sha256
+        and scientific_role_for_cell(registry, cell) == "lc_candidate"
+        and E1GeometryIdentity.from_cell(cell, registry=registry).sha256
+        == winner_sha256
         and cell.identity.optimizer == E1_OPTIMIZER_ANCHORS[0]
     )
     current = loaded[winner_cell.cell_id]

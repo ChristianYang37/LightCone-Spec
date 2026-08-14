@@ -56,8 +56,10 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     ResourceClaim,
+    ScientificMethodRole,
     WorkloadClass,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
@@ -2151,10 +2153,6 @@ def registry_pool_work_item(
     )
 
 
-def _adaptive_pair_key(cell: ExperimentCell) -> str:
-    return content_sha256(_identity_without_method_or_gpu(cell))
-
-
 def _dispatch_order_key(
     item: PoolWorkItem, *, registry_seed: int
 ) -> tuple[int, int, str, str, str]:
@@ -2794,13 +2792,35 @@ class GpuPoolScheduler:
             concurrencies = {cell.identity.concurrency for cell in activated}
             if len(widths) != 1 or len(concurrencies) != 1:
                 raise ValueError("E1 activation must select one width/load slice")
-            if {cell.identity.method for cell in activated} != {
-                "target_only",
-                "static",
-                "tts",
-                "l0",
-            }:
-                raise ValueError("E1 activation must retain the four core methods")
+            role_counts = {
+                role: sum(
+                    scientific_role_for_cell(self.registry, cell) == role
+                    for cell in activated
+                )
+                for role in (
+                    ScientificMethodRole.TARGET_ONLY.value,
+                    ScientificMethodRole.STATIC.value,
+                    ScientificMethodRole.TTS.value,
+                    ScientificMethodRole.L0_NAIVE.value,
+                    ScientificMethodRole.LC_CANDIDATE.value,
+                )
+            }
+            roles = {
+                scientific_role_for_cell(self.registry, cell) for cell in activated
+            }
+            if (
+                roles - set(role_counts)
+                or role_counts[ScientificMethodRole.TARGET_ONLY.value] != 1
+                or role_counts[ScientificMethodRole.STATIC.value] != 1
+                or role_counts[ScientificMethodRole.TTS.value]
+                != role_counts[ScientificMethodRole.L0_NAIVE.value]
+                or role_counts[ScientificMethodRole.TTS.value] > 1
+                or role_counts[ScientificMethodRole.LC_CANDIDATE.value] > 64
+            ):
+                raise ValueError(
+                    "E1 activation must retain the registered references and no "
+                    "more than its 64 LC candidates"
+                )
         else:
             if plan.activation_round not in {
                 "halving_0",
@@ -2815,16 +2835,33 @@ class GpuPoolScheduler:
             activated = [stage_cells[cell_id] for cell_id in plan.activated_cell_ids]
             if any(marker not in cell.identity.variant for cell in activated):
                 raise ValueError("E2 activation mixes successive-halving stages")
-            adaptive: dict[str, set[str]] = {}
-            for cell in activated:
-                if cell.identity.method in {"tts", "l0"}:
-                    adaptive.setdefault(_adaptive_pair_key(cell), set()).add(
-                        cell.identity.method
-                    )
-            if not adaptive or any(
-                methods != {"tts", "l0"} for methods in adaptive.values()
+            roles = tuple(
+                scientific_role_for_cell(self.registry, cell) for cell in activated
+            )
+            allowed_roles = {
+                ScientificMethodRole.TARGET_ONLY.value,
+                ScientificMethodRole.STATIC.value,
+                ScientificMethodRole.TTS.value,
+                ScientificMethodRole.L0_NAIVE.value,
+                ScientificMethodRole.LC_CANDIDATE.value,
+            }
+            if set(roles) - allowed_roles:
+                raise ValueError("E2 activation contains an unregistered role")
+            if (
+                roles.count(ScientificMethodRole.TARGET_ONLY.value) > 1
+                or roles.count(ScientificMethodRole.STATIC.value) > 1
             ):
-                raise ValueError("E2 activation must retain matched TTS/L0 pairs")
+                raise ValueError("E2 activation repeats a fixed reference")
+            if (
+                roles.count(ScientificMethodRole.TTS.value)
+                != roles.count(ScientificMethodRole.L0_NAIVE.value)
+                or roles.count(ScientificMethodRole.TTS.value) > 1
+            ):
+                raise ValueError(
+                    "E2 activation must retain one paired frozen anchor set"
+                )
+            if roles.count(ScientificMethodRole.LC_CANDIDATE.value) < 1:
+                raise ValueError("E2 activation requires at least one LC candidate")
         if any(
             not self._dispatchable(
                 stage_cells[cell_id],
@@ -2864,6 +2901,9 @@ class GpuPoolScheduler:
             for row in power_rows
         ):
             raise TypeError("family power reductions must be raw reducer artifacts")
+        stage_cells = {
+            cell.cell_id: cell for cell in self.registry.cells_for(experiment)
+        }
 
         by_round: dict[tuple[str, str], FamilyActivationArtifact] = {}
         for artifact in artifact_rows:
@@ -2910,6 +2950,14 @@ class GpuPoolScheduler:
                 family=pilot.family,
                 artifact=pilot,
             )
+            if any(
+                scientific_role_for_cell(self.registry, stage_cells[cell_id])
+                == ScientificMethodRole.LIGHTCONE_TEMPLATE.value
+                for cell_id in pilot.activated_cell_ids
+            ):
+                raise ValueError(
+                    "unmaterialized LightCone templates cannot be scheduled"
+                )
         missing_pilots = set(finals) - pilots.keys()
         if missing_pilots:
             raise ValueError(
@@ -2950,6 +2998,14 @@ class GpuPoolScheduler:
                 raise ValueError(
                     "family final activation is not reducer-generated from its "
                     "power reduction"
+                )
+            if any(
+                scientific_role_for_cell(self.registry, stage_cells[cell_id])
+                == ScientificMethodRole.LIGHTCONE_TEMPLATE.value
+                for cell_id in final.activated_cell_ids
+            ):
+                raise ValueError(
+                    "unmaterialized LightCone templates cannot be scheduled"
                 )
             activated.update(final.activated_cell_ids)
         return activated

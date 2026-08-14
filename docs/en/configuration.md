@@ -5,8 +5,11 @@
 ## Schema identity
 
 Run configurations use schema version 3, are immutable after validation, and
-reject unknown fields. Core methods are `target_only`, `static`, `tts`, and
-`l0`. The isolated OnlineSPEC comparison adds
+reject unknown fields. Runtime methods are `target_only`, `static`, `tts`, and
+`l0`. Recipe authority derives five scientific roles: Target-only, Static,
+TTS (`tts` plus the frozen TTS authority), L0-naive (`l0` plus that authority),
+and LightCone (`l0` plus an exact sealed E2 recipe receipt). An `l0` E1/E2
+search declaration is an LC-candidate. The isolated OnlineSPEC comparison adds
 `onlinespec_ogd`, `onlinespec_opt`, and `onlinespec_ens`; it has separate
 selection and evidence identities and cannot replace a core method.
 
@@ -18,10 +21,10 @@ one. Unknown schemas and retired adaptation fields fail before model loading.
 
 These names include target protocol vocabulary, not a promise that every valid
 scientific declaration is executable. The current end-to-end industrial
-executor accepts only TP1/DP1 Target-only. Static/TTS/L0 are blocked before
+executor accepts only TP1/DP1 Target-only. Static/TTS/L0-naive/LightCone are blocked before
 mutation because the pinned native begin/reset/finalize hook has no configured
 trusted hardware signer. The lower-level adaptive patch path and terminal
-schema are limited to TP1/DP1 DFlash. TTS/L0 execute the registered constant,
+schema are limited to TP1/DP1 DFlash. The adaptive runtime can execute registered constant,
 inverse-square-root-by-published-update, and finite-horizon cosine schedules,
 plus non-negative logical publication delay. `quota_shadow` is declaration-
 valid, but a real row need fails closed because DFlash currently exposes only
@@ -47,9 +50,14 @@ performance, and aggregate speculative safety evidence, while preserving zero
 round/update detailed-trace allocation; it therefore fails the trusted-signer
 release preflight.
 
-TTS and L0 require byte-equivalent model, runtime, adaptation, sampling, and
-load identities after removing the method field. They use one candidate
-implementation and may differ only in publication timing. Exact
+Recipe and publication identities are orthogonal. TTS uses the frozen,
+primary-source-bound recipe with the fixed barrier. L0-naive uses the same
+frozen recipe authority with first-ready safe-boundary publication. LC-candidates
+and LightCone use the L0 policy but, respectively, a registered E1/E2 search
+recipe or the exact sealed E2 winner. Shared reconstruction, candidate
+lifecycle, or evidence code does not imply identical live configs, candidates,
+optimizer states, or rows. Candidate bytes are compared only in a controlled
+replay whose source-state and proposal-evidence digests are identical. Exact
 full-vocabulary rejection sampling is mandatory; absence of the registered
 kernel is an error, never a silent greedy fallback.
 
@@ -110,9 +118,17 @@ scopes and three hybrid scopes, each crossed with Full plus seven LoRA ranks.
 
 ## Optimizer contract
 
-The target TTS/L0 optimizer registry contains `adam`, `adamw`, `sgdm`, `nag`,
-`muon`, and `lion`. They make a functional parameter/state proposal and mutate
-active state only on commit. Plain `sgd` is reserved for OnlineSPEC.
+The E1/E2 **LC-candidate** optimizer registry contains `adam`, `adamw`, `sgdm`,
+`nag`, `muon`, and `lion`. They make a functional parameter/state proposal and
+mutate active state only on commit. TTS does not search this registry: its
+paper-bound authority specifies Adam and one step, while its numeric learning
+rate/schedule, betas, epsilon, optimizer-state reset, weight decay/clip,
+position weights, proximal coefficient, loss normalization/precision/
+temperature, exact trainable-parameter manifest, stride-selection rule, and
+official implementation commit remain unresolved. Consequently
+`TTS-paper-reconstruction` and L0-naive remain `BLOCKED`; neither may inherit a
+schema default, historical AdamW recipe, or E1/E2 selection. Plain `sgd` is
+reserved for OnlineSPEC.
 
 | Optimizer | Required identity | Resident moment rule |
 |---|---|---|

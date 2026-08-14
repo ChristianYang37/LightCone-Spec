@@ -16,7 +16,7 @@ TP1/DP1 Target-only. The pinned patch now implements the exact
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
 begin/reset/finalize hook, and the host validates its content rather than
 trusting provider attributes. The release contains no allowlisted, out-of-band
-hardware signer, however, so Static/TTS/L0 still fail closed before mutation.
+hardware signer, however, so Static/TTS/L0-naive/LightCone still fail closed before mutation.
 Empirical Stage B is also `BLOCKED` until immutable model/data/trace inputs,
 provider access, registered hardware and interference evidence, and the trusted
 signer are available. Historical v2 evidence is usable for regression and
@@ -30,9 +30,12 @@ path, but release preflight blocks it pending trusted terminal attestation.
 Neither method's schema contract imports adaptation state or allocates
 optimizer, gradient, candidate, or adaptation trace storage.
 
-The target TTS/L0 contract shares one candidate lifecycle; the lower-level
-pinned patch and native terminal lifecycle implement this only for TP1/DP1
-DFlash. That is still not release-executable without the trusted signer:
+TTS, L0-naive, and LC-candidates reuse one bounded candidate-lifecycle
+implementation; the lower-level pinned patch and native terminal lifecycle
+implement this only for TP1/DP1 DFlash. Recipe authority and publication policy
+remain orthogonal, and shared machinery never merges live candidates,
+optimizer state, configs, or evidence. The path is still not release-executable
+without the trusted signer:
 
 1. Verification emits one `ProposalEvidence` envelope for the exact proposal
    that was sampled.
@@ -48,8 +51,8 @@ DFlash. That is still not release-executable without the trusted signer:
    read only after a nonblocking ready-event query, outside measured update
    timing. Ready-event identity and reserved scratch bytes are part of the
    candidate.
-5. TTS waits for its next fixed update boundary. L0 publishes at the first legal
-   graph boundary after the same candidate becomes ready.
+5. TTS waits for its fixed update barrier. L0-naive, LC-candidates, and
+   LightCone publish at the first legal safe graph boundary after readiness.
 6. Commit copies a complete candidate into fixed-address inference storage
    exactly once. Stale, duplicate, cancelled, generation-mismatched,
    non-finite, or conflicting candidates are discarded with a terminal reason.
@@ -57,6 +60,9 @@ DFlash. That is still not release-executable without the trusted signer:
 Candidate creation, commit, discard, cancellation, reset, and disable each have
 one terminal transition. Only one candidate may be in flight per cohort, so
 side-stream work and scratch memory remain bounded.
+Candidate equality is checked only by controlled replay with identical
+source-state and proposal-evidence digests. Live TTS and L0-naive histories may
+diverge after different publication decisions.
 
 ## Common backend evidence and reconstruction
 
@@ -163,7 +169,7 @@ bindings, while each `HostExecutionBinding` assigns port, cache, evidence, and
 contention namespaces that are collision-free within that host; literal values
 may repeat on different hosts. The remote execution binding then fixes the
 host-local materialization manifest. Independent cells are balanced over
-eligible hosts, paired TTS/L0 work and a complete confirmation block remain on
+eligible hosts, matched-geometry baseline anchors and a complete confirmation block remain on
 one host/GPU, and heterogeneous hardware envelopes are never pooled into one
 statistical family.
 
@@ -234,7 +240,7 @@ drop are counted.
 The native terminal lifecycle binds capability, begin, reset, and finalize
 receipts to one process/session/run/nonce/plan/rank identity and exact ordered
 token IDs. Static retains zero round/update detailed-trace allocation and emits
-only the required aggregate speculative safety/accounting. TTS/L0 additionally
+only the required aggregate speculative safety/accounting. Adaptive scientific roles additionally
 bind request, round, update, KV-version, publication, performance, and safety
 rows. The release verifier still blocks all three methods before mutation when
 the signer is unavailable.
@@ -297,9 +303,13 @@ FINISH hash chain before and after each runner; partial sibling failures retain
 successful raw terminal authorities, and an unfinished intent blocks rather
 than inventing retry cost.
 
-Reducer-owned activation artifacts materialize the one 130-cell E1 slice and
-each E2 successive-halving round, with an immutable disposition for every
-nonactivated template. Confirmation planning is family-local: exactly four
+Reducer-owned activation artifacts materialize the one 68-cell E1 slice from
+1,428 templates. Each slice has two fixed references, 64 L0-policy
+LC-candidates over 32 geometries, and one stage-level frozen anchor each for
+TTS and L0-naive. E2 has 11,920 templates over four successive-halving rounds,
+tunes only LC-candidates, and carries each frozen baseline once per stage. An
+exact sealed E2 final-recipe receipt is the only path to the
+LightCone role. Confirmation planning is family-local: exactly four
 excluded pilots select `POWERED` with a 12--20-block final prefix or
 `UNDERPOWERED` before confirmation is visible. Legal Target-only reuse requires
 a byte-equivalent, content-bound evidence alias, and analysis carries its
@@ -317,7 +327,7 @@ client reuses one caller-owned HTTP pool, and evidence writes batch durable WAL
 row groups without weakening terminal fsync and coverage checks.
 
 Registry and pool planning make no device-state or empirical claim. Their
-target declarations do not override release preflight: Static/TTS/L0 remain
+target declarations do not override release preflight: Static/TTS/L0-naive/LightCone remain
 `BLOCKED` on the trusted signer; all TP2/DP2 and unsupported adaptive backends
 remain `BLOCKED` on their separate implementation gates.
 

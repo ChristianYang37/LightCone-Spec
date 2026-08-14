@@ -4,7 +4,7 @@
 
 ## 状态与边界
 
-OnlineSPEC 是一个重要的、已注册的对比 baseline，但不属于 Static/TTS/L0 核心假设，
+OnlineSPEC 是一个重要的、已注册的对比 baseline，但不属于 Target-only/Static/TTS/L0-naive/LightCone 核心假设，
 也不进入其正式速度 gate。它拥有独立的 tuning 数据、selection artifact、配对
 confirmation queue、性能表、GPU attestation 与诊断分析。其结果不能选择核心方法，也
 不能改变核心 gate 的 `PASS`、`BLOCKED` 或 `UNMEASURED` 判定。
@@ -171,7 +171,7 @@ drafter 参数的 target entropy，因此二者的 drafter gradient 相同；这
 5. 下一次 proposal 使用已提交 decision；exact target rejection sampling 继续使用原先
    记录的 proposal distribution。
 
-这一边界刻意不同于 TTS 和 L0 的发布时间。OnlineSPEC 不会被静默映射到 TTS stride
+这一边界刻意不同于 fixed-barrier TTS 与 first-ready L0-policy publication。OnlineSPEC 不会被静默映射到 TTS stride
 barrier，也不能在产生监督的 proposal 尚未结束时发布。
 
 历史 drafter KV 与核心运行时相同，保持 frozen 且带版本。历史是 detach 的状态输入，
@@ -227,8 +227,8 @@ Stochastic exactness 单独验证。协议仍保持独立证据身份：
    16K headline 边界开始，避免短上下文性能提前淘汰需要更长在线轨迹才产生收益的
    learner。完整阶段表属于 manifest identity。OGD、optimistic OGD 与 Hedge 各自
    独立减半，避免一个 learner 淘汰另一个 learner。
-2. 为每个 learner 选择一个安全 candidate。CLI 强制接收核心 Static/TTS/L0
-   selection，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning
+2. 为每个 learner 选择一个安全 candidate。CLI 强制接收核心 frozen baseline 与
+   sealed-LightCone selection authority，继承其已选择并发量，并递归绑定其 SHA-256；同时绑定完整 terminal tuning
    artifact、model lock、sampling profile、manifest 与 patched SGLang tree。手工指定或
    不匹配的负载会被拒绝。
    范围较窄的复现也可以通过 `select-onlinespec-anchor-config` 为每个 learner 锁定恰好

@@ -5,21 +5,26 @@
 ## Question and current status
 
 The industrial study asks where online drafter adaptation helps, why it helps,
-and when its cost or operational risk outweighs saved target work. Target-only,
-Static, TTS, and L0 are kept distinct. TTS and L0 use the same candidates and
-differ only in publication time.
+and when its cost or operational risk outweighs saved target work. The formal
+roles are Target-only, Static, TTS, L0-naive, and LightCone. Recipe authority
+and publication policy are orthogonal: TTS uses a frozen primary-source recipe
+with a fixed barrier; L0-naive uses that authority with first-ready publication;
+LC-candidates and the E2-sealed LightCone winner use the L0 policy with search
+and sealed recipes, respectively.
 
 All formal industrial GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
 establish target protocol and coordinator contracts, not a fully runnable
 speculative surface or a benchmark result. The industrial executor currently
-runs only TP1/DP1 Target-only. Static/TTS/L0 are `BLOCKED` before mutation
+runs only TP1/DP1 Target-only. Static/TTS/L0-naive/LightCone are `BLOCKED` before mutation
 because the pinned native
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
 begin/reset/finalize hook has no configured trusted hardware signer. Stage B is
 also blocked on immutable model/data/trace locks, provider credentials,
 registered hardware, GPU smoke, and the exact interference envelope.
-Historical v2 evidence is regression/debugging material only and is excluded
-from schema-v3 selection, power sizing, confirmation, and claims.
+Historical shared-tuned-AdamW rows are matched-recipe publication-policy
+diagnostics, not TTS-paper reproduction. They are regression/debugging material
+only and are excluded from schema-v3 selection, power sizing, confirmation,
+and claims.
 
 ## Immutable dependency DAG
 
@@ -60,22 +65,38 @@ serial and formal measurements remain blocked.
 |---|---|---|
 | Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, inventory/topology, audit-only session-reset schema, cache/HTTP/writer, and interference calibration | runtime envelope |
 | E3a | Target-only/Static context, regime, concurrency, and draft-width capacity | reference load, matched width, crossover and drift witness |
-| E1 | DFlash layer scope and Full/LoRA geometry at AdamW/SGDm anchors | safe Pareto set and common load |
-| E2 | optimizer, log learning-rate grid, schedule, and successive halving | one DFlash recipe |
+| E1 | 1,428 templates; LC-candidate geometry plus stage-level frozen TTS/L0-naive anchors | safe LC Pareto set and common load |
+| E2 | 11,920 templates; LC-candidate optimizer/schedule successive halving only | one sealed LightCone recipe |
 | E4 | cumulative systems mechanisms and isolated profiling | mechanism gate |
-| E3b | paired long-context Target-only/Static/TTS/L0 confirmation | long-context confirmation |
+| E3b | 11,520 long-context cells over the five formal roles | long-context confirmation |
 | E1a | native DSpark transfer and retuning | one DSpark recipe |
-| E5 | production arrivals, cohorts, topologies, SLOs, and failures | production and topology surfaces |
-| E6 | native NEXTN interface and two-rank fit, then transfer | native MTP transfer surface |
-| E0 | model/backend/task breadth including isolated OnlineSPEC | breadth surface |
+| E5 | 11,064 production/failure cells over the five formal roles | production and topology surfaces |
+| E6 | 3,747 NEXTN transfer cells with frozen TTS and sealed LightCone recipes | native MTP transfer surface |
+| E0 | 2,144 structural cells: 864 compatibility templates plus 1,280 selected-core anchors | blocked, non-formal breadth surface |
 
-E1 crosses four native layer scopes with Full plus seven LoRA ranks and two
-optimizer anchors: exactly 64 geometry cells before downstream optimizer
-search. E2 keeps optimizer-specific fields and the schedules `constant`,
+Each activated E1 width/load slice has 68 cells: two fixed references, two
+L0-policy LC-candidate optimizer anchors under each of 32 Full/LoRA geometries,
+and one stage-level frozen anchor each for TTS and L0-naive. The 21 possible
+slices form the 1,428-template envelope. E2 tunes only LC-candidates. In each
+of four rounds it carries 2 fixed references, 32 geometries times 93 search
+recipes, and one stage-level frozen anchor for each baseline, for 2,980 cells
+per round and 11,920 templates total. The E1 selector consumes a 67-cell
+subset and the E2 selector a 2,979-cell subset: Target-only exactness, Static,
+frozen TTS, and LC-candidates. The separately planned L0-naive anchor is reserved
+for mechanism/decomposition evidence and is excluded from candidate safety,
+Pareto, and ranking inputs. E2 keeps optimizer-specific fields and the schedules `constant`,
 inverse-square-root by published update, and cosine-to-zero as separate
 identities. ChronoBelief declarations are explicitly `BLOCKED`: no authoritative
 update equation or source identity is registered, and substituting another
 optimizer is forbidden.
+
+The TTS anchor is `TTS-paper-reconstruction`. Its update-recipe authority fixes
+Adam, one step, latest-round-only supervision, position-weighted distillation
+plus a source-point proximal term, request reset, and strided side-stream
+execution. Orthogonally, TTS publication uses the paper's fixed barrier. Its
+undisclosed numeric optimizer/loss/trainable/stride fields
+keep both frozen TTS and L0-naive anchors `BLOCKED`. They never inherit a search
+candidate, schema default, historical AdamW recipe, or result-derived winner.
 
 E1a has exactly 56 adaptive configurations. Its 32 layer-only cells cross
 `last1/last3/last5/all` with Full plus seven LoRA ranks while freezing DSpark
@@ -86,10 +107,12 @@ control; the transferred candidate must also survive the native scheduler.
 
 These are registered scientific envelopes, not instructions to execute every
 template and not current release support. E1 activation consumes the sealed
-E3a selection and materializes exactly one 130-cell width/load slice; every
+E3a selection and materializes exactly one 68-cell width/load slice; every
 other E1 template receives an immutable disposition. E2 materializes only one
-successive-halving round at a time, preserves matched TTS/L0 pairs and family
-floors, and derives the next round only from the prior sealed survivor receipt.
+successive-halving round at a time, ranks each LC-candidate against fixed Static
+and frozen-TTS references, preserves family floors, and derives the next round
+only from the prior sealed survivor receipt. Only the final tuning-only E2
+receipt can seal the recipe named LightCone.
 Formal E2 reduction requires genuine per-token observation times. The official
 SGLang SSE client may coalesce several token IDs in one chunk, so the adapter
 records those token timestamps as unavailable rather than inventing evenly
@@ -107,6 +130,23 @@ DSpark/EAGLE/EAGLE3/NEXTN adaptation and all multi-rank execution. TP1/DP1
 DFlash implements the registered E2 schedules and logical delays, while a real
 quota-shadow acquisition need remains a named backend-capability block. This
 path cannot produce a claim without the out-of-band trusted signer.
+
+E3b contains 24 blocks by five roles, eight contexts, three regimes, two loads,
+and two width panels (11,520 cells). E5 contains 24 blocks over its registered
+production panels and 264 failure injections (11,064 cells). E6 contains three
+preflights; four headline roles over three models, two tasks, three contexts,
+two loads, and 24 blocks; plus L0-naive mechanism anchors for LiveCodeBench at
+16K/32K and both loads (3,747 cells). E6 already has one TTS role: it always
+uses the frozen external recipe, never an E2-derived recipe. LightCone
+uses the sealed E1/E2 winner without E6 retuning. E0 has 2,144 structural cells:
+864 compatibility templates (`4 models x 3 backends x 9 tasks x 8 roles`) plus
+1,280 preregistered selected-core anchors (`4 models x 1 DFlash backend x 2
+tasks x 2 loads x (4 excluded pilots + 12 final blocks) x 5 formal roles`).
+Both surfaces remain blocked and non-reportable until their exact recipe, load,
+repetition, and evidence authorities are sealed.
+The 24-block axis explicitly separates four excluded pilots from 20 potential
+final paired blocks at each registered load. A family reports only the sealed
+12--20 final prefix, so every reported E6 contrast has a valid 95% interval.
 
 ## Data, contexts, and traces
 
@@ -159,8 +199,8 @@ cache writer, evidence root, and exclusive resources.
 `GpuFleetInventory` composes multiple independently verified hosts above that
 same-host scheduler. It balances independent cells and whole confirmation
 blocks across eligible hosts while preserving host-local inventory,
-interference, port, cache, evidence, and materialization identities. Paired
-TTS/L0 work stays on one host/GPU. A host's concurrent headline work is limited
+interference, port, cache, evidence, and materialization identities. Matched
+baseline anchors and complete confirmation blocks stay on one host/GPU. A host's concurrent headline work is limited
 only by that host's calibrated envelope; heterogeneous hardware envelopes do
 not enter one family. Cross-host gangs are rejected with
 `cross_host_collectives_unvalidated`.
@@ -234,7 +274,7 @@ headline evidence forbidden.
 ## Power and statistical inference
 
 For every exact `ConfirmationFamilyIdentity`, exactly four paired pilot blocks
-estimate the log-effect variance for L0--Static and L0--TTS. The identity binds
+estimate the log-effect variance for LightCone--TTS and LightCone--Static. The identity binds
 experiment/model/backend/task, context/regime/load/arrival, width panel,
 topology, cohort and method family, runtime/split/trace/sampling, and hardware
 envelope. One family's pilots cannot power another. Pilot IDs are permanently
@@ -246,9 +286,18 @@ count qualifies, status is `UNDERPOWERED` and confirmation cannot start.
 
 Final goodput effects are paired log ratios with 95% BCa intervals over
 independent repetition blocks. The primary family contains exactly
-L0--Static and L0--TTS and uses Holm family-wise adjustment. Secondary breadth
-hypotheses are grouped explicitly and use Benjamini--Hochberg FDR; they cannot
-be promoted into the primary family after results are known.
+LightCone--TTS and LightCone--Static and uses Holm family-wise adjustment. The
+preregistered secondary decomposition is L0-naive--TTS and
+LightCone--L0-naive. Other secondary breadth hypotheses are grouped explicitly
+and use Benjamini--Hochberg FDR; they cannot be promoted into the primary family
+after results are known. The registered reporting target includes
+method-by-model, method-by-context, and method-by-load interactions, without
+assuming that any interaction or large-model effect is positive or choosing a
+model from observed LightCone gain.
+`CrossFamilyInteractionReducerArtifact` currently records only a content-bound,
+structural, non-formal `UNRESOLVED` contract. It does not prove completed GPU
+coverage, interval validity, or a formal interaction effect; those require the
+registered statistical reducer to consume complete attested final evidence.
 
 Long-context request-level summaries use hierarchical bootstrap: resample
 independent blocks, then requests inside the sampled blocks. Production
@@ -261,7 +310,7 @@ A legal evidence alias shares one byte-equivalent Target-only observation; it
 does not copy rows. The alias validates model/runtime/tree, sampling/seed,
 corpus/trace, limits, hardware/topology/ranks, method/server configuration,
 schema, output-token trajectory, and timing contract. Static is not
-automatically aliasable and TTS/L0 are never aliases. The dependence map makes
+automatically aliasable and adaptive scientific roles are never aliases. The dependence map makes
 all aliased consumers one resampling/covariance unit. The current formal
 reducer fails closed on a non-singleton unit unless execution plans and terminal
 evidence recompute the equivalence; a structurally valid self-described alias
@@ -308,7 +357,7 @@ process gets a private writable overlay, and CUDA Graphs never cross a process
 or GPU. Fault-injection cells always use a fresh process in this release.
 
 The native hook now binds capability, begin, reset, finalize, exact terminal
-request coverage and ordered token IDs, plus Static aggregate safety or TTS/L0
+request coverage and ordered token IDs, plus Static aggregate safety or adaptive-role
 request/round/update/KV/performance evidence. Provider object attributes are not
 trust evidence. Every successful serving run must additionally publish a
 terminal-bound `BudgetObservationReceipt` covering all registered phases,
@@ -325,7 +374,7 @@ protocol code, not performance claims or result artifacts, and this release
 contains no GPU results.
 No trusted hardware-attester identity is configured in this release. Therefore
 content-consistent caller-authored attestation files cannot promote either the
-industrial or legacy analyzers to `MEASURED`, and Static/TTS/L0 stay blocked
+industrial or legacy analyzers to `MEASURED`, and Static/TTS/L0-naive/LightCone stay blocked
 before mutation despite the implemented hook.
 
 The external `TrustedAttesterPolicyBundle` format binds public verification

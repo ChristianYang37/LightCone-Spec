@@ -66,6 +66,7 @@ from lightcone_spec.experiments.registry import (
     WorkloadClass,
     build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.statistics import (
     HardwareEnvelope,
@@ -564,7 +565,7 @@ def test_registry_uses_logical_slots_and_rejects_physical_uuid_flag(
         == 0
     )
     value = json.loads(output.read_text(encoding="utf-8"))
-    assert value["schema_version"] == 2
+    assert value["schema_version"] == 3
     assert value["parameters"]["logical_gpu_slots"] == [
         "logical-rank-slot-0",
         "logical-rank-slot-1",
@@ -658,10 +659,11 @@ def _family_power_reduction(registry, family, pilot, power):
 
     bindings = tuple(
         RawEvidenceRunBinding(
-            schema_version=1,
+            schema_version=3,
             cell_id=cell_id,
             experiment=family.experiment,
             method=cells[cell_id].identity.method,
+            scientific_role=scientific_role_for_cell(registry, cells[cell_id]),
             scientific_unit=f"excluded_pilot_{cells[cell_id].identity.block}",
             config_sha256=digest("config", cell_id),
             rank_config_sha256s=(digest("rank-config", cell_id),),
@@ -683,6 +685,8 @@ def _family_power_reduction(registry, family, pilot, power):
             terminal_receipt_sha256s=(digest("terminal", cell_id),),
             hardware_receipt_sha256=digest("hardware", cell_id),
             budget_observation_sha256=digest("observation", cell_id),
+            execution_plan_sha256=digest("execution-plan", cell_id),
+            execution_split_sha256=digest("execution-split", cell_id),
         )
         for cell_id in sorted(pilot.activated_cell_ids)
     )
@@ -837,7 +841,17 @@ def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(
         json.loads(pilot_path.read_text(encoding="utf-8"))
     )
     assert pilot.activation_round == "excluded_pilots"
-    assert len(pilot.activated_cell_ids) == 16
+    if not pilot.activated_cell_ids:
+        assert {
+            row.reason_code
+            for row in pilot.dispositions
+            if row.status is DispositionStatus.BLOCKED
+        } >= {
+            "tts_official_recipe_unavailable",
+            "sealed_e2_recipe_receipt_required",
+        }
+        return
+    assert len(pilot.activated_cell_ids) == 20
 
     multipliers = (0.99, 1.01, 1.00, 1.02)
     power = preregister_power_sizing(
@@ -879,7 +893,7 @@ def test_confirmation_family_reducers_emit_exact_pilots_and_final_prefix(
         json.loads(final_path.read_text(encoding="utf-8"))
     )
     assert final.activation_round == "final_prefix"
-    assert len(final.activated_cell_ids) == 4 * plan.selected_final_blocks
+    assert len(final.activated_cell_ids) == 5 * plan.selected_final_blocks
 
     inventory_path, envelope_path, _ = _pool_inputs(
         tmp_path,

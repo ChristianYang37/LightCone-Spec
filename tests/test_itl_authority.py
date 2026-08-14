@@ -31,7 +31,10 @@ from lightcone_spec.experiments.itl_authority import (
     require_e2_itl_timestamp_prelaunch,
 )
 from lightcone_spec.experiments.load import TokenChunkTiming
-from lightcone_spec.experiments.registry import build_industrial_registry
+from lightcone_spec.experiments.registry import (
+    build_industrial_registry,
+    scientific_role_for_cell,
+)
 
 
 def _registry_and_cell():
@@ -39,7 +42,8 @@ def _registry_and_cell():
     cell = next(
         row
         for row in registry.cells_for("E2")
-        if row.identity.method == "tts" and row.identity.optimizer == "adamw"
+        if scientific_role_for_cell(registry, row) == "lc_candidate"
+        and row.identity.optimizer == "adamw"
     )
     return registry, cell
 

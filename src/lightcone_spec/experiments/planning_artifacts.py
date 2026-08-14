@@ -610,8 +610,11 @@ def _validate_loaded_artifact(value: object) -> None:
             for reason in evaluation.safety_reason_codes:
                 _require_single_line_text("E2 safety reason", reason)
     elif isinstance(value, E2FinalRecipeArtifact):
-        if value.candidate.sha256 != value.candidate_id:
-            raise ValueError("E2 final recipe changed its candidate identity")
+        if (
+            value.candidate.sha256 != value.candidate_id
+            or value.recipe.sha256 != value.recipe_sha256
+        ):
+            raise ValueError("E2 final recipe changed candidate or recipe identity")
     elif isinstance(value, E2StageReductionArtifact):
         if (
             value.activation.sha256 != value.stage_evidence.activation_sha256

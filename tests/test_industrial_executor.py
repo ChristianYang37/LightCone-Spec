@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pyarrow.parquet as pq
 import pytest
@@ -30,6 +31,7 @@ import lightcone_spec.telemetry.writer as writer_module
 from lightcone_spec import PINNED_SGLANG_PATCH_COUNT, PINNED_SGLANG_TREE
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
+from lightcone_spec.doctor import _project_runtime_source, _project_tree
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.completion_authority import (
     AssignmentTerminalAuthority,
@@ -134,6 +136,15 @@ from lightcone_spec.runtime.distributed import (
 )
 from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT, RequestRecord
 from lightcone_spec.telemetry.writer import EvidenceWriter, load_completed_evidence
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _clean_project_tree(root: Path) -> dict[str, object]:
+    value = _project_tree(root)
+    if root.resolve() == PROJECT_ROOT:
+        value["dirty"] = False
+    return value
 
 
 class _FakeTraceConfig:
@@ -714,8 +725,10 @@ def _execution_fixture(
         source_receipt_sha256=inventory_receipt_sha256,
     )
     manifest_sha256 = content_sha256({"runtime-manifest": "executor"})
+    project_source_tree = _project_tree(PROJECT_ROOT)
+    project_source_tree["dirty"] = False
     runtime_envelope = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "readiness": {
             "status": "PASS",
@@ -724,10 +737,12 @@ def _execution_fixture(
             "unknown_count": 0,
         },
         "roots": {
-            "project": str(tmp_path.resolve()),
+            "project": str(PROJECT_ROOT),
             "patched_sglang": str(checkout.resolve()),
             "distinct": True,
         },
+        "project_source_tree": project_source_tree,
+        "project_runtime_source": _project_runtime_source(PROJECT_ROOT),
         "runtime_manifest": {
             "valid": True,
             "sha256": manifest_sha256,
@@ -988,27 +1003,86 @@ def _execution_fixture(
         compile_cache_plan_sha256=compile_plan.sha256,
         compile_cache_key_sha256=compile_plan.key.sha256,
     )
-    plan = build_industrial_execution_plan(
-        runtime_plan=runtime,
-        dispatch_plan=dispatch_plan,
-        dispatch_context=dispatch_context,
-        budget_plan=budget_plan,
-        budget=budget,
-        load_plan=load,
-        server_launch=launch,
-        dependency_receipts=(receipt,),
-        dependency_artifacts=tuple(dependencies),
-        split_artifact=split,
-        sampling_artifact=sampling,
-        model_lock_artifact=model_lock,
-        compile_cache_plan=compile_plan,
-        inventory_source_artifact=inventory_source_artifact,
-        runtime_envelope_artifact=runtime_envelope_artifact,
-        startup_timeout_s=1.0,
-        shutdown_timeout_s=1.0,
-        abort_grace_s=1.0,
-    )
+    with patch("lightcone_spec.doctor._project_tree", _clean_project_tree):
+        plan = build_industrial_execution_plan(
+            runtime_plan=runtime,
+            dispatch_plan=dispatch_plan,
+            dispatch_context=dispatch_context,
+            budget_plan=budget_plan,
+            budget=budget,
+            load_plan=load,
+            server_launch=launch,
+            dependency_receipts=(receipt,),
+            dependency_artifacts=tuple(dependencies),
+            split_artifact=split,
+            sampling_artifact=sampling,
+            model_lock_artifact=model_lock,
+            compile_cache_plan=compile_plan,
+            inventory_source_artifact=inventory_source_artifact,
+            runtime_envelope_artifact=runtime_envelope_artifact,
+            startup_timeout_s=1.0,
+            shutdown_timeout_s=1.0,
+            abort_grace_s=1.0,
+        )
     return _Fixture(plan=plan, dependency_artifacts=tuple(dependencies))
+
+
+def test_runtime_envelope_consumer_rejects_tampered_project_source(
+    tmp_path: Path,
+) -> None:
+    project_source_tree = _project_tree(PROJECT_ROOT)
+    project_source_tree["dirty"] = False
+    runtime_source = _project_runtime_source(PROJECT_ROOT)
+    digest = runtime_source["content_sha256"]
+    assert isinstance(digest, str)
+    runtime_source["content_sha256"] = ("0" if digest[0] != "0" else "1") + digest[1:]
+    tampered = _write_artifact(
+        tmp_path,
+        "runtime_envelope",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "status": "PASS",
+                "readiness": {
+                    "status": "PASS",
+                    "pass_count": 1,
+                    "fail_count": 0,
+                    "unknown_count": 0,
+                },
+                "checks": {"fixture_authority": {"status": "PASS"}},
+                "runtime_manifest": {
+                    "valid": True,
+                    "sha256": "a" * 64,
+                    "sidecar_sha256": "a" * 64,
+                },
+                "roots": {
+                    "project": str(PROJECT_ROOT),
+                    "patched_sglang": "/runtime/sglang",
+                    "distinct": True,
+                },
+                "project_source_tree": project_source_tree,
+                "project_runtime_source": runtime_source,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode(),
+    )
+    with (
+        patch("lightcone_spec.doctor._project_tree", _clean_project_tree),
+        pytest.raises(
+            ValueError,
+            match="executing LightCone source identity",
+        ),
+    ):
+        executor_module._validate_runtime_envelope_artifact(
+            tampered,
+            inventory=object(),  # type: ignore[arg-type]
+            checkout=Path("/runtime/sglang"),
+            compile_plan=object(),  # type: ignore[arg-type]
+            config=object(),  # type: ignore[arg-type]
+            inventory_driver="fixture-driver",
+            assigned_gpu_uuid="GPU-fixture",
+        )
 
 
 def _replace_compile_plan_argv(

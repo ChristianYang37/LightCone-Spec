@@ -161,7 +161,7 @@ from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 from lightcone_spec.telemetry.writer import EvidenceWriterPolicy
 
-_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v2"
+_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v3"
 _SHA256_LENGTH = 64
 _BUNDLE_KIND = "industrial_assignment_execution_bundle"
 _CONTEXT_KIND = "gpu_dispatch_execution_context"
@@ -753,7 +753,7 @@ class DispatchAttemptJournal:
         "execution_bundle_manifest_bound.v2"
     )
     # These limits apply only when a coordinator reopens remote evidence.  They
-    # are deliberately much larger than an industrial 130-cell journal while
+    # are deliberately much larger than an industrial tuning-slice journal while
     # still placing an exact ceiling on directory and file allocations.
     _READ_ONLY_MANIFEST_MAX_BYTES = 64 * 1024
     _READ_ONLY_MAX_EVENT_COUNT = 16_384
@@ -4681,7 +4681,7 @@ def _load_registry(value: object) -> ExperimentRegistry:
             }
         ),
     )
-    if row["schema_version"] != 2 or row["generator"] != _REGISTRY_GENERATOR:
+    if row["schema_version"] != 3 or row["generator"] != _REGISTRY_GENERATOR:
         raise ValueError("industrial registry generator identity mismatch")
     parameters = _strict_object(
         "industrial registry parameters",

@@ -118,8 +118,10 @@ document 或 Git。
 当前实证 Stage B 因 trusted hardware signer、provider credential、immutable model/data/trace
 lock 以及已注册 hardware/interference envelope 均不可用而 `BLOCKED`。固定 integration 已
 实现准确 native begin/reset/finalize hook，但 industrial executor 的 release run 仍只有
-TP1/DP1 Target-only；Static/TTS/L0 会在任何 mutation 前 fail preflight。仅获得硬件或 test
-signer 也不能解除 speculative blocker。DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部
+TP1/DP1 Target-only；Static/TTS/L0-naive/LightCone 会在任何 mutation 前 fail preflight。仅获得硬件或 test
+signer 也不能解除 speculative blocker。Formal TTS/L0-naive 还要求 sealed frozen TTS recipe
+authority，LightCone 要求准确 sealed E2 winner，二者都不能从 default 推断。
+DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部
 TP2/DP2 工作还需要其他实现，保持 blocked。
 
 ## Trusted Attester Bundle

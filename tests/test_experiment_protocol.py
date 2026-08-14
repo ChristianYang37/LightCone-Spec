@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -40,7 +41,7 @@ from lightcone_spec.experiments.evidence import (
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
-    assert_matched_confirmation_configs,
+    assert_historical_matched_recipe_diagnostic_configs,
     confirmation_blocks,
     select_static_load,
     successive_halving,
@@ -148,7 +149,7 @@ def _compile_cache_plan(
 def _passing_compile_doctor() -> dict[str, object]:
     checks = {"runtime": {"status": "PASS"}}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "readiness": {
             "status": "PASS",
@@ -744,6 +745,30 @@ def test_shared_selection_uses_maximin_then_resource_tiebreak(tmp_path) -> None:
     path = tmp_path / "selection.json"
     artifact.write(path)
     assert SelectionArtifact.load(path) == artifact
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 3
+    assert payload["evidence_classification"] == (
+        "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
+    )
+    assert payload["formal_execution_authorized"] is False
+
+    legacy_payload = dict(payload)
+    legacy_payload["schema_version"] = 2
+    legacy_payload.pop("evidence_classification")
+    legacy_payload.pop("formal_execution_authorized")
+    legacy_body = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    legacy_path = tmp_path / "legacy-selection.json"
+    legacy_path.write_text(legacy_body, encoding="utf-8")
+    Path(f"{legacy_path}.sha256").write_text(
+        hashlib.sha256(legacy_body.encode()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    legacy = SelectionArtifact.load(legacy_path)
+    assert legacy.schema_version == 2
+    assert legacy.evidence_classification == payload["evidence_classification"]
+    assert legacy.formal_execution_authorized is False
+    with pytest.raises(ValueError, match="read-only"):
+        legacy.write(tmp_path / "legacy-rewrite.json")
     with pytest.raises(ValueError, match="invalid concurrency"):
         replace(artifact, selected_concurrency=48).validate()
 
@@ -868,7 +893,7 @@ def test_selection_rejects_confirmation_or_unsafe_evidence() -> None:
         )
 
 
-def test_matched_confirmation_configs_bind_selected_candidate() -> None:
+def test_historical_matched_recipe_diagnostic_binds_old_selected_candidate() -> None:
     selected = tuning_candidates()[0]
     static = RunConfig.model_validate(config_value("static"))
     adapted = {}
@@ -890,14 +915,14 @@ def test_matched_confirmation_configs_bind_selected_candidate() -> None:
         )
         adapted[method] = RunConfig.model_validate(value)
     configs = {"static": static, **adapted}
-    assert_matched_confirmation_configs(
+    assert_historical_matched_recipe_diagnostic_configs(
         configs, selected_candidate=selected, selected_concurrency=8
     )
     changed = config_value("l0")
     changed["adaptation"]["stride"] = selected.stride + 1
     configs["l0"] = RunConfig.model_validate(changed)
     with pytest.raises(ValueError):
-        assert_matched_confirmation_configs(
+        assert_historical_matched_recipe_diagnostic_configs(
             configs, selected_candidate=selected, selected_concurrency=8
         )
 
@@ -1258,7 +1283,7 @@ def test_runtime_renderer_produces_three_matched_argv_plans(
     )
     candidate = tuning_candidates()[0]
     selection = SelectionArtifact(
-        schema_version=2,
+        schema_version=3,
         candidate=candidate,
         selected_concurrency=8,
         minimum_goodput_ratio=1.0,

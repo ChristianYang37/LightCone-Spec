@@ -119,8 +119,8 @@ def test_registered_universe_is_exact_and_registry_owned(
     registry: ExperimentRegistry,
     hypotheses: tuple[E0BreadthHypothesis, ...],
 ) -> None:
-    assert len(hypotheses) == 540
-    assert len({hypothesis.hypothesis_id for hypothesis in hypotheses}) == 540
+    assert len(hypotheses) == 756
+    assert len({hypothesis.hypothesis_id for hypothesis in hypotheses}) == 756
     assert tuple(hypothesis.hypothesis_id for hypothesis in hypotheses) == tuple(
         sorted(hypothesis.hypothesis_id for hypothesis in hypotheses)
     )
@@ -138,10 +138,12 @@ def test_registered_universe_is_exact_and_registry_owned(
         for hypothesis in hypotheses
         if hypothesis.family_id == "e0_isolated_onlinespec_breadth"
     )
-    assert len(core) == 216
+    assert len(core) == 432
     assert {hypothesis.contrast for hypothesis in core} == {
-        "l0_vs_static",
-        "l0_vs_tts",
+        "lightcone_vs_tts",
+        "lightcone_vs_static",
+        "l0_naive_vs_tts",
+        "lightcone_vs_l0_naive",
     }
     assert len(online) == 324
     assert {hypothesis.contrast for hypothesis in online} == {
@@ -157,6 +159,12 @@ def test_registered_universe_is_exact_and_registry_owned(
         )
         assert cells[hypothesis.denominator_cell_id].sha256 == (
             hypothesis.denominator_cell_sha256
+        )
+        assert cells[hypothesis.numerator_cell_id].identity.variant.startswith(
+            "compatibility_template:role="
+        )
+        assert cells[hypothesis.denominator_cell_id].identity.variant.startswith(
+            "compatibility_template:role="
         )
 
 
@@ -186,7 +194,7 @@ def test_complete_source_applies_existing_bh_separately_to_fixed_families(
     authority = bind_e0_breadth_fdr_authority(registry, path)
     reduction = reduce_e0_breadth_fdr(registry, authority)
 
-    assert len(authority.p_values) == len(reduction.decisions) == 540
+    assert len(authority.p_values) == len(reduction.decisions) == 756
     assert reduction.primary_family_eligible is False
     assert reduction.formal_execution_authorized is False
     assert reduction.families == (
@@ -199,7 +207,7 @@ def test_complete_source_applies_existing_bh_separately_to_fixed_families(
     }
     raw_by_id = {value.hypothesis_id: value for value in authority.p_values}
     for family_id, expected_size in (
-        ("e0_core_breadth", 216),
+        ("e0_core_breadth", 432),
         ("e0_isolated_onlinespec_breadth", 324),
     ):
         family = tuple(

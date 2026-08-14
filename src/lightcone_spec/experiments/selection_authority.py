@@ -40,6 +40,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
 from lightcone_spec.orchestration.native_terminal import (
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
 
 _SHA256_LENGTH = 64
 _NORMAL_95_LOWER_Z = 1.959963984540054
-_E1_ACTIVATED_CELL_COUNT = 130
+_E1_ACTIVATED_CELL_COUNT = 68
 E3A_SELECTION_POLICY_UNREGISTERED_REASON = "e3a_selection_policy_unregistered"
 E3A_LOCKED_OUTPUT_REDUCTION_UNREGISTERED_REASON = (
     "e3a_locked_output_typed_reduction_unregistered"
@@ -631,9 +632,11 @@ def _load_exact_cells(
 ) -> dict[str, _LoadedCell]:
     if type(manifest) is not expected_manifest_type:
         raise TypeError(f"{experiment} reduction requires its exact raw manifest")
-    if manifest.schema_version != 2:
+    expected_schema = 2 if experiment == "E3a" else 3
+    if manifest.schema_version != expected_schema:
         raise ValueError(
-            f"{experiment} formal reduction requires raw evidence schema 2"
+            f"{experiment} formal reduction requires raw evidence schema "
+            f"{expected_schema}"
         )
     references = tuple(manifest.cells)
     reference_ids = tuple(reference.cell_id for reference in references)
@@ -854,6 +857,7 @@ def _published_update_summary(cell: _LoadedCell) -> tuple[int, int]:
 
 
 def _raw_run_bindings(
+    registry: ExperimentRegistry,
     loaded: Mapping[str, _LoadedCell],
     *,
     scientific_unit: str,
@@ -864,6 +868,7 @@ def _raw_run_bindings(
     return tuple(
         analysis._loaded_cell_raw_run_binding(
             loaded[cell_id],
+            registry=registry,
             scientific_unit=scientific_unit,
             lineage_runtime_sha256=lineage_runtime_sha256,
             lineage_split_sha256=lineage_split_sha256,
@@ -1007,6 +1012,7 @@ def reduce_e3a_capacity_surface_from_raw(
         raise ValueError("E3a Target-only evidence lacks a Static comparison")
 
     run_bindings = _raw_run_bindings(
+        registry,
         loaded,
         scientific_unit="e3a_capacity",
         lineage_runtime_sha256=runtime_sha256,
@@ -1282,7 +1288,7 @@ def reduce_e1_pareto_from_raw(
     inventory: GpuInventory,
     confirmation_data_visible: bool,
 ) -> E1ParetoArtifact:
-    """Recompute E1's safe four-objective Pareto set from the exact 130 cells.
+    """Recompute E1's safe Pareto set from one exact 68-cell slice.
 
     Formal callers must first replay the path-bound E3a selection and E3a stage
     completion authorities.  ``source_activation_authority_sha256`` binds that
@@ -1324,13 +1330,26 @@ def reduce_e1_pareto_from_raw(
     )
     expected_ids = activation.plan.activated_cell_ids
     if len(expected_ids) != _E1_ACTIVATED_CELL_COUNT:
-        raise ValueError("E1 activation must contain exactly 130 cells")
+        raise ValueError("E1 activation must contain exactly 68 cells")
+    registry_cells = {cell.cell_id: cell for cell in registry.cells_for("E1")}
+    l0_naive_anchor_ids = tuple(
+        cell_id
+        for cell_id in expected_ids
+        if scientific_role_for_cell(registry, registry_cells[cell_id]) == "l0_naive"
+    )
+    if len(l0_naive_anchor_ids) != 1:
+        raise ValueError("E1 activation must contain one L0-naive mechanism anchor")
+    selection_ids = tuple(
+        cell_id for cell_id in expected_ids if cell_id not in l0_naive_anchor_ids
+    )
+    if len(selection_ids) != 67:
+        raise ValueError("E1 selection evidence must contain exactly 67 cells")
     loaded = _load_exact_cells(
         registry=registry,
         manifest=manifest,
         expected_manifest_type=analysis.RawE1ParetoEvidenceManifest,
         experiment="E1",
-        expected_cell_ids=expected_ids,
+        expected_cell_ids=selection_ids,
         hardware_envelope=hardware_envelope,
         inventory=inventory,
         runtime_sha256=runtime_sha256,
@@ -1360,20 +1379,21 @@ def reduce_e1_pareto_from_raw(
     if not widths_valid or concurrencies != {e3a_selection.concurrency}:
         raise ValueError("E1 raw evidence differs from the E3a width/load lock")
 
-    by_method: dict[str, list[_LoadedCell]] = defaultdict(list)
+    by_role: dict[str, list[_LoadedCell]] = defaultdict(list)
     metrics: dict[str, tuple[_RequestMetric, ...]] = {}
     tokens: dict[str, dict[str, tuple[int, ...]]] = {}
     for cell_id in sorted(loaded):
         row = loaded[cell_id]
         metrics[cell_id] = _metrics(row, require_complete=False)
         tokens[cell_id] = _tokens(row)
-        by_method[row.cell.identity.method].append(row)
-    if len(by_method["target_only"]) != 1 or len(by_method["static"]) != 1:
-        raise ValueError("E1 requires one Target-only and one Static reference")
-    if set(by_method) != {"target_only", "static", "tts", "l0"}:
-        raise ValueError("E1 evidence has an unsupported method")
-    target = by_method["target_only"][0]
-    static = by_method["static"][0]
+        by_role[scientific_role_for_cell(registry, row.cell)].append(row)
+    if any(len(by_role[role]) != 1 for role in ("target_only", "static", "tts")):
+        raise ValueError("E1 requires one fixed reference for each registered role")
+    expected_roles = {"target_only", "static", "tts", "lc_candidate"}
+    if set(by_role) != expected_roles:
+        raise ValueError("E1 evidence has an unsupported scientific method role")
+    target = by_role["target_only"][0]
+    static = by_role["static"][0]
     _require_zero_safety_and_valid_hardware(target)
     _require_zero_safety_and_valid_hardware(static)
     if any(
@@ -1389,49 +1409,52 @@ def reduce_e1_pareto_from_raw(
         raise ValueError("E1 Static differs from Target-only token trajectories")
     static_metrics = metrics[static.cell.cell_id]
 
-    grouped: dict[
-        str, tuple[E1GeometryIdentity, dict[tuple[str, str], _LoadedCell]]
-    ] = {}
-    for method in ("tts", "l0"):
-        for row in by_method[method]:
-            geometry = E1GeometryIdentity.from_cell(row.cell)
-            current = grouped.setdefault(geometry.sha256, (geometry, {}))
-            key = (str(row.cell.identity.optimizer), method)
-            if key in current[1]:
-                raise ValueError("E1 repeats one geometry/optimizer/method cell")
-            current[1][key] = row
-    required_pairs = {
-        (optimizer, method)
-        for optimizer in E1_OPTIMIZER_ANCHORS
-        for method in ("tts", "l0")
-    }
+    references = {"tts": by_role["tts"][0]}
+    grouped: dict[str, tuple[E1GeometryIdentity, dict[str, _LoadedCell]]] = {}
+
+    for row in by_role["lc_candidate"]:
+        geometry = E1GeometryIdentity.from_cell(row.cell, registry=registry)
+        current = grouped.setdefault(geometry.sha256, (geometry, {}))
+        optimizer = str(row.cell.identity.optimizer)
+        if optimizer in current[1]:
+            raise ValueError("E1 repeats one LC geometry/optimizer candidate")
+        current[1][optimizer] = row
+    required_candidates = set(E1_OPTIMIZER_ANCHORS)
     if len(grouped) != 32 or any(
-        set(cells) != required_pairs for _, cells in grouped.values()
+        set(candidates) != required_candidates for _, candidates in grouped.values()
     ):
         raise ValueError(
-            "E1 requires 32 geometries with TTS/L0 at both optimizer anchors"
+            "E1 requires 32 geometries with two LC candidates and one shared "
+            "frozen TTS selection reference"
         )
 
     evaluations: list[_E1GeometryEvaluation] = []
     geometry_dispositions: list[dict[str, object]] = []
     for geometry_sha256 in sorted(grouped):
-        geometry, cells = grouped[geometry_sha256]
+        geometry, candidates = grouped[geometry_sha256]
         confidence: list[float] = []
         hbm: list[int] = []
         p99_itl_us: list[int] = []
         exposed_update_us: list[int] = []
         reasons: set[str] = set()
-        for key in sorted(cells):
-            row = cells[key]
+        tts_metrics = metrics[references["tts"].cell.cell_id]
+        all_rows = (
+            *((f"reference:{role}", row, False) for role, row in references.items()),
+            *(
+                (f"candidate:{optimizer}", row, True)
+                for optimizer, row in candidates.items()
+            ),
+        )
+        for label, row, is_candidate in sorted(all_rows, key=lambda item: item[0]):
             cell_id = row.cell.cell_id
-            label = f"{key[0]}:{key[1]}"
             reasons.update(f"{label}:{reason}" for reason in _safety_reasons(row))
             cell_metrics = metrics[cell_id]
             if any(not metric.completed or metric.error for metric in cell_metrics):
                 reasons.add(f"{label}:incomplete_request")
             if tokens[cell_id] != target_tokens:
                 reasons.add(f"{label}:target_token_mismatch")
-            hbm.append(_peak_hbm(row))
+            if is_candidate:
+                hbm.append(_peak_hbm(row))
             completed_p99 = tuple(
                 metric.within_request_p99_itl_ms
                 for metric in cell_metrics
@@ -1440,18 +1463,29 @@ def reduce_e1_pareto_from_raw(
             if not completed_p99 or any(value is None for value in completed_p99):
                 reasons.add(f"{label}:incomplete_itl_timing")
             else:
-                p99_itl_us.append(
-                    math.ceil(max(float(value) for value in completed_p99) * 1_000.0)
-                )
+                if is_candidate:
+                    p99_itl_us.append(
+                        math.ceil(
+                            max(float(value) for value in completed_p99) * 1_000.0
+                        )
+                    )
             published, exposed = _published_update_summary(row)
             if published < 1:
                 reasons.add(f"{label}:no_published_update")
-            exposed_update_us.append(exposed)
-            if not reasons:
-                confidence.append(
-                    _paired_confidence_lower(cell_metrics, static_metrics)
-                )
-        cell_ids = tuple(sorted(row.cell.cell_id for row in cells.values()))
+            if is_candidate:
+                exposed_update_us.append(exposed)
+                if not reasons:
+                    confidence.extend(
+                        (
+                            _paired_confidence_lower(cell_metrics, static_metrics),
+                            _paired_confidence_lower(cell_metrics, tts_metrics),
+                        )
+                    )
+        cell_ids = tuple(
+            sorted(
+                row.cell.cell_id for row in (*candidates.values(), *references.values())
+            )
+        )
         geometry_dispositions.append(
             {
                 "geometry_sha256": geometry.sha256,
@@ -1477,6 +1511,7 @@ def reduce_e1_pareto_from_raw(
         raise ValueError("E1 has no safe non-dominated geometry")
 
     run_bindings = _raw_run_bindings(
+        registry,
         loaded,
         scientific_unit="e1_geometry_screen",
         lineage_runtime_sha256=runtime_sha256,

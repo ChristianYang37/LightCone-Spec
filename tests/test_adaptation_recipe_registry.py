@@ -9,6 +9,7 @@ from lightcone_spec.experiments.planning import E2CandidateIdentity
 from lightcone_spec.experiments.registry import (
     E2_DRAFT_WIDTH_SELECTOR,
     E2_HALVING_STAGES,
+    FROZEN_TTS_RECIPE_SENTINEL,
     AdaptationRecipeBlocker,
     CellStatus,
     ExperimentRegistry,
@@ -30,11 +31,12 @@ def _adaptive_cells(registry: ExperimentRegistry, experiment: str):
     return tuple(
         cell
         for cell in registry.cells_for(experiment)
-        if cell.identity.method in {"tts", "l0"}
+        if cell.identity.method == "l0"
+        and cell.identity.optimizer != FROZEN_TTS_RECIPE_SENTINEL
     )
 
 
-def test_e1_recipe_lookup_is_pair_shared_and_all_fields_explicit(
+def test_e1_recipe_lookup_is_lc_candidate_owned_and_all_fields_explicit(
     registry: ExperimentRegistry,
 ) -> None:
     cells = _adaptive_cells(registry, "E1")
@@ -46,8 +48,7 @@ def test_e1_recipe_lookup_is_pair_shared_and_all_fields_explicit(
     source = next(
         cell
         for cell in cells
-        if cell.identity.method == "tts"
-        and cell.identity.scope == "last3"
+        if cell.identity.scope == "last3"
         and cell.identity.parameterization == "lora"
         and cell.identity.rank == 8
         and cell.identity.optimizer == "adamw"
@@ -56,12 +57,12 @@ def test_e1_recipe_lookup_is_pair_shared_and_all_fields_explicit(
     peer = next(
         cell
         for cell in cells
-        if cell.identity.method == "l0"
-        and cell.identity.scope == source.identity.scope
+        if cell.identity.scope == source.identity.scope
         and cell.identity.parameterization == source.identity.parameterization
         and cell.identity.rank == source.identity.rank
         and cell.identity.optimizer == source.identity.optimizer
         and cell.identity.width == source.identity.width
+        and cell.identity.concurrency != source.identity.concurrency
     )
     declaration = registry.adaptation_recipe_for_cell(source.cell_id)
     assert declaration is registry.adaptation_recipe_for_cell(peer)
@@ -161,7 +162,7 @@ def test_e2_selected_width_is_dependency_owned_and_source_values_stay_blocked(
         for row in registry.adaptation_recipe_declarations
         if row.lookup_key.experiment == "E2"
     )
-    assert len(declarations) * len(E2_HALVING_STAGES) * 2 == len(cells)
+    assert len(declarations) * len(E2_HALVING_STAGES) == len(cells)
     assert {row.status for row in declarations} == {"BLOCKED"}
     assert {row.lookup_key.draft_width for row in declarations} == {None}
     assert {row.lookup_key.draft_width_selector for row in declarations} == {
@@ -283,7 +284,7 @@ def test_e2_candidate_identity_binds_selector_instead_of_middle_grid_value(
         for cell in _adaptive_cells(registry, "E2")
         if cell.identity.optimizer == "adamw"
     )
-    candidate = E2CandidateIdentity.from_cell(cell)
+    candidate = E2CandidateIdentity.from_cell(cell, registry=registry)
     assert candidate.width is None
     assert candidate.draft_width_selector == E2_DRAFT_WIDTH_SELECTOR
     with pytest.raises(ValueError, match="exactly one width authority"):

@@ -18,11 +18,17 @@
 - Schema v3 使用 canonical `target_only`、`static`、`tts`、`l0`。未知 method name 与已
   退役 adaptation 字段属于错误；
 - Target-only 要求关闭 speculation 且无 adaptation；Static 启用 speculation 但无
-  adaptation；移除 method 字段后，TTS/L0 的 adaptation 必须逐字节相同；
+  adaptation；TTS 要求 frozen TTS recipe 与 fixed-barrier publication，L0-naive 要求同一个
+  recipe authority 与 first-ready publication。采用 L0 policy 的 search recipe 只是
+  LC-candidate，直到准确 E2 final-recipe receipt 将其封存为 LightCone；
 - 对 industrial executor 而言，当前只有 TP1/DP1 Target-only 为 READY。固定 tree 已实现
   `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，但没有配置
-  release-trusted hardware signer，因此 Static/TTS/L0 会在 mutation 前失败；这是预期的
+  release-trusted hardware signer，因此 Static/TTS/L0-naive/LightCone 会在 mutation 前失败；这是预期的
   fail-closed release boundary；
+- `TTS-paper-reconstruction` 还因 numeric optimizer/loss/trainable/stride 字段未披露而刻意
+  `BLOCKED`。TTS 或 L0-naive 若继承 E1/E2 authority、schema default 或历史 AdamW recipe，
+  必须拒绝。Candidate equality 只适用于 source-state 与 proposal-evidence digest 都完全
+  相同的受控 replay；
 - Adaptation 是 `last1`、`last3`、`last5` 或 `all` 上的 Full/LoRA。LoRA 要求注册 rank 与
   `alpha/r=1`。借用 target parameter、量化或不属于 backend 的 coordinate 不能训练；
 - DSpark layer-only 与 `*_native_heads` hybrid 字段是目标 contract；当前 adaptive schema
@@ -107,7 +113,7 @@ combine、truncate 或手工编辑 segment。
 CPU mock、历史 v2 result 或 acceptance change 都不能改变它。当前新 GPU phase 保持
 `UNMEASURED`；Stage B 因缺少 trusted hardware signer、provider credential、immutable
 model/data/trace lock、已注册硬件、GPU smoke 与 interference evidence 而 `BLOCKED`。
-Static/TTS/L0、全部 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与全部 TP2/DP2 cell 都
+Static/TTS/L0-naive/LightCone、全部 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与全部 TP2/DP2 cell 都
 blocked；只有 TP1/DP1 Target-only 可端到端执行。
 
 `BLOCKED` 也是 registered cell prerequisite 或 attested criterion 失败时的正确结果。

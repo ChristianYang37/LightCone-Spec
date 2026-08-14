@@ -1,6 +1,7 @@
 """Canonical method semantics and registered comparison learners."""
 
 from .core import (
+    CandidateReplayBinding,
     CandidateTermination,
     CandidateUpdate,
     MethodPolicy,
@@ -20,6 +21,7 @@ from .onlinespec import (
 )
 
 __all__ = [
+    "CandidateReplayBinding",
     "CandidateTermination",
     "CandidateUpdate",
     "MethodPolicy",

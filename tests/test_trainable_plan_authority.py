@@ -163,7 +163,7 @@ def _e1_execution_semantics(method: str, mode: str) -> CellExecutionSemantics:
 def _inputs(
     tmp_path: Path,
     *,
-    method: str = "tts",
+    method: str = "l0",
     mode: str = "lora",
     target_id: str = "Qwen/Qwen3-8B",
     drafter_id: str = "z-lab/Qwen3-8B-DFlash-b16",
@@ -426,16 +426,14 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
     binding = values["binding"]
     assert isinstance(binding, TrainablePlanAuthorityBinding)
     plan = audit_trainable_plan_authority_for_method(
-        "tts", binding, **_expected(binding)
+        "l0", binding, **_expected(binding)
     )
     assert plan is not None and plan.sha256 == binding.trainable_plan_sha256
     with pytest.raises(
         RuntimeError,
         match="prepared_model_content_release_manifest_pin_unavailable",
     ):
-        require_trainable_plan_authority_for_method(
-            "tts", binding, **_expected(binding)
-        )
+        require_trainable_plan_authority_for_method("l0", binding, **_expected(binding))
     for method in ("target_only", "static"):
         assert require_trainable_plan_authority_for_method(method, None) is None
         with pytest.raises(ValueError, match="must not carry"):
@@ -450,7 +448,7 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
         require_trainable_plan_authority_for_method("l0", None)
     with pytest.raises(ValueError, match="expected execution semantics"):
         audit_trainable_plan_authority_for_method(
-            "tts",
+            "l0",
             binding,
             **{
                 key: value
@@ -460,7 +458,7 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
         )
     with pytest.raises(ValueError, match="differs"):
         audit_trainable_plan_authority_for_method(
-            "tts",
+            "l0",
             binding,
             **{
                 **_expected(binding),
@@ -469,7 +467,7 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
         )
     with pytest.raises(ValueError, match="differs"):
         audit_trainable_plan_authority_for_method(
-            "tts",
+            "l0",
             binding,
             **{
                 **_expected(binding),
@@ -477,17 +475,12 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
             },
         )
 
-    l0 = _inputs(tmp_path / "l0", method="l0")["binding"]
-    assert isinstance(l0, TrainablePlanAuthorityBinding)
-    assert (
-        audit_trainable_plan_authority_for_method("l0", l0, **_expected(l0)) is not None
-    )
+    with pytest.raises(ValueError, match="adapted method differs"):
+        audit_trainable_plan_authority_for_method("tts", binding, **_expected(binding))
 
     full = _inputs(tmp_path / "full", mode="full")["binding"]
     assert isinstance(full, TrainablePlanAuthorityBinding)
-    full_plan = audit_trainable_plan_authority_for_method(
-        "tts", full, **_expected(full)
-    )
+    full_plan = audit_trainable_plan_authority_for_method("l0", full, **_expected(full))
     assert full_plan is not None and full_plan.mode == "full"
 
     with pytest.raises(
@@ -518,7 +511,7 @@ def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(
         match="prepared_parameter_inventory_first_party_extractor_unavailable",
     ):
         audit_trainable_plan_authority_for_method(
-            "tts", unavailable_binding, **_expected(unavailable_binding)
+            "l0", unavailable_binding, **_expected(unavailable_binding)
         )
 
 
@@ -764,7 +757,7 @@ def test_model_revision_swap_and_raw_source_replacement_fail_closed(
     )["binding"]
     assert isinstance(swapped, TrainablePlanAuthorityBinding)
     with pytest.raises(ValueError, match="differs"):
-        audit_trainable_plan_authority_for_method("tts", swapped, **_expected(binding))
+        audit_trainable_plan_authority_for_method("l0", swapped, **_expected(binding))
 
 
 def test_path_symlink_duplicate_key_nonfinite_and_tamper_are_rejected(

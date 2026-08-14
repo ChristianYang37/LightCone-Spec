@@ -24,7 +24,10 @@ from lightcone_spec import (
     PINNED_SGLANG_TREE,
 )
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
-from lightcone_spec.doctor import format_doctor
+from lightcone_spec.doctor import (
+    _require_project_runtime_source_identity,
+    format_doctor,
+)
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.budget_authority import (
     bind_budget_materialization_authority,
@@ -136,9 +139,10 @@ from lightcone_spec.experiments.planning_artifacts import (
 )
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
+    HISTORICAL_EVIDENCE_CLASSIFICATION,
     TUNING_STAGES,
     assert_confirmation_slice_config,
-    assert_matched_confirmation_configs,
+    assert_historical_matched_recipe_diagnostic_configs,
     confirmation_blocks,
     onlinespec_blocks,
     select_static_load,
@@ -521,7 +525,7 @@ def _load_bound_run_config(path: str | Path) -> RunConfig:
 
 
 _INDUSTRIAL_REGISTRY_GENERATOR = (
-    "lightcone_spec.experiments.registry.build_industrial_registry:v2"
+    "lightcone_spec.experiments.registry.build_industrial_registry:v3"
 )
 # No hardware-rooted/provider signing identity is registered in this source
 # release.  Self-authored JSON plus hashes proves content consistency, not GPU
@@ -542,7 +546,7 @@ def _industrial_registry_artifact(
     seed: int,
 ) -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generator": _INDUSTRIAL_REGISTRY_GENERATOR,
         "parameters": {
             "logical_gpu_slots": list(registry.gpu_uuids),
@@ -569,7 +573,7 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
     }:
         raise ValueError("industrial registry artifact fields do not match schema")
     if (
-        value.get("schema_version") != 2
+        value.get("schema_version") != 3
         or value.get("generator") != _INDUSTRIAL_REGISTRY_GENERATOR
     ):
         raise ValueError("industrial registry generator identity mismatch")
@@ -4059,7 +4063,7 @@ def _collect_speed_study(args: argparse.Namespace) -> int:
             or locked.get(config.model.drafter) != config.model.drafter_revision
         ):
             raise ValueError("run config does not match the immutable model lock")
-    assert_matched_confirmation_configs(
+    assert_historical_matched_recipe_diagnostic_configs(
         configs,
         selected_candidate=selection.candidate,
         selected_concurrency=selection.selected_concurrency,
@@ -4565,7 +4569,7 @@ def _build_confirmation_queue(args: argparse.Namespace) -> int:
         configs[method] = config
     if len({str(row["base_url"]) for row in servers.values()}) != 1:
         raise ValueError("sequential method slices must reuse one endpoint")
-    assert_matched_confirmation_configs(
+    assert_historical_matched_recipe_diagnostic_configs(
         configs,
         selected_candidate=selection.candidate,
         selected_concurrency=selection.selected_concurrency,
@@ -4749,6 +4753,7 @@ _ATTESTATION_DOCTOR_CHECKS = frozenset(
         "project_patch_binding",
         "project_sglang_roots_distinct",
         "project_source_tree",
+        "project_runtime_source",
         "python",
         "linux_host",
         "torch",
@@ -4779,8 +4784,8 @@ def _validate_attestation_doctor(hardware: object, *, label: str) -> dict:
             f"{label} attestation requires a complete PASS doctor report: {reason}"
         )
 
-    if not isinstance(hardware, dict) or hardware.get("schema_version") != 1:
-        reject("doctor schema-v1 object is required")
+    if not isinstance(hardware, dict) or hardware.get("schema_version") != 2:
+        reject("doctor schema-v2 object is required")
     readiness = hardware.get("readiness")
     compatibility = hardware.get("compatibility")
     if hardware.get("status") != "PASS":
@@ -4837,6 +4842,13 @@ def _validate_attestation_doctor(hardware: object, *, label: str) -> dict:
         or project_root == sglang_root
     ):
         reject("project and patched-SGLang roots must be distinct")
+    try:
+        _require_project_runtime_source_identity(
+            hardware,
+            executing_file=Path(__file__),
+        )
+    except (TypeError, ValueError):
+        reject("LightCone source identity is stale or incomplete")
 
     source_tree = hardware.get("source_tree")
     source_head = source_tree.get("head") if isinstance(source_tree, dict) else None
@@ -4989,6 +5001,7 @@ def _preliminary_gate_statistics(gate: object) -> dict[str, object]:
         raise TypeError("preliminary pairwise statistics are incomplete")
     return {
         "status": PRELIMINARY_DIAGNOSTIC_ONLY,
+        "evidence_classification": HISTORICAL_EVIDENCE_CLASSIFICATION,
         "gpu_evidence": PRELIMINARY_DIAGNOSTIC_ONLY,
         "evidence_sha256": None,
         "tts": _preliminary_method_statistics(raw.get("tts")),
@@ -5038,6 +5051,7 @@ def _analyze(args: argparse.Namespace) -> int:
             "manifest_kind": manifest.kind,
             "manifest_sha256": manifest.sha256,
             "formal_execution_authorized": False,
+            "evidence_classification": HISTORICAL_EVIDENCE_CLASSIFICATION,
             "industrial_evidence_receipt": None,
             "diagnostic_statistics": diagnostic_statistics,
             "selection_protocol": selection.selection_protocol,

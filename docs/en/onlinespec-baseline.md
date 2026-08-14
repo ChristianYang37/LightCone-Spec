@@ -5,7 +5,7 @@
 ## Status and boundary
 
 OnlineSPEC is an important registered comparison baseline, not part of the
-Static/TTS/L0 hypothesis or its formal speed gate. It has its own tuning data,
+Target-only/Static/TTS/L0-naive/LightCone hypothesis or its formal speed gate. It has its own tuning data,
 selection artifact, paired confirmation queue, performance table, GPU
 attestation, and diagnostic analysis. Its result cannot select a core method or
 change a core `PASS`, `BLOCKED`, or `UNMEASURED` decision.
@@ -201,8 +201,8 @@ Every OnlineSPEC method follows one ordering:
 5. The next proposal uses the committed decision. Exact target rejection
    sampling continues to use the original recorded proposal distribution.
 
-This boundary is deliberately different from TTS and L0 publication
-scheduling. OnlineSPEC is neither silently mapped onto a TTS stride barrier nor
+This boundary is deliberately different from fixed-barrier TTS and first-ready
+L0-policy publication. OnlineSPEC is neither silently mapped onto a TTS stride barrier nor
 allowed to publish midway through the proposal it trained on.
 
 Historical drafter KV is frozen and versioned exactly as in the core runtime.
@@ -276,8 +276,8 @@ separate evidence identities:
    online trajectory to become useful. The complete schedule is part of the
    manifest identity. Halving occurs independently inside OGD, optimistic OGD,
    and Hedge so one learner cannot eliminate another.
-2. Select one safe candidate per learner. The CLI requires the core
-   Static/TTS/L0 selection, inherits its selected concurrency, and recursively
+2. Select one safe candidate per learner. The CLI requires the core frozen
+   baseline and sealed-LightCone selection authority, inherits its selected concurrency, and recursively
    binds its SHA-256. The OnlineSPEC selection also binds the complete terminal
    tuning artifact, model lock, sampling profile, manifest, and patched SGLang
    tree. A manually supplied or mismatched load is rejected.

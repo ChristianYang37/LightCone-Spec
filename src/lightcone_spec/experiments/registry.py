@@ -119,12 +119,55 @@ E0_TASKS = (
     "Alpaca",
     "Arena-Hard",
 )
+# E0 is a preregistered breadth confirmation, not a one-shot compatibility
+# sweep.  Its load and paired-block axes make every eventual breadth contrast
+# independently auditable.  The concrete arrival trace remains an external
+# content-bound authority; neither value is selected from observed gain.
+E0_LOADS = ("concurrency_one", "common_slo_load")
+# The breadth universe stays compact.  These are the only E0 slots that may
+# later enter a reported interaction reducer: every candidate model is named
+# now, the backend/task anchors are fixed, and the block count is the
+# preregistered minimum for a 95% paired interval (four excluded pilots plus
+# twelve final blocks).  The remaining compatibility templates are not silently
+# multiplied into a formal timing grid.
+E0_INTERACTION_MODELS = E0_MODELS
+E0_INTERACTION_BACKENDS = ("DFLASH",)
+E0_INTERACTION_TASKS = ("GSM8K", "LiveCodeBench")
+E0_INTERACTION_FINAL_BLOCKS = FINAL_BLOCKS[:12]
 CORE_METHODS = ("target_only", "static", "tts", "l0")
 E0_METHODS = CORE_METHODS + (
     "onlinespec_ogd",
     "onlinespec_opt",
     "onlinespec_ens",
 )
+
+
+class ScientificMethodRole(str, Enum):
+    """Reported method identity derived from runtime policy plus recipe authority."""
+
+    TARGET_ONLY = "target_only"
+    STATIC = "static"
+    TTS = "tts"
+    L0_NAIVE = "l0_naive"
+    LC_CANDIDATE = "lc_candidate"
+    LIGHTCONE_TEMPLATE = "lightcone_template"
+    LIGHTCONE = "lightcone"
+    ONLINESPEC_OGD = "onlinespec_ogd"
+    ONLINESPEC_OPT = "onlinespec_opt"
+    ONLINESPEC_ENS = "onlinespec_ens"
+
+
+CONFIRMATION_METHOD_ROLES = (
+    ScientificMethodRole.TARGET_ONLY.value,
+    ScientificMethodRole.STATIC.value,
+    ScientificMethodRole.TTS.value,
+    ScientificMethodRole.L0_NAIVE.value,
+    ScientificMethodRole.LIGHTCONE.value,
+)
+E0_METHOD_ROLES = CONFIRMATION_METHOD_ROLES + E0_METHODS[-3:]
+
+FROZEN_TTS_RECIPE_SENTINEL = "frozen_tts_recipe"
+SEALED_E2_RECIPE_SENTINEL = "sealed_e2_recipe"
 
 _ADAPTIVE_METHODS = frozenset(E0_METHODS) - {"target_only", "static"}
 _PATCH_UNSUPPORTED_ADAPTIVE_BACKENDS = frozenset(
@@ -153,6 +196,140 @@ PRODUCTION_SLO = (
 
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}").fullmatch
 _REASON_CODE = re.compile(r"[a-z0-9][a-z0-9_.-]*").fullmatch
+
+
+@dataclass(frozen=True)
+class FrozenTtsRecipeAuthority:
+    """Primary-source-bound TTS facts without invented numeric values."""
+
+    schema_version: int
+    authority_id: str
+    provenance_status: str
+    status: str
+    formal_eligible: bool
+    paper_arxiv_id: str
+    paper_url: str
+    paper_pdf_sha256: str
+    paper_source_sha256: str
+    official_implementation_status: str
+    known_semantics: tuple[str, ...]
+    unresolved_fields: tuple[str, ...]
+    blocker_codes: tuple[str, ...]
+    historical_diagnostic_manifest_canonical_sha256: str
+    historical_diagnostic_classification: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("only frozen TTS recipe authority schema 1 is supported")
+        for name in (
+            "authority_id",
+            "provenance_status",
+            "status",
+            "paper_arxiv_id",
+            "paper_url",
+            "official_implementation_status",
+            "historical_diagnostic_classification",
+        ):
+            value = getattr(self, name)
+            if (
+                type(value) is not str
+                or not value.strip()
+                or "\n" in value
+                or "\r" in value
+            ):
+                raise ValueError(f"{name} must be exact non-empty single-line text")
+        for name in (
+            "paper_pdf_sha256",
+            "paper_source_sha256",
+            "historical_diagnostic_manifest_canonical_sha256",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not _LOWER_SHA256(value):
+                raise ValueError(f"{name} must be a lower-case SHA-256")
+        for name in ("known_semantics", "unresolved_fields", "blocker_codes"):
+            value = getattr(self, name)
+            if type(value) is not tuple or any(type(item) is not str for item in value):
+                raise TypeError(f"{name} must be an exact text tuple")
+            if value != tuple(sorted(set(value))):
+                raise ValueError(f"{name} must be sorted and unique")
+        if self.provenance_status != "TTS-paper-reconstruction":
+            raise ValueError("the release has no official TTS code/config authority")
+        if self.status != "BLOCKED" or self.formal_eligible is not False:
+            raise ValueError("paper reconstruction must remain formally blocked")
+        if not self.unresolved_fields or not self.blocker_codes:
+            raise ValueError(
+                "blocked TTS authority requires explicit unresolved fields"
+            )
+        if any(not _REASON_CODE(code) for code in self.blocker_codes):
+            raise ValueError("TTS authority blocker codes must be stable tokens")
+        if (
+            self.historical_diagnostic_classification
+            != "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
+        ):
+            raise ValueError("historical shared-recipe evidence is diagnostic only")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _canonical(self)
+
+
+FROZEN_TTS_RECIPE_AUTHORITY = FrozenTtsRecipeAuthority(
+    schema_version=1,
+    authority_id="tts-paper-reconstruction-v1",
+    provenance_status="TTS-paper-reconstruction",
+    status="BLOCKED",
+    formal_eligible=False,
+    paper_arxiv_id="2605.09329v2",
+    paper_url="https://arxiv.org/abs/2605.09329v2",
+    paper_pdf_sha256="7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20",
+    paper_source_sha256="22c549c0297fc0a2a71af002c3721f71ddfd06d86bc46b2f41592bd6748afe59",
+    official_implementation_status="not_found_as_of_2026-08-15",
+    known_semantics=tuple(
+        sorted(
+            (
+                "adam_optimizer",
+                "exactly_one_optimization_step_per_update",
+                "fixed_update_stride",
+                "latest_round_only_supervision",
+                "position_weighted_distillation_plus_source_point_proximal_loss",
+                "request_local_state_reset",
+                "strided_side_cuda_stream_execution",
+            )
+        )
+    ),
+    unresolved_fields=tuple(
+        sorted(
+            (
+                "adam_beta1",
+                "adam_beta2",
+                "adam_epsilon",
+                "gradient_clip",
+                "learning_rate",
+                "learning_rate_schedule",
+                "loss_normalization",
+                "loss_precision",
+                "loss_temperature",
+                "official_implementation_commit",
+                "optimizer_state_reset_semantics",
+                "position_weight_values",
+                "proximal_lambda",
+                "trainable_parameter_manifest",
+                "update_stride_selection_rule",
+                "weight_decay",
+            )
+        )
+    ),
+    blocker_codes=("tts_official_recipe_unavailable",),
+    historical_diagnostic_manifest_canonical_sha256=(
+        "e21748a923d5c16206164a6b007ec9365a7654267b1afef7480387d6c7e4d09d"
+    ),
+    historical_diagnostic_classification=(
+        "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
+    ),
+)
 
 
 def _canonical(value: Any) -> Any:
@@ -437,6 +614,108 @@ class ExperimentCell:
         )
 
 
+def _has_recipe_sentinel(identity: CellIdentity, sentinel: str) -> bool:
+    return identity.optimizer == sentinel and identity.schedule == sentinel
+
+
+def _require_zero_adaptation_identity(identity: CellIdentity, *, label: str) -> None:
+    if (
+        identity.scope not in {None, "none"}
+        or identity.parameterization != "none"
+        or any(
+            value is not None
+            for value in (
+                identity.optimizer,
+                identity.learning_rate,
+                identity.schedule,
+                identity.rank,
+                identity.alpha_over_rank,
+            )
+        )
+    ):
+        raise ValueError(f"{label} cannot carry adaptation recipe state")
+
+
+def _require_frozen_tts_recipe_identity(identity: CellIdentity) -> None:
+    if (
+        identity.scope != FROZEN_TTS_RECIPE_SENTINEL
+        or identity.optimizer != FROZEN_TTS_RECIPE_SENTINEL
+        or identity.schedule != FROZEN_TTS_RECIPE_SENTINEL
+        or identity.parameterization != FROZEN_TTS_RECIPE_SENTINEL
+        or identity.learning_rate is not None
+        or identity.rank is not None
+        or identity.alpha_over_rank is not None
+    ):
+        raise ValueError("frozen TTS recipe identity is not exact")
+
+
+def _require_sealed_e2_recipe_identity(identity: CellIdentity) -> None:
+    if (
+        identity.scope != SEALED_E2_RECIPE_SENTINEL
+        or identity.optimizer != SEALED_E2_RECIPE_SENTINEL
+        or identity.schedule != SEALED_E2_RECIPE_SENTINEL
+        or identity.parameterization != SEALED_E2_RECIPE_SENTINEL
+        or identity.learning_rate is not None
+        or identity.rank is not None
+        or identity.alpha_over_rank is not None
+    ):
+        raise ValueError("sealed E2 recipe identity is not exact")
+
+
+def _require_e1a_candidate_identity(identity: CellIdentity) -> None:
+    configurations = {
+        (row.scope, row.parameterization, row.rank, row.alpha_over_rank)
+        for row in e1a_adaptive_configurations()
+    }
+    if (
+        identity.experiment != "E1a"
+        or identity.backend != "DSPARK"
+        or identity.optimizer != SEALED_E2_RECIPE_SENTINEL
+        or identity.schedule != SEALED_E2_RECIPE_SENTINEL
+        or identity.learning_rate is not None
+        or (
+            identity.scope,
+            identity.parameterization,
+            identity.rank,
+            identity.alpha_over_rank,
+        )
+        not in configurations
+        or not identity.variant.startswith("sealed_lightcone_recipe:native_heads:")
+    ):
+        raise ValueError("E1a candidate identity is not preregistered")
+
+
+def _derived_scientific_method_role(cell: ExperimentCell) -> ScientificMethodRole:
+    """Derive a role from one cell after registry ownership is established."""
+
+    identity = cell.identity
+    if identity.method == "target_only":
+        _require_zero_adaptation_identity(identity, label="Target-only")
+        return ScientificMethodRole.TARGET_ONLY
+    if identity.method == "static":
+        _require_zero_adaptation_identity(identity, label="Static")
+        return ScientificMethodRole.STATIC
+    if identity.method == "tts":
+        _require_frozen_tts_recipe_identity(identity)
+        return ScientificMethodRole.TTS
+    if identity.method == "l0":
+        if _has_recipe_sentinel(identity, FROZEN_TTS_RECIPE_SENTINEL):
+            _require_frozen_tts_recipe_identity(identity)
+            return ScientificMethodRole.L0_NAIVE
+        if _has_recipe_sentinel(identity, SEALED_E2_RECIPE_SENTINEL):
+            if identity.experiment == "E1a":
+                _require_e1a_candidate_identity(identity)
+                return ScientificMethodRole.LC_CANDIDATE
+            _require_sealed_e2_recipe_identity(identity)
+            return ScientificMethodRole.LIGHTCONE_TEMPLATE
+        if identity.experiment in {"E1", "E2"}:
+            return ScientificMethodRole.LC_CANDIDATE
+        raise ValueError("L0 identity lacks a registered recipe authority")
+    if identity.method in E0_METHODS[-3:]:
+        return ScientificMethodRole(identity.method)
+    raise ValueError("cell method has no registered scientific role")
+
+
 def unresolved_semantic_placeholder(cell: ExperimentCell) -> str | None:
     """Return the first unresolved execution value without choosing a replacement."""
 
@@ -652,11 +931,15 @@ class ParameterConfiguration:
 class AdaptationRecipeLookupKey:
     """Scientific fields that select one source-owned adaptation recipe.
 
-    TTS and L0 intentionally share a key.  E1 keys carry an exact width.  E2
-    keys carry a selector slot instead, because the width is an E3a output and
-    is not an optimizer-grid axis.
+    L0-policy LightCone candidates have E1/E2 search keys. Frozen TTS and
+    L0-naive anchors use one model/backend-compatible singleton key that binds
+    the primary-source authority without inheriting stage, load, or geometry.
+    E1 search keys carry an exact width; E2 search keys carry the sealed E3a
+    selector slot.
     """
 
+    authority_kind: str
+    model: str
     experiment: str
     backend: str
     scope: str
@@ -672,6 +955,8 @@ class AdaptationRecipeLookupKey:
 
     def __post_init__(self) -> None:
         for name in (
+            "authority_kind",
+            "model",
             "experiment",
             "backend",
             "scope",
@@ -693,10 +978,31 @@ class AdaptationRecipeLookupKey:
             _require_exact_text(
                 "adaptation recipe draft-width selector", self.draft_width_selector
             )
+        if self.authority_kind == "frozen_tts":
+            if (
+                self.experiment != "frozen_tts"
+                or self.backend not in _SERVING_BACKENDS
+                or self.scope != FROZEN_TTS_RECIPE_SENTINEL
+                or self.parameterization != FROZEN_TTS_RECIPE_SENTINEL
+                or self.rank is not None
+                or self.alpha_over_rank is not None
+                or self.optimizer != FROZEN_TTS_RECIPE_SENTINEL
+                or self.learning_rate is not None
+                or self.schedule != FROZEN_TTS_RECIPE_SENTINEL
+                or self.cohort != FROZEN_TTS_RECIPE_SENTINEL
+                or self.draft_width is not None
+                or self.draft_width_selector != FROZEN_TTS_RECIPE_SENTINEL
+            ):
+                raise ValueError("frozen TTS recipe lookup key is not canonical")
+            return
+        if self.authority_kind != "lc_candidate":
+            raise ValueError("adaptation recipe authority kind is unsupported")
         if self.experiment not in {"E1", "E2"}:
             raise ValueError("adaptation recipes are registered only for E1/E2")
         if self.backend != "DFLASH":
             raise ValueError("E1/E2 adaptation recipes require DFLASH")
+        if self.optimizer not in E2_OPTIMIZERS or self.schedule not in E2_SCHEDULES:
+            raise ValueError("LC candidate recipe lies outside its registered grid")
         if self.parameterization == "full":
             if self.rank is not None or self.alpha_over_rank is not None:
                 raise ValueError("Full recipe keys cannot carry LoRA fields")
@@ -725,11 +1031,28 @@ class AdaptationRecipeLookupKey:
     @classmethod
     def from_cell(cls, cell: ExperimentCell) -> AdaptationRecipeLookupKey:
         identity = cell.identity
-        if identity.experiment not in {"E1", "E2"} or identity.method not in {
-            "tts",
-            "l0",
-        }:
-            raise ValueError("adaptation recipe lookup requires an E1/E2 TTS/L0 cell")
+        if _has_recipe_sentinel(identity, FROZEN_TTS_RECIPE_SENTINEL):
+            if identity.method not in {"tts", "l0"}:
+                raise ValueError("frozen TTS recipe requires TTS or L0-naive")
+            _require_frozen_tts_recipe_identity(identity)
+            return cls(
+                authority_kind="frozen_tts",
+                model=identity.model,
+                experiment="frozen_tts",
+                backend=identity.backend,
+                scope=FROZEN_TTS_RECIPE_SENTINEL,
+                parameterization=FROZEN_TTS_RECIPE_SENTINEL,
+                rank=None,
+                alpha_over_rank=None,
+                optimizer=FROZEN_TTS_RECIPE_SENTINEL,
+                learning_rate=None,
+                schedule=FROZEN_TTS_RECIPE_SENTINEL,
+                cohort=FROZEN_TTS_RECIPE_SENTINEL,
+                draft_width=None,
+                draft_width_selector=FROZEN_TTS_RECIPE_SENTINEL,
+            )
+        if identity.experiment not in {"E1", "E2"} or identity.method != "l0":
+            raise ValueError("adaptation recipe lookup requires an E1/E2 LC candidate")
         if (
             identity.scope is None
             or identity.optimizer is None
@@ -747,6 +1070,8 @@ class AdaptationRecipeLookupKey:
                 )
             selector = E2_DRAFT_WIDTH_SELECTOR
         return cls(
+            authority_kind="lc_candidate",
+            model=identity.model,
             experiment=identity.experiment,
             backend=identity.backend,
             scope=identity.scope,
@@ -778,6 +1103,7 @@ _OPTIMIZER_RECIPE_FIELDS = frozenset(
         "muon_ns_steps",
         "muon_auxiliary_learning_rate",
         "muon_auxiliary_weight_decay",
+        "schedule",
         "schedule_total_published_updates",
     }
 )
@@ -839,17 +1165,14 @@ class OptimizerRecipeDeclaration:
     muon_ns_steps: int | None
     muon_auxiliary_learning_rate: float | None
     muon_auxiliary_weight_decay: float | None
-    schedule: str
+    schedule: str | None
     schedule_total_published_updates: int | None
     unresolved_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_exact_text("optimizer recipe name", self.name)
-        _require_exact_text("optimizer recipe schedule", self.schedule)
-        if self.name not in E2_OPTIMIZERS:
-            raise ValueError("optimizer recipe name is outside the registry")
-        if self.schedule not in E2_SCHEDULES:
-            raise ValueError("optimizer recipe schedule is outside the registry")
+        if self.schedule is not None:
+            _require_exact_text("optimizer recipe schedule", self.schedule)
         if type(self.unresolved_fields) is not tuple or any(
             type(value) is not str for value in self.unresolved_fields
         ):
@@ -919,6 +1242,7 @@ class OptimizerRecipeDeclaration:
             self.beta2,
             self.epsilon,
             self.grad_clip,
+            self.schedule,
         ):
             raise ValueError("optimizer recipe is not fully declared")
         from lightcone_spec.config.schema import OptimizerConfig
@@ -942,12 +1266,38 @@ class OptimizerRecipeDeclaration:
 
 _ADAPTATION_RECIPE_FIELDS = frozenset(
     {
+        "adaptation_group_id",
+        "adaptation_scope",
         "stride",
         "canvas_tokens",
         "extra_logical_delay",
+        "lora_matrix_policy",
+        "loss_position_decay",
+        "max_in_flight",
+        "native_head_policy",
+        "parameter_scope",
         "teacher_row_policy",
         "verification_mode",
         "fixed_verification_budget",
+        "weight_update_mode",
+    }
+)
+
+_FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS = frozenset(
+    {
+        "adaptation_group_id",
+        "adaptation_scope",
+        "canvas_tokens",
+        "extra_logical_delay",
+        "fixed_verification_budget",
+        "lora_matrix_policy",
+        "loss_position_decay",
+        "max_in_flight",
+        "native_head_policy",
+        "parameter_scope",
+        "stride",
+        "verification_mode",
+        "weight_update_mode",
     }
 )
 
@@ -975,6 +1325,7 @@ def _e2_required_optimizer_unresolved_fields(
     }
     if optimizer == "chronobelief":
         fields.update(_OPTIMIZER_RECIPE_FIELDS)
+        fields.discard("schedule")
         if schedule != "cosine_to_zero":
             fields.discard("schedule_total_published_updates")
         return frozenset(fields)
@@ -995,26 +1346,30 @@ def _e2_required_optimizer_unresolved_fields(
 
 @dataclass(frozen=True)
 class AdaptationRecipeDeclaration:
-    """Registry-owned, content-bound declaration of full adaptation semantics."""
+    """Registry-owned, content-bound declaration of update-side semantics.
+
+    ``extra_logical_delay`` is a source-readiness latency bound before applying
+    the method's publication policy; it is not a second publication policy.
+    """
 
     schema_version: int
     lookup_key: AdaptationRecipeLookupKey
     source_authority: str
     source_authority_sha256: str
-    weight_update_mode: str
-    parameter_scope: str
+    weight_update_mode: str | None
+    parameter_scope: str | None
     kv_history_policy: str
-    adaptation_scope: str
-    adaptation_group_id: str
+    adaptation_scope: str | None
+    adaptation_group_id: str | None
     optimizer: OptimizerRecipeDeclaration
     rank: int | None
     lora_alpha: int | None
-    lora_matrix_policy: str
-    native_head_policy: str
+    lora_matrix_policy: str | None
+    native_head_policy: str | None
     stride: int | None
-    max_in_flight: int
+    max_in_flight: int | None
     canvas_tokens: int | None
-    loss_position_decay: float
+    loss_position_decay: float | None
     extra_logical_delay: int | None
     teacher_row_policy: str | None
     verification_mode: str | None
@@ -1033,15 +1388,20 @@ class AdaptationRecipeDeclaration:
             raise TypeError("adaptation recipe requires an exact optimizer declaration")
         for name in (
             "source_authority",
+            "kv_history_policy",
+        ):
+            _require_exact_text(f"adaptation recipe {name}", getattr(self, name))
+        for name in (
             "weight_update_mode",
             "parameter_scope",
-            "kv_history_policy",
             "adaptation_scope",
             "adaptation_group_id",
             "lora_matrix_policy",
             "native_head_policy",
         ):
-            _require_exact_text(f"adaptation recipe {name}", getattr(self, name))
+            value = getattr(self, name)
+            if value is not None:
+                _require_exact_text(f"adaptation recipe {name}", value)
         for name in ("teacher_row_policy", "verification_mode"):
             value = getattr(self, name)
             if value is not None:
@@ -1062,7 +1422,10 @@ class AdaptationRecipeDeclaration:
             value = getattr(self, name)
             if value is not None and type(value) is not int:
                 raise TypeError(f"adaptation recipe {name} must be an exact integer")
-        if type(self.loss_position_decay) is not float:
+        if (
+            self.loss_position_decay is not None
+            and type(self.loss_position_decay) is not float
+        ):
             raise TypeError(
                 "adaptation recipe loss_position_decay must be an exact float"
             )
@@ -1079,6 +1442,9 @@ class AdaptationRecipeDeclaration:
             value = getattr(self, name)
             if type(value) is not tuple or any(type(item) is not str for item in value):
                 raise TypeError(f"adaptation recipe {name} must be exact text tuples")
+        if self.lookup_key.authority_kind == "frozen_tts":
+            self._validate_frozen_tts_declaration()
+            return
         if self.lookup_key.scope != self.parameter_scope:
             raise ValueError("recipe scope differs from its lookup key")
         if self.lookup_key.parameterization != self.weight_update_mode:
@@ -1114,8 +1480,10 @@ class AdaptationRecipeDeclaration:
         for name in self.unresolved_fields:
             if getattr(self, name) is not None:
                 raise ValueError("an unresolved adaptation field must remain null")
-        if not math.isfinite(self.loss_position_decay) or not (
-            0 < self.loss_position_decay <= 1
+        if (
+            self.loss_position_decay is None
+            or not math.isfinite(self.loss_position_decay)
+            or not (0 < self.loss_position_decay <= 1)
         ):
             raise ValueError("recipe loss position decay must be in (0, 1]")
         if self.extra_logical_delay is not None and self.extra_logical_delay < 0:
@@ -1179,6 +1547,59 @@ class AdaptationRecipeDeclaration:
                 raise ValueError(
                     "E2 recipe blockers differ from its unresolved field set"
                 )
+
+    def _validate_frozen_tts_declaration(self) -> None:
+        """Validate one blocked paper-reconstruction row in the shared lifecycle."""
+
+        expected_optimizer_unresolved = frozenset(
+            {
+                "beta1",
+                "beta2",
+                "epsilon",
+                "grad_clip",
+                "learning_rate",
+                "schedule",
+                "weight_decay",
+            }
+        )
+        if (
+            self.source_authority != "tts_recipe_authority_v1"
+            or self.source_authority_sha256 != FROZEN_TTS_RECIPE_AUTHORITY.sha256
+            or self.weight_update_mode is not None
+            or self.parameter_scope is not None
+            or self.kv_history_policy != "frozen"
+            or self.adaptation_scope is not None
+            or self.adaptation_group_id is not None
+            or self.optimizer.name != "adam"
+            or set(self.optimizer.unresolved_fields) != expected_optimizer_unresolved
+            or any(
+                getattr(self.optimizer, name) is not None
+                for name in expected_optimizer_unresolved
+            )
+            or self.optimizer.momentum is not None
+            or self.optimizer.muon_ns_steps is not None
+            or self.optimizer.muon_auxiliary_learning_rate is not None
+            or self.optimizer.muon_auxiliary_weight_decay is not None
+            or self.optimizer.schedule_total_published_updates is not None
+            or self.rank is not None
+            or self.lora_alpha is not None
+            or self.lora_matrix_policy is not None
+            or self.native_head_policy is not None
+            or self.stride is not None
+            or self.max_in_flight is not None
+            or self.canvas_tokens is not None
+            or self.loss_position_decay is not None
+            or self.extra_logical_delay is not None
+            or self.teacher_row_policy != "latest_round_only"
+            or self.verification_mode is not None
+            or self.fixed_verification_budget is not None
+            or self.confidence_loss_weight is not None
+            or self.status != "BLOCKED"
+            or self.blocker_codes != FROZEN_TTS_RECIPE_AUTHORITY.blocker_codes
+            or self.unresolved_fields
+            != tuple(sorted(_FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS))
+        ):
+            raise ValueError("frozen TTS declaration differs from source authority")
 
     def to_adaptation_config(self):
         """Materialize an exact-width declaration with no implicit values."""
@@ -1365,6 +1786,7 @@ def _e2_optimizer_declaration(
 
     if optimizer == "chronobelief":
         unresolved.update(_OPTIMIZER_RECIPE_FIELDS)
+        unresolved.discard("schedule")
         blockers.update(
             {
                 "chronobelief_equation_unregistered",
@@ -1488,22 +1910,92 @@ def _e2_recipe_declaration(
     )
 
 
+def _frozen_tts_recipe_declaration(
+    key: AdaptationRecipeLookupKey,
+) -> AdaptationRecipeDeclaration:
+    """Project the paper authority into the sole adaptation-recipe lifecycle."""
+
+    if key.authority_kind != "frozen_tts":
+        raise ValueError("frozen TTS declaration requires its canonical lookup key")
+    optimizer = OptimizerRecipeDeclaration(
+        name="adam",
+        learning_rate=None,
+        weight_decay=None,
+        beta1=None,
+        beta2=None,
+        epsilon=None,
+        grad_clip=None,
+        momentum=None,
+        muon_ns_steps=None,
+        muon_auxiliary_learning_rate=None,
+        muon_auxiliary_weight_decay=None,
+        schedule=None,
+        schedule_total_published_updates=None,
+        unresolved_fields=tuple(
+            sorted(
+                (
+                    "beta1",
+                    "beta2",
+                    "epsilon",
+                    "grad_clip",
+                    "learning_rate",
+                    "schedule",
+                    "weight_decay",
+                )
+            )
+        ),
+    )
+    return AdaptationRecipeDeclaration(
+        schema_version=1,
+        lookup_key=key,
+        source_authority="tts_recipe_authority_v1",
+        source_authority_sha256=FROZEN_TTS_RECIPE_AUTHORITY.sha256,
+        weight_update_mode=None,
+        parameter_scope=None,
+        kv_history_policy="frozen",
+        adaptation_scope=None,
+        adaptation_group_id=None,
+        optimizer=optimizer,
+        rank=None,
+        lora_alpha=None,
+        lora_matrix_policy=None,
+        native_head_policy=None,
+        stride=None,
+        max_in_flight=None,
+        canvas_tokens=None,
+        loss_position_decay=None,
+        extra_logical_delay=None,
+        teacher_row_policy="latest_round_only",
+        verification_mode=None,
+        fixed_verification_budget=None,
+        confidence_loss_weight=None,
+        status="BLOCKED",
+        blocker_codes=FROZEN_TTS_RECIPE_AUTHORITY.blocker_codes,
+        unresolved_fields=tuple(sorted(_FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS)),
+    )
+
+
 def _build_adaptation_recipe_declarations(
     cells: Sequence[ExperimentCell],
 ) -> tuple[AdaptationRecipeDeclaration, ...]:
     keys: dict[str, AdaptationRecipeLookupKey] = {}
     for cell in cells:
-        if cell.identity.experiment not in {"E1", "E2"} or cell.identity.method not in {
-            "tts",
-            "l0",
-        }:
+        if _has_recipe_sentinel(cell.identity, FROZEN_TTS_RECIPE_SENTINEL):
+            key = AdaptationRecipeLookupKey.from_cell(cell)
+            keys[key.sha256] = key
+            continue
+        if cell.identity.experiment not in {"E1", "E2"} or cell.identity.method != "l0":
             continue
         key = AdaptationRecipeLookupKey.from_cell(cell)
         keys[key.sha256] = key
     declarations = tuple(
-        _e1_recipe_declaration(key)
-        if key.experiment == "E1"
-        else _e2_recipe_declaration(key)
+        _frozen_tts_recipe_declaration(key)
+        if key.authority_kind == "frozen_tts"
+        else (
+            _e1_recipe_declaration(key)
+            if key.experiment == "E1"
+            else _e2_recipe_declaration(key)
+        )
         for _, key in sorted(keys.items())
     )
     identities = tuple(row.lookup_key.sha256 for row in declarations)
@@ -1589,6 +2081,14 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             dependencies=("E3a",),
             locked_outputs=("dflash_pareto_set", "common_downstream_load"),
             axes=(
+                _axis("search_method_role", (ScientificMethodRole.LC_CANDIDATE.value,)),
+                _axis(
+                    "anchor_method_role",
+                    (
+                        ScientificMethodRole.TTS.value,
+                        ScientificMethodRole.L0_NAIVE.value,
+                    ),
+                ),
                 _axis("scope", E1_SCOPES),
                 _axis("parameterization", ("full", "lora")),
                 _axis("rank", LORA_RANKS),
@@ -1601,6 +2101,14 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             dependencies=("E1",),
             locked_outputs=("dflash_recipe",),
             axes=(
+                _axis("search_method_role", (ScientificMethodRole.LC_CANDIDATE.value,)),
+                _axis(
+                    "anchor_method_role",
+                    (
+                        ScientificMethodRole.TTS.value,
+                        ScientificMethodRole.L0_NAIVE.value,
+                    ),
+                ),
                 _axis("scope", E1_SCOPES),
                 _axis("parameterization", ("full", "lora")),
                 _axis("rank", LORA_RANKS),
@@ -1643,7 +2151,7 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             dependencies=("E4",),
             locked_outputs=("long_context_confirmation",),
             axes=(
-                _axis("method", CORE_METHODS),
+                _axis("method_role", CONFIRMATION_METHOD_ROLES),
                 _axis("context", CONTEXT_GRID),
                 _axis("regime", CONTEXT_REGIMES),
                 _axis("load", ("concurrency_one", "common_load")),
@@ -1674,7 +2182,7 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             locked_outputs=("production_slo_surface", "topology_failure_surface"),
             axes=(
                 _axis("backend", ("DFLASH", "DSPARK")),
-                _axis("method", CORE_METHODS),
+                _axis("method_role", CONFIRMATION_METHOD_ROLES),
                 _axis("closed_loop_concurrency", E5_CLOSED_LOOP_CONCURRENCY),
                 _axis("open_loop_lambda_star", E5_OPEN_LOOP_LOAD_FACTORS),
                 _axis(
@@ -1702,9 +2210,21 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             locked_outputs=("native_mtp_transfer_surface",),
             axes=(
                 _axis("model", E6_CANDIDATE_MODELS),
-                _axis("method", CORE_METHODS),
+                _axis(
+                    "headline_method_role",
+                    (
+                        ScientificMethodRole.TARGET_ONLY.value,
+                        ScientificMethodRole.STATIC.value,
+                        ScientificMethodRole.TTS.value,
+                        ScientificMethodRole.LIGHTCONE.value,
+                    ),
+                ),
+                _axis("mechanism_anchor_role", (ScientificMethodRole.L0_NAIVE.value,)),
                 _axis("task", ("LiveCodeBench", "MATH-500")),
                 _axis("context", (4096, 16384, 32768)),
+                _axis("load", ("concurrency_one", "common_slo_load")),
+                _axis("block", REGISTERED_CONFIRMATION_BLOCKS),
+                _axis("block_phase", ("excluded_pilot", "final_candidate")),
                 _axis("topology", ("tp2_dp1",)),
             ),
         ),
@@ -1716,7 +2236,10 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
                 _axis("model", E0_MODELS),
                 _axis("backend", E0_BACKENDS),
                 _axis("task", E0_TASKS),
-                _axis("method", E0_METHODS),
+                _axis("method_role", E0_METHOD_ROLES),
+                _axis("load", E0_LOADS),
+                _axis("block", REGISTERED_CONFIRMATION_BLOCKS),
+                _axis("block_phase", ("excluded_pilot", "final_candidate")),
             ),
         ),
     )
@@ -1731,8 +2254,8 @@ class ExperimentRegistry:
     cells: tuple[ExperimentCell, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 2:
-            raise ValueError("only industrial registry schema version 2 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 3:
+            raise ValueError("only industrial registry schema version 3 is supported")
         _require_text("registry name", self.name)
         if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
             raise ValueError(
@@ -1762,17 +2285,60 @@ class ExperimentRegistry:
             seen_stages.add(cell.identity.experiment)
         if seen_stages != known:
             raise ValueError("every experiment must have at least one declared cell")
+        for cell in self.cells:
+            identity = cell.identity
+            _derived_scientific_method_role(cell)
+            if (
+                identity.optimizer
+                in {
+                    FROZEN_TTS_RECIPE_SENTINEL,
+                    SEALED_E2_RECIPE_SENTINEL,
+                }
+            ) != (
+                identity.schedule
+                in {
+                    FROZEN_TTS_RECIPE_SENTINEL,
+                    SEALED_E2_RECIPE_SENTINEL,
+                }
+            ):
+                raise ValueError("recipe sentinels must bind optimizer and schedule")
         declarations = {
             row.lookup_key.sha256: row for row in self.adaptation_recipe_declarations
         }
         for cell in self.cells:
-            if cell.identity.experiment not in {
-                "E1",
-                "E2",
-            } or cell.identity.method not in {
-                "tts",
-                "l0",
-            }:
+            identity = cell.identity
+            if identity.method in {"tts", "l0"} and _has_recipe_sentinel(
+                identity, FROZEN_TTS_RECIPE_SENTINEL
+            ):
+                key = AdaptationRecipeLookupKey.from_cell(cell)
+                declaration = declarations.get(key.sha256)
+                if declaration is None:
+                    raise ValueError("frozen TTS anchor lacks a recipe declaration")
+                if (
+                    declaration.source_authority_sha256
+                    != self.frozen_tts_recipe_authority.sha256
+                ):
+                    raise ValueError("frozen TTS recipe source authority differs")
+                if (
+                    declaration.status == "BLOCKED"
+                    and cell.status is not CellStatus.BLOCKED
+                ):
+                    raise ValueError(
+                        "blocked frozen TTS recipe must block formal cells"
+                    )
+                continue
+            if identity.method == "l0" and _has_recipe_sentinel(
+                identity, SEALED_E2_RECIPE_SENTINEL
+            ):
+                if (
+                    cell.status is not CellStatus.BLOCKED
+                    or cell.reason_code != "sealed_e2_recipe_receipt_required"
+                ):
+                    raise ValueError(
+                        "unmaterialized LightCone templates require an E2 seal"
+                    )
+                continue
+            if identity.experiment not in {"E1", "E2"} or identity.method != "l0":
                 continue
             key = AdaptationRecipeLookupKey.from_cell(cell)
             declaration = declarations.get(key.sha256)
@@ -1792,6 +2358,10 @@ class ExperimentRegistry:
             "name": self.name,
             "gpu_uuids": list(self.gpu_uuids),
             "definitions": [_canonical(row) for row in self.definitions],
+            "frozen_tts_recipe_authority": _canonical(self.frozen_tts_recipe_authority),
+            "frozen_tts_recipe_authority_sha256": (
+                self.frozen_tts_recipe_authority.sha256
+            ),
             "adaptation_recipe_declarations": [
                 _canonical(row) for row in self.adaptation_recipe_declarations
             ],
@@ -1824,6 +2394,31 @@ class ExperimentRegistry:
         )
 
     @cached_property
+    def _cells_by_id(self) -> dict[str, ExperimentCell]:
+        return {cell.cell_id: cell for cell in self.cells}
+
+    @property
+    def frozen_tts_recipe_authority(self) -> FrozenTtsRecipeAuthority:
+        return FROZEN_TTS_RECIPE_AUTHORITY
+
+    def scientific_method_role_for_cell(
+        self, cell_or_id: ExperimentCell | str
+    ) -> ScientificMethodRole:
+        """Derive a scientific role only from an exact registry-owned cell."""
+
+        if type(cell_or_id) is str:
+            cell = self._cells_by_id.get(cell_or_id)
+            if cell is None:
+                raise ValueError("scientific-role cell ID is absent from the registry")
+        elif type(cell_or_id) is ExperimentCell:
+            cell = self._cells_by_id.get(cell_or_id.cell_id)
+            if cell is None or cell != cell_or_id:
+                raise ValueError("scientific-role cell is not registry-owned")
+        else:
+            raise TypeError("scientific-role lookup requires a cell or cell ID")
+        return _derived_scientific_method_role(cell)
+
+    @cached_property
     def adaptation_recipe_declarations(
         self,
     ) -> tuple[AdaptationRecipeDeclaration, ...]:
@@ -1839,21 +2434,15 @@ class ExperimentRegistry:
         """Resolve only a cell owned by this registry to one exact declaration."""
 
         if type(cell_or_id) is str:
-            matches = tuple(cell for cell in self.cells if cell.cell_id == cell_or_id)
-            if len(matches) != 1:
+            cell = self._cells_by_id.get(cell_or_id)
+            if cell is None:
                 raise ValueError(
                     "adaptation recipe cell ID is absent from the registry"
                 )
-            cell = matches[0]
         elif type(cell_or_id) is ExperimentCell:
-            matches = tuple(
-                candidate
-                for candidate in self.cells
-                if candidate.cell_id == cell_or_id.cell_id
-            )
-            if len(matches) != 1 or matches[0] != cell_or_id:
+            cell = self._cells_by_id.get(cell_or_id.cell_id)
+            if cell is None or cell != cell_or_id:
                 raise ValueError("adaptation recipe cell is not registry-owned")
-            cell = cell_or_id
         else:
             raise TypeError("adaptation recipe lookup requires a cell or cell ID")
         key = AdaptationRecipeLookupKey.from_cell(cell)
@@ -1948,6 +2537,16 @@ class ExperimentRegistry:
         return None
 
 
+def scientific_role_for_cell(
+    registry: ExperimentRegistry, cell_or_id: ExperimentCell | str
+) -> str:
+    """Return the role value for an exact cell owned by ``registry``."""
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("scientific-role resolution requires an ExperimentRegistry")
+    return registry.scientific_method_role_for_cell(cell_or_id).value
+
+
 class _CellFactory:
     def __init__(
         self,
@@ -2026,6 +2625,20 @@ class _CellFactory:
                     "The pinned schema-v3 patch rejects adaptive execution for this "
                     "backend before model loading."
                 )
+        if optimizer == schedule == FROZEN_TTS_RECIPE_SENTINEL:
+            status = CellStatus.BLOCKED
+            reason_code = "tts_official_recipe_unavailable"
+            reason = (
+                "The paper fixes TTS mechanisms but does not disclose the complete "
+                "numeric recipe and no official implementation/config was found."
+            )
+        elif optimizer == schedule == SEALED_E2_RECIPE_SENTINEL:
+            status = CellStatus.BLOCKED
+            reason_code = "sealed_e2_recipe_receipt_required"
+            reason = (
+                "LightCone materialization requires the exact sealed E2 final-recipe "
+                "receipt before execution."
+            )
         if gpu_count == 1:
             if gpu_index is not None and gpu_index not in range(len(self.gpu_uuids)):
                 raise ValueError("gpu_index lies outside the logical GPU slots")
@@ -2244,6 +2857,43 @@ def _add_reference_baselines(
         )
 
 
+def _scientific_role_identity_fields(role: str) -> dict[str, Any]:
+    """Map one reported role onto the existing runtime publication method."""
+
+    parsed = ScientificMethodRole(role)
+    if parsed is ScientificMethodRole.TARGET_ONLY:
+        return {"method": "target_only", "scope": "none", "parameterization": "none"}
+    if parsed is ScientificMethodRole.STATIC:
+        return {"method": "static", "scope": "none", "parameterization": "none"}
+    if parsed in {ScientificMethodRole.TTS, ScientificMethodRole.L0_NAIVE}:
+        return {
+            "method": "tts" if parsed is ScientificMethodRole.TTS else "l0",
+            "scope": FROZEN_TTS_RECIPE_SENTINEL,
+            "optimizer": FROZEN_TTS_RECIPE_SENTINEL,
+            "schedule": FROZEN_TTS_RECIPE_SENTINEL,
+            "parameterization": FROZEN_TTS_RECIPE_SENTINEL,
+        }
+    if parsed is ScientificMethodRole.LIGHTCONE:
+        return {
+            "method": "l0",
+            "scope": SEALED_E2_RECIPE_SENTINEL,
+            "optimizer": SEALED_E2_RECIPE_SENTINEL,
+            "schedule": SEALED_E2_RECIPE_SENTINEL,
+            "parameterization": SEALED_E2_RECIPE_SENTINEL,
+        }
+    if parsed in {
+        ScientificMethodRole.ONLINESPEC_OGD,
+        ScientificMethodRole.ONLINESPEC_OPT,
+        ScientificMethodRole.ONLINESPEC_ENS,
+    }:
+        return {
+            "method": parsed.value,
+            "scope": "external_baseline_recipe",
+            "parameterization": "external_baseline_recipe",
+        }
+    raise ValueError("LC candidates require an E1/E2 search geometry")
+
+
 def _add_e1_cells(factory: _CellFactory) -> None:
     for width in DRAFT_WIDTHS:
         for concurrency in E3A_CONCURRENCY_GRID:
@@ -2263,74 +2913,66 @@ def _add_e1_cells(factory: _CellFactory) -> None:
                 concurrency=concurrency,
                 gpu_index=reference_gpu,
             )
-            for scope in E1_SCOPES:
+            anchor_gpu = _paired_gpu_index(
+                factory.seed,
+                {
+                    "experiment": "E1",
+                    "selection": selection,
+                    "kind": "frozen_tts_anchor",
+                },
+            )
+            for role in (
+                ScientificMethodRole.TTS.value,
+                ScientificMethodRole.L0_NAIVE.value,
+            ):
+                factory.add(
+                    experiment="E1",
+                    model="Qwen/Qwen3-8B",
+                    backend="DFLASH",
+                    task="LiveCodeBench_tuning",
+                    workload_class=WorkloadClass.TUNING,
+                    context=40928,
+                    regime="short_input_long_generation",
+                    width=width,
+                    arrival="locked_reference_load",
+                    slo="tuning_safety",
+                    concurrency=concurrency,
+                    variant=f"frozen_tts_anchor:{selection}:role={role}",
+                    gpu_index=anchor_gpu,
+                    **_scientific_role_identity_fields(role),
+                )
+            for configuration in _dflash_parameter_configurations():
+                geometry_gpu = _paired_gpu_index(
+                    factory.seed,
+                    {
+                        "experiment": "E1",
+                        "selection": selection,
+                        "configuration": configuration.sha256,
+                    },
+                )
                 for optimizer in E1_OPTIMIZER_ANCHORS:
-                    full_gpu = _paired_gpu_index(
-                        factory.seed,
-                        {
-                            "experiment": "E1",
-                            "selection": selection,
-                            "scope": scope,
-                            "optimizer": optimizer,
-                            "parameterization": "full",
-                        },
+                    factory.add(
+                        experiment="E1",
+                        model="Qwen/Qwen3-8B",
+                        backend="DFLASH",
+                        task="LiveCodeBench_tuning",
+                        method="l0",
+                        workload_class=WorkloadClass.TUNING,
+                        scope=configuration.scope,
+                        rank=configuration.rank,
+                        alpha_over_rank=configuration.alpha_over_rank,
+                        optimizer=optimizer,
+                        schedule="constant",
+                        context=40928,
+                        regime="short_input_long_generation",
+                        width=width,
+                        arrival="locked_reference_load",
+                        slo="tuning_safety",
+                        concurrency=concurrency,
+                        parameterization=configuration.parameterization,
+                        variant=f"lc_candidate:optimizer_anchor:{selection}",
+                        gpu_index=geometry_gpu,
                     )
-                    for method in ("tts", "l0"):
-                        factory.add(
-                            experiment="E1",
-                            model="Qwen/Qwen3-8B",
-                            backend="DFLASH",
-                            task="LiveCodeBench_tuning",
-                            method=method,
-                            workload_class=WorkloadClass.TUNING,
-                            scope=scope,
-                            optimizer=optimizer,
-                            schedule="constant",
-                            context=40928,
-                            regime="short_input_long_generation",
-                            width=width,
-                            arrival="locked_reference_load",
-                            slo="tuning_safety",
-                            concurrency=concurrency,
-                            parameterization="full",
-                            variant=f"optimizer_anchor:{selection}",
-                            gpu_index=full_gpu,
-                        )
-                    for rank in LORA_RANKS:
-                        lora_gpu = _paired_gpu_index(
-                            factory.seed,
-                            {
-                                "experiment": "E1",
-                                "selection": selection,
-                                "scope": scope,
-                                "optimizer": optimizer,
-                                "parameterization": "lora",
-                                "rank": rank,
-                            },
-                        )
-                        for method in ("tts", "l0"):
-                            factory.add(
-                                experiment="E1",
-                                model="Qwen/Qwen3-8B",
-                                backend="DFLASH",
-                                task="LiveCodeBench_tuning",
-                                method=method,
-                                workload_class=WorkloadClass.TUNING,
-                                scope=scope,
-                                rank=rank,
-                                alpha_over_rank=1.0,
-                                optimizer=optimizer,
-                                schedule="constant",
-                                context=40928,
-                                regime="short_input_long_generation",
-                                width=width,
-                                arrival="locked_reference_load",
-                                slo="tuning_safety",
-                                concurrency=concurrency,
-                                parameterization="lora",
-                                variant=f"optimizer_anchor:{selection}",
-                                gpu_index=lora_gpu,
-                            )
 
 
 def _dflash_parameter_configurations() -> tuple[ParameterConfiguration, ...]:
@@ -2386,6 +3028,29 @@ def _add_e2_cells(factory: _CellFactory) -> None:
             width=None,
             gpu_index=reference_gpu,
         )
+        anchor_gpu = _paired_gpu_index(
+            factory.seed,
+            {"experiment": "E2", "stage": stage, "kind": "frozen_tts_anchor"},
+        )
+        for role in (
+            ScientificMethodRole.TTS.value,
+            ScientificMethodRole.L0_NAIVE.value,
+        ):
+            factory.add(
+                experiment="E2",
+                model="Qwen/Qwen3-8B",
+                backend="DFLASH",
+                task="LiveCodeBench_tuning",
+                workload_class=WorkloadClass.TUNING,
+                context=context,
+                regime="short_input_long_generation",
+                width=None,
+                arrival="e1_common_load",
+                slo="tuning_safety",
+                variant=f"{stage}:frozen_tts_anchor:role={role}",
+                gpu_index=anchor_gpu,
+                **_scientific_role_identity_fields(role),
+            )
         for configuration in _dflash_parameter_configurations():
             for optimizer in E2_OPTIMIZERS:
                 for schedule in E2_SCHEDULES:
@@ -2404,35 +3069,34 @@ def _add_e2_cells(factory: _CellFactory) -> None:
                                 "learning_rate": None,
                             },
                         )
-                        for method in ("tts", "l0"):
-                            factory.add(
-                                experiment="E2",
-                                model="Qwen/Qwen3-8B",
-                                backend="DFLASH",
-                                task="LiveCodeBench_tuning",
-                                method=method,
-                                workload_class=WorkloadClass.TUNING,
-                                scope=configuration.scope,
-                                rank=configuration.rank,
-                                alpha_over_rank=configuration.alpha_over_rank,
-                                optimizer=optimizer,
-                                schedule=schedule,
-                                context=context,
-                                regime="short_input_long_generation",
-                                width=None,
-                                arrival="e1_common_load",
-                                slo="tuning_safety",
-                                parameterization=configuration.parameterization,
-                                variant=f"{stage}:optimizer_equation_unresolved",
-                                gpu_index=pair_gpu,
-                                status=CellStatus.BLOCKED,
-                                reason_code="optimizer_equation_unresolved",
-                                reason=(
-                                    "No authoritative ChronoBelief update equation or "
-                                    "source identity is registered; substitution is "
-                                    "forbidden."
-                                ),
-                            )
+                        factory.add(
+                            experiment="E2",
+                            model="Qwen/Qwen3-8B",
+                            backend="DFLASH",
+                            task="LiveCodeBench_tuning",
+                            method="l0",
+                            workload_class=WorkloadClass.TUNING,
+                            scope=configuration.scope,
+                            rank=configuration.rank,
+                            alpha_over_rank=configuration.alpha_over_rank,
+                            optimizer=optimizer,
+                            schedule=schedule,
+                            context=context,
+                            regime="short_input_long_generation",
+                            width=None,
+                            arrival="e1_common_load",
+                            slo="tuning_safety",
+                            parameterization=configuration.parameterization,
+                            variant=f"{stage}:lc_candidate:optimizer_equation_unresolved",
+                            gpu_index=pair_gpu,
+                            status=CellStatus.BLOCKED,
+                            reason_code="optimizer_equation_unresolved",
+                            reason=(
+                                "No authoritative ChronoBelief update equation or "
+                                "source identity is registered; substitution is "
+                                "forbidden."
+                            ),
+                        )
                         continue
                     for learning_rate in learning_rates:
                         pair_gpu = _paired_gpu_index(
@@ -2446,47 +3110,47 @@ def _add_e2_cells(factory: _CellFactory) -> None:
                                 "learning_rate": learning_rate,
                             },
                         )
-                        for method in ("tts", "l0"):
-                            factory.add(
-                                experiment="E2",
-                                model="Qwen/Qwen3-8B",
-                                backend="DFLASH",
-                                task="LiveCodeBench_tuning",
-                                method=method,
-                                workload_class=WorkloadClass.TUNING,
-                                scope=configuration.scope,
-                                rank=configuration.rank,
-                                alpha_over_rank=configuration.alpha_over_rank,
-                                optimizer=optimizer,
-                                learning_rate=learning_rate,
-                                schedule=schedule,
-                                context=context,
-                                regime="short_input_long_generation",
-                                width=None,
-                                arrival="e1_common_load",
-                                slo="tuning_safety",
-                                parameterization=configuration.parameterization,
-                                variant=f"{stage}:optimizer_specific_log_lr",
-                                gpu_index=pair_gpu,
-                                status=CellStatus.BLOCKED,
-                                reason_code="adaptation_recipe_values_unregistered",
-                                reason=(
-                                    "The E2 recipe declaration retains named unresolved "
-                                    "optimizer, stride, or E3a-selected width semantics; "
-                                    "schema defaults cannot authorize execution."
-                                ),
-                            )
+                        factory.add(
+                            experiment="E2",
+                            model="Qwen/Qwen3-8B",
+                            backend="DFLASH",
+                            task="LiveCodeBench_tuning",
+                            method="l0",
+                            workload_class=WorkloadClass.TUNING,
+                            scope=configuration.scope,
+                            rank=configuration.rank,
+                            alpha_over_rank=configuration.alpha_over_rank,
+                            optimizer=optimizer,
+                            learning_rate=learning_rate,
+                            schedule=schedule,
+                            context=context,
+                            regime="short_input_long_generation",
+                            width=None,
+                            arrival="e1_common_load",
+                            slo="tuning_safety",
+                            parameterization=configuration.parameterization,
+                            variant=f"{stage}:lc_candidate:optimizer_specific_log_lr",
+                            gpu_index=pair_gpu,
+                            status=CellStatus.BLOCKED,
+                            reason_code="adaptation_recipe_values_unregistered",
+                            reason=(
+                                "The E2 recipe declaration retains named unresolved "
+                                "optimizer, stride, or E3a-selected width semantics; "
+                                "schema defaults cannot authorize execution."
+                            ),
+                        )
 
 
 def _add_e4_cells(factory: _CellFactory) -> None:
-    for variant, method in (
-        ("synchronous_main_stream", "tts"),
-        ("side_stream_tts", "tts"),
-        ("l0_first_ready", "l0"),
-        ("cohort_batch", "l0"),
-        ("fixed_buffer_graph", "l0"),
-        ("bounded_telemetry", "l0"),
+    for variant, role in (
+        ("synchronous_main_stream", ScientificMethodRole.TTS.value),
+        ("side_stream_tts", ScientificMethodRole.TTS.value),
+        ("l0_first_ready", ScientificMethodRole.L0_NAIVE.value),
+        ("cohort_batch", ScientificMethodRole.LIGHTCONE.value),
+        ("fixed_buffer_graph", ScientificMethodRole.LIGHTCONE.value),
+        ("bounded_telemetry", ScientificMethodRole.LIGHTCONE.value),
     ):
+        identity_fields = _scientific_role_identity_fields(role)
         for load in ("low", "moderate", "saturation"):
             for traffic in ("pure_decode", "mixed_prefill_decode"):
                 for chunked_prefill in ("disabled", "enabled"):
@@ -2496,11 +3160,7 @@ def _add_e4_cells(factory: _CellFactory) -> None:
                             model="Qwen/Qwen3-8B",
                             backend="DFLASH",
                             task="systems_ablation",
-                            method=method,
                             workload_class=WorkloadClass.TUNING,
-                            scope="selected_e2",
-                            optimizer="selected_e2",
-                            schedule="selected_e2",
                             context=40928,
                             regime=traffic,
                             width=DRAFT_WIDTHS[1],
@@ -2510,8 +3170,8 @@ def _add_e4_cells(factory: _CellFactory) -> None:
                                 "operational_grid=locked_e2"
                             ),
                             slo="critical_path",
-                            parameterization="selected",
                             variant=variant,
+                            **identity_fields,
                         )
     for profiler in ("nvtx", "nsight_systems", "nsight_compute"):
         factory.add(
@@ -2519,27 +3179,24 @@ def _add_e4_cells(factory: _CellFactory) -> None:
             model="Qwen/Qwen3-8B",
             backend="DFLASH",
             task="isolated_profile",
-            method="l0",
             workload_class=WorkloadClass.PROFILE,
             gpu_count=2,
-            scope="selected_e2",
-            optimizer="selected_e2",
-            schedule="selected_e2",
             context=40928,
             regime="mixed_prefill_decode",
             width=DRAFT_WIDTHS[1],
             arrival="isolated_profile",
             slo="headline_evidence_forbidden",
             topology="two_gpu_host_exclusive",
-            parameterization="selected",
             variant=profiler,
+            **_scientific_role_identity_fields(ScientificMethodRole.LIGHTCONE.value),
         )
 
 
 def _add_e3b_cells(factory: _CellFactory) -> None:
     for block in REGISTERED_CONFIRMATION_BLOCKS:
         phase = "excluded_pilot" if block in PILOT_BLOCKS else "final_candidate"
-        for method in CORE_METHODS:
+        for role_index, role in enumerate(CONFIRMATION_METHOD_ROLES):
+            identity_fields = _scientific_role_identity_fields(role)
             for context in CONTEXT_GRID:
                 for regime in CONTEXT_REGIMES:
                     for load in ("concurrency_one", "common_load"):
@@ -2548,21 +3205,13 @@ def _add_e3b_cells(factory: _CellFactory) -> None:
                                 experiment="E3b",
                                 model="Qwen/Qwen3-8B",
                                 backend=(
-                                    "NONE" if method == "target_only" else "DFLASH"
+                                    "NONE"
+                                    if role == ScientificMethodRole.TARGET_ONLY.value
+                                    else "DFLASH"
                                 ),
                                 task="heldout_long_context_confirmation",
-                                method=method,
                                 workload_class=WorkloadClass.HEADLINE,
-                                gpu_index=(CORE_METHODS.index(method) + block) % 2,
-                                scope=(
-                                    "selected_e2" if method in {"tts", "l0"} else "none"
-                                ),
-                                optimizer=(
-                                    "selected_e2" if method in {"tts", "l0"} else None
-                                ),
-                                schedule=(
-                                    "selected_e2" if method in {"tts", "l0"} else None
-                                ),
+                                gpu_index=(role_index + block) % 2,
                                 context=context,
                                 regime=regime,
                                 arrival=(
@@ -2572,10 +3221,8 @@ def _add_e3b_cells(factory: _CellFactory) -> None:
                                 ),
                                 slo="paired_long_context_confirmation",
                                 block=block,
-                                parameterization=(
-                                    "selected" if method in {"tts", "l0"} else "none"
-                                ),
-                                variant=f"{phase}:{load}:{width_panel}",
+                                variant=f"{phase}:{load}:{width_panel}:role={role}",
+                                **identity_fields,
                             )
 
 
@@ -2592,15 +3239,18 @@ def _add_e1a_cells(factory: _CellFactory) -> None:
                 scope=configuration.scope,
                 rank=configuration.rank,
                 alpha_over_rank=configuration.alpha_over_rank,
-                optimizer="transferred_e2",
-                schedule="transferred_e2",
+                optimizer=SEALED_E2_RECIPE_SENTINEL,
+                schedule=SEALED_E2_RECIPE_SENTINEL,
                 context=40928,
                 regime="short_input_long_generation",
                 width=DRAFT_WIDTHS[1],
                 arrival="fixed_budget_then_native_scheduler",
                 slo="confidence_head_guard",
                 parameterization=configuration.parameterization,
-                variant=f"native_heads:{configuration.native_head_policy}",
+                variant=(
+                    "sealed_lightcone_recipe:"
+                    f"native_heads:{configuration.native_head_policy}"
+                ),
             )
     _add_reference_baselines(
         factory,
@@ -2614,27 +3264,24 @@ def _add_e1a_cells(factory: _CellFactory) -> None:
 def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
     phase = "excluded_pilot" if block in PILOT_BLOCKS else "final_candidate"
     for backend in ("DFLASH", "DSPARK"):
-        for method in CORE_METHODS:
+        for role_index, role in enumerate(CONFIRMATION_METHOD_ROLES):
+            identity_fields = _scientific_role_identity_fields(role)
             for concurrency in E5_CLOSED_LOOP_CONCURRENCY:
                 factory.add(
                     experiment="E5",
                     model="Qwen/Qwen3-8B",
                     backend=backend,
                     task="production_crossover",
-                    method=method,
                     workload_class=WorkloadClass.HEADLINE,
-                    gpu_index=(CORE_METHODS.index(method) + block) % 2,
-                    scope="selected_recipe" if method in {"tts", "l0"} else "none",
+                    gpu_index=(role_index + block) % 2,
                     context=40928,
                     regime="production_mix",
                     arrival="closed_loop",
                     slo=PRODUCTION_SLO,
                     block=block,
                     concurrency=concurrency,
-                    parameterization=(
-                        "selected" if method in {"tts", "l0"} else "none"
-                    ),
-                    variant=f"{phase}:E5a_closed_loop",
+                    variant=f"{phase}:E5a_closed_loop:role={role}",
+                    **identity_fields,
                 )
             for load_factor in E5_OPEN_LOOP_LOAD_FACTORS:
                 factory.add(
@@ -2642,20 +3289,16 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                     model="Qwen/Qwen3-8B",
                     backend=backend,
                     task="production_crossover",
-                    method=method,
                     workload_class=WorkloadClass.HEADLINE,
-                    gpu_index=(CORE_METHODS.index(method) + block) % 2,
-                    scope="selected_recipe" if method in {"tts", "l0"} else "none",
+                    gpu_index=(role_index + block) % 2,
                     context=40928,
                     regime="production_mix",
                     arrival="poisson",
                     slo=PRODUCTION_SLO,
                     block=block,
                     load_factor=load_factor,
-                    parameterization=(
-                        "selected" if method in {"tts", "l0"} else "none"
-                    ),
-                    variant=f"{phase}:E5a_open_loop_lambda_star",
+                    variant=f"{phase}:E5a_open_loop_lambda_star:role={role}",
+                    **identity_fields,
                 )
             for arrival in (
                 "immediate_burst",
@@ -2669,19 +3312,14 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                     model="Qwen/Qwen3-8B",
                     backend=backend,
                     task="production_crossover",
-                    method=method,
                     workload_class=WorkloadClass.HEADLINE,
-                    gpu_index=(CORE_METHODS.index(method) + block) % 2,
-                    scope="selected_recipe" if method in {"tts", "l0"} else "none",
+                    gpu_index=(role_index + block) % 2,
                     context=40928,
                     regime="production_mix",
                     arrival=arrival,
                     slo=PRODUCTION_SLO,
                     block=block,
-                    parameterization=(
-                        "selected" if method in {"tts", "l0"} else "none"
-                    ),
-                    variant=f"{phase}:E5a_trace_or_soak",
+                    variant=f"{phase}:E5a_trace_or_soak:role={role}",
                     status=(
                         CellStatus.BLOCKED
                         if arrival == "burstgpt_shape"
@@ -2698,10 +3336,12 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                         if arrival == "burstgpt_shape"
                         else "No complete content-bound measurement exists."
                     ),
+                    **identity_fields,
                 )
 
     for backend in ("DFLASH", "DSPARK"):
-        for method in CORE_METHODS:
+        for role_index, role in enumerate(CONFIRMATION_METHOD_ROLES):
+            identity_fields = _scientific_role_identity_fields(role)
             for topology in E5_TOPOLOGIES:
                 for cohort_count in E5_COHORT_COUNTS:
                     for distribution in E5_COHORT_DISTRIBUTIONS:
@@ -2710,16 +3350,12 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                             model="Qwen/Qwen3-8B",
                             backend=backend,
                             task="topology_cohort_capacity",
-                            method=method,
                             workload_class=WorkloadClass.HEADLINE,
                             gpu_count=1 if topology == "tp1_dp1" else 2,
                             gpu_index=(
-                                (CORE_METHODS.index(method) + block) % 2
+                                (role_index + block) % 2
                                 if topology == "tp1_dp1"
                                 else None
-                            ),
-                            scope=(
-                                "selected_recipe" if method in {"tts", "l0"} else "none"
                             ),
                             context=40928,
                             regime="production_mix",
@@ -2728,11 +3364,9 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                             block=block,
                             cohort=f"K={cohort_count}:{distribution}",
                             topology=topology,
-                            parameterization=(
-                                "selected" if method in {"tts", "l0"} else "none"
-                            ),
-                            variant=f"{phase}:E5b_topology_cohort",
+                            variant=f"{phase}:E5b_topology_cohort:role={role}",
                             cohort_count=cohort_count,
+                            **identity_fields,
                         )
     for failure in E5_FAILURES:
         factory.add(
@@ -2740,18 +3374,16 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
             model="Qwen/Qwen3-8B",
             backend="DFLASH+DSPARK",
             task="failure_injection",
-            method="l0",
             workload_class=WorkloadClass.CORRECTNESS,
             gpu_count=2,
-            scope="selected_recipe",
             context=40928,
             regime="production_mix",
             arrival=f"failure:{failure}",
             slo="excluded_from_headline",
             topology="tp2_and_two_replica",
             block=block,
-            parameterization="selected",
-            variant=f"{phase}:E5b_failure",
+            variant=f"{phase}:E5b_failure:role=lightcone",
+            **_scientific_role_identity_fields(ScientificMethodRole.LIGHTCONE.value),
         )
 
 
@@ -2761,6 +3393,12 @@ def _add_e5_cells(factory: _CellFactory) -> None:
 
 
 def _add_e6_cells(factory: _CellFactory) -> None:
+    headline_roles = (
+        ScientificMethodRole.TARGET_ONLY.value,
+        ScientificMethodRole.STATIC.value,
+        ScientificMethodRole.TTS.value,
+        ScientificMethodRole.LIGHTCONE.value,
+    )
     for model in E6_CANDIDATE_MODELS:
         factory.add(
             experiment="E6",
@@ -2775,72 +3413,151 @@ def _add_e6_cells(factory: _CellFactory) -> None:
         )
         for task in ("LiveCodeBench", "MATH-500"):
             for context in (4096, 16384, 32768):
-                for method in CORE_METHODS:
+                for load in ("concurrency_one", "common_slo_load"):
+                    for block in REGISTERED_CONFIRMATION_BLOCKS:
+                        phase = (
+                            "excluded_pilot"
+                            if block in PILOT_BLOCKS
+                            else "final_candidate"
+                        )
+                        for role in headline_roles:
+                            factory.add(
+                                experiment="E6",
+                                model=model,
+                                backend=(
+                                    "NONE"
+                                    if role == ScientificMethodRole.TARGET_ONLY.value
+                                    else "NEXTN"
+                                ),
+                                task=task,
+                                workload_class=WorkloadClass.HEADLINE,
+                                gpu_count=2,
+                                context=context,
+                                regime="native_mtp_transfer",
+                                arrival=(
+                                    "closed_loop_c1"
+                                    if load == "concurrency_one"
+                                    else "common_slo_load"
+                                ),
+                                slo=PRODUCTION_SLO,
+                                topology="tp2_dp1",
+                                block=block,
+                                variant=(
+                                    f"{phase}:{load}:compatibility_transfer:role={role}"
+                                ),
+                                status=CellStatus.BLOCKED,
+                                reason_code="native_nextn_preflight_required",
+                                reason=(
+                                    "The exact NEXTN interface and two-rank memory fit "
+                                    "have not passed their registered preflight."
+                                ),
+                                **_scientific_role_identity_fields(role),
+                            )
+        for context in (16384, 32768):
+            for load in ("concurrency_one", "common_slo_load"):
+                for block in REGISTERED_CONFIRMATION_BLOCKS:
+                    phase = (
+                        "excluded_pilot" if block in PILOT_BLOCKS else "final_candidate"
+                    )
                     factory.add(
                         experiment="E6",
                         model=model,
-                        backend="NONE" if method == "target_only" else "NEXTN",
-                        task=task,
-                        method=method,
+                        backend="NEXTN",
+                        task="LiveCodeBench",
                         workload_class=WorkloadClass.HEADLINE,
                         gpu_count=2,
-                        scope="transferred_e1_e2",
-                        optimizer=(
-                            "transferred_e2" if method in {"tts", "l0"} else None
-                        ),
-                        schedule=(
-                            "transferred_e2" if method in {"tts", "l0"} else None
-                        ),
                         context=context,
                         regime="native_mtp_transfer",
-                        arrival="common_feasible_load",
+                        arrival=(
+                            "closed_loop_c1"
+                            if load == "concurrency_one"
+                            else "common_slo_load"
+                        ),
                         slo=PRODUCTION_SLO,
                         topology="tp2_dp1",
-                        parameterization=(
-                            "transferred" if method in {"tts", "l0"} else "none"
+                        block=block,
+                        variant=(
+                            f"{phase}:{load}:largest_feasible_model_anchor_template:"
+                            "role=l0_naive"
                         ),
-                        variant="compatibility_fit_then_transfer",
                         status=CellStatus.BLOCKED,
-                        reason_code="native_nextn_preflight_required",
+                        reason_code="largest_feasible_model_selection_required",
                         reason=(
-                            "The exact NEXTN interface and two-rank memory fit have not "
-                            "passed their registered preflight."
+                            "The preregistered feasibility reducer must select the "
+                            "largest feasible model before this L0-naive anchor."
+                        ),
+                        **_scientific_role_identity_fields(
+                            ScientificMethodRole.L0_NAIVE.value
                         ),
                     )
 
 
 def _add_e0_cells(factory: _CellFactory) -> None:
+    # Keep the complete breadth compatibility universe structural.  It is not
+    # an interval-bearing interaction grid and must not be promoted merely
+    # because a later selected anchor is measured.
     for model in E0_MODELS:
         for backend in E0_BACKENDS:
             for task in E0_TASKS:
-                for method in E0_METHODS:
-                    selected = method in {
-                        "tts",
-                        "l0",
-                        "onlinespec_ogd",
-                        "onlinespec_opt",
-                        "onlinespec_ens",
-                    }
+                for role in E0_METHOD_ROLES:
                     factory.add(
                         experiment="E0",
                         model=model,
                         backend=backend,
                         task=task,
-                        method=method,
                         workload_class=WorkloadClass.HEADLINE,
-                        scope="selected_recipe" if selected else "none",
                         context=4096,
                         regime="breadth_replication",
                         arrival="deterministic_stratified_requests",
                         slo="breadth_timing",
-                        parameterization="selected" if selected else "none",
-                        variant="compatibility_template",
-                        reason_code="compatibility_unmeasured",
+                        variant=f"compatibility_template:role={role}",
+                        status=CellStatus.BLOCKED,
+                        reason_code="compatibility_template_only",
                         reason=(
-                            "The model-backend-task interface has not yet produced a "
-                            "compatibility receipt."
+                            "This breadth template cannot be reported before its exact "
+                            "recipe and compatibility authorities are materialized."
                         ),
+                        **_scientific_role_identity_fields(role),
                     )
+
+    for model in E0_INTERACTION_MODELS:
+        for backend in E0_INTERACTION_BACKENDS:
+            for task in E0_INTERACTION_TASKS:
+                for load in E0_LOADS:
+                    for block in (*PILOT_BLOCKS, *E0_INTERACTION_FINAL_BLOCKS):
+                        phase = (
+                            "excluded_pilot"
+                            if block in PILOT_BLOCKS
+                            else "final_candidate"
+                        )
+                        for role in CONFIRMATION_METHOD_ROLES:
+                            factory.add(
+                                experiment="E0",
+                                model=model,
+                                backend=backend,
+                                task=task,
+                                workload_class=WorkloadClass.HEADLINE,
+                                context=4096,
+                                regime="breadth_replication",
+                                arrival=(
+                                    "closed_loop_c1"
+                                    if load == "concurrency_one"
+                                    else "common_slo_load"
+                                ),
+                                slo="breadth_timing",
+                                block=block,
+                                variant=(
+                                    f"{phase}:{load}:compatibility_template:role={role}"
+                                ),
+                                status=CellStatus.BLOCKED,
+                                reason_code="compatibility_template_only",
+                                reason=(
+                                    "This preregistered breadth slot cannot be reported "
+                                    "before its exact recipe, load, compatibility, and "
+                                    "content-bound evidence authorities are materialized."
+                                ),
+                                **_scientific_role_identity_fields(role),
+                            )
 
 
 def build_industrial_registry(
@@ -2880,7 +3597,7 @@ def build_industrial_registry(
     _add_e6_cells(factory)
     _add_e0_cells(factory)
     registry = ExperimentRegistry(
-        schema_version=2,
+        schema_version=3,
         name="lightcone-industrial-experiment-registry",
         gpu_uuids=gpu_uuids,
         definitions=_industrial_definitions(),

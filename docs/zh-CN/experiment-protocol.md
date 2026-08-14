@@ -5,18 +5,21 @@
 ## 问题与当前状态
 
 工业级研究考察在线 drafter adaptation 在何处有效、为何有效，以及其成本或操作风险何时
-超过节省的 target work。Target-only、Static、TTS 与 L0 始终分开；TTS 与 L0 使用相同
-candidate，只在发布时间上不同。
+超过节省的 target work。Formal role 是 Target-only、Static、TTS、L0-naive 与 LightCone。
+Recipe authority 与 publication policy 正交：TTS 使用 frozen primary-source recipe 与 fixed
+barrier；L0-naive 使用同一个 authority 与 first-ready publication；LC-candidate 与 E2-sealed
+LightCone winner 分别使用 L0 policy 加 search recipe 与 sealed recipe。
 
 所有 formal industrial GPU 结果都是 `UNMEASURED`。代码、CPU 测试与 registry 建立目标 protocol 与
 coordinator contract，不是完整可运行 speculative surface 或 benchmark 结果。Industrial
-executor 当前只运行 TP1/DP1 Target-only。Static/TTS/L0 会在任何 mutation 前因缺少
+executor 当前只运行 TP1/DP1 Target-only。Static/TTS/L0-naive/LightCone 会在任何 mutation 前因缺少
 trusted hardware signer 而 `BLOCKED`；固定 native
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
 begin/reset/finalize hook 已经实现。Stage B 还因 immutable model/data/trace lock、provider
 credential、已注册硬件、GPU smoke 与准确 interference envelope 尚不可用而 blocked。历史
-v2 evidence 只用于 regression/debugging，不得进入 schema-v3 selection、power sizing、
-confirmation 或结论。
+使用 shared tuned AdamW 的历史 row 只是 matched-recipe publication-policy diagnostic，不是
+TTS-paper reproduction；它们只用于 regression/debugging，不得进入 schema-v3 selection、
+power sizing、confirmation 或结论。
 
 ## 不可变 Dependency DAG
 
@@ -52,20 +55,33 @@ scheduling 保持 serial，正式测量继续 blocked。
 |---|---|---|
 | Preflight | source/runtime/model/data identity、exactness、HBM、telemetry、inventory/topology、仅审计用 session-reset schema、cache/HTTP/writer 与 interference calibration | runtime envelope |
 | E3a | Target-only/Static context、regime、concurrency 与 draft-width capacity | reference load、matched width、crossover 与 drift witness |
-| E1 | DFlash layer scope 与 Full/LoRA geometry，使用 AdamW/SGDm anchor | safe Pareto set 与 common load |
-| E2 | optimizer、log learning-rate grid、schedule 与 successive halving | 一个 DFlash recipe |
+| E1 | 1,428 个 template；LC-candidate geometry 加 stage-level frozen TTS/L0-naive anchor | safe LC Pareto set 与 common load |
+| E2 | 11,920 个 template；只对 LC-candidate optimizer/schedule successive halving | 一个 sealed LightCone recipe |
 | E4 | 累积 systems mechanism 与隔离 profiling | mechanism gate |
-| E3b | 配对 long-context Target-only/Static/TTS/L0 confirmation | long-context confirmation |
+| E3b | 覆盖五个 formal role 的 11,520 个 long-context cell | long-context confirmation |
 | E1a | 原生 DSpark transfer 与 retuning | 一个 DSpark recipe |
-| E5 | production arrival、cohort、topology、SLO 与 failure | production/topology surface |
-| E6 | 原生 NEXTN interface 与双 rank fit，随后 transfer | native MTP transfer surface |
-| E0 | model/backend/task breadth，包括隔离 OnlineSPEC | breadth surface |
+| E5 | 覆盖五个 formal role 的 11,064 个 production/failure cell | production/topology surface |
+| E6 | 3,747 个使用 frozen TTS 与 sealed LightCone recipe 的 NEXTN transfer cell | native MTP transfer surface |
+| E0 | 2,144 个 structural cell：864 个 compatibility template 加 1,280 个 selected-core anchor | blocked、non-formal breadth surface |
 
-E1 将四种 native layer scope 与 Full 加七个 LoRA rank、两个 optimizer anchor 交叉，在下游
-optimizer 搜索前恰有 64 个 geometry cell。E2 将 optimizer 专属字段和 `constant`、按
+每个 activated E1 width/load slice 有 68 个 cell：两个 fixed reference、每种 32 Full/LoRA
+geometry 下两个 L0-policy LC-candidate optimizer anchor，以及 stage-level 的一个 frozen-TTS
+anchor 和一个 frozen-L0-naive anchor。21 个可能 slice 构成 1,428-template envelope。E2
+只调优 LC-candidate；每轮包含两个 fixed reference、32 geometry 乘以 93 个 search recipe，
+以及每种 baseline 各一个 stage-level frozen anchor，即每轮 2,980 个、总计 11,920 个 template。
+E1 selector 消费 67-cell subset，E2 selector 消费 2,979-cell subset：Target-only exactness、
+Static、frozen TTS 与 LC-candidate。另行规划的 L0-naive anchor 只用于 mechanism/decomposition
+证据，不进入 candidate safety、Pareto 或 ranking。E2 将 optimizer 专属字段和 `constant`、按
 published update 的 inverse-square-root、cosine-to-zero schedule 保持为不同身份。
 ChronoBelief declaration 显式为 `BLOCKED`：当前未注册 authoritative update equation 或
 source identity，禁止用另一 optimizer 替代。
+
+TTS anchor 标记为 `TTS-paper-reconstruction`。其 update-recipe authority 固定 Adam、一次 step、
+仅 latest-round supervision、position-weighted distillation 加 source-point proximal term、
+request reset 与 strided side-stream execution。与 recipe 正交，TTS publication 使用论文的
+fixed barrier。未披露的 numeric optimizer/loss/trainable/
+stride 字段使 frozen TTS 与 L0-naive anchor 都保持 `BLOCKED`；它们绝不继承 search candidate、
+schema default、历史 AdamW recipe 或 result-derived winner。
 
 E1a 恰有 56 个 adaptive configuration。32 个 layer-only cell 将
 `last1/last3/last5/all` 与 Full 加七个 LoRA rank 交叉，并冻结 DSpark native head。24 个
@@ -74,10 +90,11 @@ W1、W2 与 scalar acceptance/confidence state 作为 Full 训练。Fixed verifi
 只用于 tuning control；转移后的 candidate 还必须通过 native scheduler。
 
 这些是已注册 scientific envelope，不是执行每个 template 的指令，也不是当前 release
-support。E1 activation 消费 sealed E3a selection，只 materialize 一个 130-cell width/load
+support。E1 activation 消费 sealed E3a selection，只 materialize 一个 68-cell width/load
 slice，并为其他 E1 template 记录 immutable disposition。E2 每次只 materialize 一个
-successive-halving round，保留 matched TTS/L0 pair 与 family floor，且下一 round 只能从 prior
-sealed survivor receipt 派生。Formal E2 reducer 要求真实的 per-token observation time。
+successive-halving round，把每个 LC-candidate 与 fixed Static、frozen-TTS reference 比较，
+保留 family floor，且下一 round 只能从 prior sealed survivor receipt 派生。只有 tuning-only
+final E2 receipt 才能封存名为 LightCone 的 recipe。Formal E2 reducer 要求真实的 per-token observation time。
 官方 SGLang SSE client 可能在
 一个 chunk 中合并多个 token ID，因此 adapter 会把这些 token timestamp 记为 unavailable，
 而不是虚构等间隔 ITL。只有绑定 native per-token timestamp hook，或由固定 runtime 证明
@@ -91,6 +108,21 @@ family 与 auxiliary disposition 必须构成该 stage 的准确不交并集。
 固定 patch 仍会拒绝 DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部 multi-rank execution；
 TP1/DP1 DFlash 已实现注册 E2 schedule 与 logical delay，真实 quota-shadow acquisition 需求
 仍由具名 backend capability gate 阻止。该路径没有 out-of-band trusted signer 时不能产生结论。
+
+E3b 为 24 block 乘五个 role、八个 context、三个 regime、两个 load 与两个 width panel，共
+11,520 个 cell。E5 包含注册 production panel 的 24 block 与 264 个 failure injection，共
+11,064 个 cell。E6 包含三个 preflight；四个 headline role 乘三个 model、两个 task、三个
+context、两个 load 与 24 block；再加 LiveCodeBench 16K/32K、两个 load 的 L0-naive
+mechanism anchor，共 3,747 个 cell。E6 已经包含一个 TTS role：它始终使用 frozen external
+recipe，绝不使用任何 E2-derived recipe。LightCone 使用 sealed E1/E2 winner，不在 E6 retune。
+E0 共有 2,144 个 structural cell：864 个 compatibility template（`4 个 model x 3 个
+backend x 9 个 task x 8 个 role`），以及 1,280 个预注册的 selected-core anchor（`4 个
+model x 1 个 DFlash backend x 2 个 task x 2 个 load x (4 个 excluded pilot + 12 个
+final block) x 5 个 formal role`）。在准确 recipe、load、repetition 与 evidence authority
+封存前，两个 surface 都保持 blocked 且不可报告。
+24-block axis 在每个注册 load 上显式区分四个 excluded pilot 与 20 个 potential final paired
+block。每个 family 只报告 sealed 12--20 final prefix，确保每个 E6 contrast 都有有效 95%
+interval。
 
 ## 数据、Context 与 Trace
 
@@ -132,8 +164,8 @@ block，并阻止 GPU、port、cache writer、evidence root 与 exclusive resour
 
 `GpuFleetInventory` 在该 same-host scheduler 之上组合多台 independently verified host。
 它在 eligible host 间均衡 independent cell 与完整 confirmation block，同时保留 host-local
-inventory、interference、port、cache、evidence 与 materialization identity。Paired TTS/L0
-work 留在同一 host/GPU。每台主机的 headline concurrency 只由该主机已校准 envelope 限制；
+inventory、interference、port、cache、evidence 与 materialization identity。Matched baseline
+anchor 与完整 confirmation block 留在同一 host/GPU。每台主机的 headline concurrency 只由该主机已校准 envelope 限制；
 异构 hardware envelope 不进入同一 family。跨主机 gang 以
 `cross_host_collectives_unvalidated` 拒绝。
 
@@ -194,7 +226,7 @@ evidence。
 ## Power 与统计推断
 
 每个准确 `ConfirmationFamilyIdentity` 都使用恰好四个 paired pilot block，只估计
-L0--Static 与 L0--TTS 的 log-effect variance。该 identity 绑定 experiment/model/backend/task、
+LightCone--TTS 与 LightCone--Static 的 log-effect variance。该 identity 绑定 experiment/model/backend/task、
 context/regime/load/arrival、width panel、topology、cohort/method family、runtime/split/trace/
 sampling 与 hardware envelope；一个 family 的 pilot 不能为另一个 family 计算 power。Pilot
 ID 永久排除在 confirmation 外。Family alpha 0.05、第一 Holm threshold、3% 最小相对效应与
@@ -203,9 +235,15 @@ common final-block prefix，并在 confirmation 可见前封存；若没有合�
 `UNDERPOWERED`，confirmation 不能开始。
 
 最终 goodput effect 是 paired log ratio，并在独立 repetition block 上计算 95% BCa 区间。
-Primary family 恰好包含 L0--Static 与 L0--TTS，使用 Holm family-wise adjustment。
-Secondary breadth hypothesis 必须显式分组并使用 Benjamini--Hochberg FDR；看到结果后不能
-把它升级到 primary family。
+Primary family 恰好包含 LightCone--TTS 与 LightCone--Static，使用 Holm family-wise
+adjustment。预注册 secondary decomposition 是 L0-naive--TTS 与 LightCone--L0-naive。
+其他 secondary breadth hypothesis 必须显式分组并使用 Benjamini--Hochberg FDR；看到结果后
+不能把它升级到 primary family。已注册的报告目标包含 method-by-model、method-by-context 与
+method-by-load interaction；不预设 interaction 或 large-model effect 为正，也不根据观察到的
+LightCone gain 选择 model。当前 `CrossFamilyInteractionReducerArtifact` 只记录一个内容绑定、
+structural、non-formal 的 `UNRESOLVED` contract；它不能证明 GPU coverage 已完成、interval
+有效或存在 formal interaction effect。只有已注册 statistical reducer 消费完整 attested final
+evidence 后，才可能形成这类结论。
 
 Long-context request-level summary 使用 hierarchical bootstrap：先重采样独立 block，再
 在每个 sampled block 内重采样 request。Production arrival 实验重采样整个 time block，以
@@ -215,7 +253,7 @@ Long-context request-level summary 使用 hierarchical bootstrap：先重采样�
 合法 evidence alias 共享一个 byte-equivalent Target-only observation，而不是复制 row。
 Alias 验证 model/runtime/tree、sampling/seed、corpus/trace、limit、hardware/topology/rank、
 method/server configuration、schema、output-token trajectory 与 timing contract。Static 不会
-自动 alias；TTS/L0 永远不能 alias。Dependence map 会让所有 aliased consumer 在 resampling/
+自动 alias；adaptive scientific role 永远不能 alias。Dependence map 会让所有 aliased consumer 在 resampling/
 covariance 中共用一个 unit。当前 formal reducer 会对 non-singleton unit fail closed，除非
 execution plan 与 terminal evidence 重新计算该 equivalence；structurally valid 的
 self-described alias 不是 claim evidence。
@@ -254,7 +292,7 @@ process 都有 private writable overlay，CUDA Graph 绝不跨 process 或 GPU�
 fault-injection cell 始终使用 fresh process。
 
 Native hook 现会绑定 capability、begin、reset、finalize、准确 terminal request coverage 与
-ordered token ID，以及 Static aggregate safety 或 TTS/L0 request/round/update/KV/performance
+ordered token ID，以及 Static aggregate safety 或 adaptive-role request/round/update/KV/performance
 evidence。Provider object attribute 不是 trust evidence。每个成功 serving run 还必须发布与
 terminal 绑定的 `BudgetObservationReceipt`，覆盖所有注册 phase、measured gang GPU time、
 whole-instance billed time 与准确 delta。缺失 component 保持 missing 或显式 N/A，绝不能为零。
@@ -266,7 +304,7 @@ reference、hardware/power report 及每个 final Parquet digest。缺少它时�
 协议代码，不包含性能结论或 result artifact；本 release 也不包含任何 GPU 结果。
 本 release 未配置 trusted hardware-attester identity，因此内容自洽但由 caller 编写的
 attestation file 不能把 industrial 或 legacy analyzer 提升为 `MEASURED`；即使 hook 已实现，
-Static/TTS/L0 仍在 mutation 前保持 blocked。
+Static/TTS/L0-naive/LightCone 仍在 mutation 前保持 blocked。
 
 外部 `TrustedAttesterPolicyBundle` format 把 public verification key、nonce freshness/replay
 policy、hardware-envelope allowlist 与 validity 绑定到另行 provision 的 anchor。Private signing

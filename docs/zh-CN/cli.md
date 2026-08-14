@@ -19,7 +19,7 @@ industrial 命令包括：
 | `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | 从 raw preflight activation 与准确 inventory 派生仅供校准的 two-way execution envelope |
 | `reduce-interference-calibration` | 重开 path-bound execution bundle 与 terminal authority，把 raw isolated/simultaneous evidence 归约为准确 cardinality rule |
-| `reduce-e1-activation` | 从 sealed E3a evidence 派生唯一 130-cell E1 slice |
+| `reduce-e1-activation` | 从 sealed E3a evidence 派生唯一 68-cell E1 slice |
 | `reduce-e2-activation` | 从 E1 Pareto artifact 或 prior survivor materialize 一个 E2 round |
 | `reduce-e2-successive-halving` | 把准确 E2 stage evidence 归约为 sealed survivor receipt |
 | `materialize-confirmation-pilots` | 为一个 confirmation family 激活恰好四个 excluded pilot |
@@ -43,13 +43,13 @@ industrial 命令包括：
 | `list-preliminary-tuning-candidates` | 写入历史 Full/LoRA 诊断 grid |
 | `render-preliminary-target-only-runtime` | 渲染诊断性、关闭 speculation 的 Target-only endpoint |
 | `render-preliminary-static-load-runtime` | 渲染诊断性、零 adaptation 分配的 Static endpoint |
-| `render-preliminary-tuning-runtime` | 渲染 matched preliminary TTS/L0 endpoint |
+| `render-preliminary-tuning-runtime` | 渲染历史 matched-recipe publication-policy diagnostic endpoint；不是 TTS reproduction |
 | `run-preliminary-controlled-slice` | 测量一个 preliminary controlled slice |
 | `collect-preliminary-static-load-screen` | 验证 preliminary Static load coverage |
 | `advance-preliminary-tuning-stage` | 验证 preliminary halving stage |
 | `select-preliminary-speed-config` | 应用历史 tuning-only rule |
 | `select-preliminary-anchor-config` | 锁定 preliminary anchor，但不形成 claim |
-| `render-preliminary-runtime` | 生成 matched preliminary config 与 launch argv |
+| `render-preliminary-runtime` | 生成历史 matched-recipe diagnostic config 与 launch argv |
 | `build-preliminary-confirmation-queue` | 生成 clean-server 诊断 job |
 | `run-preliminary-confirmation` | 执行一个 preliminary method/block slice |
 | `run-preliminary-target-reference` | 捕获 preliminary Target-only token-ID 轨迹 |
@@ -225,7 +225,7 @@ Consumer 通过 `--activation-plan` 接收 raw manifest path 并现场重放 red
 output 会被拒绝。Reducer 从 registry status 与 release dispatch predicate 为每个 declared
 stage cell 生成 disposition。当前 release 的全部 preflight cell 都被阻止：Target-only
 compile cell 缺少 release-owned 的准确 prewarm manifest、graceful-finalization ACK 与原子
-attempt/final-cache result pointer；Static/TTS/L0 也没有受支持的 execution contract。
+attempt/final-cache result pointer；Static/TTS/L0-naive/LightCone 也没有受支持的 execution contract。
 因此 command 写出 canonical `BLOCKED` artifact 并返回 42。E6 download cell 由于没有
 first-party download terminal contract，也会被独立阻止。
 
@@ -444,7 +444,8 @@ lightcone-spec seal-industrial-stage \
 
 这些检查定义的是注册 trusted hardware attester 后的 claim-bearing 路径。当前 release 的
 seal 仍会在签发 receipt 之前返回 `BLOCKED`；该 raw-authority contract 不会让 final
-execution 或 performance claim 变为可达。
+execution 或 performance claim 变为可达。Sealed output 只能授权 LightCone role，绝不能
+改写单独 frozen 的 TTS 或 L0-naive recipe authority。
 
 下游 stage 对其准确 declared dependency 重复 `--dependency-receipt`，随后把所有 completed
 receipt 交给 planner：
@@ -473,7 +474,7 @@ Dispatch plan 是目标 protocol 数据，不证明 cell 可执行。Library ind
 launch 前验证 provider state。固定 tree 已实现准确 native terminal begin/reset/finalize
 hook，但没有配置 trusted hardware signer。Generic activation 只记录 canonical blocked
 preflight disposition；它不会创造 compile runner、execution authority 或 performance claim。
-Static/TTS/L0 在缺少 validated native capability 与 trusted signer 时仍被阻止。CLI 不会
+Static/TTS/L0-naive/LightCone 在缺少 validated native capability 与 trusted signer 时仍被阻止。CLI 不会
 静默 provision hardware，也不会启动 GPU。
 
 ## Fleet Inventory 与 Remote Host Wave
@@ -497,7 +498,7 @@ assignment 的 Python control-plane API。`GpuFleetScheduler` 只选择 host 与
 partition；每个 child plan 仍由唯一的 same-host `GpuPoolScheduler` 签发，并绑定 `host_id`、
 host inventory digest、physical GPU UUID，以及在该 host 内无冲突的 port/cache/evidence/
 contention resource；不同 host 可以重复 literal resource value。独立 remote execution
-binding 再固定 host-local execution manifest。完整 gang、paired TTS/L0 assignment 和
+binding 再固定 host-local execution manifest。完整 gang、matched-geometry baseline anchor set 和
 confirmation block 留在一台主机。若 gang 需要跨主机，会以
 `cross_host_collectives_unvalidated` 拒绝；fleet composition 绝不创建 cross-host rendezvous。
 
@@ -563,14 +564,21 @@ canonical content，不只检查 filename。
 
 ## 核心 Tuning 与 Confirmation
 
-Target-only 与 Static 渲染时不含 adaptation object 或 reserve。TTS 与 L0 的目标 declaration
-从已注册 native layer scope 共享一个 Full/LoRA candidate。Rendering 只是 pure planning；
-当前 release 只有 Target-only 可以进入 industrial execution。Static/TTS/L0 会在 endpoint
-启动前因 trusted-terminal-attester preflight 失败。
+Target-only 与 Static 渲染时不含 adaptation state 或 reserve。TTS 使用 frozen
+`TTS-paper-reconstruction` authority 与 fixed-barrier publication；L0-naive 使用同一个
+authority 与 first-ready publication。E1/E2 中采用 `l0` search recipe 的是 LC-candidate，
+只有准确 E2-sealed winner 才是 LightCone。共享 runtime code 不会合并 live candidate、
+optimizer 或 evidence identity。Rendering 只是 pure planning；当前 release 只有 Target-only
+可以进入 industrial execution。Static/TTS/L0-naive/LightCone 会在 endpoint 启动前因
+trusted-terminal-attester preflight 失败；TTS 与 L0-naive 还受未解析 recipe 字段阻止。
 
-Industrial E1/E2 command 由 reducer 控制。E1 消费 sealed E3a output，只激活一个 width/load
-slice。E2 materialize stage zero，随后每个 successive-halving round 都要求 prior sealed
-survivor receipt，同时保留 matched TTS/L0 pair 与 family floor。Confirmation planning 为
+Industrial E1/E2 command 由 reducer 控制。E1 消费 sealed E3a output，从 1,428 个 template
+中只激活一个 68-cell width/load slice：每种 geometry 调优两个 LC-candidate，并带一个
+stage-level frozen-TTS 与一个 stage-level frozen-L0-naive anchor，不按 scope/rank 或 optimizer
+candidate 复制 baseline。E2 有 11,920 个 template，
+materialize stage zero，随后每个 successive-halving round 都要求 prior sealed survivor
+receipt；它只把 LC-candidate 与 fixed Static、frozen-TTS reference 比较并保留 family floor。
+Confirmation planning 为
 每个准确 family 激活四个 excluded pilot，在 confirmation data 可见前封存 `POWERED` 的
 12--20 final block 或 `UNDERPOWERED`，并只 materialize sealed prefix。
 
@@ -607,7 +615,7 @@ lightcone-spec build-evidence-dependence-map \
 ```
 
 Dependence map 只接受 first-party reduction artifact，让 shared control 在 covariance/
-bootstrap 中保持一个 observation。Static 是 backend-specific；TTS/L0 永远不能 alias。
+bootstrap 中保持一个 observation。Static 是 backend-specific；adaptive scientific role 永远不能 alias。
 schema-v3 industrial analysis manifest 会列出 raw alias manifests；formal reducer 会逐一重放，
 并拒绝与重放结果不同的 serialized map。旧 alias receipt、caller-authored reduction summary
 以及旧 `--alias` flags 都会被拒绝。
@@ -641,7 +649,7 @@ nonzero failure，不是科学结果。
 
 Industrial registry 可能把目标 cell 声明为 `UNMEASURED`，但 declaration status 不等于
 executable readiness。Native hook 已存在；由于 trusted signer 缺失，executor preflight
-会把 Static/TTS/L0 解析为 `BLOCKED`。全部 TP2/DP2 与
+会把 Static/TTS/L0-naive/LightCone 解析为 `BLOCKED`。全部 TP2/DP2 与
 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 同样受当前 release 的其他 gate 阻止。历史 v2
 artifact 仅用于 regression，不能作为 schema-v3 stage receipt。
 

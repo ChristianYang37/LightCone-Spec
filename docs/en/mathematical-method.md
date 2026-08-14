@@ -2,7 +2,7 @@
 
 [中文](../zh-CN/mathematical-method.md) · [README](../../README.md)
 
-## Objective and semantic rows
+## Objectives and scientific identities
 
 The equations below specify the registered target method. They do not imply
 that every backend or topology is executable in this release. The industrial
@@ -10,12 +10,19 @@ executor currently completes only TP1/DP1 Target-only. The pinned patch now
 contains the native
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle and
 a lower-level adaptive implementation only for TP1/DP1 DFlash, but no trusted
-hardware signer is configured. Static/TTS/L0 remain blocked before mutation,
+hardware signer is configured. Static/TTS/L0-naive/LightCone remain blocked before mutation,
 and no new GPU result is available.
 
+Recipe authority and publication policy are separate mathematical identities.
+Target-only and Static have structural zero adaptation state. TTS uses a frozen
+TTS recipe with a fixed barrier; L0-naive uses that frozen recipe authority with
+first-ready publication; LC-candidates use registered E1/E2 recipes with the
+same first-ready policy. Only the exact E2-sealed winner is LightCone.
+
 For target distribution $p$, reconstructed proposal $q_\theta$, semantic
-mask $m$, and optional position weight $w_k$, the common proposal objective
-is target-to-draft cross entropy (equivalently KL up to target entropy):
+mask $m$, and optional position weight $w_k$, the registered LightCone-candidate
+proposal objective is target-to-draft cross entropy (equivalently KL up to
+target entropy):
 
 $$
 \mathcal L_{\mathrm{proposal}}(\theta)=
@@ -31,14 +38,37 @@ normalization prevents batch size from silently scaling the learning rate. An
 empty or non-finite denominator produces an invalid device candidate and is
 discarded; it is never converted to zero loss.
 
-For the registered block-16 DFlash recipe,
+For one registered block-16 **LightCone-candidate** recipe,
 
 $$
 w_k=\exp(-(k-1)/7).
 $$
 
-Position weighting, teacher-row policy, canvas width, and source version are
-part of configuration/evidence identity rather than result-derived choices.
+This weight is not a TTS default. Position weighting, teacher-row policy,
+canvas width, and source version are part of the candidate's registered
+configuration/evidence identity rather than result-derived choices.
+
+The primary-source TTS paper defines one latest-round update from source
+proposal $q_t$ toward the target rows $p$, with a source-point proximal term:
+
+$$
+\mathcal L_{\mathrm{TTS}}(q')=
+\sum_k w_k\,\operatorname{KL}(p_k\|q'_k)
++\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
+$$
+
+Its update-recipe authority specifies Adam, exactly one optimization step,
+request-local reset, and a strided side CUDA stream. Orthogonally, TTS
+publication uses the paper's fixed synchronization barrier. The audited
+[arXiv v2 paper](https://arxiv.org/abs/2605.09329v2) does not disclose the
+numeric learning rate or schedule, Adam betas/epsilon or optimizer-state reset,
+weight decay or clipping, the position-weight values, $\lambda$, loss
+normalization/precision/temperature, the exact trainable-parameter manifest,
+the stride-selection rule, or an official implementation commit. The
+authority is therefore `TTS-paper-reconstruction`, is not formal-eligible, and
+remains `BLOCKED` until those fields are sealed by an author/user recipe or a
+preregistered TTS-only reconstruction rule. It cannot inherit the exponential
+weight above, an E1/E2 winner, schema defaults, or a historical AdamW recipe.
 
 ## Backend evidence and reconstruction
 
@@ -145,11 +175,18 @@ matrix momentum and registered Newton--Schulz transform, plus auxiliary AdamW
 moments for non-matrices. Schedules advance on published updates, not attempted
 or discarded candidates.
 
-For source round $r$, TTS and L0 compute the same candidate $u_r$. With
-stride $S$, TTS waits until the next registered update boundary at or after
-readiness, whereas L0 uses the first legal graph boundary after readiness.
-Loss, trainable plan, optimizer arithmetic, source rows, and candidate bytes
-must match; a numerical difference is an implementation failure.
+For source round $r$, the TTS publication policy waits for the fixed registered
+barrier after readiness. The L0 policy publishes at the first legal safe graph
+boundary after readiness. TTS and L0-naive share the frozen recipe **authority**,
+not live optimizer/candidate/evidence identity. LightCone also uses the L0
+policy, but its recipe must be the exact E2-sealed winner; any unsealed search
+recipe remains an LC-candidate.
+
+Candidate equality is asserted only in a controlled mechanism replay. Two
+replay bindings must have identical source-state and proposal-evidence digests
+before their candidate bytes are compared. Live TTS and L0-naive histories may
+diverge after their publication decisions diverge, so future candidates are
+not required to remain equal.
 
 In the target CPU coordinator contract, TP2 sharded coordinates stay on their
 inference owner and replicated coordinates reduce inside the TP replica; DP2
@@ -174,8 +211,8 @@ loss. Full and LoRA factor-coordinate decisions are distinct classes; factor
 averaging is not equivalent to averaging the dense products $BA$.
 
 OnlineSPEC is transactional and TP1/DP1 under its independent protocol. Its
-equations and evidence cannot change the TTS/L0 candidate, selection, power
-plan, or core gate.
+equations and evidence cannot change the frozen TTS authority, the E1/E2
+LightCone selection, the power plan, or the core gate.
 
 ## Exact speculative sampling
 

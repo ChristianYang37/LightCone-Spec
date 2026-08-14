@@ -1,4 +1,11 @@
-"""Leakage-safe maximin selection shared by TTS and L0."""
+"""Historical matched-recipe publication-policy diagnostic selection.
+
+Legacy schema-v2 artifacts remain readable as diagnostic-only evidence.
+Schema-v3 embeds that classification and the formal-execution prohibition in
+the artifact itself.  Neither schema is a TTS-paper reproduction, can select
+the corrected LightCone recipe, or can satisfy a formal result gate.  Formal
+E1/E2 selection lives in the registry-bound raw-evidence reducers.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from pathlib import Path
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.experiments.protocol import (
     FORMAL_CONCURRENCY_GRID,
+    HISTORICAL_EVIDENCE_CLASSIFICATION,
     TUNING_STAGES,
     TuningCandidate,
     successive_halving,
@@ -367,6 +375,8 @@ class SelectionArtifact:
     patched_sglang_tree: str
     tuning_evidence_sha256: str
     selection_protocol: str = "successive_halving"
+    evidence_classification: str = HISTORICAL_EVIDENCE_CLASSIFICATION
+    formal_execution_authorized: bool = False
 
     @property
     def candidate_id(self) -> str:
@@ -374,12 +384,20 @@ class SelectionArtifact:
 
     @property
     def sha256(self) -> str:
-        body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        value = asdict(self)
+        if self.schema_version == 2:
+            value.pop("evidence_classification")
+            value.pop("formal_execution_authorized")
+        body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(body).hexdigest()
 
     def validate(self) -> None:
-        if self.schema_version != 2:
-            raise ValueError("selection artifact must use schema version 2")
+        if self.schema_version not in {2, 3}:
+            raise ValueError("selection artifact must use schema version 2 or 3")
+        if self.evidence_classification != HISTORICAL_EVIDENCE_CLASSIFICATION:
+            raise ValueError("selection artifact classification is not diagnostic")
+        if self.formal_execution_authorized is not False:
+            raise ValueError("historical selection cannot authorize formal execution")
         if self.selected_concurrency not in FORMAL_CONCURRENCY_GRID:
             raise ValueError("selection artifact has an invalid concurrency")
         if self.patched_sglang_tree != PINNED_SGLANG_TREE:
@@ -416,6 +434,8 @@ class SelectionArtifact:
 
     def write(self, path: str | Path) -> None:
         self.validate()
+        if self.schema_version != 3:
+            raise ValueError("legacy schema-v2 selection artifacts are read-only")
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
         body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
@@ -429,6 +449,8 @@ class SelectionArtifact:
         source = Path(path)
         value = json.loads(source.read_text(encoding="utf-8"))
         value.setdefault("selection_protocol", "successive_halving")
+        value.setdefault("evidence_classification", HISTORICAL_EVIDENCE_CLASSIFICATION)
+        value.setdefault("formal_execution_authorized", False)
         candidate = TuningCandidate(**value.pop("candidate"))
         artifact = cls(candidate=candidate, **value)
         artifact.validate()
@@ -494,7 +516,7 @@ def select_shared_config(
     ).hexdigest()
     evidence_hash = tuning_evidence_sha256 or rows_hash
     artifact = SelectionArtifact(
-        schema_version=2,
+        schema_version=3,
         candidate=candidates[winner_id],
         selected_concurrency=selected_concurrency,
         minimum_goodput_ratio=min(

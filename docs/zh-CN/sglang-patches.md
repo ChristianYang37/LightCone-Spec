@@ -18,7 +18,7 @@ identity 与 expected final tree 以 `patches/sglang/series` 和
 Schema-v3 envelope 定义一个 coherent **目标** runtime surface。下列 item 是 contract 与
 registry vocabulary，不表示当前 patch 已实现每一项：
 
-1. 严格 Target-only/Static/TTS/L0 与 backend-native 配置，disabled path 不分配 adaptation
+1. 严格 Target-only/Static/TTS/L0 runtime-method 与 backend-native 配置，disabled path 不分配 adaptation
    state；
 2. 公共 proposal evidence、backend payload validation、differentiable reconstruction 与准确
    sampling-distribution preservation；
@@ -56,9 +56,9 @@ begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
 `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`，final tree 为
 `fae3c1538ed4934fb3b47c7ebc82393306c43f06`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
-terminal coverage、Static aggregate safety，以及 TTS/L0 request/round/update/KV/performance
+terminal coverage、Static aggregate safety，以及 adaptive-runtime request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
-executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0。下列 execution
+executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0-naive/LightCone。下列 execution
 contract 也尚未实现。
 
 第二个 patch 还提供 opt-in native committed-token observation contract。每个 timestamp
@@ -77,10 +77,11 @@ aggregate ITL statistic 都明确为 `UNSUPPORTED`/`null`，不会把稀疏子�
   会记录该需求并由 capability gate 阻止）；
 - DSpark worker/CUDA composite-head training 与 NEXTN training interface。
 
-TP1/DP1 DFlash TTS/L0 现在会执行 constant、按 published update 的 inverse-square-root
-以及有限 horizon cosine schedule，也会记录 intrinsic readiness 并应用非负 logical delay，
-同时保持 TTS fixed-boundary 与 L0 first-ready 的 publication 区别。这些 CPU/native contract
-不构成 CUDA 性能证据。
+TP1/DP1 DFlash adaptive runtime method 现在会执行 constant、按 published update 的
+inverse-square-root 与有限 horizon cosine schedule，也会记录 intrinsic readiness 并应用
+非负 logical delay，同时保持 fixed-barrier 与 first-ready publication policy。Recipe
+authority 由 host 侧独立绑定且与 policy 正交；该 runtime support 不允许 TTS 继承 E1/E2 或
+历史 AdamW recipe。这些 CPU/native contract 不构成 CUDA 性能证据。
 
 同一个 patch 现在还提供 first-party
 `sglang.schema_v3.source_owned_all_reset_session.v1` producer，以及 capability、initial-state、
@@ -158,11 +159,12 @@ checkout。
 最终 schema-v3 patch 已通过仓库完整 apply/compile/focused-test/reverse verifier。这是
 patch-integrity 结果，不是 GPU validation。CPU package test 或旧 patched-tree receipt
 不足以证明 GPU 能力。TP1/DP1 DFlash 与严格 native terminal lifecycle 已实现，但 release
-trust policy 未配置 signer；因此 Static/TTS/L0 industrial cell 会在任何 mutation 前
+trust policy 未配置 signer；因此 Static/TTS/L0-naive/LightCone industrial cell 会在任何 mutation 前
 `BLOCKED`，而不是可运行 `UNMEASURED` work。Test signer、provider object attribute 或
 caller-supplied verifier 都不能解锁该 policy。DSpark CPU contract 不授权 execution。
 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与
 全部 TP2/DP2 cell 保持 `BLOCKED`。Target-only 是唯一 release-executable path。
 
-历史 v2 evidence 仅可用于 regression comparison。它不含新的 Target-only、backend-plan、
+历史 shared-tuned-AdamW evidence 只是 matched-recipe publication-policy diagnostic，不是
+TTS-paper reproduction，仅可用于 regression comparison。它不含新的 Target-only、backend-plan、
 topology、registry、trace、statistics 或 telemetry identity，不能通过改标签升级。

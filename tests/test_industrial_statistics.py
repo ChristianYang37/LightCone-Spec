@@ -10,6 +10,7 @@ from lightcone_spec.experiments.statistics import (
     MINIMUM_FINAL_BLOCKS,
     P99_MINIMUM_COMPLETIONS,
     PRIMARY_CONTRASTS,
+    SECONDARY_CONTRASTS,
     BootstrapInterval,
     HardwareBlockObservation,
     HardwareEnvelope,
@@ -37,7 +38,7 @@ def pilot_blocks(*, noisy: bool = False) -> tuple[PilotBlock, ...]:
             block_id=f"pilot-{index}",
             static_goodput=100.0,
             tts_goodput=101.0,
-            l0_goodput=103.0 * multiplier,
+            lightcone_goodput=103.0 * multiplier,
         )
         for index, multiplier in enumerate(multipliers)
     )
@@ -79,7 +80,7 @@ def test_power_sizing_marks_twenty_blocks_underpowered_without_extension() -> No
             "unique",
         ),
         (
-            tuple(replace(block, l0_goodput=100.0) for block in pilot_blocks()),
+            tuple(replace(block, lightcone_goodput=100.0) for block in pilot_blocks()),
             "positive finite variance",
         ),
     ],
@@ -105,30 +106,39 @@ def paired_values(ratio: float) -> dict[str, tuple[float, float]]:
 
 
 def test_paired_bca_is_block_paired_and_holm_family_is_exact() -> None:
-    l0_static = paired_bca_contrast(
-        "l0_vs_static",
+    assert SECONDARY_CONTRASTS == (
+        "l0_naive_vs_tts",
+        "lightcone_vs_l0_naive",
+    )
+    lightcone_tts = paired_bca_contrast(
+        "lightcone_vs_tts",
         paired_values(1.04),
         repetitions=2_000,
         seed=7,
     )
-    l0_tts = paired_bca_contrast(
-        "l0_vs_tts",
+    lightcone_static = paired_bca_contrast(
+        "lightcone_vs_static",
         paired_values(1.03),
         repetitions=2_000,
         seed=8,
     )
-    assert l0_static.independent_unit == "paired_block"
-    assert l0_static.mean_relative_gain == pytest.approx(0.040663, abs=1e-6)
-    assert l0_static.ci_lower_relative_gain > 0.0
-    decisions = holm_primary_contrasts({"l0_vs_static": l0_static, "l0_vs_tts": l0_tts})
+    assert lightcone_tts.independent_unit == "paired_block"
+    assert lightcone_tts.mean_relative_gain == pytest.approx(0.040663, abs=1e-6)
+    assert lightcone_tts.ci_lower_relative_gain > 0.0
+    decisions = holm_primary_contrasts(
+        {
+            "lightcone_vs_tts": lightcone_tts,
+            "lightcone_vs_static": lightcone_static,
+        }
+    )
     assert tuple(decision.name for decision in decisions) == PRIMARY_CONTRASTS
     assert all(decision.procedure == "holm" for decision in decisions)
     assert all(decision.rejected for decision in decisions)
     assert all(
         decision.adjusted_p_value >= decision.raw_p_value for decision in decisions
     )
-    with pytest.raises(ValueError, match="L0--Static and L0--TTS"):
-        holm_primary_contrasts({"l0_vs_static": l0_static})
+    with pytest.raises(ValueError, match="LightCone--TTS and LightCone--Static"):
+        holm_primary_contrasts({"lightcone_vs_tts": lightcone_tts})
 
 
 def test_paired_bca_rejects_missing_or_nonpositive_pairs() -> None:
@@ -146,7 +156,7 @@ def test_paired_bca_rejects_missing_or_nonpositive_pairs() -> None:
 
 def test_holm_monotonicity_and_bh_fdr_adjustment() -> None:
     template = PairedBcaContrast(
-        name="l0_vs_static",
+        name="lightcone_vs_tts",
         block_ids=("a", "b"),
         mean_log_ratio=0.1,
         mean_relative_gain=0.1,
@@ -157,10 +167,10 @@ def test_holm_monotonicity_and_bh_fdr_adjustment() -> None:
     )
     primary = holm_primary_contrasts(
         {
-            "l0_vs_static": template,
-            "l0_vs_tts": replace(
+            "lightcone_vs_tts": template,
+            "lightcone_vs_static": replace(
                 template,
-                name="l0_vs_tts",
+                name="lightcone_vs_static",
                 raw_p_value=0.04,
             ),
         }

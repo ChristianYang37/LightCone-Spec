@@ -2,17 +2,22 @@
 
 [English](../en/mathematical-method.md) · [README](../../README_zh-CN.md)
 
-## 目标与 Semantic Row
+## 目标函数与科学身份
 
 下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。
 Industrial executor 当前只完成 TP1/DP1 Target-only。固定 patch 已包含 native
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，但底层 adaptive
 implementation 仍只支持 TP1/DP1 DFlash，且没有配置 trusted hardware signer。因此
-Static/TTS/L0 会在 mutation 前 blocked，并且目前没有任何新 GPU 结果。
+Static/TTS/L0-naive/LightCone 会在 mutation 前 blocked，并且目前没有任何新 GPU 结果。
+
+Recipe authority 与 publication policy 是不同的数学身份。Target-only 与 Static 在结构上
+保持零 adaptation state。TTS 使用 frozen TTS recipe 与 fixed barrier；L0-naive 使用同一个
+frozen recipe authority 与 first-ready publication；LC-candidate 使用已注册 E1/E2 recipe 与
+相同 first-ready policy。只有准确 E2-sealed winner 才是 LightCone。
 
 令 target distribution 为 $p$，重建 proposal 为 $q_\theta$，semantic mask 为 $m$，
-可选 position weight 为 $w_k$。公共 proposal objective 是 target-to-draft cross entropy
-（与 KL 只相差 target entropy）：
+可选 position weight 为 $w_k$。已注册 LightCone-candidate proposal objective 是
+target-to-draft cross entropy（与 KL 只相差 target entropy）：
 
 $$
 \mathcal L_{\mathrm{proposal}}(\theta)=
@@ -26,14 +31,34 @@ canvas 生成的 teacher row，包括更早 rejection 后的 sampled counterfact
 归一化阻止 batch size 静默缩放 learning rate。空或 non-finite denominator 会产生无效
 device candidate 并被丢弃，绝不会转成 zero loss。
 
-已注册 block-16 DFlash recipe 使用
+一个已注册 block-16 **LightCone-candidate** recipe 使用
 
 $$
 w_k=\exp(-(k-1)/7).
 $$
 
-Position weight、teacher-row policy、canvas width 与 source version 都属于 config/evidence
-身份，不是从结果反推的选择。
+该 weight 不是 TTS default。Position weight、teacher-row policy、canvas width 与 source
+version 都属于 candidate 的 config/evidence 身份，不是从结果反推的选择。
+
+一手 TTS 论文定义从 source proposal $q_t$ 出发、只使用 latest-round row 的一次更新；
+objective 包含 target distillation 与 source-point proximal term：
+
+$$
+\mathcal L_{\mathrm{TTS}}(q')=
+\sum_k w_k\,\operatorname{KL}(p_k\|q'_k)
++\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
+$$
+
+其 update-recipe authority 指定 Adam、准确一次 optimization step、逐 request reset 与
+strided side CUDA stream。与 recipe 正交，TTS publication 使用论文的 fixed synchronization
+barrier。经审计的
+[arXiv v2 论文](https://arxiv.org/abs/2605.09329v2) 没有披露 numeric learning rate/schedule、
+Adam beta/epsilon 或 optimizer-state reset、weight decay/clip、position-weight value、
+$\lambda$、loss normalization/precision/temperature、准确 trainable-parameter manifest、
+stride-selection rule 或官方 implementation commit。因此 authority 标记为
+`TTS-paper-reconstruction`，不具备 formal eligibility，并在作者/用户 recipe 或预注册
+TTS-only reconstruction rule 封存这些字段前保持 `BLOCKED`。它不能继承上面的 exponential
+weight、E1/E2 winner、schema default 或历史 AdamW recipe。
 
 ## Backend 证据与重建
 
@@ -127,10 +152,14 @@ $$
 Newton--Schulz transform，并对 non-matrix 使用辅助 AdamW moment。Schedule 按 published
 update 而非 attempted/discarded candidate 前进。
 
-对 source round $r$，TTS 与 L0 计算同一 candidate $u_r$。设 stride 为 $S$，TTS 在
-ready 后等待下一个注册 update boundary，L0 则使用 ready 后首个合法 graph boundary。
-Loss、trainable plan、optimizer arithmetic、source row 与 candidate byte 必须一致；数值
-不同属于实现失败。
+对 source round $r$，TTS publication policy 会在 ready 后等待固定注册 barrier；L0 policy
+则在 ready 后首个合法 safe graph boundary 发布。TTS 与 L0-naive 共享 frozen recipe
+**authority**，不共享 live optimizer/candidate/evidence identity。LightCone 也使用 L0 policy，
+但其 recipe 必须是准确 E2-sealed winner；任何未封存 search recipe 仍只是 LC-candidate。
+
+Candidate equality 只在受控 mechanism replay 中检查。只有两个 replay binding 的
+source-state 与 proposal-evidence digest 都完全相同，才比较 candidate byte。Live TTS 与
+L0-naive 的 publication decision 分叉后，其未来 candidate 无需继续相等。
 
 在目标 CPU coordinator contract 中，TP2 sharded coordinate 留在 inference owner，
 replicated coordinate 在 TP replica 内部 reduce；DP2 cohort sticky 且 replica-local。所有
@@ -151,7 +180,7 @@ Full 与 LoRA factor-coordinate decision 是不同 class；factor averaging 不�
 product $BA$ 求平均。
 
 OnlineSPEC 是 transactional 的，并在独立协议下保持 TP1/DP1。其公式与证据不能改变
-TTS/L0 candidate、selection、power plan 或核心 gate。
+frozen TTS authority、E1/E2 LightCone selection、power plan 或核心 gate。
 
 ## Exact Speculative Sampling
 

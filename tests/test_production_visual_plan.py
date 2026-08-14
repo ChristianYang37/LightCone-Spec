@@ -42,24 +42,27 @@ def test_missing_paper_and_sources_emit_one_canonical_planned_block() -> None:
     assert json.loads(plan.canonical_json_bytes()) == plan.to_dict()
 
 
-def test_main_figure_plan_splits_registered_panels_three_plus_two() -> None:
+def test_main_figure_plan_splits_registered_panels_four_plus_four() -> None:
     value = build_production_visual_plan(_blocked_output()).to_dict()
     figures = value["figures"]
 
-    assert [figure["panels"] for figure in figures] == [3, 2]
+    assert [figure["panels"] for figure in figures] == [4, 4]
     assert [figure["placement"] for figure in figures] == ["main", "main"]
     assert [figure["render_mode"] for figure in figures] == [
         "vector-native",
         "vector-native",
     ]
     assert figures[0]["panel_ids"] == [
-        "accepted_length:l0:static",
-        "accepted_length:l0:target_only",
-        "accepted_length:l0:tts",
+        "accepted_length:l0_naive:tts",
+        "accepted_length:lightcone:l0_naive",
+        "accepted_length:lightcone:static",
+        "accepted_length:lightcone:tts",
     ]
     assert figures[1]["panel_ids"] == [
-        "committed_token_goodput:l0:static",
-        "committed_token_goodput:l0:target_only",
+        "committed_token_goodput:l0_naive:tts",
+        "committed_token_goodput:lightcone:l0_naive",
+        "committed_token_goodput:lightcone:static",
+        "committed_token_goodput:lightcone:tts",
     ]
     assert all(figure["empirical_curves"] == [] for figure in figures)
     assert all(

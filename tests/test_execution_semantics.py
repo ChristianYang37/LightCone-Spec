@@ -16,6 +16,7 @@ from lightcone_spec.experiments.execution_semantics import (
     EXECUTION_SEMANTICS_E3A_SELECTION_UNAVAILABLE_REASON,
     EXECUTION_SEMANTICS_FOREIGN_CELL_REASON,
     EXECUTION_SEMANTICS_LOAD_MISMATCH_REASON,
+    EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON,
     EXECUTION_SEMANTICS_RUN_CONFIG_MISMATCH_REASON,
     EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON,
     CellExecutionSemanticsBlockedError,
@@ -45,6 +46,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     LockedOutput,
     build_industrial_registry,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 
@@ -202,13 +204,20 @@ def e1_sources():
     )
     authority = _activation_authority(registry, selection, artifact)
     cells = {
-        method: next(
+        role: next(
             cell
             for cell in registry.cells_for("E1")
-            if cell.identity.method == method
+            if scientific_role_for_cell(registry, cell) == role
             and "width=8:concurrency=4" in cell.identity.variant
+            and (role != "lc_candidate" or cell.identity.optimizer == "adamw")
         )
-        for method in ("target_only", "static", "tts", "l0")
+        for role in (
+            "target_only",
+            "static",
+            "tts",
+            "l0_naive",
+            "lc_candidate",
+        )
     }
     return registry, selection, authority, cells
 
@@ -295,10 +304,10 @@ def _run_config(cell: ExperimentCell, adaptation=None) -> RunConfig:
     )
 
 
-@pytest.mark.parametrize("method", ("target_only", "static", "tts", "l0"))
-def test_e1_four_methods_resolve_source_owned_semantics(e1_sources, method: str):
+@pytest.mark.parametrize("role", ("target_only", "static", "lc_candidate"))
+def test_e1_executable_roles_resolve_source_owned_semantics(e1_sources, role: str):
     registry, selection, authority, cells = e1_sources
-    cell = cells[method]
+    cell = cells[role]
     semantics = resolve_cell_execution_semantics(
         activation=authority,
         load_binding=_load_binding(cell),
@@ -318,13 +327,13 @@ def test_e1_four_methods_resolve_source_owned_semantics(e1_sources, method: str)
     assert semantics.expected_sampling_profile_sha256 == SamplingProfile().sha256
     assert semantics.registered_request_count == 4
     assert len(semantics.sha256) == 64
-    if method == "target_only":
+    if role == "target_only":
         assert semantics.expected_draft_width is None
         assert semantics.expected_draft_depth is None
     else:
         assert semantics.expected_draft_width == selection.width
         assert semantics.expected_draft_depth == selection.width - 1
-    if method in {"target_only", "static"}:
+    if role in {"target_only", "static"}:
         assert semantics.adaptation_recipe is None
         assert semantics.adaptation_recipe_sha256 is None
         adaptation = None
@@ -339,6 +348,20 @@ def test_e1_four_methods_resolve_source_owned_semantics(e1_sources, method: str)
         load_binding=_load_binding(cell),
         cell=cell,
     )
+
+
+@pytest.mark.parametrize("role", ("tts", "l0_naive"))
+def test_frozen_tts_recipe_anchors_are_named_blocks(e1_sources, role: str):
+    _, _, authority, cells = e1_sources
+    cell = cells[role]
+
+    with pytest.raises(CellExecutionSemanticsBlockedError) as caught:
+        resolve_cell_execution_semantics(
+            activation=authority,
+            load_binding=_load_binding(cell),
+            cell=cell,
+        )
+    assert caught.value.reason_code == EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON
 
 
 def test_foreign_and_deferred_cells_are_named_blocks(e1_sources):
@@ -438,7 +461,7 @@ def test_non_e1_activation_is_stably_unsupported(e1_sources, experiment: str):
 
 def test_run_config_must_match_width_concurrency_and_full_recipe(e1_sources):
     _, _, authority, cells = e1_sources
-    cell = cells["tts"]
+    cell = cells["lc_candidate"]
     semantics = resolve_cell_execution_semantics(
         activation=authority,
         load_binding=_load_binding(cell),
@@ -487,7 +510,7 @@ def test_workload_and_runtime_seed_domains_cannot_be_swapped(e1_sources):
 
 def test_bool_and_nonfinite_semantic_mutations_are_rejected(e1_sources):
     _, _, authority, cells = e1_sources
-    cell = cells["tts"]
+    cell = cells["lc_candidate"]
     semantics = resolve_cell_execution_semantics(
         activation=authority,
         load_binding=_load_binding(cell),

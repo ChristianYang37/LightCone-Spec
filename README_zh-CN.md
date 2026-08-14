@@ -7,7 +7,7 @@ LightCone-Spec 是一个以证据为先的 speculative decoding 在线 drafter a
 fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明速度或容量。
 
 > 当前为 Alpha 软件。全部 formal industrial GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
-> Target-only 可以端到端运行。Static、TTS、L0 及其他所有 speculative method 会在任何
+> Target-only 可以端到端运行。Static、TTS、L0-naive、LightCone 及其他所有 speculative method 会在任何
 > process 或 network mutation 前 `BLOCKED`，因为固定
 > `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook 尚未配置可信
 > hardware signer。实证 Stage B 还因缺少 provider credential、已解析 model/data/trace lock
@@ -39,18 +39,36 @@ prefix 不是当前 release identity，不能满足任何 formal identity gate�
 
 ## 研究范围
 
-核心对比包含四种方法：
+正式对比包含五种科学角色。Recipe authority 与 publication policy 是正交身份；共享
+runtime 实现不代表配置、live candidate、optimizer state 或 evidence 相同。
 
-| 方法 | Speculation | 在线 candidate | 发布 |
-|---|---:|---:|---|
-| Target-only（`target_only`） | 否 | 无 | 原生 target decoding |
-| Static（`static`） | 是 | 无 | 原生 speculative decoding |
-| TTS（`tts`） | 是 | side-stream update | 下一个固定更新边界 |
-| L0（`l0`） | 是 | 与 TTS 逐字节相同 | ready 后首个合法边界 |
+| 科学角色 | Runtime method | Recipe authority | 发布 |
+|---|---|---|---|
+| Target-only | `target_only` | 结构性零 adaptation | 原生 target decoding |
+| Static | `static` | 结构性零 adaptation | 原生 speculative decoding |
+| TTS | `tts` | 冻结且绑定一手来源的 TTS recipe | 固定 TTS barrier |
+| L0-naive | `l0` | 同一个冻结 TTS recipe authority | first-ready safe boundary |
+| LightCone | `l0` | 一个 tuning-sealed E2 winner | first-ready safe boundary |
 
-TTS 与 L0 共用完全相同的 evidence、trainable plan、loss、optimizer candidate 与
-reconstruction 路径；唯一实验差异是发布时间。Target-only 与 Static 不分配任何
-adaptation、optimizer、candidate 或 adaptation telemetry 状态。
+使用已注册 E1/E2 search recipe 的 `l0` run 是 **LC-candidate**，不是 LightCone。只有
+准确 sealed E2 final-recipe receipt 才能物化或命名 LightCone。Target-only 与 Static 在
+结构上不分配 adaptation、optimizer、gradient、candidate 或 adaptation-telemetry state。
+
+当前 baseline authority 标记为 `TTS-paper-reconstruction`，状态为 `BLOCKED`。其 update-recipe
+authority 固定 Adam、一次 optimization step、仅 latest-round supervision、position-weighted
+distillation 加 source-point proximal term、逐 request reset 与 strided side stream。与 recipe
+正交，TTS publication 使用论文的固定 synchronization barrier。截至 2026-08-15 的
+primary-source 审计未找到作者官方代码/config；
+论文也没有给出 learning rate/schedule、
+Adam beta/epsilon 与 optimizer-state reset、weight decay/clip、position weight、proximal
+coefficient、loss normalization/precision/temperature、准确 trainable-parameter manifest、
+stride-selection rule 或官方 implementation commit。在作者/用户提供 recipe 或预注册的 TTS-only reconstruction rule
+封存这些字段前，TTS 与 L0-naive 都不能成为 formal cell；二者绝不能继承 E1/E2 winner、
+schema default 或历史 AdamW configuration。
+[Provenance authority](manifests/provenance/tts_recipe_authority_v1.json) 绑定 arXiv
+`2605.09329v2`、PDF SHA-256
+`7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20` 与 source SHA-256
+`22c549c0297fc0a2a71af002c3721f71ddfd06d86bc46b2f41592bd6748afe59`。
 
 目标 industrial registry 先覆盖 DFlash 与 DSpark，再进入 production load、多 GPU
 topology、原生 NEXTN preflight 与 breadth template。EAGLE/EAGLE3 仍是带严格兼容性
@@ -60,7 +78,7 @@ guard 的目标 backend contract；注册并不表示当前 release 可以执行
 当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层可执行 adaptive path。它会执行注册的
 constant、inverse-square-root 与有限 horizon cosine schedule，也会执行非负 logical
 publication delay。它已实现准确 begin/reset/finalize terminal-evidence
-hook，host adapter 也会验证其内容，但仓库不携带可信 hardware signer。Static/TTS/L0 因此
+hook，host adapter 也会验证其内容，但仓库不携带可信 hardware signer。Static/TTS/L0-naive/LightCone 因此
 仍不可用于结论，并在 release preflight、任何 mutation 之前失败。DSpark 现有纯 CPU native
 contract，覆盖 adapter-free reconstruction、actual-predecessor W1 feature、native-head
 selection、composite loss 与 verification-budget semantic；它没有连接 CUDA worker，也没有
@@ -84,6 +102,8 @@ NEXTN adaptation 与所有 TP2/DP2 execution 同样 fail closed。请求 quota-s
   24 个 hybrid；
 - 历史 drafter KV 冻结并带版本。发布 candidate 只影响未来 KV；重建旧 KV 或对其求导
   会定义另一种方法。
+- Candidate equality 只用于受控 mechanism replay，且要求 source-state 与 proposal-evidence
+  digest 完全相同；TTS 与 L0-naive 的 publication history 分叉后，live run 可以继续分叉。
 
 Rejection sampler 在 proposal token 被拒绝后仍从归一化 $(p-q)_+$ 采样。这个正部
 rejection distribution 属于采样数学，不是 adaptation mode 或配置 alias。
@@ -107,8 +127,21 @@ activation/disposition artifact 与 locked output。唯一的确定性同主机 
 与 DOWNLOAD cell，因为它既没有 release-owned compile prewarm/finalization result-pointer
 contract，也没有 first-party download terminal receipt contract。
 
-Reducer-owned E1 activation 会从 2,730-cell envelope 只物化一个 130-cell width/load slice；
-E2 只物化当前 quarter-retention successive-halving round。每个 family 的四个 pilot 会在
+Reducer-owned E1 activation 会从 1,428-cell envelope 只物化一个 68-cell width/load slice：
+两个固定 reference、32 geometry 下共 64 个 L0-policy LC-candidate，以及 stage-level 的一个
+frozen-TTS anchor 与一个 frozen-L0-naive anchor。E2 在四个 quarter-retention round 中共有
+11,920 个 template；每轮只包含 LC-candidate grid、两个 fixed reference，以及每种 baseline
+各一个 stage-level frozen anchor，绝不生成 TTS optimizer candidate。Selection 只使用包含
+Target-only、Static、frozen TTS 与 LC-candidate 的 E1 67-cell 或 E2 2,979-cell subset；
+另行规划的 L0-naive anchor 仅预留给 mechanism/decomposition evidence，不能排序或排除
+LightCone candidate。已注册 confirmation envelope 分别包含 11,520 个 E3b、
+11,064 个 E5 与 3,747 个 E6 cell。E6 的 TTS cell 只使用 frozen external recipe；LightCone
+cell 使用 sealed E1/E2 recipe，且不在 E6 retune。E6 显式 load/repetition axis 还包含预注册
+L0-naive mechanism anchor。E0 共有 2,144 个 structural cell：864 个 compatibility
+template（`4 个 model x 3 个 backend x 9 个 task x 8 个 role`），以及 1,280 个预注册的
+selected-core anchor（`4 个 model x 1 个 DFlash backend x 2 个 task x 2 个 load x
+(4 个 excluded pilot + 12 个 final block) x 5 个 formal role`）。在准确 recipe、load、
+repetition 与 evidence authority 封存前，它们全部保持 blocked 且不可报告。每个 family 的四个 pilot 会在
 confirmation 前锁定 12--20 final prefix 或 `UNDERPOWERED`。Per-cell budget、物理 assignment、
 terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容绑定。固定 patch
 现已包含 first-party all-reset producer，可生成 source-owned capability、initial-state 与 reset
@@ -259,8 +292,14 @@ Model lock、证据、trace、credential、provider state 与 selection 必须�
 
 四个被排除的 pilot block 仅用于估计方差。Power plan 会在下游 unblinding 前把 final
 block 数固定在 12--20；若两个 contrast 都无法对 3% 最小效应达到 80% power，则记录
-`UNDERPOWERED`。Primary L0--Static 与 L0--TTS hypothesis 使用 Holm family-wise
-correction；secondary breadth family 使用 Benjamini--Hochberg FDR。长上下文/request 数据
+`UNDERPOWERED`。Primary LightCone--TTS 与 LightCone--Static hypothesis 使用 Holm
+family-wise correction；预注册 secondary decomposition 是 L0-naive--TTS 与
+LightCone--L0-naive。已注册的报告目标包含 method-by-model、method-by-context 与
+method-by-load interaction，且不预设其正负。当前 `CrossFamilyInteractionReducerArtifact`
+只是内容绑定、structural、non-formal 的 `UNRESOLVED` contract；它不能证明 GPU coverage
+已完成、interval 有效或任何 formal interaction。只有后续对 attested final evidence 执行
+已注册 statistical reduction 才可能形成这类结论。其他 secondary breadth family 使用
+Benjamini--Hochberg FDR。长上下文/request 数据
 使用 block 后 request 的 hierarchical bootstrap；production trace 使用 time-block
 bootstrap。P99 latency 只有达到注册的最小完成数才合格。
 
@@ -278,7 +317,7 @@ doctor/attestation JSON 会被拒绝，任何 analyzer 都不能产生新的 `ME
 Target-only greedy reference；每个 prompt 的 output 是完整有序 token-ID 轨迹带格式标识的
 hash。Legacy collector 要求每种 method 的每个 block 都匹配该 reference；解码文本一致或
 仅 speculative method 彼此一致都不充分。该 reference 始终为
-`PRELIMINARY_DIAGNOSTIC_ONLY`：它不能让 Static/TTS/L0 获得 formal execution authority，
+`PRELIMINARY_DIAGNOSTIC_ONLY`：它不能让 Static/TTS/L0-naive/LightCone 获得 formal execution authority，
 也不能替代 industrial authority。
 
 ## 历史 preliminary 机制 snapshot
@@ -288,24 +327,28 @@ hash。Legacy collector 要求每种 method 的每个 block 都匹配该 referen
 `BLOCKED`，这些数字不能激活 cell、选择配置或通过 release gate。
 
 单张 RTX PRO 6000 Blackwell（96 GB）运行 Qwen3-8B + DFlash-b16，使用 16 条重复型
-受控 prompt、并发 8 和 40,928-token 安全 context 上限。每种方法均在单个 timing block
+受控 prompt、并发 8 和 40,928-token 安全 context 上限。每条 diagnostic path 均在单个 timing block
 中生成 654,042 tokens：
 
 | 方法 | Decode goodput | 相对 Static | p99 ITL | Peak HBM |
 |---|---:|---:|---:|---:|
 | Static | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
-| TTS | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
-| L0 | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
+| Matched-recipe fixed-barrier diagnostic | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
+| Matched-recipe first-ready diagnostic | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
 
-本次 snapshot 中 L0 比 TTS 快 0.86%。三种方法的完整有序 token-ID 轨迹一致，且
+本次 snapshot 中 first-ready diagnostic 比 fixed-barrier diagnostic 快 0.86%。三种路径的
+完整有序 token-ID 轨迹一致，且
 exactness violation、version mismatch、fallback、non-finite update、OOM 与 retraction
 计数均为零。绑定的历史身份是 main code `0db2ff4`、旧 patched SGLang tree `e795ecc`、
 execution-policy SHA `231ca579` 与 tuning-window SHA `132019ee`；该策略关闭 CUDA Graph
 与 Radix Cache。
 
-机制诊断表明在线工作已基本隐藏：TTS/L0 的 main-side overlap 约为 96.7%；累计约
+这些旧 row 使用同一个 shared tuned AdamW recipe；它们只是 matched-recipe
+publication-policy diagnostic，**不是** TTS paper reproduction，也不能调优新的 LightCone
+recipe 或满足 formal gate。机制诊断表明在线工作已基本隐藏：adaptive main-side overlap 约为 96.7%；累计约
 8.4--8.7 秒的 training、optimizer、merge 与 publication 工作，只在 decode critical path
-暴露约 0.27 秒。L0 的优势主要对应更少的 target calls：52,083，而 TTS 为 52,879
+暴露约 0.27 秒。First-ready diagnostic 的优势主要对应更少的 target calls：52,083，
+而 fixed-barrier diagnostic 为 52,879
 （每次 call 分别 commit 12.558 与 12.369 tokens）。Adaptation 显存账本主要由 candidate
 scratch（7.88 GiB）与 resident buffer（5.91 GiB）占用，而不是约 31.3 MiB 的 optimizer
 state。因此后续优化顺序应为 candidate scratch、staging、training activation 生命周期、
@@ -346,9 +389,11 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
 - CPU `gloo` 合同不是 GPU/NCCL 证据。Topology config 只是目标 vocabulary；无论 caller
   是否提供 patched-runtime capability receipt，本
   release 都会拒绝 TP2/DP2；
-- Static/TTS/L0 在 out-of-band 可信 signer 绑定准确 native terminal hook 与固定 tree 前
+- Static/TTS/L0-naive/LightCone 在 out-of-band 可信 signer 绑定准确 native terminal hook 与固定 tree 前
   保持 `BLOCKED`。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与所有 TP2/DP2 cell 同样
   `BLOCKED`，绝不能暗示成功；
+- Formal TTS 与 L0-naive 还因 frozen `TTS-paper-reconstruction` recipe 未解析而 blocked；
+  LightCone 另要求准确 sealed E2 final-recipe receipt，否则无法物化；
 - ChronoBelief tuning cell 在 authoritative update equation 与 source identity 注册前保持
   `BLOCKED`，不会使用替代 optimizer；
 - 历史 KV 按设计冻结。重新计算它需要新的算法、显存边界、协议与结论。

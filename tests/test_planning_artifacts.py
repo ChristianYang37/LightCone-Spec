@@ -4,11 +4,11 @@ import json
 import math
 from copy import deepcopy
 from dataclasses import replace
+from functools import cache
 
 import pytest
 
 from lightcone_spec.experiments.planning import (
-    CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256,
     E2_HALVING_PROTOCOL_SHA256,
     AnalysisDependenceUnit,
     BudgetGroupTotal,
@@ -17,7 +17,6 @@ from lightcone_spec.experiments.planning import (
     CellDisposition,
     ConfirmationFamilyIdentity,
     ConfirmationFamilyPowerPlan,
-    ConfirmationFamilyPowerReductionArtifact,
     DispositionStatus,
     E1GeometryIdentity,
     E1ParetoArtifact,
@@ -52,8 +51,6 @@ from lightcone_spec.experiments.planning_artifacts import (
     confirmation_family_identity_to_dict,
     confirmation_family_power_plan_from_dict,
     confirmation_family_power_plan_to_dict,
-    confirmation_family_power_reduction_artifact_from_dict,
-    confirmation_family_power_reduction_artifact_to_dict,
     e1_pareto_artifact_from_dict,
     e1_pareto_artifact_to_dict,
     e2_final_recipe_artifact_from_dict,
@@ -82,13 +79,14 @@ from lightcone_spec.experiments.planning_artifacts import (
     sealed_e3a_selection_to_dict,
 )
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
-    E2_DRAFT_WIDTH_SELECTOR,
+    CONFIRMATION_METHOD_ROLES,
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     StageActivationPlan,
     WorkloadClass,
+    build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.statistics import (
     MAXIMUM_FINAL_BLOCKS,
@@ -130,12 +128,15 @@ def _raw_binding(
     split_sha256: str,
     scientific_unit: str,
     method: str = "tts",
+    scientific_role: str | None = None,
 ) -> RawEvidenceRunBinding:
+    role = method if scientific_role is None else scientific_role
     return RawEvidenceRunBinding(
-        schema_version=1,
+        schema_version=3,
         cell_id=cell_id,
         experiment=experiment,
         method=method,
+        scientific_role=role,
         scientific_unit=scientific_unit,
         config_sha256=cell_id,
         rank_config_sha256s=(_sha(f"{label}-rank"),),
@@ -157,7 +158,23 @@ def _raw_binding(
         terminal_receipt_sha256s=(_sha(f"{label}-terminal"),),
         hardware_receipt_sha256=_sha(f"{label}-hardware"),
         budget_observation_sha256=_sha(f"{label}-budget"),
+        execution_plan_sha256=_sha(f"{label}-execution-plan"),
+        execution_split_sha256=_sha(f"{label}-execution-split"),
     )
+
+
+def test_raw_run_binding_rejects_unsealed_lightcone_label() -> None:
+    with pytest.raises(ValueError, match="path-replayed E2 seal"):
+        _raw_binding(
+            "unsealed-lightcone",
+            cell_id=_sha("unsealed-lightcone-cell"),
+            experiment="E3b",
+            runtime_sha256=_sha("runtime"),
+            split_sha256=_sha("split"),
+            scientific_unit="final_0",
+            method="l0",
+            scientific_role="lightcone",
+        )
 
 
 def _ms(value: int) -> ScenarioMilliseconds:
@@ -311,7 +328,7 @@ def _activation() -> ReducerActivationArtifact:
                     status=DispositionStatus.ACTIVATED,
                     reason_code="additional_e2_candidate_member",
                 )
-                for index in range(1, 4)
+                for index in range(1, 5)
             ],
             key=lambda row: row.cell_id,
         )
@@ -370,8 +387,13 @@ def _pareto() -> E1ParetoArtifact:
 
 def _e2_stage_evidence() -> E2StageEvidenceArtifact:
     activation = _activation()
-    completed = activation.plan.activated_cell_ids
-    methods = ("target_only", "static", "tts", "l0")
+    completed = activation.plan.activated_cell_ids[:4]
+    method_roles = (
+        ("target_only", "target_only"),
+        ("static", "static"),
+        ("tts", "tts"),
+        ("l0", "lc_candidate"),
+    )
     bindings = tuple(
         _raw_binding(
             f"e2-{index}",
@@ -381,16 +403,21 @@ def _e2_stage_evidence() -> E2StageEvidenceArtifact:
             split_sha256=activation.plan.split_sha256,
             scientific_unit="halving_0",
             method=method,
+            scientific_role=role,
         )
-        for index, (cell_id, method) in enumerate(zip(completed, methods, strict=True))
+        for index, (cell_id, (method, role)) in enumerate(
+            zip(completed, method_roles, strict=True)
+        )
     )
     evaluation = E2CandidateEvaluation(
         candidate_id=_sha("candidate"),
         evidence_sha256=_sha("candidate-evidence"),
         safety_passed=True,
         confidence_pareto=True,
-        min_tts_l0_static_goodput_ratio=1.05,
-        confidence_lower_goodput_ratio=1.04,
+        lc_vs_tts_goodput_ratio=1.05,
+        lc_vs_tts_confidence_lower_goodput_ratio=1.04,
+        lc_vs_static_goodput_ratio=1.06,
+        lc_vs_static_confidence_lower_goodput_ratio=1.03,
         hbm_bytes=100,
         p99_itl_us=200,
         exposed_update_us=300,
@@ -399,7 +426,7 @@ def _e2_stage_evidence() -> E2StageEvidenceArtifact:
         safety_reason_codes=(),
     )
     return E2StageEvidenceArtifact(
-        schema_version=4,
+        schema_version=5,
         registry_sha256=_sha("registry"),
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
@@ -411,6 +438,7 @@ def _e2_stage_evidence() -> E2StageEvidenceArtifact:
         stage_index=0,
         prior_stage_reduction_sha256=None,
         raw_evidence_manifest_sha256=_sha("raw-evidence"),
+        excluded_mechanism_anchor_cell_ids=(activation.plan.activated_cell_ids[-1],),
         completed_cell_ids=completed,
         terminal_receipt_sha256s=tuple(
             sorted(
@@ -434,7 +462,8 @@ def _e2_stage_evidence() -> E2StageEvidenceArtifact:
 
 
 def _e2_survivor() -> E2SurvivorReceipt:
-    stage_cells = _activation().plan.activated_cell_ids
+    evidence = _e2_stage_evidence()
+    stage_cells = evidence.completed_cell_ids
     candidate = _sha("candidate")
     return E2SurvivorReceipt(
         schema_version=2,
@@ -448,7 +477,7 @@ def _e2_survivor() -> E2SurvivorReceipt:
         completed_cells_sha256=content_sha256(stage_cells),
         completed_stage_cell_ids=stage_cells,
         completed_lineage_cell_ids=stage_cells,
-        tuning_evidence_sha256=_e2_stage_evidence().sha256,
+        tuning_evidence_sha256=evidence.sha256,
         source_candidate_ids=(candidate,),
         survivor_candidate_ids=(),
         final_recipe_candidate_id=None,
@@ -467,30 +496,28 @@ def _e2_reduction() -> E2StageReductionArtifact:
     )
 
 
+@cache
 def _e2_final_recipe() -> E2FinalRecipeArtifact:
-    candidate = E2CandidateIdentity(
-        model="target-model",
-        backend="DFLASH",
-        task="summarization",
-        scope="qv",
-        parameterization="lora",
-        rank=8,
-        alpha_over_rank=1.0,
-        optimizer="adamw",
-        learning_rate=0.001,
-        schedule="constant",
-        width=None,
-        draft_width_selector=E2_DRAFT_WIDTH_SELECTOR,
+    registry = build_industrial_registry()
+    cell = next(
+        cell
+        for cell in registry.cells_for("E2")
+        if scientific_role_for_cell(registry, cell) == "lc_candidate"
+        and cell.identity.learning_rate is not None
     )
+    candidate = E2CandidateIdentity.from_cell(cell, registry=registry)
+    recipe = registry.adaptation_recipe_for_cell(cell)
     return E2FinalRecipeArtifact(
-        schema_version=2,
-        registry_sha256=_sha("registry"),
+        schema_version=3,
+        registry_sha256=registry.sha256,
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
         final_stage_reduction_sha256=_sha("final-reduction"),
         source_activation_sha256=_sha("final-activation"),
         candidate_id=candidate.sha256,
         candidate=candidate,
+        recipe_sha256=recipe.sha256,
+        recipe=recipe,
         selection_state="locked_from_raw_halving_3",
     )
 
@@ -511,7 +538,7 @@ def _family() -> ConfirmationFamilyIdentity:
         topology="tp1_dp1",
         cohort_family="paired",
         cohort_count=1,
-        method_family=CORE_METHODS,
+        method_family=CONFIRMATION_METHOD_ROLES,
         runtime_sha256=_sha("runtime"),
         split_sha256=_sha("split"),
         trace_sha256=_sha("trace"),
@@ -567,7 +594,7 @@ def _family_power() -> ConfirmationFamilyPowerPlan:
         family=family,
         pilot_activation_sha256=_sha("pilot-activation"),
         completed_pilot_cells_sha256=content_sha256(
-            tuple(sorted(_sha(f"family-cell-{index}") for index in range(16)))
+            tuple(sorted(_sha(f"family-cell-{index}") for index in range(20)))
         ),
         pilot_evidence_sha256=_sha("pilot-evidence"),
         power_sizing=power_sizing,
@@ -576,56 +603,6 @@ def _family_power() -> ConfirmationFamilyPowerPlan:
         selected_final_prefix=FINAL_BLOCKS[:selected],
         reason_code="registered_family_power_target_met",
         selection_state="sealed_before_confirmation_unblinding",
-    )
-
-
-def _family_power_reduction() -> ConfirmationFamilyPowerReductionArtifact:
-    plan = _family_power()
-    count = len(PILOT_BLOCKS) * len(CORE_METHODS)
-    bindings = tuple(
-        sorted(
-            (
-                _raw_binding(
-                    f"family-{index}",
-                    cell_id=_sha(f"family-cell-{index}"),
-                    experiment=plan.family.experiment,
-                    runtime_sha256=plan.family.runtime_sha256,
-                    split_sha256=plan.family.split_sha256,
-                    scientific_unit=(
-                        f"excluded_pilot_{PILOT_BLOCKS[index // len(CORE_METHODS)]}"
-                    ),
-                    method=CORE_METHODS[index % len(CORE_METHODS)],
-                )
-                for index in range(count)
-            ),
-            key=lambda binding: binding.cell_id,
-        )
-    )
-    return ConfirmationFamilyPowerReductionArtifact(
-        schema_version=2,
-        plan=plan,
-        inventory_sha256=_sha("inventory"),
-        inventory_source_receipt_sha256=_sha("inventory-source"),
-        fixed_instance_gpu_count=2,
-        inventory_host_id="host-a",
-        raw_evidence_manifest_sha256=plan.pilot_evidence_sha256,
-        terminal_receipt_sha256s=tuple(
-            sorted(
-                digest
-                for binding in bindings
-                for digest in binding.terminal_receipt_sha256s
-            )
-        ),
-        hardware_receipt_sha256s=tuple(
-            sorted(binding.hardware_receipt_sha256 for binding in bindings)
-        ),
-        budget_observation_sha256s=tuple(
-            sorted(binding.budget_observation_sha256 for binding in bindings)
-        ),
-        run_bindings=bindings,
-        reducer_protocol_sha256=(CONFIRMATION_FAMILY_POWER_REDUCER_PROTOCOL_SHA256),
-        data_source="excluded_pilots_only",
-        confirmation_data_visible=False,
     )
 
 
@@ -750,11 +727,6 @@ def test_every_cli_planning_artifact_round_trips_as_json() -> None:
             confirmation_family_power_plan_to_dict,
             confirmation_family_power_plan_from_dict,
         ),
-        (
-            _family_power_reduction(),
-            confirmation_family_power_reduction_artifact_to_dict,
-            confirmation_family_power_reduction_artifact_from_dict,
-        ),
         (_alias(), evidence_alias_receipt_to_dict, evidence_alias_receipt_from_dict),
         (
             _dependence_map(),
@@ -847,7 +819,9 @@ def test_unknown_missing_enum_and_scalar_type_confusion_fail_closed() -> None:
 
 def test_nonfinite_nested_numbers_and_redundant_digests_fail_closed() -> None:
     evidence_wire = e2_stage_evidence_artifact_to_dict(_e2_stage_evidence())
-    evidence_wire["evaluations"][0]["min_tts_l0_static_goodput_ratio"] = float("inf")
+    evidence_wire["evaluations"][0]["lc_vs_tts_confidence_lower_goodput_ratio"] = float(
+        "inf"
+    )
     with pytest.raises(ValueError, match="finite"):
         e2_stage_evidence_artifact_from_dict(evidence_wire)
 

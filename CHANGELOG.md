@@ -24,8 +24,9 @@ yet been declared.
 - Added the native
   `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
   begin/reset/finalize hook and a strict host validator. Static retains zero
-  detailed round/update tracing; TTS/L0 carry exact request/round/update/KV
-  evidence on the supported TP1/DP1 DFlash boundary.
+  detailed round/update tracing; adaptive `tts`/`l0` runtime paths carry exact
+  request/round/update/KV evidence on the supported TP1/DP1 DFlash boundary
+  without merging their scientific recipe or publication identities.
 - Extended the source-owned all-reset producer with real protocol connection
   create/close events on the supported single-tokenizer HTTP/1.1 uvicorn paths,
   then bound its ordered resets to the native terminal begin/reset/finalize
@@ -42,6 +43,16 @@ yet been declared.
 
 ### Changed
 
+- Separated update-recipe identity from publication policy. TTS now requires a
+  primary-source-bound frozen Adam recipe and fixed-barrier publication;
+  L0-naive uses that same frozen recipe with first-ready publication; and only
+  an exact E2-sealed L0-policy recipe may be labelled LightCone. The paper does
+  not disclose the complete numeric TTS recipe, so formal TTS/L0-naive cells
+  remain blocked rather than inheriting the LightCone tuning winner or legacy
+  AdamW defaults.
+- Embedded the diagnostic-only classification and formal-execution prohibition
+  in new historical selection artifacts (schema v3); legacy schema-v2
+  artifacts remain read-only diagnostic inputs.
 - Required every preliminary and OnlineSPEC server launch to bind an exact
   compile-cache plan in both its API and CLI, and reject a plan whose source,
   model, TP, context, or concurrency identity differs from the RunConfig. The
@@ -62,7 +73,8 @@ yet been declared.
   budget identity now enter only through a frozen pool assignment.
 - Restricted release-supported publication methods to Target-only. The native
   terminal hook has no bundled trusted hardware signer, so content-valid
-  Static/TTS/L0 evidence remains non-claimable and cannot emit `MEASURED`.
+  Static and adaptive-role evidence remains non-claimable and cannot emit
+  `MEASURED`.
 - Added an opt-in, CPU-only committed-token host-observation contract and
   removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
   latest patch identity is
@@ -131,8 +143,10 @@ yet been declared.
 - Restricted adaptation to Full and LoRA native parameter plans; retired
   correction-only adaptation fields and scope aliases are rejected rather than
   normalized.
-- Kept TTS and L0 on one candidate, optimizer, reconstruction, and evidence
-  path; their only experimental distinction is publication timing.
+- Historical matched-recipe TTS/L0 diagnostics shared one candidate,
+  optimizer, reconstruction, and evidence path and isolated publication timing.
+  That retired diagnostic identity is not a TTS-paper reproduction and cannot
+  tune or establish the current TTS, L0-naive, or LightCone method rows.
 - Made historical drafter KV immutable and versioned across backends. New
   publication affects future KV only.
 - Made the rejection sampler's normalized positive part `(p-q)_+` explicitly a

@@ -28,6 +28,7 @@ from lightcone_spec.experiments.onlinespec import (
 from lightcone_spec.experiments.protocol import (
     DFLASH_BLOCK_SIZE,
     DFLASH_LOSS_POSITION_DECAY,
+    HISTORICAL_EVIDENCE_CLASSIFICATION,
     TuningCandidate,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
@@ -66,6 +67,15 @@ class RuntimeChoice:
     selected_concurrency: int
     model_lock_sha256: str
     selection_sha256: str | None = None
+    evidence_classification: str = HISTORICAL_EVIDENCE_CLASSIFICATION
+    formal_execution_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.evidence_classification != HISTORICAL_EVIDENCE_CLASSIFICATION
+            or self.formal_execution_authorized is not False
+        ):
+            raise ValueError("historical runtime choices are diagnostic only")
 
     @property
     def sha256(self) -> str:
@@ -140,7 +150,7 @@ def derive_diagnostic_compile_cache_key(
     readiness = doctor_report.get("readiness")
     checks = doctor_report.get("checks")
     if (
-        doctor_report.get("schema_version") != 1
+        doctor_report.get("schema_version") != 2
         or doctor_report.get("status") != "PASS"
         or not isinstance(readiness, Mapping)
         or readiness.get("status") != "PASS"
@@ -528,11 +538,13 @@ def _render_choice_plan(
     _immutable_json(
         output / "launch-plan.json",
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "execution_mode": "sequential_exclusive_device",
             "phase": choice.phase,
             "runtime_choice_sha256": choice.sha256,
             "selection_sha256": choice.selection_sha256,
+            "evidence_classification": choice.evidence_classification,
+            "formal_execution_authorized": choice.formal_execution_authorized,
             "model_lock_sha256": model_lock.sha256,
             "sampling_profile_sha256": sampling_profile.sha256,
             "execution_policy_sha256": runtime.execution_policy_sha256,

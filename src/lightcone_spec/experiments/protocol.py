@@ -31,6 +31,9 @@ TUNING_STAGES = (
     (16, DFLASH_SAFE_CONTEXT_LIMIT),
 )
 FORMAL_CONCURRENCY_GRID = (1, 2, 4, 8, 16, 32)
+HISTORICAL_EVIDENCE_CLASSIFICATION = (
+    "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
+)
 
 
 def tuning_stage(stage: int) -> tuple[int, int]:
@@ -219,15 +222,23 @@ def select_static_load(
     return int(winner["concurrency"])
 
 
-def assert_matched_confirmation_configs(
+def assert_historical_matched_recipe_diagnostic_configs(
     configs: dict[str, RunConfig],
     *,
     selected_candidate: TuningCandidate,
     selected_concurrency: int,
 ) -> None:
-    """Ensure TTS/L0 differ only in publication policy and match selection."""
+    """Validate an old matched-recipe publication-policy diagnostic.
+
+    This helper intentionally preserves the old shared-winner configuration so
+    historical smoke evidence remains replayable. It does not validate TTS,
+    L0-naive, or LightCone formal method identity and must not gate a formal
+    result.
+    """
     if set(configs) != {"static", "tts", "l0"}:
-        raise ValueError("confirmation requires exactly three method configs")
+        raise ValueError(
+            "historical matched-recipe diagnostic requires exactly three configs"
+        )
     for method, config in configs.items():
         assert_confirmation_slice_config(
             config,
@@ -247,11 +258,15 @@ def assert_matched_confirmation_configs(
     tts = configs["tts"].adaptation
     asynchronous = configs["l0"].adaptation
     if tts is None or asynchronous is None or tts != asynchronous:
-        raise ValueError("TTS and L0 must use an identical adaptation config")
+        raise ValueError(
+            "historical matched-recipe diagnostic requires identical adaptation"
+        )
     selected = _candidate_fields(selected_candidate)
     actual = _adaptation_fields(tts)
     if actual != selected:
-        raise ValueError("confirmation config does not match the tuning winner")
+        raise ValueError(
+            "historical matched-recipe diagnostic does not match its old winner"
+        )
 
 
 def _candidate_fields(candidate: TuningCandidate) -> dict[str, object]:

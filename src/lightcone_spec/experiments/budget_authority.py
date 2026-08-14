@@ -116,7 +116,7 @@ E2_STAGE_COMPLETION_AUTHORITY_MISSING_REASON = (
     "e2_prior_stage_schema_v4_completion_authority_missing"
 )
 
-_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v2"
+_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v3"
 _MANIFEST_V1_FIELDS = frozenset(
     {
         "schema_version",
@@ -495,7 +495,7 @@ def _regenerate_registry(
 def _generated_registry_from_value(value: object) -> ExperimentRegistry:
     row = _strict_object("generated registry artifact", value, _REGISTRY_FIELDS)
     if (
-        _strict_int("generated registry schema", row["schema_version"]) != 2
+        _strict_int("generated registry schema", row["schema_version"]) != 3
         or row["generator"] != _REGISTRY_GENERATOR
     ):
         raise ValueError("generated registry identity mismatch")

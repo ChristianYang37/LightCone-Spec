@@ -110,10 +110,11 @@ def _semantics() -> ExecutionDerivedAliasSemantics:
 
 def _run_binding(cell_id: str) -> RawEvidenceRunBinding:
     return RawEvidenceRunBinding(
-        schema_version=1,
+        schema_version=3,
         cell_id=cell_id,
         experiment="E3b",
         method="target_only",
+        scientific_role="target_only",
         scientific_unit="evidence_alias:block=4",
         config_sha256=_sha("config"),
         rank_config_sha256s=(_sha("rank-config"),),
@@ -135,6 +136,8 @@ def _run_binding(cell_id: str) -> RawEvidenceRunBinding:
         terminal_receipt_sha256s=(_sha("terminal-receipt"),),
         hardware_receipt_sha256=_sha("hardware-receipt"),
         budget_observation_sha256=_sha("budget-observation"),
+        execution_plan_sha256=_sha("execution-plan"),
+        execution_split_sha256=_sha("execution-split"),
     )
 
 
@@ -467,9 +470,9 @@ def _install_nonformal_executor_fixture_bridge(
         registry_path = _write_bound(
             root / "alias-authority-registry.json",
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "generator": (
-                    "lightcone_spec.experiments.registry.build_industrial_registry:v2"
+                    "lightcone_spec.experiments.registry.build_industrial_registry:v3"
                 ),
                 "parameters": {
                     "logical_gpu_slots": list(registry.gpu_uuids),

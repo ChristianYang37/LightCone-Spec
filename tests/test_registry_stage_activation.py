@@ -8,9 +8,12 @@ import pytest
 from lightcone_spec.cli.main import _industrial_completion_activation_contract
 from lightcone_spec.experiments.registry import (
     INDUSTRIAL_EXPERIMENT_ORDER,
+    SEALED_E2_RECIPE_SENTINEL,
+    CellStatus,
     ExperimentReceipt,
     build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.stage_activation import (
     REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256,
@@ -172,23 +175,31 @@ def test_generic_reducer_requires_complete_prefix_and_exact_serving_semantics() 
     } <= {
         "release_serving_contract_unresolved",
         "release_topology_executor_unsupported",
+        "sealed_e2_recipe_receipt_required",
+        "tts_official_recipe_unavailable",
     }
-    unresolved_adaptive = next(
+    frozen_tts = next(
         cell
         for cell in registry.cells_for("E4")
         if cell.identity.method == "tts"
         and cell.identity.backend == "DFLASH"
         and cell.identity.topology == "tp1_dp1"
     )
-    assert release_execution_capability_rejection_reason(unresolved_adaptive) is None
-    assert release_dispatch_rejection_reason(unresolved_adaptive) == (
-        "release_serving_contract_unresolved"
+    assert release_execution_capability_rejection_reason(frozen_tts) == (
+        "tts_official_recipe_unavailable"
     )
     assert (
-        next(
-            row for row in e4.dispositions if row.cell_id == unresolved_adaptive.cell_id
-        ).status
+        next(row for row in e4.dispositions if row.cell_id == frozen_tts.cell_id).status
         is RegistryStageDispositionStatus.BLOCKED
+    )
+    lc_candidate = next(
+        cell
+        for cell in registry.cells_for("E1")
+        if scientific_role_for_cell(registry, cell) == "lc_candidate" and cell.runnable
+    )
+    assert release_execution_capability_rejection_reason(lc_candidate) is None
+    assert release_dispatch_rejection_reason(lc_candidate) == (
+        "release_serving_contract_unresolved"
     )
     with pytest.raises(ValueError, match="cannot seal without an AVAILABLE"):
         _industrial_completion_activation_contract(
@@ -219,6 +230,8 @@ def test_generic_reducer_requires_complete_prefix_and_exact_serving_semantics() 
     } == {
         RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE,
         "native_nextn_preflight_required",
+        "sealed_e2_recipe_receipt_required",
+        "tts_official_recipe_unavailable",
     }
 
     for experiment in ("E1", "E2", "E3b", "E5"):
@@ -281,3 +294,34 @@ def test_scheduler_and_completion_replay_reject_edited_generic_activation() -> N
             family_activations=(),
             family_power_reductions=(),
         )
+
+
+def test_adaptive_recipe_identity_cannot_be_unblocked_by_status_rewrite() -> None:
+    registry = build_industrial_registry()
+    frozen_tts = next(
+        cell
+        for cell in registry.cells_for("E4")
+        if scientific_role_for_cell(registry, cell) == "tts"
+        and cell.identity.topology == "tp1_dp1"
+    )
+    sealed_template = next(
+        cell
+        for cell in registry.cells_for("E4")
+        if cell.identity.optimizer == SEALED_E2_RECIPE_SENTINEL
+        and cell.identity.topology == "tp1_dp1"
+    )
+
+    for cell, expected in (
+        (frozen_tts, "tts_official_recipe_unavailable"),
+        (sealed_template, "sealed_e2_recipe_receipt_required"),
+    ):
+        caller_unblocked = replace(
+            cell,
+            status=CellStatus.UNMEASURED,
+            reason_code="awaiting_registered_measurement",
+            reason="Caller removed the registry-owned blocker.",
+        )
+        assert release_execution_capability_rejection_reason(caller_unblocked) == (
+            expected
+        )
+        assert release_dispatch_rejection_reason(caller_unblocked) == expected

@@ -32,6 +32,7 @@ from lightcone_spec import (
     PINNED_SGLANG_TREE,
 )
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.doctor import _require_project_runtime_source_identity
 from lightcone_spec.experiments.budget_authority import (
     replay_budget_activation_authority,
     require_ready_budget_materialization_authority_binding,
@@ -97,13 +98,14 @@ from lightcone_spec.experiments.planning_artifacts import (
     production_load_plan_from_dict,
 )
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
+    CONFIRMATION_METHOD_ROLES,
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     ExperimentCell,
     ExperimentReceipt,
     ExperimentRegistry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.runtime_metrics import (
     FormalRuntimeMetricsExport,
@@ -113,6 +115,7 @@ from lightcone_spec.experiments.runtime_metrics import (
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.statistics import (
     PRIMARY_CONTRASTS,
+    SECONDARY_CONTRASTS,
     BootstrapInterval,
     HardwareBlockObservation,
     HardwareEnvelope,
@@ -154,7 +157,7 @@ type E3bStageEvidenceLevel = Literal[
 ]
 
 _LOWER_SHA256_LENGTH = 64
-_METHODS = tuple(CORE_METHODS)
+_METHODS = tuple(CONFIRMATION_METHOD_ROLES)
 _SAFETY_COUNTERS = (
     "exactness_violations",
     "version_mismatches",
@@ -171,6 +174,7 @@ _INDUSTRIAL_DOCTOR_CHECKS = frozenset(
         "project_patch_binding",
         "project_sglang_roots_distinct",
         "project_source_tree",
+        "project_runtime_source",
         "python",
         "linux_host",
         "torch",
@@ -936,14 +940,14 @@ class RawE3aSelectionEvidenceManifest:
 
 @dataclass(frozen=True)
 class RawE1ParetoEvidenceManifest:
-    """Path-bearing exact 130-cell E1 evidence for first-party Pareto replay."""
+    """Path-bearing exact 67-cell E1 selection evidence for Pareto replay."""
 
     schema_version: int
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 2:
-            raise ValueError("only raw E1 Pareto manifest schema 2 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 3:
+            raise ValueError("only raw E1 Pareto manifest schema 3 is supported")
         ids = tuple(cell.cell_id for cell in self.cells)
         if not ids or ids != tuple(sorted(set(ids))):
             raise ValueError("raw E1 cells must be cell-sorted and unique")
@@ -962,8 +966,8 @@ class RawE2StageEvidenceManifest:
     cells: tuple[IndustrialCellEvidence, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 3:
-            raise ValueError("only raw E2 stage manifest schema 3 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 4:
+            raise ValueError("only raw E2 stage manifest schema 4 is supported")
         if type(self.stage_index) is not int or self.stage_index not in range(4):
             raise ValueError("raw E2 stage index is invalid")
         ids = tuple(cell.cell_id for cell in self.cells)
@@ -1168,7 +1172,15 @@ def _raw_cell_manifest_from_dict(
         fields.add("stage_index")
     if type(value) is not dict or set(value) != fields:
         raise ValueError(f"{kind} fields differ from the strict schema")
-    expected_schema = 3 if kind == "raw_e2_stage_evidence_manifest" else 2
+    expected_schemas = {
+        "raw_e3a_selection_evidence_manifest": 2,
+        "raw_e1_pareto_evidence_manifest": 3,
+        "raw_e2_stage_evidence_manifest": 4,
+    }
+    try:
+        expected_schema = expected_schemas[kind]
+    except KeyError as exc:
+        raise ValueError("raw cell manifest kind is unsupported") from exc
     if (
         type(value.get("schema_version")) is not int
         or value.get("schema_version") != expected_schema
@@ -1218,7 +1230,7 @@ def raw_e1_pareto_manifest_from_dict(
         kind="raw_e1_pareto_evidence_manifest",
         stage_index=False,
     )
-    manifest = RawE1ParetoEvidenceManifest(schema_version=2, cells=cells)
+    manifest = RawE1ParetoEvidenceManifest(schema_version=3, cells=cells)
     if declared != manifest.sha256:
         raise ValueError("raw E1 manifest redundant SHA-256 mismatch")
     return manifest
@@ -1231,7 +1243,7 @@ def raw_e2_stage_manifest_from_dict(value: object) -> RawE2StageEvidenceManifest
         stage_index=True,
     )
     manifest = RawE2StageEvidenceManifest(
-        schema_version=3,
+        schema_version=4,
         stage_index=stage_index,  # type: ignore[arg-type]
         cells=cells,
     )
@@ -1351,21 +1363,50 @@ class IndustrialReducerArtifact:
     hardware_validity: tuple[tuple[str, str, tuple[str, ...]], ...]
     methods: tuple[MethodReduction, ...]
     primary_contrasts: tuple[PairedBcaContrast, ...]
+    secondary_contrasts: tuple[PairedBcaContrast, ...]
     holm_family: tuple[MultiplicityDecision, ...]
     bootstrap_hooks: tuple[tuple[str, tuple[str, ...]], ...]
 
     def __post_init__(self) -> None:
         if type(self.runtime_metrics) is not FormalRuntimeMetricsExport:
             raise TypeError("industrial reducer requires exact formal runtime metrics")
+        for name in (
+            "methods",
+            "primary_contrasts",
+            "secondary_contrasts",
+            "holm_family",
+        ):
+            if type(getattr(self, name)) is not tuple:
+                raise TypeError(f"industrial {name} container must be an exact tuple")
+        if any(type(row) is not MethodReduction for row in self.methods):
+            raise TypeError("industrial method reductions must be exact")
+        if any(
+            type(row) is not PairedBcaContrast
+            for row in (*self.primary_contrasts, *self.secondary_contrasts)
+        ):
+            raise TypeError("industrial contrast reductions must be exact")
+        if any(type(row) is not MultiplicityDecision for row in self.holm_family):
+            raise TypeError("industrial multiplicity decisions must be exact")
         expected_run_ids = tuple(
             sorted(binding.run_id for binding in self.run_bindings)
         )
         if self.runtime_metrics.expected_run_ids != expected_run_ids:
             raise ValueError("formal runtime metrics differ from reducer run bindings")
+        method_roles = tuple(row.method for row in self.methods)
+        if method_roles and method_roles != _METHODS:
+            raise ValueError(
+                "formal method reductions require the five registered roles"
+            )
+        primary_names = tuple(row.name for row in self.primary_contrasts)
+        if primary_names and primary_names != PRIMARY_CONTRASTS:
+            raise ValueError("industrial primary contrasts differ from registration")
+        secondary_names = tuple(row.name for row in self.secondary_contrasts)
+        if secondary_names and secondary_names != SECONDARY_CONTRASTS:
+            raise ValueError("industrial secondary contrasts differ from registration")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "industrial_schema_v3_reducer",
             "status": self.status,
             "gpu_evidence": self.gpu_evidence,
@@ -1414,6 +1455,9 @@ class IndustrialReducerArtifact:
             "methods": [asdict(method) for method in self.methods],
             "primary_contrasts": [
                 asdict(contrast) for contrast in self.primary_contrasts
+            ],
+            "secondary_contrasts": [
+                asdict(contrast) for contrast in self.secondary_contrasts
             ],
             "holm_family": [asdict(decision) for decision in self.holm_family],
             "bootstrap_hooks": [
@@ -1519,7 +1563,7 @@ class IndustrialReduction:
         metric: str,
     ) -> dict[str, np.ndarray]:
         if method not in _METHODS:
-            raise ValueError("bootstrap method must be Target-only, Static, TTS, or L0")
+            raise ValueError("bootstrap method must be a registered confirmation role")
         if metric not in _REQUEST_METRICS:
             raise ValueError("unknown request bootstrap metric")
         blocks = self._request_metrics.get(method)
@@ -1713,7 +1757,7 @@ class E3bLongContextStageArtifact:
     reductions: tuple[E3bNamedLongContextReduction, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError("E3b stage artifact schema is unsupported")
         if self.status != "UNRESOLVED":
             raise ValueError("current release cannot emit a claimable E3b stage")
@@ -1769,11 +1813,14 @@ class E3bLongContextStageArtifact:
             expected_names = tuple(
                 sorted(
                     {
-                        "accepted_length:l0:static",
-                        "accepted_length:l0:target_only",
-                        "accepted_length:l0:tts",
-                        "committed_token_goodput:l0:static",
-                        "committed_token_goodput:l0:target_only",
+                        "accepted_length:l0_naive:tts",
+                        "accepted_length:lightcone:l0_naive",
+                        "accepted_length:lightcone:static",
+                        "accepted_length:lightcone:tts",
+                        "committed_token_goodput:l0_naive:tts",
+                        "committed_token_goodput:lightcone:l0_naive",
+                        "committed_token_goodput:lightcone:static",
+                        "committed_token_goodput:lightcone:tts",
                     }
                 )
             )
@@ -1787,7 +1834,7 @@ class E3bLongContextStageArtifact:
                 raise ValueError("E3b numerical reductions lack eight raw families")
             for row in self.reductions:
                 expected_plan = E3bLongContextAnalysisPlan(
-                    schema_version=1,
+                    schema_version=2,
                     protocol_sha256=self.protocol_sha256,
                     family_sha256=self.context_family_sha256,
                     metric=row.metric,
@@ -2055,7 +2102,8 @@ def _phase_variant(cell: ExperimentCell, block: int) -> str:
     expected = "excluded_pilot" if block in PILOT_BLOCKS else "final_candidate"
     if variant is None or not variant.startswith(f"{expected}:"):
         raise ValueError("registry cell does not carry its immutable block phase")
-    return variant.split(":", 1)[1]
+    phase = variant.split(":", 1)[1]
+    return phase.rsplit(":role=", 1)[0] if ":role=" in phase else phase
 
 
 def _pairing_identity(cell: ExperimentCell, block: int) -> tuple[object, ...]:
@@ -2806,17 +2854,9 @@ def _replay_cell_execution_identity(
     """Separate shared activation lineage from one cell's execution identity."""
 
     source = reference.completion_contract
-    if source is None:
-        if not reference.diagnostic_lineage_identity:
-            raise ValueError(
-                "formal raw evidence lacks its schema-v4 completion contract"
-            )
-        # Explicit CPU-only diagnostics may retain the historical lineage
-        # identity.  This marker is not encoded by any formal raw schema.
-        return _CellExecutionIdentity(
-            experiment=family.experiment,
-            runtime_sha256=family.runtime_sha256,
-            split_sha256=family.split_sha256,
+    if source is None or reference.diagnostic_lineage_identity:
+        raise ValueError(
+            "formal raw evidence requires its schema-v4 completion contract"
         )
     value = _bound_json(
         source.path,
@@ -2968,6 +3008,10 @@ def _load_cell(
     envelope: HardwareEnvelope,
     inventory: GpuInventory,
 ) -> _LoadedCell:
+    if reference.completion_contract is None or reference.diagnostic_lineage_identity:
+        raise ValueError(
+            "formal raw evidence requires its schema-v4 completion contract"
+        )
     try:
         cell = cells_by_id[reference.cell_id]
     except KeyError as exc:
@@ -4712,6 +4756,7 @@ def _reduce_evidence_alias(
     )
     source_run_binding = _loaded_cell_raw_run_binding(
         loaded,
+        registry=registry,
         scientific_unit=f"evidence_alias:block={source.cell.identity.block}",
         lineage_runtime_sha256=family.runtime_sha256,
         lineage_split_sha256=family.split_sha256,
@@ -4963,9 +5008,13 @@ def _reduce_block(
     loaded_sequence = (*loaded_sequence, *aliased_sequence)
     if any(cell.cell.identity.block != block for cell in loaded_sequence):
         raise ValueError("block evidence contains a cell from another block")
-    loaded = {cell.cell.identity.method: cell for cell in loaded_sequence}
+    loaded = {
+        scientific_role_for_cell(registry, cell.cell): cell for cell in loaded_sequence
+    }
     if len(loaded) != len(loaded_sequence) or set(loaded) != set(_METHODS):
-        raise ValueError("paired blocks require exactly Target-only/Static/TTS/L0")
+        raise ValueError(
+            "paired blocks require exactly Target-only/Static/TTS/L0-naive/LightCone"
+        )
     loaded = {method: loaded[method] for method in _METHODS}
     pairing = {_pairing_identity(cell.cell, block) for cell in loaded.values()}
     if len(pairing) != 1:
@@ -5089,6 +5138,12 @@ def _pilot_bindings(
                     ],
                     "hardware_receipt_sha256": cell.hardware_receipt.sha256,
                     "budget_observation_sha256": cell.budget_observation.sha256,
+                    "completion_contract_sha256": (
+                        None
+                        if cell.completion_contract is None
+                        or cell.diagnostic_lineage_identity
+                        else cell.completion_contract.sha256
+                    ),
                 }
                 for cell in sorted(block.cells, key=lambda item: item.cell_id)
             ],
@@ -5098,7 +5153,7 @@ def _pilot_bindings(
     ]
     pilot_evidence_sha256 = content_sha256(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "industrial_pilot_evidence",
             "inventory_sha256": inventory.sha256,
             "inventory_source_receipt_sha256": inventory.source_receipt_sha256,
@@ -5228,6 +5283,7 @@ def _unresolved_artifact(
         hardware_validity=validity,
         methods=(),
         primary_contrasts=(),
+        secondary_contrasts=(),
         holm_family=(),
         bootstrap_hooks=(
             ("hierarchical_block_request", (independent_unit, "request")),
@@ -5290,16 +5346,18 @@ def _run_bindings(
 def _loaded_cell_raw_run_binding(
     cell: _LoadedCell,
     *,
+    registry: ExperimentRegistry,
     scientific_unit: str,
     lineage_runtime_sha256: str,
     lineage_split_sha256: str,
 ) -> RawEvidenceRunBinding:
     run = cell.run_rows[0]
     return RawEvidenceRunBinding(
-        schema_version=2,
+        schema_version=3,
         cell_id=cell.observation_source_cell_id,
         experiment=cell.cell.identity.experiment,
         method=cell.cell.identity.method,
+        scientific_role=scientific_role_for_cell(registry, cell.cell),
         scientific_unit=scientific_unit,
         config_sha256=str(run["config_sha256"]),
         rank_config_sha256s=tuple(
@@ -5344,14 +5402,14 @@ def _validate_industrial_doctor(
     readiness = report.get("readiness")
     compatibility = report.get("compatibility")
     if (
-        report.get("schema_version") != 1
+        report.get("schema_version") != 2
         or report.get("status") != "PASS"
         or not isinstance(readiness, dict)
         or readiness.get("status") != "PASS"
         or not isinstance(compatibility, dict)
         or compatibility.get("status") != "PASS"
     ):
-        raise ValueError("industrial GPU attestation requires a schema-v1 PASS doctor")
+        raise ValueError("industrial GPU attestation requires a schema-v2 PASS doctor")
 
     checks = report.get("checks")
     if (
@@ -5410,6 +5468,15 @@ def _validate_industrial_doctor(
         or compatibility.get("multi_node_supported") is not False
     ):
         raise ValueError("industrial doctor patched-tree identity is not exact")
+    try:
+        _require_project_runtime_source_identity(
+            report,
+            executing_file=Path(__file__),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "industrial doctor LightCone source identity is not exact"
+        ) from exc
 
     gpu = report.get("gpu")
     inventory = gpu.get("parsed_inventory") if isinstance(gpu, dict) else None
@@ -5755,7 +5822,7 @@ def _e2_evidence_manifest_sha256(
 ) -> str:
     return content_sha256(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "kind": "industrial_e2_raw_stage_evidence",
             "registry_sha256": registry.sha256,
             "e1_receipt_sha256": e1_receipt.sha256,
@@ -5777,6 +5844,12 @@ def _e2_evidence_manifest_sha256(
                     ],
                     "hardware_receipt_sha256": cell.hardware_receipt.sha256,
                     "budget_observation_sha256": cell.budget_observation.sha256,
+                    "completion_contract_sha256": (
+                        None
+                        if cell.completion_contract is None
+                        or cell.diagnostic_lineage_identity
+                        else cell.completion_contract.sha256
+                    ),
                     "itl_timestamp_authority_sha256": (
                         itl_authorities[cell.cell_id].sha256
                     ),
@@ -5945,13 +6018,19 @@ def _mark_e2_confidence_pareto(
         right: E2CandidateEvaluation,
     ) -> bool:
         weak = (
-            left.confidence_lower_goodput_ratio >= right.confidence_lower_goodput_ratio
+            left.lc_vs_tts_confidence_lower_goodput_ratio
+            >= right.lc_vs_tts_confidence_lower_goodput_ratio
+            and left.lc_vs_static_confidence_lower_goodput_ratio
+            >= right.lc_vs_static_confidence_lower_goodput_ratio
             and left.hbm_bytes <= right.hbm_bytes
             and left.p99_itl_us <= right.p99_itl_us
             and left.exposed_update_us <= right.exposed_update_us
         )
         strict = (
-            left.confidence_lower_goodput_ratio > right.confidence_lower_goodput_ratio
+            left.lc_vs_tts_confidence_lower_goodput_ratio
+            > right.lc_vs_tts_confidence_lower_goodput_ratio
+            or left.lc_vs_static_confidence_lower_goodput_ratio
+            > right.lc_vs_static_confidence_lower_goodput_ratio
             or left.hbm_bytes < right.hbm_bytes
             or left.p99_itl_us < right.p99_itl_us
             or left.exposed_update_us < right.exposed_update_us
@@ -6012,13 +6091,24 @@ def reduce_e2_stage_from_raw(
         raise ValueError(
             f"E2 raw stage reduction is BLOCKED: {activation.plan.reason_code}"
         )
+    cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("E2")}
+    activated_ids = activation.plan.activated_cell_ids
+    l0_naive_anchor_ids = tuple(
+        cell_id
+        for cell_id in activated_ids
+        if scientific_role_for_cell(registry, cells_by_id[cell_id]) == "l0_naive"
+    )
+    if len(l0_naive_anchor_ids) != 1:
+        raise ValueError("E2 activation requires one L0-naive mechanism anchor")
+    selection_ids = tuple(
+        cell_id for cell_id in activated_ids if cell_id not in l0_naive_anchor_ids
+    )
     references = tuple(cells)
     reference_ids = tuple(row.cell_id for row in references)
-    if len(reference_ids) != len(set(reference_ids)) or set(reference_ids) != set(
-        activation.plan.activated_cell_ids
-    ):
-        raise ValueError("E2 raw evidence must exactly cover the activated stage")
-    cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("E2")}
+    if reference_ids != selection_ids:
+        raise ValueError(
+            "E2 selection evidence must exclude the L0-naive mechanism anchor"
+        )
     _preflight_e2_itl_timestamp_authorities(
         registry=registry,
         references=references,
@@ -6069,43 +6159,52 @@ def reduce_e2_stage_from_raw(
     if first_run["patched_sglang_tree"] != PINNED_SGLANG_TREE:
         raise ValueError("E2 stage does not use the pinned patched SGLang tree")
 
-    by_method: dict[str, list[_LoadedCell]] = defaultdict(list)
+    by_role: dict[str, list[_LoadedCell]] = defaultdict(list)
     for row in loaded.values():
-        by_method[row.cell.identity.method].append(row)
-    if len(by_method["target_only"]) != 1 or len(by_method["static"]) != 1:
+        by_role[scientific_role_for_cell(registry, row.cell)].append(row)
+    required_reference_roles = ("target_only", "static", "tts")
+    if any(len(by_role[role]) != 1 for role in required_reference_roles):
         raise ValueError(
-            "E2 raw stage requires one Target-only and one Static reference"
+            "E2 raw stage requires one Target-only, Static, and frozen-TTS "
+            "selection reference"
         )
-    target = by_method["target_only"][0]
-    static = by_method["static"][0]
-    target_metrics = _e2_request_metrics_from_itl_authority(
-        target,
-        itl_authorities[target.cell.cell_id],
-    )
-    static_metrics = _e2_request_metrics_from_itl_authority(
-        static,
-        itl_authorities[static.cell.cell_id],
-    )
+    references_by_role = {role: by_role[role][0] for role in required_reference_roles}
+    target = references_by_role["target_only"]
+    reference_metrics = {
+        role: _e2_request_metrics_from_itl_authority(
+            cell,
+            itl_authorities[cell.cell.cell_id],
+        )
+        for role, cell in references_by_role.items()
+    }
     if any(
-        not row.completed or row.error for row in (*target_metrics, *static_metrics)
+        not metric.completed or metric.error
+        for metrics in reference_metrics.values()
+        for metric in metrics
     ):
         raise ValueError("E2 reference baselines require complete terminal requests")
     target_tokens = {
         str(row["request_id"]): _parse_output_token_ids(row)
         for row in target.request_rows
     }
-    static_tokens = {
-        str(row["request_id"]): _parse_output_token_ids(row)
-        for row in static.request_rows
-    }
-    if target_tokens != static_tokens:
-        raise ValueError(
-            "E2 Static reference differs from Target-only token trajectories"
-        )
+    for role, cell in references_by_role.items():
+        tokens = {
+            str(row["request_id"]): _parse_output_token_ids(row)
+            for row in cell.request_rows
+        }
+        if tokens != target_tokens:
+            raise ValueError(
+                f"E2 {role} reference differs from Target-only token trajectories"
+            )
+    static = references_by_role["static"]
+    tts = references_by_role["tts"]
+    static_metrics = reference_metrics["static"]
+    tts_metrics = reference_metrics["tts"]
     static_goodput = _raw_request_goodput(static.request_rows, static_metrics)
+    tts_goodput = _raw_request_goodput(tts.request_rows, tts_metrics)
     reference_failures = tuple(
-        (row.cell.identity.method, counter)
-        for row in (target, static)
+        (role, counter)
+        for role, row in references_by_role.items()
         for rows in row.performance_rows_by_rank
         for performance in rows
         for counter in _SAFETY_COUNTERS
@@ -6113,134 +6212,113 @@ def reduce_e2_stage_from_raw(
     )
     reference_invalid_hardware = tuple(
         identity
-        for row in (target, static)
+        for row in references_by_role.values()
         for identity, status, _ in row.hardware_validity
         if status != "VALID"
     )
     if reference_failures or reference_invalid_hardware:
         raise ValueError("E2 reference safety or hardware evidence is invalid")
 
-    candidate_cells: dict[str, dict[str, _LoadedCell]] = defaultdict(dict)
-    for method in ("tts", "l0"):
-        for row in by_method[method]:
-            candidate_id = E2CandidateIdentity.from_cell(row.cell).sha256
-            if method in candidate_cells[candidate_id]:
-                raise ValueError("E2 candidate repeats one adaptive method")
-            candidate_cells[candidate_id][method] = row
-    if not candidate_cells or any(
-        set(pair) != {"tts", "l0"} for pair in candidate_cells.values()
-    ):
-        raise ValueError("E2 raw stage lacks exact matched TTS/L0 candidate pairs")
+    candidate_cells: dict[str, _LoadedCell] = {}
+    for row in by_role["lc_candidate"]:
+        candidate_id = E2CandidateIdentity.from_cell(row.cell, registry=registry).sha256
+        if candidate_id in candidate_cells:
+            raise ValueError("E2 repeats one LightCone recipe candidate")
+        candidate_cells[candidate_id] = row
+    if not candidate_cells:
+        raise ValueError("E2 raw stage lacks LightCone recipe candidates")
+    unexpected_roles = set(by_role) - {*required_reference_roles, "lc_candidate"}
+    if unexpected_roles:
+        raise ValueError("E2 raw stage contains an unregistered scientific role")
 
     evaluations: list[E2CandidateEvaluation] = []
-    for candidate_id, pair in sorted(candidate_cells.items()):
-        method_metrics: dict[str, tuple[_RequestMetric, ...]] = {}
+    for candidate_id, cell in sorted(candidate_cells.items()):
         reasons: set[str] = set()
         hbm_values: list[int] = []
-        launched_counts: list[int] = []
-        published_counts: list[int] = []
-        exposed_update_us: list[int] = []
-        p99_itl_ms: list[float] = []
-        for method in ("tts", "l0"):
-            cell = pair[method]
-            metrics = _e2_request_metrics_from_itl_authority(
-                cell,
-                itl_authorities[cell.cell.cell_id],
-            )
-            method_metrics[method] = metrics
-            if any(not row.completed or row.error for row in metrics):
-                reasons.add(f"{method}:incomplete_request")
-            completed_rows = tuple(
-                row for row in metrics if row.completed and not row.error
-            )
-            if not completed_rows or any(
-                row.within_request_p99_itl_ms is None for row in completed_rows
-            ):
-                raise ValueError("E2 candidate lacks complete raw ITL timing")
-            p99_itl_ms.extend(
-                float(row.within_request_p99_itl_ms) for row in completed_rows
-            )
-            candidate_tokens = {
-                str(row["request_id"]): _parse_output_token_ids(row)
-                for row in cell.request_rows
-                if row.get("outcome_status") == "completed"
-            }
-            if any(
-                request_id not in target_tokens
-                or target_tokens[request_id] != token_ids
-                for request_id, token_ids in candidate_tokens.items()
-            ):
-                reasons.add(f"{method}:target_token_mismatch")
-            for rows in cell.performance_rows_by_rank:
-                for performance in rows:
-                    peak_hbm = performance.get("peak_hbm_bytes")
-                    if (
-                        not isinstance(peak_hbm, int)
-                        or isinstance(peak_hbm, bool)
-                        or peak_hbm < 0
-                    ):
-                        raise ValueError("E2 performance lacks exact peak HBM")
-                    hbm_values.append(peak_hbm)
-                    for counter in _SAFETY_COUNTERS:
-                        if performance[counter] != 0:
-                            reasons.add(f"{method}:{counter}")
-            for identity, status, _ in cell.hardware_validity:
-                if status != "VALID":
-                    reasons.add(f"{method}:hardware:{identity}")
-            launched, published, exposed = _e2_update_summary(cell)
-            launched_counts.append(launched)
-            published_counts.append(published)
-            exposed_update_us.append(exposed)
-        goodput_ratios = tuple(
-            _raw_request_goodput(pair[method].request_rows, method_metrics[method])
-            / static_goodput
-            for method in ("tts", "l0")
+        metrics = _e2_request_metrics_from_itl_authority(
+            cell,
+            itl_authorities[cell.cell.cell_id],
         )
-        point_score = min(goodput_ratios)
-        confidence_lower = min(
-            point_score,
-            *(
-                _paired_request_confidence_lower(
-                    method_metrics[method],
-                    static_metrics,
-                )
-                for method in ("tts", "l0")
-            ),
+        if any(not row.completed or row.error for row in metrics):
+            reasons.add("lc_candidate:incomplete_request")
+        completed_rows = tuple(
+            row for row in metrics if row.completed and not row.error
         )
+        if not completed_rows or any(
+            row.within_request_p99_itl_ms is None for row in completed_rows
+        ):
+            raise ValueError("E2 candidate lacks complete raw ITL timing")
+        p99_itl_ms = tuple(
+            float(row.within_request_p99_itl_ms) for row in completed_rows
+        )
+        candidate_tokens = {
+            str(row["request_id"]): _parse_output_token_ids(row)
+            for row in cell.request_rows
+            if row.get("outcome_status") == "completed"
+        }
+        if candidate_tokens != target_tokens:
+            reasons.add("lc_candidate:target_token_mismatch")
+        for rows in cell.performance_rows_by_rank:
+            for performance in rows:
+                peak_hbm = performance.get("peak_hbm_bytes")
+                if (
+                    not isinstance(peak_hbm, int)
+                    or isinstance(peak_hbm, bool)
+                    or peak_hbm < 0
+                ):
+                    raise ValueError("E2 performance lacks exact peak HBM")
+                hbm_values.append(peak_hbm)
+                for counter in _SAFETY_COUNTERS:
+                    if performance[counter] != 0:
+                        reasons.add(f"lc_candidate:{counter}")
+        for identity, status, _ in cell.hardware_validity:
+            if status != "VALID":
+                reasons.add(f"lc_candidate:hardware:{identity}")
+        launched, published, exposed = _e2_update_summary(cell)
+        candidate_goodput = _raw_request_goodput(cell.request_rows, metrics)
+        lc_vs_tts = candidate_goodput / tts_goodput
+        lc_vs_static = candidate_goodput / static_goodput
+        lc_vs_tts_lower = min(
+            lc_vs_tts,
+            _paired_request_confidence_lower(metrics, tts_metrics),
+        )
+        lc_vs_static_lower = min(
+            lc_vs_static,
+            _paired_request_confidence_lower(metrics, static_metrics),
+        )
+        evidence_rows = (*references_by_role.values(), cell)
         evidence_sha256 = content_sha256(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "industrial_e2_candidate_raw_evidence",
                 "candidate_id": candidate_id,
                 "reference_cell_ids": sorted(
-                    (target.cell.cell_id, static.cell.cell_id)
+                    row.cell.cell_id for row in references_by_role.values()
                 ),
-                "candidate_cell_ids": sorted(row.cell.cell_id for row in pair.values()),
+                "candidate_cell_id": cell.cell.cell_id,
                 "terminal_receipt_sha256s": sorted(
                     digest
-                    for row in (target, static, *pair.values())
+                    for row in evidence_rows
                     for digest in row.terminal_receipt_sha256s
                 ),
                 "hardware_receipt_sha256s": sorted(
-                    row.hardware_receipt_sha256
-                    for row in (target, static, *pair.values())
+                    row.hardware_receipt_sha256 for row in evidence_rows
                 ),
                 "budget_observation_sha256s": sorted(
-                    row.budget_observation_sha256
-                    for row in (target, static, *pair.values())
+                    row.budget_observation_sha256 for row in evidence_rows
                 ),
                 "itl_timestamp_authority_sha256s": sorted(
-                    itl_authorities[row.cell.cell_id].sha256
-                    for row in (target, static, *pair.values())
+                    itl_authorities[row.cell.cell_id].sha256 for row in evidence_rows
                 ),
                 "run_binding_sha256s": sorted(
                     _loaded_cell_raw_run_binding(
                         row,
+                        registry=registry,
                         scientific_unit=f"halving_{stage_index}",
                         lineage_runtime_sha256=activation.plan.runtime_sha256,
                         lineage_split_sha256=activation.plan.split_sha256,
                     ).sha256
-                    for row in (target, static, *pair.values())
+                    for row in evidence_rows
                 ),
             }
         )
@@ -6250,13 +6328,15 @@ def reduce_e2_stage_from_raw(
                 evidence_sha256=evidence_sha256,
                 safety_passed=not reasons,
                 confidence_pareto=False,
-                min_tts_l0_static_goodput_ratio=point_score,
-                confidence_lower_goodput_ratio=confidence_lower,
+                lc_vs_tts_goodput_ratio=lc_vs_tts,
+                lc_vs_tts_confidence_lower_goodput_ratio=lc_vs_tts_lower,
+                lc_vs_static_goodput_ratio=lc_vs_static,
+                lc_vs_static_confidence_lower_goodput_ratio=lc_vs_static_lower,
                 hbm_bytes=max(hbm_values),
                 p99_itl_us=math.ceil(max(p99_itl_ms) * 1_000.0),
-                exposed_update_us=max(exposed_update_us),
-                minimum_launched_updates=min(launched_counts),
-                minimum_published_updates=min(published_counts),
+                exposed_update_us=exposed,
+                minimum_launched_updates=launched,
+                minimum_published_updates=published,
                 safety_reason_codes=tuple(sorted(reasons)),
             )
         )
@@ -6265,6 +6345,7 @@ def reduce_e2_stage_from_raw(
     raw_run_bindings = tuple(
         _loaded_cell_raw_run_binding(
             row,
+            registry=registry,
             scientific_unit=f"halving_{stage_index}",
             lineage_runtime_sha256=activation.plan.runtime_sha256,
             lineage_split_sha256=activation.plan.split_sha256,
@@ -6272,7 +6353,7 @@ def reduce_e2_stage_from_raw(
         for row in ordered_loaded
     )
     stage_evidence = E2StageEvidenceArtifact(
-        schema_version=4,
+        schema_version=5,
         registry_sha256=registry.sha256,
         runtime_sha256=activation.plan.runtime_sha256,
         split_sha256=activation.plan.split_sha256,
@@ -6296,6 +6377,7 @@ def reduce_e2_stage_from_raw(
             cells=references,
             itl_authorities=itl_authorities,
         ),
+        excluded_mechanism_anchor_cell_ids=l0_naive_anchor_ids,
         completed_cell_ids=tuple(sorted(loaded)),
         terminal_receipt_sha256s=tuple(
             sorted(
@@ -6443,7 +6525,7 @@ def reduce_confirmation_family_power(
                 block_id=family_pilot_block_id(family, block.block),
                 static_goodput=getattr(block, pilot_metric)["static"],
                 tts_goodput=getattr(block, pilot_metric)["tts"],
-                l0_goodput=getattr(block, pilot_metric)["l0"],
+                lightcone_goodput=getattr(block, pilot_metric)["lightcone"],
             )
             for block in reduced
         )
@@ -6462,6 +6544,7 @@ def reduce_confirmation_family_power(
             (
                 _loaded_cell_raw_run_binding(
                     cell,
+                    registry=registry,
                     scientific_unit=f"excluded_pilot_{block.block}",
                     lineage_runtime_sha256=family.runtime_sha256,
                     lineage_split_sha256=family.split_sha256,
@@ -6714,7 +6797,7 @@ def reduce_industrial_schema_v3(
         len(
             _paired_dependence_components(
                 pilots,
-                numerator="l0",
+                numerator="lightcone",
                 denominator=denominator,
                 dependence_map=evidence_dependence_map,
             )
@@ -6863,14 +6946,17 @@ def reduce_industrial_schema_v3(
     if len(final) != confirmation_plan.selected_final_blocks:
         raise RuntimeError("validated final prefix changed during reduction")
     metric_name = "slo_goodput_tps" if family.experiment == "E5" else "goodput_tps"
-    primary: dict[str, PairedBcaContrast] = {}
-    for contrast, denominator in (
-        ("l0_vs_static", "static"),
-        ("l0_vs_tts", "tts"),
-    ):
+    contrast_specs = (
+        ("lightcone_vs_tts", "lightcone", "tts"),
+        ("lightcone_vs_static", "lightcone", "static"),
+        ("l0_naive_vs_tts", "l0_naive", "tts"),
+        ("lightcone_vs_l0_naive", "lightcone", "l0_naive"),
+    )
+    contrasts: dict[str, PairedBcaContrast] = {}
+    for contrast_index, (contrast, numerator, denominator) in enumerate(contrast_specs):
         components = _paired_dependence_components(
             final,
-            numerator="l0",
+            numerator=numerator,
             denominator=denominator,
             dependence_map=evidence_dependence_map,
         )
@@ -6881,7 +6967,7 @@ def reduce_industrial_schema_v3(
         paired: dict[str, tuple[float, float]] = {}
         for component_id, component in components:
             numerator_values = np.asarray(
-                [getattr(block, metric_name)["l0"] for block in component],
+                [getattr(block, metric_name)[numerator] for block in component],
                 dtype=np.float64,
             )
             denominator_values = np.asarray(
@@ -6896,9 +6982,9 @@ def reduce_industrial_schema_v3(
             contrast,
             paired,
             repetitions=bootstrap_repetitions,
-            seed=bootstrap_seed + PRIMARY_CONTRASTS.index(contrast),
+            seed=bootstrap_seed + contrast_index,
         )
-        primary[contrast] = (
+        contrasts[contrast] = (
             replace(
                 contrast_result,
                 independent_unit="evidence_dependence_component",
@@ -6906,6 +6992,7 @@ def reduce_industrial_schema_v3(
             if evidence_dependence_map is not None
             else contrast_result
         )
+    primary = {name: contrasts[name] for name in PRIMARY_CONTRASTS}
     holm = holm_primary_contrasts(primary)
 
     methods: list[MethodReduction] = []
@@ -7050,6 +7137,7 @@ def reduce_industrial_schema_v3(
         hardware_validity=validity,
         methods=tuple(methods),
         primary_contrasts=tuple(primary[name] for name in PRIMARY_CONTRASTS),
+        secondary_contrasts=tuple(contrasts[name] for name in SECONDARY_CONTRASTS),
         holm_family=holm,
         bootstrap_hooks=(
             ("hierarchical_block_request", (independent_unit, "request")),
@@ -7290,12 +7378,16 @@ def _e3b_round_ratios_by_request(
 def _e3b_accepted_length_observations(
     *,
     final_by_context: Mapping[int, tuple[_BlockReduction, ...]],
+    candidate_method: E3bMethod,
+    baseline_method: E3bMethod,
 ) -> tuple[E3bPairedRequestObservation, ...]:
     observations: list[E3bPairedRequestObservation] = []
     for context in E3B_CONTEXT_GRID:
         for block in final_by_context[context]:
-            candidate = _e3b_round_ratios_by_request(block.cells["l0"])
-            baseline = _e3b_round_ratios_by_request(block.cells["tts"])
+            candidate = _e3b_round_ratios_by_request(
+                block.cells[candidate_method.value]
+            )
+            baseline = _e3b_round_ratios_by_request(block.cells[baseline_method.value])
             if set(candidate) != set(baseline):
                 raise ValueError("E3b paired accepted-length request IDs differ")
             for request_id in sorted(candidate):
@@ -7339,7 +7431,7 @@ def _e3b_long_plan(
     bootstrap_seed: int,
 ) -> E3bLongContextAnalysisPlan:
     return E3bLongContextAnalysisPlan(
-        schema_version=1,
+        schema_version=2,
         protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
         family_sha256=context_family_sha256,
         metric=metric,
@@ -7364,7 +7456,7 @@ def _e3b_stage_artifact(
 ) -> E3bLongContextStageArtifact:
     ordered_reductions = tuple(sorted(reductions, key=lambda value: value.name))
     return E3bLongContextStageArtifact(
-        schema_version=1,
+        schema_version=2,
         status="UNRESOLVED",
         evidence_level=(
             "RAW_DIAGNOSTIC_OBSERVED_UNATTESTED"
@@ -7527,10 +7619,15 @@ def reduce_e3b_long_context_from_raw(
         if tuple(block.block for block in final) != final_block_ids:
             raise RuntimeError("validated E3b raw final prefix changed")
         if reduction._uses_evidence_dependence_units:
-            for denominator in ("static", "target_only", "tts"):
+            for numerator, denominator in (
+                ("lightcone", "tts"),
+                ("lightcone", "static"),
+                ("l0_naive", "tts"),
+                ("lightcone", "l0_naive"),
+            ):
                 components = _paired_dependence_components(
                     final,
-                    numerator="l0",
+                    numerator=numerator,
                     denominator=denominator,
                     dependence_map=next(
                         value.evidence_dependence_map
@@ -7554,12 +7651,18 @@ def reduce_e3b_long_context_from_raw(
             bootstrap_seed=bootstrap_seed,
         )
 
+    contrast_methods = (
+        (E3bMethod.LIGHTCONE, E3bMethod.TTS),
+        (E3bMethod.LIGHTCONE, E3bMethod.STATIC),
+        (E3bMethod.L0_NAIVE, E3bMethod.TTS),
+        (E3bMethod.LIGHTCONE, E3bMethod.L0_NAIVE),
+    )
     named: list[E3bNamedLongContextReduction] = []
-    for baseline in (E3bMethod.STATIC, E3bMethod.TARGET_ONLY):
+    for candidate, baseline in contrast_methods:
         plan = _e3b_long_plan(
             context_family_sha256=context_family_sha256,
             metric=E3bMetric.COMMITTED_TOKEN_GOODPUT,
-            candidate=E3bMethod.L0,
+            candidate=candidate,
             baseline=baseline,
             final_block_ids=final_block_ids,
             bootstrap_repetitions=bootstrap_repetitions,
@@ -7568,7 +7671,7 @@ def reduce_e3b_long_context_from_raw(
         try:
             observations = _e3b_goodput_observations(
                 final_by_context=final_by_context,
-                candidate_method=E3bMethod.L0,
+                candidate_method=candidate,
                 baseline_method=baseline,
             )
         except (_E3bSourceUnavailable, _RequestTerminalTimingUnavailable) as error:
@@ -7587,56 +7690,35 @@ def reduce_e3b_long_context_from_raw(
             )
         )
 
-    accepted_plan = _e3b_long_plan(
-        context_family_sha256=context_family_sha256,
-        metric=E3bMetric.ACCEPTED_LENGTH,
-        candidate=E3bMethod.L0,
-        baseline=E3bMethod.TTS,
-        final_block_ids=final_block_ids,
-        bootstrap_repetitions=bootstrap_repetitions,
-        bootstrap_seed=bootstrap_seed,
-    )
-    try:
-        accepted_observations = _e3b_accepted_length_observations(
-            final_by_context=final_by_context
-        )
-    except _E3bSourceUnavailable as error:
-        accepted_reduction = unresolved_e3b_long_context_pair(
-            accepted_plan,
-            reason_code=error.reason_code,
-        )
-    else:
-        accepted_reduction = reduce_e3b_long_context_pair(
-            accepted_plan,
-            accepted_observations,
-        )
-    named.append(
-        E3bNamedLongContextReduction(
-            metric=accepted_plan.metric,
-            candidate_method=accepted_plan.candidate_method,
-            baseline_method=accepted_plan.baseline_method,
-            reduction=accepted_reduction,
-        )
-    )
-    for baseline in (E3bMethod.STATIC, E3bMethod.TARGET_ONLY):
+    for candidate, baseline in contrast_methods:
         plan = _e3b_long_plan(
             context_family_sha256=context_family_sha256,
             metric=E3bMetric.ACCEPTED_LENGTH,
-            candidate=E3bMethod.L0,
+            candidate=candidate,
             baseline=baseline,
             final_block_ids=final_block_ids,
             bootstrap_repetitions=bootstrap_repetitions,
             bootstrap_seed=bootstrap_seed,
         )
+        try:
+            observations = _e3b_accepted_length_observations(
+                final_by_context=final_by_context,
+                candidate_method=candidate,
+                baseline_method=baseline,
+            )
+        except _E3bSourceUnavailable as error:
+            reduction = unresolved_e3b_long_context_pair(
+                plan,
+                reason_code=error.reason_code,
+            )
+        else:
+            reduction = reduce_e3b_long_context_pair(plan, observations)
         named.append(
             E3bNamedLongContextReduction(
                 metric=plan.metric,
                 candidate_method=plan.candidate_method,
                 baseline_method=plan.baseline_method,
-                reduction=unresolved_e3b_long_context_pair(
-                    plan,
-                    reason_code="e3b_baseline_round_source_unavailable",
-                ),
+                reduction=reduction,
             )
         )
 

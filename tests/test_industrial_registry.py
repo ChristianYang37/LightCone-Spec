@@ -6,11 +6,17 @@ import pytest
 
 from lightcone_spec.experiments.gpu_pool import registry_pool_work_item
 from lightcone_spec.experiments.registry import (
+    CONFIRMATION_METHOD_ROLES,
     CONTEXT_GRID,
     CONTEXT_REGIMES,
     DRAFT_WIDTHS,
     E0_BACKENDS,
-    E0_METHODS,
+    E0_INTERACTION_BACKENDS,
+    E0_INTERACTION_FINAL_BLOCKS,
+    E0_INTERACTION_MODELS,
+    E0_INTERACTION_TASKS,
+    E0_LOADS,
+    E0_METHOD_ROLES,
     E0_MODELS,
     E0_TASKS,
     E2_HALVING_STAGES,
@@ -21,6 +27,7 @@ from lightcone_spec.experiments.registry import (
     E5_OPEN_LOOP_LOAD_FACTORS,
     E5_TOPOLOGIES,
     E6_CANDIDATE_MODELS,
+    FROZEN_TTS_RECIPE_SENTINEL,
     INDUSTRIAL_EXPERIMENT_ORDER,
     INDUSTRIAL_PORT_SPAN,
     LORA_RANKS,
@@ -135,7 +142,7 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
         for cell in registry.cells_for("E2")
         if cell.identity.optimizer == "chronobelief"
     ]
-    assert len(unresolved_optimizer) == 96 * len(E2_HALVING_STAGES) * 2
+    assert len(unresolved_optimizer) == 96 * len(E2_HALVING_STAGES)
     assert {cell.status for cell in unresolved_optimizer} == {CellStatus.BLOCKED}
     assert {cell.reason_code for cell in unresolved_optimizer} == {
         "optimizer_equation_unresolved"
@@ -143,7 +150,7 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
     implemented_optimizer = [
         cell for cell in registry.cells_for("E2") if cell.identity.optimizer == "adamw"
     ]
-    assert len(implemented_optimizer) == 480 * len(E2_HALVING_STAGES) * 2
+    assert len(implemented_optimizer) == 480 * len(E2_HALVING_STAGES)
     assert len({cell.identity.learning_rate for cell in implemented_optimizer}) == 9
     assert all(
         cell.identity.learning_rate is not None for cell in implemented_optimizer
@@ -156,13 +163,13 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
     )
 
     for experiment in ("E1", "E2"):
-        adaptive = [
+        anchors = [
             cell
             for cell in registry.cells_for(experiment)
-            if cell.identity.method in {"tts", "l0"}
+            if cell.identity.optimizer == FROZEN_TTS_RECIPE_SENTINEL
         ]
         grouped: dict[tuple[object, ...], list[object]] = {}
-        for cell in adaptive:
+        for cell in anchors:
             identity = cell.identity
             key = (
                 identity.scope,
@@ -173,7 +180,6 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
                 identity.context,
                 identity.width,
                 identity.parameterization,
-                identity.variant,
                 identity.concurrency,
             )
             grouped.setdefault(key, []).append(cell)
@@ -198,7 +204,7 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
     assert len(adaptive) == 56
     assert {row.status for row in adaptive} == {CellStatus.BLOCKED}
     assert {row.reason_code for row in adaptive} == {
-        "patched_runtime_backend_unsupported"
+        "sealed_e2_recipe_receipt_required"
     }
     assert {row.identity.method for row in baselines} == {"target_only", "static"}
     assert len(baselines) == 2
@@ -239,12 +245,48 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
         if cell.identity.variant.startswith("excluded_pilot:")
     } == set(PILOT_BLOCKS)
     per_block = len(e3b_cells) // len(REGISTERED_CONFIRMATION_BLOCKS)
-    assert per_block == 4 * len(CONTEXT_GRID) * len(CONTEXT_REGIMES) * 2 * 2
+    assert per_block == len(CONFIRMATION_METHOD_ROLES) * (
+        len(CONTEXT_GRID) * len(CONTEXT_REGIMES) * 2 * 2
+    )
 
     assert _axes(registry, "E6")["model"] == E6_CANDIDATE_MODELS
-    assert len(registry.cells_for("E0")) == (
-        len(E0_MODELS) * len(E0_BACKENDS) * len(E0_TASKS) * len(E0_METHODS)
+    e0 = registry.cells_for("E0")
+    assert _axes(registry, "E0")["load"] == E0_LOADS
+    assert _axes(registry, "E0")["block"] == REGISTERED_CONFIRMATION_BLOCKS
+    assert len(e0) == (
+        len(E0_MODELS) * len(E0_BACKENDS) * len(E0_TASKS) * len(E0_METHOD_ROLES)
+        + len(E0_INTERACTION_MODELS)
+        * len(E0_INTERACTION_BACKENDS)
+        * len(E0_INTERACTION_TASKS)
+        * len(CONFIRMATION_METHOD_ROLES)
+        * len(E0_LOADS)
+        * (len(PILOT_BLOCKS) + len(E0_INTERACTION_FINAL_BLOCKS))
     )
+    interaction_anchors = [
+        cell
+        for cell in e0
+        if cell.identity.variant.startswith(("excluded_pilot:", "final_candidate:"))
+    ]
+    assert len(interaction_anchors) == (
+        len(E0_INTERACTION_MODELS)
+        * len(E0_INTERACTION_BACKENDS)
+        * len(E0_INTERACTION_TASKS)
+        * len(CONFIRMATION_METHOD_ROLES)
+        * len(E0_LOADS)
+        * (len(PILOT_BLOCKS) + len(E0_INTERACTION_FINAL_BLOCKS))
+    )
+    assert {cell.identity.model for cell in interaction_anchors} == set(E0_MODELS)
+    assert {cell.identity.backend for cell in interaction_anchors} == {"DFLASH"}
+    assert {cell.identity.task for cell in interaction_anchors} == set(
+        E0_INTERACTION_TASKS
+    )
+    assert {cell.identity.block for cell in interaction_anchors} == {
+        *PILOT_BLOCKS,
+        *E0_INTERACTION_FINAL_BLOCKS,
+    }
+    assert {
+        cell.identity.variant.split(":", 2)[1] for cell in interaction_anchors
+    } == set(E0_LOADS)
 
     unsupported_adaptive = [
         cell
@@ -389,9 +431,11 @@ def test_authoritative_registry_cell_contract_accepts_arbitrary_gpu_gangs(
         )
 
     e6_blocked = [row for row in registry.cells_for("E6") if not row.runnable]
-    assert len(e6_blocked) == 72
+    assert len(e6_blocked) == 3744
     assert {row.reason_code for row in e6_blocked} == {
-        "native_nextn_preflight_required"
+        "native_nextn_preflight_required",
+        "sealed_e2_recipe_receipt_required",
+        "tts_official_recipe_unavailable",
     }
 
 
@@ -459,7 +503,9 @@ def test_unresolved_and_blocked_cells_preserve_truthful_status(
     )
 
     blocked = next(
-        cell for cell in registry.cells_for("E6") if cell.status is CellStatus.BLOCKED
+        cell
+        for cell in registry.cells_for("E6")
+        if cell.reason_code == "native_nextn_preflight_required"
     )
     assert not blocked.runnable
     assert blocked.reason_code == "native_nextn_preflight_required"

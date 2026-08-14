@@ -51,7 +51,7 @@ _ROOT_MAXIMUM_ITERATIONS = 128
 # a sign, knot, context point, resampling unit, or crossover interpretation.
 E3B_LONG_CONTEXT_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "e3b_registered_long_context_spline_protocol",
         "context_grid_tokens": E3B_CONTEXT_GRID,
         "interior_knots_tokens": E3B_INTERIOR_KNOTS,
@@ -88,6 +88,20 @@ E3B_LONG_CONTEXT_PROTOCOL_SHA256 = content_sha256(
         "confidence": REGISTERED_CONFIDENCE,
         "interval": "hierarchical_bootstrap_percentile_linear_quantile",
         "crossover_metric": "committed_token_goodput",
+        "scientific_roles": (
+            "target_only",
+            "static",
+            "tts",
+            "l0_naive",
+            "lightcone",
+        ),
+        "registered_contrasts": (
+            "lightcone_vs_tts",
+            "lightcone_vs_static",
+            "l0_naive_vs_tts",
+            "lightcone_vs_l0_naive",
+        ),
+        "interaction_axis": "method_by_context",
         "crossover": (
             "first_measured_grid_bracket_where_paired_fitted_goodput_changes_sign"
         ),
@@ -118,7 +132,8 @@ class E3bMethod(str, Enum):
     TARGET_ONLY = "target_only"
     STATIC = "static"
     TTS = "tts"
-    L0 = "l0"
+    L0_NAIVE = "l0_naive"
+    LIGHTCONE = "lightcone"
 
 
 class E3bObservationDisposition(str, Enum):
@@ -159,7 +174,7 @@ class E3bLongContextAnalysisPlan:
     confidence: float = REGISTERED_CONFIDENCE
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError("E3b analysis plan schema is unsupported")
         if self.protocol_sha256 != E3B_LONG_CONTEXT_PROTOCOL_SHA256:
             raise ValueError("E3b analysis plan changes the registered protocol")
@@ -171,16 +186,14 @@ class E3bLongContextAnalysisPlan:
             self.baseline_method, E3bMethod
         ):
             raise TypeError("E3b methods must be E3bMethod values")
-        if self.candidate_method not in {E3bMethod.TTS, E3bMethod.L0}:
-            raise ValueError("E3b candidate must be TTS or L0")
-        if self.baseline_method not in {
-            E3bMethod.TARGET_ONLY,
-            E3bMethod.STATIC,
-            E3bMethod.TTS,
-        }:
-            raise ValueError("E3b baseline is not registered")
-        if self.candidate_method == self.baseline_method:
-            raise ValueError("E3b candidate and baseline must differ")
+        registered_pairs = {
+            (E3bMethod.LIGHTCONE, E3bMethod.TTS),
+            (E3bMethod.LIGHTCONE, E3bMethod.STATIC),
+            (E3bMethod.L0_NAIVE, E3bMethod.TTS),
+            (E3bMethod.LIGHTCONE, E3bMethod.L0_NAIVE),
+        }
+        if (self.candidate_method, self.baseline_method) not in registered_pairs:
+            raise ValueError("E3b methods do not name a registered formal contrast")
         if self.context_grid_tokens != E3B_CONTEXT_GRID:
             raise ValueError("E3b analysis requires the exact registered context grid")
         if self.interior_knots_tokens != E3B_INTERIOR_KNOTS:
@@ -334,7 +347,7 @@ class E3bLongContextReduction:
     interval_method: str = "hierarchical_bootstrap_percentile_95"
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 2:
             raise ValueError("E3b reduction schema is unsupported")
         if self.protocol_sha256 != E3B_LONG_CONTEXT_PROTOCOL_SHA256:
             raise ValueError("E3b reduction uses another protocol")
@@ -490,7 +503,7 @@ def _unresolved(
     crossover: E3bCrossoverReduction | None = None,
 ) -> E3bLongContextReduction:
     return E3bLongContextReduction(
-        schema_version=1,
+        schema_version=2,
         status=E3bReductionStatus.UNRESOLVED,
         reason_code=reason_code,
         protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
@@ -1209,7 +1222,7 @@ def reduce_e3b_long_context_pair(
         return _unresolved(plan, values, "e3b_numerical_reduction_failed")
 
     return E3bLongContextReduction(
-        schema_version=1,
+        schema_version=2,
         status=E3bReductionStatus.OBSERVED,
         reason_code="e3b_registered_long_context_reduced",
         protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,

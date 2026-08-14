@@ -4,6 +4,7 @@ import argparse
 import copy
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -12,17 +13,33 @@ from lightcone_spec import (
     PINNED_SGLANG_PATCH_COUNT,
     PINNED_SGLANG_TREE,
 )
+from lightcone_spec.doctor import _project_runtime_source, _project_tree
 from lightcone_spec.experiments.onlinespec import OnlineSpecManifest
 from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
 
 cli = importlib.import_module("lightcone_spec.cli.main")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _simulate_clean_project_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def clean_project_tree(root: Path) -> dict[str, object]:
+        value = _project_tree(root)
+        if root.resolve() == PROJECT_ROOT:
+            value["dirty"] = False
+        return value
+
+    monkeypatch.setattr("lightcone_spec.doctor._project_tree", clean_project_tree)
 
 
 def _passing_doctor() -> dict:
     manifest_sha256 = "a" * 64
     checks = {name: {"status": "PASS"} for name in cli._ATTESTATION_DOCTOR_CHECKS}
+    project_root = Path(__file__).resolve().parents[1]
+    project_source_tree = _project_tree(project_root)
+    project_source_tree["dirty"] = False
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "readiness": {
             "status": "PASS",
@@ -38,10 +55,12 @@ def _passing_doctor() -> dict:
         },
         "checks": checks,
         "roots": {
-            "project": "/runtime/lightcone-spec",
+            "project": str(project_root),
             "patched_sglang": "/runtime/sglang",
             "distinct": True,
         },
+        "project_source_tree": project_source_tree,
+        "project_runtime_source": _project_runtime_source(project_root),
         "source_tree": {
             "path": "/runtime/sglang",
             "is_git_checkout": True,
@@ -81,10 +100,40 @@ def test_complete_pass_doctor_is_accepted_for_legacy_attestation() -> None:
     assert cli._validate_attestation_doctor(report, label="GPU") is report
 
 
+def test_legacy_attestation_rejects_missing_project_runtime_source() -> None:
+    report = _passing_doctor()
+    del report["project_runtime_source"]
+    with pytest.raises(ValueError, match="source identity is stale or incomplete"):
+        cli._validate_attestation_doctor(report, label="GPU")
+
+
+def test_legacy_attestation_rejects_tampered_project_runtime_source() -> None:
+    report = _passing_doctor()
+    report["project_runtime_source"]["content_sha256"] = "c" * 64
+    with pytest.raises(ValueError, match="source identity is stale or incomplete"):
+        cli._validate_attestation_doctor(report, label="GPU")
+
+
+def test_legacy_attestation_reopens_current_project_cleanliness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _passing_doctor()
+
+    def dirty_project_tree(root: Path) -> dict[str, object]:
+        value = _project_tree(root)
+        if root.resolve() == PROJECT_ROOT:
+            value["dirty"] = True
+        return value
+
+    monkeypatch.setattr("lightcone_spec.doctor._project_tree", dirty_project_tree)
+    with pytest.raises(ValueError, match="source identity is stale or incomplete"):
+        cli._validate_attestation_doctor(report, label="GPU")
+
+
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     (
-        (("schema_version",), 2, "schema-v1"),
+        (("schema_version",), 1, "schema-v2"),
         (("status",), "FAIL", "top-level"),
         (("readiness", "status"), "UNKNOWN", "readiness.status"),
         (("compatibility", "status"), "FAIL", "compatibility.status"),

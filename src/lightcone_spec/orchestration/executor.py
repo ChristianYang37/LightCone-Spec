@@ -40,6 +40,7 @@ from lightcone_spec.adaptation.plan_authority import (
 )
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import RunConfig
+from lightcone_spec.doctor import _require_project_runtime_source_identity
 from lightcone_spec.execution import ControlledExecutionPolicy
 from lightcone_spec.experiments.failure_authority import (
     FAILURE_INJECTION_RAW_PLAN_AUTHORITY_REQUIRED_REASON,
@@ -999,7 +1000,7 @@ def _validate_runtime_envelope_artifact(
         report.get("runtime_manifest"), label="runtime compatibility manifest"
     )
     if (
-        report.get("schema_version") != 1
+        report.get("schema_version") != 2
         or report.get("status") != "PASS"
         or readiness.get("status") != "PASS"
         or readiness.get("fail_count") != 0
@@ -1016,6 +1017,12 @@ def _validate_runtime_envelope_artifact(
     ):
         raise ValueError("runtime envelope is not a complete PASS authority")
     roots = _required_object(report.get("roots"), label="runtime roots")
+    try:
+        _require_project_runtime_source_identity(report, executing_file=Path(__file__))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "runtime envelope differs from the executing LightCone source identity"
+        ) from exc
     source = _required_object(report.get("source_tree"), label="SGLang source tree")
     if (
         roots.get("patched_sglang") != str(checkout)

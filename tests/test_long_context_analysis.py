@@ -33,7 +33,7 @@ def _plan(
     final_blocks: int = 12,
 ) -> E3bLongContextAnalysisPlan:
     return E3bLongContextAnalysisPlan(
-        schema_version=1,
+        schema_version=2,
         protocol_sha256=E3B_LONG_CONTEXT_PROTOCOL_SHA256,
         family_sha256=content_sha256(
             {
@@ -44,7 +44,7 @@ def _plan(
             }
         ),
         metric=metric,
-        candidate_method=E3bMethod.L0,
+        candidate_method=E3bMethod.LIGHTCONE,
         baseline_method=E3bMethod.STATIC,
         final_block_ids=FINAL_BLOCKS[:final_blocks],
         bootstrap_repetitions=repetitions,
@@ -83,6 +83,30 @@ def _rows(
         for context in E3B_CONTEXT_GRID
         for request_index in range(requests)
     )
+
+
+def test_e3b_plan_accepts_only_registered_scientific_role_contrasts() -> None:
+    plan = _plan()
+    for candidate, baseline in (
+        (E3bMethod.LIGHTCONE, E3bMethod.TTS),
+        (E3bMethod.LIGHTCONE, E3bMethod.STATIC),
+        (E3bMethod.L0_NAIVE, E3bMethod.TTS),
+        (E3bMethod.LIGHTCONE, E3bMethod.L0_NAIVE),
+    ):
+        assert (
+            replace(
+                plan,
+                candidate_method=candidate,
+                baseline_method=baseline,
+            ).candidate_method
+            is candidate
+        )
+    with pytest.raises(ValueError, match="registered formal contrast"):
+        replace(
+            plan,
+            candidate_method=E3bMethod.TTS,
+            baseline_method=E3bMethod.STATIC,
+        )
 
 
 def _goodput_rows(
@@ -368,7 +392,7 @@ def test_no_crossover_through_40928_is_distinct_from_hbm_infeasible() -> None:
     _assert_null_numeric_reduction(infeasible)
     assert infeasible.crossover.outcome is E3bCrossoverOutcome.HBM_INFEASIBLE
     assert infeasible.crossover.infeasible_contexts == (40928,)
-    assert infeasible.crossover.infeasible_methods == (E3bMethod.L0,)
+    assert infeasible.crossover.infeasible_methods == (E3bMethod.LIGHTCONE,)
 
 
 @pytest.mark.parametrize(

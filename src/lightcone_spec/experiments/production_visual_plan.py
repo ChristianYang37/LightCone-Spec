@@ -31,19 +31,19 @@ _FIGURE_GROUPS = (
         "fig:e3b-accepted-length",
         "accepted_length",
         "Which registered methods change accepted length across context?",
-        3,
+        4,
     ),
     (
         "fig:e3b-committed-token-goodput",
         "committed_token_goodput",
         "Which registered methods change committed-token goodput across context?",
-        2,
+        4,
     ),
 )
 
 PRODUCTION_VISUAL_PLAN_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "lightcone_production_visual_plan_protocol",
         "source": "exact_production_output_artifact",
         "raw_evidence": "forbidden",
@@ -53,8 +53,8 @@ PRODUCTION_VISUAL_PLAN_PROTOCOL_SHA256 = content_sha256(
         "style_manifest": "source_owned_registration_required",
         "data_figure_render_mode": "vector_native_only",
         "main_panel_groups": {
-            "accepted_length": 3,
-            "committed_token_goodput": 2,
+            "accepted_length": 4,
+            "committed_token_goodput": 4,
         },
         "empirical_curve": "forbidden_without_registered_uncertainty",
         "power_table": "preregistered_planning_only_not_formal_result",
@@ -269,7 +269,7 @@ def _manifest(source: ProductionOutputArtifact) -> dict[str, object]:
         blockers.add("production_output_blocked")
     power_table, claim_table = source.tables
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "lightcone_production_visual_plan",
         "protocol_sha256": PRODUCTION_VISUAL_PLAN_PROTOCOL_SHA256,
         "lifecycle": "planned",
@@ -319,7 +319,7 @@ class ProductionVisualPlanArtifact:
 
     @property
     def schema_version(self) -> int:
-        return 1
+        return 2
 
     @property
     def protocol_sha256(self) -> str:

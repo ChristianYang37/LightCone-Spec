@@ -34,6 +34,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentCell,
     ExperimentRegistry,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 
@@ -330,10 +331,11 @@ class CellExecutionSemantics:
                 or self.expected_learning_rate is not None
             ):
                 raise ValueError("baseline semantics cannot bind adaptation")
-        elif self.expected_method in {"tts", "l0"}:
+        elif self.expected_method == "l0":
             recipe = self.adaptation_recipe
             if (
-                recipe is None
+                self.cell_declaration.identity.experiment != "E1"
+                or recipe is None
                 or recipe.status != "AVAILABLE"
                 or recipe.sha256 != self.adaptation_recipe_sha256
                 or recipe.lookup_key
@@ -554,6 +556,9 @@ def resolve_cell_execution_semantics(
         _block(EXECUTION_SEMANTICS_FOREIGN_CELL_REASON)
     if cell.identity.experiment != "E1":
         _block(EXECUTION_SEMANTICS_UNSUPPORTED_EXPERIMENT_REASON)
+    scientific_role = scientific_role_for_cell(registry, cell)
+    if scientific_role not in {"target_only", "static", "lc_candidate"}:
+        _block(EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON)
     if cell.cell_id not in artifact.plan.activated_cell_ids:
         _block(EXECUTION_SEMANTICS_CELL_NOT_ACTIVATED_REASON)
     identity = cell.identity
@@ -575,7 +580,7 @@ def resolve_cell_execution_semantics(
     )
 
     recipe: AdaptationRecipeDeclaration | None = None
-    if identity.method in {"tts", "l0"}:
+    if scientific_role == "lc_candidate":
         try:
             recipe = registry.adaptation_recipe_for_cell(cell)
         except (TypeError, ValueError) as error:
@@ -584,7 +589,7 @@ def resolve_cell_execution_semantics(
             ) from error
         if recipe.status != "AVAILABLE":
             _block(EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON)
-    elif identity.method not in {"target_only", "static"}:
+    elif scientific_role not in {"target_only", "static"}:
         _block(EXECUTION_SEMANTICS_RECIPE_UNAVAILABLE_REASON)
 
     registered = load_binding.registered_load

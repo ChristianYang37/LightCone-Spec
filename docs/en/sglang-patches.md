@@ -22,7 +22,7 @@ The schema-v3 envelope defines one coherent **target** runtime surface. Items
 in this list are contracts and registry vocabulary; they are not claims that
 the current patch implements every item:
 
-1. strict Target-only/Static/TTS/L0 and backend-native configuration with a
+1. strict Target-only/Static/TTS/L0 runtime-method and backend-native configuration with a
    disabled path that allocates no adaptation state;
 2. common proposal evidence, backend payload validation, differentiable
    reconstruction, and exact sampling-distribution preservation;
@@ -70,10 +70,10 @@ and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
 and the final tree is `fae3c1538ed4934fb3b47c7ebc82393306c43f06`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
-Static aggregate safety, and TTS/L0 request/round/update/KV/performance rows.
+Static aggregate safety, and adaptive-runtime request/round/update/KV/performance rows.
 It exposes a signer plugin boundary but bundles no trusted hardware key or
 release signer. The executor therefore still runs only Target-only end to end
-and blocks Static/TTS/L0 before mutation.
+and blocks Static/TTS/L0-naive/LightCone before mutation.
 
 The second patch exposes an opt-in native committed-token observation
 contract. Each timestamp is sampled by the CPU while the streamer enumerates
@@ -95,11 +95,13 @@ execution contracts are not implemented:
   supervision (the fixed ledger records and capability-blocks that need);
 - DSpark worker/CUDA composite-head training and NEXTN training interfaces.
 
-TP1/DP1 DFlash TTS/L0 now execute constant, inverse-square-root-by-published-
-update, and finite-horizon cosine schedules. They also record intrinsic
-readiness and apply non-negative logical delay without changing the TTS
-fixed-boundary versus L0 first-ready publication distinction. These CPU/native
-contracts do not claim CUDA performance evidence.
+TP1/DP1 DFlash adaptive runtime methods now execute constant,
+inverse-square-root-by-published-update, and finite-horizon cosine schedules.
+They also record intrinsic readiness and apply non-negative logical delay while
+preserving fixed-barrier versus first-ready publication policies. Recipe
+authority is host-owned and orthogonal: this runtime support does not allow TTS
+to inherit an E1/E2 or historical AdamW recipe. These CPU/native contracts do
+not claim CUDA performance evidence.
 
 The same patch now provides the first-party
 `sglang.schema_v3.source_owned_all_reset_session.v1` producer and admin
@@ -197,13 +199,15 @@ apply/compile/focused-test/reverse verifier. That is a patch-integrity result,
 not GPU validation. A CPU package test or an older patched-tree receipt is
 insufficient. TP1/DP1 DFlash and its strict native terminal lifecycle are
 implemented, but the release trust policy has no configured signer;
-Static/TTS/L0 industrial cells are therefore `BLOCKED` before mutation rather
+Static/TTS/L0-naive/LightCone industrial cells are therefore `BLOCKED` before mutation rather
 than runnable `UNMEASURED` work. A test signer, provider object attribute, or
 caller-supplied verifier cannot unlock that policy. The DSpark CPU contract
 does not authorize execution. DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2 cell remain
 `BLOCKED`. Target-only is the only release-executable path.
 
-Historical v2 evidence remains useful for regression comparison only. It does
+Historical shared-tuned-AdamW evidence remains a matched-recipe publication-
+policy diagnostic, not TTS-paper reproduction, and is useful for regression
+comparison only. It does
 not carry the new Target-only, backend-plan, topology, registry, trace,
 statistics, or telemetry identities and cannot be upgraded by changing a
 label.

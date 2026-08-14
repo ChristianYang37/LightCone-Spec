@@ -14,6 +14,7 @@ from lightcone_spec.adaptation.cohort import (
 )
 from lightcone_spec.adaptation.kv_history import FrozenKVHistory, KVSegment
 from lightcone_spec.methods import (
+    CandidateReplayBinding,
     CandidateUpdate,
     MethodPolicy,
     assert_candidate_equivalence,
@@ -27,6 +28,7 @@ def test_all_methods_share_one_package_surface() -> None:
     assert method_module.__name__ == "lightcone_spec.methods"
     assert hasattr(method_module, "__path__")
     assert tuple(method_module.__all__) == (
+        "CandidateReplayBinding",
         "CandidateTermination",
         "CandidateUpdate",
         "MethodPolicy",
@@ -43,6 +45,7 @@ def test_all_methods_share_one_package_surface() -> None:
         "publication_round",
     )
     core_members = (
+        "CandidateReplayBinding",
         "CandidateTermination",
         "CandidateUpdate",
         "MethodPolicy",
@@ -130,10 +133,51 @@ def test_invalid_stride_rejected(stride: int) -> None:
         publication_round(MethodPolicy.FIXED_BARRIER, candidate(), stride)
 
 
-def test_candidate_equivalence_is_exact() -> None:
-    assert_candidate_equivalence(candidate(), candidate())
-    with pytest.raises(ValueError, match="identical"):
-        assert_candidate_equivalence(candidate(), candidate(ready_round=13))
+def replay_binding(
+    value: CandidateUpdate | None = None,
+    *,
+    source_state_sha256: str = "a" * 64,
+    proposal_evidence_sha256: str = "b" * 64,
+) -> CandidateReplayBinding:
+    return CandidateReplayBinding(
+        candidate=candidate() if value is None else value,
+        source_state_sha256=source_state_sha256,
+        proposal_evidence_sha256=proposal_evidence_sha256,
+    )
+
+
+def test_candidate_equivalence_is_scoped_to_identical_controlled_replay() -> None:
+    assert_candidate_equivalence(replay_binding(), replay_binding())
+    with pytest.raises(ValueError, match="different candidate"):
+        assert_candidate_equivalence(
+            replay_binding(), replay_binding(candidate(ready_round=13))
+        )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"source_state_sha256": "c" * 64}, "source-state"),
+        ({"proposal_evidence_sha256": "d" * 64}, "proposal-evidence"),
+    ],
+)
+def test_candidate_equivalence_rejects_different_replay_inputs(
+    updates: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        assert_candidate_equivalence(replay_binding(), replay_binding(**updates))
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, "g" * 64])
+def test_controlled_replay_binding_requires_exact_lowercase_sha256(digest: str) -> None:
+    with pytest.raises(ValueError, match="exact lowercase SHA-256"):
+        replay_binding(source_state_sha256=digest)
+
+
+def test_raw_candidates_cannot_make_an_equivalence_claim() -> None:
+    with pytest.raises(TypeError, match="controlled replay"):
+        assert_candidate_equivalence(candidate(), candidate())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("method", ["static", "tts", "l0"])

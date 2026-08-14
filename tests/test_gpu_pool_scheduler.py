@@ -53,6 +53,7 @@ from lightcone_spec.experiments.planning import (
     BudgetJobKind,
     ConfirmationFamilyPowerPlan,
     ConfirmationFamilyPowerReductionArtifact,
+    DispositionStatus,
     ExpectedMaximumCount,
     ExperimentBudget,
     P99AnchorStatus,
@@ -67,7 +68,7 @@ from lightcone_spec.experiments.planning import (
     reduce_e1_activation,
 )
 from lightcone_spec.experiments.registry import (
-    CORE_METHODS,
+    CONFIRMATION_METHOD_ROLES,
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     ExperimentCell,
@@ -76,6 +77,7 @@ from lightcone_spec.experiments.registry import (
     WorkloadClass,
     build_industrial_registry,
     content_sha256,
+    scientific_role_for_cell,
     serving_cell_rejection_reason,
 )
 from lightcone_spec.experiments.stage_activation import (
@@ -418,10 +420,11 @@ def _family_power_reduction_from_sizing(
 
     run_bindings = tuple(
         RawEvidenceRunBinding(
-            schema_version=1,
+            schema_version=3,
             cell_id=cell_id,
             experiment=family.experiment,
             method=cells[cell_id].identity.method,
+            scientific_role=scientific_role_for_cell(registry, cells[cell_id]),
             scientific_unit=f"excluded_pilot_{cells[cell_id].identity.block}",
             config_sha256=binding_sha256("config", cell_id),
             rank_config_sha256s=(binding_sha256("rank-config", cell_id),),
@@ -443,6 +446,8 @@ def _family_power_reduction_from_sizing(
             terminal_receipt_sha256s=(binding_sha256("terminal", cell_id),),
             hardware_receipt_sha256=binding_sha256("hardware", cell_id),
             budget_observation_sha256=binding_sha256("budget-observation", cell_id),
+            execution_plan_sha256=binding_sha256("execution-plan", cell_id),
+            execution_split_sha256=binding_sha256("execution-split", cell_id),
         )
         for cell_id in sorted(pilot_activation.activated_cell_ids)
     )
@@ -734,17 +739,18 @@ def test_exact_e1_reducer_can_schedule_dflash_templates_but_direct_api_cannot(
     receipts, activation = _sealed_e1_activation(registry)
     selected = set(activation.plan.activated_cell_ids)
     cells = {cell.cell_id: cell for cell in registry.cells_for("E1")}
-    assert len(selected) == 130
-    assert {cells[cell_id].identity.method for cell_id in selected} == {
+    assert len(selected) == 66
+    assert {
+        scientific_role_for_cell(registry, cells[cell_id]) for cell_id in selected
+    } == {
         "target_only",
         "static",
-        "tts",
-        "l0",
+        "lc_candidate",
     }
     adaptive = next(
         cells[cell_id]
         for cell_id in selected
-        if cells[cell_id].identity.method == "tts"
+        if scientific_role_for_cell(registry, cells[cell_id]) == "lc_candidate"
     )
     assert release_execution_capability_rejection_reason(adaptive) is None
     assert release_dispatch_rejection_reason(adaptive) == (
@@ -796,17 +802,13 @@ def test_reducer_capability_never_bypasses_backend_topology_or_method_gates(
         dflash,
         identity=replace(dflash.identity, backend="DSPARK"),
     )
-    unsupported_topology = next(
-        cell
-        for cell in registry.cells_for("E4")
-        if cell.identity.method == "l0"
-        and cell.identity.topology == "two_gpu_host_exclusive"
-        and cell.runnable
+    unsupported_topology = replace(
+        dflash,
+        identity=replace(dflash.identity, topology="two_gpu_host_exclusive"),
     )
-    unsupported_method = next(
-        cell
-        for cell in registry.cells_for("E0")
-        if cell.identity.method.startswith("onlinespec_") and cell.runnable
+    unsupported_method = replace(
+        dflash,
+        identity=replace(dflash.identity, method="onlinespec_ogd"),
     )
     assert release_execution_capability_rejection_reason(unsupported_backend) == (
         "release_adaptive_backend_unsupported"
@@ -889,8 +891,20 @@ def test_one_confirmation_family_materializes_only_its_pilots(
 ) -> None:
     family = _e5_family(registry, concurrency=1)
     pilots = materialize_confirmation_pilots(registry, family)
+    if not pilots.activated_cell_ids:
+        assert {
+            row.reason_code
+            for row in pilots.dispositions
+            if row.status is DispositionStatus.BLOCKED
+        } >= {
+            "tts_official_recipe_unavailable",
+            "sealed_e2_recipe_receipt_required",
+        }
+        pytest.skip("formal confirmation recipes remain fail-closed")
     expected = _reducer_dispatchable_ids(registry, pilots.activated_cell_ids)
-    assert len(pilots.activated_cell_ids) == len(PILOT_BLOCKS) * len(CORE_METHODS)
+    assert len(pilots.activated_cell_ids) == len(PILOT_BLOCKS) * len(
+        CONFIRMATION_METHOD_ROLES
+    )
     assert expected == set(pilots.activated_cell_ids)
     inventory = _inventory(4)
     scheduler = _scheduler(
@@ -915,10 +929,10 @@ def test_one_confirmation_family_materializes_only_its_pilots(
     assert plan.scientific_budget_bound
     assert set(dict(plan.budget_sha256_by_cell)) == expected
     assert {
-        assignment.work_item.cell.identity.method
+        scientific_role_for_cell(registry, assignment.work_item.cell)
         for wave in plan.waves
         for assignment in wave.assignments
-    } == set(CORE_METHODS)
+    } == set(CONFIRMATION_METHOD_ROLES)
 
 
 @pytest.mark.parametrize("selected_final_blocks", (12, 20))
@@ -928,6 +942,8 @@ def test_family_final_prefix_is_exact_and_unrelated_family_does_not_block(
 ) -> None:
     family = _e5_family(registry, concurrency=1)
     pilots = materialize_confirmation_pilots(registry, family)
+    if not pilots.activated_cell_ids:
+        pytest.skip("formal confirmation recipes remain fail-closed")
     power = _family_power_reduction(
         registry,
         family,
@@ -970,7 +986,7 @@ def test_family_final_prefix_is_exact_and_unrelated_family_does_not_block(
         family_power_reductions=(power,),
     )
 
-    assert len(expected_final) == selected_final_blocks * len(CORE_METHODS)
+    assert len(expected_final) == selected_final_blocks * len(CONFIRMATION_METHOD_ROLES)
     assert _planned_cell_ids(plan) == expected
     final_blocks = {
         assignment.work_item.cell.identity.block
@@ -986,6 +1002,8 @@ def test_underpowered_family_activates_zero_final_cells(
 ) -> None:
     family = _e5_family(registry, concurrency=1)
     pilots = materialize_confirmation_pilots(registry, family)
+    if not pilots.activated_cell_ids:
+        pytest.skip("formal confirmation recipes remain fail-closed")
     sizing = _power_sizing(family)
     underpowered_sizing = replace(
         sizing,
@@ -1032,6 +1050,8 @@ def test_confirmation_family_artifacts_reject_missing_duplicate_and_forged_input
 ) -> None:
     family = _e5_family(registry, concurrency=1)
     pilots = materialize_confirmation_pilots(registry, family)
+    if not pilots.activated_cell_ids:
+        pytest.skip("formal confirmation recipes remain fail-closed")
     power = _family_power_reduction(registry, family, pilots, selected_final_blocks=12)
     final = materialize_confirmation_prefix(
         registry,

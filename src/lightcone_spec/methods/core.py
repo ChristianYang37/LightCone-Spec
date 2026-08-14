@@ -1,9 +1,11 @@
-"""Core method semantics.
+"""Core publication semantics and controlled candidate replay checks.
 
-TTS and L0 consume the same source-bound candidate. Their sole semantic
-difference is the legal publication round: TTS waits for the next fixed
-update boundary, whereas L0 publishes at the first legal boundary after the
-side-stream event becomes ready.
+Update recipe and publication policy are orthogonal identities. TTS uses its
+frozen recipe with fixed-barrier publication; L0-naive uses that recipe with
+first-ready publication; LightCone candidates use registered search recipes
+with first-ready publication. Candidate equality is meaningful only inside a
+controlled replay bound to identical source state and proposal evidence, not
+across live runs whose publication histories may have diverged.
 """
 
 from __future__ import annotations
@@ -56,6 +58,21 @@ class CandidateUpdate:
 
 
 @dataclass(frozen=True)
+class CandidateReplayBinding:
+    """Bind one candidate to the exact inputs of a controlled replay."""
+
+    candidate: CandidateUpdate
+    source_state_sha256: str
+    proposal_evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.candidate) is not CandidateUpdate:
+            raise TypeError("controlled replay requires an exact candidate update")
+        _require_sha256("source-state", self.source_state_sha256)
+        _require_sha256("proposal-evidence", self.proposal_evidence_sha256)
+
+
+@dataclass(frozen=True)
 class CandidateTermination:
     """Exactly-once terminal outcome for a source-bound candidate."""
 
@@ -100,7 +117,7 @@ def publication_round(
     stride: int,
     extra_logical_delay: int = 0,
 ) -> int | None:
-    """Return the first legal round, independent of candidate contents."""
+    """Apply one policy after the recipe-bound source-readiness delay."""
     if policy is MethodPolicy.STATIC:
         return None
     if stride < 1:
@@ -136,7 +153,32 @@ def publication_delay(
     )
 
 
-def assert_candidate_equivalence(left: CandidateUpdate, right: CandidateUpdate) -> None:
-    """Fail closed if a comparison changes anything except publication policy."""
-    if left != right:
-        raise ValueError("TTS and L0 must receive the identical candidate update")
+def assert_candidate_equivalence(
+    left: CandidateReplayBinding,
+    right: CandidateReplayBinding,
+) -> None:
+    """Assert candidate equality only within one content-bound replay."""
+    if (
+        type(left) is not CandidateReplayBinding
+        or type(right) is not CandidateReplayBinding
+    ):
+        raise TypeError("candidate equivalence requires controlled replay bindings")
+    if left.source_state_sha256 != right.source_state_sha256:
+        raise ValueError(
+            "candidate equivalence requires identical replay source-state digests"
+        )
+    if left.proposal_evidence_sha256 != right.proposal_evidence_sha256:
+        raise ValueError(
+            "candidate equivalence requires identical proposal-evidence digests"
+        )
+    if left.candidate != right.candidate:
+        raise ValueError("controlled replay produced different candidate updates")
+
+
+def _require_sha256(name: str, value: str) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} digest must be an exact lowercase SHA-256")

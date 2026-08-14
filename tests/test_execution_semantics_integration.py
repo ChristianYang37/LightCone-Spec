@@ -35,7 +35,10 @@ from lightcone_spec.experiments.planning import (
     BudgetMaterializationAuthorityBinding,
     reduce_e1_activation,
 )
-from lightcone_spec.experiments.registry import build_industrial_registry
+from lightcone_spec.experiments.registry import (
+    build_industrial_registry,
+    scientific_role_for_cell,
+)
 from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.orchestration.execution_bundle import (
     ExecutionBundleBlockedError,
@@ -58,7 +61,7 @@ from lightcone_spec.orchestration.industrial import (
 
 
 def _resolved_e1(
-    method: str = "static",
+    scientific_role: str = "static",
     *,
     registry=None,
     optimizer_name: str | None = None,
@@ -83,7 +86,7 @@ def _resolved_e1(
     cell = next(
         candidate
         for candidate in registry.cells_for("E1")
-        if candidate.identity.method == method
+        if scientific_role_for_cell(registry, candidate) == scientific_role
         and "width=8:concurrency=4" in candidate.identity.variant
         and (
             optimizer_name is None
@@ -173,7 +176,9 @@ def _replaced_and_rehashed_recipe_semantics(semantics, mutation: str):
 def test_registered_recipe_membership_rejects_replace_and_rehash(
     mutation: str,
 ) -> None:
-    registry, _, cell, _, semantics, *_ = _resolved_e1("tts", optimizer_name="adamw")
+    registry, _, cell, _, semantics, *_ = _resolved_e1(
+        "lc_candidate", optimizer_name="adamw"
+    )
     assert (
         _require_registered_e1_execution_recipe(
             registry=registry,
@@ -288,7 +293,7 @@ def test_e1_runtime_plan_binds_replay_semantics_and_exact_config() -> None:
 )
 def test_bundle_semantics_rejects_config_domain_swaps(mutation: str) -> None:
     registry, activation, cell, load_binding, semantics, *_, configs = _resolved_e1(
-        "tts"
+        "lc_candidate"
     )
     config = configs[0]
     if mutation in {"sampling", "random_seed", "runtime_context"}:
@@ -325,7 +330,7 @@ def test_bundle_recipe_membership_replay_blocks_before_config_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry, activation, cell, load_binding, semantics, *_, configs = _resolved_e1(
-        "tts"
+        "lc_candidate"
     )
     forged = _replaced_and_rehashed_recipe_semantics(semantics, "joint")
     monkeypatch.setattr(
@@ -355,7 +360,7 @@ def test_runtime_renderer_replays_registered_recipe_before_plan_construction() -
         receipts,
         topology,
         configs,
-    ) = _resolved_e1("tts")
+    ) = _resolved_e1("lc_candidate")
     forged = _replaced_and_rehashed_recipe_semantics(semantics, "joint")
 
     with pytest.raises(CellExecutionSemanticsBlockedError) as blocked:
@@ -461,7 +466,7 @@ def test_execution_renderer_replays_recipe_before_file_mutation(
     monkeypatch: pytest.MonkeyPatch,
     attack: str,
 ) -> None:
-    method = "static" if attack == "baseline_recipe_cargo" else "tts"
+    method = "static" if attack == "baseline_recipe_cargo" else "lc_candidate"
     (
         context,
         _,
@@ -490,7 +495,7 @@ def test_execution_renderer_replays_recipe_before_file_mutation(
         physical_assignment=None,
     )
     if attack == "baseline_recipe_cargo":
-        adaptive_semantics = _resolved_e1("tts", registry=registry)[4]
+        adaptive_semantics = _resolved_e1("lc_candidate", registry=registry)[4]
         forged_semantics = copy(semantics)
         object.__setattr__(
             forged_semantics,
@@ -567,7 +572,7 @@ def test_execution_plan_validate_rejects_caller_replaced_e1_overlay(
         _,
         configs,
     ) = _exact_e1_authority_context((tmp_path / "authority").resolve())
-    foreign_semantics = _resolved_e1("l0", registry=registry)[4]
+    foreign_semantics = _resolved_e1("lc_candidate", registry=registry)[4]
     assert foreign_semantics.cell_declaration != cell
     forged_runtime = copy(base.runtime_plan)
     for name, value in (
@@ -612,7 +617,7 @@ def test_execution_plan_constructor_and_final_gate_replay_registered_recipe() ->
         _,
         _,
         configs,
-    ) = _resolved_e1("tts")
+    ) = _resolved_e1("lc_candidate")
     context = SimpleNamespace(registry=registry)
     forged_semantics = _replaced_and_rehashed_recipe_semantics(semantics, "joint")
     runtime = IndustrialRuntimePlan(

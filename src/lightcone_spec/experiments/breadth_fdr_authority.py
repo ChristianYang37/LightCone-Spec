@@ -28,11 +28,14 @@ from typing import Literal
 
 from lightcone_spec.experiments.registry import (
     E0_BACKENDS,
+    E0_METHOD_ROLES,
     E0_MODELS,
     E0_TASKS,
     ExperimentCell,
     ExperimentRegistry,
+    ScientificMethodRole,
     content_sha256,
+    scientific_role_for_cell,
 )
 from lightcone_spec.experiments.statistics import benjamini_hochberg
 
@@ -57,8 +60,10 @@ E0_BREADTH_FORMAL_SOURCE_UNAVAILABLE_REASON = (
 E0_BREADTH_RELEASE_TRUSTED_RAW_SOURCE_SHA256: tuple[str, ...] = ()
 
 _CORE_CONTRASTS = (
-    ("l0_vs_static", "l0", "static"),
-    ("l0_vs_tts", "l0", "tts"),
+    ("lightcone_vs_tts", "lightcone", "tts"),
+    ("lightcone_vs_static", "lightcone", "static"),
+    ("l0_naive_vs_tts", "l0_naive", "tts"),
+    ("lightcone_vs_l0_naive", "lightcone", "l0_naive"),
 )
 _ONLINESPEC_CONTRASTS = (
     ("onlinespec_ens_vs_static", "onlinespec_ens", "static"),
@@ -68,7 +73,7 @@ _ONLINESPEC_CONTRASTS = (
 
 E0_BREADTH_FDR_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 3,
         "kind": "e0_registered_secondary_breadth_fdr",
         "families": {
             "e0_core_breadth": [row[0] for row in _CORE_CONTRASTS],
@@ -82,6 +87,8 @@ E0_BREADTH_FDR_PROTOCOL_SHA256 = content_sha256(
         "procedure": "benjamini-hochberg",
         "false_discovery_rate": E0_BREADTH_FALSE_DISCOVERY_RATE,
         "coverage": "all_registered_hypotheses_exactly_once",
+        "universe_source": "structural_compatibility_templates_only",
+        "formal_lightcone": "forbidden_without_seal_bound_materialization",
         "primary_family": "forbidden",
     }
 )
@@ -208,6 +215,8 @@ def _hypothesis(
     backend: str,
     task: str,
     contrast: str,
+    numerator_method: str,
+    denominator_method: str,
     numerator: ExperimentCell,
     denominator: ExperimentCell,
 ) -> E0BreadthHypothesis:
@@ -218,8 +227,8 @@ def _hypothesis(
         "backend": backend,
         "task": task,
         "contrast": contrast,
-        "numerator_method": numerator.identity.method,
-        "denominator_method": denominator.identity.method,
+        "numerator_method": numerator_method,
+        "denominator_method": denominator_method,
         "numerator_cell_id": numerator.cell_id,
         "numerator_cell_sha256": numerator.sha256,
         "denominator_cell_id": denominator.cell_id,
@@ -232,8 +241,8 @@ def _hypothesis(
         backend=backend,
         task=task,
         contrast=contrast,
-        numerator_method=numerator.identity.method,
-        denominator_method=denominator.identity.method,
+        numerator_method=numerator_method,
+        denominator_method=denominator_method,
         numerator_cell_id=numerator.cell_id,
         numerator_cell_sha256=numerator.sha256,
         denominator_cell_id=denominator.cell_id,
@@ -248,17 +257,30 @@ def registered_e0_breadth_hypotheses(
 
     if type(registry) is not ExperimentRegistry:
         raise TypeError("E0 breadth universe requires an exact registry")
-    cells = registry.cells_for("E0")
-    expected_cell_count = len(E0_MODELS) * len(E0_BACKENDS) * len(E0_TASKS) * 7
+    cells = tuple(
+        cell
+        for cell in registry.cells_for("E0")
+        if cell.identity.variant.startswith("compatibility_template:role=")
+    )
+    expected_cell_count = (
+        len(E0_MODELS) * len(E0_BACKENDS) * len(E0_TASKS) * len(E0_METHOD_ROLES)
+    )
     if len(cells) != expected_cell_count:
-        raise ValueError("E0 registry cell universe is incomplete")
+        raise ValueError("E0 structural breadth template universe is incomplete")
     by_key: dict[tuple[str, str, str, str], ExperimentCell] = {}
     for cell in cells:
+        role = scientific_role_for_cell(registry, cell)
+        # A sealed-sentinel registry row is only a planned slot. It may enter
+        # the preregistered universe under the intended contrast name, but the
+        # empty release raw-source allowlist below prevents it from becoming a
+        # formal LightCone finding before seal-bound materialization.
+        if role == ScientificMethodRole.LIGHTCONE_TEMPLATE.value:
+            role = ScientificMethodRole.LIGHTCONE.value
         key = (
             cell.identity.model,
             cell.identity.backend,
             cell.identity.task,
-            cell.identity.method,
+            role,
         )
         if key in by_key:
             raise ValueError("E0 registry duplicates a breadth method cell")
@@ -289,12 +311,14 @@ def registered_e0_breadth_hypotheses(
                                 backend=backend,
                                 task=task,
                                 contrast=contrast,
+                                numerator_method=numerator_method,
+                                denominator_method=denominator_method,
                                 numerator=numerator,
                                 denominator=denominator,
                             )
                         )
     result = tuple(sorted(hypotheses, key=lambda value: value.hypothesis_id))
-    if len(result) != 540 or len({row.hypothesis_id for row in result}) != 540:
+    if len(result) != 756 or len({row.hypothesis_id for row in result}) != 756:
         raise AssertionError("registered E0 breadth hypothesis count changed")
     return result
 
@@ -479,7 +503,7 @@ class E0BreadthFdrReduction:
         ):
             raise ValueError("E0 breadth reduction changed its registered families")
         ids = tuple(value.hypothesis_id for value in self.decisions)
-        if len(ids) != 540 or ids != tuple(sorted(set(ids))):
+        if len(ids) != 756 or ids != tuple(sorted(set(ids))):
             raise ValueError("E0 breadth decision coverage is incomplete")
         for value in self.decisions:
             value.__post_init__()

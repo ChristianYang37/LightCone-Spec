@@ -139,9 +139,11 @@ At present, empirical Stage B is `BLOCKED` because no trusted hardware signer,
 provider credentials, immutable model/data/trace locks, or registered hardware
 and interference envelope are available. The pinned integration already
 implements the exact native begin/reset/finalize hook, but the industrial
-executor can release-run only TP1/DP1 Target-only; Static/TTS/L0 fail preflight
+executor can release-run only TP1/DP1 Target-only; Static/TTS/L0-naive/LightCone fail preflight
 before mutation. Hardware access or a test signer alone does not unblock
-speculative work. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
+speculative work. Formal TTS/L0-naive additionally require a sealed frozen TTS
+recipe authority, and LightCone requires the exact sealed E2 winner; neither is
+inferred from defaults. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
 additional implementations and remain blocked.
 
 ## Trusted attester bundle

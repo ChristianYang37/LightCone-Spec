@@ -19,7 +19,7 @@ authority. The schema-v3 and industrial commands are:
 | `build-interference-envelope` | Derive the current serial interference envelope and its inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | Derive the calibration-only two-way execution envelope from a raw preflight activation and exact inventory |
 | `reduce-interference-calibration` | Reopen path-bound execution bundles and terminal authority, then reduce raw isolated/simultaneous evidence into exact-cardinality rules |
-| `reduce-e1-activation` | Derive the single 130-cell E1 slice from sealed E3a evidence |
+| `reduce-e1-activation` | Derive the single 68-cell E1 slice from sealed E3a evidence |
 | `reduce-e2-activation` | Materialize one E2 round from the E1 Pareto artifact or prior survivors |
 | `reduce-e2-successive-halving` | Reduce exact E2 stage evidence into a sealed survivor receipt |
 | `materialize-confirmation-pilots` | Activate exactly four excluded pilots for one confirmation family |
@@ -43,13 +43,13 @@ authority. The schema-v3 and industrial commands are:
 | `list-preliminary-tuning-candidates` | Write the historical Full/LoRA diagnostic grid |
 | `render-preliminary-target-only-runtime` | Render a diagnostic speculation-disabled Target-only endpoint |
 | `render-preliminary-static-load-runtime` | Render a diagnostic allocation-free Static endpoint |
-| `render-preliminary-tuning-runtime` | Render matched preliminary TTS/L0 endpoints |
+| `render-preliminary-tuning-runtime` | Render historical matched-recipe publication-policy diagnostic endpoints; not TTS reproduction |
 | `run-preliminary-controlled-slice` | Measure one preliminary controlled slice |
 | `collect-preliminary-static-load-screen` | Validate preliminary Static load coverage |
 | `advance-preliminary-tuning-stage` | Validate a preliminary halving stage |
 | `select-preliminary-speed-config` | Apply the historical tuning-only rule |
 | `select-preliminary-anchor-config` | Lock a preliminary anchor without a claim |
-| `render-preliminary-runtime` | Emit matched preliminary configs and launch argv |
+| `render-preliminary-runtime` | Emit historical matched-recipe diagnostic configs and launch argv |
 | `build-preliminary-confirmation-queue` | Materialize clean-server diagnostic jobs |
 | `run-preliminary-confirmation` | Execute one preliminary method/block slice |
 | `run-preliminary-target-reference` | Capture a preliminary Target-only token-ID trajectory |
@@ -243,7 +243,7 @@ reducer dispositions every declared stage cell from registry status and the
 release dispatch predicate. In this release every preflight cell is blocked:
 the Target-only compile cell has no release-owned exact prewarm manifest,
 graceful-finalization acknowledgement, or atomic attempt/final-cache result
-pointer, while Static/TTS/L0 also lack a supported execution contract. The
+pointer, while Static/TTS/L0-naive/LightCone also lack a supported execution contract. The
 command therefore writes the canonical `BLOCKED` artifact and returns 42. E6
 download cells are blocked independently because no first-party download
 terminal contract ships.
@@ -499,7 +499,9 @@ lightcone-spec seal-industrial-stage \
 These checks define the claim-bearing path once a trusted hardware attester is
 registered. In the current release, sealing still returns `BLOCKED` before it
 can issue a receipt; this raw-authority contract does not make final execution
-or a performance claim reachable.
+or a performance claim reachable. The sealed output can authorize only the
+LightCone role. It can never rewrite the separately frozen TTS or L0-naive
+recipe authority.
 
 For a downstream stage, repeat `--dependency-receipt` for its exact declared
 dependencies. Then pass all completed receipts to the planner:
@@ -529,7 +531,7 @@ The dispatch plan is target-protocol data, not proof that a cell is executable.
 The pinned tree implements the exact native terminal begin/reset/finalize hook,
 but no trusted hardware signer is configured. Generic activation records a
 canonical blocked preflight disposition; it does not create a compile runner,
-execution authority, or performance claim. Static/TTS/L0 remain blocked without
+execution authority, or performance claim. Static/TTS/L0-naive/LightCone remain blocked without
 their validated native capability and trusted signer. The CLI does not silently
 provision hardware or start a GPU.
 
@@ -557,8 +559,8 @@ is issued by the sole same-host `GpuPoolScheduler` and binds `host_id`, the host
 inventory digest, physical GPU UUIDs, and port/cache/evidence/contention
 resources that are collision-free within that host. Literal resource values may
 repeat on different hosts. The separate remote execution binding fixes the
-host-local execution manifest. A complete gang, paired
-TTS/L0 assignment, and confirmation block stay on one host. A gang that would
+host-local execution manifest. A complete gang, matched-geometry baseline
+anchor set, and confirmation block stay on one host. A gang that would
 span hosts is rejected with `cross_host_collectives_unvalidated`; fleet
 composition never creates a cross-host rendezvous.
 
@@ -634,16 +636,24 @@ requires one. The loaders validate canonical content, not only filenames.
 
 ## Core tuning and confirmation
 
-Target-only and Static render without an adaptation object or reserve. TTS and
-L0 target declarations share a Full/LoRA candidate from registered native
-layer scopes. Rendering is pure planning: in the current release only
-Target-only may proceed through industrial execution. Static/TTS/L0 fail the
-trusted-terminal-attester preflight before an endpoint starts.
+Target-only and Static render without adaptation state or reserve. TTS uses the
+frozen `TTS-paper-reconstruction` authority with fixed-barrier publication;
+L0-naive uses that same authority with first-ready publication. E1/E2 `l0`
+search recipes are LC-candidates, and only the exact E2-sealed winner is
+LightCone. Shared runtime code does not merge live candidate, optimizer, or
+evidence identity. Rendering is pure planning: in the current release only
+Target-only may proceed through industrial execution. Static/TTS/L0-naive/
+LightCone fail the trusted-terminal-attester preflight before an endpoint
+starts; TTS and L0-naive also remain blocked on unresolved recipe fields.
 
 The industrial E1/E2 commands are reducer-owned. E1 consumes sealed E3a output
-and activates exactly one width/load slice. E2 materializes stage zero and then
-requires the prior sealed survivor receipt for each successive-halving round,
-while preserving matched TTS/L0 pairs and family floors. Confirmation planning
+and activates exactly one 68-cell width/load slice from 1,428 templates. It
+tunes two LC-candidates per geometry and carries one stage-level frozen-TTS and
+one stage-level frozen-L0-naive anchor rather than duplicating baselines across
+scope/rank or optimizer candidates. E2 contains 11,920 templates, materializes stage zero and then requires the
+prior sealed survivor receipt for each successive-halving round. It ranks only
+LC-candidates against fixed Static and frozen-TTS references while preserving
+family floors. Confirmation planning
 activates four excluded pilots per exact family, seals `POWERED` with 12--20
 final blocks or `UNDERPOWERED`, and materializes only the sealed prefix before
 confirmation data is visible.
@@ -684,7 +694,7 @@ lightcone-spec build-evidence-dependence-map \
 
 The dependence map accepts only first-party reduction artifacts and makes
 shared controls one observation for covariance/bootstrap purposes. Static is
-backend-specific and TTS/L0 are never aliases. The schema-v3 industrial
+backend-specific and adaptive scientific roles are never aliases. The schema-v3 industrial
 analysis manifest lists the raw alias manifests; the formal reducer replays
 them and rejects a serialized map that differs from that replay. Legacy alias
 receipts, caller-authored reduction summaries, and the old `--alias` flags are
@@ -723,7 +733,7 @@ it exits 42 even for otherwise self-consistent diagnostic JSON.
 
 The industrial registry may declare target cells as `UNMEASURED`, but that
 declarative status is not executable readiness. The native hook is present;
-executor preflight resolves Static/TTS/L0 to `BLOCKED` because the trusted
+executor preflight resolves Static/TTS/L0-naive/LightCone to `BLOCKED` because the trusted
 signer is absent. All TP2/DP2 and DSpark/EAGLE/EAGLE3/NEXTN adaptive cells are
 likewise blocked by separate current release gates. Historical v2 artifacts
 are regression-only and cannot be supplied as schema-v3 stage receipts.

@@ -15,7 +15,9 @@ from functools import cached_property
 from typing import Any, Literal
 
 from lightcone_spec.experiments.registry import (
+    FROZEN_TTS_RECIPE_SENTINEL,
     INDUSTRIAL_EXPERIMENT_ORDER,
+    SEALED_E2_RECIPE_SENTINEL,
     CellStatus,
     ExperimentCell,
     ExperimentReceipt,
@@ -54,6 +56,10 @@ REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256 = content_sha256(
         "serving": (
             "target_only_static_and_single_rank_dflash_core_when_exact_semantics_"
             "are_bound_by_a_first_party_reducer"
+        ),
+        "scientific_identity": (
+            "frozen_tts_and_l0_naive_blocked_l0_candidates_e1_e2_only_"
+            "lightcone_requires_sealed_e2_receipt"
         ),
         "unsupported_methods": (
             "onlinespec_ogd",
@@ -366,12 +372,22 @@ def release_execution_capability_rejection_reason(
         return "release_preflight_method_unsupported"
     if cell.identity.topology != "tp1_dp1":
         return "release_topology_executor_unsupported"
-    method = cell.identity.method
+    identity = cell.identity
+    method = identity.method
     if method in {"target_only", "static"}:
         return None
-    if method in {"tts", "l0"} and cell.identity.backend == "DFLASH":
+    recipe_markers = {identity.optimizer, identity.schedule}
+    if FROZEN_TTS_RECIPE_SENTINEL in recipe_markers:
+        return "tts_official_recipe_unavailable"
+    if SEALED_E2_RECIPE_SENTINEL in recipe_markers:
+        return "sealed_e2_recipe_receipt_required"
+    if method == "tts":
+        return "tts_frozen_recipe_authority_required"
+    if method == "l0" and identity.experiment not in {"E1", "E2"}:
+        return "sealed_e2_recipe_receipt_required"
+    if method == "l0" and identity.backend == "DFLASH":
         return None
-    if method in {"tts", "l0"}:
+    if method == "l0":
         return "release_adaptive_backend_unsupported"
     if method.startswith("onlinespec_"):
         return "release_onlinespec_execution_contract_unavailable"

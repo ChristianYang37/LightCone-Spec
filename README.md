@@ -9,8 +9,8 @@ fail-closed behavior, but only registered, attested GPU evidence can establish
 speed or capacity.
 
 > Alpha software. Every formal industrial GPU outcome is `UNMEASURED`. The industrial
-> executor currently runs only Target-only end to end. Static, TTS, L0, and
-> every other speculative method are `BLOCKED` before process or network
+> executor currently runs only Target-only end to end. Static, TTS, L0-naive,
+> LightCone, and every other speculative method are `BLOCKED` before process or network
 > mutation because no trusted hardware signer is provisioned for the pinned
 > `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook.
 > Empirical Stage B is also `BLOCKED` on provider credentials, resolved
@@ -45,19 +45,42 @@ release identities and cannot satisfy any formal identity gate.
 
 ## Scope
 
-The core comparison has four methods:
+The formal comparison has five scientific roles. Recipe authority and
+publication policy are orthogonal identities; a shared runtime implementation
+does not merge configurations, live candidates, optimizer state, or evidence.
 
-| Method | Speculation | Online candidate | Publication |
-|---|---:|---:|---|
-| Target-only (`target_only`) | no | none | native target decoding |
-| Static (`static`) | yes | none | native speculative decoding |
-| TTS (`tts`) | yes | side-stream update | next fixed update boundary |
-| L0 (`l0`) | yes | byte-equivalent to TTS | first legal boundary after readiness |
+| Scientific role | Runtime method | Recipe authority | Publication |
+|---|---|---|---|
+| Target-only | `target_only` | structural zero adaptation | native target decoding |
+| Static | `static` | structural zero adaptation | native speculative decoding |
+| TTS | `tts` | frozen, primary-source-bound TTS recipe | fixed TTS barrier |
+| L0-naive | `l0` | the same frozen TTS recipe authority | first-ready safe boundary |
+| LightCone | `l0` | one tuning-sealed E2 winner | first-ready safe boundary |
 
-TTS and L0 share the same evidence, trainable plan, loss, optimizer candidate,
-and reconstruction path. Their only experimental difference is publication
-timing. Target-only and Static allocate no adaptation, optimizer, candidate, or
-adaptation telemetry state.
+An `l0` run using a registered E1/E2 search recipe is an **LC-candidate**, not
+LightCone. Only an exact sealed E2 final-recipe receipt may materialize or name
+LightCone. Target-only and Static structurally allocate no adaptation,
+optimizer, gradient, candidate, or adaptation-telemetry state.
+
+The current baseline authority is `TTS-paper-reconstruction` and is
+`BLOCKED`. Its update-recipe authority fixes Adam, one optimization step,
+latest-round-only supervision, position-weighted distillation plus a
+source-point proximal term, per-request reset, and a strided side stream.
+Separately, TTS publication uses the paper's fixed synchronization barrier.
+The primary-source audit as of 2026-08-15 found no official author code/config;
+the paper also does not fix
+the learning rate or schedule, Adam betas/epsilon and optimizer-state reset,
+weight decay/clip, position weights, proximal coefficient, loss normalization/
+precision/temperature, exact trainable-parameter manifest, stride-selection
+rule, or an official implementation commit. TTS and
+L0-naive therefore cannot become formal cells until an author/user recipe or a
+preregistered TTS-only reconstruction rule seals those fields. Neither may
+inherit an E1/E2 winner, schema default, or historical AdamW configuration.
+The [provenance authority](manifests/provenance/tts_recipe_authority_v1.json)
+binds arXiv `2605.09329v2`, PDF SHA-256
+`7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20`,
+and source SHA-256
+`22c549c0297fc0a2a71af002c3721f71ddfd06d86bc46b2f41592bd6748afe59`.
 
 The target industrial registry covers DFlash and DSpark first, followed by
 production load, multi-GPU topology, native NEXTN preflight, and breadth
@@ -71,7 +94,7 @@ TP1/DP1 DFlash. It executes the registered constant, inverse-square-root, and
 finite-horizon cosine schedules plus non-negative logical publication delay.
 It exposes the exact begin/reset/finalize terminal-evidence hook and
 the host adapter validates its content, but the repository ships no trusted
-hardware signer. Static/TTS/L0 therefore remain non-claimable and fail release
+hardware signer. Static/TTS/L0-naive/LightCone therefore remain non-claimable and fail release
 preflight before mutation.
 DSpark now has a CPU-only native contract for adapter-free reconstruction,
 actual-predecessor W1 features, native-head selection, composite loss, and
@@ -101,6 +124,9 @@ teacher row.
   hybrid configurations.
 - Historical drafter KV is frozen and versioned. Publishing a candidate affects
   future KV only; rebuilding or differentiating old KV is a different method.
+- Candidate equality is a controlled mechanism-replay assertion only. It
+  requires identical source-state and proposal-evidence digests; live TTS and
+  L0-naive runs may diverge after their publication histories diverge.
 
 The rejection sampler still uses normalized $(p-q)_+$ after rejecting a
 proposal token. That positive-part rejection distribution is sampling math; it
@@ -129,9 +155,25 @@ COMPILE and DOWNLOAD cells before budgeting or dispatch because it ships no
 release-owned compile prewarm/finalization result-pointer contract and no
 first-party download terminal receipt contract.
 
-Reducer-owned E1 activation materializes one 130-cell width/load slice from
-the 2,730-cell envelope. E2 materializes only the current quarter-retention
-successive-halving round. Family-specific four-pilot evidence fixes either a
+Reducer-owned E1 activation materializes one 68-cell width/load slice from the
+1,428-cell envelope: two fixed references, 64 L0-policy LC-candidates over 32
+geometries, and one stage-level frozen anchor each for TTS and L0-naive. E2
+contains 11,920 templates across four quarter-retention rounds; each round
+carries only its LC-candidate grid plus two fixed references and one stage-level
+frozen anchor for each baseline, never a TTS optimizer candidate. Selection
+uses the 67-cell E1 or 2,979-cell E2 subset containing Target-only, Static,
+frozen TTS, and LC-candidates; the separately planned L0-naive anchor is
+reserved for mechanism/decomposition evidence and cannot rank or exclude a LightCone
+candidate. The registered confirmation envelopes contain
+11,520 E3b, 11,064 E5, and 3,747 E6 cells. E6's TTS cells use only the frozen
+external recipe; its LightCone cells use the sealed E1/E2 recipe without E6
+retuning, and its explicit load/repetition axes include the preregistered
+L0-naive mechanism anchors. E0 has 2,144 structural cells: 864 compatibility
+templates (`4 models x 3 backends x 9 tasks x 8 roles`) plus 1,280
+preregistered selected-core anchors (`4 models x 1 DFlash backend x 2 tasks x
+2 loads x (4 excluded pilots + 12 final blocks) x 5 formal roles`). All remain
+blocked and non-reportable until their exact recipe, load, repetition, and
+evidence authorities are sealed. Family-specific four-pilot evidence fixes either a
 12--20 final prefix or `UNDERPOWERED` before confirmation. Per-cell budgets,
 physical assignments, terminal evidence, and observed-versus-registered
 GPU-time receipts are all content-bound. The pinned patch now ships a
@@ -307,10 +349,17 @@ belong under ignored external roots and must not be committed.
 ## Statistics and claims
 
 Four excluded pilot blocks estimate variance only. The power plan fixes 12--20
-final blocks before downstream unblinding and records `UNDERPOWERED` if neither
-contrast reaches 80% power for a 3% minimum effect. Primary L0--Static and
-L0--TTS hypotheses use Holm family-wise correction. Secondary breadth families
-use Benjamini--Hochberg FDR. Long-context/request data use hierarchical
+final blocks before downstream unblinding and records `UNDERPOWERED` unless
+both primary contrasts reach 80% power for a 3% minimum effect. Primary
+LightCone--TTS and LightCone--Static hypotheses use Holm family-wise
+correction. The preregistered secondary decomposition is L0-naive--TTS and
+LightCone--L0-naive. The registered reporting target includes method-by-model,
+method-by-context, and method-by-load interactions without assuming their sign.
+The current `CrossFamilyInteractionReducerArtifact` is only a content-bound,
+structural, non-formal `UNRESOLVED` contract. It does not prove completed GPU
+coverage, interval validity, or any formal interaction; those require the later
+registered statistical reduction over attested final evidence. Other secondary
+breadth families use Benjamini--Hochberg FDR. Long-context/request data use hierarchical
 block-then-request bootstrap; production traces use time-block bootstrap. P99
 latency is eligible only with its registered minimum completion count.
 
@@ -332,7 +381,7 @@ capture a locked Target-only greedy reference whose per-prompt outputs are
 format-tagged hashes of complete ordered token-ID trajectories. Legacy
 collectors require every method/block to match that reference; decoded-text
 agreement or agreement only among speculative methods is insufficient. The
-reference remains `PRELIMINARY_DIAGNOSTIC_ONLY`: it does not make Static/TTS/L0
+reference remains `PRELIMINARY_DIAGNOSTIC_ONLY`: it does not make Static/TTS/L0-naive/LightCone
 formally executable and cannot substitute for industrial authority.
 
 ## Historical preliminary mechanism snapshot
@@ -345,26 +394,31 @@ configuration, or pass a release gate.
 
 One RTX PRO 6000 Blackwell (96 GB) ran Qwen3-8B + DFlash-b16 on 16 repetitive,
 controlled prompts, at concurrency 8 and a 40,928-token safe context limit.
-Each method generated 654,042 tokens in one timing block:
+Each diagnostic path generated 654,042 tokens in one timing block:
 
 | Method | Decode goodput | vs. Static | p99 ITL | Peak HBM |
 |---|---:|---:|---:|---:|
 | Static | 1,342.0 tok/s | 1.00x | 45.04 ms | 90.36 GiB |
-| TTS | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
-| L0 | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
+| Matched-recipe fixed-barrier diagnostic | 2,497.9 tok/s | +86.13% | 45.94 ms | 90.52 GiB |
+| Matched-recipe first-ready diagnostic | 2,519.5 tok/s | +87.74% | 46.21 ms | 90.53 GiB |
 
-L0 was 0.86% faster than TTS in this snapshot. All three complete ordered
+The first-ready diagnostic was 0.86% faster than the fixed-barrier diagnostic
+in this snapshot. All three complete ordered
 token-ID trajectories matched, while exactness-violation, version-mismatch,
 fallback, non-finite-update, OOM, and retraction counters were zero. The bound
 historical identity is main code `0db2ff4`, old patched SGLang tree `e795ecc`,
 execution-policy SHA `231ca579`, and tuning-window SHA `132019ee`; CUDA Graph
 and Radix Cache were disabled by that policy.
 
-The mechanism diagnostics suggest that online work was already mostly hidden:
-TTS/L0 main-side overlap was about 96.7%, and roughly 8.4--8.7 seconds of
+These old rows used one shared tuned AdamW recipe. They are matched-recipe
+publication-policy diagnostics, **not** TTS paper reproduction, and cannot tune
+the new LightCone recipe or satisfy a formal gate. The mechanism diagnostics
+suggest that online work was already mostly hidden: adaptive main-side overlap
+was about 96.7%, and roughly 8.4--8.7 seconds of
 aggregate training, optimizer, merge, and publication work exposed only about
-0.27 seconds on the decode critical path. L0's advantage instead tracked fewer
-target calls: 52,083 versus TTS's 52,879 (12.558 versus 12.369 committed tokens
+0.27 seconds on the decode critical path. The first-ready diagnostic's advantage
+instead tracked fewer target calls: 52,083 versus the fixed-barrier diagnostic's
+52,879 (12.558 versus 12.369 committed tokens
 per call). The adaptation-memory ledger was dominated by candidate scratch
 (7.88 GiB) and resident buffers (5.91 GiB), not the approximately 31.3 MiB
 optimizer state. The follow-up optimization order is therefore candidate
@@ -410,10 +464,13 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
 - The CPU `gloo` contract is not GPU/NCCL evidence. A topology configuration is
   only target vocabulary; this release rejects TP2/DP2 regardless of any
   caller-supplied capability receipt.
-- Static/TTS/L0 remain `BLOCKED` until an out-of-band trusted signer is bound to
+- Static/TTS/L0-naive/LightCone remain `BLOCKED` until an out-of-band trusted signer is bound to
   the exact native terminal hook and pinned tree. DSpark/EAGLE/EAGLE3/NEXTN
   adaptive cells and all TP2/DP2 cells are also `BLOCKED`; they are never
   implicit successes.
+- Formal TTS and L0-naive are separately blocked on the unresolved frozen
+  `TTS-paper-reconstruction` recipe. LightCone is additionally impossible
+  without the exact sealed E2 final-recipe receipt.
 - ChronoBelief tuning cells stay `BLOCKED` until an authoritative update
   equation and source identity are registered; no substitute optimizer is used.
 - Historical KV remains frozen by design. Recomputing it requires a new

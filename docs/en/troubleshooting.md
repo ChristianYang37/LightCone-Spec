@@ -19,13 +19,20 @@
 - Schema v3 uses canonical `target_only`, `static`, `tts`, and `l0`. Unknown
   method names and retired adaptation fields are errors.
 - Target-only requires speculation off and no adaptation. Static requires
-  speculation on but no adaptation. TTS/L0 require byte-equivalent adaptation
-  after removing the method field.
+  speculation on but no adaptation. TTS requires the frozen TTS recipe plus
+  fixed-barrier publication; L0-naive requires that same recipe authority plus
+  first-ready publication. An L0-policy search recipe is an LC-candidate until
+  the exact E2 final-recipe receipt seals it as LightCone.
 - For the industrial executor, only TP1/DP1 Target-only is currently READY.
   The pinned tree implements
   `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`, but
-  Static/TTS/L0 fail before mutation because no release-trusted hardware signer
+  Static/TTS/L0-naive/LightCone fail before mutation because no release-trusted hardware signer
   is configured. This is the expected fail-closed boundary.
+- `TTS-paper-reconstruction` is also intentionally `BLOCKED` while its numeric
+  optimizer/loss/trainable/stride fields remain undisclosed. Reject any TTS or
+  L0-naive declaration that inherits an E1/E2 authority, schema default, or
+  historical AdamW recipe. Candidate equality is valid only for controlled
+  replay with identical source-state and proposal-evidence digests.
 - Adaptation is Full or LoRA over `last1`, `last3`, `last5`, or `all`. LoRA
   requires a registered rank and `alpha/r=1`. Borrowed target parameters and
   quantized/unowned coordinates cannot become trainable.
@@ -128,7 +135,7 @@ Positive diagnostics, CPU mocks, historical v2 results, or acceptance changes
 do not alter it. The current new GPU phase remains `UNMEASURED` and Stage B is
 `BLOCKED` on the missing trusted hardware signer, provider credentials,
 immutable model/data/trace locks, registered hardware, GPU smoke, and
-interference evidence. Static/TTS/L0, all
+interference evidence. Static/TTS/L0-naive/LightCone, all
 DSpark/EAGLE/EAGLE3/NEXTN adaptive cells, and all TP2/DP2 cells are blocked;
 only TP1/DP1 Target-only is end-to-end executable.
 

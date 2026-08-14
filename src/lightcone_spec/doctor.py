@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -119,6 +120,197 @@ def _project_tree(root: Path) -> dict[str, Any]:
         "tree": tree.stdout.strip(),
         "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
     }
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _project_runtime_source(root: Path) -> dict[str, Any]:
+    """Digest exact present LightCone Python bytes from one source checkout."""
+
+    try:
+        listed = _git(root, "ls-files", "-z", "--", "src/lightcone_spec")
+        untracked = _git(
+            root,
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "src/lightcone_spec",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        listed = subprocess.CompletedProcess((), 1, "")
+        untracked = subprocess.CompletedProcess((), 1, "")
+    if listed.returncode != 0 or untracked.returncode != 0:
+        return {
+            "schema_version": 1,
+            "kind": "lightcone_project_runtime_source",
+            "valid": False,
+            "file_count": 0,
+            "total_size_bytes": 0,
+            "content_sha256": None,
+        }
+    names = tuple(
+        sorted(
+            {
+                name
+                for output in (listed.stdout, untracked.stdout)
+                for name in output.split("\0")
+                if name
+            }
+        )
+    )
+    if not names or len(names) > 2_048:
+        return {
+            "schema_version": 1,
+            "kind": "lightcone_project_runtime_source",
+            "valid": False,
+            "file_count": len(names),
+            "total_size_bytes": 0,
+            "content_sha256": None,
+        }
+    rows: list[dict[str, object]] = []
+    total_size = 0
+    for relative_text in names:
+        relative = Path(relative_text)
+        unresolved_path = root / relative
+        fd: int | None = None
+        try:
+            path = unresolved_path.resolve()
+            path.relative_to(root)
+            if unresolved_path.is_symlink():
+                raise ValueError("project runtime source leaf is a symlink")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(unresolved_path, flags)
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size > 8 * 1024 * 1024
+            ):
+                raise ValueError("project runtime source leaf is not bounded")
+            body = bytearray()
+            while len(body) <= 8 * 1024 * 1024:
+                chunk = os.read(
+                    fd,
+                    min(1024 * 1024, 8 * 1024 * 1024 + 1 - len(body)),
+                )
+                if not chunk:
+                    break
+                body.extend(chunk)
+            after = os.fstat(fd)
+            current = unresolved_path.lstat()
+        except (OSError, ValueError):
+            rows = []
+            break
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if (
+            len(body) > 8 * 1024 * 1024
+            or len(body) != before.st_size
+            or _file_identity(before) != _file_identity(after)
+            or _file_identity(after) != _file_identity(current)
+            or not path.is_file()
+        ):
+            rows = []
+            break
+        total_size += len(body)
+        if total_size > 128 * 1024 * 1024:
+            rows = []
+            break
+        rows.append(
+            {
+                "path": relative.as_posix(),
+                "size_bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+            }
+        )
+    valid = len(rows) == len(names)
+    content_sha256 = (
+        hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if valid
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "kind": "lightcone_project_runtime_source",
+        "valid": valid,
+        "file_count": len(rows),
+        "total_size_bytes": total_size if valid else 0,
+        "content_sha256": content_sha256,
+    }
+
+
+def _require_project_runtime_source_identity(
+    report: Mapping[str, Any],
+    *,
+    executing_file: Path,
+) -> Path:
+    """Reopen the exact clean LightCone source identity bound by a doctor report."""
+
+    roots = report.get("roots")
+    project_source = report.get("project_source_tree")
+    runtime_source = report.get("project_runtime_source")
+    if (
+        not isinstance(roots, Mapping)
+        or not isinstance(project_source, Mapping)
+        or not isinstance(runtime_source, Mapping)
+    ):
+        raise TypeError("doctor report lacks the LightCone source identity")
+    project_root_text = roots.get("project")
+    if not isinstance(project_root_text, str):
+        raise TypeError("doctor project root must be a string")
+    project_root = Path(project_root_text)
+    try:
+        resolved_root = project_root.resolve(strict=True)
+        Path(executing_file).resolve(strict=True).relative_to(
+            resolved_root / "src" / "lightcone_spec"
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            "doctor project root does not own the executing LightCone source"
+        ) from exc
+    observed_tree = _project_tree(resolved_root)
+    observed_runtime_source = _project_runtime_source(resolved_root)
+    expected_tree = {
+        "path": str(resolved_root),
+        "is_git_checkout": True,
+        "root_matches_toplevel": True,
+        "head": project_source.get("head"),
+        "tree": project_source.get("tree"),
+    }
+    observed_tree_identity = {name: observed_tree.get(name) for name in expected_tree}
+    if (
+        not project_root.is_absolute()
+        or project_root_text != str(resolved_root)
+        or {name: project_source.get(name) for name in expected_tree} != expected_tree
+        or observed_tree_identity != expected_tree
+        or observed_tree.get("dirty") is not False
+        or project_source.get("dirty") is not False
+        or not re.fullmatch(r"[0-9a-f]{40}", str(project_source.get("head")))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(project_source.get("tree")))
+        or runtime_source.get("valid") is not True
+        or not re.fullmatch(r"[0-9a-f]{64}", str(runtime_source.get("content_sha256")))
+        or dict(runtime_source) != observed_runtime_source
+    ):
+        raise ValueError("doctor LightCone source identity is stale or incomplete")
+    return resolved_root
 
 
 def _source_tree(root: Path) -> dict[str, Any]:
@@ -392,6 +584,7 @@ def _collect_facts(project_root: Path, sglang_root: Path) -> dict[str, Any]:
             or _command(["sysctl", "-n", "machdep.cpu.brand_string"]),
         },
         "project_source_tree": _project_tree(project_root),
+        "project_runtime_source": _project_runtime_source(project_root),
         "source_tree": _source_tree(sglang_root),
         "disk": _disk_report(project_root),
         "network": {
@@ -755,6 +948,13 @@ def _evaluate(
         observed=project_tree,
         reason_code="project_source_tree_identity",
     )
+    project_runtime_source = facts["project_runtime_source"]
+    checks["project_runtime_source"] = _check(
+        "PASS" if project_runtime_source.get("valid") is True else "FAIL",
+        expected="content-bound tracked LightCone Python source",
+        observed=project_runtime_source,
+        reason_code="project_runtime_source_identity",
+    )
     checks["python"] = _required_equal(
         facts["python"]["major_minor"],
         host_requirement["python_minor"],
@@ -1110,7 +1310,7 @@ def doctor_report(
     mode_gates = _mode_gates(manifest)
     inventory_raw = facts["gpu"]["inventory_raw"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": readiness,
         "readiness": {
             "status": readiness,
@@ -1133,6 +1333,7 @@ def doctor_report(
         },
         "host": facts["host"],
         "project_source_tree": facts["project_source_tree"],
+        "project_runtime_source": facts["project_runtime_source"],
         # Retained for v2 attestation readers: this is always the SGLang tree.
         "source_tree": facts["source_tree"],
         "disk": facts["disk"],

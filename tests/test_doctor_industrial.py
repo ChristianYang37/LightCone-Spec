@@ -94,6 +94,14 @@ def _passing_facts(
             "cpu_detail": "mock CPU",
         },
         "project_source_tree": _tree(project, sglang=False),
+        "project_runtime_source": {
+            "schema_version": 1,
+            "kind": "lightcone_project_runtime_source",
+            "valid": True,
+            "file_count": 1,
+            "total_size_bytes": 1,
+            "content_sha256": "c" * 64,
+        },
         "source_tree": _tree(sglang, sglang=True),
         "disk": {
             "path": str(project),
