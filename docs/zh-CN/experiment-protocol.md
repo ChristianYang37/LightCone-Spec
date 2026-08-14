@@ -275,5 +275,4 @@ operator bundle 本身不能授权 formal DAG。
 
 协议把纯代码收口标为 `CPU_READY`，把已准备但尚未执行的 device check 标为
 `GPU_SMOKE_READY`，只有合格 attested terminal evidence 才能标为 `MEASURED`。这些标签不是
-递进结论：CPU 或 diagnostic smoke 成功仍然 non-measured。准确顺序与当前 blocker 见
-[工程就绪矩阵及 SSH runbook](engineering-readiness.md)。
+递进结论：CPU 或 diagnostic smoke 成功仍然 non-measured。

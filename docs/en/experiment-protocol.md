@@ -338,5 +338,4 @@ formal DAG.
 The protocol labels code-only closure `CPU_READY`, a prepared but unexecuted
 device check `GPU_SMOKE_READY`, and only qualifying attested terminal evidence
 `MEASURED`. These labels are not successive claims: a CPU or diagnostic smoke
-success remains non-measured. See the [engineering readiness matrix and SSH
-runbook](engineering-readiness.md) for the exact order and current blockers.
+success remains non-measured.

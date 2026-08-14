@@ -118,33 +118,33 @@ decision，$g_t=\nabla\ell_t(w_t)$ 为 verification 后获得的 loss gradient�
 
 Projected OGD 为
 
-\[
+$$
 w_{t+1}=\Pi_K(w_t-\eta g_t).
-\]
+$$
 
-Optimistic learner 保存 anchor \(\hat w_t\) 与 hint \(h_t\)。其发布 decision 与反馈后
+Optimistic learner 保存 anchor $\hat w_t$ 与 hint $h_t$。其发布 decision 与反馈后
 转移为
 
-\[
+$$
 w_t=\Pi_K(\hat w_t-\eta h_t),\qquad
 \hat w_{t+1}=\Pi_K(\hat w_t-\eta g_t),\qquad
 h_{t+1}=g_t.
-\]
+$$
 
 下一轮 decision 为
 
-\[
+$$
 w_{t+1}=\Pi_K(\hat w_{t+1}-\eta h_{t+1}).
-\]
+$$
 
 对于 Hedge，专家 $i$ 拥有各自的参数、gradient、学习率 ηᵢ 和累计 loss
 $L_{t,i}$。每个专家都在自己的 decision 上接受评估并更新后，
 
-\[
+$$
 p_{t+1,i}=\frac{\exp(-\gamma L_{t+1,i})}
 {\sum_j\exp(-\gamma L_{t+1,j})},\qquad
 w_{t+1}=\sum_i p_{t+1,i}w_{t+1,i}.
-\]
+$$
 
 专家之间绝不复用 gradient。使用 `weight_update_mode=full` 时，$w$ 是稠密 drafter
 parameter vector，decision 对应加权 parameter averaging；使用
@@ -153,7 +153,7 @@ vector。后者在更低显存的 decision class 上执行相同 Hedge 转移，
 update $BA$ 求平均，因此 manifest、layout 与 evidence 会严格区分两种 class。
 
 Target-to-draft cross entropy 与
-\(D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})\) 只相差不依赖
+$D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})$ 只相差不依赖
 drafter 参数的 target entropy，因此二者的 drafter gradient 相同；这个共同加法项也不
 改变 Hedge 权重。
 

@@ -150,8 +150,9 @@ identity 迁移到其他主机；有界 semaphore 限制 fleet transport concurr
 
 架构使用三个不可互换的标签。`CPU_READY` 只覆盖非 device contract validation；
 `GPU_SMOKE_READY` 只表示有界 device check 已准备；`MEASURED` 必须取得已注册 workload、完整
-terminal evidence、hardware envelope 与 release-owned attestation。
-[工程就绪矩阵](engineering-readiness.md)记录每条 path 的当前标签与剩余 gate。
+terminal evidence、hardware envelope 与 release-owned attestation。这些标签不授权 device
+或 performance claim；每条 execution path 都必须分别闭合自己的 runtime、evidence 与
+attestation gate。
 
 ## HBM 与 Cohort 治理
 

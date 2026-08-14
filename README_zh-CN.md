@@ -85,7 +85,7 @@ NEXTN adaptation 与所有 TP2/DP2 execution 同样 fail closed。请求 quota-s
 - 历史 drafter KV 冻结并带版本。发布 candidate 只影响未来 KV；重建旧 KV 或对其求导
   会定义另一种方法。
 
-Rejection sampler 在 proposal token 被拒绝后仍从归一化 \((p-q)_+\) 采样。这个正部
+Rejection sampler 在 proposal token 被拒绝后仍从归一化 $(p-q)_+$ 采样。这个正部
 rejection distribution 属于采样数学，不是 adaptation mode 或配置 alias。
 
 ## 工业级执行
@@ -160,9 +160,6 @@ transport concurrency 也必须显式有界。
   smoke 已通过，也不表示 formal cell 已获授权；
 - `MEASURED` 必须取得完整注册 GPU evidence 与 release-owned attestation chain。前两个标签
   都不得报告为 `MEASURED`。
-
-准确的 implementation、smoke 与 external-gate 拆分见
-[工程就绪矩阵](docs/zh-CN/engineering-readiness.md)。
 
 ## 显存、Trace 与证据
 
@@ -336,7 +333,6 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
 - [实验协议](docs/zh-CN/experiment-protocol.md)
 - [OnlineSPEC baseline](docs/zh-CN/onlinespec-baseline.md)
 - [故障排查](docs/zh-CN/troubleshooting.md)
-- [工程就绪与 SSH runbook](docs/zh-CN/engineering-readiness.md)
 
 ## 限制
 

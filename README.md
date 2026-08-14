@@ -102,7 +102,7 @@ teacher row.
 - Historical drafter KV is frozen and versioned. Publishing a candidate affects
   future KV only; rebuilding or differentiating old KV is a different method.
 
-The rejection sampler still uses normalized \((p-q)_+\) after rejecting a
+The rejection sampler still uses normalized $(p-q)_+$ after rejecting a
 proposal token. That positive-part rejection distribution is sampling math; it
 is not an adaptation mode or configuration alias.
 
@@ -196,9 +196,6 @@ Readiness labels are deliberately not performance claims:
 - `MEASURED` requires completed registered GPU evidence and the release-owned
   attestation chain. Neither of the first two labels may be reported as
   `MEASURED`.
-
-The exact implementation, smoke, and external-gate split is maintained in the
-[engineering readiness matrix](docs/en/engineering-readiness.md).
 
 ## Memory, traces, and evidence
 
@@ -399,7 +396,6 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
 - [Experiment protocol](docs/en/experiment-protocol.md)
 - [OnlineSPEC baseline](docs/en/onlinespec-baseline.md)
 - [Troubleshooting](docs/en/troubleshooting.md)
-- [Engineering readiness and SSH runbook](docs/en/engineering-readiness.md)
 
 ## Limitations
 

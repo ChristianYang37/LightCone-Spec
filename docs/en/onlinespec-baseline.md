@@ -143,45 +143,45 @@ transition below.
 
 Projected OGD uses
 
-\[
+$$
 w_{t+1}=\Pi_K(w_t-\eta g_t).
-\]
+$$
 
-The optimistic learner keeps an anchor \(\hat w_t\) and a hint \(h_t\). Its
+The optimistic learner keeps an anchor $\hat w_t$ and a hint $h_t$. Its
 published decision and post-feedback transition are
 
-\[
+$$
 w_t=\Pi_K(\hat w_t-\eta h_t),\qquad
 \hat w_{t+1}=\Pi_K(\hat w_t-\eta g_t),\qquad
 h_{t+1}=g_t.
-\]
+$$
 
 The next decision is
 
-\[
+$$
 w_{t+1}=\Pi_K(\hat w_{t+1}-\eta h_{t+1}).
-\]
+$$
 
 For Hedge, expert $i$ owns its own parameters, gradient, learning rate
 ηᵢ, and cumulative loss $L_{t,i}$. After every expert is evaluated and
 updated at its own decision,
 
-\[
+$$
 p_{t+1,i}=\frac{\exp(-\gamma L_{t+1,i})}
 {\sum_j\exp(-\gamma L_{t+1,j})},\qquad
 w_{t+1}=\sum_i p_{t+1,i}w_{t+1,i}.
-\]
+$$
 
 Gradients are never reused across experts. With `weight_update_mode=full`,
-\(w\) is the dense drafter parameter vector and the decision matches weighted
-parameter averaging. With `weight_update_mode=lora`, \(w=(A,B)\) is instead the
+$w$ is the dense drafter parameter vector and the decision matches weighted
+parameter averaging. With `weight_update_mode=lora`, $w=(A,B)$ is instead the
 registered factor-coordinate vector at a common rank. That lower-memory
 decision class applies the same Hedge transition, but it is not numerically
-equivalent to averaging dense updates (BA); manifests, layouts, and evidence
+equivalent to averaging dense updates $BA$; manifests, layouts, and evidence
 therefore keep the two classes distinct.
 
 Target-to-draft cross entropy and
-\(D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})\) differ by the
+$D_{\mathrm{KL}}(p_{\mathrm{target}}\Vert q_{\mathrm{draft}})$ differ by the
 target entropy, which is independent of the drafter parameters. They therefore
 produce the same drafter gradient, and the common additive term does not change
 Hedge probabilities.

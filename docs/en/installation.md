@@ -22,15 +22,6 @@ The optional `gpu` extra installs external dataset support. Controlled traces,
 registry generation, statistics, evidence durability, and CPU/gloo tests do not
 require it. CPU success does not imply a GPU measurement.
 
-The release dependency audit is currently `BLOCKED`. PyTorch 2.11.0 is the
-exact version exercised by the pinned SGLang patch tree, but the strict audit
-reports `PYSEC-2025-194` (fixed in PyTorch 2.13.0). PyTorch 2.11.0 also pins
-Setuptools below 82, so the resolved runtime Setuptools 81.0.0 reports
-`PYSEC-2026-3447` even though isolated package builds use Setuptools 83.0.0.
-Do not silently upgrade either runtime dependency: the package is not
-releaseable until the SGLang patch set is migrated and requalified on the fixed
-PyTorch line.
-
 On a restricted China network, set a temporary organization-approved package
 index or Hugging Face endpoint in the shell that performs the download, record
 that endpoint in the sanitized environment receipt, and unset it afterward.

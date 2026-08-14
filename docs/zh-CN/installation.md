@@ -20,13 +20,6 @@ pytest -q
 可选 `gpu` extra 安装外部 dataset 支持。Controlled trace、registry generation、statistics、
 evidence durability 与 CPU/gloo 测试不需要它。CPU 成功不表示 GPU measurement。
 
-当前 release dependency audit 为 `BLOCKED`。PyTorch 2.11.0 是固定 SGLang patch tree
-实际验证的准确版本，但 strict audit 报告 `PYSEC-2025-194`（修复版本为 PyTorch
-2.13.0）。PyTorch 2.11.0 同时要求 Setuptools 低于 82，因此解析出的 runtime
-Setuptools 81.0.0 报告 `PYSEC-2026-3447`；隔离 package build 虽使用 Setuptools
-83.0.0，也不能消除 runtime dependency 的告警。不得静默升级其中任一依赖；必须先把
-SGLang patch series 迁移到修复后的 PyTorch 版本并重新做完整资格验证，package 才可发布。
-
 在受限中国网络中，只在执行下载的 shell 临时设置组织批准的 package index 或 Hugging
 Face endpoint，把 endpoint 写入脱敏 environment receipt，并在完成后 unset。不得提交
 mirror credential；mirror 缺少 locked artifact 时也不得静默替换。

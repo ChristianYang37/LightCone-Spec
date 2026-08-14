@@ -192,9 +192,9 @@ under the same identity. A bounded semaphore limits fleet transport concurrency.
 The architecture uses three noninterchangeable labels. `CPU_READY` covers
 non-device contract validation. `GPU_SMOKE_READY` only marks a bounded device
 check as prepared. `MEASURED` requires the registered workload, complete
-terminal evidence, hardware envelope, and release-owned attestation. The
-[engineering readiness matrix](engineering-readiness.md) records the current
-label and remaining gate for each path.
+terminal evidence, hardware envelope, and release-owned attestation. These
+labels do not authorize a device or performance claim; each execution path must
+close its own runtime, evidence, and attestation gates.
 
 ## HBM and cohort governance
 
