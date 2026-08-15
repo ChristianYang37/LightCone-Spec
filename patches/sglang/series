@@ -3,3 +3,4 @@
 0003-feat-session-account-source-owned-http-connections.patch
 0004-feat-session-bind-native-trace-lifecycle.patch
 0005-feat-compile-source-owned-lifecycle.patch
+0006-fix-metrics-handle-target-only-draft-width.patch

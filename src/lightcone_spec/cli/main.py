@@ -2854,6 +2854,7 @@ def _parser() -> argparse.ArgumentParser:
     render_target.add_argument("--sglang-checkout", required=True)
     render_target.add_argument("--sampling-profile", required=True)
     render_target.add_argument("--compile-cache-plan", required=True)
+    render_target.add_argument("--gpu-uuid", required=True)
     render_target.add_argument("--mem-fraction-static", type=float, required=True)
     render_target.add_argument("--output-root", required=True)
     render_target.add_argument("--host", default="127.0.0.1")
@@ -4322,6 +4323,7 @@ def _render_target_only_runtime(args: argparse.Namespace) -> int:
     launches = render_target_only_runtime_plan(
         output_root=args.output_root,
         concurrency=args.concurrency,
+        gpu_uuid=args.gpu_uuid,
         model_lock=ModelLock.load(args.model_lock),
         model_roots=_load_bound_json(args.model_roots),
         sampling_profile=SamplingProfile.load(args.sampling_profile),

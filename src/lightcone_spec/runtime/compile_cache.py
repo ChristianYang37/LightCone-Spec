@@ -39,10 +39,10 @@ _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # for every contract in this module); the patch digest is over the exact mail
 # patch bytes registered by that manifest.
 PINNED_SGLANG_PATCH_MANIFEST_SHA256 = (
-    "e5e681024fa48a9b0b5cb3e9a04771242c4949b0bad2f47f9610ef5f5f52ee52"
+    "7bfb2ea4f1497dd782a70a7afcad0857495b2871d80ad8ac858b2cb81e32ef7b"
 )
 PINNED_SGLANG_PATCH_SHA256 = (
-    "05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12"
+    "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
 )
 SGLANG_FIRST_PARTY_COMPILE_BUILDER = "lightcone_spec.sglang_bridge.launch_server.v1"
 RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
@@ -1542,16 +1542,27 @@ class ImmutableCompileCache:
         except FileExistsError:
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
-                if not claim.exists() and object_path.exists():
+                # The object directory is renamed only after every file and
+                # directory has been flushed and made read-only.  Its atomic
+                # appearance is therefore the publication boundary; a later
+                # contender may legitimately acquire the short-lived claim
+                # before this waiter discards its private staging directory.
+                if object_path.exists():
+                    _fsync_directory(self.objects)
+                    self._discard_staging_directory(temporary)
+                    return
+                if not claim.exists():
                     break
                 time.sleep(0.01)
+            if object_path.exists():
+                _fsync_directory(self.objects)
+                self._discard_staging_directory(temporary)
+                return
             self._discard_staging_directory(temporary)
-            if claim.exists() or not object_path.exists():
-                raise CompileCacheCorruptionError(
-                    "compile-cache publication is incomplete",
-                    reason_code="incomplete_cache_publication",
-                )
-            return
+            raise CompileCacheCorruptionError(
+                "compile-cache publication is incomplete",
+                reason_code="incomplete_cache_publication",
+            )
         try:
             if object_path.exists():
                 self._discard_staging_directory(temporary)

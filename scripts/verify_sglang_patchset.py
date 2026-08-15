@@ -87,6 +87,11 @@ def _verify_native_terminal_contract(checkout: Path, changed_python: list[str]) 
     if (
         '"client_terminal_rows"' not in scheduler_source
         or "native Static safety counters are unavailable" not in scheduler_source
+        or "def _terminal_verified_drafts(" not in scheduler_source
+        or "speculative_num_draft_tokens is required for speculative metrics"
+        not in scheduler_source
+        or "verified_drafts = self._terminal_verified_drafts(target_calls)"
+        not in scheduler_source
     ):
         raise SystemExit("terminal scheduler reconciliation contract is incomplete")
 
@@ -505,6 +510,18 @@ def main() -> int:
     repository = Path(__file__).resolve().parents[1]
     patch_root = repository / "patches" / "sglang"
     manifest = json.loads((patch_root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_sha256 = hashlib.sha256(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    sidecar = (patch_root / "manifest.json.sha256").read_text(encoding="utf-8")
+    if sidecar != f"{manifest_sha256}\n":
+        raise SystemExit("patch manifest sidecar does not match canonical JSON")
     upstream = manifest["upstream"]["commit"]
     registered_files = [entry["file"] for entry in manifest["patches"]]
     series_files = [
@@ -588,6 +605,7 @@ def main() -> int:
                 "test/registered/unit/spec/test_source_owned_http_accounting.py",
                 "test/registered/unit/spec/test_terminal_speculative_evidence.py",
                 "test/registered/unit/spec/test_compile_cache_evidence.py",
+                "test/registered/unit/spec/test_terminal_target_metrics.py",
             ],
             cwd=checkout,
             env=env,
@@ -618,6 +636,10 @@ def main() -> int:
                 str(patch_root / entry["file"]),
                 cwd=checkout,
             )
+        if (
+            checkout / "test/registered/unit/spec/test_terminal_target_metrics.py"
+        ).exists():
+            raise SystemExit("reverse removal retained the patch-0006 focused test")
         _run("git", "diff", "--exit-code", upstream, cwd=checkout)
 
     if _run("git", "rev-parse", "HEAD", cwd=source) != upstream:

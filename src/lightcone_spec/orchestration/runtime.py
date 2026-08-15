@@ -46,6 +46,57 @@ from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 
 
+def _require_single_gpu_uuid(value: object) -> str:
+    """Return one canonical physical GPU UUID for an exclusive launch."""
+
+    if (
+        type(value) is not str
+        or not value.startswith("GPU-")
+        or len(value) <= len("GPU-")
+        or len(value) > 128
+        or any(
+            not character.isascii() or (not character.isalnum() and character != "-")
+            for character in value.removeprefix("GPU-")
+        )
+    ):
+        raise ValueError("Target-only runtime requires exactly one canonical GPU UUID")
+    return value
+
+
+def build_target_only_run_config(
+    *,
+    concurrency: int,
+    gpu_uuid: str,
+    model_lock: ModelLock,
+    sampling_profile: SamplingProfile,
+) -> RunConfig:
+    """Build the exact config used to derive and render Target-only diagnostics."""
+
+    device_identity = _require_single_gpu_uuid(gpu_uuid)
+    model_lock.validate()
+    sampling_profile.validate()
+    target_id = "Qwen/Qwen3-8B"
+    drafter_id = "z-lab/Qwen3-8B-DFlash-b16"
+    revisions = {model.model_id: model.revision for model in model_lock.models}
+    if target_id not in revisions or drafter_id not in revisions:
+        raise ValueError("model lock lacks the comparison pair identity")
+    return RunConfig(
+        method="target_only",
+        model=ModelPair(
+            target=target_id,
+            drafter=drafter_id,
+            target_revision=revisions[target_id],
+            drafter_revision=revisions[drafter_id],
+        ),
+        runtime=RuntimeConfig(
+            sampling_profile_sha256=sampling_profile.sha256,
+            device_identity=device_identity,
+            speculation_enabled=False,
+            max_running_requests=concurrency,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class ServerLaunch:
     method: str
@@ -595,6 +646,7 @@ def render_target_only_runtime_plan(
     *,
     output_root: str | Path,
     concurrency: int,
+    gpu_uuid: str,
     model_lock: ModelLock,
     model_roots: dict,
     sampling_profile: SamplingProfile,
@@ -605,8 +657,12 @@ def render_target_only_runtime_plan(
     first_port: int = 30000,
 ) -> tuple[ServerLaunch, ...]:
     """Render upstream autoregressive serving without resolving a drafter root."""
-    model_lock.validate()
-    sampling_profile.validate()
+    config = build_target_only_run_config(
+        concurrency=concurrency,
+        gpu_uuid=gpu_uuid,
+        model_lock=model_lock,
+        sampling_profile=sampling_profile,
+    )
     verified_checkout = verify_patched_checkout(sglang_checkout)
     if model_roots.get("schema_version") != 2:
         raise ValueError("model roots must use schema version 2")
@@ -615,29 +671,11 @@ def render_target_only_runtime_plan(
     roots = model_roots.get("roots")
     if not isinstance(roots, dict):
         raise TypeError("model roots mapping is missing")
-    target_id = "Qwen/Qwen3-8B"
-    drafter_id = "z-lab/Qwen3-8B-DFlash-b16"
-    revisions = {model.model_id: model.revision for model in model_lock.models}
-    if target_id not in revisions or drafter_id not in revisions:
-        raise ValueError("model lock lacks the comparison pair identity")
+    target_id = config.model.target
+    drafter_id = config.model.drafter
     target_root = roots.get(target_id)
     if not isinstance(target_root, str) or not Path(target_root).is_dir():
         raise ValueError("verified local target root is missing")
-    model = ModelPair(
-        target=target_id,
-        drafter=drafter_id,
-        target_revision=revisions[target_id],
-        drafter_revision=revisions[drafter_id],
-    )
-    config = RunConfig(
-        method="target_only",
-        model=model,
-        runtime=RuntimeConfig(
-            sampling_profile_sha256=sampling_profile.sha256,
-            speculation_enabled=False,
-            max_running_requests=concurrency,
-        ),
-    )
     output = Path(output_root).resolve()
     launch = _render_server(
         output=output,

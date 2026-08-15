@@ -110,14 +110,27 @@ allocator 环境。
 import json
 from pathlib import Path
 
-from lightcone_spec.config import load_run_config
+from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.locking.models import ModelLock
-from lightcone_spec.orchestration.runtime import derive_diagnostic_compile_cache_key
+from lightcone_spec.orchestration.runtime import (
+    build_target_only_run_config,
+    derive_diagnostic_compile_cache_key,
+)
 from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
 
 doctor = json.loads(Path("/absolute/runtime/doctor.json").read_text())
 model_lock = ModelLock.load("/absolute/runtime/model-lock.json")
-config = load_run_config("/absolute/runtime/rendered-run-config.json")
+sampling = SamplingProfile.load("/absolute/runtime/sampling-profile.json")
+devices = doctor["gpu"]["parsed_inventory"]["devices"]
+if len(devices) != 1:
+    raise RuntimeError("Target-only diagnostic requires one visible doctor GPU")
+gpu_uuid = devices[0]["uuid"]
+config = build_target_only_run_config(
+    concurrency=1,
+    gpu_uuid=gpu_uuid,
+    model_lock=model_lock,
+    sampling_profile=sampling,
+)
 key = derive_diagnostic_compile_cache_key(
     doctor_report=doctor,
     model_lock=model_lock,
@@ -132,13 +145,21 @@ build = CompileCacheLaunchPlan.issue(
 build_path = build.write(Path("/absolute/runtime/build-plan.json"))
 ```
 
-把 `build_path` 传给 render 命令必需的 `--compile-cache-plan`，例如：
+把 `build_path` 以及同一个 `gpu_uuid`、concurrency、model lock 和 sampling profile 传给
+render 命令。Renderer 会重新构造完全相同的 source-owned RunConfig，并把预期 plan、key
+与 RunConfig SHA-256 写入 child argv。例如：
 
 ```bash
 lightcone-spec render-preliminary-target-only-runtime \
   ... \
+  --gpu-uuid GPU-01234567-89ab-cdef-0123-456789abcdef \
   --compile-cache-plan /absolute/runtime/build-plan.json
 ```
+
+`--gpu-uuid` 是必填参数，必须等于 PASS doctor inventory 选中的唯一物理 `GPU-*` UUID。
+Renderer 会把它写入现有的 `RuntimeConfig.device_identity`；官方 launcher 会稳定重开这份
+RunConfig，并把同一个 UUID 绑定到 `CUDA_VISIBLE_DEVICES`。包含逗号或空白、以及不以
+`GPU-*` 表示的 selector，会在创建 runtime 文件或 subprocess 前被拒绝。
 
 Renderer 会把预期 plan、key 与 RunConfig SHA-256 写入 child argv。Child 会稳定重开两份
 canonical artifact 及 sidecar，从 RunConfig 派生准确 algorithm 与 draft width，并在 cache、

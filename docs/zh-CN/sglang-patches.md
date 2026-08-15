@@ -53,13 +53,18 @@ server session 可以复用已注册 connection pool，而无需复制 official 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`，final tree 为
-`fae3c1538ed4934fb3b47c7ebc82393306c43f06`；manifest 仍是 authority。Lifecycle 绑定
+`8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`，final tree 为
+`dfb60ab2e514defc6290fe8bacd179552dcd985e`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 adaptive-runtime request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
 executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0-naive/LightCone。下列 execution
 contract 也尚未实现。
+
+第六个 patch 让 speculative width 计数识别 Target-only。真正的 Target-only server
+（`spec_algorithm=none` 且未设置 draft width）不会再执行 `int(None)`：terminal evidence
+仍将 speculative counter 标为不适用，数值型 `/server_info` speed view 则报告零个
+verified draft。任何启用 speculative algorithm 却缺少 draft width 的配置仍会 fail closed。
 
 第二个 patch 还提供 opt-in native committed-token observation contract。每个 timestamp
 是在 stop handling 后，streamer 枚举已经 committed 的最终 token prefix 时由 CPU 采样；它
@@ -124,8 +129,9 @@ graph、multi-GPU、速度、容量或任何其他 GPU 结果。
 
 ## 应用
 
-`patches/sglang/apply.sh` 只接受位于准确 upstream HEAD 的 clean checkout。它检查注册 patch
-digest，按顺序使用 `git am` 应用，并把结果 Git tree 与 manifest 比较：
+`patches/sglang/apply.sh` 只接受位于准确 upstream HEAD 的 clean checkout，按注册顺序使用
+`git am` 应用 series，并把结果 Git tree 与 manifest 比较。Verifier 与 public-tree gate 会
+检查每个注册 patch digest 以及 canonical manifest sidecar：
 
 ```bash
 patches/sglang/apply.sh /path/to/clean-sglang

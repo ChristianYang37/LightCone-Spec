@@ -43,6 +43,13 @@ yet been declared.
 
 ### Changed
 
+- Required the diagnostic Target-only renderer to bind one canonical physical
+  GPU UUID into its existing `RuntimeConfig.device_identity`. The official
+  launcher now receives a launchable renderer output without weakening the
+  zero-speculation/zero-adaptation contract or making a formal evidence claim.
+- Closed an immutable compile-cache publication claim race. Contending builders
+  now treat the atomically renamed object as complete only after durably
+  flushing its parent directory, before discarding their private staging copy.
 - Separated update-recipe identity from publication policy. TTS now requires a
   primary-source-bound frozen Adam recipe and fixed-barrier publication;
   L0-naive uses that same frozen recipe with first-ready publication; and only
@@ -77,13 +84,18 @@ yet been declared.
   `MEASURED`.
 - Added an opt-in, CPU-only committed-token host-observation contract and
   removed equal-gap interpolation for coalesced SGLang benchmark chunks. The
-  latest patch identity is
-  `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`
-  with final tree `fae3c1538ed4934fb3b47c7ebc82393306c43f06`. The formal ITL
-  producer allowlist remains empty; CPU observations cannot establish p99 ITL.
+  formal ITL producer allowlist remains empty; CPU observations cannot establish
+  p99 ITL.
   The official benchmark reports exact expected/observed/coalesced/missing
   client-interval coverage and emits null aggregate ITL statistics whenever
   coverage is incomplete instead of reducing a sparse subset.
+- Made SGLang speculative-width telemetry target-aware. Target-only no longer
+  evaluates a missing draft width, preserves non-applicable terminal
+  speculative fields, and reports zero verified drafts in the numeric
+  server-info speed view. An active speculative algorithm with no draft width
+  still fails closed. The complete series ends at patch SHA-256
+  `8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`
+  and tree `dfb60ab2e514defc6290fe8bacd179552dcd985e`.
 - Added the source-owned ordered compile/prewarm CPU lifecycle and a pinned
   host consumer. GPU JIT, CUDA Graph, and cache measurements remain null and
   the independent formal GPU-vetted compile-source registry remains empty.

@@ -287,6 +287,12 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                     "05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12"
                 ),
             },
+            {
+                "file": ("0006-fix-metrics-handle-target-only-draft-width.patch"),
+                "sha256": (
+                    "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,

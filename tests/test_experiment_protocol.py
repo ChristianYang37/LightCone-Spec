@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -63,8 +64,12 @@ from lightcone_spec.experiments.statistics import (
     evaluate_speed_gate,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
-from lightcone_spec.orchestration import PreliminarySpeedStudyManifest
+from lightcone_spec.orchestration import (
+    PreliminarySpeedStudyManifest,
+    launch_server_subprocess,
+)
 from lightcone_spec.orchestration.runtime import (
+    build_target_only_run_config,
     derive_diagnostic_compile_cache_key,
     render_runtime_plan,
     render_static_load_runtime_plan,
@@ -103,6 +108,17 @@ def test_runtime_render_cli_requires_compile_cache_plan(command: str) -> None:
     )
     assert action.required
     assert "--compile-cache-plan" in commands[command].format_help()
+
+
+def test_target_only_runtime_cli_requires_one_gpu_uuid() -> None:
+    command = (
+        _parser()
+        ._subparsers._group_actions[0]
+        .choices["render-preliminary-target-only-runtime"]
+    )
+    action = next(action for action in command._actions if action.dest == "gpu_uuid")
+    assert action.required
+    assert "--gpu-uuid" in command.format_help()
 
 
 def _compile_cache_plan(
@@ -1433,22 +1449,35 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
             LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
         ),
     )
-    plan, compile_plan_path = _compile_cache_plan(
-        tmp_path,
-        lock,
-        max_running_requests=8,
-        target_only=True,
+    sampling_profile = SamplingProfile()
+    source_config = build_target_only_run_config(
+        concurrency=8,
+        gpu_uuid="GPU-test",
+        model_lock=lock,
+        sampling_profile=sampling_profile,
     )
+    key = derive_diagnostic_compile_cache_key(
+        doctor_report=_passing_compile_doctor(),
+        model_lock=lock,
+        config=source_config,
+    )
+    plan = CompileCacheLaunchPlan.issue(
+        key=key,
+        cache_root=tmp_path / "compile-cache",
+        cache_mode="build",
+    )
+    compile_plan_path = plan.write(tmp_path / "compile-cache-plan.json")
     launches = render_target_only_runtime_plan(
         output_root=tmp_path / "target-only",
         concurrency=8,
+        gpu_uuid="GPU-test",
         model_lock=lock,
         model_roots={
             "schema_version": 2,
             "lock_sha256": lock.sha256,
             "roots": {"Qwen/Qwen3-8B": str(target)},
         },
-        sampling_profile=SamplingProfile(),
+        sampling_profile=sampling_profile,
         sglang_checkout=tmp_path / "patched-sglang",
         compile_cache_plan_path=compile_plan_path,
         mem_fraction_static=0.7,
@@ -1468,6 +1497,7 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
     assert "--disable-cuda-graph" in launch.argv
     assert "--disable-overlap-schedule" in launch.argv
     rendered_config = RunConfig.model_validate_json(Path(launch.run_config).read_text())
+    assert rendered_config == source_config
     assert launch.argv[3:16] == (
         "--checkout",
         str((tmp_path / "patched-sglang").resolve()),
@@ -1486,6 +1516,29 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
     assert launch.compile_cache_plan == str(compile_plan_path.resolve())
     assert launch.compile_cache_plan_sha256 == plan.sha256
     assert launch.compile_cache_key_sha256 == plan.key.sha256
+
+    observed: dict[str, object] = {}
+
+    class Process:
+        pid = 12345
+        returncode = None
+
+    async def fake_create(*argv: str, **kwargs):
+        observed["argv"] = argv
+        observed["environment"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(
+        "lightcone_spec.orchestration.executor.verify_patched_checkout",
+        lambda path: Path(path).resolve(),
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    asyncio.run(launch_server_subprocess(launch))
+    assert observed["argv"] == launch.argv
+    environment = observed["environment"]
+    assert isinstance(environment, dict)
+    assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-test"
 
     events: list[str] = []
 
@@ -1564,6 +1617,7 @@ def test_runtime_renderer_rejects_foreign_compile_identity_before_materializatio
         render_target_only_runtime_plan(
             output_root=output,
             concurrency=8,
+            gpu_uuid="GPU-target-only",
             model_lock=lock,
             model_roots={
                 "schema_version": 2,
@@ -1575,6 +1629,42 @@ def test_runtime_renderer_rejects_foreign_compile_identity_before_materializatio
             compile_cache_plan_path=foreign_path,
             mem_fraction_static=0.7,
         )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "gpu_uuid",
+    (
+        "local-device-0",
+        "GPU-target-a,GPU-target-b",
+        "GPU-target-a\nGPU-target-b",
+    ),
+)
+def test_target_only_renderer_rejects_noncanonical_gpu_selector(
+    tmp_path: Path, gpu_uuid: str
+) -> None:
+    lock = ModelLock(
+        2,
+        (
+            LockedModel("Qwen/Qwen3-8B", "a" * 40),
+            LockedModel("z-lab/Qwen3-8B-DFlash-b16", "b" * 40),
+        ),
+    )
+    output = tmp_path / "invalid-target-only"
+
+    with pytest.raises(ValueError, match="exactly one canonical GPU UUID"):
+        render_target_only_runtime_plan(
+            output_root=output,
+            concurrency=1,
+            gpu_uuid=gpu_uuid,
+            model_lock=lock,
+            model_roots={},
+            sampling_profile=SamplingProfile(),
+            sglang_checkout=tmp_path / "patched-sglang",
+            compile_cache_plan_path=tmp_path / "compile-cache-plan.json",
+            mem_fraction_static=0.7,
+        )
+
     assert not output.exists()
 
 

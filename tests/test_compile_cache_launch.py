@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from test_schema import config_value
 
+import lightcone_spec.runtime.compile_cache as compile_cache_module
 from lightcone_spec import PINNED_SGLANG_TREE
 from lightcone_spec.config import RunConfig, run_config_sha256
 from lightcone_spec.runtime.compile_cache import (
@@ -836,6 +837,33 @@ def test_concurrent_build_contention_publishes_one_atomic_object(
         )
         == 4
     )
+
+
+def test_publish_waiter_accepts_atomic_object_while_claim_is_still_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ImmutableCompileCache(tmp_path / "cache")
+    object_path = store.objects / ("a" * 64)
+    object_path.mkdir(mode=0o555)
+    claim = store.objects / f".{object_path.name}.publish"
+    claim.mkdir(mode=0o700)
+    temporary = store.objects / f".{object_path.name}.tmp.waiter"
+    temporary.mkdir(mode=0o700)
+    (temporary / "kernel.bin").write_bytes(b"redundant")
+    fsyncs: list[Path] = []
+
+    def observe_fsync(path: Path) -> None:
+        assert temporary.exists()
+        fsyncs.append(path)
+
+    monkeypatch.setattr(compile_cache_module, "_fsync_directory", observe_fsync)
+
+    store._publish_object_directory(temporary, object_path)
+
+    assert fsyncs == [store.objects]
+    assert object_path.is_dir()
+    assert claim.is_dir()
+    assert not temporary.exists()
 
 
 def test_concurrent_reuse_copies_base_per_process_without_hardlinks(

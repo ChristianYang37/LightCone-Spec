@@ -112,6 +112,33 @@ def test_patch_manifest_binds_series_files_and_tree() -> None:
         assert patch.is_file()
         assert sha256(patch) == entry["sha256"]
         assert entry["files"] == sorted(set(entry["files"]))
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    assert (PATCH_ROOT / "manifest.json.sha256").read_text() == (
+        f"{hashlib.sha256(canonical).hexdigest()}\n"
+    )
+
+
+def test_latest_patch_target_only_metrics_are_fail_closed() -> None:
+    manifest = json.loads((PATCH_ROOT / "manifest.json").read_text())
+    latest = manifest["patches"][-1]
+    assert latest == {
+        "file": "0006-fix-metrics-handle-target-only-draft-width.patch",
+        "sha256": ("8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"),
+        "files": [
+            "python/sglang/srt/managers/scheduler.py",
+            "test/registered/unit/spec/test_terminal_target_metrics.py",
+        ],
+    }
+    patch = (PATCH_ROOT / latest["file"]).read_text()
+    assert "def _terminal_verified_drafts(self, target_calls: int) -> int:" in patch
+    assert "if self.spec_algorithm.is_none():\n+            return 0" in patch
+    assert "verified_drafts = self._terminal_verified_drafts(target_calls)" in patch
+    assert 'if method != "target_only"\n+            else 0' in patch
+    assert "test_speculative_metrics_reject_a_missing_draft_width" in patch
+
+    verifier = (ROOT / "scripts" / "verify_sglang_patchset.py").read_text()
+    assert "test_terminal_target_metrics.py" in verifier
+    assert "reverse removal retained the patch-0006 focused test" in verifier
 
 
 def test_patch_exports_exact_official_sglang_output_token_ids() -> None:

@@ -116,14 +116,27 @@ Derive the key and issue an immutable diagnostic build plan with the source API:
 import json
 from pathlib import Path
 
-from lightcone_spec.config import load_run_config
+from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.locking.models import ModelLock
-from lightcone_spec.orchestration.runtime import derive_diagnostic_compile_cache_key
+from lightcone_spec.orchestration.runtime import (
+    build_target_only_run_config,
+    derive_diagnostic_compile_cache_key,
+)
 from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
 
 doctor = json.loads(Path("/absolute/runtime/doctor.json").read_text())
 model_lock = ModelLock.load("/absolute/runtime/model-lock.json")
-config = load_run_config("/absolute/runtime/rendered-run-config.json")
+sampling = SamplingProfile.load("/absolute/runtime/sampling-profile.json")
+devices = doctor["gpu"]["parsed_inventory"]["devices"]
+if len(devices) != 1:
+    raise RuntimeError("Target-only diagnostic requires one visible doctor GPU")
+gpu_uuid = devices[0]["uuid"]
+config = build_target_only_run_config(
+    concurrency=1,
+    gpu_uuid=gpu_uuid,
+    model_lock=model_lock,
+    sampling_profile=sampling,
+)
 key = derive_diagnostic_compile_cache_key(
     doctor_report=doctor,
     model_lock=model_lock,
@@ -138,15 +151,24 @@ build = CompileCacheLaunchPlan.issue(
 build_path = build.write(Path("/absolute/runtime/build-plan.json"))
 ```
 
-Pass `build_path` to the render command's required `--compile-cache-plan`; the
-renderer embeds the expected plan, key, and RunConfig SHA-256 values in the
+Pass `build_path` and the same `gpu_uuid`, concurrency, model lock, and sampling
+profile to the render command. The renderer reconstructs the exact source-owned
+RunConfig and embeds the expected plan, key, and RunConfig SHA-256 values in the
 child argv. For example:
 
 ```bash
 lightcone-spec render-preliminary-target-only-runtime \
   ... \
+  --gpu-uuid GPU-01234567-89ab-cdef-0123-456789abcdef \
   --compile-cache-plan /absolute/runtime/build-plan.json
 ```
+
+`--gpu-uuid` is required and must be the single physical `GPU-*` UUID selected
+from the passing doctor inventory. The renderer serializes it into the existing
+`RuntimeConfig.device_identity`; the official launcher reopens that exact
+RunConfig and binds the same UUID to `CUDA_VISIBLE_DEVICES`. Comma-separated,
+whitespace-containing, and non-`GPU-*` selectors are rejected before runtime
+files or a subprocess are created.
 
 The child stably reopens both canonical artifacts and their sidecars, derives
 the exact algorithm and draft width from the RunConfig, and rejects identity or

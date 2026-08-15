@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: 05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12
-  Expected final tree: fae3c1538ed4934fb3b47c7ebc82393306c43f06
+  Latest semantic patch SHA-256: 8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163
+  Expected final tree: dfb60ab2e514defc6290fe8bacd179552dcd985e
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -41,6 +41,10 @@ native scheduler receipts bind the plan, cache/model/sampling/assignment/
 budget/inventory identities and observed request terminals. It is strictly a
 `CPU_CONTRACT_ONLY`: GPU JIT, graph, and cache counters remain null with a
 named unavailable reason, and no formal compile source is release-authorized.
+The sixth patch makes draft-width accounting target-aware: Target-only keeps
+terminal speculative fields non-applicable and reports zero verified drafts in
+the numeric server-info view, while malformed speculative configurations still
+fail closed when their draft width is missing.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

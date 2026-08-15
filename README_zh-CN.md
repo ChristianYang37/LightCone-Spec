@@ -27,9 +27,9 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `fae3c1538ed4934fb3b47c7ebc82393306c43f06` | 应用当前 patch series 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `e5e681024fa48a9b0b5cb3e9a04771242c4949b0bad2f47f9610ef5f5f52ee52` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `dfb60ab2e514defc6290fe8bacd179552dcd985e` | 应用当前 patch series 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `7bfb2ea4f1497dd782a70a7afcad0857495b2871d80ad8ac858b2cb81e32ef7b` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 

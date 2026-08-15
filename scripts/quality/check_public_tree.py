@@ -146,6 +146,17 @@ def check_readme_parity() -> None:
 def check_patchset() -> None:
     patch_root = ROOT / "patches/sglang"
     manifest = json.loads((patch_root / "manifest.json").read_text())
+    canonical = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    if (patch_root / "manifest.json.sha256").read_text() != (
+        f"{hashlib.sha256(canonical).hexdigest()}\n"
+    ):
+        fail("patch manifest canonical sidecar differs from manifest")
     series = [line for line in (patch_root / "series").read_text().splitlines() if line]
     entries = manifest["patches"]
     if series != [entry["file"] for entry in entries]:

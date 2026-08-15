@@ -1,0 +1,262 @@
+From 4c75844a92a8eedc28e1cf9d3ef99120a5c9b559 Mon Sep 17 00:00:00 2001
+From: Christian Yang <ChristianYang37@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 09:00:11 +0800
+Subject: [PATCH] fix(metrics): handle target-only draft width
+
+---
+ python/sglang/srt/managers/scheduler.py       |  36 ++--
+ .../unit/spec/test_terminal_target_metrics.py | 163 ++++++++++++++++++
+ 2 files changed, 189 insertions(+), 10 deletions(-)
+ create mode 100644 test/registered/unit/spec/test_terminal_target_metrics.py
+
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 9ba0df6..b9ca707 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1518,6 +1518,16 @@ class Scheduler(
+         adapter = self._terminal_adapter()
+         return {} if adapter is None else adapter.diagnostics()
+ 
++    def _terminal_verified_drafts(self, target_calls: int) -> int:
++        if self.spec_algorithm.is_none():
++            return 0
++        width = self.server_args.speculative_num_draft_tokens
++        if width is None:
++            raise RuntimeError(
++                "speculative_num_draft_tokens is required for speculative metrics"
++            )
++        return target_calls * max(int(width) - 1, 0)
++
+     def _terminal_performance_counters(
+         self, diagnostics: dict[str, object]
+     ) -> dict[str, object]:
+@@ -1531,10 +1541,6 @@ class Scheduler(
+         committed = int(
+             reporter.spec_total_num_accept_tokens + reporter.spec_num_accept_tokens
+         )
+-        accepted = max(committed - spec_calls, 0)
+-        verified = spec_calls * max(
+-            int(self.server_args.speculative_num_draft_tokens) - 1, 0
+-        )
+         samples = int(getattr(reporter, "speed_study_graph_total", 0))
+         request_rows = (
+             self.terminal_speculative_evidence.request_rows
+@@ -1547,6 +1553,12 @@ class Scheduler(
+             if self.terminal_speculative_evidence is not None
+             else "target_only"
+         )
++        accepted = max(committed - spec_calls, 0)
++        verified = (
++            self._terminal_verified_drafts(spec_calls)
++            if method != "target_only"
++            else 0
++        )
+         target_calls = spec_calls if method != "target_only" else output_tokens
+         counters = diagnostics.get("counters", {})
+         timings = diagnostics.get("timings_ms", {})
+@@ -1591,13 +1603,19 @@ class Scheduler(
+             "verified_drafts": verified if method != "target_only" else None,
+             "survival_weighted_accepted_prefix": None,
+             "accepted_drafts_per_verify": (
+-                accepted / spec_calls if spec_calls else None
++                accepted / spec_calls
++                if method != "target_only" and spec_calls
++                else None
+             ),
+             "committed_tokens_per_verify": (
+-                committed / spec_calls if spec_calls else None
++                committed / spec_calls
++                if method != "target_only" and spec_calls
++                else None
+             ),
+             "verified_drafts_per_verify": (
+-                verified / spec_calls if spec_calls else None
++                verified / spec_calls
++                if method != "target_only" and spec_calls
++                else None
+             ),
+             "verification_waste": (
+                 verified - accepted if method != "target_only" else None
+@@ -5135,9 +5153,7 @@ class Scheduler(
+                 + self.metrics_reporter.spec_num_accept_tokens
+             )
+             accepted_drafts = max(committed_tokens - target_calls, 0)
+-            verified_drafts = target_calls * max(
+-                int(self.server_args.speculative_num_draft_tokens) - 1, 0
+-            )
++            verified_drafts = self._terminal_verified_drafts(target_calls)
+             ret["speed_study_metrics"] = {
+                 "target_calls": target_calls,
+                 "accepted_drafts": accepted_drafts,
+diff --git a/test/registered/unit/spec/test_terminal_target_metrics.py b/test/registered/unit/spec/test_terminal_target_metrics.py
+new file mode 100644
+index 0000000..c0da369
+--- /dev/null
++++ b/test/registered/unit/spec/test_terminal_target_metrics.py
+@@ -0,0 +1,163 @@
++from __future__ import annotations
++
++import ast
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++SCHEDULER_PATH = (
++    Path(__file__).resolve().parents[4] / "python/sglang/srt/managers/scheduler.py"
++)
++
++
++def _load_scheduler_probe():
++    tree = ast.parse(SCHEDULER_PATH.read_text(encoding="utf-8"))
++    scheduler = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "Scheduler"
++    )
++    method_names = {
++        "_terminal_verified_drafts",
++        "_terminal_performance_counters",
++        "get_internal_state",
++    }
++    methods = [
++        node
++        for node in scheduler.body
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
++        and node.name in method_names
++    ]
++    if {method.name for method in methods} != method_names:
++        raise AssertionError("scheduler target-metric methods are incomplete")
++    probe = ast.ClassDef(
++        name="SchedulerProbe",
++        bases=[],
++        keywords=[],
++        body=methods,
++        decorator_list=[],
++    )
++    scope = {
++        "GetInternalStateReqOutput": lambda *, internal_state: SimpleNamespace(
++            internal_state=internal_state
++        ),
++        "RECORD_STEP_TIME": False,
++        "get_context": lambda: SimpleNamespace(resolved_server_args_dict=dict),
++        "msgspec_to_builtins": lambda value: value,
++        "torch": SimpleNamespace(
++            cuda=SimpleNamespace(
++                is_available=lambda: False,
++                max_memory_allocated=lambda _device: 0,
++            )
++        ),
++    }
++    module = ast.Module(body=[probe], type_ignores=[])
++    ast.fix_missing_locations(module)
++    exec(compile(module, SCHEDULER_PATH, "exec"), scope)  # noqa: S102
++    return scope["SchedulerProbe"]
++
++
++SchedulerProbe = _load_scheduler_probe()
++
++
++class _Algorithm:
++    def __init__(self, *, speculative: bool):
++        self.speculative = speculative
++
++    def is_none(self) -> bool:
++        return not self.speculative
++
++    def is_dspark(self) -> bool:
++        return False
++
++
++def _scheduler(*, speculative: bool, width: int | None, method: str):
++    scheduler = SchedulerProbe()
++    scheduler.spec_algorithm = _Algorithm(speculative=speculative)
++    scheduler.server_args = SimpleNamespace(
++        speculative_num_draft_tokens=width,
++        elastic_ep_backend=None,
++        speculative_adaptation_config=None,
++    )
++    scheduler.metrics_reporter = SimpleNamespace(
++        last_gen_throughput=0.0,
++        speed_study_enabled=True,
++        speed_study_graph_total=1,
++        speed_study_graph_hits=1,
++        speed_study_batch_sum=1,
++        speed_study_queue_sum=0,
++        speed_study_oom_events=0,
++        speed_study_retractions=0,
++        spec_total_num_forward_ct=3,
++        spec_num_forward_ct=0,
++        spec_total_num_accept_tokens=3,
++        spec_num_accept_tokens=0,
++    )
++    model_runner = SimpleNamespace(
++        weight_load_mem_usage=1.0,
++        graph_mem_usage=0.0,
++    )
++    scheduler.tp_worker = SimpleNamespace(model_runner=model_runner)
++    kvcache = SimpleNamespace(mem_usage=2.0)
++    scheduler.token_to_kv_pool_allocator = SimpleNamespace(get_kvcache=lambda: kvcache)
++    scheduler.max_total_num_tokens = 4096
++    scheduler.max_running_requests = 8
++    scheduler.device = "cpu"
++    scheduler.draft_worker = None
++    scheduler.terminal_speculative_evidence = SimpleNamespace(
++        method=method,
++        request_rows={"request-1": {"output_tokens": 3}},
++    )
++    return scheduler
++
++
++class TerminalTargetMetricTests(unittest.TestCase):
++    def test_target_only_with_no_draft_width_preserves_terminal_null_schema(self):
++        scheduler = _scheduler(
++            speculative=False,
++            width=None,
++            method="target_only",
++        )
++        counters = scheduler._terminal_performance_counters(
++            {"counters": {}, "timings_ms": {}}
++        )
++        self.assertEqual(counters["target_calls"], 3)
++        for field in (
++            "accepted_drafts",
++            "committed_tokens",
++            "verified_drafts",
++            "accepted_drafts_per_verify",
++            "committed_tokens_per_verify",
++            "verified_drafts_per_verify",
++            "verification_waste",
++        ):
++            self.assertIsNone(counters[field])
++
++    def test_target_only_internal_speed_metrics_report_zero_verified_drafts(self):
++        scheduler = _scheduler(
++            speculative=False,
++            width=None,
++            method="target_only",
++        )
++        state = scheduler.get_internal_state(None).internal_state
++        metrics = state["speed_study_metrics"]
++        self.assertEqual(metrics["target_calls"], 3)
++        self.assertEqual(metrics["verified_drafts"], 0)
++        self.assertEqual(metrics["verification_waste"], 0)
++
++    def test_speculative_metrics_reject_a_missing_draft_width(self):
++        scheduler = _scheduler(speculative=True, width=None, method="static")
++        with self.assertRaisesRegex(
++            RuntimeError,
++            "speculative_num_draft_tokens is required",
++        ):
++            scheduler._terminal_performance_counters({"counters": {}, "timings_ms": {}})
++        with self.assertRaisesRegex(
++            RuntimeError,
++            "speculative_num_draft_tokens is required",
++        ):
++            scheduler.get_internal_state(None)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+

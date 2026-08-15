@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "fae3c1538ed4934fb3b47c7ebc82393306c43f06",
+  "expected_tree": "dfb60ab2e514defc6290fe8bacd179552dcd985e",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -101,6 +101,14 @@
         "python/sglang/srt/managers/scheduler.py",
         "python/sglang/srt/speculative/compile_cache_evidence.py",
         "test/registered/unit/spec/test_compile_cache_evidence.py"
+      ]
+    },
+    {
+      "file": "0006-fix-metrics-handle-target-only-draft-width.patch",
+      "sha256": "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163",
+      "files": [
+        "python/sglang/srt/managers/scheduler.py",
+        "test/registered/unit/spec/test_terminal_target_metrics.py"
       ]
     }
   ]

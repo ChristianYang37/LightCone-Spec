@@ -66,14 +66,20 @@ connection pool without duplicating the official request parser.
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`05ab7ae2074f2e9ffa2387f1897e85ea1527a6daf44e1527dfd908adfb547f12`
-and the final tree is `fae3c1538ed4934fb3b47c7ebc82393306c43f06`; the manifest remains the
+`8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`
+and the final tree is `dfb60ab2e514defc6290fe8bacd179552dcd985e`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and adaptive-runtime request/round/update/KV/performance rows.
 It exposes a signer plugin boundary but bundles no trusted hardware key or
 release signer. The executor therefore still runs only Target-only end to end
 and blocks Static/TTS/L0-naive/LightCone before mutation.
+
+The sixth patch makes speculative-width accounting target-aware. A true
+Target-only server (`spec_algorithm=none` with no draft width) never evaluates
+`int(None)`: terminal evidence keeps speculative counters non-applicable, while
+the numeric `/server_info` speed view reports zero verified drafts. Any active
+speculative algorithm without a draft width still fails closed.
 
 The second patch exposes an opt-in native committed-token observation
 contract. Each timestamp is sampled by the CPU while the streamer enumerates
@@ -158,8 +164,9 @@ release.
 ## Application
 
 `patches/sglang/apply.sh` accepts only a clean checkout at the exact upstream
-HEAD. It checks the registered patch digests, applies in order with `git am`,
-and compares the resulting Git tree with the manifest:
+HEAD, applies the registered series in order with `git am`, and compares the
+resulting Git tree with the manifest. The verifier and public-tree gate check
+every registered patch digest and the canonical manifest sidecar:
 
 ```bash
 patches/sglang/apply.sh /path/to/clean-sglang
