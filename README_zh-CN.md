@@ -343,9 +343,11 @@ exactness violation、version mismatch、fallback、non-finite update、OOM 与 
 execution-policy SHA `231ca579` 与 tuning-window SHA `132019ee`；该策略关闭 CUDA Graph
 与 Radix Cache。
 
-这些旧 row 使用同一个 shared tuned AdamW recipe；它们只是 matched-recipe
-publication-policy diagnostic，**不是** TTS paper reproduction，也不能调优新的 LightCone
-recipe 或满足 formal gate。机制诊断表明在线工作已基本隐藏：adaptive main-side overlap 约为 96.7%；累计约
+归档的 selection 与 runtime config 将两条 adaptive path 绑定到同一套 shared tuned
+Adam recipe（learning rate 0.001、weight decay 0、LoRA rank 8、stride 80）。它们只是
+matched-recipe publication-policy diagnostic，**不是** TTS paper reproduction，也不能调优
+新的 LightCone recipe 或满足 formal gate。机制诊断表明在线工作已基本隐藏：adaptive
+main-side overlap 约为 96.7%；累计约
 8.4--8.7 秒的 training、optimizer、merge 与 publication 工作，只在 decode critical path
 暴露约 0.27 秒。First-ready diagnostic 的优势主要对应更少的 target calls：52,083，
 而 fixed-barrier diagnostic 为 52,879

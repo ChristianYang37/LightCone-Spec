@@ -410,9 +410,11 @@ historical identity is main code `0db2ff4`, old patched SGLang tree `e795ecc`,
 execution-policy SHA `231ca579`, and tuning-window SHA `132019ee`; CUDA Graph
 and Radix Cache were disabled by that policy.
 
-These old rows used one shared tuned AdamW recipe. They are matched-recipe
-publication-policy diagnostics, **not** TTS paper reproduction, and cannot tune
-the new LightCone recipe or satisfy a formal gate. The mechanism diagnostics
+The archived selection and runtime configs bind both adaptive rows to one
+shared tuned Adam recipe (learning rate 0.001, weight decay 0, LoRA rank 8,
+stride 80). They are matched-recipe publication-policy diagnostics, **not** TTS
+paper reproduction, and cannot tune the new LightCone recipe or satisfy a
+formal gate. The mechanism diagnostics
 suggest that online work was already mostly hidden: adaptive main-side overlap
 was about 96.7%, and roughly 8.4--8.7 seconds of
 aggregate training, optimizer, merge, and publication work exposed only about

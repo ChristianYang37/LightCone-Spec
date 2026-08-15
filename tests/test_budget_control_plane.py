@@ -515,6 +515,9 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
     registry: ExperimentRegistry,
 ) -> None:
     activation = _e1_activation(registry)
+    activated_count = len(activation.plan.activated_cell_ids)
+    assert activated_count > 1
+    incomplete_count = activated_count - 1
     bindings = tuple(
         _load_binding(cell_id) for cell_id in activation.plan.activated_cell_ids
     )
@@ -531,9 +534,9 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
     )
 
     assert plan.status == "UNRESOLVED"
-    assert len(plan.budgets) == 130
+    assert len(plan.budgets) == activated_count
     assert plan.diagnostic_budgets == plan.budgets
-    assert len(plan.dispositions) == 130
+    assert len(plan.dispositions) == activated_count
     assert {row.reason_code for row in plan.dispositions} == {
         "capacity_raw_authority_missing"
     }
@@ -559,7 +562,7 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
         capacity_envelope=capacity,
     )
     assert incomplete.status == "UNRESOLVED"
-    assert len(incomplete.diagnostic_budgets) == 129
+    assert len(incomplete.diagnostic_budgets) == incomplete_count
     assert (
         sum(
             row.reason_code == "missing_load_semantics"
@@ -572,7 +575,7 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
             row.reason_code == "capacity_budget_coverage_incomplete"
             for row in incomplete.dispositions
         )
-        == 129
+        == incomplete_count
     )
     with pytest.raises(ValueError, match="contains unresolved cells"):
         materialize_industrial_budgets(
@@ -592,7 +595,7 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
         policy=policy,
         inventory=inventory,
     )
-    assert len(missing_capacity.diagnostic_budgets) == 130
+    assert len(missing_capacity.diagnostic_budgets) == activated_count
     assert {row.reason_code for row in missing_capacity.dispositions} == {
         "capacity_envelope_missing"
     }
@@ -607,7 +610,7 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
             cell_requirements=capacity.cell_requirements[:-1],
         ),
     )
-    assert len(partial_capacity.diagnostic_budgets) == 130
+    assert len(partial_capacity.diagnostic_budgets) == activated_count
     assert (
         sum(
             row.reason_code == "capacity_requirement_missing"
@@ -620,7 +623,7 @@ def test_materializer_retains_diagnostic_budgets_without_raw_capacity_authority(
             row.reason_code == "capacity_requirement_coverage_incomplete"
             for row in partial_capacity.dispositions
         )
-        == 129
+        == incomplete_count
     )
 
 
@@ -628,6 +631,8 @@ def test_capacity_envelope_rejects_provider_and_maximum_attempt_disk_overflow(
     registry: ExperimentRegistry,
 ) -> None:
     activation = _e1_activation(registry)
+    activated_count = len(activation.plan.activated_cell_ids)
+    assert activated_count > 0
     bindings = tuple(
         _load_binding(cell_id) for cell_id in activation.plan.activated_cell_ids
     )
@@ -645,7 +650,7 @@ def test_capacity_envelope_rejects_provider_and_maximum_attempt_disk_overflow(
             provider_quota_gpu_ms=0,
         ),
     )
-    assert len(provider_blocked.diagnostic_budgets) == 130
+    assert len(provider_blocked.diagnostic_budgets) == activated_count
     assert {row.reason_code for row in provider_blocked.dispositions} == {
         "capacity_provider_quota_exceeded"
     }
@@ -703,7 +708,7 @@ def test_capacity_envelope_rejects_provider_and_maximum_attempt_disk_overflow(
             host_quota_bytes=one_attempt_bytes,
         ),
     )
-    assert len(disk_blocked.diagnostic_budgets) == 130
+    assert len(disk_blocked.diagnostic_budgets) == activated_count
     assert {row.reason_code for row in disk_blocked.dispositions} == {
         "capacity_host_disk_exceeded"
     }

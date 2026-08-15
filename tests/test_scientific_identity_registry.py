@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 
@@ -46,6 +47,16 @@ def test_tts_recipe_authority_is_manifest_bound_and_formally_blocked() -> None:
     assert FROZEN_TTS_RECIPE_AUTHORITY.historical_diagnostic_classification == (
         "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
     )
+
+
+def test_tts_recipe_authority_is_declared_as_wheel_data() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert config["tool"]["setuptools"]["data-files"][
+        "share/lightcone-spec/manifests/provenance"
+    ] == [
+        "manifests/provenance/tts_recipe_authority_v1.json",
+        "manifests/provenance/tts_recipe_authority_v1.json.sha256",
+    ]
 
 
 def test_registry_binds_authority_and_revised_stage_cardinalities(

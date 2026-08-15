@@ -35,8 +35,6 @@ from lightcone_spec.experiments.planning import (
     P99AnchorStatus,
     ScenarioMilliseconds,
     budget_inventory_identity_from_gpu_inventory,
-    derive_confirmation_family,
-    materialize_confirmation_pilots,
     materialize_industrial_budgets,
 )
 from lightcone_spec.experiments.planning_artifacts import (
@@ -45,7 +43,6 @@ from lightcone_spec.experiments.planning_artifacts import (
     budget_plan_to_dict,
     budget_policy_to_dict,
     capacity_envelope_to_dict,
-    family_activation_artifact_to_dict,
 )
 from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
@@ -194,8 +191,8 @@ def _load_binding(cell_id: str) -> BudgetLoadBinding:
     )
     scored = closed_loop_corpus(
         templates,
-        namespace="budget-cli-pilot-score",
-        split="pilot",
+        namespace="budget-cli-preflight-score",
+        split="tuning",
         concurrency=1,
         cohort_count=1,
         cohort_popularity="uniform",
@@ -241,31 +238,47 @@ def _budget_authority(
     tuple[Path, ...],
 ]:
     registry_path, registry = _registry(tmp_path)
-    source = next(
-        cell
-        for cell in registry.cells_for("E5")
-        if cell.runnable
-        and cell.identity.backend == "DFLASH"
-        and cell.identity.arrival == "closed_loop"
-        and cell.identity.concurrency == 1
-        and cell.resources.gpu_count == 1
+    runtime_path = tmp_path / "budget-preflight-runtime.json"
+    split_path = tmp_path / "budget-preflight-split.json"
+    _write_bound(runtime_path, {"runtime": "budget-preflight"})
+    _write_bound(split_path, {"split": "budget-preflight"})
+    activation_manifest = {
+        "schema_version": 1,
+        "kind": "industrial_registry_stage_activation_manifest",
+        "registry_artifact": str(registry_path),
+        "experiment": "preflight",
+        "runtime_artifact": str(runtime_path),
+        "split_artifact": str(split_path),
+        "dependency_receipts": [],
+    }
+    activation_manifest_path = tmp_path / "budget-activation-manifest.json"
+    _write_bound(activation_manifest_path, activation_manifest)
+    activation_path = tmp_path / "budget-activation.json"
+    assert (
+        main(
+            [
+                "materialize-stage-activation",
+                "--manifest",
+                str(activation_manifest_path),
+                "--output",
+                str(activation_path),
+            ]
+        )
+        == 0
     )
-    family = derive_confirmation_family(
-        registry,
-        cell_id=source.cell_id,
-        runtime_sha256=content_sha256("budget-cli-runtime"),
-        split_sha256=content_sha256("budget-cli-split"),
-        trace_sha256=content_sha256("budget-cli-trace"),
-        sampling_sha256=content_sha256("budget-cli-sampling"),
-        hardware_envelope_sha256=content_sha256("budget-cli-hardware"),
+    activation = registry_stage_activation_from_dict(
+        json.loads(activation_path.read_text(encoding="utf-8"))
     )
-    activation = materialize_confirmation_pilots(registry, family)
-    assert len(activation.activated_cell_ids) == 16
-    activation_path = tmp_path / "family-pilot-activation.json"
-    _write_bound(
-        activation_path,
-        family_activation_artifact_to_dict(activation),
+    assert activation.status == "AVAILABLE"
+    assert activation.activated_cell_ids
+    cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("preflight")}
+    activated_cells = tuple(
+        cells_by_id[cell_id] for cell_id in activation.activated_cell_ids
     )
+    assert {cell.identity.method for cell in activated_cells} == {"static"}
+    assert {cell.identity.task for cell in activated_cells} == {
+        "simultaneous_single_gpu_interference"
+    }
     policy = _budget_policy()
     policy_path = tmp_path / "budget-policy.json"
     _write_bound(policy_path, budget_policy_to_dict(policy))
@@ -346,7 +359,7 @@ def _raw_budget_args(
     args = [
         "--registry",
         str(registry_path),
-        "--family-activation",
+        "--activation-plan",
         str(activation_path),
         "--inventory",
         str(inventory_path),
@@ -372,7 +385,7 @@ def test_materialize_budget_cli_reports_diagnostics_for_one_to_sixteen_gpus(
         policy_path,
         binding_paths,
     ) = _budget_authority(tmp_path)
-    activation_path = tmp_path / "family-pilot-activation.json"
+    activation_path = tmp_path / "budget-activation-manifest.json"
     for gpu_count in (1, 2, 4, 8, 16):
         inventory, inventory_path = _write_inventory(tmp_path, gpu_count)
         _, capacity_path = _write_capacity(
@@ -424,7 +437,7 @@ def test_materialize_budget_cli_fails_closed_for_missing_quota_and_disk(
         policy_path,
         binding_paths,
     ) = _budget_authority(tmp_path)
-    activation_path = tmp_path / "family-pilot-activation.json"
+    activation_path = tmp_path / "budget-activation-manifest.json"
     inventory, inventory_path = _write_inventory(tmp_path, 2)
 
     cases = (
@@ -508,7 +521,7 @@ def test_budget_consumers_rematerialize_and_bind_physical_scheduler_authority(
         policy_path,
         binding_paths,
     ) = _budget_authority(tmp_path)
-    activation_path = tmp_path / "family-pilot-activation.json"
+    activation_path = tmp_path / "budget-activation-manifest.json"
     inventory, inventory_path = _write_inventory(tmp_path, 2)
     capacity, capacity_path = _write_capacity(
         tmp_path / "capacity-ready.json",
@@ -577,7 +590,7 @@ def test_budget_consumers_rematerialize_and_bind_physical_scheduler_authority(
     other_policy = replace(policy, policy_name="different-valid-policy")
     other_plan = materialize_industrial_budgets(
         registry,
-        family_activations=(activation,),
+        activations=(activation,),
         load_bindings=bindings,
         policy=other_policy,
         inventory=budget_inventory_identity_from_gpu_inventory(inventory),
@@ -683,7 +696,7 @@ def test_budget_cli_requires_paired_raw_capacity_authority_paths(
     )
     raw_args = _raw_budget_args(
         registry_path=registry_path,
-        activation_path=tmp_path / "family-pilot-activation.json",
+        activation_path=tmp_path / "budget-activation-manifest.json",
         inventory_path=inventory_path,
         policy_path=policy_path,
         binding_paths=binding_paths,
@@ -776,13 +789,13 @@ def test_budget_materialization_blocks_without_reducer_owned_activation(
     )
     args = _raw_budget_args(
         registry_path=registry_path,
-        activation_path=tmp_path / "family-pilot-activation.json",
+        activation_path=tmp_path / "budget-activation-manifest.json",
         inventory_path=inventory_path,
         policy_path=policy_path,
         binding_paths=binding_paths,
         capacity_path=capacity_path,
     )
-    activation_index = args.index("--family-activation")
+    activation_index = args.index("--activation-plan")
     del args[activation_index : activation_index + 2]
     output = tmp_path / "preflight-budget-plan.json"
     assert (

@@ -53,6 +53,12 @@ lightcone-spec = "lightcone_spec.cli.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.data-files]
+"share/lightcone-spec/manifests/provenance" = [
+    "manifests/provenance/tts_recipe_authority_v1.json",
+    "manifests/provenance/tts_recipe_authority_v1.json.sha256",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
