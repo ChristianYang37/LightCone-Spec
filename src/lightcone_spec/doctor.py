@@ -490,7 +490,23 @@ def _parse_topology(value: str | None) -> dict[str, Any]:
             "pairs": [],
             "parse_error": None,
         }
-    lines = [line.split() for line in value.splitlines() if line.strip()]
+    # Recent NVIDIA drivers underline the topology header even when stdout is
+    # redirected, for example ``\x1b[4mGPU0 ... GPU NUMA ID\x1b[0m``.  Strip
+    # only SGR styling; every other control sequence remains an ambiguous
+    # external-input failure rather than being silently normalized.
+    normalized = re.sub(r"\x1b\[[0-9;]*m", "", value)
+    if any(
+        (ord(character) < 32 and character not in "\t\n\r")
+        or ord(character) == 127
+        or 128 <= ord(character) <= 159
+        for character in normalized
+    ):
+        return {
+            "gpu_rows": [],
+            "pairs": [],
+            "parse_error": "unsupported_control_character",
+        }
+    lines = [line.split() for line in normalized.splitlines() if line.strip()]
     header = next(
         (
             line

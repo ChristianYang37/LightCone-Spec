@@ -7,6 +7,8 @@ import json
 import socket
 from pathlib import Path
 
+import pytest
+
 from lightcone_spec import (
     PINNED_SGLANG_COMMIT,
     PINNED_SGLANG_PATCH_COUNT,
@@ -215,6 +217,38 @@ def test_gpu_inventory_and_topology_parsers_preserve_exact_identity() -> None:
             }
         ],
         "parse_error": None,
+    }
+
+
+def test_topology_parser_accepts_redirected_nvidia_smi_sgr_header_only() -> None:
+    topology = _parse_topology(
+        "\t\x1b[4mGPU0\tGPU1\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+        "GPU0\t X \tNODE\t0-51,104-155\t0\t\tN/A\n"
+        "GPU1\tNODE\t X \t0-51,104-155\t0\t\tN/A\n"
+    )
+    assert topology == {
+        "gpu_rows": ["GPU0", "GPU1"],
+        "pairs": [
+            {
+                "left": "GPU0",
+                "right": "GPU1",
+                "link": "NODE",
+                "reciprocal_link": "NODE",
+            }
+        ],
+        "parse_error": None,
+    }
+
+
+@pytest.mark.parametrize("control", ("\x00", "\x1b[2J", "\x9b"))
+def test_topology_parser_rejects_non_sgr_control_sequences(control: str) -> None:
+    topology = _parse_topology(
+        f"{control}GPU0 GPU1 CPU Affinity\nGPU0 X NODE 0-31\nGPU1 NODE X 0-31\n"
+    )
+    assert topology == {
+        "gpu_rows": [],
+        "pairs": [],
+        "parse_error": "unsupported_control_character",
     }
 
 

@@ -213,6 +213,37 @@ def test_inventory_rejects_incomplete_or_asymmetric_topology(tmp_path: Path) -> 
         )
 
 
+def test_inventory_accepts_nvidia_smi_sgr_topology_header(tmp_path: Path) -> None:
+    sysfs, machine_id = _probe_environment(tmp_path, gpu_count=2)
+    outputs = _outputs(gpu_count=2)
+    topology_lines = outputs["topo"].splitlines()
+    topology_lines[0] = f"\x1b[4m{topology_lines[0]}\x1b[0m"
+    outputs["topo"] = "\n".join(topology_lines) + "\n"
+
+    inventory, receipt = collect_gpu_inventory(
+        challenge_nonce_sha256="f" * 64,
+        command_runner=_runner(outputs),
+        sysfs_root=sysfs,
+        machine_id_path=machine_id,
+        hostname="same-host",
+    )
+
+    assert len(inventory.devices) == 2
+    assert all(device.ready for device in inventory.devices)
+    assert receipt["parsed_topology"] == {
+        "gpu_rows": ["GPU0", "GPU1"],
+        "pairs": [
+            {
+                "left": "GPU0",
+                "right": "GPU1",
+                "link": "PHB",
+                "reciprocal_link": "PHB",
+            }
+        ],
+        "parse_error": None,
+    }
+
+
 def test_evidence_free_interference_policy_is_strictly_serial(tmp_path: Path) -> None:
     sysfs, machine_id = _probe_environment(tmp_path, gpu_count=8)
     inventory, _ = collect_gpu_inventory(
