@@ -43,6 +43,7 @@ from lightcone_spec.experiments.failure_authority import (
     FailureInjectionAuthorityBlocked,
     bind_failure_injection_authority,
     release_failure_plan_for_cell,
+    require_failure_injection_authority,
 )
 from lightcone_spec.experiments.gpu_pool import (
     GpuAvailability,
@@ -111,6 +112,7 @@ from lightcone_spec.orchestration.industrial import (
 )
 from lightcone_spec.orchestration.native_terminal import (
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
+    SUPPORTED_METHODS,
     NativeTerminalProvider,
     NativeTerminalRunBinding,
 )
@@ -1217,11 +1219,12 @@ class _FakeTransport(PinnedBenchServingTransport):
             self.events.append("capability")
         if self._native_admin is not None:
             return await self._native_admin.get_json(path)
+        assert method in SUPPORTED_METHODS
         return {
             "schema_version": 1,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
-            "supported_methods": ["l0", "static", "target_only", "tts"],
+            "supported_methods": sorted(SUPPORTED_METHODS),
             "enabled": True,
             "active_method": method,
             "method_evidence_supported": True,
@@ -2845,17 +2848,22 @@ def test_true_e5_failure_identity_blocks_mismatched_budget_and_raw_authority_bef
         encoding="utf-8",
     )
     binding = bind_failure_injection_authority(raw_path, registry=registry)
-    token = FailureExecutionAuthorityToken(
-        binding=binding,
-        authority_sha256=binding.sha256,
-        plan_sha256=raw_plan.sha256,
-        registry_sha256=registry.sha256,
-        cell_id=raw_plan.cell_id,
-        scenario=raw_plan.scenario,
-        actuator_id="caller.forged_actuator",
-        actuator_version_sha256="6" * 64,
-        actuator_capability_sha256="7" * 64,
-    )
+    with pytest.raises(
+        TypeError,
+        match="failure execution authority requires first-party validation",
+    ):
+        FailureExecutionAuthorityToken(
+            binding=binding,
+            authority_sha256=binding.sha256,
+            plan_sha256=raw_plan.sha256,
+            registry_sha256=registry.sha256,
+            cell_id=raw_plan.cell_id,
+            scenario=raw_plan.scenario,
+            actuator_id="caller.forged_actuator",
+            actuator_version_sha256="6" * 64,
+            actuator_capability_sha256="7" * 64,
+        )
+    token = require_failure_injection_authority(binding, registry=registry)
     registered_duration = fixture.plan.budget.scored_arrival
     zero = ScenarioMilliseconds(0, 0, 0)
     common_budget = {
@@ -2940,19 +2948,6 @@ def test_true_e5_failure_identity_blocks_mismatched_budget_and_raw_authority_bef
                 without_authority,
                 output_root=output,
                 run_nonce_sha256=hashlib.sha256(b"missing-failure").hexdigest(),
-                launch_server=launch_server,
-                transport=transport,
-            )
-        )
-    with pytest.raises(
-        FailureInjectionAuthorityBlocked,
-        match="failure_injection_first_party_actuator_unavailable",
-    ):
-        asyncio.run(
-            execute_industrial_plan(
-                failure_plan,
-                output_root=output,
-                run_nonce_sha256=hashlib.sha256(b"forged-failure").hexdigest(),
                 launch_server=launch_server,
                 transport=transport,
             )
@@ -3728,8 +3723,8 @@ def test_terminal_bench_failure_preserves_wal_but_cannot_publish_native_evidence
     output = Path(plan.runtime_plan.cell.resources.evidence_root)
     transport = FailedTransport(plan=plan)
     with pytest.raises(
-        RuntimeError,
-        match="submitted request lacks a reconciliable terminal outcome",
+        ValueError,
+        match="terminal request tokens/status differ from caller evidence",
     ):
         asyncio.run(
             execute_industrial_plan(
@@ -3755,7 +3750,8 @@ def test_terminal_bench_failure_preserves_wal_but_cannot_publish_native_evidence
     assert not tuple(output.glob("*.native-terminal.json"))
     aborted = json.loads(next(output.glob("*.aborted.json")).read_text())
     assert (
-        "submitted request lacks a reconciliable terminal outcome" in aborted["reason"]
+        "terminal request tokens/status differ from caller evidence"
+        in aborted["reason"]
     )
 
 
