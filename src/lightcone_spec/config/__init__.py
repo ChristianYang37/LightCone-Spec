@@ -7,6 +7,7 @@ from .schema import (
     OnlineSpecConfig,
     OptimizerConfig,
     RunConfig,
+    RuntimeConfig,
 )
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "OnlineSpecConfig",
     "OptimizerConfig",
     "RunConfig",
+    "RuntimeConfig",
     "load_run_config",
     "run_config_sha256",
 ]

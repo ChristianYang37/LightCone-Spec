@@ -46,11 +46,12 @@ from lightcone_spec.experiments.planning_artifacts import (
 )
 from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
-    build_industrial_registry,
     content_sha256,
 )
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
+)
 from lightcone_spec.experiments.stage_activation import (
-    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RegistryStageDispositionStatus,
     registry_stage_activation_from_dict,
 )
@@ -87,6 +88,7 @@ def _registry(tmp_path: Path) -> tuple[Path, ExperimentRegistry]:
         main(
             [
                 "build-industrial-registry",
+                "--legacy-diagnostic",
                 "--logical-gpu-slot",
                 "logical-rank-slot-a",
                 "logical-rank-slot-b",
@@ -269,21 +271,30 @@ def _budget_authority(
     activation = registry_stage_activation_from_dict(
         json.loads(activation_path.read_text(encoding="utf-8"))
     )
+    # Source-owned compile/exactness runners now make the complete scheduling
+    # set available.  Terminal coverage remains a separate 1+1+8 gate.
     assert activation.status == "AVAILABLE"
-    assert activation.activated_cell_ids
+    assert len(activation.activated_cell_ids) == 10
     cells_by_id = {cell.cell_id: cell for cell in registry.cells_for("preflight")}
     activated_cells = tuple(
         cells_by_id[cell_id] for cell_id in activation.activated_cell_ids
     )
-    assert {cell.identity.method for cell in activated_cells} == {"static"}
+    assert {cell.identity.method for cell in activated_cells} == {
+        "static",
+        "target_only",
+    }
     assert {cell.identity.task for cell in activated_cells} == {
-        "simultaneous_single_gpu_interference"
+        "environment_and_patch_preflight",
+        "exactness_memory_telemetry_preflight",
+        "simultaneous_single_gpu_interference",
     }
     policy = _budget_policy()
     policy_path = tmp_path / "budget-policy.json"
     _write_bound(policy_path, budget_policy_to_dict(policy))
     bindings = tuple(
-        _load_binding(cell_id) for cell_id in activation.activated_cell_ids
+        _load_binding(cell.cell_id)
+        for cell in activated_cells
+        if cell.identity.task != "environment_and_patch_preflight"
     )
     binding_paths = []
     for index, binding in enumerate(bindings):
@@ -378,7 +389,7 @@ def test_materialize_budget_cli_reports_diagnostics_for_one_to_sixteen_gpus(
 ) -> None:
     (
         registry_path,
-        _,
+        registry,
         activation,
         _,
         _,
@@ -415,10 +426,28 @@ def test_materialize_budget_cli_reports_diagnostics_for_one_to_sixteen_gpus(
         plan = budget_plan_from_dict(json.loads(output.read_text(encoding="utf-8")))
         assert plan.status == "UNRESOLVED"
         assert plan.inventory.gpu_count == gpu_count
-        assert len(plan.diagnostic_budgets) == len(activation.activated_cell_ids)
-        assert {row.reason_code for row in plan.dispositions} == {
-            "capacity_raw_authority_missing"
+        activated = {
+            cell.cell_id: cell
+            for cell in registry.cells_for("preflight")
+            if cell.cell_id in activation.activated_cell_ids
         }
+        assert len(plan.diagnostic_budgets) == sum(
+            cell.resources.gpu_count <= gpu_count
+            and cell.identity.task != "exactness_memory_telemetry_preflight"
+            for cell in activated.values()
+        )
+        expected_reasons = (
+            {
+                "capacity_budget_coverage_incomplete",
+                "insufficient_inventory_gpus",
+            }
+            if gpu_count == 1
+            else {
+                "capacity_budget_coverage_incomplete",
+                "load_context_unresolved",
+            }
+        )
+        assert {row.reason_code for row in plan.dispositions} == expected_reasons
         assert all(
             budget.fixed_instance_billed_gpu_ms == budget.wall_time.scale(gpu_count)
             for budget in plan.diagnostic_budgets
@@ -463,14 +492,14 @@ def test_materialize_budget_cli_fails_closed_for_missing_quota_and_disk(
             binding_paths,
             activation.activated_cell_ids,
             {"provider_quota_gpu_ms": 0},
-            {"capacity_provider_quota_exceeded"},
+            {"capacity_budget_coverage_incomplete"},
         ),
         (
             "disk",
             binding_paths,
             activation.activated_cell_ids,
             {"host_free_bytes": 0},
-            {"capacity_host_disk_exceeded"},
+            {"capacity_budget_coverage_incomplete"},
         ),
     )
     for name, selected_bindings, capacity_cell_ids, capacity_kwargs, reasons in cases:
@@ -501,12 +530,14 @@ def test_materialize_budget_cli_fails_closed_for_missing_quota_and_disk(
         )
         plan = budget_plan_from_dict(json.loads(output.read_text(encoding="utf-8")))
         assert plan.status == "UNRESOLVED"
+        # The source-owned compile contributes one non-serving budget while the
+        # exactness row stays unresolved in this legacy diagnostic budget plan.
         assert len(plan.diagnostic_budgets) == len(selected_bindings)
         assert {
             row.reason_code
             for row in plan.dispositions
             if row.status is BudgetDispositionStatus.UNRESOLVED
-        } == reasons
+        } == {*reasons, "load_context_unresolved"}
 
 
 def test_budget_consumers_rematerialize_and_bind_physical_scheduler_authority(
@@ -814,7 +845,7 @@ def test_budget_materialization_blocks_without_reducer_owned_activation(
     assert decision["reason_code"] == "reducer_owned_activation_manifest_missing"
 
 
-def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
+def test_preflight_activation_includes_source_owned_compile_and_exactness_runners(
     tmp_path: Path,
 ) -> None:
     registry_path, _ = _registry(tmp_path)
@@ -851,19 +882,10 @@ def test_preflight_compile_activation_and_budget_fail_closed_without_runner(
     )
     assert activation.experiment == "preflight"
     assert activation.status == "AVAILABLE"
-    assert activation.activated_cell_ids
-    assert {
-        row.reason_code
-        for row in activation.dispositions
-        if row.status is RegistryStageDispositionStatus.BLOCKED
-    } == {
-        RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
-        "release_preflight_method_unsupported",
-    }
+    assert len(activation.activated_cell_ids) == 10
     assert all(
-        row.cell_id not in activation.activated_cell_ids
+        row.status is RegistryStageDispositionStatus.ACTIVATED
         for row in activation.dispositions
-        if row.reason_code == RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
     )
 
     policy = _budget_policy()

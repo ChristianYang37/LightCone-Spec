@@ -7,9 +7,11 @@ second.  The raw input must cover both families and every registered
 hypothesis exactly once.  Missing rows, post-hoc regrouping, foreign cells, or
 non-finite p-values fail closed.
 
-This module adjusts already-derived raw p-values.  It does not derive p-values
-from GPU evidence, authorize E0 execution, or promote a secondary finding into
-the E3b primary Holm family.
+The legacy binder remains diagnostic-only.  The formal entry point instead
+deep-rebuilds the signed E0 final result DAG, derives paired block p-values
+from verifier-owned terminal/timestamp proofs, and records every compatibility
+N/A as an explicit excluded preregistered hypothesis.  No caller-supplied
+p-value or release digest allowlist is accepted.
 """
 
 from __future__ import annotations
@@ -21,11 +23,19 @@ import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+from scipy.stats import t as student_t
+
+from lightcone_spec.experiments.e0_authority_artifact import (
+    E0FinalAnalysisProjection,
+    rebuild_e0_final_analysis_projection_from_artifact,
+)
+from lightcone_spec.experiments.formal_protocol import verify_signed_payload
 from lightcone_spec.experiments.registry import (
     E0_BACKENDS,
     E0_METHOD_ROLES,
@@ -37,7 +47,15 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
     scientific_role_for_cell,
 )
-from lightcone_spec.experiments.statistics import benjamini_hochberg
+from lightcone_spec.experiments.statistics import (
+    bca_mean_interval,
+    benjamini_hochberg,
+)
+from lightcone_spec.runtime.attestation import (
+    AttestationChallenge,
+    SignedAttestation,
+    TrustedAttesterPolicy,
+)
 
 E0BreadthFamilyId = Literal[
     "e0_core_breadth",
@@ -49,15 +67,9 @@ _MAX_RAW_BYTES = 32 * 1024 * 1024
 
 E0_BREADTH_FALSE_DISCOVERY_RATE = 0.05
 E0_BREADTH_RAW_SOURCE_MISSING_REASON = "e0_breadth_raw_p_values_missing"
-E0_BREADTH_FORMAL_SOURCE_UNAVAILABLE_REASON = (
-    "e0_breadth_release_trusted_raw_source_unavailable"
-)
-
-# Empty until a release-owned raw-source digest is locked.  Keeping the
-# allowlist in source makes formal trust a release decision, never a caller
-# assertion.  The diagnostic binder below remains useful for schema and
-# reducer tests, but its output explicitly cannot authorize formal execution.
-E0_BREADTH_RELEASE_TRUSTED_RAW_SOURCE_SHA256: tuple[str, ...] = ()
+E0_BREADTH_FORMAL_SOURCE_UNAVAILABLE_REASON = "e0_final_proof_artifact_required"
+E0_BREADTH_BOOTSTRAP_REPETITIONS = 10_000
+E0_BREADTH_BOOTSTRAP_SEED = 0
 
 _CORE_CONTRASTS = (
     ("lightcone_vs_tts", "lightcone", "tts"),
@@ -71,27 +83,78 @@ _ONLINESPEC_CONTRASTS = (
     ("onlinespec_opt_vs_static", "onlinespec_opt", "static"),
 )
 
-E0_BREADTH_FDR_PROTOCOL_SHA256 = content_sha256(
+_E0_BREADTH_FAMILY_PROTOCOL = {
+    "families": {
+        "e0_core_breadth": [row[0] for row in _CORE_CONTRASTS],
+        "e0_isolated_onlinespec_breadth": [row[0] for row in _ONLINESPEC_CONTRASTS],
+    },
+    "panels": {
+        "models": list(E0_MODELS),
+        "backends": list(E0_BACKENDS),
+        "tasks": list(E0_TASKS),
+    },
+    "procedure": "benjamini-hochberg",
+    "false_discovery_rate": E0_BREADTH_FALSE_DISCOVERY_RATE,
+}
+
+E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 3,
-        "kind": "e0_registered_secondary_breadth_fdr",
-        "families": {
-            "e0_core_breadth": [row[0] for row in _CORE_CONTRASTS],
-            "e0_isolated_onlinespec_breadth": [row[0] for row in _ONLINESPEC_CONTRASTS],
-        },
-        "panels": {
-            "models": list(E0_MODELS),
-            "backends": list(E0_BACKENDS),
-            "tasks": list(E0_TASKS),
-        },
-        "procedure": "benjamini-hochberg",
-        "false_discovery_rate": E0_BREADTH_FALSE_DISCOVERY_RATE,
-        "coverage": "all_registered_hypotheses_exactly_once",
-        "universe_source": "structural_compatibility_templates_only",
-        "formal_lightcone": "forbidden_without_seal_bound_materialization",
+        "schema_version": 1,
+        "kind": "e0_legacy_diagnostic_breadth_fdr",
+        **_E0_BREADTH_FAMILY_PROTOCOL,
+        "universe_source": "legacy_structural_compatibility_templates",
+        "raw_source": "caller_file_diagnostic_only_never_formal",
         "primary_family": "forbidden",
     }
 )
+
+E0_BREADTH_FDR_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 5,
+        "kind": "e0_registered_secondary_breadth_fdr",
+        **_E0_BREADTH_FAMILY_PROTOCOL,
+        "coverage": (
+            "all_VALID_hypotheses_exactly_once_and_all_NA_hypotheses_"
+            "explicitly_excluded"
+        ),
+        "universe_source": (
+            "deep_rebuilt_signed_108_compatibility_decisions_plus_fixed_contrasts"
+        ),
+        "formal_source": (
+            "deep_rebuilt_signed_E0_final_materialization_coverage_terminal_"
+            "and_native_ITL_proofs"
+        ),
+        "independent_unit": "paired_final_block",
+        "reporting_load": "common_slo_load",
+        "bootstrap_repetitions": E0_BREADTH_BOOTSTRAP_REPETITIONS,
+        "bootstrap_seed": E0_BREADTH_BOOTSTRAP_SEED,
+        "contrast_scale": (
+            "paired_absolute_slo_goodput_tps_difference_zero_is_measured"
+        ),
+        "goodput": (
+            "individually_slo_qualified_output_tokens_per_native_scored_window"
+        ),
+        "slo_policy": (
+            "all_task_native_scored_requests_eligible;prompt_bucket_from_input_"
+            "tokens;native_TTFT_and_within_request_p99_ITL"
+        ),
+        "formal_lightcone": "seal_bound_materialization_only",
+        "primary_family": "forbidden",
+    }
+)
+
+_FORMAL_ROLE_TO_METHOD = {
+    "Target-only": "target_only",
+    "Static": "static",
+    "TTS": "tts",
+    "L0-naive": "l0_naive",
+    "LightCone": "lightcone",
+    "OnlineSPEC-OGD": "onlinespec_ogd",
+    "OnlineSPEC-OPT": "onlinespec_opt",
+    "OnlineSPEC-ENS": "onlinespec_ens",
+    "OnlineSPEC-Optimistic-OGD": "onlinespec_opt",
+    "OnlineSPEC-Hedge": "onlinespec_ens",
+}
 
 
 class E0BreadthFdrAuthorityBlocked(RuntimeError):
@@ -206,6 +269,122 @@ class E0BreadthHypothesis:
             "denominator_cell_id": self.denominator_cell_id,
             "denominator_cell_sha256": self.denominator_cell_sha256,
         }
+
+
+@dataclass(frozen=True)
+class E0FormalBreadthHypothesis:
+    """E0 hypothesis derived from signed compatibility, not legacy templates."""
+
+    family_id: E0BreadthFamilyId
+    hypothesis_id: str
+    compatibility_decision_id: str
+    compatibility_decision_sha256: str
+    model: str
+    backend: str
+    task: str
+    contrast: str
+    numerator_method: str
+    denominator_method: str
+
+    def __post_init__(self) -> None:
+        if self.family_id not in {
+            "e0_core_breadth",
+            "e0_isolated_onlinespec_breadth",
+        }:
+            raise ValueError("formal E0 breadth family is not registered")
+        for label, value in (
+            ("compatibility decision", self.compatibility_decision_id),
+            ("compatibility declaration", self.compatibility_decision_sha256),
+        ):
+            _require_sha256(f"formal E0 breadth {label}", value)
+        for label, value in (
+            ("model", self.model),
+            ("backend", self.backend),
+            ("task", self.task),
+            ("contrast", self.contrast),
+            ("numerator method", self.numerator_method),
+            ("denominator method", self.denominator_method),
+        ):
+            _require_text(f"formal E0 breadth {label}", value)
+        expected = content_sha256(
+            {
+                "schema_version": 1,
+                "family_id": self.family_id,
+                "compatibility_decision_id": self.compatibility_decision_id,
+                "compatibility_decision_sha256": (self.compatibility_decision_sha256),
+                "model": self.model,
+                "backend": self.backend,
+                "task": self.task,
+                "contrast": self.contrast,
+                "numerator_method": self.numerator_method,
+                "denominator_method": self.denominator_method,
+            }
+        )
+        if self.hypothesis_id != expected:
+            raise ValueError("formal E0 breadth hypothesis identity is not canonical")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "family_id": self.family_id,
+            "hypothesis_id": self.hypothesis_id,
+            "compatibility_decision_id": self.compatibility_decision_id,
+            "compatibility_decision_sha256": self.compatibility_decision_sha256,
+            "model": self.model,
+            "backend": self.backend,
+            "task": self.task,
+            "contrast": self.contrast,
+            "numerator_method": self.numerator_method,
+            "denominator_method": self.denominator_method,
+        }
+
+
+def registered_formal_e0_breadth_hypotheses(
+    projection: E0FinalAnalysisProjection,
+) -> tuple[E0FormalBreadthHypothesis, ...]:
+    """Derive all 756 hypotheses from the signed 108-row E0 decision set."""
+
+    if type(projection) is not E0FinalAnalysisProjection:
+        raise TypeError("formal E0 breadth universe requires an exact projection")
+    projection.__post_init__()
+    hypotheses: list[E0FormalBreadthHypothesis] = []
+    families: tuple[tuple[E0BreadthFamilyId, tuple[tuple[str, str, str], ...]], ...] = (
+        ("e0_core_breadth", _CORE_CONTRASTS),
+        ("e0_isolated_onlinespec_breadth", _ONLINESPEC_CONTRASTS),
+    )
+    for decision in projection.compatibility_decisions:
+        decision_sha256 = content_sha256(decision)
+        for family_id, contrasts in families:
+            for contrast, numerator_method, denominator_method in contrasts:
+                payload = {
+                    "schema_version": 1,
+                    "family_id": family_id,
+                    "compatibility_decision_id": decision.decision_id,
+                    "compatibility_decision_sha256": decision_sha256,
+                    "model": decision.model,
+                    "backend": decision.backend,
+                    "task": decision.task,
+                    "contrast": contrast,
+                    "numerator_method": numerator_method,
+                    "denominator_method": denominator_method,
+                }
+                hypotheses.append(
+                    E0FormalBreadthHypothesis(
+                        family_id=family_id,
+                        hypothesis_id=content_sha256(payload),
+                        compatibility_decision_id=decision.decision_id,
+                        compatibility_decision_sha256=decision_sha256,
+                        model=decision.model,
+                        backend=decision.backend,
+                        task=decision.task,
+                        contrast=contrast,
+                        numerator_method=numerator_method,
+                        denominator_method=denominator_method,
+                    )
+                )
+    result = tuple(sorted(hypotheses, key=lambda row: row.hypothesis_id))
+    if len(result) != 756 or len({row.hypothesis_id for row in result}) != 756:
+        raise AssertionError("formal E0 breadth hypothesis count changed")
+    return result
 
 
 def _hypothesis(
@@ -392,7 +571,7 @@ class E0BreadthFdrAuthority:
             ("breadth hypotheses", self.hypotheses_sha256),
         ):
             _require_sha256(label, value)
-        if self.protocol_sha256 != E0_BREADTH_FDR_PROTOCOL_SHA256:
+        if self.protocol_sha256 != E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256:
             raise ValueError("E0 breadth authority uses another protocol")
         if self.false_discovery_rate != E0_BREADTH_FALSE_DISCOVERY_RATE:
             raise ValueError("E0 breadth false-discovery rate is preregistered")
@@ -495,7 +674,7 @@ class E0BreadthFdrReduction:
             ("breadth reduction hypotheses", self.hypotheses_sha256),
         ):
             _require_sha256(label, value)
-        if self.protocol_sha256 != E0_BREADTH_FDR_PROTOCOL_SHA256:
+        if self.protocol_sha256 != E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256:
             raise ValueError("E0 breadth reduction uses another protocol")
         if self.families != (
             "e0_core_breadth",
@@ -530,6 +709,451 @@ class E0BreadthFdrReduction:
     @cached_property
     def sha256(self) -> str:
         return content_sha256(self.to_dict())
+
+
+@dataclass(frozen=True)
+class E0PairedSloGoodputContrast:
+    """Paired absolute SLO-goodput effect; measured zero remains observable."""
+
+    name: str
+    block_ids: tuple[str, ...]
+    mean_difference_tps: float
+    ci_lower_difference_tps: float
+    ci_upper_difference_tps: float
+    raw_p_value: float
+    confidence: Literal[0.95]
+    independent_unit: Literal["paired_block"] = "paired_block"
+    metric: Literal["slo_goodput_tps"] = "slo_goodput_tps"
+
+    def __post_init__(self) -> None:
+        _require_sha256("formal E0 contrast hypothesis", self.name)
+        if (
+            type(self.block_ids) is not tuple
+            or len(self.block_ids) < 12
+            or self.block_ids != tuple(sorted(set(self.block_ids)))
+        ):
+            raise ValueError("formal E0 contrast block coverage is not exact")
+        for label, value in (
+            ("mean", self.mean_difference_tps),
+            ("lower", self.ci_lower_difference_tps),
+            ("upper", self.ci_upper_difference_tps),
+            ("p-value", self.raw_p_value),
+        ):
+            if type(value) is not float or not math.isfinite(value):
+                raise ValueError(f"formal E0 contrast {label} is not finite")
+        if (
+            not 0.0 <= self.raw_p_value <= 1.0
+            or self.ci_lower_difference_tps > self.ci_upper_difference_tps
+            or self.confidence != 0.95
+            or self.independent_unit != "paired_block"
+            or self.metric != "slo_goodput_tps"
+        ):
+            raise ValueError("formal E0 contrast protocol differs")
+
+
+def _paired_slo_goodput_contrast(
+    name: str,
+    paired_goodput: Mapping[str, tuple[float, float]],
+) -> E0PairedSloGoodputContrast:
+    block_ids = tuple(sorted(paired_goodput))
+    if len(block_ids) < 12:
+        raise ValueError("formal E0 contrast requires the powered final prefix")
+    differences = []
+    for block_id in block_ids:
+        pair = paired_goodput[block_id]
+        if len(pair) != 2 or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+            for value in pair
+        ):
+            raise ValueError("formal E0 SLO-goodput pair is invalid")
+        differences.append(float(pair[0]) - float(pair[1]))
+    cluster_values = {
+        block_id: np.asarray([difference], dtype=np.float64)
+        for block_id, difference in zip(block_ids, differences, strict=True)
+    }
+    mean, lower, upper = bca_mean_interval(
+        cluster_values,
+        confidence=0.95,
+        repetitions=E0_BREADTH_BOOTSTRAP_REPETITIONS,
+        seed=E0_BREADTH_BOOTSTRAP_SEED,
+    )
+    values = np.asarray(differences, dtype=np.float64)
+    standard_deviation = float(np.std(values, ddof=1))
+    if standard_deviation <= np.finfo(np.float64).tiny:
+        raw_p_value = 1.0 if abs(mean) <= np.finfo(np.float64).eps else 0.0
+    else:
+        statistic = mean / (standard_deviation / math.sqrt(values.size))
+        raw_p_value = float(2.0 * student_t.sf(abs(statistic), values.size - 1))
+    return E0PairedSloGoodputContrast(
+        name=name,
+        block_ids=block_ids,
+        mean_difference_tps=float(mean),
+        ci_lower_difference_tps=float(lower),
+        ci_upper_difference_tps=float(upper),
+        raw_p_value=raw_p_value,
+        confidence=0.95,
+    )
+
+
+@dataclass(frozen=True)
+class E0FormalBreadthHypothesisResult:
+    """One preregistered E0 hypothesis after proof-derived eligibility."""
+
+    hypothesis: E0FormalBreadthHypothesis
+    compatibility_decision_id: str
+    status: Literal["TESTED", "EXCLUDED_NA"]
+    exclusion_reason: str | None
+    numerator_terminal_sha256s: tuple[str, ...]
+    denominator_terminal_sha256s: tuple[str, ...]
+    contrast: E0PairedSloGoodputContrast | None
+    contrast_artifact_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.hypothesis) is not E0FormalBreadthHypothesis:
+            raise TypeError("formal E0 breadth hypothesis must be exact")
+        self.hypothesis.__post_init__()
+        _require_sha256(
+            "formal E0 breadth compatibility decision",
+            self.compatibility_decision_id,
+        )
+        if self.status == "EXCLUDED_NA":
+            if (
+                not isinstance(self.exclusion_reason, str)
+                or not self.exclusion_reason
+                or self.numerator_terminal_sha256s
+                or self.denominator_terminal_sha256s
+                or self.contrast is not None
+                or self.contrast_artifact_sha256 is not None
+            ):
+                raise ValueError("excluded E0 breadth hypothesis is not explicit")
+            return
+        if self.status != "TESTED":
+            raise ValueError("formal E0 breadth hypothesis status is unsupported")
+        if self.exclusion_reason is not None:
+            raise ValueError("tested E0 breadth hypothesis cannot be excluded")
+        if (
+            type(self.numerator_terminal_sha256s) is not tuple
+            or type(self.denominator_terminal_sha256s) is not tuple
+            or len(self.numerator_terminal_sha256s) < 12
+            or len(self.numerator_terminal_sha256s)
+            != len(self.denominator_terminal_sha256s)
+            or any(
+                _SHA256.fullmatch(value) is None
+                for value in (
+                    *self.numerator_terminal_sha256s,
+                    *self.denominator_terminal_sha256s,
+                )
+            )
+            or any(
+                numerator == denominator
+                for numerator, denominator in zip(
+                    self.numerator_terminal_sha256s,
+                    self.denominator_terminal_sha256s,
+                    strict=True,
+                )
+            )
+            or type(self.contrast) is not E0PairedSloGoodputContrast
+        ):
+            raise ValueError("tested E0 breadth proof coverage is not exact")
+        assert self.contrast is not None
+        if (
+            self.contrast.name != self.hypothesis.hypothesis_id
+            or self.contrast.block_ids
+            != tuple(
+                sorted(
+                    f"block:{index}"
+                    for index in range(
+                        4,
+                        4 + len(self.numerator_terminal_sha256s),
+                    )
+                )
+            )
+            or self.contrast.independent_unit != "paired_block"
+            or self.contrast.confidence != 0.95
+        ):
+            raise ValueError("formal E0 breadth contrast changed its protocol")
+        expected = content_sha256(
+            {
+                "schema_version": 1,
+                "hypothesis_id": self.hypothesis.hypothesis_id,
+                "compatibility_decision_id": self.compatibility_decision_id,
+                "numerator_terminal_sha256s": self.numerator_terminal_sha256s,
+                "denominator_terminal_sha256s": self.denominator_terminal_sha256s,
+                "contrast": asdict(self.contrast),
+            }
+        )
+        if self.contrast_artifact_sha256 != expected:
+            raise ValueError("formal E0 breadth contrast identity differs")
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+@dataclass(frozen=True)
+class E0FormalBreadthFdrReceipt:
+    """Formal BH result derived only from a complete E0 proof projection."""
+
+    schema_version: Literal[1]
+    kind: Literal["e0_formal_breadth_fdr_receipt"]
+    registry_sha256: str
+    protocol_sha256: str
+    final_completion_receipt_sha256: str
+    final_analysis_projection_sha256: str
+    hypotheses_sha256: str
+    hypotheses: tuple[E0FormalBreadthHypothesisResult, ...]
+    decisions: tuple[E0BreadthFdrDecision, ...]
+    primary_family_eligible: Literal[False]
+    formal_result_authorized: Literal[True]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != "e0_formal_breadth_fdr_receipt":
+            raise ValueError("formal E0 breadth FDR receipt schema is unsupported")
+        for label, digest in (
+            ("registry", self.registry_sha256),
+            ("protocol", self.protocol_sha256),
+            ("final completion", self.final_completion_receipt_sha256),
+            ("final projection", self.final_analysis_projection_sha256),
+            ("hypothesis universe", self.hypotheses_sha256),
+        ):
+            _require_sha256(f"formal E0 breadth {label}", digest)
+        if self.protocol_sha256 != E0_BREADTH_FDR_PROTOCOL_SHA256:
+            raise ValueError("formal E0 breadth FDR protocol differs")
+        ids = tuple(row.hypothesis.hypothesis_id for row in self.hypotheses)
+        if (
+            type(self.hypotheses) is not tuple
+            or len(self.hypotheses) != 756
+            or ids != tuple(sorted(set(ids)))
+            or any(
+                type(row) is not E0FormalBreadthHypothesisResult
+                for row in self.hypotheses
+            )
+        ):
+            raise ValueError("formal E0 breadth hypothesis coverage is incomplete")
+        if self.hypotheses_sha256 != content_sha256(
+            [row.hypothesis.to_dict() for row in self.hypotheses]
+        ):
+            raise ValueError("formal E0 breadth hypothesis universe digest differs")
+        tested = {
+            row.hypothesis.hypothesis_id: row
+            for row in self.hypotheses
+            if row.status == "TESTED"
+        }
+        decision_ids = tuple(row.hypothesis_id for row in self.decisions)
+        if (
+            decision_ids != tuple(sorted(tested))
+            or any(type(row) is not E0BreadthFdrDecision for row in self.decisions)
+            or any(
+                row.contrast_artifact_sha256
+                != tested[row.hypothesis_id].contrast_artifact_sha256
+                for row in self.decisions
+            )
+        ):
+            raise ValueError("formal E0 breadth FDR decision coverage differs")
+        if self.primary_family_eligible is not False:
+            raise ValueError("E0 breadth findings cannot enter the primary family")
+        if self.formal_result_authorized is not True:
+            raise ValueError(
+                "proof-derived E0 breadth receipt must authorize its result"
+            )
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(self)
+
+
+@dataclass(frozen=True)
+class SignedE0FormalBreadthFdrReceipt:
+    payload: E0FormalBreadthFdrReceipt
+    payload_sha256: str
+    challenge: AttestationChallenge
+    attestation: SignedAttestation
+
+    def verify(
+        self,
+        *,
+        registry: ExperimentRegistry,
+        final_result_rebuild_artifact_path: str | Path,
+        policy: TrustedAttesterPolicy,
+        expected_policy_sha256: str,
+        now_ns: int,
+    ) -> E0FormalBreadthFdrReceipt:
+        if type(self.payload) is not E0FormalBreadthFdrReceipt:
+            raise TypeError("signed formal E0 breadth payload must be exact")
+        expected = reduce_formal_e0_breadth_fdr_from_artifact(
+            registry,
+            final_result_rebuild_artifact_path,
+            now_ns=now_ns,
+        )
+        if self.payload != expected:
+            raise ValueError(
+                "signed formal E0 breadth result differs from proof reducer"
+            )
+        verify_signed_payload(
+            self.payload,
+            payload_sha256=self.payload_sha256,
+            challenge=self.challenge,
+            attestation=self.attestation,
+            policy=policy,
+            expected_policy_sha256=expected_policy_sha256,
+            now_ns=now_ns,
+        )
+        return self.payload
+
+    @cached_property
+    def sha256(self) -> str:
+        return content_sha256(
+            {
+                "payload": asdict(self.payload),
+                "payload_sha256": self.payload_sha256,
+                "challenge": asdict(self.challenge),
+                "attestation": asdict(self.attestation),
+            }
+        )
+
+
+def formal_e0_breadth_fdr_receipt_to_dict(
+    value: E0FormalBreadthFdrReceipt,
+) -> dict[str, object]:
+    if type(value) is not E0FormalBreadthFdrReceipt:
+        raise TypeError("formal E0 breadth codec requires an exact receipt")
+    value.__post_init__()
+    return {**asdict(value), "receipt_sha256": value.sha256}
+
+
+def formal_e0_breadth_fdr_receipt_from_dict(
+    value: object,
+) -> E0FormalBreadthFdrReceipt:
+    row = dict(_strict_mapping("formal E0 breadth receipt", value))
+    _strict_keys(
+        "formal E0 breadth receipt",
+        row,
+        {*E0FormalBreadthFdrReceipt.__dataclass_fields__, "receipt_sha256"},
+    )
+    declared = _require_sha256("formal E0 breadth receipt", row.pop("receipt_sha256"))
+    hypotheses = []
+    for value_row in _strict_sequence(
+        "formal E0 breadth hypothesis results", row["hypotheses"]
+    ):
+        result_row = dict(
+            _strict_mapping("formal E0 breadth hypothesis result", value_row)
+        )
+        _strict_keys(
+            "formal E0 breadth hypothesis result",
+            result_row,
+            set(E0FormalBreadthHypothesisResult.__dataclass_fields__),
+        )
+        hypothesis_row = dict(
+            _strict_mapping("formal E0 breadth hypothesis", result_row["hypothesis"])
+        )
+        _strict_keys(
+            "formal E0 breadth hypothesis",
+            hypothesis_row,
+            set(E0FormalBreadthHypothesis.__dataclass_fields__),
+        )
+        result_row["hypothesis"] = E0FormalBreadthHypothesis(**hypothesis_row)
+        for name in (
+            "numerator_terminal_sha256s",
+            "denominator_terminal_sha256s",
+        ):
+            result_row[name] = tuple(
+                _strict_sequence(f"formal E0 breadth {name}", result_row[name])
+            )
+        if result_row["contrast"] is not None:
+            contrast_row = dict(
+                _strict_mapping("formal E0 breadth contrast", result_row["contrast"])
+            )
+            _strict_keys(
+                "formal E0 breadth contrast",
+                contrast_row,
+                set(E0PairedSloGoodputContrast.__dataclass_fields__),
+            )
+            contrast_row["block_ids"] = tuple(
+                _strict_sequence(
+                    "formal E0 breadth contrast blocks",
+                    contrast_row["block_ids"],
+                )
+            )
+            result_row["contrast"] = E0PairedSloGoodputContrast(**contrast_row)
+        hypotheses.append(E0FormalBreadthHypothesisResult(**result_row))
+    decisions = []
+    for value_row in _strict_sequence("formal E0 breadth decisions", row["decisions"]):
+        decision_row = dict(_strict_mapping("formal E0 breadth decision", value_row))
+        _strict_keys(
+            "formal E0 breadth decision",
+            decision_row,
+            set(E0BreadthFdrDecision.__dataclass_fields__),
+        )
+        decisions.append(E0BreadthFdrDecision(**decision_row))
+    row["hypotheses"] = tuple(hypotheses)
+    row["decisions"] = tuple(decisions)
+    receipt = E0FormalBreadthFdrReceipt(**row)  # type: ignore[arg-type]
+    if receipt.sha256 != declared:
+        raise ValueError("formal E0 breadth receipt digest differs from content")
+    return receipt
+
+
+def signed_formal_e0_breadth_fdr_to_dict(
+    value: SignedE0FormalBreadthFdrReceipt,
+) -> dict[str, object]:
+    if type(value) is not SignedE0FormalBreadthFdrReceipt:
+        raise TypeError("signed formal E0 breadth codec requires an exact wrapper")
+    return {
+        "payload": formal_e0_breadth_fdr_receipt_to_dict(value.payload),
+        "payload_sha256": value.payload_sha256,
+        "challenge": asdict(value.challenge),
+        "attestation": asdict(value.attestation),
+        "signed_receipt_sha256": value.sha256,
+    }
+
+
+def signed_formal_e0_breadth_fdr_from_dict(
+    value: object,
+) -> SignedE0FormalBreadthFdrReceipt:
+    row = dict(_strict_mapping("signed formal E0 breadth receipt", value))
+    _strict_keys(
+        "signed formal E0 breadth receipt",
+        row,
+        {
+            "payload",
+            "payload_sha256",
+            "challenge",
+            "attestation",
+            "signed_receipt_sha256",
+        },
+    )
+    declared = _require_sha256(
+        "signed formal E0 breadth receipt",
+        row.pop("signed_receipt_sha256"),
+    )
+    challenge_row = dict(
+        _strict_mapping("formal E0 breadth challenge", row["challenge"])
+    )
+    attestation_row = dict(
+        _strict_mapping("formal E0 breadth attestation", row["attestation"])
+    )
+    _strict_keys(
+        "formal E0 breadth challenge",
+        challenge_row,
+        set(AttestationChallenge.__dataclass_fields__),
+    )
+    _strict_keys(
+        "formal E0 breadth attestation",
+        attestation_row,
+        set(SignedAttestation.__dataclass_fields__),
+    )
+    signed = SignedE0FormalBreadthFdrReceipt(
+        payload=formal_e0_breadth_fdr_receipt_from_dict(row["payload"]),
+        payload_sha256=row["payload_sha256"],  # type: ignore[arg-type]
+        challenge=AttestationChallenge(**challenge_row),
+        attestation=SignedAttestation(**attestation_row),
+    )
+    if signed.sha256 != declared:
+        raise ValueError("signed formal E0 breadth digest differs from content")
+    return signed
 
 
 def _read_stable_raw(path_value: str | Path) -> tuple[Path, bytes]:
@@ -666,7 +1290,7 @@ def bind_e0_breadth_fdr_authority(
         source["schema_version"] != 1
         or source["kind"] != "e0_breadth_raw_p_values"
         or source["registry_sha256"] != registry.sha256
-        or source["protocol_sha256"] != E0_BREADTH_FDR_PROTOCOL_SHA256
+        or source["protocol_sha256"] != E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256
         or source["false_discovery_rate"] != E0_BREADTH_FALSE_DISCOVERY_RATE
         or source["hypotheses_sha256"] != hypotheses_sha256
     ):
@@ -710,7 +1334,7 @@ def bind_e0_breadth_fdr_authority(
         schema_version=1,
         kind="e0_breadth_fdr_authority",
         registry_sha256=registry.sha256,
-        protocol_sha256=E0_BREADTH_FDR_PROTOCOL_SHA256,
+        protocol_sha256=E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256,
         raw_source_path=str(path),
         raw_source_sha256=hashlib.sha256(raw).hexdigest(),
         false_discovery_rate=E0_BREADTH_FALSE_DISCOVERY_RATE,
@@ -732,23 +1356,217 @@ def revalidate_e0_breadth_fdr_authority(
     return rebound
 
 
+def _formal_breadth_result(
+    *,
+    hypothesis: E0FormalBreadthHypothesis,
+    projection: E0FinalAnalysisProjection,
+    decision_id: str,
+    decision_reason: str | None,
+) -> E0FormalBreadthHypothesisResult:
+    if decision_reason is not None:
+        return E0FormalBreadthHypothesisResult(
+            hypothesis=hypothesis,
+            compatibility_decision_id=decision_id,
+            status="EXCLUDED_NA",
+            exclusion_reason=decision_reason,
+            numerator_terminal_sha256s=(),
+            denominator_terminal_sha256s=(),
+            contrast=None,
+            contrast_artifact_sha256=None,
+        )
+    by_key = {
+        (row.method_role, row.block, row.load): row
+        for row in projection.cells
+        if row.compatibility_decision_id == decision_id
+    }
+    numerator_role = next(
+        role
+        for role, method in _FORMAL_ROLE_TO_METHOD.items()
+        if method == hypothesis.numerator_method
+    )
+    denominator_role = next(
+        role
+        for role, method in _FORMAL_ROLE_TO_METHOD.items()
+        if method == hypothesis.denominator_method
+    )
+    blocks = projection.completion_receipt.selected_final_prefix
+    numerator_rows = tuple(
+        by_key[(numerator_role, block, "common_slo_load")] for block in blocks
+    )
+    denominator_rows = tuple(
+        by_key[(denominator_role, block, "common_slo_load")] for block in blocks
+    )
+    paired_goodput = {
+        f"block:{block}": (
+            numerator.slo_goodput_tps,
+            denominator.slo_goodput_tps,
+        )
+        for block, numerator, denominator in zip(
+            blocks,
+            numerator_rows,
+            denominator_rows,
+            strict=True,
+        )
+    }
+    contrast = _paired_slo_goodput_contrast(
+        hypothesis.hypothesis_id,
+        paired_goodput,
+    )
+    numerator_terminals = tuple(row.terminal_receipt_sha256 for row in numerator_rows)
+    denominator_terminals = tuple(
+        row.terminal_receipt_sha256 for row in denominator_rows
+    )
+    contrast_artifact_sha256 = content_sha256(
+        {
+            "schema_version": 1,
+            "hypothesis_id": hypothesis.hypothesis_id,
+            "compatibility_decision_id": decision_id,
+            "numerator_terminal_sha256s": numerator_terminals,
+            "denominator_terminal_sha256s": denominator_terminals,
+            "contrast": asdict(contrast),
+        }
+    )
+    return E0FormalBreadthHypothesisResult(
+        hypothesis=hypothesis,
+        compatibility_decision_id=decision_id,
+        status="TESTED",
+        exclusion_reason=None,
+        numerator_terminal_sha256s=numerator_terminals,
+        denominator_terminal_sha256s=denominator_terminals,
+        contrast=contrast,
+        contrast_artifact_sha256=contrast_artifact_sha256,
+    )
+
+
+def reduce_formal_e0_breadth_fdr_from_projection(
+    registry: ExperimentRegistry,
+    projection: E0FinalAnalysisProjection,
+) -> E0FormalBreadthFdrReceipt:
+    """Reduce one already deep-validated E0 final projection."""
+
+    if type(projection) is not E0FinalAnalysisProjection:
+        raise TypeError("formal E0 breadth reducer requires an exact projection")
+    projection.__post_init__()
+    if projection.completion_receipt.registry_sha256 != registry.sha256:
+        raise ValueError("formal E0 breadth projection uses a foreign registry")
+    hypotheses = registered_formal_e0_breadth_hypotheses(projection)
+    compatibility = {
+        (row.model, row.backend, row.task): row
+        for row in projection.compatibility_decisions
+    }
+    results = []
+    for hypothesis in hypotheses:
+        decision = compatibility[
+            (hypothesis.model, hypothesis.backend, hypothesis.task)
+        ]
+        if (
+            decision.decision_id != hypothesis.compatibility_decision_id
+            or content_sha256(decision) != hypothesis.compatibility_decision_sha256
+        ):
+            raise ValueError("formal E0 breadth compatibility identity changed")
+        results.append(
+            _formal_breadth_result(
+                hypothesis=hypothesis,
+                projection=projection,
+                decision_id=decision.decision_id,
+                decision_reason=(
+                    None if decision.disposition == "VALID" else decision.reason_code
+                ),
+            )
+        )
+    ordered_results = tuple(
+        sorted(results, key=lambda row: row.hypothesis.hypothesis_id)
+    )
+    fdr_decisions = []
+    for family_id in (
+        "e0_core_breadth",
+        "e0_isolated_onlinespec_breadth",
+    ):
+        family = tuple(
+            row
+            for row in ordered_results
+            if row.hypothesis.family_id == family_id and row.status == "TESTED"
+        )
+        if not family:
+            continue
+        adjusted = benjamini_hochberg(
+            {
+                row.hypothesis.hypothesis_id: row.contrast.raw_p_value
+                for row in family
+                if row.contrast is not None
+            },
+            false_discovery_rate=E0_BREADTH_FALSE_DISCOVERY_RATE,
+        )
+        by_id = {row.hypothesis.hypothesis_id: row for row in family}
+        for decision in adjusted:
+            source = by_id[decision.name]
+            assert source.contrast_artifact_sha256 is not None
+            fdr_decisions.append(
+                E0BreadthFdrDecision(
+                    family_id=source.hypothesis.family_id,
+                    hypothesis_id=decision.name,
+                    raw_p_value=decision.raw_p_value,
+                    q_value=decision.adjusted_p_value,
+                    rejected=decision.rejected,
+                    procedure="benjamini-hochberg",
+                    false_discovery_rate=E0_BREADTH_FALSE_DISCOVERY_RATE,
+                    contrast_artifact_sha256=source.contrast_artifact_sha256,
+                )
+            )
+    receipt = E0FormalBreadthFdrReceipt(
+        schema_version=1,
+        kind="e0_formal_breadth_fdr_receipt",
+        registry_sha256=registry.sha256,
+        protocol_sha256=E0_BREADTH_FDR_PROTOCOL_SHA256,
+        final_completion_receipt_sha256=projection.completion_receipt.sha256,
+        final_analysis_projection_sha256=projection.sha256,
+        hypotheses_sha256=content_sha256(
+            [hypothesis.to_dict() for hypothesis in hypotheses]
+        ),
+        hypotheses=ordered_results,
+        decisions=tuple(
+            sorted(fdr_decisions, key=lambda decision: decision.hypothesis_id)
+        ),
+        primary_family_eligible=False,
+        formal_result_authorized=True,
+    )
+    receipt.__post_init__()
+    return receipt
+
+
+def reduce_formal_e0_breadth_fdr_from_artifact(
+    registry: ExperimentRegistry,
+    final_result_rebuild_artifact_path: str | Path,
+    *,
+    now_ns: int,
+) -> E0FormalBreadthFdrReceipt:
+    """Deep-rebuild the final proof DAG before deriving any p-value."""
+
+    projection = rebuild_e0_final_analysis_projection_from_artifact(
+        final_result_rebuild_artifact_path,
+        now_ns=now_ns,
+    )
+    return reduce_formal_e0_breadth_fdr_from_projection(registry, projection)
+
+
 def require_formal_e0_breadth_fdr_authority(
     registry: ExperimentRegistry,
-    raw_source_path: str | Path,
-) -> E0BreadthFdrAuthority:
-    """Require a release-owned E0 raw source before any file-system read.
+    final_result_rebuild_artifact_path: str | Path,
+    *,
+    now_ns: int,
+) -> E0FormalBreadthFdrReceipt:
+    """Deep-rebuild E0 final proofs and derive the registered FDR receipt.
 
-    The release allowlist is intentionally empty today.  This entry point is
-    therefore a named, pre-side-effect BLOCK rather than a way for a caller to
-    bless a self-reported p-value artifact.
+    The formal path deliberately does not accept raw p-values.  The only
+    numerical source is the path-bound E0 final proof DAG, which is reopened by
+    the same reducer used for the completion receipt.
     """
 
-    if not E0_BREADTH_RELEASE_TRUSTED_RAW_SOURCE_SHA256:
-        raise E0BreadthFdrAuthorityBlocked(E0_BREADTH_FORMAL_SOURCE_UNAVAILABLE_REASON)
-    authority = bind_e0_breadth_fdr_authority(registry, raw_source_path)
-    if authority.raw_source_sha256 not in E0_BREADTH_RELEASE_TRUSTED_RAW_SOURCE_SHA256:
-        raise E0BreadthFdrAuthorityBlocked("e0_breadth_raw_source_not_release_trusted")
-    return authority
+    return reduce_formal_e0_breadth_fdr_from_artifact(
+        registry,
+        final_result_rebuild_artifact_path,
+        now_ns=now_ns,
+    )
 
 
 def reduce_e0_breadth_fdr(
@@ -795,7 +1613,7 @@ def reduce_e0_breadth_fdr(
         schema_version=1,
         kind="e0_breadth_fdr_reduction",
         registry_sha256=registry.sha256,
-        protocol_sha256=E0_BREADTH_FDR_PROTOCOL_SHA256,
+        protocol_sha256=E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256,
         authority_sha256=bound.sha256,
         raw_source_sha256=bound.raw_source_sha256,
         hypotheses_sha256=bound.hypotheses_sha256,
@@ -810,20 +1628,34 @@ def reduce_e0_breadth_fdr(
 
 
 __all__ = [
+    "E0_BREADTH_BOOTSTRAP_REPETITIONS",
+    "E0_BREADTH_BOOTSTRAP_SEED",
     "E0_BREADTH_FALSE_DISCOVERY_RATE",
     "E0_BREADTH_FDR_PROTOCOL_SHA256",
     "E0_BREADTH_FORMAL_SOURCE_UNAVAILABLE_REASON",
+    "E0_BREADTH_LEGACY_DIAGNOSTIC_PROTOCOL_SHA256",
     "E0_BREADTH_RAW_SOURCE_MISSING_REASON",
-    "E0_BREADTH_RELEASE_TRUSTED_RAW_SOURCE_SHA256",
     "E0BreadthFdrAuthority",
     "E0BreadthFdrAuthorityBlocked",
     "E0BreadthFdrDecision",
     "E0BreadthFdrReduction",
     "E0BreadthHypothesis",
     "E0BreadthRawPValue",
+    "E0FormalBreadthFdrReceipt",
+    "E0FormalBreadthHypothesis",
+    "E0FormalBreadthHypothesisResult",
+    "E0PairedSloGoodputContrast",
+    "SignedE0FormalBreadthFdrReceipt",
     "bind_e0_breadth_fdr_authority",
+    "formal_e0_breadth_fdr_receipt_from_dict",
+    "formal_e0_breadth_fdr_receipt_to_dict",
     "reduce_e0_breadth_fdr",
+    "reduce_formal_e0_breadth_fdr_from_artifact",
+    "reduce_formal_e0_breadth_fdr_from_projection",
     "registered_e0_breadth_hypotheses",
+    "registered_formal_e0_breadth_hypotheses",
     "require_formal_e0_breadth_fdr_authority",
     "revalidate_e0_breadth_fdr_authority",
+    "signed_formal_e0_breadth_fdr_from_dict",
+    "signed_formal_e0_breadth_fdr_to_dict",
 ]

@@ -9,11 +9,15 @@ import pytest
 from pydantic import ValidationError
 
 from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
-from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.execution import (
+    ControlledExecutionPolicy,
+    FixedAddressGraphExecutionPolicy,
+)
 from lightcone_spec.orchestration.executor import (
     _require_live_controlled_execution_policy,
 )
 from lightcone_spec.orchestration.runtime import _execution_argv
+from lightcone_spec.runtime.readiness import NATIVE_RUNTIME_RELEASE_CAPABILITY
 
 POLICY_SHA256 = "231ca57941f96b2cd1593f360137aa005bccc8145296c2f06d2a13cd23c02d2b"
 
@@ -94,6 +98,74 @@ def test_runtime_schema_and_role_argv_are_exact() -> None:
         RuntimeConfig(
             sampling_profile_sha256="a" * 64,
             execution_policy_sha256="b" * 64,
+        )
+
+
+def test_fixed_address_graph_policy_is_explicit_source_bound_and_rendered(
+    tmp_path: Path,
+) -> None:
+    capability_sha256 = NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+    policy = FixedAddressGraphExecutionPolicy(
+        native_runtime_release_capability_sha256=capability_sha256
+    )
+    policy.validate()
+    path = (tmp_path / "fixed-address-graph-policy.json").resolve()
+    policy.write(path)
+    assert FixedAddressGraphExecutionPolicy.load(path) == policy
+    runtime = RuntimeConfig(
+        sampling_profile_sha256="a" * 64,
+        cuda_graph_mode="fixed_address_publication_v1",
+        disable_cuda_graph=False,
+        native_graph_release_capability_sha256=capability_sha256,
+        execution_policy_sha256=policy.sha256,
+    )
+    assert _execution_argv(runtime, role="speculative") == [
+        "--context-length",
+        "40960",
+        "--random-seed",
+        "1",
+        "--disable-radix-cache",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--cuda-graph-max-bs-decode",
+        "1",
+        "--cuda-graph-bs-decode",
+        "1",
+        "--lightcone-fixed-address-publication-graph",
+        "--lightcone-graph-batch-sizes",
+        "1",
+        "--lightcone-disable-graph-eager-fallback",
+    ]
+    fields = policy.server_info_fields(role="speculative")
+    assert fields["disable_cuda_graph"] is False
+    assert fields["lightcone_fixed_address_publication_graph"] is True
+    assert fields["lightcone_graph_batch_sizes"] == [1]
+
+
+def test_fixed_address_graph_config_rejects_missing_or_foreign_source() -> None:
+    capability_sha256 = NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+    policy = FixedAddressGraphExecutionPolicy(
+        native_runtime_release_capability_sha256=capability_sha256
+    )
+    with pytest.raises(ValidationError, match="lacks source capability"):
+        RuntimeConfig(
+            sampling_profile_sha256="a" * 64,
+            cuda_graph_mode="fixed_address_publication_v1",
+            disable_cuda_graph=False,
+            execution_policy_sha256=policy.sha256,
+        )
+    with pytest.raises(ValidationError, match="lacks source capability"):
+        RuntimeConfig(
+            sampling_profile_sha256="a" * 64,
+            cuda_graph_mode="fixed_address_publication_v1",
+            disable_cuda_graph=False,
+            native_graph_release_capability_sha256="f" * 64,
+            execution_policy_sha256=policy.sha256,
+        )
+    with pytest.raises(ValidationError, match="cannot claim graph capability"):
+        RuntimeConfig(
+            sampling_profile_sha256="a" * 64,
+            native_graph_release_capability_sha256=capability_sha256,
         )
 
 

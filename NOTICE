@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: 8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163
-  Expected final tree: dfb60ab2e514defc6290fe8bacd179552dcd985e
+  Latest semantic patch SHA-256: 38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95
+  Expected final tree: c6571336b70cd5f0e0f609d731a65fa98fd7e0b2
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -18,12 +18,19 @@ resident optimizer choices, memory-bounded LoRA-coordinate Hedge decisions,
 versioned frozen-KV lifecycle, event-fenced fixed-address publication,
 memory accounting, and lower-level adaptation/evidence fields for the
 Static/TTS/L0 target study and isolated OnlineSPEC comparison. It also carries
-the server-provided ordered output token IDs through SGLang's official serving
+an exact single-GPU session-reset qualification suite; the remote suite emits
+unsigned raw evidence and never receives the offline release signing key. The
+series carries server-provided ordered output token IDs through SGLang's official serving
 benchmark adapter without retokenizing generated text, supports a caller-owned
 HTTP session, and implements the content-bound begin/reset/finalize terminal
-evidence hook for the limited TP1/DP1 DFlash surface. It also adds a
+evidence hook for the limited TP1/DP1 DFlash surface. Distributed finalize
+binds the complete ordered client lifecycle: only exact digest-bound,
+non-submitted scored IDs may omit native rank rows; every submitted request
+and every warmup request still requires matching native terminal evidence. It
+also adds a
 source-owned all-reset capability/state/receipt producer whose GPU semantics
-remain explicitly PENDING and whose failures require a fresh process. The
+remain `IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF` and whose failures require a
+fresh process. The
 third patch counts actual protocol connection create/close events on the
 supported single-tokenizer HTTP/1.1 uvicorn paths, binds cumulative process/
 generation/created/closed/current totals, and rejects scheduler counters,
@@ -45,6 +52,12 @@ The sixth patch makes draft-width accounting target-aware: Target-only keeps
 terminal speculative fields non-applicable and reports zero verified drafts in
 the numeric server-info view, while malformed speculative configurations still
 fail closed when their draft width is missing.
+The seventh patch binds distinct TP2 and two-replica TP1/DP2 control contracts.
+TP1/DP2 has no adaptation collective or cross-replica gradient averaging; both
+distributed modes remain implemented-pending-qualification until an exact
+locally root-authorized GPU proof exists. It also carries the first-party
+native ITL result pointer through the official benchmark output; the remote
+pointer and terminal remain unsigned raw evidence and cannot self-authorize.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

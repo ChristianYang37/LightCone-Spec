@@ -49,11 +49,13 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     WorkloadClass,
-    build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.stage_activation import (
-    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RegistryStageActivationArtifact,
+    RegistryStageDispositionStatus,
     materialize_registry_stage_activation,
     release_dispatch_rejection_reason,
 )
@@ -545,6 +547,7 @@ def _build_registry(tmp_path: Path) -> tuple[Path, ExperimentRegistry]:
         main(
             [
                 "build-industrial-registry",
+                "--legacy-diagnostic",
                 "--logical-gpu-slot",
                 "logical-test-slot-a",
                 "logical-test-slot-b",
@@ -1281,7 +1284,9 @@ def test_completion_contract_requires_exact_physical_assignment_schema3(
         )
 
 
-def test_preflight_stage_has_no_executable_compile_assignment(tmp_path: Path) -> None:
+def test_preflight_stage_uses_source_owned_nonserving_assignments(
+    tmp_path: Path,
+) -> None:
     bundle = _preflight_bundle(tmp_path)
     completed_path = bundle["completed_path"]
     assert isinstance(completed_path, Path)
@@ -1290,8 +1295,7 @@ def test_preflight_stage_has_no_executable_compile_assignment(tmp_path: Path) ->
     activation = bundle["activation"]
     assert isinstance(registry, ExperimentRegistry)
     assert isinstance(activation, RegistryStageActivationArtifact)
-    assert activation.status == "BLOCKED"
-    assert activation.activated_cell_ids == ()
+    assert activation.status == "AVAILABLE"
     compile_cell = next(
         cell
         for cell in registry.cells_for("preflight")
@@ -1300,23 +1304,25 @@ def test_preflight_stage_has_no_executable_compile_assignment(tmp_path: Path) ->
     compile_disposition = next(
         row for row in activation.dispositions if row.cell_id == compile_cell.cell_id
     )
-    assert (
-        compile_disposition.reason_code
-        == RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
-    )
-    assert not Path(compile_cell.resources.evidence_root).exists()
+    assert compile_disposition.status is RegistryStageDispositionStatus.ACTIVATED
+    assert compile_disposition.reason_code == "release_dispatchability_verified"
+    assert compile_cell.cell_id in activation.activated_cell_ids
+    assert Path(compile_cell.resources.evidence_root).is_dir()
     assert set(completed) == set(activation.activated_cell_ids)
     assert digest == _sha(bundle["completed"])
 
     forged_disposition = copy.deepcopy(bundle["completed"])
-    forged_disposition["rows"][0]["reason_code"] = "caller_claimed_success"
+    disposition_row = next(
+        row for row in forged_disposition["rows"] if row["status"] == "N/A"
+    )
+    disposition_row["reason_code"] = "caller_claimed_success"
     forged_path = tmp_path / "forged-disposition.json"
     _write_bound(forged_path, forged_disposition)
     with pytest.raises(ValueError, match="exact immutable disposition"):
         _validate_bundle(bundle, forged_path)
 
 
-def test_blocked_preflight_rejects_forged_activation_and_measured_rows(
+def test_preflight_rejects_forged_activation_and_excluded_rows(
     tmp_path: Path,
 ) -> None:
     bundle = _preflight_bundle(tmp_path)
@@ -1336,31 +1342,33 @@ def test_blocked_preflight_rejects_forged_activation_and_measured_rows(
     )
 
     forged_measured = copy.deepcopy(bundle["completed"])
-    compile_cell = next(
+    excluded_cell = next(
         cell
         for cell in registry.cells_for("preflight")
-        if cell.resources.workload_class is WorkloadClass.COMPILE
+        if cell.identity.task == "simultaneous_single_gpu_interference"
     )
-    compile_row = next(
-        row for row in forged_measured["rows"] if row["cell_id"] == compile_cell.cell_id
+    excluded_row = next(
+        row
+        for row in forged_measured["rows"]
+        if row["cell_id"] == excluded_cell.cell_id
     )
-    compile_row["status"] = "MEASURED"
+    excluded_row["status"] = "MEASURED"
     cases.append(
         (
-            "forged-compile-measured-row",
+            "forged-excluded-measured-row",
             forged_measured,
             "exact immutable disposition",
         )
     )
 
     forged_reason = copy.deepcopy(bundle["completed"])
-    compile_row = next(
-        row for row in forged_reason["rows"] if row["cell_id"] == compile_cell.cell_id
+    excluded_row = next(
+        row for row in forged_reason["rows"] if row["cell_id"] == excluded_cell.cell_id
     )
-    compile_row["reason_code"] = "caller_rehashed_compile_success"
+    excluded_row["reason_code"] = "caller_rehashed_compile_success"
     cases.append(
         (
-            "forged-compile-disposition",
+            "forged-excluded-disposition",
             forged_reason,
             "exact immutable disposition",
         )

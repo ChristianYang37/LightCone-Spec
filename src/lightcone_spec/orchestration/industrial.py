@@ -34,7 +34,10 @@ from lightcone_spec.experiments.registry import (
     content_sha256,
     serving_cell_rejection_reason,
 )
-from lightcone_spec.runtime.distributed import TopologyReceiptSet
+from lightcone_spec.runtime.distributed import (
+    TopologyReceiptSet,
+    registered_runtime_topology_mode,
+)
 
 if TYPE_CHECKING:
     from lightcone_spec.experiments.execution_semantics import CellExecutionSemantics
@@ -1038,6 +1041,9 @@ def _validate_topology(
         or topology.data_parallel_size != dp_size
     ):
         raise ValueError("topology receipt disagrees with the registry topology")
+    runtime_mode = registered_runtime_topology_mode(tp_size, dp_size, 1)
+    if topology.mode != runtime_mode:
+        raise ValueError("topology receipt has another registered runtime mode")
     if cell.resources.gpu_count != world_size:
         raise ValueError("cell GPU reservation does not match its topology")
     expected_port_count = 1 if world_size == 1 else 3
@@ -1071,9 +1077,13 @@ def _validate_topology(
         zip(configs, ordered_receipts, strict=True)
     ):
         runtime = config.runtime
+        # Re-run the model validator here so direct ``model_construct`` callers
+        # cannot bypass the source-owned distributed release table.
+        runtime.validate_topology()
         rank_topology = rank_receipt.topology
         if (
-            runtime.tensor_parallel_size != tp_size
+            runtime.topology_mode != runtime_mode
+            or runtime.tensor_parallel_size != tp_size
             or runtime.data_parallel_size != dp_size
             or runtime.tp_rank != rank_topology.tensor_parallel_rank
             or runtime.dp_rank != rank_topology.data_parallel_rank
@@ -1085,10 +1095,9 @@ def _validate_topology(
             or runtime.clock_identity != rank_topology.clock_id
         ):
             raise ValueError(f"rank {global_rank} RunConfig topology is not exact")
-        if runtime.process_group_backend != "nccl":
-            raise ValueError(
-                "industrial GPU serving requires process_group_backend=nccl"
-            )
+        expected_backend = "none" if runtime_mode == "tp1_dp2" else "nccl"
+        if runtime.process_group_backend != expected_backend:
+            raise ValueError("runtime backend differs from the topology control mode")
         if world_size > 1:
             if (
                 runtime.distributed_runtime_capability != "patched_two_gpu_v1"

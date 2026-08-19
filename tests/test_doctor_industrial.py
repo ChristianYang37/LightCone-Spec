@@ -6,6 +6,7 @@ import importlib
 import json
 import socket
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,16 @@ from lightcone_spec.doctor import (
     _parse_topology,
     doctor_report,
 )
+from lightcone_spec.experiments.registry import (
+    build_industrial_registry,
+    content_sha256,
+)
+from lightcone_spec.experiments.stage_capacity import (
+    STAGE_CAPACITY_GATE_PROTOCOL_SHA256,
+    StageCapacityGate,
+    StageCapacitySchedule,
+)
+from lightcone_spec.runtime.control_attestation import ControlArtifactAttestation
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MANIFEST = ROOT / "manifests/runtime/industrial_compatibility_v1.json"
@@ -327,6 +338,12 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                     "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
                 ),
             },
+            {
+                "file": ("0007-feat-spec-bind-distributed-runtime-readiness.patch"),
+                "sha256": (
+                    "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,
@@ -409,6 +426,204 @@ def test_doctor_emits_fail_for_incompatible_known_facts(monkeypatch, tmp_path) -
         assert report["checks"][name]["status"] == "FAIL"
 
 
+def _canonical_doctor_source(path: Path, value: object) -> Path:
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return path.resolve()
+
+
+def test_doctor_uses_path_bound_stage_capacity_below_100gb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sglang = tmp_path / "patched-sglang"
+    facts = _passing_facts(ROOT, sglang)
+    facts["disk"].update(
+        {
+            "used_bytes": 270_000_000_000,
+            "free_bytes": 30_000_000_000,
+        }
+    )
+    monkeypatch.setattr("lightcone_spec.doctor._collect_facts", lambda *_args: facts)
+    assert doctor_report(ROOT, sglang)["checks"]["disk"]["status"] == "FAIL"
+
+    gate_value = {"kind": "doctor-stage-capacity-fixture", "value": "gate"}
+    schedule_value = {
+        "kind": "doctor-stage-capacity-fixture",
+        "value": "schedule",
+    }
+    control_value = {"kind": "doctor-stage-capacity-fixture", "value": "control"}
+    gate_sha256 = content_sha256(gate_value)
+    schedule_sha256 = content_sha256(schedule_value)
+    control_sha256 = content_sha256(control_value)
+    activation_sha256 = "a" * 64
+    inventory_sha256 = "b" * 64
+    control_lineage_sha256 = "c" * 64
+    gate = SimpleNamespace(
+        schema_version=3,
+        experiment="preflight",
+        schedule_sha256=schedule_sha256,
+        mode="SIGNED_STAGE_ENVELOPE",
+        status="AVAILABLE",
+        reason_code="signed_stage_capacity_verified",
+        required_free_bytes=20_000_000_000,
+        observed_free_bytes=30_000_000_000,
+        retained_evidence_bytes=10_000_000_000,
+        maximum_concurrent_transient_bytes=5_000_000_000,
+        safety_margin_bytes=5_000_000_000,
+        sha256=gate_sha256,
+    )
+    schedule = SimpleNamespace(
+        sha256=schedule_sha256,
+        gpu_inventory_sha256=inventory_sha256,
+    )
+    control = SimpleNamespace(
+        sha256=control_sha256,
+        subject=SimpleNamespace(
+            artifact_type="capacity",
+            artifact_sha256=gate_sha256,
+            protocol_sha256=STAGE_CAPACITY_GATE_PROTOCOL_SHA256,
+            registry_sha256=build_industrial_registry().sha256,
+            lineage_sha256=control_lineage_sha256,
+        ),
+    )
+    monkeypatch.setattr(
+        StageCapacityGate,
+        "from_dict",
+        classmethod(lambda _cls, _value: gate),
+    )
+    monkeypatch.setattr(
+        StageCapacitySchedule,
+        "from_dict",
+        classmethod(lambda _cls, _value: schedule),
+    )
+    monkeypatch.setattr(
+        ControlArtifactAttestation,
+        "from_dict",
+        classmethod(lambda _cls, _value: control),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.stage_capacity.stage_capacity_control_lineage_sha256",
+        lambda **_kwargs: control_lineage_sha256,
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.runtime.control_attestation.verify_release_control_artifact_attestation",
+        lambda *_args, **_kwargs: SimpleNamespace(challenge_sha256="d" * 64),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.stage_capacity.revalidate_stage_capacity_gate_sources",
+        lambda *_args, **_kwargs: object(),
+    )
+    gate_path = _canonical_doctor_source(tmp_path / "capacity-gate.json", gate_value)
+    schedule_path = _canonical_doctor_source(
+        tmp_path / "capacity-schedule.json", schedule_value
+    )
+    control_path = _canonical_doctor_source(
+        tmp_path / "capacity-control.json", control_value
+    )
+    report = doctor_report(
+        ROOT,
+        sglang,
+        stage_capacity_gate_path=gate_path,
+        stage_capacity_schedule_path=schedule_path,
+        stage_capacity_attestation_path=control_path,
+        stage_capacity_activation_sha256=activation_sha256,
+        stage_capacity_now_ns=1,
+    )
+    assert report["checks"]["disk"]["status"] == "PASS"
+    assert report["checks"]["disk"]["expected"]["minimum_free_bytes"] == (
+        20_000_000_000
+    )
+    assert report["stage_capacity"]["gate_sha256"] == gate_sha256
+
+
+def test_doctor_never_falls_back_after_stage_capacity_tamper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sglang = tmp_path / "patched-sglang"
+    facts = _passing_facts(ROOT, sglang)
+    monkeypatch.setattr("lightcone_spec.doctor._collect_facts", lambda *_args: facts)
+    gate_value = {"kind": "doctor-stage-capacity-fixture", "value": "gate"}
+    schedule_value = {
+        "kind": "doctor-stage-capacity-fixture",
+        "value": "schedule",
+    }
+    control_value = {"kind": "doctor-stage-capacity-fixture", "value": "control"}
+    gate_sha256 = content_sha256(gate_value)
+    schedule_sha256 = content_sha256(schedule_value)
+    control_sha256 = content_sha256(control_value)
+    gate = SimpleNamespace(
+        schema_version=3,
+        experiment="preflight",
+        schedule_sha256=schedule_sha256,
+        mode="SIGNED_STAGE_ENVELOPE",
+        status="AVAILABLE",
+        reason_code="signed_stage_capacity_verified",
+        required_free_bytes=1,
+        observed_free_bytes=200_000_000_000,
+        retained_evidence_bytes=0,
+        maximum_concurrent_transient_bytes=0,
+        safety_margin_bytes=1,
+        sha256=gate_sha256,
+    )
+    monkeypatch.setattr(
+        StageCapacityGate,
+        "from_dict",
+        classmethod(lambda _cls, _value: gate),
+    )
+    monkeypatch.setattr(
+        StageCapacitySchedule,
+        "from_dict",
+        classmethod(
+            lambda _cls, _value: SimpleNamespace(
+                sha256=schedule_sha256,
+                gpu_inventory_sha256="b" * 64,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        ControlArtifactAttestation,
+        "from_dict",
+        classmethod(
+            lambda _cls, _value: SimpleNamespace(
+                sha256=control_sha256,
+                subject=SimpleNamespace(),
+            )
+        ),
+    )
+
+    def tampered(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("capacity source changed")
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.stage_capacity.revalidate_stage_capacity_gate_sources",
+        tampered,
+    )
+    report = doctor_report(
+        ROOT,
+        sglang,
+        stage_capacity_gate_path=_canonical_doctor_source(
+            tmp_path / "tampered-gate.json", gate_value
+        ),
+        stage_capacity_schedule_path=_canonical_doctor_source(
+            tmp_path / "tampered-schedule.json", schedule_value
+        ),
+        stage_capacity_attestation_path=_canonical_doctor_source(
+            tmp_path / "tampered-control.json", control_value
+        ),
+        stage_capacity_activation_sha256="a" * 64,
+        stage_capacity_now_ns=1,
+    )
+    assert report["checks"]["disk"]["status"] == "FAIL"
+    assert report["stage_capacity"]["reason_code"] == (
+        "stage_capacity_authority_invalid"
+    )
+    assert report["stage_capacity"]["mode"] != "LEGACY_100GB_FALLBACK"
+
+
 def test_doctor_propagates_unknown_without_claiming_readiness(
     monkeypatch, tmp_path
 ) -> None:
@@ -470,19 +685,34 @@ def test_unsupported_release_modes_are_explicit(monkeypatch, tmp_path) -> None:
     unsupported = report["mode_gates"]["unsupported"]
     assert {
         "multi_node",
+        "adaptive_eagle",
+        "adaptive_dflash_dspark",
+    } == set(unsupported)
+    assert {entry["status"] for entry in unsupported.values()} == {"UNSUPPORTED"}
+    pending = report["mode_gates"]["pending_dynamic_gpu_proof"]
+    assert {
         "tp2",
         "dp2",
+        "adaptive_dspark",
+        "adaptive_nextn",
+        "adaptive_chronobelief",
+        "native_itl",
+        "fixed_address_publication_graph",
+        "session_reuse",
+    } == set(pending)
+    assert {entry["status"] for entry in pending.values()} == {"BLOCKED"}
+    assert {entry["implementation_status"] for entry in pending.values()} == {
+        "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
+    }
+    external = report["mode_gates"]["external_authority_required"]
+    assert {
         "static_speculative",
         "tts",
         "l0",
-        "adaptive_dspark",
-        "adaptive_eagle",
         "adaptive_eagle3",
-        "adaptive_nextn",
-        "adaptive_dflash_dspark",
         "quota_shadow_backend_acquisition",
-    } == set(unsupported)
-    assert {entry["status"] for entry in unsupported.values()} == {"UNSUPPORTED"}
+    } == set(external)
+    assert report["mode_gates"]["available_after_dynamic_proof"] == {}
 
 
 def test_cli_accepts_distinct_project_and_sglang_roots(

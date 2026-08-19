@@ -69,9 +69,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     LockedOutput,
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.statistics import (
     PilotBlock,
@@ -956,7 +958,7 @@ def test_e2_activation_blocks_before_minima_on_missing_common_load_authority(
         "static": 1,
         "tts": 1,
         "l0_naive": 1,
-        "lc_candidate": 2_976,
+        "lc_candidate": 3_360,
     }
     dispositions = {row.cell_id: row for row in activation.dispositions}
     frozen_anchor_rows = tuple(

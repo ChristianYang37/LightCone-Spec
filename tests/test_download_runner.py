@@ -38,8 +38,10 @@ from lightcone_spec.experiments.registry import (
     ExperimentCell,
     ExperimentRegistry,
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.orchestration.industrial import IndustrialPhysicalAssignment
 from lightcone_spec.runtime import download_runner

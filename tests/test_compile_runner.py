@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
+from lightcone_spec.experiments.sampling import SamplingProfile
 from lightcone_spec.experiments.serving import PinnedBenchServingTransport
 from lightcone_spec.runtime.compile_cache import (
     COMPILE_ONLY_ASSIGNMENT_PROTOCOL_SHA256,
@@ -27,12 +28,15 @@ from lightcone_spec.runtime.compile_cache import (
     _content_sha256,
 )
 from lightcone_spec.runtime.compile_runner import (
+    COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256,
     COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
+    RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE,
     RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY,
     RELEASE_COMPILE_RUNNER_UNAVAILABLE,
     RELEASE_COMPILE_SUBPROCESSES,
     RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S,
     CompileAssignmentPlan,
+    CompileLaunchManifest,
     CompilePrewarmObservation,
     CompileResultPointer,
     CompileRunnerBlocked,
@@ -48,10 +52,13 @@ from lightcone_spec.runtime.compile_runner import (
 )
 from lightcone_spec.sglang_bridge.compile_worker import (
     GPU_COMPILE_REASON,
+    GPU_COMPILE_SEMANTICS,
     NATIVE_COMPILE_BEGIN_PATH,
     NATIVE_COMPILE_FINALIZE_PATH,
+    NATIVE_COMPILE_TERMINAL_PATH,
     SOURCE_OWNED_COMPILE_HOOK,
     SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
+    SOURCE_OWNED_COMPILE_RELEASE_STATUS,
     PinnedCompileLifecycleWorker,
 )
 from lightcone_spec.sglang_bridge.launch import main as launch_main
@@ -86,6 +93,128 @@ def _key(*, target_revision: str = "a" * 40) -> CompileCacheKey:
     )
 
 
+def _raw_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_canonical(path: Path, value: object) -> str:
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    path.write_bytes(canonical + b"\n")
+    semantic = hashlib.sha256(canonical).hexdigest()
+    Path(f"{path}.sha256").write_text(f"{semantic}\n", encoding="ascii")
+    return semantic
+
+
+def _launch_manifest(
+    tmp_path: Path,
+    *,
+    cache_plan_path: Path,
+    cache_plan: CompileCacheLaunchPlan,
+    prewarm_path: Path,
+    prewarm: CompileOnlyPrewarmManifest,
+    sampling_path: Path,
+    sampling: SamplingProfile,
+    physical_assignment_sha256: str,
+    experiment_budget_sha256: str,
+    budget_materialization_authority_sha256: str,
+    inventory_sha256: str,
+    gpu_uuids: tuple[str, ...],
+) -> Path:
+    checkout = (tmp_path / "patched-sglang").resolve()
+    target = (tmp_path / "models" / "target" / "snapshots" / ("a" * 40)).resolve()
+    drafter = (tmp_path / "models" / "drafter" / "snapshots" / ("b" * 40)).resolve()
+    tokenizer = (tmp_path / "tokenizer" / "snapshots" / ("c" * 40)).resolve()
+    cuda_home = (tmp_path / "cuda").resolve()
+    library = (tmp_path / "lib").resolve()
+    for directory in (checkout, target, drafter, tokenizer, cuda_home, library):
+        directory.mkdir(parents=True, exist_ok=True)
+    run_config_path = (tmp_path / "run-config.json").resolve()
+    run_config_semantic = _write_canonical(
+        run_config_path, {"schema_version": 1, "mode": "compile-test"}
+    )
+    content_path = (tmp_path / "prepared-content.json").resolve()
+    content_semantic = _write_canonical(
+        content_path,
+        {
+            "schema_version": 1,
+            "kind": "test-prepared-content",
+            "protocol_sha256": _sha("prepared-content-protocol"),
+            "model_lock_sha256": prewarm.model_lock_sha256,
+            "prepared_model_set_sha256": _sha("prepared-model-set"),
+            "snapshots": [],
+        },
+    )
+    server_argv = (
+        str(Path(os.sys.executable).resolve()),
+        "-m",
+        "lightcone_spec.sglang_bridge.launch",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "32123",
+        "--model-path",
+        str(target),
+        "--speculative-draft-model-path",
+        str(drafter),
+    )
+    launch = CompileLaunchManifest(
+        schema_version=1,
+        kind="first_party_compile_launch_manifest",
+        protocol_sha256=COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256,
+        patched_sglang_checkout=str(checkout),
+        patched_sglang_commit=PINNED_SGLANG_COMMIT,
+        patched_sglang_tree=PINNED_SGLANG_TREE,
+        run_config_path=str(run_config_path),
+        run_config_raw_sha256=_raw_sha256(run_config_path),
+        run_config_semantic_sha256=run_config_semantic,
+        compile_cache_plan_path=str(cache_plan_path),
+        compile_cache_plan_raw_sha256=_raw_sha256(cache_plan_path),
+        compile_cache_plan_sha256=cache_plan.sha256,
+        prewarm_manifest_path=str(prewarm_path),
+        prewarm_manifest_raw_sha256=_raw_sha256(prewarm_path),
+        prewarm_manifest_sha256=prewarm.sha256,
+        sampling_profile_path=str(sampling_path),
+        sampling_profile_raw_sha256=_raw_sha256(sampling_path),
+        prepared_model_content_manifest_path=str(content_path),
+        prepared_model_content_manifest_raw_sha256=_raw_sha256(content_path),
+        prepared_model_content_manifest_sha256=content_semantic,
+        prepared_model_content_manifest_size=content_path.stat().st_size,
+        target_content_member_id="target:test:primary",
+        target_model_id="target/test",
+        target_snapshot_path=str(target),
+        target_revision="a" * 40,
+        target_content_authority_sha256=_sha("target-content"),
+        drafter_content_member_id="drafter:test:primary",
+        drafter_model_id="drafter/test",
+        drafter_snapshot_path=str(drafter),
+        drafter_revision="b" * 40,
+        drafter_content_authority_sha256=_sha("drafter-content"),
+        tokenizer_content_member_id="tokenizer:test:primary",
+        tokenizer_model_id="tokenizer/test",
+        tokenizer_snapshot_path=str(tokenizer),
+        tokenizer_revision="c" * 40,
+        tokenizer_content_authority_sha256=_sha("tokenizer-content"),
+        server_argv=server_argv,
+        server_argv_sha256=_content_sha256({"argv": list(server_argv)}),
+        localhost_port=32123,
+        model_lock_sha256=prewarm.model_lock_sha256,
+        sampling_profile_sha256=sampling.sha256,
+        physical_assignment_sha256=physical_assignment_sha256,
+        experiment_budget_sha256=experiment_budget_sha256,
+        budget_materialization_authority_sha256=(
+            budget_materialization_authority_sha256
+        ),
+        inventory_sha256=inventory_sha256,
+        gpu_uuids=gpu_uuids,
+        path_entries=(str(Path(os.sys.executable).resolve().parent),),
+        library_path_entries=(str(library),),
+        cuda_home=str(cuda_home),
+    )
+    return launch.write((tmp_path / "launch.json").resolve())
+
+
 def _inputs(tmp_path: Path) -> tuple[CompileAssignmentPlan, Path]:
     cache_root = (tmp_path / "cache").resolve()
     cache_plan = CompileCacheLaunchPlan(
@@ -98,11 +227,14 @@ def _inputs(tmp_path: Path) -> tuple[CompileAssignmentPlan, Path]:
         base_receipt_path=None,
         base_receipt_sha256=None,
     )
+    sampling = SamplingProfile()
+    sampling_path = (tmp_path / "sampling.json").resolve()
+    sampling.write(sampling_path)
     manifest = CompileOnlyPrewarmManifest(
         schema_version=1,
         kind="compile_only_prewarm_manifest",
         model_lock_sha256=_sha("model-lock"),
-        sampling_profile_sha256=_sha("sampling"),
+        sampling_profile_sha256=sampling.sha256,
         payloads=(
             CompileOnlyPrewarmPayload("bucket-1", 1, (1, 2), 1, 11),
             CompileOnlyPrewarmPayload("bucket-2", 2, (3, 4), 1, 22),
@@ -139,11 +271,28 @@ def _inputs(tmp_path: Path) -> tuple[CompileAssignmentPlan, Path]:
         manifest,
         (tmp_path / "prewarm.json").resolve(),
     )
+    launch_path = _launch_manifest(
+        tmp_path,
+        cache_plan_path=cache_plan_path,
+        cache_plan=cache_plan,
+        prewarm_path=manifest_path,
+        prewarm=manifest,
+        sampling_path=sampling_path,
+        sampling=sampling,
+        physical_assignment_sha256=assignment.physical_assignment_sha256,
+        experiment_budget_sha256=assignment.experiment_budget_sha256,
+        budget_materialization_authority_sha256=(
+            assignment.budget_materialization_authority_sha256
+        ),
+        inventory_sha256=assignment.inventory_sha256,
+        gpu_uuids=assignment.gpu_uuids,
+    )
     return (
         CompileAssignmentPlan.issue(
             assignment_manifest_path=assignment_path,
             compile_cache_plan_path=cache_plan_path,
             prewarm_manifest_path=manifest_path,
+            launch_manifest_path=launch_path,
             result_pointer_path=result_path,
             attempt_id="attempt-001",
         ),
@@ -200,6 +349,7 @@ import sys
 
 protocol = os.environ["TEST_COMPILE_PROTOCOL"]
 plan = os.environ["TEST_COMPILE_PLAN"]
+assert os.environ["LIGHTCONE_COMPILE_ASSIGNMENT_PLAN_SHA256"] == plan
 bad_request = os.environ.get("TEST_COMPILE_BAD_REQUEST")
 stubborn_pidfile = os.environ.get("TEST_COMPILE_STUBBORN_PIDFILE")
 assert "TEST_COMPILE_SECRET_SENTINEL" not in os.environ
@@ -226,9 +376,17 @@ def receive():
 send("compile_subprocess_ready", process_id=os.getpid())
 start = receive()
 assert start["kind"] == "compile_subprocess_start"
-for path in start["cache_environment"].values():
+launch = start["launch_manifest"]
+assert set(launch) == {"path", "raw_sha256", "semantic_sha256"}
+assert os.path.isabs(launch["path"])
+with open(launch["path"], "rb") as handle:
+    launch_body = handle.read()
+assert hashlib.sha256(launch_body).hexdigest() == launch["raw_sha256"]
+assert json.loads(launch_body)["protocol_sha256"]
+for name, path in start["cache_environment"].items():
     assert os.path.isabs(path)
     assert os.path.isdir(path)
+    os.environ[name] = path
 send("compile_subprocess_started", process_id=os.getpid())
 while True:
     row = receive()
@@ -340,6 +498,7 @@ def test_cpu_fake_lifecycle_requires_exact_prewarm_shutdown_and_terminal_pointer
         "assignment_manifest",
         "compile_cache_plan",
         "prewarm_manifest",
+        "launch_manifest",
         "attempt_receipt",
         "graceful_shutdown_receipt",
         "final_cache_receipt",
@@ -457,9 +616,8 @@ def test_coordinated_rehash_cannot_promote_diagnostic_receipt_or_pointer(
     receipt_row["formal_execution_authorized"] = True
     receipt_row["source_authority_sha256"] = "f" * 64
     receipt_body = _rewrite_canonical_json(receipt_path, receipt_row)
-    with pytest.raises(CompileRunnerBlocked) as receipt_blocked:
+    with pytest.raises(ValueError, match="lacks dynamic control"):
         CompileSubprocessLifecycleReceipt.load(receipt_path)
-    assert receipt_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
 
     pointer_row = json.loads(result_path.read_text(encoding="utf-8"))
     pointer_row["formal_execution_authorized"] = True
@@ -468,13 +626,10 @@ def test_coordinated_rehash_cannot_promote_diagnostic_receipt_or_pointer(
     ).hexdigest()
     pointer_row["subprocess_lifecycle_receipt"]["size"] = len(receipt_body)
     _rewrite_canonical_json(result_path, pointer_row)
-    forged_pointer = CompileResultPointer.from_dict(pointer_row)
-    with pytest.raises(CompileRunnerBlocked) as reopen_blocked:
-        forged_pointer.reopen()
-    assert reopen_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
-    with pytest.raises(CompileRunnerBlocked) as pointer_blocked:
+    with pytest.raises(ValueError, match="requires subprocess lifecycle evidence"):
+        CompileResultPointer.from_dict(pointer_row)
+    with pytest.raises(ValueError, match="requires subprocess lifecycle evidence"):
         CompileResultPointer.load(result_path)
-    assert pointer_blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
 
 
 def test_formal_subprocess_gate_blocks_before_path_or_process_access(
@@ -485,7 +640,7 @@ def test_formal_subprocess_gate_blocks_before_path_or_process_access(
     missing = (tmp_path / "missing-plan.json").resolve()
     with pytest.raises(CompileRunnerBlocked) as blocked:
         execute_release_compile_assignment_plan(missing)
-    assert blocked.value.reason_code == RELEASE_COMPILE_RUNNER_UNAVAILABLE
+    assert blocked.value.reason_code == RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE
     assert not missing.exists()
     assert not (tmp_path / "cache").exists()
 
@@ -526,6 +681,7 @@ def test_assignment_plan_rejects_caller_key_and_revalidation_tamper(
             assignment_manifest_path=plan.assignment_manifest_path,
             compile_cache_plan_path=foreign_path,
             prewarm_manifest_path=plan.prewarm_manifest_path,
+            launch_manifest_path=plan.launch_manifest_path,
             result_pointer_path=plan.result_pointer_path,
             attempt_id="attempt-foreign",
         )
@@ -553,7 +709,7 @@ def test_resume_reopens_every_pointer_binding_and_rejects_tamper(
 def test_release_entrypoint_is_named_block_before_any_path_read(tmp_path: Path) -> None:
     assert RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S == ()
     missing = CompileAssignmentPlan(
-        schema_version=1,
+        schema_version=2,
         kind="first_party_compile_assignment_plan",
         protocol_sha256=(
             "6a2b33824bb1b45b1cf207220fd7762f254182331520467b38718a81b7b90487"
@@ -564,6 +720,9 @@ def test_release_entrypoint_is_named_block_before_any_path_read(tmp_path: Path) 
         compile_cache_plan_sha256="1" * 64,
         prewarm_manifest_path=str((tmp_path / "missing-prewarm").resolve()),
         prewarm_manifest_sha256="2" * 64,
+        launch_manifest_path=str((tmp_path / "missing-launch").resolve()),
+        launch_manifest_raw_sha256="8" * 64,
+        launch_manifest_sha256="9" * 64,
         compile_key_sha256="3" * 64,
         model_lock_sha256="4" * 64,
         target_revision="target",
@@ -646,11 +805,11 @@ class _NativeCompileTransport(PinnedBenchServingTransport):
             assert self.begin is None
             identity = {key: value for key, value in body.items() if key != "prewarm"}
             receipt = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "hook": SOURCE_OWNED_COMPILE_HOOK,
                 "protocol_sha256": SOURCE_OWNED_COMPILE_PROTOCOL_SHA256,
-                "release_status": "CPU_CONTRACT_ONLY",
-                "gpu_compile_semantics": "PENDING",
+                "release_status": SOURCE_OWNED_COMPILE_RELEASE_STATUS,
+                "gpu_compile_semantics": GPU_COMPILE_SEMANTICS,
                 "gpu_compile_reason": GPU_COMPILE_REASON,
                 "patched_sglang_tree": PINNED_SGLANG_TREE,
                 "process_id": 4242,
@@ -663,6 +822,32 @@ class _NativeCompileTransport(PinnedBenchServingTransport):
             receipt["begin_sha256"] = _content_sha256(receipt)
             self.begin = receipt
             return receipt
+        if path == NATIVE_COMPILE_TERMINAL_PATH and self.begin is not None:
+            assert set(body) == {"request_id"}
+            matches = [
+                (index, payload)
+                for index, payload in enumerate(self.submitted)
+                if payload.request_id == body["request_id"]
+            ]
+            assert len(matches) == 1
+            index, payload = matches[0]
+            row = {
+                "sequence": index,
+                "graph_bucket": payload.graph_bucket,
+                "request_id": payload.request_id,
+                "input_token_count": len(payload.input_token_ids),
+                "input_token_ids_sha256": _content_sha256(
+                    list(payload.input_token_ids)
+                ),
+                "requested_output_tokens": payload.requested_output_tokens,
+                "sampling_seed": payload.sampling_seed,
+                "output_token_count": 1,
+                "output_token_ids_sha256": _content_sha256([100 + index]),
+                "terminal_status": "completed",
+                "terminal_reason": "FINISH_LENGTH",
+            }
+            row["terminal_sha256"] = _content_sha256(row)
+            return row
         if path != NATIVE_COMPILE_FINALIZE_PATH or self.begin is None:
             raise AssertionError(path)
         assert body == {"begin_sha256": self.begin["begin_sha256"]}
@@ -697,17 +882,14 @@ class _NativeCompileTransport(PinnedBenchServingTransport):
                 "ordered_terminals": terminals,
                 "final_state": {"active_requests": 0, "queued_requests": 0},
                 "gpu_measurements": {
-                    name: {"value": None, "reason": GPU_COMPILE_REASON}
-                    for name in (
-                        "cache_hits",
-                        "cache_misses",
-                        "jit_time_ns",
-                        "graph_capture_count",
-                        "graph_replay_count",
-                        "cache_write_count",
-                    )
+                    "cache_hits": 2,
+                    "cache_misses": 1,
+                    "jit_time_ns": 31,
+                    "graph_capture_count": 2,
+                    "graph_replay_count": 1,
+                    "cache_write_count": 3,
                 },
-                "completion_marker": "COMPILE_CPU_CONTRACT_COMPLETE",
+                "completion_marker": "GPU_COMPILE_COMPLETE",
             }
         )
         final["compile_receipt_sha256"] = _content_sha256(final)
@@ -726,8 +908,8 @@ def test_pinned_compile_worker_consumes_only_native_source_receipts(
         return {"caller_summary": "ignored"}
 
     result = asyncio.run(worker.execute(plan, submit_prewarm=submit))
-    assert result.release_status == "CPU_CONTRACT_ONLY"
-    assert result.gpu_compile_semantics == "PENDING"
+    assert result.release_status == SOURCE_OWNED_COMPILE_RELEASE_STATUS
+    assert result.gpu_compile_semantics == GPU_COMPILE_SEMANTICS
     assert result.formal_execution_authorized is False
     assert len(result.ordered_terminal_sha256s) == len(
         CompileOnlyPrewarmManifest.from_dict(
@@ -746,7 +928,7 @@ def test_monkeypatched_compile_allowlists_still_hit_gpu_source_registry(
 
     plan, _result_path = _inputs(tmp_path)
     checkout = (tmp_path / "patched-sglang").resolve()
-    checkout.mkdir()
+    checkout.mkdir(exist_ok=True)
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.checkout.verify_patched_checkout",
         lambda path: Path(path).resolve(),

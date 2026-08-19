@@ -23,36 +23,45 @@
   fixed-barrier publication; L0-naive requires that same recipe authority plus
   first-ready publication. An L0-policy search recipe is an LC-candidate until
   the exact E2 final-recipe receipt seals it as LightCone.
-- For the industrial executor, only TP1/DP1 Target-only is currently READY.
-  The pinned tree implements
-  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`, but
-  Static/TTS/L0-naive/LightCone fail before mutation because no release-trusted hardware signer
-  is configured. This is the expected fail-closed boundary.
-- `TTS-paper-reconstruction` is also intentionally `BLOCKED` while its numeric
-  optimizer/loss/trainable/stride fields remain undisclosed. Reject any TTS or
-  L0-naive declaration that inherits an E1/E2 authority, schema default, or
+- Do not interpret source support or a valid config as `READY`. Formal execution
+  requires a fresh root-authorized deployment/hardware policy and the exact
+  prepared-content, workload, compile, qualification, terminal, interference,
+  and capacity authorities. A checkout deliberately contains none of that
+  session evidence.
+- TTS-Cal fixes the reconstruction grid and semantics: Adam, one step,
+  `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero decay, no clipping,
+  full-drafter/latest-round-only update, source-point proximal anchor,
+  request reset, side stream, the registered learning-rate grid, and eight
+  strides. TTS and L0-naive are still `BLOCKED` until a disjoint tuning window
+  seals the exact winner. Reject inheritance from E1/E2, schema defaults, or a
   historical AdamW recipe. Candidate equality is valid only for controlled
   replay with identical source-state and proposal-evidence digests.
 - Adaptation is Full or LoRA over `last1`, `last3`, `last5`, or `all`. LoRA
   requires a registered rank and `alpha/r=1`. Borrowed target parameters and
   quantized/unowned coordinates cannot become trainable.
-- DSpark layer-only and `*_native_heads` hybrid fields are target contracts;
-  the current adaptive schema rejects DSpark before model loading. A future
-  implementation must resolve real W1/W2/confidence state and may not use
-  placeholder Markov features or an inferred predecessor.
-- EAGLE/EAGLE3 and NEXTN validators/hooks are target contracts, not current
-  implementations. Their adaptive configs are rejected before model loading.
+- DSpark layer-only and `*_native_heads` hybrid paths are implemented source
+  contracts but require a DSpark GPU proof over the real sampled predecessor,
+  W1/W2/confidence state, 56-candidate selector, and fixed/native schedulers.
+  Placeholder Markov features or an inferred predecessor are rejected.
+- NEXTN likewise requires its native MTP/interface proof and, for TP2, exact
+  two-model shard authority. Adaptive EAGLE remains unsupported. EAGLE3 is
+  limited to combinations admitted by a signed official model/selector
+  compatibility decision.
 - Optimizer-specific fields are strict: SGDm/NAG/Muon require momentum; Muon
   also requires Newton--Schulz and auxiliary AdamW values. Unused fields are
   not ignored.
 
 ## Distributed-rank refusal or collective failure
 
-- The current `RunConfig` rejects every TP2/DP2 value before model loading. A
-  caller-authored `patched_two_gpu_v1` digest cannot enable multi-rank work.
-- One-node/two-rank identity, sticky DP routing, and all-rank receipt fields are
-  CPU coordinator target contracts only. They describe what a future pinned
-  implementation must prove; they are not current SGLang support.
+- `RunConfig` recognizes only `tp1_dp1`, `tp2_dp1`, and `tp1_dp2`. A
+  distributed row must carry the exact source-owned `patched_two_gpu_v1`
+  identity and a receipt claim; formal execution additionally requires the
+  matching durable GPU qualification artifact. A caller-authored digest cannot
+  enable multi-rank work.
+- One-node/two-rank two-phase TP publication and sticky DP replica isolation
+  are implemented contracts pending dynamic GPU proof. Check the proof's exact
+  rank/UUID/topology, all-rank terminal coverage, one-rank abort behavior, and
+  zero cross-replica gradient evidence.
 - A missing prepare vote, foreign topology receipt, generation mismatch,
   non-finite candidate, unsafe boundary, or incomplete post-copy receipt aborts
   the update everywhere. A transport/split-decision failure also disables
@@ -74,6 +83,15 @@ inactive prefixes, then aborts pending adaptation and queues or rejects new
 work. Optional inactive-cohort offload is explicit and last. Do not hide an OOM
 by changing Full to LoRA, rank, scope, optimizer, precision, context, or
 admission; each change needs a new config and load screen.
+
+Disk admission is separate from HBM. A schema-3 stage capacity gate reopens
+the real provider/host/sizing snapshot and exact execution-wave schedule. It
+sums retained evidence and registered retries, adds the maximum concurrently
+resident staging/compile bytes per wave, then the safety margin. If that
+root-authorized chain is absent, the legacy 100 GB threshold remains the
+fail-closed fallback. Adding 30 GB does not itself authorize a stage; rerun the
+raw capacity reducer and obtain a fresh local `capacity` control attestation.
+Never delete user data to force the gate.
 
 For slab exhaustion, inspect tenant quota, active references, replica identity,
 generation counters, and optional cold-offload timers. Only inactive cohorts
@@ -132,12 +150,13 @@ for one run/rank, is not valid evidence.
 
 `UNMEASURED` means no eligible content-bound GPU evidence/attestation exists.
 Positive diagnostics, CPU mocks, historical v2 results, or acceptance changes
-do not alter it. The current new GPU phase remains `UNMEASURED` and Stage B is
-`BLOCKED` on the missing trusted hardware signer, provider credentials,
-immutable model/data/trace locks, registered hardware, GPU smoke, and
-interference evidence. Static/TTS/L0-naive/LightCone, all
-DSpark/EAGLE/EAGLE3/NEXTN adaptive cells, and all TP2/DP2 cells are blocked;
-only TP1/DP1 Target-only is end-to-end executable.
+do not alter it. A fresh campaign is `BLOCKED` until its provider state,
+root-authorized dynamic hardware policy, immutable content locks, GPU smoke,
+compile/exactness/interference terminals, and stage capacity control all
+verify. TP2/DP2, DSpark, NEXTN, native ITL, and session reuse specifically
+remain `implemented_pending_dynamic_gpu_proof`; TTS/L0-naive require the
+TTS-Cal seal, LightCone the E2 seal, and EAGLE3 an official compatibility
+decision. None of these may be relabelled READY from source capability alone.
 
 `BLOCKED` is also the correct outcome for a registered cell whose prerequisite
 or attested criterion failed. `UNDERPOWERED` means four excluded pilot blocks

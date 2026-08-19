@@ -150,6 +150,7 @@ class BenchServingResult:
     chunks: tuple[TokenChunkTiming, ...]
     generated_token_ids: tuple[int, ...]
     ttft_us: int | None = None
+    native_result_pointer_json: str | None = None
 
     def validate(self, request: BoundServingRequest) -> None:
         if self.request_id != request.request_id:
@@ -198,6 +199,112 @@ class BenchServingResult:
             covered += chunk.token_count
         if covered != self.output_tokens:
             raise ValueError("bench chunks do not cover the reported output tokens")
+        if self.native_result_pointer_json is not None:
+            pointer = _canonical_native_result_pointer(
+                self.native_result_pointer_json,
+                request_id=self.request_id,
+                generated_token_ids=self.generated_token_ids,
+            )
+            if pointer["terminal_status"] != (
+                "completed" if self.success else "aborted"
+            ):
+                raise ValueError("native result pointer terminal status differs")
+
+    @property
+    def native_result_pointer(self) -> dict[str, object] | None:
+        if self.native_result_pointer_json is None:
+            return None
+        value = json.loads(self.native_result_pointer_json)
+        assert isinstance(value, dict)
+        return value
+
+
+def _canonical_native_result_pointer(
+    raw_value: object,
+    *,
+    request_id: str,
+    generated_token_ids: tuple[int, ...],
+) -> dict[str, object]:
+    if isinstance(raw_value, str):
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError as error:
+            raise ValueError("native result pointer is not valid JSON") from error
+    else:
+        value = raw_value
+    fields = {
+        "schema_version",
+        "kind",
+        "hook",
+        "semantics",
+        "release_status",
+        "request_id",
+        "request_started_ns",
+        "request_terminal_ns",
+        "terminal_status",
+        "terminal_reason",
+        "events",
+        "result_pointer_sha256",
+    }
+    if type(value) is not dict or set(value) != fields:
+        raise ValueError("native result pointer fields differ from the pinned schema")
+    unsigned = dict(value)
+    digest = unsigned.pop("result_pointer_sha256")
+    if (
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or content_sha256(unsigned) != digest
+    ):
+        raise ValueError("native result pointer digest differs from its content")
+    if (
+        value["schema_version"] != 1
+        or value["kind"] != "sglang_native_itl_result_pointer"
+        or value["hook"] != "sglang.schema_v3.native_per_token_timestamp.v2"
+        or value["semantics"] != "scheduler_committed_token_at_result_processor_v1"
+        or value["release_status"] != "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
+        or value["request_id"] != request_id
+        or value["terminal_status"] not in {"completed", "aborted"}
+        or type(value["terminal_reason"]) is not str
+        or not value["terminal_reason"]
+    ):
+        raise ValueError("native result pointer release identity differs")
+    started_ns = value["request_started_ns"]
+    terminal_ns = value["request_terminal_ns"]
+    if (
+        isinstance(started_ns, bool)
+        or not isinstance(started_ns, int)
+        or started_ns < 0
+        or isinstance(terminal_ns, bool)
+        or not isinstance(terminal_ns, int)
+        or terminal_ns < started_ns
+    ):
+        raise ValueError("native result pointer request interval is invalid")
+    events = value["events"]
+    if type(events) is not list or len(events) != len(generated_token_ids):
+        raise ValueError("native result pointer token coverage is incomplete")
+    previous_ns = started_ns
+    for index, (event, token_id) in enumerate(
+        zip(events, generated_token_ids, strict=True)
+    ):
+        if type(event) is not dict or set(event) != {
+            "token_index",
+            "token_id",
+            "observed_ns",
+        }:
+            raise ValueError("native result pointer event fields differ")
+        observed_ns = event["observed_ns"]
+        if (
+            event["token_index"] != index
+            or event["token_id"] != token_id
+            or isinstance(observed_ns, bool)
+            or not isinstance(observed_ns, int)
+            or observed_ns <= previous_ns
+            or observed_ns > terminal_ns
+        ):
+            raise ValueError("native result pointer event sequence differs")
+        previous_ns = observed_ns
+    return value
 
 
 class BenchServingTransport(Protocol):
@@ -612,6 +719,7 @@ class PinnedBenchServingTransport:
             image_data=None,
             extra_request_body={
                 "rid": request.request_id,
+                "return_native_token_timestamps": True,
                 "sampling_params": sampling,
             },
             timestamp=request.arrival_us / 1000.0,
@@ -658,6 +766,27 @@ class PinnedBenchServingTransport:
             raise TypeError(
                 "official bench result has malformed ordered generated token IDs"
             )
+        token_ids = tuple(raw_token_ids)
+        raw_pointer = getattr(raw, "native_token_timestamp_result_pointer", None)
+        if success and output_tokens > 0 and raw_pointer is None:
+            raise RuntimeError(
+                "official bench result lacks its first-party native ITL pointer"
+            )
+        pointer_json = (
+            json.dumps(
+                _canonical_native_result_pointer(
+                    raw_pointer,
+                    request_id=request.request_id,
+                    generated_token_ids=token_ids,
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            if raw_pointer is not None
+            else None
+        )
         result = BenchServingResult(
             request_id=request.request_id,
             success=success,
@@ -671,8 +800,9 @@ class PinnedBenchServingTransport:
             ),
             error_code=None if success else "bench_request_failed",
             chunks=chunks,
-            generated_token_ids=tuple(raw_token_ids),
+            generated_token_ids=token_ids,
             ttft_us=ttft_us if output_tokens > 0 else None,
+            native_result_pointer_json=pointer_json,
         )
         result.validate(request)
         return result

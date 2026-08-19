@@ -34,6 +34,7 @@ from lightcone_spec.locking.prepared_models import (
     require_prepared_model_content_release_manifest_sha256,
     revalidate_prepared_model_content_authority,
 )
+from lightcone_spec.runtime.proof_artifact import relocated_evidence_path
 
 from .parameters import (
     TRAINABLE_PLAN_OPTIMIZERS,
@@ -269,6 +270,14 @@ _ADAPTATION_CONFIG_FIELDS = (
     "verification_mode",
     "fixed_verification_budget",
     "confidence_loss_weight",
+    "chronobelief_release_capability_sha256",
+    "chronobelief_gpu_proof_sha256",
+    "eagle3_e0_execution_authority_sha256",
+    "eagle3_compatibility_authority_sha256",
+    "eagle3_model_selector_sha256",
+    "eagle3_native_gpu_proof_sha256",
+    "eagle3_qualification_compatibility_authority_sha256",
+    "eagle3_qualification_model_selector_sha256",
 )
 _OPTIMIZER_CONFIG_FIELDS = (
     "name",
@@ -653,8 +662,8 @@ class TrainablePlanRawJsonBinding:
         )
 
     def load(self) -> object:
-        source = Path(self.path)
-        sidecar = Path(self.sidecar_path)
+        source = relocated_evidence_path(self.path)
+        sidecar = relocated_evidence_path(self.sidecar_path)
         body = _regular_file_bytes(source, label=f"bound {self.role}")
         sidecar_body = _regular_file_bytes(sidecar, label=f"bound {self.role} sidecar")
         value = _parse_json(body, label=f"bound {self.role}")

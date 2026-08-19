@@ -8,13 +8,12 @@ empirical claims: CPU contracts can establish identity, durability, and
 fail-closed behavior, but only registered, attested GPU evidence can establish
 speed or capacity.
 
-> Alpha software. Every formal industrial GPU outcome is `UNMEASURED`. The industrial
-> executor currently runs only Target-only end to end. Static, TTS, L0-naive,
-> LightCone, and every other speculative method are `BLOCKED` before process or network
-> mutation because no trusted hardware signer is provisioned for the pinned
-> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook.
-> Empirical Stage B is also `BLOCKED` on provider credentials, resolved
-> model/data/trace locks, and registered hardware.
+> Alpha software. Every formal industrial GPU outcome is `UNMEASURED` until a
+> new clean source/patch/protocol/registry identity passes the registered GPU
+> gates. A release-level `MEASURED` claim is authorized only by fresh
+> root-signed controls that bind the exact external inputs, inventory,
+> hardware, and native terminal evidence; the trusted single-operator path may
+> collect unsigned empirical evidence but cannot cross that claim boundary.
 > Historical v2 artifacts are regression/debugging evidence only; they are not
 > evidence for the schema-v3 protocol or a new performance claim.
 
@@ -28,13 +27,13 @@ an experiment, and a historical measurement does not become a formal result.
 | Truth field | Value | Scope |
 |---|---|---|
 | `formal_industrial_gpu_evidence` | `UNMEASURED` | Current schema-v3 formal evidence; no industrial performance claim is released. |
-| `formal_industrial_execution` | `BLOCKED` | Current release authorization; the missing trusted signer and unresolved Stage-B inputs fail closed before mutation. |
+| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | The release public trust root is configured, but fresh root-authorized source, model, hardware, control, and mandatory-preflight receipts do not yet exist; execution fails closed before mutation. |
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `dfb60ab2e514defc6290fe8bacd179552dcd985e` | Full Git tree expected after applying the current patch series. |
-| `current_patch_payload_sha256` | `8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163` | SHA-256 of the latest semantic mail-patch bytes. |
-| `current_patch_manifest_sha256` | `7bfb2ea4f1497dd782a70a7afcad0857495b2871d80ad8ac858b2cb81e32ef7b` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2` | Full Git tree expected after applying the current patch series. |
+| `current_patch_payload_sha256` | `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95` | SHA-256 of the latest semantic mail-patch bytes. |
+| `current_patch_manifest_sha256` | `cc8355703fe83c8a73ecdbf9cd656140e257e69570fbfd8d8bc08f657e72fd71` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -62,20 +61,19 @@ LightCone. Only an exact sealed E2 final-recipe receipt may materialize or name
 LightCone. Target-only and Static structurally allocate no adaptation,
 optimizer, gradient, candidate, or adaptation-telemetry state.
 
-The current baseline authority is `TTS-paper-reconstruction` and is
-`BLOCKED`. Its update-recipe authority fixes Adam, one optimization step,
-latest-round-only supervision, position-weighted distillation plus a
-source-point proximal term, per-request reset, and a strided side stream.
-Separately, TTS publication uses the paper's fixed synchronization barrier.
-The primary-source audit as of 2026-08-15 found no official author code/config;
-the paper also does not fix
-the learning rate or schedule, Adam betas/epsilon and optimizer-state reset,
-weight decay/clip, position weights, proximal coefficient, loss normalization/
-precision/temperature, exact trainable-parameter manifest, stride-selection
-rule, or an official implementation commit. TTS and
-L0-naive therefore cannot become formal cells until an author/user recipe or a
-preregistered TTS-only reconstruction rule seals those fields. Neither may
-inherit an E1/E2 winner, schema default, or historical AdamW configuration.
+The historical `TTS-paper-reconstruction` baseline remains diagnostic and
+`BLOCKED`: the primary-source audit as of 2026-08-15 found no official author
+code/config, and the paper does not fix all numerical fields. The formal path
+therefore uses a separate preregistered TTS-Cal authority. It fixes Adam, one
+optimization step, `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero weight decay,
+no clipping, full-drafter/latest-round-only updates, a digest-bound
+drafter-native position/proximal loss recipe, per-request reset, side stream,
+learning rates `1e-7, 3e-7, ..., 1e-3`, and strides
+`{1,5,10,15,20,30,40,50}`. Four excluded pilots reduce that grid with the
+registered safety-first rule; only the signed winner may freeze TTS and
+L0-naive. Before that seal both remain `BLOCKED`. Neither may inherit an E1/E2
+winner, schema default, or historical AdamW configuration. TTS publication is
+independently fixed to the paper's synchronization barrier.
 The [provenance authority](manifests/provenance/tts_recipe_authority_v1.json)
 binds arXiv `2605.09329v2`, PDF SHA-256
 `7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20`,
@@ -89,20 +87,22 @@ compatibility guards; registration is not executable release support.
 OnlineSPEC remains an important comparison with separate tuning, evidence,
 attestation, and analysis; it cannot select or alter the core gate.
 
-The current pinned SGLang patch contains a lower-level executable adaptive path only for
-TP1/DP1 DFlash. It executes the registered constant, inverse-square-root, and
-finite-horizon cosine schedules plus non-negative logical publication delay.
-It exposes the exact begin/reset/finalize terminal-evidence hook and
-the host adapter validates its content, but the repository ships no trusted
-hardware signer. Static/TTS/L0-naive/LightCone therefore remain non-claimable and fail release
-preflight before mutation.
-DSpark now has a CPU-only native contract for adapter-free reconstruction,
-actual-predecessor W1 features, native-head selection, composite loss, and
-verification-budget semantics. It does not connect a CUDA worker or authorize
-runtime adaptation. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 execution still fail
-closed. A requested quota-shadow row is identity- and quota-recorded, but the
-current DFlash backend capability blocks acquisition instead of fabricating a
-teacher row.
+The current pinned SGLang patch contains source implementations for the DFlash,
+DSpark, NEXTN, and official-selector-compatible EAGLE3 paths, including TP1,
+two-rank TP2 publication, and sticky two-replica DP2 isolation where the formal
+matrix registers them. DFlash executes the registered constant,
+inverse-square-root, and finite-horizon cosine schedules plus non-negative
+logical publication delay; DSpark binds its actual predecessor, W1/W2 and
+confidence head; NEXTN binds its MTP teacher/interface and TP2 shard authority.
+The patch also exposes exact begin/reset/finalize terminal evidence and the
+host validates its content. These are implementation claims, not GPU results:
+the repository ships no trusted hardware signer and no fresh dynamic GPU
+qualification receipt. Static/TTS/L0-naive/LightCone and every adaptive
+backend/topology therefore remain non-claimable and fail release preflight
+before mutation. Generic EAGLE is unsupported, and EAGLE3 combinations without
+an official signed compatibility decision remain N/A or `BLOCKED`. A requested
+quota-shadow row is identity- and quota-recorded; unsupported acquisition is
+rejected instead of fabricating a teacher row.
 
 ## Runtime contract
 
@@ -112,9 +112,11 @@ teacher row.
   sampled predecessor, cohort identity, source version, and a backend-native
   payload.
 - The target backend contract requires a validator to reconstruct the
-  differentiable proposal without applying an adapter twice. Only the pinned
-  patch's lower-level TP1/DP1 DFlash path implements that adaptive surface;
-  DSpark, EAGLE/EAGLE3, and NEXTN remain non-executable contracts.
+  differentiable proposal without applying an adapter twice. The pinned patch
+  implements DFlash, DSpark, NEXTN, and compatibility-authorized EAGLE3
+  surfaces, but each exact backend/topology pair stays blocked until its named
+  dynamic GPU suite and durable external-control proof pass. Generic EAGLE is
+  not implemented.
 - Adaptation is only `full` or `lora`. Layer scopes are `last1`, `last3`,
   `last5`, and `all`; LoRA ranks are 1, 2, 4, 8, 16, 32, and 64 with
   `alpha/r=1`.
@@ -137,7 +139,7 @@ is not an adaptation mode or configuration alias.
 The declarative dependency order is:
 
 ```text
-preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+preflight -> E3a -> TTS-Cal -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 ```
 
 Every cell binds scientific axes, seed, logical rank slots, ports,
@@ -150,37 +152,27 @@ more GPUs. It serializes exclusive headline/profile/download/compile work and
 permits independent work to overlap only under an exact registered
 interference-envelope rule.
 
-Isolation alone is not terminal authority. The current release blocks all
-COMPILE and DOWNLOAD cells before budgeting or dispatch because it ships no
-release-owned compile prewarm/finalization result-pointer contract and no
-first-party download terminal receipt contract.
+Isolation alone is not terminal authority. COMPILE and DOWNLOAD use typed,
+first-party assignments, immutable terminals, and atomic no-replace result
+pointers; missing dynamic control or incomplete raw coverage blocks activation.
 
-Reducer-owned E1 activation materializes one 68-cell width/load slice from the
-1,428-cell envelope: two fixed references, 64 L0-policy LC-candidates over 32
-geometries, and one stage-level frozen anchor each for TTS and L0-naive. E2
-contains 11,920 templates across four quarter-retention rounds; each round
-carries only its LC-candidate grid plus two fixed references and one stage-level
-frozen anchor for each baseline, never a TTS optimizer candidate. Selection
-uses the 67-cell E1 or 2,979-cell E2 subset containing Target-only, Static,
-frozen TTS, and LC-candidates; the separately planned L0-naive anchor is
-reserved for mechanism/decomposition evidence and cannot rank or exclude a LightCone
-candidate. The registered confirmation envelopes contain
-11,520 E3b, 11,064 E5, and 3,747 E6 cells. E6's TTS cells use only the frozen
-external recipe; its LightCone cells use the sealed E1/E2 recipe without E6
-retuning, and its explicit load/repetition axes include the preregistered
-L0-naive mechanism anchors. E0 has 2,144 structural cells: 864 compatibility
-templates (`4 models x 3 backends x 9 tasks x 8 roles`) plus 1,280
-preregistered selected-core anchors (`4 models x 1 DFlash backend x 2 tasks x
-2 loads x (4 excluded pilots + 12 final blocks) x 5 formal roles`). All remain
-blocked and non-reportable until their exact recipe, load, repetition, and
-evidence authorities are sealed. Family-specific four-pilot evidence fixes either a
+TTS-Cal has 288 disjoint tuning-only rows and seals one numeric TTS recipe.
+E1 then materializes exactly 68 rows: four fixed roles plus two optimizer
+anchors over 32 LightCone geometries. E2 registers 105 recipes per surviving
+geometry and materializes four successive-halving rounds with a floor of 21
+families and four fixed anchors per round. E4 is 48 screen + 96 local-factorial
++ 3 profiler rows; E3b is `480B`; E1a is 116 rows; E5 is `450B+264`; E6 is
+`2+60B` over exactly two target models. E0 first signs 108 compatibility
+decisions and materializes `16VB` rows only for the `V` valid combinations.
+No blocked sentinel matrix is expanded. Family-specific four-pilot evidence fixes either a
 12--20 final prefix or `UNDERPOWERED` before confirmation. Per-cell budgets,
 physical assignments, terminal evidence, and observed-versus-registered
 GPU-time receipts are all content-bound. The pinned patch now ships a
 first-party all-reset producer for source-owned capability, initial-state, and
 reset receipts. It covers drain, KV/prefix, RNG/counters, scheduler/telemetry,
-adaptation state, allocator/HBM, and a completion event. Its GPU reset semantics
-remain explicitly `PENDING`. On the supported single-tokenizer HTTP/1.1 uvicorn
+adaptation state, allocator/HBM, and a completion event. GPU reuse remains
+disabled until the exact runtime identity passes the registered device reset
+qualification. On the supported single-tokenizer HTTP/1.1 uvicorn
 paths, the HTTP process counts real protocol `connection_made`/
 `connection_lost` events and injects cumulative process, generation, created,
 closed, and current totals into reset state; scheduler request counters and
@@ -346,6 +338,44 @@ arguments; the CLI never executes the registry as an implicit shell script.
 Model locks, evidence, traces, credentials, provider state, and selections
 belong under ignored external roots and must not be committed.
 
+## Trusted v03 reproduction
+
+The implemented `formal-single-operator` path runs the immutable 21-node DAG
+with one SQLite WAL, one `flock`-guarded scheduler, and source-owned physical
+producers. It is a trusted-operator empirical path, not a substitute for the
+release attestation chain. Without a current root-authorized attestation, its
+complete outcome is
+`trusted_single_operator_empirical_no_signature` and remains `UNMEASURED`; it
+must never be reported as `MEASURED`.
+
+After publishing the source authorities, BOUND trusted-content bundle,
+preflight workload, and schema-v5 ProtocolLock, write the path-only DAG and
+bootstrap configs. Inspect code capability without allocating a GPU, then run
+the non-LLM supervisor:
+
+```bash
+lightcone-spec formal-single-operator status
+lightcone-spec formal-single-operator bootstrap-run \
+  --config /absolute/results/formal-v03-run/bootstrap-config.json
+```
+
+`status` reports code capability for all 21 nodes; it is not run-specific GPU
+readiness. On a cold start, exactly two `bootstrap-once` cycles reach a queue
+with all ten preflight attempts `PENDING`; the third cycle is the first
+GPU-launch boundary.
+Fresh paired interference evidence alone decides whether later headline work
+uses two independent single-GPU workers or isolated scheduling.
+
+E6 derives exactly two TP2 launches from the built-in `mtp.*` component in the
+two frozen target checkpoints and forbids an external draft model. E0 first
+publishes exactly 12 model/backend pre-probe interfaces, then runs the 108
+model/backend/task compatibility probes; task-specific EAGLE3 authority is
+published only after successful post-probe evidence. The rolling archive and
+three-part cross-host closure keep the GPU host spool bounded while retaining
+a fully rehydrated local archive. See the
+[trusted workflow CLI](docs/en/cli.md#trusted-single-operator-formal-workflow)
+for the complete absolute-path command sequence and shutdown boundary.
+
 ## Statistics and claims
 
 Four excluded pilot blocks estimate variance only. The power plan fixes 12--20
@@ -372,9 +402,12 @@ No gate can return `PASS` without a content-bound GPU attestation covering the
 registry/manifest, selection, model and data revisions, runtime capability and
 patched tree, hardware/power report, trace identity, and exact Parquet inputs.
 Local mocks, historical v2 evidence, or positive arithmetic remain
-`UNMEASURED`. This release intentionally has no configured trusted hardware
-attester: caller-authored doctor/attestation JSON is rejected, and no analyzer
-can emit a new `MEASURED` GPU outcome.
+`UNMEASURED`. The release ships only its offline Ed25519 public trust root; it
+does not ship a private key or a pre-authorized hardware identity. A fresh,
+challenge-bound deployment policy and source-owned control attestations must
+bind the observed inventory and new immutable source identity. Caller-authored
+doctor/attestation JSON is rejected, and no analyzer can emit a new `MEASURED`
+GPU outcome before that qualification chain and the mandatory preflight pass.
 
 For preliminary exactness diagnostics, `run-preliminary-target-reference` can
 capture a locked Target-only greedy reference whose per-prompt outputs are
@@ -455,26 +488,19 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
 
 ## Limitations
 
-- All formal industrial GPU outcomes are `UNMEASURED`. The native terminal hook is present,
-  but Stage B is `BLOCKED` on the absent trusted hardware signer, provider
-  credentials, resolved model/data/trace locks, and registered hardware.
-- The current end-to-end industrial execution surface is Target-only at
-  TP1/DP1. TP2/DP2 appear only in target registry/coordinator contracts and are
-  rejected by this release. Multi-host control distributes independent work;
-  it does not authorize cross-host TP/DP collectives, Kubernetes, elastic
-  membership, remote-object-store evidence, or automatic failover.
-- The CPU `gloo` contract is not GPU/NCCL evidence. A topology configuration is
-  only target vocabulary; this release rejects TP2/DP2 regardless of any
-  caller-supplied capability receipt.
-- Static/TTS/L0-naive/LightCone remain `BLOCKED` until an out-of-band trusted signer is bound to
-  the exact native terminal hook and pinned tree. DSpark/EAGLE/EAGLE3/NEXTN
-  adaptive cells and all TP2/DP2 cells are also `BLOCKED`; they are never
-  implicit successes.
-- Formal TTS and L0-naive are separately blocked on the unresolved frozen
-  `TTS-paper-reconstruction` recipe. LightCone is additionally impossible
-  without the exact sealed E2 final-recipe receipt.
-- ChronoBelief tuning cells stay `BLOCKED` until an authoritative update
-  equation and source identity are registered; no substitute optimizer is used.
+- All formal industrial GPU outcomes are `UNMEASURED` until the new clean code,
+  patch, protocol, registry, external-source, and hardware identities produce
+  fresh signed GPU receipts.
+- TP2/DP2, native ITL, DSpark, NEXTN, and compatible EAGLE3 paths require exact
+  mode-specific device qualification. CPU contracts and caller-provided keys
+  cannot authorize them. Multi-host execution remains independent host-local
+  work only; cross-host collectives, world size greater than two, Kubernetes,
+  elastic membership, and automatic failover remain unsupported.
+- TTS and L0-naive require the signed TTS-Cal winner. LightCone additionally
+  requires the sealed E2 final recipe. No method may inherit a result-derived
+  or legacy diagnostic recipe.
+- ChronoBelief is registered with exact equations and state semantics, but it
+  still requires the same runtime/GPU qualification as every adaptive recipe.
 - Historical KV remains frozen by design. Recomputing it requires a new
   algorithm, memory envelope, protocol, and claim.
 

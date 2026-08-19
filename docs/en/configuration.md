@@ -19,16 +19,20 @@ topology. Target-only requires `speculation_enabled=false`. Every other method
 requires speculation, and its verification width must equal draft depth plus
 one. Unknown schemas and retired adaptation fields fail before model loading.
 
-These names include target protocol vocabulary, not a promise that every valid
-scientific declaration is executable. The current end-to-end industrial
-executor accepts only TP1/DP1 Target-only. Static/TTS/L0-naive/LightCone are blocked before
-mutation because the pinned native begin/reset/finalize hook has no configured
-trusted hardware signer. The lower-level adaptive patch path and terminal
-schema are limited to TP1/DP1 DFlash. The adaptive runtime can execute registered constant,
+These names include source capability, not a promise that a declaration is
+ready to execute in a particular session. Formal mutation additionally needs
+the exact root-authorized deployment/hardware policy, prepared content,
+workload, compile, qualification, terminal, and capacity authorities. The
+source pins only the public Ed25519 root; it deliberately carries no guessed
+hardware allowlist or reusable GPU proof. DFlash, DSpark, and NEXTN adaptive
+contracts and the `tp1_dp1`, `tp2_dp1`, and `tp1_dp2` topology vocabulary are
+implemented in source, while their hardware-dependent paths remain
+`implemented_pending_dynamic_gpu_proof` until the matching fresh proof is
+verified. The adaptive runtime supports registered constant,
 inverse-square-root-by-published-update, and finite-horizon cosine schedules,
-plus non-negative logical publication delay. `quota_shadow` is declaration-
-valid, but a real row need fails closed because DFlash currently exposes only
-update-round teacher acquisition.
+plus non-negative logical publication delay. `quota_shadow` remains
+declaration-valid but fails closed without its separately authorized backend
+acquisition path.
 
 Every serving run also binds the schema-v2 controlled execution policy. The
 registered policy fixes context length 40,960 and server seed 1, disables radix
@@ -44,11 +48,11 @@ that they are throughput-optimal.
 Target-only and Static schema configs require both `adaptation: null` and
 `online_spec: null`. Target-only launches the target path without speculation;
 Static describes native speculative decoding. Neither may allocate optimizer,
-gradient, master, candidate, or cohort-adaptation state. Only Target-only is
-currently end-to-end executable. Static requires content-bound request,
-performance, and aggregate speculative safety evidence, while preserving zero
-round/update detailed-trace allocation; it therefore fails the trusted-signer
-release preflight.
+gradient, master, candidate, or cohort-adaptation state. Neither role becomes
+formally executable from configuration alone. Static requires content-bound
+request, performance, and aggregate speculative safety evidence, while
+preserving zero round/update detailed-trace allocation; missing fresh terminal
+control leaves it `BLOCKED` before serving.
 
 Recipe and publication identities are orthogonal. TTS uses the frozen,
 primary-source-bound recipe with the fixed barrier. L0-naive uses the same
@@ -91,14 +95,15 @@ plan, selection, and evidence identity.
 
 ## Backend-specific fields
 
-This section specifies target contracts. In the current executable schema,
-adaptive configurations must use DFlash; DSpark, EAGLE, EAGLE3, and NEXTN are
-rejected before model loading. DFlash's target contract uses native
-differentiable-canvas evidence. EAGLE/EAGLE3 would require
-`speculative_eagle_topk=1` for adaptation and pin one proposal source version.
-NEXTN would require a separately preflighted native interface digest; registry
-E6 also targets a two-rank memory-fit receipt. Those prerequisites do not make
-the cells executable in the current schema.
+Adaptive schema configurations may use DFlash, DSpark, or NEXTN. DFlash uses
+native differentiable-canvas evidence. DSpark requires the actual sampled
+predecessor, W1/W2 and native confidence head plus the exact 56-candidate
+selector. NEXTN requires its MTP hidden/interface, teacher rows, valid mask,
+source version, and (for TP2) exact target/drafter shard authority. These are
+source contracts; formal execution still requires their backend-specific GPU
+qualification artifacts. Adaptive EAGLE remains unsupported. EAGLE3 is
+available only to an officially compatible model/selector combination under a
+separate signed decision; it is not a generic adaptation fallback.
 
 DSpark layer-only scopes freeze W1, W2, and acceptance/confidence state. Hybrid
 scopes `last1_native_heads`, `last3_native_heads`, and `last5_native_heads`
@@ -119,16 +124,18 @@ scopes and three hybrid scopes, each crossed with Full plus seven LoRA ranks.
 ## Optimizer contract
 
 The E1/E2 **LC-candidate** optimizer registry contains `adam`, `adamw`, `sgdm`,
-`nag`, `muon`, and `lion`. They make a functional parameter/state proposal and
-mutate active state only on commit. TTS does not search this registry: its
-paper-bound authority specifies Adam and one step, while its numeric learning
-rate/schedule, betas, epsilon, optimizer-state reset, weight decay/clip,
-position weights, proximal coefficient, loss normalization/precision/
-temperature, exact trainable-parameter manifest, stride-selection rule, and
-official implementation commit remain unresolved. Consequently
-`TTS-paper-reconstruction` and L0-naive remain `BLOCKED`; neither may inherit a
-schema default, historical AdamW recipe, or E1/E2 selection. Plain `sgd` is
-reserved for OnlineSPEC.
+`nag`, `muon`, `lion`, and project-owned `chronobelief`. They make a functional
+parameter/state proposal and mutate active state only on commit. TTS does not
+search this registry. Its
+TTS-Cal authority fixes Adam, one step, `(beta1=.9, beta2=.999, epsilon=1e-8)`,
+zero weight decay, no clipping, full-drafter updates, latest-round-only
+teacher rows, drafter-native position weights, source-point proximal anchor,
+request reset, side stream, the learning-rate grid `1e-7` through `1e-3`, and
+strides `{1,5,10,15,20,30,40,50}`. The only run-specific numeric choice is the
+safety-first TTS-Cal winner. Until that disjoint tuning window and its four
+excluded pilots produce a signed seal, TTS and L0-naive remain `BLOCKED`; they
+may not inherit a schema default, historical AdamW recipe, or E1/E2 selection.
+Plain `sgd` is reserved for OnlineSPEC.
 
 | Optimizer | Required identity | Resident moment rule |
 |---|---|---|
@@ -138,14 +145,16 @@ reserved for OnlineSPEC.
 | NAG | learning rate, momentum, optional decay | one FP32 momentum; coupled decay |
 | Lion | learning rate, betas, optional decay | one FP32 moment; decoupled decay |
 | Muon | learning rate, momentum, Newton--Schulz steps, auxiliary AdamW fields | matrix momentum plus two auxiliary moments for non-matrices |
+| ChronoBelief | learning rate, betas, epsilon, decoupled decay, source/safe-boundary versions | FP32 first and centered second moments; standard bias correction; age derived as exact $d_r$ |
 
-Global `grad_clip` is positive and evidence-bound. Unused optimizer fields are
-rejected. The target schedule vocabulary includes `constant`,
+Global `grad_clip` is positive and evidence-bound for recipes that use it; the
+TTS reconstruction requires literal no-clip. Unused optimizer fields are
+rejected. The schedule vocabulary includes `constant`,
 `inverse_sqrt_published_update`, and `cosine_to_zero`, advancing from
-published-update count rather than attempted work. The current adaptive
-`RunConfig` accepts only `constant`; the other schedules remain registered but
-non-executable. Optimizer and schedule identities enter cohort, plan,
-selection, and evidence digests.
+published-update count rather than attempted work. Optimizer and schedule
+identities enter cohort, plan, selection, and evidence digests. A skipped or
+aborted ChronoBelief proposal advances neither moments, update count, nor safe
+boundary; the exact GPU parity suite remains a dynamic pre-execution gate.
 
 ## Runtime topology
 
@@ -160,15 +169,17 @@ ranks:
 
 Rank fields must lie inside their TP/DP dimensions. Device, rendezvous, router,
 clock, process-group backend, and capability receipt are part of target runtime
-identity. The current release accepts only the TP1/DP1 row and rejects all
-TP2/DP2 `RunConfig` values before model loading; a caller-authored receipt
-cannot enable them.
+identity. Configuration validation accepts a distributed row only with the
+exact source-owned `patched_two_gpu_v1` capability identity and a runtime
+receipt claim. Formal dispatch then deep-verifies the corresponding dynamic
+GPU proof; a caller-authored receipt or the source CPU capability alone cannot
+enable execution.
 
 `process_group_backend=gloo` is valid for the CPU collective contract. It does
 not certify NCCL/CUDA behavior and must not be used as a GPU capability receipt.
-The CPU contract preserves future receipt vocabulary only. Production TP2/DP2
-work remains `BLOCKED` until a new pinned runtime implements and emits the GPU
-receipt plus all-rank publication evidence.
+The CPU contract exercises state transitions only. Production TP2/DP2 remains
+`BLOCKED` until the pinned runtime emits and local control verifies the exact
+GPU qualification, all-rank publication, and terminal evidence.
 
 Prefill/decode disaggregation and two-batch overlap remain disabled. Multi-node
 and more-than-two-rank configurations fail validation; there is no Kubernetes,
@@ -179,7 +190,7 @@ registry uses two stable logical rank slots. A strict `GpuInventory` may contain
 any number of devices; the sole scheduler has explicit 1/2/4/8/16-GPU
 regression coverage and freezes physical UUIDs, rank layout, ports, topology,
 and whole-instance size in an `IndustrialPhysicalAssignment`. This does not
-enable TP2/DP2: release `RunConfig` validation remains TP1/DP1-only.
+enable TP2/DP2: the exact dynamic qualification remains mandatory.
 
 ## HBM and cohort policy
 

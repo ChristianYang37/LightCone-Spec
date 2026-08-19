@@ -30,11 +30,13 @@ from lightcone_spec.orchestration.native_terminal import (
 )
 from lightcone_spec.orchestration.session_reuse_authority import (
     SESSION_REUSE_BLOCK_REASON,
+    SESSION_REUSE_GPU_VERIFIED_REASON,
     SOURCE_OWNED_SESSION_HOOK,
     SessionReuseAuditResult,
     SourceOwnedSessionAuditRuntime,
     audit_source_owned_reuse_contract,
 )
+from lightcone_spec.runtime.readiness import VerifiedNativeRuntimeGpuProof
 
 _SESSION_CAPABILITY_PATH = "/v1/lightcone-spec/session-reset/capability"
 _SESSION_INITIAL_STATE_PATH = "/v1/lightcone-spec/session-reset/initial-state"
@@ -103,6 +105,24 @@ class SessionLiveTraceDriver(Protocol):
     ) -> Sequence[TerminalRequestExpectation]: ...
 
 
+class SessionLiveTerminalObserver(Protocol):
+    """Receive one already-validated terminal before the next reset begins.
+
+    The observer is an evidence sink, not a serving callback: request execution
+    remains owned by ``SessionLiveTraceDriver`` and the pinned transport.  A
+    raised observer error therefore fails the source-owned session and selects
+    the fresh-process fallback.
+    """
+
+    async def terminal_finalized(
+        self,
+        *,
+        trace_index: int,
+        binding: NativeTerminalRunBinding,
+        terminal: ValidatedNativeTerminalEvidence,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class SessionLiveTraceInput:
     binding: NativeTerminalRunBinding
@@ -137,15 +157,23 @@ class SessionLiveContractResult:
     transport_closed: bool
     process_closed: bool
     process_force_closed: bool
+    verified_gpu_proof_sha256: str | None = None
 
     def validate(self) -> None:
-        if self.audit.reuse_authorized:
-            raise ValueError("live CPU contract cannot authorize session reuse")
-        if self.audit.status not in {"CPU_CONTRACT_ONLY", "FRESH_PROCESS_REQUIRED"}:
+        if self.audit.status not in {
+            "CPU_CONTRACT_ONLY",
+            "FRESH_PROCESS_REQUIRED",
+            "GPU_VERIFIED",
+        }:
             raise ValueError("live session audit returned an unsupported status")
-        if self.audit.status == "CPU_CONTRACT_ONLY":
+        if self.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             if (
-                self.audit.reason != SESSION_REUSE_BLOCK_REASON
+                self.audit.reason
+                != (
+                    SESSION_REUSE_GPU_VERIFIED_REASON
+                    if self.audit.status == "GPU_VERIFIED"
+                    else SESSION_REUSE_BLOCK_REASON
+                )
                 or not self.transport_closed
                 or not self.process_closed
                 or self.process_force_closed
@@ -163,8 +191,24 @@ class SessionLiveContractResult:
             )
         if self.process_closed and self.process_force_closed:
             raise ValueError("process close disposition is ambiguous")
-        if self.audit.status == "CPU_CONTRACT_ONLY" and not self.steps:
+        if (
+            self.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}
+            and not self.steps
+        ):
             raise ValueError("live session result requires raw response bindings")
+        if (
+            self.audit.status == "GPU_VERIFIED"
+            and self.verified_gpu_proof_sha256 is None
+        ) or self.audit.reuse_authorized != (self.audit.status == "GPU_VERIFIED"):
+            raise ValueError("live session GPU proof/reuse status is inconsistent")
+        if self.verified_gpu_proof_sha256 is not None and (
+            len(self.verified_gpu_proof_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.verified_gpu_proof_sha256
+            )
+        ):
+            raise ValueError("live session GPU proof digest is invalid")
         if not self.execution_plan_sha256s or len(
             set(self.execution_plan_sha256s)
         ) != len(self.execution_plan_sha256s):
@@ -197,7 +241,7 @@ class SessionLiveContractResult:
         observed_steps = [
             (step.step, step.execution_plan_sha256) for step in self.steps
         ]
-        if self.audit.status == "CPU_CONTRACT_ONLY":
+        if self.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             if observed_steps != expected_steps:
                 raise ValueError("successful live session step chain is incomplete")
         else:
@@ -223,7 +267,7 @@ class SessionLiveContractResult:
             != self.execution_plan_sha256s[: len(self.native_terminals)]
         ):
             raise ValueError("validated native terminals changed registered order")
-        if self.audit.status == "CPU_CONTRACT_ONLY":
+        if self.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             self._validate_complete_receipt_chain()
 
     def _validate_complete_receipt_chain(self) -> None:
@@ -370,7 +414,7 @@ class SessionLiveContractResult:
     @property
     def reuse_authorized(self) -> bool:
         self.validate()
-        return False
+        return self.audit.reuse_authorized
 
 
 def _strict_json_load(value: str) -> object:
@@ -581,11 +625,13 @@ class _LiveAuditRuntime(SourceOwnedSessionAuditRuntime):
         transport: SessionLivePinnedBenchTransport,
         provider: NativeTerminalProvider,
         process_owner: SessionLiveProcessOwner,
+        terminal_observer: SessionLiveTerminalObserver | None,
     ) -> None:
         self._traces = traces
         self._transport = transport
         self._provider = provider
         self._process_owner = process_owner
+        self._terminal_observer = terminal_observer
         self._trace_index = 0
         self._scored: tuple[TerminalRequestExpectation, ...] | None = None
         self._pending_clock: object | None = None
@@ -744,6 +790,12 @@ class _LiveAuditRuntime(SourceOwnedSessionAuditRuntime):
             source.get("terminal_receipt_sha256") != terminal.terminal_sha256
         ):
             raise ValueError("source trace is not bound to validated terminal evidence")
+        if self._terminal_observer is not None:
+            await self._terminal_observer.terminal_finalized(
+                trace_index=self._trace_index,
+                binding=trace.binding,
+                terminal=terminal,
+            )
         self._transport.finish_live_trace()
         self.native_terminals.append(terminal)
         self._scored = None
@@ -775,6 +827,8 @@ async def run_session_live_contract(
     transport: SessionLivePinnedBenchTransport,
     provider: NativeTerminalProvider,
     process_owner: SessionLiveProcessOwner,
+    verified_gpu_proof: VerifiedNativeRuntimeGpuProof | None = None,
+    terminal_observer: SessionLiveTerminalObserver | None = None,
 ) -> SessionLiveContractResult:
     """Exercise the live native chain, close it, and retain a blocked audit.
 
@@ -791,6 +845,10 @@ async def run_session_live_contract(
         trace.validate()
     if type(transport) is not SessionLivePinnedBenchTransport:
         raise TypeError("live session requires the pinned atomic transport")
+    if terminal_observer is not None and not callable(
+        getattr(terminal_observer, "terminal_finalized", None)
+    ):
+        raise TypeError("live session terminal observer is incomplete")
     if (
         type(provider) is not NativeTerminalProvider
         or provider._transport is not transport
@@ -845,6 +903,7 @@ async def run_session_live_contract(
         transport=transport,
         provider=provider,
         process_owner=process_owner,
+        terminal_observer=terminal_observer,
     )
     transport_closed = False
     process_closed = False
@@ -860,8 +919,9 @@ async def run_session_live_contract(
             session_plan_sha256=session_plan_sha256,
             execution_plan_sha256s=execution_plan_sha256s,
             runtime=runtime,
+            verified_gpu_proof=verified_gpu_proof,
         )
-        if audit.status == "CPU_CONTRACT_ONLY":
+        if audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             await transport.close()
             transport_closed = True
             await process_owner.close()
@@ -903,6 +963,9 @@ async def run_session_live_contract(
         transport_closed=transport_closed,
         process_closed=process_closed,
         process_force_closed=runtime.force_closed,
+        verified_gpu_proof_sha256=(
+            None if verified_gpu_proof is None else verified_gpu_proof.sha256
+        ),
     )
     value.validate()
     if transport._evidence_sink is not None:
@@ -920,6 +983,7 @@ __all__ = (
     "SessionLivePinnedBenchTransport",
     "SessionLiveProcessOwner",
     "SessionLiveStepBinding",
+    "SessionLiveTerminalObserver",
     "SessionLiveTraceDriver",
     "SessionLiveTraceInput",
     "run_session_live_contract",

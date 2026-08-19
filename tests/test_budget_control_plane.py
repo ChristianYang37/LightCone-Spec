@@ -58,9 +58,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     LockedOutput,
-    build_industrial_registry,
     content_sha256,
     serving_cell_rejection_reason,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 
 

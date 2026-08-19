@@ -12,7 +12,19 @@ from lightcone_spec.adaptation.parameters import (
     LAYER_SCOPES,
     LORA_RANKS,
 )
-from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.execution import (
+    ControlledExecutionPolicy,
+    FixedAddressGraphExecutionPolicy,
+)
+from lightcone_spec.runtime.distributed import (
+    AdaptationCollectiveMode,
+    DistributedControlMode,
+    RuntimeTopologyMode,
+    adaptation_collective_mode,
+    distributed_control_mode,
+    registered_runtime_topology_mode,
+    require_distributed_runtime_release_capability,
+)
 
 CoreMethod = Literal["target_only", "static", "tts", "l0"]
 BaselineMethod = Literal["onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"]
@@ -39,16 +51,62 @@ class ModelPair(StrictModel):
     algorithm: Literal["DFLASH", "DSPARK", "EAGLE", "EAGLE3", "NEXTN"] = "DFLASH"
     max_context_length: int = Field(default=40960, ge=1)
     draft_depth: int = Field(default=15, ge=1)
+    nextn_mtp_mode: Literal["external_drafter", "built_in_mtp"] = "external_drafter"
+    target_snapshot_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    mtp_component_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_nextn_model_source(self) -> ModelPair:
+        built_in = self.nextn_mtp_mode == "built_in_mtp"
+        if built_in:
+            if (
+                self.algorithm != "NEXTN"
+                or self.target != self.drafter
+                or self.target_revision != self.drafter_revision
+                or self.target_snapshot_sha256 is None
+                or self.mtp_component_sha256 is None
+                or self.target_snapshot_sha256 == self.mtp_component_sha256
+            ):
+                raise ValueError(
+                    "built-in NEXTN requires one frozen target snapshot and a "
+                    "distinct embedded MTP component identity"
+                )
+        elif (
+            self.target_snapshot_sha256 is not None
+            or self.mtp_component_sha256 is not None
+        ):
+            raise ValueError(
+                "external drafter mode cannot carry a built-in MTP identity"
+            )
+        if self.algorithm != "NEXTN" and self.nextn_mtp_mode != "external_drafter":
+            raise ValueError("built-in MTP mode is defined only for NEXTN")
+        return self
 
 
 class OptimizerConfig(StrictModel):
-    name: Literal["adam", "adamw", "sgd", "sgdm", "nag", "muon", "lion", "none"]
+    name: Literal[
+        "adam",
+        "adamw",
+        "sgd",
+        "sgdm",
+        "nag",
+        "muon",
+        "lion",
+        "chronobelief",
+        "none",
+    ]
     learning_rate: float = Field(default=0.0, ge=0.0)
     weight_decay: float = Field(default=0.0, ge=0.0)
     beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
     beta2: float = Field(default=0.999, gt=0.0, lt=1.0)
     epsilon: float = Field(default=1e-8, gt=0.0)
-    grad_clip: float = Field(default=1.0, gt=0.0)
+    grad_clip: float | None = Field(default=1.0, gt=0.0)
     momentum: float | None = Field(default=None, gt=0.0, lt=1.0)
     muon_ns_steps: int | None = Field(default=None, ge=1, le=20)
     muon_auxiliary_learning_rate: float | None = Field(default=None, gt=0.0)
@@ -65,7 +123,14 @@ class OptimizerConfig(StrictModel):
                 raise ValueError("optimizer=none requires zero lr and weight decay")
         elif self.learning_rate <= 0:
             raise ValueError("an enabled optimizer requires a positive learning rate")
-        decay_optimizers = {"adamw", "sgdm", "nag", "muon", "lion"}
+        decay_optimizers = {
+            "adamw",
+            "sgdm",
+            "nag",
+            "muon",
+            "lion",
+            "chronobelief",
+        }
         if self.name not in decay_optimizers and self.weight_decay != 0:
             raise ValueError("weight_decay is unsupported for this optimizer")
         momentum_optimizers = {"sgdm", "nag", "muon"}
@@ -124,6 +189,30 @@ class AdaptationConfig(StrictModel):
     verification_mode: Literal["native_scheduler", "fixed_budget"] = "native_scheduler"
     fixed_verification_budget: int | None = Field(default=None, ge=1)
     confidence_loss_weight: float | None = Field(default=None, ge=0.0)
+    chronobelief_release_capability_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    chronobelief_gpu_proof_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_e0_execution_authority_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_compatibility_authority_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_model_selector_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_native_gpu_proof_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_qualification_compatibility_authority_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    eagle3_qualification_model_selector_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def validate_mode(self) -> AdaptationConfig:
@@ -138,6 +227,27 @@ class AdaptationConfig(StrictModel):
             self.fixed_verification_budget is not None
         ):
             raise ValueError("fixed-budget verification requires exactly one budget")
+        chronobelief_authority = (
+            self.chronobelief_release_capability_sha256,
+            self.chronobelief_gpu_proof_sha256,
+        )
+        if self.optimizer.name == "chronobelief":
+            from lightcone_spec.runtime.readiness import (
+                NATIVE_RUNTIME_RELEASE_CAPABILITY,
+            )
+
+            if (
+                self.chronobelief_release_capability_sha256
+                != NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+                or self.chronobelief_gpu_proof_sha256 is None
+            ):
+                raise ValueError(
+                    "ChronoBelief requires source capability and exact GPU proof"
+                )
+        elif any(value is not None for value in chronobelief_authority):
+            raise ValueError(
+                "ChronoBelief GPU authority is forbidden for another optimizer"
+            )
         return self
 
 
@@ -170,7 +280,12 @@ class RuntimeConfig(StrictModel):
     context_length: Literal[40960] = 40960
     random_seed: Literal[1] = 1
     disable_radix_cache: Literal[True] = True
-    disable_cuda_graph: Literal[True] = True
+    cuda_graph_mode: Literal["disabled", "fixed_address_publication_v1"] = "disabled"
+    disable_cuda_graph: bool = True
+    cuda_graph_batch_sizes: tuple[int, ...] = (1,)
+    native_graph_release_capability_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     target_reference_disable_overlap_schedule: Literal[True] = True
     speculative_disable_overlap_schedule: Literal[False] = False
     enable_deterministic_inference: Literal[False] = False
@@ -186,9 +301,12 @@ class RuntimeConfig(StrictModel):
     rendezvous_identity: str = Field(default="local-rendezvous", min_length=1)
     router_identity: str = Field(default="single-replica", min_length=1)
     clock_identity: str = Field(default="monotonic", min_length=1)
-    process_group_backend: Literal["nccl", "gloo"] = "nccl"
+    process_group_backend: Literal["nccl", "gloo", "none"] = "nccl"
     distributed_runtime_capability: Literal["single_rank", "patched_two_gpu_v1"] = (
         "single_rank"
+    )
+    distributed_release_capability_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
     )
     distributed_capability_receipt_sha256: str | None = Field(
         default=None, pattern=r"^[0-9a-f]{64}$"
@@ -198,25 +316,59 @@ class RuntimeConfig(StrictModel):
     use_rejection_sampling: bool = True
     max_running_requests: int = Field(default=1, ge=1)
     telemetry_detail: Literal["headline", "profile"] = "headline"
+    adaptation_microbatch_size: Literal[1, 2, 4, 8] = 1
+    adaptation_publication_coalescing: Literal[1, 2, 4, 8] = 1
+    adaptation_stream_priority: Literal["default", "high"] = "default"
     prefill_decode_disaggregation: Literal[False] = False
     two_batch_overlap: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_topology(self) -> RuntimeConfig:
-        policy = ControlledExecutionPolicy(
-            context_length=self.context_length,
-            random_seed=self.random_seed,
-            disable_radix_cache=self.disable_radix_cache,
-            disable_cuda_graph=self.disable_cuda_graph,
-            target_reference_disable_overlap_schedule=(
+        common_policy = {
+            "context_length": self.context_length,
+            "random_seed": self.random_seed,
+            "disable_radix_cache": self.disable_radix_cache,
+            "disable_cuda_graph": self.disable_cuda_graph,
+            "target_reference_disable_overlap_schedule": (
                 self.target_reference_disable_overlap_schedule
             ),
-            speculative_disable_overlap_schedule=(
+            "speculative_disable_overlap_schedule": (
                 self.speculative_disable_overlap_schedule
             ),
-            enable_deterministic_inference=self.enable_deterministic_inference,
-            incremental_streaming_output=self.incremental_streaming_output,
-        )
+            "enable_deterministic_inference": self.enable_deterministic_inference,
+            "incremental_streaming_output": self.incremental_streaming_output,
+        }
+        if self.cuda_graph_batch_sizes != (1,):
+            raise ValueError("runtime CUDA graph batch sizes are not registered")
+        if self.cuda_graph_mode == "disabled":
+            if (
+                self.disable_cuda_graph is not True
+                or self.native_graph_release_capability_sha256 is not None
+            ):
+                raise ValueError(
+                    "disabled CUDA graph mode cannot claim graph capability"
+                )
+            policy = ControlledExecutionPolicy(**common_policy)
+        else:
+            from lightcone_spec.runtime.readiness import (
+                NATIVE_RUNTIME_RELEASE_CAPABILITY,
+            )
+
+            if (
+                self.disable_cuda_graph is not False
+                or self.native_graph_release_capability_sha256
+                != NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+            ):
+                raise ValueError(
+                    "fixed-address CUDA graph mode lacks source capability"
+                )
+            policy = FixedAddressGraphExecutionPolicy(
+                native_runtime_release_capability_sha256=(
+                    self.native_graph_release_capability_sha256
+                ),
+                graph_batch_sizes=self.cuda_graph_batch_sizes,
+                **common_policy,
+            )
         if self.execution_policy_sha256 != policy.sha256:
             raise ValueError("runtime execution-policy identity mismatch")
         if self.tp_rank >= self.tensor_parallel_size:
@@ -225,28 +377,70 @@ class RuntimeConfig(StrictModel):
             raise ValueError("dp_rank is outside data_parallel_size")
         if self.node_rank >= self.node_count:
             raise ValueError("node_rank is outside node_count")
-        if self.node_count != 1:
-            raise ValueError("multi-node LightCone remains UNMEASURED and fail-closed")
-        if self.tensor_parallel_size * self.data_parallel_size > 2:
-            raise ValueError(
-                "the registered two-GPU topology supports at most two ranks"
-            )
+        topology_mode = registered_runtime_topology_mode(
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.node_count,
+        )
+        if self.node_rank != 0:
+            raise ValueError("registered runtime ranks must remain on the local host")
         if self.data_parallel_size > 1 and self.router_identity == "single-replica":
             raise ValueError("DP replicas require an explicit sticky router identity")
+        if self.prefill_decode_disaggregation or self.two_batch_overlap:
+            raise ValueError("unregistered serving overlap mode is forbidden")
         distributed = self.tensor_parallel_size * self.data_parallel_size > 1
         if distributed:
-            raise ValueError(
-                "the pinned schema-v3 release does not expose TP2/DP2 execution; "
-                "a caller-authored capability digest cannot enable it"
+            if self.distributed_runtime_capability != "patched_two_gpu_v1":
+                raise ValueError(
+                    "distributed topology requires patched_two_gpu_v1 capability"
+                )
+            if self.distributed_release_capability_sha256 is None:
+                raise ValueError(
+                    "distributed topology requires a source-owned release capability"
+                )
+            if self.distributed_capability_receipt_sha256 is None:
+                raise ValueError(
+                    "distributed topology requires a runtime-envelope receipt"
+                )
+            capability = require_distributed_runtime_release_capability(
+                topology_mode=topology_mode,
+                claimed_capability_sha256=(self.distributed_release_capability_sha256),
             )
+            if capability.process_group_backend != self.process_group_backend:
+                raise ValueError(
+                    "runtime process-group backend differs from release capability"
+                )
         elif (
             self.distributed_runtime_capability != "single_rank"
+            or self.distributed_release_capability_sha256 is not None
             or self.distributed_capability_receipt_sha256 is not None
         ):
             raise ValueError(
                 "single-rank runs cannot claim a distributed runtime capability"
             )
         return self
+
+    @property
+    def topology_mode(self) -> RuntimeTopologyMode:
+        """Return the registered mode without treating it as GPU readiness proof."""
+
+        return registered_runtime_topology_mode(
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.node_count,
+        )
+
+    @property
+    def distributed_control_mode(self) -> DistributedControlMode:
+        """Return the topology-owned control plane, not a readiness claim."""
+
+        return distributed_control_mode(self.topology_mode)
+
+    @property
+    def adaptation_collective_mode(self) -> AdaptationCollectiveMode:
+        """Expose that DP replicas own disjoint adaptation state."""
+
+        return adaptation_collective_mode(self.topology_mode)
 
 
 class RunConfig(StrictModel):
@@ -261,11 +455,18 @@ class RunConfig(StrictModel):
     @model_validator(mode="after")
     def validate_method_contract(self) -> RunConfig:
         algorithm = self.model.algorithm
+        mechanism_defaults = (
+            self.runtime.adaptation_microbatch_size == 1
+            and self.runtime.adaptation_publication_coalescing == 1
+            and self.runtime.adaptation_stream_priority == "default"
+        )
         if self.method == "target_only":
             if self.runtime.speculation_enabled:
                 raise ValueError("target_only requires speculation_enabled=false")
             if self.adaptation is not None or self.online_spec is not None:
                 raise ValueError("target_only must not allocate adaptation state")
+            if not mechanism_defaults:
+                raise ValueError("target_only cannot carry adaptation mechanism tuning")
             return self
         if not self.runtime.speculation_enabled:
             raise ValueError("speculative methods require speculation_enabled=true")
@@ -281,15 +482,57 @@ class RunConfig(StrictModel):
         if self.method == "static":
             if self.adaptation is not None or self.online_spec is not None:
                 raise ValueError("static must not allocate adaptation state")
+            if not mechanism_defaults:
+                raise ValueError("static cannot carry adaptation mechanism tuning")
             return self
         if self.adaptation is None:
             raise ValueError(f"method={self.method} requires adaptation configuration")
-        if algorithm != "DFLASH":
+        if algorithm not in {"DFLASH", "DSPARK", "EAGLE3", "NEXTN"}:
             raise ValueError(
-                "the pinned schema-v3 patch executes adaptation only for DFLASH"
+                "the pinned schema-v3 patch has no signed native adaptation "
+                f"authority for {algorithm}"
             )
+        eagle3_authority = (
+            self.adaptation.eagle3_e0_execution_authority_sha256,
+            self.adaptation.eagle3_compatibility_authority_sha256,
+            self.adaptation.eagle3_model_selector_sha256,
+            self.adaptation.eagle3_native_gpu_proof_sha256,
+        )
+        eagle3_qualification = (
+            self.adaptation.eagle3_qualification_compatibility_authority_sha256,
+            self.adaptation.eagle3_qualification_model_selector_sha256,
+        )
+        if algorithm == "EAGLE3":
+            formal = all(value is not None for value in eagle3_authority)
+            qualification = all(value is not None for value in eagle3_qualification)
+            if (
+                formal == qualification
+                or (not formal and any(value is not None for value in eagle3_authority))
+                or (
+                    not qualification
+                    and any(value is not None for value in eagle3_qualification)
+                )
+            ):
+                raise ValueError(
+                    "adaptive EAGLE3 requires exactly one formal-E0 or "
+                    "eagle3_tp1 qualification authority"
+                )
+            if (
+                self.runtime.tensor_parallel_size != 1
+                or self.runtime.data_parallel_size != 1
+                or self.runtime.node_count != 1
+            ):
+                raise ValueError("adaptive EAGLE3 E0 is registered only for TP1/DP1")
+        elif any(
+            value is not None for value in (*eagle3_authority, *eagle3_qualification)
+        ):
+            raise ValueError("EAGLE3 E0 authority is forbidden for another backend")
         self._validate_backend_scope()
         if self.method.startswith("onlinespec_"):
+            if not mechanism_defaults:
+                raise ValueError(
+                    "OnlineSPEC cannot inherit LightCone E4 mechanism tuning"
+                )
             self._validate_onlinespec()
             return self
         if self.online_spec is not None:
@@ -303,6 +546,7 @@ class RunConfig(StrictModel):
             "nag",
             "muon",
             "lion",
+            "chronobelief",
         }:
             raise ValueError("unsupported optimizer for TTS/L0 speed tuning")
         if self.adaptation.canvas_tokens != self.runtime.speculative_num_draft_tokens:

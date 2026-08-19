@@ -16,6 +16,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -28,21 +29,41 @@ from lightcone_spec import (
 
 RUNTIME_MANIFEST = Path("manifests/runtime/industrial_compatibility_v1.json")
 _STATUS = frozenset(("PASS", "FAIL", "UNKNOWN"))
-_FAIL_CLOSED_MODE_GATES = (
+_UNSUPPORTED_MODE_GATES = (
     ("multi_node", "release_multi_node_unsupported"),
-    ("tp2", "release_topology_executor_unsupported"),
-    ("dp2", "release_topology_executor_unsupported"),
+    ("adaptive_eagle", "release_adaptive_backend_unsupported"),
+    (
+        "adaptive_dflash_dspark",
+        "release_combined_backend_unsupported",
+    ),
+)
+_PENDING_DYNAMIC_GPU_PROOF_MODE_GATES = (
+    ("tp2", "distributed_tp2_gpu_qualification_required"),
+    ("dp2", "distributed_dp2_gpu_qualification_required"),
+    ("adaptive_dspark", "dspark_gpu_qualification_required"),
+    ("adaptive_nextn", "nextn_gpu_qualification_required"),
+    (
+        "adaptive_chronobelief",
+        "chronobelief_gpu_qualification_required",
+    ),
+    ("native_itl", "native_itl_gpu_qualification_required"),
+    (
+        "fixed_address_publication_graph",
+        "fixed_address_graph_gpu_qualification_required",
+    ),
+    ("session_reuse", "session_reset_gpu_qualification_required"),
+)
+_EXTERNAL_AUTHORITY_MODE_GATES = (
     (
         "static_speculative",
         "release_trusted_terminal_attester_unavailable",
     ),
     ("tts", "release_trusted_terminal_attester_unavailable"),
     ("l0", "release_trusted_terminal_attester_unavailable"),
-    ("adaptive_dspark", "release_adaptive_backend_unsupported"),
-    ("adaptive_eagle", "release_adaptive_backend_unsupported"),
-    ("adaptive_eagle3", "release_adaptive_backend_unsupported"),
-    ("adaptive_nextn", "release_adaptive_backend_unsupported"),
-    ("adaptive_dflash_dspark", "release_adaptive_backend_unsupported"),
+    (
+        "adaptive_eagle3",
+        "release_official_eagle3_compatibility_authority_unavailable",
+    ),
     (
         "quota_shadow_backend_acquisition",
         "release_quota_shadow_backend_acquisition_unavailable",
@@ -683,7 +704,9 @@ def _manifest_structure_error(value: Mapping[str, Any]) -> str | None:
             ("network", "artifact_dns_any_of"),
             ("network", "package_index_dns"),
             ("release_capabilities", "supported"),
-            ("release_capabilities", "blocked"),
+            ("release_capabilities", "implemented_pending_dynamic_gpu_proof"),
+            ("release_capabilities", "external_authority_required"),
+            ("release_capabilities", "unsupported"),
         ):
             if value[path[0]][path[1]] is None:
                 return f"missing_{path[0]}_{path[1]}"
@@ -696,9 +719,23 @@ def _manifest_structure_error(value: Mapping[str, Any]) -> str | None:
         ):
             if not flashinfer[key]:
                 return f"missing_packages_flashinfer_python_{key}"
-        blocked = value["release_capabilities"]["blocked"]
-        observed_gates = tuple((row["mode"], row["reason_code"]) for row in blocked)
-        if observed_gates != _FAIL_CLOSED_MODE_GATES:
+        capabilities = value["release_capabilities"]
+        pending = tuple(
+            (row["mode"], row["reason_code"])
+            for row in capabilities["implemented_pending_dynamic_gpu_proof"]
+        )
+        external = tuple(
+            (row["mode"], row["reason_code"])
+            for row in capabilities["external_authority_required"]
+        )
+        unsupported = tuple(
+            (row["mode"], row["reason_code"]) for row in capabilities["unsupported"]
+        )
+        if (
+            pending != _PENDING_DYNAMIC_GPU_PROOF_MODE_GATES
+            or external != _EXTERNAL_AUTHORITY_MODE_GATES
+            or unsupported != _UNSUPPORTED_MODE_GATES
+        ):
             return "release_mode_gates_mismatch"
         minimum_count = value["gpu"]["minimum_count"]
         reference_count = value["gpu"]["reference_count"]
@@ -844,28 +881,113 @@ def _patch_binding(project_root: Path, manifest: Mapping[str, Any]) -> dict[str,
     }
 
 
-def _mode_gates(manifest: Mapping[str, Any] | None) -> dict[str, Any]:
+def _mode_gates(
+    manifest: Mapping[str, Any] | None,
+    *,
+    distributed_gpu_proofs: tuple[object, ...] = (),
+    native_gpu_proofs: tuple[object, ...] = (),
+) -> dict[str, Any]:
     if manifest is None:
-        blocked = [
+        pending = [
             {"mode": mode, "reason_code": reason}
-            for mode, reason in _FAIL_CLOSED_MODE_GATES
+            for mode, reason in _PENDING_DYNAMIC_GPU_PROOF_MODE_GATES
+        ]
+        external = [
+            {"mode": mode, "reason_code": reason}
+            for mode, reason in _EXTERNAL_AUTHORITY_MODE_GATES
+        ]
+        unsupported = [
+            {"mode": mode, "reason_code": reason}
+            for mode, reason in _UNSUPPORTED_MODE_GATES
         ]
         supported: dict[str, Any] = {}
         source = "fail_closed_builtin"
     else:
         capabilities = manifest["release_capabilities"]
-        blocked = capabilities["blocked"]
+        pending = capabilities["implemented_pending_dynamic_gpu_proof"]
+        external = capabilities["external_authority_required"]
+        unsupported = capabilities["unsupported"]
         supported = capabilities["supported"]
         source = "canonical_manifest"
+    available: dict[str, dict[str, object]] = {}
+    verified_modes: dict[str, str] = {}
+    if distributed_gpu_proofs or native_gpu_proofs:
+        from lightcone_spec.runtime.distributed import (
+            DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
+            VerifiedDistributedRuntimeGpuProof,
+        )
+        from lightcone_spec.runtime.readiness import (
+            NATIVE_RUNTIME_RELEASE_CAPABILITY,
+            VerifiedNativeRuntimeGpuProof,
+        )
+
+        if (
+            type(distributed_gpu_proofs) is not tuple
+            or type(native_gpu_proofs) is not tuple
+        ):
+            raise TypeError("doctor dynamic proof projection requires exact tuples")
+        for proof in distributed_gpu_proofs:
+            if type(proof) is not VerifiedDistributedRuntimeGpuProof:
+                raise TypeError("doctor distributed proof must be verified")
+            capability = DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES[proof.topology_mode]
+            if proof.source_capability_sha256 != capability.sha256:
+                raise ValueError("doctor distributed proof changed source capability")
+            mode = "tp2" if proof.topology_mode == "tp2_dp1" else "dp2"
+            verified_modes[mode] = proof.receipt_sha256
+        native_modes = {
+            "chronobelief_gpu_parity": ("adaptive_chronobelief",),
+            "dspark_tp1": ("adaptive_dspark",),
+            "nextn_tp1": ("adaptive_nextn",),
+            "nextn_tp2": ("adaptive_nextn",),
+            "native_hot_path_tp1": (
+                "native_itl",
+                "fixed_address_publication_graph",
+            ),
+            "session_reset_tp1": ("session_reuse",),
+        }
+        for proof in native_gpu_proofs:
+            if type(proof) is not VerifiedNativeRuntimeGpuProof:
+                raise TypeError("doctor native proof must be verified")
+            if (
+                proof.source_capability_sha256
+                != NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+            ):
+                raise ValueError("doctor native proof changed source capability")
+            for mode in native_modes[proof.suite_id]:
+                verified_modes[mode] = proof.receipt_sha256
+    pending_projection: dict[str, dict[str, object]] = {}
+    for row in pending:
+        mode = row["mode"]
+        proof_sha256 = verified_modes.get(mode)
+        if proof_sha256 is None:
+            pending_projection[mode] = {
+                "status": "BLOCKED",
+                "implementation_status": ("IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"),
+                "reason_code": row["reason_code"],
+            }
+        else:
+            available[mode] = {
+                "status": "AVAILABLE",
+                "qualification_receipt_sha256": proof_sha256,
+            }
     return {
         "source": source,
         "supported": supported,
+        "available_after_dynamic_proof": available,
+        "pending_dynamic_gpu_proof": pending_projection,
+        "external_authority_required": {
+            row["mode"]: {
+                "status": "BLOCKED",
+                "reason_code": row["reason_code"],
+            }
+            for row in external
+        },
         "unsupported": {
             row["mode"]: {
                 "status": "UNSUPPORTED",
                 "reason_code": row["reason_code"],
             }
-            for row in blocked
+            for row in unsupported
         },
     }
 
@@ -1292,14 +1414,185 @@ def _evaluate(
 def doctor_report(
     project_root: str | Path = ".",
     sglang_root: str | Path | None = None,
+    *,
+    stage_capacity_gate_path: str | Path | None = None,
+    stage_capacity_schedule_path: str | Path | None = None,
+    stage_capacity_attestation_path: str | Path | None = None,
+    stage_capacity_activation_sha256: str | None = None,
+    stage_capacity_now_ns: int | None = None,
 ) -> dict[str, Any]:
     project = Path(project_root).resolve()
     sglang = Path(sglang_root).resolve() if sglang_root is not None else project
     manifest, manifest_report = _load_manifest(project)
+    evaluation_manifest = manifest
+    capacity_report: dict[str, Any]
+    capacity_error: str | None = None
+    capacity_inputs = (
+        stage_capacity_gate_path,
+        stage_capacity_schedule_path,
+        stage_capacity_attestation_path,
+        stage_capacity_activation_sha256,
+    )
+    if all(value is None for value in capacity_inputs):
+        capacity_report = {
+            "mode": "LEGACY_100GB_FALLBACK",
+            "status": "FALLBACK",
+            "reason_code": "stage_capacity_authority_absent",
+            "required_free_bytes": (
+                None
+                if manifest is None
+                else manifest.get("disk", {}).get("minimum_free_bytes")
+            ),
+            "gate_sha256": None,
+            "schedule_sha256": None,
+        }
+    elif any(value is None for value in capacity_inputs):
+        capacity_report = {
+            "mode": "SIGNED_STAGE_ENVELOPE",
+            "status": "FAIL",
+            "reason_code": "stage_capacity_gate_schedule_control_required_together",
+            "required_free_bytes": None,
+            "gate_sha256": None,
+            "schedule_sha256": None,
+        }
+        capacity_error = capacity_report["reason_code"]
+    else:
+        from lightcone_spec.experiments.capacity_authority import (
+            CapacityAuthorityUnavailableError as CapacityUnavailable,
+        )
+
+        try:
+            from lightcone_spec.experiments.registry import (
+                build_industrial_registry,
+            )
+            from lightcone_spec.experiments.stage_capacity import (
+                STAGE_CAPACITY_GATE_PROTOCOL_SHA256,
+                StageCapacityGate,
+                StageCapacitySchedule,
+                revalidate_stage_capacity_gate_sources,
+                stage_capacity_control_lineage_sha256,
+            )
+            from lightcone_spec.runtime.control_attestation import (
+                ControlArtifactAttestation,
+                verify_release_control_artifact_attestation,
+            )
+            from lightcone_spec.runtime.proof_artifact import (
+                CanonicalJsonProofBinding,
+            )
+
+            verification_ns = (
+                time.time_ns()
+                if stage_capacity_now_ns is None
+                else stage_capacity_now_ns
+            )
+            if type(verification_ns) is not int or verification_ns < 0:
+                raise ValueError("stage capacity verification time is invalid")
+            gate_source = CanonicalJsonProofBinding.bind(stage_capacity_gate_path)
+            schedule_source = CanonicalJsonProofBinding.bind(
+                stage_capacity_schedule_path
+            )
+            attestation_source = CanonicalJsonProofBinding.bind(
+                stage_capacity_attestation_path
+            )
+            gate = StageCapacityGate.from_dict(gate_source.reopen())
+            schedule = StageCapacitySchedule.from_dict(schedule_source.reopen())
+            attestation = ControlArtifactAttestation.from_dict(
+                attestation_source.reopen()
+            )
+            registry = build_industrial_registry()
+            if (
+                gate_source.semantic_sha256 != gate.sha256
+                or schedule_source.semantic_sha256 != schedule.sha256
+                or gate.schema_version != 3
+                or gate.experiment != "preflight"
+                or gate.schedule_sha256 != schedule.sha256
+            ):
+                raise ValueError("stage capacity identity differs from preflight")
+            revalidate_stage_capacity_gate_sources(
+                registry,
+                gate,
+                schedule=schedule,
+                now_ns=verification_ns,
+            )
+            if (
+                type(stage_capacity_activation_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", stage_capacity_activation_sha256)
+                is None
+            ):
+                raise ValueError("stage capacity activation SHA-256 is invalid")
+            expected_lineage = stage_capacity_control_lineage_sha256(
+                activation_sha256=stage_capacity_activation_sha256,
+                inventory_sha256=schedule.gpu_inventory_sha256,
+                gate=gate,
+            )
+            subject = attestation.subject
+            if (
+                attestation_source.semantic_sha256 != attestation.sha256
+                or subject.artifact_type != "capacity"
+                or subject.artifact_sha256 != gate.sha256
+                or subject.protocol_sha256 != STAGE_CAPACITY_GATE_PROTOCOL_SHA256
+                or subject.registry_sha256 != registry.sha256
+                or subject.lineage_sha256 != expected_lineage
+            ):
+                raise ValueError("stage capacity control subject differs")
+            verified_capacity = verify_release_control_artifact_attestation(
+                attestation,
+                expected_inventory_sha256=schedule.gpu_inventory_sha256,
+                now_ns=verification_ns,
+                consumed_challenge_sha256s=(),
+            )
+            capacity_report = {
+                "mode": gate.mode,
+                "status": gate.status,
+                "reason_code": gate.reason_code,
+                "required_free_bytes": gate.required_free_bytes,
+                "observed_free_bytes": gate.observed_free_bytes,
+                "retained_evidence_bytes": gate.retained_evidence_bytes,
+                "maximum_concurrent_transient_bytes": (
+                    gate.maximum_concurrent_transient_bytes
+                ),
+                "safety_margin_bytes": gate.safety_margin_bytes,
+                "gate_sha256": gate.sha256,
+                "schedule_sha256": schedule.sha256,
+                "control_envelope_sha256": attestation.sha256,
+                "control_challenge_sha256": verified_capacity.challenge_sha256,
+            }
+            if manifest is not None:
+                evaluation_manifest = {
+                    **manifest,
+                    "disk": {
+                        **manifest["disk"],
+                        "minimum_free_bytes": gate.required_free_bytes,
+                    },
+                }
+        except CapacityUnavailable:
+            capacity_report = {
+                "mode": "LEGACY_100GB_FALLBACK",
+                "status": "FALLBACK",
+                "reason_code": "stage_capacity_authority_unavailable",
+                "required_free_bytes": (
+                    None
+                    if manifest is None
+                    else manifest.get("disk", {}).get("minimum_free_bytes")
+                ),
+                "gate_sha256": None,
+                "schedule_sha256": None,
+            }
+        except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
+            capacity_error = f"{type(error).__name__}:{error}"
+            capacity_report = {
+                "mode": "SIGNED_STAGE_ENVELOPE",
+                "status": "FAIL",
+                "reason_code": "stage_capacity_authority_invalid",
+                "required_free_bytes": None,
+                "gate_sha256": None,
+                "schedule_sha256": None,
+                "error": capacity_error,
+            }
     facts = _collect_facts(project, sglang)
     try:
         checks = _evaluate(
-            manifest,
+            evaluation_manifest,
             manifest_report,
             facts,
             project_root=project,
@@ -1318,6 +1611,16 @@ def doctor_report(
             facts,
             project_root=project,
             sglang_root=sglang,
+        )
+    if capacity_error is not None or capacity_report["status"] == "BLOCKED":
+        checks["disk"] = _check(
+            "FAIL",
+            expected={
+                "stage_capacity": "valid AVAILABLE schema-3 path-bound gate",
+                "legacy_fallback_bytes": 100_000_000_000,
+            },
+            observed=capacity_report,
+            reason_code="runtime_disk_capacity",
         )
     statuses = [check["status"] for check in checks.values()]
     readiness = (
@@ -1380,13 +1683,30 @@ def doctor_report(
             "patch_count": PINNED_SGLANG_PATCH_COUNT,
             "manifest_sha256": manifest_report["sha256"],
         },
+        "stage_capacity": capacity_report,
     }
 
 
 def format_doctor(
     project_root: str | Path = ".",
     sglang_root: str | Path | None = None,
+    *,
+    stage_capacity_gate_path: str | Path | None = None,
+    stage_capacity_schedule_path: str | Path | None = None,
+    stage_capacity_attestation_path: str | Path | None = None,
+    stage_capacity_activation_sha256: str | None = None,
+    stage_capacity_now_ns: int | None = None,
 ) -> str:
     return json.dumps(
-        doctor_report(project_root, sglang_root), indent=2, sort_keys=True
+        doctor_report(
+            project_root,
+            sglang_root,
+            stage_capacity_gate_path=stage_capacity_gate_path,
+            stage_capacity_schedule_path=stage_capacity_schedule_path,
+            stage_capacity_attestation_path=stage_capacity_attestation_path,
+            stage_capacity_activation_sha256=stage_capacity_activation_sha256,
+            stage_capacity_now_ns=stage_capacity_now_ns,
+        ),
+        indent=2,
+        sort_keys=True,
     )

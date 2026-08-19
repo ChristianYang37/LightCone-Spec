@@ -5,10 +5,11 @@ ordered native terminal begin/reset/finalize chain, and owns continuous HTTP
 connection accounting at the transport lifecycle on supported single-tokenizer
 HTTP/1.1 uvicorn paths.  Its terminal receipt truthfully leaves transport close
 pending until the caller closes the pool and terminates the process. Unsupported
-HTTP server topologies fail closed before capability production. The release
-has not established CUDA/HBM/graph reset semantics on the pinned GPU, so this
-CPU contract remains non-authorizing. Scheduler/request counters and client
-headers may never impersonate connection-pool evidence.
+HTTP server topologies fail closed before capability production. Source support
+is present, but reuse remains non-authorizing until the exact ``session_reset_tp1``
+GPU qualification is externally controlled and durably reopened.  Missing or
+invalid proof selects fresh-process fallback. Scheduler/request counters and
+client headers may never impersonate connection-pool evidence.
 """
 
 from __future__ import annotations
@@ -21,13 +22,18 @@ from dataclasses import asdict, dataclass
 from typing import Protocol, Self
 
 from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec.runtime.readiness import (
+    NATIVE_RUNTIME_RELEASE_CAPABILITY,
+    VerifiedNativeRuntimeGpuProof,
+)
 
 SOURCE_OWNED_SESSION_HOOK = "sglang.schema_v3.source_owned_all_reset_session.v1"
 OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE = True
 OFFICIAL_ALL_RESET_PRODUCER_AVAILABLE = True
 CONTINUOUS_CONNECTION_ACCOUNTING_AVAILABLE = True
-GPU_RESET_SEMANTICS = "PENDING"
+GPU_RESET_SEMANTICS = "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
 SESSION_REUSE_BLOCK_REASON = "native_all_reset_gpu_semantics_pending"
+SESSION_REUSE_GPU_VERIFIED_REASON = "source_owned_all_reset_gpu_qualified"
 CONNECTION_ACCOUNTING_BLOCK_REASON = (
     "official_source_owned_continuous_connection_accounting_unavailable"
 )
@@ -831,8 +837,9 @@ async def audit_source_owned_reuse_contract(
     execution_plan_sha256s: Sequence[str],
     runtime: SourceOwnedSessionAuditRuntime,
     fault_injection: bool = False,
+    verified_gpu_proof: VerifiedNativeRuntimeGpuProof | None = None,
 ) -> SessionReuseAuditResult:
-    """Exercise the exact CPU/native lifecycle without authorizing GPU reuse.
+    """Exercise the exact lifecycle; authorize reuse only after root GPU proof.
 
     A failure after trusted identity requires a content-bound close receipt;
     an earlier failure invokes the process owner's force-close contract.  No
@@ -846,6 +853,19 @@ async def audit_source_owned_reuse_contract(
         raise ValueError("reuse audit requires unique ordered logical traces")
     for trace_sha in trace_shas:
         _require_sha256("execution_plan_sha256", trace_sha)
+    gpu_reuse_authorized = False
+    if verified_gpu_proof is not None:
+        if type(verified_gpu_proof) is not VerifiedNativeRuntimeGpuProof:
+            raise TypeError("session reuse requires an exact verified GPU proof")
+        if (
+            verified_gpu_proof.suite_id != "session_reset_tp1"
+            or verified_gpu_proof.source_capability_sha256
+            != NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+            or verified_gpu_proof.backend_capabilities != ("session_reset",)
+            or verified_gpu_proof.topology_mode != "tp1_dp1"
+        ):
+            raise ValueError("session reset proof differs from the reuse contract")
+        gpu_reuse_authorized = True
 
     capability: SourceOwnedSessionCapability | None = None
     initial_receipt: SourceOwnedInitialStateReceipt | None = None
@@ -976,10 +996,14 @@ async def audit_source_owned_reuse_contract(
                     f"{type(close_error).__name__}:{close_error}"
                 )
 
+    cpu_complete = len(trace_receipts) == len(
+        trace_shas
+    ) and not failure_reason.startswith("shared_session_")
     status = (
-        "CPU_CONTRACT_ONLY"
-        if len(trace_receipts) == len(trace_shas)
-        and not failure_reason.startswith("shared_session_")
+        "GPU_VERIFIED"
+        if cpu_complete and gpu_reuse_authorized
+        else "CPU_CONTRACT_ONLY"
+        if cpu_complete
         else "FRESH_PROCESS_REQUIRED"
     )
     # The source producer is present, but CUDA/HBM/graph behavior remains
@@ -987,6 +1011,8 @@ async def audit_source_owned_reuse_contract(
     # the safe fresh-process fallback.
     if status == "CPU_CONTRACT_ONLY":
         failure_reason = SESSION_REUSE_BLOCK_REASON
+    elif status == "GPU_VERIFIED":
+        failure_reason = SESSION_REUSE_GPU_VERIFIED_REASON
     return SessionReuseAuditResult(
         status=status,
         reason=failure_reason,
@@ -1004,7 +1030,7 @@ async def audit_source_owned_reuse_contract(
         clock_receipt_sha256s=tuple(clock_receipts),
         trace_receipt_sha256s=tuple(trace_receipts),
         close_receipt_sha256=close_sha,
-        reuse_authorized=False,
+        reuse_authorized=status == "GPU_VERIFIED",
         fallback_mode=FRESH_PROCESS_FALLBACK_MODE,
     )
 
@@ -1018,6 +1044,7 @@ __all__ = (
     "OFFICIAL_RESET_STATE_PRODUCER_AVAILABLE",
     "RESET_STATE_FIELDS",
     "SESSION_REUSE_BLOCK_REASON",
+    "SESSION_REUSE_GPU_VERIFIED_REASON",
     "SOURCE_OWNED_SESSION_HOOK",
     "ConnectionAccounting",
     "SessionReuseAuditResult",

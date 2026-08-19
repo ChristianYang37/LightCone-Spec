@@ -22,10 +22,11 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Protocol, Self
 
-from lightcone_spec import PINNED_SGLANG_TREE
+from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
 from lightcone_spec.runtime.compile_cache import (
     COMPILE_CACHE_ENVIRONMENT_VARIABLES,
     COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256,
@@ -48,10 +49,26 @@ from lightcone_spec.runtime.compile_cache import (
     preflight_compile_cache_launch,
     start_compile_cache_launch,
 )
+from lightcone_spec.runtime.content_authorization import (
+    ContentVerificationReceipt,
+    VerifiedPreparedModelContentRelease,
+)
+from lightcone_spec.runtime.control_attestation import (
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    VerifiedControlArtifact,
+    control_challenge_reservation_sha256,
+    verify_and_reserve_release_control_artifact_attestations,
+    verify_release_control_artifact_attestation,
+)
+from lightcone_spec.runtime.proof_artifact import (
+    CanonicalJsonProofBinding,
+    relocated_evidence_path,
+)
 
 COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256 = _content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "first_party_compile_assignment_plan",
         "inputs": (
             "assignment_manifest_path_and_sha256",
@@ -62,6 +79,7 @@ COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256 = _content_sha256(
             "target_and_drafter_revisions",
             "attempt_id",
             "result_pointer_path",
+            "source_owned_launch_manifest_path_raw_and_semantic_sha256",
         ),
         "prewarm_coverage": "every_graph_bucket_exactly_once_or_more",
         "terminal_order": (
@@ -73,10 +91,16 @@ COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256 = _content_sha256(
             "reopen_all_pointer_bindings",
         ),
         "caller_supplied_compile_key_forbidden": True,
-        "release_execution_available": False,
+        "release_execution": (
+            "root_signed_dynamic_control_plus_durable_prepared_content_"
+            "verification_receipt_without_challenge_reuse"
+        ),
     }
 )
 RELEASE_COMPILE_RUNNER_UNAVAILABLE = "release_first_party_compile_runner_unavailable"
+RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE = (
+    "release_dynamic_compile_control_unavailable"
+)
 RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY = (
     "release_compile_assignment_plan_allowlist_empty"
 )
@@ -87,13 +111,13 @@ RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S: tuple[str, ...] = ()
 
 COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256 = _content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "first_party_compile_subprocess_lifecycle",
         "transport": "canonical_json_lines_over_private_stdin_stdout",
         "child_must_delay_model_and_gpu_initialization_until_start": True,
         "ordered_messages": (
             "ready",
-            "start_with_private_compile_environment",
+            "start_with_private_compile_environment_and_exact_launch_manifest",
             "started",
             "one_prewarm_request_and_completion_per_manifest_payload",
             "drain_and_shutdown",
@@ -108,6 +132,8 @@ COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256 = _content_sha256(
         "formal_authority": (
             "source_owned_exact_command_and_executable_digest",
             "source_owned_exact_assignment_plan_sha256",
+            "source_owned_launch_manifest_path_raw_and_semantic_sha256",
+            "root_signed_dynamic_compile_control_and_atomic_replay_reservation",
         ),
         "cpu_diagnostic_cannot_authorize_formal_execution": True,
     }
@@ -264,6 +290,20 @@ class CompileWorkerSourceDescriptor:
         self.validate(reopen_sources=False)
         return _content_sha256(asdict(self))
 
+    def to_dict(self) -> dict[str, object]:
+        self.validate(reopen_sources=False)
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            field.name for field in dataclass_fields(cls)
+        }:
+            raise ValueError("compile worker source fields differ from schema")
+        value = cls(**raw)
+        value.validate(reopen_sources=False)
+        return value
+
 
 @dataclass(frozen=True)
 class ReleaseCompileSubprocess:
@@ -405,6 +445,720 @@ def load_compile_prewarm_manifest(path: str | Path) -> CompileOnlyPrewarmManifes
     return manifest
 
 
+COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "first_party_compile_launch_manifest",
+        "source": (PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE),
+        "bindings": (
+            "patched_checkout",
+            "exact_run_config_raw_and_semantic",
+            "compile_cache_plan_raw_and_semantic",
+            "prewarm_manifest_raw_and_semantic",
+            "sampling_profile_raw_and_semantic",
+            "prepared_model_content_manifest_raw_semantic_size",
+            "target_drafter_tokenizer_prepared_snapshots_and_content_authorities",
+            "exact_localhost_server_argv_and_port",
+            "model_sampling_physical_budget_inventory_identities",
+            "explicit_PATH_LD_LIBRARY_PATH_CUDA_HOME_without_inherited_environment",
+        ),
+        "child_start": "manifest_path_raw_semantic_sha256",
+    }
+)
+TRUSTED_SINGLE_OPERATOR_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 2,
+        "kind": "first_party_compile_launch_manifest",
+        "content_source": (
+            "runtime_BOUND_trusted_single_operator_bundle_exact_stage_role_"
+            "model_revision_snapshot_tree_without_offline_authorization_claims"
+        ),
+        "legacy_signed_schema": "schema1_unchanged",
+        "remaining_bindings": "same_as_schema1",
+    }
+)
+TRUSTED_SINGLE_OPERATOR_BUILT_IN_MTP_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256 = (
+    _content_sha256(
+        {
+            "schema_version": 3,
+            "kind": "first_party_compile_launch_manifest",
+            "content_source": "runtime_BOUND_trusted_single_operator_bundle",
+            "nextn_mode": "built_in_mtp_same_target_snapshot_no_external_drafter",
+            "mtp_component": (
+                "path_bound_config_weight_index_and_safetensors_header_scan"
+            ),
+            "target_snapshot": "frozen_content_sha256",
+            "legacy_signed_and_external_schemas": "schema1_and_schema2_unchanged",
+        }
+    )
+)
+
+
+@dataclass(frozen=True)
+class CompileLaunchManifest:
+    """Every non-cache input needed by the source-owned compile worker."""
+
+    schema_version: int
+    kind: str
+    protocol_sha256: str
+    patched_sglang_checkout: str
+    patched_sglang_commit: str
+    patched_sglang_tree: str
+    run_config_path: str
+    run_config_raw_sha256: str
+    run_config_semantic_sha256: str
+    compile_cache_plan_path: str
+    compile_cache_plan_raw_sha256: str
+    compile_cache_plan_sha256: str
+    prewarm_manifest_path: str
+    prewarm_manifest_raw_sha256: str
+    prewarm_manifest_sha256: str
+    sampling_profile_path: str
+    sampling_profile_raw_sha256: str
+    prepared_model_content_manifest_path: str
+    prepared_model_content_manifest_raw_sha256: str
+    prepared_model_content_manifest_sha256: str
+    prepared_model_content_manifest_size: int
+    target_content_member_id: str
+    target_model_id: str
+    target_snapshot_path: str
+    target_revision: str
+    target_content_authority_sha256: str | None
+    drafter_content_member_id: str | None
+    drafter_model_id: str | None
+    drafter_snapshot_path: str | None
+    drafter_revision: str | None
+    drafter_content_authority_sha256: str | None
+    tokenizer_content_member_id: str
+    tokenizer_model_id: str
+    tokenizer_snapshot_path: str
+    tokenizer_revision: str
+    tokenizer_content_authority_sha256: str | None
+    server_argv: tuple[str, ...]
+    server_argv_sha256: str
+    localhost_port: int
+    model_lock_sha256: str
+    sampling_profile_sha256: str
+    physical_assignment_sha256: str
+    experiment_budget_sha256: str
+    budget_materialization_authority_sha256: str
+    inventory_sha256: str
+    gpu_uuids: tuple[str, ...]
+    path_entries: tuple[str, ...]
+    library_path_entries: tuple[str, ...]
+    cuda_home: str
+    formal_stage: str | None = None
+    content_source_binding: object | None = None
+    nextn_mtp_mode: str | None = None
+    target_snapshot_sha256: str | None = None
+    mtp_component_sha256: str | None = None
+    mtp_component_binding: object | None = None
+
+    def validate(self, *, reopen_inputs: bool) -> None:
+        if (
+            self.schema_version not in {1, 2, 3}
+            or self.kind != "first_party_compile_launch_manifest"
+            or self.patched_sglang_commit != PINNED_SGLANG_COMMIT
+            or self.patched_sglang_tree != PINNED_SGLANG_TREE
+        ):
+            raise ValueError("compile launch manifest schema/source is unsupported")
+        if self.schema_version == 1:
+            if (
+                self.protocol_sha256 != COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256
+                or self.formal_stage is not None
+                or self.content_source_binding is not None
+            ):
+                raise ValueError("legacy compile launch content source differs")
+        elif self.schema_version == 2:
+            if self.protocol_sha256 != (
+                TRUSTED_SINGLE_OPERATOR_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256
+            ):
+                raise ValueError("trusted compile launch protocol differs")
+        elif self.protocol_sha256 != (
+            TRUSTED_SINGLE_OPERATOR_BUILT_IN_MTP_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256
+        ):
+            raise ValueError("trusted built-in MTP compile launch protocol differs")
+        for label, digest in (
+            ("run config raw", self.run_config_raw_sha256),
+            ("run config semantic", self.run_config_semantic_sha256),
+            ("compile cache plan raw", self.compile_cache_plan_raw_sha256),
+            ("compile cache plan", self.compile_cache_plan_sha256),
+            ("prewarm manifest raw", self.prewarm_manifest_raw_sha256),
+            ("prewarm manifest", self.prewarm_manifest_sha256),
+            ("sampling profile raw", self.sampling_profile_raw_sha256),
+            (
+                "prepared-model content manifest raw",
+                self.prepared_model_content_manifest_raw_sha256,
+            ),
+            (
+                "prepared-model content manifest",
+                self.prepared_model_content_manifest_sha256,
+            ),
+            ("server argv", self.server_argv_sha256),
+            ("model lock", self.model_lock_sha256),
+            ("sampling profile", self.sampling_profile_sha256),
+            ("physical assignment", self.physical_assignment_sha256),
+            ("experiment budget", self.experiment_budget_sha256),
+            (
+                "budget materialization authority",
+                self.budget_materialization_authority_sha256,
+            ),
+            ("inventory", self.inventory_sha256),
+        ):
+            _require_sha256(f"compile launch {label}", digest)
+        if self.schema_version == 1:
+            _require_sha256(
+                "compile launch target content authority",
+                self.target_content_authority_sha256,
+            )
+            _require_sha256(
+                "compile launch tokenizer content authority",
+                self.tokenizer_content_authority_sha256,
+            )
+        elif (
+            self.target_content_authority_sha256 is not None
+            or self.tokenizer_content_authority_sha256 is not None
+            or self.drafter_content_authority_sha256 is not None
+        ):
+            raise ValueError(
+                "trusted compile launch must not carry offline authorization claims"
+            )
+        for label, value in (
+            ("target model ID", self.target_model_id),
+            ("target revision", self.target_revision),
+            ("target content member ID", self.target_content_member_id),
+            ("tokenizer model ID", self.tokenizer_model_id),
+            ("tokenizer revision", self.tokenizer_revision),
+            ("tokenizer content member ID", self.tokenizer_content_member_id),
+        ):
+            _require_text(f"compile launch {label}", value)
+        for label, value in (
+            ("target", self.target_revision),
+            ("tokenizer", self.tokenizer_revision),
+        ):
+            if len(value) not in {40, 64} or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"compile launch {label} revision is not immutable")
+        drafter_values = (
+            self.drafter_content_member_id,
+            self.drafter_model_id,
+            self.drafter_snapshot_path,
+            self.drafter_revision,
+        )
+        if any(value is None for value in drafter_values) != all(
+            value is None for value in drafter_values
+        ):
+            raise ValueError(
+                "compile launch drafter inputs must be all present or absent"
+            )
+        if self.schema_version == 1 and (
+            (self.drafter_model_id is None)
+            != (self.drafter_content_authority_sha256 is None)
+        ):
+            raise ValueError(
+                "compile launch drafter authority must follow its model inputs"
+            )
+        if self.drafter_model_id is not None:
+            _require_text(
+                "compile launch drafter content member ID",
+                self.drafter_content_member_id,
+            )
+            _require_text("compile launch drafter model ID", self.drafter_model_id)
+            _require_text("compile launch drafter revision", self.drafter_revision)
+            if len(self.drafter_revision) not in {40, 64} or any(
+                character not in "0123456789abcdef"
+                for character in self.drafter_revision
+            ):
+                raise ValueError("compile launch drafter revision is not immutable")
+            if self.schema_version == 1:
+                _require_sha256(
+                    "compile launch drafter content authority",
+                    self.drafter_content_authority_sha256,
+                )
+        checkout = _absolute_path(
+            "compile launch patched checkout", self.patched_sglang_checkout
+        )
+        run_config = _absolute_path("compile launch run config", self.run_config_path)
+        cache_plan_path = _absolute_path(
+            "compile launch cache plan", self.compile_cache_plan_path
+        )
+        prewarm_path = _absolute_path(
+            "compile launch prewarm manifest", self.prewarm_manifest_path
+        )
+        sampling_path = _absolute_path(
+            "compile launch sampling profile", self.sampling_profile_path
+        )
+        prepared_content_path = _absolute_path(
+            "compile launch prepared-model content manifest",
+            self.prepared_model_content_manifest_path,
+        )
+        if (
+            type(self.prepared_model_content_manifest_size) is not int
+            or self.prepared_model_content_manifest_size < 1
+        ):
+            raise ValueError("compile launch prepared content size is invalid")
+        target = _absolute_path(
+            "compile launch target snapshot", self.target_snapshot_path
+        )
+        tokenizer = _absolute_path(
+            "compile launch tokenizer snapshot", self.tokenizer_snapshot_path
+        )
+        drafter = (
+            None
+            if self.drafter_snapshot_path is None
+            else _absolute_path(
+                "compile launch drafter snapshot", self.drafter_snapshot_path
+            )
+        )
+        if self.schema_version in {2, 3}:
+            from lightcone_spec.experiments.formal_content_source import (
+                FormalContentSourceBinding,
+            )
+            from lightcone_spec.experiments.formal_single_operator_content import (
+                TrustedSingleOperatorContentBundle,
+            )
+
+            if (
+                type(self.content_source_binding) is not FormalContentSourceBinding
+                or self.content_source_binding.mode != "trusted_single_operator"
+                or type(self.formal_stage) is not str
+                or not self.formal_stage
+            ):
+                raise ValueError("trusted compile launch content lineage differs")
+            bundle = self.content_source_binding.reopen()
+            if type(bundle) is not TrustedSingleOperatorContentBundle:
+                raise TypeError("trusted compile launch content bundle is not exact")
+            trusted_binding = self.content_source_binding.trusted_single_operator
+            assert trusted_binding is not None
+            if (
+                bundle.runtime_binding_status != "BOUND"
+                or bundle.source_snapshot.sglang_upstream_commit
+                != self.patched_sglang_commit
+                or bundle.source_snapshot.patched_sglang_tree
+                != self.patched_sglang_tree
+                or prepared_content_path != Path(trusted_binding.absolute_path)
+                or self.prepared_model_content_manifest_raw_sha256
+                != trusted_binding.raw_sha256
+                or self.prepared_model_content_manifest_sha256
+                != trusted_binding.semantic_sha256
+                or self.prepared_model_content_manifest_size != trusted_binding.size
+            ):
+                raise ValueError("trusted compile launch bundle identity differs")
+
+            def require_trusted_member(
+                *,
+                member_id: str,
+                role: str,
+                model_id: str,
+                revision: str,
+                snapshot_path: Path,
+            ) -> None:
+                matches = tuple(
+                    row
+                    for row in bundle.model_members
+                    if row.role == role
+                    and row.model_id == model_id
+                    and row.revision == revision
+                    and self.formal_stage in row.stages
+                    and Path(row.local_snapshot_path) == snapshot_path
+                )
+                if len(matches) != 1 or matches[0].sha256 != member_id:
+                    raise ValueError("trusted compile launch model member is not exact")
+
+            require_trusted_member(
+                member_id=self.target_content_member_id,
+                role="target",
+                model_id=self.target_model_id,
+                revision=self.target_revision,
+                snapshot_path=target,
+            )
+            require_trusted_member(
+                member_id=self.tokenizer_content_member_id,
+                role="tokenizer",
+                model_id=self.tokenizer_model_id,
+                revision=self.tokenizer_revision,
+                snapshot_path=tokenizer,
+            )
+            if drafter is not None and self.schema_version == 2:
+                assert self.drafter_content_member_id is not None
+                assert self.drafter_model_id is not None
+                assert self.drafter_revision is not None
+                require_trusted_member(
+                    member_id=self.drafter_content_member_id,
+                    role="drafter",
+                    model_id=self.drafter_model_id,
+                    revision=self.drafter_revision,
+                    snapshot_path=drafter,
+                )
+            if self.schema_version == 3:
+                from lightcone_spec.config import load_run_config
+                from lightcone_spec.experiments.formal_single_operator_e6_builtin_mtp import (
+                    FormalSingleOperatorE6BuiltInMtpComponent,
+                    revalidate_formal_single_operator_e6_builtin_mtp_component,
+                )
+                from lightcone_spec.runtime.proof_artifact import (
+                    CanonicalJsonProofBinding,
+                )
+
+                target_members = tuple(
+                    row
+                    for row in bundle.model_members
+                    if row.sha256 == self.target_content_member_id
+                    and row.role == "target"
+                    and row.model_id == self.target_model_id
+                    and row.revision == self.target_revision
+                    and self.formal_stage in row.stages
+                    and Path(row.local_snapshot_path) == target
+                )
+                if len(target_members) != 1:
+                    raise ValueError("built-in MTP target member is not exact")
+                target_member = target_members[0]
+                if type(self.mtp_component_binding) is not CanonicalJsonProofBinding:
+                    raise TypeError(
+                        "built-in MTP compile launch lacks component binding"
+                    )
+                component = revalidate_formal_single_operator_e6_builtin_mtp_component(
+                    self.mtp_component_binding.absolute_path,
+                    member=target_member,
+                )
+                config = load_run_config(self.run_config_path)
+                if (
+                    type(component) is not FormalSingleOperatorE6BuiltInMtpComponent
+                    or self.nextn_mtp_mode != "built_in_mtp"
+                    or self.target_snapshot_sha256 != target_member.content_sha256
+                    or self.target_snapshot_sha256 != component.target_snapshot_sha256
+                    or self.mtp_component_sha256 != component.sha256
+                    or self.mtp_component_binding.semantic_sha256 != component.sha256
+                    or config.model.algorithm != "NEXTN"
+                    or config.model.nextn_mtp_mode != "built_in_mtp"
+                    or config.model.target_snapshot_sha256
+                    != self.target_snapshot_sha256
+                    or config.model.mtp_component_sha256 != self.mtp_component_sha256
+                    or self.drafter_content_member_id != self.target_content_member_id
+                    or self.drafter_model_id != self.target_model_id
+                    or self.drafter_revision != self.target_revision
+                    or drafter != target
+                ):
+                    raise ValueError("built-in MTP compile launch identity differs")
+        if self.schema_version in {1, 2} and any(
+            value is not None
+            for value in (
+                self.nextn_mtp_mode,
+                self.target_snapshot_sha256,
+                self.mtp_component_sha256,
+                self.mtp_component_binding,
+            )
+        ):
+            raise ValueError(
+                "legacy/external compile launch carries built-in MTP state"
+            )
+        if target.name != self.target_revision or tokenizer.name != (
+            self.tokenizer_revision
+        ):
+            raise ValueError("compile launch snapshot leaf differs from revision")
+        if drafter is not None and drafter.name != self.drafter_revision:
+            raise ValueError("compile launch drafter leaf differs from revision")
+        if (
+            type(self.server_argv) is not tuple
+            or not self.server_argv
+            or any(
+                type(argument) is not str or not argument or "\x00" in argument
+                for argument in self.server_argv
+            )
+            or self.server_argv_sha256
+            != _content_sha256({"argv": list(self.server_argv)})
+        ):
+            raise ValueError("compile launch server argv is invalid")
+        if type(self.localhost_port) is not int or not (
+            1_024 <= self.localhost_port <= 65_535
+        ):
+            raise ValueError("compile launch localhost port is invalid")
+        expected_pairs = {
+            "--host": "127.0.0.1",
+            "--port": str(self.localhost_port),
+            "--model-path": str(target),
+        }
+        if self.drafter_snapshot_path is not None and self.schema_version != 3:
+            expected_pairs["--speculative-draft-model-path"] = str(drafter)
+        for flag, expected in expected_pairs.items():
+            positions = tuple(
+                index
+                for index, argument in enumerate(self.server_argv)
+                if argument == flag
+            )
+            if (
+                len(positions) != 1
+                or positions[0] + 1 >= len(self.server_argv)
+                or self.server_argv[positions[0] + 1] != expected
+            ):
+                raise ValueError(f"compile launch server argv differs at {flag}")
+        if self.schema_version == 3 and "--speculative-draft-model-path" in (
+            self.server_argv
+        ):
+            raise ValueError("built-in MTP launch must not pass an external draft path")
+        if (
+            type(self.gpu_uuids) is not tuple
+            or not self.gpu_uuids
+            or len(set(self.gpu_uuids)) != len(self.gpu_uuids)
+        ):
+            raise ValueError("compile launch GPU UUIDs are invalid")
+        for gpu_uuid in self.gpu_uuids:
+            _require_text("compile launch GPU UUID", gpu_uuid)
+        for label, values in (
+            ("PATH", self.path_entries),
+            ("LD_LIBRARY_PATH", self.library_path_entries),
+        ):
+            if (
+                type(values) is not tuple
+                or not values
+                or len(set(values)) != len(values)
+            ):
+                raise ValueError(f"compile launch {label} entries are invalid")
+            for entry in values:
+                path = _absolute_path(f"compile launch {label} entry", entry)
+                if reopen_inputs and (not path.is_dir() or path.is_symlink()):
+                    raise ValueError(f"compile launch {label} entry is unavailable")
+        cuda_home = _absolute_path("compile launch CUDA home", self.cuda_home)
+        if not reopen_inputs:
+            return
+        for label, directory in (
+            ("patched checkout", checkout),
+            ("target snapshot", target),
+            ("tokenizer snapshot", tokenizer),
+            ("CUDA home", cuda_home),
+        ):
+            if not directory.is_dir() or directory.is_symlink():
+                raise ValueError(f"compile launch {label} is unavailable")
+        if drafter is not None and (not drafter.is_dir() or drafter.is_symlink()):
+            raise ValueError("compile launch drafter snapshot is unavailable")
+        raw_digest, raw_size = _raw_sha256(
+            run_config, label="compile launch run config"
+        )
+        if raw_size < 1 or raw_digest != self.run_config_raw_sha256:
+            raise ValueError("compile launch run-config raw bytes changed")
+        _raw, semantic = _load_canonical_json_with_sidecar(
+            run_config, label="compile launch run config"
+        )
+        if semantic != self.run_config_semantic_sha256:
+            raise ValueError("compile launch run-config semantic identity changed")
+        bound_files = [
+            (
+                "cache plan",
+                cache_plan_path,
+                self.compile_cache_plan_raw_sha256,
+                self.compile_cache_plan_sha256,
+            ),
+            (
+                "prewarm manifest",
+                prewarm_path,
+                self.prewarm_manifest_raw_sha256,
+                self.prewarm_manifest_sha256,
+            ),
+            (
+                "sampling profile",
+                sampling_path,
+                self.sampling_profile_raw_sha256,
+                self.sampling_profile_sha256,
+            ),
+        ]
+        if self.schema_version == 1:
+            bound_files.append(
+                (
+                    "prepared-model content manifest",
+                    prepared_content_path,
+                    self.prepared_model_content_manifest_raw_sha256,
+                    self.prepared_model_content_manifest_sha256,
+                )
+            )
+        for label, path, expected_raw, expected_semantic in bound_files:
+            file_raw, file_size = _raw_sha256(path, label=f"compile launch {label}")
+            _value, file_semantic = _load_canonical_json_with_sidecar(
+                path, label=f"compile launch {label}"
+            )
+            if (
+                file_size < 1
+                or file_raw != expected_raw
+                or file_semantic != expected_semantic
+                or (
+                    label == "prepared-model content manifest"
+                    and file_size != self.prepared_model_content_manifest_size
+                )
+            ):
+                raise ValueError(f"compile launch {label} identity changed")
+        cache_plan = CompileCacheLaunchPlan.load(cache_plan_path)
+        prewarm = load_compile_prewarm_manifest(prewarm_path)
+        if (
+            cache_plan.sha256 != self.compile_cache_plan_sha256
+            or prewarm.sha256 != self.prewarm_manifest_sha256
+            or prewarm.sampling_profile_sha256 != self.sampling_profile_sha256
+        ):
+            raise ValueError("compile launch cache/prewarm/sampling bindings differ")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate(reopen_inputs=False)
+        value = {
+            **asdict(self),
+            "server_argv": list(self.server_argv),
+            "gpu_uuids": list(self.gpu_uuids),
+            "path_entries": list(self.path_entries),
+            "library_path_entries": list(self.library_path_entries),
+        }
+        if self.schema_version == 1:
+            value.pop("formal_stage")
+            value.pop("content_source_binding")
+            value.pop("nextn_mtp_mode")
+            value.pop("target_snapshot_sha256")
+            value.pop("mtp_component_sha256")
+            value.pop("mtp_component_binding")
+        elif self.schema_version == 2:
+            value.pop("nextn_mtp_mode")
+            value.pop("target_snapshot_sha256")
+            value.pop("mtp_component_sha256")
+            value.pop("mtp_component_binding")
+            from lightcone_spec.experiments.formal_content_source import (
+                FormalContentSourceBinding,
+            )
+
+            assert type(self.content_source_binding) is FormalContentSourceBinding
+            value["content_source_binding"] = self.content_source_binding.to_dict()
+        else:
+            from lightcone_spec.experiments.formal_content_source import (
+                FormalContentSourceBinding,
+            )
+
+            assert type(self.content_source_binding) is FormalContentSourceBinding
+            value["content_source_binding"] = self.content_source_binding.to_dict()
+            from lightcone_spec.runtime.proof_artifact import (
+                CanonicalJsonProofBinding,
+            )
+
+            assert type(self.mtp_component_binding) is CanonicalJsonProofBinding
+            value["mtp_component_binding"] = self.mtp_component_binding.to_dict()
+        return value
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict:
+            raise TypeError("compile launch manifest must be a JSON object")
+        schema_version = raw.get("schema_version")
+        expected = {field.name for field in dataclass_fields(cls)}
+        if schema_version == 1:
+            expected -= {
+                "formal_stage",
+                "content_source_binding",
+                "nextn_mtp_mode",
+                "target_snapshot_sha256",
+                "mtp_component_sha256",
+                "mtp_component_binding",
+            }
+        elif schema_version == 2:
+            expected -= {
+                "nextn_mtp_mode",
+                "target_snapshot_sha256",
+                "mtp_component_sha256",
+                "mtp_component_binding",
+            }
+        if set(raw) != expected:
+            raise ValueError("compile launch manifest fields differ from schema")
+        payload = dict(raw)
+        for name in (
+            "server_argv",
+            "gpu_uuids",
+            "path_entries",
+            "library_path_entries",
+        ):
+            value = payload[name]
+            if type(value) is not list:
+                raise TypeError(f"compile launch {name} must be an array")
+            payload[name] = tuple(value)
+        if schema_version == 1:
+            payload["formal_stage"] = None
+            payload["content_source_binding"] = None
+            payload["nextn_mtp_mode"] = None
+            payload["target_snapshot_sha256"] = None
+            payload["mtp_component_sha256"] = None
+            payload["mtp_component_binding"] = None
+        else:
+            from lightcone_spec.experiments.formal_content_source import (
+                FormalContentSourceBinding,
+            )
+
+            payload["content_source_binding"] = FormalContentSourceBinding.from_dict(
+                payload["content_source_binding"]
+            )
+            if schema_version == 2:
+                payload["nextn_mtp_mode"] = None
+                payload["target_snapshot_sha256"] = None
+                payload["mtp_component_sha256"] = None
+                payload["mtp_component_binding"] = None
+            else:
+                from lightcone_spec.runtime.proof_artifact import (
+                    CanonicalJsonProofBinding,
+                )
+
+                payload["mtp_component_binding"] = CanonicalJsonProofBinding.from_dict(
+                    payload["mtp_component_binding"]
+                )
+        result = cls(**payload)
+        result.validate(reopen_inputs=False)
+        return result
+
+    def write(self, path: str | Path) -> Path:
+        destination = _absolute_path("compile launch manifest", str(path))
+        _publish_json(destination, self.to_dict())
+        _publish_text(Path(f"{destination}.sha256"), self.sha256)
+        return destination
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        source = _absolute_path("compile launch manifest", str(path))
+        raw, semantic = _load_canonical_json_with_sidecar(
+            source, label="compile launch manifest"
+        )
+        value = cls.from_dict(raw)
+        if semantic != value.sha256:
+            raise ValueError("compile launch manifest semantic digest differs")
+        value.validate(reopen_inputs=True)
+        return value
+
+    def child_environment(self) -> dict[str, str]:
+        self.validate(reopen_inputs=True)
+        environment = {
+            "PATH": os.pathsep.join(self.path_entries),
+            "LD_LIBRARY_PATH": os.pathsep.join(self.library_path_entries),
+            "CUDA_HOME": self.cuda_home,
+            "CUDA_PATH": self.cuda_home,
+            "CUDA_VISIBLE_DEVICES": ",".join(self.gpu_uuids),
+            "NCCL_DEBUG": "INFO",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        if self.schema_version == 3:
+            assert self.target_snapshot_sha256 is not None
+            assert self.mtp_component_sha256 is not None
+            assert self.mtp_component_binding is not None
+            environment.update(
+                {
+                    "LIGHTCONE_NEXTN_MTP_MODE": "built_in_mtp",
+                    "LIGHTCONE_NEXTN_TARGET_SNAPSHOT_SHA256": (
+                        self.target_snapshot_sha256
+                    ),
+                    "LIGHTCONE_NEXTN_MTP_COMPONENT_SHA256": (self.mtp_component_sha256),
+                    "LIGHTCONE_NEXTN_MTP_COMPONENT_PATH": (
+                        self.mtp_component_binding.absolute_path
+                    ),
+                }
+            )
+        return environment
+
+
 @dataclass(frozen=True)
 class CompileAssignmentPlan:
     schema_version: int
@@ -416,6 +1170,9 @@ class CompileAssignmentPlan:
     compile_cache_plan_sha256: str
     prewarm_manifest_path: str
     prewarm_manifest_sha256: str
+    launch_manifest_path: str
+    launch_manifest_raw_sha256: str
+    launch_manifest_sha256: str
     compile_key_sha256: str
     model_lock_sha256: str
     target_revision: str
@@ -437,7 +1194,7 @@ class CompileAssignmentPlan:
     def validate(self) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version != 1
+            or self.schema_version != 2
             or self.kind != "first_party_compile_assignment_plan"
         ):
             raise ValueError("compile assignment plan schema is unsupported")
@@ -447,6 +1204,8 @@ class CompileAssignmentPlan:
             ("assignment", self.assignment_sha256),
             ("cache plan", self.compile_cache_plan_sha256),
             ("prewarm manifest", self.prewarm_manifest_sha256),
+            ("launch manifest raw", self.launch_manifest_raw_sha256),
+            ("launch manifest", self.launch_manifest_sha256),
             ("compile key", self.compile_key_sha256),
             ("model lock", self.model_lock_sha256),
             ("physical assignment", self.physical_assignment_sha256),
@@ -460,6 +1219,7 @@ class CompileAssignmentPlan:
             ("assignment manifest", self.assignment_manifest_path),
             ("compile cache plan", self.compile_cache_plan_path),
             ("prewarm manifest", self.prewarm_manifest_path),
+            ("launch manifest", self.launch_manifest_path),
             ("compile result pointer", self.result_pointer_path),
         ):
             _absolute_path(label, value)
@@ -535,6 +1295,9 @@ class CompileAssignmentPlan:
             "compile_cache_plan_sha256",
             "prewarm_manifest_path",
             "prewarm_manifest_sha256",
+            "launch_manifest_path",
+            "launch_manifest_raw_sha256",
+            "launch_manifest_sha256",
             "compile_key_sha256",
             "model_lock_sha256",
             "target_revision",
@@ -588,6 +1351,7 @@ class CompileAssignmentPlan:
         assignment_manifest_path: str | Path,
         compile_cache_plan_path: str | Path,
         prewarm_manifest_path: str | Path,
+        launch_manifest_path: str | Path,
         result_pointer_path: str | Path,
         attempt_id: str,
     ) -> Self:
@@ -598,12 +1362,16 @@ class CompileAssignmentPlan:
             "compile cache plan", str(compile_cache_plan_path)
         )
         prewarm_path = _absolute_path("prewarm manifest", str(prewarm_manifest_path))
+        launch_path = _absolute_path(
+            "compile launch manifest", str(launch_manifest_path)
+        )
         pointer_path = _absolute_path(
             "compile result pointer", str(result_pointer_path)
         )
         assignment = CompileOnlyAssignmentContract.load(assignment_path)
         cache_plan = CompileCacheLaunchPlan.load(cache_plan_path)
         prewarm = load_compile_prewarm_manifest(prewarm_path)
+        launch = CompileLaunchManifest.load(launch_path)
         if cache_plan != assignment.compile_cache_plan:
             raise ValueError("compile cache plan differs from assignment authority")
         if prewarm != assignment.prewarm_manifest:
@@ -613,10 +1381,36 @@ class CompileAssignmentPlan:
         if pointer_path != Path(assignment.result_pointer_path):
             raise ValueError("compile result pointer differs from assignment authority")
         key = cache_plan.key
+        if (
+            launch.patched_sglang_tree != key.patched_sglang_tree
+            or launch.compile_cache_plan_path != str(cache_plan_path)
+            or launch.compile_cache_plan_sha256 != cache_plan.sha256
+            or launch.prewarm_manifest_path != str(prewarm_path)
+            or launch.prewarm_manifest_sha256 != prewarm.sha256
+            or launch.target_revision != key.target_revision
+            or launch.drafter_revision != key.drafter_revision
+            or launch.model_lock_sha256 != prewarm.model_lock_sha256
+            or launch.sampling_profile_sha256 != prewarm.sampling_profile_sha256
+            or launch.physical_assignment_sha256
+            != assignment.physical_assignment_sha256
+            or launch.experiment_budget_sha256 != assignment.experiment_budget_sha256
+            or launch.budget_materialization_authority_sha256
+            != assignment.budget_materialization_authority_sha256
+            or launch.inventory_sha256 != assignment.inventory_sha256
+            or launch.gpu_uuids != assignment.gpu_uuids
+        ):
+            raise ValueError(
+                "compile launch manifest differs from assignment authority"
+            )
+        launch_raw_sha256, launch_size = _raw_sha256(
+            launch_path, label="compile launch manifest"
+        )
+        if launch_size < 1:
+            raise ValueError("compile launch manifest is empty")
         if prewarm.model_lock_sha256 != assignment.prewarm_manifest.model_lock_sha256:
             raise ValueError("compile model lock differs from assignment authority")
         value = cls(
-            schema_version=1,
+            schema_version=2,
             kind="first_party_compile_assignment_plan",
             protocol_sha256=COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256,
             assignment_manifest_path=str(assignment_path),
@@ -625,6 +1419,9 @@ class CompileAssignmentPlan:
             compile_cache_plan_sha256=cache_plan.sha256,
             prewarm_manifest_path=str(prewarm_path),
             prewarm_manifest_sha256=prewarm.sha256,
+            launch_manifest_path=str(launch_path),
+            launch_manifest_raw_sha256=launch_raw_sha256,
+            launch_manifest_sha256=launch.sha256,
             compile_key_sha256=key.sha256,
             model_lock_sha256=prewarm.model_lock_sha256,
             target_revision=key.target_revision,
@@ -655,17 +1452,29 @@ class CompileAssignmentPlan:
         CompileOnlyAssignmentContract,
         CompileCacheLaunchPlan,
         CompileOnlyPrewarmManifest,
+        CompileLaunchManifest,
     ]:
         self.validate()
         assignment = CompileOnlyAssignmentContract.load(self.assignment_manifest_path)
         cache_plan = CompileCacheLaunchPlan.load(self.compile_cache_plan_path)
         prewarm = load_compile_prewarm_manifest(self.prewarm_manifest_path)
+        launch_path = Path(self.launch_manifest_path)
+        launch = CompileLaunchManifest.load(launch_path)
         if assignment.sha256 != self.assignment_sha256:
             raise ValueError("compile assignment changed during revalidation")
         if cache_plan.sha256 != self.compile_cache_plan_sha256:
             raise ValueError("compile cache plan changed during revalidation")
         if prewarm.sha256 != self.prewarm_manifest_sha256:
             raise ValueError("compile prewarm manifest changed during revalidation")
+        launch_raw_sha256, launch_size = _raw_sha256(
+            launch_path, label="compile launch manifest"
+        )
+        if (
+            launch_size < 1
+            or launch_raw_sha256 != self.launch_manifest_raw_sha256
+            or launch.sha256 != self.launch_manifest_sha256
+        ):
+            raise ValueError("compile launch manifest changed during revalidation")
         if (
             cache_plan != assignment.compile_cache_plan
             or prewarm != assignment.prewarm_manifest
@@ -681,6 +1490,21 @@ class CompileAssignmentPlan:
             )
         if (
             key.sha256 != self.compile_key_sha256
+            or launch.patched_sglang_tree != key.patched_sglang_tree
+            or launch.compile_cache_plan_path != self.compile_cache_plan_path
+            or launch.compile_cache_plan_sha256 != self.compile_cache_plan_sha256
+            or launch.prewarm_manifest_path != self.prewarm_manifest_path
+            or launch.prewarm_manifest_sha256 != self.prewarm_manifest_sha256
+            or launch.target_revision != key.target_revision
+            or launch.drafter_revision != key.drafter_revision
+            or launch.model_lock_sha256 != self.model_lock_sha256
+            or launch.sampling_profile_sha256 != prewarm.sampling_profile_sha256
+            or launch.physical_assignment_sha256 != self.physical_assignment_sha256
+            or launch.experiment_budget_sha256 != self.experiment_budget_sha256
+            or launch.budget_materialization_authority_sha256
+            != assignment.budget_materialization_authority_sha256
+            or launch.inventory_sha256 != self.inventory_sha256
+            or launch.gpu_uuids != self.gpu_uuids
             or key.target_revision != self.target_revision
             or key.drafter_revision != self.drafter_revision
             or prewarm.model_lock_sha256 != self.model_lock_sha256
@@ -700,7 +1524,486 @@ class CompileAssignmentPlan:
             != self.result_pointer_protocol_sha256
         ):
             raise ValueError("compile assignment identity changed during revalidation")
-        return assignment, cache_plan, prewarm
+        return assignment, cache_plan, prewarm, launch
+
+
+COMPILE_CONTROL_VERIFICATION_PROTOCOL_SHA256 = _content_sha256(
+    {
+        "schema_version": 2,
+        "kind": "compile_control_verification_receipt",
+        "control": "root_verified_dynamic_deployment_policy",
+        "bindings": (
+            "assignment_plan_and_inventory",
+            "source_descriptor_and_launch_manifest",
+            "durable_prepared_content_verification_receipt",
+            "compile_control_subject_and_lineage",
+            "artifact_deployment_and_fresh_additional_challenges",
+            "atomic_no_replace_replay_reservation",
+        ),
+        "reopen": (
+            "verify_compile_signatures_at_recorded_decision_time_reopen_"
+            "reservation_and_deep_revalidate_previously_reserved_content_receipt"
+        ),
+        "forbidden": "reserving_the_prepared_content_challenge_twice",
+    }
+)
+
+
+def compile_control_lineage_sha256(
+    plan: CompileAssignmentPlan,
+    source: CompileWorkerSourceDescriptor,
+) -> str:
+    """Bind the compile control signature to every executable launch input."""
+
+    if type(plan) is not CompileAssignmentPlan:
+        raise TypeError("compile control lineage requires an exact plan")
+    if type(source) is not CompileWorkerSourceDescriptor:
+        raise TypeError("compile control lineage requires an exact source descriptor")
+    assignment, cache_plan, prewarm, launch = plan.revalidate()
+    source.validate(reopen_sources=True)
+    if (
+        source.patched_sglang_checkout != launch.patched_sglang_checkout
+        or source.patched_sglang_tree != launch.patched_sglang_tree
+    ):
+        raise ValueError("compile control source differs from launch manifest")
+    return _content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "compile_control_lineage",
+            "assignment_plan_sha256": plan.sha256,
+            "assignment_contract_sha256": assignment.sha256,
+            "cache_plan_sha256": cache_plan.sha256,
+            "prewarm_manifest_sha256": prewarm.sha256,
+            "launch_manifest_raw_sha256": plan.launch_manifest_raw_sha256,
+            "launch_manifest_sha256": launch.sha256,
+            "source_descriptor_sha256": source.sha256,
+            "subprocess_protocol_sha256": (
+                COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256
+            ),
+        }
+    )
+
+
+@dataclass(frozen=True)
+class CompileControlVerificationReceipt:
+    """Reopenable proof that dynamic release control was atomically consumed."""
+
+    schema_version: int
+    kind: str
+    protocol_sha256: str
+    verified_ns: int
+    assignment_plan_sha256: str
+    inventory_sha256: str
+    lineage_sha256: str
+    control_envelope: ControlArtifactAttestation
+    verified_control: VerifiedControlArtifact
+    source_descriptor: CompileWorkerSourceDescriptor
+    prepared_content_verification_receipt: CanonicalJsonProofBinding
+    prepared_content_authorization_sha256: str
+    additional_challenge_sha256s: tuple[str, ...]
+    reservation_sha256: str
+    reservation_record_path: str
+    reservation_record_raw_sha256: str
+    reservation_record_size: int
+
+    def validate(self, *, reopen_sources: bool) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 2
+            or self.kind != "compile_control_verification_receipt"
+            or self.protocol_sha256 != COMPILE_CONTROL_VERIFICATION_PROTOCOL_SHA256
+        ):
+            raise ValueError("compile control verification schema is unsupported")
+        if type(self.verified_ns) is not int or self.verified_ns < 0:
+            raise ValueError("compile control verification time is invalid")
+        for label, digest in (
+            ("assignment plan", self.assignment_plan_sha256),
+            ("inventory", self.inventory_sha256),
+            ("lineage", self.lineage_sha256),
+            (
+                "prepared content authorization",
+                self.prepared_content_authorization_sha256,
+            ),
+            ("reservation", self.reservation_sha256),
+            ("reservation raw", self.reservation_record_raw_sha256),
+        ):
+            _require_sha256(f"compile control {label}", digest)
+        if type(self.control_envelope) is not ControlArtifactAttestation:
+            raise TypeError("compile control receipt requires an exact envelope")
+        if type(self.verified_control) is not VerifiedControlArtifact:
+            raise TypeError("compile control receipt requires an exact verification")
+        if type(self.source_descriptor) is not CompileWorkerSourceDescriptor:
+            raise TypeError("compile control receipt requires an exact source")
+        self.source_descriptor.validate(reopen_sources=reopen_sources)
+        if type(self.prepared_content_verification_receipt) is not (
+            CanonicalJsonProofBinding
+        ):
+            raise TypeError(
+                "compile control receipt requires a prepared-content receipt binding"
+            )
+        if reopen_sources:
+            prepared = _verified_prepared_release_from_content_receipt(
+                self.prepared_content_verification_receipt,
+                current_ns=self.verified_ns,
+            )
+            if (
+                prepared.authorization_sha256
+                != self.prepared_content_authorization_sha256
+            ):
+                raise ValueError(
+                    "compile control prepared-content authorization changed"
+                )
+        if (
+            type(self.additional_challenge_sha256s) is not tuple
+            or tuple(sorted(set(self.additional_challenge_sha256s)))
+            != self.additional_challenge_sha256s
+        ):
+            raise ValueError("compile control additional challenges are not canonical")
+        for digest in self.additional_challenge_sha256s:
+            _require_sha256("compile control additional challenge", digest)
+        replayed = verify_release_control_artifact_attestation(
+            self.control_envelope,
+            expected_inventory_sha256=self.inventory_sha256,
+            now_ns=self.verified_ns,
+            consumed_challenge_sha256s=(),
+        )
+        if replayed != self.verified_control:
+            raise ValueError("compile control verification result changed")
+        if (
+            replayed.artifact_type != "compile"
+            or replayed.artifact_sha256 != self.assignment_plan_sha256
+            or self.control_envelope.subject.protocol_sha256
+            != COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256
+            or self.control_envelope.subject.lineage_sha256 != self.lineage_sha256
+        ):
+            raise ValueError("compile control subject differs from assignment")
+        expected_reservation = control_challenge_reservation_sha256(
+            (replayed,),
+            reserved_ns=self.verified_ns,
+            additional_challenge_sha256s=self.additional_challenge_sha256s,
+        )
+        if expected_reservation != self.reservation_sha256:
+            raise ValueError("compile control replay reservation identity changed")
+        reservation_path = _absolute_path(
+            "compile control reservation", self.reservation_record_path
+        )
+        if reservation_path.name != f"reservation-{self.reservation_sha256}.json":
+            raise ValueError("compile control reservation path is not exact")
+        if type(self.reservation_record_size) is not int or (
+            self.reservation_record_size < 1
+        ):
+            raise ValueError("compile control reservation size is invalid")
+        if reopen_sources:
+            raw, size = _raw_sha256(
+                reservation_path, label="compile control reservation"
+            )
+            if (
+                raw != self.reservation_record_raw_sha256
+                or size != self.reservation_record_size
+            ):
+                raise ValueError("compile control reservation changed")
+            expected_challenges = tuple(
+                sorted(
+                    {
+                        replayed.challenge_sha256,
+                        replayed.deployment_policy_challenge_sha256,
+                        *self.additional_challenge_sha256s,
+                    }
+                )
+            )
+            row = _strict_json_object(
+                _stable_regular_file_bytes(
+                    reservation_path, label="compile control reservation"
+                ),
+                label="compile control reservation",
+            )
+            if row != {
+                "schema_version": 2,
+                "kind": "lightcone_control_challenge_reservation",
+                "reserved_ns": self.verified_ns,
+                "challenge_sha256s": list(expected_challenges),
+            }:
+                raise ValueError("compile control reservation content differs")
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate(reopen_sources=False)
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "protocol_sha256": self.protocol_sha256,
+            "verified_ns": self.verified_ns,
+            "assignment_plan_sha256": self.assignment_plan_sha256,
+            "inventory_sha256": self.inventory_sha256,
+            "lineage_sha256": self.lineage_sha256,
+            "control_envelope": self.control_envelope.to_dict(),
+            "verified_control": asdict(self.verified_control),
+            "source_descriptor": self.source_descriptor.to_dict(),
+            "prepared_content_verification_receipt": (
+                self.prepared_content_verification_receipt.to_dict()
+            ),
+            "prepared_content_authorization_sha256": (
+                self.prepared_content_authorization_sha256
+            ),
+            "additional_challenge_sha256s": list(self.additional_challenge_sha256s),
+            "reservation_sha256": self.reservation_sha256,
+            "reservation_record_path": self.reservation_record_path,
+            "reservation_record_raw_sha256": self.reservation_record_raw_sha256,
+            "reservation_record_size": self.reservation_record_size,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, raw: object) -> Self:
+        if type(raw) is not dict or set(raw) != {
+            field.name for field in dataclass_fields(cls)
+        }:
+            raise ValueError("compile control verification fields differ from schema")
+        payload = dict(raw)
+        envelope = ControlArtifactAttestation.from_dict(payload.pop("control_envelope"))
+        verified_row = payload.pop("verified_control")
+        if type(verified_row) is not dict:
+            raise TypeError("compile verified control must be an object")
+        verified = VerifiedControlArtifact(**verified_row)
+        source = CompileWorkerSourceDescriptor.from_dict(
+            payload.pop("source_descriptor")
+        )
+        prepared_content_receipt = CanonicalJsonProofBinding.from_dict(
+            payload.pop("prepared_content_verification_receipt")
+        )
+        additional = payload.pop("additional_challenge_sha256s")
+        if type(additional) is not list:
+            raise TypeError("compile control additional challenges must be an array")
+        value = cls(
+            **payload,
+            control_envelope=envelope,
+            verified_control=verified,
+            source_descriptor=source,
+            prepared_content_verification_receipt=prepared_content_receipt,
+            additional_challenge_sha256s=tuple(additional),
+        )
+        value.validate(reopen_sources=False)
+        return value
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        source = _absolute_path("compile control verification", str(path))
+        raw, semantic = _load_canonical_json_with_sidecar(
+            source, label="compile control verification"
+        )
+        value = cls.from_dict(raw)
+        if value.sha256 != semantic:
+            raise ValueError("compile control verification digest differs")
+        value.validate(reopen_sources=True)
+        return value
+
+
+def _verified_prepared_release_from_content_receipt(
+    binding: CanonicalJsonProofBinding,
+    *,
+    current_ns: int,
+) -> VerifiedPreparedModelContentRelease:
+    """Deep-reopen one durable content receipt without re-consuming challenges."""
+
+    if type(binding) is not CanonicalJsonProofBinding:
+        raise TypeError("prepared content receipt binding must be exact")
+    raw = binding.reopen()
+    receipt = ContentVerificationReceipt.from_dict(raw)
+    if receipt.sha256 != binding.semantic_sha256:
+        raise ValueError("prepared content receipt semantic identity differs")
+    verified = receipt.revalidate(current_ns=current_ns)
+    prepared = tuple(
+        row for row in verified if type(row) is VerifiedPreparedModelContentRelease
+    )
+    if len(prepared) != 1:
+        raise ValueError(
+            "content verification receipt must contain one prepared-model authority"
+        )
+    return prepared[0]
+
+
+def revalidate_prepared_content_verification_receipt(
+    path: str | Path,
+    *,
+    current_ns: int,
+) -> tuple[CanonicalJsonProofBinding, VerifiedPreparedModelContentRelease]:
+    """Bind and deep-reopen durable prepared content for formal execution."""
+
+    binding = CanonicalJsonProofBinding.bind(path)
+    return binding, _verified_prepared_release_from_content_receipt(
+        binding,
+        current_ns=current_ns,
+    )
+
+
+def verify_and_reserve_compile_control(
+    plan: CompileAssignmentPlan,
+    envelope: ControlArtifactAttestation,
+    *,
+    prepared_content_verification_receipt_path: str | Path,
+    replay_store: ChallengeReplayStore,
+    now_ns: int,
+    additional_challenge_sha256s: tuple[str, ...] = (),
+) -> CompileControlVerificationReceipt:
+    """Consume one root-authorized compile control before spawning GPU work."""
+
+    if type(plan) is not CompileAssignmentPlan:
+        raise TypeError("compile control requires an exact assignment plan")
+    (
+        prepared_content_receipt,
+        prepared_model_authorization,
+    ) = revalidate_prepared_content_verification_receipt(
+        prepared_content_verification_receipt_path,
+        current_ns=now_ns,
+    )
+    assignment, _cache, _prewarm, launch = plan.revalidate()
+    prepared_release = prepared_model_authorization.authorization
+    target = prepared_model_authorization.member(launch.target_content_member_id)
+    tokenizer = prepared_model_authorization.member(launch.tokenizer_content_member_id)
+    drafter = (
+        None
+        if launch.drafter_content_member_id is None
+        else prepared_model_authorization.member(launch.drafter_content_member_id)
+    )
+    expected_content_authority = prepared_model_authorization.authorization_sha256
+    content_value, content_semantic = _load_canonical_json_with_sidecar(
+        Path(launch.prepared_model_content_manifest_path),
+        label="compile prepared-model content manifest",
+    )
+    if type(content_value) is not dict or set(content_value) != {
+        "schema_version",
+        "kind",
+        "protocol_sha256",
+        "model_lock_sha256",
+        "prepared_model_set_sha256",
+        "snapshots",
+    }:
+        raise ValueError("compile prepared-model content manifest schema differs")
+    snapshots = content_value["snapshots"]
+    if type(snapshots) is not list or any(type(row) is not dict for row in snapshots):
+        raise TypeError("compile prepared-model snapshots must be objects")
+    snapshot_by_identity = {
+        (row.get("model_id"), row.get("revision")): row for row in snapshots
+    }
+    if len(snapshot_by_identity) != len(snapshots):
+        raise ValueError("compile prepared-model snapshots are duplicated")
+    launch_paths = {
+        "target": launch.target_snapshot_path,
+        "tokenizer": launch.tokenizer_snapshot_path,
+    }
+    if launch.drafter_snapshot_path is not None:
+        launch_paths["drafter"] = launch.drafter_snapshot_path
+    selected_models = (target, tokenizer) + (() if drafter is None else (drafter,))
+    for authorized_model in selected_models:
+        snapshot = snapshot_by_identity.get(
+            (authorized_model.model_id, authorized_model.revision)
+        )
+        snapshot_sha256 = None if snapshot is None else _content_sha256(snapshot)
+        if (
+            snapshot is None
+            or snapshot.get("root") != launch_paths.get(authorized_model.role)
+            or authorized_model.snapshot_manifest_raw_sha256 != snapshot_sha256
+            or authorized_model.snapshot_manifest_semantic_sha256 != snapshot_sha256
+        ):
+            raise ValueError(
+                "compile prepared-model role differs from signed content manifest"
+            )
+    if (
+        prepared_release.model_lock_sha256 != launch.model_lock_sha256
+        or content_value["model_lock_sha256"] != launch.model_lock_sha256
+        or content_value["prepared_model_set_sha256"]
+        != prepared_release.prepared_model_set_sha256
+        or prepared_release.content_manifest_raw_sha256
+        != launch.prepared_model_content_manifest_raw_sha256
+        or prepared_release.content_manifest_semantic_sha256
+        != launch.prepared_model_content_manifest_sha256
+        or prepared_release.content_manifest_size
+        != launch.prepared_model_content_manifest_size
+        or content_semantic != launch.prepared_model_content_manifest_sha256
+        or launch.target_content_authority_sha256 != expected_content_authority
+        or launch.tokenizer_content_authority_sha256 != expected_content_authority
+        or (launch.target_model_id, launch.target_revision)
+        != (target.model_id, target.revision)
+        or target.role != "target"
+        or (launch.tokenizer_model_id, launch.tokenizer_revision)
+        != (tokenizer.model_id, tokenizer.revision)
+        or tokenizer.role != "tokenizer"
+        or ((launch.drafter_model_id is None) != (drafter is None))
+        or (
+            drafter is not None
+            and (
+                launch.drafter_content_authority_sha256 != expected_content_authority
+                or (launch.drafter_model_id, launch.drafter_revision)
+                != (drafter.model_id, drafter.revision)
+                or drafter.role != "drafter"
+            )
+        )
+    ):
+        raise ValueError(
+            "compile launch differs from prepared-model content authorization"
+        )
+    all_additional_challenges = tuple(sorted(set(additional_challenge_sha256s)))
+    if len(all_additional_challenges) != len(additional_challenge_sha256s):
+        raise ValueError("compile control additional challenges are duplicated")
+    if prepared_model_authorization.challenge_sha256 in all_additional_challenges:
+        raise ValueError(
+            "compile control must not reserve the prepared-content challenge twice"
+        )
+    source = CompileWorkerSourceDescriptor.issue(
+        patched_sglang_checkout=launch.patched_sglang_checkout
+    )
+    lineage = compile_control_lineage_sha256(plan, source)
+    subject = envelope.subject
+    if (
+        subject.artifact_type != "compile"
+        or subject.artifact_sha256 != plan.sha256
+        or subject.protocol_sha256 != COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256
+        or subject.registry_sha256 != assignment.registry_sha256
+        or subject.lineage_sha256 != lineage
+    ):
+        raise ValueError("compile control envelope does not authorize this launch")
+    results = verify_and_reserve_release_control_artifact_attestations(
+        (envelope,),
+        expected_inventory_sha256=plan.inventory_sha256,
+        now_ns=now_ns,
+        replay_store=replay_store,
+        additional_challenge_sha256s=all_additional_challenges,
+    )
+    verified = results[0]
+    reservation = control_challenge_reservation_sha256(
+        results,
+        reserved_ns=now_ns,
+        additional_challenge_sha256s=all_additional_challenges,
+    )
+    reservation_path = Path(replay_store.root) / f"reservation-{reservation}.json"
+    raw_sha256, size = _raw_sha256(
+        reservation_path, label="compile control reservation"
+    )
+    receipt = CompileControlVerificationReceipt(
+        schema_version=2,
+        kind="compile_control_verification_receipt",
+        protocol_sha256=COMPILE_CONTROL_VERIFICATION_PROTOCOL_SHA256,
+        verified_ns=now_ns,
+        assignment_plan_sha256=plan.sha256,
+        inventory_sha256=plan.inventory_sha256,
+        lineage_sha256=lineage,
+        control_envelope=envelope,
+        verified_control=verified,
+        source_descriptor=source,
+        prepared_content_verification_receipt=prepared_content_receipt,
+        prepared_content_authorization_sha256=(
+            prepared_model_authorization.authorization_sha256
+        ),
+        additional_challenge_sha256s=all_additional_challenges,
+        reservation_sha256=reservation,
+        reservation_record_path=str(reservation_path),
+        reservation_record_raw_sha256=raw_sha256,
+        reservation_record_size=size,
+    )
+    receipt.validate(reopen_sources=True)
+    return receipt
 
 
 def require_release_compile_assignment_plan(
@@ -840,6 +2143,10 @@ class CompileSubprocessLifecycleReceipt:
     executable_size: int
     argv_sha256: str
     source_authority_sha256: str | None
+    launch_manifest_path: str
+    launch_manifest_raw_sha256: str
+    launch_manifest_sha256: str
+    control_verification_receipt_sha256: str | None
     process_id: int
     process_started_ns: int
     process_exited_ns: int
@@ -850,7 +2157,7 @@ class CompileSubprocessLifecycleReceipt:
     def validate(self, *, reopen_executable: bool) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version != 1
+            or self.schema_version != 2
             or self.kind != "compile_subprocess_lifecycle_raw_receipt"
         ):
             raise ValueError("compile subprocess receipt schema is unsupported")
@@ -867,6 +2174,20 @@ class CompileSubprocessLifecycleReceipt:
         if self.source_authority_sha256 is not None:
             _require_sha256(
                 "compile subprocess source authority", self.source_authority_sha256
+            )
+        launch_path = _absolute_path(
+            "compile subprocess launch manifest", self.launch_manifest_path
+        )
+        _require_sha256(
+            "compile subprocess launch manifest raw", self.launch_manifest_raw_sha256
+        )
+        _require_sha256(
+            "compile subprocess launch manifest", self.launch_manifest_sha256
+        )
+        if self.control_verification_receipt_sha256 is not None:
+            _require_sha256(
+                "compile subprocess control verification",
+                self.control_verification_receipt_sha256,
             )
         for label, value in (
             ("process ID", self.process_id),
@@ -929,22 +2250,25 @@ class CompileSubprocessLifecycleReceipt:
             ):
                 raise ValueError("compile subprocess prewarm exchange differs")
         if self.formal_execution_authorized is True:
-            if self.source_authority_sha256 is None:
-                raise ValueError("formal compile receipt lacks source authority")
-            _require_formal_compile_receipt_authority(
-                assignment_plan_sha256=self.assignment_plan_sha256,
-                executable_path=self.executable_path,
-                executable_raw_sha256=self.executable_raw_sha256,
-                argv_sha256=self.argv_sha256,
-                source_authority_sha256=self.source_authority_sha256,
-                reopen_executable=reopen_executable,
-            )
+            if (
+                self.source_authority_sha256 is None
+                or self.control_verification_receipt_sha256 is None
+            ):
+                raise ValueError(
+                    "formal compile receipt lacks dynamic control authority"
+                )
         elif self.formal_execution_authorized is not False:
             raise TypeError("compile subprocess formal flag must be boolean")
-        elif self.source_authority_sha256 is not None:
-            raise ValueError("diagnostic compile receipt cannot claim source authority")
+        elif (
+            self.source_authority_sha256 is not None
+            or self.control_verification_receipt_sha256 is not None
+        ):
+            raise ValueError(
+                "diagnostic compile receipt cannot claim control authority"
+            )
         start_row = event_rows[1]
         start_environment = start_row.get("cache_environment")
+        start_launch = start_row.get("launch_manifest")
         if (
             type(start_environment) is not dict
             or set(start_environment) != set(COMPILE_CACHE_ENVIRONMENT_VARIABLES)
@@ -956,7 +2280,23 @@ class CompileSubprocessLifecycleReceipt:
             )
         ):
             raise ValueError("compile subprocess receipt cache environment differs")
+        if start_launch != {
+            "path": self.launch_manifest_path,
+            "raw_sha256": self.launch_manifest_raw_sha256,
+            "semantic_sha256": self.launch_manifest_sha256,
+        }:
+            raise ValueError("compile subprocess receipt launch manifest differs")
         if reopen_executable:
+            launch = CompileLaunchManifest.load(launch_path)
+            launch_raw, launch_size = _raw_sha256(
+                launch_path, label="compile subprocess launch manifest"
+            )
+            if (
+                launch_size < 1
+                or launch_raw != self.launch_manifest_raw_sha256
+                or launch.sha256 != self.launch_manifest_sha256
+            ):
+                raise ValueError("compile subprocess launch manifest changed")
             digest, size = _raw_sha256(
                 executable, label="compile subprocess executable"
             )
@@ -977,6 +2317,12 @@ class CompileSubprocessLifecycleReceipt:
             "executable_size": self.executable_size,
             "argv_sha256": self.argv_sha256,
             "source_authority_sha256": self.source_authority_sha256,
+            "launch_manifest_path": self.launch_manifest_path,
+            "launch_manifest_raw_sha256": self.launch_manifest_raw_sha256,
+            "launch_manifest_sha256": self.launch_manifest_sha256,
+            "control_verification_receipt_sha256": (
+                self.control_verification_receipt_sha256
+            ),
             "process_id": self.process_id,
             "process_started_ns": self.process_started_ns,
             "process_exited_ns": self.process_exited_ns,
@@ -1001,6 +2347,10 @@ class CompileSubprocessLifecycleReceipt:
             "executable_size",
             "argv_sha256",
             "source_authority_sha256",
+            "launch_manifest_path",
+            "launch_manifest_raw_sha256",
+            "launch_manifest_sha256",
+            "control_verification_receipt_sha256",
             "process_id",
             "process_started_ns",
             "process_exited_ns",
@@ -1042,9 +2392,10 @@ class _CompileSubprocessDriver:
         self,
         *,
         argv: tuple[str, ...],
-        assignment_plan_sha256: str,
+        plan: CompileAssignmentPlan,
         timeout_seconds: float,
         source_authority_sha256: str | None,
+        control_verification_receipt_sha256: str | None,
         formal_execution_authorized: bool,
     ) -> None:
         if type(argv) is not tuple or not argv:
@@ -1054,31 +2405,51 @@ class _CompileSubprocessDriver:
                 raise ValueError("compile subprocess argument contains NUL")
         executable = _absolute_path("compile subprocess executable", argv[0])
         digest, size = _raw_sha256(executable, label="compile subprocess executable")
-        _require_sha256("compile subprocess plan", assignment_plan_sha256)
+        if type(plan) is not CompileAssignmentPlan:
+            raise TypeError("compile subprocess requires an exact assignment plan")
+        plan.validate()
+        launch = CompileLaunchManifest.load(plan.launch_manifest_path)
+        if launch.sha256 != plan.launch_manifest_sha256:
+            raise ValueError("compile subprocess launch manifest differs from plan")
         if (
             type(timeout_seconds) not in {int, float}
             or isinstance(timeout_seconds, bool)
-            or not (0 < float(timeout_seconds) <= 600)
+            or not (0 < float(timeout_seconds) <= 3_600)
         ):
-            raise ValueError("compile subprocess timeout must be in (0, 600] seconds")
+            raise ValueError("compile subprocess timeout must be in (0, 3600] seconds")
         if formal_execution_authorized is True:
-            if source_authority_sha256 is None:
-                raise ValueError("formal compile subprocess lacks source authority")
+            if (
+                source_authority_sha256 is None
+                or control_verification_receipt_sha256 is None
+            ):
+                raise ValueError("formal compile subprocess lacks dynamic control")
             _require_sha256(
                 "compile subprocess source authority", source_authority_sha256
             )
+            _require_sha256(
+                "compile subprocess control verification",
+                control_verification_receipt_sha256,
+            )
         elif formal_execution_authorized is not False:
             raise TypeError("compile subprocess formal flag must be boolean")
-        elif source_authority_sha256 is not None:
+        elif (
+            source_authority_sha256 is not None
+            or control_verification_receipt_sha256 is not None
+        ):
             raise ValueError("diagnostic compile subprocess cannot claim authority")
         self.argv = argv
-        self.assignment_plan_sha256 = assignment_plan_sha256
+        self.assignment_plan_sha256 = plan.sha256
+        self.launch = launch
+        self.launch_manifest_path = plan.launch_manifest_path
+        self.launch_manifest_raw_sha256 = plan.launch_manifest_raw_sha256
+        self.launch_manifest_sha256 = plan.launch_manifest_sha256
         self.timeout_seconds = float(timeout_seconds)
         self.executable_path = executable
         self.executable_raw_sha256 = digest
         self.executable_size = size
         self.argv_sha256 = _content_sha256({"argv": list(argv)})
         self.source_authority_sha256 = source_authority_sha256
+        self.control_verification_receipt_sha256 = control_verification_receipt_sha256
         self.formal_execution_authorized = formal_execution_authorized
         self._process: subprocess.Popen[bytes] | None = None
         self._stdout_buffer = b""
@@ -1086,6 +2457,7 @@ class _CompileSubprocessDriver:
         self._process_started_ns: int | None = None
         self._process_exited_ns: int | None = None
         self._exit_code: int | None = None
+        self._deadline_monotonic: float | None = None
 
     @property
     def process_id(self) -> int:
@@ -1140,7 +2512,9 @@ class _CompileSubprocessDriver:
     def _read_line(self) -> bytes:
         if self._process is None or self._process.stdout is None:
             raise RuntimeError("compile subprocess stdout is unavailable")
-        deadline = time.monotonic() + self.timeout_seconds
+        if self._deadline_monotonic is None:
+            raise RuntimeError("compile subprocess deadline is unavailable")
+        deadline = self._deadline_monotonic
         descriptor = self._process.stdout.fileno()
         with selectors.DefaultSelector() as selector:
             selector.register(descriptor, selectors.EVENT_READ)
@@ -1185,12 +2559,16 @@ class _CompileSubprocessDriver:
         # or unregistered cache paths into the compile child.  A future GPU
         # command needing another variable must bind it in source policy.
         environment = {
-            "LANG": "C",
-            "LC_ALL": "C",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUNBUFFERED": "1",
+            **self.launch.child_environment(),
+            # The worker must echo the exact routing identity before it may
+            # receive the start manifest.  Putting this parent-validated digest
+            # in the otherwise explicit environment avoids an assignment ↔
+            # launch-manifest digest cycle; it is neither a secret nor launch
+            # authority.
+            "LIGHTCONE_COMPILE_ASSIGNMENT_PLAN_SHA256": (self.assignment_plan_sha256),
         }
         self._process_started_ns = time.monotonic_ns()
+        self._deadline_monotonic = time.monotonic() + self.timeout_seconds
         try:
             self._process = subprocess.Popen(
                 self.argv,
@@ -1230,6 +2608,11 @@ class _CompileSubprocessDriver:
                 "protocol_sha256": COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
                 "assignment_plan_sha256": self.assignment_plan_sha256,
                 "cache_environment": cache_environment,
+                "launch_manifest": {
+                    "path": self.launch_manifest_path,
+                    "raw_sha256": self.launch_manifest_raw_sha256,
+                    "semantic_sha256": self.launch_manifest_sha256,
+                },
             }
         )
         started = self._receive(
@@ -1295,8 +2678,13 @@ class _CompileSubprocessDriver:
             kind="compile_subprocess_drained",
             fields={"active_requests", "queued_requests", "provider_ack_sha256"},
         )
+        if self._deadline_monotonic is None:
+            raise RuntimeError("compile subprocess deadline is unavailable")
+        remaining = self._deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("compile subprocess exceeded its process hard cap")
         try:
-            exit_code = self._process.wait(timeout=self.timeout_seconds)
+            exit_code = self._process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as error:
             raise TimeoutError("compile subprocess did not exit after drain") from error
         self._process_exited_ns = time.monotonic_ns()
@@ -1330,7 +2718,7 @@ class _CompileSubprocessDriver:
         ):
             raise RuntimeError("compile subprocess is not terminal")
         receipt = CompileSubprocessLifecycleReceipt(
-            schema_version=1,
+            schema_version=2,
             kind="compile_subprocess_lifecycle_raw_receipt",
             protocol_sha256=COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256,
             assignment_plan_sha256=self.assignment_plan_sha256,
@@ -1339,6 +2727,12 @@ class _CompileSubprocessDriver:
             executable_size=self.executable_size,
             argv_sha256=self.argv_sha256,
             source_authority_sha256=self.source_authority_sha256,
+            launch_manifest_path=self.launch_manifest_path,
+            launch_manifest_raw_sha256=self.launch_manifest_raw_sha256,
+            launch_manifest_sha256=self.launch_manifest_sha256,
+            control_verification_receipt_sha256=(
+                self.control_verification_receipt_sha256
+            ),
             process_id=self.process_id,
             process_started_ns=self._process_started_ns,
             process_exited_ns=self._process_exited_ns,
@@ -1407,7 +2801,8 @@ class CompileResultBinding:
 
     def reopen(self, *, label: str) -> None:
         digest, size = _raw_sha256(
-            _absolute_path(label, self.absolute_path), label=label
+            relocated_evidence_path(_absolute_path(label, self.absolute_path)),
+            label=label,
         )
         if digest != self.raw_sha256 or size != self.size:
             raise ValueError(f"{label} changed after terminal publication")
@@ -1437,6 +2832,7 @@ class CompileResultPointer:
     assignment_manifest: CompileResultBinding
     compile_cache_plan: CompileResultBinding
     prewarm_manifest: CompileResultBinding
+    launch_manifest: CompileResultBinding
     attempt_receipt: CompileResultBinding
     graceful_shutdown_receipt: CompileResultBinding
     final_cache_receipt: CompileResultBinding
@@ -1444,11 +2840,12 @@ class CompileResultPointer:
     formal_execution_authorized: bool
     assignment_plan_source: CompileResultBinding | None = None
     subprocess_lifecycle_receipt: CompileResultBinding | None = None
+    control_verification_receipt: CompileResultBinding | None = None
 
     def validate(self) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version not in {1, 2}
+            or self.schema_version not in {1, 2, 3}
             or self.kind != "compile_atomic_result_pointer"
         ):
             raise ValueError("compile result pointer schema is unsupported")
@@ -1462,6 +2859,7 @@ class CompileResultPointer:
             if (
                 self.assignment_plan_source is not None
                 or self.subprocess_lifecycle_receipt is not None
+                or self.control_verification_receipt is not None
             ):
                 raise ValueError(
                     "legacy compile pointer cannot claim subprocess evidence"
@@ -1471,9 +2869,16 @@ class CompileResultPointer:
             or type(self.subprocess_lifecycle_receipt) is not CompileResultBinding
         ):
             raise TypeError("subprocess compile pointer lacks path-bound raw evidence")
+        if self.schema_version == 2 and self.control_verification_receipt is not None:
+            raise ValueError("diagnostic subprocess pointer cannot claim control")
+        if (
+            self.schema_version == 3
+            and type(self.control_verification_receipt) is not CompileResultBinding
+        ):
+            raise TypeError("formal compile pointer lacks dynamic control evidence")
         if type(self.formal_execution_authorized) is not bool:
             raise TypeError("compile result formal flag must be boolean")
-        if self.formal_execution_authorized is True and self.schema_version != 2:
+        if self.formal_execution_authorized is True and self.schema_version != 3:
             raise ValueError(
                 "formal compile execution requires subprocess lifecycle evidence"
             )
@@ -1490,6 +2895,7 @@ class CompileResultPointer:
             "assignment_manifest": self.assignment_manifest,
             "compile_cache_plan": self.compile_cache_plan,
             "prewarm_manifest": self.prewarm_manifest,
+            "launch_manifest": self.launch_manifest,
             "attempt_receipt": self.attempt_receipt,
             "graceful_shutdown_receipt": self.graceful_shutdown_receipt,
             "final_cache_receipt": self.final_cache_receipt,
@@ -1499,6 +2905,8 @@ class CompileResultPointer:
             bindings["assignment_plan_source"] = self.assignment_plan_source
         if self.subprocess_lifecycle_receipt is not None:
             bindings["subprocess_lifecycle_receipt"] = self.subprocess_lifecycle_receipt
+        if self.control_verification_receipt is not None:
+            bindings["control_verification_receipt"] = self.control_verification_receipt
         return bindings
 
     def to_dict(self) -> dict[str, object]:
@@ -1521,7 +2929,7 @@ class CompileResultPointer:
         self.validate()
         for label, binding in self.bindings().items():
             binding.reopen(label=f"compile result {label}")
-        if self.schema_version == 2:
+        if self.schema_version in {2, 3}:
             if self.assignment_plan_source is None:
                 raise AssertionError("validated subprocess pointer lost its plan")
             if self.subprocess_lifecycle_receipt is None:
@@ -1538,6 +2946,22 @@ class CompileResultPointer:
                 is not self.formal_execution_authorized
             ):
                 raise ValueError("compile pointer subprocess receipt differs")
+            plan_launch = CompileResultBinding.bind(
+                Path(plan.launch_manifest_path), label="compile launch manifest"
+            )
+            if self.launch_manifest != plan_launch:
+                raise ValueError("compile pointer launch manifest differs")
+            if self.schema_version == 3:
+                if self.control_verification_receipt is None:
+                    raise AssertionError("formal compile pointer lost dynamic control")
+                control = CompileControlVerificationReceipt.load(
+                    self.control_verification_receipt.absolute_path
+                )
+                if (
+                    control.sha256 != receipt.control_verification_receipt_sha256
+                    or control.assignment_plan_sha256 != self.assignment_plan_sha256
+                ):
+                    raise ValueError("compile pointer control verification differs")
 
     @classmethod
     def from_dict(cls, raw: object) -> Self:
@@ -1545,6 +2969,7 @@ class CompileResultPointer:
             "assignment_manifest",
             "compile_cache_plan",
             "prewarm_manifest",
+            "launch_manifest",
             "attempt_receipt",
             "graceful_shutdown_receipt",
             "final_cache_receipt",
@@ -1563,11 +2988,14 @@ class CompileResultPointer:
         schema_version = raw.get("schema_version")
         binding_names = set(legacy_binding_names)
         expected = set(common)
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             binding_names.update(
                 {"assignment_plan_source", "subprocess_lifecycle_receipt"}
             )
             expected.update({"assignment_plan_source", "subprocess_lifecycle_receipt"})
+        if schema_version == 3:
+            binding_names.add("control_verification_receipt")
+            expected.add("control_verification_receipt")
         if set(raw) != expected:
             raise ValueError("compile result pointer fields differ from schema")
         scalar = {
@@ -1594,7 +3022,7 @@ class CompileResultPointer:
         if semantic_sha256 != value.sha256:
             raise ValueError("compile result pointer semantic digest differs")
         value.reopen()
-        if value.schema_version == 2:
+        if value.schema_version in {2, 3}:
             if value.assignment_plan_source is None:
                 raise AssertionError("validated subprocess pointer lost its plan")
             plan = CompileAssignmentPlan.load(
@@ -1626,17 +3054,24 @@ def _execute_compile_assignment(
     materialize_cache_files: Callable[[Path], None] | None,
     assignment_plan_source: Path | None,
     subprocess_driver: _CompileSubprocessDriver | None,
+    control_verification_receipt_path: Path | None,
     formal_execution_authorized: bool,
 ) -> CompileResultPointer:
     if type(plan) is not CompileAssignmentPlan:
         raise TypeError("compile lifecycle requires an exact assignment plan")
-    _, cache_plan, manifest = plan.revalidate()
+    _, cache_plan, manifest, _launch = plan.revalidate()
     preflight_compile_cache_launch(cache_plan)
     if type(driver.process_id) is not int or driver.process_id < 1:
         raise ValueError("compile lifecycle driver process ID is invalid")
     if formal_execution_authorized is True:
-        if subprocess_driver is None or assignment_plan_source is None:
-            raise ValueError("formal compile lifecycle requires path-bound subprocess")
+        if (
+            subprocess_driver is None
+            or assignment_plan_source is None
+            or control_verification_receipt_path is None
+        ):
+            raise ValueError(
+                "formal compile lifecycle requires path-bound subprocess and control"
+            )
     elif formal_execution_authorized is not False:
         raise TypeError("compile lifecycle formal flag must be boolean")
     session = start_compile_cache_launch(
@@ -1693,6 +3128,14 @@ def _execute_compile_assignment(
             subprocess_receipt.assignment_plan_sha256 != plan.sha256
             or subprocess_receipt.formal_execution_authorized
             is not formal_execution_authorized
+            or subprocess_receipt.control_verification_receipt_sha256
+            != (
+                None
+                if control_verification_receipt_path is None
+                else CompileControlVerificationReceipt.load(
+                    control_verification_receipt_path
+                ).sha256
+            )
         ):
             raise ValueError("compile subprocess receipt differs from execution")
         subprocess_receipt_path = _publish_terminal(
@@ -1740,8 +3183,12 @@ def _execute_compile_assignment(
             "formal_execution_authorized": formal_execution_authorized,
         },
     )
-    schema_version = 2 if subprocess_receipt_path is not None else 1
-    if schema_version == 2 and assignment_plan_source is None:
+    schema_version = (
+        3
+        if control_verification_receipt_path is not None
+        else (2 if subprocess_receipt_path is not None else 1)
+    )
+    if schema_version in {2, 3} and assignment_plan_source is None:
         raise AssertionError("subprocess execution lost its path-bound plan")
     pointer = CompileResultPointer(
         schema_version=schema_version,
@@ -1756,6 +3203,9 @@ def _execute_compile_assignment(
         ),
         prewarm_manifest=CompileResultBinding.bind(
             Path(plan.prewarm_manifest_path), label="prewarm manifest"
+        ),
+        launch_manifest=CompileResultBinding.bind(
+            Path(plan.launch_manifest_path), label="compile launch manifest"
         ),
         attempt_receipt=CompileResultBinding.bind(
             attempt_path, label="compile attempt receipt"
@@ -1785,6 +3235,14 @@ def _execute_compile_assignment(
                 label="compile subprocess lifecycle receipt",
             )
         ),
+        control_verification_receipt=(
+            None
+            if control_verification_receipt_path is None
+            else CompileResultBinding.bind(
+                control_verification_receipt_path,
+                label="compile control verification receipt",
+            )
+        ),
     )
     pointer.validate()
     result_path = Path(plan.result_pointer_path)
@@ -1810,6 +3268,7 @@ def execute_compile_assignment_for_cpu_test(
         materialize_cache_files=materialize_cache_files,
         assignment_plan_source=None,
         subprocess_driver=None,
+        control_verification_receipt_path=None,
         formal_execution_authorized=False,
     )
 
@@ -1820,6 +3279,7 @@ def _preflight_subprocess_result(
     assignment_plan_source: Path,
     formal_execution_authorized: bool,
     source_authority_sha256: str | None,
+    control_verification_receipt_sha256: str | None,
     argv_sha256: str,
 ) -> CompileResultPointer | None:
     result_path = Path(plan.result_pointer_path)
@@ -1831,7 +3291,7 @@ def _preflight_subprocess_result(
             raise ValueError("compile result pointer commit marker is incomplete")
         pointer = CompileResultPointer.load(result_path)
         if (
-            pointer.schema_version != 2
+            pointer.schema_version != (3 if formal_execution_authorized else 2)
             or pointer.assignment_plan_sha256 != plan.sha256
             or pointer.formal_execution_authorized is not formal_execution_authorized
             or pointer.assignment_plan_source is None
@@ -1847,6 +3307,8 @@ def _preflight_subprocess_result(
         if (
             receipt.source_authority_sha256 != source_authority_sha256
             or receipt.argv_sha256 != argv_sha256
+            or receipt.control_verification_receipt_sha256
+            != control_verification_receipt_sha256
         ):
             raise ValueError("compile result pointer uses another subprocess authority")
         return pointer
@@ -1862,11 +3324,13 @@ def _execute_compile_assignment_subprocess_path(
     argv: tuple[str, ...],
     timeout_seconds: float,
     source_authority_sha256: str | None,
+    control_verification_receipt_sha256: str | None,
+    control_verification_receipt_path: Path | None,
     formal_execution_authorized: bool,
 ) -> CompileResultPointer:
     plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
     plan = CompileAssignmentPlan.load(plan_path)
-    _assignment, cache_plan, _manifest = plan.revalidate()
+    _assignment, cache_plan, _manifest, _launch = plan.revalidate()
     preflight_compile_cache_launch(cache_plan)
     argv_sha256 = _content_sha256({"argv": list(argv)})
     resumed = _preflight_subprocess_result(
@@ -1874,15 +3338,17 @@ def _execute_compile_assignment_subprocess_path(
         assignment_plan_source=plan_path,
         formal_execution_authorized=formal_execution_authorized,
         source_authority_sha256=source_authority_sha256,
+        control_verification_receipt_sha256=(control_verification_receipt_sha256),
         argv_sha256=argv_sha256,
     )
     if resumed is not None:
         return resumed
     driver = _CompileSubprocessDriver(
         argv=argv,
-        assignment_plan_sha256=plan.sha256,
+        plan=plan,
         timeout_seconds=timeout_seconds,
         source_authority_sha256=source_authority_sha256,
+        control_verification_receipt_sha256=(control_verification_receipt_sha256),
         formal_execution_authorized=formal_execution_authorized,
     )
     driver.spawn()
@@ -1893,6 +3359,7 @@ def _execute_compile_assignment_subprocess_path(
             materialize_cache_files=None,
             assignment_plan_source=plan_path,
             subprocess_driver=driver,
+            control_verification_receipt_path=control_verification_receipt_path,
             formal_execution_authorized=formal_execution_authorized,
         )
     finally:
@@ -1912,46 +3379,137 @@ def execute_compile_assignment_subprocess_for_cpu_test(
         argv=argv,
         timeout_seconds=timeout_seconds,
         source_authority_sha256=None,
+        control_verification_receipt_sha256=None,
+        control_verification_receipt_path=None,
         formal_execution_authorized=False,
+    )
+
+
+def _execute_release_compile_assignment_plan_admitted(
+    assignment_plan_path: str | Path,
+    *,
+    control_attestation: ControlArtifactAttestation | None = None,
+    prepared_content_verification_receipt_path: str | Path | None = None,
+    replay_store: ChallengeReplayStore | None = None,
+    now_ns: int | None = None,
+    additional_challenge_sha256s: tuple[str, ...] = (),
+    timeout_seconds: float,
+) -> CompileResultPointer:
+    """Execute one exact plan under root-signed dynamic deployment control."""
+
+    if (
+        type(control_attestation) is not ControlArtifactAttestation
+        or not isinstance(prepared_content_verification_receipt_path, (str, Path))
+        or type(replay_store) is not ChallengeReplayStore
+        or type(now_ns) is not int
+        or now_ns < 0
+    ):
+        raise CompileRunnerBlocked(RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE)
+    plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
+    plan = CompileAssignmentPlan.load(plan_path)
+    (
+        prepared_content_receipt,
+        prepared_model_authorization,
+    ) = revalidate_prepared_content_verification_receipt(
+        prepared_content_verification_receipt_path,
+        current_ns=now_ns,
+    )
+    expected_additional_challenges = tuple(sorted(set(additional_challenge_sha256s)))
+    if len(expected_additional_challenges) != len(additional_challenge_sha256s):
+        raise ValueError("compile control additional challenges are duplicated")
+    if prepared_model_authorization.challenge_sha256 in expected_additional_challenges:
+        raise ValueError(
+            "compile control must not reserve the prepared-content challenge twice"
+        )
+    result_path = Path(plan.result_pointer_path)
+    if result_path.exists() or Path(f"{result_path}.sha256").exists():
+        pointer = CompileResultPointer.load(result_path)
+        if (
+            pointer.schema_version != 3
+            or pointer.assignment_plan_sha256 != plan.sha256
+            or pointer.control_verification_receipt is None
+        ):
+            raise ValueError("existing compile pointer is not this formal execution")
+        prior = CompileControlVerificationReceipt.load(
+            pointer.control_verification_receipt.absolute_path
+        )
+        if (
+            prior.control_envelope != control_attestation
+            or prior.additional_challenge_sha256s != expected_additional_challenges
+            or prior.prepared_content_verification_receipt != prepared_content_receipt
+        ):
+            raise ValueError("existing compile pointer uses another control")
+        return pointer
+    control = verify_and_reserve_compile_control(
+        plan,
+        control_attestation,
+        prepared_content_verification_receipt_path=(
+            prepared_content_verification_receipt_path
+        ),
+        replay_store=replay_store,
+        now_ns=now_ns,
+        additional_challenge_sha256s=additional_challenge_sha256s,
+    )
+    control_path = Path(plan.result_pointer_path).parent / (
+        f"compile-control-{plan.sha256}.json"
+    )
+    if control_path.exists() or Path(f"{control_path}.sha256").exists():
+        existing = CompileControlVerificationReceipt.load(control_path)
+        if existing != control:
+            raise ValueError("compile control path belongs to another authorization")
+    else:
+        _publish_json(control_path, control.to_dict())
+        _publish_text(Path(f"{control_path}.sha256"), control.sha256)
+        CompileControlVerificationReceipt.load(control_path)
+    source = control.source_descriptor
+    argv = (source.interpreter_path, source.helper_path)
+    return _execute_compile_assignment_subprocess_path(
+        plan_path,
+        argv=argv,
+        timeout_seconds=timeout_seconds,
+        source_authority_sha256=source.sha256,
+        control_verification_receipt_sha256=control.sha256,
+        control_verification_receipt_path=control_path,
+        formal_execution_authorized=True,
     )
 
 
 def execute_release_compile_assignment_plan(
     assignment_plan_path: str | Path,
     *,
-    timeout_seconds: float = 600.0,
+    control_attestation: ControlArtifactAttestation | None = None,
+    prepared_content_verification_receipt_path: str | Path | None = None,
+    replay_store: ChallengeReplayStore | None = None,
+    now_ns: int | None = None,
+    additional_challenge_sha256s: tuple[str, ...] = (),
 ) -> CompileResultPointer:
-    """Execute a path-bound formal plan only under exact source allowlists."""
+    """Reject direct formal execution lacking a typed launch-cap admission.
 
-    # Both empty policies are checked before opening the caller-named plan path.
-    if len(RELEASE_COMPILE_SUBPROCESSES) != 1:
-        raise CompileRunnerBlocked(RELEASE_COMPILE_RUNNER_UNAVAILABLE)
-    if not RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S:
-        raise CompileRunnerBlocked(RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY)
-    source = RELEASE_COMPILE_SUBPROCESSES[0]
-    source.validate(reopen_executable=True)
-    if not RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
-        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY)
-    if source.sha256 not in RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S:
-        raise CompileRunnerBlocked(RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED)
-    plan_path = _absolute_path("compile assignment plan", str(assignment_plan_path))
-    plan = CompileAssignmentPlan.load(plan_path)
-    source = require_release_compile_assignment_plan(plan)
-    return _execute_compile_assignment_subprocess_path(
-        plan_path,
-        argv=source.argv,
-        timeout_seconds=timeout_seconds,
-        source_authority_sha256=source.sha256,
-        formal_execution_authorized=True,
+    The admitted preflight operator calls the private boundary above only after
+    atomically consuming its sealed per-cell cap.  Keeping this compatibility
+    name fail-closed prevents callers from supplying an independent timeout.
+    """
+
+    del (
+        assignment_plan_path,
+        control_attestation,
+        prepared_content_verification_receipt_path,
+        replay_store,
+        now_ns,
+        additional_challenge_sha256s,
     )
+    raise CompileRunnerBlocked(RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE)
 
 
 __all__ = [
     "COMPILE_ASSIGNMENT_PLAN_PROTOCOL_SHA256",
+    "COMPILE_CONTROL_VERIFICATION_PROTOCOL_SHA256",
+    "COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256",
     "COMPILE_SUBPROCESS_LIFECYCLE_PROTOCOL_SHA256",
     "COMPILE_WORKER_IMPORT_PROTOCOL_SHA256",
     "RELEASE_COMPILE_ASSIGNMENT_PLAN_ALLOWLIST_EMPTY",
     "RELEASE_COMPILE_ASSIGNMENT_PLAN_UNTRUSTED",
+    "RELEASE_COMPILE_DYNAMIC_CONTROL_UNAVAILABLE",
     "RELEASE_COMPILE_GPU_SOURCE_REGISTRY_EMPTY",
     "RELEASE_COMPILE_GPU_SOURCE_UNTRUSTED",
     "RELEASE_COMPILE_RUNNER_UNAVAILABLE",
@@ -1959,6 +3517,8 @@ __all__ = [
     "RELEASE_GPU_VETTED_COMPILE_SOURCE_SHA256S",
     "RELEASE_TRUSTED_COMPILE_ASSIGNMENT_PLAN_SHA256S",
     "CompileAssignmentPlan",
+    "CompileControlVerificationReceipt",
+    "CompileLaunchManifest",
     "CompileLifecycleDriver",
     "CompilePrewarmObservation",
     "CompileResultBinding",
@@ -1974,5 +3534,7 @@ __all__ = [
     "execute_release_compile_assignment_plan",
     "load_compile_prewarm_manifest",
     "require_release_compile_assignment_plan",
+    "revalidate_prepared_content_verification_receipt",
+    "verify_and_reserve_compile_control",
     "write_compile_prewarm_manifest",
 ]

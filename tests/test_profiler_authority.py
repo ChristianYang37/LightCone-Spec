@@ -33,7 +33,9 @@ from lightcone_spec.experiments.profiler_authority import (
 )
 from lightcone_spec.experiments.registry import (
     WorkloadClass,
-    build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 
 

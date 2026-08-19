@@ -9,8 +9,10 @@ import json
 import math
 import os
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import NoReturn
@@ -23,12 +25,22 @@ from lightcone_spec import (
     PINNED_SGLANG_PATCH_COUNT,
     PINNED_SGLANG_TREE,
 )
+from lightcone_spec.cli.formal_single_operator import (
+    add_formal_single_operator_parser,
+    handle_formal_single_operator_command,
+)
 from lightcone_spec.config import RunConfig, load_run_config, run_config_sha256
 from lightcone_spec.doctor import (
     _require_project_runtime_source_identity,
     format_doctor,
 )
 from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.experiments.breadth_fdr_authority import (
+    formal_e0_breadth_fdr_receipt_to_dict,
+    reduce_formal_e0_breadth_fdr_from_artifact,
+    signed_formal_e0_breadth_fdr_from_dict,
+    signed_formal_e0_breadth_fdr_to_dict,
+)
 from lightcone_spec.experiments.budget_authority import (
     bind_budget_materialization_authority,
 )
@@ -39,14 +51,181 @@ from lightcone_spec.experiments.data import (
     load_natural_prompts,
     sample_set_sha256,
 )
+from lightcone_spec.experiments.e0_authority_artifact import (
+    E0ExecutionRebuildShard,
+    E0FinalResultRebuildArtifact,
+    E0FormalRegistryAuthorityArtifact,
+    E5FailureExecutionRebuildShard,
+    E6RecursiveSourceDagArtifact,
+    e0_final_completion_receipt_to_dict,
+    load_e0_formal_registry_authority_artifact_index,
+    load_e0_formal_registry_authority_bundle,
+    publish_e0_execution_rebuild_shard,
+    publish_e0_final_result_rebuild_artifact,
+    publish_e0_formal_registry_authority_artifact,
+    publish_e5_failure_execution_rebuild_shard,
+    publish_e6_recursive_source_dag_artifact,
+    reduce_e0_final_completion_from_artifact,
+    signed_e0_final_completion_from_dict,
+    signed_e0_final_completion_to_dict,
+    signed_e1a_verification_to_dict,
+    signed_e3b_confirmation_to_dict,
+    signed_e5_confirmation_to_dict,
+    signed_e6_confirmation_to_dict,
+    signed_e6_model_compatibility_to_dict,
+)
+from lightcone_spec.experiments.e3a_staged_selection_proof import (
+    bind_formal_e3a_staged_selection_proof_artifact,
+    publish_formal_e3a_staged_selection_proof_artifact,
+    revalidate_formal_e3a_staged_selection_proof_artifact,
+)
+from lightcone_spec.experiments.e4_stage_authority import (
+    e4_profiler_completion_receipt_to_dict,
+    reduce_e4_profiler_completion_from_registry,
+    signed_e4_profiler_completion_from_dict,
+    signed_e4_profiler_completion_to_dict,
+)
 from lightcone_spec.experiments.evidence import (
     GreedyTargetReference,
     evidence_files_sha256,
+)
+from lightcone_spec.experiments.formal_downstream_prefix import (
+    FORMAL_DOWNSTREAM_MATERIALIZATION_ORDER,
+    build_formal_downstream_completed_prefix_artifact,
+    build_formal_downstream_materialization_proof_artifact,
+    build_formal_downstream_pilot_precoverage_artifact,
+    build_formal_downstream_reduction_proof_artifact,
+    publish_formal_downstream_completed_prefix_artifact,
+    publish_formal_downstream_materialization_proof_artifact,
+    publish_formal_downstream_pilot_precoverage_artifact,
+    publish_formal_downstream_reduction_proof_artifact,
+    rebuild_formal_downstream_completed_prefix,
+    rebuild_formal_downstream_materialization_proof,
+    rebuild_formal_downstream_pilot_precoverage,
+    rebuild_formal_downstream_reduction_proof,
+)
+from lightcone_spec.experiments.formal_gpu_hour_proof import (
+    bind_formal_stage_gpu_hour_envelope_proof_artifact,
+    publish_formal_stage_gpu_hour_envelope_proof_artifact,
+)
+from lightcone_spec.experiments.formal_gpu_hour_registry import (
+    FormalStageGpuHourVerificationReceipt,
+    aggregate_formal_study_gpu_hours,
+    reserve_formal_stage_gpu_hour_verification_receipt,
+)
+from lightcone_spec.experiments.formal_initial_stage_proof import (
+    bind_formal_initial_stage_materialization_proof_artifact,
+    publish_formal_initial_stage_materialization_proof_artifact,
+)
+from lightcone_spec.experiments.formal_method_authority import (
+    build_source_chronobelief_authority_artifact,
+    build_source_tts_calibration_authority_artifact,
+    load_chronobelief_authority_artifact,
+    load_tts_calibration_authority_artifact,
+    publish_chronobelief_authority_artifact,
+    publish_tts_calibration_authority_artifact,
+)
+from lightcone_spec.experiments.formal_protocol import (
+    FORMAL_STAGE_DAG,
+    ProtocolLock,
+    code_owned_qualification_source_identities,
+)
+from lightcone_spec.experiments.formal_protocol_lock_proof import (
+    bind_formal_protocol_lock_source_proof_artifact,
+    publish_formal_protocol_lock_git_snapshot,
+    publish_formal_protocol_lock_source_proof_artifact,
+    revalidate_formal_protocol_lock_source_proof_artifact,
+)
+from lightcone_spec.experiments.formal_registry import (
+    assemble_and_reserve_formal_registry_manifest,
+    extend_formal_registry_verification_receipt,
+    formal_runtime_authority_manifest_from_dict,
+    gpu_hour_estimate_from_dict,
+    gpu_hour_estimate_to_dict,
+    protocol_lock_to_dict,
+    publish_formal_runtime_authority_manifest,
+    reserve_formal_registry_verification_receipt,
+    signed_e0_compatibility_from_dict,
+    signed_e0_compatibility_to_dict,
+    signed_e0_onlinespec_tuning_seal_to_dict,
+    signed_e0_power_prefix_to_dict,
+    signed_e1_survivor_selection_from_dict,
+    signed_e1_survivor_selection_to_dict,
+    signed_e2_staged_selection_from_dict,
+    signed_e2_staged_selection_to_dict,
+    signed_e3a_staged_selection_from_dict,
+    signed_e3a_staged_selection_to_dict,
+    signed_e3b_power_prefix_from_dict,
+    signed_e3b_power_prefix_to_dict,
+    signed_e4_stage_selection_from_dict,
+    signed_e4_stage_selection_to_dict,
+    signed_e5_anchor_selection_from_dict,
+    signed_e5_power_and_anchor_from_dict,
+    signed_e5_power_and_anchor_to_dict,
+    signed_e6_power_prefix_from_dict,
+    signed_e6_power_prefix_to_dict,
+    signed_pilot_duration_from_dict,
+    signed_protocol_lock_from_dict,
+    signed_stage_coverage_from_dict,
+    signed_stage_gpu_hour_from_dict,
+    signed_stage_materialization_from_dict,
+    signed_tts_calibration_seal_from_dict,
+    signed_tts_calibration_seal_to_dict,
+    stage_coverage_receipt_from_dict,
+    stage_coverage_receipt_to_dict,
+    stage_gpu_hour_envelope_from_dict,
+    stage_gpu_hour_envelope_to_dict,
+    stage_materialization_receipt_from_dict,
+    stage_materialization_receipt_to_dict,
+    tts_calibration_authority_from_dict,
+    tts_l0_candidate_state_coverage_from_dict,
+)
+from lightcone_spec.experiments.formal_registry_layers import (
+    FORMAL_REGISTRY_LAYER_ARTIFACT_KIND,
+    bind_formal_registry_layer_artifact,
+    load_formal_registry_verification_receipt_path,
+    load_formal_signed_coverage_path,
+    load_formal_signed_materialization_path,
+    publish_formal_registry_layer_artifact,
+    publish_formal_registry_replay_proof_shards,
+)
+from lightcone_spec.experiments.formal_runtime_manifest import (
+    build_source_formal_runtime_authority_manifest,
+)
+from lightcone_spec.experiments.formal_stage_coverage_portable import (
+    bind_formal_portable_stage_coverage_proof_artifact,
+    publish_formal_portable_stage_coverage_proof_artifact,
+    revalidate_portable_formal_stage_coverage_proof_artifact,
+)
+from lightcone_spec.experiments.formal_stage_execution import (
+    FormalServingExecutionRebuildInput,
+    FormalStageSourceRebuildInput,
+    build_source_e1_recipe_anchor_authority_artifact,
+    load_e1_recipe_anchor_authority_artifact,
+    publish_e1_recipe_anchor_authority_artifact,
+    publish_formal_stage_source_rebuild_input,
+)
+from lightcone_spec.experiments.formal_stage_prefix import (
+    FORMAL_STAGE_EXECUTION_REBUILD_SHARD_KIND,
+    FORMAL_STAGE_PREFIX_ORDER,
+    FormalStageExecutionRebuildShard,
+    bind_formal_stage_prefix_artifact,
+    load_and_rebuild_formal_stage_prefix,
+    materialize_next_formal_stage_from_prefix,
+    publish_formal_stage_execution_rebuild_shard,
+    publish_formal_stage_prefix_artifact,
+    reduce_formal_stage_prefix,
+    verify_signed_formal_stage_prefix_result,
 )
 from lightcone_spec.experiments.gpu_fleet import (
     GpuFleetInventory,
     HostInventoryBinding,
     assemble_gpu_fleet_inventory,
+)
+from lightcone_spec.experiments.gpu_hour_authority import (
+    materialize_prospective_stage_gpu_hour_envelope,
+    materialize_staged_prospective_gpu_hour_envelope,
+    verify_registered_prospective_gpu_hour_authority,
 )
 from lightcone_spec.experiments.gpu_pool import (
     GpuDispatchPlan,
@@ -115,6 +294,7 @@ from lightcone_spec.experiments.planning import (
 )
 from lightcone_spec.experiments.planning_artifacts import (
     budget_load_binding_from_dict,
+    budget_materialization_authority_binding_from_dict,
     budget_materialization_authority_binding_to_dict,
     budget_plan_from_dict,
     budget_plan_to_dict,
@@ -137,6 +317,16 @@ from lightcone_spec.experiments.planning_artifacts import (
     reducer_activation_artifact_to_dict,
     sealed_e3a_selection_from_dict,
 )
+from lightcone_spec.experiments.preflight_authority import (
+    PREFLIGHT_COVERAGE_PROTOCOL_SHA256,
+    PreflightCoverageReceipt,
+    PreflightExecutionSourceAuthority,
+    PreflightSealControlBinding,
+    materialize_pointer_preflight_coverage,
+    preflight_coverage_control_lineage_sha256,
+    require_complete_preflight_coverage,
+    verify_preflight_coverage,
+)
 from lightcone_spec.experiments.protocol import (
     DFLASH_LOSS_POSITION_DECAY,
     HISTORICAL_EVIDENCE_CLASSIFICATION,
@@ -154,6 +344,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     LockedOutput,
     build_industrial_registry,
+    build_legacy_industrial_registry,
 )
 from lightcone_spec.experiments.runner import (
     collect_onlinespec_performance,
@@ -189,19 +380,56 @@ from lightcone_spec.experiments.stage_activation import (
     materialize_registry_stage_activation,
     registry_stage_activation_from_dict,
     registry_stage_activation_to_dict,
+    verify_pointer_preflight_stage_activation,
     verify_registry_stage_activation,
+)
+from lightcone_spec.experiments.stage_capacity import (
+    STAGE_CAPACITY_GATE_PROTOCOL_SHA256,
+    StageCapacityGate,
+    StageCapacitySchedule,
+    materialize_stage_capacity_gate_from_raw_sources,
+    revalidate_stage_capacity_gate_sources,
+    stage_capacity_control_lineage_sha256,
+)
+from lightcone_spec.experiments.stage_materialization import (
+    E1Geometry,
+    E2CandidateRecipe,
+    FormalGpuHourAuthorityBlocked,
+    GpuHourEstimate,
+    StageCellDisposition,
+    StageCoverageReceipt,
+    default_e2_recipe_grid_authority,
+    materialize_e0_from_signed_compatibility,
+    materialize_e1_first_slice,
+    materialize_e1a,
+    materialize_e2_round,
+    materialize_e3a,
+    materialize_e3b,
+    materialize_e3b_excluded_pilots,
+    materialize_e4_profiler,
+    materialize_e4_strength2_screen,
+    materialize_e4_winner_neighborhood,
+    materialize_e5,
+    materialize_e6,
+    materialize_preflight,
+    materialize_tts_calibration,
+    reduce_stage_gpu_hour_envelope_from_signed_pilots,
 )
 from lightcone_spec.experiments.statistics import (
     HardwareEnvelope,
     evaluate_speed_gate,
 )
+from lightcone_spec.experiments.tts_calibration_authority import (
+    build_formal_tts_calibration_reduction_proof_artifact,
+    publish_formal_tts_calibration_reduction_proof_artifact,
+    revalidate_formal_tts_calibration_reduction_proof_artifact,
+)
 from lightcone_spec.experiments.workload_authority import (
     FORMAL_WORKLOAD_PROTOCOLS,
-    FormalWorkloadAuthority,
-    FormalWorkloadAuthorityBlocked,
-    FormalWorkloadSample,
-    bind_formal_workload_authority,
-    revalidate_formal_workload_authority,
+    bind_authorized_formal_workload_authority,
+    formal_workload_authority_cli_artifact,
+    formal_workload_authority_from_cli_artifact,
+    revalidate_authorized_formal_workload_authority,
 )
 from lightcone_spec.locking import ModelLock, prepare_models, resolve_model_lock
 from lightcone_spec.orchestration import (
@@ -227,6 +455,34 @@ from lightcone_spec.orchestration.manifest import (
 from lightcone_spec.orchestration.remote_dispatch import (
     MAX_REQUEST_BYTES,
     execute_host_local_wave_request,
+)
+from lightcone_spec.runtime.content_authorization import (
+    ContentJsonArtifactBinding,
+    ContentVerificationReceipt,
+    VerifiedDatasetContentRelease,
+    VerifiedPreparedModelContentRelease,
+    VerifiedReleaseWorkloadSources,
+    derive_stage_content_verification_receipt,
+    verify_and_reserve_content_authorizations,
+)
+from lightcone_spec.runtime.control_attestation import (
+    ChallengeReplayReservationBinding,
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    control_challenge_reservation_sha256,
+    verify_and_reserve_release_control_artifact_attestations,
+    verify_release_control_artifact_attestation,
+)
+from lightcone_spec.runtime.proof_artifact import (
+    CanonicalJsonProofBinding,
+    publish_canonical_json_no_replace,
+)
+from lightcone_spec.runtime.scientific_signing import (
+    rebuild_scientific_signed_proof_wrapper,
+)
+from lightcone_spec.runtime.scientific_source_validation import (
+    PROOF_REPLAY_SCIENTIFIC_ARTIFACT_TYPES,
+    publish_scientific_source_validation_artifact,
 )
 from lightcone_spec.sglang_bridge import (
     SGLangHTTPClient,
@@ -435,82 +691,57 @@ def _load_bound_json(path: str | Path) -> object:
     return value
 
 
+def _load_formal_registry_receipt_path(
+    path: str | Path,
+    *,
+    now_ns: int,
+):
+    """Load a bounded schema-5 proof-replay registry layer."""
+
+    source = Path(os.path.abspath(os.fspath(path)))
+    proof = CanonicalJsonProofBinding.bind(source)
+    value = proof.reopen()
+    if value.get("kind") == FORMAL_REGISTRY_LAYER_ARTIFACT_KIND:
+        return load_formal_registry_verification_receipt_path(
+            proof.absolute_path,
+            now_ns=now_ns,
+        )
+    return load_formal_registry_verification_receipt_path(
+        proof.absolute_path,
+        now_ns=now_ns,
+    )
+
+
+def _load_formal_scientific_signed_path(
+    path: str | Path,
+    *,
+    artifact_type: str,
+    decoder,
+    now_ns: int,
+):
+    """Load a compact reducer wrapper; ProtocolLock has no raw fallback."""
+
+    binding = CanonicalJsonProofBinding.bind(path)
+    value = binding.reopen()
+    if value.get("kind") == "lightcone_scientific_signed_proof_wrapper":
+        signed = rebuild_scientific_signed_proof_wrapper(
+            binding.absolute_path,
+            now_ns=now_ns,
+        )
+    elif artifact_type == "protocol-lock":
+        raise ValueError("formal ProtocolLock requires a proof-replay wrapper")
+    else:
+        signed = decoder(value)
+    if CanonicalJsonProofBinding.bind(path) != binding:
+        raise RuntimeError("formal scientific signed source changed")
+    return signed
+
+
 def _artifact_sha256(path: str | Path) -> str:
     source = Path(path)
     if source.suffix.lower() == ".json":
         return _canonical_sha256(_load_bound_json(source))
     return _file_sha256(source)
-
-
-def _formal_workload_cli_artifact(
-    authority: FormalWorkloadAuthority,
-) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "kind": "formal_workload_cli_binding",
-        "formal_execution_authorized": False,
-        "authority_sha256": authority.sha256,
-        "authority": authority.to_dict(),
-    }
-
-
-def _formal_workload_authority_from_cli_artifact(
-    value: object,
-) -> FormalWorkloadAuthority:
-    if not isinstance(value, dict) or set(value) != {
-        "schema_version",
-        "kind",
-        "formal_execution_authorized",
-        "authority_sha256",
-        "authority",
-    }:
-        raise ValueError("formal workload CLI binding fields differ")
-    if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
-        or value["kind"] != "formal_workload_cli_binding"
-        or value["formal_execution_authorized"] is not False
-        or not _is_lower_sha256(value["authority_sha256"])
-    ):
-        raise ValueError("formal workload CLI binding is not diagnostic-only schema-v1")
-    raw_authority = value["authority"]
-    if not isinstance(raw_authority, dict) or set(raw_authority) != set(
-        FormalWorkloadAuthority.__dataclass_fields__
-    ):
-        raise ValueError("formal workload authority fields differ")
-    raw_samples = raw_authority["samples"]
-    if not isinstance(raw_samples, list) or not raw_samples:
-        raise ValueError("formal workload authority requires selected samples")
-    samples: list[FormalWorkloadSample] = []
-    sample_fields = set(FormalWorkloadSample.__dataclass_fields__)
-    for raw_sample in raw_samples:
-        if not isinstance(raw_sample, dict) or set(raw_sample) != sample_fields:
-            raise ValueError("formal workload sample fields differ")
-        samples.append(
-            FormalWorkloadSample(
-                source_row_id=raw_sample["source_row_id"],  # type: ignore[arg-type]
-                sample_id=raw_sample["sample_id"],  # type: ignore[arg-type]
-                prompt=raw_sample["prompt"],  # type: ignore[arg-type]
-                seed=raw_sample["seed"],  # type: ignore[arg-type]
-            )
-        )
-    authority = FormalWorkloadAuthority(
-        schema_version=raw_authority["schema_version"],  # type: ignore[arg-type]
-        kind=raw_authority["kind"],  # type: ignore[arg-type]
-        workload_id=raw_authority["workload_id"],  # type: ignore[arg-type]
-        raw_source_path=raw_authority["raw_source_path"],  # type: ignore[arg-type]
-        raw_file_sha256=raw_authority["raw_file_sha256"],  # type: ignore[arg-type]
-        repository_revision=raw_authority["repository_revision"],  # type: ignore[arg-type]
-        raw_row_count=raw_authority["raw_row_count"],  # type: ignore[arg-type]
-        selected_row_count=raw_authority["selected_row_count"],  # type: ignore[arg-type]
-        selected_rows_sha256=raw_authority["selected_rows_sha256"],  # type: ignore[arg-type]
-        source_lock_sha256=raw_authority["source_lock_sha256"],  # type: ignore[arg-type]
-        protocol_sha256=raw_authority["protocol_sha256"],  # type: ignore[arg-type]
-        samples=tuple(samples),
-    )
-    if authority.sha256 != value["authority_sha256"]:
-        raise ValueError("formal workload CLI binding changed authority identity")
-    return authority
 
 
 def _load_bound_run_config(path: str | Path) -> RunConfig:
@@ -525,7 +756,10 @@ def _load_bound_run_config(path: str | Path) -> RunConfig:
 
 
 _INDUSTRIAL_REGISTRY_GENERATOR = (
-    "lightcone_spec.experiments.registry.build_industrial_registry:v3"
+    "lightcone_spec.experiments.registry.build_industrial_registry:signed-staged-v1"
+)
+_LEGACY_INDUSTRIAL_REGISTRY_GENERATOR = (
+    "lightcone_spec.experiments.registry.build_legacy_industrial_registry:v3"
 )
 # No hardware-rooted/provider signing identity is registered in this source
 # release.  Self-authored JSON plus hashes proves content consistency, not GPU
@@ -547,7 +781,11 @@ def _industrial_registry_artifact(
 ) -> dict:
     return {
         "schema_version": 3,
-        "generator": _INDUSTRIAL_REGISTRY_GENERATOR,
+        "generator": (
+            _LEGACY_INDUSTRIAL_REGISTRY_GENERATOR
+            if registry.materialization_mode == "legacy_diagnostic"
+            else _INDUSTRIAL_REGISTRY_GENERATOR
+        ),
         "parameters": {
             "logical_gpu_slots": list(registry.gpu_uuids),
             "base_port": base_port,
@@ -572,10 +810,11 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
         "registry",
     }:
         raise ValueError("industrial registry artifact fields do not match schema")
-    if (
-        value.get("schema_version") != 3
-        or value.get("generator") != _INDUSTRIAL_REGISTRY_GENERATOR
-    ):
+    generator = value.get("generator")
+    if value.get("schema_version") != 3 or generator not in {
+        _INDUSTRIAL_REGISTRY_GENERATOR,
+        _LEGACY_INDUSTRIAL_REGISTRY_GENERATOR,
+    }:
         raise ValueError("industrial registry generator identity mismatch")
     parameters = value.get("parameters")
     if not isinstance(parameters, dict):
@@ -612,7 +851,12 @@ def _load_industrial_registry(path: str | Path) -> ExperimentRegistry:
         or not parameters["evidence_root"]
     ):
         raise TypeError("industrial registry parameter types do not match schema")
-    registry = build_industrial_registry(
+    registry_builder = (
+        build_legacy_industrial_registry
+        if generator == _LEGACY_INDUSTRIAL_REGISTRY_GENERATOR
+        else build_industrial_registry
+    )
+    registry = registry_builder(
         gpu_uuids=tuple(logical_gpu_slots),
         base_port=parameters["base_port"],
         cache_root=parameters["cache_root"],
@@ -891,6 +1135,39 @@ def _load_registry_stage_activation_manifest(
     return artifact
 
 
+def _load_preflight_pointer_activation_manifest(
+    path: str | Path,
+) -> RegistryStageActivationArtifact:
+    value = _load_bound_json(path)
+    expected = {
+        "schema_version",
+        "kind",
+        "registry_artifact",
+        "source_authority",
+        "activation",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("preflight pointer activation manifest fields differ")
+    if value.get("schema_version") != 1 or value.get("kind") != (
+        "formal_preflight_pointer_activation_manifest"
+    ):
+        raise ValueError("preflight pointer activation manifest identity differs")
+    registry_path = value.get("registry_artifact")
+    source_path = value.get("source_authority")
+    if not isinstance(registry_path, str) or not isinstance(source_path, str):
+        raise TypeError("preflight pointer manifest paths must be strings")
+    registry = _load_industrial_registry(registry_path)
+    source = PreflightExecutionSourceAuthority.from_dict(_load_bound_json(source_path))
+    source.revalidate(registry)
+    activation = registry_stage_activation_from_dict(value.get("activation"))
+    verify_pointer_preflight_stage_activation(
+        registry,
+        activation,
+        source_authority_sha256=source.sha256,
+    )
+    return activation
+
+
 def _load_stage_activation_plan(path: str | None):
     if path is None:
         return None
@@ -900,6 +1177,11 @@ def _load_stage_activation_plan(path: str | None):
         and value.get("kind") == "industrial_registry_stage_activation_manifest"
     ):
         return _load_registry_stage_activation_manifest(path)
+    if (
+        isinstance(value, dict)
+        and value.get("kind") == "formal_preflight_pointer_activation_manifest"
+    ):
+        return _load_preflight_pointer_activation_manifest(path)
     if (
         isinstance(value, dict)
         and value.get("artifact_kind") == "registry_stage_activation"
@@ -2494,6 +2776,7 @@ def _load_preliminary_table(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lightcone-spec")
     commands = parser.add_subparsers(dest="command", required=True)
+    add_formal_single_operator_parser(commands)
 
     doctor = commands.add_parser("doctor")
     doctor.add_argument(
@@ -2507,6 +2790,30 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--path",
         help="legacy shorthand that uses one path for both roots (not ready)",
+    )
+    doctor.add_argument(
+        "--stage-capacity-gate",
+        help=(
+            "path-bound schema-3 preflight capacity gate; requires the exact "
+            "stage schedule"
+        ),
+    )
+    doctor.add_argument(
+        "--stage-capacity-schedule",
+        help="path-bound schedule used to rederive the supplied capacity gate",
+    )
+    doctor.add_argument(
+        "--stage-capacity-attestation",
+        help="root-authorized dynamic capacity control for the exact gate",
+    )
+    doctor.add_argument(
+        "--stage-capacity-activation-sha256",
+        help="exact preflight activation identity bound by the capacity control",
+    )
+    doctor.add_argument(
+        "--stage-capacity-now-ns",
+        type=int,
+        help="verification time for the path-bound raw capacity receipts",
     )
 
     validate = commands.add_parser("validate-config")
@@ -2524,12 +2831,52 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
     )
     bind_workload.add_argument("--source", required=True)
+    bind_workload.add_argument("--content-verification-receipt", required=True)
+    bind_workload.add_argument("--now-ns", type=int, required=True)
     bind_workload.add_argument("--output", required=True)
 
     revalidate_workload = commands.add_parser(
         "revalidate-formal-workload-authority", allow_abbrev=False
     )
     revalidate_workload.add_argument("--authority", required=True)
+    revalidate_workload.add_argument("--content-verification-receipt", required=True)
+    revalidate_workload.add_argument("--now-ns", type=int, required=True)
+
+    verify_content = commands.add_parser(
+        "verify-content-authorizations", allow_abbrev=False
+    )
+    verify_content.add_argument("--workload-authorization", required=True)
+    verify_content.add_argument("--prepared-model-authorization", required=True)
+    verify_content.add_argument("--burstgpt-authorization", required=True)
+    verify_content.add_argument("--e0-dataset-authorization", required=True)
+    verify_content.add_argument(
+        "--content-artifact",
+        action="append",
+        required=True,
+        metavar="ARTIFACT_ID=ABSOLUTE_PATH",
+    )
+    verify_content.add_argument("--replay-store", required=True)
+    verify_content.add_argument("--now-ns", type=int, required=True)
+    verify_content.add_argument("--output", required=True)
+
+    scope_content = commands.add_parser(
+        "scope-content-verification-receipt", allow_abbrev=False
+    )
+    scope_content.add_argument("--master-receipt", required=True)
+    scope_content.add_argument(
+        "--stage",
+        choices=tuple(stage for stage in FORMAL_STAGE_DAG if stage != "preflight"),
+        required=True,
+    )
+    scope_content.add_argument("--now-ns", type=int, required=True)
+    scope_content.add_argument("--output", required=True)
+
+    burstgpt_shape = commands.add_parser(
+        "publish-burstgpt-shape-authority", allow_abbrev=False
+    )
+    burstgpt_shape.add_argument("--content-verification-receipt", required=True)
+    burstgpt_shape.add_argument("--now-ns", type=int, required=True)
+    burstgpt_shape.add_argument("--output", required=True)
 
     build_industrial = commands.add_parser("build-industrial-registry")
     build_industrial.add_argument(
@@ -2546,7 +2893,790 @@ def _parser() -> argparse.ArgumentParser:
     build_industrial.add_argument("--cache-root", default="runtime-cache/industrial")
     build_industrial.add_argument("--evidence-root", default="artifacts/industrial")
     build_industrial.add_argument("--seed", type=int, default=20260811)
+    build_industrial.add_argument(
+        "--legacy-diagnostic",
+        action="store_true",
+        help=("emit the eager schema-v3 historical matrix; never formal-executable"),
+    )
     build_industrial.add_argument("--output", required=True)
+
+    publish_tts_authority = commands.add_parser(
+        "publish-tts-calibration-source-authority", allow_abbrev=False
+    )
+    publish_tts_authority.add_argument("--paper-pdf", required=True)
+    publish_tts_authority.add_argument("--paper-source", required=True)
+    publish_tts_authority.add_argument("--tuning-window", required=True)
+    publish_tts_authority.add_argument("--trainable-plan-authority", required=True)
+    publish_tts_authority.add_argument("--drafter-native-loss", required=True)
+    publish_tts_authority.add_argument("--output", required=True)
+
+    publish_chronobelief_authority = commands.add_parser(
+        "publish-chronobelief-source-authority", allow_abbrev=False
+    )
+    publish_chronobelief_authority.add_argument("--paper-pdf", required=True)
+    publish_chronobelief_authority.add_argument("--tex-source", required=True)
+    publish_chronobelief_authority.add_argument("--output", required=True)
+
+    publish_e1_anchor_authority = commands.add_parser(
+        "publish-e1-recipe-anchor-authority", allow_abbrev=False
+    )
+    publish_e1_anchor_authority.add_argument(
+        "--trainable-plan-authority", required=True
+    )
+    publish_e1_anchor_authority.add_argument("--output", required=True)
+
+    publish_lock_git_snapshot = commands.add_parser(
+        "publish-formal-protocol-lock-git-snapshot",
+        allow_abbrev=False,
+    )
+    publish_lock_git_snapshot.add_argument("--project-root", required=True)
+    publish_lock_git_snapshot.add_argument("--chunk-output-directory", required=True)
+    publish_lock_git_snapshot.add_argument("--output", required=True)
+
+    publish_lock_source_proof = commands.add_parser(
+        "publish-formal-protocol-lock-source-proof",
+        allow_abbrev=False,
+    )
+    publish_lock_source_proof.add_argument("--protocol-id", required=True)
+    publish_lock_source_proof.add_argument("--git-snapshot", required=True)
+    publish_lock_source_proof.add_argument(
+        "--patch-manifest-relative-path", required=True
+    )
+    publish_lock_source_proof.add_argument(
+        "--english-protocol-relative-path", required=True
+    )
+    publish_lock_source_proof.add_argument(
+        "--chinese-protocol-relative-path", required=True
+    )
+    publish_lock_source_proof.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    publish_lock_source_proof.add_argument("--tts-calibration-authority", required=True)
+    publish_lock_source_proof.add_argument("--chronobelief-authority", required=True)
+    publish_lock_source_proof.add_argument(
+        "--e1-recipe-anchor-authority", required=True
+    )
+    publish_lock_source_proof.add_argument(
+        "--content-verification-receipt", required=True
+    )
+    publish_lock_source_proof.add_argument("--burstgpt-shape-authority", required=True)
+    publish_lock_source_proof.add_argument("--now-ns", type=int, required=True)
+    publish_lock_source_proof.add_argument("--output", required=True)
+
+    create_lock = commands.add_parser("create-protocol-lock", allow_abbrev=False)
+    create_lock.add_argument("--protocol-id", required=True)
+    create_lock.add_argument("--project-root", required=True)
+    create_lock.add_argument("--code-git-head")
+    create_lock.add_argument("--code-git-tree")
+    create_lock.add_argument("--patch-manifest", required=True)
+    create_lock.add_argument("--patch-manifest-sha256")
+    create_lock.add_argument("--registry-sha256")
+    create_lock.add_argument("--english-protocol", required=True)
+    create_lock.add_argument("--english-protocol-sha256")
+    create_lock.add_argument("--chinese-protocol", required=True)
+    create_lock.add_argument("--chinese-protocol-sha256")
+    create_lock.add_argument("--tts-calibration-authority", required=True)
+    create_lock.add_argument("--chronobelief-authority", required=True)
+    create_lock.add_argument("--e1-recipe-anchor-authority", required=True)
+    create_lock.add_argument("--formal-runtime-authority-manifest", required=True)
+    create_lock.add_argument("--content-verification-receipt", required=True)
+    create_lock.add_argument("--content-verification-now-ns", type=int, required=True)
+    create_lock.add_argument("--burstgpt-shape-authority", required=True)
+    create_lock.add_argument("--output", required=True)
+
+    verify_lock = commands.add_parser("verify-signed-protocol-lock", allow_abbrev=False)
+    verify_lock.add_argument("--signed-lock", required=True)
+    verify_lock.add_argument("--control-attestation", required=True)
+    verify_lock.add_argument("--inventory-sha256", required=True)
+    verify_lock.add_argument("--control-replay-store", required=True)
+    verify_lock.add_argument("--now-ns", type=int, required=True)
+    verify_lock.add_argument("--output", required=True)
+
+    gpu_hours = commands.add_parser("create-gpu-hour-envelope", allow_abbrev=False)
+    gpu_hours.add_argument("--output", required=True)
+
+    reduce_gpu_hours = commands.add_parser(
+        "reduce-stage-gpu-hour-envelope", allow_abbrev=False
+    )
+    reduce_gpu_hours.add_argument("--signed-pilot-receipt", required=True)
+    reduce_gpu_hours.add_argument("--control-attestation", required=True)
+    reduce_gpu_hours.add_argument("--inventory-sha256", required=True)
+    reduce_gpu_hours.add_argument("--control-replay-store", required=True)
+    reduce_gpu_hours.add_argument("--protocol-lock-sha256", required=True)
+    reduce_gpu_hours.add_argument("--materialization-receipt-sha256", required=True)
+    reduce_gpu_hours.add_argument("--schedule-sha256", required=True)
+    reduce_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    reduce_gpu_hours.add_argument("--output", required=True)
+
+    preflight_gpu_hours = commands.add_parser(
+        "materialize-preflight-gpu-hour-envelope",
+        allow_abbrev=False,
+    )
+    preflight_gpu_hours.add_argument("--dispatch-receipt", required=True)
+    preflight_gpu_hours.add_argument("--remote-raw-receipt", required=True)
+    preflight_gpu_hours.add_argument("--source-authority", required=True)
+    preflight_gpu_hours.add_argument("--activation", required=True)
+    preflight_gpu_hours.add_argument("--coverage", required=True)
+    preflight_gpu_hours.add_argument("--stage-coverage", required=True)
+    preflight_gpu_hours.add_argument(
+        "--interference-lifecycle-proof",
+        action="append",
+        required=True,
+        metavar="CELL_ID=PATH",
+    )
+    preflight_gpu_hours.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    preflight_gpu_hours.add_argument("--source-output", required=True)
+    preflight_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    preflight_gpu_hours.add_argument("--output", required=True)
+
+    prospective_gpu_hours = commands.add_parser(
+        "materialize-prospective-stage-gpu-hours", allow_abbrev=False
+    )
+    prospective_gpu_hours.add_argument(
+        "--stage", choices=("E3b", "E5", "E6", "E0"), required=True
+    )
+    prospective_gpu_hours.add_argument("--registry-verification-receipt", required=True)
+    prospective_gpu_hours.add_argument("--pilot-materialization", required=True)
+    prospective_gpu_hours.add_argument("--pilot-envelope", required=True)
+    prospective_gpu_hours.add_argument("--pilot-source-manifest", required=True)
+    prospective_gpu_hours.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    prospective_gpu_hours.add_argument("--inventory", required=True)
+    prospective_gpu_hours.add_argument("--one-shot-source-manifest")
+    prospective_gpu_hours.add_argument("--source-output", required=True)
+    prospective_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    prospective_gpu_hours.add_argument("--output", required=True)
+
+    staged_prospective_gpu_hours = commands.add_parser(
+        "materialize-staged-prospective-gpu-hours", allow_abbrev=False
+    )
+    staged_prospective_gpu_hours.add_argument(
+        "--stage",
+        choices=("E3a", "TTS-Cal", "E1", "E2", "E4", "E1a"),
+        required=True,
+    )
+    staged_prospective_gpu_hours.add_argument("--materialization-sha256", required=True)
+    staged_prospective_gpu_hours.add_argument(
+        "--registry-verification-receipt", required=True
+    )
+    staged_prospective_gpu_hours.add_argument("--completed-source-manifest")
+    staged_prospective_gpu_hours.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    staged_prospective_gpu_hours.add_argument("--inventory", required=True)
+    staged_prospective_gpu_hours.add_argument("--source-output", required=True)
+    staged_prospective_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    staged_prospective_gpu_hours.add_argument("--output", required=True)
+
+    publish_gpu_hour_proof = commands.add_parser(
+        "publish-formal-stage-gpu-hour-envelope-proof", allow_abbrev=False
+    )
+    publish_gpu_hour_proof.add_argument("--protocol-lock", required=True)
+    publish_gpu_hour_proof.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    publish_gpu_hour_proof.add_argument("--registry-layer", required=True)
+    publish_gpu_hour_proof.add_argument("--inventory", required=True)
+    publish_gpu_hour_proof.add_argument("--final-materialization", required=True)
+    publish_gpu_hour_proof.add_argument("--pilot-materialization")
+    publish_gpu_hour_proof.add_argument("--gpu-hour-source-manifest", required=True)
+    publish_gpu_hour_proof.add_argument("--envelope", required=True)
+    publish_gpu_hour_proof.add_argument("--preflight-coverage-proof")
+    publish_gpu_hour_proof.add_argument("--now-ns", type=int, required=True)
+    publish_gpu_hour_proof.add_argument("--output", required=True)
+
+    publish_initial_materialization_proof = commands.add_parser(
+        "publish-formal-initial-stage-materialization-proof",
+        allow_abbrev=False,
+    )
+    publish_initial_materialization_proof.add_argument(
+        "--phase",
+        choices=("preflight", "e3a", "tts_calibration", "e1"),
+        required=True,
+    )
+    publish_initial_materialization_proof.add_argument(
+        "--registry-layer", required=True
+    )
+    publish_initial_materialization_proof.add_argument("--tts-calibration-authority")
+    publish_initial_materialization_proof.add_argument(
+        "--now-ns", type=int, required=True
+    )
+    publish_initial_materialization_proof.add_argument("--output", required=True)
+
+    publish_downstream_materialization_proof = commands.add_parser(
+        "publish-formal-downstream-materialization-proof",
+        allow_abbrev=False,
+    )
+    publish_downstream_materialization_proof.add_argument(
+        "--phase",
+        choices=FORMAL_DOWNSTREAM_MATERIALIZATION_ORDER,
+        required=True,
+    )
+    publish_downstream_materialization_proof.add_argument(
+        "--registry-layer", required=True
+    )
+    publish_downstream_materialization_proof.add_argument(
+        "--immediate-predecessor", required=True
+    )
+    publish_downstream_materialization_proof.add_argument(
+        "--now-ns", type=int, required=True
+    )
+    publish_downstream_materialization_proof.add_argument("--output", required=True)
+
+    publish_downstream_pilot_precoverage = commands.add_parser(
+        "publish-formal-downstream-pilot-precoverage",
+        allow_abbrev=False,
+    )
+    publish_downstream_pilot_precoverage.add_argument(
+        "--phase",
+        choices=("e3b_pilot", "e5_pilot", "e6_pilot", "e0_pilot"),
+        required=True,
+    )
+    publish_downstream_pilot_precoverage.add_argument(
+        "--materialization-proof", required=True
+    )
+    publish_downstream_pilot_precoverage.add_argument(
+        "--signed-materialization", required=True
+    )
+    publish_downstream_pilot_precoverage.add_argument(
+        "--now-ns", type=int, required=True
+    )
+    publish_downstream_pilot_precoverage.add_argument("--output", required=True)
+
+    publish_portable_stage_coverage = commands.add_parser(
+        "publish-formal-portable-stage-coverage-proof",
+        allow_abbrev=False,
+    )
+    publish_portable_stage_coverage.add_argument("--coverage-proof", required=True)
+    publish_portable_stage_coverage.add_argument("--registry-layer", required=True)
+    publish_portable_stage_coverage.add_argument("--prior-prefix")
+    publish_portable_stage_coverage.add_argument("--e1-recipe-anchor-authority")
+    publish_portable_stage_coverage.add_argument("--downstream-pilot-precoverage")
+    publish_portable_stage_coverage.add_argument("--now-ns", type=int, required=True)
+    publish_portable_stage_coverage.add_argument("--output", required=True)
+
+    publish_downstream_reduction_proof = commands.add_parser(
+        "publish-formal-downstream-reduction-proof",
+        allow_abbrev=False,
+    )
+    publish_downstream_reduction_proof.add_argument(
+        "--phase",
+        choices=FORMAL_DOWNSTREAM_MATERIALIZATION_ORDER,
+        required=True,
+    )
+    publish_downstream_reduction_proof.add_argument(
+        "--materialization-proof", required=True
+    )
+    publish_downstream_reduction_proof.add_argument(
+        "--portable-coverage-proof", required=True
+    )
+    publish_downstream_reduction_proof.add_argument("--now-ns", type=int, required=True)
+    publish_downstream_reduction_proof.add_argument("--output", required=True)
+
+    publish_downstream_completed_prefix = commands.add_parser(
+        "publish-formal-downstream-completed-prefix",
+        allow_abbrev=False,
+    )
+    publish_downstream_completed_prefix.add_argument(
+        "--phase",
+        choices=FORMAL_DOWNSTREAM_MATERIALIZATION_ORDER,
+        required=True,
+    )
+    publish_downstream_completed_prefix.add_argument("--reduction-proof", required=True)
+    publish_downstream_completed_prefix.add_argument("--signed-result", required=True)
+    publish_downstream_completed_prefix.add_argument(
+        "--now-ns", type=int, required=True
+    )
+    publish_downstream_completed_prefix.add_argument("--output", required=True)
+
+    publish_e3a_selection_proof = commands.add_parser(
+        "publish-formal-e3a-staged-selection-proof",
+        allow_abbrev=False,
+    )
+    publish_e3a_selection_proof.add_argument("--coverage-proof", required=True)
+    publish_e3a_selection_proof.add_argument("--registry-layer", required=True)
+    publish_e3a_selection_proof.add_argument("--now-ns", type=int, required=True)
+    publish_e3a_selection_proof.add_argument("--output", required=True)
+
+    reserve_formal_gpu_hours = commands.add_parser(
+        "reserve-formal-stage-gpu-hours", allow_abbrev=False
+    )
+    reserve_formal_gpu_hours.add_argument(
+        "--registry-verification-receipt", required=True
+    )
+    reserve_formal_gpu_hours.add_argument("--signed-envelope", required=True)
+    reserve_formal_gpu_hours.add_argument("--source-manifest", required=True)
+    reserve_formal_gpu_hours.add_argument("--prospective-pilot-materialization")
+    reserve_formal_gpu_hours.add_argument(
+        "--formal-runtime-authority-manifest", required=True
+    )
+    reserve_formal_gpu_hours.add_argument("--inventory", required=True)
+    reserve_formal_gpu_hours.add_argument("--control-attestation", required=True)
+    reserve_formal_gpu_hours.add_argument("--control-replay-store", required=True)
+    reserve_formal_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    reserve_formal_gpu_hours.add_argument("--output", required=True)
+
+    aggregate_formal_gpu_hours = commands.add_parser(
+        "aggregate-formal-study-gpu-hours", allow_abbrev=False
+    )
+    aggregate_formal_gpu_hours.add_argument(
+        "--registry-verification-receipt", required=True
+    )
+    aggregate_formal_gpu_hours.add_argument(
+        "--stage-receipt", action="append", required=True
+    )
+    aggregate_formal_gpu_hours.add_argument("--now-ns", type=int, required=True)
+    aggregate_formal_gpu_hours.add_argument("--allow-partial", action="store_true")
+    aggregate_formal_gpu_hours.add_argument("--output", required=True)
+
+    create_materialization = commands.add_parser(
+        "create-stage-materialization-receipt", allow_abbrev=False
+    )
+    create_materialization.add_argument("--request", required=True)
+    create_materialization.add_argument("--control-attestation")
+    create_materialization.add_argument("--inventory-sha256")
+    create_materialization.add_argument("--control-replay-store")
+    create_materialization.add_argument("--now-ns", type=int)
+    create_materialization.add_argument("--output", required=True)
+
+    verify_materialization = commands.add_parser(
+        "verify-signed-stage-materialization", allow_abbrev=False
+    )
+    verify_materialization.add_argument("--signed-receipt", required=True)
+    verify_materialization.add_argument("--control-attestation", required=True)
+    verify_materialization.add_argument("--inventory-sha256", required=True)
+    verify_materialization.add_argument("--control-replay-store", required=True)
+    verify_materialization.add_argument("--now-ns", type=int, required=True)
+    verify_materialization.add_argument("--output", required=True)
+
+    create_coverage = commands.add_parser(
+        "create-stage-coverage-receipt", allow_abbrev=False
+    )
+    create_coverage.add_argument("--materialization", required=True)
+    create_coverage.add_argument("--dispositions", required=True)
+    create_coverage.add_argument(
+        "--tts-l0-candidate-state-coverage",
+        action="append",
+        default=[],
+    )
+    create_coverage.add_argument("--output", required=True)
+
+    verify_coverage = commands.add_parser(
+        "verify-signed-stage-coverage", allow_abbrev=False
+    )
+    verify_coverage.add_argument("--signed-receipt", required=True)
+    verify_coverage.add_argument("--materialization", required=True)
+    verify_coverage.add_argument("--control-attestation", required=True)
+    verify_coverage.add_argument("--inventory-sha256", required=True)
+    verify_coverage.add_argument("--control-replay-store", required=True)
+    verify_coverage.add_argument("--now-ns", type=int, required=True)
+    verify_coverage.add_argument("--output", required=True)
+
+    publish_runtime_manifest = commands.add_parser(
+        "publish-formal-runtime-authority-manifest", allow_abbrev=False
+    )
+    publish_runtime_manifest.add_argument("--repository-root", required=True)
+    publish_runtime_manifest.add_argument("--output", required=True)
+
+    publish_formal_rebuild = commands.add_parser(
+        "publish-formal-rebuild-artifact", allow_abbrev=False
+    )
+    publish_formal_rebuild.add_argument(
+        "--artifact-kind",
+        choices=(
+            "stage-source",
+            "serving-shard",
+            "failure-shard",
+            "e6-recursive-dag",
+            "e0-aggregate",
+            "e0-final-result",
+        ),
+        required=True,
+    )
+    publish_formal_rebuild.add_argument("--input", required=True)
+    publish_formal_rebuild.add_argument("--output", required=True)
+
+    publish_tts_reduction = commands.add_parser(
+        "publish-formal-tts-calibration-reduction-proof", allow_abbrev=False
+    )
+    publish_tts_reduction.add_argument("--portable-coverage-proof", required=True)
+    publish_tts_reduction.add_argument("--hardware-envelope", required=True)
+    publish_tts_reduction.add_argument("--replay-reservation", required=True)
+    publish_tts_reduction.add_argument("--runtime-sha256", required=True)
+    publish_tts_reduction.add_argument("--split-sha256", required=True)
+    publish_tts_reduction.add_argument("--now-ns", type=int, required=True)
+    publish_tts_reduction.add_argument("--output", required=True)
+
+    publish_formal_stage_shard = commands.add_parser(
+        "publish-formal-stage-execution-shard", allow_abbrev=False
+    )
+    publish_formal_stage_shard.add_argument(
+        "--phase",
+        choices=(
+            "e1_selection",
+            "e2_round0",
+            "e2_round1",
+            "e2_round2",
+            "e2_round3",
+            "e4_screen",
+            "e4_local",
+        ),
+        required=True,
+    )
+    publish_formal_stage_shard.add_argument("--materialization", required=True)
+    publish_formal_stage_shard.add_argument("--stage-source-rebuild")
+    publish_formal_stage_shard.add_argument(
+        "--execution-rebuild-input", action="append", required=True
+    )
+    publish_formal_stage_shard.add_argument("--output", required=True)
+
+    publish_formal_stage_prefix = commands.add_parser(
+        "publish-formal-stage-prefix", allow_abbrev=False
+    )
+    publish_formal_stage_prefix.add_argument(
+        "--phase", choices=FORMAL_STAGE_PREFIX_ORDER, required=True
+    )
+    publish_formal_stage_prefix.add_argument(
+        "--registry-verification-receipt", required=True
+    )
+    publish_formal_stage_prefix.add_argument("--formal-runtime-authority-manifest")
+    publish_formal_stage_prefix.add_argument("--inventory")
+    publish_formal_stage_prefix.add_argument("--materialization")
+    publish_formal_stage_prefix.add_argument("--coverage")
+    publish_formal_stage_prefix.add_argument("--coverage-proof", required=True)
+    publish_formal_stage_prefix.add_argument("--stage-source-rebuild")
+    publish_formal_stage_prefix.add_argument(
+        "--execution-rebuild-shard", action="append", default=[]
+    )
+    publish_formal_stage_prefix.add_argument("--e1-recipe-anchor-authority")
+    publish_formal_stage_prefix.add_argument("--prior-prefix")
+    publish_formal_stage_prefix.add_argument("--now-ns", type=int, required=True)
+    publish_formal_stage_prefix.add_argument("--output", required=True)
+
+    publish_scientific_source = commands.add_parser(
+        "publish-scientific-source-validation", allow_abbrev=False
+    )
+    publish_scientific_source.add_argument(
+        "--artifact-type",
+        choices=tuple(sorted(PROOF_REPLAY_SCIENTIFIC_ARTIFACT_TYPES)),
+        required=True,
+    )
+    publish_scientific_source.add_argument(
+        "--proof-bundle",
+        dest="proof_bundle",
+        required=True,
+    )
+    publish_scientific_source.add_argument("--proof-entry")
+    publish_scientific_source.add_argument("--now-ns", type=int, required=True)
+    publish_scientific_source.add_argument("--output", required=True)
+
+    formal_stage_operation = commands.add_parser(
+        "formal-stage-operation", allow_abbrev=False
+    )
+    formal_stage_operation.add_argument(
+        "--operation", choices=("materialize", "reduce", "sign"), required=True
+    )
+    formal_stage_operation.add_argument(
+        "--stage",
+        choices=("E3a", "TTS-Cal", "E1", "E2", "E4", "E3b", "E1a", "E5", "E6", "E0"),
+        required=True,
+    )
+    formal_stage_operation.add_argument("--phase", required=True)
+    formal_stage_operation.add_argument(
+        "--registry-verification-receipt", required=True
+    )
+    formal_stage_operation.add_argument(
+        "--stage-prefix-artifact",
+        help=(
+            "current-only path-bound E1/E2/E4 proof prefix; mandatory for "
+            "sequential materialize/reduce/sign"
+        ),
+    )
+    formal_stage_operation.add_argument("--e0-authority-bundle")
+    formal_stage_operation.add_argument(
+        "--e0-materialization",
+        help="exact offline-signed E0 final materialization wrapper",
+    )
+    formal_stage_operation.add_argument(
+        "--result-rebuild-artifact",
+        help="typed proof-rebuild artifact consumed by a stage result reducer",
+    )
+    formal_stage_operation.add_argument(
+        "--signed-stage-result",
+        help="offline-signed result wrapper to deep-verify against the reducer",
+    )
+    formal_stage_operation.add_argument(
+        "--signed-e0-fdr-result",
+        help=(
+            "offline-signed proof-derived E0 breadth FDR wrapper; required with "
+            "E0 final sign"
+        ),
+    )
+    formal_stage_operation.add_argument(
+        "--tts-calibration-authority",
+        help="typed TTS calibration authority required to materialize TTS-Cal",
+    )
+    formal_stage_operation.add_argument("--now-ns", type=int, required=True)
+    formal_stage_operation.add_argument("--output", required=True)
+
+    assemble_formal = commands.add_parser(
+        "assemble-formal-registry-manifest", allow_abbrev=False
+    )
+    assemble_formal.add_argument("--signed-protocol-lock", required=True)
+    assemble_formal.add_argument(
+        "--signed-materialization", action="append", default=[]
+    )
+    assemble_formal.add_argument("--signed-coverage", action="append", default=[])
+    assemble_formal.add_argument(
+        "--tts-calibration-authority", action="append", default=[]
+    )
+    assemble_formal.add_argument(
+        "--signed-tts-calibration-seal", action="append", default=[]
+    )
+    assemble_formal.add_argument(
+        "--signed-e3b-power-prefix", action="append", default=[]
+    )
+    assemble_formal.add_argument(
+        "--signed-e5-power-and-anchor-prefix", action="append", default=[]
+    )
+    assemble_formal.add_argument(
+        "--signed-e6-power-prefix", action="append", default=[]
+    )
+    assemble_formal.add_argument(
+        "--control-attestation", action="append", required=True
+    )
+    assemble_formal.add_argument(
+        "--candidate-state-replay-proof-artifact",
+        action="append",
+        default=[],
+        help=(
+            "repeat for every durable, externally controlled TTS/L0 replay proof "
+            "referenced by stage coverage"
+        ),
+    )
+    assemble_formal.add_argument("--inventory-sha256", required=True)
+    assemble_formal.add_argument("--control-replay-store", required=True)
+    assemble_formal.add_argument("--now-ns", type=int, required=True)
+    assemble_formal.add_argument("--output", required=True)
+
+    reserve_formal_registry = commands.add_parser(
+        "reserve-formal-registry-verification",
+        allow_abbrev=False,
+    )
+    reserve_formal_registry.add_argument("--signed-protocol-lock", required=True)
+    reserve_formal_registry.add_argument("--control-attestation", required=True)
+    reserve_formal_registry.add_argument("--inventory-sha256", required=True)
+    reserve_formal_registry.add_argument("--control-replay-store", required=True)
+    reserve_formal_registry.add_argument("--now-ns", type=int, required=True)
+    reserve_formal_registry.add_argument("--output", required=True)
+
+    extend_formal_registry = commands.add_parser(
+        "extend-formal-registry-verification",
+        allow_abbrev=False,
+    )
+    extend_formal_registry.add_argument("--prior-receipt", required=True)
+    extend_formal_registry.add_argument(
+        "--signed-materialization", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-coverage", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--control-attestation", action="append", required=True
+    )
+    extend_formal_registry.add_argument(
+        "--tts-calibration-authority", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-tts-calibration-seal", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--tts-calibration-reduction-proof",
+        action="append",
+        default=[],
+        help=(
+            "path-bound 288-cell raw reduction proof; required one-for-one "
+            "with every appended signed TTS calibration seal"
+        ),
+    )
+    extend_formal_registry.add_argument(
+        "--e3a-staged-selection-proof",
+        action="append",
+        default=[],
+        help=(
+            "path-bound exact 360-row reducer proof; required one-for-one "
+            "with every appended signed E3a staged selection"
+        ),
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e3a-staged-selection", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e1-survivor-selection", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e2-staged-selection", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e4-stage-selection", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--formal-stage-prefix-artifact",
+        action="append",
+        default=[],
+        help=(
+            "mandatory path-bound proof prefix for every E1/E2/E4 "
+            "coverage/selection append"
+        ),
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e3b-power-prefix", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e5-power-and-anchor-prefix", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--signed-e6-power-prefix", action="append", default=[]
+    )
+    extend_formal_registry.add_argument(
+        "--e0-authority-bundle",
+        action="append",
+        default=[],
+        help=(
+            "complete path-bound E0 typed authority bundle; digest-only inputs "
+            "are never accepted"
+        ),
+    )
+    extend_formal_registry.add_argument(
+        "--candidate-state-replay-proof-artifact",
+        action="append",
+        default=[],
+    )
+    extend_formal_registry.add_argument("--control-replay-store", required=True)
+    extend_formal_registry.add_argument("--now-ns", type=int, required=True)
+    extend_formal_registry.add_argument("--output", required=True)
+
+    verify_formal_registry = commands.add_parser(
+        "verify-formal-registry-verification",
+        allow_abbrev=False,
+    )
+    verify_formal_registry.add_argument("--receipt", required=True)
+    verify_formal_registry.add_argument("--now-ns", type=int, required=True)
+    verify_formal_registry.add_argument("--output", required=True)
+
+    authorize_preflight = commands.add_parser(
+        "authorize-formal-preflight-dispatch",
+        allow_abbrev=False,
+    )
+    authorize_preflight.add_argument("--registry-verification-receipt", required=True)
+    authorize_preflight.add_argument("--signed-materialization", required=True)
+    authorize_preflight.add_argument("--capacity-control", required=True)
+    authorize_preflight.add_argument("--dispatch-control", required=True)
+    authorize_preflight.add_argument("--inventory", required=True)
+    authorize_preflight.add_argument("--stage-activation", required=True)
+    authorize_preflight.add_argument("--budget-plan", required=True)
+    authorize_preflight.add_argument("--budget-authority", required=True)
+    authorize_preflight.add_argument("--dispatch-plan", required=True)
+    authorize_preflight.add_argument("--capacity-schedule", required=True)
+    authorize_preflight.add_argument("--capacity-gate", required=True)
+    authorize_preflight.add_argument("--control-replay-store", required=True)
+    authorize_preflight.add_argument("--now-ns", type=int, required=True)
+    authorize_preflight.add_argument("--output", required=True)
+
+    materialize_preflight_caps = commands.add_parser(
+        "materialize-formal-preflight-launch-cap-schedule",
+        allow_abbrev=False,
+    )
+    materialize_preflight_caps.add_argument("--dispatch-receipt", required=True)
+    materialize_preflight_caps.add_argument("--now-ns", type=int, required=True)
+    materialize_preflight_caps.add_argument("--output", required=True)
+
+    execute_preflight_raw = commands.add_parser(
+        "execute-formal-preflight-raw",
+        allow_abbrev=False,
+    )
+    execute_preflight_raw.add_argument("--dispatch-receipt", required=True)
+    execute_preflight_raw.add_argument("--launch-cap-schedule", required=True)
+    execute_preflight_raw.add_argument("--compile-assignment-plan", required=True)
+    execute_preflight_raw.add_argument(
+        "--prepared-content-verification-receipt", required=True
+    )
+    execute_preflight_raw.add_argument("--compile-control", required=True)
+    execute_preflight_raw.add_argument("--exactness-assignment", required=True)
+    execute_preflight_raw.add_argument("--exactness-control", required=True)
+    execute_preflight_raw.add_argument(
+        "--interference-execution-manifest", required=True
+    )
+    execute_preflight_raw.add_argument("--nvidia-smi", required=True)
+    execute_preflight_raw.add_argument("--control-replay-store", required=True)
+    execute_preflight_raw.add_argument("--evidence-root", required=True)
+    execute_preflight_raw.add_argument("--now-ns", type=int, required=True)
+    execute_preflight_raw.add_argument("--output", required=True)
+
+    qualify_preflight_exactness = commands.add_parser(
+        "qualify-formal-preflight-exactness",
+        allow_abbrev=False,
+    )
+    qualify_preflight_exactness.add_argument("--dispatch-receipt", required=True)
+    qualify_preflight_exactness.add_argument("--remote-raw-receipt", required=True)
+    qualify_preflight_exactness.add_argument("--rank-aggregate-control", required=True)
+    qualify_preflight_exactness.add_argument("--control-replay-store", required=True)
+    qualify_preflight_exactness.add_argument("--now-ns", type=int, required=True)
+    qualify_preflight_exactness.add_argument("--proof-output", required=True)
+    qualify_preflight_exactness.add_argument("--qualified-output", required=True)
+
+    qualify_preflight_interference = commands.add_parser(
+        "qualify-formal-preflight-interference",
+        allow_abbrev=False,
+    )
+    qualify_preflight_interference.add_argument("--dispatch-receipt", required=True)
+    qualify_preflight_interference.add_argument("--remote-raw-receipt", required=True)
+    qualify_preflight_interference.add_argument(
+        "--native-result-proof",
+        action="append",
+        required=True,
+        metavar="CELL_ID=PATH",
+    )
+    qualify_preflight_interference.add_argument(
+        "--native-itl-proof",
+        action="append",
+        required=True,
+        metavar="CELL_ID=PATH",
+    )
+    qualify_preflight_interference.add_argument("--aggregate-control", required=True)
+    qualify_preflight_interference.add_argument("--control-replay-store", required=True)
+    qualify_preflight_interference.add_argument("--now-ns", type=int, required=True)
+    qualify_preflight_interference.add_argument("--output", required=True)
+
+    finalize_preflight = commands.add_parser(
+        "finalize-formal-preflight-evidence",
+        allow_abbrev=False,
+    )
+    finalize_preflight.add_argument("--dispatch-receipt", required=True)
+    finalize_preflight.add_argument("--remote-raw-receipt", required=True)
+    finalize_preflight.add_argument("--exactness-result", required=True)
+    finalize_preflight.add_argument("--interference-proof", required=True)
+    finalize_preflight.add_argument(
+        "--qualification-proof",
+        action="append",
+        required=True,
+        metavar="SUITE=RESULT_POINTER,PROOF_ARTIFACT",
+    )
+    finalize_preflight.add_argument("--candidate-state-coverage", required=True)
+    finalize_preflight.add_argument(
+        "--candidate-replay-proof",
+        action="append",
+        required=True,
+        metavar="PATH",
+    )
+    finalize_preflight.add_argument("--now-ns", type=int, required=True)
+    finalize_preflight.add_argument("--source-output", required=True)
+    finalize_preflight.add_argument("--activation-output", required=True)
+    finalize_preflight.add_argument("--coverage-output", required=True)
+    finalize_preflight.add_argument("--stage-coverage-output", required=True)
 
     collect_inventory = commands.add_parser("collect-gpu-inventory")
     collect_inventory.add_argument("--challenge-nonce-sha256", required=True)
@@ -2592,6 +3722,16 @@ def _parser() -> argparse.ArgumentParser:
     reduce_interference.add_argument("--envelope-output", required=True)
     reduce_interference.add_argument("--output", required=True)
 
+    materialize_capacity = commands.add_parser(
+        "materialize-stage-capacity-gate",
+        allow_abbrev=False,
+    )
+    materialize_capacity.add_argument("--registry", required=True)
+    materialize_capacity.add_argument("--capacity-source-manifest", required=True)
+    materialize_capacity.add_argument("--stage-schedule", required=True)
+    materialize_capacity.add_argument("--now-ns", type=int, required=True)
+    materialize_capacity.add_argument("--output", required=True)
+
     seal_industrial = commands.add_parser("seal-industrial-stage")
     seal_industrial.add_argument("--registry", required=True)
     seal_industrial.add_argument("--experiment", required=True)
@@ -2601,6 +3741,12 @@ def _parser() -> argparse.ArgumentParser:
     seal_industrial.add_argument("--inventory", required=True)
     seal_industrial.add_argument("--e2-final-stage-manifest")
     seal_industrial.add_argument("--interference-calibration-authority")
+    seal_industrial.add_argument("--preflight-coverage-receipt")
+    seal_industrial.add_argument("--preflight-coverage-attestation")
+    seal_industrial.add_argument("--stage-capacity-gate")
+    seal_industrial.add_argument("--stage-capacity-attestation")
+    seal_industrial.add_argument("--control-replay-store")
+    seal_industrial.add_argument("--preflight-control-binding-output")
     seal_industrial.add_argument("--activation-plan")
     seal_industrial.add_argument("--family-activation", action="append", default=[])
     seal_industrial.add_argument("--family-power-plan", action="append", default=[])
@@ -2672,6 +3818,19 @@ def _parser() -> argparse.ArgumentParser:
     materialize_stage = commands.add_parser("materialize-stage-activation")
     materialize_stage.add_argument("--manifest", required=True)
     materialize_stage.add_argument("--output", required=True)
+
+    pointer_preflight = commands.add_parser(
+        "materialize-preflight-pointer-coverage", allow_abbrev=False
+    )
+    pointer_preflight.add_argument("--registry", required=True)
+    pointer_preflight.add_argument("--runtime-artifact", required=True)
+    pointer_preflight.add_argument("--split-artifact", required=True)
+    pointer_preflight.add_argument("--compile-result", required=True)
+    pointer_preflight.add_argument("--exactness-result", required=True)
+    pointer_preflight.add_argument("--interference-authority", required=True)
+    pointer_preflight.add_argument("--source-output", required=True)
+    pointer_preflight.add_argument("--activation-output", required=True)
+    pointer_preflight.add_argument("--coverage-output", required=True)
 
     estimate_budget = commands.add_parser("estimate-industrial-budget")
     estimate_budget.add_argument("--registry", required=True)
@@ -5117,6 +6276,3274 @@ def _analyze_onlinespec(args: argparse.Namespace) -> int:
     return 42
 
 
+def _formal_request(
+    value: object,
+    *,
+    kind: str,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    if type(value) is not dict or any(type(key) is not str for key in value):
+        raise TypeError("formal materialization request must be a JSON object")
+    if value.get("kind") != kind or set(value) != fields | {"kind"}:
+        raise ValueError(f"{kind} materialization request fields differ from schema")
+    return dict(value)
+
+
+def _formal_single_control_lineage_sha256(
+    *,
+    signed_artifact_sha256: str,
+    protocol_lock_sha256: str,
+) -> str:
+    return _canonical_sha256(
+        {
+            "schema_version": 1,
+            "kind": "lightcone_formal_single_control_lineage",
+            "signed_artifact_sha256": signed_artifact_sha256,
+            "protocol_lock_sha256": protocol_lock_sha256,
+            "registry_sha256": build_industrial_registry().sha256,
+        }
+    )
+
+
+def _candidate_dynamic_formal_policy(
+    control: ControlArtifactAttestation,
+):
+    authorization = control.deployment_policy_authorization
+    policy = authorization.bundle.trusted_attester_policy
+    if (
+        control.trust_bundle_sha256 != authorization.bundle.sha256
+        or control.trusted_attester_policy_sha256 != policy.sha256
+    ):
+        raise ValueError("formal control differs from its deployment policy")
+    return policy, policy.sha256
+
+
+def _reserve_single_formal_control(
+    control: ControlArtifactAttestation,
+    *,
+    signed_artifact_sha256: str,
+    inner_challenge_sha256: str,
+    protocol_lock_sha256: str,
+    expected_artifact_type: str,
+    inventory_sha256: str,
+    replay_store_path: str,
+    now_ns: int,
+) -> str:
+    registry_sha256 = build_industrial_registry().sha256
+    subject = control.subject
+    if (
+        subject.artifact_type != expected_artifact_type
+        or subject.artifact_sha256 != signed_artifact_sha256
+        or subject.protocol_sha256 != protocol_lock_sha256
+        or subject.registry_sha256 != registry_sha256
+        or subject.lineage_sha256
+        != _formal_single_control_lineage_sha256(
+            signed_artifact_sha256=signed_artifact_sha256,
+            protocol_lock_sha256=protocol_lock_sha256,
+        )
+    ):
+        raise ValueError("formal single-control subject differs from signed authority")
+    verified = verify_and_reserve_release_control_artifact_attestations(
+        (control,),
+        expected_inventory_sha256=inventory_sha256,
+        now_ns=now_ns,
+        replay_store=ChallengeReplayStore(replay_store_path),
+        additional_challenge_sha256s=(inner_challenge_sha256,),
+    )
+    if verified[0].artifact_sha256 != signed_artifact_sha256:
+        raise RuntimeError("verified formal control differs from signed authority")
+    return control_challenge_reservation_sha256(
+        verified,
+        additional_challenge_sha256s=(inner_challenge_sha256,),
+        reserved_ns=now_ns,
+    )
+
+
+def _verify_single_formal_control_diagnostic(
+    control: ControlArtifactAttestation,
+    *,
+    signed_artifact_sha256: str,
+    protocol_lock_sha256: str,
+    expected_artifact_type: str,
+    inventory_sha256: str,
+    now_ns: int,
+):
+    """Verify one control without consuming its formal execution challenge."""
+
+    registry_sha256 = build_industrial_registry().sha256
+    subject = control.subject
+    if (
+        subject.artifact_type != expected_artifact_type
+        or subject.artifact_sha256 != signed_artifact_sha256
+        or subject.protocol_sha256 != protocol_lock_sha256
+        or subject.registry_sha256 != registry_sha256
+        or subject.lineage_sha256
+        != _formal_single_control_lineage_sha256(
+            signed_artifact_sha256=signed_artifact_sha256,
+            protocol_lock_sha256=protocol_lock_sha256,
+        )
+    ):
+        raise ValueError("formal single-control subject differs from signed authority")
+    verified = verify_release_control_artifact_attestation(
+        control,
+        expected_inventory_sha256=inventory_sha256,
+        now_ns=now_ns,
+        consumed_challenge_sha256s=(),
+    )
+    if verified.artifact_sha256 != signed_artifact_sha256:
+        raise RuntimeError("verified formal control differs from signed authority")
+    return verified
+
+
+def _formal_clean_git_identity(project_root: str | Path) -> tuple[Path, str, str]:
+    root = Path(os.path.abspath(os.fspath(project_root)))
+    if root.is_symlink() or not root.is_dir() or root.resolve() != root:
+        raise ValueError("formal project root must be an existing resolved directory")
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ("git", "-C", str(root), *arguments),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise ValueError("formal project root is not a readable Git checkout")
+        return completed.stdout.strip()
+
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("formal ProtocolLock requires a clean Git worktree")
+    head = git("rev-parse", "--verify", "HEAD")
+    tree = git("rev-parse", "--verify", "HEAD^{tree}")
+    for label, value in (("HEAD", head), ("tree", tree)):
+        if len(value) != 40 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError(f"formal Git {label} is not an exact object ID")
+    return root, head, tree
+
+
+def _formal_source_file_sha256(
+    project_root: Path,
+    source_path: str | Path,
+    *,
+    label: str,
+) -> str:
+    source = Path(os.path.abspath(os.fspath(source_path)))
+    if source.is_symlink() or source.resolve() != source:
+        raise ValueError(f"formal {label} source path must be resolved")
+    try:
+        source.relative_to(project_root)
+    except ValueError as error:
+        raise ValueError(
+            f"formal {label} source must be inside project root"
+        ) from error
+    return hashlib.sha256(_read_regular_bytes(source, label=label)).hexdigest()
+
+
+def _require_expected_identity(label: str, expected: str | None, observed: str) -> None:
+    if expected is not None and expected != observed:
+        raise ValueError(f"formal {label} differs from reopened source identity")
+
+
+def _publish_tts_calibration_source_authority(args: argparse.Namespace) -> int:
+    artifact = build_source_tts_calibration_authority_artifact(
+        paper_pdf_path=Path(os.path.abspath(args.paper_pdf)),
+        paper_source_path=Path(os.path.abspath(args.paper_source)),
+        tuning_window_path=Path(os.path.abspath(args.tuning_window)),
+        trainable_plan_authority_path=Path(
+            os.path.abspath(args.trainable_plan_authority)
+        ),
+        drafter_native_loss_path=Path(os.path.abspath(args.drafter_native_loss)),
+    )
+    publish_tts_calibration_authority_artifact(
+        artifact,
+        Path(os.path.abspath(args.output)),
+    )
+    print(artifact.authority.sha256)
+    return 0
+
+
+def _publish_chronobelief_source_authority(args: argparse.Namespace) -> int:
+    artifact = build_source_chronobelief_authority_artifact(
+        paper_pdf_path=Path(os.path.abspath(args.paper_pdf)),
+        tex_source_path=Path(os.path.abspath(args.tex_source)),
+    )
+    publish_chronobelief_authority_artifact(
+        artifact,
+        Path(os.path.abspath(args.output)),
+    )
+    print(artifact.authority.sha256)
+    return 0
+
+
+def _publish_e1_recipe_anchor_authority(args: argparse.Namespace) -> int:
+    artifact = build_source_e1_recipe_anchor_authority_artifact(
+        Path(os.path.abspath(args.trainable_plan_authority))
+    )
+    publish_e1_recipe_anchor_authority_artifact(
+        artifact,
+        Path(os.path.abspath(args.output)),
+    )
+    print(artifact.authority.sha256)
+    return 0
+
+
+def _publish_formal_protocol_lock_git_snapshot(args: argparse.Namespace) -> int:
+    binding = publish_formal_protocol_lock_git_snapshot(
+        project_root=Path(os.path.abspath(args.project_root)),
+        chunk_output_directory=Path(os.path.abspath(args.chunk_output_directory)),
+        index_output_path=Path(os.path.abspath(args.output)),
+    )
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_protocol_lock_source_proof(args: argparse.Namespace) -> int:
+    artifact = bind_formal_protocol_lock_source_proof_artifact(
+        protocol_id=args.protocol_id,
+        git_snapshot_path=Path(os.path.abspath(args.git_snapshot)),
+        patch_manifest_relative_path=args.patch_manifest_relative_path,
+        english_protocol_relative_path=args.english_protocol_relative_path,
+        chinese_protocol_relative_path=args.chinese_protocol_relative_path,
+        runtime_authority_path=Path(
+            os.path.abspath(args.formal_runtime_authority_manifest)
+        ),
+        tts_calibration_authority_path=Path(
+            os.path.abspath(args.tts_calibration_authority)
+        ),
+        chronobelief_authority_path=Path(os.path.abspath(args.chronobelief_authority)),
+        e1_recipe_anchor_authority_path=Path(
+            os.path.abspath(args.e1_recipe_anchor_authority)
+        ),
+        content_verification_receipt_path=Path(
+            os.path.abspath(args.content_verification_receipt)
+        ),
+        burstgpt_shape_authority_path=Path(
+            os.path.abspath(args.burstgpt_shape_authority)
+        ),
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_protocol_lock_source_proof_artifact(
+        artifact,
+        Path(os.path.abspath(args.output)),
+    )
+    lock = revalidate_formal_protocol_lock_source_proof_artifact(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    print(lock.sha256)
+    return 0
+
+
+def _create_protocol_lock(args: argparse.Namespace) -> int:
+    project_root, code_git_head, code_git_tree = _formal_clean_git_identity(
+        args.project_root
+    )
+    patch_manifest_sha256 = _formal_source_file_sha256(
+        project_root, args.patch_manifest, label="patch manifest"
+    )
+    english_protocol_sha256 = _formal_source_file_sha256(
+        project_root, args.english_protocol, label="English protocol"
+    )
+    chinese_protocol_sha256 = _formal_source_file_sha256(
+        project_root, args.chinese_protocol, label="Chinese protocol"
+    )
+    runtime_manifest_path = Path(
+        os.path.abspath(args.formal_runtime_authority_manifest)
+    )
+    try:
+        runtime_manifest_path.relative_to(project_root)
+    except ValueError as error:
+        raise ValueError(
+            "formal runtime authority manifest must be inside project root"
+        ) from error
+    runtime_binding_before = CanonicalJsonProofBinding.bind(str(runtime_manifest_path))
+    runtime_authority_manifest = formal_runtime_authority_manifest_from_dict(
+        runtime_binding_before.reopen()
+    )
+    source_runtime_authority_manifest = build_source_formal_runtime_authority_manifest(
+        project_root
+    )
+    if runtime_authority_manifest != source_runtime_authority_manifest:
+        raise ValueError(
+            "formal runtime authority manifest differs from source-owned rebuild"
+        )
+    if CanonicalJsonProofBinding.bind(str(runtime_manifest_path)) != (
+        runtime_binding_before
+    ):
+        raise RuntimeError(
+            "formal runtime authority changed while ProtocolLock was built"
+        )
+    tts_artifact = load_tts_calibration_authority_artifact(
+        Path(os.path.abspath(args.tts_calibration_authority))
+    )
+    chronobelief_artifact = load_chronobelief_authority_artifact(
+        Path(os.path.abspath(args.chronobelief_authority))
+    )
+    e1_anchor_artifact = load_e1_recipe_anchor_authority_artifact(
+        Path(os.path.abspath(args.e1_recipe_anchor_authority))
+    )
+    e2_grid = default_e2_recipe_grid_authority()
+    qualification_identities = code_owned_qualification_source_identities()
+    native_qualification = qualification_identities["native_runtime"]
+    compile_qualification = qualification_identities["compile"]
+    exactness_qualification = qualification_identities["exactness"]
+    content_receipt, verified_content = _load_content_verification_receipt(
+        args.content_verification_receipt,
+        now_ns=args.content_verification_now_ns,
+    )
+    verified_content = content_receipt.revalidate_formal_scope(
+        current_ns=args.content_verification_now_ns
+    )
+    prepared_content = tuple(
+        row
+        for row in verified_content
+        if type(row) is VerifiedPreparedModelContentRelease
+    )
+    workload_content = tuple(
+        row for row in verified_content if type(row) is VerifiedReleaseWorkloadSources
+    )
+    e0_content = tuple(
+        row
+        for row in verified_content
+        if type(row) is VerifiedDatasetContentRelease
+        and row.authority_domain == "e0_task_native"
+    )
+    if len(prepared_content) != 1 or len(workload_content) != 1 or len(e0_content) != 1:
+        raise ValueError("ProtocolLock content master lacks exact formal authorities")
+    root_manifest_sha256s = {
+        row.authorization.root_manifest_sha256 for row in verified_content
+    }
+    if len(root_manifest_sha256s) != 1:
+        raise ValueError("ProtocolLock content authorities use different roots")
+    from lightcone_spec.runtime.preflight_runner import (
+        BurstGptShapeAuthority,
+        derive_burstgpt_shape_authority_from_content_receipt,
+    )
+
+    burstgpt_shape_authority = BurstGptShapeAuthority.from_dict(
+        CanonicalJsonProofBinding.bind(args.burstgpt_shape_authority).reopen()
+    )
+    derived_burstgpt_shape = derive_burstgpt_shape_authority_from_content_receipt(
+        content_receipt,
+        current_ns=args.content_verification_now_ns,
+    )
+    if burstgpt_shape_authority != derived_burstgpt_shape:
+        raise ValueError("ProtocolLock BurstGPT shape differs from signed content")
+    registry_sha256 = build_industrial_registry().sha256
+    for label, expected, observed in (
+        ("Git HEAD", args.code_git_head, code_git_head),
+        ("Git tree", args.code_git_tree, code_git_tree),
+        ("patch manifest", args.patch_manifest_sha256, patch_manifest_sha256),
+        ("registry", args.registry_sha256, registry_sha256),
+        (
+            "English protocol",
+            args.english_protocol_sha256,
+            english_protocol_sha256,
+        ),
+        (
+            "Chinese protocol",
+            args.chinese_protocol_sha256,
+            chinese_protocol_sha256,
+        ),
+    ):
+        _require_expected_identity(label, expected, observed)
+    root_after, head_after, tree_after = _formal_clean_git_identity(project_root)
+    if (
+        root_after != project_root
+        or head_after != code_git_head
+        or tree_after != code_git_tree
+    ):
+        raise RuntimeError(
+            "formal source checkout changed while ProtocolLock was built"
+        )
+    if (
+        load_tts_calibration_authority_artifact(
+            Path(os.path.abspath(args.tts_calibration_authority))
+        )
+        != tts_artifact
+        or load_chronobelief_authority_artifact(
+            Path(os.path.abspath(args.chronobelief_authority))
+        )
+        != chronobelief_artifact
+        or load_e1_recipe_anchor_authority_artifact(
+            Path(os.path.abspath(args.e1_recipe_anchor_authority))
+        )
+        != e1_anchor_artifact
+    ):
+        raise RuntimeError("formal method authority changed while lock was built")
+    lock = ProtocolLock(
+        schema_version=4,
+        protocol_id=args.protocol_id,
+        code_git_head=code_git_head,
+        code_git_tree=code_git_tree,
+        patch_manifest_sha256=patch_manifest_sha256,
+        registry_sha256=registry_sha256,
+        english_protocol_sha256=english_protocol_sha256,
+        chinese_protocol_sha256=chinese_protocol_sha256,
+        tts_calibration_authority_sha256=tts_artifact.authority.sha256,
+        chronobelief_authority_sha256=chronobelief_artifact.authority.sha256,
+        e1_recipe_anchor_authority_sha256=e1_anchor_artifact.authority.sha256,
+        e2_recipe_grid_authority_sha256=e2_grid.sha256,
+        formal_runtime_authority_manifest_sha256=(runtime_authority_manifest.sha256),
+        offline_release_trust_root_sha256=next(iter(root_manifest_sha256s)),
+        prepared_model_content_authorization_sha256=(
+            prepared_content[0].authorization_sha256
+        ),
+        formal_workload_e3a_authorization_sha256=(
+            workload_content[0].authorization_sha256
+        ),
+        formal_workload_e0_authorization_sha256=(e0_content[0].authorization_sha256),
+        burstgpt_shape_authorization_sha256=burstgpt_shape_authority.sha256,
+        native_runtime_qualification_protocol_sha256=native_qualification[0],
+        native_runtime_qualification_runner_sha256=native_qualification[1],
+        native_runtime_qualification_test_set_sha256=native_qualification[2],
+        compile_qualification_protocol_sha256=compile_qualification[0],
+        compile_qualification_runner_sha256=compile_qualification[1],
+        compile_qualification_test_set_sha256=compile_qualification[2],
+        exactness_qualification_protocol_sha256=exactness_qualification[0],
+        exactness_qualification_runner_sha256=exactness_qualification[1],
+        exactness_qualification_test_set_sha256=exactness_qualification[2],
+    )
+    _write_json(
+        args.output,
+        {
+            "schema_version": 1,
+            "kind": "unsigned_protocol_lock_payload",
+            "payload": protocol_lock_to_dict(lock),
+            "payload_sha256": lock.sha256,
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(lock.sha256)
+    return 0
+
+
+def _verify_signed_protocol_lock(args: argparse.Namespace) -> int:
+    signed = signed_protocol_lock_from_dict(_load_bound_json(args.signed_lock))
+    control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.control_attestation)
+    )
+    policy, policy_sha256 = _candidate_dynamic_formal_policy(control)
+    payload = signed.verify(
+        policy=policy,
+        expected_policy_sha256=policy_sha256,
+        now_ns=args.now_ns,
+    )
+    if payload.registry_sha256 != build_industrial_registry().sha256:
+        raise ValueError("ProtocolLock does not bind the staged registry")
+    verified_control = _verify_single_formal_control_diagnostic(
+        control,
+        signed_artifact_sha256=signed.sha256,
+        protocol_lock_sha256=payload.sha256,
+        expected_artifact_type="dispatch",
+        inventory_sha256=args.inventory_sha256,
+        now_ns=args.now_ns,
+    )
+    _write_json(
+        args.output,
+        {
+            "schema_version": 1,
+            "kind": "verified_protocol_lock_receipt",
+            "payload_sha256": payload.sha256,
+            "signed_protocol_lock_sha256": signed.sha256,
+            "trusted_attester_policy_sha256": policy_sha256,
+            "control_envelope_sha256": verified_control.envelope_sha256,
+            "challenge_reservation_sha256": None,
+            "verification_mode": "diagnostic_only_non_consuming",
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(payload.sha256)
+    return 0
+
+
+def _create_gpu_hour_envelope(args: argparse.Namespace) -> int:
+    estimate = GpuHourEstimate.unmeasured()
+    _write_json(args.output, gpu_hour_estimate_to_dict(estimate))
+    print(_canonical_sha256(gpu_hour_estimate_to_dict(estimate)))
+    return 0
+
+
+def _reduce_stage_gpu_hour_envelope(args: argparse.Namespace) -> int:
+    signed = signed_pilot_duration_from_dict(
+        _load_bound_json(args.signed_pilot_receipt)
+    )
+    control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.control_attestation)
+    )
+    policy, policy_sha256 = _candidate_dynamic_formal_policy(control)
+    try:
+        envelope = reduce_stage_gpu_hour_envelope_from_signed_pilots(
+            signed,
+            policy=policy,
+            expected_policy_sha256=policy_sha256,
+            protocol_lock_sha256=args.protocol_lock_sha256,
+            materialization_receipt_sha256=args.materialization_receipt_sha256,
+            schedule_sha256=args.schedule_sha256,
+            now_ns=args.now_ns,
+        )
+    except FormalGpuHourAuthorityBlocked as error:
+        _write_json(
+            args.output,
+            {
+                "schema_version": 1,
+                "kind": "formal_stage_gpu_hour_envelope_blocked",
+                "status": "BLOCKED",
+                "reason_code": str(error),
+                "formal_dispatch_authorized": False,
+            },
+        )
+        print(str(error))
+        return 42
+    reservation_sha256 = _reserve_single_formal_control(
+        control,
+        signed_artifact_sha256=signed.sha256,
+        inner_challenge_sha256=signed.challenge.sha256,
+        protocol_lock_sha256=args.protocol_lock_sha256,
+        expected_artifact_type="capacity",
+        inventory_sha256=args.inventory_sha256,
+        replay_store_path=args.control_replay_store,
+        now_ns=args.now_ns,
+    )
+    _write_json(
+        args.output,
+        {
+            **stage_gpu_hour_envelope_to_dict(envelope),
+            "challenge_reservation_sha256": reservation_sha256,
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(envelope.sha256)
+    return 0
+
+
+def _parse_preflight_gpu_hour_lifecycle_proofs(
+    values: list[str],
+) -> tuple[object, ...]:
+    """Decode exactly eight unique CELL_ID=PATH interference proof joins."""
+
+    from lightcone_spec.experiments.gpu_hour_authority import (
+        PreflightGpuHourLifecycleProofInput,
+    )
+
+    parsed: dict[str, str] = {}
+    for value in values:
+        cell_id, separator, path_text = value.partition("=")
+        path = Path(path_text)
+        if (
+            separator != "="
+            or not cell_id
+            or not path_text
+            or cell_id in parsed
+            or not path.is_absolute()
+            or path != path.resolve(strict=False)
+        ):
+            raise ValueError(
+                "preflight GPU-hour lifecycle proof must be unique CELL_ID=PATH"
+            )
+        parsed[cell_id] = str(path)
+    if len(parsed) != 8 or len(set(parsed.values())) != 8:
+        raise ValueError(
+            "preflight GPU-hour lifecycle proofs must cover exact eight cells"
+        )
+    return tuple(
+        PreflightGpuHourLifecycleProofInput(
+            materialized_cell_id=cell_id,
+            lifecycle_proof_artifact_path=path,
+        )
+        for cell_id, path in sorted(parsed.items())
+    )
+
+
+def _materialize_preflight_gpu_hour_envelope_cli(args: argparse.Namespace) -> int:
+    """Deep-reopen typed 1+1+8 timing and publish a signable envelope."""
+
+    from lightcone_spec.experiments.formal_dispatch import (
+        FormalPreflightDispatchReceipt,
+    )
+    from lightcone_spec.experiments.formal_preflight_execution import (
+        FormalPreflightFinalEvidence,
+        FormalPreflightRemoteRawEvidenceReceipt,
+    )
+    from lightcone_spec.experiments.gpu_hour_authority import (
+        materialize_preflight_gpu_hour_envelope,
+    )
+    from lightcone_spec.experiments.preflight_authority import (
+        PreflightCoverageReceipt,
+        PreflightExecutionSourceAuthority,
+    )
+    from lightcone_spec.runtime.proof_artifact import (
+        CanonicalJsonProofBinding,
+        publish_canonical_json_no_replace,
+    )
+
+    source_output = Path(args.source_output)
+    envelope_output = Path(args.output)
+    if (
+        not source_output.is_absolute()
+        or source_output != source_output.resolve(strict=False)
+        or not envelope_output.is_absolute()
+        or envelope_output != envelope_output.resolve(strict=False)
+        or source_output == envelope_output
+    ):
+        raise ValueError(
+            "preflight GPU-hour outputs must be distinct absolute normalized paths"
+        )
+    lifecycle_proofs = _parse_preflight_gpu_hour_lifecycle_proofs(
+        args.interference_lifecycle_proof
+    )
+    dispatch_binding = CanonicalJsonProofBinding.bind(args.dispatch_receipt)
+    durable_dispatch = FormalPreflightDispatchReceipt.from_dict(
+        dispatch_binding.reopen()
+    )
+    token = durable_dispatch.revalidate(current_ns=args.now_ns)
+    if CanonicalJsonProofBinding.bind(args.dispatch_receipt) != dispatch_binding:
+        raise ValueError("preflight GPU-hour dispatch receipt changed")
+    runtime_binding = CanonicalJsonProofBinding.bind(
+        args.formal_runtime_authority_manifest
+    )
+    runtime_manifest = formal_runtime_authority_manifest_from_dict(
+        runtime_binding.reopen()
+    )
+    remote_raw_receipt = CanonicalJsonProofBinding.bind(args.remote_raw_receipt)
+    remote_raw_payload = remote_raw_receipt.reopen()
+    remote_raw = FormalPreflightRemoteRawEvidenceReceipt.from_dict(remote_raw_payload)
+    remote_raw.revalidate(token)
+    if remote_raw_receipt.semantic_sha256 != remote_raw.sha256:
+        raise ValueError("preflight GPU-hour raw receipt identity differs")
+    evidence = FormalPreflightFinalEvidence(
+        remote_raw_receipt=remote_raw_receipt,
+        source_authority=PreflightExecutionSourceAuthority.from_dict(
+            CanonicalJsonProofBinding.bind(args.source_authority).reopen()
+        ),
+        activation=registry_stage_activation_from_dict(
+            CanonicalJsonProofBinding.bind(args.activation).reopen()
+        ),
+        coverage=PreflightCoverageReceipt.from_dict(
+            CanonicalJsonProofBinding.bind(args.coverage).reopen()
+        ),
+        materialization=durable_dispatch.signed_materialization.payload,
+        stage_coverage=stage_coverage_receipt_from_dict(
+            CanonicalJsonProofBinding.bind(args.stage_coverage).reopen()
+        ),
+    )
+    if (
+        token.protocol_lock
+        != durable_dispatch.registry_verification_receipt.signed_protocol_lock.payload
+        or evidence.materialization != durable_dispatch.signed_materialization.payload
+        or evidence.activation != durable_dispatch.activation
+        or evidence.source_authority.inventory_sha256
+        != token.dispatch_context.inventory.sha256
+    ):
+        raise ValueError("preflight GPU-hour sealed dispatch identity differs")
+    envelope = materialize_preflight_gpu_hour_envelope(
+        protocol_lock=token.protocol_lock,
+        formal_runtime_authority_manifest=runtime_manifest,
+        final_evidence=evidence,
+        inventory=token.dispatch_context.inventory,
+        interference_lifecycle_proof_inputs=lifecycle_proofs,
+        source_manifest_output_path=str(source_output),
+        now_ns=args.now_ns,
+    )
+    publish_canonical_json_no_replace(
+        envelope_output,
+        stage_gpu_hour_envelope_to_dict(envelope),
+    )
+    reopened = stage_gpu_hour_envelope_from_dict(
+        CanonicalJsonProofBinding.bind(envelope_output).reopen()
+    )
+    if reopened != envelope:
+        raise RuntimeError("preflight GPU-hour envelope changed during publication")
+    print(envelope.sha256)
+    return 0
+
+
+def _reserve_formal_stage_gpu_hours(args: argparse.Namespace) -> int:
+    """Deep-reopen lifecycle sources and consume their stage budget once."""
+
+    receipt = reserve_formal_stage_gpu_hour_verification_receipt(
+        registry_receipt=_load_formal_registry_receipt_path(
+            args.registry_verification_receipt,
+            now_ns=args.now_ns,
+        ),
+        registry_receipt_path=args.registry_verification_receipt,
+        signed_envelope=signed_stage_gpu_hour_from_dict(
+            _load_bound_json(args.signed_envelope)
+        ),
+        source_manifest_path=args.source_manifest,
+        formal_runtime_authority_manifest=formal_runtime_authority_manifest_from_dict(
+            _load_bound_json(args.formal_runtime_authority_manifest)
+        ),
+        inventory=_load_gpu_inventory(args.inventory),
+        control_attestation=ControlArtifactAttestation.from_dict(
+            _load_bound_json(args.control_attestation)
+        ),
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+        prospective_pilot_materialization_path=(args.prospective_pilot_materialization),
+    )
+    _write_json(args.output, receipt.to_dict())
+    print(receipt.sha256)
+    return 0
+
+
+def _publish_formal_stage_gpu_hour_envelope_proof(
+    args: argparse.Namespace,
+) -> int:
+    """Publish a deep-replayed source proof for one signable envelope."""
+
+    artifact = bind_formal_stage_gpu_hour_envelope_proof_artifact(
+        protocol_lock_path=args.protocol_lock,
+        runtime_authority_path=args.formal_runtime_authority_manifest,
+        registry_layer_path=args.registry_layer,
+        inventory_path=args.inventory,
+        final_materialization_path=args.final_materialization,
+        pilot_materialization_path=args.pilot_materialization,
+        gpu_hour_source_manifest_path=args.gpu_hour_source_manifest,
+        envelope_path=args.envelope,
+        preflight_coverage_proof_path=args.preflight_coverage_proof,
+        now_ns=args.now_ns,
+    )
+    publish_formal_stage_gpu_hour_envelope_proof_artifact(
+        artifact,
+        args.output,
+    )
+    print(artifact.sha256)
+    return 0
+
+
+def _publish_formal_initial_stage_materialization_proof(
+    args: argparse.Namespace,
+) -> int:
+    """Publish a replayable preflight/E3a/TTS-Cal/E1 materializer proof."""
+
+    artifact = bind_formal_initial_stage_materialization_proof_artifact(
+        phase=args.phase,
+        registry_layer_path=args.registry_layer,
+        tts_calibration_authority_path=args.tts_calibration_authority,
+        now_ns=args.now_ns,
+    )
+    publish_formal_initial_stage_materialization_proof_artifact(
+        artifact,
+        args.output,
+    )
+    print(artifact.sha256)
+    return 0
+
+
+def _publish_formal_downstream_materialization_proof(
+    args: argparse.Namespace,
+) -> int:
+    """Publish a current-only post-E4 typed materializer proof."""
+
+    artifact = build_formal_downstream_materialization_proof_artifact(
+        phase=args.phase,
+        registry_layer_path=args.registry_layer,
+        immediate_predecessor_path=args.immediate_predecessor,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_downstream_materialization_proof_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt = rebuild_formal_downstream_materialization_proof(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.artifact != artifact:
+        raise RuntimeError("formal downstream proof changed after publication")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_downstream_pilot_precoverage(args: argparse.Namespace) -> int:
+    """Publish the proof-replayed signed pilot bridge before coverage."""
+
+    artifact = build_formal_downstream_pilot_precoverage_artifact(
+        phase=args.phase,
+        materialization_proof_path=args.materialization_proof,
+        signed_materialization_path=args.signed_materialization,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_downstream_pilot_precoverage_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt = rebuild_formal_downstream_pilot_precoverage(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.artifact != artifact:
+        raise RuntimeError("formal pilot precoverage changed after publication")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_portable_stage_coverage(args: argparse.Namespace) -> int:
+    """Publish one zero-caller portable stage-coverage proof graph."""
+
+    artifact = bind_formal_portable_stage_coverage_proof_artifact(
+        args.coverage_proof,
+        registry_layer_path=args.registry_layer,
+        prior_prefix_path=args.prior_prefix,
+        e1_recipe_anchor_authority_path=args.e1_recipe_anchor_authority,
+        downstream_pilot_precoverage_path=args.downstream_pilot_precoverage,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_portable_stage_coverage_proof_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt = revalidate_portable_formal_stage_coverage_proof_artifact(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.coverage.sha256 != artifact.coverage_receipt_sha256:
+        raise RuntimeError("portable stage coverage changed after publication")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_downstream_reduction_proof(args: argparse.Namespace) -> int:
+    """Publish one proof-derived post-E4 reducer root."""
+
+    artifact = build_formal_downstream_reduction_proof_artifact(
+        phase=args.phase,
+        materialization_proof_path=args.materialization_proof,
+        portable_coverage_proof_path=args.portable_coverage_proof,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_downstream_reduction_proof_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt = rebuild_formal_downstream_reduction_proof(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.artifact != artifact:
+        raise RuntimeError("formal downstream reduction changed after publication")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_downstream_completed_prefix(args: argparse.Namespace) -> int:
+    """Publish one signed, reducer-replayed downstream prefix node."""
+
+    artifact = build_formal_downstream_completed_prefix_artifact(
+        phase=args.phase,
+        reduction_proof_path=args.reduction_proof,
+        signed_result_path=args.signed_result,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_downstream_completed_prefix_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt = rebuild_formal_downstream_completed_prefix(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.artifact != artifact:
+        raise RuntimeError(
+            "formal downstream completed prefix changed after publication"
+        )
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_e3a_staged_selection_proof(
+    args: argparse.Namespace,
+) -> int:
+    """Publish the proof-replayed exact 360-row E3a selection root."""
+
+    artifact = bind_formal_e3a_staged_selection_proof_artifact(
+        coverage_proof_path=args.coverage_proof,
+        registry_layer_path=args.registry_layer,
+        now_ns=args.now_ns,
+    )
+    publish_formal_e3a_staged_selection_proof_artifact(
+        artifact,
+        args.output,
+    )
+    print(artifact.sha256)
+    return 0
+
+
+def _materialize_prospective_stage_gpu_hours(args: argparse.Namespace) -> int:
+    """Create a source-bound powered stage estimate without duration scalars."""
+
+    registry_receipt = _load_formal_registry_receipt_path(
+        args.registry_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    final_materializations = tuple(
+        row.payload
+        for row in registry_receipt.cumulative_signed_materializations
+        if row.payload.stage == args.stage
+    )
+    if len(final_materializations) != 1:
+        raise ValueError(
+            "prospective GPU-hour CLI requires one exact registered final stage"
+        )
+    final_materialization = final_materializations[0]
+    pilot_materialization = stage_materialization_receipt_from_dict(
+        _load_bound_json(args.pilot_materialization)
+    )
+    authority = verify_registered_prospective_gpu_hour_authority(
+        registry_receipt=registry_receipt,
+        pilot_materialization=pilot_materialization,
+        final_materialization=final_materialization,
+        current_ns=args.now_ns,
+    )
+    _source, envelope = materialize_prospective_stage_gpu_hour_envelope(
+        authority=authority,
+        protocol_lock=registry_receipt.signed_protocol_lock.payload,
+        formal_runtime_authority_manifest=(
+            formal_runtime_authority_manifest_from_dict(
+                _load_bound_json(args.formal_runtime_authority_manifest)
+            )
+        ),
+        pilot_materialization=pilot_materialization,
+        pilot_envelope=stage_gpu_hour_envelope_from_dict(
+            _load_bound_json(args.pilot_envelope)
+        ),
+        pilot_source_manifest_path=args.pilot_source_manifest,
+        final_materialization=final_materialization,
+        inventory=_load_gpu_inventory(args.inventory),
+        prospective_source_manifest_output_path=args.source_output,
+        now_ns=args.now_ns,
+        existing_one_shot_source_manifest_path=(args.one_shot_source_manifest),
+    )
+    _write_json(args.output, stage_gpu_hour_envelope_to_dict(envelope))
+    print(envelope.sha256)
+    return 0
+
+
+def _materialize_staged_prospective_gpu_hours(args: argparse.Namespace) -> int:
+    """Publish honest early-stage totals or a minimum-pilot BLOCKED report."""
+
+    source_output = Path(args.source_output)
+    result_output = Path(args.output)
+    if (
+        not source_output.is_absolute()
+        or source_output != source_output.resolve(strict=False)
+        or not result_output.is_absolute()
+        or result_output != result_output.resolve(strict=False)
+        or source_output == result_output
+    ):
+        raise ValueError(
+            "staged prospective GPU-hour outputs must be distinct absolute paths"
+        )
+    registry_receipt = _load_formal_registry_receipt_path(
+        args.registry_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    candidates = tuple(
+        row.payload
+        for row in registry_receipt.cumulative_signed_materializations
+        if row.payload.stage == args.stage
+        and row.payload.sha256 == args.materialization_sha256
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            "staged prospective GPU-hour CLI requires one exact registered "
+            "materialization"
+        )
+    manifest, envelope = materialize_staged_prospective_gpu_hour_envelope(
+        protocol_lock=registry_receipt.signed_protocol_lock.payload,
+        formal_runtime_authority_manifest=(
+            formal_runtime_authority_manifest_from_dict(
+                _load_bound_json(args.formal_runtime_authority_manifest)
+            )
+        ),
+        materialization=candidates[0],
+        inventory=_load_gpu_inventory(args.inventory),
+        completed_source_manifest_path=args.completed_source_manifest,
+        source_manifest_output_path=str(source_output),
+        now_ns=args.now_ns,
+    )
+    if envelope is None:
+        _write_json(result_output, manifest.to_dict())
+        print(manifest.sha256)
+        return 42
+    _write_json(result_output, stage_gpu_hour_envelope_to_dict(envelope))
+    print(envelope.sha256)
+    return 0
+
+
+def _aggregate_formal_study_gpu_hours(args: argparse.Namespace) -> int:
+    """Publish study totals only from durable, source-reopened stage receipts."""
+
+    estimate = aggregate_formal_study_gpu_hours(
+        registry_receipt=_load_formal_registry_receipt_path(
+            args.registry_verification_receipt,
+            now_ns=args.now_ns,
+        ),
+        stage_receipts=tuple(
+            FormalStageGpuHourVerificationReceipt.from_dict(_load_bound_json(path))
+            for path in args.stage_receipt
+        ),
+        current_ns=args.now_ns,
+        require_complete=not args.allow_partial,
+    )
+    _write_json(args.output, estimate.to_dict())
+    print(estimate.derivation_sha256)
+    return 0 if estimate.status == "COMPLETE" else 42
+
+
+def _materialize_formal_request(
+    value: object,
+    *,
+    now_ns: int | None,
+    nested_policy=None,
+    nested_policy_sha256: str | None = None,
+):
+    if type(value) is not dict or type(value.get("kind")) is not str:
+        raise TypeError("formal materialization request requires a kind")
+    kind = value["kind"]
+    common = {"protocol_lock_sha256", "gpu_hours"}
+    if kind == "preflight":
+        row = _formal_request(value, kind=kind, fields=frozenset(common))
+        return materialize_preflight(
+            protocol_lock_sha256=row["protocol_lock_sha256"],
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind == "E3a":
+        raise ValueError(
+            "E3a JSON summaries are non-authorizing; formal E3a materialization "
+            "requires the durable registry receipt and exact signed preflight "
+            "coverage API"
+        )
+    if kind == "TTS-Cal":
+        raise ValueError(
+            "TTS-Cal JSON summaries are non-authorizing; formal TTS-Cal "
+            "materialization requires the durable signed E3a six-output source "
+            "and exact TTS authority API"
+        )
+    if kind == "E1":
+        raise ValueError(
+            "E1 JSON summaries are non-authorizing; formal E1 materialization "
+            "requires the path-reopened signed E3a selection and signed TTS-Cal "
+            "seal API"
+        )
+    if kind in {
+        "E2",
+        "E4-screen",
+        "E4-local",
+        "E4-profile",
+        "E3b",
+        "E1a",
+        "E5",
+        "E6",
+        "E0",
+    }:
+        raise ValueError(
+            f"{kind} JSON summaries are non-authorizing; formal materialization "
+            "requires the stage-specific path-reopened signed selection, power, "
+            "and upstream coverage authority API"
+        )
+    if kind == "E2":
+        row = _formal_request(
+            value,
+            kind=kind,
+            fields=frozenset(
+                common
+                | {
+                    "upstream_receipt_sha256",
+                    "source_selection_sha256",
+                    "grid_authority_sha256",
+                    "geometries",
+                    "round_index",
+                    "model",
+                    "frozen_tts_recipe_sha256",
+                    "candidate_recipes",
+                    "prior_round_materialization",
+                }
+            ),
+        )
+        grid = default_e2_recipe_grid_authority()
+        if row["grid_authority_sha256"] != grid.sha256:
+            raise ValueError("E2 request differs from the registered recipe grid")
+        if type(row["geometries"]) is not list:
+            raise TypeError("E2 geometries must be a JSON array")
+        geometries = tuple(E1Geometry(**item) for item in row["geometries"])
+        raw_candidates = row["candidate_recipes"]
+        if raw_candidates is None:
+            candidates = None
+        else:
+            if type(raw_candidates) is not list:
+                raise TypeError("E2 candidate recipes must be a JSON array")
+            candidates = tuple(
+                E2CandidateRecipe(
+                    geometry=E1Geometry(**item["geometry"]),
+                    optimizer=item["optimizer"],
+                    schedule=item["schedule"],
+                    learning_rate=item["learning_rate"],
+                    optimizer_recipe_authority_sha256=item[
+                        "optimizer_recipe_authority_sha256"
+                    ],
+                )
+                for item in raw_candidates
+            )
+        raw_prior = row["prior_round_materialization"]
+        prior = (
+            None
+            if raw_prior is None
+            else stage_materialization_receipt_from_dict(raw_prior)
+        )
+        return materialize_e2_round(
+            protocol_lock_sha256=row["protocol_lock_sha256"],
+            upstream_receipt_sha256=row["upstream_receipt_sha256"],
+            source_selection_sha256=row["source_selection_sha256"],
+            grid=grid,
+            geometries=geometries,
+            round_index=row["round_index"],
+            model=row["model"],
+            frozen_tts_recipe_sha256=row["frozen_tts_recipe_sha256"],
+            candidate_recipes=candidates,
+            prior_round_materialization=prior,
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind == "E4-screen":
+        row = _formal_request(
+            value,
+            kind=kind,
+            fields=frozenset(
+                common
+                | {
+                    "upstream_e2_receipt_sha256",
+                    "source_decision_sha256",
+                    "model",
+                    "lightcone_recipe_sha256",
+                }
+            ),
+        )
+        return materialize_e4_strength2_screen(
+            **{name: row[name] for name in row if name not in {"kind", "gpu_hours"}},
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind == "E4-local":
+        row = _formal_request(
+            value,
+            kind=kind,
+            fields=frozenset(
+                common
+                | {
+                    "upstream_screen_receipt_sha256",
+                    "winner_decision_sha256",
+                    "model",
+                    "lightcone_recipe_sha256",
+                    "factor_neighborhoods",
+                }
+            ),
+        )
+        if type(row["factor_neighborhoods"]) is not list:
+            raise TypeError("E4 factor neighborhoods must be a JSON array")
+        neighborhoods = tuple(tuple(item) for item in row["factor_neighborhoods"])
+        return materialize_e4_winner_neighborhood(
+            protocol_lock_sha256=row["protocol_lock_sha256"],
+            upstream_screen_receipt_sha256=row["upstream_screen_receipt_sha256"],
+            winner_decision_sha256=row["winner_decision_sha256"],
+            model=row["model"],
+            lightcone_recipe_sha256=row["lightcone_recipe_sha256"],
+            factor_neighborhoods=neighborhoods,
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind == "E4-profile":
+        row = _formal_request(
+            value,
+            kind=kind,
+            fields=frozenset(
+                common
+                | {
+                    "upstream_local_receipt_sha256",
+                    "selected_configuration_sha256",
+                    "model",
+                    "lightcone_recipe_sha256",
+                }
+            ),
+        )
+        return materialize_e4_profiler(
+            **{name: row[name] for name in row if name not in {"kind", "gpu_hours"}},
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind in {"E3b", "E1a", "E5", "E6"}:
+        fields_by_kind = {
+            "E3b": {
+                "upstream_receipt_sha256",
+                "source_decision_sha256",
+                "model",
+                "frozen_tts_recipe_sha256",
+                "lightcone_recipe_sha256",
+                "final_blocks",
+            },
+            "E1a": {
+                "upstream_receipt_sha256",
+                "source_decision_sha256",
+                "model",
+                "lightcone_recipe_sha256",
+            },
+            "E5": {
+                "upstream_e1a_receipt_sha256",
+                "power_prefix_decision_sha256",
+                "model",
+                "frozen_tts_recipe_sha256",
+                "lightcone_recipe_sha256",
+                "final_blocks",
+                "signed_anchor_selection",
+            },
+            "E6": {
+                "upstream_receipt_sha256",
+                "source_decision_sha256",
+                "frozen_tts_recipe_sha256",
+                "lightcone_recipe_sha256",
+                "final_blocks",
+            },
+        }
+        row = _formal_request(
+            value, kind=kind, fields=frozenset(common | fields_by_kind[kind])
+        )
+        if kind == "E5":
+            if nested_policy is None or nested_policy_sha256 is None:
+                raise ValueError("E5 requires a dynamically authorized anchor policy")
+            return materialize_e5(
+                protocol_lock_sha256=row["protocol_lock_sha256"],
+                upstream_e1a_receipt_sha256=row["upstream_e1a_receipt_sha256"],
+                power_prefix_decision_sha256=row["power_prefix_decision_sha256"],
+                model=row["model"],
+                frozen_tts_recipe_sha256=row["frozen_tts_recipe_sha256"],
+                lightcone_recipe_sha256=row["lightcone_recipe_sha256"],
+                final_blocks=row["final_blocks"],
+                signed_anchor_selection=signed_e5_anchor_selection_from_dict(
+                    row["signed_anchor_selection"]
+                ),
+                anchor_policy=nested_policy,
+                expected_anchor_policy_sha256=nested_policy_sha256,
+                now_ns=now_ns,
+                gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+            )
+        function = {
+            "E3b": materialize_e3b,
+            "E1a": materialize_e1a,
+            "E6": materialize_e6,
+        }[kind]
+        return function(
+            **{name: row[name] for name in row if name not in {"kind", "gpu_hours"}},
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    if kind == "E0":
+        row = _formal_request(
+            value,
+            kind=kind,
+            fields=frozenset(
+                common
+                | {
+                    "signed_compatibility",
+                    "source_decision_sha256",
+                    "frozen_tts_recipe_sha256",
+                    "lightcone_recipe_sha256",
+                    "online_spec_recipe_sha256s",
+                    "final_blocks",
+                }
+            ),
+        )
+        if (
+            row["protocol_lock_sha256"]
+            != row["signed_compatibility"]["payload"]["protocol_lock_sha256"]
+        ):
+            raise ValueError("E0 request ProtocolLock differs from compatibility")
+        if type(row["online_spec_recipe_sha256s"]) is not list:
+            raise TypeError("E0 OnlineSPEC recipes must be a JSON array")
+        if nested_policy is None or nested_policy_sha256 is None:
+            raise ValueError(
+                "E0 requires a dynamically authorized compatibility policy"
+            )
+        return materialize_e0_from_signed_compatibility(
+            signed_e0_compatibility_from_dict(row["signed_compatibility"]),
+            policy=nested_policy,
+            expected_policy_sha256=nested_policy_sha256,
+            now_ns=now_ns,
+            source_decision_sha256=row["source_decision_sha256"],
+            frozen_tts_recipe_sha256=row["frozen_tts_recipe_sha256"],
+            lightcone_recipe_sha256=row["lightcone_recipe_sha256"],
+            online_spec_recipe_sha256s=tuple(
+                tuple(item) for item in row["online_spec_recipe_sha256s"]
+            ),
+            final_blocks=row["final_blocks"],
+            gpu_hours=gpu_hour_estimate_from_dict(row["gpu_hours"]),
+        )
+    raise ValueError("formal materialization request names an unknown stage/wave")
+
+
+def _create_stage_materialization(args: argparse.Namespace) -> int:
+    request = _load_bound_json(args.request)
+    if type(request) is not dict or type(request.get("kind")) is not str:
+        raise TypeError("formal materialization request requires a kind")
+    nested_signed = None
+    control = None
+    policy = None
+    policy_sha256 = None
+    if request["kind"] in {"E5", "E0"}:
+        if not all(
+            (
+                args.control_attestation,
+                args.inventory_sha256,
+                args.control_replay_store,
+                args.now_ns is not None,
+            )
+        ):
+            raise ValueError("signed nested authority requires dynamic control inputs")
+        nested_signed = (
+            signed_e5_anchor_selection_from_dict(request["signed_anchor_selection"])
+            if request["kind"] == "E5"
+            else signed_e0_compatibility_from_dict(request["signed_compatibility"])
+        )
+        control = ControlArtifactAttestation.from_dict(
+            _load_bound_json(args.control_attestation)
+        )
+        policy, policy_sha256 = _candidate_dynamic_formal_policy(control)
+    receipt = _materialize_formal_request(
+        request,
+        now_ns=args.now_ns,
+        nested_policy=policy,
+        nested_policy_sha256=policy_sha256,
+    )
+    if nested_signed is not None and control is not None:
+        _verify_single_formal_control_diagnostic(
+            control,
+            signed_artifact_sha256=nested_signed.sha256,
+            protocol_lock_sha256=receipt.protocol_lock_sha256,
+            expected_artifact_type="dispatch",
+            inventory_sha256=args.inventory_sha256,
+            now_ns=args.now_ns,
+        )
+    _write_json(args.output, stage_materialization_receipt_to_dict(receipt))
+    print(receipt.sha256)
+    return 0
+
+
+def _verify_signed_stage_materialization(args: argparse.Namespace) -> int:
+    signed = signed_stage_materialization_from_dict(
+        _load_bound_json(args.signed_receipt)
+    )
+    control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.control_attestation)
+    )
+    policy, policy_sha256 = _candidate_dynamic_formal_policy(control)
+    payload = signed.verify(
+        policy=policy,
+        expected_policy_sha256=policy_sha256,
+        now_ns=args.now_ns,
+    )
+    verified_control = _verify_single_formal_control_diagnostic(
+        control,
+        signed_artifact_sha256=signed.sha256,
+        protocol_lock_sha256=payload.protocol_lock_sha256,
+        expected_artifact_type="dispatch",
+        inventory_sha256=args.inventory_sha256,
+        now_ns=args.now_ns,
+    )
+    _write_json(
+        args.output,
+        {
+            "schema_version": 1,
+            "kind": "verified_stage_materialization_receipt",
+            "stage": payload.stage,
+            "payload_sha256": payload.sha256,
+            "signed_receipt_sha256": signed.sha256,
+            "trusted_attester_policy_sha256": policy_sha256,
+            "control_envelope_sha256": verified_control.envelope_sha256,
+            "challenge_reservation_sha256": None,
+            "verification_mode": "diagnostic_only_non_consuming",
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(payload.sha256)
+    return 0
+
+
+def _create_stage_coverage(args: argparse.Namespace) -> int:
+    materialization = stage_materialization_receipt_from_dict(
+        _load_bound_json(args.materialization)
+    )
+    if materialization.stage in FORMAL_STAGE_DAG:
+        raise ValueError(
+            "formal DAG coverage is reducer-owned; use the stage-specific "
+            "proof-derived coverage reducer"
+        )
+    raw_dispositions = _load_bound_json(args.dispositions)
+    if type(raw_dispositions) is not list:
+        raise TypeError("coverage dispositions must be a JSON array")
+    dispositions = tuple(StageCellDisposition(**row) for row in raw_dispositions)
+    receipt = StageCoverageReceipt(
+        schema_version=2,
+        stage=materialization.stage,
+        protocol_lock_sha256=materialization.protocol_lock_sha256,
+        materialization_receipt_sha256=materialization.sha256,
+        dispositions=tuple(sorted(dispositions, key=lambda row: row.cell_id)),
+        tts_l0_candidate_state_coverages=tuple(
+            sorted(
+                (
+                    tts_l0_candidate_state_coverage_from_dict(_load_bound_json(path))
+                    for path in args.tts_l0_candidate_state_coverage
+                ),
+                key=lambda row: row.pair_id,
+            )
+        ),
+    )
+    receipt.validate_against(materialization)
+    _write_json(args.output, stage_coverage_receipt_to_dict(receipt))
+    print(receipt.sha256)
+    return 0
+
+
+def _verify_signed_stage_coverage(args: argparse.Namespace) -> int:
+    materialization = stage_materialization_receipt_from_dict(
+        _load_bound_json(args.materialization)
+    )
+    signed = signed_stage_coverage_from_dict(_load_bound_json(args.signed_receipt))
+    control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.control_attestation)
+    )
+    policy, policy_sha256 = _candidate_dynamic_formal_policy(control)
+    payload = signed.verify(
+        materialization=materialization,
+        policy=policy,
+        expected_policy_sha256=policy_sha256,
+        now_ns=args.now_ns,
+    )
+    verified_control = _verify_single_formal_control_diagnostic(
+        control,
+        signed_artifact_sha256=signed.sha256,
+        protocol_lock_sha256=payload.protocol_lock_sha256,
+        expected_artifact_type="rank_aggregate",
+        inventory_sha256=args.inventory_sha256,
+        now_ns=args.now_ns,
+    )
+    _write_json(
+        args.output,
+        {
+            "schema_version": 1,
+            "kind": "verified_stage_coverage_receipt",
+            "stage": payload.stage,
+            "payload_sha256": payload.sha256,
+            "signed_receipt_sha256": signed.sha256,
+            "trusted_attester_policy_sha256": policy_sha256,
+            "control_envelope_sha256": verified_control.envelope_sha256,
+            "challenge_reservation_sha256": None,
+            "verification_mode": "diagnostic_only_non_consuming",
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(payload.sha256)
+    return 0
+
+
+def _publish_formal_rebuild_artifact(args: argparse.Namespace) -> int:
+    """Strictly decode and immutably publish one closed rebuild artifact."""
+
+    value = _load_bound_json(args.input)
+    handlers = {
+        "stage-source": (
+            FormalStageSourceRebuildInput.from_dict,
+            publish_formal_stage_source_rebuild_input,
+        ),
+        "serving-shard": (
+            E0ExecutionRebuildShard.from_dict,
+            publish_e0_execution_rebuild_shard,
+        ),
+        "failure-shard": (
+            E5FailureExecutionRebuildShard.from_dict,
+            publish_e5_failure_execution_rebuild_shard,
+        ),
+        "e6-recursive-dag": (
+            E6RecursiveSourceDagArtifact.from_dict,
+            publish_e6_recursive_source_dag_artifact,
+        ),
+        "e0-aggregate": (
+            E0FormalRegistryAuthorityArtifact.from_dict,
+            publish_e0_formal_registry_authority_artifact,
+        ),
+        "e0-final-result": (
+            E0FinalResultRebuildArtifact.from_dict,
+            publish_e0_final_result_rebuild_artifact,
+        ),
+    }
+    decoder, publisher = handlers[args.artifact_kind]
+    artifact = decoder(value)
+    binding = publisher(artifact, Path(args.output).resolve())
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_tts_calibration_reduction_proof(
+    args: argparse.Namespace,
+) -> int:
+    """Re-reduce all 288 TTS controls and publish the unique winner proof."""
+
+    reservation = ChallengeReplayReservationBinding.from_dict(
+        _load_bound_json(args.replay_reservation)
+    )
+    artifact = build_formal_tts_calibration_reduction_proof_artifact(
+        portable_coverage_proof_path=args.portable_coverage_proof,
+        hardware_envelope_source_path=args.hardware_envelope,
+        replay_reservation=reservation,
+        runtime_sha256=args.runtime_sha256,
+        split_sha256=args.split_sha256,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_tts_calibration_reduction_proof_artifact(
+        artifact,
+        args.output,
+        now_ns=args.now_ns,
+    )
+    rebuilt, seal = revalidate_formal_tts_calibration_reduction_proof_artifact(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if (
+        rebuilt.sha256 != artifact.expected_reduction_sha256
+        or seal.sha256 != artifact.expected_seal_payload_sha256
+    ):
+        raise AssertionError("TTS reduction proof changed after publication")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_stage_execution_shard(args: argparse.Namespace) -> int:
+    materialization = stage_materialization_receipt_from_dict(
+        _load_bound_json(args.materialization)
+    )
+    stage_source = (
+        None
+        if args.stage_source_rebuild is None
+        else FormalStageSourceRebuildInput.from_dict(
+            _load_bound_json(args.stage_source_rebuild)
+        )
+    )
+    shard = FormalStageExecutionRebuildShard(
+        schema_version=1,
+        kind=FORMAL_STAGE_EXECUTION_REBUILD_SHARD_KIND,
+        phase=args.phase,
+        materialization_receipt_sha256=materialization.sha256,
+        stage_source_rebuild_input_sha256=(
+            None if stage_source is None else stage_source.sha256
+        ),
+        descriptors=tuple(
+            FormalServingExecutionRebuildInput.from_dict(_load_bound_json(path))
+            for path in args.execution_rebuild_input
+        ),
+    )
+    binding = publish_formal_stage_execution_rebuild_shard(shard, args.output)
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_stage_prefix(args: argparse.Namespace) -> int:
+    artifact = bind_formal_stage_prefix_artifact(
+        phase=args.phase,
+        registry_verification_receipt_path=args.registry_verification_receipt,
+        formal_runtime_authority_manifest_path=(args.formal_runtime_authority_manifest),
+        inventory_path=args.inventory,
+        materialization_path=args.materialization,
+        coverage_path=args.coverage,
+        coverage_proof_path=args.coverage_proof,
+        stage_source_rebuild_path=args.stage_source_rebuild,
+        execution_rebuild_shard_paths=tuple(args.execution_rebuild_shard),
+        e1_recipe_anchor_authority_path=args.e1_recipe_anchor_authority,
+        prior_prefix_path=args.prior_prefix,
+    )
+    binding = publish_formal_stage_prefix_artifact(artifact, args.output)
+    rebuilt = load_and_rebuild_formal_stage_prefix(
+        binding.absolute_path,
+        now_ns=args.now_ns,
+    )
+    if rebuilt.artifact != artifact:
+        raise RuntimeError("published formal stage prefix changed while rebuilt")
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_scientific_source_validation(args: argparse.Namespace) -> int:
+    binding = publish_scientific_source_validation_artifact(
+        artifact_type=args.artifact_type,
+        proof_bundle_path=args.proof_bundle,
+        proof_entry_remote_absolute_path=args.proof_entry,
+        now_ns=args.now_ns,
+        output_path=args.output,
+    )
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_formal_runtime_authority_manifest(args: argparse.Namespace) -> int:
+    """Derive the closed runtime authority from source and publish O_EXCL."""
+
+    manifest = build_source_formal_runtime_authority_manifest(
+        Path(args.repository_root)
+    )
+    binding = publish_formal_runtime_authority_manifest(args.output, manifest)
+    reopened = formal_runtime_authority_manifest_from_dict(binding.reopen())
+    if reopened != manifest:
+        raise RuntimeError("formal runtime authority changed after CLI publication")
+    print(manifest.sha256)
+    return 0
+
+
+def _one_formal_operator_row(rows, *, label: str, predicate):
+    selected = tuple(row for row in rows if predicate(row))
+    if len(selected) != 1:
+        raise ValueError(f"formal stage operator requires one exact {label}")
+    return selected[0]
+
+
+def _formal_operator_e2_round(materialization) -> int:
+    rounds = {dict(cell.dimensions).get("round") for cell in materialization.cells}
+    if len(rounds) != 1:
+        raise ValueError("formal stage operator E2 materialization is not one round")
+    round_index = next(iter(rounds))
+    if type(round_index) is not int or round_index not in range(4):
+        raise ValueError("formal stage operator E2 round is invalid")
+    return round_index
+
+
+_FORMAL_OPERATOR_E4_RULE_BY_PHASE = {
+    "screen": "strength2_8_rows_x_3_loads_x_2_traffic",
+    "local": "winner_neighborhood_2pow4_x_3_loads_x_2_traffic",
+    "profiler": "three_profiler_only_rows_separate_from_headline",
+}
+
+_FORMAL_OPERATOR_PHASES = {
+    "E3a": frozenset({"selection"}),
+    "TTS-Cal": frozenset({"calibration"}),
+    "E1": frozenset({"selection"}),
+    "E2": frozenset({"round0", "round1", "round2", "round3"}),
+    "E4": frozenset(_FORMAL_OPERATOR_E4_RULE_BY_PHASE),
+    "E3b": frozenset({"pilot", "final"}),
+    "E1a": frozenset({"verification"}),
+    "E5": frozenset({"pilot", "final"}),
+    "E6": frozenset({"compatibility", "pilot", "final"}),
+    "E0": frozenset({"compatibility", "tuning", "pilot", "final"}),
+}
+
+
+def _require_formal_operator_phase(*, stage: str, phase: str) -> None:
+    if phase not in _FORMAL_OPERATOR_PHASES[stage]:
+        allowed = ",".join(sorted(_FORMAL_OPERATOR_PHASES[stage]))
+        raise ValueError(
+            f"formal stage operator phase is unsupported for {stage}; expected {allowed}"
+        )
+
+
+def _reopen_formal_operator_dag(
+    artifact: E0FormalRegistryAuthorityArtifact,
+    *,
+    registry_receipt,
+) -> E6RecursiveSourceDagArtifact:
+    binding = artifact.e6_recursive_source_dag_source
+    before = CanonicalJsonProofBinding.bind(binding.absolute_path)
+    if before != binding:
+        raise ValueError("formal stage operator recursive DAG path identity changed")
+    dag = E6RecursiveSourceDagArtifact.from_dict(before.reopen())
+    after = CanonicalJsonProofBinding.bind(binding.absolute_path)
+    if (
+        after != before
+        or dag.protocol_lock_sha256 != artifact.protocol_lock_sha256
+        or dag.registry_verification_receipt_sha256 != registry_receipt.sha256
+    ):
+        raise ValueError("formal stage operator recursive DAG lineage differs")
+    return dag
+
+
+def _load_formal_operator_e0_context(
+    args: argparse.Namespace,
+    *,
+    registry_receipt,
+):
+    if args.e0_authority_bundle is None or args.e0_materialization is None:
+        raise ValueError(
+            "formal downstream operator requires both E0 aggregate and exact "
+            "offline-signed E0 materialization"
+        )
+    signed_e0_materialization = signed_stage_materialization_from_dict(
+        _load_bound_json(args.e0_materialization)
+    )
+    if signed_e0_materialization.payload.stage != "E0":
+        raise ValueError(
+            "formal downstream operator E0 materialization has wrong stage"
+        )
+    artifact = load_e0_formal_registry_authority_artifact_index(
+        args.e0_authority_bundle,
+        registry_verification_receipt=registry_receipt,
+        materialization=signed_e0_materialization.payload,
+    )
+    bundle = load_e0_formal_registry_authority_bundle(
+        args.e0_authority_bundle,
+        registry_verification_receipt=registry_receipt,
+        materialization=signed_e0_materialization.payload,
+        now_ns=args.now_ns,
+    )
+    return (
+        signed_e0_materialization,
+        artifact,
+        _reopen_formal_operator_dag(artifact, registry_receipt=registry_receipt),
+        bundle,
+    )
+
+
+def _reopen_formal_operator_materialization(binding: CanonicalJsonProofBinding):
+    before = CanonicalJsonProofBinding.bind(binding.absolute_path)
+    if before != binding:
+        raise ValueError("formal stage operator materialization path identity changed")
+    materialization = stage_materialization_receipt_from_dict(before.reopen())
+    if CanonicalJsonProofBinding.bind(binding.absolute_path) != before:
+        raise RuntimeError("formal stage operator materialization changed while read")
+    return materialization
+
+
+def _formal_operator_upstream_pair(registry_receipt, *, stage: str):
+    materializations = tuple(
+        row.payload
+        for row in registry_receipt.cumulative_signed_materializations
+        if row.payload.stage == stage
+    )
+    if len(materializations) != 1:
+        raise ValueError(f"formal operator requires one exact {stage} materialization")
+    materialization = materializations[0]
+    coverages = tuple(
+        row.payload
+        for row in registry_receipt.cumulative_signed_coverage
+        if row.payload.stage == stage
+        and row.payload.materialization_receipt_sha256 == materialization.sha256
+    )
+    if len(coverages) != 1:
+        raise ValueError(f"formal operator requires one exact {stage} coverage")
+    return materialization, coverages[0]
+
+
+def _formal_operator_create_upstream_materialization(
+    args: argparse.Namespace,
+    *,
+    registry_receipt,
+):
+    """Create the early DAG stages directly from the durable typed prefix."""
+
+    unmeasured = GpuHourEstimate.unmeasured()
+    if args.stage == "E3a" and args.phase == "selection":
+        protocol_lock = registry_receipt.signed_protocol_lock.payload
+        preflight, preflight_coverage = _formal_operator_upstream_pair(
+            registry_receipt, stage="preflight"
+        )
+        return materialize_e3a(
+            registry_verification_receipt=registry_receipt,
+            protocol_lock=protocol_lock,
+            preflight_materialization=preflight,
+            preflight_coverage=preflight_coverage,
+            now_ns=args.now_ns,
+            gpu_hours=unmeasured,
+        )
+    if args.stage == "TTS-Cal" and args.phase == "calibration":
+        protocol_lock = registry_receipt.signed_protocol_lock.payload
+        if args.tts_calibration_authority is None:
+            raise ValueError(
+                "TTS-Cal materialization requires its typed calibration authority"
+            )
+        e3a, e3a_coverage = _formal_operator_upstream_pair(
+            registry_receipt, stage="E3a"
+        )
+        authority = tts_calibration_authority_from_dict(
+            _load_bound_json(args.tts_calibration_authority)
+        )
+        return materialize_tts_calibration(
+            registry_verification_receipt=registry_receipt,
+            protocol_lock=protocol_lock,
+            tts_calibration_authority=authority,
+            e3a_materialization=e3a,
+            e3a_coverage=e3a_coverage,
+            now_ns=args.now_ns,
+            gpu_hours=unmeasured,
+        )
+    if args.stage == "E1" and args.phase == "selection":
+        protocol_lock = registry_receipt.signed_protocol_lock.payload
+        e3a, e3a_coverage = _formal_operator_upstream_pair(
+            registry_receipt, stage="E3a"
+        )
+        calibration, calibration_coverage = _formal_operator_upstream_pair(
+            registry_receipt, stage="TTS-Cal"
+        )
+        return materialize_e1_first_slice(
+            registry_verification_receipt=registry_receipt,
+            protocol_lock=protocol_lock,
+            tts_calibration_materialization=calibration,
+            tts_calibration_coverage=calibration_coverage,
+            e3a_materialization=e3a,
+            e3a_coverage=e3a_coverage,
+            now_ns=args.now_ns,
+            gpu_hours=unmeasured,
+        )
+    return None
+
+
+def _formal_operator_materialization(
+    *,
+    stage: str,
+    phase: str,
+    registry_receipt,
+    signed_e0_materialization,
+    artifact: E0FormalRegistryAuthorityArtifact | None,
+    dag: E6RecursiveSourceDagArtifact | None,
+):
+    signed_rows = registry_receipt.cumulative_signed_materializations
+    if stage == "E0" and phase == "final":
+        if signed_e0_materialization is None:
+            raise ValueError("formal E0 final materialization wrapper is missing")
+        return signed_e0_materialization.payload
+    if stage == "E0" and phase in {"tuning", "pilot"}:
+        if artifact is None:
+            raise ValueError("formal E0 aggregate is missing")
+        binding = (
+            artifact.e0_tuning_materialization_source
+            if phase == "tuning"
+            else artifact.e0_pilot_materialization_source
+        )
+        return _reopen_formal_operator_materialization(binding)
+    if stage in {"E3b", "E5", "E6"} and phase == "pilot":
+        if dag is None:
+            raise ValueError("formal recursive DAG is missing")
+        node_id = {"E3b": "e3b_pilot", "E5": "e5_pilot", "E6": "e6_pilot"}[stage]
+        node = _one_formal_operator_row(
+            dag.nodes,
+            label=f"{node_id} DAG node",
+            predicate=lambda row: row.node_id == node_id,
+        )
+        return _reopen_formal_operator_materialization(node.materialization_source)
+    if phase in {"compatibility"}:
+        raise ValueError(f"formal {stage} compatibility is not a materialization phase")
+    if stage == "E2":
+        round_index = int(phase.removeprefix("round"))
+        signed = _one_formal_operator_row(
+            signed_rows,
+            label=f"E2 round {round_index} materialization",
+            predicate=lambda row: (
+                row.payload.stage == "E2"
+                and _formal_operator_e2_round(row.payload) == round_index
+            ),
+        )
+        return signed.payload
+    if stage == "E4":
+        signed = _one_formal_operator_row(
+            signed_rows,
+            label=f"E4 {phase} materialization",
+            predicate=lambda row: (
+                row.payload.stage == "E4"
+                and row.payload.materialization_rule
+                == _FORMAL_OPERATOR_E4_RULE_BY_PHASE[phase]
+            ),
+        )
+        return signed.payload
+    signed = _one_formal_operator_row(
+        signed_rows,
+        label=f"{stage} materialization",
+        predicate=lambda row: row.payload.stage == stage,
+    )
+    return signed.payload
+
+
+def _formal_operator_signed_sources(
+    *,
+    stage: str,
+    phase: str,
+    registry_receipt,
+    artifact: E0FormalRegistryAuthorityArtifact | None,
+    dag: E6RecursiveSourceDagArtifact | None,
+):
+    if stage == "E3a":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e3a_staged_selections,
+            label="signed E3a selection",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_e3a_staged_selection_to_dict),)
+    if stage == "TTS-Cal":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_tts_calibration_seals,
+            label="signed TTS calibration seal",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_tts_calibration_seal_to_dict),)
+    if stage == "E1":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e1_survivor_selections,
+            label="signed E1 survivor selection",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_e1_survivor_selection_to_dict),)
+    if stage == "E2":
+        round_index = int(phase.removeprefix("round"))
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e2_staged_selections,
+            label=f"signed E2 round {round_index} selection",
+            predicate=lambda item: item.payload.round_index == round_index,
+        )
+        return ((row, signed_e2_staged_selection_to_dict),)
+    if stage == "E4":
+        if phase == "profiler":
+            raise ValueError("formal E4 profiler has no registered reducer/sign result")
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e4_stage_selections,
+            label=f"signed E4 {phase} selection",
+            predicate=lambda item: item.payload.phase == phase,
+        )
+        return ((row, signed_e4_stage_selection_to_dict),)
+    if stage == "E3b" and phase == "pilot":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e3b_power_prefixes,
+            label="signed E3b power prefix",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_e3b_power_prefix_to_dict),)
+    if stage == "E5" and phase == "pilot":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e5_power_and_anchor_prefixes,
+            label="signed E5 power/anchor prefix",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_e5_power_and_anchor_to_dict),)
+    if stage == "E6" and phase == "pilot":
+        row = _one_formal_operator_row(
+            registry_receipt.cumulative_signed_e6_power_prefixes,
+            label="signed E6 power prefix",
+            predicate=lambda _row: True,
+        )
+        return ((row, signed_e6_power_prefix_to_dict),)
+    if artifact is None or dag is None:
+        raise ValueError("formal downstream signed source requires the E0 aggregate")
+    if stage == "E3b" and phase == "final":
+        return ((dag.signed_e3b_confirmation, signed_e3b_confirmation_to_dict),)
+    if stage == "E1a":
+        return ((dag.signed_e1a_verification, signed_e1a_verification_to_dict),)
+    if stage == "E5" and phase == "final":
+        return ((dag.signed_e5_confirmation, signed_e5_confirmation_to_dict),)
+    if stage == "E6" and phase == "compatibility":
+        return (
+            (
+                artifact.signed_e6_model_compatibility,
+                signed_e6_model_compatibility_to_dict,
+            ),
+        )
+    if stage == "E6" and phase == "final":
+        return ((artifact.signed_e6_confirmation, signed_e6_confirmation_to_dict),)
+    if stage == "E0" and phase == "compatibility":
+        return ((artifact.signed_e0_compatibility, signed_e0_compatibility_to_dict),)
+    if stage == "E0" and phase == "tuning":
+        return tuple(
+            (row, signed_e0_onlinespec_tuning_seal_to_dict)
+            for row in artifact.signed_e0_tuning_seals
+        )
+    if stage == "E0" and phase == "pilot":
+        return ((artifact.signed_e0_power_prefix, signed_e0_power_prefix_to_dict),)
+    if stage == "E0" and phase == "final":
+        raise ValueError("formal E0 final result requires its proof-rebuild artifact")
+    raise AssertionError((stage, phase))
+
+
+def _formal_operator_reduce_completion(
+    args: argparse.Namespace,
+    *,
+    registry_receipt,
+):
+    """Run one proof-derived completion reducer, never a result replay."""
+
+    if args.stage == "E4" and args.phase == "profiler":
+        materialization = _formal_operator_materialization(
+            stage=args.stage,
+            phase=args.phase,
+            registry_receipt=registry_receipt,
+            signed_e0_materialization=None,
+            artifact=None,
+            dag=None,
+        )
+        receipt = reduce_e4_profiler_completion_from_registry(
+            registry_verification_receipt=registry_receipt,
+            materialization=materialization,
+            now_ns=args.now_ns,
+        )
+        return receipt, e4_profiler_completion_receipt_to_dict
+    if args.stage == "E0" and args.phase == "final":
+        if args.result_rebuild_artifact is None:
+            raise ValueError(
+                "formal E0 final reducer requires a proof-rebuild artifact"
+            )
+        receipt = reduce_e0_final_completion_from_artifact(
+            args.result_rebuild_artifact,
+            now_ns=args.now_ns,
+        )
+        if receipt.current_registry_verification_receipt_sha256 != (
+            registry_receipt.sha256
+        ):
+            raise ValueError("formal E0 final reducer used a foreign registry prefix")
+        return receipt, e0_final_completion_receipt_to_dict
+    return None
+
+
+def _formal_operator_verify_completion_signature(
+    args: argparse.Namespace,
+    *,
+    registry_receipt,
+):
+    """Deep-reduce then verify one existing offline-signed completion."""
+
+    if args.signed_stage_result is None:
+        raise ValueError("formal completion sign verification requires signed result")
+    policy = registry_receipt.trusted_release_policy(current_ns=args.now_ns)
+    expected_policy_sha256 = policy.sha256
+    if args.stage == "E4" and args.phase == "profiler":
+        materialization = _formal_operator_materialization(
+            stage=args.stage,
+            phase=args.phase,
+            registry_receipt=registry_receipt,
+            signed_e0_materialization=None,
+            artifact=None,
+            dag=None,
+        )
+        signed = signed_e4_profiler_completion_from_dict(
+            _load_bound_json(args.signed_stage_result)
+        )
+        signed.verify(
+            registry_verification_receipt=registry_receipt,
+            materialization=materialization,
+            policy=policy,
+            expected_policy_sha256=expected_policy_sha256,
+            now_ns=args.now_ns,
+        )
+        return signed, signed_e4_profiler_completion_to_dict
+    if args.stage == "E0" and args.phase == "final":
+        if args.result_rebuild_artifact is None:
+            raise ValueError(
+                "formal E0 final signature verification requires proof-rebuild artifact"
+            )
+        signed = signed_e0_final_completion_from_dict(
+            _load_bound_json(args.signed_stage_result)
+        )
+        payload = signed.verify(
+            rebuild_artifact_path=args.result_rebuild_artifact,
+            policy=policy,
+            expected_policy_sha256=expected_policy_sha256,
+            now_ns=args.now_ns,
+        )
+        if payload.current_registry_verification_receipt_sha256 != (
+            registry_receipt.sha256
+        ):
+            raise ValueError(
+                "formal E0 final signed result used a foreign registry prefix"
+            )
+        return signed, signed_e0_final_completion_to_dict
+    return None
+
+
+def _formal_prefix_requested_operation(
+    args: argparse.Namespace,
+    *,
+    registry_receipt,
+):
+    """Replay one sequential E1/E2/E4 operation from its current-only prefix."""
+
+    path = getattr(args, "stage_prefix_artifact", None)
+    if path is None:
+        return None
+    prefix = load_and_rebuild_formal_stage_prefix(path, now_ns=args.now_ns)
+    current = {
+        "e1_selection": ("E1", "selection"),
+        "e2_round0": ("E2", "round0"),
+        "e2_round1": ("E2", "round1"),
+        "e2_round2": ("E2", "round2"),
+        "e2_round3": ("E2", "round3"),
+        "e4_screen": ("E4", "screen"),
+        "e4_local": ("E4", "local"),
+        "e4_profiler": ("E4", "profiler"),
+    }[prefix.artifact.phase]
+    if args.operation == "materialize":
+        successor = {
+            "e1_selection": ("E2", "round0"),
+            "e2_round0": ("E2", "round1"),
+            "e2_round1": ("E2", "round2"),
+            "e2_round2": ("E2", "round3"),
+            "e2_round3": ("E4", "screen"),
+            "e4_screen": ("E4", "local"),
+            "e4_local": ("E4", "profiler"),
+            "e4_profiler": ("E3b", "pilot"),
+        }.get(prefix.artifact.phase)
+        if successor is None or (args.stage, args.phase) != successor:
+            raise ValueError("formal stage prefix is not the requested DAG predecessor")
+        if prefix.artifact.phase == "e4_profiler":
+            prior = prefix.prior
+            if prior is None or prior.artifact.phase != "e4_local":
+                raise ValueError("formal E3b pilot lacks its immediate E4 local prefix")
+            signed_e4 = _one_formal_operator_row(
+                registry_receipt.cumulative_signed_e4_stage_selections,
+                label="signed E4 local selection",
+                predicate=lambda row: (
+                    row.payload.phase == "local"
+                    and row.payload.materialization_receipt_sha256
+                    == prior.materialization.sha256
+                    and row.payload.coverage_receipt_sha256 == prior.coverage.sha256
+                ),
+            )
+            tts = _one_formal_operator_row(
+                registry_receipt.cumulative_tts_calibration_authorities,
+                label="frozen TTS authority",
+                predicate=lambda _row: True,
+            )
+            signed_tts = _one_formal_operator_row(
+                registry_receipt.cumulative_signed_tts_calibration_seals,
+                label="signed frozen TTS seal",
+                predicate=lambda _row: True,
+            )
+            if prior.evidence_manifest is None:
+                raise ValueError("formal E3b pilot lacks proof-derived E4 evidence")
+            materialization = materialize_e3b_excluded_pilots(
+                registry_verification_receipt=registry_receipt,
+                signed_e4_final_selection=signed_e4,
+                local_materialization=prior.materialization,
+                local_coverage=prior.coverage,
+                local_evidence_manifest=prior.evidence_manifest,
+                local_execution_bindings=prior.execution_bindings,
+                profiler_materialization=prefix.materialization,
+                profiler_coverage=prefix.coverage,
+                tts_calibration_authority=tts,
+                signed_tts_calibration_seal=signed_tts,
+                now_ns=args.now_ns,
+            )
+        else:
+            materialization = materialize_next_formal_stage_from_prefix(
+                prefix,
+                registry_verification_receipt=registry_receipt,
+                now_ns=args.now_ns,
+            )
+        return "materialization", materialization
+    if (args.stage, args.phase) != current:
+        raise ValueError("formal stage prefix is not the requested reducer phase")
+    if prefix.artifact.phase == "e4_profiler":
+        raise ValueError(
+            "formal E4 profiler completion is reduced only after registry append"
+        )
+    if registry_receipt.sha256 != prefix.registry_verification_receipt.sha256:
+        raise ValueError("formal reducer registry differs from its bound prefix")
+    if args.operation == "reduce":
+        return "reduction", reduce_formal_stage_prefix(prefix, now_ns=args.now_ns)
+    if args.signed_stage_result is None:
+        raise ValueError("formal prefix sign verification requires signed result")
+    if prefix.artifact.phase == "e1_selection":
+        artifact_type = "e1-survivor-selection"
+        decoder = signed_e1_survivor_selection_from_dict
+    elif prefix.artifact.phase.startswith("e2_round"):
+        artifact_type = "e2-staged-selection"
+        decoder = signed_e2_staged_selection_from_dict
+    else:
+        artifact_type = "e4-stage-selection"
+        decoder = signed_e4_stage_selection_from_dict
+    signed = _load_formal_scientific_signed_path(
+        args.signed_stage_result,
+        artifact_type=artifact_type,
+        decoder=decoder,
+        now_ns=args.now_ns,
+    )
+    verify_signed_formal_stage_prefix_result(prefix, signed, now_ns=args.now_ns)
+    return "signature", signed
+
+
+def _formal_prefix_payload_json(value: object) -> dict[str, object]:
+    normalized = json.loads(json.dumps(asdict(value), sort_keys=True))
+    if type(normalized) is not dict:
+        raise TypeError("formal prefix reducer payload is not a JSON object")
+    return normalized
+
+
+def _formal_stage_operation(args: argparse.Namespace) -> int:
+    """Replay one closed stage operation from durable public signed inputs.
+
+    ``sign`` validates and exports an existing offline-signed wrapper.  It never
+    loads a private key or mints a new scientific authority.
+    """
+
+    _require_formal_operator_phase(stage=args.stage, phase=args.phase)
+    registry_receipt = _load_formal_registry_receipt_path(
+        args.registry_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    completion_operation = (args.stage, args.phase) in {
+        ("E4", "profiler"),
+        ("E0", "final"),
+    } and args.operation in {"reduce", "sign"}
+    needs_e0_context = (
+        args.stage in {"E3b", "E1a", "E5", "E6", "E0"}
+        and getattr(args, "stage_prefix_artifact", None) is None
+        and not (args.stage == "E0" and args.phase == "final" and completion_operation)
+    )
+    signed_e0_materialization = artifact = dag = authority_bundle = None
+    if needs_e0_context or args.e0_authority_bundle is not None:
+        (
+            signed_e0_materialization,
+            artifact,
+            dag,
+            authority_bundle,
+        ) = _load_formal_operator_e0_context(
+            args,
+            registry_receipt=registry_receipt,
+        )
+    elif args.e0_materialization is not None:
+        raise ValueError("E0 materialization cannot be supplied without its aggregate")
+
+    artifacts: list[dict[str, object]] = []
+    recursively_reduced = authority_bundle is not None
+    prefix_operation = _formal_prefix_requested_operation(
+        args,
+        registry_receipt=registry_receipt,
+    )
+    created_upstream = (
+        _formal_operator_create_upstream_materialization(
+            args,
+            registry_receipt=registry_receipt,
+        )
+        if args.operation == "materialize"
+        else None
+    )
+    if (
+        args.operation == "materialize"
+        and not recursively_reduced
+        and created_upstream is None
+        and prefix_operation is None
+    ):
+        raise ValueError(
+            "formal materialization is NON_OPERATOR_BLOCKED without a typed "
+            "source-rebuild authority"
+        )
+    if args.operation == "materialize":
+        materialization = (
+            prefix_operation[1]
+            if prefix_operation is not None
+            else created_upstream
+            if created_upstream is not None
+            else _formal_operator_materialization(
+                stage=args.stage,
+                phase=args.phase,
+                registry_receipt=registry_receipt,
+                signed_e0_materialization=signed_e0_materialization,
+                artifact=artifact,
+                dag=dag,
+            )
+        )
+        artifacts.append(
+            {
+                "artifact_kind": "stage_materialization_receipt",
+                "artifact_sha256": materialization.sha256,
+                "value": stage_materialization_receipt_to_dict(materialization),
+            }
+        )
+    elif prefix_operation is not None and prefix_operation[0] == "reduction":
+        reduced = prefix_operation[1]
+        artifacts.append(
+            {
+                "artifact_kind": "proof_derived_stage_selection_receipt",
+                "artifact_sha256": reduced.sha256,
+                "value": _formal_prefix_payload_json(reduced),
+            }
+        )
+    elif prefix_operation is not None and prefix_operation[0] == "signature":
+        signed = prefix_operation[1]
+        if args.stage == "E1":
+            encoded = signed_e1_survivor_selection_to_dict(signed)
+        elif args.stage == "E2":
+            encoded = signed_e2_staged_selection_to_dict(signed)
+        else:
+            encoded = signed_e4_stage_selection_to_dict(signed)
+        artifacts.append(
+            {
+                "artifact_kind": "verified_offline_signed_stage_selection",
+                "artifact_sha256": signed.sha256,
+                "value": encoded,
+            }
+        )
+    elif completion_operation and args.operation == "reduce":
+        reduced = _formal_operator_reduce_completion(
+            args,
+            registry_receipt=registry_receipt,
+        )
+        if reduced is None:
+            raise AssertionError((args.stage, args.phase))
+        receipt, codec = reduced
+        artifacts.append(
+            {
+                "artifact_kind": "proof_derived_completion_receipt",
+                "artifact_sha256": receipt.sha256,
+                "value": codec(receipt),
+            }
+        )
+        if args.stage == "E0" and args.phase == "final":
+            staged_registry = build_industrial_registry()
+            fdr = reduce_formal_e0_breadth_fdr_from_artifact(
+                staged_registry,
+                args.result_rebuild_artifact,
+                now_ns=args.now_ns,
+            )
+            artifacts.append(
+                {
+                    "artifact_kind": "proof_derived_e0_breadth_fdr_receipt",
+                    "artifact_sha256": fdr.sha256,
+                    "value": formal_e0_breadth_fdr_receipt_to_dict(fdr),
+                }
+            )
+    elif completion_operation and args.operation == "sign":
+        verified = _formal_operator_verify_completion_signature(
+            args,
+            registry_receipt=registry_receipt,
+        )
+        if verified is None:
+            raise AssertionError((args.stage, args.phase))
+        signed, codec = verified
+        artifacts.append(
+            {
+                "artifact_kind": "verified_offline_signed_completion",
+                "artifact_sha256": signed.sha256,
+                "value": codec(signed),
+            }
+        )
+        if args.stage == "E0" and args.phase == "final":
+            signed_fdr_path = getattr(args, "signed_e0_fdr_result", None)
+            if signed_fdr_path is None:
+                raise ValueError(
+                    "formal E0 final signature verification requires its signed FDR"
+                )
+            signed_fdr = signed_formal_e0_breadth_fdr_from_dict(
+                _load_bound_json(signed_fdr_path)
+            )
+            policy = registry_receipt.trusted_release_policy(current_ns=args.now_ns)
+            signed_fdr.verify(
+                registry=build_industrial_registry(),
+                final_result_rebuild_artifact_path=args.result_rebuild_artifact,
+                policy=policy,
+                expected_policy_sha256=policy.sha256,
+                now_ns=args.now_ns,
+            )
+            artifacts.append(
+                {
+                    "artifact_kind": "verified_offline_signed_e0_breadth_fdr",
+                    "artifact_sha256": signed_fdr.sha256,
+                    "value": signed_formal_e0_breadth_fdr_to_dict(signed_fdr),
+                }
+            )
+    elif recursively_reduced:
+        sources = _formal_operator_signed_sources(
+            stage=args.stage,
+            phase=args.phase,
+            registry_receipt=registry_receipt,
+            artifact=artifact,
+            dag=dag,
+        )
+        for signed, codec in sources:
+            signed_value = codec(signed)
+            artifacts.append(
+                {
+                    "artifact_kind": (
+                        "offline_signed_source_authority"
+                        if args.operation == "sign"
+                        else "reducer_source_payload"
+                    ),
+                    "artifact_sha256": (
+                        signed.sha256
+                        if args.operation == "sign"
+                        else signed.payload.sha256
+                    ),
+                    "value": (
+                        signed_value
+                        if args.operation == "sign"
+                        else signed_value["payload"]
+                    ),
+                }
+            )
+    else:
+        raise ValueError(
+            "formal stage operation is NON_OPERATOR_BLOCKED without a typed "
+            "proof-rebuild authority"
+        )
+    status = (
+        "PROOF_MATERIALIZED"
+        if args.operation == "materialize"
+        and (
+            recursively_reduced
+            or created_upstream is not None
+            or prefix_operation is not None
+        )
+        else "NON_OPERATOR_BLOCKED"
+        if args.operation == "materialize"
+        else "PROOF_REDUCED"
+        if completion_operation and args.operation == "reduce"
+        else "OFFLINE_SIGNATURE_VERIFIED"
+        if completion_operation and args.operation == "sign"
+        else "OFFLINE_SIGNATURE_VERIFIED"
+        if args.operation == "sign"
+        and (recursively_reduced or prefix_operation is not None)
+        else "PROOF_REDUCED"
+        if args.operation == "reduce"
+        and (recursively_reduced or prefix_operation is not None)
+        else "NON_OPERATOR_BLOCKED"
+    )
+    result = {
+        "schema_version": 1,
+        "kind": "lightcone_formal_stage_operator_result",
+        "operation": args.operation,
+        "stage": args.stage,
+        "phase": args.phase,
+        "registry_verification_receipt_sha256": registry_receipt.sha256,
+        "e0_authority_artifact_sha256": (None if artifact is None else artifact.sha256),
+        "verification_mode": "public_recursive_replay_no_private_key",
+        "formal_dispatch_authorized": False,
+        "status": status,
+        "artifacts": artifacts,
+    }
+    _write_json(args.output, result)
+    print(_canonical_sha256(result))
+    return 0
+
+
+def _load_formal_registry_power_sources(
+    args: argparse.Namespace,
+) -> tuple[tuple[object, ...], tuple[object, ...], tuple[object, ...]]:
+    """Strictly decode the three source-owned downstream power authorities."""
+
+    return (
+        tuple(
+            signed_e3b_power_prefix_from_dict(_load_bound_json(path))
+            for path in getattr(args, "signed_e3b_power_prefix", ())
+        ),
+        tuple(
+            signed_e5_power_and_anchor_from_dict(_load_bound_json(path))
+            for path in getattr(args, "signed_e5_power_and_anchor_prefix", ())
+        ),
+        tuple(
+            signed_e6_power_prefix_from_dict(_load_bound_json(path))
+            for path in getattr(args, "signed_e6_power_prefix", ())
+        ),
+    )
+
+
+def _assemble_formal_registry(args: argparse.Namespace) -> int:
+    raise ValueError(
+        "assemble-formal-registry-manifest is NON_OPERATOR_BLOCKED; use the "
+        "proof-replay root reservation and schema-5 registry layer"
+    )
+    lock = signed_protocol_lock_from_dict(  # pragma: no cover - blocked legacy body
+        _load_bound_json(args.signed_protocol_lock)
+    )
+    materializations = tuple(
+        signed_stage_materialization_from_dict(_load_bound_json(path))
+        for path in args.signed_materialization
+    )
+    coverage = tuple(
+        signed_stage_coverage_from_dict(_load_bound_json(path))
+        for path in args.signed_coverage
+    )
+    controls = tuple(
+        ControlArtifactAttestation.from_dict(_load_bound_json(path))
+        for path in args.control_attestation
+    )
+    candidate_replay_proof_artifact_paths = tuple(
+        args.candidate_state_replay_proof_artifact
+    )
+    e3b_power, e5_power_and_anchor, e6_power = _load_formal_registry_power_sources(args)
+    manifest = assemble_and_reserve_formal_registry_manifest(
+        lock,
+        signed_materializations=materializations,
+        signed_coverage=coverage,
+        tts_calibration_authorities=tuple(
+            tts_calibration_authority_from_dict(_load_bound_json(path))
+            for path in getattr(args, "tts_calibration_authority", ())
+        ),
+        signed_tts_calibration_seals=tuple(
+            signed_tts_calibration_seal_from_dict(_load_bound_json(path))
+            for path in getattr(args, "signed_tts_calibration_seal", ())
+        ),
+        signed_e3b_power_prefixes=e3b_power,
+        signed_e5_power_and_anchor_prefixes=e5_power_and_anchor,
+        signed_e6_power_prefixes=e6_power,
+        control_attestations=controls,
+        candidate_replay_proof_artifact_paths=(candidate_replay_proof_artifact_paths),
+        expected_inventory_sha256=args.inventory_sha256,
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+    )
+    _write_json(args.output, manifest.to_dict())
+    print(manifest.sha256)
+    return 0
+
+
+def _reserve_formal_registry_verification(args: argparse.Namespace) -> int:
+    """Consume the immutable ProtocolLock control exactly once."""
+
+    signed_lock = _load_formal_scientific_signed_path(
+        args.signed_protocol_lock,
+        artifact_type="protocol-lock",
+        decoder=signed_protocol_lock_from_dict,
+        now_ns=args.now_ns,
+    )
+    receipt = reserve_formal_registry_verification_receipt(
+        signed_lock,
+        control_attestation=ControlArtifactAttestation.from_dict(
+            _load_bound_json(args.control_attestation)
+        ),
+        expected_inventory_sha256=args.inventory_sha256,
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+    )
+    layer = bind_formal_registry_layer_artifact(
+        receipt,
+        prior_layer_path=None,
+        signed_protocol_lock_path=args.signed_protocol_lock,
+        signed_materialization_paths=(),
+        signed_coverage_paths=(),
+        formal_stage_prefix_paths=(),
+    )
+    publish_formal_registry_layer_artifact(layer, args.output)
+    print(receipt.sha256)
+    return 0
+
+
+def _extend_formal_registry_verification(args: argparse.Namespace) -> int:
+    """Atomically append newly signed rows to a durable registry prefix."""
+
+    prior_receipt = _load_formal_registry_receipt_path(
+        args.prior_receipt,
+        now_ns=args.now_ns,
+    )
+    materializations = tuple(
+        load_formal_signed_materialization_path(path, now_ns=args.now_ns)
+        for path in args.signed_materialization
+    )
+    prefix_paths = tuple(getattr(args, "formal_stage_prefix_artifact", ()))
+    legacy_e2_evidence = tuple(getattr(args, "e2_staged_evidence_manifest", ()))
+    legacy_e4_evidence = tuple(getattr(args, "e4_staged_evidence_manifest", ()))
+    if legacy_e2_evidence or legacy_e4_evidence:
+        raise ValueError(
+            "formal registry evidence is derived from stage-prefix proof shards"
+        )
+    rebuilt_prefixes = tuple(
+        load_and_rebuild_formal_stage_prefix(path, now_ns=args.now_ns)
+        for path in prefix_paths
+    )
+    e2_evidence = tuple(
+        row.evidence_manifest
+        for row in rebuilt_prefixes
+        if row.artifact.phase.startswith("e2_round")
+    )
+    e4_evidence = tuple(
+        row.evidence_manifest
+        for row in rebuilt_prefixes
+        if row.artifact.phase in {"e4_screen", "e4_local"}
+    )
+    if any(row is None for row in (*e2_evidence, *e4_evidence)):
+        raise ValueError("formal registry stage prefix lacks reducer evidence")
+    coverages = tuple(
+        load_formal_signed_coverage_path(
+            path,
+            formal_stage_prefix_paths=prefix_paths,
+            now_ns=args.now_ns,
+        )
+        for path in args.signed_coverage
+    )
+    e0_materializations = tuple(
+        row.payload for row in materializations if row.payload.stage == "E0"
+    )
+    e0_artifact_paths = tuple(getattr(args, "e0_authority_bundle", ()))
+    if e0_artifact_paths and (
+        len(e0_artifact_paths) != 1 or len(e0_materializations) != 1
+    ):
+        raise ValueError(
+            "E0 CLI append requires one bundle and one exact E0 materialization"
+        )
+    e0_bundles = tuple(
+        load_e0_formal_registry_authority_bundle(
+            path,
+            registry_verification_receipt=prior_receipt,
+            materialization=e0_materializations[0],
+            now_ns=args.now_ns,
+        )
+        for path in e0_artifact_paths
+    )
+    e3b_power, e5_power_and_anchor, e6_power = _load_formal_registry_power_sources(args)
+    e3a_proof_paths = tuple(getattr(args, "e3a_staged_selection_proof", ()))
+    e3a_reductions = tuple(
+        revalidate_formal_e3a_staged_selection_proof_artifact(
+            path,
+            now_ns=args.now_ns,
+        )
+        for path in e3a_proof_paths
+    )
+    signed_e3a_paths = tuple(getattr(args, "signed_e3a_staged_selection", ()))
+    signed_e3a = tuple(
+        _load_formal_scientific_signed_path(
+            path,
+            artifact_type="e3a-staged-selection",
+            decoder=signed_e3a_staged_selection_from_dict,
+            now_ns=args.now_ns,
+        )
+        for path in signed_e3a_paths
+    )
+    receipt = extend_formal_registry_verification_receipt(
+        prior_receipt,
+        appended_signed_materializations=materializations,
+        appended_signed_coverage=coverages,
+        appended_e3a_staged_selection_artifacts=tuple(
+            artifact for artifact, _receipt in e3a_reductions
+        ),
+        appended_signed_e3a_staged_selections=signed_e3a,
+        appended_e2_staged_evidence_manifests=e2_evidence,
+        appended_signed_e2_staged_selections=tuple(
+            _load_formal_scientific_signed_path(
+                path,
+                artifact_type="e2-staged-selection",
+                decoder=signed_e2_staged_selection_from_dict,
+                now_ns=args.now_ns,
+            )
+            for path in getattr(args, "signed_e2_staged_selection", ())
+        ),
+        appended_signed_e1_survivor_selections=tuple(
+            _load_formal_scientific_signed_path(
+                path,
+                artifact_type="e1-survivor-selection",
+                decoder=signed_e1_survivor_selection_from_dict,
+                now_ns=args.now_ns,
+            )
+            for path in getattr(args, "signed_e1_survivor_selection", ())
+        ),
+        appended_e4_staged_evidence_manifests=e4_evidence,
+        appended_signed_e4_stage_selections=tuple(
+            _load_formal_scientific_signed_path(
+                path,
+                artifact_type="e4-stage-selection",
+                decoder=signed_e4_stage_selection_from_dict,
+                now_ns=args.now_ns,
+            )
+            for path in getattr(args, "signed_e4_stage_selection", ())
+        ),
+        appended_tts_calibration_authorities=tuple(
+            tts_calibration_authority_from_dict(_load_bound_json(path))
+            for path in getattr(args, "tts_calibration_authority", ())
+        ),
+        appended_signed_tts_calibration_seals=tuple(
+            signed_tts_calibration_seal_from_dict(_load_bound_json(path))
+            for path in getattr(args, "signed_tts_calibration_seal", ())
+        ),
+        appended_signed_e3b_power_prefixes=e3b_power,
+        appended_signed_e5_power_and_anchor_prefixes=e5_power_and_anchor,
+        appended_signed_e6_power_prefixes=e6_power,
+        appended_e0_authority_bundles=e0_bundles,
+        formal_stage_prefix_artifact_paths=prefix_paths,
+        control_attestations=tuple(
+            ControlArtifactAttestation.from_dict(_load_bound_json(path))
+            for path in args.control_attestation
+        ),
+        candidate_replay_proof_artifact_paths=tuple(
+            args.candidate_state_replay_proof_artifact
+        ),
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+    )
+    replay_proof_paths = tuple(args.candidate_state_replay_proof_artifact)
+    replay_shard_count = (len(replay_proof_paths) + 255) // 256
+    layer_output = Path(args.output)
+    replay_shard_paths = tuple(
+        layer_output.with_name(f"{layer_output.stem}.candidate-replay-{index:04d}.json")
+        for index in range(replay_shard_count)
+    )
+    publish_formal_registry_replay_proof_shards(
+        receipt,
+        prior_receipt=prior_receipt,
+        candidate_replay_proof_paths=replay_proof_paths,
+        shard_output_paths=replay_shard_paths,
+    )
+    layer = bind_formal_registry_layer_artifact(
+        receipt,
+        prior_layer_path=args.prior_receipt,
+        signed_materialization_paths=tuple(args.signed_materialization),
+        signed_coverage_paths=tuple(args.signed_coverage),
+        formal_stage_prefix_paths=prefix_paths,
+        candidate_replay_proof_shard_paths=replay_shard_paths,
+        tts_calibration_reduction_proof_paths=tuple(
+            getattr(args, "tts_calibration_reduction_proof", ())
+        ),
+        e3a_staged_selection_proof_paths=e3a_proof_paths,
+        signed_e3a_staged_selection_paths=signed_e3a_paths,
+    )
+    publish_formal_registry_layer_artifact(layer, args.output)
+    print(receipt.sha256)
+    return 0
+
+
+def _verify_formal_registry_verification(args: argparse.Namespace) -> int:
+    """Deep-reopen a durable receipt without consuming another challenge."""
+
+    receipt = _load_formal_registry_receipt_path(
+        args.receipt,
+        now_ns=args.now_ns,
+    )
+    manifest = receipt.manifest
+    _write_json(
+        args.output,
+        {
+            "schema_version": 1,
+            "kind": "verified_formal_registry_verification_receipt",
+            "receipt_sha256": receipt.sha256,
+            "manifest_sha256": manifest.sha256,
+            "status": manifest.status,
+            "verification_mode": "diagnostic_only_non_consuming",
+            "formal_dispatch_authorized": False,
+        },
+    )
+    print(receipt.sha256)
+    return 0
+
+
+def _authorize_formal_preflight_dispatch_cli(args: argparse.Namespace) -> int:
+    """Atomically authorize and persist the exact ten-cell preflight token."""
+
+    from lightcone_spec.experiments.budget_authority import (
+        replay_budget_activation_authority,
+    )
+    from lightcone_spec.experiments.formal_dispatch import (
+        authorize_formal_preflight_dispatch,
+        publish_formal_preflight_dispatch_receipt,
+    )
+    from lightcone_spec.experiments.gpu_pool import GpuDispatchExecutionContext
+
+    registry_receipt = _load_formal_registry_receipt_path(
+        args.registry_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    signed_materialization = signed_stage_materialization_from_dict(
+        _load_bound_json(args.signed_materialization)
+    )
+    inventory = _load_gpu_inventory(args.inventory)
+    activation = registry_stage_activation_from_dict(
+        _load_bound_json(args.stage_activation)
+    )
+    budget_plan = budget_plan_from_dict(_load_bound_json(args.budget_plan))
+    budget_authority = budget_materialization_authority_binding_from_dict(
+        _load_bound_json(args.budget_authority)
+    )
+    replay = replay_budget_activation_authority(budget_authority.activation)
+    if (
+        replay.activation_artifact != activation
+        or replay.family_activations
+        or replay.family_power_reductions
+        or replay.stage_family_authorities
+        or replay.auxiliary_authority is not None
+    ):
+        raise ValueError(
+            "formal preflight budget authority is not the exact stage activation"
+        )
+    registry = build_industrial_registry()
+    bootstrap = materialize_interference_calibration_bootstrap_authority(
+        registry,
+        inventory,
+        activation,
+    )
+    context = GpuDispatchExecutionContext(
+        registry=registry,
+        inventory=inventory,
+        interference_envelope=bootstrap.bootstrap_envelope,
+        budgets=budget_plan.diagnostic_budgets,
+        receipts=replay.dependency_receipts,
+        activation_artifact=activation,
+        budget_plan=budget_plan,
+        budget_materialization_authority=budget_authority,
+        interference_calibration_bootstrap_authority=bootstrap,
+    )
+    dispatch_plan = GpuDispatchPlan.from_dict(
+        _load_bound_json(args.dispatch_plan),
+        planning_context=context,
+    )
+    capacity_schedule = StageCapacitySchedule.from_dict(
+        _load_bound_json(args.capacity_schedule)
+    )
+    capacity_gate = StageCapacityGate.from_dict(_load_bound_json(args.capacity_gate))
+    capacity_control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.capacity_control)
+    )
+    dispatch_control = ControlArtifactAttestation.from_dict(
+        _load_bound_json(args.dispatch_control)
+    )
+    replay_store = ChallengeReplayStore(args.control_replay_store)
+    token = authorize_formal_preflight_dispatch(
+        registry_receipt,
+        signed_materialization=signed_materialization,
+        capacity_control_attestation=capacity_control,
+        dispatch_control_attestation=dispatch_control,
+        dispatch_context=context,
+        dispatch_plan=dispatch_plan,
+        capacity_schedule=capacity_schedule,
+        capacity_gate=capacity_gate,
+        replay_store=replay_store,
+        now_ns=args.now_ns,
+    )
+    binding = publish_formal_preflight_dispatch_receipt(
+        token,
+        registry_verification_receipt=registry_receipt,
+        signed_materialization=signed_materialization,
+        capacity_schedule=capacity_schedule,
+        capacity_gate=capacity_gate,
+        capacity_control_attestation=capacity_control,
+        dispatch_control_attestation=dispatch_control,
+        replay_store=replay_store,
+        verified_ns=args.now_ns,
+        output_path=args.output,
+    )
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_preflight_dispatch_authorization_result",
+                "status": "AUTHORIZED",
+                "dispatch_sha256": token.sha256,
+                "receipt_raw_sha256": binding.raw_sha256,
+                "receipt_semantic_sha256": binding.semantic_sha256,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _publish_formal_preflight_remote_error(
+    output_path: str | Path,
+    *,
+    dispatch_receipt_path: str | Path,
+    phase: str,
+    error: BaseException,
+) -> None:
+    """Publish a path-safe error terminal without serializing exception text."""
+
+    from lightcone_spec.runtime.proof_artifact import (
+        CanonicalJsonProofBinding,
+        publish_canonical_json_no_replace,
+    )
+
+    try:
+        receipt_sha256: str | None = CanonicalJsonProofBinding.bind(
+            dispatch_receipt_path
+        ).semantic_sha256
+    except (OSError, TypeError, ValueError):
+        receipt_sha256 = None
+    reason_code = getattr(error, "reason_code", None)
+    if type(reason_code) is not str or not reason_code.isidentifier():
+        reason_code = "formal_preflight_remote_phase_failed"
+    publish_canonical_json_no_replace(
+        output_path,
+        {
+            "schema_version": 1,
+            "kind": "formal_preflight_remote_error_terminal",
+            "status": "ERROR",
+            "phase": phase,
+            "reason_code": reason_code,
+            "exception_type": type(error).__name__,
+            "dispatch_receipt_semantic_sha256": receipt_sha256,
+            "formal_coverage_complete": False,
+            "requires_local_control": True,
+        },
+    )
+
+
+def _materialize_formal_preflight_launch_cap_schedule_cli(
+    args: argparse.Namespace,
+) -> int:
+    from lightcone_spec.experiments.formal_preflight_launch import (
+        materialize_formal_preflight_launch_cap_schedule,
+    )
+
+    schedule = materialize_formal_preflight_launch_cap_schedule(
+        dispatch_receipt_path=args.dispatch_receipt,
+        output_path=args.output,
+        current_ns=args.now_ns,
+    )
+    print(
+        json.dumps(
+            {
+                "status": "READY",
+                "schedule_sha256": schedule.sha256,
+                "cell_count": len(schedule.cell_caps),
+                "wave_count": len({row.wave_index for row in schedule.cell_caps}),
+                "output": str(Path(args.output).resolve()),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _execute_formal_preflight_raw_cli(args: argparse.Namespace) -> int:
+    """Run remote unsigned sources and stop at the stable-pull boundary."""
+
+    from lightcone_spec.experiments.formal_dispatch import (
+        load_formal_preflight_dispatch_receipt,
+    )
+    from lightcone_spec.experiments.formal_preflight_execution import (
+        FormalPreflightInterferenceExecutionManifest,
+        execute_formal_preflight_compile_raw,
+        execute_formal_preflight_exactness_raw,
+        execute_formal_preflight_interference_raw,
+        publish_formal_preflight_remote_raw_evidence_receipt,
+    )
+    from lightcone_spec.orchestration.live_sglang import PinnedNvidiaSmiTool
+    from lightcone_spec.runtime.compile_runner import CompileAssignmentPlan
+    from lightcone_spec.runtime.preflight_runner import ExactnessPreflightAssignment
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    phase = "load_dispatch"
+    try:
+        dispatch_receipt = CanonicalJsonProofBinding.bind(args.dispatch_receipt)
+        token = load_formal_preflight_dispatch_receipt(
+            args.dispatch_receipt,
+            current_ns=args.now_ns,
+        )
+        manifest = FormalPreflightInterferenceExecutionManifest.from_dict(
+            _load_bound_json(args.interference_execution_manifest)
+        )
+        if (
+            manifest.dispatch_receipt_semantic_sha256
+            != dispatch_receipt.semantic_sha256
+        ):
+            raise ValueError(
+                "interference execution manifest belongs to another dispatch receipt"
+            )
+        replay_store = ChallengeReplayStore(args.control_replay_store)
+        phase = "compile"
+        compile_pointer, compile_launch_consumption = (
+            execute_formal_preflight_compile_raw(
+                token,
+                launch_cap_schedule_path=args.launch_cap_schedule,
+                assignment_plan_path=args.compile_assignment_plan,
+                prepared_content_verification_receipt_path=(
+                    args.prepared_content_verification_receipt
+                ),
+                control_attestation=ControlArtifactAttestation.from_dict(
+                    _load_bound_json(args.compile_control)
+                ),
+                replay_store=replay_store,
+                now_ns=args.now_ns,
+            )
+        )
+        compile_result_path = CompileAssignmentPlan.load(
+            args.compile_assignment_plan
+        ).result_pointer_path
+        if compile_pointer != type(compile_pointer).load(compile_result_path):
+            raise RuntimeError("compile runner returned another result pointer")
+
+        phase = "exactness"
+        exactness_pointer, exactness_launch_consumption = (
+            execute_formal_preflight_exactness_raw(
+                token,
+                launch_cap_schedule_path=args.launch_cap_schedule,
+                assignment_path=args.exactness_assignment,
+                dispatch_attestation=ControlArtifactAttestation.from_dict(
+                    _load_bound_json(args.exactness_control)
+                ),
+                replay_store=replay_store,
+                now_ns=args.now_ns,
+            )
+        )
+        exactness_result_path = (
+            Path(
+                ExactnessPreflightAssignment.load(
+                    args.exactness_assignment
+                ).evidence_directory
+            )
+            / "result.json"
+        )
+        if exactness_pointer != type(exactness_pointer).load(exactness_result_path):
+            raise RuntimeError("exactness runner returned another result pointer")
+
+        phase = "interference"
+        interference = asyncio.run(
+            execute_formal_preflight_interference_raw(
+                token,
+                launch_cap_schedule_path=args.launch_cap_schedule,
+                execution_inputs={row.registry_cell_id: row for row in manifest.inputs},
+                nvidia_smi_tool=PinnedNvidiaSmiTool.bind(args.nvidia_smi),
+                evidence_root=args.evidence_root,
+                now_ns=args.now_ns,
+            )
+        )
+        if interference.status != "WAITING_FOR_LOCAL_CONTROL":
+            raise RuntimeError("interference remote phase did not reach stable pull")
+        phase = "publish_waiting_terminal"
+        binding = publish_formal_preflight_remote_raw_evidence_receipt(
+            token,
+            launch_cap_schedule_path=args.launch_cap_schedule,
+            launch_consumption_paths=tuple(
+                row.absolute_path
+                for row in (
+                    compile_launch_consumption,
+                    exactness_launch_consumption,
+                    *interference.launch_consumptions,
+                )
+            ),
+            compile_result_path=compile_result_path,
+            exactness_result_path=exactness_result_path,
+            interference_raw_batch_path=interference.raw_batch.absolute_path,
+            output_path=args.output,
+        )
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        _publish_formal_preflight_remote_error(
+            args.output,
+            dispatch_receipt_path=args.dispatch_receipt,
+            phase=phase,
+            error=error,
+        )
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "formal_preflight_remote_execution_result",
+                    "status": "ERROR",
+                    "phase": phase,
+                    "formal_coverage_complete": False,
+                },
+                sort_keys=True,
+            )
+        )
+        return 42
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_preflight_remote_execution_result",
+                "status": "WAITING_FOR_LOCAL_CONTROL",
+                "raw_receipt_semantic_sha256": binding.semantic_sha256,
+                "formal_coverage_complete": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 42
+
+
+def _qualify_formal_preflight_exactness_cli(args: argparse.Namespace) -> int:
+    """Locally bind the pulled exactness result to rank-aggregate control."""
+
+    from lightcone_spec.experiments.formal_dispatch import (
+        load_formal_preflight_dispatch_receipt,
+    )
+    from lightcone_spec.experiments.formal_preflight_execution import (
+        qualify_formal_preflight_exactness_locally,
+    )
+
+    token = load_formal_preflight_dispatch_receipt(
+        args.dispatch_receipt,
+        current_ns=args.now_ns,
+    )
+    pointer = qualify_formal_preflight_exactness_locally(
+        token,
+        remote_raw_receipt_path=args.remote_raw_receipt,
+        rank_aggregate_control_attestation=ControlArtifactAttestation.from_dict(
+            _load_bound_json(args.rank_aggregate_control)
+        ),
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+        proof_artifact_path=args.proof_output,
+        qualified_result_pointer_path=args.qualified_output,
+    )
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_preflight_local_exactness_result",
+                "status": "WAITING_FOR_INTERFERENCE_AND_SUITE_PROOFS",
+                "qualified_result_sha256": pointer.sha256,
+                "formal_coverage_complete": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 42
+
+
+def _parse_preflight_cell_proof_paths(values: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values:
+        cell_id, separator, path = value.partition("=")
+        if (
+            separator != "="
+            or not _is_lower_sha256(cell_id)
+            or not path
+            or cell_id in parsed
+        ):
+            raise ValueError("preflight proof paths must be unique CELL_ID=PATH values")
+        parsed[cell_id] = path
+    if len(parsed) != 8:
+        raise ValueError("preflight proof paths must cover exactly eight cells")
+    return parsed
+
+
+def _qualify_formal_preflight_interference_cli(args: argparse.Namespace) -> int:
+    """Locally control and deep-reopen the pulled exact-eight serving batch."""
+
+    from lightcone_spec.experiments.formal_dispatch import (
+        load_formal_preflight_dispatch_receipt,
+    )
+    from lightcone_spec.experiments.formal_preflight_execution import (
+        qualify_formal_preflight_interference_locally,
+    )
+
+    token = load_formal_preflight_dispatch_receipt(
+        args.dispatch_receipt,
+        current_ns=args.now_ns,
+    )
+    proof = qualify_formal_preflight_interference_locally(
+        token,
+        remote_raw_receipt_path=args.remote_raw_receipt,
+        native_result_proof_paths=_parse_preflight_cell_proof_paths(
+            args.native_result_proof
+        ),
+        native_itl_proof_paths=_parse_preflight_cell_proof_paths(args.native_itl_proof),
+        aggregate_control_attestation=ControlArtifactAttestation.from_dict(
+            _load_bound_json(args.aggregate_control)
+        ),
+        replay_store=ChallengeReplayStore(args.control_replay_store),
+        now_ns=args.now_ns,
+        proof_artifact_path=args.output,
+    )
+    passed = proof.status == "PASSED"
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_preflight_local_interference_result",
+                "status": (
+                    "WAITING_FOR_EXACTNESS_AND_SUITE_PROOFS" if passed else "FAILED"
+                ),
+                "interference_proof_sha256": proof.artifact_sha256,
+                "formal_coverage_complete": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 42
+
+
+def _parse_preflight_qualification_proofs(
+    values: list[str],
+) -> dict[str, tuple[str, str]]:
+    from lightcone_spec.experiments.preflight_authority import (
+        PREFLIGHT_REQUIRED_QUALIFICATION_SUITES,
+    )
+
+    parsed: dict[str, tuple[str, str]] = {}
+    for value in values:
+        suite, separator, paths = value.partition("=")
+        result, comma, artifact = paths.partition(",")
+        if (
+            separator != "="
+            or comma != ","
+            or not suite
+            or not result
+            or not artifact
+            or suite in parsed
+        ):
+            raise ValueError(
+                "qualification proof must be unique SUITE=RESULT_POINTER,PROOF_ARTIFACT"
+            )
+        parsed[suite] = (result, artifact)
+    if tuple(sorted(parsed)) != PREFLIGHT_REQUIRED_QUALIFICATION_SUITES:
+        raise ValueError("qualification proofs do not cover the exact eight suites")
+    return parsed
+
+
+def _finalize_formal_preflight_evidence_cli(args: argparse.Namespace) -> int:
+    """Deep-reduce qualified 1+1+8 sources into complete coverage."""
+
+    from lightcone_spec.experiments.formal_dispatch import (
+        FormalPreflightDispatchReceipt,
+        load_formal_preflight_dispatch_receipt,
+    )
+    from lightcone_spec.experiments.formal_preflight_execution import (
+        finalize_formal_preflight_evidence,
+    )
+    from lightcone_spec.runtime.proof_artifact import publish_canonical_json_no_replace
+
+    token = load_formal_preflight_dispatch_receipt(
+        args.dispatch_receipt,
+        current_ns=args.now_ns,
+    )
+    durable_dispatch = FormalPreflightDispatchReceipt.from_dict(
+        _load_bound_json(args.dispatch_receipt)
+    )
+    if durable_dispatch.revalidate(current_ns=args.now_ns).sha256 != token.sha256:
+        raise ValueError(
+            "formal preflight dispatch receipt changed during finalization"
+        )
+    replay_proofs = tuple(args.candidate_replay_proof)
+    if len(replay_proofs) != 2 or len(set(replay_proofs)) != 2:
+        raise ValueError("preflight finalization requires two candidate replay proofs")
+    evidence = finalize_formal_preflight_evidence(
+        token,
+        remote_raw_receipt_path=args.remote_raw_receipt,
+        exactness_result_path=args.exactness_result,
+        interference_proof_artifact_path=args.interference_proof,
+        qualification_proof_paths=_parse_preflight_qualification_proofs(
+            args.qualification_proof
+        ),
+        materialization=durable_dispatch.signed_materialization.payload,
+        candidate_state_coverage=tts_l0_candidate_state_coverage_from_dict(
+            _load_bound_json(args.candidate_state_coverage)
+        ),
+        candidate_replay_proof_paths=(replay_proofs[0], replay_proofs[1]),
+        now_ns=args.now_ns,
+    )
+    publish_canonical_json_no_replace(
+        args.source_output,
+        evidence.source_authority.to_dict(),
+    )
+    publish_canonical_json_no_replace(
+        args.activation_output,
+        registry_stage_activation_to_dict(evidence.activation),
+    )
+    publish_canonical_json_no_replace(
+        args.coverage_output,
+        evidence.coverage.to_dict(),
+    )
+    publish_canonical_json_no_replace(
+        args.stage_coverage_output,
+        stage_coverage_receipt_to_dict(evidence.stage_coverage),
+    )
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formal_preflight_finalization_result",
+                "status": "COMPLETE",
+                "source_authority_sha256": evidence.source_authority.sha256,
+                "activation_sha256": evidence.activation.sha256,
+                "coverage_sha256": evidence.coverage.sha256,
+                "stage_coverage_sha256": evidence.stage_coverage.sha256,
+                "next_required_action": (
+                    "externally_sign_stage_coverage_then_extend_formal_registry"
+                ),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _build_industrial_registry(args: argparse.Namespace) -> int:
     logical_slots = tuple(args.logical_gpu_slot)
     if (
@@ -5131,7 +9558,12 @@ def _build_industrial_registry(args: argparse.Namespace) -> int:
         )
     ):
         raise ValueError("logical GPU rank slots must be one or more unique names")
-    registry = build_industrial_registry(
+    registry_builder = (
+        build_legacy_industrial_registry
+        if args.legacy_diagnostic
+        else build_industrial_registry
+    )
+    registry = registry_builder(
         gpu_uuids=logical_slots,
         base_port=args.base_port,
         cache_root=args.cache_root,
@@ -5242,9 +9674,17 @@ def _validate_preflight_interference_seal_authority(
     terminal_cell_ids = tuple(
         sorted(plan.runtime_plan.cell_id for plan in terminal_plans)
     )
+    expected_interference_cell_ids = tuple(
+        sorted(
+            cell.cell_id
+            for cell in registry.cells_for("preflight")
+            if is_serving_interference_calibration_cell(cell)
+        )
+    )
     if (
         audit.inventory != inventory
-        or terminal_cell_ids != tuple(sorted(completed_cell_ids))
+        or terminal_cell_ids != expected_interference_cell_ids
+        or not set(terminal_cell_ids) <= set(completed_cell_ids)
         or len(terminal_cell_ids) != len(set(terminal_cell_ids))
         or any(
             plan.dispatch_context.registry != registry
@@ -5269,10 +9709,201 @@ def _validate_preflight_interference_seal_authority(
         )
 
 
+def _validate_preflight_control_seal_authorities(
+    *,
+    coverage_receipt_path: str,
+    coverage_attestation_path: str,
+    capacity_gate_path: str,
+    capacity_attestation_path: str,
+    replay_store_path: str,
+    registry: ExperimentRegistry,
+    activation: RegistryStageActivationArtifact,
+    inventory: GpuInventory,
+    runtime_sha256: str,
+    split_sha256: str,
+    raw_completed_cells_sha256: str,
+    completed_cell_ids: tuple[str, ...],
+) -> PreflightSealControlBinding:
+    """Consume exact signed coverage/capacity authority before receipt sealing."""
+
+    if type(activation) is not RegistryStageActivationArtifact:
+        raise TypeError("preflight seal requires exact registry activation")
+    verify_registry_stage_activation(registry, activation)
+    if (
+        activation.experiment != "preflight"
+        or activation.status != "AVAILABLE"
+        or activation.runtime_sha256 != runtime_sha256
+        or activation.split_sha256 != split_sha256
+    ):
+        raise ValueError("preflight activation differs from sealing lineage")
+    activated_cell_ids = tuple(
+        sorted(
+            row.cell_id
+            for row in activation.dispositions
+            if row.status is RegistryStageDispositionStatus.ACTIVATED
+        )
+    )
+    if activated_cell_ids != tuple(sorted(completed_cell_ids)):
+        raise ValueError("preflight completed cells differ from full activation")
+    coverage = PreflightCoverageReceipt.from_dict(
+        _load_bound_json(coverage_receipt_path)
+    )
+    verify_preflight_coverage(registry, activation, coverage)
+    require_complete_preflight_coverage(coverage)
+    if (
+        tuple(row.cell_id for row in coverage.terminals) != activated_cell_ids
+        or coverage.runtime_sha256 != runtime_sha256
+        or coverage.split_sha256 != split_sha256
+    ):
+        raise ValueError("preflight terminal aggregate differs from sealing inputs")
+    capacity = StageCapacityGate.from_dict(_load_bound_json(capacity_gate_path))
+    if (
+        capacity.registry_sha256 != registry.sha256
+        or capacity.experiment != "preflight"
+        or capacity.activated_cell_ids != activated_cell_ids
+        or capacity.status != "AVAILABLE"
+    ):
+        raise ValueError("preflight capacity gate is not available for this stage")
+    if (
+        len(inventory.devices) != 2
+        or any(not device.ready for device in inventory.devices)
+        or len({device.hardware_envelope_sha256 for device in inventory.devices}) != 1
+    ):
+        raise ValueError(
+            "preflight control authority requires two ready homogeneous GPUs"
+        )
+    hardware_envelope_sha256 = inventory.devices[0].hardware_envelope_sha256
+    coverage_attestation = ControlArtifactAttestation.from_dict(
+        _load_bound_json(coverage_attestation_path)
+    )
+    capacity_attestation = ControlArtifactAttestation.from_dict(
+        _load_bound_json(capacity_attestation_path)
+    )
+    expected_coverage_lineage = preflight_coverage_control_lineage_sha256(
+        activation_sha256=activation.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        inventory_sha256=inventory.sha256,
+        raw_completed_cells_sha256=raw_completed_cells_sha256,
+    )
+    expected_capacity_lineage = stage_capacity_control_lineage_sha256(
+        activation_sha256=activation.sha256,
+        inventory_sha256=inventory.sha256,
+        gate=capacity,
+    )
+    for envelope, artifact_type, artifact_sha256, protocol_sha256, lineage in (
+        (
+            coverage_attestation,
+            "rank_aggregate",
+            coverage.sha256,
+            PREFLIGHT_COVERAGE_PROTOCOL_SHA256,
+            expected_coverage_lineage,
+        ),
+        (
+            capacity_attestation,
+            "capacity",
+            capacity.sha256,
+            STAGE_CAPACITY_GATE_PROTOCOL_SHA256,
+            expected_capacity_lineage,
+        ),
+    ):
+        subject = envelope.subject
+        if (
+            subject.artifact_type != artifact_type
+            or subject.artifact_sha256 != artifact_sha256
+            or subject.protocol_sha256 != protocol_sha256
+            or subject.registry_sha256 != registry.sha256
+            or subject.lineage_sha256 != lineage
+            or envelope.hardware_envelope_sha256 != hardware_envelope_sha256
+        ):
+            raise ValueError("preflight control attestation subject is not exact")
+    if (
+        coverage_attestation.deployment_policy_authorization
+        != capacity_attestation.deployment_policy_authorization
+    ):
+        raise ValueError("preflight control artifacts require one deployment policy")
+    reserved_ns = time.time_ns()
+    results = verify_and_reserve_release_control_artifact_attestations(
+        (coverage_attestation, capacity_attestation),
+        expected_inventory_sha256=inventory.sha256,
+        now_ns=reserved_ns,
+        replay_store=ChallengeReplayStore(
+            str(Path(os.path.abspath(replay_store_path)))
+        ),
+    )
+    coverage_result, capacity_result = results
+    if (
+        coverage_result.artifact_type != "rank_aggregate"
+        or capacity_result.artifact_type != "capacity"
+        or coverage_result.deployment_policy_authorization_sha256
+        != capacity_result.deployment_policy_authorization_sha256
+        or coverage_result.trust_bundle_sha256 != capacity_result.trust_bundle_sha256
+        or coverage_result.trusted_attester_policy_sha256
+        != capacity_result.trusted_attester_policy_sha256
+    ):
+        raise ValueError("preflight control verifier returned inconsistent authority")
+    return PreflightSealControlBinding(
+        schema_version=1,
+        kind="formal_preflight_seal_control_binding",
+        status="SEALED",
+        registry_sha256=registry.sha256,
+        activation_sha256=activation.sha256,
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        inventory_sha256=inventory.sha256,
+        hardware_envelope_sha256=hardware_envelope_sha256,
+        raw_completed_cells_sha256=raw_completed_cells_sha256,
+        coverage_receipt_sha256=coverage.sha256,
+        coverage_attestation_sha256=coverage_attestation.sha256,
+        capacity_gate_sha256=capacity.sha256,
+        capacity_attestation_sha256=capacity_attestation.sha256,
+        deployment_policy_authorization_sha256=(
+            coverage_result.deployment_policy_authorization_sha256
+        ),
+        trust_bundle_sha256=coverage_result.trust_bundle_sha256,
+        trusted_attester_policy_sha256=(coverage_result.trusted_attester_policy_sha256),
+        replay_reservation_sha256=control_challenge_reservation_sha256(
+            results, reserved_ns=reserved_ns
+        ),
+    )
+
+
+def _materialize_stage_capacity_gate_cli(args: argparse.Namespace) -> int:
+    """Derive a capacity gate solely from path-bound raw sources and schedule."""
+
+    registry = _load_industrial_registry(args.registry)
+    schedule = StageCapacitySchedule.from_dict(_load_bound_json(args.stage_schedule))
+    gate = materialize_stage_capacity_gate_from_raw_sources(
+        registry,
+        experiment=schedule.experiment,
+        activated_cell_ids=schedule.activated_cell_ids,
+        source_manifest_path=os.path.abspath(args.capacity_source_manifest),
+        schedule=schedule,
+        now_ns=args.now_ns,
+    )
+    _write_json(args.output, gate.to_dict())
+    reopened = StageCapacityGate.from_dict(_load_bound_json(args.output))
+    if reopened != gate:
+        raise RuntimeError("written stage capacity gate changed identity")
+    revalidate_stage_capacity_gate_sources(
+        registry,
+        reopened,
+        schedule=schedule,
+        now_ns=args.now_ns,
+    )
+    print(gate.sha256)
+    return 0 if gate.status == "AVAILABLE" else 42
+
+
 def _seal_industrial_stage(args: argparse.Namespace) -> int:
     registry = _load_industrial_registry(args.registry)
     registry.definition(args.experiment)
-    if _TRUSTED_HARDWARE_ATTESTER_ID is None:
+    if registry.materialization_mode != "legacy_diagnostic":
+        raise ValueError(
+            "seal-industrial-stage is legacy diagnostic only; signed_staged "
+            "registries require the dynamic formal authorization bridge"
+        )
+    if _TRUSTED_HARDWARE_ATTESTER_ID is None and args.experiment != "preflight":
         artifact = {
             "schema_version": 1,
             "kind": "industrial_stage_seal_decision",
@@ -5282,6 +9913,8 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
             "registry_sha256": registry.sha256,
             "experiment": args.experiment,
             "trusted_attester_id": None,
+            "execution_mode": "diagnostic_non_authorizing",
+            "formal_dispatch_authorized": False,
         }
         _write_json(args.output, artifact)
         print(_canonical_sha256(artifact))
@@ -5318,12 +9951,36 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
     )
     if completed_sha256 is None:
         raise ValueError("stage sealing requires content-bound completed-cell evidence")
+    receipt_completed_sha256 = completed_sha256
     locked_output_paths = _parse_locked_output_paths(args.locked_output)
     if args.experiment == "preflight":
-        if args.interference_calibration_authority is None:
+        required_preflight_paths = {
+            "interference calibration authority": (
+                args.interference_calibration_authority
+            ),
+            "preflight coverage receipt": args.preflight_coverage_receipt,
+            "preflight coverage attestation": (args.preflight_coverage_attestation),
+            "stage capacity gate": args.stage_capacity_gate,
+            "stage capacity attestation": args.stage_capacity_attestation,
+            "control replay store": args.control_replay_store,
+            "preflight control binding output": (args.preflight_control_binding_output),
+        }
+        missing = tuple(
+            label for label, path in required_preflight_paths.items() if path is None
+        )
+        if missing:
             raise ValueError(
-                "preflight seal requires --interference-calibration-authority"
+                "preflight seal lacks mandatory control authority: " + ",".join(missing)
             )
+        if type(activation_artifact) is not RegistryStageActivationArtifact:
+            raise TypeError("preflight seal requires --activation-plan")
+        assert args.interference_calibration_authority is not None
+        assert args.preflight_coverage_receipt is not None
+        assert args.preflight_coverage_attestation is not None
+        assert args.stage_capacity_gate is not None
+        assert args.stage_capacity_attestation is not None
+        assert args.control_replay_store is not None
+        assert args.preflight_control_binding_output is not None
         _validate_preflight_interference_seal_authority(
             authority_path=args.interference_calibration_authority,
             registry=registry,
@@ -5333,10 +9990,40 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
             completed_cell_ids=completed_cell_ids,
             locked_output_paths=locked_output_paths,
         )
-    elif args.interference_calibration_authority is not None:
-        raise ValueError(
-            "interference calibration authority cannot seal another experiment"
+        control_binding = _validate_preflight_control_seal_authorities(
+            coverage_receipt_path=args.preflight_coverage_receipt,
+            coverage_attestation_path=args.preflight_coverage_attestation,
+            capacity_gate_path=args.stage_capacity_gate,
+            capacity_attestation_path=args.stage_capacity_attestation,
+            replay_store_path=args.control_replay_store,
+            registry=registry,
+            activation=activation_artifact,
+            inventory=inventory,
+            runtime_sha256=runtime_sha256,
+            split_sha256=split_sha256,
+            raw_completed_cells_sha256=completed_sha256,
+            completed_cell_ids=completed_cell_ids,
         )
+        _write_json(
+            args.preflight_control_binding_output,
+            control_binding.to_dict(),
+        )
+        receipt_completed_sha256 = _artifact_sha256(
+            args.preflight_control_binding_output
+        )
+    elif any(
+        value is not None
+        for value in (
+            args.interference_calibration_authority,
+            args.preflight_coverage_receipt,
+            args.preflight_coverage_attestation,
+            args.stage_capacity_gate,
+            args.stage_capacity_attestation,
+            args.control_replay_store,
+            args.preflight_control_binding_output,
+        )
+    ):
+        raise ValueError("preflight control authority cannot seal another experiment")
     if args.experiment == "E2":
         if args.e2_final_stage_manifest is None:
             raise ValueError("E2 seal requires --e2-final-stage-manifest")
@@ -5358,7 +10045,7 @@ def _seal_industrial_stage(args: argparse.Namespace) -> int:
         {name: _artifact_sha256(path) for name, path in locked_output_paths.items()},
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
-        completed_cells_sha256=completed_sha256,
+        completed_cells_sha256=receipt_completed_sha256,
         dependencies=dependencies,
     )
     _write_json(args.output, receipt.to_dict())
@@ -5633,9 +10320,13 @@ def _completed_industrial_cells(
             if contract.get("patched_sglang_tree") != PINNED_SGLANG_TREE:
                 raise ValueError("locked split uses another patched SGLang tree")
             expected_workload = (
-                f"industrial_{cell.identity.method}"
-                if cell.identity.method in {"target_only", "static"}
-                else "industrial_adapted"
+                f"industrial_preflight_{cell.identity.method}"
+                if stage == "preflight"
+                else (
+                    f"industrial_{cell.identity.method}"
+                    if cell.identity.method in {"target_only", "static"}
+                    else "industrial_adapted"
+                )
             )
             if contract.get("workload_contract") != expected_workload:
                 raise ValueError(
@@ -6827,7 +11518,53 @@ def _materialize_stage_activation(args: argparse.Namespace) -> int:
     if reloaded != artifact:
         raise RuntimeError("written registry-stage activation changed identity")
     print(artifact.sha256)
-    return 0 if artifact.status == "AVAILABLE" else 42
+    # This command materializes a diagnostic decision.  Successfully writing a
+    # BLOCKED artifact is a successful CLI operation; execution boundaries
+    # separately require AVAILABLE and therefore cannot mistake exit status for
+    # release authority.
+    return 0
+
+
+def _materialize_preflight_pointer_coverage(args: argparse.Namespace) -> int:
+    """Deep-reopen the one compile, one exactness, and eight serving terminals."""
+
+    registry = _load_industrial_registry(args.registry)
+    source = PreflightExecutionSourceAuthority.bind(
+        registry=registry,
+        runtime_sha256=_artifact_sha256(args.runtime_artifact),
+        split_sha256=_artifact_sha256(args.split_artifact),
+        compile_result_path=args.compile_result,
+        exactness_result_path=args.exactness_result,
+        interference_execution_authority_path=args.interference_authority,
+    )
+    activation, coverage = materialize_pointer_preflight_coverage(registry, source)
+    _write_json(args.source_output, source.to_dict())
+    _write_json(
+        args.activation_output,
+        {
+            "schema_version": 1,
+            "kind": "formal_preflight_pointer_activation_manifest",
+            "registry_artifact": str(Path(args.registry).resolve()),
+            "source_authority": str(Path(args.source_output).resolve()),
+            "activation": registry_stage_activation_to_dict(activation),
+        },
+    )
+    _write_json(args.coverage_output, coverage.to_dict())
+    reopened_source = PreflightExecutionSourceAuthority.from_dict(
+        _load_bound_json(args.source_output)
+    )
+    reopened_activation = _load_preflight_pointer_activation_manifest(
+        args.activation_output
+    )
+    reopened_coverage = PreflightCoverageReceipt.from_dict(
+        _load_bound_json(args.coverage_output)
+    )
+    if reopened_source != source or reopened_activation != activation:
+        raise RuntimeError("written preflight pointer authority changed identity")
+    verify_preflight_coverage(registry, reopened_activation, reopened_coverage)
+    require_complete_preflight_coverage(reopened_coverage)
+    print(reopened_coverage.sha256)
+    return 0
 
 
 def _estimate_industrial_budget(args: argparse.Namespace) -> int:
@@ -6848,20 +11585,30 @@ def _estimate_industrial_budget(args: argparse.Namespace) -> int:
         capacity_verification_receipt_path=args.capacity_verification_receipt,
         require_ready=False,
     )
-    plan_assumptions = tuple(
-        sorted(
-            {
-                row.reason_code
-                for row in plan.dispositions
-                if row.status is BudgetDispositionStatus.UNRESOLVED
-            }
-        )
-    )
+    assumption_values = {
+        row.reason_code
+        for row in plan.dispositions
+        if row.status is BudgetDispositionStatus.UNRESOLVED
+    }
+    if plan.capacity_envelope is not None and plan.capacity_authority is None:
+        # Capacity arithmetic without its path-bound raw-source receipt is
+        # useful diagnostic input, but it is never launch authority.  Keep the
+        # missing trust lift visible even when incomplete budget coverage is
+        # the per-cell disposition selected by the materializer.
+        assumption_values.add("capacity_raw_authority_missing")
+    plan_assumptions = tuple(sorted(assumption_values))
+    diagnostic_budgets = plan.diagnostic_budgets
+    diagnostic_cell_ids = tuple(row.cell_id for row in diagnostic_budgets)
     report = estimate_industrial_budget(
         registry,
-        activated_cell_ids=plan.activated_cell_ids,
+        # The exact reducer requires one budget for every supplied cell.  An
+        # UNRESOLVED plan can intentionally retain only the subset whose
+        # source-owned load semantics were materializable.  Report that exact
+        # diagnostic subset and carry the missing-cell reasons above; all
+        # scheduler/executor boundaries still call ``plan.require_ready()``.
+        activated_cell_ids=diagnostic_cell_ids,
         activation_sha256=plan.activation_sha256,
-        budgets=plan.diagnostic_budgets,
+        budgets=diagnostic_budgets,
         inventory=plan.inventory,
         gpu_inventory=gpu_inventory,
         interference_envelope=interference_envelope,
@@ -6890,8 +11637,15 @@ def _plan_industrial_dispatch(args: argparse.Namespace) -> int:
             capacity_envelope_path=args.capacity_envelope,
             capacity_manifest_path=args.capacity_manifest,
             capacity_verification_receipt_path=(args.capacity_verification_receipt),
+            require_ready=False,
         )
     )
+    if budget_plan.capacity_authority is None:
+        raise ValueError(
+            "capacity_raw_authority_missing: dispatch requires the path-bound "
+            "capacity manifest and verification receipt"
+        )
+    budget_plan.require_ready()
     if len(activations) > 1:
         raise ValueError("dispatch accepts at most one reducer activation artifact")
     receipts = _load_industrial_receipts(args.receipt)
@@ -7139,39 +11893,150 @@ def _analyze_e3b_long_context(args: argparse.Namespace) -> int:
     return 42
 
 
-def _print_formal_workload_block(
+def _load_content_verification_receipt(
+    path: str,
     *,
-    workload_id: str | None,
-    reason_code: str,
-) -> int:
-    print(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "formal_workload_authority_decision",
-                "status": "BLOCKED",
-                "reason_code": reason_code,
-                "workload_id": workload_id,
-                "authority_sha256": None,
-                "formal_execution_authorized": False,
-            },
-            sort_keys=True,
-        )
+    now_ns: int,
+) -> tuple[ContentVerificationReceipt, tuple[object, ...]]:
+    receipt = ContentVerificationReceipt.from_dict(
+        CanonicalJsonProofBinding.bind(path).reopen()
     )
-    return 42
+    return receipt, receipt.revalidate(current_ns=now_ns)
+
+
+def _verified_workload_sources_from_receipt(
+    path: str,
+    *,
+    now_ns: int,
+) -> VerifiedReleaseWorkloadSources:
+    _receipt, verified_rows = _load_content_verification_receipt(
+        path,
+        now_ns=now_ns,
+    )
+    matches = tuple(
+        row for row in verified_rows if type(row) is VerifiedReleaseWorkloadSources
+    )
+    if len(matches) != 1:
+        raise ValueError("content receipt lacks one workload authorization")
+    return matches[0]
+
+
+def _content_artifact_bindings(
+    specifications: list[str],
+) -> tuple[ContentJsonArtifactBinding, ...]:
+    rows: list[ContentJsonArtifactBinding] = []
+    for specification in specifications:
+        if type(specification) is not str or specification.count("=") != 1:
+            raise ValueError("content artifact must be ARTIFACT_ID=ABSOLUTE_PATH")
+        artifact_id, path_text = specification.split("=", 1)
+        if not artifact_id or not path_text:
+            raise ValueError("content artifact must be ARTIFACT_ID=ABSOLUTE_PATH")
+        rows.append(ContentJsonArtifactBinding.from_path(artifact_id, path_text))
+    result = tuple(sorted(rows, key=lambda row: row.artifact_id))
+    if tuple(row.artifact_id for row in result) != tuple(
+        sorted({row.artifact_id for row in result})
+    ):
+        raise ValueError("content artifact IDs must be unique")
+    return result
+
+
+def _verify_content_authorizations_cli(args: argparse.Namespace) -> int:
+    authorizations = (
+        ContentJsonArtifactBinding.from_path(
+            "dataset:burstgpt_six_source", args.burstgpt_authorization
+        ),
+        ContentJsonArtifactBinding.from_path(
+            "dataset:e0_task_native", args.e0_dataset_authorization
+        ),
+        ContentJsonArtifactBinding.from_path(
+            "prepared:formal_dag", args.prepared_model_authorization
+        ),
+        ContentJsonArtifactBinding.from_path(
+            "workload:e3a", args.workload_authorization
+        ),
+    )
+    receipt = verify_and_reserve_content_authorizations(
+        verified_ns=args.now_ns,
+        authorization_artifacts=authorizations,
+        content_artifacts=_content_artifact_bindings(args.content_artifact),
+        replay_store=ChallengeReplayStore(args.replay_store),
+    )
+    publish_canonical_json_no_replace(args.output, receipt.to_dict())
+    reopened = ContentVerificationReceipt.from_dict(
+        CanonicalJsonProofBinding.bind(args.output).reopen()
+    )
+    if reopened != receipt or reopened.sha256 != receipt.sha256:
+        raise RuntimeError("content verification receipt changed after publication")
+    reopened.revalidate(current_ns=args.now_ns)
+    print(receipt.sha256)
+    return 0
+
+
+def _scope_content_verification_receipt_cli(args: argparse.Namespace) -> int:
+    master_binding = ContentJsonArtifactBinding.from_path(
+        "content:master_verification_receipt",
+        args.master_receipt,
+    )
+    master = ContentVerificationReceipt.from_dict(master_binding.load())
+    scoped = derive_stage_content_verification_receipt(
+        master,
+        master_artifact=master_binding,
+        stage=args.stage,
+        current_ns=args.now_ns,
+    )
+    publish_canonical_json_no_replace(args.output, scoped.to_dict())
+    reopened = ContentVerificationReceipt.from_dict(
+        CanonicalJsonProofBinding.bind(args.output).reopen()
+    )
+    if reopened != scoped or reopened.sha256 != scoped.sha256:
+        raise RuntimeError("scoped content receipt changed after publication")
+    reopened.revalidate_formal_scope(current_ns=args.now_ns)
+    print(scoped.sha256)
+    return 0
+
+
+def _publish_burstgpt_shape_authority_cli(args: argparse.Namespace) -> int:
+    from lightcone_spec.runtime.preflight_runner import (
+        BurstGptShapeAuthority,
+        derive_burstgpt_shape_authority_from_content_receipt,
+    )
+
+    receipt, _verified = _load_content_verification_receipt(
+        args.content_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    authority = derive_burstgpt_shape_authority_from_content_receipt(
+        receipt,
+        current_ns=args.now_ns,
+    )
+    publish_canonical_json_no_replace(args.output, authority.to_dict())
+    reopened = BurstGptShapeAuthority.from_dict(
+        CanonicalJsonProofBinding.bind(args.output).reopen()
+    )
+    if reopened != authority or reopened.sha256 != authority.sha256:
+        raise RuntimeError("BurstGPT shape authority changed after publication")
+    print(authority.sha256)
+    return 0
 
 
 def _bind_formal_workload_cli(args: argparse.Namespace) -> int:
-    try:
-        authority = bind_formal_workload_authority(args.workload, args.source)
-    except FormalWorkloadAuthorityBlocked as error:
-        return _print_formal_workload_block(
-            workload_id=args.workload,
-            reason_code=error.reason,
-        )
-    artifact = _formal_workload_cli_artifact(authority)
-    _write_json(args.output, artifact)
-    reloaded = _formal_workload_authority_from_cli_artifact(
+    authorization = _verified_workload_sources_from_receipt(
+        args.content_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    authority = bind_authorized_formal_workload_authority(
+        args.workload,
+        args.source,
+        authorization=authorization,
+    )
+    artifact = formal_workload_authority_cli_artifact(authority)
+    publish_canonical_json_no_replace(args.output, artifact)
+    _publish_immutable_bytes(
+        Path(f"{Path(args.output).resolve()}.sha256"),
+        f"{_canonical_sha256(artifact)}\n".encode("ascii"),
+        label="formal workload authority sidecar",
+    )
+    reloaded = formal_workload_authority_from_cli_artifact(
         _load_bound_json(args.output)
     )
     if reloaded != authority or reloaded.sha256 != authority.sha256:
@@ -7181,7 +12046,7 @@ def _bind_formal_workload_cli(args: argparse.Namespace) -> int:
             {
                 "schema_version": 1,
                 "kind": "formal_workload_authority_decision",
-                "status": "BOUND_DIAGNOSTIC",
+                "status": "BOUND_AUTHORIZED_CONTENT",
                 "reason_code": None,
                 "workload_id": authority.workload_id,
                 "authority_sha256": authority.sha256,
@@ -7225,22 +12090,23 @@ def _materialize_dispatch_execution_bundles_cli(args: argparse.Namespace) -> int
 
 
 def _revalidate_formal_workload_cli(args: argparse.Namespace) -> int:
-    authority = _formal_workload_authority_from_cli_artifact(
+    authority = formal_workload_authority_from_cli_artifact(
         _load_bound_json(args.authority)
     )
-    try:
-        rebound = revalidate_formal_workload_authority(authority)
-    except FormalWorkloadAuthorityBlocked as error:
-        return _print_formal_workload_block(
-            workload_id=authority.workload_id,
-            reason_code=error.reason,
-        )
+    authorization = _verified_workload_sources_from_receipt(
+        args.content_verification_receipt,
+        now_ns=args.now_ns,
+    )
+    rebound = revalidate_authorized_formal_workload_authority(
+        authority,
+        authorization=authorization,
+    )
     print(
         json.dumps(
             {
                 "schema_version": 1,
                 "kind": "formal_workload_authority_decision",
-                "status": "BOUND_DIAGNOSTIC",
+                "status": "BOUND_AUTHORIZED_CONTENT",
                 "reason_code": None,
                 "workload_id": rebound.workload_id,
                 "authority_sha256": rebound.sha256,
@@ -7254,10 +12120,30 @@ def _revalidate_formal_workload_cli(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    single_operator_result = handle_formal_single_operator_command(args)
+    if single_operator_result is not None:
+        return single_operator_result
     if args.command == "doctor":
         project_root = args.project_root or args.path or "."
         sglang_root = args.sglang_root or args.path
-        formatted = format_doctor(project_root, sglang_root)
+        capacity_options = {}
+        if (
+            args.stage_capacity_gate is not None
+            or args.stage_capacity_schedule is not None
+            or args.stage_capacity_attestation is not None
+            or args.stage_capacity_activation_sha256 is not None
+            or args.stage_capacity_now_ns is not None
+        ):
+            capacity_options = {
+                "stage_capacity_gate_path": args.stage_capacity_gate,
+                "stage_capacity_schedule_path": args.stage_capacity_schedule,
+                "stage_capacity_attestation_path": (args.stage_capacity_attestation),
+                "stage_capacity_activation_sha256": (
+                    args.stage_capacity_activation_sha256
+                ),
+                "stage_capacity_now_ns": args.stage_capacity_now_ns,
+            }
+        formatted = format_doctor(project_root, sglang_root, **capacity_options)
         print(formatted)
         report = json.loads(formatted)
         return 0 if report.get("status") == "PASS" else 42
@@ -7274,8 +12160,100 @@ def main(argv: list[str] | None = None) -> int:
         return _bind_formal_workload_cli(args)
     if args.command == "revalidate-formal-workload-authority":
         return _revalidate_formal_workload_cli(args)
+    if args.command == "verify-content-authorizations":
+        return _verify_content_authorizations_cli(args)
+    if args.command == "scope-content-verification-receipt":
+        return _scope_content_verification_receipt_cli(args)
+    if args.command == "publish-burstgpt-shape-authority":
+        return _publish_burstgpt_shape_authority_cli(args)
     if args.command == "build-industrial-registry":
         return _build_industrial_registry(args)
+    if args.command == "publish-tts-calibration-source-authority":
+        return _publish_tts_calibration_source_authority(args)
+    if args.command == "publish-chronobelief-source-authority":
+        return _publish_chronobelief_source_authority(args)
+    if args.command == "publish-e1-recipe-anchor-authority":
+        return _publish_e1_recipe_anchor_authority(args)
+    if args.command == "publish-formal-protocol-lock-git-snapshot":
+        return _publish_formal_protocol_lock_git_snapshot(args)
+    if args.command == "publish-formal-protocol-lock-source-proof":
+        return _publish_formal_protocol_lock_source_proof(args)
+    if args.command == "create-protocol-lock":
+        return _create_protocol_lock(args)
+    if args.command == "verify-signed-protocol-lock":
+        return _verify_signed_protocol_lock(args)
+    if args.command == "create-gpu-hour-envelope":
+        return _create_gpu_hour_envelope(args)
+    if args.command == "reduce-stage-gpu-hour-envelope":
+        return _reduce_stage_gpu_hour_envelope(args)
+    if args.command == "materialize-preflight-gpu-hour-envelope":
+        return _materialize_preflight_gpu_hour_envelope_cli(args)
+    if args.command == "materialize-prospective-stage-gpu-hours":
+        return _materialize_prospective_stage_gpu_hours(args)
+    if args.command == "materialize-staged-prospective-gpu-hours":
+        return _materialize_staged_prospective_gpu_hours(args)
+    if args.command == "publish-formal-stage-gpu-hour-envelope-proof":
+        return _publish_formal_stage_gpu_hour_envelope_proof(args)
+    if args.command == "publish-formal-initial-stage-materialization-proof":
+        return _publish_formal_initial_stage_materialization_proof(args)
+    if args.command == "publish-formal-downstream-materialization-proof":
+        return _publish_formal_downstream_materialization_proof(args)
+    if args.command == "publish-formal-downstream-pilot-precoverage":
+        return _publish_formal_downstream_pilot_precoverage(args)
+    if args.command == "publish-formal-portable-stage-coverage-proof":
+        return _publish_formal_portable_stage_coverage(args)
+    if args.command == "publish-formal-downstream-reduction-proof":
+        return _publish_formal_downstream_reduction_proof(args)
+    if args.command == "publish-formal-downstream-completed-prefix":
+        return _publish_formal_downstream_completed_prefix(args)
+    if args.command == "publish-formal-e3a-staged-selection-proof":
+        return _publish_formal_e3a_staged_selection_proof(args)
+    if args.command == "reserve-formal-stage-gpu-hours":
+        return _reserve_formal_stage_gpu_hours(args)
+    if args.command == "aggregate-formal-study-gpu-hours":
+        return _aggregate_formal_study_gpu_hours(args)
+    if args.command == "create-stage-materialization-receipt":
+        return _create_stage_materialization(args)
+    if args.command == "verify-signed-stage-materialization":
+        return _verify_signed_stage_materialization(args)
+    if args.command == "create-stage-coverage-receipt":
+        return _create_stage_coverage(args)
+    if args.command == "verify-signed-stage-coverage":
+        return _verify_signed_stage_coverage(args)
+    if args.command == "publish-formal-runtime-authority-manifest":
+        return _publish_formal_runtime_authority_manifest(args)
+    if args.command == "publish-formal-rebuild-artifact":
+        return _publish_formal_rebuild_artifact(args)
+    if args.command == "publish-formal-tts-calibration-reduction-proof":
+        return _publish_formal_tts_calibration_reduction_proof(args)
+    if args.command == "publish-formal-stage-execution-shard":
+        return _publish_formal_stage_execution_shard(args)
+    if args.command == "publish-formal-stage-prefix":
+        return _publish_formal_stage_prefix(args)
+    if args.command == "publish-scientific-source-validation":
+        return _publish_scientific_source_validation(args)
+    if args.command == "formal-stage-operation":
+        return _formal_stage_operation(args)
+    if args.command == "assemble-formal-registry-manifest":
+        return _assemble_formal_registry(args)
+    if args.command == "reserve-formal-registry-verification":
+        return _reserve_formal_registry_verification(args)
+    if args.command == "extend-formal-registry-verification":
+        return _extend_formal_registry_verification(args)
+    if args.command == "verify-formal-registry-verification":
+        return _verify_formal_registry_verification(args)
+    if args.command == "authorize-formal-preflight-dispatch":
+        return _authorize_formal_preflight_dispatch_cli(args)
+    if args.command == "materialize-formal-preflight-launch-cap-schedule":
+        return _materialize_formal_preflight_launch_cap_schedule_cli(args)
+    if args.command == "execute-formal-preflight-raw":
+        return _execute_formal_preflight_raw_cli(args)
+    if args.command == "qualify-formal-preflight-exactness":
+        return _qualify_formal_preflight_exactness_cli(args)
+    if args.command == "qualify-formal-preflight-interference":
+        return _qualify_formal_preflight_interference_cli(args)
+    if args.command == "finalize-formal-preflight-evidence":
+        return _finalize_formal_preflight_evidence_cli(args)
     if args.command == "collect-gpu-inventory":
         return _collect_gpu_inventory(args)
     if args.command == "assemble-gpu-fleet-inventory":
@@ -7286,6 +12264,8 @@ def main(argv: list[str] | None = None) -> int:
         return _materialize_interference_calibration_bootstrap(args)
     if args.command == "reduce-interference-calibration":
         return _reduce_interference_calibration(args)
+    if args.command == "materialize-stage-capacity-gate":
+        return _materialize_stage_capacity_gate_cli(args)
     if args.command == "seal-industrial-stage":
         return _seal_industrial_stage(args)
     if args.command == "plan-industrial-dispatch":
@@ -7300,6 +12280,8 @@ def main(argv: list[str] | None = None) -> int:
         return _bind_industrial_budget_authority(args)
     if args.command == "materialize-stage-activation":
         return _materialize_stage_activation(args)
+    if args.command == "materialize-preflight-pointer-coverage":
+        return _materialize_preflight_pointer_coverage(args)
     if args.command == "estimate-industrial-budget":
         return _estimate_industrial_budget(args)
     if args.command == "reduce-e1-activation":

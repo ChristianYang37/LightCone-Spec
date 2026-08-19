@@ -33,9 +33,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     LockedOutput,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.selection_authority import (
     E1_COMMON_LOAD_AUTHORITY_UNREGISTERED_REASON,

@@ -11,14 +11,15 @@ from lightcone_spec.experiments.registry import (
     SEALED_E2_RECIPE_SENTINEL,
     CellStatus,
     ExperimentReceipt,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.stage_activation import (
     REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256,
     REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256,
-    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RegistryStageDispositionStatus,
     materialize_registry_stage_activation,
@@ -63,6 +64,10 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
         split_sha256=_sha("preflight-split"),
     )
 
+    # Preflight is conjunctive.  The source-owned compile and exactness
+    # runners now grant scheduling capability alongside all eight serving
+    # rows; execution still needs the exact dynamic controls and terminal
+    # pointers at their dedicated launch boundaries.
     assert artifact.status == "AVAILABLE"
     assert artifact.reducer_protocol_sha256 == (
         REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256
@@ -84,19 +89,13 @@ def test_registry_stage_reducer_uses_canonical_genesis_and_release_policy() -> N
         if release_dispatch_rejection_reason(cell) is None
     }
     assert activated == expected
-    assert activated == {
-        cell.cell_id
-        for cell in registry.cells_for("preflight")
-        if cell.identity.task == "simultaneous_single_gpu_interference"
-    }
-    assert {
-        row.reason_code
+    assert activated == {cell.cell_id for cell in registry.cells_for("preflight")}
+    assert all(
+        row.status is RegistryStageDispositionStatus.ACTIVATED
         for row in artifact.dispositions
-        if row.status is RegistryStageDispositionStatus.BLOCKED
-    } == {
-        RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
-        "release_preflight_method_unsupported",
-    }
+    )
+    with pytest.raises(ValueError, match="status differs"):
+        replace(artifact, status="BLOCKED")
     calibration = tuple(
         cell
         for cell in registry.cells_for("preflight")
@@ -255,14 +254,10 @@ def test_scheduler_and_completion_replay_reject_edited_generic_activation() -> N
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
     )
-    blocked_index = next(
-        index
-        for index, row in enumerate(artifact.dispositions)
-        if row.status is RegistryStageDispositionStatus.BLOCKED
-    )
+    edited_index = 0
     edited_rows = list(artifact.dispositions)
-    edited_rows[blocked_index] = replace(
-        edited_rows[blocked_index], reason_code="caller_edited_block_reason"
+    edited_rows[edited_index] = replace(
+        edited_rows[edited_index], reason_code="caller_edited_activation_reason"
     )
     edited = replace(artifact, dispositions=tuple(edited_rows))
     with pytest.raises(ValueError, match="exact reducer-generated"):

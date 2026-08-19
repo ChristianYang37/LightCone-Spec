@@ -32,6 +32,7 @@ from lightcone_spec.experiments.capacity_authority import (
     capacity_verification_receipt_template,
 )
 from lightcone_spec.experiments.failure_authority import (
+    FailureExecutionAuthorityToken,
     bind_failure_injection_authority,
     release_failure_plan_for_cell,
 )
@@ -45,7 +46,7 @@ from lightcone_spec.experiments.gpu_pool import (
 )
 from lightcone_spec.experiments.inventory import build_serial_interference_envelope
 from lightcone_spec.experiments.itl_authority import (
-    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON,
     release_e2_itl_timestamp_plan,
 )
 from lightcone_spec.experiments.load import (
@@ -80,7 +81,9 @@ from lightcone_spec.experiments.planning_artifacts import (
     production_load_plan_to_dict,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
@@ -1049,7 +1052,8 @@ def _bundle_fixture(
         {
             "schema_version": 3,
             "generator": (
-                "lightcone_spec.experiments.registry.build_industrial_registry:v3"
+                "lightcone_spec.experiments.registry."
+                "build_legacy_industrial_registry:v3"
             ),
             "parameters": {
                 "logical_gpu_slots": list(registry.gpu_uuids),
@@ -1441,7 +1445,7 @@ def test_e2_bundle_blocks_empty_release_producer_before_downstream_replay(
         cell_id=cell.cell_id,
         itl_timestamp_plan=_source(plan_path, semantic_sha256=plan.sha256),
         itl_timestamp_plan_sha256=plan.sha256,
-        itl_timestamp_producer_sha256=None,
+        itl_timestamp_producer_sha256=plan.producer.sha256,
     )
     inventory_reads = 0
     original_load = bundle_module.BoundJsonSource.load
@@ -1455,7 +1459,7 @@ def test_e2_bundle_blocks_empty_release_producer_before_downstream_replay(
     monkeypatch.setattr(bundle_module.BoundJsonSource, "load", track_load)
     with pytest.raises(
         ExecutionBundleBlockedError,
-        match=ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+        match=ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON,
     ):
         bundle.reconstruct_execution_plan()
 
@@ -1892,16 +1896,23 @@ def test_bundle_rejects_failure_authority_on_nonfailure_assignment(
     )
     assert diagnostic_sha256 == binding.sha256
     assert token is None
-    with pytest.raises(
-        ExecutionBundleBlockedError,
-        match="failure_injection_first_party_actuator_unavailable",
-    ):
-        bundle_module._require_bundle_failure_injection_authority(
-            registry=registry,
-            cell=failure_cell,
-            binding=binding,
-            diagnostic=False,
-        )
+    authority_sha256, token = bundle_module._require_bundle_failure_injection_authority(
+        registry=registry,
+        cell=failure_cell,
+        binding=binding,
+        diagnostic=False,
+    )
+    assert authority_sha256 == binding.sha256
+    assert type(token) is FailureExecutionAuthorityToken
+    assert token.binding == binding
+    assert token.plan_sha256 == plan.sha256
+    assert token.registry_sha256 == registry.sha256
+    assert token.cell_id == failure_cell.cell_id
+    assert token.scenario == plan.scenario
+    # This source-owned token authorizes only the child-process actuator plan.
+    # It is deliberately not the external-control GPU result proof.
+    assert not hasattr(token, "recovery_terminal_sha256")
+    assert not hasattr(token, "control_attestation")
     with pytest.raises(
         ExecutionBundleBlockedError,
         match="failure_injection_raw_plan_authority_required",
@@ -1918,6 +1929,28 @@ def test_bundle_rejects_failure_authority_on_nonfailure_assignment(
             cell=nonfailure_cell,
             binding=binding,
             diagnostic=True,
+        )
+
+    foreign_cell = next(
+        row
+        for row in registry.cells_for("E5")
+        if row.identity.task == "failure_injection"
+        and row.cell_id != failure_cell.cell_id
+    )
+    foreign_plan = release_failure_plan_for_cell(registry, foreign_cell)
+    foreign_path = _write_bound(
+        tmp_path / "foreign-failure-plan.json", foreign_plan.to_dict()
+    )
+    foreign_binding = bind_failure_injection_authority(
+        foreign_path,
+        registry=registry,
+    )
+    with pytest.raises(ValueError, match="names another assignment cell"):
+        bundle_module._require_bundle_failure_injection_authority(
+            registry=registry,
+            cell=failure_cell,
+            binding=foreign_binding,
+            diagnostic=False,
         )
 
 

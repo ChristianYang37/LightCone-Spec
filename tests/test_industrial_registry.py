@@ -39,6 +39,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     WorkloadClass,
     build_industrial_registry,
+    build_legacy_industrial_registry,
     content_sha256,
     e1a_adaptive_configurations,
     serving_cell_rejection_reason,
@@ -48,7 +49,7 @@ from lightcone_spec.experiments.registry import (
 
 @pytest.fixture(scope="module")
 def registry() -> ExperimentRegistry:
-    return build_industrial_registry(
+    return build_legacy_industrial_registry(
         gpu_uuids=("GPU-aaaaaaaa", "GPU-bbbbbbbb"),
         base_port=24000,
         cache_root="runtime-cache/test",
@@ -93,7 +94,7 @@ def _receipts_through(
 
 
 def test_registry_digest_and_order_are_stable(registry: ExperimentRegistry) -> None:
-    rebuilt = build_industrial_registry(
+    rebuilt = build_legacy_industrial_registry(
         gpu_uuids=("GPU-aaaaaaaa", "GPU-bbbbbbbb"),
         base_port=24000,
         cache_root="runtime-cache/test",
@@ -109,6 +110,7 @@ def test_registry_digest_and_order_are_stable(registry: ExperimentRegistry) -> N
         (),
         ("preflight",),
         ("E3a",),
+        ("TTS-Cal",),
         ("E1",),
         ("E2",),
         ("E4",),
@@ -137,15 +139,15 @@ def test_protocol_axes_and_e1a_cardinality_are_complete(
     assert e1["rank"] == LORA_RANKS
     assert e1["alpha_over_rank"] == (1.0,)
 
-    unresolved_optimizer = [
+    chronobelief_optimizer = [
         cell
         for cell in registry.cells_for("E2")
         if cell.identity.optimizer == "chronobelief"
     ]
-    assert len(unresolved_optimizer) == 96 * len(E2_HALVING_STAGES)
-    assert {cell.status for cell in unresolved_optimizer} == {CellStatus.BLOCKED}
-    assert {cell.reason_code for cell in unresolved_optimizer} == {
-        "optimizer_equation_unresolved"
+    assert len(chronobelief_optimizer) == 480 * len(E2_HALVING_STAGES)
+    assert {cell.status for cell in chronobelief_optimizer} == {CellStatus.BLOCKED}
+    assert {cell.reason_code for cell in chronobelief_optimizer} == {
+        "adaptation_recipe_values_unregistered"
     }
     implemented_optimizer = [
         cell for cell in registry.cells_for("E2") if cell.identity.optimizer == "adamw"
@@ -431,7 +433,7 @@ def test_authoritative_registry_cell_contract_accepts_arbitrary_gpu_gangs(
         )
 
     e6_blocked = [row for row in registry.cells_for("E6") if not row.runnable]
-    assert len(e6_blocked) == 3744
+    assert len(e6_blocked) == 2496
     assert {row.reason_code for row in e6_blocked} == {
         "native_nextn_preflight_required",
         "sealed_e2_recipe_receipt_required",
@@ -469,6 +471,7 @@ def test_locked_outputs_and_dependency_receipts_fail_closed(
     assert tuple(registry.validate_receipts(through_e2)) == (
         "preflight",
         "E3a",
+        "TTS-Cal",
         "E1",
         "E2",
     )

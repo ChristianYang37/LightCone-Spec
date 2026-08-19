@@ -171,6 +171,13 @@ class UpdateRecord:
     online_expert_probabilities: str | None
     online_cumulative_losses: str | None
     online_expert_gradient_norms: str | None
+    # Exact byte identities are emitted only by the registered mechanism-replay
+    # profile.  They are atomic: a row has all four or none.  Headline serving
+    # leaves them null so hashing cannot add a blocking device-to-host hot path.
+    source_state_sha256: str | None = None
+    candidate_bytes_sha256: str | None = None
+    optimizer_state_bytes_sha256: str | None = None
+    proposal_evidence_sha256: str | None = None
     cohort_epoch: int | None = None
     route_id: str | None = None
     retry_identity: str | None = None

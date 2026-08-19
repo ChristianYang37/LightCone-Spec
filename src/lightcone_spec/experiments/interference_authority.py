@@ -231,6 +231,9 @@ def materialize_interference_calibration_bootstrap_authority(
     verify_registry_stage_activation(registry, activation)
     if activation.experiment != "preflight":
         raise ValueError("calibration bootstrap requires the preflight activation")
+    # Compile and exactness remain fail-closed in the generic dispatcher.  The
+    # only preflight cells it may expose are the exact registered static
+    # interference rows consumed by this bespoke bootstrap reducer.
     by_id = {cell.cell_id: cell for cell in registry.cells_for("preflight")}
     activated = tuple(by_id[cell_id] for cell_id in activation.activated_cell_ids)
     calibration = tuple(
@@ -240,11 +243,9 @@ def materialize_interference_calibration_bootstrap_authority(
         and cell.identity.method == "static"
         and cell.resources.workload_class is WorkloadClass.CORRECTNESS
     )
-    if len(calibration) != 8 or {cell.cell_id for cell in calibration} != {
-        cell.cell_id for cell in activated
-    }:
+    if len(calibration) != 8:
         raise ValueError(
-            "calibration bootstrap activation must contain only all registered runs"
+            "calibration bootstrap activation must contain all registered runs"
         )
     if len(inventory.devices) < 2:
         raise ValueError("calibration bootstrap requires two physical GPUs")

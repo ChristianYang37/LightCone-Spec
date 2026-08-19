@@ -64,7 +64,7 @@ from lightcone_spec.experiments.registry import (
     FINAL_BLOCKS,
     PILOT_BLOCKS,
     WorkloadClass,
-    build_industrial_registry,
+    build_legacy_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
 )
@@ -249,6 +249,7 @@ def _build_registry(tmp_path: Path) -> tuple[Path, dict]:
         main(
             [
                 "build-industrial-registry",
+                "--legacy-diagnostic",
                 "--logical-gpu-slot",
                 "logical-rank-slot-a",
                 "logical-rank-slot-b",
@@ -451,7 +452,7 @@ def test_stage_sealing_is_blocked_before_cpu_evidence_can_mint_a_receipt(
     _write_bound(locked, {"runtime_envelope": "passed"})
     completed = _completed_stage(tmp_path, registry, "preflight")
     output = tmp_path / "forged-receipt.json"
-    assert (
+    with pytest.raises(ValueError, match="schema-version-4"):
         main(
             [
                 "seal-industrial-stage",
@@ -475,12 +476,7 @@ def test_stage_sealing_is_blocked_before_cpu_evidence_can_mint_a_receipt(
                 str(output),
             ]
         )
-        == 42
-    )
-    decision = json.loads(output.read_text(encoding="utf-8"))
-    assert decision["status"] == "BLOCKED"
-    assert decision["gpu_evidence"] == "UNMEASURED"
-    assert decision["reason_code"] == "trusted_hardware_attester_unavailable"
+    assert not output.exists()
 
 
 def test_registry_and_receipt_edits_fail_closed(tmp_path: Path) -> None:
@@ -613,7 +609,7 @@ def _confirmation_family_inputs(tmp_path: Path):
     cache_root = str(tmp_path / "runtime-cache")
     evidence_root = str(tmp_path / "artifacts")
     registry_path, _ = _build_registry(tmp_path)
-    registry = build_industrial_registry(
+    registry = build_legacy_industrial_registry(
         gpu_uuids=logical_slots,
         cache_root=cache_root,
         evidence_root=evidence_root,

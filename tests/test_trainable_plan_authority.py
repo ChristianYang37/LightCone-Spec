@@ -41,8 +41,10 @@ from lightcone_spec.experiments.execution_semantics import (
 from lightcone_spec.experiments.planning import reduce_e1_activation
 from lightcone_spec.experiments.registry import (
     ExperimentCell,
-    build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
 from lightcone_spec.locking.prepared_models import (
@@ -133,7 +135,11 @@ def _cell_to_dict(cell: ExperimentCell) -> dict[str, object]:
 
 
 @cache
-def _e1_execution_semantics(method: str, mode: str) -> CellExecutionSemantics:
+def _e1_execution_semantics(
+    method: str,
+    mode: str,
+    scope: str = "last1",
+) -> CellExecutionSemantics:
     registry = build_industrial_registry()
     selection, receipt = _e3a_selection_and_receipt(registry)
     activation = reduce_e1_activation(
@@ -147,7 +153,7 @@ def _e1_execution_semantics(method: str, mode: str) -> CellExecutionSemantics:
         candidate
         for candidate in registry.cells_for("E1")
         if candidate.identity.method == method
-        and candidate.identity.scope == "last1"
+        and candidate.identity.scope == scope
         and candidate.identity.parameterization == mode
         and candidate.identity.rank == expected_rank
         and candidate.identity.optimizer == "adamw"
@@ -165,13 +171,14 @@ def _inputs(
     *,
     method: str = "l0",
     mode: str = "lora",
+    scope: str = "last1",
     target_id: str = "Qwen/Qwen3-8B",
     drafter_id: str = "z-lab/Qwen3-8B-DFlash-b16",
     target_revision: str = "1" * 40,
     drafter_revision: str = "2" * 40,
 ) -> dict[str, object]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    execution_semantics = _e1_execution_semantics(method, mode)
+    execution_semantics = _e1_execution_semantics(method, mode, scope)
     if target_id != execution_semantics.expected_model:
         raise ValueError("test model differs from registered E1 execution semantics")
     recipe = execution_semantics.adaptation_recipe

@@ -203,7 +203,10 @@ def test_recursive_completion_graph_replays_but_cannot_mint_authority(
         fixture.binding
     )
 
-    with pytest.raises(ValueError, match="activation binding is missing or forged"):
+    with pytest.raises(
+        ValueError,
+        match="budget authority supports only runnable serving activation",
+    ):
         require_ready_registry_stage_dependency_completions(
             fixture.binding,
             expected_registry=fixture.registry,
@@ -453,7 +456,8 @@ def test_e1_dependency_completion_blocks_before_opening_opaque_common_load(
         semantic_sha256=receipt.completed_cells_sha256,
     )
     inventory = object()
-    prior_receipts = (object(), object())
+    # TTS-Cal is now an explicit upstream DAG stage between E3a and E1.
+    prior_receipts = (object(), object(), object())
     prior_records = tuple(
         SimpleNamespace(
             binding=object(),

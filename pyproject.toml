@@ -53,6 +53,12 @@ lightcone-spec = "lightcone_spec.cli.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"lightcone_spec.runtime" = [
+    "trust/release_ed25519_root_v1.json",
+    "trust/release_ed25519_root_v1.json.sha256",
+]
+
 [tool.setuptools.data-files]
 "share/lightcone-spec/manifests/provenance" = [
     "manifests/provenance/tts_recipe_authority_v1.json",

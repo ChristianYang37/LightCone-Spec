@@ -268,7 +268,7 @@ def test_sglang_launcher_blocks_compile_only_before_checkout_or_cache_mutation(
     assert not Path(contract.result_pointer_path).exists()
 
 
-def test_every_current_compile_cell_has_the_same_release_owned_block_reason() -> None:
+def test_current_compile_cells_are_plannable_but_direct_release_stays_blocked() -> None:
     registry = build_industrial_registry()
     compile_cells = tuple(
         cell
@@ -279,9 +279,7 @@ def test_every_current_compile_cell_has_the_same_release_owned_block_reason() ->
     assert RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE == (
         STAGE_COMPILE_BLOCK_REASON
     )
-    assert {release_dispatch_rejection_reason(cell) for cell in compile_cells} == {
-        RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
-    }
+    assert {release_dispatch_rejection_reason(cell) for cell in compile_cells} == {None}
     assert not any(
         Path(cell.resources.evidence_root).exists() for cell in compile_cells
     )

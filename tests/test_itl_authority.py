@@ -14,13 +14,14 @@ from lightcone_spec.experiments.industrial_analysis import _request_metric
 from lightcone_spec.experiments.itl_authority import (
     ITL_COALESCED_CHUNK_UNPROVEN_REASON,
     ITL_CPU_CONTRACT_ONLY_REASON,
-    ITL_FIRST_PARTY_RESULT_POINTER_UNAVAILABLE_REASON,
+    ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON,
     ITL_RAW_RECEIPT_MISSING_REASON,
     ITL_TIMESTAMP_AUTHORITY_PROTOCOL_SHA256,
-    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
     ItlRequestExpectation,
     ItlTimestampAuthorityBlocked,
     ReleaseItlTimestampProducer,
+    StageItlExecutionIdentity,
+    StageItlTimestampAuthority,
     assess_serving_chunks_for_formal_itl,
     bind_itl_timestamp_authority,
     evaluate_e2_itl_timestamp_activation,
@@ -32,7 +33,9 @@ from lightcone_spec.experiments.itl_authority import (
 )
 from lightcone_spec.experiments.load import TokenChunkTiming
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     scientific_role_for_cell,
 )
 
@@ -51,7 +54,7 @@ def _registry_and_cell():
 def _producer(mode: str) -> ReleaseItlTimestampProducer:
     hook = {
         "native_per_token_timestamp_hook": (
-            "sglang.schema_v3.native_per_token_timestamp.v1"
+            "sglang.schema_v3.native_per_token_timestamp.v2"
         ),
         "sse_one_token_per_frame": (
             "sglang.benchmark.serving.raw_sse_frame_observation.v1"
@@ -137,16 +140,16 @@ def test_current_release_blocks_e2_before_raw_path_is_inspected(tmp_path: Path) 
     activation = evaluate_e2_itl_timestamp_activation(plan)
 
     assert activation.status == "BLOCKED"
-    assert activation.reason_code == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert activation.reason_code == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
     assert activation.producer_sha256 is None
     with pytest.raises(ItlTimestampAuthorityBlocked) as error:
         require_e2_itl_timestamp_prelaunch(plan)
-    assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert error.value.reason == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
 
     missing = tmp_path / "must-not-be-created" / "raw-itl.json"
     with pytest.raises(ItlTimestampAuthorityBlocked) as error:
         bind_itl_timestamp_authority(plan, missing, expected_requests=_expected())
-    assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert error.value.reason == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
     assert not missing.parent.exists()
 
     with pytest.raises(ItlTimestampAuthorityBlocked) as error:
@@ -156,7 +159,7 @@ def test_current_release_blocks_e2_before_raw_path_is_inspected(tmp_path: Path) 
             cell=cell,
             expected_requests=_expected(),
         )
-    assert error.value.reason == ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON
+    assert error.value.reason == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
     assert not missing.parent.exists()
 
 
@@ -215,11 +218,11 @@ def test_producer_allowlist_alone_cannot_mint_formal_itl(
     plan = release_e2_itl_timestamp_plan(registry, cell)
     activation = evaluate_e2_itl_timestamp_activation(plan)
     assert activation.status == "BLOCKED"
-    assert activation.reason_code == ITL_FIRST_PARTY_RESULT_POINTER_UNAVAILABLE_REASON
+    assert activation.reason_code == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
     missing = tmp_path / "must-not-read" / "forged.json"
     with pytest.raises(ItlTimestampAuthorityBlocked) as error:
         bind_itl_timestamp_authority(plan, missing, expected_requests=_expected())
-    assert error.value.reason == ITL_FIRST_PARTY_RESULT_POINTER_UNAVAILABLE_REASON
+    assert error.value.reason == ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON
     assert not missing.parent.exists()
 
 
@@ -235,6 +238,106 @@ def test_terminal_expectation_has_no_cross_clock_timestamp_fields() -> None:
     forged["request_terminal_ns"] = 180
     with pytest.raises(ValueError, match="fields differ"):
         ItlRequestExpectation.from_dict(forged)
+
+
+def test_stage_itl_identity_binds_materialized_execution_and_rejects_forgery() -> None:
+    identity = StageItlExecutionIdentity(
+        schema_version=1,
+        kind="stage_itl_execution_identity",
+        materialized_cell_id="1" * 64,
+        inventory_sha256="2" * 64,
+        registry_sha256="3" * 64,
+        execution_plan_sha256="4" * 64,
+        rank_config_sha256="5" * 64,
+        run_id="run-e1-0",
+        run_nonce_sha256="6" * 64,
+        attempt_id="attempt-e1-0",
+        method="l0",
+    )
+    assert StageItlExecutionIdentity.from_dict(identity.to_dict()) == identity
+    assert identity.sha256 == itl_authority.content_sha256(identity.to_dict())
+    forged = identity.to_dict()
+    forged["materialized_cell_id"] = "not-a-digest"
+    with pytest.raises(ValueError, match="materialized cell"):
+        StageItlExecutionIdentity.from_dict(forged)
+
+
+@pytest.mark.parametrize(
+    "method",
+    ("onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"),
+)
+def test_stage_itl_identity_accepts_only_registered_onlinespec_methods(
+    method: str,
+) -> None:
+    value = StageItlExecutionIdentity(
+        schema_version=1,
+        kind="stage_itl_execution_identity",
+        materialized_cell_id="1" * 64,
+        inventory_sha256="2" * 64,
+        registry_sha256="3" * 64,
+        execution_plan_sha256="4" * 64,
+        rank_config_sha256="5" * 64,
+        run_id=f"run-{method}",
+        run_nonce_sha256="6" * 64,
+        attempt_id=f"attempt-{method}",
+        method=method,  # type: ignore[arg-type]
+    )
+    assert StageItlExecutionIdentity.from_dict(value.to_dict()) == value
+
+    forged = value.to_dict()
+    forged["method"] = "onlinespec_unregistered"
+    with pytest.raises(ValueError, match="method is unsupported"):
+        StageItlExecutionIdentity.from_dict(forged)
+
+
+def test_stage_itl_authority_cannot_be_constructed_from_caller_timestamps() -> None:
+    identity = StageItlExecutionIdentity(
+        schema_version=1,
+        kind="stage_itl_execution_identity",
+        materialized_cell_id="1" * 64,
+        inventory_sha256="2" * 64,
+        registry_sha256="3" * 64,
+        execution_plan_sha256="4" * 64,
+        rank_config_sha256="5" * 64,
+        run_id="run-e1-0",
+        run_nonce_sha256="6" * 64,
+        attempt_id="attempt-e1-0",
+        method="l0",
+    )
+    with pytest.raises(TypeError, match="first-party validation"):
+        StageItlTimestampAuthority(
+            execution_identity=identity,
+            raw_receipt=None,  # type: ignore[arg-type]
+            native_result_proof=None,  # type: ignore[arg-type]
+            native_gpu_proof=None,  # type: ignore[arg-type]
+            native_gpu_verified_proof_sha256="7" * 64,
+            producer_sha256="8" * 64,
+            control_binding_sha256="9" * 64,
+            control_envelope_sha256="a" * 64,
+            replay_reservation_sha256="b" * 64,
+            expectations_sha256="c" * 64,
+            native_result_pointer_sha256s=("d" * 64,),
+            requests=(),
+            _verification_tag=object(),
+        )
+
+
+def test_stage_itl_source_derives_integer_measurement_inputs_only() -> None:
+    source = Path(itl_authority.__file__).read_text(encoding="utf-8")
+    for required in (
+        '"arrival_ns": row.request_started_ns',
+        '"first_token_ns": row.token_observed_ns[0]',
+        '"completion_ns": row.request_terminal_ns',
+        '"native_per_token_observed_ns": list(row.token_observed_ns)',
+        "throughput_numerator_tokens",
+        "throughput_window_ns",
+        "p99_itl_input_ns",
+        "validate_formal_terminal_result_proof_artifact",
+        "NativeRuntimeGpuProofArtifact.from_dict",
+        "verify_and_reserve_release_control_artifact_attestations",
+    ):
+        assert required in source
+    assert "caller_goodput" not in source
 
 
 def test_external_itl_schema_versions_reject_boolean_values(

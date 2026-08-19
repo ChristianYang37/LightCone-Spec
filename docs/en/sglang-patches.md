@@ -62,24 +62,50 @@ missing, discontinuous, or rewritten trajectories fail the claim-grade
 exactness gate. The benchmark client now also accepts a caller-owned async HTTP
 session used by submit and abort, so one server session can reuse a registered
 connection pool without duplicating the official request parser.
+The seventh patch additionally preserves the server's content-bound native ITL
+result pointer on that official response path. Remote collection publishes it
+as a separate content-addressed unsigned bundle joined to the terminal; only a
+later local external-control proof can make either artifact formal evidence.
 
 The patch implements the content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`
-and the final tree is `dfb60ab2e514defc6290fe8bacd179552dcd985e`; the manifest remains the
+`38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`
+and the final tree is `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and adaptive-runtime request/round/update/KV/performance rows.
 It exposes a signer plugin boundary but bundles no trusted hardware key or
-release signer. The executor therefore still runs only Target-only end to end
-and blocks Static/TTS/L0-naive/LightCone before mutation.
+release signer. Source implementations therefore remain fail-closed until the
+corresponding local external-control proof has been verified; CPU contract
+coverage alone cannot authorize a formal method run.
 
 The sixth patch makes speculative-width accounting target-aware. A true
 Target-only server (`spec_algorithm=none` with no draft width) never evaluates
 `int(None)`: terminal evidence keeps speculative counters non-applicable, while
 the numeric `/server_info` speed view reports zero verified drafts. Any active
 speculative algorithm without a draft width still fails closed.
+
+The seventh patch freezes separate TP2 and two-replica TP1/DP2 readiness
+contracts. TP2 binds NCCL only to its all-rank two-phase/sharded update path;
+TP1/DP2 binds sticky replica-local control with no adaptation collective or
+cross-replica gradient averaging. The same patch adds the non-skippable
+`session_reset_tp1` eight-test live-server suite. Its source-owned runner uses
+the exact launch manifest for a cold process and a reused adapted process,
+binds token/reset/HBM/fixed-address/HTTP/fallback/terminal observations, and
+requires empty before/after compute-process snapshots. These paths remain
+`IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF` until their exact locally controlled
+GPU proofs are produced; a remote worker never receives the offline key.
+
+The distributed finalize path also binds the full ordered client-lifecycle
+digest for warmup and scored schedules. It permits native rank coverage to
+omit only the exact digest-bound scored request IDs that the client proves were
+not submitted. Every submitted request still requires a matching native
+completed/aborted terminal, an observed native row cannot be downgraded to
+non-submitted, and every warmup row must be offered, submitted, and completed.
+Rejected, timed-out, cancelled, and unfinished client outcomes therefore stay
+in the registered serving evidence without making an otherwise valid
+scientific run an incomplete distributed terminal.
 
 The second patch exposes an opt-in native committed-token observation
 contract. Each timestamp is sampled by the CPU while the streamer enumerates
@@ -92,14 +118,24 @@ coalesced, and missing client intervals plus exact coverage. Any incomplete
 coverage makes every aggregate ITL statistic, including p99, explicitly
 `UNSUPPORTED`/`null`; a sparse subset is never promoted to a distribution.
 
-The executor also rejects the following before model loading because their
-execution contracts are not implemented:
+The seventh patch implements source-owned qualification and formal-serving
+paths for DSpark, NEXTN, one-node TP2, and sticky two-replica DP2. It also
+implements the TP1 EAGLE3 path behind an exact official-selector compatibility
+decision: compatible assignments have a real qualification bootstrap and a
+formal path that consumes durable external-control proof; incompatible or
+unverified assignments are signed N/A or remain `BLOCKED`. EAGLE remains
+unsupported. DSpark/NEXTN TP1 and topology-specific TP2/DP2 suites, all-rank
+two-phase publication, sticky replica isolation, and the native training
+interfaces are implemented source paths, but remain
+`IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF` until their exact non-skipped GPU
+qualification artifacts exist. Quota-shadow teacher acquisition still fails
+closed when the required native supervision rows are absent.
 
-- DSpark, EAGLE, EAGLE3, and NEXTN adaptation;
-- every TP2 or DP2 run;
-- quota-shadow teacher acquisition when an update round lacks native
-  supervision (the fixed ledger records and capability-blocks that need);
-- DSpark worker/CUDA composite-head training and NEXTN training interfaces.
+The second patch's CPU committed-token observations remain diagnostic only.
+They are distinct from the seventh patch's native qualification producer,
+whose first-party token-production/commit pointers and exact suite proof are
+the only patched-SGLang path eligible for native ITL release policy after the
+dynamic GPU gate passes.
 
 TP1/DP1 DFlash adaptive runtime methods now execute constant,
 inverse-square-root-by-published-update, and finite-horizon cosine schedules.
@@ -204,13 +240,14 @@ commit a patched checkout.
 The final schema-v3 patch has passed the repository's complete
 apply/compile/focused-test/reverse verifier. That is a patch-integrity result,
 not GPU validation. A CPU package test or an older patched-tree receipt is
-insufficient. TP1/DP1 DFlash and its strict native terminal lifecycle are
-implemented, but the release trust policy has no configured signer;
-Static/TTS/L0-naive/LightCone industrial cells are therefore `BLOCKED` before mutation rather
-than runnable `UNMEASURED` work. A test signer, provider object attribute, or
-caller-supplied verifier cannot unlock that policy. The DSpark CPU contract
-does not authorize execution. DSpark/EAGLE/EAGLE3/NEXTN adaptive cells and every TP2/DP2 cell remain
-`BLOCKED`. Target-only is the only release-executable path.
+insufficient. The patch implements registered DFlash, DSpark, NEXTN,
+compatible EAGLE3, TP2, and sticky DP2 source paths, but the release trust
+policy has no configured signer and none has a fresh exact dynamic GPU proof.
+Static/TTS/L0-naive/LightCone industrial cells are therefore `BLOCKED` before
+mutation rather than runnable `UNMEASURED` work. A test signer, provider object
+attribute, or caller-supplied verifier cannot unlock that policy. Generic
+EAGLE remains unsupported; incompatible EAGLE3 combinations remain N/A or
+`BLOCKED`. Target-only is the only currently claimable path.
 
 Historical shared-tuned-AdamW evidence remains a matched-recipe publication-
 policy diagnostic, not TTS-paper reproduction, and is useful for regression

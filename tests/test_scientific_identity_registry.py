@@ -10,14 +10,14 @@ import pytest
 from lightcone_spec.experiments.registry import (
     CONFIRMATION_METHOD_ROLES,
     E0_METHOD_ROLES,
-    FROZEN_TTS_RECIPE_AUTHORITY,
     FROZEN_TTS_RECIPE_SENTINEL,
+    LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY,
     REGISTERED_CONFIRMATION_BLOCKS,
     SEALED_E2_RECIPE_SENTINEL,
     CellStatus,
     ExperimentRegistry,
     ScientificMethodRole,
-    build_industrial_registry,
+    build_legacy_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
 )
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def registry() -> ExperimentRegistry:
-    return build_industrial_registry(
+    return build_legacy_industrial_registry(
         gpu_uuids=("GPU-scientific-a", "GPU-scientific-b"),
         cache_root="runtime-cache/scientific-identity-test",
         evidence_root="artifacts/scientific-identity-test",
@@ -39,12 +39,13 @@ def test_tts_recipe_authority_is_manifest_bound_and_formally_blocked() -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     sidecar = path.with_suffix(path.suffix + ".sha256").read_text().strip()
 
-    assert payload == FROZEN_TTS_RECIPE_AUTHORITY.to_dict()
-    assert content_sha256(payload) == sidecar == FROZEN_TTS_RECIPE_AUTHORITY.sha256
-    assert FROZEN_TTS_RECIPE_AUTHORITY.provenance_status == ("TTS-paper-reconstruction")
-    assert FROZEN_TTS_RECIPE_AUTHORITY.status == "BLOCKED"
-    assert not FROZEN_TTS_RECIPE_AUTHORITY.formal_eligible
-    assert FROZEN_TTS_RECIPE_AUTHORITY.historical_diagnostic_classification == (
+    authority = LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY
+    assert payload == authority.to_dict()
+    assert content_sha256(payload) == sidecar == authority.sha256
+    assert authority.provenance_status == ("TTS-paper-reconstruction")
+    assert authority.status == "BLOCKED"
+    assert not authority.formal_eligible
+    assert authority.historical_diagnostic_classification == (
         "matched_recipe_publication_policy_diagnostic_not_tts_reproduction"
     )
 
@@ -63,11 +64,11 @@ def test_registry_binds_authority_and_revised_stage_cardinalities(
     registry: ExperimentRegistry,
 ) -> None:
     payload = registry.to_dict()
-    assert payload["frozen_tts_recipe_authority"] == (
-        FROZEN_TTS_RECIPE_AUTHORITY.to_dict()
+    assert payload["legacy_frozen_tts_recipe_authority"] == (
+        LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.to_dict()
     )
-    assert payload["frozen_tts_recipe_authority_sha256"] == (
-        FROZEN_TTS_RECIPE_AUTHORITY.sha256
+    assert payload["legacy_frozen_tts_recipe_authority_sha256"] == (
+        LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.sha256
     )
     assert {
         stage: len(registry.cells_for(stage))
@@ -82,10 +83,10 @@ def test_registry_binds_authority_and_revised_stage_cardinalities(
     } == {
         "E0": 2144,
         "E1": 1428,
-        "E2": 11920,
+        "E2": 13456,
         "E3b": 11520,
         "E5": 11064,
-        "E6": 3747,
+        "E6": 2498,
     }
 
 
@@ -213,7 +214,9 @@ def test_frozen_tts_and_l0_naive_share_only_recipe_authority(
     tts_recipe = registry.adaptation_recipe_for_cell(tts)
     assert tts_recipe is registry.adaptation_recipe_for_cell(naive)
     assert tts_recipe.lookup_key.authority_kind == "frozen_tts"
-    assert tts_recipe.source_authority_sha256 == FROZEN_TTS_RECIPE_AUTHORITY.sha256
+    assert tts_recipe.source_authority_sha256 == (
+        LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.sha256
+    )
     assert tts_recipe.optimizer.name == "adam"
     assert tts_recipe.optimizer.schedule is None
     assert tts_recipe.status == "BLOCKED"
@@ -312,7 +315,7 @@ def test_confirmation_and_e6_roles_have_registered_repetition_and_load_axes(
         for cell in e6
         if "largest_feasible_model_anchor_template" in cell.identity.variant
     )
-    assert len(anchors) == 3 * 2 * 2 * len(REGISTERED_CONFIRMATION_BLOCKS)
+    assert len(anchors) == 2 * 2 * 2 * len(REGISTERED_CONFIRMATION_BLOCKS)
     assert {cell.identity.task for cell in anchors} == {"LiveCodeBench"}
     assert {cell.identity.context for cell in anchors} == {16384, 32768}
     assert {scientific_role_for_cell(registry, cell) for cell in anchors} == {

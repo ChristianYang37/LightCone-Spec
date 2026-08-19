@@ -15,6 +15,11 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Literal
 
+from lightcone_spec.runtime.content_authorization import (
+    VerifiedPreparedModelContentRelease,
+)
+from lightcone_spec.runtime.proof_artifact import relocated_evidence_path
+
 from .models import ModelLock
 
 
@@ -70,19 +75,33 @@ _CONTENT_PROFILE_PAYLOAD = {
     },
 }
 
+_GENERIC_CONTENT_PROFILE_PAYLOAD = {
+    "profile": "generic_complete_lightweight_safetensors_v1",
+    "discovery": (
+        "all_regular_non_safetensors_files_recursive_plus_exact_safetensors_"
+        "index_or_single_model"
+    ),
+    "filesystem": (
+        "regular_files_or_single_hop_repo_local_hf_blob_links_bounded_stable_reopen"
+    ),
+    "weight_kind": "derived_exactly_from_model_safetensors_layout",
+    "weight_identity": "complete_payload_sha256_plus_header_tensor_metadata",
+}
+
 PREPARED_MODEL_CONTENT_PROTOCOL_SHA256 = _canonical_sha256(
     {
         "schema_version": 1,
         "kind": "lightcone_prepared_model_content_protocol",
         "release_profiles": _CONTENT_PROFILE_PAYLOAD,
+        "generic_profile": _GENERIC_CONTENT_PROFILE_PAYLOAD,
         "filesystem": (
             "absolute_resolved_revision_root_no_symlink_no_hardlink_"
             "nofollow_stable_stat"
         ),
         "manifest": "path_bound_strict_json_sidecar_and_external_release_sha256",
         "scope": (
-            "critical_files_and_safetensors_index_headers_plus_local_shard_"
-            "stat_identity_not_weight_payload_hash"
+            "all_registered_or_generic_lightweight_files_plus_complete_"
+            "safetensors_payload_sha256_header_and_tensor_metadata"
         ),
     }
 )
@@ -98,6 +117,8 @@ _SHA256_LENGTH = 64
 _MAX_CRITICAL_FILE_BYTES = 64 * 1024 * 1024
 _MAX_CONTENT_MANIFEST_BYTES = 64 * 1024 * 1024
 _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
+_MAX_GENERIC_SNAPSHOT_FILES = 16_384
+_BANNED_MODEL_ID = "Qwen/Qwen3.5-35B-A3B"
 _CONTENT_FILE_FIELDS = frozenset({"relative_path", "size", "raw_sha256"})
 _TENSOR_FIELDS = frozenset({"name", "shape", "dtype", "data_start", "data_end"})
 _HEADER_FIELDS = frozenset(
@@ -110,6 +131,7 @@ _HEADER_FIELDS = frozenset(
         "ctime_ns",
         "header_size",
         "header_sha256",
+        "raw_sha256",
         "tensors",
     }
 )
@@ -396,11 +418,11 @@ def _safe_relative_path(value: object, *, label: str) -> str:
     path = PurePosixPath(text)
     if (
         path.is_absolute()
-        or len(path.parts) != 1
-        or path.parts[0] in {".", ".."}
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
         or str(path) != text
     ):
-        raise ValueError(f"{label} must be one canonical snapshot-relative file")
+        raise ValueError(f"{label} must be one canonical snapshot-relative path")
     return text
 
 
@@ -416,12 +438,23 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+@dataclass(frozen=True)
+class _OpenedSnapshotSource:
+    entry_stat: os.stat_result
+    target_path: str
+    target_stat: os.stat_result
+    link_text: str | None
+    blob_name: str | None
+    blobs_root_path: str | None
+    blobs_root_stat: os.stat_result | None
+
+
 def _open_snapshot_file(
     root: Path,
     relative_path: str,
     *,
     label: str,
-) -> tuple[int, os.stat_result]:
+) -> tuple[int, os.stat_result, _OpenedSnapshotSource]:
     relative = _safe_relative_path(relative_path, label=f"{label} relative path")
     root_flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -441,10 +474,63 @@ def _open_snapshot_file(
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        current = os.stat(relative, dir_fd=root_descriptor, follow_symlinks=False)
-        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
-            raise ValueError(f"{label} file {relative!r} is a symlink or hardlink")
-        descriptor = os.open(relative, flags, dir_fd=root_descriptor)
+        entry = os.stat(relative, dir_fd=root_descriptor, follow_symlinks=False)
+        link_text: str | None = None
+        blob_name: str | None = None
+        if stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1:
+            target_path = root / relative
+            descriptor = os.open(relative, flags, dir_fd=root_descriptor)
+            blobs_root_path: str | None = None
+            blobs_root_stat: os.stat_result | None = None
+        elif stat.S_ISLNK(entry.st_mode):
+            link_text = os.readlink(relative, dir_fd=root_descriptor)
+            link = Path(link_text)
+            if link.is_absolute() or "\x00" in link_text:
+                raise ValueError(f"{label} file {relative!r} has an unsafe cache link")
+            repository_root = root.parent.parent
+            blobs_root = repository_root / "blobs"
+            target_path = Path(os.path.abspath((root / relative).parent / link))
+            if (
+                not repository_root.name.startswith("models--")
+                or target_path.parent != blobs_root
+                or len(target_path.name) not in {40, 64}
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in target_path.name
+                )
+            ):
+                raise ValueError(
+                    f"{label} file {relative!r} escapes the canonical HF blobs root"
+                )
+            expected_link = Path(
+                os.path.relpath(target_path, start=(root / relative).parent)
+            ).as_posix()
+            if link_text != expected_link:
+                raise ValueError(
+                    f"{label} file {relative!r} has a non-canonical HF blob link"
+                )
+            blobs_root_stat = os.lstat(blobs_root)
+            if (
+                not stat.S_ISDIR(blobs_root_stat.st_mode)
+                or stat.S_ISLNK(blobs_root_stat.st_mode)
+                or blobs_root_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(blobs_root_stat.st_mode) & 0o022
+            ):
+                raise ValueError(
+                    f"{label} file {relative!r} uses an unsafe HF blobs directory"
+                )
+            blobs_root_path = str(blobs_root)
+            target_lstat = os.lstat(target_path)
+            if not stat.S_ISREG(target_lstat.st_mode) or target_lstat.st_nlink != 1:
+                raise ValueError(
+                    f"{label} file {relative!r} has a chained or hardlinked blob"
+                )
+            descriptor = os.open(target_path, flags)
+            blob_name = target_path.name
+        else:
+            raise ValueError(
+                f"{label} file {relative!r} is a hardlink or unsupported entry"
+            )
         opened = os.fstat(descriptor)
     except ValueError:
         if descriptor is not None:
@@ -463,14 +549,24 @@ def _open_snapshot_file(
         raise RuntimeError(f"{label} file descriptor was not opened")
     if (
         not stat.S_ISREG(opened.st_mode)
-        or not stat.S_ISREG(current.st_mode)
         or opened.st_nlink != 1
-        or current.st_nlink != 1
-        or _stat_identity(opened) != _stat_identity(current)
+        or _stat_identity(opened) != _stat_identity(os.lstat(target_path))
     ):
         os.close(descriptor)
-        raise ValueError(f"{label} file {relative!r} is a symlink or hardlink")
-    return descriptor, opened
+        raise ValueError(f"{label} file {relative!r} target changed while opening")
+    return (
+        descriptor,
+        opened,
+        _OpenedSnapshotSource(
+            entry_stat=entry,
+            target_path=str(target_path),
+            target_stat=opened,
+            link_text=link_text,
+            blob_name=blob_name,
+            blobs_root_path=blobs_root_path,
+            blobs_root_stat=blobs_root_stat,
+        ),
+    )
 
 
 def _finish_stable_read(
@@ -479,6 +575,7 @@ def _finish_stable_read(
     *,
     root: Path,
     relative_path: str,
+    source: _OpenedSnapshotSource,
     expected_bytes: int | None,
     label: str,
 ) -> None:
@@ -492,12 +589,31 @@ def _finish_stable_read(
         root_flags |= os.O_NOFOLLOW
     root_descriptor = os.open(root, root_flags)
     try:
-        current = os.stat(relative_path, dir_fd=root_descriptor, follow_symlinks=False)
+        entry = os.stat(relative_path, dir_fd=root_descriptor, follow_symlinks=False)
+        current_link = (
+            None
+            if source.link_text is None
+            else os.readlink(relative_path, dir_fd=root_descriptor)
+        )
     finally:
         os.close(root_descriptor)
+    current_target = os.lstat(source.target_path)
+    current_blobs_root = (
+        None if source.blobs_root_path is None else os.lstat(source.blobs_root_path)
+    )
     if (
         _stat_identity(opened) != _stat_identity(reopened)
-        or _stat_identity(reopened) != _stat_identity(current)
+        or _stat_identity(reopened) != _stat_identity(current_target)
+        or _stat_identity(source.entry_stat) != _stat_identity(entry)
+        or source.link_text != current_link
+        or (
+            source.blobs_root_stat is not None
+            and (
+                current_blobs_root is None
+                or _stat_identity(source.blobs_root_stat)
+                != _stat_identity(current_blobs_root)
+            )
+        )
         or (expected_bytes is not None and reopened.st_size != expected_bytes)
     ):
         raise RuntimeError(f"{label} changed while it was read")
@@ -510,7 +626,7 @@ def _read_snapshot_file(
     label: str,
     maximum_bytes: int = _MAX_CRITICAL_FILE_BYTES,
 ) -> tuple[bytes, os.stat_result]:
-    descriptor, opened = _open_snapshot_file(root, relative_path, label=label)
+    descriptor, opened, source = _open_snapshot_file(root, relative_path, label=label)
     try:
         if opened.st_size < 1 or opened.st_size > maximum_bytes:
             raise PreparedModelContentAuthorityBlocked(
@@ -524,11 +640,20 @@ def _read_snapshot_file(
             opened,
             root=root,
             relative_path=relative_path,
+            source=source,
             expected_bytes=len(body),
             label=f"{label} file {relative_path!r}",
         )
         if len(body) != opened.st_size:
             raise RuntimeError(f"{label} file {relative_path!r} was truncated")
+        if (
+            source.blob_name is not None
+            and len(source.blob_name) == 64
+            and hashlib.sha256(body).hexdigest() != source.blob_name
+        ):
+            raise ValueError(
+                f"{label} file {relative_path!r} differs from its HF blob SHA-256"
+            )
         return body, opened
     finally:
         os.close(descriptor)
@@ -617,6 +742,7 @@ class SafetensorsHeaderBinding:
     ctime_ns: int
     header_size: int
     header_sha256: str
+    raw_sha256: str
     tensors: tuple[SnapshotTensorMetadata, ...]
 
     def __post_init__(self) -> None:
@@ -632,6 +758,7 @@ class SafetensorsHeaderBinding:
         _positive_int("safetensors ctime", self.ctime_ns)
         _positive_int("safetensors header size", self.header_size)
         _require_sha256("safetensors header digest", self.header_sha256)
+        _require_sha256("safetensors payload digest", self.raw_sha256)
         if (
             type(self.tensors) is not tuple
             or not self.tensors
@@ -663,6 +790,7 @@ class SafetensorsHeaderBinding:
             "ctime_ns": self.ctime_ns,
             "header_size": self.header_size,
             "header_sha256": self.header_sha256,
+            "raw_sha256": self.raw_sha256,
             "tensors": [item.to_dict() for item in self.tensors],
         }
 
@@ -678,6 +806,7 @@ class SafetensorsHeaderBinding:
             ctime_ns=row["ctime_ns"],
             header_size=row["header_size"],
             header_sha256=row["header_sha256"],
+            raw_sha256=row["raw_sha256"],
             tensors=tuple(
                 SnapshotTensorMetadata.from_dict(item)
                 for item in _strict_list("safetensors tensors", row["tensors"])
@@ -894,9 +1023,12 @@ class PreparedModelContentManifestBinding:
         )
 
     def load(self) -> object:
-        body = _regular_file_bytes(Path(self.path), label="bound content manifest")
+        body = _regular_file_bytes(
+            relocated_evidence_path(self.path), label="bound content manifest"
+        )
         sidecar = _regular_file_bytes(
-            Path(self.sidecar_path), label="bound content manifest sidecar"
+            relocated_evidence_path(self.sidecar_path),
+            label="bound content manifest sidecar",
         )
         value = _strict_json(body, label="bound content manifest")
         semantic = _canonical_sha256(value)
@@ -963,15 +1095,16 @@ class PreparedModelSnapshot:
             character not in "0123456789abcdef" for character in self.revision
         ):
             raise ValueError("prepared model revision must be an immutable Git SHA")
-        root = Path(self.root)
-        if not root.is_absolute() or root.resolve() != root:
+        identity = Path(self.root)
+        if not identity.is_absolute() or identity.resolve() != identity:
             raise ValueError("prepared model root must be absolute and resolved")
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError("prepared model root must be a regular directory")
-        if root.name != self.revision or root.parent.name != "snapshots":
+        if identity.name != self.revision or identity.parent.name != "snapshots":
             raise ValueError(
                 "prepared model root must be the locked revision snapshot directory"
             )
+        root = relocated_evidence_path(identity)
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("prepared model root must be a regular directory")
 
     def to_dict(self) -> dict[str, str]:
         self.validate()
@@ -1140,7 +1273,7 @@ def _read_safetensors_header(
     *,
     label: str,
 ) -> SafetensorsHeaderBinding:
-    descriptor, opened = _open_snapshot_file(root, relative_path, label=label)
+    descriptor, opened, source = _open_snapshot_file(root, relative_path, label=label)
     try:
         prefix = os.read(descriptor, 8)
         if len(prefix) != 8:
@@ -1165,14 +1298,33 @@ def _read_safetensors_header(
                 "prepared_model_content_safetensors_layout_unsupported",
                 f"{label} safetensors header is truncated",
             )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        payload_hasher = hashlib.sha256()
+        payload_bytes = 0
+        while True:
+            chunk = os.read(descriptor, 8 * 1024 * 1024)
+            if not chunk:
+                break
+            payload_hasher.update(chunk)
+            payload_bytes += len(chunk)
         _finish_stable_read(
             descriptor,
             opened,
             root=root,
             relative_path=relative_path,
+            source=source,
             expected_bytes=opened.st_size,
             label=label,
         )
+        if payload_bytes != opened.st_size:
+            raise RuntimeError(f"{label} payload was truncated")
+        raw_sha256 = payload_hasher.hexdigest()
+        if (
+            source.blob_name is not None
+            and len(source.blob_name) == 64
+            and raw_sha256 != source.blob_name
+        ):
+            raise ValueError(f"{label} differs from its HF blob SHA-256")
     finally:
         os.close(descriptor)
     raw_header = _strict_json(header, label=f"{label} safetensors header")
@@ -1236,6 +1388,7 @@ def _read_safetensors_header(
         ctime_ns=opened.st_ctime_ns,
         header_size=header_size,
         header_sha256=hashlib.sha256(header).hexdigest(),
+        raw_sha256=raw_sha256,
         tensors=tuple(tensors),
     )
 
@@ -1244,7 +1397,7 @@ def _critical_files(
     snapshot: PreparedModelSnapshot,
     profile: _ContentProfile,
 ) -> tuple[PreparedModelContentFile, ...]:
-    root = Path(snapshot.root)
+    root = relocated_evidence_path(snapshot.root)
     rows: list[PreparedModelContentFile] = []
     for relative_path in profile.critical_files:
         body, opened = _read_snapshot_file(
@@ -1262,11 +1415,94 @@ def _critical_files(
     return tuple(sorted(rows, key=lambda item: item.relative_path))
 
 
+def _generic_content_profile(
+    snapshot: PreparedModelSnapshot,
+) -> _ContentProfile:
+    """Discover one complete lightweight manifest without model-name trust.
+
+    The fallback is source-owned and deliberately stricter than a signer-picked
+    file list: every non-weight regular file below the immutable snapshot root
+    is hashed, while weight payloads are represented by exact safetensors
+    headers and stable file identities.  Unknown layouts remain BLOCKED.
+    """
+
+    root = relocated_evidence_path(snapshot.root)
+    discovered: list[str] = []
+    safetensors: list[str] = []
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.sort()
+        files.sort()
+        for directory in directories:
+            candidate = current_path / directory
+            status = os.lstat(candidate)
+            if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
+                raise PreparedModelContentAuthorityBlocked(
+                    "prepared_model_content_required_files_unavailable",
+                    f"{snapshot.model_id} contains a non-regular directory entry",
+                )
+        for filename in files:
+            candidate = current_path / filename
+            relative = candidate.relative_to(root).as_posix()
+            _safe_relative_path(relative, label="generic snapshot relative path")
+            status = os.lstat(candidate)
+            if not (
+                (stat.S_ISREG(status.st_mode) and status.st_nlink == 1)
+                or stat.S_ISLNK(status.st_mode)
+            ):
+                raise PreparedModelContentAuthorityBlocked(
+                    "prepared_model_content_required_files_unavailable",
+                    f"{snapshot.model_id} contains an unsupported file entry",
+                )
+            if relative.endswith(".incomplete"):
+                raise PreparedModelContentAuthorityBlocked(
+                    "prepared_model_content_required_files_unavailable",
+                    f"{snapshot.model_id} contains an incomplete download",
+                )
+            if relative.endswith(".safetensors"):
+                safetensors.append(relative)
+            else:
+                discovered.append(relative)
+            if len(discovered) + len(safetensors) > _MAX_GENERIC_SNAPSHOT_FILES:
+                raise PreparedModelContentAuthorityBlocked(
+                    "prepared_model_content_required_files_unavailable",
+                    f"{snapshot.model_id} contains too many files",
+                )
+    if "config.json" not in discovered:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_required_files_unavailable",
+            f"{snapshot.model_id} has no config.json",
+        )
+    has_index = "model.safetensors.index.json" in discovered
+    has_single = "model.safetensors" in safetensors
+    if has_index == has_single:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_safetensors_layout_unsupported",
+            f"{snapshot.model_id} must have exactly one indexed or single layout",
+        )
+    if has_index:
+        weight_kind: Literal["sharded_safetensors", "single_safetensors"] = (
+            "sharded_safetensors"
+        )
+    else:
+        if safetensors != ["model.safetensors"]:
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_safetensors_layout_unsupported",
+                f"{snapshot.model_id} single layout contains foreign weight files",
+            )
+        weight_kind = "single_safetensors"
+    return _ContentProfile(
+        name=str(_GENERIC_CONTENT_PROFILE_PAYLOAD["profile"]),
+        critical_files=tuple(discovered),
+        weight_kind=weight_kind,
+    )
+
+
 def _sharded_headers(
     snapshot: PreparedModelSnapshot,
     critical: tuple[PreparedModelContentFile, ...],
 ) -> tuple[SafetensorsHeaderBinding, ...]:
-    root = Path(snapshot.root)
+    root = relocated_evidence_path(snapshot.root)
     index_file = next(
         (
             item
@@ -1334,13 +1570,14 @@ def _scan_snapshot_content(
     snapshot: PreparedModelSnapshot,
     prepared: PreparedModelSet,
 ) -> PreparedModelSnapshotContent:
-    try:
-        profile = _CONTENT_PROFILES[snapshot.model_id]
-    except KeyError as error:
+    if snapshot.model_id == _BANNED_MODEL_ID:
         raise PreparedModelContentAuthorityBlocked(
-            "prepared_model_content_profile_unregistered",
-            f"no release-owned content profile exists for {snapshot.model_id!r}",
-        ) from error
+            "prepared_model_content_banned_model",
+            f"{snapshot.model_id} is globally prohibited",
+        )
+    profile = _CONTENT_PROFILES.get(snapshot.model_id)
+    if profile is None:
+        profile = _generic_content_profile(snapshot)
     if profile.tokenizer_source is not None and profile.tokenizer_source not in {
         item.model_id for item in prepared.snapshots
     }:
@@ -1354,7 +1591,7 @@ def _scan_snapshot_content(
     else:
         headers = (
             _read_safetensors_header(
-                Path(snapshot.root),
+                relocated_evidence_path(snapshot.root),
                 "model.safetensors",
                 label=f"prepared snapshot {snapshot.model_id} model.safetensors",
             ),
@@ -1579,6 +1816,24 @@ def bind_prepared_model_content_authority(
     )
 
 
+def _portable_snapshot_content_identity(
+    snapshot: PreparedModelSnapshotContent,
+) -> dict[str, object]:
+    """Drop only host-local TOCTOU fields after a complete B-side rescan."""
+
+    value = snapshot.to_dict()
+    value.pop("root")
+    headers = value["weight_headers"]
+    if type(headers) is not list:
+        raise TypeError("prepared snapshot headers are not an array")
+    for header in headers:
+        if type(header) is not dict:
+            raise TypeError("prepared snapshot header is not an object")
+        for name in ("device", "inode", "mtime_ns", "ctime_ns"):
+            header.pop(name)
+    return value
+
+
 def revalidate_prepared_model_content_authority(
     model_lock: ModelLock,
     authority: PreparedModelContentAuthorityBinding,
@@ -1603,9 +1858,143 @@ def revalidate_prepared_model_content_authority(
         raise ValueError("prepared content authority differs from release/model lock")
     serialized, snapshots = _parse_content_manifest(authority.manifest.load())
     observed, rescanned = _content_manifest(model_lock, authority.prepared_model_set)
-    if serialized != observed or snapshots != rescanned:
+    if serialized == observed and snapshots == rescanned:
+        return PreparedModelContentAuthorityResult(
+            binding=authority,
+            snapshots=rescanned,
+        )
+    relocated = tuple(
+        relocated_evidence_path(snapshot.root) != Path(snapshot.root)
+        for snapshot in authority.prepared_model_set.snapshots
+    )
+    if (
+        not relocated
+        or not all(relocated)
+        or tuple(
+            _portable_snapshot_content_identity(snapshot) for snapshot in snapshots
+        )
+        != tuple(
+            _portable_snapshot_content_identity(snapshot) for snapshot in rescanned
+        )
+    ):
         raise ValueError("prepared content authority differs from live snapshot replay")
-    return PreparedModelContentAuthorityResult(binding=authority, snapshots=rescanned)
+    # The serialized A-side rows remain the scientific identity.  The B-side
+    # scan proves the same complete bytes/tensors while its device, inode and
+    # timestamp fields serve only as local TOCTOU guards.
+    return PreparedModelContentAuthorityResult(binding=authority, snapshots=snapshots)
+
+
+def _require_authorized_prepared_model_content_release(
+    model_lock: ModelLock,
+    prepared: PreparedModelSet,
+    manifest: PreparedModelContentManifestBinding,
+    authorization: VerifiedPreparedModelContentRelease,
+) -> None:
+    """Match one verifier-owned root authorization to live, reopened content.
+
+    Per-role snapshot digests use the canonical nested snapshot object from the
+    complete content manifest.  Its canonical byte representation has no
+    whitespace or trailing newline, so its raw and semantic SHA-256 are
+    intentionally identical.  This prevents a signer from authorizing only a
+    model name/revision while leaving the measured tensor/header inventory
+    caller-selected.
+    """
+
+    if type(authorization) is not VerifiedPreparedModelContentRelease:
+        raise TypeError("prepared content binding requires a verified authorization")
+    release = authorization.authorization
+    if (
+        release.model_lock_sha256 != model_lock.sha256
+        or release.prepared_model_set_sha256 != prepared.sha256
+        or release.content_manifest_raw_sha256 != manifest.file_sha256
+        or release.content_manifest_semantic_sha256 != manifest.semantic_sha256
+        or release.content_manifest_size != manifest.size
+    ):
+        raise ValueError(
+            "prepared content authorization differs from lock, set, or manifest"
+        )
+    serialized, snapshots = _parse_content_manifest(manifest.load())
+    if (
+        serialized["model_lock_sha256"] != model_lock.sha256
+        or serialized["prepared_model_set_sha256"] != prepared.sha256
+    ):
+        raise ValueError("authorized prepared content manifest names another set")
+    by_identity = {
+        (snapshot.model_id, snapshot.revision): snapshot for snapshot in snapshots
+    }
+    non_tokenizer = tuple(
+        (row.model_id, row.revision)
+        for row in release.models
+        if row.role != "tokenizer"
+    )
+    if set(non_tokenizer) != set(by_identity):
+        raise ValueError(
+            "prepared content authorization does not cover snapshots exactly"
+        )
+    for row in release.models:
+        snapshot = by_identity.get((row.model_id, row.revision))
+        if snapshot is None:
+            raise ValueError(
+                "prepared content authorization role names an unknown snapshot"
+            )
+        snapshot_sha256 = _canonical_sha256(snapshot.to_dict())
+        if (
+            row.snapshot_manifest_raw_sha256 != snapshot_sha256
+            or row.snapshot_manifest_semantic_sha256 != snapshot_sha256
+        ):
+            raise ValueError("prepared content authorization snapshot digest differs")
+
+
+def bind_authorized_prepared_model_content_authority(
+    model_lock: ModelLock,
+    prepared: PreparedModelSet,
+    manifest_path: str | Path,
+    *,
+    authorization: VerifiedPreparedModelContentRelease,
+) -> PreparedModelContentAuthorityBinding:
+    """Bind live model bytes only under a verified offline-root wrapper."""
+
+    if type(authorization) is not VerifiedPreparedModelContentRelease:
+        raise TypeError("prepared content binding requires a verified authorization")
+    release = authorization.authorization
+    binding = bind_prepared_model_content_authority(
+        model_lock,
+        prepared,
+        manifest_path,
+        expected_release_manifest_sha256=(release.content_manifest_semantic_sha256),
+    )
+    _require_authorized_prepared_model_content_release(
+        model_lock,
+        prepared,
+        binding.manifest,
+        authorization,
+    )
+    return binding
+
+
+def revalidate_authorized_prepared_model_content_authority(
+    model_lock: ModelLock,
+    authority: PreparedModelContentAuthorityBinding,
+    *,
+    authorization: VerifiedPreparedModelContentRelease,
+) -> PreparedModelContentAuthorityResult:
+    """Reopen the manifest/snapshots and reject authorization or TOCTOU drift."""
+
+    if type(authorization) is not VerifiedPreparedModelContentRelease:
+        raise TypeError("prepared content replay requires a verified authorization")
+    release = authorization.authorization
+    result = revalidate_prepared_model_content_authority(
+        model_lock,
+        authority,
+        expected_release_manifest_sha256=(release.content_manifest_semantic_sha256),
+    )
+    _require_authorized_prepared_model_content_release(
+        model_lock,
+        authority.prepared_model_set,
+        authority.manifest,
+        authorization,
+    )
+    return result
 
 
 def prepared_model_content_authority_to_dict(
@@ -1636,6 +2025,7 @@ __all__ = [
     "PreparedModelSnapshotContent",
     "SafetensorsHeaderBinding",
     "SnapshotTensorMetadata",
+    "bind_authorized_prepared_model_content_authority",
     "bind_prepared_model_content_authority",
     "bind_prepared_models",
     "has_prepared_model_content_release_manifest_sha256",
@@ -1644,6 +2034,7 @@ __all__ = [
     "prepared_model_content_authority_to_dict",
     "prepared_model_content_release_identity_sha256",
     "require_prepared_model_content_release_manifest_sha256",
+    "revalidate_authorized_prepared_model_content_authority",
     "revalidate_prepared_model_content_authority",
     "revalidate_prepared_models",
 ]

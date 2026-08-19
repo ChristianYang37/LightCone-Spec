@@ -12,15 +12,19 @@ with a fixed barrier; L0-naive uses that authority with first-ready publication;
 LC-candidates and the E2-sealed LightCone winner use the L0 policy with search
 and sealed recipes, respectively.
 
-All formal industrial GPU outcomes are `UNMEASURED`. The code, CPU tests, and registry
-establish target protocol and coordinator contracts, not a fully runnable
-speculative surface or a benchmark result. The industrial executor currently
-runs only TP1/DP1 Target-only. Static/TTS/L0-naive/LightCone are `BLOCKED` before mutation
-because the pinned native
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
-begin/reset/finalize hook has no configured trusted hardware signer. Stage B is
-also blocked on immutable model/data/trace locks, provider credentials,
-registered hardware, GPU smoke, and the exact interference envelope.
+All formal industrial GPU outcomes are `UNMEASURED`. The staged registry, CPU
+tests, and runtime contracts do not by themselves authorize a benchmark result.
+The trusted single-operator path may collect complete empirical evidence from
+one clean Git HEAD/tree, the complete semantic SGLang patch series, a schema-v5
+trusted ProtocolLock, exact external-source locks, and fresh dynamic GPU
+qualification. Without a current root-authorized attestation, that evidence is
+`trusted_single_operator_empirical_no_signature`, has
+`formal_measured=false`, and remains `UNMEASURED`. A release-level `MEASURED`
+outcome additionally requires the repository-owned Ed25519 root chain. Until
+the relevant run-specific receipts exist, each assignment remains fail-closed
+before allocation. CPU state-machine tests, caller-authored digests, and an old
+smoke result cannot promote TP2/DP2, native ITL, DSpark, NEXTN, or EAGLE3 to
+formal support.
 Historical shared-tuned-AdamW rows are matched-recipe publication-policy
 diagnostics, not TTS-paper reproduction. They are regression/debugging material
 only and are excluded from schema-v3 selection, power sizing, confirmation,
@@ -31,7 +35,7 @@ and claims.
 The registry fixes this order:
 
 ```text
-preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+preflight -> E3a -> TTS-Cal -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 ```
 
 Each target definition names dependencies, locked outputs, and scientific
@@ -65,88 +69,94 @@ serial and formal measurements remain blocked.
 |---|---|---|
 | Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, inventory/topology, audit-only session-reset schema, cache/HTTP/writer, and interference calibration | runtime envelope |
 | E3a | Target-only/Static context, regime, concurrency, and draft-width capacity | reference load, matched width, crossover and drift witness |
-| E1 | 1,428 templates; LC-candidate geometry plus stage-level frozen TTS/L0-naive anchors | safe LC Pareto set and common load |
-| E2 | 11,920 templates; LC-candidate optimizer/schedule successive halving only | one sealed LightCone recipe |
-| E4 | cumulative systems mechanisms and isolated profiling | mechanism gate |
-| E3b | 11,520 long-context cells over the five formal roles | long-context confirmation |
-| E1a | native DSpark transfer and retuning | one DSpark recipe |
-| E5 | 11,064 production/failure cells over the five formal roles | production and topology surfaces |
-| E6 | 3,747 NEXTN transfer cells with frozen TTS and sealed LightCone recipes | native MTP transfer surface |
-| E0 | 2,144 structural cells: 864 compatibility templates plus 1,280 selected-core anchors | blocked, non-formal breadth surface |
+| TTS-Cal | 288 disjoint tuning-only rows: 9 learning rates x 8 strides x 4 excluded pilots | one frozen TTS recipe |
+| E1 | exactly 68 rows after E3a/TTS-Cal sealing | safe LC Pareto set and common load |
+| E2 | four successively materialized rounds; `n0=105g`, `n(k+1)=max(ceil(nk/4),21)`, plus four anchors per round | one sealed LightCone recipe |
+| E4 | 48 strength-2 screen rows, 96 local-factorial rows, and 3 isolated profiler rows | mechanism gate |
+| E3b | `480B` long-context rows, where `B=4+N` and `N` is a sealed 12--20 final prefix | long-context confirmation |
+| E1a | 58 configurations x 2 verification modes = 116 rows | one DSpark recipe |
+| E5 | `450B+264` rows: powered headline families plus the locked 11 faults x 2 backends x 3 topologies x 4 cohort-count one-shot diagnostic matrix | production and topology surfaces |
+| E6 | `2+60B` rows over exactly two NEXTN target models | native MTP transfer surface |
+| E0 | 108 signed compatibility decisions, then `16VB` rows for the `V` valid model/backend/task combinations | OnlineSPEC breadth surface |
 
-Each activated E1 width/load slice has 68 cells: two fixed references, two
-L0-policy LC-candidate optimizer anchors under each of 32 Full/LoRA geometries,
-and one stage-level frozen anchor each for TTS and L0-naive. The 21 possible
-slices form the 1,428-template envelope. E2 tunes only LC-candidates. In each
-of four rounds it carries 2 fixed references, 32 geometries times 93 search
-recipes, and one stage-level frozen anchor for each baseline, for 2,980 cells
-per round and 11,920 templates total. The E1 selector consumes a 67-cell
-subset and the E2 selector a 2,979-cell subset: Target-only exactness, Static,
-frozen TTS, and LC-candidates. The separately planned L0-naive anchor is reserved
-for mechanism/decomposition evidence and is excluded from candidate safety,
-Pareto, and ranking inputs. E2 keeps optimizer-specific fields and the schedules `constant`,
-inverse-square-root by published update, and cosine-to-zero as separate
-identities. ChronoBelief declarations are explicitly `BLOCKED`: no authoritative
-update equation or source identity is registered, and substituting another
-optimizer is forbidden.
+E1 has exactly 68 rows: Target-only, Static, frozen TTS, frozen L0-naive, and
+two optimizer anchors under each of 32 Full/LoRA LightCone geometries. The
+L0-naive row is a mechanism anchor and cannot enter candidate ranking. E2 tunes
+only LightCone candidates. For every surviving E1 geometry it registers seven
+optimizers (`Adam`, `AdamW`, `SGDM`, `NAG`, `Muon`, `Lion`, and project-owned
+`ChronoBelief`), three schedules, and five learning rates, hence 105 recipes
+per geometry in round zero. Each later round is an exact subset of its sealed
+predecessor; no candidate may re-enter. Four fixed role anchors are added to
+each round, so the complete E2 count is `16 + sum(n0..n3)` rather than an eager
+sentinel matrix.
 
-The TTS anchor is `TTS-paper-reconstruction`. Its update-recipe authority fixes
-Adam, one step, latest-round-only supervision, position-weighted distillation
-plus a source-point proximal term, request reset, and strided side-stream
-execution. Orthogonally, TTS publication uses the paper's fixed barrier. Its
-undisclosed numeric optimizer/loss/trainable/stride fields
-keep both frozen TTS and L0-naive anchors `BLOCKED`. They never inherit a search
-candidate, schema default, historical AdamW recipe, or result-derived winner.
+The TTS reconstruction authority fixes Adam `(beta1=.9, beta2=.999,
+epsilon=1e-8, weight_decay=0)`, one update step, full-drafter training, no
+clipping, latest-round-only supervision, drafter-native position weights, a
+source-point proximal term, request reset, and a side stream. TTS-Cal crosses
+learning rates `1e-7, 3e-7, ..., 1e-3` with strides
+`1,5,10,15,20,30,40,50` over four excluded pilots. Selection is safety-first,
+then maximum SLO-goodput, and is signed before E1. TTS publishes at a fixed
+barrier; L0-naive consumes the identical frozen recipe/candidate bytes and
+changes only publication to first-ready. Neither may inherit an E2 winner.
 
-E1a has exactly 56 adaptive configurations. Its 32 layer-only cells cross
+ChronoBelief is a project-owned preregistered optimizer. Its identity binds the
+four update equations, PDF/TeX digests, standard update-count bias correction,
+decoupled weight decay, and safe-boundary age `d_r`. Skip and abort leave
+moments and the update counter byte-identical; only a committed proposal may
+advance optimizer state.
+
+E1a has exactly 58 configurations: 56 adaptive configurations plus two fixed
+references. Its 32 layer-only adaptive configurations cross
 `last1/last3/last5/all` with Full plus seven LoRA ranks while freezing DSpark
 native heads. Its 24 hybrid cells cross `last1/last3/last5` with the same eight
 backbone parameterizations and additionally train native W1, W2, and scalar
-acceptance/confidence state as Full. Fixed verification budget is a tuning
-control; the transferred candidate must also survive the native scheduler.
+acceptance/confidence state as Full. Every configuration runs once with a fixed
+verification budget and once with the native scheduler, yielding 116 rows.
 
-These are registered scientific envelopes, not instructions to execute every
-template and not current release support. E1 activation consumes the sealed
-E3a selection and materializes exactly one 68-cell width/load slice; every
-other E1 template receives an immutable disposition. E2 materializes only one
+These are signed staged materializations, not instructions to expand a future
+matrix. E1 consumes sealed E3a and TTS-Cal receipts and materializes exactly
+one 68-row width/load slice. E2 materializes only one
 successive-halving round at a time, ranks each LC-candidate against fixed Static
 and frozen-TTS references, preserves family floors, and derives the next round
 only from the prior sealed survivor receipt. Only the final tuning-only E2
 receipt can seal the recipe named LightCone.
-Formal E2 reduction requires genuine per-token observation times. The official
-SGLang SSE client may coalesce several token IDs in one chunk, so the adapter
-records those token timestamps as unavailable rather than inventing evenly
-spaced ITLs. E2 therefore remains `BLOCKED` until a native per-token timestamp
-hook is bound or one-token-per-chunk delivery is proven by the pinned runtime.
+Formal E2 reduction requires native per-token production/commit timestamps.
+Coalesced SSE chunks are never divided into invented intervals; absent or
+incomplete native timestamp coverage blocks the reducer.
 Confirmation materialization is family-local: four excluded pilots are reduced
 before confirmation is visible, then only a sealed 12--20-block final prefix is
 activated. A family remains the incremental scheduling/power unit, but a stage
 dependency receipt is issued only from a separate exact-coverage aggregate:
 families are SHA-sorted and replayed from raw pilot/final completion authority.
-E5's 264 non-family failure-injection cells use a deterministic auxiliary
-activation/completion, and the family plus auxiliary dispositions must be an
-exact disjoint cover of the stage. The pinned patch still rejects
-DSpark/EAGLE/EAGLE3/NEXTN adaptation and all multi-rank execution. TP1/DP1
-DFlash implements the registered E2 schedules and logical delays, while a real
-quota-shadow acquisition need remains a named backend-capability block. This
-path cannot produce a claim without the out-of-band trusted signer.
+E5's 264 deterministic failure injections are one-shot diagnostic passes;
+they are not multiplied by confirmation blocks. Selected p99 anchors require
+at least 10,000 completed requests. The pilot reducer seals each selected
+backend/topology family before final unblinding; all five paired method cells
+in that existing family then consume the same exact 11,000-offer extension
+pool in every included block. The extension creates no extra materialized row.
+Headline families and the 264 failure diagnostics form the exact signed
+materialization.
 
-E3b contains 24 blocks by five roles, eight contexts, three regimes, two loads,
-and two width panels (11,520 cells). E5 contains 24 blocks over its registered
-production panels and 264 failure injections (11,064 cells). E6 contains three
-preflights; four headline roles over three models, two tasks, three contexts,
-two loads, and 24 blocks; plus L0-naive mechanism anchors for LiveCodeBench at
-16K/32K and both loads (3,747 cells). E6 already has one TTS role: it always
-uses the frozen external recipe, never an E2-derived recipe. LightCone
-uses the sealed E1/E2 winner without E6 retuning. E0 has 2,144 structural cells:
-864 compatibility templates (`4 models x 3 backends x 9 tasks x 8 roles`) plus
-1,280 preregistered selected-core anchors (`4 models x 1 DFlash backend x 2
-tasks x 2 loads x (4 excluded pilots + 12 final blocks) x 5 formal roles`).
-Both surfaces remain blocked and non-reportable until their exact recipe, load,
-repetition, and evidence authorities are sealed.
-The 24-block axis explicitly separates four excluded pilots from 20 potential
-final paired blocks at each registered load. A family reports only the sealed
-12--20 final prefix, so every reported E6 contrast has a valid 95% interval.
+E3b materializes 480 rows per block. E5 materializes 450 headline rows per
+block plus 264 one-shot failure diagnostics; the sealed selected-p99 set only
+adds execution requirements to matching headline cells.
+E6 has one globally deduplicated immutable-interface preflight per target model
+and 60 rows per block over exactly `Qwen/Qwen3.6-35B-A3B` and
+`Qwen/Qwen3.5-122B-A10B-FP8`. Its source-owned producer derives exactly two TP2
+launches from the built-in `mtp.*` component of those same frozen target
+snapshots; a separate draft-model path is forbidden. TTS always uses its frozen
+external recipe; LightCone uses the sealed E1/E2 winner without E6 retuning.
+
+E0 first publishes exactly 12 source-owned pre-probe interfaces for the four
+models by three backends. Those interfaces contain no pre-existing task proof.
+The physical campaign then executes 12 launch groups, each covering the nine
+task-native probes, to produce the exact 108 model/backend/task compatibility
+terminals. A task-specific EAGLE3 proof row may be published only after its
+successful one-request core evidence exists. Only the resulting `V` valid
+decisions materialize serving rows: eight roles, task-native requests,
+concurrency one and common SLO load, giving `16VB`. An all-N/A compatibility
+receipt legitimately emits zero timing rows.
 
 ## Data, contexts, and traces
 
@@ -181,10 +191,13 @@ nonclaimable failure. A synthetic BurstGPT-shaped trace is never labelled as
 the real dataset without an immutable external corpus digest.
 
 Paired open-loop methods consume identical trace bytes; paired closed-loop
-methods consume the same pool and client ordering. Every actual offer is
-accounted exactly once as rejected, completed, timed out, cancelled, or
-unfinished. Unfinished work remains in the denominator through its registered
-timeout boundary. Missing rows are not filled with zero.
+methods consume the same pool and client ordering. Pairing is bound to the
+digest of that complete registered source pool, not to a method's realized
+offered prefix or response tokens. Observed outputs remain in the evidence and
+a separate exactness gate compares every request completed by two methods.
+Every actual offer is accounted exactly once as rejected, completed, timed
+out, cancelled, or unfinished. Unfinished work remains in the denominator
+through its registered timeout boundary. Missing rows are not filled with zero.
 
 ## GPU-pool staging
 
@@ -214,17 +227,22 @@ the frozen headline waves remain two-way. Runtime completion never creates
 result-dependent co-tenancy. Profiler, download, and compile work is
 exclusive-host and cannot contend with headline timing.
 
-Exclusive-host classification is not execution authority. This release does
-not dispatch COMPILE or DOWNLOAD cells: compile lacks an exact release-owned
-prewarm/finalization manifest and atomic cache-result pointer, and download
-lacks a first-party terminal receipt contract.
+Disk admission uses a signed stage-specific capacity envelope. It combines
+static input sizing, compile/cache high-water, evidence high-water, retry
+reserve, and a safety margin against the exact dispatch schedule. The legacy
+100 GB free-space rule is used only when that authority is absent or
+unavailable; a bad signature or tampered envelope never falls back. Additional
+disk allocation is not an automatic pass, and admission never deletes user
+data.
 
-A future compile contract must bind the assignment, budget, inventory and GPU
-UUIDs; compile-plan/key and model revisions; TP, context, concurrency, and graph
-buckets; deterministic prewarm payloads; and a graceful-shutdown acknowledgement.
-Its atomically published result pointer must name and hash the manifest, attempt
-receipt, final cache receipt, and immutable cache object. Resume must reopen all
-of those files rather than accept the pointer's serialized summary.
+Exclusive-host classification is not execution authority. COMPILE and DOWNLOAD
+use distinct first-party runners. Their typed assignments bind budget,
+inventory/GPU UUIDs, source checkout, prepared model/tokenizer content,
+RunConfig, launch argv/ports, deterministic prewarm or download plan, and
+graceful shutdown. Each runner publishes an immutable terminal and atomic
+no-replace result pointer; resume reopens every named raw file and sidecar.
+Missing dynamic control, partial terminal coverage, or a cache-pointer mismatch
+blocks activation.
 
 Each dispatch plan binds the exact `ExperimentBudget` digest for every
 assignment. Wall time, requested-gang compute GPU time, reserved GPU time, and
@@ -233,15 +251,17 @@ its wall time, while whole-instance billing charges the entire frozen inventory
 for the observed wall interval. A queue is data, not an instruction to launch
 every assignment simultaneously.
 
-TP2 and sticky-replica DP2 are target coordinator contracts. A future release
-would require a verified patched-runtime capability receipt and all-rank
-prepare/decide/apply/receipt evidence for one publication identity. The current
-`RunConfig` rejects every TP2/DP2 cell before model loading; the CPU `gloo`
-harness is only a state-machine test and cannot enable those cells.
+`RunConfig` supports only `tp1_dp1`, `tp2_dp1`, and `tp1_dp2`, on one host and
+at most two ranks. TP2 requires all-rank prepare/decide/apply/receipt evidence
+for one publication identity and proves one-rank abort produces zero partial
+publication. DP2 is two TP1 replicas behind a sticky cohort router and forbids
+cross-replica gradient averaging. Neither topology becomes executable from CPU
+state-machine coverage: a fresh root-authorized mode-specific GPU qualification
+receipt must bind the exact patched tree and two-GPU inventory.
 
 Multi-host control distributes independent host-local work through
 content-bound requests and receipts. No stage claims cross-host collectives,
-an executable TP2/DP2 path, Kubernetes scheduling, elastic membership, or
+world size greater than two, Kubernetes scheduling, elastic membership, or
 automatic failover. Fleet SSH transport concurrency is explicitly bounded. A
 failed host preserves completed peer receipts. Any post-dispatch loss of
 authority is `REMOTE_OUTCOME_UNKNOWN` and requires an independent
@@ -334,24 +354,21 @@ queue and Parquet row-group limits, checkpoint interval, overflow mode, SQLite
 WAL/FULL settings, and file/checkpoint/directory fsync gates. The checkpoint,
 prepared receipt, terminal receipt, and resume path must agree on that policy.
 
-The pinned source now produces content-bound all-reset capability, initial
-state, and boundary receipts. The receipt proves the registered drain,
-KV/prefix, RNG/counter, scheduler/telemetry, adaptation-state, allocator/HBM,
-and completion-event predicates at the CPU contract boundary. Its GPU reset
-semantics remain `PENDING`. On the supported single-tokenizer HTTP/1.1 uvicorn
+The pinned source produces content-bound all-reset capability, initial-state,
+and boundary receipts. The receipt covers drain, KV/prefix, RNG/counter,
+scheduler/telemetry, adaptation state, allocator/HBM, and completion events.
+GPU reuse remains disabled until the exact identity passes reset/address/value/
+HBM qualification; a verified proof enables only the measured identity and
+topology. On the supported single-tokenizer HTTP/1.1 uvicorn
 paths, continuous HTTP accounting comes from real protocol connection creation/
 closure events and remains bound to one HTTP process generation with monotonic,
 conserved totals; request counters and client fields are rejected as
 substitutes. Granian HTTP/2 and multiple-tokenizer HTTP-process paths fail
-closed before producing this capability. The receipt is not yet durably bound
-into the terminal envelope or continuous launch-to-termination inventory accounting.
-The source patch covers reset-state accounting only and does not yet produce
-native warm-up, trace, or close receipts. All live GPU reuse entry points
-therefore remain blocked and fall back to a
-distinct clean process and HTTP pool per trace; no reset or startup-saving
-claim is recorded. Within each supported single-trace path, submit and abort
-share that official HTTP pool, with timeouts bound to the request deadline and
-abort grace.
+closed before producing this capability. The terminal envelope binds warm-up,
+trace, reset, close, and continuous launch-to-termination inventory accounting.
+If any receipt is absent or the dynamic proof does not match, the executor
+falls back to a distinct clean process and HTTP pool per trace and records no
+startup-saving claim.
 Immutable compile-cache bases remain content-addressed and verified, each
 process gets a private writable overlay, and CUDA Graphs never cross a process
 or GPU. Fault-injection cells always use a fresh process in this release.
@@ -364,25 +381,26 @@ terminal-bound `BudgetObservationReceipt` covering all registered phases,
 measured gang GPU time, whole-instance billed time, and exact deltas. Missing
 components remain missing or explicit N/A, never zero.
 
-An empirical gate additionally requires an attestation binding the registry or
-manifest, selections and stage receipts, exact runtime/capability and patched
-tree, model/tokenizer/data/trace identities, the Target-only reference,
-hardware and power report, and every final Parquet digest. Without it, status
-is `UNMEASURED` even when local arithmetic is positive. Valid attested evidence
-that fails a registered criterion is `BLOCKED`. The repository contains
-protocol code, not performance claims or result artifacts, and this release
-contains no GPU results.
-No trusted hardware-attester identity is configured in this release. Therefore
-content-consistent caller-authored attestation files cannot promote either the
-industrial or legacy analyzers to `MEASURED`, and Static/TTS/L0-naive/LightCone stay blocked
-before mutation despite the implemented hook.
-
-The external `TrustedAttesterPolicyBundle` format binds public verification
-keys, nonce freshness/replay policy, hardware-envelope allowlists, and validity
-to a separately provisioned anchor. Private signing material never belongs in
-the repository or experiment artifacts. The source-release anchor is currently
-unconfigured, so loading an operator bundle cannot by itself authorize the
-formal DAG.
+The trusted single-operator final audit may close complete, reproducible
+empirical evidence without a signature, but it must label that closure
+`trusted_single_operator_empirical_no_signature` and keep
+`formal_measured=false`. Promotion to `MEASURED` additionally requires an
+attestation binding the registry or manifest, selections and stage receipts,
+exact runtime/capability and patched tree, model/tokenizer/data/trace
+identities, the Target-only reference, hardware and power report, and every
+final Parquet digest. Without it, status is `UNMEASURED` even when the empirical
+campaign and local arithmetic are complete. Valid attested evidence that fails
+a registered criterion is `BLOCKED`. The repository contains protocol code,
+not performance claims or result artifacts, and this release contains no GPU
+results.
+The repository contains one offline Ed25519 public root and its fingerprint.
+Private signing material never belongs in the repository, remote instance,
+argv, environment, logs, or experiment artifacts. Root-authorized deployment
+policies bind control type, nonce freshness/replay, exact inventory/hardware,
+validity, and source lineage. Dispatch, compile, non-serving terminal,
+capacity, interference, and rank aggregate controls share that policy and one
+atomic replay reservation. A content-consistent caller-authored key or bundle
+cannot authorize the formal DAG.
 
 The protocol labels code-only closure `CPU_READY`, a prepared but unexecuted
 device check `GPU_SMOKE_READY`, and only qualifying attested terminal evidence

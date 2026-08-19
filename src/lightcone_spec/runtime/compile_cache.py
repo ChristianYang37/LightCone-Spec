@@ -39,10 +39,10 @@ _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # for every contract in this module); the patch digest is over the exact mail
 # patch bytes registered by that manifest.
 PINNED_SGLANG_PATCH_MANIFEST_SHA256 = (
-    "7bfb2ea4f1497dd782a70a7afcad0857495b2871d80ad8ac858b2cb81e32ef7b"
+    "cc8355703fe83c8a73ecdbf9cd656140e257e69570fbfd8d8bc08f657e72fd71"
 )
 PINNED_SGLANG_PATCH_SHA256 = (
-    "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
+    "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
 )
 SGLANG_FIRST_PARTY_COMPILE_BUILDER = "lightcone_spec.sglang_bridge.launch_server.v1"
 RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
@@ -119,15 +119,18 @@ COMPILE_ONLY_GRACEFUL_SHUTDOWN_PROTOCOL_SHA256 = _content_sha256(
 )
 COMPILE_ONLY_RESULT_POINTER_PROTOCOL_SHA256 = _content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "compile_only_atomic_result_pointer_protocol",
         "required_path_bindings": (
             "assignment_manifest",
             "prewarm_manifest",
+            "launch_manifest",
             "attempt_receipt",
             "graceful_shutdown_receipt",
             "final_cache_receipt",
             "immutable_cache_object_manifest",
+            "subprocess_lifecycle_receipt_when_executed",
+            "dynamic_control_verification_receipt_when_formal",
         ),
         "each_binding_requires": ("absolute_path", "raw_sha256", "size"),
         "publication": "atomic_no_replace_with_exact_sidecar",

@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_industrial_executor import _execution_fixture
+from test_industrial_executor import _clean_project_tree, _execution_fixture
 from test_telemetry_durability import (
     performance_record,
     request_record,
@@ -23,6 +23,7 @@ from lightcone_spec.telemetry import (
 
 def test_registered_writer_policy_is_strict_and_changes_plan_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     policy = DEFAULT_EVIDENCE_WRITER_POLICY
     assert EvidenceWriterPolicy.from_dict(policy.to_dict()) == policy
@@ -30,6 +31,12 @@ def test_registered_writer_policy_is_strict_and_changes_plan_identity(
     with pytest.raises(ValueError, match="fields differ"):
         EvidenceWriterPolicy.from_dict({**policy.to_dict(), "extra": 1})
 
+    # This fixture models the clean project identity required by production
+    # while the surrounding development worktree intentionally contains edits.
+    monkeypatch.setattr(
+        "lightcone_spec.doctor._project_tree",
+        _clean_project_tree,
+    )
     plan = _execution_fixture(tmp_path, request_count=1).plan
     changed = replace(policy, async_batch_rows=64)
     changed_plan = replace(plan, evidence_writer_policy=changed)

@@ -100,9 +100,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     LockedOutput,
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.runtime_metrics import RuntimeMetricStatus
 from lightcone_spec.experiments.statistics import (
@@ -1442,7 +1444,9 @@ def _build_e2_stage_evidence(
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         completed_cells_sha256=content_sha256({"E1": "completed"}),
-        dependency_receipts=(LockedOutput("E3a", content_sha256({"E3a": "receipt"})),),
+        dependency_receipts=(
+            LockedOutput("TTS-Cal", content_sha256({"TTS-Cal": "receipt"})),
+        ),
         outputs=(
             LockedOutput(
                 "common_downstream_load",
@@ -1682,6 +1686,7 @@ def _analysis_manifest(
         main(
             [
                 "build-industrial-registry",
+                "--legacy-diagnostic",
                 "--logical-gpu-slot",
                 *registry.gpu_uuids,
                 "--cache-root",
@@ -2989,7 +2994,9 @@ def test_e2_raw_stage_reducer_stops_at_unregistered_common_load_authority() -> N
         runtime_sha256=runtime_sha256,
         split_sha256=split_sha256,
         completed_cells_sha256=content_sha256({"E1": "completed"}),
-        dependency_receipts=(LockedOutput("E3a", content_sha256({"E3a": "receipt"})),),
+        dependency_receipts=(
+            LockedOutput("TTS-Cal", content_sha256({"TTS-Cal": "receipt"})),
+        ),
         outputs=(
             LockedOutput(
                 "common_downstream_load",

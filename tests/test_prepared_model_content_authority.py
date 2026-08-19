@@ -175,7 +175,7 @@ def test_content_authority_replays_critical_files_and_safetensors_headers(
     )
 
 
-def test_unregistered_profile_and_missing_required_file_are_named_blocks(
+def test_generic_profile_and_missing_required_file_are_fail_closed(
     tmp_path: Path,
 ) -> None:
     lock, prepared, roots = _fixture(tmp_path)
@@ -192,9 +192,23 @@ def test_unregistered_profile_and_missing_required_file_are_named_blocks(
     unknown = bind_prepared_models(unknown_lock, {"unknown/model": unknown_root})
     with pytest.raises(
         PreparedModelContentAuthorityBlocked,
-        match="prepared_model_content_profile_unregistered",
+        match="prepared_model_content_required_files_unavailable",
     ):
         materialize_prepared_model_content_manifest(unknown_lock, unknown)
+
+    (unknown_root / "config.json").write_bytes(b'{"model_type":"unknown"}')
+    (unknown_root / "source.py").write_bytes(b"MODEL = 'unknown'\n")
+    _write_safetensors(
+        unknown_root / "model.safetensors",
+        {"model.layers.0.weight": ("BF16", (2, 2))},
+    )
+    manifest = materialize_prepared_model_content_manifest(unknown_lock, unknown)
+    snapshot = manifest["snapshots"][0]
+    assert snapshot["profile"] == "generic_complete_lightweight_safetensors_v1"
+    assert [row["relative_path"] for row in snapshot["critical_files"]] == [
+        "config.json",
+        "source.py",
+    ]
 
 
 def test_snapshot_sources_reject_symlink_hardlink_and_manifest_path_escape(
@@ -205,14 +219,14 @@ def test_snapshot_sources_reject_symlink_hardlink_and_manifest_path_escape(
     original = roots["drafter"] / "config-real.json"
     config.rename(original)
     config.symlink_to(original)
-    with pytest.raises(ValueError, match="symlink or hardlink"):
+    with pytest.raises(ValueError, match="unsafe cache link|hardlink"):
         materialize_prepared_model_content_manifest(lock, prepared)
 
     lock, prepared, roots = _fixture(tmp_path / "hardlink")
     config = roots["drafter"] / "config.json"
     alias = roots["drafter"] / "config-hardlink.json"
     os.link(config, alias)
-    with pytest.raises(ValueError, match="symlink or hardlink"):
+    with pytest.raises(ValueError, match="hardlink"):
         materialize_prepared_model_content_manifest(lock, prepared)
 
     lock, prepared, _, paths = _authority(tmp_path / "escape")
@@ -237,6 +251,112 @@ def test_snapshot_sources_reject_symlink_hardlink_and_manifest_path_escape(
             duplicate,
             expected_release_manifest_sha256="0" * 64,
         )
+
+
+def _hf_cache_generic_fixture(
+    tmp_path: Path,
+) -> tuple[ModelLock, object, Path, dict[str, Path]]:
+    model_id = "example/Generic-Model"
+    revision = "4" * 40
+    repository = (tmp_path / "models--example--Generic-Model").resolve()
+    snapshot = repository / "snapshots" / revision
+    blobs = repository / "blobs"
+    (snapshot / "code").mkdir(parents=True)
+    blobs.mkdir()
+
+    def linked(relative: str, body: bytes) -> Path:
+        digest = hashlib.sha256(body).hexdigest()
+        blob = blobs / digest
+        blob.write_bytes(body)
+        destination = snapshot / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        depth = len(Path(relative).parts) - 1
+        destination.symlink_to(Path(*([".."] * (2 + depth))) / "blobs" / digest)
+        return blob
+
+    config_blob = linked("config.json", b'{"model_type":"generic"}')
+    source_blob = linked("code/source.py", b"MODEL = 'generic'\n")
+    temporary_weight = tmp_path / "weight.tmp"
+    _write_safetensors(
+        temporary_weight,
+        {"model.layers.0.weight": ("BF16", (2, 2))},
+    )
+    weight_blob = linked("model.safetensors", temporary_weight.read_bytes())
+    temporary_weight.unlink()
+    lock = ModelLock(2, (LockedModel(model_id, revision),))
+    prepared = bind_prepared_models(lock, {model_id: snapshot})
+    return (
+        lock,
+        prepared,
+        snapshot,
+        {
+            "config": config_blob,
+            "source": source_blob,
+            "weight": weight_blob,
+        },
+    )
+
+
+def test_hf_cache_links_are_repo_local_content_addressed_and_toctou_bound(
+    tmp_path: Path,
+) -> None:
+    lock, prepared, snapshot, blobs = _hf_cache_generic_fixture(tmp_path)
+    manifest = materialize_prepared_model_content_manifest(lock, prepared)
+    content = manifest["snapshots"][0]
+    assert [row["relative_path"] for row in content["critical_files"]] == [
+        "code/source.py",
+        "config.json",
+    ]
+    assert content["weight_headers"][0]["raw_sha256"] == blobs["weight"].name
+
+    blobs["source"].write_bytes(blobs["source"].read_bytes() + b"# changed\n")
+    with pytest.raises(ValueError, match="HF blob SHA-256"):
+        materialize_prepared_model_content_manifest(lock, prepared)
+
+    lock, prepared, snapshot, _ = _hf_cache_generic_fixture(tmp_path / "foreign")
+    foreign = (tmp_path / "outside").resolve()
+    foreign.write_bytes(b'{"model_type":"foreign"}')
+    (snapshot / "config.json").unlink()
+    (snapshot / "config.json").symlink_to(foreign)
+    with pytest.raises(ValueError, match="unsafe cache link|canonical HF blobs"):
+        materialize_prepared_model_content_manifest(lock, prepared)
+
+    lock, prepared, snapshot, blobs = _hf_cache_generic_fixture(tmp_path / "bad-hash")
+    bad = blobs["config"].with_name("0" * 64)
+    bad.write_bytes(blobs["config"].read_bytes())
+    (snapshot / "config.json").unlink()
+    (snapshot / "config.json").symlink_to(Path("../../blobs") / bad.name)
+    with pytest.raises(ValueError, match="HF blob SHA-256"):
+        materialize_prepared_model_content_manifest(lock, prepared)
+
+    lock, prepared, snapshot, blobs = _hf_cache_generic_fixture(tmp_path / "chained")
+    chained = blobs["config"].with_name("1" * 64)
+    chained.symlink_to(blobs["config"])
+    (snapshot / "config.json").unlink()
+    (snapshot / "config.json").symlink_to(Path("../../blobs") / chained.name)
+    with pytest.raises(ValueError, match="chained"):
+        materialize_prepared_model_content_manifest(lock, prepared)
+
+    lock, prepared, snapshot, _ = _hf_cache_generic_fixture(
+        tmp_path / "blobs-root-symlink"
+    )
+    repository = snapshot.parent.parent
+    real_blobs = repository / "blobs"
+    foreign_blobs = (tmp_path / "foreign-blobs").resolve()
+    real_blobs.rename(foreign_blobs)
+    real_blobs.symlink_to(foreign_blobs, target_is_directory=True)
+    with pytest.raises(ValueError, match="unsafe HF blobs directory"):
+        materialize_prepared_model_content_manifest(lock, prepared)
+
+    lock, prepared, snapshot, blobs = _hf_cache_generic_fixture(
+        tmp_path / "noncanonical-link"
+    )
+    (snapshot / "config.json").unlink()
+    (snapshot / "config.json").symlink_to(
+        Path("../../blobs/../blobs") / blobs["config"].name
+    )
+    with pytest.raises(ValueError, match="non-canonical HF blob link"):
+        materialize_prepared_model_content_manifest(lock, prepared)
 
 
 def test_external_release_digest_rejects_coordinated_rehash_and_model_swap(

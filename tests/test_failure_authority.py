@@ -26,7 +26,12 @@ from lightcone_spec.experiments.failure_authority import (
     revalidate_failure_execution_authority,
     revalidate_failure_injection_authority,
 )
-from lightcone_spec.experiments.registry import E5_FAILURES, build_industrial_registry
+from lightcone_spec.experiments.registry import (
+    E5_FAILURES,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
+)
 from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
 
 
@@ -169,10 +174,15 @@ def test_release_plan_is_registry_derived_and_all_rank() -> None:
     assert plan.cell_id == cell.cell_id
     assert plan.scenario == "communicator_failure"
     assert tuple(row.topology for row in plan.topology_targets) == (
+        "tp1_dp1",
         "tp2_dp1",
-        "two_replica_tp1_dp2",
+        "tp1_dp2",
     )
-    assert all(row.target_ranks == (0, 1) for row in plan.topology_targets)
+    assert tuple(row.target_ranks for row in plan.topology_targets) == (
+        (0,),
+        (0, 1),
+        (0, 1),
+    )
     assert plan.lifecycle.fresh_process_required
     assert plan.correctness_only
 
@@ -182,12 +192,9 @@ def test_bind_revalidates_raw_plan_and_blocks_before_execution(tmp_path: Path) -
 
     replay = revalidate_failure_injection_authority(binding, registry=registry)
     assert replay.plan == plan
-    with pytest.raises(FailureInjectionAuthorityBlocked) as captured:
-        require_failure_injection_authority(binding, registry=registry)
-    assert (
-        captured.value.reason
-        == FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
-    )
+    token = require_failure_injection_authority(binding, registry=registry)
+    assert token.plan_sha256 == plan.sha256
+    assert token.registry_sha256 == registry.sha256
 
 
 def test_failure_binding_wire_round_trip_is_path_and_content_bound(
@@ -261,17 +268,17 @@ def test_public_token_constructor_cannot_replace_source_capability(
     assert not hasattr(authority_module, "RELEASE_FAILURE_ACTUATORS")
     registry, plan, _, binding = _bound_plan(tmp_path)
     cell = next(row for row in registry.cells_for("E5") if row.cell_id == plan.cell_id)
-    token = _caller_token(plan, binding)
-
-    with pytest.raises(
-        FailureInjectionAuthorityBlocked,
-        match=FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON,
-    ):
+    with pytest.raises(TypeError, match="first-party validation"):
+        _caller_token(plan, binding)
+    token = require_failure_injection_authority(binding, registry=registry)
+    assert (
         revalidate_failure_execution_authority(
             token,
             cell=cell,
             expected_registry_sha256=registry.sha256,
-        )
+        ).plan
+        == plan
+    )
 
 
 def test_joint_raw_plan_and_token_rehash_cannot_change_runtime_cell(
@@ -290,11 +297,13 @@ def test_joint_raw_plan_and_token_rehash_cannot_change_runtime_cell(
     foreign_plan = release_failure_plan_for_cell(registry, foreign_cell)
     _write_json(plan_path, foreign_plan.to_dict())
     foreign_binding = bind_failure_injection_authority(plan_path, registry=registry)
-    forged = _caller_token(foreign_plan, foreign_binding)
+    foreign_token = require_failure_injection_authority(
+        foreign_binding, registry=registry
+    )
 
     with pytest.raises(ValueError, match="differs from its runtime cell"):
         revalidate_failure_execution_authority(
-            forged,
+            foreign_token,
             cell=original_cell,
             expected_registry_sha256=registry.sha256,
         )
@@ -305,12 +314,12 @@ def test_joint_raw_plan_and_token_rehash_cannot_change_runtime_cell(
     [
         (lambda row: row.update(scenario="failure"), "vague or unregistered"),
         (
-            lambda row: row["topology_targets"][0].update(target_ranks=[0]),
+            lambda row: row["topology_targets"][0].update(target_ranks=[1]),
             "every rank",
         ),
         (
             lambda row: row["topology_targets"].pop(),
-            "both registered topologies",
+            "all three registered topologies",
         ),
         (
             lambda row: row.update(topology_failure_surface="f" * 64),
@@ -374,7 +383,7 @@ def test_raw_receipt_rejects_partial_rank_and_nonatomic_terminal(
 ) -> None:
     registry, plan, _, binding = _bound_plan(tmp_path)
     partial = _receipt(plan, binding)
-    partial["topologies"][0]["rank_receipts"].pop()  # type: ignore[index]
+    partial["topologies"][1]["rank_receipts"].pop()  # type: ignore[index]
     partial_path = _write_json(tmp_path / "partial.json", partial)
     with pytest.raises(ValueError, match="partial, duplicate, or foreign ranks"):
         reduce_failure_actuation_receipt(binding, partial_path, registry=registry)

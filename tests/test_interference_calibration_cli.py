@@ -17,7 +17,9 @@ from lightcone_spec.experiments.interference_authority import (
     materialize_interference_calibration_bootstrap_authority,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.stage_activation import (
@@ -49,6 +51,7 @@ def _registry(tmp_path: Path) -> tuple[Path, object]:
         main(
             [
                 "build-industrial-registry",
+                "--legacy-diagnostic",
                 "--logical-gpu-slot",
                 "logical-rank-slot-a",
                 "logical-rank-slot-b",

@@ -402,12 +402,10 @@ NO_TRUSTED_ATTESTERS = TrustedAttesterPolicy(
     trusted_attesters=(),
 )
 
-# This is the trust root compiled into the current source release.  Public-key
-# verification remains reusable as a library primitive, but formal execution
-# and reduction must never promote an arbitrary caller-supplied policy into a
-# release authority.  A future hardware rollout must change this constant in a
-# reviewed source release (and update the runtime manifest) before any signer
-# can unlock claims.
+# This is the trust root compiled into the legacy attestation path.  The new
+# release-control path pins its offline Ed25519 root independently and requires
+# a short-lived, root-signed deployment policy after observing hardware.  Keep
+# this older path unavailable so it cannot become a static-policy bypass.
 RELEASE_TRUSTED_ATTESTER_POLICY = NO_TRUSTED_ATTESTERS
 
 

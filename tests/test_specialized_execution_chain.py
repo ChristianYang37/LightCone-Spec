@@ -19,7 +19,9 @@ from lightcone_spec.experiments.industrial_analysis import (
     raw_e3a_selection_manifest_to_dict,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.orchestration.execution_bundle import (

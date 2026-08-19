@@ -26,6 +26,9 @@ FORBIDDEN_NAMES = {
     "selected_optimizer_config.json",
     "SSH_AGENT_HANDOFF_PROMPT_2026-08-04.md",
 }
+RAW_FILE_SIDECAR_MANIFESTS = {
+    "runtime/release_ed25519_root_v1.json",
+}
 TEXT_SUFFIXES = {
     ".cfg",
     ".ini",
@@ -51,7 +54,10 @@ RETIRED_DESIGN = re.compile(
     "|".join(
         (
             r"\bL" + r"[123]\b",
-            r"\bcontrol" + r"ler\b",
+            # "controller" is also the conventional name for the durable
+            # orchestration state machine.  Only the retired adaptation
+            # design is forbidden; do not reject unrelated operator APIs.
+            r"\b(?:adaptation|optimizer) control" + r"ler\b",
             r"\boracle " + r"replay\b",
             r"\bFish" + r"er\b",
             r"\bdamp" + r"ing\b",
@@ -185,9 +191,16 @@ def check_manifest_sidecars() -> None:
         sidecar = Path(f"{path}.sha256")
         if not sidecar.is_file():
             fail(f"manifest sidecar missing: {path.relative_to(ROOT)}")
-        value = json.loads(path.read_text())
-        canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-        if hashlib.sha256(canonical).hexdigest() != sidecar.read_text().strip():
+        relative = path.relative_to(ROOT / "manifests").as_posix()
+        if relative in RAW_FILE_SIDECAR_MANIFESTS:
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            value = json.loads(path.read_text())
+            canonical = json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ).encode()
+            expected = hashlib.sha256(canonical).hexdigest()
+        if expected != sidecar.read_text().strip():
             fail(f"manifest sidecar mismatch: {path.relative_to(ROOT)}")
 
 

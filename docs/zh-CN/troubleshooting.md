@@ -21,30 +21,32 @@
   adaptation；TTS 要求 frozen TTS recipe 与 fixed-barrier publication，L0-naive 要求同一个
   recipe authority 与 first-ready publication。采用 L0 policy 的 search recipe 只是
   LC-candidate，直到准确 E2 final-recipe receipt 将其封存为 LightCone；
-- 对 industrial executor 而言，当前只有 TP1/DP1 Target-only 为 READY。固定 tree 已实现
-  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`，但没有配置
-  release-trusted hardware signer，因此 Static/TTS/L0-naive/LightCone 会在 mutation 前失败；这是预期的
-  fail-closed release boundary；
-- `TTS-paper-reconstruction` 还因 numeric optimizer/loss/trainable/stride 字段未披露而刻意
-  `BLOCKED`。TTS 或 L0-naive 若继承 E1/E2 authority、schema default 或历史 AdamW recipe，
-  必须拒绝。Candidate equality 只适用于 source-state 与 proposal-evidence digest 都完全
-  相同的受控 replay；
+- 不得把源码支持或合法配置解释为 `READY`。Formal execution 仍须取得新的 root-authorized
+  deployment/hardware policy，以及准确的 prepared-content、workload、compile、qualification、
+  terminal、interference 与 capacity authorities；checkout 本身刻意不携带这些 session evidence；
+- TTS-Cal 固定 reconstruction grid 与语义：Adam 单步、
+  `(beta1=.9, beta2=.999, epsilon=1e-8)`、零 decay、不裁剪、全 drafter 且仅最新 round
+  更新、source-point proximal anchor、逐请求 reset、side stream、已注册 learning-rate grid
+  与八种 stride。TTS 与 L0-naive 在独立 tuning window 封存准确 winner 前仍为 `BLOCKED`；
+  若继承 E1/E2 authority、schema default 或历史 AdamW recipe 必须拒绝。Candidate equality
+  只适用于 source-state 与 proposal-evidence digest 都完全相同的受控 replay；
 - Adaptation 是 `last1`、`last3`、`last5` 或 `all` 上的 Full/LoRA。LoRA 要求注册 rank 与
   `alpha/r=1`。借用 target parameter、量化或不属于 backend 的 coordinate 不能训练；
-- DSpark layer-only 与 `*_native_heads` hybrid 字段是目标 contract；当前 adaptive schema
-  会在 model loading 前拒绝 DSpark。未来实现必须解析真实 W1/W2/confidence state，不得使用
-  placeholder Markov feature 或推断 predecessor；
-- EAGLE/EAGLE3 与 NEXTN validator/hook 是目标 contract，不是当前实现。它们的 adaptive
-  config 会在 model loading 前被拒绝；
+- DSpark layer-only 与 `*_native_heads` hybrid 是已实现的源码 contract，但必须提供覆盖真实
+  sampled predecessor、W1/W2/confidence state、56-candidate selector 及 fixed/native
+  scheduler 的 DSpark GPU proof；placeholder Markov feature 或推断 predecessor 会被拒绝；
+- NEXTN 同样要求 native MTP/interface proof，TP2 还要求准确的双模型 shard authority。
+  Adaptive EAGLE 不受支持；EAGLE3 仅限 signed official model/selector compatibility 判定
+  允许的组合；
 - Optimizer 专属字段严格校验：SGDm/NAG/Muon 要求 momentum；Muon 还要求 Newton--Schulz
   与 auxiliary AdamW value。未使用字段不会被忽略。
 
 ## Distributed Rank 被拒绝或 Collective 失败
 
-- 当前 `RunConfig` 会在 model loading 前拒绝全部 TP2/DP2 value；caller 自己填写
-  `patched_two_gpu_v1` digest 也不能启用 multi-rank 工作；
-- 单节点/双 rank identity、sticky DP routing 与 all-rank receipt 字段只是 CPU coordinator
-  目标 contract。它们描述未来固定实现必须证明的内容，不是当前 SGLang support；
+- `RunConfig` 只在准确 source-owned capability identity 与 runtime receipt claim 存在时接受
+  TP2/DP2；formal dispatch 还会深验匹配的 dynamic GPU proof，caller 自填 digest 无法启用；
+- 单节点双 rank、sticky DP routing 与 all-rank publication 已有 source-owned producer，但
+  在 fresh GPU qualification 出现前状态仍是 `implemented_pending_dynamic_gpu_proof`；
 - 缺 prepare vote、foreign topology receipt、generation mismatch、non-finite candidate、
   unsafe boundary 或不完整 post-copy receipt 会让全部 rank abort update。Transport/split-
   decision failure 还会关闭 admission，直至显式 same-topology restart；

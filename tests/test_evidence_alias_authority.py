@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_industrial_executor import _execution_fixture
+from test_industrial_executor import _clean_project_tree, _execution_fixture
 
 from lightcone_spec.experiments.budget_authority import (
     BudgetMaterializationBlockedError,
@@ -46,7 +46,9 @@ from lightcone_spec.experiments.planning_artifacts import (
     production_load_plan_to_dict,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.statistics import HardwareEnvelope
@@ -472,7 +474,8 @@ def _install_nonformal_executor_fixture_bridge(
             {
                 "schema_version": 3,
                 "generator": (
-                    "lightcone_spec.experiments.registry.build_industrial_registry:v3"
+                    "lightcone_spec.experiments.registry."
+                    "build_legacy_industrial_registry:v3"
                 ),
                 "parameters": {
                     "logical_gpu_slots": list(registry.gpu_uuids),
@@ -611,6 +614,14 @@ def test_execution_candidate_is_rebuilt_from_current_raw_plan_and_locks(
 ) -> None:
     root = tmp_path.resolve()
     _install_nonformal_executor_fixture_bridge(monkeypatch, root)
+    # The production validator must reopen a clean project identity.  This
+    # fixture deliberately models that identity while the surrounding
+    # development worktree is dirty, so retain the same fixture boundary for
+    # every validation rather than weakening the production check.
+    monkeypatch.setattr(
+        "lightcone_spec.doctor._project_tree",
+        _clean_project_tree,
+    )
     base = _execution_fixture(root).plan
     config = base.runtime_plan.rank_configs[0]
     model_lock = ModelLock(

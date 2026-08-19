@@ -822,7 +822,9 @@ def test_auxiliary_activation_uses_only_the_release_owned_registry_remainder(
     )
     receipts = tuple(
         SimpleNamespace(experiment=experiment, sha256=_sha(f"receipt-{experiment}"))
-        for experiment in INDUSTRIAL_EXPERIMENT_ORDER[:7]
+        for experiment in INDUSTRIAL_EXPERIMENT_ORDER[
+            : INDUSTRIAL_EXPERIMENT_ORDER.index("E5")
+        ]
     )
     artifact = materialize_confirmation_auxiliary_activation(
         registry,

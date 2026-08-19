@@ -22,22 +22,12 @@ from lightcone_spec.experiments import (
 REVISION = "a" * 40
 
 
-def _canonical_sha256(value: object) -> str:
-    raw = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
 def _raw_math_source(path: Path) -> tuple[dict[str, object], bytes]:
     rows = [
         {
             "unique_id": f"math-{index:03d}",
             "problem": f"Solve formal problem {index}.",
-            "level": "Level 5" if index < 40 else "Level 4",
+            "level": 5 if index < 40 else 4,
         }
         for index in range(47)
     ]
@@ -90,100 +80,52 @@ def test_public_workload_authority_exports_are_available() -> None:
     assert callable(revalidate_formal_workload_authority)
 
 
-def test_cli_blocks_before_missing_source_read_or_output_creation(
+def test_cli_requires_content_receipt_before_source_read_or_output_creation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = tmp_path / "missing-source" / "math500.json"
     output = tmp_path / "must-not-exist" / "authority.json"
 
-    status = main(
-        [
-            "bind-formal-workload-authority",
-            "--workload",
-            "math500_level5",
-            "--source",
-            str(source),
-            "--output",
-            str(output),
-        ]
-    )
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "bind-formal-workload-authority",
+                "--workload",
+                "math500_level5",
+                "--source",
+                str(source),
+                "--output",
+                str(output),
+            ]
+        )
 
-    decision = json.loads(capsys.readouterr().out)
-    assert status == 42
-    assert decision == {
-        "schema_version": 1,
-        "kind": "formal_workload_authority_decision",
-        "status": "BLOCKED",
-        "reason_code": FORMAL_WORKLOAD_SOURCE_ALLOWLIST_EMPTY_REASON,
-        "workload_id": "math500_level5",
-        "authority_sha256": None,
-        "formal_execution_authorized": False,
-    }
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "--content-verification-receipt" in stderr
+    assert "--now-ns" in stderr
     assert not source.parent.exists()
     assert not output.parent.exists()
 
 
-def test_diagnostic_bind_and_revalidate_never_authorize_formal_execution(
+def test_legacy_diagnostic_binding_never_authorizes_formal_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     source = (tmp_path / "math500.json").resolve()
-    output = tmp_path / "authority.json"
     _install_test_source_lock(monkeypatch, source)
 
-    bind_status = main(
-        [
-            "bind-formal-workload-authority",
-            "--workload",
-            "math500_level5",
-            "--source",
-            str(source),
-            "--output",
-            str(output),
-        ]
-    )
-    bind_decision = json.loads(capsys.readouterr().out)
-    artifact = json.loads(output.read_text(encoding="utf-8"))
-
-    assert bind_status == 0
-    assert bind_decision["status"] == "BOUND_DIAGNOSTIC"
-    assert bind_decision["formal_execution_authorized"] is False
+    authority = bind_formal_workload_authority("math500_level5", source)
+    assert revalidate_formal_workload_authority(authority) == authority
+    artifact = workload_authority.formal_workload_authority_cli_artifact(authority)
     assert artifact["formal_execution_authorized"] is False
     assert artifact["authority"]["selected_row_count"] == 40
-    assert output.with_suffix(".json.sha256").read_text().strip() == (
-        _canonical_sha256(artifact)
-    )
-
-    revalidate_status = main(
-        [
-            "revalidate-formal-workload-authority",
-            "--authority",
-            str(output),
-        ]
-    )
-    revalidate_decision = json.loads(capsys.readouterr().out)
-    assert revalidate_status == 0
-    assert revalidate_decision == bind_decision
 
     monkeypatch.setattr(
         workload_authority,
         "RELEASE_FORMAL_WORKLOAD_SOURCES",
         (),
     )
-    production_status = main(
-        [
-            "revalidate-formal-workload-authority",
-            "--authority",
-            str(output),
-        ]
-    )
-    production_decision = json.loads(capsys.readouterr().out)
-    assert production_status == 42
-    assert production_decision["status"] == "BLOCKED"
-    assert (
-        production_decision["reason_code"]
-        == FORMAL_WORKLOAD_SOURCE_ALLOWLIST_EMPTY_REASON
-    )
-    assert production_decision["formal_execution_authorized"] is False
+    with pytest.raises(FormalWorkloadAuthorityBlocked) as blocked:
+        revalidate_formal_workload_authority(authority)
+    assert blocked.value.reason == FORMAL_WORKLOAD_SOURCE_ALLOWLIST_EMPTY_REASON

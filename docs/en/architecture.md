@@ -24,18 +24,19 @@ debugging only and cannot support a new claim.
 
 ## One decode and candidate lifecycle
 
-Target-only disables speculation and is the only path the industrial executor
-can currently complete. Static is an allocation-free native speculative target
-path, but release preflight blocks it pending trusted terminal attestation.
+Target-only disables speculation and is the only currently claimable path.
+Static is an allocation-free native speculative target path, but release
+preflight blocks it pending trusted terminal attestation.
 Neither method's schema contract imports adaptation state or allocates
 optimizer, gradient, candidate, or adaptation trace storage.
 
 TTS, L0-naive, and LC-candidates reuse one bounded candidate-lifecycle
-implementation; the lower-level pinned patch and native terminal lifecycle
-implement this only for TP1/DP1 DFlash. Recipe authority and publication policy
-remain orthogonal, and shared machinery never merges live candidates,
-optimizer state, configs, or evidence. The path is still not release-executable
-without the trusted signer:
+implementation. The pinned patch also contains the registered DSpark, NEXTN,
+compatible EAGLE3, TP2, and sticky DP2 source paths. Recipe authority and
+publication policy remain orthogonal, and shared machinery never merges live
+candidates, optimizer state, configs, or evidence. Every exact path remains
+non-claimable until its dynamic GPU qualification and trusted external-control
+proof pass:
 
 1. Verification emits one `ProposalEvidence` envelope for the exact proposal
    that was sampled.
@@ -80,26 +81,30 @@ The target contract requires construction to check shape, dtype, device,
 uniqueness, and identity while keeping numerical checks as device predicates.
 It requires a backend validator to reconstruct `proposal_logits`,
 `corrected_distribution`, and optional confidence, and to reject an adapter
-delta when native inference already applied it. The current patch implements
-that lower-level adaptive reconstruction only for TP1/DP1 DFlash.
+delta when native inference already applied it. The pinned patch implements
+this reconstruction for DFlash, DSpark, NEXTN, and an
+official-selector-gated EAGLE3 path. These are source capabilities, not
+hardware claims: each remains fail-closed until its exact fresh GPU
+qualification is verified.
 
-The target envelope declares, but this release does not execute, the following
-cross-backend semantics:
+The cross-backend semantics are:
 
 - DFlash binds the deployed differentiable canvas and the sampling-time
   proposal correction; only this backend has a lower-level adaptive patch path.
 - DSpark binds real inference-native Markov W1/W2 features, the actual sampled
   predecessor, scheduler mode, proposal distribution, and confidence state.
-- EAGLE/EAGLE3 bind tree state, top-k-one execution, and one source version for
-  the entire proposal/verification chain.
+- EAGLE3 binds tree state, top-k-one execution, and one source version for the
+  entire proposal/verification chain, but only for a prepared-model selector
+  decision marked compatible. Generic EAGLE remains unsupported.
 - NEXTN binds native MTP hidden state and an immutable upstream interface
-  digest. Its target contract would additionally require interface and
-  memory-fit preflight; the current schema rejects it independently.
+  digest, plus interface and memory-fit preflight.
 
-DSpark, EAGLE, EAGLE3, and NEXTN adaptation remain `BLOCKED` before model
-loading. Historical drafter KV is detached, immutable, and versioned in the
-target contract. An eligible update path may use it as state but must never
-rebuild or differentiate it; future KV records the newly published version.
+DSpark, NEXTN, and compatible EAGLE3 are
+`implemented_pending_dynamic_gpu_proof`; absent or mismatched proof is rejected
+before worker allocation. EAGLE is unsupported. Historical drafter KV is
+detached, immutable, and versioned. An eligible update path may use it as state
+but must never rebuild or differentiate it; future KV records the newly
+published version.
 
 ## Trainable plans
 
@@ -132,20 +137,20 @@ than a fixed multiplier of model size.
 
 ## Topology and publication
 
-The target schema and CPU coordinator vocabulary describe one-host TP1/DP1,
-TP2/DP1, and TP1/DP2 identities. The current `RunConfig` accepts only TP1/DP1;
-it rejects every TP2/DP2 configuration before model loading because this
-release cannot issue a content-bound `patched_two_gpu_v1` capability receipt.
-The target multi-rank receipt would bind global/local/TP/DP rank, device, node,
+The schema and coordinator describe one-host TP1/DP1, TP2/DP1, and TP1/DP2.
+`RunConfig` accepts a two-rank configuration only with the exact source-owned
+`patched_two_gpu_v1` capability identity; formal dispatch additionally requires
+a fresh root-authorized dynamic GPU proof. A caller-authored receipt cannot
+enable it. The multi-rank identity binds global/local/TP/DP rank, device, node,
 process, rendezvous, router, clock, runtime, and model identity.
 
-In that non-executable target coordinator contract, TP trainable state follows
+In this coordinator contract, TP trainable state follows
 inference ownership. Sharded parameters remain local; replicated parameters
 reduce only within the owning TP replica. DP uses sticky cohort routing: a
 cohort stays replica-local and adaptation gradients are never averaged between
 replicas.
 
-Target distributed publication is two-phase. Each rank prepares the same
+Distributed publication is two-phase. Each rank prepares the same
 retry-stable update/candidate identity and reports source version, epoch,
 buffer/optimizer generation, readiness, finiteness, memory reservation, safe
 boundary, and process-group health. One all-rank decision either commits
@@ -229,8 +234,11 @@ timeouts/cancellations, and warmup/scored windows. Synthetic Poisson and
 immediate-burst generators are deterministic from their seeds and explicitly
 labelled synthetic. A BurstGPT-shaped trace is not represented as the real
 dataset without an immutable external corpus digest. Paired methods must bind
-the same trace digest and account for every offered request as rejected,
-completed, timed out, cancelled, or unfinished.
+the same complete registered source-pool digest; a closed-loop method-specific
+offered prefix and its observed output tokens do not redefine pairing.
+Completed outputs are checked by a separate exactness gate. Every offered
+request is accounted as rejected, completed, timed out, cancelled, or
+unfinished.
 
 The evidence schema can represent per-process/rank run, request, round, update,
 and performance records through a bounded queue. Duplicate primary identities
@@ -303,13 +311,17 @@ FINISH hash chain before and after each runner; partial sibling failures retain
 successful raw terminal authorities, and an unfinished intent blocks rather
 than inventing retry cost.
 
-Reducer-owned activation artifacts materialize the one 68-cell E1 slice from
-1,428 templates. Each slice has two fixed references, 64 L0-policy
-LC-candidates over 32 geometries, and one stage-level frozen anchor each for
-TTS and L0-naive. E2 has 11,920 templates over four successive-halving rounds,
-tunes only LC-candidates, and carries each frozen baseline once per stage. An
-exact sealed E2 final-recipe receipt is the only path to the
-LightCone role. Confirmation planning is family-local: exactly four
+Reducer-owned, signed materialization consumes the sealed upstream receipts
+and creates exactly one 68-cell E1 stage: Target-only, Static, frozen TTS,
+frozen L0-naive, and 64 LightCone candidates over 32 geometries and two
+optimizer anchors. L0-naive is a mechanism anchor and is not ranked as a
+candidate. For each of the `g` surviving geometries, E2 materializes
+`n0 = 105g` recipes (seven optimizers by three schedules by five learning
+rates), then three successive-halving rounds with
+`n(k+1) = max(ceil(nk/4), 21)`; every round also carries four fixed anchors.
+There is no eager sentinel matrix. An exact sealed E2 final-recipe receipt is
+the only path to the LightCone role. Confirmation planning is family-local:
+exactly four
 excluded pilots select `POWERED` with a 12--20-block final prefix or
 `UNDERPOWERED` before confirmation is visible. Legal Target-only reuse requires
 a byte-equivalent, content-bound evidence alias, and analysis carries its
@@ -327,11 +339,13 @@ client reuses one caller-owned HTTP pool, and evidence writes batch durable WAL
 row groups without weakening terminal fsync and coverage checks.
 
 Registry and pool planning make no device-state or empirical claim. Their
-target declarations do not override release preflight: Static/TTS/L0-naive/LightCone remain
-`BLOCKED` on the trusted signer; all TP2/DP2 and unsupported adaptive backends
-remain `BLOCKED` on their separate implementation gates.
+declarations do not override release preflight: every formal role still needs
+its signed content, capacity, compile, execution, terminal, and qualification
+chain. TP2/DP2 and backend-specific paths remain blocked until their exact
+dynamic proofs exist.
 
-This release claims no speculative industrial execution, multi-rank model
-execution, cross-host collective, Kubernetes scheduling, elastic membership,
-remote evidence storage, or automatic failover. Its multi-host control plane
-distributes independent host-local work only. It contains no new GPU result.
+This release claims no completed industrial measurement, cross-host collective,
+Kubernetes scheduling, elastic membership, remote evidence storage, or
+automatic failover. Its multi-host control plane distributes independent
+host-local work only. Source implementation is not a substitute for a fresh
+GPU result.

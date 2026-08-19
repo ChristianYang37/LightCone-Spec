@@ -19,8 +19,18 @@ from lightcone_spec.orchestration.native_terminal import (
 )
 from lightcone_spec.orchestration.session_live_runtime import (
     SessionLivePinnedBenchTransport,
+    SessionLiveStepBinding,
     SessionLiveTraceInput,
     run_session_live_contract,
+)
+from lightcone_spec.runtime import readiness as readiness_module
+from lightcone_spec.runtime.readiness import (
+    NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256,
+    NATIVE_RUNTIME_QUALIFICATION_TESTS,
+    NATIVE_RUNTIME_RELEASE_CAPABILITY,
+    NATIVE_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S,
+    NativeRuntimeGpuProofReceipt,
+    VerifiedNativeRuntimeGpuProof,
 )
 
 _TERMINAL_FIXTURE_PATH = Path(__file__).with_name("test_native_terminal_provider.py")
@@ -329,7 +339,49 @@ def _resources(
     )
 
 
-def _run(resources):
+def _session_gpu_proof() -> VerifiedNativeRuntimeGpuProof:
+    capability = NATIVE_RUNTIME_RELEASE_CAPABILITY
+    receipt = NativeRuntimeGpuProofReceipt(
+        schema_version=1,
+        kind="lightcone_native_runtime_gpu_proof",
+        suite_id="session_reset_tp1",
+        topology_mode="tp1_dp1",
+        topology_sha256=_sha("session-topology"),
+        runner_protocol_sha256=NATIVE_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S[
+            "session_reset_tp1"
+        ],
+        assignment_sha256=_sha("session-assignment"),
+        qualification_observation_sha256=_sha("session-observation"),
+        source_capability_sha256=capability.sha256,
+        pinned_sglang_commit=capability.pinned_sglang_commit,
+        patched_sglang_tree=capability.patched_sglang_tree,
+        semantic_patch_sha256=capability.semantic_patch_sha256,
+        run_nonce_sha256=_sha("session-qualification-nonce"),
+        qualification_authority_sha256=(NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256),
+        source_identity_sha256=_sha("session-source"),
+        inventory_sha256=_sha("session-inventory"),
+        gpu_uuids=("GPU-A",),
+        hardware_envelope_sha256=_sha("session-hardware"),
+        junit_xml_sha256=_sha("session-junit"),
+        test_names=NATIVE_RUNTIME_QUALIFICATION_TESTS["session_reset_tp1"],
+        tests_collected=8,
+        tests_passed=8,
+        tests_failed=0,
+        tests_errored=0,
+        tests_skipped=0,
+    )
+    return VerifiedNativeRuntimeGpuProof(
+        receipt=receipt,
+        receipt_raw_sha256=_sha("session-raw-receipt"),
+        trusted_policy_sha256=_sha("session-policy"),
+        challenge_sha256=_sha("session-control-challenge"),
+        control_envelope_sha256=_sha("session-control-envelope"),
+        challenge_reservation_sha256=_sha("session-reservation"),
+        _verification_tag=readiness_module._VERIFIED_NATIVE_GPU_PROOF_SENTINEL,
+    )
+
+
+def _run(resources, *, verified_gpu_proof=None):
     plan, trace, transport, provider, owner, backend, events = resources
     result = asyncio.run(
         run_session_live_contract(
@@ -341,6 +393,7 @@ def _run(resources):
             transport=transport,
             provider=provider,
             process_owner=owner,
+            verified_gpu_proof=verified_gpu_proof,
         )
     )
     return result, owner, backend, events
@@ -374,6 +427,40 @@ def test_live_consumer_uses_one_pool_one_provider_and_exact_order() -> None:
         "/v1/lightcone-spec/session-reset/trace/finalize",
         "/v1/lightcone-spec/session-reset/close-terminal",
     ]
+
+
+def test_exact_session_gpu_proof_authorizes_reuse_without_weakening_close() -> None:
+    proof = _session_gpu_proof()
+    result, owner, _backend, events = _run(
+        _resources(),
+        verified_gpu_proof=proof,
+    )
+
+    assert result.audit.status == "GPU_VERIFIED"
+    assert result.reuse_authorized
+    assert result.verified_gpu_proof_sha256 == proof.sha256
+    assert owner.close_calls == 1 and owner.force_close_calls == 0
+    assert events == ["run_warmup", "run_scored"]
+
+
+def test_gpu_verified_result_still_deep_validates_retained_receipt_chain() -> None:
+    result, _owner, _backend, _events = _run(
+        _resources(),
+        verified_gpu_proof=_session_gpu_proof(),
+    )
+    steps = list(result.steps)
+    index = next(
+        index for index, step in enumerate(steps) if step.step == "session_capability"
+    )
+    payload = json.loads(steps[index].raw_json)
+    payload["session_plan_sha256"] = _sha("replaced-session-plan")
+    steps[index] = SessionLiveStepBinding.capture(
+        step="session_capability",
+        value=payload,
+    )
+
+    with pytest.raises(ValueError, match="not content-bound|raw authority changed"):
+        replace(result, steps=tuple(steps)).validate()
 
 
 def test_malformed_clock_blocks_before_any_scored_request_and_force_closes() -> None:

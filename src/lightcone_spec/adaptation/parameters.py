@@ -18,7 +18,15 @@ DSPARK_HYBRID_SCOPES = (
     "last3_native_heads",
     "last5_native_heads",
 )
-TRAINABLE_PLAN_OPTIMIZERS = ("adam", "adamw", "lion", "muon", "nag", "sgdm")
+TRAINABLE_PLAN_OPTIMIZERS = (
+    "adam",
+    "adamw",
+    "chronobelief",
+    "lion",
+    "muon",
+    "nag",
+    "sgdm",
+)
 
 _BORROWED_COMPONENTS = (
     "embed_tokens",
@@ -285,7 +293,7 @@ class TrainablePlan:
         masters = 4 * trainable
         gradients = 4 * trainable
         first = 4 * trainable
-        second = 4 * trainable if optimizer in {"adam", "adamw"} else 0
+        second = 4 * trainable if optimizer in {"adam", "adamw", "chronobelief"} else 0
         if optimizer == "muon":
             second = sum(
                 8 * _numel(entry.shape)

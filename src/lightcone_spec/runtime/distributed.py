@@ -9,9 +9,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Literal
+
+from .control_attestation import (
+    ChallengeReplayReservationBinding,
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    control_challenge_reservation_sha256,
+    verify_and_reserve_release_control_artifact_attestations,
+    verify_release_control_artifact_attestation,
+)
+from .proof_artifact import (
+    CanonicalJsonProofBinding,
+    publish_canonical_json_no_replace,
+)
+from .qualification_spec import (
+    DISTRIBUTED_RUNTIME_GPU_PROOF_PROTOCOL_SHA256,
+    DISTRIBUTED_RUNTIME_QUALIFICATION_TESTS,
+    DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S,
+)
+from .readiness import NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256
+
+RuntimeTopologyMode = Literal["tp1_dp1", "tp2_dp1", "tp1_dp2"]
+DistributedControlMode = Literal[
+    "single_rank",
+    "tp_all_rank_two_phase",
+    "dp_sticky_replica_local",
+]
+AdaptationCollectiveMode = Literal["none", "tp_shard_all_rank"]
+
+_REGISTERED_RUNTIME_TOPOLOGIES: dict[tuple[int, int], RuntimeTopologyMode] = {
+    (1, 1): "tp1_dp1",
+    (2, 1): "tp2_dp1",
+    (1, 2): "tp1_dp2",
+}
 
 
 def _sha256(value: Any) -> str:
@@ -32,6 +67,909 @@ def _require_nonempty(name: str, value: str) -> None:
 def _require_counter(name: str, value: int, *, minimum: int = 0) -> None:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
+def registered_runtime_topology_mode(
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    node_count: int,
+) -> RuntimeTopologyMode:
+    """Return the only registered single-host runtime topology identity.
+
+    The fleet control plane may dispatch independent cells to multiple hosts,
+    but one serving/adaptation gang is deliberately limited to at most two
+    ranks on one host.  In particular, TP2+DP2 is not a convenient shorthand
+    for a supported four-rank topology.
+    """
+
+    for name, value in (
+        ("tensor_parallel_size", tensor_parallel_size),
+        ("data_parallel_size", data_parallel_size),
+        ("node_count", node_count),
+    ):
+        _require_counter(name, value, minimum=1)
+    if node_count != 1:
+        raise ValueError("multi-node runtime collectives are restricted to one host")
+    try:
+        return _REGISTERED_RUNTIME_TOPOLOGIES[
+            (tensor_parallel_size, data_parallel_size)
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            "runtime topology must be tp1_dp1, tp2_dp1, or tp1_dp2"
+        ) from exc
+
+
+def distributed_control_mode(mode: RuntimeTopologyMode) -> DistributedControlMode:
+    """Return the control plane required by one registered topology."""
+
+    return {
+        "tp1_dp1": "single_rank",
+        "tp2_dp1": "tp_all_rank_two_phase",
+        "tp1_dp2": "dp_sticky_replica_local",
+    }[mode]
+
+
+def adaptation_collective_mode(
+    mode: RuntimeTopologyMode,
+) -> AdaptationCollectiveMode:
+    """Return the adaptation collective, deliberately excluding cross-DP sync."""
+
+    return "tp_shard_all_rank" if mode == "tp2_dp1" else "none"
+
+
+class DistributedRuntimeAuthorityBlocked(RuntimeError):
+    """Stable fail-closed result for an unavailable audited release capability."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {detail}")
+
+
+@dataclass(frozen=True)
+class DistributedRuntimeReleaseCapability:
+    """Source-owned CPU-audited identity for one host-local runtime mode.
+
+    A digest supplied in a run configuration is only a claim.  Authority comes
+    from an exact object in ``DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES``.  That
+    source table pins the semantic patch before GPU smoke.  It never represents
+    GPU proof; a signed ``DistributedRuntimeGpuProofReceipt`` supplies that
+    dynamic authority without changing the source tree after smoke.
+    """
+
+    schema_version: Literal[1]
+    topology_mode: Literal["tp2_dp1", "tp1_dp2"]
+    pinned_sglang_commit: str
+    patched_sglang_tree: str
+    semantic_patch_sha256: str
+    native_terminal_protocol_sha256: str
+    control_mode: Literal[
+        "tp_all_rank_two_phase",
+        "dp_sticky_replica_local",
+    ]
+    process_group_backend: Literal["nccl", "none"]
+    adaptation_collective: AdaptationCollectiveMode
+    evidence_status: Literal["CPU_CONTRACT_ONLY", "GPU_VERIFIED"]
+    gpu_proof_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("distributed release capability schema is unsupported")
+        for label, value in (
+            ("pinned SGLang commit", self.pinned_sglang_commit),
+            ("patched SGLang tree", self.patched_sglang_tree),
+        ):
+            _require_hash(label, value, length=40)
+        for label, value in (
+            ("semantic patch", self.semantic_patch_sha256),
+            ("native terminal protocol", self.native_terminal_protocol_sha256),
+        ):
+            _require_hash(label, value)
+        expected_control = distributed_control_mode(self.topology_mode)
+        expected_collective = adaptation_collective_mode(self.topology_mode)
+        expected_backend = "nccl" if self.topology_mode == "tp2_dp1" else "none"
+        if self.control_mode != expected_control:
+            raise ValueError("distributed release control mode differs from topology")
+        if self.adaptation_collective != expected_collective:
+            raise ValueError(
+                "distributed release adaptation collective differs from topology"
+            )
+        if self.process_group_backend != expected_backend:
+            raise ValueError(
+                "distributed release process-group backend differs from topology"
+            )
+        if self.evidence_status == "GPU_VERIFIED":
+            if self.gpu_proof_sha256 is None:
+                raise ValueError("GPU-verified distributed release requires proof")
+            _require_hash("distributed GPU proof", self.gpu_proof_sha256)
+        elif self.gpu_proof_sha256 is not None:
+            raise ValueError("CPU-only distributed capability cannot carry GPU proof")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(asdict(self))
+
+
+# A caller-authored digest never mutates this table, and a source entry alone
+# authorizes only diagnostic smoke, never formal execution.  Both entries bind
+# semantic patch 0007 and its resulting complete SGLang tree.
+DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES: Mapping[
+    RuntimeTopologyMode, DistributedRuntimeReleaseCapability
+] = MappingProxyType(
+    {
+        mode: DistributedRuntimeReleaseCapability(
+            schema_version=1,
+            topology_mode=mode,
+            pinned_sglang_commit="3312645a307453893a00778592f105581e3d1c3d",
+            patched_sglang_tree="c6571336b70cd5f0e0f609d731a65fa98fd7e0b2",
+            semantic_patch_sha256=(
+                "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+            ),
+            native_terminal_protocol_sha256=(
+                "5c3113405e0646e0fa61bbd054e690d588996982e2f57ded94d77b6e0c072e02"
+            ),
+            control_mode=distributed_control_mode(mode),
+            process_group_backend="nccl" if mode == "tp2_dp1" else "none",
+            adaptation_collective=adaptation_collective_mode(mode),
+            evidence_status="CPU_CONTRACT_ONLY",
+            gpu_proof_sha256=None,
+        )
+        for mode in ("tp2_dp1", "tp1_dp2")
+    }
+)
+
+
+def require_distributed_runtime_release_capability(
+    *,
+    topology_mode: RuntimeTopologyMode,
+    claimed_capability_sha256: str,
+) -> DistributedRuntimeReleaseCapability:
+    """Resolve a CPU-audited source capability; never trust the run claim."""
+
+    if topology_mode == "tp1_dp1":
+        raise ValueError("single-rank topology does not use a distributed capability")
+    _require_hash("claimed distributed release capability", claimed_capability_sha256)
+    capability = DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES.get(topology_mode)
+    if (
+        type(capability) is not DistributedRuntimeReleaseCapability
+        or capability.topology_mode != topology_mode
+        or capability.sha256 != claimed_capability_sha256
+        or capability.evidence_status != "CPU_CONTRACT_ONLY"
+    ):
+        raise DistributedRuntimeAuthorityBlocked(
+            "distributed_runtime_release_capability_unavailable",
+            "the release has no CPU-audited semantic patch identity for this mode",
+        )
+    return capability
+
+
+@dataclass(frozen=True)
+class DistributedRuntimeGpuProofReceipt:
+    """Unsigned remote base-smoke plus exact distributed qualification."""
+
+    schema_version: Literal[1]
+    kind: Literal["lightcone_distributed_runtime_gpu_proof"]
+    topology_mode: Literal["tp2_dp1", "tp1_dp2"]
+    topology_sha256: str
+    runner_protocol_sha256: str
+    assignment_sha256: str
+    qualification_observation_sha256: str
+    base_exactness_result_pointer_sha256: str
+    source_capability_sha256: str
+    pinned_sglang_commit: str
+    patched_sglang_tree: str
+    semantic_patch_sha256: str
+    run_nonce_sha256: str
+    qualification_authority_sha256: str
+    source_identity_sha256: str
+    inventory_sha256: str
+    gpu_uuids: tuple[str, str]
+    hardware_envelope_sha256: str
+    junit_xml_sha256: str
+    tests_collected: Literal[8]
+    tests_passed: Literal[8]
+    tests_failed: Literal[0]
+    tests_errored: Literal[0]
+    tests_skipped: Literal[0]
+    qualification_junit_xml_sha256: str
+    qualification_test_names: tuple[str, ...]
+    qualification_tests_collected: int
+    qualification_tests_passed: int
+    qualification_tests_failed: Literal[0]
+    qualification_tests_errored: Literal[0]
+    qualification_tests_skipped: Literal[0]
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.kind != "lightcone_distributed_runtime_gpu_proof"
+        ):
+            raise ValueError("distributed GPU proof schema is unsupported")
+        for label, value, length in (
+            ("proof source capability", self.source_capability_sha256, 64),
+            ("proof topology", self.topology_sha256, 64),
+            ("proof runner protocol", self.runner_protocol_sha256, 64),
+            ("proof assignment", self.assignment_sha256, 64),
+            (
+                "proof qualification observation",
+                self.qualification_observation_sha256,
+                64,
+            ),
+            (
+                "proof base exactness result pointer",
+                self.base_exactness_result_pointer_sha256,
+                64,
+            ),
+            ("proof pinned SGLang commit", self.pinned_sglang_commit, 40),
+            ("proof patched SGLang tree", self.patched_sglang_tree, 40),
+            ("proof semantic patch", self.semantic_patch_sha256, 64),
+            ("proof run nonce", self.run_nonce_sha256, 64),
+            (
+                "proof qualification authority",
+                self.qualification_authority_sha256,
+                64,
+            ),
+            ("proof source identity", self.source_identity_sha256, 64),
+            ("proof inventory", self.inventory_sha256, 64),
+            ("proof hardware envelope", self.hardware_envelope_sha256, 64),
+            ("proof JUnit XML", self.junit_xml_sha256, 64),
+            (
+                "proof qualification JUnit XML",
+                self.qualification_junit_xml_sha256,
+                64,
+            ),
+        ):
+            _require_hash(label, value, length=length)
+        if (
+            self.qualification_authority_sha256
+            != NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256
+        ):
+            raise ValueError("distributed qualification authority differs")
+        if (
+            self.runner_protocol_sha256
+            != (DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S[self.topology_mode])
+        ):
+            raise ValueError("distributed GPU proof runner protocol differs")
+        if (
+            type(self.gpu_uuids) is not tuple
+            or len(self.gpu_uuids) != 2
+            or len(set(self.gpu_uuids)) != 2
+        ):
+            raise ValueError("distributed GPU proof requires two unique GPU UUIDs")
+        for gpu_uuid in self.gpu_uuids:
+            _require_nonempty("proof GPU UUID", gpu_uuid)
+        counts = (
+            self.tests_collected,
+            self.tests_passed,
+            self.tests_failed,
+            self.tests_errored,
+            self.tests_skipped,
+        )
+        if counts != (8, 8, 0, 0, 0):
+            raise ValueError(
+                "distributed GPU proof requires the base 8-test smoke with zero "
+                "skip/failure"
+            )
+        expected_qualification = DISTRIBUTED_RUNTIME_QUALIFICATION_TESTS[
+            self.topology_mode
+        ]
+        if self.qualification_test_names != expected_qualification:
+            raise ValueError(
+                "distributed GPU proof lacks the exact named qualification suite"
+            )
+        qualification_counts = (
+            self.qualification_tests_collected,
+            self.qualification_tests_passed,
+            self.qualification_tests_failed,
+            self.qualification_tests_errored,
+            self.qualification_tests_skipped,
+        )
+        if qualification_counts != (
+            len(expected_qualification),
+            len(expected_qualification),
+            0,
+            0,
+            0,
+        ):
+            raise ValueError(
+                "distributed GPU proof requires every named qualification with "
+                "zero skip/failure"
+            )
+
+    @property
+    def payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "topology_mode": self.topology_mode,
+            "topology_sha256": self.topology_sha256,
+            "runner_protocol_sha256": self.runner_protocol_sha256,
+            "assignment_sha256": self.assignment_sha256,
+            "qualification_observation_sha256": (self.qualification_observation_sha256),
+            "base_exactness_result_pointer_sha256": (
+                self.base_exactness_result_pointer_sha256
+            ),
+            "source_capability_sha256": self.source_capability_sha256,
+            "pinned_sglang_commit": self.pinned_sglang_commit,
+            "patched_sglang_tree": self.patched_sglang_tree,
+            "semantic_patch_sha256": self.semantic_patch_sha256,
+            "run_nonce_sha256": self.run_nonce_sha256,
+            "qualification_authority_sha256": self.qualification_authority_sha256,
+            "source_identity_sha256": self.source_identity_sha256,
+            "inventory_sha256": self.inventory_sha256,
+            "gpu_uuids": list(self.gpu_uuids),
+            "hardware_envelope_sha256": self.hardware_envelope_sha256,
+            "junit_xml_sha256": self.junit_xml_sha256,
+            "tests_collected": self.tests_collected,
+            "tests_passed": self.tests_passed,
+            "tests_failed": self.tests_failed,
+            "tests_errored": self.tests_errored,
+            "tests_skipped": self.tests_skipped,
+            "qualification_junit_xml_sha256": (self.qualification_junit_xml_sha256),
+            "qualification_test_names": list(self.qualification_test_names),
+            "qualification_tests_collected": self.qualification_tests_collected,
+            "qualification_tests_passed": self.qualification_tests_passed,
+            "qualification_tests_failed": self.qualification_tests_failed,
+            "qualification_tests_errored": self.qualification_tests_errored,
+            "qualification_tests_skipped": self.qualification_tests_skipped,
+        }
+
+    @property
+    def payload_sha256(self) -> str:
+        return _sha256(self.payload)
+
+    @property
+    def sha256(self) -> str:
+        return self.payload_sha256
+
+    def to_dict(self) -> dict[str, object]:
+        return self.payload
+
+    def write_unsigned(self, path: str) -> CanonicalJsonProofBinding:
+        """Publish remote observations; this operation grants no trust."""
+
+        publish_canonical_json_no_replace(path, self.to_dict())
+        return CanonicalJsonProofBinding.bind(
+            path,
+            semantic_sha256=self.sha256,
+        )
+
+    @classmethod
+    def from_dict(cls, value: object) -> DistributedRuntimeGpuProofReceipt:
+        if type(value) is not dict or set(value) != {
+            "schema_version",
+            "kind",
+            "topology_mode",
+            "topology_sha256",
+            "runner_protocol_sha256",
+            "assignment_sha256",
+            "qualification_observation_sha256",
+            "base_exactness_result_pointer_sha256",
+            "source_capability_sha256",
+            "pinned_sglang_commit",
+            "patched_sglang_tree",
+            "semantic_patch_sha256",
+            "run_nonce_sha256",
+            "qualification_authority_sha256",
+            "source_identity_sha256",
+            "inventory_sha256",
+            "gpu_uuids",
+            "hardware_envelope_sha256",
+            "junit_xml_sha256",
+            "tests_collected",
+            "tests_passed",
+            "tests_failed",
+            "tests_errored",
+            "tests_skipped",
+            "qualification_junit_xml_sha256",
+            "qualification_test_names",
+            "qualification_tests_collected",
+            "qualification_tests_passed",
+            "qualification_tests_failed",
+            "qualification_tests_errored",
+            "qualification_tests_skipped",
+        }:
+            raise ValueError("distributed GPU proof receipt fields differ")
+        row = dict(value)
+        gpu_uuids = row.pop("gpu_uuids")
+        test_names = row.pop("qualification_test_names")
+        if type(gpu_uuids) is not list or type(test_names) is not list:
+            raise TypeError("distributed GPU proof receipt arrays are malformed")
+        return cls(
+            gpu_uuids=tuple(gpu_uuids),
+            qualification_test_names=tuple(test_names),
+            **row,
+        )
+
+    @property
+    def control_lineage_sha256(self) -> str:
+        return _sha256(
+            {
+                "schema_version": 1,
+                "kind": "lightcone_distributed_gpu_proof_control_lineage",
+                "receipt_sha256": self.sha256,
+                "run_nonce_sha256": self.run_nonce_sha256,
+                "source_capability_sha256": self.source_capability_sha256,
+                "qualification_authority_sha256": (self.qualification_authority_sha256),
+                "source_identity_sha256": self.source_identity_sha256,
+                "runner_protocol_sha256": self.runner_protocol_sha256,
+                "assignment_sha256": self.assignment_sha256,
+                "qualification_observation_sha256": (
+                    self.qualification_observation_sha256
+                ),
+                "base_exactness_result_pointer_sha256": (
+                    self.base_exactness_result_pointer_sha256
+                ),
+                "inventory_sha256": self.inventory_sha256,
+                "hardware_envelope_sha256": self.hardware_envelope_sha256,
+                "topology_mode": self.topology_mode,
+                "topology_sha256": self.topology_sha256,
+                "gpu_uuids": self.gpu_uuids,
+                "base_junit_xml_sha256": self.junit_xml_sha256,
+                "qualification_junit_xml_sha256": (self.qualification_junit_xml_sha256),
+            }
+        )
+
+
+_VERIFIED_GPU_PROOF_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedDistributedRuntimeGpuProof:
+    """Formal, replay-consumed authorization for one exact runtime identity."""
+
+    receipt_sha256: str
+    receipt_raw_sha256: str
+    runner_protocol_sha256: str
+    assignment_sha256: str
+    qualification_observation_sha256: str
+    base_exactness_result_pointer_sha256: str
+    source_capability_sha256: str
+    qualification_authority_sha256: str
+    trusted_policy_sha256: str
+    challenge_sha256: str
+    source_identity_sha256: str
+    inventory_sha256: str
+    hardware_envelope_sha256: str
+    topology_mode: Literal["tp2_dp1", "tp1_dp2"]
+    topology_sha256: str
+    gpu_uuids: tuple[str, str]
+    control_envelope_sha256: str
+    challenge_reservation_sha256: str
+
+    def __init__(
+        self,
+        *,
+        receipt_sha256: str,
+        receipt_raw_sha256: str,
+        runner_protocol_sha256: str,
+        assignment_sha256: str,
+        qualification_observation_sha256: str,
+        base_exactness_result_pointer_sha256: str,
+        source_capability_sha256: str,
+        qualification_authority_sha256: str,
+        trusted_policy_sha256: str,
+        challenge_sha256: str,
+        source_identity_sha256: str,
+        inventory_sha256: str,
+        hardware_envelope_sha256: str,
+        topology_mode: Literal["tp2_dp1", "tp1_dp2"],
+        topology_sha256: str,
+        gpu_uuids: tuple[str, str],
+        control_envelope_sha256: str,
+        challenge_reservation_sha256: str,
+        _verification_tag: object,
+    ) -> None:
+        if _verification_tag is not _VERIFIED_GPU_PROOF_SENTINEL:
+            raise TypeError(
+                "verified distributed GPU proof can only come from signature verification"
+            )
+        for name, value in (
+            ("receipt_sha256", receipt_sha256),
+            ("receipt_raw_sha256", receipt_raw_sha256),
+            ("runner_protocol_sha256", runner_protocol_sha256),
+            ("assignment_sha256", assignment_sha256),
+            (
+                "qualification_observation_sha256",
+                qualification_observation_sha256,
+            ),
+            (
+                "base_exactness_result_pointer_sha256",
+                base_exactness_result_pointer_sha256,
+            ),
+            ("source_capability_sha256", source_capability_sha256),
+            ("qualification_authority_sha256", qualification_authority_sha256),
+            ("trusted_policy_sha256", trusted_policy_sha256),
+            ("challenge_sha256", challenge_sha256),
+            ("source_identity_sha256", source_identity_sha256),
+            ("inventory_sha256", inventory_sha256),
+            ("hardware_envelope_sha256", hardware_envelope_sha256),
+            ("topology_mode", topology_mode),
+            ("topology_sha256", topology_sha256),
+            ("gpu_uuids", gpu_uuids),
+            ("control_envelope_sha256", control_envelope_sha256),
+            ("challenge_reservation_sha256", challenge_reservation_sha256),
+        ):
+            object.__setattr__(self, name, value)
+        for label, value in (
+            ("verified proof receipt", self.receipt_sha256),
+            ("verified proof receipt raw", self.receipt_raw_sha256),
+            ("verified proof runner protocol", self.runner_protocol_sha256),
+            ("verified proof assignment", self.assignment_sha256),
+            (
+                "verified proof qualification observation",
+                self.qualification_observation_sha256,
+            ),
+            (
+                "verified proof base exactness result pointer",
+                self.base_exactness_result_pointer_sha256,
+            ),
+            ("verified proof capability", self.source_capability_sha256),
+            (
+                "verified proof qualification authority",
+                self.qualification_authority_sha256,
+            ),
+            ("verified proof trust policy", self.trusted_policy_sha256),
+            ("verified proof challenge", self.challenge_sha256),
+            ("verified proof source identity", self.source_identity_sha256),
+            ("verified proof inventory", self.inventory_sha256),
+            ("verified proof hardware envelope", self.hardware_envelope_sha256),
+            ("verified proof topology", self.topology_sha256),
+            ("verified proof control envelope", self.control_envelope_sha256),
+            (
+                "verified proof challenge reservation",
+                self.challenge_reservation_sha256,
+            ),
+        ):
+            _require_hash(label, value)
+        if (
+            type(self.gpu_uuids) is not tuple
+            or len(self.gpu_uuids) != 2
+            or len(set(self.gpu_uuids)) != 2
+        ):
+            raise ValueError("verified distributed proof requires two GPU UUIDs")
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(asdict(self))
+
+
+def verify_distributed_runtime_gpu_proof(
+    receipt_path: str,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    expected_topology_mode: Literal["tp2_dp1", "tp1_dp2"],
+    expected_topology_sha256: str,
+    expected_source_capability_sha256: str,
+    expected_source_identity_sha256: str,
+    expected_inventory_sha256: str,
+    expected_gpu_uuids: tuple[str, str],
+    expected_hardware_envelope_sha256: str,
+    expected_run_nonce_sha256: str,
+    now_ns: int,
+) -> VerifiedDistributedRuntimeGpuProof:
+    """Trust-lift one unsigned remote proof and reserve every nonce atomically."""
+
+    raw = CanonicalJsonProofBinding.bind(
+        receipt_path,
+    )
+    receipt = DistributedRuntimeGpuProofReceipt.from_dict(raw.reopen())
+    if receipt.sha256 != raw.semantic_sha256:
+        raise ValueError("distributed proof semantic identity differs from content")
+    binding = raw
+    if type(control_attestation) is not ControlArtifactAttestation:
+        raise TypeError("distributed GPU proof requires an exact control envelope")
+    if type(replay_store) is not ChallengeReplayStore:
+        raise TypeError("distributed GPU proof requires the release replay store")
+    capability = require_distributed_runtime_release_capability(
+        topology_mode=expected_topology_mode,
+        claimed_capability_sha256=expected_source_capability_sha256,
+    )
+    if (
+        receipt.topology_mode != expected_topology_mode
+        or receipt.topology_sha256 != expected_topology_sha256
+        or receipt.source_capability_sha256 != capability.sha256
+        or receipt.pinned_sglang_commit != capability.pinned_sglang_commit
+        or receipt.patched_sglang_tree != capability.patched_sglang_tree
+        or receipt.semantic_patch_sha256 != capability.semantic_patch_sha256
+        or receipt.run_nonce_sha256 != expected_run_nonce_sha256
+        or receipt.source_identity_sha256 != expected_source_identity_sha256
+        or receipt.inventory_sha256 != expected_inventory_sha256
+        or receipt.gpu_uuids != expected_gpu_uuids
+        or receipt.hardware_envelope_sha256 != expected_hardware_envelope_sha256
+    ):
+        raise ValueError("distributed GPU proof differs from the expected identity")
+    subject = control_attestation.subject
+    if (
+        subject.artifact_type != "non_serving_terminal"
+        or subject.artifact_sha256 != binding.raw_sha256
+        or subject.protocol_sha256 != DISTRIBUTED_RUNTIME_GPU_PROOF_PROTOCOL_SHA256
+        or subject.registry_sha256 != receipt.source_identity_sha256
+        or subject.lineage_sha256 != receipt.control_lineage_sha256
+    ):
+        raise ValueError("distributed GPU proof control subject is not exact")
+    bundle = control_attestation.deployment_policy_authorization.bundle
+    bundle.require_hardware_envelope(receipt.hardware_envelope_sha256)
+    verified_controls = verify_and_reserve_release_control_artifact_attestations(
+        (control_attestation,),
+        expected_inventory_sha256=receipt.inventory_sha256,
+        now_ns=now_ns,
+        replay_store=replay_store,
+        additional_challenge_sha256s=(receipt.run_nonce_sha256,),
+    )
+    verified_control = verified_controls[0]
+    reservation_sha256 = control_challenge_reservation_sha256(
+        verified_controls,
+        reserved_ns=now_ns,
+        additional_challenge_sha256s=(receipt.run_nonce_sha256,),
+    )
+    return VerifiedDistributedRuntimeGpuProof(
+        receipt_sha256=receipt.sha256,
+        receipt_raw_sha256=binding.raw_sha256,
+        runner_protocol_sha256=receipt.runner_protocol_sha256,
+        assignment_sha256=receipt.assignment_sha256,
+        qualification_observation_sha256=receipt.qualification_observation_sha256,
+        base_exactness_result_pointer_sha256=(
+            receipt.base_exactness_result_pointer_sha256
+        ),
+        source_capability_sha256=capability.sha256,
+        qualification_authority_sha256=receipt.qualification_authority_sha256,
+        trusted_policy_sha256=verified_control.trusted_attester_policy_sha256,
+        challenge_sha256=verified_control.challenge_sha256,
+        source_identity_sha256=receipt.source_identity_sha256,
+        inventory_sha256=receipt.inventory_sha256,
+        hardware_envelope_sha256=receipt.hardware_envelope_sha256,
+        topology_mode=receipt.topology_mode,
+        topology_sha256=receipt.topology_sha256,
+        gpu_uuids=receipt.gpu_uuids,
+        control_envelope_sha256=verified_control.envelope_sha256,
+        challenge_reservation_sha256=reservation_sha256,
+        _verification_tag=_VERIFIED_GPU_PROOF_SENTINEL,
+    )
+
+
+@dataclass(frozen=True)
+class DistributedRuntimeGpuProofArtifact:
+    """Durable external-control lift for one unsigned distributed receipt."""
+
+    schema_version: Literal[1]
+    kind: Literal["lightcone_distributed_runtime_gpu_proof_artifact"]
+    receipt: CanonicalJsonProofBinding
+    control_attestation: ControlArtifactAttestation
+    replay_reservation: ChallengeReplayReservationBinding
+    verified_proof_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != (
+            "lightcone_distributed_runtime_gpu_proof_artifact"
+        ):
+            raise ValueError("distributed proof artifact schema is unsupported")
+        if type(self.receipt) is not CanonicalJsonProofBinding:
+            raise TypeError("distributed proof artifact requires a raw receipt")
+        if type(self.control_attestation) is not ControlArtifactAttestation:
+            raise TypeError("distributed proof artifact requires external control")
+        if type(self.replay_reservation) is not ChallengeReplayReservationBinding:
+            raise TypeError("distributed proof artifact requires replay reservation")
+        self.receipt.__post_init__()
+        self.control_attestation.__post_init__()
+        self.replay_reservation.__post_init__()
+        _require_hash("distributed verified proof", self.verified_proof_sha256)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "receipt": self.receipt.to_dict(),
+            "control_attestation": self.control_attestation.to_dict(),
+            "replay_reservation": self.replay_reservation.to_dict(),
+            "verified_proof_sha256": self.verified_proof_sha256,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return _sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: object) -> DistributedRuntimeGpuProofArtifact:
+        if type(value) is not dict or set(value) != {
+            "schema_version",
+            "kind",
+            "receipt",
+            "control_attestation",
+            "replay_reservation",
+            "verified_proof_sha256",
+        }:
+            raise ValueError("distributed proof artifact fields differ")
+        row = dict(value)
+        return cls(
+            receipt=CanonicalJsonProofBinding.from_dict(row.pop("receipt")),
+            control_attestation=ControlArtifactAttestation.from_dict(
+                row.pop("control_attestation")
+            ),
+            replay_reservation=ChallengeReplayReservationBinding.from_dict(
+                row.pop("replay_reservation")
+            ),
+            **row,
+        )
+
+    def revalidate(self, *, now_ns: int) -> VerifiedDistributedRuntimeGpuProof:
+        self.__post_init__()
+        reserved = self.replay_reservation.revalidate()
+        if type(now_ns) is not int or now_ns < self.replay_reservation.reserved_ns:
+            raise ValueError("distributed proof current time precedes reservation")
+        verified_at_ns = self.replay_reservation.reserved_ns
+        receipt = DistributedRuntimeGpuProofReceipt.from_dict(self.receipt.reopen())
+        if receipt.sha256 != self.receipt.semantic_sha256:
+            raise ValueError("distributed proof semantic receipt changed")
+        capability = require_distributed_runtime_release_capability(
+            topology_mode=receipt.topology_mode,
+            claimed_capability_sha256=receipt.source_capability_sha256,
+        )
+        if (
+            receipt.pinned_sglang_commit != capability.pinned_sglang_commit
+            or receipt.patched_sglang_tree != capability.patched_sglang_tree
+            or receipt.semantic_patch_sha256 != capability.semantic_patch_sha256
+        ):
+            raise ValueError("distributed proof source capability changed")
+        subject = self.control_attestation.subject
+        if (
+            subject.artifact_type != "non_serving_terminal"
+            or subject.artifact_sha256 != self.receipt.raw_sha256
+            or subject.protocol_sha256 != DISTRIBUTED_RUNTIME_GPU_PROOF_PROTOCOL_SHA256
+            or subject.registry_sha256 != receipt.source_identity_sha256
+            or subject.lineage_sha256 != receipt.control_lineage_sha256
+        ):
+            raise ValueError("distributed proof external control differs")
+        verified_control = verify_release_control_artifact_attestation(
+            self.control_attestation,
+            expected_inventory_sha256=receipt.inventory_sha256,
+            now_ns=verified_at_ns,
+            consumed_challenge_sha256s=(),
+        )
+        self.control_attestation.deployment_policy_authorization.bundle.require_hardware_envelope(
+            receipt.hardware_envelope_sha256
+        )
+        expected_challenges = tuple(
+            sorted(
+                {
+                    receipt.run_nonce_sha256,
+                    verified_control.challenge_sha256,
+                    verified_control.deployment_policy_challenge_sha256,
+                }
+            )
+        )
+        expected_reservation = control_challenge_reservation_sha256(
+            (verified_control,),
+            reserved_ns=self.replay_reservation.reserved_ns,
+            additional_challenge_sha256s=(receipt.run_nonce_sha256,),
+        )
+        if (
+            reserved != expected_challenges
+            or self.replay_reservation.reservation_sha256 != expected_reservation
+        ):
+            raise ValueError("distributed proof replay reservation differs")
+        verified = VerifiedDistributedRuntimeGpuProof(
+            receipt_sha256=receipt.sha256,
+            receipt_raw_sha256=self.receipt.raw_sha256,
+            runner_protocol_sha256=receipt.runner_protocol_sha256,
+            assignment_sha256=receipt.assignment_sha256,
+            qualification_observation_sha256=(receipt.qualification_observation_sha256),
+            base_exactness_result_pointer_sha256=(
+                receipt.base_exactness_result_pointer_sha256
+            ),
+            source_capability_sha256=capability.sha256,
+            qualification_authority_sha256=receipt.qualification_authority_sha256,
+            trusted_policy_sha256=verified_control.trusted_attester_policy_sha256,
+            challenge_sha256=verified_control.challenge_sha256,
+            source_identity_sha256=receipt.source_identity_sha256,
+            inventory_sha256=receipt.inventory_sha256,
+            hardware_envelope_sha256=receipt.hardware_envelope_sha256,
+            topology_mode=receipt.topology_mode,
+            topology_sha256=receipt.topology_sha256,
+            gpu_uuids=receipt.gpu_uuids,
+            control_envelope_sha256=verified_control.envelope_sha256,
+            challenge_reservation_sha256=expected_reservation,
+            _verification_tag=_VERIFIED_GPU_PROOF_SENTINEL,
+        )
+        if verified.sha256 != self.verified_proof_sha256:
+            raise ValueError("distributed verified proof identity changed")
+        return verified
+
+
+def build_distributed_runtime_gpu_proof_artifact(
+    *,
+    receipt_path: str,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    verified_proof: VerifiedDistributedRuntimeGpuProof,
+) -> DistributedRuntimeGpuProofArtifact:
+    if type(verified_proof) is not VerifiedDistributedRuntimeGpuProof:
+        raise TypeError("distributed proof artifact requires an exact verified proof")
+    binding = CanonicalJsonProofBinding.bind(
+        receipt_path,
+        semantic_sha256=verified_proof.receipt_sha256,
+    )
+    receipt = DistributedRuntimeGpuProofReceipt.from_dict(binding.reopen())
+    if (
+        receipt.sha256 != verified_proof.receipt_sha256
+        or binding.raw_sha256 != verified_proof.receipt_raw_sha256
+        or control_attestation.sha256 != verified_proof.control_envelope_sha256
+        or control_attestation.challenge.sha256 != verified_proof.challenge_sha256
+    ):
+        raise ValueError("distributed proof artifact inputs differ")
+    return DistributedRuntimeGpuProofArtifact(
+        schema_version=1,
+        kind="lightcone_distributed_runtime_gpu_proof_artifact",
+        receipt=binding,
+        control_attestation=control_attestation,
+        replay_reservation=replay_store.bind_reservation(
+            verified_proof.challenge_reservation_sha256
+        ),
+        verified_proof_sha256=verified_proof.sha256,
+    )
+
+
+def validate_distributed_runtime_gpu_proof_artifact(
+    artifact_path: str,
+    *,
+    expected_topology_mode: Literal["tp2_dp1", "tp1_dp2"],
+    expected_topology_sha256: str,
+    expected_source_identity_sha256: str,
+    expected_inventory_sha256: str,
+    expected_gpu_uuids: tuple[str, str],
+    expected_hardware_envelope_sha256: str,
+    expected_assignment_sha256: str,
+    expected_qualification_observation_sha256: str,
+    expected_base_exactness_result_pointer_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+) -> VerifiedDistributedRuntimeGpuProof:
+    """Deep-open one topology-specific durable distributed GPU proof."""
+
+    for label, value in (
+        ("distributed expected topology", expected_topology_sha256),
+        ("distributed expected source identity", expected_source_identity_sha256),
+        ("distributed expected inventory", expected_inventory_sha256),
+        ("distributed expected hardware envelope", expected_hardware_envelope_sha256),
+        ("distributed expected assignment", expected_assignment_sha256),
+        (
+            "distributed expected qualification observation",
+            expected_qualification_observation_sha256,
+        ),
+        (
+            "distributed expected base exactness result pointer",
+            expected_base_exactness_result_pointer_sha256,
+        ),
+        ("distributed expected root manifest", expected_root_manifest_sha256),
+    ):
+        _require_hash(label, value)
+    binding = CanonicalJsonProofBinding.bind(artifact_path)
+    artifact = DistributedRuntimeGpuProofArtifact.from_dict(binding.reopen())
+    if artifact.sha256 != binding.semantic_sha256:
+        raise ValueError("distributed proof artifact semantic identity changed")
+    verified = artifact.revalidate(now_ns=now_ns)
+    receipt = DistributedRuntimeGpuProofReceipt.from_dict(artifact.receipt.reopen())
+    if (
+        verified.topology_mode != expected_topology_mode
+        or verified.topology_sha256 != expected_topology_sha256
+        or verified.source_identity_sha256 != expected_source_identity_sha256
+        or verified.inventory_sha256 != expected_inventory_sha256
+        or verified.gpu_uuids != expected_gpu_uuids
+        or verified.hardware_envelope_sha256 != expected_hardware_envelope_sha256
+        or verified.runner_protocol_sha256
+        != DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S[expected_topology_mode]
+        or verified.assignment_sha256 != expected_assignment_sha256
+        or verified.qualification_observation_sha256
+        != expected_qualification_observation_sha256
+        or verified.base_exactness_result_pointer_sha256
+        != expected_base_exactness_result_pointer_sha256
+        or receipt.sha256 != verified.receipt_sha256
+        or artifact.control_attestation.deployment_policy_authorization.root_manifest_sha256
+        != expected_root_manifest_sha256
+    ):
+        raise ValueError("distributed proof artifact differs from expected identity")
+    return verified
 
 
 @dataclass(frozen=True)
@@ -83,16 +1021,33 @@ class TopologyIdentity:
             raise ValueError("tensor_parallel_rank is outside its TP group")
         if self.data_parallel_rank >= self.data_parallel_size:
             raise ValueError("data_parallel_rank is outside its DP topology")
+        registered_runtime_topology_mode(
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.node_count,
+        )
         expected_rank = (
             self.data_parallel_rank * self.tensor_parallel_size
             + self.tensor_parallel_rank
         )
         if self.global_rank != expected_rank:
             raise ValueError("global rank does not match the declared TP/DP ranks")
+        if self.node_rank != 0 or self.local_rank != self.global_rank:
+            raise ValueError(
+                "registered runtime ranks must be host-local with local_rank=global_rank"
+            )
 
     @property
     def world_size(self) -> int:
         return self.tensor_parallel_size * self.data_parallel_size
+
+    @property
+    def mode(self) -> RuntimeTopologyMode:
+        return registered_runtime_topology_mode(
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.node_count,
+        )
 
     @property
     def sha256(self) -> str:
@@ -187,6 +1142,10 @@ class TopologyReceiptSet:
     @property
     def data_parallel_size(self) -> int:
         return self.receipts[0].topology.data_parallel_size
+
+    @property
+    def mode(self) -> RuntimeTopologyMode:
+        return self.receipts[0].topology.mode
 
     @property
     def topology_sha256(self) -> str:
@@ -419,6 +1378,24 @@ class PreparedPublication:
     reasons: tuple[str, ...]
     ranks: tuple[int, ...]
 
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("prepared update", self.update_sha256),
+            ("prepared candidate", self.candidate_sha256),
+            ("prepared topology", self.topology_sha256),
+        ):
+            _require_hash(name, value)
+        if type(self.disposition) is not PrepareDisposition:
+            raise TypeError("prepared publication disposition must be exact")
+        if (
+            type(self.reasons) is not tuple
+            or not self.reasons
+            or self.reasons != tuple(sorted(set(self.reasons)))
+        ):
+            raise ValueError("prepared publication reasons must be canonical")
+        if self.ranks != tuple(range(len(self.ranks))) or not self.ranks:
+            raise ValueError("prepared publication requires exact all-rank coverage")
+
     @property
     def sha256(self) -> str:
         return _sha256(
@@ -450,6 +1427,36 @@ class PublicationDecision:
     service_ready: bool
     admission_allowed: bool
     restart_required: bool
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("decision update", self.update_sha256),
+            ("decision candidate", self.candidate_sha256),
+            ("decision topology", self.topology_sha256),
+        ):
+            _require_hash(name, value)
+        if type(self.outcome) is not PublicationOutcome:
+            raise TypeError("publication outcome must be exact")
+        if (
+            type(self.reasons) is not tuple
+            or not self.reasons
+            or self.reasons != tuple(sorted(set(self.reasons)))
+        ):
+            raise ValueError("publication decision reasons must be canonical")
+        if self.ranks != tuple(range(len(self.ranks))) or not self.ranks:
+            raise ValueError("publication decision requires exact all-rank coverage")
+        state = (
+            self.service_ready,
+            self.admission_allowed,
+            self.restart_required,
+        )
+        expected = (
+            (False, False, True)
+            if self.outcome is PublicationOutcome.PROCESS_GROUP_FAILURE
+            else (False, False, False)
+        )
+        if state != expected:
+            raise ValueError("publication decision service state is not fail-closed")
 
     @property
     def sha256(self) -> str:
@@ -490,6 +1497,10 @@ def validate_decision_receipts(
 ) -> None:
     """Reject missing, duplicate, mixed, or foreign all-rank outcomes."""
 
+    if decision.topology_sha256 != topology.topology_sha256:
+        raise ValueError("publication decision belongs to another topology")
+    if decision.ranks != tuple(range(topology.world_size)):
+        raise ValueError("publication decision lacks exact all-rank coverage")
     ranks = [receipt.rank for receipt in receipts]
     expected = set(range(topology.world_size))
     if len(ranks) != len(set(ranks)):
@@ -609,7 +1620,6 @@ class AllRankPublicationCoordinator:
             ),
         }[prepared.disposition]
         process_failed = outcome is PublicationOutcome.PROCESS_GROUP_FAILURE
-        commit_in_progress = outcome is PublicationOutcome.COMMIT
         decision = PublicationDecision(
             update_sha256=prepared.update_sha256,
             candidate_sha256=prepared.candidate_sha256,
@@ -617,8 +1627,8 @@ class AllRankPublicationCoordinator:
             outcome=outcome,
             reasons=prepared.reasons,
             ranks=prepared.ranks,
-            service_ready=not process_failed and not commit_in_progress,
-            admission_allowed=not process_failed and not commit_in_progress,
+            service_ready=False,
+            admission_allowed=False,
             restart_required=process_failed,
         )
         self.service_ready = decision.service_ready

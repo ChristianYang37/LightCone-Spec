@@ -2756,7 +2756,26 @@ class GpuPoolScheduler:
             raise ValueError("stage activation plan identity mismatch")
         receipt_by_name = self.registry.validate_receipts(receipts)
         dependency = self.registry.definition(experiment).dependencies[0]
-        if plan.dependency_receipt_sha256 != receipt_by_name[dependency].sha256:
+        expected_dependency_sha256 = receipt_by_name[dependency].sha256
+        # The E1 geometry reducer is sourced from the sealed E3a width/load
+        # result, while TTS-Cal is the direct DAG predecessor that freezes the
+        # independent TTS anchor.  Require both receipts and their exact chain;
+        # do not misinterpret the reducer's E3a source binding as an attempt to
+        # skip TTS-Cal.
+        if experiment == "E1":
+            e3a = receipt_by_name.get("E3a")
+            tts_cal = receipt_by_name.get("TTS-Cal")
+            if (
+                e3a is None
+                or tts_cal is None
+                or not any(
+                    row.name == "E3a" and row.content_sha256 == e3a.sha256
+                    for row in tts_cal.dependency_receipts
+                )
+            ):
+                raise ValueError("E1 scheduling lacks the exact E3a to TTS-Cal chain")
+            expected_dependency_sha256 = e3a.sha256
+        if plan.dependency_receipt_sha256 != expected_dependency_sha256:
             raise ValueError(
                 "activation plan does not bind the direct dependency receipt"
             )

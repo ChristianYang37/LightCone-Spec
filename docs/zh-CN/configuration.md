@@ -17,13 +17,15 @@ SGLang commit、sampling-profile SHA-256、tenant 与 runtime topology。Target-
 `speculation_enabled=false`；其他方法必须启用 speculation，且 verification width 等于
 draft depth 加一。未知 schema 与已退役 adaptation 字段会在加载模型前失败。
 
-这些名称包含目标 protocol vocabulary，不承诺每个合法 scientific declaration 都可执行。
-当前端到端 industrial executor 只接受 TP1/DP1 Target-only。Static/TTS/L0-naive/LightCone 会在任何
-mutation 前被阻止，因为固定 native begin/reset/finalize hook 没有配置 trusted hardware
-signer。底层 adaptive patch path 与 terminal schema 仅限 TP1/DP1 DFlash；adaptive runtime 会执行
-已注册 constant、按 published update 的 inverse-square-root 与有限 horizon cosine schedule，
-也会执行非负 logical publication delay。`quota_shadow` 可以声明，但 DFlash 当前只提供
-update-round teacher acquisition，因此真实缺 row 时会 fail closed。
+这些名称表示源码 capability，不承诺某个 declaration 在当前 session 已可执行。Formal
+mutation 还必须具有准确的 root-authorized deployment/hardware policy、prepared content、
+workload、compile、qualification、terminal 与 capacity authority。源码只固定 public
+Ed25519 root，不携带猜测的 hardware allowlist 或可复用 GPU proof。DFlash、DSpark、NEXTN
+以及 `tp1_dp1`、`tp2_dp1`、`tp1_dp2` topology vocabulary 已在源码实现；其依赖硬件的路径
+在 matching fresh proof 被验证前保持 `implemented_pending_dynamic_gpu_proof`。Adaptive
+runtime 会执行已注册 constant、按 published update 的 inverse-square-root 与有限 horizon
+cosine schedule，也会执行非负 logical publication delay。`quota_shadow` 可声明，但缺少
+独立授权的 backend acquisition path 时会 fail closed。
 
 每个 serving run 还会绑定 schema-v2 controlled execution policy。注册策略固定 context
 length 40,960 与 server seed 1，关闭 radix cache 和 CUDA Graph，并要求
@@ -77,12 +79,13 @@ selection 与证据身份。
 
 ## Backend 专属字段
 
-本节描述目标 contract。当前可执行 schema 的 adaptive config 必须使用 DFlash；DSpark、
-EAGLE、EAGLE3 与 NEXTN 会在 model loading 前被拒绝。DFlash 的目标 contract 使用 native
-differentiable-canvas evidence。EAGLE/EAGLE3 adaptation 将要求
-`speculative_eagle_topk=1`，并钉住一个 proposal source version。NEXTN 将要求单独 preflight
-的 native interface digest；registry E6 还以双 rank memory-fit receipt 为目标。这些
-prerequisite 不会让 cell 在当前 schema 中变得可执行。
+Adaptive schema 可使用 DFlash、DSpark 或 NEXTN。DFlash 使用 native
+differentiable-canvas evidence；DSpark 要求实际 sampled predecessor、W1/W2、native
+confidence head 与准确的 56-candidate selector；NEXTN 要求 MTP hidden/interface、teacher
+row、valid mask、source version，并在 TP2 下要求 target/drafter shard authority。这些都是
+源码 contract；formal execution 仍必须提供 backend 专属 GPU qualification。EAGLE 不受
+支持。EAGLE3 只允许 signed official model/selector compatibility 判定通过的组合，不能作为
+generic fallback。
 
 DSpark layer-only scope 冻结 W1、W2 与 acceptance/confidence state。Hybrid scope
 `last1_native_heads`、`last3_native_heads`、`last5_native_heads` 选择命名 backbone scope，
@@ -99,15 +102,15 @@ scope，各自交叉 Full 加七个 LoRA rank。
 
 ## Optimizer 合同
 
-E1/E2 **LC-candidate** optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon` 与
-`lion`。它们生成 functional parameter/state proposal，只有 commit 时才修改 active state。
-TTS 不搜索该 registry：paper-bound authority 指定 Adam 与一次 step，但 numeric learning
-rate/schedule、beta、epsilon、optimizer-state reset、weight decay/clip、position weight、
-proximal coefficient、loss normalization/precision/temperature、准确 trainable-parameter
-manifest、stride-selection rule 与官方 implementation commit 尚未解析。因此
-`TTS-paper-reconstruction` 与 L0-naive
-保持 `BLOCKED`；二者不能继承 schema default、历史 AdamW recipe 或 E1/E2 selection。Plain
-`sgd` 只用于 OnlineSPEC。
+E1/E2 **LC-candidate** optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon`、
+`lion` 与项目自有 `chronobelief`。它们生成 functional parameter/state proposal，只有 commit
+时才修改 active state。TTS 不搜索该 registry；TTS-Cal authority 固定 Adam、一步、
+`(beta1=.9, beta2=.999, epsilon=1e-8)`、zero decay、无 clipping、全 drafter/
+latest-round-only update、drafter-native position weight、source-point proximal anchor、
+request reset、side stream、注册的 learning-rate grid 与八个 stride。四个 excluded pilot 按
+safety-first reducer 生成 signed winner；在 seal 之前 TTS 与 L0-naive 保持 `BLOCKED`，且
+不能继承 schema default、历史 AdamW recipe 或 E1/E2 selection。Plain `sgd` 只用于
+OnlineSPEC。
 
 | Optimizer | 必需身份 | 常驻 moment 规则 |
 |---|---|---|
@@ -117,12 +120,14 @@ manifest、stride-selection rule 与官方 implementation commit 尚未解析。
 | NAG | learning rate、momentum、可选 decay | 一个 FP32 momentum；coupled decay |
 | Lion | learning rate、beta、可选 decay | 一个 FP32 moment；decoupled decay |
 | Muon | learning rate、momentum、Newton--Schulz step、辅助 AdamW 字段 | matrix momentum，加 non-matrix 的两个辅助 moment |
+| ChronoBelief | learning rate、beta、epsilon、decoupled decay、source/safe-boundary version | FP32 一阶与 centered 二阶 moment；标准 bias correction；从版本准确派生 $d_r$ age |
 
-全局 `grad_clip` 必须为正并进入证据身份；未使用 optimizer 字段会被拒绝。目标 schedule
-vocabulary 包含 `constant`、`inverse_sqrt_published_update` 与 `cosine_to_zero`，按已发布
-update 数而不是 attempted work 前进。当前 adaptive `RunConfig` 只接受 `constant`；另外两种
-schedule 保持已注册但不可执行。Optimizer 与 schedule identity 进入 cohort、plan、
-selection 与 evidence digest。
+使用 clip 的 recipe，其全局 `grad_clip` 必须为正并进入证据身份；TTS 明确为 no-clip。未使用
+optimizer 字段会被拒绝。目标 schedule vocabulary 包含 `constant`、
+`inverse_sqrt_published_update` 与 `cosine_to_zero`，按已发布 update 数而不是 attempted work
+前进；三者都由正式 numeric authority 精确绑定。Optimizer 与 schedule identity 进入
+cohort、plan、selection 与 evidence digest。ChronoBelief 的 skipped/aborted proposal 不推进
+moment、update count 或 safe boundary；其准确 GPU parity suite 仍是执行前 dynamic gate。
 
 ## Runtime Topology
 
@@ -135,13 +140,14 @@ selection 与 evidence digest。
 | TP1/DP2 | 相同 capability receipt，另需显式 sticky `router_identity` |
 
 Rank 字段必须位于 TP/DP 维度内。Device、rendezvous、router、clock、process-group backend
-与 capability receipt 都属于目标 runtime identity。当前 release 只接受 TP1/DP1，并会在
-model loading 前拒绝全部 TP2/DP2 `RunConfig`；caller 自己填写 receipt 也不能启用。
+与 capability receipt 都属于 runtime identity。Configuration 只在准确的 source-owned
+`patched_two_gpu_v1` capability identity 与 runtime receipt claim 存在时接受 distributed
+row；formal dispatch 随后深验对应 dynamic GPU proof。Caller 自己填写 receipt 不能启用。
 
 `process_group_backend=gloo` 只适用于 CPU collective 合同，不能认证 NCCL/CUDA 行为，
-也不能充当 GPU capability receipt。CPU contract 只保留未来 receipt vocabulary。
-Production TP2/DP2 工作会保持 `BLOCKED`，直到新的固定 runtime 实现并发出 GPU receipt
-与 all-rank publication evidence。
+也不能充当 GPU capability receipt。CPU contract 只验证状态机。Production TP2/DP2
+在固定 runtime 发出、且本地控制验证准确 GPU qualification、all-rank publication 与
+terminal evidence 前保持 `BLOCKED`。
 
 Prefill/decode disaggregation 与 two-batch overlap 仍关闭。Multi-node 和超过两个 rank 的
 配置会验证失败；不存在 Kubernetes、elastic 或 automatic-failover 设置。
@@ -149,8 +155,8 @@ Prefill/decode disaggregation 与 two-batch overlap 仍关闭。Multi-node 和�
 Runtime topology 与 pool capacity 是不同 identity。Scientific registry 使用两个稳定
 logical rank slot；严格 `GpuInventory` 可以包含任意数量 device。唯一 scheduler 对
 1/2/4/8/16 GPU 有明确 regression coverage，并在 `IndustrialPhysicalAssignment` 中冻结
-physical UUID、rank layout、port、topology 与 whole-instance size。这不会启用 TP2/DP2：
-release `RunConfig` validation 仍只接受 TP1/DP1。
+physical UUID、rank layout、port、topology 与 whole-instance size。这不会自动启用
+TP2/DP2：准确 dynamic qualification 仍是强制门禁。
 
 ## HBM 与 Cohort 策略
 

@@ -939,6 +939,79 @@ class RawE3aSelectionEvidenceManifest:
 
 
 @dataclass(frozen=True)
+class TtsCalibrationPilotEvidence:
+    """One excluded TTS-calibration pilot and its frozen SLO qualification."""
+
+    block: int
+    qualification_lock: BoundArtifact
+    cells: tuple[IndustrialCellEvidence, ...]
+    terminal_control_attestations: tuple[BoundArtifact, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.block) is not int or self.block not in PILOT_BLOCKS:
+            raise ValueError("TTS calibration pilot block is not preregistered")
+        if type(self.qualification_lock) is not BoundArtifact:
+            raise TypeError("TTS calibration pilot requires a qualification lock")
+        ids = tuple(cell.cell_id for cell in self.cells)
+        if len(ids) != 72 or ids != tuple(sorted(set(ids))):
+            raise ValueError(
+                "TTS calibration pilot must contain 72 sorted unique cells"
+            )
+        if (
+            type(self.terminal_control_attestations) is not tuple
+            or len(self.terminal_control_attestations) != len(self.cells)
+            or any(
+                type(reference) is not BoundArtifact
+                for reference in self.terminal_control_attestations
+            )
+        ):
+            raise ValueError(
+                "TTS calibration pilot requires one external control per cell"
+            )
+        control_paths = tuple(
+            reference.path for reference in self.terminal_control_attestations
+        )
+        if len(control_paths) != len(set(control_paths)):
+            raise ValueError("TTS calibration pilot reuses an external control path")
+
+
+@dataclass(frozen=True)
+class RawTtsCalibrationEvidenceManifest:
+    """Path-bearing 72-candidate x four-pilot TTS calibration evidence."""
+
+    schema_version: int
+    tuning_window: BoundArtifact
+    pilots: tuple[TtsCalibrationPilotEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only raw TTS calibration evidence schema 2 is supported")
+        if type(self.tuning_window) is not BoundArtifact:
+            raise TypeError("raw TTS calibration requires a bound tuning window")
+        if (
+            type(self.pilots) is not tuple
+            or tuple(pilot.block for pilot in self.pilots) != PILOT_BLOCKS
+            or any(
+                type(pilot) is not TtsCalibrationPilotEvidence for pilot in self.pilots
+            )
+        ):
+            raise ValueError(
+                "raw TTS calibration requires four ordered excluded pilots"
+            )
+        ids = tuple(cell.cell_id for pilot in self.pilots for cell in pilot.cells)
+        if len(ids) != 288 or len(set(ids)) != 288:
+            raise ValueError("raw TTS calibration must cover exactly 288 cells")
+
+    @property
+    def cells(self) -> tuple[IndustrialCellEvidence, ...]:
+        return tuple(cell for pilot in self.pilots for cell in pilot.cells)
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(raw_tts_calibration_manifest_to_dict(self, digest=False))
+
+
+@dataclass(frozen=True)
 class RawE1ParetoEvidenceManifest:
     """Path-bearing exact 67-cell E1 selection evidence for Pareto replay."""
 
@@ -1008,7 +1081,8 @@ class RawConfirmationFamilyPowerEvidenceManifest:
 
 def validate_raw_evidence_manifest_sidecars(
     manifest: (
-        RawE3aSelectionEvidenceManifest
+        RawTtsCalibrationEvidenceManifest
+        | RawE3aSelectionEvidenceManifest
         | RawE1ParetoEvidenceManifest
         | RawE2StageEvidenceManifest
         | RawConfirmationFamilyPowerEvidenceManifest
@@ -1025,12 +1099,25 @@ def validate_raw_evidence_manifest_sidecars(
     """
 
     if type(manifest) in {
+        RawTtsCalibrationEvidenceManifest,
         RawE3aSelectionEvidenceManifest,
         RawE1ParetoEvidenceManifest,
         RawE2StageEvidenceManifest,
     }:
         cells = manifest.cells
-        extra: tuple[BoundArtifact, ...] = ()
+        extra: tuple[BoundArtifact, ...] = (
+            (
+                manifest.tuning_window,
+                *(pilot.qualification_lock for pilot in manifest.pilots),
+                *(
+                    control
+                    for pilot in manifest.pilots
+                    for control in pilot.terminal_control_attestations
+                ),
+            )
+            if type(manifest) is RawTtsCalibrationEvidenceManifest
+            else ()
+        )
     elif type(manifest) is RawConfirmationFamilyPowerEvidenceManifest:
         cells = tuple(cell for block in manifest.blocks for cell in block.cells)
         extra = tuple(block.qualification_lock for block in manifest.blocks)
@@ -1115,6 +1202,38 @@ def raw_e3a_selection_manifest_to_dict(
         cells=manifest.cells,
         artifact_sha256=manifest.sha256 if digest else None,
     )
+
+
+def raw_tts_calibration_manifest_to_dict(
+    manifest: RawTtsCalibrationEvidenceManifest, *, digest: bool = True
+) -> dict[str, object]:
+    if type(manifest) is not RawTtsCalibrationEvidenceManifest:
+        raise TypeError("raw TTS calibration serialization requires an exact value")
+    value: dict[str, object] = {
+        "schema_version": manifest.schema_version,
+        "kind": "raw_tts_calibration_evidence_manifest",
+        "tuning_window": _raw_evidence_reference_to_dict(manifest.tuning_window),
+        "pilots": [
+            {
+                "block": pilot.block,
+                "qualification_lock": _raw_evidence_reference_to_dict(
+                    pilot.qualification_lock
+                ),
+                "terminal_control_attestations": [
+                    _raw_evidence_reference_to_dict(reference)
+                    for reference in pilot.terminal_control_attestations
+                ],
+                "cells": [
+                    _raw_cell_to_dict(cell, require_itl_authority=False)
+                    for cell in pilot.cells
+                ],
+            }
+            for pilot in manifest.pilots
+        ],
+    }
+    if digest:
+        value["artifact_sha256"] = manifest.sha256
+    return value
 
 
 def raw_e1_pareto_manifest_to_dict(
@@ -1219,6 +1338,78 @@ def raw_e3a_selection_manifest_from_dict(
     manifest = RawE3aSelectionEvidenceManifest(schema_version=2, cells=cells)
     if declared != manifest.sha256:
         raise ValueError("raw E3a manifest redundant SHA-256 mismatch")
+    return manifest
+
+
+def raw_tts_calibration_manifest_from_dict(
+    value: object,
+) -> RawTtsCalibrationEvidenceManifest:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "kind",
+        "artifact_sha256",
+        "tuning_window",
+        "pilots",
+    }:
+        raise ValueError("raw TTS calibration manifest fields differ")
+    if (
+        value.get("schema_version") != 2
+        or value.get("kind") != "raw_tts_calibration_evidence_manifest"
+    ):
+        raise ValueError("raw TTS calibration manifest identity is invalid")
+    rows = value.get("pilots")
+    if type(rows) is not list:
+        raise TypeError("raw TTS calibration pilots must be a JSON list")
+    pilots: list[TtsCalibrationPilotEvidence] = []
+    for index, row in enumerate(rows):
+        if type(row) is not dict or set(row) != {
+            "block",
+            "qualification_lock",
+            "cells",
+            "terminal_control_attestations",
+        }:
+            raise ValueError("raw TTS calibration pilot fields differ")
+        cells = row.get("cells")
+        controls = row.get("terminal_control_attestations")
+        if type(cells) is not list or type(controls) is not list:
+            raise TypeError(
+                "raw TTS calibration pilot cells and controls must be JSON lists"
+            )
+        pilots.append(
+            TtsCalibrationPilotEvidence(
+                block=row.get("block"),  # type: ignore[arg-type]
+                qualification_lock=_raw_evidence_reference_from_dict(
+                    row.get("qualification_lock"),
+                    label=f"raw TTS pilot[{index}].qualification_lock",
+                ),
+                cells=tuple(
+                    _raw_cell_from_dict(
+                        cell,
+                        label=f"raw TTS pilot[{index}].cells[{cell_index}]",
+                    )
+                    for cell_index, cell in enumerate(cells)
+                ),
+                terminal_control_attestations=tuple(
+                    _raw_evidence_reference_from_dict(
+                        control,
+                        label=(
+                            f"raw TTS pilot[{index}]."
+                            f"terminal_control_attestations[{control_index}]"
+                        ),
+                    )
+                    for control_index, control in enumerate(controls)
+                ),
+            )
+        )
+    manifest = RawTtsCalibrationEvidenceManifest(
+        schema_version=2,
+        tuning_window=_raw_evidence_reference_from_dict(
+            value.get("tuning_window"), label="raw TTS tuning_window"
+        ),
+        pilots=tuple(pilots),
+    )
+    if value.get("artifact_sha256") != manifest.sha256:
+        raise ValueError("raw TTS calibration redundant SHA-256 mismatch")
     return manifest
 
 

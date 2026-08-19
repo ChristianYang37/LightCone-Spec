@@ -10,7 +10,28 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Self
 
+from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
+
 ExecutionRole = Literal["target_reference", "speculative"]
+
+FIXED_ADDRESS_GRAPH_EXECUTION_PROTOCOL_SHA256 = hashlib.sha256(
+    json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "fixed_address_publication_graph_execution_policy",
+            "pinned_sglang_commit": PINNED_SGLANG_COMMIT,
+            "patched_sglang_tree": PINNED_SGLANG_TREE,
+            "graph_batch_sizes": [1],
+            "fixed_addresses_required": True,
+            "eager_fallback_allowed": False,
+            "blocking_d2h_allowed": False,
+            "host_synchronization_allowed": False,
+            "formal_authority": "dynamic_native_hot_path_gpu_proof",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+).hexdigest()
 
 
 def _absolute_lexical_path(path: str | Path) -> Path:
@@ -242,4 +263,186 @@ class ControlledExecutionPolicy:
         )
         if sidecar != f"{policy.sha256}\n".encode("ascii"):
             raise ValueError("execution policy sidecar is missing or invalid")
+        return policy
+
+
+@dataclass(frozen=True)
+class FixedAddressGraphExecutionPolicy:
+    """Explicit graph-enabled policy; dynamic GPU proof remains orthogonal."""
+
+    schema_version: int = 1
+    kind: str = "fixed_address_publication_graph_execution_policy"
+    protocol_sha256: str = FIXED_ADDRESS_GRAPH_EXECUTION_PROTOCOL_SHA256
+    native_runtime_release_capability_sha256: str = ""
+    context_length: int = 40960
+    random_seed: int = 1
+    disable_radix_cache: bool = True
+    disable_cuda_graph: bool = False
+    target_reference_disable_overlap_schedule: bool = True
+    speculative_disable_overlap_schedule: bool = False
+    enable_deterministic_inference: bool = False
+    incremental_streaming_output: bool = False
+    graph_batch_sizes: tuple[int, ...] = (1,)
+    fixed_addresses_required: bool = True
+    eager_fallback_allowed: bool = False
+    blocking_d2h_allowed: bool = False
+    host_synchronization_allowed: bool = False
+
+    def validate(self) -> None:
+        from lightcone_spec.runtime.readiness import (
+            NATIVE_RUNTIME_RELEASE_CAPABILITY,
+        )
+
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != "fixed_address_publication_graph_execution_policy"
+            or self.protocol_sha256 != FIXED_ADDRESS_GRAPH_EXECUTION_PROTOCOL_SHA256
+        ):
+            raise ValueError("fixed-address graph policy schema is unsupported")
+        if len(self.native_runtime_release_capability_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.native_runtime_release_capability_sha256
+        ):
+            raise ValueError("fixed-address graph policy lacks source capability")
+        if (
+            self.native_runtime_release_capability_sha256
+            != NATIVE_RUNTIME_RELEASE_CAPABILITY.sha256
+        ):
+            raise ValueError(
+                "fixed-address graph policy source capability is unregistered"
+            )
+        if type(self.context_length) is not int or self.context_length != 40960:
+            raise ValueError(
+                "graph execution context must equal the locked model limit"
+            )
+        if type(self.random_seed) is not int or self.random_seed < 0:
+            raise ValueError("graph execution random seed must be non-negative")
+        boolean_fields = (
+            self.disable_radix_cache,
+            self.disable_cuda_graph,
+            self.target_reference_disable_overlap_schedule,
+            self.speculative_disable_overlap_schedule,
+            self.enable_deterministic_inference,
+            self.incremental_streaming_output,
+            self.fixed_addresses_required,
+            self.eager_fallback_allowed,
+            self.blocking_d2h_allowed,
+            self.host_synchronization_allowed,
+        )
+        if any(type(value) is not bool for value in boolean_fields):
+            raise ValueError("graph execution switches must be booleans")
+        if (
+            not self.disable_radix_cache
+            or self.disable_cuda_graph
+            or not self.target_reference_disable_overlap_schedule
+            or self.speculative_disable_overlap_schedule
+            or self.enable_deterministic_inference
+            or self.incremental_streaming_output
+            or not self.fixed_addresses_required
+            or self.eager_fallback_allowed
+            or self.blocking_d2h_allowed
+            or self.host_synchronization_allowed
+            or self.graph_batch_sizes != (1,)
+        ):
+            raise ValueError(
+                "fixed-address graph policy weakens the registered contract"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        self.validate()
+        value = asdict(self)
+        value["graph_batch_sizes"] = list(self.graph_batch_sizes)
+        return value
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def overlap_disabled(self, *, role: ExecutionRole) -> bool:
+        self.validate()
+        if role == "target_reference":
+            return self.target_reference_disable_overlap_schedule
+        if role == "speculative":
+            return self.speculative_disable_overlap_schedule
+        raise ValueError(f"unknown execution-policy role: {role}")
+
+    def server_info_fields(self, *, role: ExecutionRole) -> dict[str, object]:
+        self.validate()
+        return {
+            "context_length": self.context_length,
+            "random_seed": self.random_seed,
+            "disable_radix_cache": self.disable_radix_cache,
+            "disable_cuda_graph": self.disable_cuda_graph,
+            "disable_overlap_schedule": self.overlap_disabled(role=role),
+            "enable_deterministic_inference": self.enable_deterministic_inference,
+            "incremental_streaming_output": self.incremental_streaming_output,
+            "lightcone_fixed_address_publication_graph": True,
+            "lightcone_graph_batch_sizes": list(self.graph_batch_sizes),
+            "lightcone_graph_eager_fallback": self.eager_fallback_allowed,
+        }
+
+    def validate_server_info(self, server_info: object, *, role: ExecutionRole) -> None:
+        if type(server_info) is not dict:
+            raise TypeError("server_info must be an object")
+        for name, expected in self.server_info_fields(role=role).items():
+            value = server_info.get(name)
+            if type(value) is not type(expected) or value != expected:
+                raise ValueError(f"server graph execution policy mismatch: {name}")
+
+    def write(self, path: str | Path) -> None:
+        """Publish canonical graph-policy bytes without overwriting."""
+
+        output = _absolute_lexical_path(path)
+        body = (
+            json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        _publish_immutable(output, body, label="fixed-address graph policy")
+        _publish_immutable(
+            Path(f"{output}.sha256"),
+            f"{self.sha256}\n".encode("ascii"),
+            label="fixed-address graph policy sidecar",
+        )
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        expected = set(asdict(cls()))
+        if type(value) is not dict or set(value) != expected:
+            raise ValueError("fixed-address graph policy fields differ")
+        row = dict(value)
+        graph_batch_sizes = row.pop("graph_batch_sizes")
+        if type(graph_batch_sizes) is not list:
+            raise TypeError("fixed-address graph batch sizes must be an array")
+        policy = cls(**row, graph_batch_sizes=tuple(graph_batch_sizes))
+        policy.validate()
+        return policy
+
+    @classmethod
+    def load(cls, path: str | Path) -> Self:
+        source = _absolute_lexical_path(path)
+        body = _read_regular(source, label="fixed-address graph policy")
+        try:
+            value = json.loads(
+                body.decode("utf-8"),
+                parse_constant=_reject_constant,
+                object_pairs_hook=_reject_duplicate_pairs,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "fixed-address graph policy is not strict UTF-8 JSON"
+            ) from error
+        policy = cls.from_dict(value)
+        canonical = (
+            json.dumps(policy.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        if body != canonical:
+            raise ValueError("fixed-address graph policy bytes are not canonical")
+        sidecar = _read_regular(
+            Path(f"{source}.sha256"),
+            label="fixed-address graph policy sidecar",
+        )
+        if sidecar != f"{policy.sha256}\n".encode("ascii"):
+            raise ValueError("fixed-address graph policy sidecar is invalid")
         return policy

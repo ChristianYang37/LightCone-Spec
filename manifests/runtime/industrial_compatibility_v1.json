@@ -49,19 +49,7 @@
     "triton": "3.6.0"
   },
   "release_capabilities": {
-    "blocked": [
-      {
-        "mode": "multi_node",
-        "reason_code": "release_multi_node_unsupported"
-      },
-      {
-        "mode": "tp2",
-        "reason_code": "release_topology_executor_unsupported"
-      },
-      {
-        "mode": "dp2",
-        "reason_code": "release_topology_executor_unsupported"
-      },
+    "external_authority_required": [
       {
         "mode": "static_speculative",
         "reason_code": "release_trusted_terminal_attester_unavailable"
@@ -75,28 +63,46 @@
         "reason_code": "release_trusted_terminal_attester_unavailable"
       },
       {
-        "mode": "adaptive_dspark",
-        "reason_code": "release_adaptive_backend_unsupported"
-      },
-      {
-        "mode": "adaptive_eagle",
-        "reason_code": "release_adaptive_backend_unsupported"
-      },
-      {
         "mode": "adaptive_eagle3",
-        "reason_code": "release_adaptive_backend_unsupported"
-      },
-      {
-        "mode": "adaptive_nextn",
-        "reason_code": "release_adaptive_backend_unsupported"
-      },
-      {
-        "mode": "adaptive_dflash_dspark",
-        "reason_code": "release_adaptive_backend_unsupported"
+        "reason_code": "release_official_eagle3_compatibility_authority_unavailable"
       },
       {
         "mode": "quota_shadow_backend_acquisition",
         "reason_code": "release_quota_shadow_backend_acquisition_unavailable"
+      }
+    ],
+    "implemented_pending_dynamic_gpu_proof": [
+      {
+        "mode": "tp2",
+        "reason_code": "distributed_tp2_gpu_qualification_required"
+      },
+      {
+        "mode": "dp2",
+        "reason_code": "distributed_dp2_gpu_qualification_required"
+      },
+      {
+        "mode": "adaptive_dspark",
+        "reason_code": "dspark_gpu_qualification_required"
+      },
+      {
+        "mode": "adaptive_nextn",
+        "reason_code": "nextn_gpu_qualification_required"
+      },
+      {
+        "mode": "adaptive_chronobelief",
+        "reason_code": "chronobelief_gpu_qualification_required"
+      },
+      {
+        "mode": "native_itl",
+        "reason_code": "native_itl_gpu_qualification_required"
+      },
+      {
+        "mode": "fixed_address_publication_graph",
+        "reason_code": "fixed_address_graph_gpu_qualification_required"
+      },
+      {
+        "mode": "session_reuse",
+        "reason_code": "session_reset_gpu_qualification_required"
       }
     ],
     "supported": {
@@ -112,13 +118,27 @@
       "tensor_parallel_sizes": [
         1
       ]
-    }
+    },
+    "unsupported": [
+      {
+        "mode": "multi_node",
+        "reason_code": "release_multi_node_unsupported"
+      },
+      {
+        "mode": "adaptive_eagle",
+        "reason_code": "release_adaptive_backend_unsupported"
+      },
+      {
+        "mode": "adaptive_dflash_dspark",
+        "reason_code": "release_combined_backend_unsupported"
+      }
+    ]
   },
   "release_version": "0.3.0",
   "schema_version": 1,
   "sglang": {
-    "expected_patch_count": 6,
-    "expected_tree": "dfb60ab2e514defc6290fe8bacd179552dcd985e",
+    "expected_patch_count": 7,
+    "expected_tree": "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2",
     "patches": [
       {
         "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -143,6 +163,10 @@
       {
         "file": "0006-fix-metrics-handle-target-only-draft-width.patch",
         "sha256": "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
+      },
+      {
+        "file": "0007-feat-spec-bind-distributed-runtime-readiness.patch",
+        "sha256": "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
       }
     ],
     "repository": "https://github.com/sgl-project/sglang.git",

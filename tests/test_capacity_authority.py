@@ -10,6 +10,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from lightcone_spec.cli.main import _industrial_registry_artifact
+from lightcone_spec.cli.main import main as cli_main
 from lightcone_spec.experiments.capacity_authority import (
     CapacityAuthorityUnavailableError,
     bind_capacity_authority,
@@ -27,6 +29,7 @@ from lightcone_spec.experiments.gpu_pool import (
 )
 from lightcone_spec.experiments.planning import (
     BUDGET_MATERIALIZATION_PROTOCOL_SHA256,
+    CAPACITY_MAXIMUM_SOURCE_AGE_NS,
     CELL_CAPACITY_SIZING_PROTOCOL_SHA256,
     ZERO_MILLISECONDS,
     BudgetDisposition,
@@ -54,6 +57,14 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.stage_capacity import (
+    StageCapacityGate,
+    StageCapacityRetryBinding,
+    StageCapacitySchedule,
+    StageCapacityWaveBinding,
+    materialize_stage_capacity_gate_from_raw_sources,
+    revalidate_stage_capacity_gate_sources,
 )
 from lightcone_spec.runtime.attestation import (
     AttestationChallenge,
@@ -183,6 +194,7 @@ class _RawAuthorityFixture:
     inventory: GpuInventory
     envelope: CapacityEnvelope
     authority: object
+    manifest_path: Path
     provider_path: Path
     verification_path: Path
 
@@ -367,6 +379,7 @@ def _raw_authority(root: Path, *, provider_quota_gpu_ms: int) -> _RawAuthorityFi
         inventory=inventory,
         envelope=envelope,
         authority=authority,
+        manifest_path=manifest_path,
         provider_path=provider_path,
         verification_path=verification_path,
     )
@@ -558,3 +571,153 @@ def test_formal_revalidation_rejects_an_expired_signed_snapshot(
             ),
             expected_envelope=fixture.envelope,
         )
+
+
+def _raw_stage_schedule(fixture: _RawAuthorityFixture) -> StageCapacitySchedule:
+    return StageCapacitySchedule(
+        schema_version=1,
+        kind="industrial_stage_capacity_schedule",
+        registry_sha256=fixture.registry.sha256,
+        experiment="preflight",
+        activated_cell_ids=(fixture.cell_id,),
+        gpu_inventory_sha256=fixture.inventory.sha256,
+        dispatch_plan_sha256=content_sha256("raw-capacity-dispatch"),
+        budget_plan_sha256=content_sha256("raw-capacity-budget"),
+        capacity_envelope_sha256=fixture.envelope.sha256,
+        capacity_authority_sha256=fixture.authority.sha256,
+        waves=(
+            StageCapacityWaveBinding(
+                wave_index=0,
+                cell_ids=(fixture.cell_id,),
+                topology_sha256=content_sha256("raw-capacity-wave"),
+            ),
+        ),
+        retries=(
+            StageCapacityRetryBinding(
+                cell_id=fixture.cell_id,
+                experiment_budget_sha256=content_sha256("raw-capacity-cell-budget"),
+                retry_allowance=2,
+            ),
+        ),
+    )
+
+
+def test_dynamic_stage_gate_is_derived_from_reopened_raw_bytes_and_schedule(
+    tmp_path: Path,
+) -> None:
+    fixture = _raw_authority(tmp_path / "dynamic-stage", provider_quota_gpu_ms=10**12)
+    schedule = _raw_stage_schedule(fixture)
+    now_ns = time.time_ns()
+
+    gate = materialize_stage_capacity_gate_from_raw_sources(
+        fixture.registry,
+        experiment="preflight",
+        activated_cell_ids=(fixture.cell_id,),
+        source_manifest_path=str(fixture.manifest_path),
+        schedule=StageCapacitySchedule.from_dict(schedule.to_dict()),
+        now_ns=now_ns,
+    )
+
+    assert gate.schema_version == 3
+    assert gate.status == "AVAILABLE"
+    assert gate.capacity_verification_receipt_sha256 is None
+    assert gate.capacity_source_authority is not None
+    assert gate.retained_evidence_bytes == 3_000
+    assert gate.maximum_concurrent_transient_bytes == 5_000
+    assert type(gate).from_dict(gate.to_dict()) == gate
+    replay = revalidate_stage_capacity_gate_sources(
+        fixture.registry,
+        gate,
+        schedule=schedule,
+        now_ns=now_ns,
+    )
+    assert replay.source_manifest.path == str(fixture.manifest_path)
+    assert replay.capacity_envelope == fixture.envelope
+
+    provider = json.loads(fixture.provider_path.read_text(encoding="utf-8"))
+    provider["host_capacity_injection"] = True
+    _write_bound(fixture.provider_path, provider)
+    with pytest.raises((RuntimeError, ValueError), match="changed|fields differ"):
+        revalidate_stage_capacity_gate_sources(
+            fixture.registry,
+            gate,
+            schedule=schedule,
+            now_ns=now_ns,
+        )
+
+
+def test_dynamic_stage_gate_rejects_stale_raw_observation_and_wrong_schedule(
+    tmp_path: Path,
+) -> None:
+    fixture = _raw_authority(tmp_path / "dynamic-stale", provider_quota_gpu_ms=10**12)
+    schedule = _raw_stage_schedule(fixture)
+    wrong_schedule = replace(
+        schedule,
+        capacity_envelope_sha256=content_sha256("foreign-capacity-envelope"),
+    )
+    with pytest.raises(ValueError, match="differs from the exact stage schedule"):
+        materialize_stage_capacity_gate_from_raw_sources(
+            fixture.registry,
+            experiment="preflight",
+            activated_cell_ids=(fixture.cell_id,),
+            source_manifest_path=str(fixture.manifest_path),
+            schedule=wrong_schedule,
+            now_ns=time.time_ns(),
+        )
+
+    provider = json.loads(fixture.provider_path.read_text(encoding="utf-8"))
+    stale_now_ns = int(provider["captured_at_ns"]) + CAPACITY_MAXIMUM_SOURCE_AGE_NS + 1
+    with pytest.raises(ValueError, match="observations are stale"):
+        materialize_stage_capacity_gate_from_raw_sources(
+            fixture.registry,
+            experiment="preflight",
+            activated_cell_ids=(fixture.cell_id,),
+            source_manifest_path=str(fixture.manifest_path),
+            schedule=schedule,
+            now_ns=stale_now_ns,
+        )
+
+
+def test_materialize_stage_capacity_gate_cli_reopens_all_inputs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "dynamic-cli"
+    fixture = _raw_authority(root, provider_quota_gpu_ms=10**12)
+    schedule = _raw_stage_schedule(fixture)
+    registry_path = _write_bound(
+        root / "registry.json",
+        _industrial_registry_artifact(
+            fixture.registry,
+            base_port=24_000,
+            cache_root=str(root / "cache"),
+            evidence_root=str(root / "evidence"),
+            seed=20_260_811,
+        ),
+    )
+    schedule_path = _write_bound(root / "schedule.json", schedule.to_dict())
+    output_path = root / "stage-capacity-gate.json"
+
+    assert (
+        cli_main(
+            [
+                "materialize-stage-capacity-gate",
+                "--registry",
+                str(registry_path),
+                "--capacity-source-manifest",
+                str(fixture.manifest_path),
+                "--stage-schedule",
+                str(schedule_path),
+                "--now-ns",
+                str(time.time_ns()),
+                "--output",
+                str(output_path),
+            ]
+        )
+        == 0
+    )
+    gate = StageCapacityGate.from_dict(
+        json.loads(output_path.read_text(encoding="utf-8"))
+    )
+    assert gate.schema_version == 3
+    assert gate.status == "AVAILABLE"
+    assert gate.capacity_source_authority is not None

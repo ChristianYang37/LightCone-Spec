@@ -84,9 +84,11 @@ from lightcone_spec.experiments.registry import (
     PILOT_BLOCKS,
     StageActivationPlan,
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.statistics import (
     MAXIMUM_FINAL_BLOCKS,

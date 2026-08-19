@@ -12,7 +12,19 @@ from types import SimpleNamespace
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from test_control_attestation import (
+    HARDWARE_SHA256,
+    INVENTORY_SHA256,
+    NOW_NS,
+    _public_bytes,
+)
+from test_control_attestation import (
+    _authority as _control_authority,
+)
 
+from lightcone_spec.experiments.load import FrozenSamplingParameters
+from lightcone_spec.experiments.registry import content_sha256
+from lightcone_spec.experiments.serving import BoundServingRequest
 from lightcone_spec.orchestration.executor import (
     TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON,
     native_evidence_preflight,
@@ -21,17 +33,44 @@ from lightcone_spec.orchestration.native_terminal import (
     CAPABILITY_PATH,
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
     NATIVE_TERMINAL_EVIDENCE_HOOK,
+    NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256,
     PINNED_SGLANG_PATCH_SHA256,
     PINNED_SGLANG_TREE,
     TERMINAL_EVIDENCE_PATH,
     NativeTerminalProvider,
+    NativeTerminalResultProjection,
     NativeTerminalRunBinding,
     TerminalRequestExpectation,
+    UnsignedNativeServingPhaseResult,
+    ValidatedNativeTerminalEvidence,
+    build_native_terminal_external_control_binding,
     canonical_json_bytes,
     canonical_sha256,
+    collect_unsigned_native_terminal_artifact,
+    derive_candidate_state_replay_pointer,
+    publish_candidate_state_replay_proof_artifact,
+    publish_candidate_state_replay_proof_artifacts,
+    publish_native_terminal_result_proof_artifact,
+    validate_candidate_state_replay_pointer_artifact,
+    validate_candidate_state_replay_proof_artifact,
+    validate_controlled_candidate_state_replay_pointer_artifact,
     validate_native_terminal_artifact,
+    validate_native_terminal_artifact_with_external_control,
+    validate_native_terminal_result_proof_artifact,
+    validate_unsigned_native_itl_pointer_bundle,
 )
-from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
+from lightcone_spec.runtime.attestation import (
+    NO_TRUSTED_ATTESTERS,
+    AttestationChallenge,
+    SignedAttestation,
+    TrustedAttesterPolicy,
+    attestation_message,
+)
+from lightcone_spec.runtime.control_attestation import (
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    ControlArtifactSubject,
+)
 from lightcone_spec.telemetry.writer import EvidenceWriter
 
 SHA_A = "a" * 64
@@ -40,6 +79,26 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
 SHA_F = "f" * 64
+ADAPTIVE_METHODS = frozenset(
+    {
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }
+)
+SUPPORTED_METHODS = frozenset(
+    {
+        "target_only",
+        "static",
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }
+)
 
 
 def _release_policy(
@@ -67,14 +126,16 @@ def _binding(
     method: str = "static",
     warmup: tuple[str, ...] = ("warm-0",),
     scored: tuple[str, ...] = ("score-0",),
+    identity_suffix: str = "0",
+    run_nonce_sha256: str = SHA_A,
 ) -> NativeTerminalRunBinding:
     return NativeTerminalRunBinding(
-        run_id="run-0",
-        run_nonce_sha256=SHA_A,
+        run_id=f"run-{identity_suffix}",
+        run_nonce_sha256=run_nonce_sha256,
         execution_plan_sha256=SHA_B,
         rank_config_sha256=SHA_C,
-        attempt_id="attempt-0",
-        session_id="session-0",
+        attempt_id=f"attempt-{identity_suffix}",
+        session_id=f"session-{identity_suffix}",
         session_epoch=1,
         previous_run_id=None,
         challenge_nonce_sha256=SHA_D,
@@ -100,6 +161,61 @@ def _server_request(
         terminal_reason=reason,
         submitted_to_server=True,
     )
+
+
+def _bound_request(
+    request_id: str,
+    *,
+    inputs: tuple[int, ...],
+    requested_output_tokens: int,
+    ordinal: int,
+) -> BoundServingRequest:
+    request = BoundServingRequest(
+        request_id=request_id,
+        namespace="unsigned-collector-test",
+        split="confirmation",
+        ordinal=ordinal,
+        input_token_ids=inputs,
+        requested_output_tokens=requested_output_tokens,
+        arrival_us=ordinal,
+        cancellation_offset_us=None,
+        cohort_id="cohort-0",
+        cohort_sha256=content_sha256("cohort-0"),
+        route_id="single-replica",
+        sampling=FrozenSamplingParameters.from_mapping(
+            {"temperature": 0.0, "max_new_tokens": requested_output_tokens}
+        ),
+    )
+    request.validate()
+    return request
+
+
+def _native_itl_pointer(request: TerminalRequestExpectation) -> str:
+    assert request.output_token_ids is not None
+    started_ns = 100
+    events = [
+        {
+            "token_index": index,
+            "token_id": token_id,
+            "observed_ns": started_ns + index + 1,
+        }
+        for index, token_id in enumerate(request.output_token_ids)
+    ]
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "sglang_native_itl_result_pointer",
+        "hook": "sglang.schema_v3.native_per_token_timestamp.v2",
+        "semantics": "scheduler_committed_token_at_result_processor_v1",
+        "release_status": "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF",
+        "request_id": request.request_id,
+        "request_started_ns": started_ns,
+        "request_terminal_ns": started_ns + len(events) + 1,
+        "terminal_status": request.terminal_status,
+        "terminal_reason": "length",
+        "events": events,
+    }
+    value["result_pointer_sha256"] = canonical_sha256(value)
+    return canonical_json_bytes(value).decode("utf-8")
 
 
 def _client_request(
@@ -154,7 +270,7 @@ def _server_row(request: TerminalRequestExpectation) -> dict[str, object]:
 
 
 def _state(*, method: str, generation: int, published: int = 0) -> dict[str, object]:
-    adapted = method in {"tts", "l0"}
+    adapted = method in ADAPTIVE_METHODS
     return {
         "schema_version": 1,
         "scheduler_idle": True,
@@ -196,7 +312,7 @@ def _performance(
     accepted = 1 if speculative else None
     committed = 2 if speculative else None
     verified = 1 if speculative else None
-    adapted = method in {"tts", "l0"}
+    adapted = method in ADAPTIVE_METHODS
     return {
         "target_calls": target_calls,
         "accepted_drafts": accepted,
@@ -321,6 +437,10 @@ def _round_and_update(
         "online_expert_probabilities": None,
         "online_cumulative_losses": None,
         "online_expert_gradient_norms": None,
+        "source_state_sha256": SHA_A,
+        "candidate_bytes_sha256": SHA_B,
+        "optimizer_state_bytes_sha256": SHA_C,
+        "proposal_evidence_sha256": SHA_D,
     }
     update["update_sha256"] = canonical_sha256(update)
     return [round_row], [update], kv
@@ -365,7 +485,7 @@ class FakeAdminTransport:
             "schema_version": 1,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
-            "supported_methods": ["l0", "static", "target_only", "tts"],
+            "supported_methods": sorted(SUPPORTED_METHODS),
             "enabled": True,
             "active_method": self.binding.method,
             "method_evidence_supported": True,
@@ -497,7 +617,7 @@ class FakeAdminTransport:
             row["request_sha256"] = canonical_sha256(row)
             request_rows.append(row)
         output_tokens = sum(int(row["output_tokens"]) for row in request_rows)
-        if self.binding.method in {"tts", "l0"}:
+        if self.binding.method in ADAPTIVE_METHODS:
             rounds, updates, kv = _round_and_update(self.scored[0])
         else:
             rounds, updates, kv = [], [], {}
@@ -520,7 +640,7 @@ class FakeAdminTransport:
             "final_state": _state(
                 method=self.binding.method,
                 generation=5,
-                published=1 if self.binding.method in {"tts", "l0"} else 0,
+                published=1 if self.binding.method in ADAPTIVE_METHODS else 0,
             ),
             "completion_marker": "TERMINAL_COMPLETE",
         }
@@ -669,6 +789,50 @@ def test_tts_round_update_kv_closure_converts_without_bucket_imputation() -> Non
     assert batch.updates[0].candidate_status == "published"
     assert batch.updates[0].training_cuda_ms is None
     assert dict(batch.performance_overrides)["training_cuda_ms"] == 0.4
+
+
+@pytest.mark.parametrize(
+    "method", ("onlinespec_ogd", "onlinespec_opt", "onlinespec_ens")
+)
+def test_onlinespec_terminal_codec_is_adapted_but_not_candidate_replay(
+    method: str,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
+    binding = _binding(method=method, warmup=())
+    scored = (_server_request("score-0", inputs=(1, 2), outputs=(3, 4)),)
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+        attester_id="prod-hsm-1",
+        trust_domain="hardware",
+        signing_key=private_key,
+    )
+
+    _, _, _, terminal = asyncio.run(
+        _run(
+            transport,
+            provider=NativeTerminalProvider(
+                transport,
+                trusted_attester_policy=policy,
+            ),
+        )
+    )
+
+    batch = terminal.to_native_evidence_batch()
+    assert terminal.binding.method == method
+    assert len(batch.rounds) == 1
+    assert len(batch.updates) == 1
+    assert dict(batch.performance_overrides)["updates_published"] == 1
+    with pytest.raises(ValueError, match="requires TTS or L0"):
+        derive_candidate_state_replay_pointer(terminal)
+
+
+def test_native_terminal_method_set_rejects_unregistered_method() -> None:
+    binding = _binding(method="caller_defined", warmup=())
+    with pytest.raises(ValueError, match="method is unsupported"):
+        binding.validate()
 
 
 @pytest.mark.parametrize("location", ["capability", "terminal", "request"])
@@ -893,6 +1057,602 @@ def test_release_owned_ed25519_allowlist_is_the_only_positive_trust_path() -> No
     assert terminal.trusted_attester_policy_sha256 == policy.sha256
 
 
+def test_candidate_state_pointer_requires_trusted_profile_bytes() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    policy = _release_policy(private_key)
+    binding = _binding(method="l0", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(
+        binding=binding,
+        warmup=(),
+        scored=scored,
+        attester_id="prod-hsm-1",
+        trust_domain="hardware",
+        signing_key=private_key,
+    )
+    provider = NativeTerminalProvider(transport, trusted_attester_policy=policy)
+
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+    pointer = derive_candidate_state_replay_pointer(terminal)
+
+    assert pointer.run_id == binding.run_id
+    assert pointer.method == "l0"
+    assert pointer.terminal_sha256 == terminal.terminal_sha256
+    assert pointer.updates[0].source_state_sha256 == SHA_A
+    assert pointer.updates[0].proposal_evidence_sha256 == SHA_D
+    reopened = validate_candidate_state_replay_pointer_artifact(
+        terminal.to_artifact(warmup_requests=()),
+        trusted_attester_policy=policy,
+    )
+    assert reopened.sha256 == pointer.sha256
+
+
+def test_validated_native_terminal_evidence_rejects_direct_construction() -> None:
+    with pytest.raises(TypeError, match="first-party validation"):
+        ValidatedNativeTerminalEvidence(
+            binding=None,  # type: ignore[arg-type]
+            begin_receipt=None,  # type: ignore[arg-type]
+            reset_receipt=None,  # type: ignore[arg-type]
+            requests=(),
+            attestation=None,  # type: ignore[arg-type]
+            terminal_sha256=SHA_A,
+            raw_json="{}",
+            _verification_tag=object(),
+        )
+
+
+def test_candidate_state_pointer_rejects_untrusted_terminal() -> None:
+    binding = _binding(method="tts", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+    _, _, _, terminal = asyncio.run(_run(transport))
+
+    with pytest.raises(RuntimeError, match="trusted attestation"):
+        derive_candidate_state_replay_pointer(terminal)
+
+
+def _external_terminal_control(
+    *,
+    private_key: Ed25519PrivateKey,
+    root_binding,
+    bundle,
+    authorization,
+    binding_sha256: str,
+    lineage_sha256: str,
+) -> ControlArtifactAttestation:
+    subject = ControlArtifactSubject(
+        schema_version=1,
+        kind="lightcone_control_artifact_subject",
+        artifact_type="non_serving_terminal",
+        artifact_sha256=binding_sha256,
+        protocol_sha256=NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256,
+        registry_sha256=SHA_F,
+        lineage_sha256=lineage_sha256,
+    )
+    challenge = AttestationChallenge(
+        schema_version=1,
+        kind="lightcone_attestation_challenge",
+        challenge_id="native-terminal-control-1",
+        nonce_base64=base64.b64encode(b"t" * 32).decode("ascii"),
+        subject_sha256=subject.sha256,
+        issued_ns=1_600_000_000,
+        expires_ns=2_600_000_000,
+    )
+    public_key = _public_bytes(private_key)
+    signature = private_key.sign(
+        attestation_message(challenge, payload_sha256=binding_sha256)
+    )
+    return ControlArtifactAttestation(
+        schema_version=1,
+        kind="lightcone_control_artifact_attestation",
+        subject=subject,
+        hardware_envelope_sha256=HARDWARE_SHA256,
+        trust_anchor_sha256=root_binding.sha256,
+        trust_bundle_sha256=bundle.sha256,
+        trusted_attester_policy_sha256=bundle.trusted_attester_policy.sha256,
+        deployment_policy_authorization=authorization,
+        challenge=challenge,
+        attestation=SignedAttestation(
+            schema_version=1,
+            kind="lightcone_signed_attestation",
+            algorithm="Ed25519",
+            attester_id="validation-signer",
+            key_id="validation-signer-key",
+            environment="release",
+            public_key_base64=base64.b64encode(public_key).decode("ascii"),
+            challenge_sha256=challenge.sha256,
+            payload_sha256=binding_sha256,
+            signature_base64=base64.b64encode(signature).decode("ascii"),
+        ),
+    )
+
+
+def test_unsigned_remote_terminal_requires_local_external_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private, root_binding, bundle, authorization = _control_authority(monkeypatch)
+    binding = _binding(method="l0", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+    )
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+    assert terminal.authority_kind == "untrusted_raw_terminal"
+    artifact = terminal.to_artifact(warmup_requests=())
+    external_binding = build_native_terminal_external_control_binding(
+        artifact,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        inventory_sha256=INVENTORY_SHA256,
+        expected_binding=binding,
+    )
+    control = _external_terminal_control(
+        private_key=private,
+        root_binding=root_binding,
+        bundle=bundle,
+        authorization=authorization,
+        binding_sha256=external_binding.sha256,
+        lineage_sha256=external_binding.lineage_sha256,
+    )
+    replay_root = tmp_path / "replay"
+    replay_root.mkdir(mode=0o700)
+    replay_store = ChallengeReplayStore(str(replay_root))
+    controlled = validate_native_terminal_artifact_with_external_control(
+        artifact,
+        control_attestation=control,
+        replay_store=replay_store,
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        now_ns=NOW_NS,
+        expected_binding=binding,
+    )
+    assert controlled.trusted_attestation
+    assert controlled.authority_kind == "external_release_control"
+    assert controlled.attestation.status == "UNAVAILABLE"
+    assert controlled.external_control_binding_sha256 == external_binding.sha256
+
+    pointer = derive_candidate_state_replay_pointer(controlled)
+    assert pointer.authority_kind == "external_release_control"
+    assert pointer.external_control_envelope_sha256 == control.sha256
+    assert pointer.updates[0].candidate_bytes_sha256 == SHA_B
+
+    with pytest.raises(ValueError, match="already consumed"):
+        validate_controlled_candidate_state_replay_pointer_artifact(
+            artifact,
+            control_attestation=control,
+            replay_store=replay_store,
+            expected_inventory_sha256=INVENTORY_SHA256,
+            expected_registry_sha256=SHA_F,
+            expected_root_manifest_sha256=root_binding.semantic_sha256,
+            now_ns=NOW_NS,
+            expected_binding=binding,
+        )
+
+
+def test_first_party_unsigned_collection_publishes_no_authority(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(method="static", warmup=("warm-0",))
+    warmup_expected = (_server_request("warm-0", inputs=(1,), outputs=(2,)),)
+    scored_expected = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    warmup = (
+        _bound_request("warm-0", inputs=(1,), requested_output_tokens=1, ordinal=0),
+    )
+    scored = (
+        _bound_request("score-0", inputs=(1,), requested_output_tokens=2, ordinal=1),
+    )
+    transport = FakeAdminTransport(
+        binding=binding, warmup=warmup_expected, scored=scored_expected
+    )
+    executed: list[tuple[str, ...]] = []
+
+    async def execute_requests(
+        phase: str,
+        requests: tuple[BoundServingRequest, ...],
+    ) -> UnsignedNativeServingPhaseResult:
+        executed.append(tuple(request.request_id for request in requests))
+        results = warmup_expected if phase == "warmup" else scored_expected
+        return UnsignedNativeServingPhaseResult(
+            phase=phase,
+            requests=results,
+            native_result_pointer_json=tuple(
+                _native_itl_pointer(request) for request in results
+            ),
+        )
+
+    output = (tmp_path / "unsigned-static-terminal.json").resolve()
+    pointers = (tmp_path / "unsigned-static-itl.json").resolve()
+    collection = asyncio.run(
+        collect_unsigned_native_terminal_artifact(
+            transport,
+            binding=binding,
+            warmup_requests=warmup,
+            scored_requests=scored,
+            execute_requests=execute_requests,
+            output_path=str(output),
+            native_itl_pointer_output_path=str(pointers),
+            expected_server_process_id=1234,
+        )
+    )
+    value = collection.terminal_artifact.reopen()
+    assert executed == [("warm-0",), ("score-0",)]
+    assert value["terminal"]["attestation"]["status"] == "UNAVAILABLE"
+    pointer_bundle = collection.native_itl_pointer_artifact.reopen()
+    assert pointer_bundle["terminal_artifact_raw_sha256"] == (
+        collection.terminal_artifact.raw_sha256
+    )
+    assert [row["request_id"] for row in pointer_bundle["native_result_pointers"]] == [
+        "score-0"
+    ]
+    validated_pointers = validate_unsigned_native_itl_pointer_bundle(
+        collection.native_itl_pointer_artifact,
+        expected_binding=binding,
+        expected_terminal_artifact=collection.terminal_artifact,
+        expected_scored_request_inputs_sha256=canonical_sha256(
+            [request.sha256 for request in scored]
+        ),
+        expected_terminal_output_tokens={"score-0": (2, 3)},
+    )
+    assert validated_pointers.pointers[0].request_id == "score-0"
+    assert tuple(event.token_id for event in validated_pointers.pointers[0].events) == (
+        2,
+        3,
+    )
+    with pytest.raises(ValueError, match="lineage differs"):
+        validate_unsigned_native_itl_pointer_bundle(
+            collection.native_itl_pointer_artifact,
+            expected_binding=binding,
+            expected_terminal_artifact=collection.terminal_artifact,
+            expected_scored_request_inputs_sha256=SHA_A,
+            expected_terminal_output_tokens={"score-0": (2, 3)},
+        )
+    evidence = validate_native_terminal_artifact(
+        value,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        expected_binding=binding,
+        expected_warmup_requests=warmup_expected,
+        expected_scored_requests=scored_expected,
+    )
+    assert evidence.authority_kind == "untrusted_raw_terminal"
+
+
+def test_first_party_unsigned_collection_rejects_foreign_server_process(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(method="static", warmup=())
+    scored = (
+        _bound_request("score-0", inputs=(1,), requested_output_tokens=2, ordinal=0),
+    )
+    expected = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=expected)
+
+    async def execute_requests(
+        phase: str,
+        requests: tuple[BoundServingRequest, ...],
+    ) -> UnsignedNativeServingPhaseResult:
+        del phase, requests
+        raise AssertionError("foreign server process reached request execution")
+
+    with pytest.raises(RuntimeError, match="unexpected server process"):
+        asyncio.run(
+            collect_unsigned_native_terminal_artifact(
+                transport,
+                binding=binding,
+                warmup_requests=(),
+                scored_requests=scored,
+                execute_requests=execute_requests,
+                output_path=str((tmp_path / "terminal.json").resolve()),
+                native_itl_pointer_output_path=str((tmp_path / "itl.json").resolve()),
+                expected_server_process_id=9999,
+            )
+        )
+    assert not (tmp_path / "terminal.json").exists()
+    assert not (tmp_path / "itl.json").exists()
+
+
+def test_first_party_unsigned_collection_rejects_post_execution_input_drift(
+    tmp_path: Path,
+) -> None:
+    binding = _binding(method="static", warmup=())
+    scored = (
+        _bound_request("score-0", inputs=(1,), requested_output_tokens=2, ordinal=0),
+    )
+    expected = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=expected)
+
+    async def execute_requests(
+        phase: str,
+        requests: tuple[BoundServingRequest, ...],
+    ) -> UnsignedNativeServingPhaseResult:
+        assert phase == "warmup" or requests == scored
+        rows = (
+            ()
+            if phase == "warmup"
+            else (_server_request("score-0", inputs=(9,), outputs=(2, 3)),)
+        )
+        return UnsignedNativeServingPhaseResult(
+            phase=phase,
+            requests=rows,
+            native_result_pointer_json=(
+                () if phase == "warmup" else (_native_itl_pointer(expected[0]),)
+            ),
+        )
+
+    with pytest.raises(ValueError, match="input identity changed"):
+        asyncio.run(
+            collect_unsigned_native_terminal_artifact(
+                transport,
+                binding=binding,
+                warmup_requests=(),
+                scored_requests=scored,
+                execute_requests=execute_requests,
+                output_path=str((tmp_path / "terminal.json").resolve()),
+                native_itl_pointer_output_path=str((tmp_path / "itl.json").resolve()),
+            )
+        )
+    assert not (tmp_path / "terminal.json").exists()
+
+
+def test_candidate_state_external_control_proof_is_durable_and_non_consuming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private, root_binding, bundle, authorization = _control_authority(monkeypatch)
+    binding = _binding(method="l0", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+    )
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+    artifact = terminal.to_artifact(warmup_requests=())
+    raw_path = (tmp_path / "raw-terminal.json").resolve()
+    raw_path.write_text(
+        json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    external_binding = build_native_terminal_external_control_binding(
+        artifact,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        inventory_sha256=INVENTORY_SHA256,
+        expected_binding=binding,
+    )
+    control = _external_terminal_control(
+        private_key=private,
+        root_binding=root_binding,
+        bundle=bundle,
+        authorization=authorization,
+        binding_sha256=external_binding.sha256,
+        lineage_sha256=external_binding.lineage_sha256,
+    )
+    replay_root = tmp_path / "replay-durable"
+    replay_root.mkdir(mode=0o700)
+    replay_store = ChallengeReplayStore(str(replay_root.resolve()))
+    proof_path = (tmp_path / "candidate-proof.json").resolve()
+    proof_binding = publish_candidate_state_replay_proof_artifact(
+        str(raw_path),
+        control_attestation=control,
+        replay_store=replay_store,
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        now_ns=NOW_NS,
+        proof_artifact_path=str(proof_path),
+        expected_binding=binding,
+    )
+    reservation_files = tuple(replay_root.glob("reservation-*.json"))
+    assert len(reservation_files) == 1
+
+    reopened = validate_candidate_state_replay_proof_artifact(
+        str(proof_path),
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        now_ns=NOW_NS + 10_000_000_000,
+    )
+    assert reopened.method == "l0"
+    assert reopened.external_control_reservation_sha256 is not None
+    assert reopened.semantic_commitment_sha256 == canonical_sha256(
+        reopened.semantic_commitment_dict()
+    )
+    assert proof_binding.semantic_sha256 == canonical_sha256(
+        json.loads(proof_path.read_text(encoding="utf-8"))
+    )
+    assert tuple(replay_root.glob("reservation-*.json")) == reservation_files
+
+    with pytest.raises(ValueError, match="file identity differs"):
+        validate_candidate_state_replay_proof_artifact(
+            str(proof_path),
+            expected_inventory_sha256=SHA_E,
+            expected_registry_sha256=SHA_F,
+            expected_root_manifest_sha256=root_binding.semantic_sha256,
+            now_ns=NOW_NS,
+        )
+
+
+def test_candidate_state_external_controls_publish_one_shared_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private, root_binding, bundle, authorization = _control_authority(monkeypatch)
+    bindings = (
+        _binding(method="tts", warmup=(), identity_suffix="tts"),
+        _binding(
+            method="l0",
+            warmup=(),
+            identity_suffix="l0",
+            run_nonce_sha256=SHA_E,
+        ),
+    )
+    raw_paths: list[str] = []
+    controls: list[ControlArtifactAttestation] = []
+    for index, binding in enumerate(bindings):
+        scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+        transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+        provider = NativeTerminalProvider(
+            transport,
+            trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        )
+        _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+        artifact = terminal.to_artifact(warmup_requests=())
+        raw_path = (tmp_path / f"raw-terminal-{index}.json").resolve()
+        raw_path.write_text(
+            json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        raw_paths.append(str(raw_path))
+        external_binding = build_native_terminal_external_control_binding(
+            artifact,
+            trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+            inventory_sha256=INVENTORY_SHA256,
+            expected_binding=binding,
+        )
+        controls.append(
+            _external_terminal_control(
+                private_key=private,
+                root_binding=root_binding,
+                bundle=bundle,
+                authorization=authorization,
+                binding_sha256=external_binding.sha256,
+                lineage_sha256=external_binding.lineage_sha256,
+            )
+        )
+    replay_root = tmp_path / "replay-batch"
+    replay_root.mkdir(mode=0o700)
+    output_paths = tuple(
+        str((tmp_path / f"candidate-proof-{index}.json").resolve())
+        for index in range(2)
+    )
+    proof_bindings = publish_candidate_state_replay_proof_artifacts(
+        tuple(raw_paths),
+        control_attestations=tuple(controls),
+        replay_store=ChallengeReplayStore(str(replay_root.resolve())),
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        now_ns=NOW_NS,
+        proof_artifact_paths=output_paths,
+        expected_bindings=bindings,
+    )
+    assert len(proof_bindings) == 2
+    pointers = tuple(
+        validate_candidate_state_replay_proof_artifact(
+            path,
+            expected_inventory_sha256=INVENTORY_SHA256,
+            expected_registry_sha256=SHA_F,
+            expected_root_manifest_sha256=root_binding.semantic_sha256,
+            now_ns=NOW_NS,
+        )
+        for path in output_paths
+    )
+    assert {pointer.method for pointer in pointers} == {"tts", "l0"}
+    assert (
+        len({pointer.external_control_reservation_sha256 for pointer in pointers}) == 1
+    )
+    assert len(tuple(replay_root.glob("reservation-*.json"))) == 1
+
+
+def test_native_terminal_result_proof_projects_only_controlled_native_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private, root_binding, bundle, authorization = _control_authority(monkeypatch)
+    binding = _binding(method="l0", warmup=())
+    scored = (_server_request("score-0", inputs=(1,), outputs=(2, 3)),)
+    transport = FakeAdminTransport(binding=binding, warmup=(), scored=scored)
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+    )
+    _, _, _, terminal = asyncio.run(_run(transport, provider=provider))
+    artifact = terminal.to_artifact(warmup_requests=())
+    raw_path = (tmp_path / "raw-static-terminal.json").resolve()
+    raw_path.write_text(
+        json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    external_binding = build_native_terminal_external_control_binding(
+        artifact,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        inventory_sha256=INVENTORY_SHA256,
+        expected_binding=binding,
+    )
+    control = _external_terminal_control(
+        private_key=private,
+        root_binding=root_binding,
+        bundle=bundle,
+        authorization=authorization,
+        binding_sha256=external_binding.sha256,
+        lineage_sha256=external_binding.lineage_sha256,
+    )
+    replay_root = tmp_path / "result-replay"
+    replay_root.mkdir(mode=0o700)
+    replay_store = ChallengeReplayStore(str(replay_root.resolve()))
+    proof_path = (tmp_path / "native-result-proof.json").resolve()
+    publish_native_terminal_result_proof_artifact(
+        str(raw_path),
+        control_attestation=control,
+        replay_store=replay_store,
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        now_ns=NOW_NS,
+        proof_artifact_path=str(proof_path),
+        expected_binding=binding,
+    )
+    reservation_files = tuple(replay_root.glob("reservation-*.json"))
+    result = validate_native_terminal_result_proof_artifact(
+        str(proof_path),
+        expected_inventory_sha256=INVENTORY_SHA256,
+        expected_registry_sha256=SHA_F,
+        expected_root_manifest_sha256=root_binding.semantic_sha256,
+        expected_execution_plan_sha256=binding.execution_plan_sha256,
+        expected_rank_config_sha256=binding.rank_config_sha256,
+        expected_run_id=binding.run_id,
+        expected_run_nonce_sha256=binding.run_nonce_sha256,
+        expected_attempt_id=binding.attempt_id,
+        expected_method=binding.method,
+        now_ns=NOW_NS + 10_000_000_000,
+    )
+    assert type(result) is NativeTerminalResultProjection
+    assert result.output_token_count == 2
+    assert result.requests[0].request_id == "score-0"
+    assert result.requests[0].output_token_ids == (2, 3)
+    assert result.requests[0].terminal_status == "completed"
+    assert len(result.updates) == 1
+    assert result.updates[0].update_index == 0
+    assert result.updates[0].status == "published"
+    assert result.updates[0].published_version == 1
+    assert result.updates[0].reconstruction_ok
+    assert result.updates[0].source_round == 1
+    assert result.updates[0].source_version == 0
+    assert result.updates[0].optimizer_step == 1
+    assert len(result.updates[0].update_sha256) == 64
+    assert result.performance_counters["peak_hbm_bytes"] == 3072
+    assert result.performance_counters["exposed_update_ms"] == 0.1
+    assert "goodput" not in result.to_dict()
+    assert tuple(replay_root.glob("reservation-*.json")) == reservation_files
+
+    with pytest.raises(ValueError, match="formal execution identity differs"):
+        validate_native_terminal_result_proof_artifact(
+            str(proof_path),
+            expected_inventory_sha256=INVENTORY_SHA256,
+            expected_registry_sha256=SHA_F,
+            expected_root_manifest_sha256=root_binding.semantic_sha256,
+            expected_execution_plan_sha256=SHA_E,
+            expected_rank_config_sha256=binding.rank_config_sha256,
+            expected_run_id=binding.run_id,
+            expected_run_nonce_sha256=binding.run_nonce_sha256,
+            expected_attempt_id=binding.attempt_id,
+            expected_method=binding.method,
+            now_ns=NOW_NS,
+        )
+
+
 def test_caller_release_policy_cannot_unlock_speculative_preflight() -> None:
     private_key = Ed25519PrivateKey.generate()
     policy = _release_policy(private_key)
@@ -1059,8 +1819,8 @@ def test_final_hook_patch_and_tree_are_exactly_pinned() -> None:
         "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
     )
     assert PINNED_SGLANG_PATCH_SHA256 == (
-        "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
+        "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
     )
-    assert PINNED_SGLANG_TREE == "dfb60ab2e514defc6290fe8bacd179552dcd985e"
+    assert PINNED_SGLANG_TREE == "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2"
     assert canonical_sha256({"b": 2, "a": 1}) == canonical_sha256({"a": 1, "b": 2})
     assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,6 +49,10 @@ class OptimizerProposal:
     second_moments: tuple[Tensor, ...]
     step: int
     numerical_predicate: Tensor
+    safe_boundary_age: int | None = None
+    source_version: int | None = None
+    safe_boundary_version: int | None = None
+    _owner_token: object = field(default=None, repr=False, compare=False)
 
 
 class GPUOptimizer:
@@ -58,10 +62,35 @@ class GPUOptimizer:
         self,
         parameters: Iterable[Tensor],
         config: OptimizerConfig,
+        *,
+        initial_safe_boundary_version: int = 0,
     ) -> None:
+        supported = {
+            "adam",
+            "adamw",
+            "chronobelief",
+            "lion",
+            "muon",
+            "nag",
+            "sgd",
+            "sgdm",
+        }
         if config.name == "none":
             raise ValueError("GPUOptimizer cannot be constructed for none")
+        if config.name not in supported:
+            raise ValueError("GPUOptimizer received an unsupported optimizer")
+        if (
+            type(initial_safe_boundary_version) is not int
+            or initial_safe_boundary_version < 0
+        ):
+            raise ValueError("initial safe-boundary version must be non-negative")
+        if config.name != "chronobelief" and initial_safe_boundary_version != 0:
+            raise ValueError(
+                "safe-boundary version is only defined for optimizer=chronobelief"
+            )
         self.config = config
+        self.safe_boundary_version = initial_safe_boundary_version
+        self._proposal_owner = object()
         self.master = tuple(
             parameter.detach().to(dtype=torch.float32).clone()
             for parameter in parameters
@@ -70,7 +99,15 @@ class GPUOptimizer:
             raise ValueError("optimizer needs at least one parameter")
         if any(not bool(torch.isfinite(parameter).all()) for parameter in self.master):
             raise ValueError("optimizer parameters must be finite")
-        first_names = {"adam", "adamw", "sgdm", "nag", "muon", "lion"}
+        first_names = {
+            "adam",
+            "adamw",
+            "chronobelief",
+            "sgdm",
+            "nag",
+            "muon",
+            "lion",
+        }
         self.first_moments = tuple(
             torch.zeros_like(parameter)
             if config.name in first_names
@@ -79,7 +116,7 @@ class GPUOptimizer:
         )
         self.second_moments = tuple(
             torch.zeros_like(parameter)
-            if config.name in {"adam", "adamw"}
+            if config.name in {"adam", "adamw", "chronobelief"}
             or (config.name == "muon" and parameter.ndim != 2)
             else torch.empty(0, device=parameter.device, dtype=torch.float32)
             for parameter in self.master
@@ -104,13 +141,16 @@ class GPUOptimizer:
             scale = 0.5 * (1.0 + math.cos(math.pi * (step - 1) / (horizon - 1)))
         return base_learning_rate * scale
 
-    @staticmethod
     def _proposal(
+        self,
         parameters: tuple[Tensor, ...],
         first_moments: tuple[Tensor, ...],
         second_moments: tuple[Tensor, ...],
         step: int,
         gradients: tuple[Tensor, ...],
+        safe_boundary_age: int | None = None,
+        source_version: int | None = None,
+        safe_boundary_version: int | None = None,
     ) -> OptimizerProposal:
         numerical = torch.stack(
             tuple(
@@ -124,12 +164,18 @@ class GPUOptimizer:
                 if tensor.numel() > 0
             )
         ).all()
+        if numerical.device.type == "cpu" and not bool(numerical):
+            raise ValueError("optimizer proposal is non-finite")
         return OptimizerProposal(
             parameters,
             first_moments,
             second_moments,
             step,
             numerical,
+            safe_boundary_age,
+            source_version,
+            safe_boundary_version,
+            self._proposal_owner,
         )
 
     def _adamw_update(
@@ -162,7 +208,41 @@ class GPUOptimizer:
         )
         return updated, next_first, next_second
 
-    def propose(self, gradients: Sequence[Tensor]) -> OptimizerProposal:
+    def propose(
+        self,
+        gradients: Sequence[Tensor],
+        *,
+        safe_boundary_age: int | None = None,
+        source_version: int | None = None,
+        safe_boundary_version: int | None = None,
+    ) -> OptimizerProposal:
+        if self.config.name == "chronobelief":
+            if safe_boundary_age is not None:
+                raise ValueError(
+                    "ChronoBelief safe-boundary age is derived from source versions"
+                )
+            if (
+                type(source_version) is not int
+                or source_version < 0
+                or type(safe_boundary_version) is not int
+                or safe_boundary_version < source_version
+            ):
+                raise ValueError(
+                    "ChronoBelief requires ordered non-negative source versions"
+                )
+            if safe_boundary_version != self.safe_boundary_version:
+                raise ValueError(
+                    "ChronoBelief proposal does not bind the current safe boundary"
+                )
+            safe_boundary_age = safe_boundary_version - source_version
+        elif any(
+            value is not None
+            for value in (safe_boundary_age, source_version, safe_boundary_version)
+        ):
+            raise ValueError(
+                "source/safe-boundary versions are only defined for "
+                "optimizer=chronobelief"
+            )
         if len(gradients) != len(self.master):
             raise ValueError("one gradient is required per master parameter")
         if any(
@@ -176,16 +256,17 @@ class GPUOptimizer:
         ).all()
         if grads[0].device.type == "cpu" and not bool(gradient_predicate):
             raise ValueError("optimizer gradients must be finite")
-        total_norm = (
-            torch.stack(tuple(gradient.square().sum() for gradient in grads))
-            .sum()
-            .sqrt()
-        )
-        clip = torch.clamp(
-            self.config.grad_clip / (total_norm + 1e-12),
-            max=1.0,
-        )
-        grads = tuple(gradient * clip for gradient in grads)
+        if self.config.grad_clip is not None:
+            total_norm = (
+                torch.stack(tuple(gradient.square().sum() for gradient in grads))
+                .sum()
+                .sqrt()
+            )
+            clip = torch.clamp(
+                self.config.grad_clip / (total_norm + 1e-12),
+                max=1.0,
+            )
+            grads = tuple(gradient * clip for gradient in grads)
         step = self.step_number + 1
         learning_rate = self.scheduled_learning_rate(
             self.config.learning_rate,
@@ -301,6 +382,48 @@ class GPUOptimizer:
                 tuple(parameters), tuple(first), tuple(second), step, grads
             )
 
+        if self.config.name == "chronobelief":
+            assert safe_boundary_age is not None
+            beta1 = self.config.beta1
+            beta2 = self.config.beta2
+            first = tuple(
+                beta1 * old + (1.0 - beta1) * gradient
+                for old, gradient in zip(self.first_moments, grads, strict=True)
+            )
+            second = tuple(
+                beta2 * old + (1.0 - beta2) * (gradient - moment).square()
+                for old, gradient, moment in zip(
+                    self.second_moments, grads, first, strict=True
+                )
+            )
+            correction1 = 1.0 - beta1**step
+            correction2 = 1.0 - beta2**step
+            age_ratio = beta1 / math.sqrt(beta2)
+            kappa = 1.0 if age_ratio >= 1.0 else age_ratio**safe_boundary_age
+            decay = 1.0 - learning_rate * self.config.weight_decay
+            parameters = tuple(
+                parameter * decay
+                - learning_rate
+                * kappa
+                * (moment1 / correction1)
+                / ((moment2 / correction2).sqrt() + self.config.epsilon)
+                for parameter, moment1, moment2 in zip(
+                    self.master, first, second, strict=True
+                )
+            )
+            return self._proposal(
+                parameters,
+                first,
+                second,
+                step,
+                grads,
+                safe_boundary_age,
+                source_version,
+                safe_boundary_version,
+            )
+
+        if self.config.name not in {"adam", "adamw"}:
+            raise ValueError("GPUOptimizer optimizer branch is not implemented")
         beta1 = self.config.beta1
         beta2 = self.config.beta2
         first = tuple(
@@ -329,8 +452,31 @@ class GPUOptimizer:
         *,
         numerical_receipt: bool | None = None,
     ) -> None:
+        if proposal._owner_token is not self._proposal_owner:
+            raise ValueError("optimizer proposal belongs to another state owner")
         if proposal.step != self.step_number + 1:
             raise ValueError("optimizer proposal step conflict")
+        if self.config.name == "chronobelief":
+            if (
+                type(proposal.safe_boundary_age) is not int
+                or type(proposal.source_version) is not int
+                or type(proposal.safe_boundary_version) is not int
+                or proposal.safe_boundary_version != self.safe_boundary_version
+                or proposal.source_version + proposal.safe_boundary_age
+                != proposal.safe_boundary_version
+            ):
+                raise ValueError(
+                    "ChronoBelief proposal lacks the current source boundary"
+                )
+        elif any(
+            value is not None
+            for value in (
+                proposal.safe_boundary_age,
+                proposal.source_version,
+                proposal.safe_boundary_version,
+            )
+        ):
+            raise ValueError("non-ChronoBelief proposal carries source-boundary state")
         if proposal.numerical_predicate.device.type == "cpu":
             valid = bool(proposal.numerical_predicate)
         elif numerical_receipt is None:
@@ -357,6 +503,8 @@ class GPUOptimizer:
             ):
                 active.copy_(candidate)
         self.step_number = proposal.step
+        if self.config.name == "chronobelief":
+            self.safe_boundary_version += 1
 
 
 class FixedAddressBank:

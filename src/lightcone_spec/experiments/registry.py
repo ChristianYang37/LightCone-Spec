@@ -21,6 +21,7 @@ from typing import Any
 INDUSTRIAL_EXPERIMENT_ORDER = (
     "preflight",
     "E3a",
+    "TTS-Cal",
     "E1",
     "E2",
     "E4",
@@ -97,9 +98,8 @@ E5_FAILURES = (
     "replica_restart",
 )
 E6_CANDIDATE_MODELS = (
-    "Qwen/Qwen3.5-35B-A3B",
-    "Qwen/Qwen3.5-122B-A10B-FP8",
     "Qwen/Qwen3.6-35B-A3B",
+    "Qwen/Qwen3.5-122B-A10B-FP8",
 )
 E0_MODELS = (
     "Qwen/Qwen3-4B",
@@ -147,6 +147,7 @@ class ScientificMethodRole(str, Enum):
 
     TARGET_ONLY = "target_only"
     STATIC = "static"
+    TTS_CALIBRATION_CANDIDATE = "tts_calibration_candidate"
     TTS = "tts"
     L0_NAIVE = "l0_naive"
     LC_CANDIDATE = "lc_candidate"
@@ -276,7 +277,7 @@ class FrozenTtsRecipeAuthority:
         return _canonical(self)
 
 
-FROZEN_TTS_RECIPE_AUTHORITY = FrozenTtsRecipeAuthority(
+LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY = FrozenTtsRecipeAuthority(
     schema_version=1,
     authority_id="tts-paper-reconstruction-v1",
     provenance_status="TTS-paper-reconstruction",
@@ -689,6 +690,30 @@ def _derived_scientific_method_role(cell: ExperimentCell) -> ScientificMethodRol
     """Derive a role from one cell after registry ownership is established."""
 
     identity = cell.identity
+    if identity.experiment == "TTS-Cal":
+        try:
+            stride = int(identity.variant.removeprefix("tts_calibration:stride="))
+        except ValueError as error:
+            raise ValueError("TTS-Cal stride identity is not exact") from error
+        from lightcone_spec.experiments.formal_protocol import (
+            TTS_LEARNING_RATES,
+            TTS_STRIDES,
+        )
+
+        if (
+            identity.method != "tts"
+            or identity.backend != "DFLASH"
+            or identity.scope != "full_drafter"
+            or identity.parameterization != "full"
+            or identity.optimizer != "adam"
+            or identity.schedule != "constant"
+            or identity.learning_rate not in TTS_LEARNING_RATES
+            or stride not in TTS_STRIDES
+            or identity.rank is not None
+            or identity.alpha_over_rank is not None
+        ):
+            raise ValueError("TTS-Cal candidate identity is not preregistered")
+        return ScientificMethodRole.TTS_CALIBRATION_CANDIDATE
     if identity.method == "target_only":
         _require_zero_adaptation_identity(identity, label="Target-only")
         return ScientificMethodRole.TARGET_ONLY
@@ -1109,7 +1134,6 @@ _OPTIMIZER_RECIPE_FIELDS = frozenset(
 )
 
 _E2_RECIPE_BLOCKER_FIELD_BY_CODE = {
-    "chronobelief_equation_unregistered": "optimizer.equation",
     "e2_beta1_unregistered": "optimizer.beta1",
     "e2_beta2_unregistered": "optimizer.beta2",
     "e2_cosine_horizon_unregistered": ("optimizer.schedule_total_published_updates"),
@@ -1323,12 +1347,6 @@ def _e2_required_optimizer_unresolved_fields(
         "epsilon",
         "grad_clip",
     }
-    if optimizer == "chronobelief":
-        fields.update(_OPTIMIZER_RECIPE_FIELDS)
-        fields.discard("schedule")
-        if schedule != "cosine_to_zero":
-            fields.discard("schedule_total_published_updates")
-        return frozenset(fields)
     if optimizer in {"sgdm", "nag", "muon"}:
         fields.add("momentum")
     if optimizer == "muon":
@@ -1375,6 +1393,14 @@ class AdaptationRecipeDeclaration:
     verification_mode: str | None
     fixed_verification_budget: int | None
     confidence_loss_weight: float | None
+    chronobelief_release_capability_sha256: str | None
+    chronobelief_gpu_proof_sha256: str | None
+    eagle3_e0_execution_authority_sha256: str | None
+    eagle3_compatibility_authority_sha256: str | None
+    eagle3_model_selector_sha256: str | None
+    eagle3_native_gpu_proof_sha256: str | None
+    eagle3_qualification_compatibility_authority_sha256: str | None
+    eagle3_qualification_model_selector_sha256: str | None
     status: str
     blocker_codes: tuple[str, ...]
     unresolved_fields: tuple[str, ...] = ()
@@ -1436,6 +1462,19 @@ class AdaptationRecipeDeclaration:
             raise TypeError(
                 "adaptation recipe confidence_loss_weight must be an exact float"
             )
+        for name in (
+            "chronobelief_release_capability_sha256",
+            "chronobelief_gpu_proof_sha256",
+            "eagle3_e0_execution_authority_sha256",
+            "eagle3_compatibility_authority_sha256",
+            "eagle3_model_selector_sha256",
+            "eagle3_native_gpu_proof_sha256",
+            "eagle3_qualification_compatibility_authority_sha256",
+            "eagle3_qualification_model_selector_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None and not _LOWER_SHA256(value):
+                raise ValueError(f"adaptation recipe {name} must be a SHA-256")
         if type(self.status) is not str:
             raise TypeError("adaptation recipe status must be exact text")
         for name in ("blocker_codes", "unresolved_fields"):
@@ -1538,8 +1577,6 @@ class AdaptationRecipeDeclaration:
                 *(f"optimizer.{field}" for field in self.optimizer.unresolved_fields),
                 *self.unresolved_fields,
             }
-            if self.optimizer.name == "chronobelief":
-                expected_fields.add("optimizer.equation")
             if (
                 len(blocker_fields) != len(set(blocker_fields))
                 or set(blocker_fields) != expected_fields
@@ -1564,7 +1601,8 @@ class AdaptationRecipeDeclaration:
         )
         if (
             self.source_authority != "tts_recipe_authority_v1"
-            or self.source_authority_sha256 != FROZEN_TTS_RECIPE_AUTHORITY.sha256
+            or self.source_authority_sha256
+            != LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.sha256
             or self.weight_update_mode is not None
             or self.parameter_scope is not None
             or self.kv_history_policy != "frozen"
@@ -1594,8 +1632,22 @@ class AdaptationRecipeDeclaration:
             or self.verification_mode is not None
             or self.fixed_verification_budget is not None
             or self.confidence_loss_weight is not None
+            or any(
+                getattr(self, name) is not None
+                for name in (
+                    "chronobelief_release_capability_sha256",
+                    "chronobelief_gpu_proof_sha256",
+                    "eagle3_e0_execution_authority_sha256",
+                    "eagle3_compatibility_authority_sha256",
+                    "eagle3_model_selector_sha256",
+                    "eagle3_native_gpu_proof_sha256",
+                    "eagle3_qualification_compatibility_authority_sha256",
+                    "eagle3_qualification_model_selector_sha256",
+                )
+            )
             or self.status != "BLOCKED"
-            or self.blocker_codes != FROZEN_TTS_RECIPE_AUTHORITY.blocker_codes
+            or self.blocker_codes
+            != LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.blocker_codes
             or self.unresolved_fields
             != tuple(sorted(_FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS))
         ):
@@ -1639,6 +1691,24 @@ class AdaptationRecipeDeclaration:
             verification_mode=self.verification_mode,
             fixed_verification_budget=self.fixed_verification_budget,
             confidence_loss_weight=self.confidence_loss_weight,
+            chronobelief_release_capability_sha256=(
+                self.chronobelief_release_capability_sha256
+            ),
+            chronobelief_gpu_proof_sha256=self.chronobelief_gpu_proof_sha256,
+            eagle3_e0_execution_authority_sha256=(
+                self.eagle3_e0_execution_authority_sha256
+            ),
+            eagle3_compatibility_authority_sha256=(
+                self.eagle3_compatibility_authority_sha256
+            ),
+            eagle3_model_selector_sha256=self.eagle3_model_selector_sha256,
+            eagle3_native_gpu_proof_sha256=self.eagle3_native_gpu_proof_sha256,
+            eagle3_qualification_compatibility_authority_sha256=(
+                self.eagle3_qualification_compatibility_authority_sha256
+            ),
+            eagle3_qualification_model_selector_sha256=(
+                self.eagle3_qualification_model_selector_sha256
+            ),
         )
 
     @cached_property
@@ -1750,6 +1820,14 @@ def _e1_recipe_declaration(
         verification_mode="native_scheduler",
         fixed_verification_budget=None,
         confidence_loss_weight=None,
+        chronobelief_release_capability_sha256=None,
+        chronobelief_gpu_proof_sha256=None,
+        eagle3_e0_execution_authority_sha256=None,
+        eagle3_compatibility_authority_sha256=None,
+        eagle3_model_selector_sha256=None,
+        eagle3_native_gpu_proof_sha256=None,
+        eagle3_qualification_compatibility_authority_sha256=None,
+        eagle3_qualification_model_selector_sha256=None,
         status="AVAILABLE",
         blocker_codes=(),
     )
@@ -1784,45 +1862,27 @@ def _e2_optimizer_declaration(
     auxiliary_lr: float | None = None
     auxiliary_decay: float | None = None
 
-    if optimizer == "chronobelief":
-        unresolved.update(_OPTIMIZER_RECIPE_FIELDS)
-        unresolved.discard("schedule")
+    if optimizer in {"sgdm", "nag", "muon"}:
+        unresolved.add("momentum")
+        blockers.add("e2_momentum_unregistered")
+    if optimizer == "muon":
+        unresolved.update(
+            {
+                "muon_ns_steps",
+                "muon_auxiliary_learning_rate",
+                "muon_auxiliary_weight_decay",
+            }
+        )
         blockers.update(
             {
-                "chronobelief_equation_unregistered",
-                "e2_learning_rate_unregistered",
-                "e2_momentum_unregistered",
                 "e2_muon_ns_steps_unregistered",
                 "e2_muon_auxiliary_learning_rate_unregistered",
                 "e2_muon_auxiliary_weight_decay_unregistered",
             }
         )
-        if key.schedule != "cosine_to_zero":
-            unresolved.discard("schedule_total_published_updates")
-        else:
-            blockers.add("e2_cosine_horizon_unregistered")
-    else:
-        if optimizer in {"sgdm", "nag", "muon"}:
-            unresolved.add("momentum")
-            blockers.add("e2_momentum_unregistered")
-        if optimizer == "muon":
-            unresolved.update(
-                {
-                    "muon_ns_steps",
-                    "muon_auxiliary_learning_rate",
-                    "muon_auxiliary_weight_decay",
-                }
-            )
-            blockers.update(
-                {
-                    "e2_muon_ns_steps_unregistered",
-                    "e2_muon_auxiliary_learning_rate_unregistered",
-                    "e2_muon_auxiliary_weight_decay_unregistered",
-                }
-            )
-        if key.schedule == "cosine_to_zero":
-            unresolved.add("schedule_total_published_updates")
-            blockers.add("e2_cosine_horizon_unregistered")
+    if key.schedule == "cosine_to_zero":
+        unresolved.add("schedule_total_published_updates")
+        blockers.add("e2_cosine_horizon_unregistered")
     values = {
         "name": optimizer,
         # The numeric cell axis describes the intended logarithmic template,
@@ -1898,6 +1958,14 @@ def _e2_recipe_declaration(
         verification_mode=None,
         fixed_verification_budget=None,
         confidence_loss_weight=None,
+        chronobelief_release_capability_sha256=None,
+        chronobelief_gpu_proof_sha256=None,
+        eagle3_e0_execution_authority_sha256=None,
+        eagle3_compatibility_authority_sha256=None,
+        eagle3_model_selector_sha256=None,
+        eagle3_native_gpu_proof_sha256=None,
+        eagle3_qualification_compatibility_authority_sha256=None,
+        eagle3_qualification_model_selector_sha256=None,
         status="BLOCKED",
         blocker_codes=blockers,
         unresolved_fields=(
@@ -1949,7 +2017,7 @@ def _frozen_tts_recipe_declaration(
         schema_version=1,
         lookup_key=key,
         source_authority="tts_recipe_authority_v1",
-        source_authority_sha256=FROZEN_TTS_RECIPE_AUTHORITY.sha256,
+        source_authority_sha256=(LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.sha256),
         weight_update_mode=None,
         parameter_scope=None,
         kv_history_policy="frozen",
@@ -1969,8 +2037,16 @@ def _frozen_tts_recipe_declaration(
         verification_mode=None,
         fixed_verification_budget=None,
         confidence_loss_weight=None,
+        chronobelief_release_capability_sha256=None,
+        chronobelief_gpu_proof_sha256=None,
+        eagle3_e0_execution_authority_sha256=None,
+        eagle3_compatibility_authority_sha256=None,
+        eagle3_model_selector_sha256=None,
+        eagle3_native_gpu_proof_sha256=None,
+        eagle3_qualification_compatibility_authority_sha256=None,
+        eagle3_qualification_model_selector_sha256=None,
         status="BLOCKED",
-        blocker_codes=FROZEN_TTS_RECIPE_AUTHORITY.blocker_codes,
+        blocker_codes=LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY.blocker_codes,
         unresolved_fields=tuple(sorted(_FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS)),
     )
 
@@ -2077,8 +2153,24 @@ def _industrial_definitions() -> tuple[ExperimentDefinition, ...]:
             ),
         ),
         ExperimentDefinition(
-            name="E1",
+            name="TTS-Cal",
             dependencies=("E3a",),
+            locked_outputs=("frozen_tts_recipe",),
+            axes=(
+                _axis("method_role", ("tts_calibration_candidate",)),
+                _axis("optimizer", ("adam",)),
+                _axis(
+                    "learning_rate",
+                    (1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3),
+                ),
+                _axis("stride", (1, 5, 10, 15, 20, 30, 40, 50)),
+                _axis("pilot_block", PILOT_BLOCKS),
+                _axis("result_class", ("tuning_only_not_formal",)),
+            ),
+        ),
+        ExperimentDefinition(
+            name="E1",
+            dependencies=("TTS-Cal",),
             locked_outputs=("dflash_pareto_set", "common_downstream_load"),
             axes=(
                 _axis("search_method_role", (ScientificMethodRole.LC_CANDIDATE.value,)),
@@ -2252,11 +2344,17 @@ class ExperimentRegistry:
     gpu_uuids: tuple[str, ...]
     definitions: tuple[ExperimentDefinition, ...]
     cells: tuple[ExperimentCell, ...]
+    materialization_mode: str = "signed_staged"
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 3:
             raise ValueError("only industrial registry schema version 3 is supported")
         _require_text("registry name", self.name)
+        if self.materialization_mode not in {
+            "signed_staged",
+            "legacy_diagnostic",
+        }:
+            raise ValueError("registry materialization mode is unsupported")
         if not self.gpu_uuids or len(set(self.gpu_uuids)) != len(self.gpu_uuids):
             raise ValueError(
                 "the industrial registry requires unique logical GPU slots"
@@ -2283,11 +2381,28 @@ class ExperimentRegistry:
             if not set(cell.resources.gpu_uuids).issubset(self.gpu_uuids):
                 raise ValueError("cell reserves a GPU outside the registry inventory")
             seen_stages.add(cell.identity.experiment)
-        if seen_stages != known:
-            raise ValueError("every experiment must have at least one declared cell")
+        if self.materialization_mode == "legacy_diagnostic":
+            if seen_stages != known:
+                raise ValueError("legacy registry must declare every experiment")
+        else:
+            staged_prefix = set(INDUSTRIAL_EXPERIMENT_ORDER[:3])
+            if seen_stages != staged_prefix:
+                raise ValueError(
+                    "staged registry must contain exactly preflight, E3a, and TTS-Cal"
+                )
         for cell in self.cells:
             identity = cell.identity
             _derived_scientific_method_role(cell)
+            if self.materialization_mode == "signed_staged" and any(
+                value in {FROZEN_TTS_RECIPE_SENTINEL, SEALED_E2_RECIPE_SENTINEL}
+                for value in (
+                    identity.scope,
+                    identity.optimizer,
+                    identity.schedule,
+                    identity.parameterization,
+                )
+            ):
+                raise ValueError("staged registry cannot contain recipe sentinels")
             if (
                 identity.optimizer
                 in {
@@ -2316,7 +2431,7 @@ class ExperimentRegistry:
                     raise ValueError("frozen TTS anchor lacks a recipe declaration")
                 if (
                     declaration.source_authority_sha256
-                    != self.frozen_tts_recipe_authority.sha256
+                    != self.legacy_diagnostic_tts_reconstruction_authority.sha256
                 ):
                     raise ValueError("frozen TTS recipe source authority differs")
                 if (
@@ -2353,15 +2468,12 @@ class ExperimentRegistry:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "schema_version": self.schema_version,
             "name": self.name,
+            "materialization_mode": self.materialization_mode,
             "gpu_uuids": list(self.gpu_uuids),
             "definitions": [_canonical(row) for row in self.definitions],
-            "frozen_tts_recipe_authority": _canonical(self.frozen_tts_recipe_authority),
-            "frozen_tts_recipe_authority_sha256": (
-                self.frozen_tts_recipe_authority.sha256
-            ),
             "adaptation_recipe_declarations": [
                 _canonical(row) for row in self.adaptation_recipe_declarations
             ],
@@ -2373,6 +2485,14 @@ class ExperimentRegistry:
                 for cell in sorted(self.cells, key=lambda row: row.cell_id)
             ],
         }
+        if self.materialization_mode == "legacy_diagnostic":
+            value["legacy_frozen_tts_recipe_authority"] = _canonical(
+                self.legacy_diagnostic_tts_reconstruction_authority
+            )
+            value["legacy_frozen_tts_recipe_authority_sha256"] = (
+                self.legacy_diagnostic_tts_reconstruction_authority.sha256
+            )
+        return value
 
     @cached_property
     def sha256(self) -> str:
@@ -2398,8 +2518,12 @@ class ExperimentRegistry:
         return {cell.cell_id: cell for cell in self.cells}
 
     @property
-    def frozen_tts_recipe_authority(self) -> FrozenTtsRecipeAuthority:
-        return FROZEN_TTS_RECIPE_AUTHORITY
+    def legacy_diagnostic_tts_reconstruction_authority(
+        self,
+    ) -> FrozenTtsRecipeAuthority:
+        if self.materialization_mode != "legacy_diagnostic":
+            raise ValueError("paper-only frozen TTS authority is a legacy diagnostic")
+        return LEGACY_DIAGNOSTIC_TTS_RECONSTRUCTION_AUTHORITY
 
     def scientific_method_role_for_cell(
         self, cell_or_id: ExperimentCell | str
@@ -2818,6 +2942,43 @@ def _add_e3a_cells(factory: _CellFactory) -> None:
                     )
 
 
+def _add_tts_cal_cells(factory: _CellFactory) -> None:
+    """Declare the disjoint 9-by-8 numeric TTS calibration grid.
+
+    These are tuning-only rows.  Their signed offline reducer freezes one
+    candidate before E1 materialization; no row is a publication result.
+    """
+
+    from lightcone_spec.experiments.formal_protocol import (
+        TTS_LEARNING_RATES,
+        TTS_STRIDES,
+    )
+
+    for learning_rate in TTS_LEARNING_RATES:
+        for stride in TTS_STRIDES:
+            for pilot_block in PILOT_BLOCKS:
+                factory.add(
+                    experiment="TTS-Cal",
+                    model="Qwen/Qwen3-8B",
+                    backend="DFLASH",
+                    task="disjoint_tts_numeric_calibration",
+                    method="tts",
+                    workload_class=WorkloadClass.TUNING,
+                    scope="full_drafter",
+                    optimizer="adam",
+                    learning_rate=learning_rate,
+                    schedule="constant",
+                    context=40928,
+                    regime="short_input_long_generation",
+                    width=16,
+                    arrival="disjoint_tuning_window",
+                    slo="safety_first_then_maximize_slo_goodput",
+                    parameterization="full",
+                    block=pilot_block,
+                    variant=f"tts_calibration:stride={stride}",
+                )
+
+
 def _paired_gpu_index(seed: int, payload: Mapping[str, Any]) -> int:
     """Assign every member of a scientific pair to the same rotating GPU."""
 
@@ -2993,8 +3154,6 @@ def _optimizer_learning_rates(
 ) -> tuple[float, ...]:
     if parameterization not in {"full", "lora"}:
         raise ValueError("unknown parameterization for optimizer grid")
-    if optimizer == "chronobelief":
-        return ()
     if parameterization == "lora":
         return {
             "sgdm": (1e-4, 3e-4, 1e-3, 3e-3, 1e-2),
@@ -3057,47 +3216,6 @@ def _add_e2_cells(factory: _CellFactory) -> None:
                     learning_rates = _optimizer_learning_rates(
                         optimizer, configuration.parameterization
                     )
-                    if not learning_rates:
-                        pair_gpu = _paired_gpu_index(
-                            factory.seed,
-                            {
-                                "experiment": "E2",
-                                "stage": stage,
-                                "configuration": configuration.sha256,
-                                "optimizer": optimizer,
-                                "schedule": schedule,
-                                "learning_rate": None,
-                            },
-                        )
-                        factory.add(
-                            experiment="E2",
-                            model="Qwen/Qwen3-8B",
-                            backend="DFLASH",
-                            task="LiveCodeBench_tuning",
-                            method="l0",
-                            workload_class=WorkloadClass.TUNING,
-                            scope=configuration.scope,
-                            rank=configuration.rank,
-                            alpha_over_rank=configuration.alpha_over_rank,
-                            optimizer=optimizer,
-                            schedule=schedule,
-                            context=context,
-                            regime="short_input_long_generation",
-                            width=None,
-                            arrival="e1_common_load",
-                            slo="tuning_safety",
-                            parameterization=configuration.parameterization,
-                            variant=f"{stage}:lc_candidate:optimizer_equation_unresolved",
-                            gpu_index=pair_gpu,
-                            status=CellStatus.BLOCKED,
-                            reason_code="optimizer_equation_unresolved",
-                            reason=(
-                                "No authoritative ChronoBelief update equation or "
-                                "source identity is registered; substitution is "
-                                "forbidden."
-                            ),
-                        )
-                        continue
                     for learning_rate in learning_rates:
                         pair_gpu = _paired_gpu_index(
                             factory.seed,
@@ -3320,22 +3438,9 @@ def _add_e5_block_cells(factory: _CellFactory, block: int) -> None:
                     slo=PRODUCTION_SLO,
                     block=block,
                     variant=f"{phase}:E5a_trace_or_soak:role={role}",
-                    status=(
-                        CellStatus.BLOCKED
-                        if arrival == "burstgpt_shape"
-                        else CellStatus.UNMEASURED
-                    ),
-                    reason_code=(
-                        "burstgpt_source_lock_missing"
-                        if arrival == "burstgpt_shape"
-                        else "awaiting_registered_measurement"
-                    ),
-                    reason=(
-                        "No reviewed BurstGPT asset revision and row digest are "
-                        "pinned in the external source lock."
-                        if arrival == "burstgpt_shape"
-                        else "No complete content-bound measurement exists."
-                    ),
+                    status=CellStatus.UNMEASURED,
+                    reason_code="awaiting_registered_measurement",
+                    reason="No complete content-bound measurement exists.",
                     **identity_fields,
                 )
 
@@ -3560,7 +3665,7 @@ def _add_e0_cells(factory: _CellFactory) -> None:
                             )
 
 
-def build_industrial_registry(
+def build_legacy_industrial_registry(
     *,
     gpu_uuids: tuple[str, ...] = (
         "logical-rank-slot-0",
@@ -3571,7 +3676,12 @@ def build_industrial_registry(
     evidence_root: str = "artifacts/industrial",
     seed: int = 20260811,
 ) -> ExperimentRegistry:
-    """Build the immutable Phase-II registry without allocating device state."""
+    """Build the eager historical registry for explicit diagnostics only.
+
+    Formal execution must use signed staged materialization receipts.  This
+    compatibility builder remains available to inspect and migrate historical
+    schema-v3 evidence; it is not a formal experiment authority.
+    """
 
     port_span = _industrial_port_span(len(gpu_uuids))
     if base_port + port_span - 1 > 65_535:
@@ -3588,6 +3698,7 @@ def build_industrial_registry(
     )
     _add_preflight_cells(factory)
     _add_e3a_cells(factory)
+    _add_tts_cal_cells(factory)
     _add_e1_cells(factory)
     _add_e2_cells(factory)
     _add_e4_cells(factory)
@@ -3602,8 +3713,55 @@ def build_industrial_registry(
         gpu_uuids=gpu_uuids,
         definitions=_industrial_definitions(),
         cells=tuple(factory.cells),
+        materialization_mode="legacy_diagnostic",
     )
     used_ports = {port for cell in registry.cells for port in cell.resources.ports}
     if used_ports != set(range(base_port, base_port + port_span)):
         raise AssertionError("industrial port-pool declaration is out of date")
+    return registry
+
+
+def build_industrial_registry(
+    *,
+    gpu_uuids: tuple[str, ...] = (
+        "logical-rank-slot-0",
+        "logical-rank-slot-1",
+    ),
+    base_port: int = 24000,
+    cache_root: str = "runtime-cache/industrial",
+    evidence_root: str = "artifacts/industrial",
+    seed: int = 20260811,
+) -> ExperimentRegistry:
+    """Build only the concrete preregistration prefix for signed staging.
+
+    Future stages are absent rather than represented by BLOCKED/sentinel rows.
+    They can exist only in signed :class:`StageMaterializationReceipt` values.
+    """
+
+    port_span = _industrial_port_span(len(gpu_uuids))
+    if base_port + port_span - 1 > 65_535:
+        raise ValueError(
+            "base_port cannot fit the complete collision-free industrial port span"
+        )
+    factory = _CellFactory(
+        gpu_uuids=gpu_uuids,
+        base_port=base_port,
+        cache_root=cache_root,
+        evidence_root=evidence_root,
+        seed=seed,
+    )
+    _add_preflight_cells(factory)
+    _add_e3a_cells(factory)
+    _add_tts_cal_cells(factory)
+    registry = ExperimentRegistry(
+        schema_version=3,
+        name="lightcone-formal-staged-registry",
+        gpu_uuids=gpu_uuids,
+        definitions=_industrial_definitions(),
+        cells=tuple(factory.cells),
+        materialization_mode="signed_staged",
+    )
+    used_ports = {port for cell in registry.cells for port in cell.resources.ports}
+    if used_ports != set(range(base_port, base_port + port_span)):
+        raise AssertionError("staged registry port-pool declaration is out of date")
     return registry

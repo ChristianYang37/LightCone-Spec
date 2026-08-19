@@ -61,7 +61,7 @@ def test_publish_and_reopen_requires_exact_typed_live_result(tmp_path: Path) -> 
     assert publication == reopened
     assert publication.reuse_authorized is False
     assert publication.evidence_level == "CPU_CONTRACT_ONLY"
-    assert publication.gpu_reset_semantics == "PENDING"
+    assert publication.gpu_reset_semantics == "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
     assert len(publication.trace_artifacts) == 1
     paths = [
         tmp_path / publication.trace_artifacts[0].filename,
@@ -78,6 +78,32 @@ def test_publish_and_reopen_requires_exact_typed_live_result(tmp_path: Path) -> 
         "session_close_terminal",
     ]
     assert manifest["close_receipt_sha256"] == result.audit.close_receipt_sha256
+
+
+def test_gpu_qualified_session_publication_binds_exact_proof(tmp_path: Path) -> None:
+    proof = _LIVE._session_gpu_proof()
+    result, _owner, _backend, _events = _LIVE._run(
+        _LIVE._resources(),
+        verified_gpu_proof=proof,
+    )
+
+    publication = publish_session_live_evidence(
+        output_dir=tmp_path.resolve(),
+        result=result,
+    )
+    reopened = reopen_session_live_evidence(
+        output_dir=tmp_path.resolve(),
+        expected_result=result,
+    )
+
+    assert publication == reopened
+    assert publication.status == "GPU_VERIFIED"
+    assert publication.reuse_authorized
+    assert publication.evidence_level == "GPU_VERIFIED"
+    assert publication.gpu_reset_semantics == "DYNAMIC_GPU_PROOF_VERIFIED"
+    assert publication.verified_gpu_proof_sha256 == proof.sha256
+    manifest = json.loads((tmp_path / SESSION_LIVE_CLOSE_MANIFEST).read_bytes())
+    assert manifest["verified_gpu_proof_sha256"] == proof.sha256
 
 
 def test_failed_session_retains_partial_trace_without_commit_marker(

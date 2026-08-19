@@ -78,7 +78,9 @@ from lightcone_spec.experiments.planning import (
     budget_inventory_identity_from_gpu_inventory,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
@@ -138,6 +140,35 @@ from lightcone_spec.telemetry.records import OUTPUT_HASH_FORMAT, RequestRecord
 from lightcone_spec.telemetry.writer import EvidenceWriter, load_completed_evidence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _native_itl_result_pointer(
+    request_id: str,
+    token_ids: tuple[int, ...],
+) -> dict[str, object]:
+    started_ns = 100
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "sglang_native_itl_result_pointer",
+        "hook": "sglang.schema_v3.native_per_token_timestamp.v2",
+        "semantics": "scheduler_committed_token_at_result_processor_v1",
+        "release_status": "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF",
+        "request_id": request_id,
+        "request_started_ns": started_ns,
+        "request_terminal_ns": started_ns + len(token_ids) + 1,
+        "terminal_status": "completed",
+        "terminal_reason": "length",
+        "events": [
+            {
+                "token_index": index,
+                "token_id": token_id,
+                "observed_ns": started_ns + index + 1,
+            }
+            for index, token_id in enumerate(token_ids)
+        ],
+    }
+    value["result_pointer_sha256"] = content_sha256(value)
+    return value
 
 
 def _clean_project_tree(root: Path) -> dict[str, object]:
@@ -1374,6 +1405,9 @@ def test_official_adapter_preserves_exact_request_and_marks_coalescing() -> None
             latency=0.002,
             ttft=0.0005,
             generated_token_ids=(101, 102),
+            native_token_timestamp_result_pointer=_native_itl_result_pointer(
+                observed["extra_request_body"]["rid"], (101, 102)
+            ),
             # Upstream's distributed per-token ITLs must not cross the adapter.
             itl=[0.001],
         )
@@ -1421,6 +1455,7 @@ def test_official_adapter_preserves_exact_request_and_marks_coalescing() -> None
     assert observed["routing_key"] == "single-replica"
     assert observed["extra_request_body"] == {
         "rid": request.request_id,
+        "return_native_token_timestamps": True,
         "sampling_params": {"max_new_tokens": 2, "temperature": 0.0},
     }
     assert result.generated_token_ids == (101, 102)
@@ -1582,6 +1617,9 @@ def test_official_adapter_reuses_one_pool_for_submit_and_abort() -> None:
             latency=0.001,
             ttft=0.001,
             generated_token_ids=(101,),
+            native_token_timestamp_result_pointer=_native_itl_result_pointer(
+                request_func_input.request_id, (101,)
+            ),
         )
 
     async def abort_callable(
@@ -1930,6 +1968,10 @@ def test_real_aiohttp_pool_counts_connections_reuse_abort_and_timeout() -> None:
             output_len=1,
             latency=latency,
             ttft=latency,
+            native_token_timestamp_result_pointer=_native_itl_result_pointer(
+                request_func_input.extra_request_body["rid"],
+                tuple(body["generated_token_ids"]),
+            ),
         )
 
     async def async_request_sglang_abort(

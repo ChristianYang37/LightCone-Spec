@@ -94,8 +94,27 @@ yet been declared.
   speculative fields, and reports zero verified drafts in the numeric
   server-info speed view. An active speculative algorithm with no draft width
   still fails closed. The complete series ends at patch SHA-256
-  `8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`
-  and tree `dfb60ab2e514defc6290fe8bacd179552dcd985e`.
+  `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`
+  and tree `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`.
+- Added source-owned CPU-audited TP2 and TP1/DP2 readiness identities. Formal
+  launch additionally requires an exact root-signed, nonce/inventory/hardware/
+  source/JUnit-bound two-card GPU proof; a config digest alone grants no authority.
+  TP1/DP2 uses sticky replica-local state with no adaptation all-reduce.
+- Bound distributed scored terminals to the complete client-lifecycle digest.
+  Only exact non-submitted scored request IDs may omit native rank rows;
+  submitted requests still require native terminal evidence, and warmup remains
+  strictly offered, submitted, and completed.
+- Bound paired serving inference to the complete registered source-request-pool
+  digest rather than each method's realized closed-loop prefix or response
+  tokens. Completed-output exactness remains a separate mandatory gate.
+- Preserved the content-bound native ITL result pointer through SGLang's
+  official benchmark response and added an input-only remote collector that
+  emits separate unsigned, content-addressed terminal and timing bundles.
+- Added the exact eight-test `session_reset_tp1` live-server runner. It binds
+  one cold and one reused adapted TP1/DP1 process, exact JUnit and raw terminal,
+  before/after assigned-GPU process snapshots, and a local external-control
+  durable proof. Until that real GPU proof exists, reuse still falls back to a
+  fresh process.
 - Added the source-owned ordered compile/prewarm CPU lifecycle and a pinned
   host consumer. GPU JIT, CUDA Graph, and cache measurements remain null and
   the independent formal GPU-vetted compile-source registry remains empty.

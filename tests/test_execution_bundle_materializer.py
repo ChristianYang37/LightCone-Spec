@@ -14,11 +14,13 @@ from lightcone_spec.experiments.gpu_pool import (
     registry_pool_work_item,
 )
 from lightcone_spec.experiments.itl_authority import (
-    ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+    ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON,
     release_e2_itl_timestamp_plan,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     content_sha256,
     serving_cell_rejection_reason,
 )
@@ -299,7 +301,7 @@ def test_e2_provisional_materialization_blocks_empty_producer_before_runtime_rea
 
     with pytest.raises(
         DispatchBundleMaterializationBlocked,
-        match=ITL_TIMESTAMP_PRODUCER_UNAVAILABLE_REASON,
+        match=ITL_DYNAMIC_GPU_PROOF_UNAVAILABLE_REASON,
     ):
         module._materialize_assignment_provisional(
             assignment=assignment,

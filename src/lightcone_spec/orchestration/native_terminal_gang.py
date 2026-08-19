@@ -18,9 +18,13 @@ import stat
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from typing import Literal, Protocol, TypeVar
 
+from lightcone_spec.orchestration.formal_terminal_shards import (
+    SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
+    publish_scalable_native_terminal_artifact,
+    reopen_scalable_native_terminal_artifact,
+)
 from lightcone_spec.orchestration.native_terminal import (
     NativeTerminalProvider,
     NativeTerminalRunBinding,
@@ -32,10 +36,18 @@ from lightcone_spec.orchestration.native_terminal import (
 )
 from lightcone_spec.runtime.attestation import TrustedAttesterPolicy
 from lightcone_spec.runtime.distributed import (
+    AdaptationCollectiveMode,
     CohortRouteIdentity,
+    DistributedControlMode,
     ReplicaLocalRouter,
+    RuntimeTopologyMode,
     TopologyReceiptSet,
+    VerifiedDistributedRuntimeGpuProof,
+    adaptation_collective_mode,
+    distributed_control_mode,
+    registered_runtime_topology_mode,
 )
+from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
 
 NATIVE_TERMINAL_GANG_HOOK = (
     "sglang.schema_v3.content_bound_terminal_speculative_evidence.gang_v1"
@@ -58,10 +70,18 @@ NATIVE_TERMINAL_GANG_PROTOCOL_SHA256 = canonical_sha256(
     }
 )
 
-# A caller-authored capability digest grants no authority.  Entries may only be
-# added by an audited source change that pins an exact SGLang tree/patch and
-# topology.  The current release deliberately exposes none.
-NATIVE_TERMINAL_GANG_RELEASE_CAPABILITIES: Mapping[str, str] = MappingProxyType({})
+# This is the CPU-audited native producer identity, not GPU evidence.  Formal
+# consumers additionally require an exact root-verified qualification token.
+NATIVE_TERMINAL_GANG_RELEASE_CAPABILITY_SHA256 = canonical_sha256(
+    {
+        "schema_version": 1,
+        "kind": "lightcone_native_terminal_gang_release_capability",
+        "protocol_sha256": NATIVE_TERMINAL_GANG_PROTOCOL_SHA256,
+        "sglang_upstream": "3312645a307453893a00778592f105581e3d1c3d",
+        "supported_modes": ["tp2_dp1", "tp1_dp2"],
+        "evidence_status": "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF",
+    }
+)
 
 _SHA256_LENGTH = 64
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -84,15 +104,14 @@ def require_native_terminal_gang_release_capability(
 ) -> str:
     """Resolve a source-owned distributed capability before path access."""
 
-    topology = _require_sha256("topology", topology_sha256)
+    _require_sha256("topology", topology_sha256)
     claimed = _require_sha256("claimed gang capability", claimed_capability_sha256)
-    expected = NATIVE_TERMINAL_GANG_RELEASE_CAPABILITIES.get(topology)
-    if expected is None or claimed != expected:
+    if claimed != NATIVE_TERMINAL_GANG_RELEASE_CAPABILITY_SHA256:
         raise NativeTerminalGangAuthorityBlocked(
             "native_terminal_gang_release_capability_unavailable",
-            "the release has no audited native all-rank terminal producer for this topology",
+            "the claim differs from the source-audited all-rank terminal producer",
         )
-    return expected
+    return claimed
 
 
 def _is_sha256(value: object) -> bool:
@@ -337,6 +356,11 @@ class NativeTerminalRankBinding:
             raise ValueError("native terminal gang is restricted to one local node")
         if self.world_size != self.tensor_parallel_size * self.data_parallel_size:
             raise ValueError("rank world size differs from TP*DP")
+        registered_runtime_topology_mode(
+            self.tensor_parallel_size,
+            self.data_parallel_size,
+            self.node_count,
+        )
         if self.tensor_parallel_rank >= self.tensor_parallel_size:
             raise ValueError("tensor-parallel rank is outside the topology")
         if self.data_parallel_rank >= self.data_parallel_size:
@@ -710,6 +734,23 @@ class NativeTerminalGangBinding:
     @property
     def world_size(self) -> int:
         return self.ranks[0].world_size
+
+    @property
+    def topology_mode(self) -> RuntimeTopologyMode:
+        first = self.ranks[0]
+        return registered_runtime_topology_mode(
+            first.tensor_parallel_size,
+            first.data_parallel_size,
+            first.node_count,
+        )
+
+    @property
+    def distributed_control_mode(self) -> DistributedControlMode:
+        return distributed_control_mode(self.topology_mode)
+
+    @property
+    def adaptation_collective_mode(self) -> AdaptationCollectiveMode:
+        return adaptation_collective_mode(self.topology_mode)
 
     @property
     def topology_sha256(self) -> str:
@@ -1724,9 +1765,22 @@ def publish_native_terminal_gang_aggregate(
         body = canonical_json_bytes(artifact)
         rank_path = output.with_name(f"{output.name}.rank{rank}.json")
         sidecar_path = Path(f"{rank_path}.sha256")
+        if len(body) > 1_500_000:
+            publish_scalable_native_terminal_artifact(
+                output_path=rank_path,
+                legacy_artifact=artifact,
+            )
+            body = _read_regular_file(
+                rank_path, label="sharded native terminal rank artifact"
+            )
+        else:
+            _publish_exclusive(
+                rank_path,
+                body,
+                label="native terminal rank artifact",
+            )
         digest = hashlib.sha256(body).hexdigest()
         sidecar_body = f"{digest}\n".encode("ascii")
-        _publish_exclusive(rank_path, body, label="native terminal rank artifact")
         _publish_exclusive(
             sidecar_path,
             sidecar_body,
@@ -1827,7 +1881,17 @@ def reopen_native_terminal_gang_aggregate_diagnostic(
         ):
             raise RuntimeError("bound native terminal rank artifact changed")
         rank_value = _strict_json(rank_body, label="native terminal rank artifact")
-        if rank_body != canonical_json_bytes(rank_value):
+        is_sharded = (
+            type(rank_value) is dict
+            and rank_value.get("schema_version") == 2
+            and rank_value.get("artifact_kind") == SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+        )
+        if is_sharded:
+            canonical_binding = CanonicalJsonProofBinding.bind(row.path)
+            if canonical_binding.raw_sha256 != row.raw_sha256:
+                raise RuntimeError("sharded native terminal rank binding changed")
+            rank_value = reopen_scalable_native_terminal_artifact(rank_value)
+        elif rank_body != canonical_json_bytes(rank_value):
             raise RuntimeError("native terminal rank artifact is not canonical JSON")
         evidence = validate_native_terminal_artifact(
             rank_value,
@@ -1864,25 +1928,36 @@ def require_native_terminal_gang_aggregate(
     expected_aggregate_sha256: str,
     expected_binding: NativeTerminalGangBinding,
     claimed_capability_sha256: str,
+    verified_gpu_proof: VerifiedDistributedRuntimeGpuProof | None = None,
     trusted_attester_policy: TrustedAttesterPolicy,
     expected_warmup_requests: Mapping[int, Sequence[TerminalRequestExpectation]],
     expected_scored_requests: Mapping[int, Sequence[TerminalRequestExpectation]],
 ) -> NativeTerminalAggregateReceipt:
     """Formal entry: source-owned capability check precedes every path read."""
 
+    if expected_binding.world_size > 1:
+        if type(verified_gpu_proof) is not VerifiedDistributedRuntimeGpuProof:
+            raise NativeTerminalGangAuthorityBlocked(
+                "distributed_runtime_gpu_proof_unavailable",
+                "formal gang evidence lacks a verified root-signed GPU proof",
+            )
+        if (
+            verified_gpu_proof.topology_mode != expected_binding.topology_mode
+            or verified_gpu_proof.topology_sha256 != expected_binding.topology_sha256
+        ):
+            raise ValueError("distributed GPU proof belongs to another topology")
     require_native_terminal_gang_release_capability(
         topology_sha256=expected_binding.topology_sha256,
         claimed_capability_sha256=claimed_capability_sha256,
     )
-    if expected_binding.route_plan is not None:
-        raise NativeTerminalGangAuthorityBlocked(
-            "native_terminal_dp_actual_route_producer_unavailable",
-            "the current release has no native producer for actual DP route receipts",
-        )
     if expected_binding.world_size > 1:
-        raise NativeTerminalGangAuthorityBlocked(
-            "native_terminal_gang_first_party_result_pointer_unavailable",
-            "the current patch cannot bind its all-rank collective result pointer",
+        return reopen_native_terminal_gang_aggregate_diagnostic(
+            aggregate_path=aggregate_path,
+            expected_aggregate_sha256=expected_aggregate_sha256,
+            expected_binding=expected_binding,
+            trusted_attester_policy=trusted_attester_policy,
+            expected_warmup_requests=expected_warmup_requests,
+            expected_scored_requests=expected_scored_requests,
         )
     raise NativeTerminalGangAuthorityBlocked(
         "native_terminal_gang_world1_uses_legacy_authority",
@@ -1938,7 +2013,7 @@ def _legacy_transitions(
 __all__ = [
     "NATIVE_TERMINAL_GANG_HOOK",
     "NATIVE_TERMINAL_GANG_PROTOCOL_SHA256",
-    "NATIVE_TERMINAL_GANG_RELEASE_CAPABILITIES",
+    "NATIVE_TERMINAL_GANG_RELEASE_CAPABILITY_SHA256",
     "NativeTerminalAggregateReceipt",
     "NativeTerminalGangAuthorityBlocked",
     "NativeTerminalGangBinding",

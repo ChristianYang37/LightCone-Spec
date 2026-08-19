@@ -12,24 +12,49 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
+from lightcone_spec.orchestration.formal_terminal_shards import (
+    publish_scalable_native_terminal_artifact,
+    publish_scalable_unsigned_native_itl_bundle,
+    reopen_scalable_native_terminal_artifact,
+    reopen_scalable_unsigned_native_itl_bundle,
+)
 from lightcone_spec.runtime.attestation import (
     NO_TRUSTED_ATTESTERS,
     TrustedAttesterPolicy,
 )
+from lightcone_spec.runtime.control_attestation import (
+    ChallengeReplayReservationBinding,
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    VerifiedControlArtifact,
+    control_challenge_reservation_sha256,
+    verify_and_reserve_release_control_artifact_attestations,
+    verify_release_control_artifact_attestation,
+)
+from lightcone_spec.runtime.proof_artifact import (
+    CanonicalJsonProofBinding,
+    publish_canonical_json_no_replace,
+)
+
+if TYPE_CHECKING:
+    from lightcone_spec.experiments.serving import BoundServingRequest
 
 NATIVE_TERMINAL_EVIDENCE_HOOK = (
     "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
 )
 PINNED_SGLANG_UPSTREAM_COMMIT = "3312645a307453893a00778592f105581e3d1c3d"
 PINNED_SGLANG_PATCH_SHA256 = (
-    "8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163"
+    "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
 )
-PINNED_SGLANG_TREE = "dfb60ab2e514defc6290fe8bacd179552dcd985e"
+PINNED_SGLANG_TREE = "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2"
 
 CAPABILITY_PATH = "/v1/lightcone-spec/terminal-evidence/capability"
 TERMINAL_EVIDENCE_PATH = "/v1/lightcone-spec/terminal-evidence"
@@ -61,8 +86,28 @@ NATIVE_TERMINAL_EVIDENCE_FIELDS = (
     "terminal_sha256",
     "attestation",
 )
-SUPPORTED_METHODS = frozenset({"target_only", "static", "tts", "l0"})
-_ORDERED_SUPPORTED_METHODS = ("l0", "static", "target_only", "tts")
+_CANDIDATE_METHODS = frozenset({"tts", "l0"})
+_ADAPTIVE_METHODS = frozenset(
+    {
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }
+)
+SUPPORTED_METHODS = frozenset(
+    {
+        "target_only",
+        "static",
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }
+)
+_ORDERED_SUPPORTED_METHODS = tuple(sorted(SUPPORTED_METHODS))
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}\Z")
@@ -193,6 +238,10 @@ _UPDATE_KEYS = {
     "online_expert_probabilities",
     "online_cumulative_losses",
     "online_expert_gradient_norms",
+    "source_state_sha256",
+    "candidate_bytes_sha256",
+    "optimizer_state_bytes_sha256",
+    "proposal_evidence_sha256",
     "update_sha256",
 }
 _PERFORMANCE_KEYS = {
@@ -453,6 +502,25 @@ def _validate_strict_json(value: object, field: str = "payload") -> None:
     raise ValueError(f"{field} is not strict JSON")
 
 
+NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256 = canonical_sha256(
+    {
+        "schema_version": 1,
+        "kind": "native_terminal_external_control_protocol",
+        "remote_producer": "canonical_unsigned_or_genuine_hardware_signed_terminal",
+        "local_authority": "root_authorized_non_serving_terminal_control",
+        "content_binding": [
+            "canonical_raw_sha256",
+            "semantic_artifact_sha256",
+            "native_terminal_sha256",
+            "inventory_sha256",
+            "registry_sha256",
+            "run_and_attempt_lineage",
+        ],
+        "replay": "atomic_release_control_reservation",
+    }
+)
+
+
 def _exact_object(value: object, keys: set[str], field: str) -> dict[str, object]:
     _validate_strict_json(value, field)
     if not isinstance(value, dict) or set(value) != keys:
@@ -618,10 +686,215 @@ class TerminalRequestExpectation:
                 raise ValueError("submitted request requires exact output token IDs")
             _token_ids(self.output_token_ids, "output_token_ids")
         else:
-            if self.terminal_status not in {"rejected", "cancelled", "timed_out"}:
+            if self.terminal_status not in {
+                "rejected",
+                "cancelled",
+                "timed_out",
+                "unfinished",
+            }:
                 raise ValueError("non-submitted request has an invalid client status")
             if self.output_token_ids is not None:
                 raise ValueError("non-submitted terminal rows cannot carry output IDs")
+
+
+@dataclass(frozen=True)
+class UnsignedNativeServingPhaseResult:
+    """Untrusted result of executing one exact input-only serving phase.
+
+    The remote producer has no release key.  It returns exact terminal rows
+    only after generation and preserves each first-party native ITL pointer as
+    canonical JSON.  Validation here prevents input/output mixups; formal
+    authority still requires the durable local external-control proof chain.
+    """
+
+    phase: str
+    requests: tuple[TerminalRequestExpectation, ...]
+    native_result_pointer_json: tuple[str, ...]
+    client_lifecycle_rows: tuple[dict[str, object], ...] = ()
+
+    def validate(
+        self,
+        *,
+        expected_phase: str,
+        bound_requests: tuple[BoundServingRequest, ...],
+    ) -> tuple[dict[str, object], ...]:
+        if self.phase != expected_phase or expected_phase not in {"warmup", "scored"}:
+            raise ValueError("unsigned serving phase identity differs")
+        if type(self.requests) is not tuple:
+            raise TypeError("unsigned serving phase requires exact terminal rows")
+        if tuple(row.request_id for row in self.requests) != tuple(
+            row.request_id for row in bound_requests
+        ):
+            raise ValueError("unsigned serving terminal order differs from inputs")
+        if self.client_lifecycle_rows and (
+            type(self.client_lifecycle_rows) is not tuple
+            or any(type(row) is not dict for row in self.client_lifecycle_rows)
+            or tuple(row.get("request_id") for row in self.client_lifecycle_rows)
+            != tuple(row.request_id for row in bound_requests)
+        ):
+            raise ValueError("unsigned serving client lifecycle coverage differs")
+        for bound, observed in zip(bound_requests, self.requests, strict=True):
+            if type(observed) is not TerminalRequestExpectation:
+                raise TypeError("unsigned serving terminal rows must be typed")
+            observed.validate()
+            if (
+                observed.request_id != bound.request_id
+                or observed.input_token_ids != bound.input_token_ids
+            ):
+                raise ValueError("unsigned serving terminal input identity changed")
+        pointers = tuple(
+            _validate_unsigned_native_result_pointer(value)
+            for value in self.native_result_pointer_json
+        )
+        by_request = {str(value["request_id"]): value for value in pointers}
+        if len(by_request) != len(pointers):
+            raise ValueError("unsigned native ITL pointers contain duplicates")
+        expected_pointer_ids = {
+            row.request_id
+            for row in self.requests
+            if row.submitted_to_server and row.terminal_status == "completed"
+        }
+        if set(by_request) != expected_pointer_ids:
+            raise ValueError("unsigned native ITL pointer coverage is incomplete")
+        for row in self.requests:
+            pointer = by_request.get(row.request_id)
+            if pointer is None:
+                continue
+            events = pointer["events"]
+            assert isinstance(events, list)
+            if (
+                pointer["terminal_status"] != row.terminal_status
+                or row.output_token_ids is None
+                or tuple(event["token_id"] for event in events) != row.output_token_ids
+            ):
+                raise ValueError(
+                    "unsigned native ITL pointer differs from terminal output"
+                )
+        return pointers
+
+
+@dataclass(frozen=True)
+class UnsignedNativeLifecycleEvents:
+    """Source-owned monotonic phase edges for one unsigned lifecycle."""
+
+    begin_started_ns: int
+    begin_finished_ns: int
+    warmup_started_ns: int
+    warmup_finished_ns: int
+    reset_started_ns: int
+    reset_finished_ns: int
+    scored_started_ns: int
+    scored_finished_ns: int
+    finalize_started_ns: int
+    finalize_finished_ns: int
+    terminal_published_ns: int
+    itl_pointer_published_ns: int
+
+    def __post_init__(self) -> None:
+        values = tuple(self.__dict__.values())
+        if any(type(value) is not int or value < 1 for value in values) or values != (
+            tuple(sorted(values))
+        ):
+            raise ValueError("unsigned native lifecycle timestamps are not ordered")
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, int]:
+        return dict(self.__dict__)
+
+
+@dataclass(frozen=True)
+class UnsignedNativeTerminalCollection:
+    """Path-bound remote outputs; neither binding is formal authority."""
+
+    terminal_artifact: CanonicalJsonProofBinding
+    native_itl_pointer_artifact: CanonicalJsonProofBinding
+    lifecycle_events: UnsignedNativeLifecycleEvents | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.terminal_artifact) is not CanonicalJsonProofBinding
+            or type(self.native_itl_pointer_artifact) is not CanonicalJsonProofBinding
+            or (
+                self.lifecycle_events is not None
+                and type(self.lifecycle_events) is not UnsignedNativeLifecycleEvents
+            )
+        ):
+            raise TypeError("unsigned native collection requires exact bindings")
+
+
+@dataclass(frozen=True)
+class UnsignedNativeItlTokenEvent:
+    token_index: int
+    token_id: int
+    observed_ns: int
+
+
+_VALIDATED_UNSIGNED_ITL_BUNDLE_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
+class ValidatedUnsignedNativeItlPointer:
+    """One first-party pointer reopened from the path-bound unsigned bundle."""
+
+    request_id: str
+    request_started_ns: int
+    request_terminal_ns: int
+    terminal_status: str
+    terminal_reason: str
+    events: tuple[UnsignedNativeItlTokenEvent, ...]
+    result_pointer_sha256: str
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        request_started_ns: int,
+        request_terminal_ns: int,
+        terminal_status: str,
+        terminal_reason: str,
+        events: tuple[UnsignedNativeItlTokenEvent, ...],
+        result_pointer_sha256: str,
+        _verification_tag: object = None,
+    ) -> None:
+        if _verification_tag is not _VALIDATED_UNSIGNED_ITL_BUNDLE_SENTINEL:
+            raise TypeError("unsigned native ITL pointer requires path validation")
+        for name, value in locals().copy().items():
+            if name not in {"self", "_verification_tag"}:
+                object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True, init=False)
+class ValidatedUnsignedNativeItlPointerBundle:
+    """Verifier-owned view of a collector bundle; never formal authority."""
+
+    artifact_raw_sha256: str
+    artifact_semantic_sha256: str
+    run_binding_sha256: str
+    terminal_artifact_raw_sha256: str
+    terminal_artifact_semantic_sha256: str
+    scored_request_inputs_sha256: str
+    pointers: tuple[ValidatedUnsignedNativeItlPointer, ...]
+
+    def __init__(
+        self,
+        *,
+        artifact_raw_sha256: str,
+        artifact_semantic_sha256: str,
+        run_binding_sha256: str,
+        terminal_artifact_raw_sha256: str,
+        terminal_artifact_semantic_sha256: str,
+        scored_request_inputs_sha256: str,
+        pointers: tuple[ValidatedUnsignedNativeItlPointer, ...],
+        _verification_tag: object = None,
+    ) -> None:
+        if _verification_tag is not _VALIDATED_UNSIGNED_ITL_BUNDLE_SENTINEL:
+            raise TypeError("unsigned native ITL bundle requires path validation")
+        for name, value in locals().copy().items():
+            if name not in {"self", "_verification_tag"}:
+                object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -671,7 +944,10 @@ class NativeTerminalAttestation:
     trusted: bool
 
 
-@dataclass(frozen=True)
+_VALIDATED_NATIVE_TERMINAL_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
 class ValidatedNativeTerminalEvidence:
     """Immutable validated terminal envelope.
 
@@ -686,14 +962,101 @@ class ValidatedNativeTerminalEvidence:
     attestation: NativeTerminalAttestation
     terminal_sha256: str
     raw_json: str
+    external_control_binding_sha256: str | None
+    external_control_envelope_sha256: str | None
+    external_control_reservation_sha256: str | None
+    external_control_trusted_policy_sha256: str | None
+
+    def __init__(
+        self,
+        *,
+        binding: NativeTerminalRunBinding,
+        begin_receipt: NativeTerminalBeginReceipt,
+        reset_receipt: NativeTerminalResetReceipt,
+        requests: tuple[TerminalRequestExpectation, ...],
+        attestation: NativeTerminalAttestation,
+        terminal_sha256: str,
+        raw_json: str,
+        _verification_tag: object,
+        external_control_binding_sha256: str | None = None,
+        external_control_envelope_sha256: str | None = None,
+        external_control_reservation_sha256: str | None = None,
+        external_control_trusted_policy_sha256: str | None = None,
+    ) -> None:
+        if _verification_tag is not _VALIDATED_NATIVE_TERMINAL_SENTINEL:
+            raise TypeError(
+                "validated native terminal evidence requires first-party validation"
+            )
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "begin_receipt", begin_receipt)
+        object.__setattr__(self, "reset_receipt", reset_receipt)
+        object.__setattr__(self, "requests", requests)
+        object.__setattr__(self, "attestation", attestation)
+        object.__setattr__(self, "terminal_sha256", terminal_sha256)
+        object.__setattr__(self, "raw_json", raw_json)
+        control_fields = (
+            external_control_binding_sha256,
+            external_control_envelope_sha256,
+            external_control_reservation_sha256,
+            external_control_trusted_policy_sha256,
+        )
+        if any(value is None for value in control_fields) and any(
+            value is not None for value in control_fields
+        ):
+            raise ValueError("native terminal external control fields are atomic")
+        for label, value in zip(
+            (
+                "native terminal control binding",
+                "native terminal control envelope",
+                "native terminal control reservation",
+                "native terminal control policy",
+            ),
+            control_fields,
+            strict=True,
+        ):
+            if value is not None:
+                _sha256(value, label)
+        object.__setattr__(
+            self,
+            "external_control_binding_sha256",
+            external_control_binding_sha256,
+        )
+        object.__setattr__(
+            self,
+            "external_control_envelope_sha256",
+            external_control_envelope_sha256,
+        )
+        object.__setattr__(
+            self,
+            "external_control_reservation_sha256",
+            external_control_reservation_sha256,
+        )
+        object.__setattr__(
+            self,
+            "external_control_trusted_policy_sha256",
+            external_control_trusted_policy_sha256,
+        )
 
     @property
     def trusted_attestation(self) -> bool:
-        return self.attestation.trusted
+        return self.attestation.trusted or (
+            self.external_control_envelope_sha256 is not None
+        )
+
+    @property
+    def authority_kind(self) -> str:
+        if self.external_control_envelope_sha256 is not None:
+            return "external_release_control"
+        if self.attestation.trusted:
+            return "native_hardware_attestation"
+        return "untrusted_raw_terminal"
 
     @property
     def trusted_attester_policy_sha256(self) -> str:
-        return self.attestation.trusted_attester_policy_sha256
+        return (
+            self.external_control_trusted_policy_sha256
+            or self.attestation.trusted_attester_policy_sha256
+        )
 
     def to_dict(self) -> dict[str, object]:
         value = json.loads(self.raw_json)
@@ -866,6 +1229,26 @@ class ValidatedNativeTerminalEvidence:
                     if row["online_expert_gradient_norms"] is None
                     else _canonical_json_text(row["online_expert_gradient_norms"])
                 ),
+                source_state_sha256=(
+                    None
+                    if row["source_state_sha256"] is None
+                    else str(row["source_state_sha256"])
+                ),
+                candidate_bytes_sha256=(
+                    None
+                    if row["candidate_bytes_sha256"] is None
+                    else str(row["candidate_bytes_sha256"])
+                ),
+                optimizer_state_bytes_sha256=(
+                    None
+                    if row["optimizer_state_bytes_sha256"] is None
+                    else str(row["optimizer_state_bytes_sha256"])
+                ),
+                proposal_evidence_sha256=(
+                    None
+                    if row["proposal_evidence_sha256"] is None
+                    else str(row["proposal_evidence_sha256"])
+                ),
                 cohort_epoch=int(row["cohort_epoch"]),
                 exactness_violation=row["status"] == "reconstruction_mismatch",
                 stale_candidate=row["status"] == "version_conflict",
@@ -886,6 +1269,1274 @@ class ValidatedNativeTerminalEvidence:
         )
         batch.validate(run_id=self.binding.run_id, method=self.binding.method)
         return batch
+
+
+@dataclass(frozen=True)
+class NativeTerminalExternalControlBinding:
+    """Typed content identity signed only after the raw terminal is pulled.
+
+    The remote SGLang process never receives the offline release key.  It emits
+    the canonical terminal bundle, while this binding commits both its exact
+    canonical bytes and its semantic object identity before a local control
+    attestation can authorize downstream use.
+    """
+
+    schema_version: int
+    kind: str
+    canonical_raw_sha256: str
+    semantic_artifact_sha256: str
+    terminal_sha256: str
+    run_id: str
+    run_nonce_sha256: str
+    execution_plan_sha256: str
+    rank_config_sha256: str
+    attempt_id: str
+    session_id: str
+    session_epoch: int
+    method: str
+    inventory_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != (
+            "native_terminal_external_control_binding"
+        ):
+            raise ValueError("native terminal control binding schema is unsupported")
+        for label, value in (
+            ("terminal canonical raw", self.canonical_raw_sha256),
+            ("terminal semantic artifact", self.semantic_artifact_sha256),
+            ("terminal semantic receipt", self.terminal_sha256),
+            ("terminal run nonce", self.run_nonce_sha256),
+            ("terminal execution plan", self.execution_plan_sha256),
+            ("terminal rank config", self.rank_config_sha256),
+            ("terminal inventory", self.inventory_sha256),
+        ):
+            _sha256(value, label)
+        for label, value in (
+            ("terminal run", self.run_id),
+            ("terminal attempt", self.attempt_id),
+            ("terminal session", self.session_id),
+            ("terminal method", self.method),
+        ):
+            _safe_id(value, label)
+        _integer(self.session_epoch, "terminal session epoch", minimum=1)
+        if self.method not in SUPPORTED_METHODS:
+            raise ValueError("native terminal control method is unsupported")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "canonical_raw_sha256": self.canonical_raw_sha256,
+            "semantic_artifact_sha256": self.semantic_artifact_sha256,
+            "terminal_sha256": self.terminal_sha256,
+            "run_id": self.run_id,
+            "run_nonce_sha256": self.run_nonce_sha256,
+            "execution_plan_sha256": self.execution_plan_sha256,
+            "rank_config_sha256": self.rank_config_sha256,
+            "attempt_id": self.attempt_id,
+            "session_id": self.session_id,
+            "session_epoch": self.session_epoch,
+            "method": self.method,
+            "inventory_sha256": self.inventory_sha256,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    @property
+    def lineage_sha256(self) -> str:
+        return canonical_sha256(
+            {
+                "schema_version": 1,
+                "kind": "native_terminal_external_control_lineage",
+                "terminal_binding_sha256": self.sha256,
+                "run_id": self.run_id,
+                "run_nonce_sha256": self.run_nonce_sha256,
+                "execution_plan_sha256": self.execution_plan_sha256,
+                "rank_config_sha256": self.rank_config_sha256,
+                "attempt_id": self.attempt_id,
+                "session_id": self.session_id,
+                "session_epoch": self.session_epoch,
+                "method": self.method,
+                "terminal_sha256": self.terminal_sha256,
+                "inventory_sha256": self.inventory_sha256,
+            }
+        )
+
+
+_PREPARED_NATIVE_TERMINAL_CONTROL_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
+class PreparedNativeTerminalExternalControl:
+    """Structurally checked batch row with no replay-store mutation."""
+
+    evidence: ValidatedNativeTerminalEvidence
+    binding: NativeTerminalExternalControlBinding
+    control_attestation: ControlArtifactAttestation
+    expected_inventory_sha256: str
+    expected_registry_sha256: str
+
+    def __init__(
+        self,
+        *,
+        evidence: ValidatedNativeTerminalEvidence,
+        binding: NativeTerminalExternalControlBinding,
+        control_attestation: ControlArtifactAttestation,
+        expected_inventory_sha256: str,
+        expected_registry_sha256: str,
+        _verification_tag: object,
+    ) -> None:
+        if _verification_tag is not _PREPARED_NATIVE_TERMINAL_CONTROL_SENTINEL:
+            raise TypeError("prepared native terminal control requires validation")
+        if type(evidence) is not ValidatedNativeTerminalEvidence:
+            raise TypeError("prepared native terminal control evidence is not exact")
+        if type(binding) is not NativeTerminalExternalControlBinding:
+            raise TypeError("prepared native terminal control binding is not exact")
+        if type(control_attestation) is not ControlArtifactAttestation:
+            raise TypeError("prepared native terminal control envelope is not exact")
+        _sha256(expected_inventory_sha256, "prepared terminal inventory")
+        _sha256(expected_registry_sha256, "prepared terminal registry")
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "control_attestation", control_attestation)
+        object.__setattr__(self, "expected_inventory_sha256", expected_inventory_sha256)
+        object.__setattr__(self, "expected_registry_sha256", expected_registry_sha256)
+
+
+_CANDIDATE_STATE_POINTER_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
+class CandidateStateByteIdentity:
+    """One source-owned mechanism-replay update byte identity."""
+
+    update_index: int
+    source_round: int
+    source_version: int
+    request_ids: tuple[str, ...]
+    source_state_sha256: str
+    candidate_bytes_sha256: str
+    optimizer_state_bytes_sha256: str
+    proposal_evidence_sha256: str
+    update_sha256: str
+
+    def __init__(
+        self,
+        *,
+        update_index: int,
+        source_round: int,
+        source_version: int,
+        request_ids: tuple[str, ...],
+        source_state_sha256: str,
+        candidate_bytes_sha256: str,
+        optimizer_state_bytes_sha256: str,
+        proposal_evidence_sha256: str,
+        update_sha256: str,
+        _verification_tag: object,
+    ) -> None:
+        if _verification_tag is not _CANDIDATE_STATE_POINTER_SENTINEL:
+            raise TypeError(
+                "candidate-state byte identity requires validated native evidence"
+            )
+        for name, value in (
+            ("source_state_sha256", source_state_sha256),
+            ("candidate_bytes_sha256", candidate_bytes_sha256),
+            ("optimizer_state_bytes_sha256", optimizer_state_bytes_sha256),
+            ("proposal_evidence_sha256", proposal_evidence_sha256),
+            ("update_sha256", update_sha256),
+        ):
+            _sha256(value, name)
+        if not request_ids or len(request_ids) != len(set(request_ids)):
+            raise ValueError("candidate-state request coverage is not unique")
+        for request_id in request_ids:
+            _safe_id(request_id, "candidate_state.request_id")
+        for name, value, minimum in (
+            ("update_index", update_index, 0),
+            ("source_round", source_round, 1),
+            ("source_version", source_version, 0),
+        ):
+            _integer(value, name, minimum=minimum)
+        object.__setattr__(self, "update_index", update_index)
+        object.__setattr__(self, "source_round", source_round)
+        object.__setattr__(self, "source_version", source_version)
+        object.__setattr__(self, "request_ids", request_ids)
+        object.__setattr__(self, "source_state_sha256", source_state_sha256)
+        object.__setattr__(self, "candidate_bytes_sha256", candidate_bytes_sha256)
+        object.__setattr__(
+            self, "optimizer_state_bytes_sha256", optimizer_state_bytes_sha256
+        )
+        object.__setattr__(self, "proposal_evidence_sha256", proposal_evidence_sha256)
+        object.__setattr__(self, "update_sha256", update_sha256)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "update_index": self.update_index,
+            "source_round": self.source_round,
+            "source_version": self.source_version,
+            "request_ids": list(self.request_ids),
+            "source_state_sha256": self.source_state_sha256,
+            "candidate_bytes_sha256": self.candidate_bytes_sha256,
+            "optimizer_state_bytes_sha256": self.optimizer_state_bytes_sha256,
+            "proposal_evidence_sha256": self.proposal_evidence_sha256,
+            "update_sha256": self.update_sha256,
+        }
+
+
+@dataclass(frozen=True, init=False)
+class CandidateStateReplayPointer:
+    """Deep-replay pointer derived from one trusted first-party terminal."""
+
+    schema_version: int
+    kind: str
+    run_id: str
+    method: str
+    run_nonce_sha256: str
+    execution_plan_sha256: str
+    rank_config_sha256: str
+    attempt_id: str
+    terminal_sha256: str
+    attestation_message_sha256: str
+    trusted_attester_policy_sha256: str
+    authority_kind: str
+    external_control_binding_sha256: str | None
+    external_control_envelope_sha256: str | None
+    external_control_reservation_sha256: str | None
+    updates: tuple[CandidateStateByteIdentity, ...]
+
+    def __init__(
+        self,
+        *,
+        evidence: ValidatedNativeTerminalEvidence,
+        updates: tuple[CandidateStateByteIdentity, ...],
+        _verification_tag: object,
+    ) -> None:
+        if (
+            _verification_tag is not _CANDIDATE_STATE_POINTER_SENTINEL
+            or type(evidence) is not ValidatedNativeTerminalEvidence
+            or not evidence.trusted_attestation
+        ):
+            raise TypeError(
+                "candidate-state replay pointer requires trusted native evidence"
+            )
+        if evidence.binding.method not in _CANDIDATE_METHODS:
+            raise ValueError("candidate-state replay requires TTS or L0 evidence")
+        if not updates or any(
+            type(value) is not CandidateStateByteIdentity for value in updates
+        ):
+            raise ValueError("candidate-state replay lacks exact update coverage")
+        object.__setattr__(self, "schema_version", 1)
+        object.__setattr__(self, "kind", "native_candidate_state_replay_pointer")
+        object.__setattr__(self, "run_id", evidence.binding.run_id)
+        object.__setattr__(self, "method", evidence.binding.method)
+        object.__setattr__(self, "run_nonce_sha256", evidence.binding.run_nonce_sha256)
+        object.__setattr__(
+            self, "execution_plan_sha256", evidence.binding.execution_plan_sha256
+        )
+        object.__setattr__(
+            self, "rank_config_sha256", evidence.binding.rank_config_sha256
+        )
+        object.__setattr__(self, "attempt_id", evidence.binding.attempt_id)
+        object.__setattr__(self, "terminal_sha256", evidence.terminal_sha256)
+        object.__setattr__(
+            self,
+            "attestation_message_sha256",
+            evidence.attestation.message_sha256,
+        )
+        object.__setattr__(
+            self,
+            "trusted_attester_policy_sha256",
+            evidence.trusted_attester_policy_sha256,
+        )
+        object.__setattr__(self, "authority_kind", evidence.authority_kind)
+        object.__setattr__(
+            self,
+            "external_control_binding_sha256",
+            evidence.external_control_binding_sha256,
+        )
+        object.__setattr__(
+            self,
+            "external_control_envelope_sha256",
+            evidence.external_control_envelope_sha256,
+        )
+        object.__setattr__(
+            self,
+            "external_control_reservation_sha256",
+            evidence.external_control_reservation_sha256,
+        )
+        object.__setattr__(self, "updates", updates)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "run_id": self.run_id,
+            "method": self.method,
+            "run_nonce_sha256": self.run_nonce_sha256,
+            "execution_plan_sha256": self.execution_plan_sha256,
+            "rank_config_sha256": self.rank_config_sha256,
+            "attempt_id": self.attempt_id,
+            "terminal_sha256": self.terminal_sha256,
+            "attestation_message_sha256": self.attestation_message_sha256,
+            "trusted_attester_policy_sha256": self.trusted_attester_policy_sha256,
+            "authority_kind": self.authority_kind,
+            "external_control_binding_sha256": (self.external_control_binding_sha256),
+            "external_control_envelope_sha256": (self.external_control_envelope_sha256),
+            "external_control_reservation_sha256": (
+                self.external_control_reservation_sha256
+            ),
+            "updates": [value.to_dict() for value in self.updates],
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    def semantic_commitment_dict(self) -> dict[str, object]:
+        """Return the reservation-independent scientific replay identity."""
+
+        value = self.to_dict()
+        value.pop("external_control_reservation_sha256")
+        value["kind"] = "native_candidate_state_replay_commitment"
+        return value
+
+    @property
+    def semantic_commitment_sha256(self) -> str:
+        return canonical_sha256(self.semantic_commitment_dict())
+
+
+@dataclass(frozen=True)
+class CandidateStateReplayProjection:
+    """Non-authorizing pre-reservation projection for atomic coverage checks."""
+
+    schema_version: int
+    kind: str
+    terminal_binding_sha256: str
+    control_envelope_sha256: str
+    pointer_commitment: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != (
+            "native_candidate_state_replay_projection_untrusted"
+        ):
+            raise ValueError("candidate-state projection schema is unsupported")
+        for label, value in (
+            ("projection terminal binding", self.terminal_binding_sha256),
+            ("projection control envelope", self.control_envelope_sha256),
+        ):
+            _sha256(value, label)
+        if (
+            type(self.pointer_commitment) is not dict
+            or "external_control_reservation_sha256" in self.pointer_commitment
+            or self.pointer_commitment.get("kind")
+            != "native_candidate_state_replay_commitment"
+        ):
+            raise TypeError(
+                "candidate-state projection requires a reservation-free commitment"
+            )
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(
+            {
+                "schema_version": self.schema_version,
+                "kind": self.kind,
+                "terminal_binding_sha256": self.terminal_binding_sha256,
+                "control_envelope_sha256": self.control_envelope_sha256,
+                "pointer_commitment": self.pointer_commitment,
+            }
+        )
+
+    @property
+    def pointer_commitment_sha256(self) -> str:
+        return canonical_sha256(self.pointer_commitment)
+
+
+@dataclass(frozen=True)
+class CandidateStateReplayProofArtifact:
+    """Durable external-control proof for one candidate-state replay pointer.
+
+    The raw serving terminal is produced unsigned on the GPU host.  A local
+    release signer authorizes its exact content binding and atomically
+    reserves the terminal nonce together with both control challenges.  This
+    artifact stores only public verification material; reopening it never
+    reserves or consumes a challenge a second time.
+    """
+
+    schema_version: int
+    kind: str
+    raw_terminal: CanonicalJsonProofBinding
+    control_attestation: ControlArtifactAttestation
+    replay_reservation: ChallengeReplayReservationBinding
+    expected_inventory_sha256: str
+    expected_registry_sha256: str
+    expected_root_manifest_sha256: str
+    pointer: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != (
+            "native_candidate_state_replay_proof_artifact"
+        ):
+            raise ValueError("candidate-state proof artifact schema is unsupported")
+        if type(self.raw_terminal) is not CanonicalJsonProofBinding:
+            raise TypeError("candidate-state proof requires one raw terminal binding")
+        if type(self.control_attestation) is not ControlArtifactAttestation:
+            raise TypeError("candidate-state proof requires one exact control envelope")
+        if type(self.replay_reservation) is not ChallengeReplayReservationBinding:
+            raise TypeError("candidate-state proof requires one replay reservation")
+        _sha256(
+            self.expected_inventory_sha256,
+            "candidate-state proof inventory",
+        )
+        _sha256(
+            self.expected_registry_sha256,
+            "candidate-state proof registry",
+        )
+        _sha256(
+            self.expected_root_manifest_sha256,
+            "candidate-state proof release root",
+        )
+        # ``pointer_sha256`` is deliberately not embedded because that would
+        # make its identity recursive.  The exact derived pointer is compared
+        # during deep revalidation below.
+        if type(self.pointer) is not dict or set(self.pointer) != {
+            "schema_version",
+            "kind",
+            "run_id",
+            "method",
+            "run_nonce_sha256",
+            "execution_plan_sha256",
+            "rank_config_sha256",
+            "attempt_id",
+            "terminal_sha256",
+            "attestation_message_sha256",
+            "trusted_attester_policy_sha256",
+            "authority_kind",
+            "external_control_binding_sha256",
+            "external_control_envelope_sha256",
+            "external_control_reservation_sha256",
+            "updates",
+        }:
+            raise ValueError("candidate-state proof pointer fields differ")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "raw_terminal": self.raw_terminal.to_dict(),
+            "control_attestation": self.control_attestation.to_dict(),
+            "replay_reservation": self.replay_reservation.to_dict(),
+            "expected_inventory_sha256": self.expected_inventory_sha256,
+            "expected_registry_sha256": self.expected_registry_sha256,
+            "expected_root_manifest_sha256": self.expected_root_manifest_sha256,
+            "pointer": self.pointer,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: object) -> CandidateStateReplayProofArtifact:
+        raw = _exact_object(
+            value,
+            {
+                "schema_version",
+                "kind",
+                "raw_terminal",
+                "control_attestation",
+                "replay_reservation",
+                "expected_inventory_sha256",
+                "expected_registry_sha256",
+                "expected_root_manifest_sha256",
+                "pointer",
+            },
+            "candidate-state proof artifact",
+        )
+        pointer = raw.pop("pointer")
+        if type(pointer) is not dict:
+            raise TypeError("candidate-state proof pointer must be an object")
+        raw_terminal = CanonicalJsonProofBinding.from_dict(raw.pop("raw_terminal"))
+        control_attestation = ControlArtifactAttestation.from_dict(
+            raw.pop("control_attestation")
+        )
+        replay_reservation = ChallengeReplayReservationBinding.from_dict(
+            raw.pop("replay_reservation")
+        )
+        return cls(
+            **raw,
+            raw_terminal=raw_terminal,
+            control_attestation=control_attestation,
+            replay_reservation=replay_reservation,
+            pointer=pointer,
+        )
+
+    def revalidate(self, *, now_ns: int) -> CandidateStateReplayPointer:
+        """Deep-reopen every authority without mutating the replay ledger."""
+
+        controlled = _revalidate_controlled_native_terminal_proof(
+            raw_terminal=self.raw_terminal,
+            control_attestation=self.control_attestation,
+            replay_reservation=self.replay_reservation,
+            expected_inventory_sha256=self.expected_inventory_sha256,
+            expected_registry_sha256=self.expected_registry_sha256,
+            expected_root_manifest_sha256=self.expected_root_manifest_sha256,
+            now_ns=now_ns,
+            field="candidate-state proof",
+        )
+        pointer = derive_candidate_state_replay_pointer(controlled)
+        if pointer.to_dict() != self.pointer:
+            raise ValueError("candidate-state proof derived pointer changed")
+        return pointer
+
+
+_NATIVE_TERMINAL_RESULT_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
+class NativeTerminalRequestResult:
+    """One exact request outcome projected from controlled native evidence."""
+
+    request_id: str
+    input_token_ids: tuple[int, ...]
+    output_token_ids: tuple[int, ...] | None
+    terminal_status: str
+    terminal_reason: str
+    submitted_to_server: bool
+    request_sha256: str
+
+    def __init__(
+        self,
+        *,
+        expectation: TerminalRequestExpectation,
+        request_row: Mapping[str, object],
+        _verification_tag: object,
+    ) -> None:
+        if (
+            _verification_tag is not _NATIVE_TERMINAL_RESULT_SENTINEL
+            or type(expectation) is not TerminalRequestExpectation
+        ):
+            raise TypeError("native request result requires validated evidence")
+        expectation.validate()
+        if request_row.get("request_id") != expectation.request_id:
+            raise RuntimeError("native request result row identity differs")
+        request_sha256 = _sha256(
+            request_row.get("request_sha256"), "native request result digest"
+        )
+        object.__setattr__(self, "request_id", expectation.request_id)
+        object.__setattr__(self, "input_token_ids", expectation.input_token_ids)
+        object.__setattr__(self, "output_token_ids", expectation.output_token_ids)
+        object.__setattr__(self, "terminal_status", expectation.terminal_status)
+        object.__setattr__(self, "terminal_reason", expectation.terminal_reason)
+        object.__setattr__(self, "submitted_to_server", expectation.submitted_to_server)
+        object.__setattr__(self, "request_sha256", request_sha256)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "request_id": self.request_id,
+            "input_token_ids": list(self.input_token_ids),
+            "output_token_ids": (
+                None if self.output_token_ids is None else list(self.output_token_ids)
+            ),
+            "terminal_status": self.terminal_status,
+            "terminal_reason": self.terminal_reason,
+            "submitted_to_server": self.submitted_to_server,
+            "request_sha256": self.request_sha256,
+        }
+
+
+@dataclass(frozen=True, init=False)
+class NativeTerminalUpdateResult:
+    """Verifier-sealed update row projected from the validated native terminal."""
+
+    update_index: int
+    status: str
+    published_version: int | None
+    reconstruction_ok: bool
+    source_round: int
+    source_version: int
+    optimizer_step: int
+    cohort_sha256: str
+    parameter_layout_sha256: str
+    request_ids: tuple[str, ...]
+    source_state_sha256: str | None
+    candidate_bytes_sha256: str | None
+    optimizer_state_bytes_sha256: str | None
+    proposal_evidence_sha256: str | None
+    update_sha256: str
+
+    def __init__(
+        self,
+        *,
+        update_row: Mapping[str, object],
+        _verification_tag: object,
+    ) -> None:
+        if _verification_tag is not _NATIVE_TERMINAL_RESULT_SENTINEL:
+            raise TypeError("native update result requires validated evidence")
+        requests = update_row.get("request_ids")
+        if not isinstance(requests, list):  # validated terminal invariant
+            raise TypeError("native update result request IDs are malformed")
+        values = {
+            "update_index": int(update_row["update_index"]),
+            "status": str(update_row["status"]),
+            "published_version": (
+                None
+                if update_row["published_version"] is None
+                else int(update_row["published_version"])
+            ),
+            "reconstruction_ok": bool(update_row["reconstruction_ok"]),
+            "source_round": int(update_row["source_round"]),
+            "source_version": int(update_row["source_version"]),
+            "optimizer_step": int(update_row["optimizer_step"]),
+            "cohort_sha256": str(update_row["cohort_sha256"]),
+            "parameter_layout_sha256": str(update_row["parameter_layout_sha256"]),
+            "request_ids": tuple(str(value) for value in requests),
+            "source_state_sha256": update_row["source_state_sha256"],
+            "candidate_bytes_sha256": update_row["candidate_bytes_sha256"],
+            "optimizer_state_bytes_sha256": (
+                update_row["optimizer_state_bytes_sha256"]
+            ),
+            "proposal_evidence_sha256": update_row["proposal_evidence_sha256"],
+            "update_sha256": str(update_row["update_sha256"]),
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "update_index": self.update_index,
+            "status": self.status,
+            "published_version": self.published_version,
+            "reconstruction_ok": self.reconstruction_ok,
+            "source_round": self.source_round,
+            "source_version": self.source_version,
+            "optimizer_step": self.optimizer_step,
+            "cohort_sha256": self.cohort_sha256,
+            "parameter_layout_sha256": self.parameter_layout_sha256,
+            "request_ids": list(self.request_ids),
+            "source_state_sha256": self.source_state_sha256,
+            "candidate_bytes_sha256": self.candidate_bytes_sha256,
+            "optimizer_state_bytes_sha256": self.optimizer_state_bytes_sha256,
+            "proposal_evidence_sha256": self.proposal_evidence_sha256,
+            "update_sha256": self.update_sha256,
+        }
+
+
+@dataclass(frozen=True, init=False)
+class NativeTerminalResultProjection:
+    """Typed performance/safety projection from one controlled raw terminal.
+
+    This projection intentionally contains no goodput or ITL statistic.  The
+    native terminal has exact token/count/state evidence but no client arrival
+    or completion timestamps; those statistics require their independent
+    path-bound client-timestamp authority.
+    """
+
+    schema_version: int
+    kind: str
+    run_id: str
+    method: str
+    run_nonce_sha256: str
+    execution_plan_sha256: str
+    rank_config_sha256: str
+    attempt_id: str
+    terminal_sha256: str
+    authority_kind: str
+    external_control_binding_sha256: str
+    external_control_envelope_sha256: str
+    external_control_reservation_sha256: str
+    requests: tuple[NativeTerminalRequestResult, ...]
+    updates: tuple[NativeTerminalUpdateResult, ...]
+    scored_request_ids: tuple[str, ...]
+    output_token_count: int
+    request_rows_sha256: str
+    round_rows_sha256: str
+    update_rows_sha256: str
+    performance_counters_sha256: str
+    final_state_sha256: str
+    performance_counters_json: str
+
+    def __init__(
+        self,
+        *,
+        evidence: ValidatedNativeTerminalEvidence,
+        _verification_tag: object,
+    ) -> None:
+        if (
+            _verification_tag is not _NATIVE_TERMINAL_RESULT_SENTINEL
+            or type(evidence) is not ValidatedNativeTerminalEvidence
+            or evidence.authority_kind != "external_release_control"
+        ):
+            raise TypeError(
+                "native terminal result requires externally controlled evidence"
+            )
+        control_values = (
+            evidence.external_control_binding_sha256,
+            evidence.external_control_envelope_sha256,
+            evidence.external_control_reservation_sha256,
+        )
+        if any(value is None for value in control_values):
+            raise TypeError("native terminal result lacks external control identity")
+        envelope = evidence.to_dict()
+        request_round_rows = _exact_object(
+            envelope["request_round_rows"],
+            {"requests", "rounds"},
+            "native terminal result request/round rows",
+        )
+        requests = request_round_rows["requests"]
+        rounds = request_round_rows["rounds"]
+        updates = envelope["update_rows"]
+        performance = envelope["performance_counters"]
+        final_state = envelope["final_state"]
+        if (
+            not isinstance(requests, list)
+            or not isinstance(rounds, list)
+            or not isinstance(updates, list)
+            or not isinstance(performance, dict)
+            or not isinstance(final_state, dict)
+        ):
+            raise TypeError("native terminal result containers are malformed")
+        output_token_count = sum(
+            _integer(row.get("output_tokens"), "result.output_tokens")
+            for row in requests
+            if isinstance(row, dict)
+        )
+        if len(requests) != len(evidence.requests):
+            raise RuntimeError("native terminal result request coverage changed")
+        request_results = tuple(
+            NativeTerminalRequestResult(
+                expectation=expectation,
+                request_row=request_row,
+                _verification_tag=_NATIVE_TERMINAL_RESULT_SENTINEL,
+            )
+            for expectation, request_row in zip(
+                evidence.requests,
+                requests,
+                strict=True,
+            )
+        )
+        update_results = tuple(
+            NativeTerminalUpdateResult(
+                update_row=row,
+                _verification_tag=_NATIVE_TERMINAL_RESULT_SENTINEL,
+            )
+            for row in updates
+        )
+        object.__setattr__(self, "schema_version", 1)
+        object.__setattr__(self, "kind", "native_terminal_result_projection")
+        object.__setattr__(self, "run_id", evidence.binding.run_id)
+        object.__setattr__(self, "method", evidence.binding.method)
+        object.__setattr__(self, "run_nonce_sha256", evidence.binding.run_nonce_sha256)
+        object.__setattr__(
+            self, "execution_plan_sha256", evidence.binding.execution_plan_sha256
+        )
+        object.__setattr__(
+            self, "rank_config_sha256", evidence.binding.rank_config_sha256
+        )
+        object.__setattr__(self, "attempt_id", evidence.binding.attempt_id)
+        object.__setattr__(self, "terminal_sha256", evidence.terminal_sha256)
+        object.__setattr__(self, "authority_kind", evidence.authority_kind)
+        object.__setattr__(self, "external_control_binding_sha256", control_values[0])
+        object.__setattr__(self, "external_control_envelope_sha256", control_values[1])
+        object.__setattr__(
+            self, "external_control_reservation_sha256", control_values[2]
+        )
+        object.__setattr__(self, "requests", request_results)
+        object.__setattr__(self, "updates", update_results)
+        object.__setattr__(
+            self, "scored_request_ids", evidence.binding.scored_request_ids
+        )
+        object.__setattr__(self, "output_token_count", output_token_count)
+        object.__setattr__(self, "request_rows_sha256", canonical_sha256(requests))
+        object.__setattr__(self, "round_rows_sha256", canonical_sha256(rounds))
+        object.__setattr__(self, "update_rows_sha256", canonical_sha256(updates))
+        object.__setattr__(
+            self, "performance_counters_sha256", canonical_sha256(performance)
+        )
+        object.__setattr__(self, "final_state_sha256", canonical_sha256(final_state))
+        object.__setattr__(
+            self, "performance_counters_json", _canonical_json_text(performance)
+        )
+
+    @property
+    def performance_counters(self) -> dict[str, object]:
+        value = json.loads(self.performance_counters_json)
+        if not isinstance(value, dict):  # pragma: no cover - constructor invariant
+            raise TypeError("native result performance stopped being an object")
+        return value
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "run_id": self.run_id,
+            "method": self.method,
+            "run_nonce_sha256": self.run_nonce_sha256,
+            "execution_plan_sha256": self.execution_plan_sha256,
+            "rank_config_sha256": self.rank_config_sha256,
+            "attempt_id": self.attempt_id,
+            "terminal_sha256": self.terminal_sha256,
+            "authority_kind": self.authority_kind,
+            "external_control_binding_sha256": (self.external_control_binding_sha256),
+            "external_control_envelope_sha256": (self.external_control_envelope_sha256),
+            "external_control_reservation_sha256": (
+                self.external_control_reservation_sha256
+            ),
+            "requests": [request.to_dict() for request in self.requests],
+            "updates": [update.to_dict() for update in self.updates],
+            "scored_request_ids": list(self.scored_request_ids),
+            "output_token_count": self.output_token_count,
+            "request_rows_sha256": self.request_rows_sha256,
+            "round_rows_sha256": self.round_rows_sha256,
+            "update_rows_sha256": self.update_rows_sha256,
+            "performance_counters_sha256": self.performance_counters_sha256,
+            "final_state_sha256": self.final_state_sha256,
+            "performance_counters": self.performance_counters,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+
+@dataclass(frozen=True)
+class NativeTerminalResultProofArtifact:
+    """Durable external-control proof for native performance/safety rows."""
+
+    schema_version: int
+    kind: str
+    raw_terminal: CanonicalJsonProofBinding
+    control_attestation: ControlArtifactAttestation
+    replay_reservation: ChallengeReplayReservationBinding
+    expected_inventory_sha256: str
+    expected_registry_sha256: str
+    expected_root_manifest_sha256: str
+    result: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.kind != (
+            "native_terminal_result_proof_artifact"
+        ):
+            raise ValueError("native result proof artifact schema is unsupported")
+        if type(self.raw_terminal) is not CanonicalJsonProofBinding:
+            raise TypeError("native result proof requires one raw terminal binding")
+        if type(self.control_attestation) is not ControlArtifactAttestation:
+            raise TypeError("native result proof requires one exact control envelope")
+        if type(self.replay_reservation) is not ChallengeReplayReservationBinding:
+            raise TypeError("native result proof requires one replay reservation")
+        for label, value in (
+            ("native result proof inventory", self.expected_inventory_sha256),
+            ("native result proof registry", self.expected_registry_sha256),
+            ("native result proof release root", self.expected_root_manifest_sha256),
+        ):
+            _sha256(value, label)
+        if (
+            type(self.result) is not dict
+            or self.result.get("kind") != "native_terminal_result_projection"
+        ):
+            raise TypeError("native result proof projection is malformed")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "raw_terminal": self.raw_terminal.to_dict(),
+            "control_attestation": self.control_attestation.to_dict(),
+            "replay_reservation": self.replay_reservation.to_dict(),
+            "expected_inventory_sha256": self.expected_inventory_sha256,
+            "expected_registry_sha256": self.expected_registry_sha256,
+            "expected_root_manifest_sha256": self.expected_root_manifest_sha256,
+            "result": self.result,
+        }
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, value: object) -> NativeTerminalResultProofArtifact:
+        raw = _exact_object(
+            value,
+            {
+                "schema_version",
+                "kind",
+                "raw_terminal",
+                "control_attestation",
+                "replay_reservation",
+                "expected_inventory_sha256",
+                "expected_registry_sha256",
+                "expected_root_manifest_sha256",
+                "result",
+            },
+            "native result proof artifact",
+        )
+        result = raw.pop("result")
+        if type(result) is not dict:
+            raise TypeError("native result proof projection must be an object")
+        raw_terminal = CanonicalJsonProofBinding.from_dict(raw.pop("raw_terminal"))
+        control_attestation = ControlArtifactAttestation.from_dict(
+            raw.pop("control_attestation")
+        )
+        replay_reservation = ChallengeReplayReservationBinding.from_dict(
+            raw.pop("replay_reservation")
+        )
+        return cls(
+            **raw,
+            raw_terminal=raw_terminal,
+            control_attestation=control_attestation,
+            replay_reservation=replay_reservation,
+            result=result,
+        )
+
+    def revalidate(self, *, now_ns: int) -> NativeTerminalResultProjection:
+        evidence = _revalidate_controlled_native_terminal_proof(
+            raw_terminal=self.raw_terminal,
+            control_attestation=self.control_attestation,
+            replay_reservation=self.replay_reservation,
+            expected_inventory_sha256=self.expected_inventory_sha256,
+            expected_registry_sha256=self.expected_registry_sha256,
+            expected_root_manifest_sha256=self.expected_root_manifest_sha256,
+            now_ns=now_ns,
+            field="native result proof",
+        )
+        result = derive_native_terminal_result_projection(evidence)
+        if result.to_dict() != self.result:
+            raise ValueError("native result proof derived projection changed")
+        return result
+
+
+def _revalidate_controlled_native_terminal_proof(
+    *,
+    raw_terminal: CanonicalJsonProofBinding,
+    control_attestation: ControlArtifactAttestation,
+    replay_reservation: ChallengeReplayReservationBinding,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    field: str,
+) -> ValidatedNativeTerminalEvidence:
+    """Deep-reopen a durable external-control proof without replay mutation."""
+
+    if type(now_ns) is not int or now_ns < replay_reservation.reserved_ns:
+        raise ValueError(f"{field} time precedes reservation")
+    if (
+        control_attestation.deployment_policy_authorization.root_manifest_sha256
+        != expected_root_manifest_sha256
+    ):
+        raise ValueError(f"{field} release root differs")
+    prepared = prepare_native_terminal_external_control(
+        raw_terminal.reopen(),
+        control_attestation=control_attestation,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+    )
+    reserved = replay_reservation.revalidate()
+    verified = verify_release_control_artifact_attestation(
+        control_attestation,
+        expected_inventory_sha256=expected_inventory_sha256,
+        now_ns=replay_reservation.reserved_ns,
+        consumed_challenge_sha256s=(),
+    )
+    required_challenges = {
+        verified.challenge_sha256,
+        verified.deployment_policy_challenge_sha256,
+        prepared.evidence.binding.run_nonce_sha256,
+    }
+    if not required_challenges.issubset(set(reserved)):
+        raise ValueError(f"{field} reservation is incomplete")
+    if (
+        verified.artifact_type != "non_serving_terminal"
+        or verified.artifact_sha256 != prepared.binding.sha256
+        or verified.envelope_sha256 != control_attestation.sha256
+    ):
+        raise ValueError(f"{field} control identity differs")
+    raw_evidence = prepared.evidence
+    return ValidatedNativeTerminalEvidence(
+        binding=raw_evidence.binding,
+        begin_receipt=raw_evidence.begin_receipt,
+        reset_receipt=raw_evidence.reset_receipt,
+        requests=raw_evidence.requests,
+        attestation=raw_evidence.attestation,
+        terminal_sha256=raw_evidence.terminal_sha256,
+        raw_json=raw_evidence.raw_json,
+        external_control_binding_sha256=prepared.binding.sha256,
+        external_control_envelope_sha256=verified.envelope_sha256,
+        external_control_reservation_sha256=(replay_reservation.reservation_sha256),
+        external_control_trusted_policy_sha256=(
+            verified.trusted_attester_policy_sha256
+        ),
+        _verification_tag=_VALIDATED_NATIVE_TERMINAL_SENTINEL,
+    )
+
+
+def derive_native_terminal_result_projection(
+    evidence: ValidatedNativeTerminalEvidence,
+) -> NativeTerminalResultProjection:
+    """Project exact native performance/safety rows from controlled evidence."""
+
+    if type(evidence) is not ValidatedNativeTerminalEvidence:
+        raise TypeError("native terminal result requires exact native evidence")
+    return NativeTerminalResultProjection(
+        evidence=evidence,
+        _verification_tag=_NATIVE_TERMINAL_RESULT_SENTINEL,
+    )
+
+
+def derive_native_terminal_result_projection_from_verified_formal_control(
+    value: object,
+    *,
+    expected_binding: NativeTerminalRunBinding,
+    expected_inventory_sha256: str,
+    formal_control_binding_sha256: str,
+    verified_control: VerifiedControlArtifact,
+    replay_reservation: ChallengeReplayReservationBinding,
+) -> NativeTerminalResultProjection:
+    """Project a native TP1 terminal under a verifier-owned formal wrapper.
+
+    The formal wrapper may bind more evidence than the native terminal alone
+    (launch admission, spend ledger, process lifecycle).  This helper accepts
+    only an already verified control and replay reservation, reopens the raw
+    native terminal under the empty remote trust policy, and carries the exact
+    formal control identity into the standard native result projection.
+    """
+
+    if type(verified_control) is not VerifiedControlArtifact:
+        raise TypeError("formal native projection requires verified control")
+    if type(replay_reservation) is not ChallengeReplayReservationBinding:
+        raise TypeError("formal native projection requires replay reservation")
+    _sha256(formal_control_binding_sha256, "formal native control binding")
+    _sha256(expected_inventory_sha256, "formal native expected inventory")
+    if (
+        verified_control.artifact_type != "non_serving_terminal"
+        or verified_control.artifact_sha256 != formal_control_binding_sha256
+    ):
+        raise ValueError("formal native control does not authorize this binding")
+    raw = validate_native_terminal_artifact(
+        value,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        expected_binding=expected_binding,
+    )
+    if raw.binding.run_nonce_sha256 != expected_binding.run_nonce_sha256:
+        raise ValueError("formal native terminal run nonce differs")
+    reserved = replay_reservation.revalidate()
+    required = {
+        expected_binding.run_nonce_sha256,
+        verified_control.challenge_sha256,
+        verified_control.deployment_policy_challenge_sha256,
+    }
+    if not required.issubset(set(reserved)):
+        raise ValueError("formal native terminal replay reservation is incomplete")
+    controlled = ValidatedNativeTerminalEvidence(
+        binding=raw.binding,
+        begin_receipt=raw.begin_receipt,
+        reset_receipt=raw.reset_receipt,
+        requests=raw.requests,
+        attestation=raw.attestation,
+        terminal_sha256=raw.terminal_sha256,
+        raw_json=raw.raw_json,
+        external_control_binding_sha256=formal_control_binding_sha256,
+        external_control_envelope_sha256=verified_control.envelope_sha256,
+        external_control_reservation_sha256=replay_reservation.reservation_sha256,
+        external_control_trusted_policy_sha256=(
+            verified_control.trusted_attester_policy_sha256
+        ),
+        _verification_tag=_VALIDATED_NATIVE_TERMINAL_SENTINEL,
+    )
+    return derive_native_terminal_result_projection(controlled)
+
+
+def derive_candidate_state_replay_pointer(
+    evidence: ValidatedNativeTerminalEvidence,
+) -> CandidateStateReplayPointer:
+    """Derive formal replay provenance from a validated signed terminal only."""
+
+    if type(evidence) is not ValidatedNativeTerminalEvidence:
+        raise TypeError("candidate-state replay requires exact native evidence")
+    if not evidence.trusted_attestation:
+        raise RuntimeError("candidate-state replay requires trusted attestation")
+    envelope = evidence.to_dict()
+    raw_updates = envelope.get("update_rows")
+    if not isinstance(raw_updates, list) or not raw_updates:
+        raise RuntimeError("candidate-state replay lacks update rows")
+    updates: list[CandidateStateByteIdentity] = []
+    for raw in raw_updates:
+        if not isinstance(raw, dict):  # validated evidence invariant
+            raise TypeError("candidate-state replay update is malformed")
+        replay_fields = (
+            raw["source_state_sha256"],
+            raw["candidate_bytes_sha256"],
+            raw["optimizer_state_bytes_sha256"],
+            raw["proposal_evidence_sha256"],
+        )
+        if any(value is None for value in replay_fields):
+            raise RuntimeError(
+                "candidate-state replay requires profile byte identities"
+            )
+        updates.append(
+            CandidateStateByteIdentity(
+                update_index=int(raw["update_index"]),
+                source_round=int(raw["source_round"]),
+                source_version=int(raw["source_version"]),
+                request_ids=tuple(str(value) for value in raw["request_ids"]),
+                source_state_sha256=str(replay_fields[0]),
+                candidate_bytes_sha256=str(replay_fields[1]),
+                optimizer_state_bytes_sha256=str(replay_fields[2]),
+                proposal_evidence_sha256=str(replay_fields[3]),
+                update_sha256=str(raw["update_sha256"]),
+                _verification_tag=_CANDIDATE_STATE_POINTER_SENTINEL,
+            )
+        )
+    return CandidateStateReplayPointer(
+        evidence=evidence,
+        updates=tuple(updates),
+        _verification_tag=_CANDIDATE_STATE_POINTER_SENTINEL,
+    )
+
+
+def _controlled_evidence_for_reservation(
+    prepared: PreparedNativeTerminalExternalControl,
+    verified_control: VerifiedControlArtifact,
+    reservation_sha256: str,
+) -> ValidatedNativeTerminalEvidence:
+    if type(prepared) is not PreparedNativeTerminalExternalControl:
+        raise TypeError("controlled terminal finalization requires one prepared row")
+    if type(verified_control) is not VerifiedControlArtifact:
+        raise TypeError("controlled terminal finalization requires verified control")
+    _sha256(reservation_sha256, "controlled terminal reservation")
+    if (
+        verified_control.artifact_type != "non_serving_terminal"
+        or verified_control.artifact_sha256 != prepared.binding.sha256
+        or verified_control.envelope_sha256 != prepared.control_attestation.sha256
+        or verified_control.trusted_attester_policy_sha256
+        != prepared.control_attestation.trusted_attester_policy_sha256
+    ):
+        raise ValueError("controlled terminal verified identity differs")
+    evidence = prepared.evidence
+    return ValidatedNativeTerminalEvidence(
+        binding=evidence.binding,
+        begin_receipt=evidence.begin_receipt,
+        reset_receipt=evidence.reset_receipt,
+        requests=evidence.requests,
+        attestation=evidence.attestation,
+        terminal_sha256=evidence.terminal_sha256,
+        raw_json=evidence.raw_json,
+        external_control_binding_sha256=prepared.binding.sha256,
+        external_control_envelope_sha256=verified_control.envelope_sha256,
+        external_control_reservation_sha256=reservation_sha256,
+        external_control_trusted_policy_sha256=(
+            verified_control.trusted_attester_policy_sha256
+        ),
+        _verification_tag=_VALIDATED_NATIVE_TERMINAL_SENTINEL,
+    )
+
+
+def project_prepared_candidate_state_replay_pointer(
+    prepared: PreparedNativeTerminalExternalControl,
+    *,
+    verified_control: VerifiedControlArtifact,
+) -> CandidateStateReplayProjection:
+    """Project rows before one wider atomic registry reservation.
+
+    The return type is intentionally not a ``CandidateStateReplayPointer`` and
+    cannot authorize coverage or materialization.  It exists only so a caller
+    can validate the complete candidate-coverage structure before committing a
+    single reservation shared with its registry controls.
+    """
+
+    evidence = _controlled_evidence_for_reservation(
+        prepared,
+        verified_control,
+        "0" * 64,
+    )
+    pointer = derive_candidate_state_replay_pointer(evidence)
+    return CandidateStateReplayProjection(
+        schema_version=1,
+        kind="native_candidate_state_replay_projection_untrusted",
+        terminal_binding_sha256=prepared.binding.sha256,
+        control_envelope_sha256=verified_control.envelope_sha256,
+        pointer_commitment=pointer.semantic_commitment_dict(),
+    )
+
+
+def finalize_prepared_native_terminal_external_controls(
+    prepared: tuple[PreparedNativeTerminalExternalControl, ...],
+    *,
+    verified_controls: tuple[VerifiedControlArtifact, ...],
+    replay_reservation: ChallengeReplayReservationBinding,
+) -> tuple[ValidatedNativeTerminalEvidence, ...]:
+    """Finalize a caller-owned atomic reservation without reserving again."""
+
+    if (
+        type(prepared) is not tuple
+        or not prepared
+        or any(
+            type(row) is not PreparedNativeTerminalExternalControl for row in prepared
+        )
+        or type(verified_controls) is not tuple
+        or len(verified_controls) != len(prepared)
+        or any(type(row) is not VerifiedControlArtifact for row in verified_controls)
+    ):
+        raise TypeError("controlled terminal finalization requires exact tuples")
+    if type(replay_reservation) is not ChallengeReplayReservationBinding:
+        raise TypeError("controlled terminal finalization requires replay binding")
+    reserved = set(replay_reservation.revalidate())
+    results: list[ValidatedNativeTerminalEvidence] = []
+    for row, supplied_verified in zip(prepared, verified_controls, strict=True):
+        reverified = verify_release_control_artifact_attestation(
+            row.control_attestation,
+            expected_inventory_sha256=row.expected_inventory_sha256,
+            now_ns=replay_reservation.reserved_ns,
+            consumed_challenge_sha256s=(),
+        )
+        if reverified != supplied_verified:
+            raise ValueError("controlled terminal verified row changed")
+        required = {
+            reverified.challenge_sha256,
+            reverified.deployment_policy_challenge_sha256,
+            row.evidence.binding.run_nonce_sha256,
+        }
+        if not required.issubset(reserved):
+            raise ValueError("controlled terminal replay reservation is incomplete")
+        results.append(
+            _controlled_evidence_for_reservation(
+                row,
+                reverified,
+                replay_reservation.reservation_sha256,
+            )
+        )
+    return tuple(results)
+
+
+def finalize_prepared_candidate_state_replay_pointers(
+    prepared: tuple[PreparedNativeTerminalExternalControl, ...],
+    *,
+    verified_controls: tuple[VerifiedControlArtifact, ...],
+    replay_reservation: ChallengeReplayReservationBinding,
+) -> tuple[CandidateStateReplayPointer, ...]:
+    """Return sealed pointers after a unified reservation is durable."""
+
+    evidences = finalize_prepared_native_terminal_external_controls(
+        prepared,
+        verified_controls=verified_controls,
+        replay_reservation=replay_reservation,
+    )
+    return tuple(derive_candidate_state_replay_pointer(row) for row in evidences)
+
+
+def validate_candidate_state_replay_pointer_artifact(
+    value: object,
+    *,
+    trusted_attester_policy: TrustedAttesterPolicy,
+) -> CandidateStateReplayPointer:
+    """Deep-reopen a durable native terminal before deriving replay identity."""
+
+    evidence = validate_native_terminal_artifact(
+        value,
+        trusted_attester_policy=trusted_attester_policy,
+    )
+    return derive_candidate_state_replay_pointer(evidence)
 
 
 def _binding_artifact(binding: NativeTerminalRunBinding) -> dict[str, object]:
@@ -959,7 +2610,11 @@ def validate_native_terminal_artifact(
     if type(trusted_attester_policy) is not TrustedAttesterPolicy:
         raise TypeError("terminal artifact requires an exact release policy")
     trusted_attester_policy.validate()
-    raw = _exact_object(value, _ARTIFACT_KEYS, "native terminal artifact")
+    raw = _exact_object(
+        reopen_scalable_native_terminal_artifact(value),
+        _ARTIFACT_KEYS,
+        "native terminal artifact",
+    )
     if (
         raw["schema_version"] != 1
         or raw["artifact_kind"] != NATIVE_TERMINAL_ARTIFACT_KIND
@@ -1031,6 +2686,599 @@ def validate_native_terminal_artifact(
     ):
         raise ValueError("native terminal artifact digest binding is inconsistent")
     return terminal
+
+
+def build_native_terminal_external_control_binding(
+    value: object,
+    *,
+    trusted_attester_policy: TrustedAttesterPolicy,
+    inventory_sha256: str,
+    expected_binding: NativeTerminalRunBinding | None = None,
+    expected_warmup_requests: Sequence[TerminalRequestExpectation] | None = None,
+    expected_scored_requests: Sequence[TerminalRequestExpectation] | None = None,
+) -> NativeTerminalExternalControlBinding:
+    """Deep-validate pulled raw evidence and derive the offline signing subject."""
+
+    _sha256(inventory_sha256, "native terminal external-control inventory")
+    evidence = validate_native_terminal_artifact(
+        value,
+        trusted_attester_policy=trusted_attester_policy,
+        expected_binding=expected_binding,
+        expected_warmup_requests=expected_warmup_requests,
+        expected_scored_requests=expected_scored_requests,
+    )
+    canonical_body = canonical_json_bytes(value) + b"\n"
+    binding = evidence.binding
+    return NativeTerminalExternalControlBinding(
+        schema_version=1,
+        kind="native_terminal_external_control_binding",
+        canonical_raw_sha256=hashlib.sha256(canonical_body).hexdigest(),
+        semantic_artifact_sha256=canonical_sha256(value),
+        terminal_sha256=evidence.terminal_sha256,
+        run_id=binding.run_id,
+        run_nonce_sha256=binding.run_nonce_sha256,
+        execution_plan_sha256=binding.execution_plan_sha256,
+        rank_config_sha256=binding.rank_config_sha256,
+        attempt_id=binding.attempt_id,
+        session_id=binding.session_id,
+        session_epoch=binding.session_epoch,
+        method=binding.method,
+        inventory_sha256=inventory_sha256,
+    )
+
+
+def prepare_native_terminal_external_control(
+    value: object,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_binding: NativeTerminalRunBinding | None = None,
+    expected_warmup_requests: Sequence[TerminalRequestExpectation] | None = None,
+    expected_scored_requests: Sequence[TerminalRequestExpectation] | None = None,
+) -> PreparedNativeTerminalExternalControl:
+    """Deep-check raw evidence and its subject without consuming a nonce."""
+
+    if type(control_attestation) is not ControlArtifactAttestation:
+        raise TypeError("native terminal requires an exact external control")
+    _sha256(expected_inventory_sha256, "native terminal expected inventory")
+    _sha256(expected_registry_sha256, "native terminal expected registry")
+    control_attestation.__post_init__()
+    # Formal remote collection is deliberately unsigned: the offline/root and
+    # signer keys never enter the serving host.  Reopen that raw artifact
+    # under the source-owned empty policy, then authorize it independently via
+    # the dynamic local control below.  Using the signer policy here would
+    # make every first-party unsigned collection impossible to qualify.
+    policy = NO_TRUSTED_ATTESTERS
+    evidence = validate_native_terminal_artifact(
+        value,
+        trusted_attester_policy=policy,
+        expected_binding=expected_binding,
+        expected_warmup_requests=expected_warmup_requests,
+        expected_scored_requests=expected_scored_requests,
+    )
+    control_binding = build_native_terminal_external_control_binding(
+        value,
+        trusted_attester_policy=policy,
+        inventory_sha256=expected_inventory_sha256,
+        expected_binding=expected_binding,
+        expected_warmup_requests=expected_warmup_requests,
+        expected_scored_requests=expected_scored_requests,
+    )
+    subject = control_attestation.subject
+    if (
+        subject.artifact_type != "non_serving_terminal"
+        or subject.artifact_sha256 != control_binding.sha256
+        or subject.protocol_sha256 != NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256
+        or subject.registry_sha256 != expected_registry_sha256
+        or subject.lineage_sha256 != control_binding.lineage_sha256
+    ):
+        raise ValueError("native terminal external control subject is not exact")
+    return PreparedNativeTerminalExternalControl(
+        evidence=evidence,
+        binding=control_binding,
+        control_attestation=control_attestation,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        _verification_tag=_PREPARED_NATIVE_TERMINAL_CONTROL_SENTINEL,
+    )
+
+
+def validate_native_terminal_artifacts_with_external_controls(
+    prepared: tuple[PreparedNativeTerminalExternalControl, ...],
+    *,
+    replay_store: ChallengeReplayStore,
+    now_ns: int,
+) -> tuple[ValidatedNativeTerminalEvidence, ...]:
+    """Verify a complete terminal batch and reserve all challenges atomically."""
+
+    if (
+        type(prepared) is not tuple
+        or not prepared
+        or any(
+            type(row) is not PreparedNativeTerminalExternalControl for row in prepared
+        )
+    ):
+        raise TypeError("native terminal control batch requires exact prepared rows")
+    if type(replay_store) is not ChallengeReplayStore:
+        raise TypeError("native terminal control batch requires the replay store")
+    inventories = {row.expected_inventory_sha256 for row in prepared}
+    if len(inventories) != 1:
+        raise ValueError("native terminal control batch spans multiple inventories")
+    binding_sha256s = tuple(row.binding.sha256 for row in prepared)
+    envelope_sha256s = tuple(row.control_attestation.sha256 for row in prepared)
+    run_attempts = tuple(
+        (row.evidence.binding.run_id, row.evidence.binding.attempt_id)
+        for row in prepared
+    )
+    if (
+        len(set(binding_sha256s)) != len(binding_sha256s)
+        or len(set(envelope_sha256s)) != len(envelope_sha256s)
+        or len(set(run_attempts)) != len(run_attempts)
+    ):
+        raise ValueError("native terminal control batch contains duplicate evidence")
+    controls = tuple(row.control_attestation for row in prepared)
+    run_nonces = tuple(row.evidence.binding.run_nonce_sha256 for row in prepared)
+    if len(set(run_nonces)) != len(run_nonces):
+        raise ValueError("native terminal control batch reuses one run nonce")
+    verified_rows = verify_and_reserve_release_control_artifact_attestations(
+        controls,
+        expected_inventory_sha256=next(iter(inventories)),
+        now_ns=now_ns,
+        replay_store=replay_store,
+        additional_challenge_sha256s=run_nonces,
+    )
+    reservation_sha256 = control_challenge_reservation_sha256(
+        verified_rows,
+        reserved_ns=now_ns,
+        additional_challenge_sha256s=run_nonces,
+    )
+    reservation = replay_store.bind_reservation(reservation_sha256)
+    return finalize_prepared_native_terminal_external_controls(
+        prepared,
+        verified_controls=verified_rows,
+        replay_reservation=reservation,
+    )
+
+
+def validate_native_terminal_artifact_with_external_control(
+    value: object,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    expected_binding: NativeTerminalRunBinding | None = None,
+    expected_warmup_requests: Sequence[TerminalRequestExpectation] | None = None,
+    expected_scored_requests: Sequence[TerminalRequestExpectation] | None = None,
+) -> ValidatedNativeTerminalEvidence:
+    """Authorize one pulled terminal with local root-controlled evidence.
+
+    The control key is intentionally absent from the remote process.  Only the
+    canonical terminal returned by the native producer is accepted, and the
+    deployment/control challenges are reserved atomically before the sealed
+    evidence object becomes trusted.
+    """
+
+    _sha256(expected_root_manifest_sha256, "native terminal expected release root")
+    if (
+        control_attestation.deployment_policy_authorization.root_manifest_sha256
+        != expected_root_manifest_sha256
+    ):
+        raise ValueError("native terminal external control uses another release root")
+    prepared = prepare_native_terminal_external_control(
+        value,
+        control_attestation=control_attestation,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_binding=expected_binding,
+        expected_warmup_requests=expected_warmup_requests,
+        expected_scored_requests=expected_scored_requests,
+    )
+    return validate_native_terminal_artifacts_with_external_controls(
+        (prepared,),
+        replay_store=replay_store,
+        now_ns=now_ns,
+    )[0]
+
+
+def validate_controlled_candidate_state_replay_pointer_artifact(
+    value: object,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    expected_binding: NativeTerminalRunBinding | None = None,
+) -> CandidateStateReplayPointer:
+    """Deep-reopen, externally authorize, then seal candidate-state rows."""
+
+    evidence = validate_native_terminal_artifact_with_external_control(
+        value,
+        control_attestation=control_attestation,
+        replay_store=replay_store,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_root_manifest_sha256=expected_root_manifest_sha256,
+        now_ns=now_ns,
+        expected_binding=expected_binding,
+    )
+    return derive_candidate_state_replay_pointer(evidence)
+
+
+def _reserve_native_terminal_proof_batch(
+    raw_terminal_artifact_paths: tuple[str, ...],
+    *,
+    control_attestations: tuple[ControlArtifactAttestation, ...],
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    proof_artifact_paths: tuple[str, ...],
+    expected_bindings: tuple[NativeTerminalRunBinding | None, ...],
+    field: str,
+) -> tuple[
+    tuple[CanonicalJsonProofBinding, ...],
+    tuple[ValidatedNativeTerminalEvidence, ...],
+    ChallengeReplayReservationBinding,
+]:
+    """Validate a complete proof batch, then reserve its authority once."""
+
+    rows = (
+        raw_terminal_artifact_paths,
+        control_attestations,
+        proof_artifact_paths,
+        expected_bindings,
+    )
+    if (
+        any(type(row) is not tuple for row in rows)
+        or not raw_terminal_artifact_paths
+        or len(raw_terminal_artifact_paths) > 512
+        or any(len(row) != len(raw_terminal_artifact_paths) for row in rows[1:])
+        or any(
+            type(value) is not ControlArtifactAttestation
+            for value in control_attestations
+        )
+        or any(
+            value is not None and type(value) is not NativeTerminalRunBinding
+            for value in expected_bindings
+        )
+    ):
+        raise TypeError(f"{field} batch inputs are not exact")
+    _sha256(expected_inventory_sha256, f"{field} expected inventory")
+    _sha256(expected_registry_sha256, f"{field} expected registry")
+    _sha256(expected_root_manifest_sha256, f"{field} expected release root")
+    if len(set(raw_terminal_artifact_paths)) != len(raw_terminal_artifact_paths) or len(
+        set(proof_artifact_paths)
+    ) != len(proof_artifact_paths):
+        raise ValueError(f"{field} batch paths must be unique")
+    for path_value in proof_artifact_paths:
+        path = Path(path_value)
+        if (
+            not path.is_absolute()
+            or Path(os.path.abspath(path)) != path
+            or path.exists()
+        ):
+            raise ValueError(f"{field} output must be a new absolute path")
+    raw_bindings = tuple(
+        CanonicalJsonProofBinding.bind(path) for path in raw_terminal_artifact_paths
+    )
+    prepared = tuple(
+        prepare_native_terminal_external_control(
+            raw_binding.reopen(),
+            control_attestation=control,
+            expected_inventory_sha256=expected_inventory_sha256,
+            expected_registry_sha256=expected_registry_sha256,
+            expected_binding=expected_binding,
+        )
+        for raw_binding, control, expected_binding in zip(
+            raw_bindings,
+            control_attestations,
+            expected_bindings,
+            strict=True,
+        )
+    )
+    if any(
+        control.deployment_policy_authorization.root_manifest_sha256
+        != expected_root_manifest_sha256
+        for control in control_attestations
+    ):
+        raise ValueError(f"{field} batch uses another release root")
+    evidences = validate_native_terminal_artifacts_with_external_controls(
+        prepared,
+        replay_store=replay_store,
+        now_ns=now_ns,
+    )
+    reservation_sha256s = {
+        evidence.external_control_reservation_sha256 for evidence in evidences
+    }
+    if len(reservation_sha256s) != 1 or None in reservation_sha256s:
+        raise RuntimeError(f"{field} batch lacks one reservation")
+    reservation_sha256 = next(iter(reservation_sha256s))
+    assert reservation_sha256 is not None
+    return (
+        raw_bindings,
+        evidences,
+        replay_store.bind_reservation(reservation_sha256),
+    )
+
+
+def publish_candidate_state_replay_proof_artifact(
+    raw_terminal_artifact_path: str,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    proof_artifact_path: str,
+    expected_binding: NativeTerminalRunBinding | None = None,
+) -> CanonicalJsonProofBinding:
+    """Trust-lift one pulled raw terminal and publish a durable replay proof.
+
+    This is the only producer for the external-control proof artifact.  The
+    raw terminal must already be an immutable canonical file in a safe local
+    evidence directory.  The replay reservation is committed once here; later
+    registry or coverage validation uses :func:`validate_candidate_state_replay_proof_artifact`
+    and never mutates the replay store.
+    """
+
+    return publish_candidate_state_replay_proof_artifacts(
+        (raw_terminal_artifact_path,),
+        control_attestations=(control_attestation,),
+        replay_store=replay_store,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_root_manifest_sha256=expected_root_manifest_sha256,
+        now_ns=now_ns,
+        proof_artifact_paths=(proof_artifact_path,),
+        expected_bindings=(expected_binding,),
+    )[0]
+
+
+def publish_candidate_state_replay_proof_artifacts(
+    raw_terminal_artifact_paths: tuple[str, ...],
+    *,
+    control_attestations: tuple[ControlArtifactAttestation, ...],
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    proof_artifact_paths: tuple[str, ...],
+    expected_bindings: tuple[NativeTerminalRunBinding | None, ...],
+) -> tuple[CanonicalJsonProofBinding, ...]:
+    """Publish one exact terminal batch under a shared atomic reservation.
+
+    All raw terminals, control subjects, and output-path conflicts are checked
+    before the replay ledger changes.  Signature verification and reservation
+    are one locked transaction.  If a later filesystem publication fails, the
+    reservation remains consumed and the function returns no bindings; formal
+    coverage must require the complete returned batch and one shared
+    reservation SHA, so an orphaned partial file remains non-materializable.
+    """
+
+    raw_bindings, evidences, reservation = _reserve_native_terminal_proof_batch(
+        raw_terminal_artifact_paths,
+        control_attestations=control_attestations,
+        replay_store=replay_store,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_root_manifest_sha256=expected_root_manifest_sha256,
+        now_ns=now_ns,
+        proof_artifact_paths=proof_artifact_paths,
+        expected_bindings=expected_bindings,
+        field="candidate-state proof",
+    )
+    bindings: list[CanonicalJsonProofBinding] = []
+    try:
+        for raw_binding, control, evidence, output_path in zip(
+            raw_bindings,
+            control_attestations,
+            evidences,
+            proof_artifact_paths,
+            strict=True,
+        ):
+            pointer = derive_candidate_state_replay_pointer(evidence)
+            artifact = CandidateStateReplayProofArtifact(
+                schema_version=1,
+                kind="native_candidate_state_replay_proof_artifact",
+                raw_terminal=raw_binding,
+                control_attestation=control,
+                replay_reservation=reservation,
+                expected_inventory_sha256=expected_inventory_sha256,
+                expected_registry_sha256=expected_registry_sha256,
+                expected_root_manifest_sha256=expected_root_manifest_sha256,
+                pointer=pointer.to_dict(),
+            )
+            publish_canonical_json_no_replace(output_path, artifact.to_dict())
+            bindings.append(
+                CanonicalJsonProofBinding.bind(
+                    output_path,
+                    semantic_sha256=artifact.sha256,
+                )
+            )
+    except Exception as error:
+        raise RuntimeError(
+            "candidate-state proof batch publication failed after reservation; "
+            "discard every partial output and issue new controls"
+        ) from error
+    return tuple(bindings)
+
+
+def validate_candidate_state_replay_proof_artifact(
+    proof_artifact_path: str,
+    *,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+) -> CandidateStateReplayPointer:
+    """Deep-reopen a durable proof without consuming its challenges again."""
+
+    _sha256(expected_inventory_sha256, "candidate-state expected inventory")
+    _sha256(expected_registry_sha256, "candidate-state expected registry")
+    _sha256(expected_root_manifest_sha256, "candidate-state expected release root")
+    binding = CanonicalJsonProofBinding.bind(proof_artifact_path)
+    artifact = CandidateStateReplayProofArtifact.from_dict(binding.reopen())
+    if (
+        binding.semantic_sha256 != artifact.sha256
+        or artifact.expected_inventory_sha256 != expected_inventory_sha256
+        or artifact.expected_registry_sha256 != expected_registry_sha256
+        or artifact.expected_root_manifest_sha256 != expected_root_manifest_sha256
+    ):
+        raise ValueError("candidate-state proof file identity differs")
+    return artifact.revalidate(now_ns=now_ns)
+
+
+def publish_native_terminal_result_proof_artifact(
+    raw_terminal_artifact_path: str,
+    *,
+    control_attestation: ControlArtifactAttestation,
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    proof_artifact_path: str,
+    expected_binding: NativeTerminalRunBinding,
+) -> CanonicalJsonProofBinding:
+    """Publish one durable native performance/safety result proof."""
+
+    return publish_native_terminal_result_proof_artifacts(
+        (raw_terminal_artifact_path,),
+        control_attestations=(control_attestation,),
+        replay_store=replay_store,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_root_manifest_sha256=expected_root_manifest_sha256,
+        now_ns=now_ns,
+        proof_artifact_paths=(proof_artifact_path,),
+        expected_bindings=(expected_binding,),
+    )[0]
+
+
+def publish_native_terminal_result_proof_artifacts(
+    raw_terminal_artifact_paths: tuple[str, ...],
+    *,
+    control_attestations: tuple[ControlArtifactAttestation, ...],
+    replay_store: ChallengeReplayStore,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    now_ns: int,
+    proof_artifact_paths: tuple[str, ...],
+    expected_bindings: tuple[NativeTerminalRunBinding, ...],
+) -> tuple[CanonicalJsonProofBinding, ...]:
+    """Publish a result-proof batch under one atomic replay reservation."""
+
+    if type(expected_bindings) is not tuple or any(
+        type(value) is not NativeTerminalRunBinding for value in expected_bindings
+    ):
+        raise TypeError("native result proof requires exact expected bindings")
+    raw_bindings, evidences, reservation = _reserve_native_terminal_proof_batch(
+        raw_terminal_artifact_paths,
+        control_attestations=control_attestations,
+        replay_store=replay_store,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_registry_sha256=expected_registry_sha256,
+        expected_root_manifest_sha256=expected_root_manifest_sha256,
+        now_ns=now_ns,
+        proof_artifact_paths=proof_artifact_paths,
+        expected_bindings=expected_bindings,
+        field="native result proof",
+    )
+    bindings: list[CanonicalJsonProofBinding] = []
+    try:
+        for raw_binding, control, evidence, output_path in zip(
+            raw_bindings,
+            control_attestations,
+            evidences,
+            proof_artifact_paths,
+            strict=True,
+        ):
+            result = derive_native_terminal_result_projection(evidence)
+            artifact = NativeTerminalResultProofArtifact(
+                schema_version=1,
+                kind="native_terminal_result_proof_artifact",
+                raw_terminal=raw_binding,
+                control_attestation=control,
+                replay_reservation=reservation,
+                expected_inventory_sha256=expected_inventory_sha256,
+                expected_registry_sha256=expected_registry_sha256,
+                expected_root_manifest_sha256=expected_root_manifest_sha256,
+                result=result.to_dict(),
+            )
+            publish_canonical_json_no_replace(output_path, artifact.to_dict())
+            bindings.append(
+                CanonicalJsonProofBinding.bind(
+                    output_path,
+                    semantic_sha256=artifact.sha256,
+                )
+            )
+    except Exception as error:
+        raise RuntimeError(
+            "native result proof batch publication failed after reservation; "
+            "discard every partial output and issue new controls"
+        ) from error
+    return tuple(bindings)
+
+
+def validate_native_terminal_result_proof_artifact(
+    proof_artifact_path: str,
+    *,
+    expected_inventory_sha256: str,
+    expected_registry_sha256: str,
+    expected_root_manifest_sha256: str,
+    expected_execution_plan_sha256: str,
+    expected_rank_config_sha256: str,
+    expected_run_id: str,
+    expected_run_nonce_sha256: str,
+    expected_attempt_id: str,
+    expected_method: str,
+    now_ns: int,
+) -> NativeTerminalResultProjection:
+    """Deep-reopen one result proof and bind it to formal execution identity."""
+
+    for label, value in (
+        ("native result expected inventory", expected_inventory_sha256),
+        ("native result expected registry", expected_registry_sha256),
+        ("native result expected release root", expected_root_manifest_sha256),
+        ("native result expected execution plan", expected_execution_plan_sha256),
+        ("native result expected rank config", expected_rank_config_sha256),
+        ("native result expected run nonce", expected_run_nonce_sha256),
+    ):
+        _sha256(value, label)
+    _safe_id(expected_run_id, "native result expected run")
+    _safe_id(expected_attempt_id, "native result expected attempt")
+    if expected_method not in SUPPORTED_METHODS:
+        raise ValueError("native result expected method is unsupported")
+    binding = CanonicalJsonProofBinding.bind(proof_artifact_path)
+    artifact = NativeTerminalResultProofArtifact.from_dict(binding.reopen())
+    if (
+        binding.semantic_sha256 != artifact.sha256
+        or artifact.expected_inventory_sha256 != expected_inventory_sha256
+        or artifact.expected_registry_sha256 != expected_registry_sha256
+        or artifact.expected_root_manifest_sha256 != expected_root_manifest_sha256
+    ):
+        raise ValueError("native result proof file identity differs")
+    result = artifact.revalidate(now_ns=now_ns)
+    if (
+        result.execution_plan_sha256 != expected_execution_plan_sha256
+        or result.rank_config_sha256 != expected_rank_config_sha256
+        or result.run_id != expected_run_id
+        or result.run_nonce_sha256 != expected_run_nonce_sha256
+        or result.attempt_id != expected_attempt_id
+        or result.method != expected_method
+    ):
+        raise ValueError("native result proof formal execution identity differs")
+    return result
 
 
 def _validate_capability(
@@ -1444,7 +3692,7 @@ def _validate_performance(
         )
         if raw["verification_waste"] != verified - accepted:
             raise RuntimeError("verification-waste aggregate closure is inconsistent")
-    if method in {"tts", "l0"}:
+    if method in _ADAPTIVE_METHODS:
         for field in (
             "optimizer_bytes",
             "trainable_parameters",
@@ -1572,7 +3820,7 @@ def _validate_state(
         or not raw["adapter_reset_verified"]
     ):
         raise RuntimeError("allocation-free final state reports adaptation mutation")
-    if method in {"tts", "l0"} and (
+    if method in _ADAPTIVE_METHODS and (
         raw["adapter_active_version"] != performance["updates_published"]
         or raw["optimizer_generation"] != performance["updates_published"]
     ):
@@ -1721,6 +3969,7 @@ def _validate_updates(
         "nonfinite_update",
         "reconstruction_mismatch",
     }
+    seen_source_identities: set[tuple[int, int]] = set()
     for expected_index, value_row in enumerate(value):
         raw = _exact_object(value_row, _UPDATE_KEYS, "terminal update row")
         if raw["update_index"] != expected_index:
@@ -1781,6 +4030,28 @@ def _validate_updates(
             "online_effective_experts",
         ):
             _number(raw[field], f"update.{field}", nullable=True, minimum=0)
+        replay_digest_fields = (
+            "source_state_sha256",
+            "candidate_bytes_sha256",
+            "optimizer_state_bytes_sha256",
+            "proposal_evidence_sha256",
+        )
+        replay_digests = tuple(raw[field] for field in replay_digest_fields)
+        if any(value is None for value in replay_digests) and any(
+            value is not None for value in replay_digests
+        ):
+            raise ValueError("terminal mechanism-replay byte digests must be atomic")
+        for field, digest_value in zip(
+            replay_digest_fields, replay_digests, strict=True
+        ):
+            if digest_value is not None:
+                _sha256(digest_value, f"update.{field}")
+        source_identity = (int(raw["source_round"]), int(raw["source_version"]))
+        if source_identity in seen_source_identities:
+            raise RuntimeError(
+                "terminal update duplicates a source-round/version identity"
+            )
+        seen_source_identities.add(source_identity)
         if (
             raw["reconstruction_top1_match"] is not None
             and raw["reconstruction_top1_match"] > 1
@@ -1991,6 +4262,7 @@ def _validate_terminal(
         attestation=attestation,
         terminal_sha256=terminal_digest,
         raw_json=_canonical_json_text(raw),
+        _verification_tag=_VALIDATED_NATIVE_TERMINAL_SENTINEL,
     )
 
 
@@ -2181,3 +4453,319 @@ class NativeTerminalProvider:
         except BaseException:
             self._phase = "FAILED"
             raise
+
+
+def _validate_unsigned_native_result_pointer(value: str) -> dict[str, object]:
+    if type(value) is not str:
+        raise TypeError("unsigned native ITL pointer must be canonical JSON text")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError("unsigned native ITL pointer is not valid JSON") from error
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "hook",
+        "semantics",
+        "release_status",
+        "request_id",
+        "request_started_ns",
+        "request_terminal_ns",
+        "terminal_status",
+        "terminal_reason",
+        "events",
+        "result_pointer_sha256",
+    }
+    row = _exact_object(parsed, expected_fields, "unsigned native ITL pointer")
+    if value != _canonical_json_text(row):
+        raise ValueError("unsigned native ITL pointer is not canonical JSON")
+    digest = _sha256(row["result_pointer_sha256"], "unsigned native ITL result pointer")
+    unsigned = dict(row)
+    unsigned.pop("result_pointer_sha256")
+    if canonical_sha256(unsigned) != digest:
+        raise ValueError("unsigned native ITL pointer content digest mismatch")
+    if (
+        row["schema_version"] != 1
+        or row["kind"] != "sglang_native_itl_result_pointer"
+        or row["hook"] != "sglang.schema_v3.native_per_token_timestamp.v2"
+        or row["semantics"] != "scheduler_committed_token_at_result_processor_v1"
+        or row["release_status"] != "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
+        or row["terminal_status"] != "completed"
+    ):
+        raise ValueError("unsigned native ITL pointer release identity differs")
+    _safe_id(row["request_id"], "unsigned native ITL request")
+    _safe_id(row["terminal_reason"], "unsigned native ITL terminal reason")
+    started_ns = _integer(
+        row["request_started_ns"], "unsigned native ITL request start"
+    )
+    terminal_ns = _integer(
+        row["request_terminal_ns"], "unsigned native ITL request terminal"
+    )
+    if terminal_ns < started_ns:
+        raise ValueError("unsigned native ITL terminal precedes request start")
+    raw_events = row["events"]
+    if type(raw_events) is not list or not raw_events:
+        raise ValueError("unsigned native ITL pointer has no token coverage")
+    previous_ns = started_ns
+    for index, event_value in enumerate(raw_events):
+        event = _exact_object(
+            event_value,
+            {"token_index", "token_id", "observed_ns"},
+            "unsigned native ITL event",
+        )
+        if _integer(event["token_index"], "unsigned native ITL token index") != index:
+            raise ValueError("unsigned native ITL token indices are not contiguous")
+        _integer(event["token_id"], "unsigned native ITL token ID")
+        observed_ns = _integer(event["observed_ns"], "unsigned native ITL observation")
+        if observed_ns <= previous_ns or observed_ns > terminal_ns:
+            raise ValueError("unsigned native ITL observations are not ordered")
+        previous_ns = observed_ns
+    return row
+
+
+def validate_unsigned_native_itl_pointer_bundle(
+    pointer_artifact: str | Path | CanonicalJsonProofBinding,
+    *,
+    expected_binding: NativeTerminalRunBinding,
+    expected_terminal_artifact: CanonicalJsonProofBinding,
+    expected_scored_request_inputs_sha256: str,
+    expected_terminal_output_tokens: Mapping[str, tuple[int, ...]],
+) -> ValidatedUnsignedNativeItlPointerBundle:
+    """Deep-reopen the collector's ITL bundle under exact serving lineage.
+
+    The expected input digest must come from the sealed request materialization;
+    output token tuples must come from the independently validated native
+    terminal.  The returned type is verifier-constructed but remains unsigned
+    input to the later local external-control proof.
+    """
+
+    if type(expected_binding) is not NativeTerminalRunBinding:
+        raise TypeError("unsigned native ITL bundle requires exact run binding")
+    expected_binding.validate()
+    if type(expected_terminal_artifact) is not CanonicalJsonProofBinding:
+        raise TypeError("unsigned native ITL bundle requires terminal binding")
+    expected_terminal_artifact.__post_init__()
+    _sha256(
+        expected_scored_request_inputs_sha256,
+        "unsigned native ITL scored request inputs",
+    )
+    if type(expected_terminal_output_tokens) is not dict:
+        raise TypeError("unsigned native ITL terminal outputs must be an exact map")
+    expected_pointer_ids = tuple(
+        request_id
+        for request_id in expected_binding.scored_request_ids
+        if request_id in expected_terminal_output_tokens
+    )
+    if tuple(expected_terminal_output_tokens) != expected_pointer_ids:
+        raise ValueError("unsigned native ITL terminal output coverage differs")
+    for request_id, token_ids in expected_terminal_output_tokens.items():
+        _safe_id(request_id, "unsigned native ITL expected request")
+        _token_ids(token_ids, "unsigned native ITL expected output tokens")
+    if type(pointer_artifact) is CanonicalJsonProofBinding:
+        artifact = pointer_artifact
+        artifact.__post_init__()
+    elif isinstance(pointer_artifact, (str, Path)):
+        artifact = CanonicalJsonProofBinding.bind(pointer_artifact)
+    else:
+        raise TypeError("unsigned native ITL bundle requires path-bound artifact")
+    raw = _exact_object(
+        reopen_scalable_unsigned_native_itl_bundle(artifact.reopen()),
+        {
+            "schema_version",
+            "kind",
+            "run_binding_sha256",
+            "terminal_artifact_raw_sha256",
+            "terminal_artifact_semantic_sha256",
+            "scored_request_inputs_sha256",
+            "native_result_pointers",
+        },
+        "unsigned native ITL pointer bundle",
+    )
+    expected_run_binding_sha256 = canonical_sha256(expected_binding.begin_payload())
+    if (
+        raw["schema_version"] != 1
+        or raw["kind"] != "unsigned_native_itl_result_pointer_bundle"
+        or raw["run_binding_sha256"] != expected_run_binding_sha256
+        or raw["terminal_artifact_raw_sha256"] != expected_terminal_artifact.raw_sha256
+        or raw["terminal_artifact_semantic_sha256"]
+        != expected_terminal_artifact.semantic_sha256
+        or raw["scored_request_inputs_sha256"] != expected_scored_request_inputs_sha256
+    ):
+        raise ValueError("unsigned native ITL pointer bundle lineage differs")
+    pointer_values = raw["native_result_pointers"]
+    if type(pointer_values) is not list:
+        raise ValueError("unsigned native ITL pointer bundle pointers are malformed")
+    pointers: list[ValidatedUnsignedNativeItlPointer] = []
+    for pointer_value in pointer_values:
+        if type(pointer_value) is not dict:
+            raise TypeError("unsigned native ITL pointer must be an object")
+        row = _validate_unsigned_native_result_pointer(
+            _canonical_json_text(pointer_value)
+        )
+        request_id = str(row["request_id"])
+        raw_events = row["events"]
+        assert isinstance(raw_events, list)
+        events = tuple(
+            UnsignedNativeItlTokenEvent(
+                token_index=int(event["token_index"]),
+                token_id=int(event["token_id"]),
+                observed_ns=int(event["observed_ns"]),
+            )
+            for event in raw_events
+        )
+        if tuple(event.token_id for event in events) != (
+            expected_terminal_output_tokens.get(request_id)
+        ):
+            raise ValueError("unsigned native ITL pointer differs from terminal tokens")
+        pointers.append(
+            ValidatedUnsignedNativeItlPointer(
+                request_id=request_id,
+                request_started_ns=int(row["request_started_ns"]),
+                request_terminal_ns=int(row["request_terminal_ns"]),
+                terminal_status=str(row["terminal_status"]),
+                terminal_reason=str(row["terminal_reason"]),
+                events=events,
+                result_pointer_sha256=str(row["result_pointer_sha256"]),
+                _verification_tag=_VALIDATED_UNSIGNED_ITL_BUNDLE_SENTINEL,
+            )
+        )
+    if tuple(pointer.request_id for pointer in pointers) != expected_pointer_ids:
+        raise ValueError("unsigned native ITL pointer order/coverage differs")
+    return ValidatedUnsignedNativeItlPointerBundle(
+        artifact_raw_sha256=artifact.raw_sha256,
+        artifact_semantic_sha256=artifact.semantic_sha256,
+        run_binding_sha256=expected_run_binding_sha256,
+        terminal_artifact_raw_sha256=expected_terminal_artifact.raw_sha256,
+        terminal_artifact_semantic_sha256=expected_terminal_artifact.semantic_sha256,
+        scored_request_inputs_sha256=expected_scored_request_inputs_sha256,
+        pointers=tuple(pointers),
+        _verification_tag=_VALIDATED_UNSIGNED_ITL_BUNDLE_SENTINEL,
+    )
+
+
+def _validate_bound_serving_phase(
+    requests: Sequence[BoundServingRequest],
+    *,
+    expected_ids: tuple[str, ...],
+) -> tuple[BoundServingRequest, ...]:
+    # Local import avoids the experiments -> orchestration package-init cycle.
+    from lightcone_spec.experiments.serving import BoundServingRequest
+
+    values = tuple(requests)
+    if tuple(request.request_id for request in values) != expected_ids:
+        raise ValueError("unsigned serving inputs differ from terminal binding")
+    for request in values:
+        if type(request) is not BoundServingRequest:
+            raise TypeError("unsigned serving inputs must be exact bound requests")
+        request.validate()
+    return values
+
+
+async def collect_unsigned_native_terminal_artifact(
+    transport: AsyncNativeTerminalAdminTransport,
+    *,
+    binding: NativeTerminalRunBinding,
+    warmup_requests: Sequence[BoundServingRequest],
+    scored_requests: Sequence[BoundServingRequest],
+    execute_requests: Callable[
+        [str, tuple[BoundServingRequest, ...]],
+        Awaitable[UnsignedNativeServingPhaseResult],
+    ],
+    output_path: str,
+    native_itl_pointer_output_path: str,
+    expected_server_process_id: int | None = None,
+) -> UnsignedNativeTerminalCollection:
+    """Run one first-party lifecycle and publish an unsigned raw terminal.
+
+    This is the remote half of the formal evidence DAG.  It intentionally uses
+    ``NO_TRUSTED_ATTESTERS`` and therefore cannot mint an execution/completion
+    authority.  After stable pull, the local verifier must consume the result
+    through the external-control durable proof APIs in this module.
+    """
+
+    if not callable(execute_requests):
+        raise TypeError("unsigned native collection requires a request executor")
+    binding.validate()
+    warmup = _validate_bound_serving_phase(
+        warmup_requests,
+        expected_ids=binding.warmup_request_ids,
+    )
+    scored = _validate_bound_serving_phase(
+        scored_requests,
+        expected_ids=binding.scored_request_ids,
+    )
+    provider = NativeTerminalProvider(
+        transport,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+    )
+    begin_started_ns = time.monotonic_ns()
+    begin = await provider.begin(binding)
+    begin_finished_ns = time.monotonic_ns()
+    if expected_server_process_id is not None and (
+        type(expected_server_process_id) is not int
+        or expected_server_process_id < 1
+        or begin.server_process_id != expected_server_process_id
+    ):
+        raise RuntimeError(
+            "unsigned native lifecycle reached an unexpected server process"
+        )
+    warmup_started_ns = time.monotonic_ns()
+    warmup_result = await execute_requests("warmup", warmup)
+    warmup_finished_ns = time.monotonic_ns()
+    if type(warmup_result) is not UnsignedNativeServingPhaseResult:
+        raise TypeError("unsigned warmup executor returned an untyped result")
+    warmup_result.validate(expected_phase="warmup", bound_requests=warmup)
+    reset_started_ns = time.monotonic_ns()
+    await provider.reset(warmup_requests=warmup_result.requests)
+    reset_finished_ns = time.monotonic_ns()
+    scored_started_ns = time.monotonic_ns()
+    scored_result = await execute_requests("scored", scored)
+    scored_finished_ns = time.monotonic_ns()
+    if type(scored_result) is not UnsignedNativeServingPhaseResult:
+        raise TypeError("unsigned scored executor returned an untyped result")
+    scored_pointers = scored_result.validate(
+        expected_phase="scored", bound_requests=scored
+    )
+    finalize_started_ns = time.monotonic_ns()
+    evidence = await provider.finalize(requests=scored_result.requests)
+    finalize_finished_ns = time.monotonic_ns()
+    if evidence.authority_kind != "untrusted_raw_terminal":
+        raise RuntimeError("unsigned native collection unexpectedly gained authority")
+    terminal_binding = publish_scalable_native_terminal_artifact(
+        output_path=output_path,
+        legacy_artifact=evidence.to_artifact(warmup_requests=warmup_result.requests),
+    )
+    terminal_published_ns = time.monotonic_ns()
+    itl_binding = publish_scalable_unsigned_native_itl_bundle(
+        output_path=native_itl_pointer_output_path,
+        legacy_bundle={
+            "schema_version": 1,
+            "kind": "unsigned_native_itl_result_pointer_bundle",
+            "run_binding_sha256": canonical_sha256(binding.begin_payload()),
+            "terminal_artifact_raw_sha256": terminal_binding.raw_sha256,
+            "terminal_artifact_semantic_sha256": terminal_binding.semantic_sha256,
+            "scored_request_inputs_sha256": canonical_sha256(
+                [request.sha256 for request in scored]
+            ),
+            "native_result_pointers": [dict(value) for value in scored_pointers],
+        },
+    )
+    itl_pointer_published_ns = time.monotonic_ns()
+    return UnsignedNativeTerminalCollection(
+        terminal_artifact=terminal_binding,
+        native_itl_pointer_artifact=itl_binding,
+        lifecycle_events=UnsignedNativeLifecycleEvents(
+            begin_started_ns=begin_started_ns,
+            begin_finished_ns=begin_finished_ns,
+            warmup_started_ns=warmup_started_ns,
+            warmup_finished_ns=warmup_finished_ns,
+            reset_started_ns=reset_started_ns,
+            reset_finished_ns=reset_finished_ns,
+            scored_started_ns=scored_started_ns,
+            scored_finished_ns=scored_finished_ns,
+            finalize_started_ns=finalize_started_ns,
+            finalize_finished_ns=finalize_finished_ns,
+            terminal_published_ns=terminal_published_ns,
+            itl_pointer_published_ns=itl_pointer_published_ns,
+        ),
+    )

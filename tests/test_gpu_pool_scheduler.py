@@ -75,13 +75,14 @@ from lightcone_spec.experiments.registry import (
     ExperimentReceipt,
     ExperimentRegistry,
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
     scientific_role_for_cell,
     serving_cell_rejection_reason,
 )
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
+)
 from lightcone_spec.experiments.stage_activation import (
-    RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE,
     RegistryStageActivationArtifact,
     RegistryStageDispositionStatus,
@@ -281,7 +282,18 @@ def _sealed_e1_activation(
         completed_cells_sha256=content_sha256("e3a-reducer-completed"),
         dependencies=(preflight,),
     )
-    return (preflight, e3a), reduce_e1_activation(
+    tts_cal = registry.make_receipt(
+        "TTS-Cal",
+        {
+            output: content_sha256({"tts-cal-output": output})
+            for output in registry.definition("TTS-Cal").locked_outputs
+        },
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        completed_cells_sha256=content_sha256("tts-cal-reducer-completed"),
+        dependencies=(preflight, e3a),
+    )
+    return (preflight, e3a, tts_cal), reduce_e1_activation(
         registry,
         e3a_receipt=e3a,
         selection=selection,
@@ -1221,7 +1233,7 @@ def test_registered_interference_calibration_freezes_isolated_and_paired_waves(
     cells_by_id = {cell.cell_id: cell for cell in registry.cells}
     items = tuple(
         registry_pool_work_item(cells_by_id[cell_id], estimated_duration_seconds=1.0)
-        for cell_id in activation.activated_cell_ids
+        for cell_id in bootstrap.calibration_cell_ids
     )
 
     plan = _scheduler(
@@ -1515,9 +1527,10 @@ def test_nonserving_cells_without_terminal_contracts_never_dispatch(
         for cell in registry.cells_for("E6")
         if cell.resources.workload_class is WorkloadClass.DOWNLOAD
     )
-    assert release_dispatch_rejection_reason(preflight.cell) == (
-        RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
-    )
+    # The trusted exact-ten runner gives the registered preflight compile row
+    # a source-owned physical path, so the planning-only pool may place it.
+    # Its dedicated launch boundary still requires the exact-ten group spec.
+    assert release_dispatch_rejection_reason(preflight.cell) is None
     assert release_dispatch_rejection_reason(download.cell) == (
         RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE
     )
@@ -1539,12 +1552,15 @@ def test_nonserving_cells_without_terminal_contracts_never_dispatch(
         rules=rules,
         source_receipt_sha256=content_sha256("envelope"),
     )
-    for nonserving in (preflight, download):
-        with pytest.raises(ValueError, match="non-executable"):
-            _scheduler(registry, inventory, envelope).schedule_work_items(
-                (tuning, nonserving),
-                receipts_sha256=content_sha256("receipts"),
-            )
+    _scheduler(registry, inventory, envelope).schedule_work_items(
+        (tuning, preflight),
+        receipts_sha256=content_sha256("receipts"),
+    )
+    with pytest.raises(ValueError, match="non-executable"):
+        _scheduler(registry, inventory, envelope).schedule_work_items(
+            (tuning, download),
+            receipts_sha256=content_sha256("receipts"),
+        )
 
     blocked_profile = next(
         registry_pool_work_item(cell, estimated_duration_seconds=1.0)

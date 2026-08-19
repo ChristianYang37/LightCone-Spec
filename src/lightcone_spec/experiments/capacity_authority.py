@@ -46,6 +46,7 @@ from lightcone_spec.runtime.attestation import (
     SignedAttestation,
     require_release_trusted_attester_policy,
 )
+from lightcone_spec.runtime.proof_artifact import relocated_evidence_path
 
 TRUSTED_CAPACITY_VERIFIER_UNAVAILABLE_REASON = "trusted_capacity_verifier_unavailable"
 
@@ -355,8 +356,8 @@ def load_capacity_raw_json(binding: CapacityRawJsonBinding) -> object:
 
     if type(binding) is not CapacityRawJsonBinding:
         raise TypeError("capacity source must be an exact raw JSON binding")
-    source = Path(binding.path)
-    sidecar = Path(binding.sidecar_path)
+    source = relocated_evidence_path(binding.path)
+    sidecar = relocated_evidence_path(binding.sidecar_path)
     body = _regular_file_bytes(source, label="bound capacity JSON")
     sidecar_body = _regular_file_bytes(sidecar, label="bound capacity JSON sidecar")
     if (
@@ -504,6 +505,60 @@ class CapacityAuthorityResult:
 
 
 @dataclass(frozen=True)
+class UnsignedCapacitySourceReplay:
+    """Verifier-owned replay of raw capacity bytes, prior to control signing."""
+
+    source_manifest: CapacityRawJsonBinding
+    capacity_envelope: CapacityEnvelope
+    budget_inventory: BudgetInventoryIdentity
+    gpu_inventory: GpuInventory
+    registry_sha256: str
+    captured_at_ns: int
+    provider_quota_receipt_sha256: str
+    host_capacity_receipt_sha256: str
+    cell_sizing_receipt_sha256s: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.source_manifest) is not CapacityRawJsonBinding:
+            raise TypeError("capacity replay requires an exact source manifest")
+        if type(self.capacity_envelope) is not CapacityEnvelope:
+            raise TypeError("capacity replay envelope is invalid")
+        if type(self.budget_inventory) is not BudgetInventoryIdentity:
+            raise TypeError("capacity replay budget inventory is invalid")
+        if type(self.gpu_inventory) is not GpuInventory:
+            raise TypeError("capacity replay GPU inventory is invalid")
+        _require_sha256("capacity replay registry", self.registry_sha256)
+        _nonnegative_int("capacity replay capture time", self.captured_at_ns)
+        for label, digest in (
+            ("provider quota", self.provider_quota_receipt_sha256),
+            ("host capacity", self.host_capacity_receipt_sha256),
+        ):
+            _require_sha256(f"capacity replay {label}", digest)
+        if not self.cell_sizing_receipt_sha256s or any(
+            not _is_sha256(value) for value in self.cell_sizing_receipt_sha256s
+        ):
+            raise ValueError("capacity replay sizing receipts are invalid")
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "industrial_unsigned_capacity_source_replay",
+                "source_manifest_sha256": self.source_manifest.sha256,
+                "capacity_envelope_sha256": self.capacity_envelope.sha256,
+                "budget_inventory_sha256": self.budget_inventory.sha256,
+                "gpu_inventory_sha256": self.gpu_inventory.sha256,
+                "registry_sha256": self.registry_sha256,
+                "captured_at_ns": self.captured_at_ns,
+                "provider_quota_receipt_sha256": (self.provider_quota_receipt_sha256),
+                "host_capacity_receipt_sha256": (self.host_capacity_receipt_sha256),
+                "cell_sizing_receipt_sha256s": (self.cell_sizing_receipt_sha256s),
+            }
+        )
+
+
+@dataclass(frozen=True)
 class _ValidatedCapacitySources:
     envelope: CapacityEnvelope
     budget_inventory: BudgetInventoryIdentity
@@ -541,6 +596,45 @@ def build_capacity_verification_payload(
     """Replay a manifest into the exact payload a release verifier must sign."""
 
     return _validate_capacity_sources(source_manifest).verification_payload()
+
+
+def replay_unsigned_capacity_source_manifest(
+    source_manifest_path: str | Path,
+    *,
+    expected_registry_sha256: str,
+    now_ns: int,
+) -> UnsignedCapacitySourceReplay:
+    """Deep-open one fresh raw source set without using the legacy verifier.
+
+    This result is deliberately unsigned.  A stage-capacity reducer must bind
+    it to the exact schedule, derive the gate, and require dynamic ``capacity``
+    control before dispatch.  It cannot independently authorize GPU work.
+    """
+
+    _require_sha256("capacity replay expected registry", expected_registry_sha256)
+    _nonnegative_int("capacity replay current time", now_ns)
+    binding = bind_capacity_raw_json(source_manifest_path)
+    sources = _validate_capacity_sources(load_capacity_raw_json(binding))
+    if sources.registry_sha256 != expected_registry_sha256:
+        raise ValueError("capacity source manifest belongs to another registry")
+    if (
+        now_ns < sources.captured_at_ns
+        or now_ns - sources.captured_at_ns > CAPACITY_MAXIMUM_SOURCE_AGE_NS
+    ):
+        raise ValueError("capacity provider/host observations are stale")
+    replay = UnsignedCapacitySourceReplay(
+        source_manifest=binding,
+        capacity_envelope=sources.envelope,
+        budget_inventory=sources.budget_inventory,
+        gpu_inventory=sources.gpu_inventory,
+        registry_sha256=sources.registry_sha256,
+        captured_at_ns=sources.captured_at_ns,
+        provider_quota_receipt_sha256=sources.provider_receipt_sha256,
+        host_capacity_receipt_sha256=sources.host_receipt_sha256,
+        cell_sizing_receipt_sha256s=sources.sizing_receipt_sha256s,
+    )
+    replay.__post_init__()
+    return replay
 
 
 def _validate_capacity_sources(value: object) -> _ValidatedCapacitySources:
@@ -1074,6 +1168,7 @@ __all__ = [
     "CapacityAuthority",
     "CapacityAuthorityResult",
     "CapacityAuthorityUnavailableError",
+    "UnsignedCapacitySourceReplay",
     "bind_capacity_authority",
     "bind_capacity_raw_json",
     "build_capacity_source_manifest",
@@ -1081,5 +1176,6 @@ __all__ = [
     "capacity_source_receipt_sha256_from_paths",
     "capacity_verification_receipt_template",
     "load_capacity_raw_json",
+    "replay_unsigned_capacity_source_manifest",
     "revalidate_capacity_authority_binding",
 ]

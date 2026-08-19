@@ -45,13 +45,21 @@ RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE = (
 
 REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "industrial_registry_stage_release_capability",
         "generic_stages": _GENERIC_REGISTRY_STAGES,
         "preflight": (
-            "only_registered_static_interference_calibration_cells_are_serving"
+            "registered_compile_exactness_and_static_interference_cells_are_"
+            "planning_schedulable_but_launch_requires_exact_source_owned_inputs"
         ),
-        "compile": "blocked_without_first_party_prewarm_and_result_pointer",
+        "compile": (
+            "first_party_compile_assignment_launch_terminal_and_result_pointer_"
+            "with_dynamic_control_and_durable_prepared_content"
+        ),
+        "exactness": (
+            "first_party_non_serving_exact_eight_runner_terminal_and_schema4_"
+            "qualification_with_dynamic_controls"
+        ),
         "download": "blocked_without_first_party_download_terminal_contract",
         "serving": (
             "target_only_static_and_single_rank_dflash_core_when_exact_semantics_"
@@ -71,7 +79,7 @@ REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256 = content_sha256(
 )
 REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "industrial_registry_stage_activation_reducer",
         "inputs": (
             "exact_registry",
@@ -83,7 +91,40 @@ REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256 = content_sha256(
         "root_authority": "canonical_registry_genesis_v1",
         "cell_selection_input_forbidden": True,
         "all_stage_cells_dispositioned": True,
+        "preflight_availability": (
+            "every_non_na_mandatory_cell_activated_no_partial_stage_promotion"
+        ),
         "release_capability_sha256": REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256,
+    }
+)
+PREFLIGHT_POINTER_RELEASE_CAPABILITY_SHA256 = content_sha256(
+    {
+        "schema_version": 2,
+        "kind": "formal_preflight_pointer_release_capability",
+        "compile": "formal_schema3_compile_result_pointer_and_dynamic_control",
+        "exactness": (
+            "formal_schema4_qualified_exactness_pointer_exact_eight_zero_skip_"
+            "two_rank_native_terminals_rank_aggregate_control_and_reservation"
+        ),
+        "interference": (
+            "eight_path_bound_first_party_assignment_terminal_authorities"
+        ),
+        "coverage": "all_ten_mandatory_registry_cells_exactly_once",
+        "partial": "blocked",
+    }
+)
+PREFLIGHT_POINTER_ACTIVATION_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "formal_preflight_pointer_stage_activation_reducer",
+        "inputs": (
+            "exact_registry",
+            "content_bound_runtime_and_split",
+            "path_bound_compile_exactness_and_interference_source_authority",
+        ),
+        "source_verification": "specialized_deep_reopen_required",
+        "all_mandatory_cells": "activated_only_after_terminal_and_control_replay",
+        "release_capability_sha256": PREFLIGHT_POINTER_RELEASE_CAPABILITY_SHA256,
     }
 )
 
@@ -226,25 +267,38 @@ class RegistryStageActivationArtifact:
     release_capability_sha256: str
     reducer_protocol_sha256: str
     source_authority_sha256: str
-    activation_round: Literal["registry_release_dispatchability_v1"]
+    activation_round: Literal[
+        "registry_release_dispatchability_v1",
+        "preflight_pointer_terminal_dispatchability_v2",
+    ]
     status: Literal["AVAILABLE", "BLOCKED"]
     dispositions: tuple[RegistryStageCellDisposition, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError(
-                "only registry-stage activation artifact schema 1 is supported"
-            )
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
+            raise ValueError("registry-stage activation artifact schema is unsupported")
         for name in ("registry_sha256", "runtime_sha256", "split_sha256"):
             _require_sha256(f"registry-stage {name}", getattr(self, name))
         if self.experiment not in _GENERIC_REGISTRY_STAGES:
             raise ValueError("stage requires a bespoke activation reducer")
-        if self.release_capability_sha256 != (REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256):
-            raise ValueError("registry-stage activation uses another release policy")
-        if self.reducer_protocol_sha256 != (REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256):
-            raise ValueError("registry-stage activation uses another reducer")
-        if self.activation_round != "registry_release_dispatchability_v1":
-            raise ValueError("registry-stage activation round is invalid")
+        specialized_preflight = self.schema_version == 2
+        if specialized_preflight:
+            if (
+                self.experiment != "preflight"
+                or self.release_capability_sha256
+                != PREFLIGHT_POINTER_RELEASE_CAPABILITY_SHA256
+                or self.reducer_protocol_sha256
+                != PREFLIGHT_POINTER_ACTIVATION_PROTOCOL_SHA256
+                or self.activation_round
+                != "preflight_pointer_terminal_dispatchability_v2"
+            ):
+                raise ValueError("specialized preflight activation identity differs")
+        elif (
+            self.release_capability_sha256 != REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256
+            or self.reducer_protocol_sha256 != REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256
+            or self.activation_round != "registry_release_dispatchability_v1"
+        ):
+            raise ValueError("registry-stage activation policy identity differs")
         if any(
             type(receipt) is not ExperimentReceipt
             for receipt in self.dependency_receipts
@@ -273,22 +327,28 @@ class RegistryStageActivationArtifact:
                 raise ValueError("root activation lacks canonical genesis authority")
         elif self.genesis_authority is not None:
             raise ValueError("non-root activation cannot claim genesis authority")
-        expected_source = _source_authority_sha256(
-            registry_sha256=self.registry_sha256,
-            experiment=self.experiment,
-            runtime_sha256=self.runtime_sha256,
-            split_sha256=self.split_sha256,
-            dependency_receipt_sha256s=tuple(
-                receipt.sha256 for receipt in self.dependency_receipts
-            ),
-            genesis_authority_sha256=(
-                None
-                if self.genesis_authority is None
-                else self.genesis_authority.sha256
-            ),
-        )
-        if self.source_authority_sha256 != expected_source:
-            raise ValueError("registry-stage source authority identity mismatch")
+        if specialized_preflight:
+            _require_sha256(
+                "specialized preflight source authority",
+                self.source_authority_sha256,
+            )
+        else:
+            expected_source = _source_authority_sha256(
+                registry_sha256=self.registry_sha256,
+                experiment=self.experiment,
+                runtime_sha256=self.runtime_sha256,
+                split_sha256=self.split_sha256,
+                dependency_receipt_sha256s=tuple(
+                    receipt.sha256 for receipt in self.dependency_receipts
+                ),
+                genesis_authority_sha256=(
+                    None
+                    if self.genesis_authority is None
+                    else self.genesis_authority.sha256
+                ),
+            )
+            if self.source_authority_sha256 != expected_source:
+                raise ValueError("registry-stage source authority identity mismatch")
         if not self.dispositions:
             raise ValueError("registry-stage activation requires cell dispositions")
         if self.dispositions != tuple(
@@ -298,7 +358,26 @@ class RegistryStageActivationArtifact:
                 "registry-stage dispositions must be cell-sorted and unique"
             )
         active = self.activated_cell_ids
-        expected_status = "AVAILABLE" if active else "BLOCKED"
+        if self.experiment == "preflight":
+            # Preflight is a conjunctive release gate.  Compile, exactness and
+            # interference are all mandatory, so a runnable subset cannot
+            # promote the root stage.  N/A rows are explicitly non-mandatory;
+            # every other disposition must be activated.
+            expected_status = (
+                "AVAILABLE"
+                if active
+                and all(
+                    row.status
+                    in {
+                        RegistryStageDispositionStatus.ACTIVATED,
+                        RegistryStageDispositionStatus.NOT_APPLICABLE,
+                    }
+                    for row in self.dispositions
+                )
+                else "BLOCKED"
+            )
+        else:
+            expected_status = "AVAILABLE" if active else "BLOCKED"
         if self.status != expected_status:
             raise ValueError("registry-stage status differs from its dispositions")
 
@@ -359,15 +438,28 @@ def release_execution_capability_rejection_reason(
     if cell.status is not CellStatus.UNMEASURED:
         return cell.reason_code
     # Resource isolation is only a placement property.  It is not terminal
-    # authority.  This release has neither an exact compile-workload manifest
-    # and atomic cache result pointer nor a first-party download receipt
-    # contract, so neither non-serving class may enter the scheduler.
+    # authority.  The two registered preflight non-serving rows have narrow,
+    # source-owned runners; their launch boundaries separately require exact
+    # assignments, content authorities, dynamic controls and typed terminal
+    # pointers.  This predicate grants scheduling capability only.  It never
+    # promotes an unmeasured result or weakens those launch/terminal gates.
     if cell.resources.workload_class is WorkloadClass.COMPILE:
+        if (
+            cell.identity.experiment == "preflight"
+            and cell.identity.task == "environment_and_patch_preflight"
+        ):
+            return None
         return RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE
     if cell.resources.workload_class is WorkloadClass.DOWNLOAD:
         return RELEASE_DOWNLOAD_ASSIGNMENT_CONTRACT_UNAVAILABLE
     if cell.identity.experiment == "preflight":
         if is_serving_interference_calibration_cell(cell):
+            return None
+        if (
+            cell.identity.task == "exactness_memory_telemetry_preflight"
+            and cell.identity.method == "static"
+            and cell.resources.workload_class is WorkloadClass.CORRECTNESS
+        ):
             return None
         return "release_preflight_method_unsupported"
     if cell.identity.topology != "tp1_dp1":
@@ -400,6 +492,13 @@ def release_dispatch_rejection_reason(cell: ExperimentCell) -> str | None:
     capability = release_execution_capability_rejection_reason(cell)
     if capability is not None:
         return capability
+    # Generic activation is a planning disposition, not a launch capability.
+    # The trusted single-operator path reconstructs the exact ten assignments
+    # and its execution functions still require those path-bound inputs.  Keep
+    # all source-owned preflight rows schedulable here so diagnostics and
+    # capacity planning do not depend on the legacy signed dispatch ceremony.
+    if cell.identity.experiment == "preflight":
+        return None
     if is_serving_interference_calibration_cell(cell):
         return None
     if serving_cell_rejection_reason(cell) is not None:
@@ -505,13 +604,113 @@ def materialize_registry_stage_activation(
         activation_round="registry_release_dispatchability_v1",
         status=(
             "AVAILABLE"
-            if any(
-                row.status is RegistryStageDispositionStatus.ACTIVATED for row in rows
+            if (
+                any(
+                    row.status is RegistryStageDispositionStatus.ACTIVATED
+                    for row in rows
+                )
+                and (
+                    experiment != "preflight"
+                    or all(
+                        row.status
+                        in {
+                            RegistryStageDispositionStatus.ACTIVATED,
+                            RegistryStageDispositionStatus.NOT_APPLICABLE,
+                        }
+                        for row in rows
+                    )
+                )
             )
             else "BLOCKED"
         ),
         dispositions=tuple(sorted(rows, key=lambda row: row.cell_id)),
     )
+
+
+def materialize_pointer_preflight_stage_activation(
+    registry: ExperimentRegistry,
+    *,
+    runtime_sha256: str,
+    split_sha256: str,
+    source_authority_sha256: str,
+) -> RegistryStageActivationArtifact:
+    """Activate all mandatory preflight cells from one deep-reopened source.
+
+    This reducer deliberately accepts only the *identity* of the specialized
+    source authority.  The caller must first deep-reopen that authority and
+    later pass it again to :func:`verify_pointer_preflight_stage_activation`.
+    Generic verification never accepts this artifact on a digest alone.
+    """
+
+    if type(registry) is not ExperimentRegistry:
+        raise TypeError("pointer preflight activation requires an exact registry")
+    _require_sha256("pointer preflight runtime", runtime_sha256)
+    _require_sha256("pointer preflight split", split_sha256)
+    _require_sha256("pointer preflight source", source_authority_sha256)
+    if INDUSTRIAL_EXPERIMENT_ORDER[0] != "preflight":
+        raise ValueError("preflight is no longer the registry root stage")
+    genesis = _genesis_authority(registry)
+    rows = tuple(
+        sorted(
+            (
+                RegistryStageCellDisposition(
+                    cell_id=cell.cell_id,
+                    status=(
+                        RegistryStageDispositionStatus.NOT_APPLICABLE
+                        if cell.status is CellStatus.NOT_APPLICABLE
+                        else RegistryStageDispositionStatus.ACTIVATED
+                    ),
+                    reason_code=(
+                        cell.reason_code
+                        if cell.status is CellStatus.NOT_APPLICABLE
+                        else "pointer_terminal_and_control_verified"
+                    ),
+                )
+                for cell in registry.cells_for("preflight")
+            ),
+            key=lambda row: row.cell_id,
+        )
+    )
+    if any(
+        cell.status not in {CellStatus.UNMEASURED, CellStatus.NOT_APPLICABLE}
+        for cell in registry.cells_for("preflight")
+    ):
+        raise ValueError("pointer preflight registry contains a blocked mandatory cell")
+    return RegistryStageActivationArtifact(
+        schema_version=2,
+        registry_sha256=registry.sha256,
+        experiment="preflight",
+        runtime_sha256=runtime_sha256,
+        split_sha256=split_sha256,
+        dependency_receipts=(),
+        genesis_authority=genesis,
+        release_capability_sha256=PREFLIGHT_POINTER_RELEASE_CAPABILITY_SHA256,
+        reducer_protocol_sha256=PREFLIGHT_POINTER_ACTIVATION_PROTOCOL_SHA256,
+        source_authority_sha256=source_authority_sha256,
+        activation_round="preflight_pointer_terminal_dispatchability_v2",
+        status="AVAILABLE",
+        dispositions=rows,
+    )
+
+
+def verify_pointer_preflight_stage_activation(
+    registry: ExperimentRegistry,
+    artifact: RegistryStageActivationArtifact,
+    *,
+    source_authority_sha256: str,
+) -> None:
+    """Replay a specialized preflight activation with an already-open source."""
+
+    if type(artifact) is not RegistryStageActivationArtifact:
+        raise TypeError("pointer preflight authority must be the exact artifact")
+    expected = materialize_pointer_preflight_stage_activation(
+        registry,
+        runtime_sha256=artifact.runtime_sha256,
+        split_sha256=artifact.split_sha256,
+        source_authority_sha256=source_authority_sha256,
+    )
+    if artifact != expected:
+        raise ValueError("preflight activation is not the exact pointer reducer output")
 
 
 def verify_registry_stage_activation(
@@ -522,6 +721,10 @@ def verify_registry_stage_activation(
 
     if type(artifact) is not RegistryStageActivationArtifact:
         raise TypeError("registry-stage authority must be the exact artifact type")
+    if artifact.schema_version == 2:
+        raise ValueError(
+            "pointer preflight activation requires its deep-reopened source authority"
+        )
     expected = materialize_registry_stage_activation(
         registry,
         experiment=artifact.experiment,
@@ -715,6 +918,8 @@ def registry_stage_activation_from_dict(
 
 
 __all__ = [
+    "PREFLIGHT_POINTER_ACTIVATION_PROTOCOL_SHA256",
+    "PREFLIGHT_POINTER_RELEASE_CAPABILITY_SHA256",
     "REGISTRY_STAGE_ACTIVATION_PROTOCOL_SHA256",
     "REGISTRY_STAGE_RELEASE_CAPABILITY_SHA256",
     "RELEASE_COMPILE_ASSIGNMENT_CONTRACT_UNAVAILABLE",
@@ -724,10 +929,12 @@ __all__ = [
     "RegistryStageCellDisposition",
     "RegistryStageDispositionStatus",
     "is_serving_interference_calibration_cell",
+    "materialize_pointer_preflight_stage_activation",
     "materialize_registry_stage_activation",
     "registry_stage_activation_from_dict",
     "registry_stage_activation_to_dict",
     "release_dispatch_rejection_reason",
     "release_execution_capability_rejection_reason",
+    "verify_pointer_preflight_stage_activation",
     "verify_registry_stage_activation",
 ]

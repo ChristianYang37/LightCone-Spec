@@ -8,8 +8,8 @@ LightCone-Spec 分离 Python 协议、面向一次性 SGLang checkout 的 semant
 集成，以及外部模型/数据/run artifact。唯一 runtime 源码身份是固定 upstream commit、
 完整 patch series 与 expected final Git tree。工作区 checkout 永远不是隐式依赖。
 
-CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。当前端到端
-industrial executor 只支持 TP1/DP1 Target-only。固定 patch 现已实现准确的
+CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。当前唯一可用于
+claim 的 execution 是 TP1/DP1 Target-only。固定 patch 现已实现准确的
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
 begin/reset/finalize hook，host 会验证其内容，而不信任 provider attribute。但本 release
 没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0-naive/LightCone 仍在任何 mutation 前
@@ -19,15 +19,16 @@ evidence 仅可用于 regression/debugging，不能支撑新结论。
 
 ## 统一 Decode 与 Candidate 生命周期
 
-Target-only 关闭 speculation，是 industrial executor 当前唯一可完成的 path。Static 是
+Target-only 关闭 speculation，是当前唯一可用于 claim 的 path。Static 是
 零 adaptation 分配的原生 speculative 目标 path，但 release preflight 会在 trusted
 terminal attestation 可用前阻止它。两者的 schema contract 都不导入 adaptation state，也不分配
 optimizer、gradient、candidate 或 adaptation trace。
 
-TTS、L0-naive 与 LC-candidate 复用一个有界 candidate-lifecycle 实现；固定 patch 只为
-TP1/DP1 DFlash 实现底层路径与 native terminal lifecycle。Recipe authority 与 publication
-policy 保持正交，共享 machinery 不会合并 live candidate、optimizer state、config 或 evidence；
-没有 trusted signer 时仍不构成 release-executable support：
+TTS、L0-naive 与 LC-candidate 复用一个有界 candidate-lifecycle 实现。固定 patch 还包含
+注册的 DSpark、NEXTN、compatible EAGLE3、TP2 与 sticky DP2 source path。Recipe authority
+与 publication policy 保持正交，共享 machinery 不会合并 live candidate、optimizer state、
+config 或 evidence；每个准确 path 都必须通过 dynamic GPU qualification 与 trusted
+external-control proof 才可用于 claim：
 
 1. Verification 为实际被采样的 proposal 生成一个 `ProposalEvidence` envelope；
 2. Cohort 只保留每个请求最新的合法 supervision row，并把 batch 绑定到 cohort、epoch、
@@ -62,22 +63,26 @@ Candidate equality 只在 source-state 与 proposal-evidence digest 完全相同
 目标 contract 要求构造阶段检查 shape、dtype、device、唯一性与身份，同时把数值检查保留
 为 device predicate；还要求 backend validator 重建 `proposal_logits`、
 `corrected_distribution` 与可选 confidence，并在 native inference 已施加 adapter 时拒绝
-额外 delta。当前 patch 只为 TP1/DP1 DFlash 实现该底层 adaptive reconstruction。
+额外 delta。固定 patch 已为 DFlash、DSpark、NEXTN 以及受官方 selector 门控的 EAGLE3
+实现 reconstruction。这些是源码能力而非硬件结论；每条路径在其准确、全新的 GPU
+qualification 被验证前都保持 fail closed。
 
-目标 envelope 声明、但本 release 不执行下列 cross-backend 语义：
+Cross-backend 语义如下：
 
 - DFlash 绑定 deployed differentiable canvas 与 sampling-time proposal correction；只有该
   backend 具有底层 adaptive patch path；
 - DSpark 绑定真实 inference-native Markov W1/W2 feature、实际 sampled predecessor、
   scheduler mode、proposal distribution 与 confidence state；
-- EAGLE/EAGLE3 绑定 tree state、top-k-one execution，以及贯穿整个 proposal/verification
-  chain 的一个 source version；
-- NEXTN 绑定 native MTP hidden state 与不可变 upstream interface digest。其目标 contract
-  还将要求 interface 与 memory-fit preflight；当前 schema 会独立拒绝它。
+- EAGLE3 绑定 tree state、top-k-one execution，以及贯穿整个 proposal/verification chain
+  的一个 source version，但只适用于 prepared-model selector 判定为 compatible 的组合；
+  generic EAGLE 仍不受支持；
+- NEXTN 绑定 native MTP hidden state 与不可变 upstream interface digest，并要求
+  interface 与 memory-fit preflight。
 
-DSpark、EAGLE、EAGLE3 与 NEXTN adaptation 会在 model loading 前保持 `BLOCKED`。在目标
-contract 中，历史 drafter KV 被 detach、不可变且带版本；合格 update path 可把它当作
-state 使用，但绝不能重建或对其求导，未来 KV 记录最新 published version。
+DSpark、NEXTN 与 compatible EAGLE3 的状态为
+`implemented_pending_dynamic_gpu_proof`；proof 缺失或不匹配时会在 worker allocation 前
+拒绝。EAGLE 不受支持。历史 drafter KV 被 detach、不可变且带版本；合格 update path
+可把它当作 state 使用，但绝不能重建或对其求导，未来 KV 记录最新 published version。
 
 ## Trainable Plan
 
@@ -104,17 +109,17 @@ Plan 按实际 coordinate 与 optimizer state 计算显存，而不是使用 mod
 
 ## Topology 与发布
 
-目标 schema 与 CPU coordinator vocabulary 描述单主机 TP1/DP1、TP2/DP1 与 TP1/DP2
-identity。当前 `RunConfig` 只接受 TP1/DP1；由于本 release 无法签发内容绑定的
-`patched_two_gpu_v1` capability receipt，它会在 model loading 前拒绝全部 TP2/DP2 config。
-目标 multi-rank receipt 会绑定 global/local/TP/DP rank、device、node、process、rendezvous、
-router、clock、runtime 与 model identity。
+Schema 与 coordinator 描述单主机 TP1/DP1、TP2/DP1 与 TP1/DP2。`RunConfig` 只在携带
+准确的 source-owned `patched_two_gpu_v1` capability identity 时接受双 rank 配置；formal
+dispatch 还必须验证全新的 root-authorized dynamic GPU proof。Caller 自填 receipt 不能
+启用它。Multi-rank identity 绑定 global/local/TP/DP rank、device、node、process、
+rendezvous、router、clock、runtime 与 model identity。
 
-在该不可执行目标 coordinator contract 中，TP trainable state 跟随 inference ownership。Sharded parameter 保持 local；replicated
+在该 coordinator contract 中，TP trainable state 跟随 inference ownership。Sharded parameter 保持 local；replicated
 parameter 只在所属 TP replica 内 reduce。DP 使用 sticky cohort routing：一个 cohort 始终
 留在 replica-local，replica 之间绝不平均 adaptation gradient。
 
-目标 distributed publication 分两阶段。每个 rank 对同一个 retry-stable update/candidate 身份
+Distributed publication 分两阶段。每个 rank 对同一个 retry-stable update/candidate 身份
 prepare，并报告 source version、epoch、buffer/optimizer generation、readiness、finiteness、
 memory reservation、safe boundary 与 process-group health。单一 all-rank decision 要么全部
 commit，要么全部 abort；post-copy receipt 会拒绝 partial application。Collective 或 split
@@ -179,8 +184,10 @@ offload；transfer/reclamation receipt 保留 slab 与 byte 身份。
 Load trace 为 request content、arrival、timeout/cancellation 与 warmup/scored window 绑定
 相互独立的身份。Synthetic Poisson 与 immediate-burst generator 按 seed 确定，并明确标为
 synthetic。没有不可变外部 corpus digest 时，BurstGPT-shaped trace 不会被表示成真实数据集。
-配对方法必须绑定相同 trace digest，并把每个 offered request 恰好计为 rejected、completed、
-timed out、cancelled 或 unfinished。
+配对方法必须绑定相同的完整 registered source-pool digest；closed-loop 中各 method 实际消费的
+offered prefix 与 observed output token 不会重新定义配对。Completed output 由独立 exactness
+gate 检查；每个 offered request 恰好计为 rejected、completed、timed out、cancelled 或
+unfinished。
 
 Evidence schema 可以表示每个 process/rank 的 run、request、round、update 与 performance
 record，并通过有界 queue 写入。
@@ -237,11 +244,13 @@ resume 也绝不从目录存在推断完成。Dispatch 会在每个 runner 前�
 WAVE/INTENT/FINISH hash chain；partial sibling failure 会保留成功 raw terminal authority，
 未完成 intent 则阻断，而不是伪造 retry cost。
 
-Reducer-owned activation artifact 从 1,428 个 template 中只 materialize E1 的一个 68-cell
-slice：两个 fixed reference、32 geometry 下共 64 个 L0-policy LC-candidate，以及 stage-level
-的一个 frozen-TTS anchor 与一个 frozen-L0-naive anchor。E2 在四个 successive-halving round
-中有 11,920 个 template，只调优 LC-candidate，并为每个 stage 各带一次 frozen baseline。
-只有准确 sealed E2 final-recipe receipt 才能产生 LightCone role。Confirmation
+Reducer-owned signed materialization 消费 sealed upstream receipt，恰好生成一个 68-cell
+E1 stage：Target-only、Static、frozen TTS、frozen L0-naive，以及 32 个 geometry、每个两个
+optimizer anchor 所形成的 64 个 LightCone candidate。L0-naive 只是 mechanism anchor，不参与
+候选排名。对 `g` 个 E1 survivor geometry，E2 首轮物化 `n0 = 105g` 个 recipe（七种
+optimizer × 三种 schedule × 五个 learning rate），后三轮满足
+`n(k+1) = max(ceil(nk/4), 21)`，且每轮另带四个 fixed anchor；不存在 eager sentinel
+matrix。只有准确 sealed E2 final-recipe receipt 才能产生 LightCone role。Confirmation
 planning 以 family 为局部单位：恰好四个 excluded pilot 会在 confirmation 可见前选择
 `POWERED` 的 12--20-block final prefix，或选择 `UNDERPOWERED`。合法 Target-only 复用必须
 使用 byte-equivalent、content-bound evidence alias；analysis 会保留其 dependence unit，
@@ -256,11 +265,11 @@ compile-cache base 使用每个 process 的 private overlay，official serving c
 caller-owned HTTP pool，evidence writer 批量写 durable WAL row group，同时保留 terminal
 fsync 与 coverage check。
 
-Registry 与 pool planning 都不分配 device state，也不产生实证结论。其 target declaration
-不会绕过 release preflight：Static/TTS/L0-naive/LightCone 因 trusted signer 保持 `BLOCKED`；全部 TP2/DP2
-和不受支持的 adaptive backend 仍受各自 implementation gate 阻止。
+Registry 与 pool planning 都不分配 device state，也不产生实证结论。其 declaration 不会
+绕过 release preflight：每个正式角色仍须具备签名 content、capacity、compile、execution、
+terminal 与 qualification 全链。TP2/DP2 和 backend 专属路径在准确 dynamic proof 出现前
+仍保持 blocked。
 
-本 release 不声明 speculative industrial execution、multi-rank model execution、跨主机
-collective、Kubernetes scheduling、elastic membership、remote evidence storage 或 automatic
-failover。Multi-host control plane 只分发 independent host-local work，也不包含任何新 GPU
-结果。
+本 release 不声明已完成 industrial measurement、跨主机 collective、Kubernetes scheduling、
+elastic membership、remote evidence storage 或 automatic failover。Multi-host control plane
+只分发 independent host-local work；源码实现不能替代全新的 GPU 结果。

@@ -24,6 +24,8 @@ from lightcone_spec.experiments.statistics import (
     holm_primary_contrasts,
     paired_bca_contrast,
     preregister_power_sizing,
+    resolve_paired_bca_contrast,
+    resolve_preregistered_power_sizing,
     time_block_bootstrap,
     validate_final_block_ids,
     validate_hardware_block,
@@ -60,6 +62,91 @@ def test_power_sizing_uses_four_excluded_pilots_and_fixed_range() -> None:
         validate_final_block_ids(plan, ("pilot-0", *final_ids[1:]))
     with pytest.raises(ValueError, match="count"):
         validate_final_block_ids(plan, final_ids[:-1])
+
+
+@pytest.mark.parametrize(
+    ("blocks", "reason"),
+    (
+        (
+            tuple(
+                PilotBlock(
+                    block_id=f"zero-{index}",
+                    static_goodput=100.0,
+                    tts_goodput=101.0,
+                    lightcone_goodput=0.0 if index == 2 else 103.0,
+                )
+                for index in range(4)
+            ),
+            "UNRESOLVED_ZERO_GOODPUT",
+        ),
+        (
+            tuple(
+                PilotBlock(
+                    block_id=f"constant-{index}",
+                    static_goodput=100.0,
+                    tts_goodput=101.0,
+                    lightcone_goodput=103.0,
+                )
+                for index in range(4)
+            ),
+            "UNRESOLVED_ZERO_VARIANCE",
+        ),
+    ),
+)
+def test_power_resolution_seals_valid_zero_without_pseudocount(
+    blocks: tuple[PilotBlock, ...],
+    reason: str,
+) -> None:
+    result = resolve_preregistered_power_sizing(blocks)
+
+    assert result.status == "POWER_UNRESOLVED"
+    assert result.reason_code == reason
+    assert result.selected_final_blocks is None
+    assert not hasattr(result, "power_grid")
+
+
+def test_paired_resolution_preserves_other_contrasts_without_fake_ci() -> None:
+    zero = resolve_paired_bca_contrast(
+        "zero",
+        {"b0": (0.0, 1.0), "b1": (1.0, 1.0)},
+    )
+    constant = resolve_paired_bca_contrast(
+        "constant",
+        {"b0": (2.0, 1.0), "b1": (2.0, 1.0)},
+    )
+    resolved = resolve_paired_bca_contrast(
+        "resolved",
+        {"b0": (2.0, 1.0), "b1": (3.0, 1.0)},
+        repetitions=100,
+    )
+
+    assert zero.status == "UNRESOLVED_ZERO_GOODPUT"
+    assert constant.status == "UNRESOLVED_ZERO_VARIANCE"
+    assert not hasattr(zero, "ci_lower_relative_gain")
+    assert not hasattr(constant, "raw_p_value")
+    assert resolved.name == "resolved"
+    assert hasattr(resolved, "ci_lower_relative_gain")
+    with pytest.raises(ValueError, match="fixed at 95%"):
+        resolve_paired_bca_contrast(
+            "zero",
+            {"b0": (0.0, 1.0), "b1": (1.0, 1.0)},
+            confidence=0.90,
+        )
+
+
+def test_zero_aware_resolvers_reject_non_numeric_measurements() -> None:
+    malformed_pilots = list(pilot_blocks())
+    malformed_pilots[0] = replace(
+        malformed_pilots[0],
+        static_goodput=True,  # type: ignore[arg-type]
+    )
+    with pytest.raises(TypeError, match="real number"):
+        resolve_preregistered_power_sizing(tuple(malformed_pilots))
+    with pytest.raises(TypeError, match="real numbers"):
+        resolve_paired_bca_contrast(
+            "malformed",
+            {"b0": ("1", 1.0), "b1": (2.0, 1.0)},  # type: ignore[dict-item]
+        )
 
 
 def test_power_sizing_marks_twenty_blocks_underpowered_without_extension() -> None:

@@ -6,12 +6,17 @@ import torch
 from lightcone_spec.adaptation.memory import AdaptationMemoryLedger, tensor_bytes
 from lightcone_spec.adaptation.optimizer import FixedAddressBank, GPUOptimizer
 from lightcone_spec.adaptation.parameters import (
+    TRAINABLE_PLAN_OPTIMIZERS,
     DFlashParameterPlan,
     DSparkParameterPlan,
     LoRAFactors,
     NativeLayerParameterPlan,
 )
 from lightcone_spec.config.schema import OptimizerConfig
+from lightcone_spec.experiments.formal_protocol import (
+    ChronoBeliefState,
+    chronobelief_reference_transition,
+)
 from lightcone_spec.runtime.dflash_canvas import (
     CanvasReconstruction,
     DifferentiableCanvasContract,
@@ -141,6 +146,194 @@ def test_muon_matches_reference_and_uses_adamw_for_non_matrices() -> None:
     torch.testing.assert_close(proposal.parameters[1], auxiliary.detach())
     assert proposal.second_moments[0].numel() == 0
     assert proposal.second_moments[1].numel() == vector.numel()
+
+
+def test_seven_registered_optimizer_reference_paths_are_implemented() -> None:
+    assert TRAINABLE_PLAN_OPTIMIZERS == (
+        "adam",
+        "adamw",
+        "chronobelief",
+        "lion",
+        "muon",
+        "nag",
+        "sgdm",
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_chronobelief_matches_cpu_reference_and_mixed_precision(dtype) -> None:
+    initial = torch.tensor([0.75, -1.25], dtype=dtype)
+    gradient = torch.tensor([0.2, -0.4], dtype=dtype)
+    config = optimizer_config("chronobelief", weight_decay=0.01)
+    optimizer = GPUOptimizer((initial,), config, initial_safe_boundary_version=3)
+    proposal = optimizer.propose((gradient,), source_version=0, safe_boundary_version=3)
+    reference = chronobelief_reference_transition(
+        ChronoBeliefState(
+            tuple(float(value) for value in initial.float()),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            0,
+        ),
+        tuple(float(value) for value in gradient.float()),
+        safe_boundary_age=3,
+        learning_rate=config.learning_rate,
+        beta1=config.beta1,
+        beta2=config.beta2,
+        epsilon=config.epsilon,
+        weight_decay=config.weight_decay,
+    )
+    torch.testing.assert_close(
+        proposal.parameters[0],
+        torch.tensor(reference.parameters),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    torch.testing.assert_close(
+        proposal.first_moments[0],
+        torch.tensor(reference.first_moments),
+    )
+    torch.testing.assert_close(
+        proposal.second_moments[0],
+        torch.tensor(reference.second_moments),
+        rtol=2e-5,
+        atol=2e-5,
+    )
+    assert proposal.safe_boundary_age == 3
+
+
+def test_chronobelief_age_is_exact_and_abort_does_not_advance_state() -> None:
+    optimizer = GPUOptimizer(
+        (torch.tensor([1.0, -2.0]),),
+        optimizer_config("chronobelief", weight_decay=0.01),
+        initial_safe_boundary_version=5,
+    )
+    with pytest.raises(ValueError, match="source versions"):
+        optimizer.propose((torch.tensor([0.25, -0.5]),))
+    with pytest.raises(ValueError, match="derived from source versions"):
+        optimizer.propose(
+            (torch.tensor([0.25, -0.5]),),
+            safe_boundary_age=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="current safe boundary"):
+        optimizer.propose(
+            (torch.tensor([0.25, -0.5]),),
+            source_version=0,
+            safe_boundary_version=4,
+        )
+
+    first = optimizer.propose(
+        (torch.tensor([0.25, -0.5]),),
+        source_version=5,
+        safe_boundary_version=5,
+    )
+    stale = optimizer.propose(
+        (torch.tensor([0.25, -0.5]),),
+        source_version=0,
+        safe_boundary_version=5,
+    )
+    assert first.step == stale.step == 1
+    assert optimizer.step_number == 0
+    assert all(bool((moment == 0).all()) for moment in optimizer.first_moments)
+    assert all(bool((moment == 0).all()) for moment in optimizer.second_moments)
+    assert not torch.equal(first.parameters[0], stale.parameters[0])
+
+    optimizer.commit(stale)
+    assert optimizer.step_number == 1
+    assert optimizer.safe_boundary_version == 6
+    torch.testing.assert_close(optimizer.master[0], stale.parameters[0])
+    torch.testing.assert_close(optimizer.first_moments[0], stale.first_moments[0])
+    torch.testing.assert_close(optimizer.second_moments[0], stale.second_moments[0])
+    with pytest.raises(ValueError, match="step conflict"):
+        optimizer.commit(first)
+
+    other = GPUOptimizer(
+        (torch.tensor([1.0, -2.0]),),
+        optimizer_config("chronobelief", weight_decay=0.01),
+        initial_safe_boundary_version=5,
+    )
+    foreign = other.propose(
+        (torch.tensor([0.25, -0.5]),),
+        source_version=5,
+        safe_boundary_version=5,
+    )
+    with pytest.raises(ValueError, match="another state owner"):
+        optimizer.commit(foreign)
+
+
+def test_chronobelief_large_age_is_safe_and_nonfinite_candidates_are_rejected() -> None:
+    config = OptimizerConfig(
+        name="chronobelief",
+        learning_rate=0.01,
+        weight_decay=0.0,
+        beta1=0.99,
+        beta2=0.01,
+        epsilon=1e-8,
+        grad_clip=1.0,
+    )
+    optimizer = GPUOptimizer(
+        (torch.tensor([1.0]),),
+        config,
+        initial_safe_boundary_version=10**9,
+    )
+    proposal = optimizer.propose(
+        (torch.tensor([0.25]),),
+        source_version=0,
+        safe_boundary_version=10**9,
+    )
+    assert bool(torch.isfinite(proposal.parameters[0]).all())
+    assert bool(torch.isfinite(proposal.first_moments[0]).all())
+    assert bool(torch.isfinite(proposal.second_moments[0]).all())
+
+    overflow = GPUOptimizer(
+        (torch.tensor([3e38]),),
+        OptimizerConfig(
+            name="chronobelief",
+            learning_rate=1e38,
+            weight_decay=1e38,
+            beta1=0.9,
+            beta2=0.999,
+            epsilon=1e-8,
+            grad_clip=1.0,
+        ),
+    )
+    with pytest.raises(ValueError, match="proposal is non-finite"):
+        overflow.propose(
+            (torch.tensor([1.0]),),
+            source_version=0,
+            safe_boundary_version=0,
+        )
+
+
+def test_tts_none_gradient_clipping_is_exact_and_l0_candidate_bytes_match() -> None:
+    config = OptimizerConfig(
+        name="adam",
+        learning_rate=0.1,
+        weight_decay=0.0,
+        beta1=0.9,
+        beta2=0.999,
+        epsilon=1e-8,
+        grad_clip=None,
+    )
+    assert OptimizerConfig.model_validate(config.model_dump()).grad_clip is None
+    initial = torch.tensor([1.0, -2.0])
+    gradient = torch.tensor([100.0, -200.0])
+    tts = GPUOptimizer((initial,), config).propose((gradient,))
+    l0_naive = GPUOptimizer((initial,), config).propose((gradient,))
+    expected_first = 0.1 * gradient
+    expected_second = 0.001 * gradient.square()
+    expected_direction = (expected_first / 0.1) / (
+        (expected_second / 0.001).sqrt() + 1e-8
+    )
+    torch.testing.assert_close(tts.parameters[0], initial - 0.1 * expected_direction)
+    assert torch.equal(tts.parameters[0], l0_naive.parameters[0])
+    assert torch.equal(tts.first_moments[0], l0_naive.first_moments[0])
+    assert torch.equal(tts.second_moments[0], l0_naive.second_moments[0])
+
+    clipped = GPUOptimizer(
+        (initial,),
+        OptimizerConfig(**{**config.model_dump(), "grad_clip": 1.0}),
+    ).propose((gradient,))
+    assert not torch.equal(tts.first_moments[0], clipped.first_moments[0])
 
 
 def test_optimizer_rejects_layout_and_step_conflicts() -> None:
@@ -343,6 +536,18 @@ def test_lora_memory_charges_full_fixed_banks_and_merge_temporaries() -> None:
     assert prediction.staging == prediction.active_merged
     assert prediction.merge_scratch == 3 * 4 * 4 * 4
     assert prediction.peak_bytes > prediction.resident_bytes
+
+
+def test_chronobelief_memory_reserves_both_fp32_moment_vectors() -> None:
+    plan = DFlashParameterPlan.build(
+        {"layers.0.self_attn.q_proj.weight": torch.zeros(4, 4)},
+        mode="full",
+        scope="last1",
+    )
+    prediction = plan.predict_memory("chronobelief")
+    assert prediction.optimizer_first == 4 * plan.trainable_parameter_count
+    assert prediction.optimizer_second == 4 * plan.trainable_parameter_count
+    assert prediction == plan.predict_memory("adamw")
 
 
 def test_memory_ledger_reserves_adaptation_before_kv() -> None:

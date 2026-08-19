@@ -4,11 +4,13 @@
 
 ## 目标函数与科学身份
 
-下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。
-Industrial executor 当前只完成 TP1/DP1 Target-only。固定 patch 已包含 native
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，但底层 adaptive
-implementation 仍只支持 TP1/DP1 DFlash，且没有配置 trusted hardware signer。因此
-Static/TTS/L0-naive/LightCone 会在 mutation 前 blocked，并且目前没有任何新 GPU 结果。
+下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。当前
+唯一可用于 claim 的 execution 仍是 TP1/DP1 Target-only。固定 patch 已包含 native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，以及注册的
+DFlash、DSpark、NEXTN、compatible EAGLE3、TP2 与 sticky DP2 source implementation。但这些
+都不是 GPU 结果：准确 dynamic suite 与 trusted external-control proof 尚未生成，也没有配置
+trusted hardware signer。因此 Static/TTS/L0-naive/LightCone 会在 mutation 前 blocked，并且
+目前没有任何新 GPU 结果。
 
 Recipe authority 与 publication policy 是不同的数学身份。Target-only 与 Static 在结构上
 保持零 adaptation state。TTS 使用 frozen TTS recipe 与 fixed barrier；L0-naive 使用同一个
@@ -49,16 +51,16 @@ $$
 +\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
 $$
 
-其 update-recipe authority 指定 Adam、准确一次 optimization step、逐 request reset 与
-strided side CUDA stream。与 recipe 正交，TTS publication 使用论文的 fixed synchronization
-barrier。经审计的
-[arXiv v2 论文](https://arxiv.org/abs/2605.09329v2) 没有披露 numeric learning rate/schedule、
-Adam beta/epsilon 或 optimizer-state reset、weight decay/clip、position-weight value、
-$\lambda$、loss normalization/precision/temperature、准确 trainable-parameter manifest、
-stride-selection rule 或官方 implementation commit。因此 authority 标记为
-`TTS-paper-reconstruction`，不具备 formal eligibility，并在作者/用户 recipe 或预注册
-TTS-only reconstruction rule 封存这些字段前保持 `BLOCKED`。它不能继承上面的 exponential
-weight、E1/E2 winner、schema default 或历史 AdamW recipe。
+经审计的 [arXiv v2 论文](https://arxiv.org/abs/2605.09329v2) 没有披露全部数值字段，因此历史
+`TTS-paper-reconstruction` authority 继续是 diagnostic 且不具备 formal eligibility。Formal
+TTS-Cal authority 是独立预注册 reconstruction：Adam、准确一步、
+`(beta1=.9, beta2=.999, epsilon=1e-8)`、zero decay、无 clipping、全 drafter/
+latest-round-only update、digest-bound drafter-native position/proximal loss recipe、逐 request
+reset、side stream、learning rate `1e-7, 3e-7, ..., 1e-3` 与 stride
+`{1,5,10,15,20,30,40,50}`。四个 excluded pilot 按注册的 safety-first reducer 选出 winner，并
+由 signed seal 冻结；在该 seal 存在前 TTS 与 L0-naive 保持 `BLOCKED`。二者不能继承上面的
+exponential weight、E1/E2 winner、schema default 或历史 AdamW recipe。与 recipe 正交，TTS
+publication 使用论文的 fixed synchronization barrier。
 
 ## Backend 证据与重建
 
@@ -83,16 +85,15 @@ supervision validity 生成三 byte device receipt；side stream 会在 completi
 event synchronization。Invalid receipt 不推进 optimizer step 或 active version，也不发布
 任何 tensor。
 
-当前底层 patch 为 TP1/DP1 重建 DFlash differentiable canvas。目标 DSpark contract 要求
-native Markov W1/W2 feature 与实际 sampled predecessor；EAGLE/EAGLE3 将绑定 tree state 与
-贯穿 proposal chain 的一个 source version；NEXTN 将绑定 native MTP hidden state 与
-upstream interface 内容 digest。这些 payload 不能互换，并且 DSpark/EAGLE/EAGLE3/NEXTN
-adaptation 保持 `BLOCKED`。
+固定 patch 重建 DFlash differentiable canvas、DSpark native Markov W1/W2 feature 与实际
+sampled predecessor、NEXTN MTP hidden/interface state，以及受官方 selector 门控的 EAGLE3
+路径。这些 payload 不能互换。DSpark、NEXTN 与 compatible EAGLE3 保持
+`implemented_pending_dynamic_gpu_proof`；generic EAGLE 不受支持。
 
 ## DSpark Composite Objective
 
-不可执行的目标 DSpark contract 中，hybrid plan 还可训练 native confidence/acceptance
-state。对 verified target row $p$
+DSpark contract 的 hybrid plan 还可训练 native confidence/acceptance state，但必须通过
+准确的 dynamic qualification。对 verified target row $p$
 与 sampling-bound proposal $q$，定义 stop-gradient conditional-survival target
 
 $$
@@ -161,10 +162,11 @@ Candidate equality 只在受控 mechanism replay 中检查。只有两个 replay
 source-state 与 proposal-evidence digest 都完全相同，才比较 candidate byte。Live TTS 与
 L0-naive 的 publication decision 分叉后，其未来 candidate 无需继续相等。
 
-在目标 CPU coordinator contract 中，TP2 sharded coordinate 留在 inference owner，
+在 distributed coordinator contract 中，TP2 sharded coordinate 留在 inference owner，
 replicated coordinate 在 TP replica 内部 reduce；DP2 cohort sticky 且 replica-local。所有
-rank 将对一个 update identity prepare，并导出一个 commit/abort decision。当前 `RunConfig`
-会在 model loading 前拒绝全部 TP2/DP2 plan，因此这些公式不是 multi-rank execution claim。
+rank 将对一个 update identity prepare，并导出一个 commit/abort decision。`RunConfig` 只在
+准确 source capability identity 存在时接受这些 topology；formal dispatch 在缺少全新
+all-rank GPU qualification 时仍会拒绝。因此公式本身不构成 multi-rank 结果。
 
 ## OnlineSPEC 对比 Learner
 

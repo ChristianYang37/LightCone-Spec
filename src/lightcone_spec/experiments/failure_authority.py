@@ -69,7 +69,7 @@ FAILURE_INJECTION_REDUCER_PROTOCOL_SHA256 = content_sha256(
         "kind": "e5_failure_injection_raw_reducer_protocol",
         "scope": "correctness_only_not_headline_performance",
         "source": "release_derived_registry_cell_and_path_bound_raw_receipt",
-        "topologies": ["tp2_dp1", "two_replica_tp1_dp2"],
+        "topologies": ["tp1_dp1", "tp2_dp1", "tp1_dp2"],
         "required_rank_coverage": "every_rank_in_every_topology",
         "lifecycle": ["arm", "trigger", "recover", "terminal"],
         "session_reuse": "forbidden_fresh_process_required",
@@ -250,7 +250,7 @@ class FailureExpectedCounter:
 
 @dataclass(frozen=True)
 class FailureTopologyTarget:
-    topology: Literal["tp2_dp1", "two_replica_tp1_dp2"]
+    topology: Literal["tp1_dp1", "tp2_dp1", "tp1_dp2"]
     tensor_parallel_size: int
     data_parallel_size: int
     world_size: int
@@ -258,8 +258,9 @@ class FailureTopologyTarget:
 
     def __post_init__(self) -> None:
         expected = {
+            "tp1_dp1": (1, 1),
             "tp2_dp1": (2, 1),
-            "two_replica_tp1_dp2": (1, 2),
+            "tp1_dp2": (1, 2),
         }
         if self.topology not in expected:
             raise ValueError("failure topology is vague or unsupported")
@@ -267,8 +268,9 @@ class FailureTopologyTarget:
             self.topology
         ]:
             raise ValueError("failure topology dimensions differ from release plan")
-        if self.world_size != 2:
-            raise ValueError("E5 failure topology must use exactly two ranks")
+        expected_world_size = 1 if self.topology == "tp1_dp1" else 2
+        if self.world_size != expected_world_size:
+            raise ValueError("E5 failure topology world size differs")
         if self.target_ranks != tuple(range(self.world_size)):
             raise ValueError("failure actuation must target every rank exactly once")
 
@@ -342,10 +344,11 @@ class ReleaseFailurePlan:
         if self.scenario not in E5_FAILURES or self.scenario not in _SCENARIO_COUNTER:
             raise ValueError("failure scenario is vague or unregistered")
         if tuple(row.topology for row in self.topology_targets) != (
+            "tp1_dp1",
             "tp2_dp1",
-            "two_replica_tp1_dp2",
+            "tp1_dp2",
         ):
-            raise ValueError("failure plan must cover both registered topologies")
+            raise ValueError("failure plan must cover all three registered topologies")
         names = tuple(row.name for row in self.expected_counters)
         expected_names = tuple(
             sorted((*_UNIVERSAL_ZERO_COUNTERS, _SCENARIO_COUNTER[self.scenario]))
@@ -417,8 +420,9 @@ def _release_failure_plan_for_cell_identity(
         cell_declaration_sha256=cell.sha256,
         scenario=scenario,
         topology_targets=(
+            FailureTopologyTarget("tp1_dp1", 1, 1, 1, (0,)),
             FailureTopologyTarget("tp2_dp1", 2, 1, 2, (0, 1)),
-            FailureTopologyTarget("two_replica_tp1_dp2", 1, 2, 2, (0, 1)),
+            FailureTopologyTarget("tp1_dp2", 1, 2, 2, (0, 1)),
         ),
         lifecycle=FailureLifecycleWindow(
             phases=("arm", "trigger", "recover", "terminal"),
@@ -708,7 +712,10 @@ def revalidate_failure_injection_authority(
     return FailureInjectionAuthorityResult(binding=binding, plan=_plan_from_dict(row))
 
 
-@dataclass(frozen=True)
+_FAILURE_EXECUTION_AUTHORITY_SENTINEL = object()
+
+
+@dataclass(frozen=True, init=False)
 class FailureExecutionAuthorityToken:
     binding: FailureInjectionAuthorityBinding
     authority_sha256: str
@@ -719,6 +726,38 @@ class FailureExecutionAuthorityToken:
     actuator_id: str
     actuator_version_sha256: str
     actuator_capability_sha256: str
+
+    def __init__(
+        self,
+        *,
+        binding: FailureInjectionAuthorityBinding,
+        authority_sha256: str,
+        plan_sha256: str,
+        registry_sha256: str,
+        cell_id: str,
+        scenario: str,
+        actuator_id: str,
+        actuator_version_sha256: str,
+        actuator_capability_sha256: str,
+        _verification_tag: object = None,
+    ) -> None:
+        if _verification_tag is not _FAILURE_EXECUTION_AUTHORITY_SENTINEL:
+            raise TypeError(
+                "failure execution authority requires first-party validation"
+            )
+        for name, value in (
+            ("binding", binding),
+            ("authority_sha256", authority_sha256),
+            ("plan_sha256", plan_sha256),
+            ("registry_sha256", registry_sha256),
+            ("cell_id", cell_id),
+            ("scenario", scenario),
+            ("actuator_id", actuator_id),
+            ("actuator_version_sha256", actuator_version_sha256),
+            ("actuator_capability_sha256", actuator_capability_sha256),
+        ):
+            object.__setattr__(self, name, value)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if type(self.binding) is not FailureInjectionAuthorityBinding:
@@ -822,11 +861,6 @@ def revalidate_failure_execution_authority(
         raise FailureInjectionAuthorityBlocked(
             FAILURE_INJECTION_FIRST_PARTY_ACTUATOR_UNAVAILABLE_REASON
         )
-    policy = require_release_trusted_attester_policy(RELEASE_TRUSTED_ATTESTER_POLICY)
-    if not policy.release_ready:
-        raise FailureInjectionAuthorityBlocked(
-            FAILURE_INJECTION_TRUSTED_SIGNER_UNAVAILABLE_REASON
-        )
     return FailureInjectionAuthorityResult(binding=replayed_binding, plan=plan)
 
 
@@ -835,15 +869,15 @@ def require_failure_injection_authority(
     *,
     registry: ExperimentRegistry,
 ) -> FailureExecutionAuthorityToken:
-    """Fail closed before actuation unless this release owns actuator and signer."""
+    """Mint execution authority from the raw plan and source-owned actuator.
+
+    This token authorizes only the scoped remote lifecycle.  It does not trust
+    the resulting evidence; the remote has no release private key and formal
+    completion requires the separate local external-control proof.
+    """
 
     result = revalidate_failure_injection_authority(binding, registry=registry)
     capability = _require_release_failure_actuator_capability()
-    policy = require_release_trusted_attester_policy(RELEASE_TRUSTED_ATTESTER_POLICY)
-    if not policy.release_ready:
-        raise FailureInjectionAuthorityBlocked(
-            FAILURE_INJECTION_TRUSTED_SIGNER_UNAVAILABLE_REASON
-        )
     return FailureExecutionAuthorityToken(
         binding=result.binding,
         authority_sha256=result.binding.sha256,
@@ -854,6 +888,7 @@ def require_failure_injection_authority(
         actuator_id=capability.actuator_id,
         actuator_version_sha256=capability.actuator_version_sha256,
         actuator_capability_sha256=capability.sha256,
+        _verification_tag=_FAILURE_EXECUTION_AUTHORITY_SENTINEL,
     )
 
 
@@ -862,24 +897,31 @@ def require_failure_execution_lifecycle(
     *,
     cell: ExperimentCell,
     expected_registry_sha256: str,
-) -> None:
-    """Keep failure jobs blocked until the actuator lifecycle is wired.
+) -> FailureInjectionAuthorityResult:
+    """Authorize only the exact source-owned dedicated failure lifecycle."""
 
-    A release capability entry and a signed raw plan are necessary but not
-    sufficient: the executor must also own and invoke arm, trigger, recovery,
-    and terminal-proof operations.  That implementation does not exist in
-    this release, so merely adding a capability must never turn a failure cell
-    into an ordinary serving launch.
-    """
-
-    revalidate_failure_execution_authority(
+    result = revalidate_failure_execution_authority(
         token,
         cell=cell,
         expected_registry_sha256=expected_registry_sha256,
     )
-    raise FailureInjectionAuthorityBlocked(
-        FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON
+    from lightcone_spec.experiments.failure_actuator import (
+        SourceOwnedSglangFailureActuator,
+        release_failure_actuator_capability,
+        release_failure_actuator_factory,
     )
+
+    capability = release_failure_actuator_capability()
+    if (
+        capability.factory is not release_failure_actuator_factory
+        or capability.actuator_id != SourceOwnedSglangFailureActuator.actuator_id
+        or capability.actuator_version_sha256
+        != SourceOwnedSglangFailureActuator.actuator_version_sha256
+    ):
+        raise FailureInjectionAuthorityBlocked(
+            FAILURE_INJECTION_EXECUTION_LIFECYCLE_UNAVAILABLE_REASON
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -938,7 +980,7 @@ class FailureTopologyReceipt:
     rank_receipts: tuple[FailureRankReceipt, ...]
 
     def __post_init__(self) -> None:
-        if self.topology not in {"tp2_dp1", "two_replica_tp1_dp2"}:
+        if self.topology not in {"tp1_dp1", "tp2_dp1", "tp1_dp2"}:
             raise ValueError("failure topology receipt is vague or unsupported")
         ranks = tuple(row.rank for row in self.rank_receipts)
         if not ranks or ranks != tuple(sorted(set(ranks))):
@@ -991,10 +1033,11 @@ class AtomicFailureActuationReceipt:
         if self.fresh_process is not True:
             raise ValueError("failure receipt must prove a fresh process")
         if tuple(row.topology for row in self.topologies) != (
+            "tp1_dp1",
             "tp2_dp1",
-            "two_replica_tp1_dp2",
+            "tp1_dp2",
         ):
-            raise ValueError("failure receipt must cover both topologies")
+            raise ValueError("failure receipt must cover all three topologies")
         if self.terminal_status != "RECOVERED" or self.committed is not True:
             raise ValueError("failure receipt is not atomically terminal")
         if self.trust_domain != "hardware":

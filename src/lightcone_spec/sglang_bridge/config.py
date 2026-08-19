@@ -9,6 +9,10 @@ from lightcone_spec.config.schema import RunConfig
 
 
 def sglang_adaptation_payload(config: RunConfig) -> dict | None:
+    # The bridge is a direct Python boundary as well as a CLI helper.  Re-run
+    # the runtime gate so ``model_construct`` cannot smuggle an unregistered
+    # distributed mode into the native patch payload.
+    config.runtime.validate_topology()
     if config.method in {"target_only", "static"}:
         return None
     adaptation = config.adaptation
@@ -38,10 +42,33 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         "verification_mode": adaptation.verification_mode,
         "fixed_verification_budget": adaptation.fixed_verification_budget,
         "confidence_loss_weight": adaptation.confidence_loss_weight,
+        "chronobelief_release_capability_sha256": (
+            adaptation.chronobelief_release_capability_sha256
+        ),
+        "chronobelief_gpu_proof_sha256": (adaptation.chronobelief_gpu_proof_sha256),
+        "eagle3_e0_execution_authority_sha256": (
+            adaptation.eagle3_e0_execution_authority_sha256
+        ),
+        "eagle3_compatibility_authority_sha256": (
+            adaptation.eagle3_compatibility_authority_sha256
+        ),
+        "eagle3_model_selector_sha256": adaptation.eagle3_model_selector_sha256,
+        "eagle3_native_gpu_proof_sha256": (adaptation.eagle3_native_gpu_proof_sha256),
+        "eagle3_qualification_compatibility_authority_sha256": (
+            adaptation.eagle3_qualification_compatibility_authority_sha256
+        ),
+        "eagle3_qualification_model_selector_sha256": (
+            adaptation.eagle3_qualification_model_selector_sha256
+        ),
         "target_revision": config.model.target_revision,
         "drafter_revision": config.model.drafter_revision,
         "sampling_profile_sha256": (config.runtime.sampling_profile_sha256),
         "telemetry_detail": config.runtime.telemetry_detail,
+        "adaptation_microbatch_size": (config.runtime.adaptation_microbatch_size),
+        "adaptation_publication_coalescing": (
+            config.runtime.adaptation_publication_coalescing
+        ),
+        "adaptation_stream_priority": (config.runtime.adaptation_stream_priority),
         "topology": {
             "tensor_parallel_size": config.runtime.tensor_parallel_size,
             "data_parallel_size": config.runtime.data_parallel_size,
@@ -57,9 +84,14 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
             "distributed_runtime_capability": (
                 config.runtime.distributed_runtime_capability
             ),
+            "distributed_release_capability_sha256": (
+                config.runtime.distributed_release_capability_sha256
+            ),
             "distributed_capability_receipt_sha256": (
                 config.runtime.distributed_capability_receipt_sha256
             ),
+            "distributed_control_mode": config.runtime.distributed_control_mode,
+            "adaptation_collective_mode": (config.runtime.adaptation_collective_mode),
         },
     }
     if config.online_spec is not None:

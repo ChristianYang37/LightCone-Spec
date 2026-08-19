@@ -28,6 +28,8 @@ authority. The schema-v3 and industrial commands are:
 | `validate-evidence-alias` | Replay one raw alias manifest against registry, hardware, inventory, and terminal authority |
 | `build-evidence-dependence-map` | Preserve shared-observation dependence from reducer-issued alias artifacts |
 | `materialize-stage-activation` | Replay generic registry-stage dispatchability from raw registry, lineage, runtime, and split authority |
+| `materialize-preflight-pointer-coverage` | Deep-reopen one compile, one exactness, and eight interference result authorities into the exact ten-cell preflight activation/coverage receipt |
+| `materialize-stage-capacity-gate` | Derive a stage-specific capacity gate from path-bound raw capacity sources and an exact execution-wave schedule |
 | `materialize-industrial-budgets` | Derive one fail-closed `BudgetPlan` from reducer, load, inventory, policy, and capacity authority |
 | `bind-industrial-budget-authority` | Bind a declared `BudgetPlan` to its complete tagged raw activation/load/capacity closure |
 | `estimate-industrial-budget` | Replay one ready `BudgetPlan` on an exact physical inventory and interference envelope |
@@ -197,19 +199,24 @@ order and never takes the first 32 rows.
 lightcone-spec bind-formal-workload-authority \
   --workload math500_level5 \
   --source /absolute/path/to/math500-locked.json \
+  --content-verification-receipt /absolute/path/to/content-E3a.json \
+  --now-ns 1786900000000000000 \
   --output artifacts/industrial/math500-workload-authority.json
 
 lightcone-spec revalidate-formal-workload-authority \
-  --authority artifacts/industrial/math500-workload-authority.json
+  --authority artifacts/industrial/math500-workload-authority.json \
+  --content-verification-receipt /absolute/path/to/content-E3a.json \
+  --now-ns 1786900000000000000
 ```
 
-This release has an empty formal-workload source allowlist. Bind therefore
-returns 42 with `status=BLOCKED` and
-`reason_code=formal_workload_source_allowlist_empty` before inspecting the
-source path or creating the output directory. A future allowlisted source may
-produce a `BOUND_DIAGNOSTIC` artifact, but that artifact permanently carries
-`formal_execution_authorized=false`; it is workload input identity, not GPU
-dispatch, attestation, or a formal result.
+Both commands require a current, root-verified content-verification receipt and
+an explicit verification time. Missing or invalid content authority fails
+closed before the raw workload can be bound. A successful bind reports
+`BOUND_AUTHORIZED_CONTENT`, but the emitted wrapper still permanently carries
+`formal_execution_authorized=false`; it is workload input identity that must be
+replayed with the same verified content authority, not GPU dispatch,
+attestation, or a formal result. The legacy source-allowlist API remains a
+non-authorizing diagnostic and is not the production CLI path.
 
 ## Industrial registry workflow
 
@@ -261,16 +268,32 @@ lightcone-spec materialize-stage-activation \
 
 Consumers take the raw manifest path through `--activation-plan` and replay
 the reducer; they reject the serialized output as standalone authority. The
-reducer dispositions every declared stage cell from registry status and the
-release dispatch predicate. In this release every preflight cell is blocked:
-the Target-only compile cell has no release-owned exact prewarm manifest,
-graceful-finalization acknowledgement, or atomic attempt/final-cache result
-pointer, while Static/TTS/L0-naive/LightCone also lack a supported execution contract. The
-command therefore writes the canonical `BLOCKED` artifact and returns 42. E6
-download cells are blocked independently because no first-party download
-terminal contract ships.
+generic command always writes the canonical diagnostic decision and returns
+zero when that write/reload succeeds, including when the decision is
+`BLOCKED`. Exit status is not execution permission. Formal preflight becomes
+`AVAILABLE` only through the first-party pointer reducer, which deep-reopens
+exactly one compile result, one exactness result, and eight interference
+serving results and requires all ten mandatory cells terminal with zero skip:
 
-Budget materialization is fail-closed. It consumes reducer-generated stage or
+```bash
+lightcone-spec materialize-preflight-pointer-coverage \
+  --registry artifacts/formal/registry.json \
+  --runtime-artifact artifacts/formal/runtime.json \
+  --split-artifact artifacts/formal/preflight-split.json \
+  --compile-result artifacts/formal/compile-result.json \
+  --exactness-result artifacts/formal/exactness-result.json \
+  --interference-authority artifacts/formal/interference-execution.json \
+  --source-output artifacts/formal/preflight-source.json \
+  --activation-output artifacts/formal/preflight-activation.json \
+  --coverage-output artifacts/formal/preflight-coverage.json
+```
+
+The reducer reopens the compile cache/result pointer, JUnit and rank/native
+exactness artifacts, and every interference terminal authority. A caller-entered
+terminal digest, partial coverage, failed/error/skipped case, missing rank, or
+foreign runtime/split identity is rejected.
+
+Budget materialization is fail-closed. The legacy diagnostic command consumes reducer-generated stage or
 family activation, a complete `BudgetPolicy`, one `BudgetLoadBinding` for every
 activated serving cell, an independently sourced `CapacityEnvelope`, and the
 complete physical inventory. Formal capacity authority additionally requires
@@ -295,11 +318,33 @@ lightcone-spec materialize-industrial-budgets \
   --output artifacts/industrial/budget-plan.json
 ```
 
-There is no caller-selected-cell or duration-sequence fallback. Preflight now
-closes through the generic reducer; omitting its bound raw manifest is still an
-explicit unresolved authority error, and a caller-authored activation cannot
-bridge it. Serving activations additionally repeat `--budget-load-binding PATH`
-once per activated serving cell.
+Formal staged execution uses the separate schema-3 capacity gate. It reopens
+the raw provider/host/sizing sources and exact stage schedule, sums retained
+evidence (including registered retries), adds only the maximum concurrently
+resident staging/compile bytes for each execution wave, then adds the fixed
+safety margin. The command accepts no caller-entered free-space or high-water
+number:
+
+```bash
+lightcone-spec materialize-stage-capacity-gate \
+  --registry artifacts/formal/registry.json \
+  --capacity-source-manifest artifacts/formal/capacity-sources.json \
+  --stage-schedule artifacts/formal/preflight-capacity-schedule.json \
+  --now-ns 1786900000000000000 \
+  --output artifacts/formal/preflight-capacity-gate.json
+```
+
+Formal dispatch then requires a local dynamic `capacity` control attestation
+for that exact gate and atomically reserves its challenge with the other
+controls. Missing signed authority retains the 100 GB fail-closed fallback;
+source tamper, schedule drift, or an undersized observed envelope is an error,
+not permission to fall back.
+
+There is no caller-selected-cell or duration-sequence fallback. Formal
+preflight closes through the typed pointer reducer; omitting its bound raw
+sources is an explicit unresolved authority error, and a caller-authored
+activation cannot bridge it. Serving activations additionally repeat
+`--budget-load-binding PATH` once per activated serving cell.
 
 Formal consumers do not accept the `BudgetPlan` alone. After materialization,
 publish its path-bound raw closure with the tagged activation manifest (not a
@@ -476,6 +521,73 @@ interference-envelope SHA-256. If the exact scheduler replay is not executable,
 it retains the real derived GPU-hour diagnostics, records a named unresolved
 assumption, and exits 42; the report cannot be used as launch authority.
 
+Actual preflight GPU hours are materialized only from the finalized, sealed
+preflight chain. The command accepts no duration, run-count, or reserve scalar.
+It reopens the sole compile and exactness lifecycle authorities transitively
+from `--source-authority`, and it requires exactly eight distinct path-bound
+interference lifecycle proofs whose cell IDs match the finalized 1+1+8 source:
+
+```bash
+lightcone-spec materialize-preflight-gpu-hour-envelope \
+  --dispatch-receipt /absolute/evidence/preflight-dispatch.json \
+  --remote-raw-receipt /absolute/evidence/preflight-remote-raw.json \
+  --source-authority /absolute/evidence/preflight-source.json \
+  --activation /absolute/evidence/preflight-activation.json \
+  --coverage /absolute/evidence/preflight-pointer-coverage.json \
+  --stage-coverage /absolute/evidence/preflight-stage-coverage.json \
+  --interference-lifecycle-proof 9a4d4b4f84399bbd9e33e542d110e237d33ef0d1f738d60406399611cadaf6d6=/absolute/evidence/lifecycle-0.json \
+  --interference-lifecycle-proof a88676a576111058c46b44dc2754a4d171e6c8f2226c3ebb65f2db4716c5c253=/absolute/evidence/lifecycle-1.json \
+  --interference-lifecycle-proof 11de28835716cb8fa5af2dea84571e2ae930f6f3642a6ccecaaa46529ca76f10=/absolute/evidence/lifecycle-2.json \
+  --interference-lifecycle-proof 2761af3f18adceab26d68bc7887b50f21575c8f54062738ff893d402ffa5c32e=/absolute/evidence/lifecycle-3.json \
+  --interference-lifecycle-proof 1e7933ad9c1b95af086d1a8626d882beb4f376987786e5799b2e440f4ae536dd=/absolute/evidence/lifecycle-4.json \
+  --interference-lifecycle-proof 8902eb962b1ab7703a29446c1f4bb56f183d620496043e02814bfd1d0d94a630=/absolute/evidence/lifecycle-5.json \
+  --interference-lifecycle-proof 52f11f9c36ea5016a0cba90b4a1ae843b77a15be00936df846f8a9a6cfe620f8=/absolute/evidence/lifecycle-6.json \
+  --interference-lifecycle-proof e93df280d22db443b27ee32e6dc95eed9bc7ecb6a1f4a439dddf57c93c5206e5=/absolute/evidence/lifecycle-7.json \
+  --formal-runtime-authority-manifest /absolute/evidence/runtime-authority.json \
+  --source-output /absolute/evidence/preflight-gpu-hour-source.json \
+  --now-ns 2000000000 \
+  --output /absolute/evidence/preflight-gpu-hour-envelope.json
+```
+
+Both output paths must be distinct, absolute, normalized, and absent. The
+source manifest and schema-2 envelope are published atomically without
+replacement. The envelope is accepted directly by the offline scientific
+signer's `stage-gpu-hour-envelope` decoder; the finalized signed wrapper and
+the source manifest then enter `reserve-formal-stage-gpu-hours`. An ordinary
+formal-stage counterpart is intentionally unavailable until the public,
+path-bound stage-source rebuild bundle exists; a digest, generic JSON, or a
+serialized private execution seal is never a substitute.
+
+### Source-owned method authorities
+
+Before creating `ProtocolLock`, publish the three code-owned method inputs from
+their exact bound sources:
+
+```bash
+lightcone-spec publish-tts-calibration-source-authority \
+  --paper-pdf /absolute/source/tts-v2.pdf \
+  --paper-source /absolute/source/tts-v2.tex \
+  --tuning-window /absolute/source/tts-tuning-window.json \
+  --trainable-plan-authority /absolute/source/trainable-plan.json \
+  --drafter-native-loss /absolute/source/drafter-native-loss.json \
+  --output /absolute/evidence/tts-calibration-authority.json
+
+lightcone-spec publish-chronobelief-source-authority \
+  --paper-pdf /absolute/source/chronobelief.pdf \
+  --tex-source /absolute/source/chronobelief.tex \
+  --output /absolute/evidence/chronobelief-authority.json
+
+lightcone-spec publish-e1-recipe-anchor-authority \
+  --trainable-plan-authority /absolute/source/trainable-plan.json \
+  --output /absolute/evidence/e1-recipe-anchor-authority.json
+```
+
+These commands deep-read the named source files, derive the closed numerical
+or recipe authority, and publish with atomic no-replace semantics. They accept
+no caller-supplied authority digest or recipe override. The outputs are inputs
+to `create-protocol-lock`; they do not sign a result, authorize dispatch, or
+replace the later tuning and GPU evidence gates.
+
 After a stage's activated cells and dispositions are durable, seal them.
 `--inventory PATH` is the authority for the physical GPU identities and
 topology used by the completed evidence. Every repeated `--locked-output` has
@@ -518,10 +630,10 @@ lightcone-spec seal-industrial-stage \
   --output artifacts/industrial/receipts/E2.json
 ```
 
-These checks define the claim-bearing path once a trusted hardware attester is
-registered. In the current release, sealing still returns `BLOCKED` before it
-can issue a receipt; this raw-authority contract does not make final execution
-or a performance claim reachable. The sealed output can authorize only the
+These checks define the claim-bearing path once the current session's dynamic
+hardware and typed control chain is verified. Without that chain, sealing
+returns `BLOCKED`; the raw-authority contract alone does not make execution or
+a performance claim reachable. The sealed output can authorize only the
 LightCone role. It can never rewrite the separately frozen TTS or L0-naive
 recipe authority.
 
@@ -550,12 +662,13 @@ or GPU accounting is not replaced with zero. Resume accepts only a complete
 receipt and never directory presence.
 
 The dispatch plan is target-protocol data, not proof that a cell is executable.
-The pinned tree implements the exact native terminal begin/reset/finalize hook,
-but no trusted hardware signer is configured. Generic activation records a
-canonical blocked preflight disposition; it does not create a compile runner,
-execution authority, or performance claim. Static/TTS/L0-naive/LightCone remain blocked without
-their validated native capability and trusted signer. The CLI does not silently
-provision hardware or start a GPU.
+The pinned tree implements the compile, exact native terminal, and coverage
+contracts, while the package pins only the offline public root. Generic
+activation records a diagnostic disposition; it does not create result
+pointers, a fresh dynamic hardware policy, execution authority, or a
+performance claim. Every role remains `BLOCKED` until its exact content,
+qualification, terminal, and control artifacts are present. The CLI does not
+silently provision hardware or start a GPU.
 
 ## Fleet inventory and remote host waves
 
@@ -623,9 +736,29 @@ host-exclusive, headline concurrency never exceeds that host's calibrated
 envelope, and fleet SSH concurrency is bounded separately.
 
 No command accepts a caller-selected trusted-attester bundle as release
-authority. Public `TrustedAttesterPolicyBundle` loading is anchored by external
-operator/source configuration; the source-release anchor is currently absent,
-so formal dispatch remains fail-closed.
+authority. The installed package pins the offline Ed25519 public root and
+fingerprint. A fresh root-signed deployment policy supplies the observed
+hardware allowlist and typed control keys without changing source HEAD; the
+private key remains offline. Missing, expired, replayed, wrong-key, or
+hardware-mismatched policy keeps formal dispatch fail-closed.
+
+The local-only signer is invoked as a Python module, not on the GPU host:
+
+```bash
+python -m lightcone_spec.runtime.offline_signer sign-deployment --help
+python -m lightcone_spec.runtime.offline_signer sign-control --help
+python -m lightcone_spec.runtime.offline_signer sign-scientific --help
+python -m lightcone_spec.runtime.offline_signer finalize-scientific --help
+```
+
+No signing subcommand has a key-path or key-bytes option. Without `--key-fd`, it
+requires an interactive unechoed TTY path prompt. With `--key-fd`, the argument
+is only the numeric inherited descriptor. Outputs are canonical public JSON
+and are created atomically without replacement; signing errors use a generic
+message so a prompted private path cannot enter logs. `sign-scientific`
+accepts only the closed set of typed scientific wrappers; its candidate must
+then pass `finalize-scientific`, which revalidates policy and atomically records
+the challenge in a private single-use ledger. There is no generic JSON signer.
 
 ## Identity and topology flow
 
@@ -647,11 +780,13 @@ source + patched tree + model/data/trace locks
  family power + dependence-aware statistics + trusted attestation
 ```
 
-TP2 and sticky DP2 fields are target registry/CPU-coordinator vocabulary. The
-current `RunConfig` rejects every TP2/DP2 value before model loading, and the
-CPU `gloo` contract or a caller-authored receipt cannot enable them. A future
-implementation would have to bind rank, UUID, rendezvous, router, clock,
-process-group, ownership, and receipt identity exactly.
+TP2 and sticky DP2 are implemented source contracts, but the source capability
+table is CPU-audited identity rather than GPU proof. A distributed `RunConfig`
+must bind that exact capability plus a receipt claim, and formal dispatch must
+verify the matching durable GPU qualification artifact. The CPU `gloo`
+contract or a caller-authored digest cannot enable execution. The proof binds
+rank, UUID, rendezvous, router, clock, process group, ownership, all-rank
+publication, and terminal identity exactly.
 
 Generated JSON uses an adjacent `.sha256` sidecar where the command contract
 requires one. The loaders validate canonical content, not only filenames.
@@ -659,23 +794,27 @@ requires one. The loaders validate canonical content, not only filenames.
 ## Core tuning and confirmation
 
 Target-only and Static render without adaptation state or reserve. TTS uses the
-frozen `TTS-paper-reconstruction` authority with fixed-barrier publication;
-L0-naive uses that same authority with first-ready publication. E1/E2 `l0`
+recipe frozen by the signed TTS-Cal seal with fixed-barrier publication;
+L0-naive uses that same frozen recipe authority with first-ready publication.
+The historical `TTS-paper-reconstruction` authority is diagnostic only. E1/E2 `l0`
 search recipes are LC-candidates, and only the exact E2-sealed winner is
 LightCone. Shared runtime code does not merge live candidate, optimizer, or
-evidence identity. Rendering is pure planning: in the current release only
-Target-only may proceed through industrial execution. Static/TTS/L0-naive/
-LightCone fail the trusted-terminal-attester preflight before an endpoint
-starts; TTS and L0-naive also remain blocked on unresolved recipe fields.
+evidence identity. Rendering is pure planning and grants no role execution
+permission. TTS-Cal fixes the numeric reconstruction grid and semantics; TTS
+and L0-naive remain blocked until the disjoint tuning evidence seals one exact
+winner. All five roles still require their fresh content, runtime, terminal,
+capacity, and dynamic control authorities before an endpoint starts.
 
-The industrial E1/E2 commands are reducer-owned. E1 consumes sealed E3a output
-and activates exactly one 68-cell width/load slice from 1,428 templates. It
-tunes two LC-candidates per geometry and carries one stage-level frozen-TTS and
-one stage-level frozen-L0-naive anchor rather than duplicating baselines across
-scope/rank or optimizer candidates. E2 contains 11,920 templates, materializes stage zero and then requires the
-prior sealed survivor receipt for each successive-halving round. It ranks only
-LC-candidates against fixed Static and frozen-TTS references while preserving
-family floors. Confirmation planning
+The industrial E1/E2 commands are reducer-owned. E1 consumes sealed E3a and
+TTS-Cal receipts and materializes exactly 68 cells: four fixed roles plus two
+LightCone candidates for each of 32 geometries. L0-naive remains a mechanism
+anchor and never enters candidate ranking. For `g` surviving geometries, E2
+materializes `n0 = 105g` recipes (seven optimizers by three schedules by five
+learning rates), then requires the prior sealed survivor receipt for each of
+three later rounds with `n(k+1) = max(ceil(nk/4), 21)`. Four fixed anchors are
+added per round. It ranks only LightCone candidates against fixed Static and
+frozen-TTS references; no command expands an eager sentinel matrix.
+Confirmation planning
 activates four excluded pilots per exact family, seals `POWERED` with 12--20
 final blocks or `UNDERPOWERED`, and materializes only the sealed prefix before
 confirmation data is visible.
@@ -749,16 +888,20 @@ if a future trusted attester is configured. `attest-preliminary-speed-study`
 and `attest-onlinespec-study` likewise emit categorical non-authority decisions
 and exit 42. Identity, schema, I/O, receipt, or runtime errors are ordinary
 nonzero failures, not scientific outcomes.
-The current release has no trusted hardware-attester identity, so a supplied
-legacy attestation is rejected and `analyze-industrial` cannot emit `MEASURED`;
-it exits 42 even for otherwise self-consistent diagnostic JSON.
+The source release pins a public trust root but no reusable hardware identity.
+A supplied legacy attestation is rejected. `analyze-industrial` can emit
+`MEASURED` only after the exact current-session root-authorized hardware and
+typed control chain is verified; self-consistent diagnostic JSON still exits
+42.
 
 The industrial registry may declare target cells as `UNMEASURED`, but that
-declarative status is not executable readiness. The native hook is present;
-executor preflight resolves Static/TTS/L0-naive/LightCone to `BLOCKED` because the trusted
-signer is absent. All TP2/DP2 and DSpark/EAGLE/EAGLE3/NEXTN adaptive cells are
-likewise blocked by separate current release gates. Historical v2 artifacts
-are regression-only and cannot be supplied as schema-v3 stage receipts.
+declarative status is not executable readiness. The source paths for TP2/DP2,
+DSpark, NEXTN, native ITL, and session reuse are
+`implemented_pending_dynamic_gpu_proof`; they remain `BLOCKED` without those
+exact proofs. TTS/L0-naive require the sealed TTS-Cal winner, LightCone the
+sealed E2 winner, and EAGLE3 an official compatible model/selector decision.
+Historical v2 artifacts are regression-only and cannot be supplied as
+schema-v3 stage receipts.
 
 ### Target-output reference diagnostic
 
@@ -779,3 +922,266 @@ access through a temporary `HF_TOKEN` environment variable or another secure
 channel. Do not place tokens, passwords, provider API keys, private prompts,
 instance addresses, or machine-specific paths in arguments, manifests, logs,
 documentation, or Git.
+
+## Trusted single-operator formal workflow
+
+### Claim boundary
+
+`formal_single_operator_v1` is the path for a trusted operator to collect and
+reduce the complete v03 empirical campaign from one controlled clean checkout.
+It records canonical SHA-256 provenance and publishes only to new,
+non-overwriting directories. It is neither an adversarial attestation mode nor
+permission to call an unsigned result formal `MEASURED` evidence. Without the
+current release-root attestation, finalization must report
+`trusted_single_operator_empirical_no_signature`,
+`formal_measured=false`, and `UNMEASURED`.
+
+The public supervisor commands are:
+
+| Command | Purpose |
+|---|---|
+| `formal-single-operator status` | Report source-code capability for all 21 nodes without reading run evidence or allocating a GPU |
+| `publish-trusted-content` | Deep-bind one typed content path spec and its runtime observations into a BOUND bundle |
+| `publish-preflight-workload` | Derive the preflight workload authority from that exact BOUND bundle |
+| `publish-onlinespec-source-authority` | Bind the audited external OnlineSPEC checkout for E0 only |
+| `build-trusted-protocol-lock` | Build the schema-v5 trusted ProtocolLock from path-bound sources |
+| `write-dag-driver-config` | Publish one immutable path-only 21-node driver config |
+| `write-bootstrap-config` | Publish the non-LLM supervisor config |
+| `bootstrap-once` | Advance at most one durable controller/scheduler cycle |
+| `bootstrap-run` | Block until the DAG completes or reaches a genuine unresolved block |
+
+The lower-level `materialize-node`, `prepare-run`, `execute-run`,
+`finalize-run`, and reducer commands remain useful for focused replay and
+debugging. Do not interleave them with a running bootstrap supervisor or start
+a second scheduler.
+
+### Publish immutable inputs
+
+Publish the runtime and method source authorities from their exact files. These
+commands derive authority content; they do not accept a caller-entered digest:
+
+```bash
+lightcone-spec publish-formal-runtime-authority-manifest \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --output /absolute/sources/runtime-authority.json
+
+lightcone-spec publish-tts-calibration-source-authority \
+  --paper-pdf /absolute/sources/tts-paper.pdf \
+  --paper-source /absolute/sources/tts-paper.tex \
+  --tuning-window /absolute/sources/tts-tuning-window.json \
+  --trainable-plan-authority /absolute/sources/tts-trainable-plan.json \
+  --drafter-native-loss /absolute/sources/tts-native-loss.json \
+  --output /absolute/sources/tts-calibration-authority.json
+
+lightcone-spec publish-chronobelief-source-authority \
+  --paper-pdf /absolute/sources/chronobelief-paper.pdf \
+  --tex-source /absolute/sources/chronobelief-paper.tex \
+  --output /absolute/sources/chronobelief-authority.json
+
+lightcone-spec publish-e1-recipe-anchor-authority \
+  --trainable-plan-authority /absolute/sources/e1-trainable-plan.json \
+  --output /absolute/sources/e1-recipe-anchor-authority.json
+
+lightcone-spec formal-single-operator publish-onlinespec-source-authority \
+  --checkout /absolute/sources/onlinespec-checkout \
+  --audit /absolute/sources/onlinespec-source-audit.json \
+  --output /absolute/sources/onlinespec-source-authority.json
+```
+
+The typed `trusted_single_operator_content_path_spec` must name the clean
+checkout; every target, drafter, and tokenizer snapshot with immutable
+revision; locked LiveCodeBench, MATH-500, BurstGPT and E0 task-native sources;
+and the fresh inventory and doctor paths. Generate that typed spec from the
+source API rather than hand-entering content digests. Then publish the BOUND
+bundle and derive its preflight workload:
+
+```bash
+lightcone-spec formal-single-operator publish-trusted-content \
+  --spec /absolute/sources/content-path-spec.json \
+  --output /absolute/sources/trusted-content.json
+
+lightcone-spec formal-single-operator publish-preflight-workload \
+  --content-source /absolute/sources/trusted-content.json \
+  --output /absolute/sources/preflight-workload.json
+
+lightcone-spec formal-single-operator build-trusted-protocol-lock \
+  --protocol-id lightcone-v03-study \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --runtime-authority-manifest /absolute/sources/runtime-authority.json \
+  --tts-calibration-authority /absolute/sources/tts-calibration-authority.json \
+  --chronobelief-authority /absolute/sources/chronobelief-authority.json \
+  --e1-recipe-anchor-authority /absolute/sources/e1-recipe-anchor-authority.json \
+  --output /absolute/sources/protocol-lock.json
+```
+
+All source and output paths must be absolute and normalized. Outputs use
+atomic no-replace publication. Model/data payloads, provider state, credentials,
+and all run artifacts stay outside the checkout.
+
+### Configure and cross the first GPU boundary
+
+Create new private run and prerequisite-catalog directories outside the Git
+checkout, then publish the two path-only configs:
+
+```bash
+lightcone-spec formal-single-operator write-dag-driver-config \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --run-root /absolute/run/formal-v03-study \
+  --protocol-lock /absolute/sources/protocol-lock.json \
+  --content-source /absolute/sources/trusted-content.json \
+  --runtime-authority-manifest /absolute/sources/runtime-authority.json \
+  --inventory /absolute/sources/gpu-inventory.json \
+  --doctor-report /absolute/sources/doctor.json \
+  --preflight-workload-authority /absolute/sources/preflight-workload.json \
+  --profiler-tool /absolute/tools/nsys \
+  --profiler-tool /absolute/tools/ncu \
+  --prerequisite-catalog /absolute/run/formal-v03-prerequisites \
+  --output /absolute/run/formal-v03-study/driver-config.json
+
+lightcone-spec formal-single-operator write-bootstrap-config \
+  --driver-config /absolute/run/formal-v03-study/driver-config.json \
+  --onlinespec-source-authority /absolute/sources/onlinespec-source-authority.json \
+  --output /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+`status` has `readiness_scope=code_capability_only`. A 21/21 result confirms
+that each node has callable materializer/producer/mapper/executor/finalizer
+code; it does not establish that this run's files, models, tools, GPUs, or
+upstream receipts are ready:
+
+```bash
+lightcone-spec formal-single-operator status
+```
+
+A cold start has an intentionally inspectable boundary. The first cycle
+materializes preflight. The second plans the exact one compile, one exactness,
+and eight interference cells and commits all ten attempts plus their two-GPU
+physical group as `PENDING`, with no PID/PGID. The third cycle is the first one
+that may atomically mark the group `RUNNING` and spawn its `setsid` child:
+
+```bash
+lightcone-spec formal-single-operator bootstrap-once \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+lightcone-spec formal-single-operator bootstrap-once \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+Inspect the exported progress and host boundary before deliberately invoking a
+third cycle or `bootstrap-run`.
+
+### Automated 21-node progression
+
+Once the GPU host, rolling archive, and finalizer inputs are ready, the
+non-LLM supervisor resumes the same durable state:
+
+```bash
+lightcone-spec formal-single-operator bootstrap-run \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+One `/absolute/run/formal-v03-study/operator.sqlite3` WAL is the lifecycle
+authority. One `formal-dag-driver.lock` prevents a competing scheduler. The
+watchdog reconciles PID/PGID, heartbeat, GPU state, log growth, timeout/OOM,
+terminal publication, and capacity at its fixed 30-second cadence; progress
+tables are atomically exported under the run root. Exit `42` means a retained
+real block, `43` means the whole DAG reached controller completion, and `0`
+means an intermediate cycle changed state.
+
+The 21 nodes are the exact sequential expansion of
+`preflight -> E3a -> TTS-Cal -> E1 -> E2(r0..r3) ->
+E4(screen,local,profiler) -> E3b(pilot,final) -> E1a ->
+E5(pilot,final) -> E6(pilot,final) -> E0(tuning,pilot,final)`. Only the current
+node is materialized. Prerequisite and auxiliary catalogs are append-only and
+source-owned; a future result never unlocks an earlier node.
+
+Preflight retains exactly ten stage cells while the exactness execution also
+runs the six source-defined native qualification suites. Its eight fresh
+interference observations are reduced with paired BCa 95% intervals. Only a
+passing <=1% goodput and native-p99-ITL gate may switch the scheduler to two
+independent single-GPU headline workers; every other outcome remains isolated.
+
+E6 publishes exactly two TP2 launch descriptors from the built-in `mtp.*`
+component in the frozen Qwen target checkpoints. It neither downloads nor
+accepts an external drafter. E0 first publishes 12 model/backend pre-probe
+interfaces, then runs 12 launch groups over nine task-native probes to produce
+the exact 108 compatibility terminals. EAGLE3 task authority is post-probe
+only. The resulting VALID/N/A bundle, not a caller-entered `V`, controls E0
+tuning and serving materialization.
+
+For E5, the pilot reducer seals each selected backend/topology p99 family
+before final unblinding. The existing cells for all five paired methods in that
+family receive the same exact 11,000-offer extension pool and must reach at
+least 10,000 completions; no diagnostic or headline row is added.
+
+### Rolling archive and restoration
+
+Run the local non-LLM companion alongside the DAG when the remote spool is
+small. Its endpoint file contains routing and pinned SSH/rsync tool paths, not
+credentials. It polls every 30 seconds, archives only sealed safe boundaries,
+verifies every SHA-256, performs a full local rehydrate, and only then asks the
+remote operator to evict exact inode-bound v03 files. It never recursively
+deletes directories, model caches, or old runs:
+
+```bash
+/absolute/runtime/python -m lightcone_spec.orchestration.formal_rolling_archive_companion \
+  --endpoint /absolute/archive-host/control/archive-endpoint.json \
+  --remote-run-root /absolute/gpu-host/formal-v03-study \
+  --local-results-root /absolute/archive-host/formal-v03-study/results \
+  --state-root /absolute/archive-host/formal-v03-study/archive-state \
+  --lock /absolute/archive-host/formal-v03-study/archive.lock \
+  run
+```
+
+If a later reducer needs an evicted member, the companion streams only that
+member back to its original path with a remote free-space gate, no-replace
+publication, and per-file restart records. `restore-all --order reverse`
+restores every retained archive in reverse node order before a manual audit;
+the remote scientific closure also consumes its exact rehydration catalog.
+
+### Cross-host archive, shutdown, and billing
+
+Finalization has three irreversible parts. Config files for this boundary must
+be created with the typed `publish_remote_closure_config`,
+`publish_cross_host_ssh_endpoint`, and `publish_cross_host_finalizer_config`
+source APIs; do not hand-author their digests or place a provider token in
+them.
+
+Part A runs on the GPU host only after all 21 nodes are `REDUCED`. It stops
+dispatch, restores any catalogued rolling members, proves zero running attempts
+and writers, exports progress, and seals one digest-addressed whole-run payload.
+After its receipt is published, the remote SQLite is permanently read-only:
+
+```bash
+/absolute/runtime/python \
+  /absolute/checkout/scripts/formal_experiment_production_finalizer.py \
+  remote-seal \
+  --config /absolute/gpu-host/formal-v03-study/remote-closure-config.json
+```
+
+Parts B and C run once from the archive host. `run` fetches the closure and
+payload, checks the local SHA manifest, fully rehydrates the archive, obtains a
+fresh remote zero-writer probe, and publishes the pre-power composite. Only
+then does it journal at most one AutoDL `power_off` mutation, require
+`code=="Success"`, verify the same instance as `shutdown` through both status
+and list responses, close the provider boot interval, and publish compute,
+reserved, allocated-billed, whole-instance-billed, archive, idle, and wall-time
+accounting:
+
+```bash
+/absolute/runtime/python \
+  /absolute/checkout/scripts/formal_experiment_production_finalizer.py \
+  run \
+  --config /absolute/archive-host/formal-v03-study/local-finalizer-config.json
+```
+
+The provider token is read only from the local process environment. A crash
+after the power intent is retained as indeterminate and cannot issue a second
+mutation; restart reopens the journals and continues status/list confirmation.
+Successful cross-host completion still has
+`formal_measured=false` unless the separate release-root attestation exists.
+
+Before pilots, `gpu-hours-pre` reports fixed cell counts,
+`duration_unmeasured`, and the minimum pilot set. After pilots,
+`gpu-hours-post` consumes actual single-operator run manifests and lifecycle
+timings to separate actual pilot cost, same-stratum projection, and one-shot
+diagnostics. It never promotes a registry prefix into whole-study completion.

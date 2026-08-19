@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from types import MappingProxyType
+from typing import Literal
 
 import numpy as np
 from scipy.stats import nct, norm, t
@@ -143,6 +145,39 @@ class PowerSizingPlan:
         if len(matches) != 1:
             raise ValueError("requested power cell is not registered")
         return matches[0]
+
+
+@dataclass(frozen=True)
+class UnresolvedPowerSizing:
+    """A measured pilot family for which registered power is undefined.
+
+    Zero goodput and exactly zero between-block variance are legitimate
+    observations.  Neither admits the registered log-ratio power calculation,
+    so they are preserved as a negative decision instead of being perturbed by
+    a pseudocount or converted into a degenerate confidence interval.
+    """
+
+    status: Literal["POWER_UNRESOLVED"]
+    reason_code: Literal[
+        "UNRESOLVED_ZERO_GOODPUT",
+        "UNRESOLVED_ZERO_VARIANCE",
+        "UNSAFE_OR_INACTIVE_PILOT",
+    ]
+    pilot_block_ids: tuple[str, ...]
+    selected_final_blocks: None
+    minimum_final_blocks: int
+    maximum_final_blocks: int
+    target_power: float
+    family_alpha: float
+    minimum_relative_effect: float
+
+    @property
+    def underpowered(self) -> bool:
+        # Undefined power is distinct from a valid grid that misses 80% at N=20.
+        return False
+
+
+PowerSizingResolution = PowerSizingPlan | UnresolvedPowerSizing
 
 
 def _finite_positive(value: float, *, field: str) -> float:
@@ -289,6 +324,81 @@ def preregister_power_sizing(
     )
 
 
+def resolve_preregistered_power_sizing(
+    pilot_blocks: Sequence[PilotBlock],
+) -> PowerSizingResolution:
+    """Resolve the fixed power rule without turning valid negatives into errors.
+
+    Structural defects, negative/non-finite measurements, and an altered pilot
+    universe still raise.  Exactly-zero goodput or variance instead yields a
+    durable ``POWER_UNRESOLVED`` decision with no synthetic power grid.
+    """
+
+    blocks = tuple(pilot_blocks)
+    if len(blocks) != PILOT_BLOCK_COUNT:
+        raise ValueError("power sizing requires exactly four pilot blocks")
+    block_ids = tuple(block.block_id for block in blocks)
+    if any(type(block_id) is not str or not block_id for block_id in block_ids):
+        raise ValueError("pilot block IDs must be non-empty")
+    if len(set(block_ids)) != len(block_ids):
+        raise ValueError("pilot block IDs must be unique")
+    raw_values = tuple(
+        value
+        for block in blocks
+        for value in (
+            block.static_goodput,
+            block.tts_goodput,
+            block.lightcone_goodput,
+        )
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, Real) for value in raw_values
+    ):
+        raise TypeError("pilot goodput must be a real number")
+    values = tuple(float(value) for value in raw_values)
+    if any(not np.isfinite(value) or value < 0.0 for value in values):
+        raise ValueError("pilot goodput must be finite and non-negative")
+
+    reason: (
+        Literal[
+            "UNRESOLVED_ZERO_GOODPUT",
+            "UNRESOLVED_ZERO_VARIANCE",
+        ]
+        | None
+    ) = None
+    if any(value == 0.0 for value in values):
+        reason = "UNRESOLVED_ZERO_GOODPUT"
+    else:
+        effects = {
+            "lightcone_vs_tts": tuple(
+                float(np.log(block.lightcone_goodput / block.tts_goodput))
+                for block in blocks
+            ),
+            "lightcone_vs_static": tuple(
+                float(np.log(block.lightcone_goodput / block.static_goodput))
+                for block in blocks
+            ),
+        }
+        if any(
+            float(np.std(np.asarray(rows), ddof=1)) <= np.finfo(np.float64).tiny
+            for rows in effects.values()
+        ):
+            reason = "UNRESOLVED_ZERO_VARIANCE"
+    if reason is None:
+        return preregister_power_sizing(blocks)
+    return UnresolvedPowerSizing(
+        status="POWER_UNRESOLVED",
+        reason_code=reason,
+        pilot_block_ids=block_ids,
+        selected_final_blocks=None,
+        minimum_final_blocks=MINIMUM_FINAL_BLOCKS,
+        maximum_final_blocks=MAXIMUM_FINAL_BLOCKS,
+        target_power=PRIMARY_TARGET_POWER,
+        family_alpha=PRIMARY_FAMILY_ALPHA,
+        minimum_relative_effect=PRIMARY_MINIMUM_RELATIVE_EFFECT,
+    )
+
+
 def validate_final_block_ids(
     plan: PowerSizingPlan,
     final_block_ids: Sequence[str],
@@ -321,6 +431,23 @@ class PairedBcaContrast:
     raw_p_value: float
     confidence: float
     independent_unit: str = "paired_block"
+
+
+@dataclass(frozen=True)
+class UnresolvedPairedContrast:
+    """A complete paired family whose registered log inference is undefined."""
+
+    name: str
+    block_ids: tuple[str, ...]
+    status: Literal[
+        "UNRESOLVED_ZERO_GOODPUT",
+        "UNRESOLVED_ZERO_VARIANCE",
+    ]
+    reason_codes: tuple[str, ...]
+    independent_unit: str = "paired_block"
+
+
+PairedContrastResolution = PairedBcaContrast | UnresolvedPairedContrast
 
 
 def paired_bca_contrast(
@@ -376,6 +503,79 @@ def paired_bca_contrast(
         ci_upper_relative_gain=float(np.expm1(upper)),
         raw_p_value=raw_p_value,
         confidence=confidence,
+    )
+
+
+def resolve_paired_bca_contrast(
+    name: str,
+    paired_goodput: Mapping[str, tuple[float, float]],
+    *,
+    confidence: float = REGISTERED_CONFIDENCE,
+    repetitions: int = 10_000,
+    seed: int = 0,
+) -> PairedContrastResolution:
+    """Run paired BCa or seal a measured zero/degenerate negative result.
+
+    The unresolved variants intentionally carry no point estimate, p-value, or
+    confidence bounds.  Callers can therefore continue reducing independent
+    contrasts without publishing ``[x, x]`` as a pretend interval.
+    """
+
+    if type(name) is not str or not name:
+        raise ValueError("contrast name must be non-empty")
+    if confidence != REGISTERED_CONFIDENCE:
+        raise ValueError("registered analysis intervals are fixed at 95%")
+    if (
+        isinstance(repetitions, bool)
+        or not isinstance(repetitions, int)
+        or repetitions < 100
+    ):
+        raise ValueError("bootstrap repetitions are too small")
+    if len(paired_goodput) < 2:
+        raise ValueError("paired inference requires at least two blocks")
+    block_ids = tuple(sorted(paired_goodput))
+    if any(type(block_id) is not str or not block_id for block_id in block_ids):
+        raise ValueError("paired block IDs must be non-empty")
+    log_effects = []
+    saw_zero = False
+    for block_id in block_ids:
+        pair = paired_goodput[block_id]
+        if type(pair) is not tuple or len(pair) != 2:
+            raise ValueError("each paired block requires numerator and denominator")
+        if any(
+            isinstance(value, bool) or not isinstance(value, Real) for value in pair
+        ):
+            raise TypeError("paired goodput must contain real numbers")
+        numerator, denominator = (float(pair[0]), float(pair[1]))
+        if any(
+            not np.isfinite(value) or value < 0.0 for value in (numerator, denominator)
+        ):
+            raise ValueError("paired goodput must be finite and non-negative")
+        if numerator == 0.0 or denominator == 0.0:
+            saw_zero = True
+        else:
+            log_effects.append(float(np.log(numerator / denominator)))
+    if saw_zero:
+        return UnresolvedPairedContrast(
+            name=name,
+            block_ids=block_ids,
+            status="UNRESOLVED_ZERO_GOODPUT",
+            reason_codes=("UNRESOLVED_ZERO_GOODPUT",),
+        )
+    deviation = float(np.std(np.asarray(log_effects), ddof=1))
+    if deviation <= np.finfo(np.float64).tiny:
+        return UnresolvedPairedContrast(
+            name=name,
+            block_ids=block_ids,
+            status="UNRESOLVED_ZERO_VARIANCE",
+            reason_codes=("UNRESOLVED_ZERO_VARIANCE",),
+        )
+    return paired_bca_contrast(
+        name,
+        paired_goodput,
+        confidence=confidence,
+        repetitions=repetitions,
+        seed=seed,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 
 import pytest
 import torch
@@ -10,6 +11,10 @@ from lightcone_spec import PINNED_SGLANG_COMMIT
 from lightcone_spec.config import load_run_config, run_config_sha256
 from lightcone_spec.config.schema import RunConfig
 from lightcone_spec.execution import ControlledExecutionPolicy
+from lightcone_spec.runtime import distributed as distributed_module
+from lightcone_spec.runtime.distributed import (
+    DistributedRuntimeReleaseCapability,
+)
 from lightcone_spec.sglang_bridge.config import (
     sglang_adaptation_payload,
     sglang_adaptation_sha256,
@@ -69,6 +74,26 @@ def config_value(method: str = "tts") -> dict:
     return value
 
 
+def _distributed_release(
+    mode: str,
+) -> DistributedRuntimeReleaseCapability:
+    return DistributedRuntimeReleaseCapability(
+        schema_version=1,
+        topology_mode=mode,
+        pinned_sglang_commit=PINNED_SGLANG_COMMIT,
+        patched_sglang_tree="d" * 40,
+        semantic_patch_sha256="e" * 64,
+        native_terminal_protocol_sha256="f" * 64,
+        control_mode=(
+            "tp_all_rank_two_phase" if mode == "tp2_dp1" else "dp_sticky_replica_local"
+        ),
+        process_group_backend="nccl" if mode == "tp2_dp1" else "none",
+        adaptation_collective=("tp_shard_all_rank" if mode == "tp2_dp1" else "none"),
+        evidence_status="CPU_CONTRACT_ONLY",
+        gpu_proof_sha256=None,
+    )
+
+
 @pytest.mark.parametrize("method", ["target_only", "static"])
 def test_disabled_methods_have_no_adaptation_payload_or_tensor_allocation(
     method: str,
@@ -93,10 +118,65 @@ def test_runtime_binds_registered_role_safe_execution_policy() -> None:
     assert config.runtime.target_reference_disable_overlap_schedule is True
     assert config.runtime.speculative_disable_overlap_schedule is False
     assert config.runtime.execution_policy_sha256 == ControlledExecutionPolicy().sha256
+    assert config.runtime.topology_mode == "tp1_dp1"
     value = config_value("static")
     value["runtime"]["execution_policy_sha256"] = "0" * 64
     with pytest.raises(ValidationError, match="execution-policy identity mismatch"):
         RunConfig.model_validate(value)
+
+
+def test_e4_mechanism_runtime_fields_are_exact_and_allocation_free_roles_reject() -> (
+    None
+):
+    value = config_value("l0")
+    value["runtime"].update(
+        adaptation_microbatch_size=4,
+        adaptation_publication_coalescing=8,
+        adaptation_stream_priority="high",
+    )
+    config = RunConfig.model_validate(value)
+    payload = sglang_adaptation_payload(config)
+    assert payload is not None
+    assert payload["adaptation_microbatch_size"] == 4
+    assert payload["adaptation_publication_coalescing"] == 8
+    assert payload["adaptation_stream_priority"] == "high"
+
+    for field, invalid in (
+        ("adaptation_microbatch_size", 3),
+        ("adaptation_publication_coalescing", 16),
+        ("adaptation_stream_priority", "realtime"),
+    ):
+        foreign = config_value("l0")
+        foreign["runtime"][field] = invalid
+        with pytest.raises(ValidationError):
+            RunConfig.model_validate(foreign)
+
+    for method in ("target_only", "static", "onlinespec_ogd"):
+        foreign = config_value(method)
+        if method == "onlinespec_ogd":
+            foreign["adaptation"].update(
+                weight_update_mode="full",
+                parameter_scope="all",
+                optimizer={
+                    "name": "sgd",
+                    "learning_rate": 0.1,
+                    "weight_decay": 0.0,
+                    "beta1": 0.9,
+                    "beta2": 0.999,
+                    "epsilon": 1e-8,
+                    "grad_clip": 1.0,
+                },
+                rank=None,
+                lora_alpha=None,
+            )
+            foreign["online_spec"] = {
+                "projection_radius": None,
+                "additional_learning_rates": [],
+                "hedge_learning_rate": None,
+            }
+        foreign["runtime"]["adaptation_stream_priority"] = "high"
+        with pytest.raises(ValidationError, match="mechanism tuning"):
+            RunConfig.model_validate(foreign)
 
 
 @pytest.mark.parametrize("method", ["tts", "l0"])
@@ -193,19 +273,28 @@ def test_unimplemented_tp2_and_replica_local_dp2_topologies_fail_closed() -> Non
         tensor_parallel_size=2,
         tp_rank=1,
         distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_release_capability_sha256="e" * 64,
         distributed_capability_receipt_sha256="d" * 64,
     )
-    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+    with pytest.raises(
+        distributed_module.DistributedRuntimeAuthorityBlocked,
+        match="release_capability_unavailable",
+    ):
         RunConfig.model_validate(tp)
     dp = config_value()
     dp["runtime"].update(
         data_parallel_size=2,
         dp_rank=1,
         router_identity="sticky-router-v1",
+        process_group_backend="none",
         distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_release_capability_sha256="e" * 64,
         distributed_capability_receipt_sha256="d" * 64,
     )
-    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+    with pytest.raises(
+        distributed_module.DistributedRuntimeAuthorityBlocked,
+        match="release_capability_unavailable",
+    ):
         RunConfig.model_validate(dp)
 
 
@@ -220,10 +309,98 @@ def test_unimplemented_tp2_and_replica_local_dp2_topologies_fail_closed() -> Non
         },
     ],
 )
-def test_two_gpu_schema_fails_closed_without_runtime_receipt(updates: dict) -> None:
+def test_two_gpu_schema_fails_closed_without_runtime_receipt(
+    updates: dict,
+) -> None:
     value = config_value()
     value["runtime"].update(updates)
-    with pytest.raises(ValidationError, match="does not expose TP2/DP2"):
+    with pytest.raises(ValidationError, match="patched_two_gpu_v1"):
+        RunConfig.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    ("mode", "runtime_updates", "backend", "control", "collective"),
+    (
+        (
+            "tp2_dp1",
+            {"tensor_parallel_size": 2, "tp_rank": 1},
+            "nccl",
+            "tp_all_rank_two_phase",
+            "tp_shard_all_rank",
+        ),
+        (
+            "tp1_dp2",
+            {
+                "data_parallel_size": 2,
+                "dp_rank": 1,
+                "router_identity": "sticky-router-v1",
+            },
+            "none",
+            "dp_sticky_replica_local",
+            "none",
+        ),
+    ),
+)
+def test_source_pinned_release_enables_only_its_registered_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    runtime_updates: dict[str, object],
+    backend: str,
+    control: str,
+    collective: str,
+) -> None:
+    capability = _distributed_release(mode)
+    monkeypatch.setattr(
+        distributed_module,
+        "DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES",
+        MappingProxyType({mode: capability}),
+    )
+    value = config_value()
+    value["runtime"].update(runtime_updates)
+    value["runtime"].update(
+        process_group_backend=backend,
+        distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_release_capability_sha256=capability.sha256,
+        distributed_capability_receipt_sha256="d" * 64,
+    )
+    config = RunConfig.model_validate(value)
+    assert config.runtime.topology_mode == mode
+    assert config.runtime.distributed_control_mode == control
+    assert config.runtime.adaptation_collective_mode == collective
+    payload = sglang_adaptation_payload(config)
+    assert payload is not None
+    assert payload["topology"]["distributed_control_mode"] == control
+    assert payload["topology"]["adaptation_collective_mode"] == collective
+
+    foreign = config_value()
+    foreign["runtime"].update(
+        data_parallel_size=2 if mode == "tp2_dp1" else 1,
+        tensor_parallel_size=2 if mode == "tp1_dp2" else 1,
+        router_identity=("sticky-router-v1" if mode == "tp2_dp1" else "single-replica"),
+        process_group_backend="none" if mode == "tp2_dp1" else "nccl",
+        distributed_runtime_capability="patched_two_gpu_v1",
+        distributed_release_capability_sha256=capability.sha256,
+        distributed_capability_receipt_sha256="d" * 64,
+    )
+    with pytest.raises(
+        distributed_module.DistributedRuntimeAuthorityBlocked,
+        match="release_capability_unavailable",
+    ):
+        RunConfig.model_validate(foreign)
+
+
+def test_runtime_rejects_world_four_and_unregistered_overlap() -> None:
+    value = config_value()
+    value["runtime"].update(
+        tensor_parallel_size=2,
+        data_parallel_size=2,
+        router_identity="sticky-router-v1",
+    )
+    with pytest.raises(ValidationError, match="tp1_dp1, tp2_dp1, or tp1_dp2"):
+        RunConfig.model_validate(value)
+    value = config_value()
+    value["runtime"]["two_batch_overlap"] = True
+    with pytest.raises(ValidationError):
         RunConfig.model_validate(value)
 
 
@@ -254,9 +431,72 @@ def test_native_e2_adaptation_modes_are_schema_valid(
     assert getattr(parsed_target, field) == value
 
 
-@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3", "NEXTN"])
 @pytest.mark.parametrize("method", ["tts", "l0"])
-def test_unimplemented_backend_adaptation_fails_closed(
+def test_unimplemented_eagle_adaptation_fails_closed(method: str) -> None:
+    value = config_value(method)
+    value["model"]["algorithm"] = "EAGLE"
+    value["adaptation"].update(parameter_scope="last1")
+    value["runtime"]["speculative_eagle_topk"] = 1
+    with pytest.raises(ValidationError, match="no signed native adaptation authority"):
+        RunConfig.model_validate(value)
+
+
+@pytest.mark.parametrize("method", ["tts", "l0"])
+def test_eagle3_adaptation_requires_exact_e0_authority_claims(method: str) -> None:
+    value = config_value(method)
+    value["model"]["algorithm"] = "EAGLE3"
+    value["adaptation"].update(parameter_scope="last1")
+    value["runtime"]["speculative_eagle_topk"] = 1
+    with pytest.raises(ValidationError, match="exactly one formal-E0"):
+        RunConfig.model_validate(value)
+    value["adaptation"].update(
+        eagle3_e0_execution_authority_sha256="d" * 64,
+        eagle3_compatibility_authority_sha256="e" * 64,
+        eagle3_model_selector_sha256="f" * 64,
+        eagle3_native_gpu_proof_sha256="1" * 64,
+    )
+    parsed = RunConfig.model_validate(value)
+    payload = sglang_adaptation_payload(parsed)
+    assert payload is not None
+    assert payload["eagle3_e0_execution_authority_sha256"] == "d" * 64
+
+
+def test_eagle3_qualification_config_does_not_claim_future_gpu_proof() -> None:
+    value = config_value("l0")
+    value["model"]["algorithm"] = "EAGLE3"
+    value["adaptation"].update(
+        parameter_scope="last1",
+        eagle3_qualification_compatibility_authority_sha256="d" * 64,
+        eagle3_qualification_model_selector_sha256="e" * 64,
+    )
+    value["runtime"]["speculative_eagle_topk"] = 1
+    parsed = RunConfig.model_validate(value)
+    payload = sglang_adaptation_payload(parsed)
+    assert payload is not None
+    assert payload["eagle3_native_gpu_proof_sha256"] is None
+    assert payload["eagle3_qualification_compatibility_authority_sha256"] == "d" * 64
+
+
+def test_eagle3_qualification_and_formal_authority_cannot_mix() -> None:
+    value = config_value("l0")
+    value["model"]["algorithm"] = "EAGLE3"
+    value["adaptation"].update(
+        parameter_scope="last1",
+        eagle3_e0_execution_authority_sha256="a" * 64,
+        eagle3_compatibility_authority_sha256="b" * 64,
+        eagle3_model_selector_sha256="c" * 64,
+        eagle3_native_gpu_proof_sha256="d" * 64,
+        eagle3_qualification_compatibility_authority_sha256="e" * 64,
+        eagle3_qualification_model_selector_sha256="f" * 64,
+    )
+    value["runtime"]["speculative_eagle_topk"] = 1
+    with pytest.raises(ValidationError, match="exactly one formal-E0"):
+        RunConfig.model_validate(value)
+
+
+@pytest.mark.parametrize("algorithm", ["DSPARK", "NEXTN"])
+@pytest.mark.parametrize("method", ["tts", "l0"])
+def test_implemented_native_backend_schema_is_reachable_but_not_gpu_authority(
     algorithm: str, method: str
 ) -> None:
     value = config_value(method)
@@ -270,10 +510,9 @@ def test_unimplemented_backend_adaptation_fails_closed(
             verification_mode="fixed_budget",
             fixed_verification_budget=8,
         )
-    if algorithm in {"EAGLE", "EAGLE3"}:
-        value["runtime"]["speculative_eagle_topk"] = 1
-    with pytest.raises(ValidationError, match="adaptation only for DFLASH"):
-        RunConfig.model_validate(value)
+    parsed = RunConfig.model_validate(value)
+    assert parsed.model.algorithm == algorithm
+    assert sglang_adaptation_payload(parsed) is not None
 
 
 @pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE", "EAGLE3", "NEXTN"])

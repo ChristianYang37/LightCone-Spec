@@ -20,7 +20,11 @@ from lightcone_spec.config.schema import (
     RuntimeConfig,
 )
 from lightcone_spec.doctor import _nvcc_release
-from lightcone_spec.execution import ControlledExecutionPolicy, ExecutionRole
+from lightcone_spec.execution import (
+    ControlledExecutionPolicy,
+    ExecutionRole,
+    FixedAddressGraphExecutionPolicy,
+)
 from lightcone_spec.experiments.onlinespec import (
     OnlineSpecCandidate,
     OnlineSpecSelection,
@@ -164,21 +168,35 @@ def _execution_role(method: str) -> ExecutionRole:
     raise ValueError(f"unknown execution-policy method: {method}")
 
 
-def _runtime_execution_policy(runtime: RuntimeConfig) -> ControlledExecutionPolicy:
-    policy = ControlledExecutionPolicy(
-        context_length=runtime.context_length,
-        random_seed=runtime.random_seed,
-        disable_radix_cache=runtime.disable_radix_cache,
-        disable_cuda_graph=runtime.disable_cuda_graph,
-        target_reference_disable_overlap_schedule=(
+def _runtime_execution_policy(
+    runtime: RuntimeConfig,
+) -> ControlledExecutionPolicy | FixedAddressGraphExecutionPolicy:
+    common = {
+        "context_length": runtime.context_length,
+        "random_seed": runtime.random_seed,
+        "disable_radix_cache": runtime.disable_radix_cache,
+        "disable_cuda_graph": runtime.disable_cuda_graph,
+        "target_reference_disable_overlap_schedule": (
             runtime.target_reference_disable_overlap_schedule
         ),
-        speculative_disable_overlap_schedule=(
+        "speculative_disable_overlap_schedule": (
             runtime.speculative_disable_overlap_schedule
         ),
-        enable_deterministic_inference=runtime.enable_deterministic_inference,
-        incremental_streaming_output=runtime.incremental_streaming_output,
-    )
+        "enable_deterministic_inference": runtime.enable_deterministic_inference,
+        "incremental_streaming_output": runtime.incremental_streaming_output,
+    }
+    if runtime.cuda_graph_mode == "disabled":
+        policy = ControlledExecutionPolicy(**common)
+    else:
+        if runtime.native_graph_release_capability_sha256 is None:
+            raise ValueError("fixed-address graph runtime lost source capability")
+        policy = FixedAddressGraphExecutionPolicy(
+            native_runtime_release_capability_sha256=(
+                runtime.native_graph_release_capability_sha256
+            ),
+            graph_batch_sizes=runtime.cuda_graph_batch_sizes,
+            **common,
+        )
     if runtime.execution_policy_sha256 != policy.sha256:
         raise ValueError("runtime execution-policy identity mismatch")
     return policy
@@ -315,6 +333,21 @@ def _execution_argv(runtime: RuntimeConfig, *, role: ExecutionRole) -> list[str]
         argv.append("--disable-radix-cache")
     if policy.disable_cuda_graph:
         argv.append("--disable-cuda-graph")
+    elif type(policy) is FixedAddressGraphExecutionPolicy:
+        argv.extend(
+            [
+                "--cuda-graph-backend-decode",
+                "full",
+                "--cuda-graph-max-bs-decode",
+                "1",
+                "--cuda-graph-bs-decode",
+                "1",
+                "--lightcone-fixed-address-publication-graph",
+                "--lightcone-graph-batch-sizes",
+                ",".join(str(value) for value in policy.graph_batch_sizes),
+                "--lightcone-disable-graph-eager-fallback",
+            ]
+        )
     if policy.overlap_disabled(role=role):
         argv.append("--disable-overlap-schedule")
     if policy.enable_deterministic_inference:
@@ -322,6 +355,20 @@ def _execution_argv(runtime: RuntimeConfig, *, role: ExecutionRole) -> list[str]
     if policy.incremental_streaming_output:
         argv.append("--incremental-streaming-output")
     return argv
+
+
+def _adaptation_mechanism_argv(runtime: RuntimeConfig) -> list[str]:
+    """Render the exact E4-operational knobs for an adapted worker."""
+
+    runtime.validate_topology()
+    return [
+        "--lightcone-adaptation-microbatch-size",
+        str(runtime.adaptation_microbatch_size),
+        "--lightcone-adaptation-publication-coalescing",
+        str(runtime.adaptation_publication_coalescing),
+        "--lightcone-adaptation-stream-priority",
+        runtime.adaptation_stream_priority,
+    ]
 
 
 def _render_server(
@@ -397,12 +444,16 @@ def _render_server(
     )
     argv.extend(_execution_argv(config.runtime, role=_execution_role(method)))
     if method != "target_only":
+        argv.extend(("--speculative-algorithm", config.model.algorithm))
+        if config.model.nextn_mtp_mode != "built_in_mtp":
+            argv.extend(
+                (
+                    "--speculative-draft-model-path",
+                    str(Path(roots[drafter_id]).resolve()),
+                )
+            )
         argv.extend(
             (
-                "--speculative-algorithm",
-                config.model.algorithm,
-                "--speculative-draft-model-path",
-                str(Path(roots[drafter_id]).resolve()),
                 "--speculative-num-draft-tokens",
                 str(config.runtime.speculative_num_draft_tokens),
                 "--speculative-draft-window-size",
@@ -419,6 +470,7 @@ def _render_server(
     # It does not by itself create a drafter, adapter, optimizer, or update path.
     argv.append("--speculative-speed-study-metrics")
     if adaptation_path is not None and telemetry_path is not None:
+        argv.extend(_adaptation_mechanism_argv(config.runtime))
         argv.extend(
             (
                 "--speculative-adaptation-config",

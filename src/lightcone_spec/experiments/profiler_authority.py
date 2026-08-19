@@ -306,6 +306,18 @@ def _tool_contract(variant: str) -> ProfilerToolContract:
     raise ValueError("profiler variant is not registered")
 
 
+def registered_profiler_tool_contract(variant: str) -> ProfilerToolContract:
+    """Return the code-owned command/metric contract for one profiler row.
+
+    This accessor does not consult or weaken the adversarial release tool
+    allowlist.  It lets the trusted single-operator runner reuse the exact
+    registered command template while discovering and hashing the executable
+    onsite.
+    """
+
+    return _tool_contract(variant)
+
+
 @dataclass(frozen=True)
 class ProfilerExecutionPlan:
     schema_version: int
@@ -897,6 +909,7 @@ __all__ = [
     "ProfilerToolContract",
     "bind_profiler_plan_authority",
     "reduce_profiler_terminal_authority",
+    "registered_profiler_tool_contract",
     "release_profiler_plan",
     "require_profiler_execution_authority",
     "revalidate_profiler_plan_authority",

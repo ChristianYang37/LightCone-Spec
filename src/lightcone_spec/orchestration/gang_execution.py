@@ -28,6 +28,10 @@ from lightcone_spec.orchestration.native_terminal_gang import (
     ReplicaRouteBinding,
     require_native_terminal_gang_release_capability,
 )
+from lightcone_spec.runtime.distributed import (
+    RuntimeTopologyMode,
+    VerifiedDistributedRuntimeGpuProof,
+)
 from lightcone_spec.telemetry.records import RunRecord
 
 SERVING_GANG_EXECUTION_PROTOCOL_SHA256 = canonical_sha256(
@@ -48,7 +52,17 @@ SERVING_GANG_EXECUTION_PROTOCOL_SHA256 = canonical_sha256(
     }
 )
 
-_METHODS = frozenset({"target_only", "static", "tts", "l0"})
+_METHODS = frozenset(
+    {
+        "target_only",
+        "static",
+        "tts",
+        "l0",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }
+)
 _SHA_LENGTH = 64
 _SAFE_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:@+-"
@@ -277,7 +291,7 @@ def _flag_value(argv: tuple[str, ...], flag: str) -> str:
 
 @dataclass(frozen=True)
 class ServingGangLaunch:
-    mode: Literal["tp2_dp1", "two_replica_tp1_dp2"]
+    mode: Literal["tp2_dp1", "tp1_dp2"]
     method: str
     run_id: str
     gang_binding_sha256: str
@@ -296,7 +310,7 @@ class ServingGangLaunch:
     route_plan_sha256: str | None
 
     def __post_init__(self) -> None:
-        if self.mode not in {"tp2_dp1", "two_replica_tp1_dp2"}:
+        if self.mode not in {"tp2_dp1", "tp1_dp2"}:
             raise ValueError("serving gang launch mode is unsupported")
         if self.method not in _METHODS:
             raise ValueError("serving gang launch method is unsupported")
@@ -378,6 +392,10 @@ class ServingGangLaunch:
     def world_size(self) -> int:
         return 2
 
+    @property
+    def runtime_topology_mode(self) -> RuntimeTopologyMode:
+        return self.mode
+
     def _validate_supervisor(self) -> None:
         argv = self.supervisor_argv
         if (
@@ -415,7 +433,7 @@ class ServingGangLaunch:
             raise ValueError("supervisor argv differs from the gang topology/ports")
         if str(self.ports.reserved_control) in argv:
             raise ValueError("reserved control port cannot be advertised as live")
-        if self.mode == "two_replica_tp1_dp2":
+        if self.mode == "tp1_dp2":
             if (
                 _flag_value(argv, "--load-balance-method") != "round_robin"
                 or argv.index("--load-balance-method") <= separator
@@ -587,7 +605,7 @@ def build_diagnostic_serving_gang_launch(
     ):
         raise ValueError("gang route plan differs from topology receipt coverage")
     return ServingGangLaunch(
-        mode="tp2_dp1" if topology == (2, 1) else "two_replica_tp1_dp2",
+        mode="tp2_dp1" if topology == (2, 1) else "tp1_dp2",
         method=first.run.method,
         run_id=first.run.run_id,
         gang_binding_sha256=gang_binding.sha256,
@@ -851,12 +869,49 @@ class DiagnosticGangCompletion:
 
 
 @dataclass(frozen=True)
+class FormalGangCompletion:
+    """First-party all-rank terminal result returned by the native workload."""
+
+    serving_gang_launch_sha256: str
+    terminal_aggregate_sha256: str
+    rank_terminal_sha256s: tuple[str, str]
+    run_record_topology_summary_sha256: str
+    gpu_proof_receipt_sha256: str
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("formal completion launch", self.serving_gang_launch_sha256),
+            ("formal completion aggregate", self.terminal_aggregate_sha256),
+            ("formal completion run summary", self.run_record_topology_summary_sha256),
+            ("formal completion GPU proof", self.gpu_proof_receipt_sha256),
+        ):
+            _require_sha256(label, value)
+        if (
+            type(self.rank_terminal_sha256s) is not tuple
+            or len(self.rank_terminal_sha256s) != 2
+            or len(set(self.rank_terminal_sha256s)) != 2
+        ):
+            raise ValueError("formal completion requires two unique rank terminals")
+        for value in self.rank_terminal_sha256s:
+            _require_sha256("formal completion rank terminal", value)
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(
+            {
+                **asdict(self),
+                "rank_terminal_sha256s": list(self.rank_terminal_sha256s),
+            }
+        )
+
+
+@dataclass(frozen=True)
 class ServingGangAttemptReceipt:
     attempt_id: str
     serving_gang_launch_sha256: str
     previous_failed_attempt_sha256: str | None
     process_identity: str | None
-    status: Literal["DIAGNOSTIC_COMPLETE", "POISONED"]
+    status: Literal["DIAGNOSTIC_COMPLETE", "TERMINAL_COMPLETE", "POISONED"]
     completion_sha256: str | None
     error_code: str | None
     restart_required: bool
@@ -870,7 +925,7 @@ class ServingGangAttemptReceipt:
             )
         if self.process_identity is not None:
             _require_text("gang supervisor process identity", self.process_identity)
-        if self.status == "DIAGNOSTIC_COMPLETE":
+        if self.status in {"DIAGNOSTIC_COMPLETE", "TERMINAL_COMPLETE"}:
             if self.process_identity is None:
                 raise ValueError("completed diagnostic attempt requires a supervisor")
             _require_sha256("gang attempt completion", self.completion_sha256)
@@ -910,6 +965,9 @@ ServingGangSupervisorLauncher = Callable[
 ]
 DiagnosticGangWorkload = Callable[
     [ServingGangSupervisorHandle], Awaitable[DiagnosticGangCompletion]
+]
+FormalGangWorkload = Callable[
+    [ServingGangSupervisorHandle], Awaitable[FormalGangCompletion]
 ]
 
 
@@ -1028,22 +1086,27 @@ class FreshProcessServingGangExecutor:
 
 
 def require_formal_serving_gang_launch(
-    *, launch: ServingGangLaunch, claimed_capability_sha256: str
+    *,
+    launch: ServingGangLaunch,
+    claimed_capability_sha256: str,
+    verified_gpu_proof: VerifiedDistributedRuntimeGpuProof | None = None,
 ) -> None:
     """Block before launch until source pin and native result pointer both exist."""
 
+    if type(verified_gpu_proof) is not VerifiedDistributedRuntimeGpuProof:
+        raise NativeTerminalGangAuthorityBlocked(
+            "distributed_runtime_gpu_proof_unavailable",
+            "formal gang launch lacks a verified root-signed GPU proof",
+        )
+    if (
+        verified_gpu_proof.topology_mode != launch.runtime_topology_mode
+        or verified_gpu_proof.topology_sha256 != launch.topology_sha256
+        or verified_gpu_proof.gpu_uuids != tuple(rank.gpu_uuid for rank in launch.ranks)
+    ):
+        raise ValueError("distributed GPU proof belongs to another launch identity")
     require_native_terminal_gang_release_capability(
         topology_sha256=launch.topology_sha256,
         claimed_capability_sha256=claimed_capability_sha256,
-    )
-    if launch.route_plan_sha256 is not None:
-        raise NativeTerminalGangAuthorityBlocked(
-            "native_terminal_dp_actual_route_producer_unavailable",
-            "formal DP2 needs first-party proof of each actual routed replica",
-        )
-    raise NativeTerminalGangAuthorityBlocked(
-        "native_terminal_gang_first_party_result_pointer_unavailable",
-        "formal TP2 needs the patch-native all-rank collective result pointer",
     )
 
 
@@ -1051,22 +1114,100 @@ async def execute_formal_serving_gang(
     *,
     launch: ServingGangLaunch,
     claimed_capability_sha256: str,
+    verified_gpu_proof: VerifiedDistributedRuntimeGpuProof | None = None,
     launcher: ServingGangSupervisorLauncher,
-) -> None:
-    """Formal pre-mutation entry; the current release never calls launcher."""
+    attempt_id: str | None = None,
+    previous_failed_attempt_sha256: str | None = None,
+    workload: FormalGangWorkload | None = None,
+    startup_timeout_s: float = 180.0,
+    shutdown_timeout_s: float = 60.0,
+) -> ServingGangAttemptReceipt:
+    """Run one fresh proof-gated gang and poison every incomplete lifecycle."""
 
     require_formal_serving_gang_launch(
         launch=launch,
         claimed_capability_sha256=claimed_capability_sha256,
+        verified_gpu_proof=verified_gpu_proof,
     )
-    _ = launcher  # pragma: no cover - future source-owned capability branch
-    raise AssertionError("formal gang launch gate unexpectedly returned")
+    if attempt_id is None or workload is None:
+        raise ValueError("formal gang execution requires an attempt ID and workload")
+    _require_text("formal gang attempt ID", attempt_id)
+    if previous_failed_attempt_sha256 is not None:
+        _require_sha256(
+            "formal previous failed attempt",
+            previous_failed_attempt_sha256,
+        )
+    for label, value in (
+        ("formal gang startup timeout", startup_timeout_s),
+        ("formal gang shutdown timeout", shutdown_timeout_s),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ValueError(f"{label} must be finite and positive")
+
+    handle: ServingGangSupervisorHandle | None = None
+    process_identity: str | None = None
+    terminated = False
+    try:
+        handle = await launcher(launch)
+        process_identity = _require_text(
+            "formal gang supervisor process identity", handle.process_identity
+        )
+        await handle.wait_ready(float(startup_timeout_s))
+        completion = await workload(handle)
+        if type(completion) is not FormalGangCompletion:
+            raise TypeError("formal gang workload returned a non-formal completion")
+        if (
+            completion.serving_gang_launch_sha256 != launch.sha256
+            or completion.gpu_proof_receipt_sha256 != verified_gpu_proof.receipt_sha256
+        ):
+            raise ValueError("formal gang completion belongs to another authority")
+        await handle.terminate(float(shutdown_timeout_s))
+        terminated = True
+        return ServingGangAttemptReceipt(
+            attempt_id=attempt_id,
+            serving_gang_launch_sha256=launch.sha256,
+            previous_failed_attempt_sha256=previous_failed_attempt_sha256,
+            process_identity=process_identity,
+            status="TERMINAL_COMPLETE",
+            completion_sha256=completion.sha256,
+            error_code=None,
+            restart_required=False,
+        )
+    except BaseException as error:
+        termination_failed = False
+        if handle is not None and not terminated:
+            try:
+                await handle.terminate(float(shutdown_timeout_s))
+            except BaseException:  # noqa: BLE001 - cleanup failure poisons evidence
+                termination_failed = True
+        receipt = ServingGangAttemptReceipt(
+            attempt_id=attempt_id,
+            serving_gang_launch_sha256=launch.sha256,
+            previous_failed_attempt_sha256=previous_failed_attempt_sha256,
+            process_identity=process_identity,
+            status="POISONED",
+            completion_sha256=None,
+            error_code=(
+                "gang_supervisor_termination_failed"
+                if termination_failed
+                else "gang_execution_failed"
+            ),
+            restart_required=True,
+        )
+        raise ServingGangAttemptFailed(receipt) from error
 
 
 __all__ = [
     "SERVING_GANG_EXECUTION_PROTOCOL_SHA256",
     "DiagnosticGangCompletion",
     "DiagnosticGangWorkload",
+    "FormalGangCompletion",
+    "FormalGangWorkload",
     "FreshProcessServingGangExecutor",
     "GangRunRecordTopologySummary",
     "RoutedServingRequestBody",

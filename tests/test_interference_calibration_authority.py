@@ -40,8 +40,10 @@ from lightcone_spec.experiments.interference_authority import (
 )
 from lightcone_spec.experiments.registry import (
     WorkloadClass,
-    build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.stage_activation import (
     materialize_registry_stage_activation,

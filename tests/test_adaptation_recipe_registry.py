@@ -13,8 +13,10 @@ from lightcone_spec.experiments.registry import (
     AdaptationRecipeBlocker,
     CellStatus,
     ExperimentRegistry,
-    build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 
 
@@ -271,7 +273,7 @@ def test_e2_missing_optimizer_semantics_have_named_blockers(
     assert "schedule_total_published_updates" in cosine.optimizer.unresolved_fields
 
     chronobelief = one("chronobelief")
-    assert "chronobelief_equation_unregistered" in chronobelief.blocker_codes
+    assert "chronobelief_equation_unregistered" not in chronobelief.blocker_codes
     assert "e2_learning_rate_unregistered" in chronobelief.blocker_codes
     assert chronobelief.optimizer.learning_rate is None
 

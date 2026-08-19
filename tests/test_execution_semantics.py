@@ -45,8 +45,10 @@ from lightcone_spec.experiments.registry import (
     ExperimentCell,
     ExperimentReceipt,
     LockedOutput,
-    build_industrial_registry,
     scientific_role_for_cell,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
 

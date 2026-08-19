@@ -24,10 +24,11 @@ SourceKind = Literal["poisson", "closed_loop", "immediate_burst", "external_shap
 OutcomeStatus = Literal["rejected", "completed", "timed_out", "cancelled", "unfinished"]
 
 REGISTERED_COHORT_COUNTS = frozenset({1, 4, 16, 64})
-# External replay names are claims, not free-form labels. A source enters this
-# immutable allowlist only with a reviewed public revision and canonical row
-# digest. No BurstGPT asset is pinned in this source release, so its cells stay
-# BLOCKED instead of accepting caller-authored rows under that name.
+# External replay names are claims, not free-form labels.  This legacy API only
+# accepts one globally fixed shape digest.  Current single-operator BurstGPT
+# replay is instead block-stratified and rate-scaled from a six-asset v2.0
+# release lock in ``formal_single_operator_loads``; keeping this map empty
+# prevents the legacy API from accepting caller-authored rows under that name.
 REGISTERED_EXTERNAL_SHAPES: Mapping[tuple[str, str], str] = MappingProxyType({})
 
 

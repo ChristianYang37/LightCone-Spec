@@ -62,11 +62,12 @@ coverage。Scientific registry 仍携带两个 logical rank slot；frozen assign
 topology-aware gang，不表示较大 rank method 已可执行。Tracked compatibility manifest 仍会
 独立描述其准确 reference host。
 
-目标 registry 与 CPU coordinator 描述单节点 TP2 与 sticky DP2 identity，但当前 release
-只接受 TP1/DP1，并会在 model loading 前拒绝全部 TP2/DP2 `RunConfig`。未来 multi-rank
-release 将要求内容绑定的 `patched_two_gpu_v1` capability receipt 与每个 rank 的 matching
-receipt。真实 CPU `gloo` harness 只测试 collective state transition，不能启用该 release
-surface，也不能提供 GPU/NCCL evidence。
+源码 runtime 实现三种已注册单机模式：`tp1_dp1`、`tp2_dp1` 与 sticky-replica
+`tp1_dp2`。Distributed `RunConfig` 只在携带准确的 source-owned
+`patched_two_gpu_v1` capability identity 与 runtime-envelope receipt 时被接受。Schema 支持
+不等于 GPU authority；TP2/DP2 在全新 dynamic qualification、all-rank publication 与
+terminal evidence 被验证前仍保持 fail closed。真实 CPU `gloo` harness 只测试 collective
+state transition，不能提供 GPU/NCCL evidence。
 
 HBM preflight 必须测量每个 rank，并由最不可行 rank 决定。Adaptation reserve、KV pool、
 safety margin、固定 cohort-slab capacity 与 telemetry queue bound 都来自已注册 memory ledger。
@@ -115,33 +116,94 @@ inventory 和 storage 可用，并记录脱敏 provisioning receipt。不得把 
 temporary URL、instance address 或 access token 写入 command、manifest、evidence、handoff
 document 或 Git。
 
-当前实证 Stage B 因 trusted hardware signer、provider credential、immutable model/data/trace
-lock 以及已注册 hardware/interference envelope 均不可用而 `BLOCKED`。固定 integration 已
-实现准确 native begin/reset/finalize hook，但 industrial executor 的 release run 仍只有
-TP1/DP1 Target-only；Static/TTS/L0-naive/LightCone 会在任何 mutation 前 fail preflight。仅获得硬件或 test
-signer 也不能解除 speculative blocker。Formal TTS/L0-naive 还要求 sealed frozen TTS recipe
-authority，LightCone 要求准确 sealed E2 winner，二者都不能从 default 推断。
-DSpark/EAGLE/EAGLE3/NEXTN adaptation 与全部
-TP2/DP2 工作还需要其他实现，保持 blocked。
+Source tree 本身不包含可直接宣称实测完成的 Stage B。Formal session 在取得 fresh provider
+state、root-authorized deployment/hardware policy、不可变 prepared-model/workload content
+receipt、精确 compile/exactness/interference terminal 以及 stage capacity control 前保持
+`BLOCKED`。固定 integration 已提供 first-party compile 与 non-serving terminal contract；
+checkout 中存在 source capability 并不等于已有 execution evidence，硬件或 test signer 也
+不能单独解除 speculative blocker。Formal TTS/L0-naive 还要求 sealed TTS-Cal winner，
+LightCone 要求准确 sealed E2 winner，二者都不能从 default 推断。TP2/DP2、DSpark、NEXTN、
+native ITL 与 session reuse 已实现，但必须等待各自精确的 dynamic GPU proof。EAGLE3 还要求
+独立签署的官方 model/selector compatibility decision；不支持或不兼容的组合保持 N/A 或
+`BLOCKED`。
 
 ## Trusted Attester Bundle
 
-可信 verification material 以 canonical `TrustedAttesterPolicyBundle` 及相邻 semantic SHA-256
-sidecar 的形式，在仓库外 provision。Public bundle 包含 Ed25519 public key 与 attester
-allowlist、challenge-nonce lifetime 与 external single-use replay policy、hardware-envelope
-digest allowlist 及 validity interval；绝不能包含 private key、signing seed、test identity、
-credential 或 host routing detail。
+Package 在 `manifests/runtime/release_ed25519_root_v1.json` 固定一个离线 Ed25519 **公钥**及
+fingerprint，并用相邻 raw-file SHA-256 sidecar 绑定；wheel 与 sdist 携带相同 public
+resource。Repository 不保存 private key、signing seed、credential、host route 或 hardware
+digest。
 
-信任来自另行 provision 的 `TrustedAttesterAnchorDescriptor`；它固定 bundle 的 absolute
-normalized path、semantic digest、validity 与 authority。Loader 会拒绝 symlink、hard link、
-重复 JSON key、非 canonical byte、读取中变化的文件、expired policy、未 allowlist hardware，
-以及 replayed 或未绑定 challenge。Caller 自选 path 加 digest 不构成 trust root。
+取得真实 inventory 后，离线 root 对短期、challenge-bound、包含准确 homogeneous hardware
+allowlist 与 typed control-attester keys 的 deployment policy 签名。该动态层不需要猜测未来
+GPU topology，也不要求更改 source HEAD。Loader 会验证 pinned root、policy signature 与
+validity、精确 policy digest、hardware membership、challenge replay reservation 以及
+path/content identity；wrong key、expiry、replay、TOCTOU、symlink、hard link、非 canonical
+bytes 或 caller-selected trust root 均被拒绝。External private key 不会复制到 remote instance，
+也不会进入 argv、environment variable 或 log。
 
-本 source release 的 `SOURCE_RELEASE_TRUSTED_ATTESTER_ANCHOR` 刻意未配置。因此，即使 operator
-能为 diagnostic deployment 加载 public verification material，formal release 仍会 fail
-closed。未来经过 review 的 release 必须先在 out-of-band source authority 中 anchor public
-bundle，formal DAG 才可能输出 `MEASURED`；signing key 始终留在外部 attester，绝不提交或
-放入 command argument。
+Public root 的存在不会把 run 变成 `MEASURED`；每个 formal session 仍需要 fresh root-signed
+deployment policy 与相应的 locally controlled terminal/aggregate attestation。
+
+### 本地离线签名仪式
+
+只在可信本地签名端运行签名。Source-owned signer 通过继承的 file descriptor 接收 private
+key，或通过不回显的 TTY 提示读取绝对 key path；它没有 private-key path、private bytes 或
+passphrase 参数，也不会从 environment 读取这些值。Key file 必须位于 private directory，
+由当前用户拥有、权限为 `0600`、只有一个 hardlink；公钥必须匹配 pinned root 或
+root-authorized signing policy。
+
+```bash
+python -m lightcone_spec.runtime.offline_signer sign-deployment \
+  --bundle /safe/public/deployment-bundle.json \
+  --inventory-sha256 "$INVENTORY_SHA256" \
+  --challenge-id deployment-2026-08-17-001 \
+  --output /safe/evidence/deployment-authorization.json
+
+python -m lightcone_spec.runtime.offline_signer sign-control \
+  --subject /safe/public/compile-control-subject.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --hardware-envelope-sha256 "$HARDWARE_ENVELOPE_SHA256" \
+  --attester-id release-signer \
+  --key-id release-signer-key \
+  --challenge-id compile-control-2026-08-17-001 \
+  --output /safe/evidence/compile-control.json
+
+python -m lightcone_spec.runtime.offline_signer sign-scientific \
+  --artifact-type stage-materialization \
+  --payload /safe/public/stage-materialization.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --attester-id release-signer \
+  --key-id release-signer-key \
+  --challenge-id stage-materialization-2026-08-17-001 \
+  --output /safe/evidence/stage-materialization.candidate.json
+
+python -m lightcone_spec.runtime.offline_signer finalize-scientific \
+  --artifact-type stage-materialization \
+  --candidate /safe/evidence/stage-materialization.candidate.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --challenge-ledger /safe/private/single-use-challenge-ledger \
+  --output /safe/evidence/signed-stage-materialization.json
+```
+
+所有签名命令都会创建 fresh challenge，并以 no-replace 语义发布 canonical file。Scientific
+authority 使用 closed、typed 的两阶段仪式：第一步只接受注册的 payload type；finalizer 会重新
+核验 deployment policy，并先在 private single-use ledger 中保留 challenge，再发布 signed
+wrapper；不存在 generic JSON signing mode。自动化只能
+通过 `--key-fd` 传入数字型 inherited descriptor；不得把 key 或 key path 放进 argv。只将
+public authorization/control artifact 复制给执行流程；绝不能把 private key 或 signer input
+FD 复制到 GPU host。
+
+本地签名 CLI 还提供帮助：
+
+```bash
+python -m lightcone_spec.runtime.offline_signer sign-deployment --help
+python -m lightcone_spec.runtime.offline_signer sign-control --help
+python -m lightcone_spec.runtime.offline_signer sign-scientific --help
+python -m lightcone_spec.runtime.offline_signer finalize-scientific --help
+```
+
+帮助命令同样不会读取或输出 private material。
 
 ## Model 与数据准备
 

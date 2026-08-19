@@ -89,8 +89,8 @@ completion authority 或 materialized bundle；其 table 与 receipt 也绝不�
 
 Bootstrap envelope 只授权生成八个已注册 Static calibration observation，不能授权
 headline co-tenancy 或更大 cardinality。`reduce-interference-calibration` 会在打开 caller
-path 前先检查 release trust root；因此当前无 signer 的 release 只写入 `BLOCKED` decision，
-不会生成 calibrated envelope。Preflight stage 只有在重开同一份 raw execution authority
+path 前先检查 source-pinned public root 和 fresh dynamic control；缺少真实签名 evidence 时
+只写入 `BLOCKED` decision，不会生成 calibrated envelope。Preflight stage 只有在重开同一份 raw execution authority
 后才能封存 `runtime_envelope=PATH`，绝不接受手写 rule list 或 bare digest。
 
 ## Compile-cache plan 绑定
@@ -185,18 +185,22 @@ SHA-256、row count、筛选协议与完整 selected-row SHA-256 全部由源码
 lightcone-spec bind-formal-workload-authority \
   --workload math500_level5 \
   --source /absolute/path/to/math500-locked.json \
+  --content-verification-receipt /absolute/path/to/content-E3a.json \
+  --now-ns 1786900000000000000 \
   --output artifacts/industrial/math500-workload-authority.json
 
 lightcone-spec revalidate-formal-workload-authority \
-  --authority artifacts/industrial/math500-workload-authority.json
+  --authority artifacts/industrial/math500-workload-authority.json \
+  --content-verification-receipt /absolute/path/to/content-E3a.json \
+  --now-ns 1786900000000000000
 ```
 
-本 release 的 formal-workload source allowlist 为空。因此 bind 会在检查 source path 或创建
-output directory 之前返回 42，并报告 `status=BLOCKED` 与
-`reason_code=formal_workload_source_allowlist_empty`。未来 allowlisted source 可以生成
-`BOUND_DIAGNOSTIC` artifact，但该 artifact 永久携带
-`formal_execution_authorized=false`；它只是 workload input identity，不是 GPU dispatch、
-attestation 或 formal result。
+两个命令都要求当前有效、经 root 验证的 content-verification receipt，并显式提供验证时间。
+缺失或无效的 content authority 会在绑定 raw workload 之前 fail closed。成功绑定会报告
+`BOUND_AUTHORIZED_CONTENT`，但生成的 wrapper 仍永久携带
+`formal_execution_authorized=false`；它只是必须与同一 verified content authority 一起
+replay 的 workload input identity，不是 GPU dispatch、attestation 或 formal result。
+旧 source-allowlist API 仍是非授权 diagnostic，不是 production CLI 路径。
 
 ## Industrial Registry 工作流
 
@@ -389,9 +393,9 @@ lightcone-spec execute-dispatch-wave \
   --receipt-output artifacts/industrial/dispatch-wave-0.json
 ```
 
-当前 source release 的 release-owned trust policy 没有 trusted hardware attester。即使
-caller/test signer 的签名在密码学上有效，也不能解锁 formal execution；bare
-`CapacityEnvelope` 同样不能授予 execution authority。因此，即使 request 在其他方面完整，
+当前 source release 固定 offline Ed25519 public root；真实 inventory 后必须另行提供
+root-signed short-lived deployment/hardware policy 和对应 typed controls。Caller/test signer
+仍不能解锁 formal execution；bare `CapacityEnvelope` 同样不能授予 execution authority。因此，即使 request 在其他方面完整，
 materialization 也会在全 assignment 的 release preflight 处返回 `BLOCKED`/42，且不会创建
 publication directory。Formal execution 则会独立地在 entry trust gate 返回 `BLOCKED`/42，
 发生在读取 materialization manifest、创建 receipt parent/evidence root、导入 serving client
@@ -423,6 +427,68 @@ Estimator 会执行同样的 raw-input rematerialization 与现场 capacity reva
 同时绑定 scheduler inventory SHA-256 与 interference-envelope SHA-256；若准确 scheduler
 replay 不可执行，它仍保留真实派生的 GPU-hour diagnostics，记录具名 unresolved assumption
 并返回 42；该 report 不能用作 launch authority。
+
+Preflight 的实际 GPU hours 只能从已 finalized、sealed 的 preflight chain 物化。该命令不
+接受 duration、run count 或 reserve scalar；唯一 compile 与 exactness lifecycle authority
+会从 `--source-authority` 传递重开，另强制要求八个不重复、path-bound 的 interference
+lifecycle proof，其 cell ID 必须与 finalized 1+1+8 source 精确一致：
+
+```bash
+lightcone-spec materialize-preflight-gpu-hour-envelope \
+  --dispatch-receipt /absolute/evidence/preflight-dispatch.json \
+  --remote-raw-receipt /absolute/evidence/preflight-remote-raw.json \
+  --source-authority /absolute/evidence/preflight-source.json \
+  --activation /absolute/evidence/preflight-activation.json \
+  --coverage /absolute/evidence/preflight-pointer-coverage.json \
+  --stage-coverage /absolute/evidence/preflight-stage-coverage.json \
+  --interference-lifecycle-proof 9a4d4b4f84399bbd9e33e542d110e237d33ef0d1f738d60406399611cadaf6d6=/absolute/evidence/lifecycle-0.json \
+  --interference-lifecycle-proof a88676a576111058c46b44dc2754a4d171e6c8f2226c3ebb65f2db4716c5c253=/absolute/evidence/lifecycle-1.json \
+  --interference-lifecycle-proof 11de28835716cb8fa5af2dea84571e2ae930f6f3642a6ccecaaa46529ca76f10=/absolute/evidence/lifecycle-2.json \
+  --interference-lifecycle-proof 2761af3f18adceab26d68bc7887b50f21575c8f54062738ff893d402ffa5c32e=/absolute/evidence/lifecycle-3.json \
+  --interference-lifecycle-proof 1e7933ad9c1b95af086d1a8626d882beb4f376987786e5799b2e440f4ae536dd=/absolute/evidence/lifecycle-4.json \
+  --interference-lifecycle-proof 8902eb962b1ab7703a29446c1f4bb56f183d620496043e02814bfd1d0d94a630=/absolute/evidence/lifecycle-5.json \
+  --interference-lifecycle-proof 52f11f9c36ea5016a0cba90b4a1ae843b77a15be00936df846f8a9a6cfe620f8=/absolute/evidence/lifecycle-6.json \
+  --interference-lifecycle-proof e93df280d22db443b27ee32e6dc95eed9bc7ecb6a1f4a439dddf57c93c5206e5=/absolute/evidence/lifecycle-7.json \
+  --formal-runtime-authority-manifest /absolute/evidence/runtime-authority.json \
+  --source-output /absolute/evidence/preflight-gpu-hour-source.json \
+  --now-ns 2000000000 \
+  --output /absolute/evidence/preflight-gpu-hour-envelope.json
+```
+
+两个 output path 必须互异、absolute、normalized 且尚不存在；source manifest 与 schema-2
+envelope 都以 atomic no-replace 发布。Envelope 可直接进入 offline scientific signer 的
+`stage-gpu-hour-envelope` typed decoder；finalized signed wrapper 与 source manifest 随后进入
+`reserve-formal-stage-gpu-hours`。普通 formal stage 的对应命令会在 public、path-bound
+stage-source rebuild bundle 出现之前保持不可用；digest、generic JSON 或序列化 private
+execution seal 都不能替代它。
+
+### Source-owned 方法 authority
+
+创建 `ProtocolLock` 前，必须从准确 bound source 发布三个 code-owned 方法输入：
+
+```bash
+lightcone-spec publish-tts-calibration-source-authority \
+  --paper-pdf /absolute/source/tts-v2.pdf \
+  --paper-source /absolute/source/tts-v2.tex \
+  --tuning-window /absolute/source/tts-tuning-window.json \
+  --trainable-plan-authority /absolute/source/trainable-plan.json \
+  --drafter-native-loss /absolute/source/drafter-native-loss.json \
+  --output /absolute/evidence/tts-calibration-authority.json
+
+lightcone-spec publish-chronobelief-source-authority \
+  --paper-pdf /absolute/source/chronobelief.pdf \
+  --tex-source /absolute/source/chronobelief.tex \
+  --output /absolute/evidence/chronobelief-authority.json
+
+lightcone-spec publish-e1-recipe-anchor-authority \
+  --trainable-plan-authority /absolute/source/trainable-plan.json \
+  --output /absolute/evidence/e1-recipe-anchor-authority.json
+```
+
+这些命令会深读所列 source file，确定性派生封闭的 numeric/recipe authority，并使用
+atomic no-replace 发布。它们不接受 caller 提供的 authority digest 或 recipe override。
+输出只作为 `create-protocol-lock` 的输入；不会签署实验结果、授权 dispatch，也不能替代
+后续 tuning 与 GPU evidence gate。
 
 Stage 的 activated cell 与 disposition durable 后再封存。`--inventory PATH` 是 completed
 evidence 所用 physical GPU identity 与 topology 的 authority。每次重复的
@@ -551,9 +617,25 @@ receipt/evidence bytes 会在本地重算 content identity，缺失、伪造、�
 保持 host-exclusive；headline concurrency 绝不超过该主机自己的 calibrated envelope，fleet
 SSH concurrency 另有独立上限。
 
-没有任何 command 接受 caller-selected trusted-attester bundle 作为 release authority。Public
-`TrustedAttesterPolicyBundle` 由外部 operator/source configuration anchor；当前 source-release
-anchor 不存在，因此 formal dispatch 继续 fail closed。
+没有任何 command 接受 caller-selected trusted-attester bundle 作为 release authority。Package
+固定 offline Ed25519 public root/fingerprint；真实 inventory 后由该 root 签署短期动态 policy，
+且 formal dispatch 原子消费 deployment/control challenge。私钥只通过本地
+`python -m lightcone_spec.runtime.offline_signer` 的 TTY prompt 或数字 `--key-fd` 输入；CLI
+没有 key path/bytes 参数，GPU host 也不得接收私钥。缺失、过期、replay、wrong-key 或硬件不
+匹配时继续 fail closed。
+
+本地 signer 的完整 help surface 为：
+
+```bash
+python -m lightcone_spec.runtime.offline_signer sign-deployment --help
+python -m lightcone_spec.runtime.offline_signer sign-control --help
+python -m lightcone_spec.runtime.offline_signer sign-scientific --help
+python -m lightcone_spec.runtime.offline_signer finalize-scientific --help
+```
+
+`sign-scientific` 只接受 closed allowlist 内的 typed scientific wrapper；生成的 candidate 必须
+再由 `finalize-scientific` 重验 policy，并将 challenge 原子写入 private single-use ledger 后才
+能成为 signed artifact。不存在 generic JSON signer，也没有 key path/bytes 参数。
 
 ## 身份与 Topology 链
 
@@ -575,30 +657,34 @@ source + patched tree + model/data/trace locks
  family power + dependence-aware statistics + trusted attestation
 ```
 
-TP2 与 sticky DP2 字段是目标 registry/CPU-coordinator vocabulary。当前 `RunConfig` 会在
-model loading 前拒绝全部 TP2/DP2 value；CPU `gloo` contract 或 caller 自己填写 receipt 都
-不能启用。未来实现必须准确绑定 rank、UUID、rendezvous、router、clock、process-group、
-ownership 与 receipt identity。
+TP2 与 sticky DP2 是已注册的源码 vocabulary。`RunConfig` 只在准确 source-owned
+`patched_two_gpu_v1` capability identity 与 runtime receipt claim 存在时接受 distributed
+row；formal dispatch 随后深验 matching dynamic GPU proof。CPU `gloo` contract 或 caller
+自己填写 receipt 都不能启用。Identity 必须准确绑定 rank、UUID、rendezvous、router、
+clock、process-group、ownership 与 receipt。
 
 当 command contract 要求时，generated JSON 使用相邻 `.sha256` sidecar。Loader 验证
 canonical content，不只检查 filename。
 
 ## 核心 Tuning 与 Confirmation
 
-Target-only 与 Static 渲染时不含 adaptation state 或 reserve。TTS 使用 frozen
-`TTS-paper-reconstruction` authority 与 fixed-barrier publication；L0-naive 使用同一个
-authority 与 first-ready publication。E1/E2 中采用 `l0` search recipe 的是 LC-candidate，
+Target-only 与 Static 渲染时不含 adaptation state 或 reserve。TTS 使用 signed TTS-Cal seal
+冻结的 recipe authority 与 fixed-barrier publication；L0-naive 使用同一个 frozen recipe
+authority 与 first-ready publication。历史 `TTS-paper-reconstruction` authority 只用于
+diagnostic。E1/E2 中采用 `l0` search recipe 的是 LC-candidate，
 只有准确 E2-sealed winner 才是 LightCone。共享 runtime code 不会合并 live candidate、
 optimizer 或 evidence identity。Rendering 只是 pure planning；当前 release 只有 Target-only
-可以进入 industrial execution。Static/TTS/L0-naive/LightCone 会在 endpoint 启动前因
-trusted-terminal-attester preflight 失败；TTS 与 L0-naive 还受未解析 recipe 字段阻止。
+可以用于 claim。Static/TTS/L0-naive/LightCone 会在 endpoint 启动前因缺少 fresh dynamic
+GPU qualification 与 trusted external-control evidence 而 fail closed；TTS 与 L0-naive 还
+必须等待 disjoint TTS-Cal 的 signed winner seal。
 
-Industrial E1/E2 command 由 reducer 控制。E1 消费 sealed E3a output，从 1,428 个 template
-中只激活一个 68-cell width/load slice：每种 geometry 调优两个 LC-candidate，并带一个
-stage-level frozen-TTS 与一个 stage-level frozen-L0-naive anchor，不按 scope/rank 或 optimizer
-candidate 复制 baseline。E2 有 11,920 个 template，
-materialize stage zero，随后每个 successive-halving round 都要求 prior sealed survivor
-receipt；它只把 LC-candidate 与 fixed Static、frozen-TTS reference 比较并保留 family floor。
+Industrial E1/E2 command 由 reducer 控制。E1 消费 sealed E3a 与 TTS-Cal receipt，恰好
+materialize 68 个 cell：四个 fixed role，加上 32 个 geometry、每个两个 LightCone
+candidate。L0-naive 保持 mechanism anchor，不参与 candidate ranking。对 `g` 个 survivor
+geometry，E2 首轮 materialize `n0 = 105g` 个 recipe（七种 optimizer × 三种 schedule ×
+五个 learning rate），后三轮都要求 prior sealed survivor receipt，并满足
+`n(k+1) = max(ceil(nk/4), 21)`；每轮另加四个 fixed anchor。它只把 LightCone candidate
+与 fixed Static、frozen-TTS reference 比较，不会展开 eager sentinel matrix。
 Confirmation planning 为
 每个准确 family 激活四个 excluded pilot，在 confirmation data 可见前封存 `POWERED` 的
 12--20 final block 或 `UNDERPOWERED`，并只 materialize sealed prefix。
@@ -664,14 +750,15 @@ reference load，但不能改变该 load 或影响核心 gate。Anchor selection
 `attest-preliminary-speed-study` 与 `attest-onlinespec-study` 同样只输出确定性的
 non-authority decision 并退出 42。Identity、schema、I/O、receipt 或 runtime 错误是普通
 nonzero failure，不是科学结果。
-当前 release 没有 trusted hardware-attester identity，因此 supplied legacy attestation
-会被拒绝；即使 diagnostic JSON 内部一致，`analyze-industrial` 也不能生成 `MEASURED`，
-并会退出 42。
+Supplied legacy/static attestation 会被拒绝；只有 fresh root-authorized dynamic policy、typed
+control、真实 terminal/qualification evidence 和 complete coverage 才可能生成 `MEASURED`。
+缺其中任何一项时 `analyze-industrial` 继续退出 42。
 
 Industrial registry 可能把目标 cell 声明为 `UNMEASURED`，但 declaration status 不等于
-executable readiness。Native hook 已存在；由于 trusted signer 缺失，executor preflight
-会把 Static/TTS/L0-naive/LightCone 解析为 `BLOCKED`。全部 TP2/DP2 与
-DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 同样受当前 release 的其他 gate 阻止。历史 v2
+executable readiness。Native hook 与 source-owned runner 已存在；在尚未取得 fresh dynamic
+control 或对应 GPU qualification proof 时，executor preflight 仍将相关角色解析为 `BLOCKED`。
+TP2/DP2、DSpark、NEXTN 与 native ITL 必须分别消费 typed suite proof；EAGLE3 还要求 official
+model/selector compatibility。历史 v2
 artifact 仅用于 regression，不能作为 schema-v3 stage receipt。
 
 ### Target-output Reference 诊断
@@ -688,3 +775,241 @@ Artifact、model root、cache、trace、provider state、profile、selection、a
 handoff file 必须位于 ignored external root。通过临时 `HF_TOKEN` 环境变量或其他安全渠道
 传递模型权限。不要把 token、password、provider API key、private prompt、instance address
 或 machine-specific path 放入 argument、manifest、log、文档或 Git。
+
+## 单可信操作者正式实验链
+
+### 结论边界
+
+`formal_single_operator_v1` 是单一可信操作者从受控 clean checkout 采集并归约完整 v03
+empirical campaign 的路径。它记录 canonical SHA-256 provenance，且只向新的不可覆盖目录
+发布。该模式既不是对抗式 attestation，也不允许把无签名结果称为 formal `MEASURED`
+evidence。缺少当前 release-root attestation 时，finalization 必须报告
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与
+`UNMEASURED`。
+
+公开 supervisor 命令为：
+
+| 命令 | 用途 |
+|---|---|
+| `formal-single-operator status` | 不读取 run evidence、不分配 GPU，只报告 21 个节点的源码 capability |
+| `publish-trusted-content` | 深度绑定 typed content path spec 与 runtime observation，发布 BOUND bundle |
+| `publish-preflight-workload` | 从该准确 BOUND bundle 派生 preflight workload authority |
+| `publish-onlinespec-source-authority` | 只为 E0 绑定已审计的外部 OnlineSPEC checkout |
+| `build-trusted-protocol-lock` | 从 path-bound source 构建 schema-v5 trusted ProtocolLock |
+| `write-dag-driver-config` | 发布一份不可变、只含路径的 21 节点 driver config |
+| `write-bootstrap-config` | 发布非 LLM supervisor config |
+| `bootstrap-once` | 最多推进一个 durable controller/scheduler cycle |
+| `bootstrap-run` | 阻塞至 DAG 完成或遇到真实 unresolved block |
+
+较底层的 `materialize-node`、`prepare-run`、`execute-run`、`finalize-run` 与 reducer 命令
+仍可用于 focused replay/debugging。不要把它们与正在运行的 bootstrap supervisor 混用，也
+不要启动第二个 scheduler。
+
+### 发布不可变输入
+
+从准确文件发布 runtime 与 method source authority。以下命令会自行派生 authority content，
+不接受 caller 填写 digest：
+
+```bash
+lightcone-spec publish-formal-runtime-authority-manifest \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --output /absolute/sources/runtime-authority.json
+
+lightcone-spec publish-tts-calibration-source-authority \
+  --paper-pdf /absolute/sources/tts-paper.pdf \
+  --paper-source /absolute/sources/tts-paper.tex \
+  --tuning-window /absolute/sources/tts-tuning-window.json \
+  --trainable-plan-authority /absolute/sources/tts-trainable-plan.json \
+  --drafter-native-loss /absolute/sources/tts-native-loss.json \
+  --output /absolute/sources/tts-calibration-authority.json
+
+lightcone-spec publish-chronobelief-source-authority \
+  --paper-pdf /absolute/sources/chronobelief-paper.pdf \
+  --tex-source /absolute/sources/chronobelief-paper.tex \
+  --output /absolute/sources/chronobelief-authority.json
+
+lightcone-spec publish-e1-recipe-anchor-authority \
+  --trainable-plan-authority /absolute/sources/e1-trainable-plan.json \
+  --output /absolute/sources/e1-recipe-anchor-authority.json
+
+lightcone-spec formal-single-operator publish-onlinespec-source-authority \
+  --checkout /absolute/sources/onlinespec-checkout \
+  --audit /absolute/sources/onlinespec-source-audit.json \
+  --output /absolute/sources/onlinespec-source-authority.json
+```
+
+Typed `trusted_single_operator_content_path_spec` 必须列出 clean checkout；每个 target、
+drafter、tokenizer snapshot 及 immutable revision；锁定的 LiveCodeBench、MATH-500、
+BurstGPT 与 E0 task-native source；以及 fresh inventory/doctor path。应通过 source API 生成
+typed spec，不能手工填写 content digest。随后发布 BOUND bundle 并派生 preflight workload：
+
+```bash
+lightcone-spec formal-single-operator publish-trusted-content \
+  --spec /absolute/sources/content-path-spec.json \
+  --output /absolute/sources/trusted-content.json
+
+lightcone-spec formal-single-operator publish-preflight-workload \
+  --content-source /absolute/sources/trusted-content.json \
+  --output /absolute/sources/preflight-workload.json
+
+lightcone-spec formal-single-operator build-trusted-protocol-lock \
+  --protocol-id lightcone-v03-study \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --runtime-authority-manifest /absolute/sources/runtime-authority.json \
+  --tts-calibration-authority /absolute/sources/tts-calibration-authority.json \
+  --chronobelief-authority /absolute/sources/chronobelief-authority.json \
+  --e1-recipe-anchor-authority /absolute/sources/e1-recipe-anchor-authority.json \
+  --output /absolute/sources/protocol-lock.json
+```
+
+所有 source/output path 必须 absolute 且 normalized。Output 使用 atomic no-replace
+publication。Model/data payload、provider state、credential 与全部 run artifact 都留在
+checkout 外。
+
+### 配置并到达第一个 GPU 边界
+
+先在 Git checkout 外创建新的 private run 与 prerequisite-catalog 目录，再发布两份只含路径
+的 config：
+
+```bash
+lightcone-spec formal-single-operator write-dag-driver-config \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --run-root /absolute/run/formal-v03-study \
+  --protocol-lock /absolute/sources/protocol-lock.json \
+  --content-source /absolute/sources/trusted-content.json \
+  --runtime-authority-manifest /absolute/sources/runtime-authority.json \
+  --inventory /absolute/sources/gpu-inventory.json \
+  --doctor-report /absolute/sources/doctor.json \
+  --preflight-workload-authority /absolute/sources/preflight-workload.json \
+  --profiler-tool /absolute/tools/nsys \
+  --profiler-tool /absolute/tools/ncu \
+  --prerequisite-catalog /absolute/run/formal-v03-prerequisites \
+  --output /absolute/run/formal-v03-study/driver-config.json
+
+lightcone-spec formal-single-operator write-bootstrap-config \
+  --driver-config /absolute/run/formal-v03-study/driver-config.json \
+  --onlinespec-source-authority /absolute/sources/onlinespec-source-authority.json \
+  --output /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+`status` 的 `readiness_scope=code_capability_only`。21/21 只证明每个节点的 materializer/
+producer/mapper/executor/finalizer code 均可调用；不证明本次 run 的文件、模型、tool、GPU 或
+upstream receipt 已就绪：
+
+```bash
+lightcone-spec formal-single-operator status
+```
+
+Cold start 刻意保留一个可检查边界。第一次 cycle materialize preflight；第二次规划准确
+一条 compile、一条 exactness 与八条 interference cell，并把十个 attempt 及其双卡 physical
+group 全部提交为 `PENDING`，此时没有 PID/PGID。第三次 cycle 才可能 atomic 标记该 group
+为 `RUNNING` 并 spawn `setsid` child：
+
+```bash
+lightcone-spec formal-single-operator bootstrap-once \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+lightcone-spec formal-single-operator bootstrap-once \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+应先检查导出的 progress 与 host boundary，再明确调用第三次 cycle 或 `bootstrap-run`。
+
+### 自动推进 21 节点
+
+GPU host、滚动归档与 finalizer input 就绪后，非 LLM supervisor 会从同一 durable state 恢复：
+
+```bash
+lightcone-spec formal-single-operator bootstrap-run \
+  --config /absolute/run/formal-v03-study/bootstrap-config.json
+```
+
+唯一的 `/absolute/run/formal-v03-study/operator.sqlite3` WAL 是 lifecycle authority；唯一的
+`formal-dag-driver.lock` 阻止竞争 scheduler。Watchdog 按固定 30 秒 cadence reconcile
+PID/PGID、heartbeat、GPU state、log growth、timeout/OOM、terminal publication 与 capacity；
+progress table 在 run root 下 atomic 导出。退出码 `42` 表示保留了真实 block，`43` 表示整个
+DAG 达到 controller completion，`0` 表示中间 cycle 发生状态变化。
+
+21 个节点是以下顺序的准确展开：
+`preflight -> E3a -> TTS-Cal -> E1 -> E2(r0..r3) ->
+E4(screen,local,profiler) -> E3b(pilot,final) -> E1a ->
+E5(pilot,final) -> E6(pilot,final) -> E0(tuning,pilot,final)`。任何时刻只 materialize 当前
+node。Prerequisite/auxiliary catalog append-only 且 source-owned；未来结果不能解锁早期节点。
+
+Preflight 仍准确包含十个 stage cell，同时 exactness execution 会运行六个 source-defined
+native qualification suite。八个 fresh interference observation 使用 paired BCa 95% interval
+归约；只有 goodput 与 native-p99-ITL 均满足 <=1% 的 pass gate，scheduler 才可切换为两个
+独立单卡 headline worker，其他结果一律 isolated。
+
+E6 只从冻结 Qwen target checkpoint 内置的 `mtp.*` component 发布准确两条 TP2 launch
+descriptor，不下载也不接受 external drafter。E0 先发布 12 个 model/backend pre-probe
+interface，再以 12 个 launch group 分别运行九个 task-native probe，形成准确 108 个
+compatibility terminal。EAGLE3 task authority 只能 post-probe 产生。控制 E0 tuning/serving
+materialization 的是最终 VALID/N/A bundle，而不是 caller 输入的 `V`。
+
+E5 pilot reducer 会在 final unblinding 前封存每个选中的 backend/topology p99 family。该
+family 中五个 paired method 的既有 cell 都接收同一份准确 11,000-offer extension pool，且
+必须至少完成 10,000 个 request；不会因此新增 diagnostic 或 headline row。
+
+### 滚动归档与恢复
+
+远端 spool 较小时，应让本机非 LLM companion 与 DAG 同时运行。Endpoint file 只包含 routing
+和固定 SSH/rsync tool path，不含 credential。Companion 每 30 秒轮询，只归档 sealed safe
+boundary；逐文件验证 SHA-256、完成本地 full rehydrate 后，才请求远端 operator 驱逐准确的
+inode-bound v03 文件。它不会 recursive delete directory、model cache 或旧 run：
+
+```bash
+/absolute/runtime/python -m lightcone_spec.orchestration.formal_rolling_archive_companion \
+  --endpoint /absolute/archive-host/control/archive-endpoint.json \
+  --remote-run-root /absolute/gpu-host/formal-v03-study \
+  --local-results-root /absolute/archive-host/formal-v03-study/results \
+  --state-root /absolute/archive-host/formal-v03-study/archive-state \
+  --lock /absolute/archive-host/formal-v03-study/archive.lock \
+  run
+```
+
+后续 reducer 若需要已驱逐 member，companion 只把该 member stream 回原路径，并执行远端
+free-space gate、no-replace publication 与 per-file restart record。
+`restore-all --order reverse` 可在手工 audit 前按 node 逆序恢复所有保留 archive；远端
+scientific closure 也会消费其准确 rehydration catalog。
+
+### 跨主机归档、关机与计费
+
+Finalization 有三个不可逆阶段。该边界的 config 必须用 typed
+`publish_remote_closure_config`、`publish_cross_host_ssh_endpoint` 与
+`publish_cross_host_finalizer_config` source API 创建；不得手工填写 digest，也不得把 provider
+token 写入 config。
+
+A 阶段只在 21 个节点全部 `REDUCED` 后于 GPU host 运行。它停止 dispatch、恢复 catalog 中
+的 rolling member、证明零 running attempt/writer、导出 progress，并 seal 一份按 digest
+寻址的 whole-run payload。Receipt 发布后，远端 SQLite 永久只读：
+
+```bash
+/absolute/runtime/python \
+  /absolute/checkout/scripts/formal_experiment_production_finalizer.py \
+  remote-seal \
+  --config /absolute/gpu-host/formal-v03-study/remote-closure-config.json
+```
+
+B/C 阶段只在 archive host 运行一次。`run` 拉取 closure/payload，校验本地 SHA manifest，
+完整 rehydrate archive，取得 fresh 远端 zero-writer probe，并发布 pre-power composite。只有
+随后才 journal 最多一次 AutoDL `power_off` mutation，要求 `code=="Success"`，再通过 status
+与 list 两条 response 确认同一实例为 `shutdown`，关闭 provider boot interval，并发布
+compute、reserved、allocated-billed、whole-instance-billed、archive、idle 与 wall-time
+accounting：
+
+```bash
+/absolute/runtime/python \
+  /absolute/checkout/scripts/formal_experiment_production_finalizer.py \
+  run \
+  --config /absolute/archive-host/formal-v03-study/local-finalizer-config.json
+```
+
+Provider token 只从本机 process environment 读取。Power intent 之后 crash 会保留为
+indeterminate，不能再次发送 mutation；restart 会重开 journal 并继续 status/list confirmation。
+即使 cross-host completion 成功，若缺少独立 release-root attestation，仍保持
+`formal_measured=false`。
+
+Pilot 前，`gpu-hours-pre` 只报告固定 cell 数、`duration_unmeasured` 与最小 pilot 集。
+Pilot 后，`gpu-hours-post` 消费真实 single-operator run manifest 与 lifecycle timing，分别
+报告 actual pilot、same-stratum projection 和 one-shot diagnostic；它不会把 registry
+prefix 冒充 whole-study completion。

@@ -78,6 +78,7 @@ def _rank_binding(
     *,
     rank: int,
     request_ids: tuple[str, ...],
+    method: str = "static",
 ) -> NativeTerminalRankBinding:
     identity = topology.receipt_for_rank(rank).topology
     run = NativeTerminalRunBinding(
@@ -90,7 +91,7 @@ def _rank_binding(
         session_epoch=1,
         previous_run_id=None,
         challenge_nonce_sha256=SHA_C,
-        method="static",
+        method=method,
         warmup_request_ids=(),
         scored_request_ids=request_ids,
     )
@@ -109,12 +110,17 @@ def _rank_binding(
     )
 
 
-def _gang_binding(*, mode: str) -> NativeTerminalGangBinding:
+def _gang_binding(*, mode: str, method: str = "static") -> NativeTerminalGangBinding:
     if mode == "tp2":
         topology = _topology(tp=2, dp=1)
         return NativeTerminalGangBinding(
             ranks=tuple(
-                _rank_binding(topology, rank=rank, request_ids=("request-0",))
+                _rank_binding(
+                    topology,
+                    rank=rank,
+                    request_ids=("request-0",),
+                    method=method,
+                )
                 for rank in range(2)
             )
         )
@@ -139,6 +145,7 @@ def _gang_binding(*, mode: str) -> NativeTerminalGangBinding:
             _rank_binding(
                 topology,
                 rank=rank,
+                method=method,
                 request_ids=tuple(
                     route.request_id
                     for route in route_plan.routes
@@ -205,13 +212,15 @@ def _argv(*, tp: int, dp: int) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _launch(*, mode: str) -> tuple[ServingGangLaunch, NativeTerminalGangBinding]:
-    binding = _gang_binding(mode=mode)
+def _launch(
+    *, mode: str, method: str = "static"
+) -> tuple[ServingGangLaunch, NativeTerminalGangBinding]:
+    binding = _gang_binding(mode=mode, method=method)
     tp, dp = (2, 1) if mode == "tp2" else (1, 2)
     assignment = _assignment(tp=tp, dp=dp)
     launch = object.__new__(ServingGangLaunch)
     values = {
-        "mode": "tp2_dp1" if tp == 2 else "two_replica_tp1_dp2",
+        "mode": "tp2_dp1" if tp == 2 else "tp1_dp2",
         "method": binding.ranks[0].run.method,
         "run_id": binding.ranks[0].run.run_id,
         "gang_binding_sha256": binding.sha256,
@@ -284,6 +293,23 @@ def test_tp2_launch_is_one_supervisor_with_exact_ports_ranks_and_codec() -> None
     tampered["rank_config_set_sha256"] = SHA_A
     with pytest.raises(ValueError, match="rank-config set differs"):
         ServingGangLaunch.from_dict(tampered)
+
+
+@pytest.mark.parametrize(
+    "method", ("onlinespec_ogd", "onlinespec_opt", "onlinespec_ens")
+)
+@pytest.mark.parametrize("mode", ("tp2", "dp2"))
+def test_onlinespec_gang_launch_method_closure_is_exact(method: str, mode: str) -> None:
+    launch, binding = _launch(mode=mode, method=method)
+    assert {rank.run.method for rank in binding.ranks} == {method}
+    with pytest.raises(NativeTerminalGangAuthorityBlocked) as blocked:
+        replace(launch)
+    assert blocked.value.code == (
+        "diagnostic_serving_gang_compile_authority_unavailable"
+    )
+
+    with pytest.raises(ValueError, match="method is unsupported"):
+        replace(launch, method="caller_defined")
 
 
 def test_valid_gang_supervisor_is_explicitly_blocked_before_construction() -> None:
@@ -620,31 +646,62 @@ def test_formal_gate_blocks_before_launcher_is_called() -> None:
                 launcher=launcher,
             )
         )
-    assert error.value.code == "native_terminal_gang_release_capability_unavailable"
+    assert error.value.code == "distributed_runtime_gpu_proof_unavailable"
     assert launcher.launches == []
 
 
-def test_formal_gate_still_blocks_native_pointer_and_actual_dp_route(
+def test_formal_gate_executes_proof_bound_terminal_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class _VerifiedProof:
+        def __init__(self, launch: ServingGangLaunch) -> None:
+            self.topology_mode = launch.runtime_topology_mode
+            self.topology_sha256 = launch.topology_sha256
+            self.gpu_uuids = tuple(rank.gpu_uuid for rank in launch.ranks)
+            self.receipt_sha256 = SHA_C
+
+    monkeypatch.setattr(
+        gang_execution,
+        "VerifiedDistributedRuntimeGpuProof",
+        _VerifiedProof,
+    )
     monkeypatch.setattr(
         gang_execution,
         "require_native_terminal_gang_release_capability",
         lambda **_kwargs: SHA_A,
     )
-    for mode, expected_code in (
-        ("tp2", "native_terminal_gang_first_party_result_pointer_unavailable"),
-        ("dp2", "native_terminal_dp_actual_route_producer_unavailable"),
-    ):
+    for mode in ("tp2", "dp2"):
         launch, _ = _launch(mode=mode)
-        launcher = _Launcher((_Handle("must-not-launch"),))
-        with pytest.raises(NativeTerminalGangAuthorityBlocked) as error:
-            asyncio.run(
-                execute_formal_serving_gang(
-                    launch=launch,
-                    claimed_capability_sha256=SHA_A,
-                    launcher=launcher,
-                )
+        handle = _Handle(f"formal-{mode}")
+        launcher = _Launcher((handle,))
+
+        async def complete(
+            _handle: _Handle,
+            *,
+            handle_binding: _Handle = handle,
+            launch_binding: ServingGangLaunch = launch,
+        ) -> gang_execution.FormalGangCompletion:
+            assert _handle is handle_binding
+            return gang_execution.FormalGangCompletion(
+                serving_gang_launch_sha256=launch_binding.sha256,
+                terminal_aggregate_sha256=SHA_A,
+                rank_terminal_sha256s=(SHA_B, SHA_C),
+                run_record_topology_summary_sha256="d" * 64,
+                gpu_proof_receipt_sha256=SHA_C,
             )
-        assert error.value.code == expected_code
-        assert launcher.launches == []
+
+        receipt = asyncio.run(
+            execute_formal_serving_gang(
+                launch=launch,
+                claimed_capability_sha256=SHA_A,
+                verified_gpu_proof=_VerifiedProof(launch),
+                launcher=launcher,
+                attempt_id=f"attempt-{mode}",
+                workload=complete,
+                startup_timeout_s=1.0,
+                shutdown_timeout_s=2.0,
+            )
+        )
+        assert receipt.status == "TERMINAL_COMPLETE"
+        assert launcher.launches == [launch]
+        assert handle.terminate_calls == 1

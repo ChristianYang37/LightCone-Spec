@@ -37,8 +37,10 @@ from lightcone_spec.experiments.gpu_pool import (
 )
 from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
-    build_industrial_registry,
     content_sha256,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 
 

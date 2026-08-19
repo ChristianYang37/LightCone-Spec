@@ -36,7 +36,9 @@ from lightcone_spec.experiments.planning import (
     reduce_e1_activation,
 )
 from lightcone_spec.experiments.registry import (
-    build_industrial_registry,
+    build_legacy_industrial_registry as build_industrial_registry,
+)
+from lightcone_spec.experiments.registry import (
     scientific_role_for_cell,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile

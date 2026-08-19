@@ -39,9 +39,11 @@ from lightcone_spec.experiments.registry import (
     ExperimentCell,
     ExperimentReceipt,
     ExperimentRegistry,
-    build_industrial_registry,
     content_sha256,
     serving_cell_rejection_reason,
+)
+from lightcone_spec.experiments.registry import (
+    build_legacy_industrial_registry as build_industrial_registry,
 )
 from lightcone_spec.experiments.stage_activation import (
     materialize_registry_stage_activation,
@@ -52,6 +54,7 @@ from lightcone_spec.orchestration.industrial import (
     render_industrial_cell_runtime_plan,
 )
 from lightcone_spec.runtime.distributed import (
+    DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
     RankTopologyReceipt,
     TopologyIdentity,
     TopologyReceiptSet,
@@ -361,6 +364,11 @@ def _configs(
     for rank in range(topology.world_size):
         rank_identity = topology.receipt_for_rank(rank).topology
         distributed = topology.world_size > 1
+        release_capability = (
+            DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES[topology.mode]
+            if distributed
+            else None
+        )
         configs.append(
             _materialise(
                 RunConfig(
@@ -387,9 +395,16 @@ def _configs(
                         rendezvous_identity=rank_identity.rendezvous_id,
                         router_identity=rank_identity.router_id,
                         clock_identity=rank_identity.clock_id,
-                        process_group_backend="nccl",
+                        process_group_backend=(
+                            "none" if topology.mode == "tp1_dp2" else "nccl"
+                        ),
                         distributed_runtime_capability=(
                             "patched_two_gpu_v1" if distributed else "single_rank"
+                        ),
+                        distributed_release_capability_sha256=(
+                            None
+                            if release_capability is None
+                            else release_capability.sha256
                         ),
                         distributed_capability_receipt_sha256=(
                             _runtime_envelope(receipts) if distributed else None

@@ -86,9 +86,14 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     LockedOutput,
     WorkloadClass,
-    build_industrial_registry,
+    build_legacy_industrial_registry,
     content_sha256,
 )
+
+# Historical budget/completion fixtures are defined against the eager
+# diagnostic registry.  Keep the module-local legacy name for those explicit
+# compatibility callers; the public registry default remains signed-staged.
+build_industrial_registry = build_legacy_industrial_registry
 from lightcone_spec.experiments.stage_activation import (
     RegistryStageActivationArtifact,
     is_serving_interference_calibration_cell,
@@ -116,7 +121,9 @@ E2_STAGE_COMPLETION_AUTHORITY_MISSING_REASON = (
     "e2_prior_stage_schema_v4_completion_authority_missing"
 )
 
-_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v3"
+_REGISTRY_GENERATOR = (
+    "lightcone_spec.experiments.registry.build_legacy_industrial_registry:v3"
+)
 _MANIFEST_V1_FIELDS = frozenset(
     {
         "schema_version",
@@ -483,7 +490,7 @@ def _regenerate_registry(
 ) -> ExperimentRegistry:
     """Memoize only the deterministic reducer, never a raw artifact read."""
 
-    return build_industrial_registry(
+    return build_legacy_industrial_registry(
         gpu_uuids=slots,
         base_port=base_port,
         cache_root=cache_root,

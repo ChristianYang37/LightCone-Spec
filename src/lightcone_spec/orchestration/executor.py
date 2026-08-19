@@ -2746,6 +2746,234 @@ class RequestExecution:
 
 
 @dataclass(frozen=True)
+class RegisteredServingRequestLifecycle:
+    """One source-owned client lifecycle row for scientific accounting.
+
+    Native SGLang terminal rows answer whether a submitted request completed or
+    was aborted.  They deliberately do not decide the registered client-side
+    denominator.  This row keeps that orthogonal decision: an item in a
+    closed-loop maximum pool may remain unoffered, while every *offered* item
+    has exactly one of the five registered scientific outcomes.
+    """
+
+    request_id: str
+    phase: str
+    scheduled_arrival_us: int
+    offered: bool
+    offered_at_us: int | None
+    admitted_at_us: int | None
+    effective_deadline_us: int | None
+    cancellation_at_us: int | None
+    terminal_at_us: int | None
+    outcome_status: str | None
+    outcome_code: str
+    submitted_to_server: bool
+    native_terminal_status: str | None
+    native_result_pointer_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.request_id) is not str
+            or not self.request_id
+            or self.phase not in {"warmup", "scored"}
+            or type(self.scheduled_arrival_us) is not int
+            or self.scheduled_arrival_us < 0
+            or type(self.offered) is not bool
+            or type(self.submitted_to_server) is not bool
+            or type(self.outcome_code) is not str
+            or not self.outcome_code
+        ):
+            raise ValueError("registered serving lifecycle identity is invalid")
+        for label, value in (
+            ("offer", self.offered_at_us),
+            ("admission", self.admitted_at_us),
+            ("deadline", self.effective_deadline_us),
+            ("cancellation", self.cancellation_at_us),
+            ("terminal", self.terminal_at_us),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"registered serving {label} time is invalid")
+        if not self.offered:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.offered_at_us,
+                        self.admitted_at_us,
+                        self.effective_deadline_us,
+                        self.cancellation_at_us,
+                        self.terminal_at_us,
+                        self.outcome_status,
+                        self.native_terminal_status,
+                        self.native_result_pointer_sha256,
+                    )
+                )
+                or self.submitted_to_server
+            ):
+                raise ValueError("unoffered serving pool row carries a lifecycle")
+            return
+        if (
+            self.offered_at_us is None
+            or self.effective_deadline_us is None
+            or self.outcome_status
+            not in {"completed", "rejected", "timed_out", "cancelled", "unfinished"}
+            or (self.submitted_to_server and self.admitted_at_us is None)
+        ):
+            raise ValueError("offered serving lifecycle is incomplete")
+        effective_admission = (
+            self.offered_at_us if self.admitted_at_us is None else self.admitted_at_us
+        )
+        if not self.offered_at_us <= effective_admission <= self.effective_deadline_us:
+            raise ValueError("serving admission lies outside the request lifetime")
+        if self.outcome_status == "unfinished":
+            if self.terminal_at_us is not None:
+                raise ValueError("unfinished serving request has a terminal time")
+        elif self.terminal_at_us is None or not (
+            self.offered_at_us <= self.terminal_at_us <= self.effective_deadline_us
+        ):
+            raise ValueError("serving terminal lies outside the request lifetime")
+        if self.outcome_status == "rejected" and self.submitted_to_server:
+            raise ValueError("rejected serving request was submitted")
+        if self.native_terminal_status not in {None, "completed", "aborted"}:
+            raise ValueError("serving native terminal status is invalid")
+        if self.submitted_to_server:
+            if self.native_terminal_status is None or (
+                self.outcome_status == "completed"
+            ) != (self.native_terminal_status == "completed"):
+                raise ValueError("submitted serving client/native status differs")
+        elif self.native_terminal_status is not None:
+            raise ValueError("non-submitted serving request has a native terminal")
+        if self.native_result_pointer_sha256 is not None and not _is_sha256(
+            self.native_result_pointer_sha256
+        ):
+            raise ValueError("serving native result pointer digest is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RegisteredServingExecutionPolicy:
+    """Code/source-owned request timing and admission contract."""
+
+    schema_version: int
+    kind: str
+    source_kind: str
+    warmup_duration_us: int
+    arrival_duration_us: int
+    request_deadline_us: int
+    drain_duration_us: int
+    max_concurrency: int
+    complete_closed_loop_pool: bool
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.kind != "registered_serving_execution_policy"
+            or self.source_kind not in {"scheduled", "closed_loop"}
+            or type(self.complete_closed_loop_pool) is not bool
+        ):
+            raise ValueError("registered serving execution policy identity differs")
+        for label, value in (
+            ("warmup duration", self.warmup_duration_us),
+            ("arrival duration", self.arrival_duration_us),
+            ("request deadline", self.request_deadline_us),
+            ("drain duration", self.drain_duration_us),
+            ("max concurrency", self.max_concurrency),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"registered serving {label} is invalid")
+        if self.complete_closed_loop_pool and self.source_kind != "closed_loop":
+            raise ValueError("complete serving pool policy must be closed-loop")
+
+    @property
+    def minimum_process_timeout_us(self) -> int:
+        self.__post_init__()
+        return (
+            self.warmup_duration_us
+            + self.arrival_duration_us
+            + self.request_deadline_us
+            + self.drain_duration_us
+        )
+
+    @property
+    def sha256(self) -> str:
+        return content_sha256(self.to_dict())
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> RegisteredServingExecutionPolicy:
+        if type(value) is not dict or set(value) != {
+            "schema_version",
+            "kind",
+            "source_kind",
+            "warmup_duration_us",
+            "arrival_duration_us",
+            "request_deadline_us",
+            "drain_duration_us",
+            "max_concurrency",
+            "complete_closed_loop_pool",
+        }:
+            raise ValueError("registered serving execution policy fields differ")
+        return cls(**value)
+
+
+@dataclass(frozen=True)
+class RegisteredServingPhaseExecution:
+    """Complete ordered execution result for one warmup or scored phase."""
+
+    phase: str
+    origin_ns: int
+    finished_ns: int
+    arrival_duration_us: int
+    request_deadline_us: int
+    drain_duration_us: int
+    concurrency: int
+    source_kind: str
+    complete_closed_loop_pool: bool
+    executions: tuple[RequestExecution, ...]
+    lifecycles: tuple[RegisteredServingRequestLifecycle, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.phase not in {"warmup", "scored"}
+            or type(self.origin_ns) is not int
+            or self.origin_ns < 1
+            or type(self.finished_ns) is not int
+            or self.finished_ns < self.origin_ns
+            or self.source_kind not in {"scheduled", "closed_loop"}
+            or type(self.complete_closed_loop_pool) is not bool
+        ):
+            raise ValueError("registered serving phase identity is invalid")
+        for label, value in (
+            ("arrival duration", self.arrival_duration_us),
+            ("request deadline", self.request_deadline_us),
+            ("drain duration", self.drain_duration_us),
+            ("concurrency", self.concurrency),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"registered serving {label} is invalid")
+        if self.complete_closed_loop_pool and self.source_kind != "closed_loop":
+            raise ValueError("only closed-loop serving can require its complete pool")
+        execution_ids = tuple(row.request.request_id for row in self.executions)
+        lifecycle_ids = tuple(row.request_id for row in self.lifecycles)
+        if len(lifecycle_ids) != len(set(lifecycle_ids)) or execution_ids != tuple(
+            row.request_id for row in self.lifecycles if row.offered
+        ):
+            raise ValueError("registered serving phase coverage differs")
+        if self.complete_closed_loop_pool and not all(
+            row.offered for row in self.lifecycles
+        ):
+            raise ValueError("complete closed-loop pool was not fully offered")
+
+    @property
+    def accounting_rows(self) -> tuple[dict[str, object], ...]:
+        return tuple(row.to_dict() for row in self.lifecycles)
+
+
+@dataclass(frozen=True)
 class NativeEvidenceBatch:
     """Server-native rows and aggregate fields unavailable to the HTTP client."""
 
@@ -3291,7 +3519,11 @@ def _terminal_request_expectation(
 ) -> TerminalRequestExpectation:
     outcome = execution.outcome
     result = execution.result
-    submitted = outcome.admitted_at_us is not None
+    # Local lane admission and a server-observed terminal are distinct.  A
+    # transport failure after lane admission remains an offered ``unfinished``
+    # client row and is reconciled without pretending that the server observed
+    # a terminal response.
+    submitted = outcome.admitted_at_us is not None and result is not None
     if submitted:
         if outcome.status == "completed":
             if (
@@ -3303,18 +3535,22 @@ def _terminal_request_expectation(
                 )
             terminal_status = "completed"
             terminal_reason = "FINISH_LENGTH"
-        elif outcome.status in {"cancelled", "timed_out"}:
-            if result is None:
-                raise RuntimeError("aborted native request lacks its terminal result")
+        elif outcome.status in {"cancelled", "timed_out", "unfinished"}:
             terminal_status = "aborted"
             terminal_reason = "FINISH_ABORT"
         else:
             raise RuntimeError(
                 "submitted request lacks a reconciliable terminal outcome"
             )
+        assert result is not None
         output_token_ids: tuple[int, ...] | None = result.generated_token_ids
     else:
-        if outcome.status not in {"rejected", "cancelled", "timed_out"}:
+        if outcome.status not in {
+            "rejected",
+            "cancelled",
+            "timed_out",
+            "unfinished",
+        }:
             raise RuntimeError("non-submitted request lacks a client terminal outcome")
         terminal_status = outcome.status
         terminal_reason = outcome.code
@@ -3329,6 +3565,16 @@ def _terminal_request_expectation(
     )
     expectation.validate()
     return expectation
+
+
+def terminal_request_expectation_for_execution(
+    execution: RequestExecution,
+) -> TerminalRequestExpectation:
+    """Public bridge from the shared client state machine to native evidence."""
+
+    if type(execution) is not RequestExecution:
+        raise TypeError("native reconciliation requires an exact request execution")
+    return _terminal_request_expectation(execution)
 
 
 def _bind_native_terminal_transport(
@@ -3627,12 +3873,15 @@ async def _execute_corpus(
     abort_grace_s: float,
     clock: ExecutionClock,
     on_terminal: Callable[[RequestExecution], Awaitable[None]] | None = None,
+    origin_ns: int | None = None,
 ) -> tuple[RequestExecution, ...]:
     if not requests:
         return ()
     if len(requests) > MAX_IN_MEMORY_REQUEST_EXECUTIONS:
         raise ValueError("request corpus exceeds the bounded execution capacity")
-    origin_ns = clock.monotonic_ns()
+    origin_ns = clock.monotonic_ns() if origin_ns is None else origin_ns
+    if type(origin_ns) is not int or origin_ns < 1 or origin_ns > clock.monotonic_ns():
+        raise ValueError("request corpus origin is invalid")
     semaphore = asyncio.Semaphore(concurrency)
     completed: dict[str, RequestExecution] = {}
     errors: list[Exception] = []
@@ -3681,6 +3930,8 @@ async def _execute_closed_loop_corpus(
     abort_grace_s: float,
     clock: ExecutionClock,
     on_terminal: Callable[[RequestExecution], Awaitable[None]],
+    complete_pool: bool = False,
+    origin_ns: int | None = None,
 ) -> tuple[RequestExecution, ...]:
     """Issue one zero-think sequential request stream per client lane."""
 
@@ -3688,7 +3939,9 @@ async def _execute_closed_loop_corpus(
         return ()
     if len(requests) > MAX_IN_MEMORY_REQUEST_EXECUTIONS:
         raise ValueError("request corpus exceeds the bounded execution capacity")
-    origin_ns = clock.monotonic_ns()
+    origin_ns = clock.monotonic_ns() if origin_ns is None else origin_ns
+    if type(origin_ns) is not int or origin_ns < 1 or origin_ns > clock.monotonic_ns():
+        raise ValueError("closed-loop corpus origin is invalid")
     semaphore = asyncio.Semaphore(concurrency)
     completed: dict[str, RequestExecution] = {}
     exhausted_lanes: set[int] = set()
@@ -3698,15 +3951,22 @@ async def _execute_closed_loop_corpus(
     async def run_lane(lane: int) -> None:
         next_offer_us = 0
         for request in requests[lane::concurrency]:
-            if stop_issuing.is_set() or next_offer_us >= arrival_duration_us:
+            if stop_issuing.is_set() or (
+                not complete_pool and next_offer_us >= arrival_duration_us
+            ):
                 return
             try:
-                execution = await _execute_request(
-                    request,
-                    deadline_us=min(
+                effective_deadline_us = (
+                    next_offer_us + request_deadline_us
+                    if complete_pool
+                    else min(
                         next_offer_us + request_deadline_us,
                         scored_global_end_us,
-                    ),
+                    )
+                )
+                execution = await _execute_request(
+                    request,
+                    deadline_us=effective_deadline_us,
                     origin_ns=origin_ns,
                     semaphore=semaphore,
                     transport=transport,
@@ -3722,10 +3982,20 @@ async def _execute_closed_loop_corpus(
                 errors.append(error)
                 stop_issuing.set()
                 return
-            if execution.outcome.terminal_at_us is None:
-                return
-            next_offer_us = execution.outcome.terminal_at_us
-        if not stop_issuing.is_set() and next_offer_us < arrival_duration_us:
+            # ``unfinished`` means the client lacks terminal/abort proof, not
+            # that the registered lane may silently disappear.  Hold that lane
+            # until its effective deadline before offering the next request;
+            # this keeps exact-pool coverage and does not hide the lost proof.
+            next_offer_us = (
+                effective_deadline_us
+                if execution.outcome.terminal_at_us is None
+                else execution.outcome.terminal_at_us
+            )
+        if (
+            not complete_pool
+            and not stop_issuing.is_set()
+            and next_offer_us < arrival_duration_us
+        ):
             exhausted_lanes.add(lane)
 
     async with asyncio.TaskGroup() as group:
@@ -3747,6 +4017,205 @@ async def _execute_closed_loop_corpus(
     if not ordered:
         raise RuntimeError("closed-loop arrival window offered no requests")
     return ordered
+
+
+def _native_result_pointer_sha256(result: BenchServingResult | None) -> str | None:
+    if result is None or result.native_result_pointer_json is None:
+        return None
+    try:
+        value = json.loads(result.native_result_pointer_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("native result pointer is not JSON") from error
+    if type(value) is not dict:
+        raise TypeError("native result pointer must be an object")
+    digest = value.get("result_pointer_sha256")
+    if type(digest) is not str or not _is_sha256(digest):
+        raise ValueError("native result pointer digest is invalid")
+    return digest
+
+
+def _registered_request_lifecycle(
+    *,
+    phase: str,
+    request: BoundServingRequest,
+    execution: RequestExecution | None,
+    request_deadline_us: int,
+    scored_global_end_us: int,
+    complete_closed_loop_pool: bool,
+) -> RegisteredServingRequestLifecycle:
+    if execution is None:
+        return RegisteredServingRequestLifecycle(
+            request_id=request.request_id,
+            phase=phase,
+            scheduled_arrival_us=request.arrival_us,
+            offered=False,
+            offered_at_us=None,
+            admitted_at_us=None,
+            effective_deadline_us=None,
+            cancellation_at_us=None,
+            terminal_at_us=None,
+            outcome_status=None,
+            outcome_code="not_offered_after_arrival_window",
+            submitted_to_server=False,
+            native_terminal_status=None,
+            native_result_pointer_sha256=None,
+        )
+    outcome = execution.outcome
+    offered = (
+        request.arrival_us if outcome.offered_at_us is None else outcome.offered_at_us
+    )
+    effective_deadline = (
+        offered + request_deadline_us
+        if complete_closed_loop_pool
+        else min(offered + request_deadline_us, scored_global_end_us)
+    )
+    cancellation = (
+        None
+        if request.cancellation_offset_us is None
+        else offered + request.cancellation_offset_us
+    )
+    pointer_sha256 = _native_result_pointer_sha256(execution.result)
+    native_terminal_status = None
+    if outcome.admitted_at_us is not None and execution.result is not None:
+        native_terminal_status = (
+            "completed" if outcome.status == "completed" else "aborted"
+        )
+    lifecycle = RegisteredServingRequestLifecycle(
+        request_id=request.request_id,
+        phase=phase,
+        scheduled_arrival_us=request.arrival_us,
+        offered=True,
+        offered_at_us=offered,
+        admitted_at_us=outcome.admitted_at_us,
+        effective_deadline_us=effective_deadline,
+        cancellation_at_us=cancellation,
+        terminal_at_us=outcome.terminal_at_us,
+        outcome_status=outcome.status,
+        outcome_code=outcome.code,
+        submitted_to_server=(
+            outcome.admitted_at_us is not None and execution.result is not None
+        ),
+        native_terminal_status=native_terminal_status,
+        native_result_pointer_sha256=pointer_sha256,
+    )
+    lifecycle.__post_init__()
+    return lifecycle
+
+
+async def execute_registered_serving_phase(
+    phase: str,
+    requests: tuple[BoundServingRequest, ...],
+    *,
+    source_kind: str,
+    arrival_duration_us: int,
+    request_deadline_us: int,
+    drain_duration_us: int,
+    concurrency: int,
+    transport: BenchServingTransport,
+    base_url: str,
+    served_model: str,
+    abort_grace_s: float,
+    complete_closed_loop_pool: bool = False,
+    shared_origin_ns: int | None = None,
+    clock: ExecutionClock | None = None,
+) -> RegisteredServingPhaseExecution:
+    """Execute one registered phase using the industrial request state machine.
+
+    Semaphore wait starts only after the registered offer and remains inside
+    the request deadline.  Expected negative client outcomes are returned as
+    data; sibling requests are not cancelled.  A closed-loop phase issues one
+    zero-think stream per lane.  The selected p99 extension may instead consume
+    its exact maximum pool to completion, independent of the ordinary arrival
+    cutoff.
+    """
+
+    if phase not in {"warmup", "scored"}:
+        raise ValueError("registered serving phase is unsupported")
+    if source_kind not in {"scheduled", "closed_loop"}:
+        raise ValueError("registered serving source kind is unsupported")
+    if not requests or len(requests) > MAX_IN_MEMORY_REQUEST_EXECUTIONS:
+        raise ValueError("registered serving phase request coverage is invalid")
+    for label, value in (
+        ("arrival duration", arrival_duration_us),
+        ("request deadline", request_deadline_us),
+        ("drain duration", drain_duration_us),
+        ("concurrency", concurrency),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"registered serving {label} is invalid")
+    if complete_closed_loop_pool and source_kind != "closed_loop":
+        raise ValueError("complete serving pools must be closed-loop")
+    resolved_clock = ExecutionClock() if clock is None else clock
+    if type(resolved_clock) is not ExecutionClock:
+        raise TypeError("registered serving phase requires an exact clock")
+    origin_ns = (
+        resolved_clock.monotonic_ns() if shared_origin_ns is None else shared_origin_ns
+    )
+    if type(origin_ns) is not int or origin_ns < 1:
+        raise ValueError("registered serving phase origin is invalid")
+
+    async def no_op(_execution: RequestExecution) -> None:
+        return None
+
+    scored_global_end_us = arrival_duration_us + drain_duration_us
+    if source_kind == "closed_loop":
+        executions = await _execute_closed_loop_corpus(
+            requests,
+            concurrency=concurrency,
+            arrival_duration_us=arrival_duration_us,
+            request_deadline_us=request_deadline_us,
+            scored_global_end_us=scored_global_end_us,
+            transport=transport,
+            base_url=base_url,
+            served_model=served_model,
+            abort_grace_s=abort_grace_s,
+            clock=resolved_clock,
+            on_terminal=no_op,
+            complete_pool=complete_closed_loop_pool,
+            origin_ns=origin_ns,
+        )
+    else:
+        executions = await _execute_corpus(
+            requests,
+            deadline_for=lambda request: min(
+                request.arrival_us + request_deadline_us,
+                scored_global_end_us,
+            ),
+            concurrency=concurrency,
+            transport=transport,
+            base_url=base_url,
+            served_model=served_model,
+            abort_grace_s=abort_grace_s,
+            clock=resolved_clock,
+            origin_ns=origin_ns,
+        )
+    by_id = {row.request.request_id: row for row in executions}
+    lifecycles = tuple(
+        _registered_request_lifecycle(
+            phase=phase,
+            request=request,
+            execution=by_id.get(request.request_id),
+            request_deadline_us=request_deadline_us,
+            scored_global_end_us=scored_global_end_us,
+            complete_closed_loop_pool=complete_closed_loop_pool,
+        )
+        for request in requests
+    )
+    result = RegisteredServingPhaseExecution(
+        phase=phase,
+        origin_ns=origin_ns,
+        finished_ns=resolved_clock.monotonic_ns(),
+        arrival_duration_us=arrival_duration_us,
+        request_deadline_us=request_deadline_us,
+        drain_duration_us=drain_duration_us,
+        concurrency=concurrency,
+        source_kind=source_kind,
+        complete_closed_loop_pool=complete_closed_loop_pool,
+        executions=executions,
+        lifecycles=lifecycles,
+    )
+    result.__post_init__()
+    return result
 
 
 def _timing_timestamps(
@@ -4246,8 +4715,6 @@ def _validate_resumed_native_terminal(
         or (session_binding is None and terminal.reset_receipt.reset_generation != 2)
     ):
         raise RuntimeError("completed native terminal artifact changed run identity")
-    if binding.method != "target_only" and not terminal.trusted_attestation:
-        raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
     native = terminal.to_native_evidence_batch()
     round_rows = (
         pq.read_table(completed["round"]).to_pylist() if "round" in completed else []
@@ -4752,9 +5219,10 @@ async def execute_industrial_plan(
             transport=pinned_transport,
             config=config,
         )
-        capability = await native_evidence.capability(expected_method=method)
-        if method != "target_only" and not capability.trusted_attester_configured:
-            raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
+        # The remote process is only the raw evidence producer.  It must never
+        # receive the offline release key; a pulled canonical terminal is
+        # authorized later by the root-controlled non-serving-terminal path.
+        await native_evidence.capability(expected_method=method)
         native_binding = _native_terminal_binding(
             plan=plan,
             run_id=run_id,
@@ -4908,8 +5376,6 @@ async def execute_industrial_plan(
             != plan.trusted_attester_policy.sha256
         ):
             raise RuntimeError("native terminal envelope changed its release policy")
-        if config.method != "target_only" and not terminal.trusted_attestation:
-            raise RuntimeError(TRUSTED_NATIVE_ATTESTER_UNAVAILABLE_REASON)
         terminal_artifact = terminal.to_artifact(
             warmup_requests=warmup_terminal_requests
         )

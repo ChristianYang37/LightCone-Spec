@@ -6,12 +6,11 @@ LightCone-Spec 是一个以证据为先的 speculative decoding 在线 drafter a
 研究框架。它严格区分 runtime 工程与实证结论：CPU 合同可以验证身份、持久性和
 fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明速度或容量。
 
-> 当前为 Alpha 软件。全部 formal industrial GPU 结果均为 `UNMEASURED`。工业级 executor 目前只有
-> Target-only 可以端到端运行。Static、TTS、L0-naive、LightCone 及其他所有 speculative method 会在任何
-> process 或 network mutation 前 `BLOCKED`，因为固定
-> `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` hook 尚未配置可信
-> hardware signer。实证 Stage B 还因缺少 provider credential、已解析 model/data/trace lock
-> 与已注册硬件而 `BLOCKED`。历史 v2 artifact 仅可用于
+> 当前为 Alpha 软件。全部 formal industrial GPU 结果在新的 clean source/patch/protocol/
+> registry identity 通过注册 GPU gate 前均为 `UNMEASURED`。Release-level `MEASURED`
+> 结论只能由 fresh root-signed control 授权，并绑定准确 external input、inventory、hardware
+> 与 native terminal evidence；trusted single-operator 路径可以收集 unsigned empirical
+> evidence，但不能越过该结论边界。历史 v2 artifact 仅可用于
 > regression/debugging；它们不能证明 schema-v3 协议或任何新性能结论。
 
 <!-- RESULT_TRUTH_GATE_BEGIN -->
@@ -23,13 +22,13 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | Truth field | 值 | 范围 |
 |---|---|---|
 | `formal_industrial_gpu_evidence` | `UNMEASURED` | 当前 schema-v3 formal 证据；没有发布任何 industrial 性能结论。 |
-| `formal_industrial_execution` | `BLOCKED` | 当前 release 授权；缺少 trusted signer 且 Stage-B 输入未解析，因此在 mutation 前 fail closed。 |
+| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | release public trust root 已配置，但新的 root-authorized source、model、hardware、control 与 mandatory-preflight receipt 尚未生成，因此在 mutation 前 fail closed。 |
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `dfb60ab2e514defc6290fe8bacd179552dcd985e` | 应用当前 patch series 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `7bfb2ea4f1497dd782a70a7afcad0857495b2871d80ad8ac858b2cb81e32ef7b` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2` | 应用当前 patch series 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `cc8355703fe83c8a73ecdbf9cd656140e257e69570fbfd8d8bc08f657e72fd71` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
@@ -54,17 +53,16 @@ runtime 实现不代表配置、live candidate、optimizer state 或 evidence �
 准确 sealed E2 final-recipe receipt 才能物化或命名 LightCone。Target-only 与 Static 在
 结构上不分配 adaptation、optimizer、gradient、candidate 或 adaptation-telemetry state。
 
-当前 baseline authority 标记为 `TTS-paper-reconstruction`，状态为 `BLOCKED`。其 update-recipe
-authority 固定 Adam、一次 optimization step、仅 latest-round supervision、position-weighted
-distillation 加 source-point proximal term、逐 request reset 与 strided side stream。与 recipe
-正交，TTS publication 使用论文的固定 synchronization barrier。截至 2026-08-15 的
-primary-source 审计未找到作者官方代码/config；
-论文也没有给出 learning rate/schedule、
-Adam beta/epsilon 与 optimizer-state reset、weight decay/clip、position weight、proximal
-coefficient、loss normalization/precision/temperature、准确 trainable-parameter manifest、
-stride-selection rule 或官方 implementation commit。在作者/用户提供 recipe 或预注册的 TTS-only reconstruction rule
-封存这些字段前，TTS 与 L0-naive 都不能成为 formal cell；二者绝不能继承 E1/E2 winner、
-schema default 或历史 AdamW configuration。
+历史 `TTS-paper-reconstruction` baseline 继续是 diagnostic 且 `BLOCKED`：截至 2026-08-15
+的 primary-source 审计未找到作者官方代码/config，论文也没有固定全部数值字段。因此 formal
+路径使用独立的预注册 TTS-Cal authority：固定 Adam、一次 optimization step、
+`(beta1=.9, beta2=.999, epsilon=1e-8)`、zero weight decay、无 clipping、全 drafter/
+latest-round-only update、digest-bound drafter-native position/proximal loss recipe、逐 request
+reset、side stream、learning-rate grid `1e-7, 3e-7, ..., 1e-3` 与 stride
+`{1,5,10,15,20,30,40,50}`。四个 excluded pilot 按注册的 safety-first 规则缩减网格；只有
+signed winner 才能冻结 TTS 与 L0-naive。在 seal 生成前二者保持 `BLOCKED`，且绝不能继承
+E1/E2 winner、schema default 或历史 AdamW configuration。TTS publication 独立固定为论文的
+synchronization barrier。
 [Provenance authority](manifests/provenance/tts_recipe_authority_v1.json) 绑定 arXiv
 `2605.09329v2`、PDF SHA-256
 `7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20` 与 source SHA-256
@@ -75,16 +73,18 @@ topology、原生 NEXTN preflight 与 breadth template。EAGLE/EAGLE3 仍是带�
 guard 的目标 backend contract；注册并不表示当前 release 可以执行。OnlineSPEC 是重要
 对比，但使用独立 tuning、证据、attestation 与分析，不能选择或改变核心 gate。
 
-当前固定 SGLang patch 只包含 TP1/DP1 DFlash 的底层可执行 adaptive path。它会执行注册的
-constant、inverse-square-root 与有限 horizon cosine schedule，也会执行非负 logical
-publication delay。它已实现准确 begin/reset/finalize terminal-evidence
-hook，host adapter 也会验证其内容，但仓库不携带可信 hardware signer。Static/TTS/L0-naive/LightCone 因此
-仍不可用于结论，并在 release preflight、任何 mutation 之前失败。DSpark 现有纯 CPU native
-contract，覆盖 adapter-free reconstruction、actual-predecessor W1 feature、native-head
-selection、composite loss 与 verification-budget semantic；它没有连接 CUDA worker，也没有
-授权 runtime adaptation。DSpark/EAGLE/EAGLE3/
-NEXTN adaptation 与所有 TP2/DP2 execution 同样 fail closed。请求 quota-shadow row 时会记录
-准确 identity 与 quota，但当前 DFlash backend capability 会阻止 acquisition，不会伪造 teacher row。
+当前固定 SGLang patch 已包含 DFlash、DSpark、NEXTN 与 official-selector-compatible EAGLE3
+的 source implementation，并在正式矩阵注册的范围内实现 TP1、双 rank TP2 publication 和
+sticky 双 replica DP2 isolation。DFlash 执行注册的 constant、inverse-square-root、有限
+horizon cosine schedule 与非负 logical publication delay；DSpark 绑定真实 predecessor、
+W1/W2 与 confidence head；NEXTN 绑定 MTP teacher/interface 与 TP2 shard authority。Patch
+也提供准确 begin/reset/finalize terminal evidence，host adapter 会重验内容。但这些只是实现
+状态，不是 GPU 结果：仓库不携带 trusted hardware signer，也没有 fresh dynamic GPU
+qualification receipt。因此 Static/TTS/L0-naive/LightCone 以及所有 adaptive backend/topology
+仍不可用于结论，并在 release preflight、任何 mutation 之前 fail closed。Generic EAGLE 不受
+支持；没有 official signed compatibility decision 的 EAGLE3 组合保持 N/A 或 `BLOCKED`。
+请求 quota-shadow row 时会记录准确 identity 与 quota；不支持的 acquisition 会被拒绝，不会
+伪造 teacher row。
 
 ## Runtime 合同
 
@@ -93,8 +93,9 @@ NEXTN adaptation 与所有 TP2/DP2 execution 同样 fail closed。请求 quota-s
   distribution、semantic mask、target teacher row、真实 sampled predecessor、cohort
   身份、source version 与 backend-native payload；
 - 目标 backend contract 要求 validator 在不重复施加 adapter 的前提下重建可微 proposal。
-  只有固定 patch 的底层 TP1/DP1 DFlash path 实现该 adaptive surface；DSpark、
-  EAGLE/EAGLE3 与 NEXTN 仍是不可执行 contract；
+  固定 patch 已实现 DFlash、DSpark、NEXTN 与 compatibility-authorized EAGLE3 surface，但每个
+  准确 backend/topology pair 仍须通过其 named dynamic GPU suite 与 durable external-control
+  proof 才能解锁；generic EAGLE 未实现；
 - Adaptation 只有 `full` 与 `lora`。Layer scope 为 `last1`、`last3`、`last5`、`all`；
   LoRA rank 为 1、2、4、8、16、32、64，且 `alpha/r=1`；
 - DSpark 另注册三种 hybrid scope：最后 1、3 或 5 层 backbone，加原生 W1、W2 与
@@ -113,7 +114,7 @@ rejection distribution 属于采样数学，不是 adaptation mode 或配置 ali
 声明式依赖顺序为：
 
 ```text
-preflight -> E3a -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
+preflight -> E3a -> TTS-Cal -> E1 -> E2 -> E4 -> E3b -> E1a -> E5 -> E6 -> E0
 ```
 
 每个 cell 都绑定科学轴、seed、逻辑 rank slot、port、cache/evidence root、资源隔离与真实
@@ -123,46 +124,34 @@ activation/disposition artifact 与 locked output。唯一的确定性同主机 
 独占 headline/profile/download/compile 工作；只有准确注册的 interference-envelope rule
 允许时，互相独立的工作才可并行。
 
-资源隔离不等于 terminal authority。当前 release 会在预算与 dispatch 前阻止全部 COMPILE
-与 DOWNLOAD cell，因为它既没有 release-owned compile prewarm/finalization result-pointer
-contract，也没有 first-party download terminal receipt contract。
+资源隔离不等于 terminal authority。COMPILE 与 DOWNLOAD 使用 typed first-party assignment、
+immutable terminal 与 atomic no-replace result pointer；缺少 dynamic control 或 raw coverage
+不完整会阻止 activation。
 
-Reducer-owned E1 activation 会从 1,428-cell envelope 只物化一个 68-cell width/load slice：
-两个固定 reference、32 geometry 下共 64 个 L0-policy LC-candidate，以及 stage-level 的一个
-frozen-TTS anchor 与一个 frozen-L0-naive anchor。E2 在四个 quarter-retention round 中共有
-11,920 个 template；每轮只包含 LC-candidate grid、两个 fixed reference，以及每种 baseline
-各一个 stage-level frozen anchor，绝不生成 TTS optimizer candidate。Selection 只使用包含
-Target-only、Static、frozen TTS 与 LC-candidate 的 E1 67-cell 或 E2 2,979-cell subset；
-另行规划的 L0-naive anchor 仅预留给 mechanism/decomposition evidence，不能排序或排除
-LightCone candidate。已注册 confirmation envelope 分别包含 11,520 个 E3b、
-11,064 个 E5 与 3,747 个 E6 cell。E6 的 TTS cell 只使用 frozen external recipe；LightCone
-cell 使用 sealed E1/E2 recipe，且不在 E6 retune。E6 显式 load/repetition axis 还包含预注册
-L0-naive mechanism anchor。E0 共有 2,144 个 structural cell：864 个 compatibility
-template（`4 个 model x 3 个 backend x 9 个 task x 8 个 role`），以及 1,280 个预注册的
-selected-core anchor（`4 个 model x 1 个 DFlash backend x 2 个 task x 2 个 load x
-(4 个 excluded pilot + 12 个 final block) x 5 个 formal role`）。在准确 recipe、load、
-repetition 与 evidence authority 封存前，它们全部保持 blocked 且不可报告。每个 family 的四个 pilot 会在
+TTS-Cal 有 288 个不相交 tuning-only row 并封存一个 numeric TTS recipe。E1 随后恰好
+materialize 68 行：四个 fixed role 加 32 个 LightCone geometry 各自的两个 optimizer anchor。
+E2 为每个 survivor geometry 注册 105 个 recipe，并运行四轮、family floor 为 21、每轮加四个
+fixed anchor 的 successive halving。E4 为 48 screen + 96 local-factorial + 3 profiler 行；
+E3b 为 `480B`；E1a 为 116 行；E5 为 `450B+264`；E6 为只覆盖两个 target model 的
+`2+60B`。E0 先签署 108 个 compatibility decision，只为其中 `V` 个 valid combination
+materialize `16VB` 行；不再展开 blocked sentinel matrix。每个 family 的四个 pilot 会在
 confirmation 前锁定 12--20 final prefix 或 `UNDERPOWERED`。Per-cell budget、物理 assignment、
 terminal evidence 与 observed-versus-registered GPU-time receipt 全部内容绑定。固定 patch
 现已包含 first-party all-reset producer，可生成 source-owned capability、initial-state 与 reset
 receipt，覆盖 drain、KV/prefix、RNG/counter、scheduler/telemetry、adaptation state、allocator/HBM
-和 completion event。其 GPU reset semantics 仍明确为 `PENDING`，receipt 尚未 durable 接入
-terminal 与 whole-inventory accounting。在支持的 single-tokenizer HTTP/1.1 uvicorn 路径上，
+和 completion event。只有准确 runtime identity 通过注册的 device reset qualification 后才
+允许 GPU reuse。在支持的 single-tokenizer HTTP/1.1 uvicorn 路径上，
 HTTP process 会在真实 protocol `connection_made`/`connection_lost` lifecycle 上累计 process、
 generation、created、closed、current；scheduler request counter 与 client field 都不能替代。
 Granian HTTP/2 与 multiple-tokenizer HTTP-process 路径会在生成该 capability 前 fail closed。
-故 live GPU reuse 继续阻止；该 patch 只关闭 reset-state accounting slice，尚无 native warm-up/
-trace/close receipt 与 durable terminal/whole-inventory binding；因此回退到每条 trace 一个
-clean process 与 HTTP pool。
+若 reset/trace/close receipt 或 dynamic proof 缺失，live GPU reuse 会 fail closed 并回退到
+每条 trace 一个 clean process 与 HTTP pool。
 
-目标 schema 与 CPU coordinator vocabulary 定义单节点 TP2、sticky-replica DP2 identity、
-inference-sharded TP state、replica-local DP cohort，以及 all-rank prepare/decision/
-application/receipt transition；这些定义不会让 topology 变得可执行。当前 `RunConfig` 与
-固定 SGLang patch 会在 model loading 前拒绝全部 TP2/DP2 run，也不能签发
-`patched_two_gpu_v1` capability receipt。
-
-真实 CPU `gloo` harness 只验证 collective state-machine 行为。它不能 attest NCCL、CUDA
-stream、graph boundary、device copy、throughput 或双 GPU 正确性。
+`RunConfig` 只支持单机最多两 rank 的 TP1/DP1、TP2/DP1 与 sticky-replica TP1/DP2。TP2
+要求 all-rank prepare/decision/application/receipt 与 zero-partial abort；DP2 保持 replica-local
+state 且禁止跨 replica gradient averaging。CPU `gloo` harness 仍只验证 state machine，不能
+attest NCCL、CUDA stream、graph boundary、device copy、throughput 或双卡正确性；只有 fresh
+root-authorized mode-specific GPU proof 才能启用对应 topology。
 
 ## 部署规模与就绪状态
 
@@ -288,6 +277,37 @@ speculative 或 multi-rank cell 变得可运行。
 Model lock、证据、trace、credential、provider state 与 selection 必须放在忽略的外部 root，
 不得提交。
 
+## Trusted v03 复现
+
+已实现的 `formal-single-operator` 路径用一个 SQLite WAL、一个受 `flock` 保护的 scheduler
+和 source-owned physical producer 运行不可变的 21 节点 DAG。它是可信操作者 empirical
+路径，不能替代 release attestation chain。缺少当前 root-authorized attestation 时，即使全部
+完成，结果也只能标记为 `trusted_single_operator_empirical_no_signature` 并保持
+`UNMEASURED`；绝不能报告成 `MEASURED`。
+
+发布 source authority、BOUND trusted-content bundle、preflight workload 与 schema-v5
+ProtocolLock 后，写入只含路径的 DAG/bootstrap config。先在不分配 GPU 的情况下检查 code
+capability，再运行非 LLM supervisor：
+
+```bash
+lightcone-spec formal-single-operator status
+lightcone-spec formal-single-operator bootstrap-run \
+  --config /absolute/results/formal-v03-run/bootstrap-config.json
+```
+
+`status` 报告 21 个节点的 code capability，而不是 run-specific GPU readiness。Cold start
+准确执行两次 `bootstrap-once` 后，会得到十个 preflight attempt 均为 `PENDING` 的 queue；
+第三次才是第一个 GPU launch boundary。后续 headline 使用两条独立单卡 worker 还是
+isolated scheduling，只能由
+fresh paired interference evidence 决定。
+
+E6 只从两个冻结 target checkpoint 内置的 `mtp.*` component 派生准确两条 TP2 launch，并
+禁止 external draft model。E0 先发布准确 12 个 model/backend pre-probe interface，再运行
+108 个 model/backend/task compatibility probe；task-specific EAGLE3 authority 只能在真实
+post-probe evidence 成功后发布。滚动归档与三段式跨主机 closure 在限制 GPU host spool 的
+同时保留完整 rehydrate 的本地 archive。完整绝对路径命令及关机边界见
+[可信工作流 CLI](docs/zh-CN/cli.md#%E5%8D%95%E5%8F%AF%E4%BF%A1%E6%93%8D%E4%BD%9C%E8%80%85%E6%AD%A3%E5%BC%8F%E5%AE%9E%E9%AA%8C%E9%93%BE)。
+
 ## 统计与结论
 
 四个被排除的 pilot block 仅用于估计方差。Power plan 会在下游 unblinding 前把 final
@@ -310,8 +330,11 @@ power/clock/thermal envelope。缺失值不能替换为零。
 只有 content-bound GPU attestation 同时覆盖 registry/manifest、selection、模型与数据
 revision、runtime capability 与 patched tree、hardware/power report、trace 身份及精确
 Parquet 输入时，gate 才可能返回 `PASS`。本地 mock、历史 v2 evidence 或正向算术仍然是
-`UNMEASURED`。本 release 故意未配置 trusted hardware attester；caller-authored
-doctor/attestation JSON 会被拒绝，任何 analyzer 都不能产生新的 `MEASURED` GPU outcome。
+`UNMEASURED`。本 release 只携带 offline Ed25519 public trust root，不携带 private key 或
+预授权硬件身份。必须由新的 challenge-bound deployment policy 与 source-owned control
+attestation 绑定实测 inventory 和新的 immutable source identity。Caller-authored
+doctor/attestation JSON 会被拒绝；在这条 qualification chain 与 mandatory preflight
+通过前，任何 analyzer 都不能产生新的 `MEASURED` GPU outcome。
 
 对于 preliminary exactness 诊断，`run-preliminary-target-reference` 可以捕获一份锁定的
 Target-only greedy reference；每个 prompt 的 output 是完整有序 token-ID 轨迹带格式标识的
@@ -381,23 +404,16 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
 
 ## 限制
 
-- 全部 formal industrial GPU 结果均为 `UNMEASURED`；native terminal hook 已存在，但 Stage B 因缺少可信
-  hardware signer、provider credential、已解析 model/data/trace lock 与已注册硬件而保持
-  `BLOCKED`；
-- 当前端到端 industrial execution surface 只有 TP1/DP1 Target-only。TP2/DP2 仅存在于
-  目标 registry/coordinator contract，本 release 会拒绝它们。Multi-host control 只分发
-  independent work；它不授权跨主机 TP/DP collective，也不声明 Kubernetes、elastic
-  membership、remote-object-store evidence 或自动 failover；
-- CPU `gloo` 合同不是 GPU/NCCL 证据。Topology config 只是目标 vocabulary；无论 caller
-  是否提供 patched-runtime capability receipt，本
-  release 都会拒绝 TP2/DP2；
-- Static/TTS/L0-naive/LightCone 在 out-of-band 可信 signer 绑定准确 native terminal hook 与固定 tree 前
-  保持 `BLOCKED`。DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与所有 TP2/DP2 cell 同样
-  `BLOCKED`，绝不能暗示成功；
-- Formal TTS 与 L0-naive 还因 frozen `TTS-paper-reconstruction` recipe 未解析而 blocked；
-  LightCone 另要求准确 sealed E2 final-recipe receipt，否则无法物化；
-- ChronoBelief tuning cell 在 authoritative update equation 与 source identity 注册前保持
-  `BLOCKED`，不会使用替代 optimizer；
+- 全部 formal industrial GPU 结果在新的 clean code、patch、protocol、registry、external-source
+  与 hardware identity 产生 fresh signed GPU receipt 前均为 `UNMEASURED`；
+- TP2/DP2、native ITL、DSpark、NEXTN 与 compatible EAGLE3 路径都要求准确的 mode-specific
+  device qualification。CPU contract 与 caller-provided key 不能授权它们。Multi-host 只执行
+  independent host-local work；跨主机 collective、world size 大于二、Kubernetes、elastic
+  membership 与自动 failover 仍不支持；
+- TTS 与 L0-naive 要求 signed TTS-Cal winner；LightCone 还要求 sealed E2 final recipe。任何
+  method 都不能继承 result-derived 或 legacy diagnostic recipe；
+- ChronoBelief 已注册准确 equation 与 state semantics，但仍与其他 adaptive recipe 一样需要
+  runtime/GPU qualification；
 - 历史 KV 按设计冻结。重新计算它需要新的算法、显存边界、协议与结论。
 
 ## 贡献与许可证

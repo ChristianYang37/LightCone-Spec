@@ -5,13 +5,15 @@
 ## Objectives and scientific identities
 
 The equations below specify the registered target method. They do not imply
-that every backend or topology is executable in this release. The industrial
-executor currently completes only TP1/DP1 Target-only. The pinned patch now
+that every backend or topology is executable in this release. The only
+currently claimable execution remains TP1/DP1 Target-only. The pinned patch
 contains the native
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle and
-a lower-level adaptive implementation only for TP1/DP1 DFlash, but no trusted
-hardware signer is configured. Static/TTS/L0-naive/LightCone remain blocked before mutation,
-and no new GPU result is available.
+source implementations for registered DFlash, DSpark, NEXTN, compatible
+EAGLE3, TP2, and sticky DP2 paths. None is a GPU result: the exact dynamic suite
+and trusted external-control proof have not yet been produced, and no trusted
+hardware signer is configured. Static/TTS/L0-naive/LightCone remain blocked
+before mutation, and no new GPU result is available.
 
 Recipe authority and publication policy are separate mathematical identities.
 Target-only and Static have structural zero adaptation state. TTS uses a frozen
@@ -57,18 +59,19 @@ $$
 +\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
 $$
 
-Its update-recipe authority specifies Adam, exactly one optimization step,
-request-local reset, and a strided side CUDA stream. Orthogonally, TTS
-publication uses the paper's fixed synchronization barrier. The audited
-[arXiv v2 paper](https://arxiv.org/abs/2605.09329v2) does not disclose the
-numeric learning rate or schedule, Adam betas/epsilon or optimizer-state reset,
-weight decay or clipping, the position-weight values, $\lambda$, loss
-normalization/precision/temperature, the exact trainable-parameter manifest,
-the stride-selection rule, or an official implementation commit. The
-authority is therefore `TTS-paper-reconstruction`, is not formal-eligible, and
-remains `BLOCKED` until those fields are sealed by an author/user recipe or a
-preregistered TTS-only reconstruction rule. It cannot inherit the exponential
-weight above, an E1/E2 winner, schema defaults, or a historical AdamW recipe.
+The audited [arXiv v2 paper](https://arxiv.org/abs/2605.09329v2) does not
+disclose every numerical field, so the historical
+`TTS-paper-reconstruction` authority remains diagnostic and non-formal. The
+formal TTS-Cal authority is a separate preregistered reconstruction: Adam,
+exactly one step, `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero decay, no
+clipping, full-drafter/latest-round-only updates, a digest-bound drafter-native
+position/proximal loss recipe, request-local reset, side stream, learning rates
+`1e-7, 3e-7, ..., 1e-3`, and strides `{1,5,10,15,20,30,40,50}`. Four excluded
+pilots apply the registered safety-first reduction and the winner is frozen by
+a signed seal. TTS and L0-naive remain `BLOCKED` until that seal exists. They
+cannot inherit the exponential weight above, an E1/E2 winner, schema defaults,
+or a historical AdamW recipe. Orthogonally, TTS publication uses the paper's
+fixed synchronization barrier.
 
 ## Backend evidence and reconstruction
 
@@ -97,17 +100,16 @@ the measured update interval. It uses neither `.item()` nor a blocking event
 synchronization. An invalid receipt advances neither optimizer step nor active
 version and publishes no tensors.
 
-The current lower-level patch reconstructs DFlash's differentiable canvas for
-TP1/DP1. The target contracts for DSpark require native Markov W1/W2 features
-and the actual sampled predecessor; EAGLE/EAGLE3 would bind tree state and one
-source version across the proposal chain; NEXTN would bind native MTP hidden
-state and a content digest of the upstream interface. These payloads are not
-interchangeable, and DSpark/EAGLE/EAGLE3/NEXTN adaptation remains `BLOCKED`.
+The pinned patch reconstructs DFlash's differentiable canvas, DSpark's native
+Markov W1/W2 features and sampled predecessor, NEXTN's MTP hidden/interface
+state, and an official-selector-gated EAGLE3 path. These payloads are not
+interchangeable. DSpark, NEXTN, and compatible EAGLE3 remain
+`implemented_pending_dynamic_gpu_proof`; generic EAGLE is unsupported.
 
 ## DSpark composite objective
 
-The non-executable target DSpark contract may also train its native
-confidence/acceptance state in a hybrid plan.
+The DSpark contract may also train its native confidence/acceptance state in a
+hybrid plan, subject to its exact dynamic qualification.
 For a verified target row $p$ and the sampling-bound proposal $q$, define a
 stop-gradient conditional-survival target
 
@@ -188,12 +190,13 @@ before their candidate bytes are compared. Live TTS and L0-naive histories may
 diverge after their publication decisions diverge, so future candidates are
 not required to remain equal.
 
-In the target CPU coordinator contract, TP2 sharded coordinates stay on their
+In the distributed coordinator contract, TP2 sharded coordinates stay on their
 inference owner and replicated coordinates reduce inside the TP replica; DP2
 cohorts are sticky and replica-local. All ranks would prepare one update
-identity and derive one commit or abort decision. The current `RunConfig`
-rejects every TP2/DP2 plan before model loading, so these equations are not a
-multi-rank execution claim.
+identity and derive one commit or abort decision. `RunConfig` accepts these
+topologies only with the exact source capability identity, and formal dispatch
+still rejects them without a fresh all-rank GPU qualification. The equations
+therefore do not themselves constitute a multi-rank result.
 
 ## OnlineSPEC comparison learners
 

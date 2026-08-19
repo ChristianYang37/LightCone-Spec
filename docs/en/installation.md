@@ -71,13 +71,16 @@ This inventory scaling supports more independent jobs and topology-aware gangs,
 not an executable larger-rank method. The tracked compatibility manifest
 continues to describe its exact reference host separately.
 
-The target registry and CPU coordinator describe one-node TP2 and sticky DP2
-identities, but the current release accepts only TP1/DP1 and rejects every
-TP2/DP2 `RunConfig` before model loading. A future multi-rank release would
-require a content-bound `patched_two_gpu_v1` capability receipt and matching
-receipts from every rank. The real CPU `gloo` harness tests collective state
-transitions only; it cannot enable that release surface or supply GPU/NCCL
-evidence.
+The source runtime implements three registered single-host modes:
+`tp1_dp1`, `tp2_dp1`, and sticky-replica `tp1_dp2`. A distributed `RunConfig`
+is accepted only when it carries the exact source-owned
+`patched_two_gpu_v1` capability identity and a runtime-envelope receipt. That
+schema support is not GPU authority. TP2 and DP2 remain fail-closed until a
+fresh root-authorized deployment policy permits the observed homogeneous
+two-GPU inventory and the matching GPU qualification artifact proves the
+rank, UUID, rendezvous, ownership, publication, and terminal contracts. The
+real CPU `gloo` harness tests collective state transitions only; it cannot
+supply GPU/NCCL evidence.
 
 HBM preflight must measure every rank and uses the least feasible rank. Choose
 adaptation reserve, KV pool, safety margin, fixed cohort-slab capacity, and
@@ -135,39 +138,94 @@ sanitized provisioning receipt. Never place provider secrets, temporary URLs,
 instance addresses, or access tokens in commands, manifests, evidence, handoff
 documents, or Git.
 
-At present, empirical Stage B is `BLOCKED` because no trusted hardware signer,
-provider credentials, immutable model/data/trace locks, or registered hardware
-and interference envelope are available. The pinned integration already
-implements the exact native begin/reset/finalize hook, but the industrial
-executor can release-run only TP1/DP1 Target-only; Static/TTS/L0-naive/LightCone fail preflight
-before mutation. Hardware access or a test signer alone does not unblock
-speculative work. Formal TTS/L0-naive additionally require a sealed frozen TTS
-recipe authority, and LightCone requires the exact sealed E2 winner; neither is
-inferred from defaults. DSpark/EAGLE/EAGLE3/NEXTN adaptation and all TP2/DP2 work need
-additional implementations and remain blocked.
+The source tree does not itself contain a runnable empirical Stage B. A formal
+session remains `BLOCKED` until it has fresh provider state, root-authorized
+deployment/hardware policy, immutable prepared-model and workload content
+receipts, exact compile/exactness/interference terminals, and a stage capacity
+control. The pinned integration contains first-party compile and non-serving
+terminal contracts, but their absence from a checkout is intentional: source
+capability is not execution evidence. Hardware access or a test signer alone
+does not unblock speculative work. Formal TTS/L0-naive additionally require a
+sealed TTS-Cal winner, and LightCone requires the exact sealed E2 winner;
+neither is inferred from defaults. TP2/DP2, DSpark, NEXTN, native ITL, and
+session reuse are implemented pending their exact dynamic GPU proofs. EAGLE3
+requires a separate signed official model/selector compatibility decision;
+unsupported or incompatible combinations stay N/A or `BLOCKED`.
 
 ## Trusted attester bundle
 
-Trusted verification material is provisioned outside the repository as a
-canonical `TrustedAttesterPolicyBundle` plus an adjacent semantic SHA-256
-sidecar. The public bundle contains Ed25519 public keys and attester allowlists,
-challenge-nonce lifetime and external single-use replay policy, an allowlist of
-hardware-envelope digests, and a validity interval. It must never contain a
-private key, signing seed, test identity, credential, or host routing detail.
+The package pins one offline Ed25519 **public** root and its fingerprint in
+`manifests/runtime/release_ed25519_root_v1.json`, with a raw-file SHA-256
+sidecar. The installed wheel and sdist carry the same public resource. No
+private key, signing seed, credential, host route, or hardware digest is stored
+in the repository.
 
-Trust comes from a separately provisioned `TrustedAttesterAnchorDescriptor`
-that fixes the bundle's absolute normalized path, semantic digest, validity,
-and authority. The loader rejects symlinks, hard links, duplicate JSON keys,
-noncanonical bytes, changed files, expired policy, unallowlisted hardware, and
-replayed or unbound challenges. A caller-selected path and digest are not a
-trust root.
+After a real inventory is observed, the offline root signs a short-lived,
+challenge-bound deployment policy containing the exact homogeneous hardware
+allowlist and typed control-attester keys. This dynamic layer avoids guessing a
+future GPU topology or changing source HEAD. Loaders verify the pinned root,
+policy signature and validity, exact policy digest, hardware membership,
+challenge replay reservation, and path/content identity. They reject wrong
+keys, expiry, replay, TOCTOU changes, symlinks, hard links, noncanonical bytes,
+and caller-selected trust roots. The external private key is never copied to a
+remote instance or passed through argv, environment variables, or logs.
 
-`SOURCE_RELEASE_TRUSTED_ATTESTER_ANCHOR` is intentionally unconfigured in this
-source release. Consequently, the formal release remains fail-closed even when
-an operator can load public verification material for a diagnostic deployment.
-A reviewed future release must anchor the public bundle out of band before any
-formal DAG can emit `MEASURED`; signing keys always remain in the external
-attester and are never committed or passed in command arguments.
+The presence of the public root does not make a run `MEASURED`: each formal
+session still needs a fresh root-signed deployment policy and the appropriate
+locally controlled terminal/aggregate attestations.
+
+### Local offline-signing ceremony
+
+Run signing only on the trusted local signing host. The source-owned signer
+accepts a private key through an inherited file descriptor, or prompts for an
+absolute key path through an unechoed TTY. It has no private-key path, private
+bytes, or passphrase argument and never reads those values from the
+environment. Key files must be single-link, current-user-owned mode `0600`
+files in a private directory; the public key must match the pinned root or the
+root-authorized signing policy.
+
+```bash
+python -m lightcone_spec.runtime.offline_signer sign-deployment \
+  --bundle /safe/public/deployment-bundle.json \
+  --inventory-sha256 "$INVENTORY_SHA256" \
+  --challenge-id deployment-2026-08-17-001 \
+  --output /safe/evidence/deployment-authorization.json
+
+python -m lightcone_spec.runtime.offline_signer sign-control \
+  --subject /safe/public/compile-control-subject.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --hardware-envelope-sha256 "$HARDWARE_ENVELOPE_SHA256" \
+  --attester-id release-signer \
+  --key-id release-signer-key \
+  --challenge-id compile-control-2026-08-17-001 \
+  --output /safe/evidence/compile-control.json
+
+python -m lightcone_spec.runtime.offline_signer sign-scientific \
+  --artifact-type stage-materialization \
+  --payload /safe/public/stage-materialization.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --attester-id release-signer \
+  --key-id release-signer-key \
+  --challenge-id stage-materialization-2026-08-17-001 \
+  --output /safe/evidence/stage-materialization.candidate.json
+
+python -m lightcone_spec.runtime.offline_signer finalize-scientific \
+  --artifact-type stage-materialization \
+  --candidate /safe/evidence/stage-materialization.candidate.json \
+  --deployment-authorization /safe/evidence/deployment-authorization.json \
+  --challenge-ledger /safe/private/single-use-challenge-ledger \
+  --output /safe/evidence/signed-stage-materialization.json
+```
+
+Every signing command creates a fresh challenge and publishes one canonical
+file with no-replace semantics. Scientific signing is a closed, typed
+two-phase ceremony: the first command accepts only a registered payload type;
+the finalizer revalidates its deployment policy and reserves the challenge in
+a private, single-use ledger before publishing the signed wrapper. It has no
+generic JSON signing mode. For automation, pass only a numeric inherited descriptor
+with `--key-fd`; never place a key or key path in argv. Copy only the public
+authorization/control artifact to the execution workflow. Never copy the
+private key or signer input FD to the GPU host.
 
 ## Model and data preparation
 

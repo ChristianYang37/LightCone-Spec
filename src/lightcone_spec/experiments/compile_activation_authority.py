@@ -284,7 +284,7 @@ def materialize_compile_diagnostic_activation(
     )
     plan_path = Path(compile_assignment_plan_path)
     plan = CompileAssignmentPlan.load(plan_path)
-    assignment, _cache_plan, _prewarm = plan.revalidate()
+    assignment, _cache_plan, _prewarm, _launch = plan.revalidate()
     if (
         assignment.registry_sha256 != registry.sha256
         or assignment.runtime_sha256 != runtime_sha256

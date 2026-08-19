@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import multiprocessing
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import lightcone_spec.runtime.release_trust_root as release_root_module
 from lightcone_spec.adaptation.governor import (
     BoundedCohortStateManager,
     CohortAdmissionReason,
@@ -18,9 +25,31 @@ from lightcone_spec.adaptation.governor import (
     MemoryPressureAction,
     RankMemoryState,
 )
+from lightcone_spec.doctor import _mode_gates
+from lightcone_spec.runtime.attestation import (
+    AttestationChallenge,
+    SignedAttestation,
+    TrustedAttesterPolicy,
+    attestation_message,
+)
+from lightcone_spec.runtime.attester_bundle import (
+    AttestationNoncePolicy,
+    TrustedAttesterPolicyBundle,
+)
+from lightcone_spec.runtime.control_attestation import (
+    ChallengeReplayStore,
+    ControlArtifactAttestation,
+    ControlArtifactSubject,
+)
 from lightcone_spec.runtime.distributed import (
+    DISTRIBUTED_RUNTIME_GPU_PROOF_PROTOCOL_SHA256,
+    DISTRIBUTED_RUNTIME_QUALIFICATION_TESTS,
+    DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
+    DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S,
     AllRankPublicationCoordinator,
     CohortRouteIdentity,
+    DistributedRuntimeGpuProofArtifact,
+    DistributedRuntimeGpuProofReceipt,
     GlooPublicationTransport,
     InferenceParameterOwnership,
     ParameterOwnership,
@@ -34,7 +63,19 @@ from lightcone_spec.runtime.distributed import (
     TopologyIdentity,
     TopologyReceiptSet,
     UpdateIdentity,
+    VerifiedDistributedRuntimeGpuProof,
+    build_distributed_runtime_gpu_proof_artifact,
     validate_decision_receipts,
+    verify_distributed_runtime_gpu_proof,
+)
+from lightcone_spec.runtime.readiness import (
+    NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256,
+)
+from lightcone_spec.runtime.release_trust_root import (
+    DeploymentPolicyAuthorization,
+    SourceReleaseEd25519Root,
+    SourceReleaseRootBinding,
+    deployment_policy_subject_sha256,
 )
 
 
@@ -84,21 +125,20 @@ def _gloo_publication_worker(
 def topology_receipts(
     *,
     tp: int = 2,
-    dp: int = 2,
+    dp: int = 1,
     process_prefix: str = "process",
 ) -> TopologyReceiptSet:
     world = tp * dp
     receipts = []
     for rank in range(world):
-        node_rank = rank // tp
         topology = TopologyIdentity(
             tensor_parallel_size=tp,
             data_parallel_size=dp,
-            node_count=dp,
-            node_id=f"node-{node_rank}",
-            node_rank=node_rank,
+            node_count=1,
+            node_id="node-0",
+            node_rank=0,
             global_rank=rank,
-            local_rank=rank % tp,
+            local_rank=rank,
             tensor_parallel_rank=rank % tp,
             data_parallel_rank=rank // tp,
             device_id=f"gpu-{rank}",
@@ -169,13 +209,391 @@ def decision_receipts(
     )
 
 
+def _unsigned_gpu_proof(
+    *,
+    mode: str = "tp2_dp1",
+    now_ns: int = 1_000,
+) -> tuple[
+    DistributedRuntimeGpuProofReceipt,
+    TrustedAttesterPolicy,
+    Ed25519PrivateKey,
+]:
+    capability = DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES[mode]
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    public_key_base64 = base64.b64encode(public_key).decode()
+    public_key_sha256 = hashlib.sha256(public_key).hexdigest()
+    policy = TrustedAttesterPolicy(
+        policy_id="release-distributed-gpu-proof-v1",
+        trusted_attesters=(("release-root", "release-root-key", public_key_sha256),),
+        public_keys=((public_key_sha256, public_key_base64),),
+    )
+    receipt = DistributedRuntimeGpuProofReceipt(
+        schema_version=1,
+        kind="lightcone_distributed_runtime_gpu_proof",
+        topology_mode=mode,
+        topology_sha256="5" * 64,
+        runner_protocol_sha256=DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S[mode],
+        assignment_sha256="7" * 64,
+        qualification_observation_sha256="8" * 64,
+        base_exactness_result_pointer_sha256="9" * 64,
+        source_capability_sha256=capability.sha256,
+        pinned_sglang_commit=capability.pinned_sglang_commit,
+        patched_sglang_tree=capability.patched_sglang_tree,
+        semantic_patch_sha256=capability.semantic_patch_sha256,
+        run_nonce_sha256=hashlib.sha256(
+            f"distributed-qualification:{mode}:{now_ns}".encode()
+        ).hexdigest(),
+        qualification_authority_sha256=(NATIVE_RUNTIME_QUALIFICATION_AUTHORITY_SHA256),
+        source_identity_sha256="1" * 64,
+        inventory_sha256="2" * 64,
+        gpu_uuids=("GPU-A", "GPU-B"),
+        hardware_envelope_sha256="3" * 64,
+        junit_xml_sha256="4" * 64,
+        tests_collected=8,
+        tests_passed=8,
+        tests_failed=0,
+        tests_errored=0,
+        tests_skipped=0,
+        qualification_junit_xml_sha256="6" * 64,
+        qualification_test_names=DISTRIBUTED_RUNTIME_QUALIFICATION_TESTS[mode],
+        qualification_tests_collected=8,
+        qualification_tests_passed=8,
+        qualification_tests_failed=0,
+        qualification_tests_errored=0,
+        qualification_tests_skipped=0,
+    )
+    with pytest.raises(ValueError, match="qualification authority differs"):
+        replace(receipt, qualification_authority_sha256="0" * 64)
+    return receipt, policy, private_key
+
+
+def _write_unsigned_gpu_proof(
+    root: Path,
+    receipt: DistributedRuntimeGpuProofReceipt,
+) -> tuple[str, str]:
+    path = root / "distributed-runtime-gpu-proof.json"
+    binding = receipt.write_unsigned(str(path.resolve()))
+    return binding.absolute_path, binding.raw_sha256
+
+
+def _gpu_proof_control_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    receipt: DistributedRuntimeGpuProofReceipt,
+    receipt_raw_sha256: str,
+    policy: TrustedAttesterPolicy,
+    artifact_private_key: Ed25519PrivateKey,
+    now_ns: int,
+) -> ControlArtifactAttestation:
+    root_private_key = Ed25519PrivateKey.generate()
+    root_public_key = root_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    root_spki = root_private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    root = SourceReleaseEd25519Root(
+        schema_version=1,
+        kind="lightcone_source_release_ed25519_root",
+        root_id="lightcone-release-root-2026q3",
+        key_id="lightcone-release-root-key-2026q3",
+        algorithm="Ed25519",
+        public_key_base64=base64.b64encode(root_public_key).decode("ascii"),
+        public_key_sha256=hashlib.sha256(root_public_key).hexdigest(),
+        spki_sha256=hashlib.sha256(root_spki).hexdigest(),
+    )
+    root_binding = SourceReleaseRootBinding(
+        root=root,
+        path="/validation/release-root.json",
+        sidecar_path="/validation/release-root.json.sha256",
+        semantic_sha256=root.sha256,
+        file_sha256="7" * 64,
+        sidecar_file_sha256="8" * 64,
+    )
+    bundle = TrustedAttesterPolicyBundle(
+        schema_version=1,
+        kind="lightcone_trusted_attester_policy_bundle",
+        bundle_id="release-distributed-gpu-proof-bundle-v1",
+        valid_from_ns=now_ns - 1_000_000_000,
+        expires_ns=now_ns + 2_000_000_000,
+        nonce_policy=AttestationNoncePolicy(
+            schema_version=1,
+            kind="lightcone_attestation_nonce_policy",
+            nonce_bytes=32,
+            minimum_lifetime_ns=100_000_000,
+            maximum_lifetime_ns=2_000_000_000,
+            maximum_clock_skew_ns=100_000_000,
+            replay_policy="external_single_use_store",
+            subject_binding_required=True,
+        ),
+        hardware_envelope_sha256_allowlist=(receipt.hardware_envelope_sha256,),
+        trusted_attester_policy=policy,
+    )
+    deployment_subject = deployment_policy_subject_sha256(
+        root_manifest_sha256=root_binding.semantic_sha256,
+        inventory_sha256=receipt.inventory_sha256,
+        bundle_sha256=bundle.sha256,
+    )
+    deployment_challenge = AttestationChallenge(
+        schema_version=1,
+        kind="lightcone_attestation_challenge",
+        challenge_id="release-distributed-deployment-policy",
+        nonce_base64=base64.b64encode(b"d" * 32).decode("ascii"),
+        subject_sha256=deployment_subject,
+        issued_ns=now_ns - 500_000_000,
+        expires_ns=now_ns + 1_500_000_000,
+    )
+    deployment_signature = root_private_key.sign(
+        attestation_message(deployment_challenge, payload_sha256=bundle.sha256)
+    )
+    authorization = DeploymentPolicyAuthorization(
+        schema_version=1,
+        kind="lightcone_deployment_policy_authorization",
+        root_manifest_sha256=root_binding.semantic_sha256,
+        inventory_sha256=receipt.inventory_sha256,
+        bundle=bundle,
+        challenge=deployment_challenge,
+        signature_base64=base64.b64encode(deployment_signature).decode("ascii"),
+    )
+    subject = ControlArtifactSubject(
+        schema_version=1,
+        kind="lightcone_control_artifact_subject",
+        artifact_type="non_serving_terminal",
+        artifact_sha256=receipt_raw_sha256,
+        protocol_sha256=DISTRIBUTED_RUNTIME_GPU_PROOF_PROTOCOL_SHA256,
+        registry_sha256=receipt.source_identity_sha256,
+        lineage_sha256=receipt.control_lineage_sha256,
+    )
+    control_challenge = AttestationChallenge(
+        schema_version=1,
+        kind="lightcone_attestation_challenge",
+        challenge_id="release-distributed-proof-control",
+        nonce_base64=base64.b64encode(b"c" * 32).decode("ascii"),
+        subject_sha256=subject.sha256,
+        issued_ns=now_ns - 100_000_000,
+        expires_ns=now_ns + 900_000_000,
+    )
+    control_signature = artifact_private_key.sign(
+        attestation_message(
+            control_challenge,
+            payload_sha256=subject.artifact_sha256,
+        )
+    )
+    public_key_base64 = policy.public_keys[0][1]
+    control = ControlArtifactAttestation(
+        schema_version=1,
+        kind="lightcone_control_artifact_attestation",
+        subject=subject,
+        hardware_envelope_sha256=receipt.hardware_envelope_sha256,
+        trust_anchor_sha256=root_binding.sha256,
+        trust_bundle_sha256=bundle.sha256,
+        trusted_attester_policy_sha256=policy.sha256,
+        deployment_policy_authorization=authorization,
+        challenge=control_challenge,
+        attestation=SignedAttestation(
+            schema_version=1,
+            kind="lightcone_signed_attestation",
+            algorithm="Ed25519",
+            attester_id="release-root",
+            key_id="release-root-key",
+            environment="release",
+            public_key_base64=public_key_base64,
+            challenge_sha256=control_challenge.sha256,
+            payload_sha256=subject.artifact_sha256,
+            signature_base64=base64.b64encode(control_signature).decode("ascii"),
+        ),
+    )
+    monkeypatch.setattr(
+        release_root_module,
+        "load_source_release_ed25519_root",
+        lambda: root_binding,
+    )
+    return control
+
+
+def test_distributed_gpu_proof_is_root_signed_identity_bound_and_one_shot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now_ns = 2_000_000_000
+    receipt, policy, private_key = _unsigned_gpu_proof(now_ns=now_ns)
+    receipt_path, receipt_raw_sha256 = _write_unsigned_gpu_proof(tmp_path, receipt)
+    control = _gpu_proof_control_attestation(
+        monkeypatch,
+        receipt=receipt,
+        receipt_raw_sha256=receipt_raw_sha256,
+        policy=policy,
+        artifact_private_key=private_key,
+        now_ns=now_ns,
+    )
+    replay_root = tmp_path / "distributed-proof-replay"
+    replay_root.mkdir()
+    replay_store = ChallengeReplayStore(str(replay_root.resolve()))
+    verified = verify_distributed_runtime_gpu_proof(
+        receipt_path,
+        control_attestation=control,
+        replay_store=replay_store,
+        expected_topology_mode="tp2_dp1",
+        expected_topology_sha256="5" * 64,
+        expected_source_capability_sha256=receipt.source_capability_sha256,
+        expected_source_identity_sha256="1" * 64,
+        expected_inventory_sha256="2" * 64,
+        expected_gpu_uuids=("GPU-A", "GPU-B"),
+        expected_hardware_envelope_sha256="3" * 64,
+        expected_run_nonce_sha256=receipt.run_nonce_sha256,
+        now_ns=now_ns,
+    )
+    assert verified.receipt_sha256 == receipt.sha256
+    assert verified.topology_mode == "tp2_dp1"
+    assert verified.control_envelope_sha256 == control.sha256
+    manifest_path = (
+        Path(__file__).resolve().parents[1]
+        / "manifests/runtime/industrial_compatibility_v1.json"
+    )
+    projection = _mode_gates(
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+        distributed_gpu_proofs=(verified,),
+    )
+    assert projection["available_after_dynamic_proof"]["tp2"] == {
+        "status": "AVAILABLE",
+        "qualification_receipt_sha256": verified.receipt_sha256,
+    }
+    assert "tp2" not in projection["pending_dynamic_gpu_proof"]
+    assert "dp2" in projection["pending_dynamic_gpu_proof"]
+    assert tuple(replay_root.glob("reservation-*.json"))
+    with pytest.raises(ValueError, match="already consumed"):
+        verify_distributed_runtime_gpu_proof(
+            receipt_path,
+            control_attestation=control,
+            replay_store=replay_store,
+            expected_topology_mode="tp2_dp1",
+            expected_topology_sha256="5" * 64,
+            expected_source_capability_sha256=receipt.source_capability_sha256,
+            expected_source_identity_sha256="1" * 64,
+            expected_inventory_sha256="2" * 64,
+            expected_gpu_uuids=("GPU-A", "GPU-B"),
+            expected_hardware_envelope_sha256="3" * 64,
+            expected_run_nonce_sha256=receipt.run_nonce_sha256,
+            now_ns=now_ns,
+        )
+    with pytest.raises(TypeError, match="only come from signature verification"):
+        VerifiedDistributedRuntimeGpuProof(
+            receipt_sha256=receipt.sha256,
+            receipt_raw_sha256=receipt_raw_sha256,
+            runner_protocol_sha256=receipt.runner_protocol_sha256,
+            assignment_sha256=receipt.assignment_sha256,
+            qualification_observation_sha256=(receipt.qualification_observation_sha256),
+            base_exactness_result_pointer_sha256=(
+                receipt.base_exactness_result_pointer_sha256
+            ),
+            source_capability_sha256=receipt.source_capability_sha256,
+            qualification_authority_sha256=(receipt.qualification_authority_sha256),
+            trusted_policy_sha256=policy.sha256,
+            challenge_sha256=control.challenge.sha256,
+            source_identity_sha256="1" * 64,
+            inventory_sha256="2" * 64,
+            hardware_envelope_sha256="3" * 64,
+            topology_mode="tp2_dp1",
+            topology_sha256="5" * 64,
+            gpu_uuids=("GPU-A", "GPU-B"),
+            control_envelope_sha256=control.sha256,
+            challenge_reservation_sha256=verified.challenge_reservation_sha256,
+            _verification_tag=object(),
+        )
+    artifact = build_distributed_runtime_gpu_proof_artifact(
+        receipt_path=receipt_path,
+        control_attestation=control,
+        replay_store=replay_store,
+        verified_proof=verified,
+    )
+    reopened = DistributedRuntimeGpuProofArtifact.from_dict(artifact.to_dict())
+    assert reopened.revalidate(now_ns=now_ns).sha256 == verified.sha256
+
+
+def test_distributed_gpu_proof_rejects_expiry_identity_drift_and_skips(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now_ns = 2_000_000_000
+    receipt, policy, private_key = _unsigned_gpu_proof(now_ns=now_ns)
+    receipt_path, receipt_raw_sha256 = _write_unsigned_gpu_proof(tmp_path, receipt)
+    control = _gpu_proof_control_attestation(
+        monkeypatch,
+        receipt=receipt,
+        receipt_raw_sha256=receipt_raw_sha256,
+        policy=policy,
+        artifact_private_key=private_key,
+        now_ns=now_ns,
+    )
+    replay_root = tmp_path / "distributed-proof-replay"
+    replay_root.mkdir()
+    replay_store = ChallengeReplayStore(str(replay_root.resolve()))
+    with pytest.raises(ValueError, match="expected identity"):
+        verify_distributed_runtime_gpu_proof(
+            receipt_path,
+            control_attestation=control,
+            replay_store=replay_store,
+            expected_topology_mode="tp2_dp1",
+            expected_topology_sha256="5" * 64,
+            expected_source_capability_sha256=receipt.source_capability_sha256,
+            expected_source_identity_sha256="1" * 64,
+            expected_inventory_sha256="9" * 64,
+            expected_gpu_uuids=("GPU-A", "GPU-B"),
+            expected_hardware_envelope_sha256="3" * 64,
+            expected_run_nonce_sha256=receipt.run_nonce_sha256,
+            now_ns=now_ns,
+        )
+    with pytest.raises(ValueError, match="expired"):
+        verify_distributed_runtime_gpu_proof(
+            receipt_path,
+            control_attestation=control,
+            replay_store=replay_store,
+            expected_topology_mode="tp2_dp1",
+            expected_topology_sha256="5" * 64,
+            expected_source_capability_sha256=receipt.source_capability_sha256,
+            expected_source_identity_sha256="1" * 64,
+            expected_inventory_sha256="2" * 64,
+            expected_gpu_uuids=("GPU-A", "GPU-B"),
+            expected_hardware_envelope_sha256="3" * 64,
+            expected_run_nonce_sha256=receipt.run_nonce_sha256,
+            now_ns=control.challenge.expires_ns + 1,
+        )
+    with pytest.raises(ValueError, match="challenge subject"):
+        replace(
+            control,
+            subject=replace(control.subject, registry_sha256="9" * 64),
+        )
+    with pytest.raises(ValueError, match="zero skip"):
+        replace(receipt, tests_passed=7, tests_skipped=1)
+    with pytest.raises(ValueError, match="named qualification"):
+        replace(
+            receipt,
+            qualification_test_names=(
+                *receipt.qualification_test_names[:-1],
+                "caller_substituted_qualification",
+            ),
+        )
+    with pytest.raises(ValueError, match="every named qualification"):
+        replace(
+            receipt,
+            qualification_tests_passed=7,
+            qualification_tests_skipped=1,
+        )
+
+
 def test_topology_identity_is_complete_stable_and_fail_closed() -> None:
     receipts = topology_receipts()
     rebuilt = topology_receipts()
     assert receipts.topology_sha256 == rebuilt.topology_sha256
     assert receipts.receipt_sha256 == rebuilt.receipt_sha256
     assert receipts.tensor_parallel_group(0) == (0, 1)
-    assert receipts.tensor_parallel_group(1) == (2, 3)
+    assert receipts.mode == "tp2_dp1"
     with pytest.raises(ValueError, match="global rank"):
         replace(
             receipts.receipt_for_rank(0).topology,
@@ -183,29 +601,42 @@ def test_topology_identity_is_complete_stable_and_fail_closed() -> None:
         )
     with pytest.raises(ValueError, match="cover every declared rank"):
         TopologyReceiptSet(receipts.receipts[:-1])
+    with pytest.raises(ValueError, match="tp1_dp1, tp2_dp1, or tp1_dp2"):
+        replace(receipts.receipt_for_rank(0).topology, data_parallel_size=2)
+    with pytest.raises(ValueError, match="multi-node"):
+        replace(receipts.receipt_for_rank(0).topology, node_count=2)
 
 
 def test_inference_ownership_never_averages_across_dp_replicas() -> None:
-    topology = topology_receipts()
+    topology = topology_receipts(tp=2, dp=1)
     sharded = InferenceParameterOwnership(
         "layers.0.q_proj.weight",
         ParameterOwnership.SHARDED,
-        (0, 1, 2, 3),
+        (0, 1),
         shard_axis=0,
     )
     replicated = InferenceParameterOwnership(
         "acceptance_projection",
         ParameterOwnership.REPLICATED,
-        (0, 1, 2, 3),
+        (0, 1),
     )
-    assert sharded.gradient_reduction_ranks(2, topology) == (2,)
-    assert replicated.gradient_reduction_ranks(2, topology) == (2, 3)
+    assert sharded.gradient_reduction_ranks(0, topology) == (0,)
+    assert replicated.gradient_reduction_ranks(0, topology) == (0, 1)
     with pytest.raises(ValueError, match="partially covers"):
         InferenceParameterOwnership(
             "partial",
             ParameterOwnership.REPLICATED,
-            (0, 2),
+            (0,),
         ).validate(topology)
+
+    replicas = topology_receipts(tp=1, dp=2)
+    replica_local = InferenceParameterOwnership(
+        "replica_local_adapter",
+        ParameterOwnership.REPLICATED,
+        (0, 1),
+    )
+    assert replica_local.gradient_reduction_ranks(0, replicas) == (0,)
+    assert replica_local.gradient_reduction_ranks(1, replicas) == (1,)
 
 
 def test_two_phase_publication_commits_one_all_rank_decision() -> None:
@@ -291,9 +722,11 @@ def test_tp_candidate_failure_collectively_aborts_to_static() -> None:
     assert prepared.reasons == ("rank_1:finiteness",)
     decision = coordinator.decide(prepared)
     assert decision.outcome is PublicationOutcome.ABORT_STATIC
-    assert decision.service_ready
-    assert decision.admission_allowed
+    assert not decision.service_ready
+    assert not decision.admission_allowed
     assert not decision.restart_required
+    with pytest.raises(ValueError, match="service state"):
+        replace(decision, service_ready=True, admission_allowed=True)
     validate_decision_receipts(
         decision,
         decision_receipts(topology, decision.sha256, applied=False),
@@ -303,6 +736,8 @@ def test_tp_candidate_failure_collectively_aborts_to_static() -> None:
         decision,
         decision_receipts(topology, decision.sha256, applied=False),
     )
+    assert coordinator.service_ready
+    assert coordinator.admission_allowed
 
 
 @pytest.mark.parametrize(
@@ -336,7 +771,7 @@ def test_process_group_failure_stops_admission_until_clean_restart() -> None:
     topology = topology_receipts()
     update = candidate()
     votes = list(prepare_votes(topology, update))
-    votes[3] = replace(votes[3], process_group_healthy=False)
+    votes[1] = replace(votes[1], process_group_healthy=False)
     coordinator = AllRankPublicationCoordinator(topology)
     decision = coordinator.decide(coordinator.prepare(update, tuple(votes)))
     assert decision.outcome is PublicationOutcome.PROCESS_GROUP_FAILURE
@@ -383,11 +818,11 @@ def test_missing_rank_is_process_failure_and_retry_identity_is_deduplicated() ->
     second = candidate(sequence=8)
     missing = coordinator.prepare(second, prepare_votes(topology, second)[:-1])
     assert missing.disposition is PrepareDisposition.PROCESS_GROUP_FAILURE
-    assert missing.reasons == ("missing_ranks:3",)
+    assert missing.reasons == ("missing_ranks:1",)
 
 
 def test_replica_local_routing_is_sticky_and_topology_bound() -> None:
-    topology = topology_receipts()
+    topology = topology_receipts(tp=1, dp=2)
     router = ReplicaLocalRouter(topology)
     identity = CohortRouteIdentity(
         tenant_id="tenant-a",
@@ -401,6 +836,30 @@ def test_replica_local_routing_is_sticky_and_topology_bound() -> None:
     assert not router.data_parallel_gradient_averaging
     with pytest.raises(ValueError, match="another router"):
         router.route(replace(identity, router_id="other-router"))
+
+
+def test_dp2_cohort_versions_and_optimizer_slabs_never_cross_replicas() -> None:
+    manager = BoundedCohortStateManager(
+        capacity=2,
+        slab_bytes=4096,
+        tenant_quotas={"tenant-a": 2},
+        ttl_seconds=60,
+    )
+    replica_zero = cohort_key("f", replica=0)
+    replica_one = cohort_key("f", replica=1)
+    assert manager.admit(replica_zero, now=0, version=3).admitted
+    assert manager.admit(replica_one, now=0, version=11).admitted
+    zero = manager.publish_version(
+        replica_zero,
+        source_version=3,
+        new_version=4,
+        now=1,
+    )
+    one = manager.snapshot(replica_one)
+    assert one is not None
+    assert zero.slab_id != one.slab_id
+    assert zero.version == 4
+    assert one.version == 11
 
 
 def full_ledger(*, global_peak: int) -> HBMLedger:

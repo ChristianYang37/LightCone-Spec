@@ -26,7 +26,9 @@ from lightcone_spec.orchestration.session_live_runtime import (
 )
 
 SESSION_LIVE_EVIDENCE_LEVEL = "CPU_CONTRACT_ONLY"
-SESSION_LIVE_GPU_RESET_SEMANTICS = "PENDING"
+SESSION_LIVE_GPU_RESET_SEMANTICS = "IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF"
+SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL = "GPU_VERIFIED"
+SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS = "DYNAMIC_GPU_PROOF_VERIFIED"
 SESSION_LIVE_CLOSE_MANIFEST = "session-close-manifest.json"
 SESSION_LIVE_STEP_PREFIX = "live-step-"
 
@@ -76,23 +78,43 @@ class SessionLiveEvidencePublication:
     trace_artifacts: tuple[SessionLiveTraceArtifactBinding, ...]
     close_manifest_path: Path | None
     close_manifest_sha256: str | None
+    verified_gpu_proof_sha256: str | None = None
 
     def validate(self) -> None:
-        if self.reuse_authorized:
-            raise ValueError("session live evidence cannot authorize reuse")
-        if (
-            self.evidence_level != SESSION_LIVE_EVIDENCE_LEVEL
-            or self.gpu_reset_semantics != SESSION_LIVE_GPU_RESET_SEMANTICS
+        if self.status not in {
+            "CPU_CONTRACT_ONLY",
+            "FRESH_PROCESS_REQUIRED",
+            "GPU_VERIFIED",
+        }:
+            raise ValueError("session live evidence status is unsupported")
+        gpu_verified = self.status == "GPU_VERIFIED"
+        if self.reuse_authorized != gpu_verified:
+            raise ValueError("session live reuse status differs from GPU proof")
+        if gpu_verified:
+            if (
+                self.evidence_level != SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL
+                or self.gpu_reset_semantics != SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS
+                or self.verified_gpu_proof_sha256 is None
+            ):
+                raise ValueError("GPU-verified session evidence lacks its proof")
+        elif self.evidence_level != SESSION_LIVE_EVIDENCE_LEVEL or (
+            self.gpu_reset_semantics != SESSION_LIVE_GPU_RESET_SEMANTICS
         ):
             raise ValueError("session live evidence overstated its evidence level")
-        if self.status not in {"CPU_CONTRACT_ONLY", "FRESH_PROCESS_REQUIRED"}:
-            raise ValueError("session live evidence status is unsupported")
+        if self.verified_gpu_proof_sha256 is not None and (
+            len(self.verified_gpu_proof_sha256) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in self.verified_gpu_proof_sha256
+            )
+        ):
+            raise ValueError("session live GPU proof digest is invalid")
         committed = self.close_manifest_path is not None
         if committed != (self.close_manifest_sha256 is not None):
             raise ValueError("session live close-manifest identity is incomplete")
-        if committed != (self.status == "CPU_CONTRACT_ONLY"):
+        if committed != (self.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}):
             raise ValueError("only a complete CPU contract may have a close manifest")
-        if self.status == "CPU_CONTRACT_ONLY" and (
+        if self.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"} and (
             not self.trace_artifacts
             or not all(binding.complete for binding in self.trace_artifacts)
         ):
@@ -201,9 +223,18 @@ def _trace_artifact(
         "artifact_kind": _TRACE_ARTIFACT_KIND,
         "status": result.audit.status,
         "reason": result.audit.reason,
-        "evidence_level": SESSION_LIVE_EVIDENCE_LEVEL,
-        "gpu_reset_semantics": SESSION_LIVE_GPU_RESET_SEMANTICS,
-        "reuse_authorized": False,
+        "evidence_level": (
+            SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_EVIDENCE_LEVEL
+        ),
+        "gpu_reset_semantics": (
+            SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_GPU_RESET_SEMANTICS
+        ),
+        "reuse_authorized": result.audit.reuse_authorized,
+        "verified_gpu_proof_sha256": result.verified_gpu_proof_sha256,
         "session_plan_sha256": result.audit.session_plan_sha256,
         "trace_index": trace_index,
         "execution_plan_sha256": execution_plan_sha256,
@@ -225,17 +256,30 @@ def _close_manifest(
     *,
     incremental_steps: tuple[SessionLiveStepArtifactBinding, ...] = (),
 ) -> dict[str, object]:
-    if result.audit.status != "CPU_CONTRACT_ONLY":
+    if result.audit.status not in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
         raise ValueError("failed session evidence cannot produce a close manifest")
     manifest: dict[str, object] = {
         "schema_version": 1,
         "artifact_kind": _CLOSE_MANIFEST_KIND,
-        "commit_marker": "COMPLETE_CPU_CONTRACT_ONLY",
+        "commit_marker": (
+            "COMPLETE_GPU_VERIFIED"
+            if result.audit.status == "GPU_VERIFIED"
+            else "COMPLETE_CPU_CONTRACT_ONLY"
+        ),
         "status": result.audit.status,
         "reason": result.audit.reason,
-        "evidence_level": SESSION_LIVE_EVIDENCE_LEVEL,
-        "gpu_reset_semantics": SESSION_LIVE_GPU_RESET_SEMANTICS,
-        "reuse_authorized": False,
+        "evidence_level": (
+            SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_EVIDENCE_LEVEL
+        ),
+        "gpu_reset_semantics": (
+            SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_GPU_RESET_SEMANTICS
+        ),
+        "reuse_authorized": result.audit.reuse_authorized,
+        "verified_gpu_proof_sha256": result.verified_gpu_proof_sha256,
         "session_plan_sha256": result.audit.session_plan_sha256,
         "audit_sha256": result.audit.sha256,
         "execution_plan_sha256s": list(result.execution_plan_sha256s),
@@ -581,7 +625,7 @@ def publish_session_live_evidence(
         binding_values = tuple(bindings)
         manifest_path: Path | None = None
         manifest_sha256: str | None = None
-        if result.audit.status == "CPU_CONTRACT_ONLY":
+        if result.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             if len(binding_values) != len(result.execution_plan_sha256s) or not all(
                 binding.complete for binding in binding_values
             ):
@@ -606,12 +650,21 @@ def publish_session_live_evidence(
     publication = SessionLiveEvidencePublication(
         status=result.audit.status,
         reason=result.audit.reason,
-        evidence_level=SESSION_LIVE_EVIDENCE_LEVEL,
-        gpu_reset_semantics=SESSION_LIVE_GPU_RESET_SEMANTICS,
-        reuse_authorized=False,
+        evidence_level=(
+            SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_EVIDENCE_LEVEL
+        ),
+        gpu_reset_semantics=(
+            SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS
+            if result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_GPU_RESET_SEMANTICS
+        ),
+        reuse_authorized=result.audit.reuse_authorized,
         trace_artifacts=tuple(bindings),
         close_manifest_path=manifest_path,
         close_manifest_sha256=manifest_sha256,
+        verified_gpu_proof_sha256=result.verified_gpu_proof_sha256,
     )
     publication.validate()
     return publication
@@ -704,7 +757,7 @@ def reopen_session_live_evidence(
         }
         if observed_trace_names != expected_trace_names:
             raise RuntimeError("session live trace artifact coverage changed")
-        if expected_result.audit.status == "CPU_CONTRACT_ONLY":
+        if expected_result.audit.status in {"CPU_CONTRACT_ONLY", "GPU_VERIFIED"}:
             if len(binding_values) != len(expected_result.execution_plan_sha256s):
                 raise RuntimeError("expected live result lacks trace evidence")
             expected_manifest = _close_manifest(
@@ -734,12 +787,21 @@ def reopen_session_live_evidence(
     publication = SessionLiveEvidencePublication(
         status=expected_result.audit.status,
         reason=expected_result.audit.reason,
-        evidence_level=SESSION_LIVE_EVIDENCE_LEVEL,
-        gpu_reset_semantics=SESSION_LIVE_GPU_RESET_SEMANTICS,
-        reuse_authorized=False,
+        evidence_level=(
+            SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL
+            if expected_result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_EVIDENCE_LEVEL
+        ),
+        gpu_reset_semantics=(
+            SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS
+            if expected_result.audit.status == "GPU_VERIFIED"
+            else SESSION_LIVE_GPU_RESET_SEMANTICS
+        ),
+        reuse_authorized=expected_result.audit.reuse_authorized,
         trace_artifacts=binding_values,
         close_manifest_path=manifest_path,
         close_manifest_sha256=manifest_sha256,
+        verified_gpu_proof_sha256=expected_result.verified_gpu_proof_sha256,
     )
     publication.validate()
     return publication
@@ -749,6 +811,8 @@ __all__ = (
     "SESSION_LIVE_CLOSE_MANIFEST",
     "SESSION_LIVE_EVIDENCE_LEVEL",
     "SESSION_LIVE_GPU_RESET_SEMANTICS",
+    "SESSION_LIVE_GPU_VERIFIED_EVIDENCE_LEVEL",
+    "SESSION_LIVE_GPU_VERIFIED_RESET_SEMANTICS",
     "SESSION_LIVE_STEP_PREFIX",
     "IncrementalSessionLiveEvidenceSink",
     "SessionLiveEvidencePublication",

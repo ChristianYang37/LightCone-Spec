@@ -49,22 +49,42 @@ response 暴露 server 原样返回的有序 `output_ids`。这些 ID 不会通�
 重建；缺失、不连续或改写的 trajectory 会无法通过 claim-grade exactness gate。Benchmark
 client 现在还接受由 caller 拥有的 async HTTP session，submit 与 abort 共用它，因此一个
 server session 可以复用已注册 connection pool，而无需复制 official request parser。
+第七个 patch 还会在该 official response 路径保留 server 产生、内容绑定的 native ITL
+result pointer。远端 collector 将其作为与 terminal 关联但独立内容寻址的 unsigned bundle
+发布；只有后续本地 external-control proof 才能把任一 artifact 提升为正式证据。
 
 Patch 已实现 content-bound
 `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`8b0d05ba862fb0a9ec02092a35990ed487d56e294eb7b10d210c67ca1e84b163`，final tree 为
-`dfb60ab2e514defc6290fe8bacd179552dcd985e`；manifest 仍是 authority。Lifecycle 绑定
+`38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`，final tree 为
+`c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 adaptive-runtime request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
-executor 仍只端到端运行 Target-only，并在 mutation 前阻止 Static/TTS/L0-naive/LightCone。下列 execution
-contract 也尚未实现。
+所有 source implementation 在对应的本地 external-control proof 验证前仍 fail closed；仅有
+CPU contract coverage 不能授权 formal method run。
 
 第六个 patch 让 speculative width 计数识别 Target-only。真正的 Target-only server
 （`spec_algorithm=none` 且未设置 draft width）不会再执行 `int(None)`：terminal evidence
 仍将 speculative counter 标为不适用，数值型 `/server_info` speed view 则报告零个
 verified draft。任何启用 speculative algorithm 却缺少 draft width 的配置仍会 fail closed。
+
+第七个 patch 分别冻结 TP2 与双 TP1/DP2 replica 的 readiness contract。TP2 只在 all-rank
+two-phase/sharded update 路径绑定 NCCL；TP1/DP2 使用 sticky replica-local control，不存在
+adaptation collective 或跨 replica gradient averaging。同一 patch 还加入不可 skip 的
+`session_reset_tp1` 八项 live-server suite。source-owned runner 对 cold process 与复用的
+adapted process 使用同一份精确 launch manifest，绑定 token/reset/HBM/fixed-address/HTTP/
+fallback/terminal observation，并要求运行前后 assigned GPU 的 compute-process 都为空。
+这些路径在产生精确、本地控制的 GPU proof 前保持
+`IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF`；remote worker 永远不持有 offline key。
+
+Distributed finalize 路径还会绑定 warmup 与 scored schedule 的完整有序 client-lifecycle
+digest。只有 client 证明未提交、且准确包含在该 digest 中的 scored request ID，才允许不
+出现在 native rank coverage；每个已提交 request 仍须有匹配的 native completed/aborted
+terminal，已经观察到的 native row 不能被降格为 non-submitted，所有 warmup row 则必须
+offered、submitted 且 completed。因此 rejected、timed-out、cancelled 与 unfinished 等
+client outcome 会留在注册 serving 证据中，而不会让其他方面有效的 scientific run 变成
+不完整的 distributed terminal。
 
 第二个 patch 还提供 opt-in native committed-token observation contract。每个 timestamp
 是在 stop handling 后，streamer 枚举已经 committed 的最终 token prefix 时由 CPU 采样；它
@@ -74,13 +94,20 @@ Coalesced SSE chunk 也不再被等分成虚构 ITL。Benchmark 会准确输出 
 coalesced、missing client interval 与 coverage；coverage 不完整时，包含 p99 在内的全部
 aggregate ITL statistic 都明确为 `UNSUPPORTED`/`null`，不会把稀疏子集升级为 distribution。
 
-下列 execution contract 会在 model loading 前拒绝：
+第七个 patch 已实现 DSpark、NEXTN、单节点 TP2 与 sticky 双 replica DP2 的 source-owned
+qualification 和 formal-serving 路径。它还在精确的官方 selector compatibility decision
+之后实现 TP1 EAGLE3：兼容 assignment 有真实 qualification bootstrap，formal 路径消费
+durable external-control proof；不兼容或尚未验证的 assignment 会签署 N/A 或保持
+`BLOCKED`。EAGLE 仍不支持。DSpark/NEXTN TP1、topology-specific TP2/DP2 suite、all-rank
+two-phase publication、sticky replica isolation 和 native training interface 都已有 source
+path，但在产生精确且零 skip 的 GPU qualification artifact 前仍为
+`IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF`。缺少所需 native supervision row 时，
+quota-shadow teacher acquisition 仍 fail closed。
 
-- DSpark、EAGLE、EAGLE3 与 NEXTN adaptation；
-- 全部 TP2 或 DP2 run；
-- update round 缺少 native supervision 时的 quota-shadow teacher acquisition（固定 ledger
-  会记录该需求并由 capability gate 阻止）；
-- DSpark worker/CUDA composite-head training 与 NEXTN training interface。
+第二个 patch 的 CPU committed-token observation 仍只用于诊断。它与第七个 patch 的
+native qualification producer 明确分离；只有后者的 first-party token-production/commit
+pointer 与 exact suite proof 在 dynamic GPU gate 通过后才有资格进入 native ITL release
+policy。
 
 TP1/DP1 DFlash adaptive runtime method 现在会执行 constant、按 published update 的
 inverse-square-root 与有限 horizon cosine schedule，也会记录 intrinsic readiness 并应用
@@ -164,12 +191,12 @@ checkout。
 
 最终 schema-v3 patch 已通过仓库完整 apply/compile/focused-test/reverse verifier。这是
 patch-integrity 结果，不是 GPU validation。CPU package test 或旧 patched-tree receipt
-不足以证明 GPU 能力。TP1/DP1 DFlash 与严格 native terminal lifecycle 已实现，但 release
-trust policy 未配置 signer；因此 Static/TTS/L0-naive/LightCone industrial cell 会在任何 mutation 前
-`BLOCKED`，而不是可运行 `UNMEASURED` work。Test signer、provider object attribute 或
-caller-supplied verifier 都不能解锁该 policy。DSpark CPU contract 不授权 execution。
-DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与
-全部 TP2/DP2 cell 保持 `BLOCKED`。Target-only 是唯一 release-executable path。
+不足以证明 GPU 能力。Patch 已实现注册的 DFlash、DSpark、NEXTN、compatible EAGLE3、TP2
+与 sticky DP2 source path，但 release trust policy 未配置 signer，且任何路径都没有 fresh
+exact dynamic GPU proof。因此 Static/TTS/L0-naive/LightCone industrial cell 会在任何
+mutation 前 `BLOCKED`，而不是可运行 `UNMEASURED` work。Test signer、provider object
+attribute 或 caller-supplied verifier 都不能解锁该 policy。Generic EAGLE 不受支持；不兼容
+的 EAGLE3 组合保持 N/A 或 `BLOCKED`。Target-only 是当前唯一可用于 claim 的 path。
 
 历史 shared-tuned-AdamW evidence 只是 matched-recipe publication-policy diagnostic，不是
 TTS-paper reproduction，仅可用于 regression comparison。它不含新的 Target-only、backend-plan、

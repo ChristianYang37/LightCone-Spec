@@ -18,7 +18,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 STATUS_FIELDS = {
     "formal_industrial_gpu_evidence": "UNMEASURED",
-    "formal_industrial_execution": "BLOCKED",
+    "formal_industrial_execution": "BLOCKED_PENDING_QUALIFICATION",
     "historical_snapshot_evidence": "PRELIMINARY_NON_FORMAL",
     "historical_snapshot_host_at_archive": "POWERED_OFF_NOT_RELEASED",
 }

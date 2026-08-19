@@ -111,7 +111,7 @@ from lightcone_spec.experiments.registry import (
     ExperimentRegistry,
     LockedOutput,
     WorkloadClass,
-    build_industrial_registry,
+    build_legacy_industrial_registry,
     content_sha256,
 )
 from lightcone_spec.experiments.sampling import SamplingProfile
@@ -157,11 +157,14 @@ from lightcone_spec.runtime.distributed import (
     TopologyIdentity,
     TopologyReceiptSet,
 )
+from lightcone_spec.runtime.proof_artifact import relocated_evidence_path
 from lightcone_spec.sglang_bridge.checkout import verify_patched_checkout
 from lightcone_spec.sglang_bridge.config import sglang_adaptation_payload
 from lightcone_spec.telemetry.writer import EvidenceWriterPolicy
 
-_REGISTRY_GENERATOR = "lightcone_spec.experiments.registry.build_industrial_registry:v3"
+_REGISTRY_GENERATOR = (
+    "lightcone_spec.experiments.registry.build_legacy_industrial_registry:v3"
+)
 _SHA256_LENGTH = 64
 _BUNDLE_KIND = "industrial_assignment_execution_bundle"
 _CONTEXT_KIND = "gpu_dispatch_execution_context"
@@ -2736,10 +2739,10 @@ class BoundJsonSource:
         )
 
     def load(self) -> object:
-        source = Path(self.path)
+        source = relocated_evidence_path(self.path)
         body = _read_regular_file(source, label="bound bundle source")
         sidecar_body = _read_regular_file(
-            Path(f"{source}.sha256"),
+            relocated_evidence_path(f"{self.path}.sha256"),
             label="bound bundle source sidecar",
         )
         value = _decode_json(body, label="bound bundle source")
@@ -4704,7 +4707,7 @@ def _load_registry(value: object) -> ExperimentRegistry:
     )
     if not slots or len(slots) != len(set(slots)):
         raise ValueError("industrial registry logical slots are invalid")
-    registry = build_industrial_registry(
+    registry = build_legacy_industrial_registry(
         gpu_uuids=slots,
         base_port=_strict_int("registry base_port", parameters["base_port"]),
         cache_root=_strict_text("registry cache_root", parameters["cache_root"]),
