@@ -35,16 +35,18 @@ from lightcone_spec.config.schema import ModelPair, RunConfig, RuntimeConfig
 from lightcone_spec.experiments.formal_single_operator_content import (
     TrustedModelSnapshotMember,
     TrustedSingleOperatorContentBundleBinding,
+    TrustedSingleOperatorContentReplayAuthorityBinding,
 )
 from lightcone_spec.experiments.formal_single_operator_model_registry import (
     require_formal_v03_bound_content_bundle,
 )
 from lightcone_spec.locking.models import LockedModel, ModelLock
 from lightcone_spec.locking.prepared_models import (
+    PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256,
     PreparedModelSnapshotContent,
     bind_prepared_model_content_authority,
     bind_prepared_models,
-    materialize_prepared_model_content_manifest,
+    materialize_trusted_prepared_model_content_manifest,
     revalidate_prepared_model_content_authority,
 )
 from lightcone_spec.runtime.proof_artifact import (
@@ -219,6 +221,16 @@ def _publish_trusted_structural_trainable_plan(
     if content.runtime_binding_status != "BOUND":
         raise ValueError("trainable-plan producer requires runtime-BOUND content")
     bundle = content.reopen()
+    replay_binding = bundle.content_replay_authority
+    if (
+        bundle.schema_version != 2
+        or type(replay_binding)
+        is not TrustedSingleOperatorContentReplayAuthorityBinding
+    ):
+        raise ValueError(
+            "trusted formal v03 trainable plans require schema-2 content replay"
+        )
+    replay = replay_binding.reopen()
     require_formal_v03_bound_content_bundle(bundle)
     target = _member(bundle.model_members, model_id=_TARGET_MODEL_ID, role="target")
     drafter = _member(
@@ -231,6 +243,11 @@ def _publish_trusted_structural_trainable_plan(
         or semantics.expected_drafter_model_id != drafter.model_id
     ):
         raise ValueError("structural plan models differ from trusted content")
+    if (
+        replay.member(model_id=target.model_id, role="target") != target
+        or replay.member(model_id=drafter.model_id, role="drafter") != drafter
+    ):
+        raise ValueError("structural plan models differ from content replay")
 
     model_lock = ModelLock(
         schema_version=2,
@@ -247,9 +264,12 @@ def _publish_trusted_structural_trainable_plan(
             drafter.model_id: drafter.local_snapshot_path,
         },
     )
-    prepared_content = materialize_prepared_model_content_manifest(
+    prepared_content = materialize_trusted_prepared_model_content_manifest(
         model_lock,
         prepared_models,
+        trusted_content_bundle_binding=content,
+        target_model_id=target.model_id,
+        drafter_model_id=drafter.model_id,
     )
     inventory = _prevalidate_inventory(
         prepared_content=prepared_content,
@@ -325,6 +345,12 @@ def _publish_trusted_structural_trainable_plan(
             _canonical_bytes(prepared_content)
         ).hexdigest(),
     )
+    if (
+        prepared_content_authority.schema_version != 2
+        or prepared_content_authority.protocol_sha256
+        != PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256
+    ):
+        raise RuntimeError("trusted formal v03 prepared content lost replay identity")
     run_config_path = _publish_bound_json(
         directory,
         "run-config.json",

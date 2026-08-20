@@ -189,7 +189,7 @@ def _content_inputs(
         registry, "load_e0_task_native_source_authority", load_authority
     )
     return FormalV03ContentPathInputs(
-        schema_version=1,
+        schema_version=2,
         kind="formal_v03_content_path_inputs",
         repository_root=str(repository),
         model_snapshot_paths=_model_paths(tmp_path),
@@ -199,6 +199,9 @@ def _content_inputs(
         e0_source_authority_paths=tuple(authority_paths),
         inventory_path=str(inventory),
         doctor_path=str((tmp_path / "future-doctor.json").resolve()),
+        content_replay_authority_path=str(
+            (tmp_path / "future-content-replay.json").resolve()
+        ),
     )
 
 
@@ -413,6 +416,14 @@ def test_path_only_producer_requires_exact_members_before_mt_bench_na(
     assert "sha256" not in json.dumps(inputs.to_dict(), sort_keys=True)
     assert "sha256" not in json.dumps(spec.to_dict(), sort_keys=True)
 
+    legacy = replace(
+        spec,
+        schema_version=1,
+        content_replay_authority_path=None,
+    )
+    with pytest.raises(ValueError, match="lacks replay authority"):
+        require_formal_v03_content_path_spec(legacy)
+
     calls = 0
 
     def forbidden_loader(_path: str):
@@ -514,6 +525,8 @@ def test_content_path_spec_publication_round_trips_without_caller_digests(
         inputs.inventory_path,
         "--doctor-output",
         inputs.doctor_path,
+        "--content-replay-authority-output",
+        str(inputs.content_replay_authority_path),
         "--output",
         str(input_path),
     ]
@@ -727,6 +740,12 @@ def test_bound_content_capacity_policy_reaches_both_doctor_replays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = object.__new__(TrustedSingleOperatorContentBundle)
+    object.__setattr__(bundle, "schema_version", 2)
+    object.__setattr__(
+        bundle,
+        "content_replay_authority",
+        SimpleNamespace(reopen=lambda: SimpleNamespace(model_members=())),
+    )
     object.__setattr__(bundle, "runtime_binding_status", "BOUND")
     object.__setattr__(
         bundle,
@@ -781,6 +800,15 @@ def test_bound_content_capacity_policy_reaches_both_doctor_replays(
         ("closure", True),
         ("runtime", False, False),
     ]
+
+
+def test_formal_bound_content_hard_rejects_legacy_bundle_schema() -> None:
+    bundle = object.__new__(TrustedSingleOperatorContentBundle)
+    object.__setattr__(bundle, "schema_version", 1)
+    object.__setattr__(bundle, "content_replay_authority", None)
+
+    with pytest.raises(ValueError, match="lacks replay authority"):
+        registry.require_formal_v03_bound_content_bundle(bundle)
 
 
 def test_runtime_identity_only_reopens_bytes_without_fresh_doctor(

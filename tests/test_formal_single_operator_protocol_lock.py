@@ -611,6 +611,7 @@ def test_running_restart_constructs_between_safety_and_new_wave_threshold(
         tmp_path,
         monkeypatch,
     )
+    assert authority.schema_version == 4
     _bypass_deep_revalidation(
         monkeypatch,
         authority_path=authority_path,

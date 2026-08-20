@@ -18,8 +18,17 @@ attestation 时，这些证据只能标记为 `trusted_single_operator_empirical
 `formal_measured=false`、状态保持 `UNMEASURED`。Release-level `MEASURED` 结果还必须具备
 仓库 Ed25519 public root chain。相应 run-specific receipt 未就绪时，每个 assignment 都会在
 分配资源前 fail closed。CPU state-machine test、caller-authored digest 与旧 smoke 结果都不能
-把 TP2/DP2、native ITL、DSpark、NEXTN 或 EAGLE3 提升为 formal support。历史
-使用 shared tuned AdamW 的历史 row 只是 matched-recipe publication-policy diagnostic，不是
+把 TP2/DP2、native ITL、DSpark、NEXTN 或 EAGLE3 提升为 formal support。
+
+Trusted ceremony 首先发布 path-bound content replay authority，对每个唯一 physical
+snapshot 的模型字节完整读取一次。后续步骤不再重读 model payload，而是 replay 完整
+namespace、VFS metadata、symlink target/blob identity 与 filesystem/mount identity。
+它通过 inode、ctime、metadata 或 namespace drift 捕获正常 VFS mutation；但不声称抵抗
+能够在没有可观察 metadata 变化时静默改写字节的特权 kernel 或底层 storage。Model
+prepare/load 会绑定 receipt 的准确 byte hash，并在有界 safetensors-header 检查或实际 load
+前立即重新验证 metadata/namespace identity；不接受 caller-supplied digest。
+
+历史使用 shared tuned AdamW 的 row 只是 matched-recipe publication-policy diagnostic，不是
 TTS-paper reproduction；它们只用于 regression/debugging，不得进入 schema-v3 selection、
 power sizing、confirmation 或结论。
 

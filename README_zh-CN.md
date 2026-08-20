@@ -296,6 +296,14 @@ Model lock、证据、trace、credential、provider state 与 selection 必须�
 完成，结果也只能标记为 `trusted_single_operator_empirical_no_signature` 并保持
 `UNMEASURED`；绝不能报告成 `MEASURED`。
 
+发布 capacity 前，path-bound content replay authority 会对每个唯一 physical snapshot
+逐字节读取一次全部模型内容。后续 ceremony 不再重读 model payload，而是 replay 完整
+namespace、VFS object metadata、symlink target/blob identity 与 filesystem/mount identity。
+它通过 inode、ctime、metadata 或 namespace drift 捕获正常 VFS mutation；但不声称抵抗能够
+在不产生可观察 metadata 变化时静默改写字节的特权 kernel 或底层 storage。Model
+prepare/load 会绑定 receipt 的准确 byte hash，并在有界 safetensors-header 检查或实际 load
+前立即重新验证 metadata/namespace identity；不接受 caller-supplied digest。
+
 发布 source authority、BOUND trusted-content bundle、preflight workload 与 schema-v5
 ProtocolLock 后，写入只含路径的 DAG/bootstrap config。先在不分配 GPU 的情况下检查 code
 capability，再运行非 LLM supervisor：

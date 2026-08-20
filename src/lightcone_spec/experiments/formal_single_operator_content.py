@@ -42,6 +42,7 @@ from lightcone_spec.experiments.workload_authority import (
     build_livecodebench_v6_hard_verification_metadata,
     build_math500_level5_verification_metadata,
 )
+from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
 
 TrustedModelRole = Literal["target", "drafter", "tokenizer"]
 TrustedSnapshotStorageMode = Literal[
@@ -73,6 +74,36 @@ _FORMAL_STAGE_ORDER = (
 )
 _FORMAL_STAGES = frozenset(_FORMAL_STAGE_ORDER)
 _MAX_JSON_BYTES = 256 * 1024 * 1024
+
+TRUSTED_SINGLE_OPERATOR_CONTENT_REPLAY_PROTOCOL_SHA256 = content_sha256(
+    {
+        "schema_version": 1,
+        "kind": "trusted_single_operator_content_replay_protocol",
+        "trust_mode": "trusted_single_operator_no_signature",
+        "deep_publication": (
+            "one_payload_sha256_scan_per_unique_resolved_snapshot_path"
+        ),
+        "projection": "one_exact_content_closure_to_every_registered_role_member",
+        "replay": (
+            "complete_walk_and_exact_lstat_fstat_symlink_target_resolved_blob_"
+            "identity_without_payload_read"
+        ),
+        "identity_fields": ("dev_ino_mode_uid_gid_nlink_size_mtime_ns_ctime_ns"),
+        "mount_identity_scope": "snapshot_and_cache_roots",
+        "mount_identity_fields": (
+            "device_mount_point_mount_id_mount_root_filesystem_type_mount_source_"
+            "filesystem_id_block_size_fragment_size_name_max_flags"
+        ),
+        "path_authority": "canonical_content_path_spec_binding",
+        "code_authority": "exact_trusted_source_git_head_tree_and_snapshot_sha256",
+        "publication": "canonical_atomic_no_replace_after_complete_deep_scan",
+        "failure": "fail_closed_without_payload_fallback",
+    }
+)
+
+
+class TrustedSingleOperatorContentReplayBlocked(RuntimeError):
+    """A persisted content closure no longer matches its exact filesystem."""
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -460,6 +491,740 @@ def _scan_directory(
     if len({row.relative_path for row in result}) != len(result):
         raise ValueError(f"{label} contains duplicate relative paths")
     return result
+
+
+@dataclass(frozen=True, order=True)
+class TrustedContentReplayFilesystemIdentity:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("device", self.device),
+            ("inode", self.inode),
+            ("mode", self.mode),
+            ("uid", self.uid),
+            ("gid", self.gid),
+            ("size", self.size),
+            ("mtime", self.mtime_ns),
+            ("ctime", self.ctime_ns),
+        ):
+            _require_nonnegative_int(f"trusted replay filesystem {label}", value)
+        _require_positive_int("trusted replay filesystem link count", self.link_count)
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> Self:
+        return cls(
+            device=int(value.st_dev),
+            inode=int(value.st_ino),
+            mode=int(value.st_mode),
+            uid=int(value.st_uid),
+            gid=int(value.st_gid),
+            link_count=int(value.st_nlink),
+            size=int(value.st_size),
+            mtime_ns=int(value.st_mtime_ns),
+            ctime_ns=int(value.st_ctime_ns),
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "mode": self.mode,
+            "uid": self.uid,
+            "gid": self.gid,
+            "link_count": self.link_count,
+            "size": self.size,
+            "mtime_ns": self.mtime_ns,
+            "ctime_ns": self.ctime_ns,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        return cls(**_from_fields("trusted replay filesystem identity", cls, value))  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, order=True)
+class TrustedContentReplayMountIdentity:
+    device: int
+    mount_point: str
+    mount_id: int | None
+    mount_root: str
+    filesystem_type: str
+    mount_source: str
+    filesystem_id: int | None
+    block_size: int
+    fragment_size: int
+    name_max: int
+    flags: int
+
+    def __post_init__(self) -> None:
+        _require_nonnegative_int("trusted replay mount device", self.device)
+        point = Path(self.mount_point)
+        if not point.is_absolute() or Path(os.path.abspath(point)) != point:
+            raise ValueError("trusted replay mount point must be normalized absolute")
+        if self.mount_id is not None:
+            _require_positive_int("trusted replay mount ID", self.mount_id)
+        _require_text("trusted replay mount root", self.mount_root)
+        _require_text("trusted replay filesystem type", self.filesystem_type)
+        _require_text("trusted replay mount source", self.mount_source)
+        if self.filesystem_id is not None:
+            _require_nonnegative_int("trusted replay filesystem ID", self.filesystem_id)
+        for label, value in (
+            ("block size", self.block_size),
+            ("fragment size", self.fragment_size),
+            ("name max", self.name_max),
+        ):
+            _require_positive_int(f"trusted replay mount {label}", value)
+        _require_nonnegative_int("trusted replay mount flags", self.flags)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "device": self.device,
+            "mount_point": self.mount_point,
+            "mount_id": self.mount_id,
+            "mount_root": self.mount_root,
+            "filesystem_type": self.filesystem_type,
+            "mount_source": self.mount_source,
+            "filesystem_id": self.filesystem_id,
+            "block_size": self.block_size,
+            "fragment_size": self.fragment_size,
+            "name_max": self.name_max,
+            "flags": self.flags,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        return cls(**_from_fields("trusted replay mount identity", cls, value))  # type: ignore[arg-type]
+
+
+def _mountinfo_text(value: str) -> str:
+    for encoded, decoded in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(encoded, decoded)
+    return value
+
+
+def _content_replay_mount_identity(path: Path) -> TrustedContentReplayMountIdentity:
+    status = path.stat(follow_symlinks=False)
+    filesystem = os.statvfs(path)
+    mount_point = path
+    while mount_point != mount_point.parent and not os.path.ismount(mount_point):
+        mount_point = mount_point.parent
+    mount_id: int | None = None
+    mount_root = "/"
+    filesystem_type = "platform_statvfs"
+    mount_source = "platform_statvfs"
+    mountinfo = Path("/proc/self/mountinfo")
+    if mountinfo.is_file():
+        candidates: list[tuple[int, Path, str, str, str]] = []
+        major_minor = f"{os.major(status.st_dev)}:{os.minor(status.st_dev)}"
+        try:
+            lines = mountinfo.read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                "trusted replay cannot read current mount identity"
+            ) from error
+        for line in lines:
+            left, separator, right = line.partition(" - ")
+            fields = left.split()
+            right_fields = right.split()
+            if not separator or len(fields) < 6 or len(right_fields) < 2:
+                raise TrustedSingleOperatorContentReplayBlocked(
+                    "trusted replay mountinfo is malformed"
+                )
+            candidate = Path(_mountinfo_text(fields[4]))
+            if fields[2] != major_minor or (
+                path != candidate and not path.is_relative_to(candidate)
+            ):
+                continue
+            candidates.append(
+                (
+                    int(fields[0]),
+                    candidate,
+                    _mountinfo_text(fields[3]),
+                    _mountinfo_text(right_fields[0]),
+                    _mountinfo_text(right_fields[1]),
+                )
+            )
+        if not candidates:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                "trusted replay path has no matching mountinfo identity"
+            )
+        mount_id, mount_point, mount_root, filesystem_type, mount_source = max(
+            candidates, key=lambda row: len(row[1].parts)
+        )
+    filesystem_id_value = getattr(filesystem, "f_fsid", None)
+    return TrustedContentReplayMountIdentity(
+        device=int(status.st_dev),
+        mount_point=str(mount_point),
+        mount_id=mount_id,
+        mount_root=mount_root,
+        filesystem_type=filesystem_type,
+        mount_source=mount_source,
+        filesystem_id=(
+            None
+            if filesystem_id_value is None
+            else int(filesystem_id_value) & ((1 << 64) - 1)
+        ),
+        block_size=int(filesystem.f_bsize),
+        fragment_size=int(filesystem.f_frsize),
+        name_max=int(filesystem.f_namemax),
+        flags=int(filesystem.f_flag),
+    )
+
+
+@dataclass(frozen=True, order=True)
+class TrustedContentReplayEntry:
+    relative_path: str
+    entry_kind: Literal["directory", "regular", "symlink"]
+    identity: TrustedContentReplayFilesystemIdentity
+    symlink_target: str | None = None
+    resolved_relative_path: str | None = None
+    resolved_identity: TrustedContentReplayFilesystemIdentity | None = None
+
+    def __post_init__(self) -> None:
+        _safe_relative_path(self.relative_path, label="trusted replay entry path")
+        if type(self.identity) is not TrustedContentReplayFilesystemIdentity:
+            raise TypeError("trusted replay entry filesystem identity differs")
+        expected_mode = {
+            "directory": stat.S_ISDIR,
+            "regular": stat.S_ISREG,
+            "symlink": stat.S_ISLNK,
+        }.get(self.entry_kind)
+        if expected_mode is None or not expected_mode(self.identity.mode):
+            raise ValueError("trusted replay entry kind/mode differs")
+        if self.entry_kind == "symlink":
+            _require_text("trusted replay symlink target", self.symlink_target)
+            _safe_relative_path(
+                self.resolved_relative_path,
+                label="trusted replay resolved cache path",
+            )
+            if type(
+                self.resolved_identity
+            ) is not TrustedContentReplayFilesystemIdentity or not stat.S_ISREG(
+                self.resolved_identity.mode
+            ):
+                raise ValueError("trusted replay symlink lacks one resolved blob")
+        elif any(
+            value is not None
+            for value in (
+                self.symlink_target,
+                self.resolved_relative_path,
+                self.resolved_identity,
+            )
+        ):
+            raise ValueError("non-symlink trusted replay entry has link metadata")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "relative_path": self.relative_path,
+            "entry_kind": self.entry_kind,
+            "identity": self.identity.to_dict(),
+            "symlink_target": self.symlink_target,
+            "resolved_relative_path": self.resolved_relative_path,
+            "resolved_identity": (
+                None
+                if self.resolved_identity is None
+                else self.resolved_identity.to_dict()
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _from_fields("trusted replay entry", cls, value)
+        identity = row.pop("identity")
+        resolved = row.pop("resolved_identity")
+        return cls(
+            **row,
+            identity=TrustedContentReplayFilesystemIdentity.from_dict(identity),
+            resolved_identity=(
+                None
+                if resolved is None
+                else TrustedContentReplayFilesystemIdentity.from_dict(resolved)
+            ),
+        )  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class TrustedContentReplaySnapshotClosure:
+    local_snapshot_path: str
+    storage_mode: TrustedSnapshotStorageMode
+    content_cache_root: str | None
+    snapshot_mount: TrustedContentReplayMountIdentity
+    cache_mount: TrustedContentReplayMountIdentity | None
+    root_identity: TrustedContentReplayFilesystemIdentity
+    entries: tuple[TrustedContentReplayEntry, ...]
+    files: tuple[TrustedContentFile, ...]
+    tree_sha256: str
+    content_sha256: str
+
+    def __post_init__(self) -> None:
+        root = _resolved_directory(
+            self.local_snapshot_path, label="trusted replay snapshot"
+        )
+        if (
+            type(self.root_identity) is not TrustedContentReplayFilesystemIdentity
+            or not stat.S_ISDIR(self.root_identity.mode)
+            or type(self.snapshot_mount) is not TrustedContentReplayMountIdentity
+            or self.snapshot_mount.device != self.root_identity.device
+        ):
+            raise ValueError("trusted replay snapshot root identity differs")
+        cache_root = (
+            None
+            if self.content_cache_root is None
+            else _resolved_directory(
+                self.content_cache_root, label="trusted replay cache root"
+            )
+        )
+        if (self.storage_mode == "regular_tree") != (cache_root is None):
+            raise ValueError("trusted replay storage/cache identity differs")
+        if (cache_root is None) != (self.cache_mount is None):
+            raise ValueError("trusted replay cache mount identity differs")
+        if self.storage_mode == "huggingface_cache_symlinks":
+            assert cache_root is not None
+            assert self.cache_mount is not None
+            try:
+                root.relative_to(cache_root)
+            except ValueError as error:
+                raise ValueError("trusted replay snapshot leaves cache root") from error
+        elif self.storage_mode != "regular_tree":
+            raise ValueError("trusted replay storage mode is unsupported")
+        if (
+            type(self.entries) is not tuple
+            or not self.entries
+            or any(type(row) is not TrustedContentReplayEntry for row in self.entries)
+            or self.entries
+            != tuple(sorted(self.entries, key=lambda row: row.relative_path))
+            or len({row.relative_path for row in self.entries}) != len(self.entries)
+        ):
+            raise ValueError("trusted replay snapshot entries are not canonical")
+        if (
+            type(self.files) is not tuple
+            or not self.files
+            or any(type(row) is not TrustedContentFile for row in self.files)
+            or self.files
+            != tuple(sorted(self.files, key=lambda row: row.relative_path))
+        ):
+            raise ValueError("trusted replay snapshot files are not canonical")
+        entries = {row.relative_path: row for row in self.entries}
+        for row in self.files:
+            entry = entries.get(row.relative_path)
+            if entry is None or entry.entry_kind not in {"regular", "symlink"}:
+                raise ValueError("trusted replay file lacks its exact entry")
+            observed_size = (
+                entry.identity.size
+                if entry.entry_kind == "regular"
+                else entry.resolved_identity.size  # type: ignore[union-attr]
+            )
+            if observed_size != row.size:
+                raise ValueError("trusted replay file size differs from entry")
+        expected_tree = content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "trusted_model_snapshot_tree",
+                "files": [row.to_dict() for row in self.files],
+            }
+        )
+        expected_content = content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "trusted_model_snapshot_content",
+                "files": [
+                    {"size": row.size, "sha256": row.sha256} for row in self.files
+                ],
+            }
+        )
+        if self.tree_sha256 != expected_tree or self.content_sha256 != expected_content:
+            raise ValueError("trusted replay snapshot digest differs")
+
+    @property
+    def key(self) -> tuple[str, TrustedSnapshotStorageMode, str | None]:
+        return (
+            self.local_snapshot_path,
+            self.storage_mode,
+            self.content_cache_root,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "local_snapshot_path": self.local_snapshot_path,
+            "storage_mode": self.storage_mode,
+            "content_cache_root": self.content_cache_root,
+            "snapshot_mount": self.snapshot_mount.to_dict(),
+            "cache_mount": (
+                None if self.cache_mount is None else self.cache_mount.to_dict()
+            ),
+            "root_identity": self.root_identity.to_dict(),
+            "entries": [row.to_dict() for row in self.entries],
+            "files": [row.to_dict() for row in self.files],
+            "tree_sha256": self.tree_sha256,
+            "content_sha256": self.content_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _from_fields("trusted replay snapshot closure", cls, value)
+        root = row.pop("root_identity")
+        snapshot_mount = row.pop("snapshot_mount")
+        cache_mount = row.pop("cache_mount")
+        entries = _strict_list("trusted replay snapshot entries", row.pop("entries"))
+        files = _strict_list("trusted replay snapshot files", row.pop("files"))
+        return cls(
+            **row,
+            snapshot_mount=TrustedContentReplayMountIdentity.from_dict(snapshot_mount),
+            cache_mount=(
+                None
+                if cache_mount is None
+                else TrustedContentReplayMountIdentity.from_dict(cache_mount)
+            ),
+            root_identity=TrustedContentReplayFilesystemIdentity.from_dict(root),
+            entries=tuple(
+                TrustedContentReplayEntry.from_dict(item) for item in entries
+            ),
+            files=tuple(TrustedContentFile.from_dict(item) for item in files),
+        )  # type: ignore[arg-type]
+
+
+def _opened_regular_file_identity(
+    path: Path,
+    *,
+    label: str,
+) -> TrustedContentReplayFilesystemIdentity:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TrustedSingleOperatorContentReplayBlocked(
+            f"{label} cannot be reopened without following a link"
+        ) from error
+    try:
+        opened = TrustedContentReplayFilesystemIdentity.from_stat(os.fstat(descriptor))
+        current = TrustedContentReplayFilesystemIdentity.from_stat(
+            path.stat(follow_symlinks=False)
+        )
+        if not stat.S_ISREG(opened.mode) or opened != current:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                f"{label} changed while its identity was reopened"
+            )
+        return opened
+    finally:
+        os.close(descriptor)
+
+
+def _opened_directory_identity(
+    path: Path,
+    *,
+    label: str,
+) -> TrustedContentReplayFilesystemIdentity:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TrustedSingleOperatorContentReplayBlocked(
+            f"{label} cannot be reopened without following a link"
+        ) from error
+    try:
+        opened = TrustedContentReplayFilesystemIdentity.from_stat(os.fstat(descriptor))
+        current = TrustedContentReplayFilesystemIdentity.from_stat(
+            path.stat(follow_symlinks=False)
+        )
+        if not stat.S_ISDIR(opened.mode) or opened != current:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                f"{label} changed while its identity was reopened"
+            )
+        return opened
+    finally:
+        os.close(descriptor)
+
+
+def _observe_snapshot_replay_state(
+    spec: TrustedModelSnapshotSpec,
+    *,
+    include_payload: bool,
+) -> tuple[
+    TrustedContentReplayFilesystemIdentity,
+    tuple[TrustedContentReplayEntry, ...],
+    tuple[TrustedContentFile, ...] | None,
+]:
+    if type(spec) is not TrustedModelSnapshotSpec:
+        raise TypeError("trusted replay scanner requires an exact model path spec")
+    root = _resolved_directory(
+        spec.local_snapshot_path, label="trusted replay snapshot"
+    )
+    cache_root = (
+        None
+        if spec.content_cache_root is None
+        else _resolved_directory(spec.content_cache_root, label="trusted replay cache")
+    )
+    if (spec.storage_mode == "regular_tree") != (cache_root is None):
+        raise ValueError("trusted replay scanner storage/cache mode differs")
+    if cache_root is not None:
+        try:
+            root.relative_to(cache_root)
+        except ValueError as error:
+            raise ValueError("trusted replay scanner snapshot leaves cache") from error
+
+    entries: list[TrustedContentReplayEntry] = []
+    files: list[TrustedContentFile] = []
+    seen_regular_inodes: set[tuple[int, int]] = set()
+
+    def visit(directory: Path, prefix: PurePosixPath | None) -> None:
+        before = _opened_directory_identity(
+            directory,
+            label="trusted replay directory",
+        )
+        for entry in sorted(os.scandir(directory), key=lambda row: row.name):
+            if unicodedata.normalize("NFC", entry.name) != entry.name:
+                raise ValueError("trusted replay snapshot contains a non-NFC path")
+            relative = (
+                PurePosixPath(entry.name) if prefix is None else prefix / entry.name
+            )
+            relative_text = relative.as_posix()
+            observed = TrustedContentReplayFilesystemIdentity.from_stat(
+                entry.stat(follow_symlinks=False)
+            )
+            path = Path(entry.path)
+            if stat.S_ISLNK(observed.mode):
+                if (
+                    spec.storage_mode != "huggingface_cache_symlinks"
+                    or cache_root is None
+                ):
+                    raise ValueError("trusted replay snapshot contains a symlink")
+                target = os.readlink(path)
+                _require_text("trusted replay symlink target", target)
+                try:
+                    resolved = path.resolve(strict=True)
+                    resolved_relative = resolved.relative_to(cache_root)
+                except (OSError, ValueError) as error:
+                    raise ValueError(
+                        "trusted replay symlink leaves its cache"
+                    ) from error
+                resolved_identity = _opened_regular_file_identity(
+                    resolved, label="trusted replay resolved blob"
+                )
+                digest = None
+                if include_payload:
+                    size, digest = _stable_file_digest(
+                        resolved, label="trusted replay resolved blob"
+                    )
+                    if size != resolved_identity.size:
+                        raise TrustedSingleOperatorContentReplayBlocked(
+                            "trusted replay blob size changed during deep scan"
+                        )
+                after = TrustedContentReplayFilesystemIdentity.from_stat(
+                    path.stat(follow_symlinks=False)
+                )
+                if (
+                    observed != after
+                    or os.readlink(path) != target
+                    or _opened_regular_file_identity(
+                        resolved, label="trusted replay resolved blob"
+                    )
+                    != resolved_identity
+                ):
+                    raise TrustedSingleOperatorContentReplayBlocked(
+                        "trusted replay symlink changed during observation"
+                    )
+                entries.append(
+                    TrustedContentReplayEntry(
+                        relative_path=relative_text,
+                        entry_kind="symlink",
+                        identity=observed,
+                        symlink_target=target,
+                        resolved_relative_path=resolved_relative.as_posix(),
+                        resolved_identity=resolved_identity,
+                    )
+                )
+                if digest is not None:
+                    files.append(
+                        TrustedContentFile(
+                            relative_path=relative_text,
+                            size=resolved_identity.size,
+                            sha256=digest,
+                            storage_kind="symlinked_blob",
+                            symlink_target=target,
+                            resolved_relative_path=resolved_relative.as_posix(),
+                        )
+                    )
+                continue
+            if stat.S_ISDIR(observed.mode):
+                visit(path, relative)
+                after = TrustedContentReplayFilesystemIdentity.from_stat(
+                    path.stat(follow_symlinks=False)
+                )
+                if after != observed:
+                    raise TrustedSingleOperatorContentReplayBlocked(
+                        "trusted replay directory changed during observation"
+                    )
+                entries.append(
+                    TrustedContentReplayEntry(
+                        relative_path=relative_text,
+                        entry_kind="directory",
+                        identity=observed,
+                    )
+                )
+                continue
+            if not stat.S_ISREG(observed.mode):
+                raise ValueError("trusted replay snapshot has a non-regular entry")
+            inode = (observed.device, observed.inode)
+            if inode in seen_regular_inodes:
+                raise ValueError("trusted replay snapshot contains a hard-link alias")
+            seen_regular_inodes.add(inode)
+            reopened = _opened_regular_file_identity(
+                path, label="trusted replay regular file"
+            )
+            if reopened != observed:
+                raise TrustedSingleOperatorContentReplayBlocked(
+                    "trusted replay regular file changed before observation"
+                )
+            digest = None
+            if include_payload:
+                size, digest = _stable_file_digest(
+                    path, label="trusted replay regular file"
+                )
+                if size != observed.size:
+                    raise TrustedSingleOperatorContentReplayBlocked(
+                        "trusted replay regular file size changed during deep scan"
+                    )
+            if (
+                _opened_regular_file_identity(path, label="trusted replay regular file")
+                != observed
+            ):
+                raise TrustedSingleOperatorContentReplayBlocked(
+                    "trusted replay regular file changed during observation"
+                )
+            entries.append(
+                TrustedContentReplayEntry(
+                    relative_path=relative_text,
+                    entry_kind="regular",
+                    identity=observed,
+                )
+            )
+            if digest is not None:
+                files.append(
+                    TrustedContentFile(
+                        relative_path=relative_text,
+                        size=observed.size,
+                        sha256=digest,
+                    )
+                )
+        after = _opened_directory_identity(
+            directory,
+            label="trusted replay directory",
+        )
+        if after != before:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                "trusted replay directory changed during complete walk"
+            )
+
+    root_identity = _opened_directory_identity(
+        root,
+        label="trusted replay root",
+    )
+    visit(root, None)
+    if _opened_directory_identity(root, label="trusted replay root") != root_identity:
+        raise TrustedSingleOperatorContentReplayBlocked(
+            "trusted replay root changed during complete walk"
+        )
+    ordered_entries = tuple(sorted(entries, key=lambda row: row.relative_path))
+    if not ordered_entries:
+        raise ValueError("trusted replay snapshot contains no entries")
+    return (
+        root_identity,
+        ordered_entries,
+        None
+        if not include_payload
+        else tuple(sorted(files, key=lambda row: row.relative_path)),
+    )
+
+
+def _deep_snapshot_replay_closure(
+    spec: TrustedModelSnapshotSpec,
+) -> TrustedContentReplaySnapshotClosure:
+    root, entries, observed_files = _observe_snapshot_replay_state(
+        spec, include_payload=True
+    )
+    assert observed_files is not None
+    tree_sha256 = content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "trusted_model_snapshot_tree",
+            "files": [row.to_dict() for row in observed_files],
+        }
+    )
+    content_digest = content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "trusted_model_snapshot_content",
+            "files": [
+                {"size": row.size, "sha256": row.sha256} for row in observed_files
+            ],
+        }
+    )
+    return TrustedContentReplaySnapshotClosure(
+        local_snapshot_path=spec.local_snapshot_path,
+        storage_mode=spec.storage_mode,
+        content_cache_root=spec.content_cache_root,
+        snapshot_mount=_content_replay_mount_identity(Path(spec.local_snapshot_path)),
+        cache_mount=(
+            None
+            if spec.content_cache_root is None
+            else _content_replay_mount_identity(Path(spec.content_cache_root))
+        ),
+        root_identity=root,
+        entries=entries,
+        files=observed_files,
+        tree_sha256=tree_sha256,
+        content_sha256=content_digest,
+    )
+
+
+def _revalidate_snapshot_replay_closure(
+    closure: TrustedContentReplaySnapshotClosure,
+) -> None:
+    if type(closure) is not TrustedContentReplaySnapshotClosure:
+        raise TypeError("trusted replay requires an exact snapshot closure")
+    probe = TrustedModelSnapshotSpec(
+        model_id="content-replay/metadata-probe",
+        revision="metadata-replay",
+        role="drafter",
+        stages=("preflight",),
+        local_snapshot_path=closure.local_snapshot_path,
+        storage_mode=closure.storage_mode,
+        content_cache_root=closure.content_cache_root,
+    )
+    root, entries, files = _observe_snapshot_replay_state(probe, include_payload=False)
+    current_snapshot_mount = _content_replay_mount_identity(
+        Path(closure.local_snapshot_path)
+    )
+    current_cache_mount = (
+        None
+        if closure.content_cache_root is None
+        else _content_replay_mount_identity(Path(closure.content_cache_root))
+    )
+    if (
+        files is not None
+        or current_snapshot_mount != closure.snapshot_mount
+        or current_cache_mount != closure.cache_mount
+        or root != closure.root_identity
+        or entries != closure.entries
+    ):
+        raise TrustedSingleOperatorContentReplayBlocked(
+            "trusted replay snapshot metadata or member set changed"
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -1527,12 +2292,13 @@ class TrustedNamedInputPath:
 class TrustedSingleOperatorContentPathSpec:
     """Canonical path-only recipe for publishing one runtime-bound bundle.
 
-    The spec intentionally contains no caller-provided content digest.  All
-    source, model, workload, trace, inventory, and doctor identities are
-    scanned again by the source-owned publishers at execution time.
+    The spec intentionally contains no caller-provided content digest.  Its
+    replay authority first hashes every unique model snapshot, then later
+    publishers replay exact model namespace/VFS identity while independently
+    reopening the other source, workload, trace, inventory, and doctor inputs.
     """
 
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     kind: Literal["trusted_single_operator_content_path_spec"]
     repository_root: str
     model_specs: tuple[TrustedModelSnapshotSpec, ...]
@@ -1542,10 +2308,11 @@ class TrustedSingleOperatorContentPathSpec:
     e0_task_native_specs: tuple[TrustedE0TaskNativeDescriptorSpec, ...]
     inventory_path: str
     doctor_path: str
+    content_replay_authority_path: str | None = None
 
     def __post_init__(self) -> None:
         if (
-            self.schema_version != 1
+            self.schema_version not in {1, 2}
             or self.kind != "trusted_single_operator_content_path_spec"
         ):
             raise ValueError("trusted content path spec identity differs")
@@ -1611,9 +2378,19 @@ class TrustedSingleOperatorContentPathSpec:
         )
         if inventory == doctor:
             raise ValueError("trusted inventory and doctor paths must differ")
+        if self.schema_version == 1:
+            if self.content_replay_authority_path is not None:
+                raise ValueError("legacy trusted content path spec carries replay")
+        else:
+            replay = _normalized_future_file(
+                self.content_replay_authority_path,
+                label="trusted content replay authority",
+            )
+            if replay in {inventory, doctor}:
+                raise ValueError("trusted replay authority path aliases runtime input")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "repository_root": self.repository_root,
@@ -1629,13 +2406,24 @@ class TrustedSingleOperatorContentPathSpec:
             "inventory_path": self.inventory_path,
             "doctor_path": self.doctor_path,
         }
+        if self.schema_version == 2:
+            result["content_replay_authority_path"] = self.content_replay_authority_path
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
+        if type(value) is not dict:
+            raise TypeError(
+                "trusted single-operator content path spec must be an object"
+            )
+        version = value.get("schema_version")
+        expected = set(cls.__dataclass_fields__)
+        if version == 1:
+            expected.remove("content_replay_authority_path")
         row = _strict_object(
             "trusted single-operator content path spec",
             value,
-            set(cls.__dataclass_fields__),
+            expected,
         )
         models = _strict_list(
             "trusted content model path specs", row.pop("model_specs")
@@ -1648,6 +2436,7 @@ class TrustedSingleOperatorContentPathSpec:
             "trusted content E0 descriptor path specs",
             row.pop("e0_task_native_specs"),
         )
+        replay = row.pop("content_replay_authority_path", None)
         return cls(
             **row,
             model_specs=tuple(
@@ -1659,12 +2448,316 @@ class TrustedSingleOperatorContentPathSpec:
             e0_task_native_specs=tuple(
                 TrustedE0TaskNativeDescriptorSpec.from_dict(item) for item in e0
             ),
+            content_replay_authority_path=(None if version == 1 else replay),
+        )  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class TrustedSingleOperatorContentReplayAuthority:
+    schema_version: Literal[1]
+    kind: Literal["trusted_single_operator_content_replay_authority"]
+    protocol_sha256: str
+    trust_mode: Literal["trusted_single_operator_no_signature"]
+    absolute_path: str
+    content_path_spec: CanonicalJsonProofBinding
+    source_git_head: str
+    source_git_tree: str
+    source_snapshot_sha256: str
+    snapshot_closures: tuple[TrustedContentReplaySnapshotClosure, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.kind != "trusted_single_operator_content_replay_authority"
+            or self.protocol_sha256
+            != TRUSTED_SINGLE_OPERATOR_CONTENT_REPLAY_PROTOCOL_SHA256
+            or self.trust_mode != "trusted_single_operator_no_signature"
+        ):
+            raise ValueError("trusted content replay authority identity differs")
+        if type(self.content_path_spec) is not CanonicalJsonProofBinding:
+            raise TypeError("trusted content replay path-spec binding differs")
+        _normalized_future_file(
+            self.absolute_path, label="trusted content replay authority identity"
+        )
+        _require_git_oid("trusted content replay Git HEAD", self.source_git_head)
+        _require_git_oid("trusted content replay Git tree", self.source_git_tree)
+        _require_sha256(
+            "trusted content replay source snapshot", self.source_snapshot_sha256
+        )
+        if (
+            type(self.snapshot_closures) is not tuple
+            or not self.snapshot_closures
+            or any(
+                type(row) is not TrustedContentReplaySnapshotClosure
+                for row in self.snapshot_closures
+            )
+            or self.snapshot_closures
+            != tuple(
+                sorted(
+                    self.snapshot_closures,
+                    key=lambda row: (
+                        row.local_snapshot_path,
+                        row.storage_mode,
+                        row.content_cache_root or "",
+                    ),
+                )
+            )
+            or len({row.key for row in self.snapshot_closures})
+            != len(self.snapshot_closures)
+        ):
+            raise ValueError("trusted content replay snapshot closure is not canonical")
+
+    def _path_spec(self) -> TrustedSingleOperatorContentPathSpec:
+        value = self.content_path_spec.reopen()
+        spec = TrustedSingleOperatorContentPathSpec.from_dict(value)
+        rebound = CanonicalJsonProofBinding.bind(self.content_path_spec.absolute_path)
+        if rebound != self.content_path_spec:
+            raise TrustedSingleOperatorContentReplayBlocked(
+                "trusted content replay path spec changed"
+            )
+        if spec.schema_version != 2:
+            raise ValueError("trusted content replay requires path-spec schema 2")
+        if spec.content_replay_authority_path is None or Path(
+            self.absolute_path
+        ) != Path(spec.content_replay_authority_path):
+            raise ValueError("trusted content replay authority path is spliced")
+        return spec
+
+    @cached_property
+    def model_members(self) -> tuple[TrustedModelSnapshotMember, ...]:
+        spec = self._path_spec()
+        closures = {row.key: row for row in self.snapshot_closures}
+        expected_keys = {
+            (
+                row.local_snapshot_path,
+                row.storage_mode,
+                row.content_cache_root,
+            )
+            for row in spec.model_specs
+        }
+        if set(closures) != expected_keys:
+            raise ValueError("trusted content replay path-spec coverage differs")
+        return tuple(
+            sorted(
+                (
+                    TrustedModelSnapshotMember(
+                        model_id=row.model_id,
+                        revision=row.revision,
+                        role=row.role,
+                        stages=row.stages,
+                        local_snapshot_path=row.local_snapshot_path,
+                        files=closures[
+                            (
+                                row.local_snapshot_path,
+                                row.storage_mode,
+                                row.content_cache_root,
+                            )
+                        ].files,
+                        tree_sha256=closures[
+                            (
+                                row.local_snapshot_path,
+                                row.storage_mode,
+                                row.content_cache_root,
+                            )
+                        ].tree_sha256,
+                        content_sha256=closures[
+                            (
+                                row.local_snapshot_path,
+                                row.storage_mode,
+                                row.content_cache_root,
+                            )
+                        ].content_sha256,
+                        storage_mode=row.storage_mode,
+                        content_cache_root=row.content_cache_root,
+                        runtime_bindings=row.runtime_bindings,
+                    )
+                    for row in spec.model_specs
+                ),
+                key=lambda row: (
+                    row.role,
+                    row.model_id,
+                    row.revision,
+                    row.local_snapshot_path,
+                ),
+            )
+        )
+
+    def member(
+        self,
+        *,
+        model_id: str,
+        role: TrustedModelRole,
+    ) -> TrustedModelSnapshotMember:
+        matches = tuple(
+            row
+            for row in self.model_members
+            if row.model_id == model_id and row.role == role
+        )
+        if len(matches) != 1:
+            raise ValueError("trusted content replay lacks one exact model member")
+        return matches[0]
+
+    def closure_for_member(
+        self,
+        *,
+        model_id: str,
+        role: TrustedModelRole,
+    ) -> TrustedContentReplaySnapshotClosure:
+        member = self.member(model_id=model_id, role=role)
+        matches = tuple(
+            row
+            for row in self.snapshot_closures
+            if row.key
+            == (
+                member.local_snapshot_path,
+                member.storage_mode,
+                member.content_cache_root,
+            )
+        )
+        if len(matches) != 1:
+            raise ValueError("trusted content replay member closure is ambiguous")
+        return matches[0]
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "protocol_sha256": self.protocol_sha256,
+            "trust_mode": self.trust_mode,
+            "absolute_path": self.absolute_path,
+            "content_path_spec": self.content_path_spec.to_dict(),
+            "source_git_head": self.source_git_head,
+            "source_git_tree": self.source_git_tree,
+            "source_snapshot_sha256": self.source_snapshot_sha256,
+            "snapshot_closures": [row.to_dict() for row in self.snapshot_closures],
+        }
+
+    @cached_property
+    def semantic_sha256(self) -> str:
+        return content_sha256(self._payload())
+
+    def to_dict(self) -> dict[str, object]:
+        return {"semantic_sha256": self.semantic_sha256, **self._payload()}
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _strict_object(
+            "trusted content replay authority",
+            value,
+            set(cls.__dataclass_fields__) | {"semantic_sha256"},
+        )
+        declared = _require_sha256(
+            "trusted content replay authority", row.pop("semantic_sha256")
+        )
+        path_spec = row.pop("content_path_spec")
+        closures = _strict_list(
+            "trusted content replay closures", row.pop("snapshot_closures")
+        )
+        authority = cls(
+            **row,
+            content_path_spec=CanonicalJsonProofBinding.from_dict(path_spec),
+            snapshot_closures=tuple(
+                TrustedContentReplaySnapshotClosure.from_dict(item) for item in closures
+            ),
+        )  # type: ignore[arg-type]
+        if authority.semantic_sha256 != declared:
+            raise ValueError("trusted content replay authority digest differs")
+        return authority
+
+
+@dataclass(frozen=True)
+class TrustedSingleOperatorContentReplayAuthorityBinding:
+    absolute_path: str
+    size: int
+    raw_sha256: str
+    semantic_sha256: str
+    protocol_sha256: str
+    content_path_spec: CanonicalJsonProofBinding
+
+    def __post_init__(self) -> None:
+        _resolved_file(self.absolute_path, label="trusted content replay binding")
+        _require_positive_int("trusted content replay binding size", self.size)
+        _require_sha256("trusted content replay binding raw", self.raw_sha256)
+        _require_sha256("trusted content replay binding semantic", self.semantic_sha256)
+        if (
+            self.protocol_sha256
+            != TRUSTED_SINGLE_OPERATOR_CONTENT_REPLAY_PROTOCOL_SHA256
+        ):
+            raise ValueError("trusted content replay binding protocol differs")
+        if type(self.content_path_spec) is not CanonicalJsonProofBinding:
+            raise TypeError("trusted content replay binding path spec differs")
+
+    @classmethod
+    def bind(
+        cls,
+        path: str | Path,
+        *,
+        expected_content_path_spec_path: str | Path | None = None,
+    ) -> Self:
+        authority = load_trusted_single_operator_content_replay_authority(path)
+        revalidate_trusted_single_operator_content_replay_authority(authority)
+        if Path(path) != Path(authority.absolute_path):
+            raise ValueError("trusted content replay binding path is spliced")
+        if expected_content_path_spec_path is not None and Path(
+            authority.content_path_spec.absolute_path
+        ) != Path(expected_content_path_spec_path):
+            raise ValueError("trusted content replay binding path spec differs")
+        size, raw_sha256 = _stable_file_digest(
+            Path(path), label="trusted content replay binding"
+        )
+        return cls(
+            absolute_path=str(Path(path)),
+            size=size,
+            raw_sha256=raw_sha256,
+            semantic_sha256=authority.semantic_sha256,
+            protocol_sha256=authority.protocol_sha256,
+            content_path_spec=authority.content_path_spec,
+        )
+
+    def reopen(self) -> TrustedSingleOperatorContentReplayAuthority:
+        size, raw_sha256 = _stable_file_digest(
+            Path(self.absolute_path), label="trusted content replay binding"
+        )
+        authority = load_trusted_single_operator_content_replay_authority(
+            self.absolute_path
+        )
+        revalidate_trusted_single_operator_content_replay_authority(authority)
+        if (
+            size != self.size
+            or raw_sha256 != self.raw_sha256
+            or authority.semantic_sha256 != self.semantic_sha256
+            or authority.protocol_sha256 != self.protocol_sha256
+            or authority.content_path_spec != self.content_path_spec
+            or authority.absolute_path != self.absolute_path
+        ):
+            raise TrustedSingleOperatorContentReplayBlocked(
+                "trusted content replay binding changed"
+            )
+        return authority
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "absolute_path": self.absolute_path,
+            "size": self.size,
+            "raw_sha256": self.raw_sha256,
+            "semantic_sha256": self.semantic_sha256,
+            "protocol_sha256": self.protocol_sha256,
+            "content_path_spec": self.content_path_spec.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        row = _from_fields("trusted content replay binding", cls, value)
+        path_spec = row.pop("content_path_spec")
+        return cls(
+            **row,
+            content_path_spec=CanonicalJsonProofBinding.from_dict(path_spec),
         )  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
 class TrustedSingleOperatorContentBundle:
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     kind: Literal["trusted_single_operator_content_bundle"]
     trust_mode: Literal["trusted_single_operator_no_signature"]
     signature: None
@@ -1678,10 +2771,13 @@ class TrustedSingleOperatorContentBundle:
     e0_task_native_descriptors: tuple[TrustedE0TaskNativeDescriptor, ...]
     runtime_binding_status: TrustedRuntimeBindingStatus
     runtime_observations: TrustedRuntimeObservations | None
+    content_replay_authority: (
+        TrustedSingleOperatorContentReplayAuthorityBinding | None
+    ) = None
 
     def __post_init__(self) -> None:
         if (
-            self.schema_version != 1
+            self.schema_version not in {1, 2}
             or self.kind != "trusted_single_operator_content_bundle"
             or self.trust_mode != "trusted_single_operator_no_signature"
             or self.signature is not None
@@ -1753,9 +2849,17 @@ class TrustedSingleOperatorContentBundle:
             and type(self.runtime_observations) is not TrustedRuntimeObservations
         ):
             raise TypeError("trusted runtime observation type differs")
+        if self.schema_version == 1:
+            if self.content_replay_authority is not None:
+                raise ValueError("legacy trusted content bundle carries replay")
+        elif (
+            type(self.content_replay_authority)
+            is not TrustedSingleOperatorContentReplayAuthorityBinding
+        ):
+            raise TypeError("trusted content bundle lacks exact replay authority")
 
     def _payload(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "trust_mode": self.trust_mode,
@@ -1777,6 +2881,10 @@ class TrustedSingleOperatorContentBundle:
                 else self.runtime_observations.to_dict()
             ),
         }
+        if self.schema_version == 2:
+            assert self.content_replay_authority is not None
+            result["content_replay_authority"] = self.content_replay_authority.to_dict()
+        return result
 
     @cached_property
     def semantic_sha256(self) -> str:
@@ -1793,10 +2901,16 @@ class TrustedSingleOperatorContentBundle:
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
+        if type(value) is not dict:
+            raise TypeError("trusted single-operator content bundle must be an object")
+        version = value.get("schema_version")
+        expected = set(cls.__dataclass_fields__) | {"semantic_sha256"}
+        if version == 1:
+            expected.remove("content_replay_authority")
         row = _strict_object(
             "trusted single-operator content bundle",
             value,
-            set(cls.__dataclass_fields__) | {"semantic_sha256"},
+            expected,
         )
         declared = _require_sha256(
             "trusted single-operator content bundle",
@@ -1813,6 +2927,7 @@ class TrustedSingleOperatorContentBundle:
             row.pop("e0_task_native_descriptors"),
         )
         runtime = row.pop("runtime_observations")
+        replay = row.pop("content_replay_authority", None)
         bundle = cls(
             **row,
             source_snapshot=TrustedSourceSnapshot.from_dict(source),
@@ -1831,6 +2946,13 @@ class TrustedSingleOperatorContentBundle:
                 if runtime is None
                 else TrustedRuntimeObservations.from_dict(runtime)
             ),
+            content_replay_authority=(
+                None
+                if replay is None
+                else TrustedSingleOperatorContentReplayAuthorityBinding.from_dict(
+                    replay
+                )
+            ),
         )  # type: ignore[arg-type]
         if bundle.semantic_sha256 != declared:
             raise ValueError("trusted single-operator content bundle digest differs")
@@ -1845,6 +2967,8 @@ def build_trusted_single_operator_content_bundle(
     math500_raw_path: str | Path,
     burstgpt_asset_paths: Mapping[str, str | Path],
     e0_task_native_specs: Sequence[TrustedE0TaskNativeDescriptorSpec] = (),
+    content_path_spec_path: str | Path | None = None,
+    content_replay_authority_path: str | Path | None = None,
 ) -> TrustedSingleOperatorContentBundle:
     if isinstance(model_specs, (str, bytes)) or not isinstance(model_specs, Sequence):
         raise TypeError("trusted model specs must be a sequence")
@@ -1853,17 +2977,44 @@ def build_trusted_single_operator_content_bundle(
         Sequence,
     ):
         raise TypeError("trusted E0 descriptor specs must be a sequence")
-    models = tuple(
-        sorted(
-            (bind_trusted_model_snapshot_member(spec) for spec in model_specs),
-            key=lambda row: (
-                row.role,
-                row.model_id,
-                row.revision,
-                row.local_snapshot_path,
-            ),
+    exact_model_specs = tuple(model_specs)
+    replay_binding = None
+    if (content_path_spec_path is None) != (content_replay_authority_path is None):
+        raise ValueError("trusted content replay paths must be supplied together")
+    if content_replay_authority_path is None:
+        models = tuple(
+            sorted(
+                (
+                    bind_trusted_model_snapshot_member(spec)
+                    for spec in exact_model_specs
+                ),
+                key=lambda row: (
+                    row.role,
+                    row.model_id,
+                    row.revision,
+                    row.local_snapshot_path,
+                ),
+            )
         )
-    )
+    else:
+        assert content_path_spec_path is not None
+        replay_binding = TrustedSingleOperatorContentReplayAuthorityBinding.bind(
+            content_replay_authority_path,
+            expected_content_path_spec_path=content_path_spec_path,
+        )
+        replay = replay_binding.reopen()
+        path_spec = replay._path_spec()
+        if (
+            path_spec.model_specs != exact_model_specs
+            or path_spec.repository_root != str(repository_root)
+            or path_spec.livecodebench_raw_path != str(livecodebench_raw_path)
+            or path_spec.math500_raw_path != str(math500_raw_path)
+            or {row.name: row.absolute_path for row in path_spec.burstgpt_asset_paths}
+            != {name: str(path) for name, path in burstgpt_asset_paths.items()}
+            or path_spec.e0_task_native_specs != tuple(e0_task_native_specs)
+        ):
+            raise ValueError("trusted content replay inputs differ from path spec")
+        models = replay.model_members
     e0 = tuple(
         sorted(
             (
@@ -1874,7 +3025,7 @@ def build_trusted_single_operator_content_bundle(
         )
     )
     return TrustedSingleOperatorContentBundle(
-        schema_version=1,
+        schema_version=1 if replay_binding is None else 2,
         kind="trusted_single_operator_content_bundle",
         trust_mode="trusted_single_operator_no_signature",
         signature=None,
@@ -1896,6 +3047,7 @@ def build_trusted_single_operator_content_bundle(
         e0_task_native_descriptors=e0,
         runtime_binding_status="PENDING_REMOTE_BINDING",
         runtime_observations=None,
+        content_replay_authority=replay_binding,
     )
 
 
@@ -1954,10 +3106,19 @@ def revalidate_trusted_single_operator_content_bundle(
     if type(bundle) is not TrustedSingleOperatorContentBundle:
         raise TypeError("trusted content revalidator requires an exact bundle")
     source = bind_trusted_source_snapshot(bundle.source_snapshot.repository_root)
-    models = tuple(
-        revalidate_trusted_model_snapshot_member(member)
-        for member in bundle.model_members
-    )
+    if bundle.schema_version == 1:
+        models = tuple(
+            revalidate_trusted_model_snapshot_member(member)
+            for member in bundle.model_members
+        )
+    else:
+        replay_binding = bundle.content_replay_authority
+        if (
+            type(replay_binding)
+            is not TrustedSingleOperatorContentReplayAuthorityBinding
+        ):
+            raise TypeError("trusted content bundle replay binding differs")
+        models = replay_binding.reopen().model_members
     workloads = tuple(
         bind_trusted_locked_workload(row.workload_id, row.raw_source_path)
         for row in bundle.locked_workloads
@@ -2148,6 +3309,186 @@ def load_trusted_single_operator_content_path_spec(
     return spec
 
 
+def _unique_content_replay_specs(
+    model_specs: Sequence[TrustedModelSnapshotSpec],
+) -> tuple[TrustedModelSnapshotSpec, ...]:
+    by_path: dict[str, TrustedModelSnapshotSpec] = {}
+    for row in model_specs:
+        if type(row) is not TrustedModelSnapshotSpec:
+            raise TypeError("trusted content replay model spec differs")
+        prior = by_path.get(row.local_snapshot_path)
+        if prior is not None and (
+            prior.storage_mode != row.storage_mode
+            or prior.content_cache_root != row.content_cache_root
+        ):
+            raise ValueError("trusted content replay aliases one path by another mode")
+        by_path.setdefault(row.local_snapshot_path, row)
+    if not by_path:
+        raise ValueError("trusted content replay has no model snapshots")
+    return tuple(by_path[path] for path in sorted(by_path))
+
+
+def build_trusted_single_operator_content_replay_authority(
+    spec_path: str | Path,
+) -> TrustedSingleOperatorContentReplayAuthority:
+    """Deep-scan each unique model root once without publishing an artifact."""
+
+    path_binding = CanonicalJsonProofBinding.bind(spec_path)
+    spec = load_trusted_single_operator_content_path_spec(spec_path)
+    if spec.schema_version != 2 or spec.content_replay_authority_path is None:
+        raise ValueError("trusted content replay requires path-spec schema 2")
+    if path_binding.reopen() != spec.to_dict():
+        raise ValueError("trusted content replay path-spec binding differs")
+    source = bind_trusted_source_snapshot(spec.repository_root)
+    closures = tuple(
+        _deep_snapshot_replay_closure(row)
+        for row in _unique_content_replay_specs(spec.model_specs)
+    )
+    authority = TrustedSingleOperatorContentReplayAuthority(
+        schema_version=1,
+        kind="trusted_single_operator_content_replay_authority",
+        protocol_sha256=TRUSTED_SINGLE_OPERATOR_CONTENT_REPLAY_PROTOCOL_SHA256,
+        trust_mode="trusted_single_operator_no_signature",
+        absolute_path=spec.content_replay_authority_path,
+        content_path_spec=path_binding,
+        source_git_head=source.git_head,
+        source_git_tree=source.git_tree,
+        source_snapshot_sha256=source.source_snapshot_sha256,
+        snapshot_closures=closures,
+    )
+    for closure in closures:
+        _revalidate_snapshot_replay_closure(closure)
+    rebound_source = bind_trusted_source_snapshot(spec.repository_root)
+    rebound_path = CanonicalJsonProofBinding.bind(spec_path)
+    if (
+        rebound_source != source
+        or rebound_path != path_binding
+        or authority.model_members
+        != tuple(
+            sorted(
+                authority.model_members,
+                key=lambda row: (
+                    row.role,
+                    row.model_id,
+                    row.revision,
+                    row.local_snapshot_path,
+                ),
+            )
+        )
+    ):
+        raise TrustedSingleOperatorContentReplayBlocked(
+            "trusted content replay inputs changed during deep scan"
+        )
+    return authority
+
+
+def load_trusted_single_operator_content_replay_authority(
+    path: str | Path,
+) -> TrustedSingleOperatorContentReplayAuthority:
+    source, raw = _stable_file_bytes(
+        path,
+        label="trusted content replay authority",
+        maximum_bytes=_MAX_JSON_BYTES,
+    )
+    authority = TrustedSingleOperatorContentReplayAuthority.from_dict(
+        _strict_json(raw, label="trusted content replay authority")
+    )
+    if raw != _canonical_bytes(authority.to_dict()) + b"\n":
+        raise ValueError("trusted content replay authority is not canonical JSON")
+    if source != Path(path) or source != Path(authority.absolute_path):
+        raise ValueError("trusted content replay authority path differs")
+    return authority
+
+
+def revalidate_trusted_single_operator_content_replay_authority(
+    authority: TrustedSingleOperatorContentReplayAuthority,
+) -> TrustedSingleOperatorContentReplayAuthority:
+    """Replay all namespace and VFS identities without reading model payloads."""
+
+    if type(authority) is not TrustedSingleOperatorContentReplayAuthority:
+        raise TypeError("trusted content replay requires an exact authority")
+    authority.__post_init__()
+    spec = authority._path_spec()
+    source = bind_trusted_source_snapshot(spec.repository_root)
+    if (
+        source.git_head != authority.source_git_head
+        or source.git_tree != authority.source_git_tree
+        or source.source_snapshot_sha256 != authority.source_snapshot_sha256
+    ):
+        raise TrustedSingleOperatorContentReplayBlocked(
+            "trusted content replay source/code identity changed"
+        )
+    expected_keys = {
+        (
+            row.local_snapshot_path,
+            row.storage_mode,
+            row.content_cache_root,
+        )
+        for row in spec.model_specs
+    }
+    if {row.key for row in authority.snapshot_closures} != expected_keys:
+        raise ValueError("trusted content replay model-root coverage differs")
+    for closure in authority.snapshot_closures:
+        _revalidate_snapshot_replay_closure(closure)
+    if len(authority.model_members) != len(spec.model_specs):
+        raise ValueError("trusted content replay member projection differs")
+    return authority
+
+
+def publish_trusted_single_operator_content_replay_authority_from_spec(
+    *,
+    spec_path: str | Path,
+    output_path: str | Path,
+) -> TrustedSingleOperatorContentReplayAuthorityBinding:
+    """Deep-scan then atomically publish the sole path-spec-bound replay receipt."""
+
+    spec = load_trusted_single_operator_content_path_spec(spec_path)
+    output = Path(output_path)
+    if (
+        spec.schema_version != 2
+        or spec.content_replay_authority_path is None
+        or output != Path(spec.content_replay_authority_path)
+    ):
+        raise ValueError("trusted content replay output differs from path spec")
+    if output.exists() or output.is_symlink():
+        raise FileExistsError("trusted content replay output already exists")
+    _normalized_future_file(output, label="trusted content replay output")
+    repository = Path(spec.repository_root)
+    if output == repository or output.is_relative_to(repository):
+        raise ValueError(
+            "trusted content replay authority must stay outside source Git"
+        )
+    authority = build_trusted_single_operator_content_replay_authority(spec_path)
+    body = _canonical_bytes(authority.to_dict()) + b"\n"
+    _atomic_publish_no_replace(output, body)
+    published = output.stat(follow_symlinks=False)
+    try:
+        binding = TrustedSingleOperatorContentReplayAuthorityBinding.bind(
+            output,
+            expected_content_path_spec_path=spec_path,
+        )
+        if binding.semantic_sha256 != authority.semantic_sha256:
+            raise RuntimeError("published trusted content replay authority changed")
+    except BaseException:
+        try:
+            current = output.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (
+                published.st_dev,
+                published.st_ino,
+            ):
+                output.unlink()
+                descriptor = os.open(output.parent, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        raise
+    return binding
+
+
 def publish_trusted_single_operator_content_path_spec(
     spec: TrustedSingleOperatorContentPathSpec,
     output_path: str | Path,
@@ -2196,6 +3537,8 @@ def publish_runtime_bound_trusted_single_operator_content_from_spec(
             row.name: row.absolute_path for row in spec.burstgpt_asset_paths
         },
         e0_task_native_specs=spec.e0_task_native_specs,
+        content_path_spec_path=spec_path,
+        content_replay_authority_path=spec.content_replay_authority_path,
     )
     bound = bind_trusted_single_operator_runtime_observations(
         pending,
@@ -2290,9 +3633,14 @@ def publish_trusted_preflight_workload_authority_from_content(
 
 
 __all__ = [
+    "TRUSTED_SINGLE_OPERATOR_CONTENT_REPLAY_PROTOCOL_SHA256",
     "TrustedBurstGptAssetPath",
     "TrustedBurstGptRelease",
     "TrustedContentFile",
+    "TrustedContentReplayEntry",
+    "TrustedContentReplayFilesystemIdentity",
+    "TrustedContentReplayMountIdentity",
+    "TrustedContentReplaySnapshotClosure",
     "TrustedE0TaskNativeDescriptor",
     "TrustedE0TaskNativeDescriptorSpec",
     "TrustedJsonArtifact",
@@ -2306,6 +3654,9 @@ __all__ = [
     "TrustedSingleOperatorContentBundle",
     "TrustedSingleOperatorContentBundleBinding",
     "TrustedSingleOperatorContentPathSpec",
+    "TrustedSingleOperatorContentReplayAuthority",
+    "TrustedSingleOperatorContentReplayAuthorityBinding",
+    "TrustedSingleOperatorContentReplayBlocked",
     "TrustedSnapshotStorageMode",
     "TrustedSourceSnapshot",
     "bind_trusted_burstgpt_release",
@@ -2316,13 +3667,17 @@ __all__ = [
     "bind_trusted_single_operator_runtime_observations",
     "bind_trusted_source_snapshot",
     "build_trusted_single_operator_content_bundle",
+    "build_trusted_single_operator_content_replay_authority",
     "load_trusted_single_operator_content_bundle",
     "load_trusted_single_operator_content_path_spec",
+    "load_trusted_single_operator_content_replay_authority",
     "publish_runtime_bound_trusted_single_operator_content_from_spec",
     "publish_trusted_preflight_workload_authority_from_content",
     "publish_trusted_single_operator_content_bundle",
     "publish_trusted_single_operator_content_path_spec",
+    "publish_trusted_single_operator_content_replay_authority_from_spec",
     "revalidate_trusted_json_artifact",
     "revalidate_trusted_model_snapshot_member",
     "revalidate_trusted_single_operator_content_bundle",
+    "revalidate_trusted_single_operator_content_replay_authority",
 ]

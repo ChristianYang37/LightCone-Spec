@@ -757,7 +757,7 @@ class FormalV03E0SourceAuthorityIndex:
 class FormalV03ContentPathInputs:
     """Path-only operator input for the source-owned v03 content recipe."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     kind: Literal["formal_v03_content_path_inputs"]
     repository_root: str
     model_snapshot_paths: tuple[FormalV03NamedDirectoryPath, ...]
@@ -767,9 +767,13 @@ class FormalV03ContentPathInputs:
     e0_source_authority_paths: tuple[FormalV03NamedFilePath, ...]
     inventory_path: str
     doctor_path: str
+    content_replay_authority_path: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != "formal_v03_content_path_inputs":
+        if (
+            self.schema_version not in {1, 2}
+            or self.kind != "formal_v03_content_path_inputs"
+        ):
             raise ValueError("formal v03 content input identity differs")
         _resolved_directory(self.repository_root, label="formal v03 source repository")
         expected_models = tuple(sorted(_registry_by_key()))
@@ -816,9 +820,19 @@ class FormalV03ContentPathInputs:
         )
         if inventory == doctor:
             raise ValueError("formal v03 inventory and doctor paths alias")
+        if self.schema_version == 1:
+            if self.content_replay_authority_path is not None:
+                raise ValueError("legacy formal v03 inputs carry replay authority")
+        else:
+            replay = _normalized_future_file(
+                self.content_replay_authority_path,
+                label="formal v03 content replay authority",
+            )
+            if replay in {inventory, doctor}:
+                raise ValueError("formal v03 replay authority path aliases runtime")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "repository_root": self.repository_root,
@@ -836,13 +850,22 @@ class FormalV03ContentPathInputs:
             "inventory_path": self.inventory_path,
             "doctor_path": self.doctor_path,
         }
+        if self.schema_version == 2:
+            result["content_replay_authority_path"] = self.content_replay_authority_path
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
+        if type(value) is not dict:
+            raise TypeError("formal v03 content path inputs must be an object")
+        version = value.get("schema_version")
+        expected = {field.name for field in fields(cls)}
+        if version == 1:
+            expected.remove("content_replay_authority_path")
         row = _strict_object(
             "formal v03 content path inputs",
             value,
-            {field.name for field in fields(cls)},
+            expected,
         )
         models = _strict_list(
             "formal v03 model snapshot paths", row.pop("model_snapshot_paths")
@@ -854,6 +877,7 @@ class FormalV03ContentPathInputs:
             "formal v03 E0 source authority paths",
             row.pop("e0_source_authority_paths"),
         )
+        replay = row.pop("content_replay_authority_path", None)
         return cls(
             **row,
             model_snapshot_paths=tuple(
@@ -865,6 +889,7 @@ class FormalV03ContentPathInputs:
             e0_source_authority_paths=tuple(
                 FormalV03NamedFilePath.from_dict(item) for item in e0
             ),
+            content_replay_authority_path=(None if version == 1 else replay),
         )  # type: ignore[arg-type]
 
 
@@ -935,17 +960,21 @@ def publish_formal_v03_content_path_inputs(
     e0_source_authority_paths: Mapping[str, str | Path],
     inventory_path: str | Path,
     doctor_output_path: str | Path,
+    content_replay_authority_output_path: str | Path,
     output_path: str | Path,
 ) -> CanonicalJsonProofBinding:
     """Publish the registry-complete, path-only v03 content input handoff."""
 
     doctor = Path(doctor_output_path)
-    if doctor == Path(output_path):
-        raise ValueError("formal v03 inputs and future doctor outputs must differ")
+    replay = Path(content_replay_authority_output_path)
+    if len({doctor, replay, Path(output_path), Path(inventory_path)}) != 4:
+        raise ValueError("formal v03 inputs, replay, inventory, and doctor must differ")
     if doctor.exists() or doctor.is_symlink():
         raise FileExistsError("formal v03 doctor output must be a future file")
+    if replay.exists() or replay.is_symlink():
+        raise FileExistsError("formal v03 replay authority must be a future file")
     inputs = FormalV03ContentPathInputs(
-        schema_version=1,
+        schema_version=2,
         kind="formal_v03_content_path_inputs",
         repository_root=str(repository_root),
         model_snapshot_paths=_named_directory_paths(model_snapshot_paths),
@@ -955,6 +984,7 @@ def publish_formal_v03_content_path_inputs(
         e0_source_authority_paths=_named_file_paths(e0_source_authority_paths),
         inventory_path=str(inventory_path),
         doctor_path=str(doctor),
+        content_replay_authority_path=str(replay),
     )
     publish_canonical_json_no_replace(output_path, inputs.to_dict())
     binding = CanonicalJsonProofBinding.bind(output_path)
@@ -1174,8 +1204,10 @@ def build_formal_v03_content_path_spec(
 
     if type(inputs) is not FormalV03ContentPathInputs:
         raise TypeError("formal v03 content producer requires exact path inputs")
+    if inputs.schema_version != 2 or inputs.content_replay_authority_path is None:
+        raise ValueError("formal v03 content producer requires replay authority")
     spec = TrustedSingleOperatorContentPathSpec(
-        schema_version=1,
+        schema_version=2,
         kind="trusted_single_operator_content_path_spec",
         repository_root=inputs.repository_root,
         model_specs=_model_specs_from_paths(inputs.model_snapshot_paths),
@@ -1190,6 +1222,7 @@ def build_formal_v03_content_path_spec(
         ),
         inventory_path=inputs.inventory_path,
         doctor_path=inputs.doctor_path,
+        content_replay_authority_path=inputs.content_replay_authority_path,
     )
     require_formal_v03_content_path_spec(spec)
     return spec
@@ -1334,6 +1367,8 @@ def require_formal_v03_content_path_spec(
     # an unsupported task can never hide a missing model/backend binding.
     _require_formal_v03_model_coverage(spec.model_specs)
     _require_formal_v03_e0_spec_coverage(spec.e0_task_native_specs)
+    if spec.schema_version != 2 or spec.content_replay_authority_path is None:
+        raise ValueError("formal v03 content path spec lacks replay authority")
 
 
 def _canonical_artifact_binding(
@@ -1436,6 +1471,11 @@ def require_formal_v03_bound_content_bundle(
         raise TypeError("formal v03 bound-content replay policies must be boolean")
     if type(bundle) is not TrustedSingleOperatorContentBundle:
         raise TypeError("formal v03 coverage requires an exact content bundle")
+    if bundle.schema_version != 2 or bundle.content_replay_authority is None:
+        raise ValueError("formal v03 content bundle lacks replay authority")
+    replay = bundle.content_replay_authority.reopen()
+    if replay.model_members != bundle.model_members:
+        raise ValueError("formal v03 replay/model projection differs")
     if bundle.runtime_binding_status != "BOUND" or bundle.runtime_observations is None:
         raise ValueError("formal v03 content bundle is not runtime-BOUND")
     _require_formal_v03_model_coverage(bundle.model_members)

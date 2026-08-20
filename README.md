@@ -377,6 +377,17 @@ complete outcome is
 `trusted_single_operator_empirical_no_signature` and remains `UNMEASURED`; it
 must never be reported as `MEASURED`.
 
+Before capacity publication, a path-bound content replay authority reads every
+model byte once per unique physical snapshot. Later ceremony steps replay the
+complete namespace, VFS object metadata, symlink target/blob identity, and
+filesystem/mount identity without rereading model payloads. This detects normal
+VFS mutations through inode, ctime, metadata, or namespace drift; it does not
+claim resistance to a privileged kernel or storage layer that can silently
+alter bytes without observable metadata. Model preparation and loading bind
+the receipt's exact byte hashes and immediately revalidate metadata and
+namespace identity before bounded safetensors-header inspection or actual
+loading; no caller-supplied digest is accepted.
+
 After publishing the source authorities, BOUND trusted-content bundle,
 preflight workload, and schema-v5 ProtocolLock, write the path-only DAG and
 bootstrap configs. Inspect code capability without allocating a GPU, then run

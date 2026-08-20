@@ -25,6 +25,18 @@ the relevant run-specific receipts exist, each assignment remains fail-closed
 before allocation. CPU state-machine tests, caller-authored digests, and an old
 smoke result cannot promote TP2/DP2, native ITL, DSpark, NEXTN, or EAGLE3 to
 formal support.
+
+The trusted ceremony first publishes a path-bound content replay authority by
+reading every model byte once per unique physical snapshot. Subsequent steps
+replay the full namespace, VFS metadata, symlink target/blob identity, and
+filesystem/mount identity without rereading model payloads. This catches normal
+VFS mutation through inode, ctime, metadata, or namespace drift; it does not
+claim to resist a privileged kernel or storage layer capable of silent byte
+changes without observable metadata. Model preparation and loading bind the
+receipt's exact byte hashes and immediately revalidate metadata and namespace
+identity before bounded safetensors-header inspection or actual loading; no
+caller-supplied digest is accepted.
+
 Historical shared-tuned-AdamW rows are matched-recipe publication-policy
 diagnostics, not TTS-paper reproduction. They are regression/debugging material
 only and are excluded from schema-v3 selection, power sizing, confirmation,

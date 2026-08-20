@@ -76,6 +76,10 @@ def add_formal_single_operator_parser(
     )
     v03_content_path_inputs.add_argument("--inventory", required=True)
     v03_content_path_inputs.add_argument("--doctor-output", required=True)
+    v03_content_path_inputs.add_argument(
+        "--content-replay-authority-output",
+        required=True,
+    )
     v03_content_path_inputs.add_argument("--output", required=True)
     v03_content_path_inputs.set_defaults(_formal_single_operator=True)
 
@@ -86,6 +90,14 @@ def add_formal_single_operator_parser(
     v03_content_spec.add_argument("--inputs", required=True)
     v03_content_spec.add_argument("--output", required=True)
     v03_content_spec.set_defaults(_formal_single_operator=True)
+
+    content_replay = operations.add_parser(
+        "publish-content-replay-authority",
+        allow_abbrev=False,
+    )
+    content_replay.add_argument("--spec", required=True)
+    content_replay.add_argument("--output", required=True)
+    content_replay.set_defaults(_formal_single_operator=True)
 
     stage_capacity = operations.add_parser(
         "publish-stage-capacity",
@@ -609,6 +621,7 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
             ),
             inventory_path=args.inventory,
             doctor_output_path=args.doctor_output,
+            content_replay_authority_output_path=(args.content_replay_authority_output),
             output_path=args.output,
         )
         print(json.dumps(binding.to_dict(), sort_keys=True))
@@ -628,6 +641,26 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
                 {
                     "path": str(Path(args.output)),
                     "semantic_sha256": content_sha256(spec.to_dict()),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if operation == "publish-content-replay-authority":
+        from lightcone_spec.experiments.formal_single_operator_content import (
+            publish_trusted_single_operator_content_replay_authority_from_spec,
+        )
+
+        binding = publish_trusted_single_operator_content_replay_authority_from_spec(
+            spec_path=args.spec,
+            output_path=args.output,
+        )
+        print(
+            json.dumps(
+                {
+                    "path": binding.absolute_path,
+                    "semantic_sha256": binding.semantic_sha256,
+                    "protocol_sha256": binding.protocol_sha256,
                 },
                 sort_keys=True,
             )

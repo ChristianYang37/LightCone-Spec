@@ -989,6 +989,7 @@ The public supervisor commands are:
 | `publish-v03-e0-source-authorities` | Scan those seven sources and publish their typed authorities |
 | `write-v03-content-path-inputs` | Canonically publish exact model/data/E0/inventory and future-doctor paths |
 | `publish-v03-content-path-spec` | Derive the digest-free pre-doctor content path spec |
+| `publish-content-replay-authority` | Deep-scan each unique model snapshot once and publish its path-bound replay receipt |
 | `publish-stage-capacity` | Bind the pre-doctor spec, run-root filesystem, and required free-byte threshold |
 | `publish-trusted-content` | Deep-bind one typed content path spec and its runtime observations into a BOUND bundle |
 | `publish-preflight-workload` | Derive the preflight workload authority from that exact BOUND bundle |
@@ -1097,16 +1098,22 @@ lightcone-spec formal-single-operator write-v03-content-path-inputs \
   --e0-source-authority MT-Bench=/absolute/sources/e0-authorities/formal-v03-e0-mt_bench-source-authority.json \
   --inventory /absolute/sources/gpu-inventory.json \
   --doctor-output /absolute/sources/doctor.json \
+  --content-replay-authority-output /absolute/sources/v03-content-replay-authority.json \
   --output /absolute/sources/v03-content-path-inputs.json
 
 lightcone-spec formal-single-operator publish-v03-content-path-spec \
   --inputs /absolute/sources/v03-content-path-inputs.json \
   --output /absolute/sources/v03-content-path-spec.json
+
+lightcone-spec formal-single-operator publish-content-replay-authority \
+  --spec /absolute/sources/v03-content-path-spec.json \
+  --output /absolute/sources/v03-content-replay-authority.json
 ```
 
-Derive capacity from that pre-doctor spec, then publish the fresh canonical
-doctor report directly. A non-`PASS` report is still retained and exits 42; it
-cannot be reused as `BOUND` content.
+The replay publisher reads every byte of each unique physical snapshot once.
+Derive capacity from that receipt-bound pre-doctor spec, then publish the fresh
+canonical doctor report directly. A non-`PASS` report is still retained and
+exits 42; it cannot be reused as `BOUND` content.
 
 ```bash
 lightcone-spec formal-single-operator publish-stage-capacity \

@@ -8,7 +8,6 @@ from copy import deepcopy
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_execution_semantics import (
@@ -16,6 +15,7 @@ from test_execution_semantics import (
     _e3a_selection_and_receipt,
     _load_binding,
 )
+from test_prepared_model_content_authority import _trusted_bundle_fixture
 
 import lightcone_spec.experiments.formal_single_operator_trainable_plan as plan_producer
 from lightcone_spec.adaptation import (
@@ -651,53 +651,27 @@ def test_public_structural_plan_producers_no_replace_foreign_and_tamper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    values = _inputs(tmp_path / "prepared", tts_calibration=True)
-    authority = values["prepared_model_content_authority"]
-    snapshots = {row.model_id: row for row in authority.prepared_model_set.snapshots}
+    _, _, trusted_content, _ = _trusted_bundle_fixture(
+        tmp_path / "trusted",
+        monkeypatch,
+    )
     expected_revisions = {
         "Qwen/Qwen3-8B": "1" * 40,
         "z-lab/Qwen3-8B-DFlash-b16": "2" * 40,
     }
 
-    def install_content(*, foreign_target_revision: bool = False) -> None:
-        members = tuple(
-            SimpleNamespace(
-                model_id=model_id,
-                revision=(
-                    "f" * 40
-                    if foreign_target_revision and model_id == "Qwen/Qwen3-8B"
-                    else snapshot.revision
-                ),
-                role=("target" if model_id == "Qwen/Qwen3-8B" else "drafter"),
-                local_snapshot_path=snapshot.root,
-            )
-            for model_id, snapshot in sorted(snapshots.items())
-        )
-        bundle = SimpleNamespace(model_members=members)
-        binding = SimpleNamespace(
-            runtime_binding_status="BOUND",
-            reopen=lambda: bundle,
-        )
-        monkeypatch.setattr(
-            plan_producer.TrustedSingleOperatorContentBundleBinding,
-            "bind",
-            classmethod(lambda _cls, _path: binding),
-        )
+    def require_formal(candidate) -> None:
+        observed = {row.model_id: row.revision for row in candidate.model_members}
+        if observed != expected_revisions:
+            raise ValueError("formal v03 content has a foreign model revision")
 
-        def require_formal(candidate) -> None:
-            observed = {row.model_id: row.revision for row in candidate.model_members}
-            if observed != expected_revisions:
-                raise ValueError("formal v03 content has a foreign model revision")
+    monkeypatch.setattr(
+        plan_producer,
+        "require_formal_v03_bound_content_bundle",
+        require_formal,
+    )
 
-        monkeypatch.setattr(
-            plan_producer,
-            "require_formal_v03_bound_content_bundle",
-            require_formal,
-        )
-
-    bundle_path = (tmp_path / "bound-content.json").resolve()
-    bundle_path.write_text("{}\n", encoding="utf-8")
-    install_content()
+    bundle_path = Path(trusted_content.absolute_path)
     published = []
     for name, publisher in (
         (
@@ -726,7 +700,14 @@ def test_public_structural_plan_producers_no_replace_foreign_and_tamper(
     with pytest.raises(RuntimeError, match="changed"):
         published[0].revalidate()
 
-    install_content(foreign_target_revision=True)
+    def reject_foreign(_candidate) -> None:
+        raise ValueError("formal v03 content has a foreign model revision")
+
+    monkeypatch.setattr(
+        plan_producer,
+        "require_formal_v03_bound_content_bundle",
+        reject_foreign,
+    )
     foreign_output = (tmp_path / "foreign-revision-plan.json").resolve()
     with pytest.raises(ValueError, match="foreign model revision"):
         plan_producer.publish_trusted_tts_calibration_trainable_plan_authority(

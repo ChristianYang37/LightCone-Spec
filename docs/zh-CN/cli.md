@@ -830,6 +830,7 @@ evidence。缺少当前 release-root attestation 时，finalization 必须报告
 | `publish-v03-e0-source-authorities` | 扫描七项 source 并发布 typed authority |
 | `write-v03-content-path-inputs` | Canonical 发布准确 model/data/E0/inventory 与 future-doctor path |
 | `publish-v03-content-path-spec` | 派生 digest-free pre-doctor content path spec |
+| `publish-content-replay-authority` | 对每个唯一 model snapshot 深扫一次，并发布 path-bound replay receipt |
 | `publish-stage-capacity` | 绑定 pre-doctor spec、run-root filesystem 与所需 free-byte threshold |
 | `publish-trusted-content` | 深度绑定 typed content path spec 与 runtime observation，发布 BOUND bundle |
 | `publish-preflight-workload` | 从该准确 BOUND bundle 派生 preflight workload authority |
@@ -934,15 +935,21 @@ lightcone-spec formal-single-operator write-v03-content-path-inputs \
   --e0-source-authority MT-Bench=/absolute/sources/e0-authorities/formal-v03-e0-mt_bench-source-authority.json \
   --inventory /absolute/sources/gpu-inventory.json \
   --doctor-output /absolute/sources/doctor.json \
+  --content-replay-authority-output /absolute/sources/v03-content-replay-authority.json \
   --output /absolute/sources/v03-content-path-inputs.json
 
 lightcone-spec formal-single-operator publish-v03-content-path-spec \
   --inputs /absolute/sources/v03-content-path-inputs.json \
   --output /absolute/sources/v03-content-path-spec.json
+
+lightcone-spec formal-single-operator publish-content-replay-authority \
+  --spec /absolute/sources/v03-content-path-spec.json \
+  --output /absolute/sources/v03-content-replay-authority.json
 ```
 
-从该 pre-doctor spec 派生 capacity，再直接发布 fresh canonical doctor report。非 `PASS`
-report 仍会保留并返回 42，但不能作为 `BOUND` content 使用。
+Replay publisher 会逐字节读取每个唯一 physical snapshot 一次。从该 receipt-bound
+pre-doctor spec 派生 capacity，再直接发布 fresh canonical doctor report。非 `PASS` report
+仍会保留并返回 42，但不能作为 `BOUND` content 使用。
 
 ```bash
 lightcone-spec formal-single-operator publish-stage-capacity \

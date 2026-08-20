@@ -364,6 +364,53 @@ def test_publish_stage_capacity_cli_is_path_only_and_empirical(
     }
 
 
+def test_publish_content_replay_authority_cli_is_path_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_content as content,
+    )
+
+    spec = (tmp_path / "content-path-spec.json").resolve()
+    output = (tmp_path / "content-replay.json").resolve()
+    observed: dict[str, object] = {}
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            absolute_path=str(output),
+            semantic_sha256="a" * 64,
+            protocol_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(
+        content,
+        "publish_trusted_single_operator_content_replay_authority_from_spec",
+        publish,
+    )
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-content-replay-authority",
+                "--spec",
+                str(spec),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {"spec_path": str(spec), "output_path": str(output)}
+    assert json.loads(capsys.readouterr().out) == {
+        "path": str(output),
+        "protocol_sha256": "b" * 64,
+        "semantic_sha256": "a" * 64,
+    }
+
+
 def test_publish_v03_e0_source_authorities_cli_is_exact_path_handoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

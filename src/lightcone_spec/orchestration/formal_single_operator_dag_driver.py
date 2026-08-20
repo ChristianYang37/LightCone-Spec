@@ -4817,7 +4817,7 @@ def _static_trusted_capacity_authority_binding_from_doctor(
     payload.pop("authority_sha256")
     run_root = authority.get("run_root")
     if (
-        authority.get("schema_version") != 3
+        authority.get("schema_version") != 4
         or authority.get("kind") != "trusted_single_operator_stage_capacity_authority"
         or authority.get("protocol_sha256")
         != TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256

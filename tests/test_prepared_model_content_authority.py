@@ -7,7 +7,25 @@ import struct
 from pathlib import Path
 
 import pytest
+from test_formal_single_operator_content import (
+    _fake_locked_workload,
+    _source_repository,
+    _tiny_burstgpt_assets,
+)
 
+import lightcone_spec.experiments.formal_single_operator_content as content_module
+import lightcone_spec.locking.prepared_models as prepared_module
+from lightcone_spec.experiments.formal_single_operator_content import (
+    TrustedModelSnapshotSpec,
+    TrustedNamedInputPath,
+    TrustedSingleOperatorContentBundleBinding,
+    TrustedSingleOperatorContentPathSpec,
+    TrustedSingleOperatorContentReplayBlocked,
+    bind_trusted_single_operator_runtime_observations,
+    build_trusted_single_operator_content_bundle,
+    publish_trusted_single_operator_content_bundle,
+    publish_trusted_single_operator_content_replay_authority_from_spec,
+)
 from lightcone_spec.locking import (
     ModelLock,
     PreparedModelContentAuthorityBinding,
@@ -15,6 +33,7 @@ from lightcone_spec.locking import (
     bind_prepared_model_content_authority,
     bind_prepared_models,
     materialize_prepared_model_content_manifest,
+    materialize_trusted_prepared_model_content_manifest,
     prepared_model_content_authority_from_dict,
     prepared_model_content_authority_to_dict,
     revalidate_prepared_model_content_authority,
@@ -140,6 +159,117 @@ def _authority(tmp_path: Path) -> tuple[ModelLock, object, object, dict[str, Pat
         expected_release_manifest_sha256=digest,
     )
     return lock, prepared, authority, {**roots, "manifest": manifest_path}
+
+
+def _trusted_bundle_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    ModelLock,
+    object,
+    TrustedSingleOperatorContentBundleBinding,
+    dict[str, Path],
+]:
+    lock, prepared, roots = _fixture(tmp_path / "prepared")
+    repository = _source_repository(tmp_path)
+    livecodebench = (tmp_path / "livecodebench.jsonl").resolve()
+    math500 = (tmp_path / "math500.jsonl").resolve()
+    inventory = (tmp_path / "inventory.json").resolve()
+    runtime_doctor = (tmp_path / "runtime-doctor.json").resolve()
+    for path in (livecodebench, math500, inventory, runtime_doctor):
+        path.write_text("{}\n", encoding="utf-8")
+    burst = _tiny_burstgpt_assets(tmp_path, monkeypatch)
+    stages = ("preflight", "TTS-Cal", "E1")
+    specs = tuple(
+        sorted(
+            (
+                TrustedModelSnapshotSpec(
+                    model_id=TARGET_ID,
+                    revision=TARGET_REVISION,
+                    role="target",
+                    stages=stages,
+                    local_snapshot_path=str(roots["target"]),
+                ),
+                TrustedModelSnapshotSpec(
+                    model_id=TARGET_ID,
+                    revision=TARGET_REVISION,
+                    role="tokenizer",
+                    stages=stages,
+                    local_snapshot_path=str(roots["target"]),
+                ),
+                TrustedModelSnapshotSpec(
+                    model_id=DRAFTER_ID,
+                    revision=DRAFTER_REVISION,
+                    role="drafter",
+                    stages=stages,
+                    local_snapshot_path=str(roots["drafter"]),
+                ),
+            ),
+            key=lambda row: (
+                row.role,
+                row.model_id,
+                row.revision,
+                row.local_snapshot_path,
+            ),
+        )
+    )
+    replay_path = (tmp_path / "content-replay.json").resolve()
+    path_spec = TrustedSingleOperatorContentPathSpec(
+        schema_version=2,
+        kind="trusted_single_operator_content_path_spec",
+        repository_root=str(repository),
+        model_specs=specs,
+        livecodebench_raw_path=str(livecodebench),
+        math500_raw_path=str(math500),
+        burstgpt_asset_paths=tuple(
+            TrustedNamedInputPath(name=name, absolute_path=str(path))
+            for name, path in sorted(burst.items())
+        ),
+        e0_task_native_specs=(),
+        inventory_path=str(inventory),
+        doctor_path=str((tmp_path / "future-doctor.json").resolve()),
+        content_replay_authority_path=str(replay_path),
+    )
+    path_spec_path = (tmp_path / "content-path-spec.json").resolve()
+    path_spec_path.write_text(
+        json.dumps(path_spec.to_dict(), sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    publish_trusted_single_operator_content_replay_authority_from_spec(
+        spec_path=path_spec_path,
+        output_path=replay_path,
+    )
+    workloads = {
+        workload_id: _fake_locked_workload(tmp_path, workload_id)
+        for workload_id in ("livecodebench_v6_hard", "math500_level5")
+    }
+    monkeypatch.setattr(
+        content_module,
+        "bind_trusted_locked_workload",
+        lambda workload_id, _path: workloads[workload_id],
+    )
+    bundle = build_trusted_single_operator_content_bundle(
+        repository_root=repository,
+        model_specs=specs,
+        livecodebench_raw_path=livecodebench,
+        math500_raw_path=math500,
+        burstgpt_asset_paths=burst,
+        content_path_spec_path=path_spec_path,
+        content_replay_authority_path=replay_path,
+    )
+    bound = bind_trusted_single_operator_runtime_observations(
+        bundle,
+        inventory_path=inventory,
+        doctor_path=runtime_doctor,
+    )
+    bundle_path = (tmp_path / "content-bundle.json").resolve()
+    publish_trusted_single_operator_content_bundle(bound, bundle_path)
+    return (
+        lock,
+        prepared,
+        TrustedSingleOperatorContentBundleBinding.bind(bundle_path),
+        roots,
+    )
 
 
 def test_content_authority_replays_critical_files_and_safetensors_headers(
@@ -405,4 +535,174 @@ def test_external_release_digest_rejects_coordinated_rehash_and_model_swap(
             lock,
             authority,
             expected_release_manifest_sha256=(authority.release_manifest_sha256),
+        )
+
+
+def test_trusted_replay_projects_exact_members_without_weight_payload_rehash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock, prepared, bundle_binding, roots = _trusted_bundle_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    original_digest = content_module._stable_file_digest
+
+    def forbid_replay_payload(path: Path, *, label: str):
+        if any(path.is_relative_to(root) for root in roots.values()):
+            raise AssertionError(f"trusted replay reopened model payload: {path}")
+        return original_digest(path, label=label)
+
+    monkeypatch.setattr(
+        content_module,
+        "_stable_file_digest",
+        forbid_replay_payload,
+    )
+    original_header = prepared_module._read_safetensors_header
+    read_sizes: list[int] = []
+
+    def bounded_header(*args, **kwargs):
+        original_read = prepared_module.os.read
+
+        def checked_read(descriptor: int, size: int) -> bytes:
+            read_sizes.append(size)
+            if size == 8 * 1024 * 1024:
+                raise AssertionError("trusted prepared replay read weight payload")
+            return original_read(descriptor, size)
+
+        with monkeypatch.context() as nested:
+            nested.setattr(prepared_module.os, "read", checked_read)
+            return original_header(*args, **kwargs)
+
+    monkeypatch.setattr(
+        prepared_module,
+        "_read_safetensors_header",
+        bounded_header,
+    )
+    manifest = materialize_trusted_prepared_model_content_manifest(
+        lock,
+        prepared,
+        trusted_content_bundle_binding=bundle_binding,
+        target_model_id=TARGET_ID,
+        drafter_model_id=DRAFTER_ID,
+    )
+    assert manifest["schema_version"] == 2
+    snapshots = {
+        row["model_id"]: row
+        for row in manifest["snapshots"]  # type: ignore[index]
+    }
+    assert snapshots[TARGET_ID]["trusted_content_member"]["role"] == "target"
+    assert snapshots[DRAFTER_ID]["trusted_content_member"]["role"] == "drafter"
+    for snapshot in snapshots.values():
+        member_files = {
+            row["relative_path"]: row
+            for row in snapshot["trusted_content_member"]["files"]
+        }
+        for header in snapshot["weight_headers"]:
+            assert (
+                header["raw_sha256"] == member_files[header["relative_path"]]["sha256"]
+            )
+
+    manifest_path = (tmp_path / "prepared-content.json").resolve()
+    digest = _write_manifest(manifest_path, manifest)
+    authority = bind_prepared_model_content_authority(
+        lock,
+        prepared,
+        manifest_path,
+        expected_release_manifest_sha256=digest,
+    )
+    assert authority.schema_version == 2
+    first = revalidate_prepared_model_content_authority(
+        lock,
+        authority,
+        expected_release_manifest_sha256=digest,
+    )
+    second = revalidate_prepared_model_content_authority(
+        lock,
+        authority,
+        expected_release_manifest_sha256=digest,
+    )
+    assert first == second
+    assert read_sizes and 8 * 1024 * 1024 not in read_sizes
+
+
+def test_trusted_replay_blocks_metadata_role_and_member_projection_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock, prepared, bundle_binding, roots = _trusted_bundle_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    with pytest.raises(
+        PreparedModelContentAuthorityBlocked,
+        match="lacks its exact",
+    ):
+        materialize_trusted_prepared_model_content_manifest(
+            lock,
+            prepared,
+            trusted_content_bundle_binding=bundle_binding,
+            target_model_id=DRAFTER_ID,
+            drafter_model_id=TARGET_ID,
+        )
+
+    manifest = materialize_trusted_prepared_model_content_manifest(
+        lock,
+        prepared,
+        trusted_content_bundle_binding=bundle_binding,
+        target_model_id=TARGET_ID,
+        drafter_model_id=DRAFTER_ID,
+    )
+    swapped = json.loads(json.dumps(manifest))
+    for snapshot in swapped["snapshots"]:
+        member = snapshot["trusted_content_member"]
+        member["role"] = "drafter" if member["role"] == "target" else "target"
+    swapped_path = (tmp_path / "swapped-role.json").resolve()
+    swapped_digest = _write_manifest(swapped_path, swapped)
+    with pytest.raises(
+        PreparedModelContentAuthorityBlocked,
+        match="lacks its exact",
+    ):
+        bind_prepared_model_content_authority(
+            lock,
+            prepared,
+            swapped_path,
+            expected_release_manifest_sha256=swapped_digest,
+        )
+
+    spliced = json.loads(json.dumps(manifest))
+    spliced["snapshots"][0]["trusted_content_member"]["member_sha256"] = "0" * 64
+    spliced_path = (tmp_path / "spliced-member.json").resolve()
+    spliced_digest = _write_manifest(spliced_path, spliced)
+    with pytest.raises(ValueError, match="differs from live snapshot content"):
+        bind_prepared_model_content_authority(
+            lock,
+            prepared,
+            spliced_path,
+            expected_release_manifest_sha256=spliced_digest,
+        )
+
+    manifest_path = (tmp_path / "prepared-content.json").resolve()
+    digest = _write_manifest(manifest_path, manifest)
+    authority = bind_prepared_model_content_authority(
+        lock,
+        prepared,
+        manifest_path,
+        expected_release_manifest_sha256=digest,
+    )
+    weight = roots["drafter"] / "model.safetensors"
+    before = weight.stat(follow_symlinks=False)
+    body = bytearray(weight.read_bytes())
+    body[-1] ^= 1
+    weight.write_bytes(body)
+    os.utime(weight, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = weight.stat(follow_symlinks=False)
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_ctime_ns != before.st_ctime_ns
+    with pytest.raises(TrustedSingleOperatorContentReplayBlocked, match="metadata"):
+        revalidate_prepared_model_content_authority(
+            lock,
+            authority,
+            expected_release_manifest_sha256=digest,
         )

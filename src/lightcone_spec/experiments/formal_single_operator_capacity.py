@@ -5,11 +5,13 @@ unsigned, explicitly empirical authority for the trusted operator and must
 never be reported as formal ``MEASURED`` capacity.
 
 Bootstrap is acyclic: the public publisher accepts only an exact v03 content
-path spec, an existing run root, and an output path.  It deep-scans the content
-closure before doctor exists, binds all content/cache/run filesystem
-identities, and derives every byte scalar from source.  Doctor consumes this
-authority; the eventual runtime-BOUND content bundle must then reproduce the
-same pre-doctor closure and bind the exact PASS doctor report.
+path spec, an existing run root, and an output path.  The path spec names a
+previously deep-scanned, no-replace content replay authority.  Capacity fully
+replays that authority's namespace, VFS, symlink/blob, filesystem, and mount
+identities without rereading model payload bytes, binds all content/cache/run
+filesystem identities, and derives every byte scalar from source.  Doctor
+consumes this authority; the eventual runtime-BOUND content bundle must then
+reproduce the same pre-doctor closure and bind the exact PASS doctor report.
 
 Zero retry reserve is exact because this authority disables every automatic
 retry.  A failed physical or auxiliary attempt durably stops/blocks before a
@@ -66,12 +68,19 @@ TRUSTED_SINGLE_OPERATOR_RETRY_POLICY_SHA256 = content_sha256(
 
 TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256 = content_sha256(
     {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "trusted_single_operator_stage_capacity",
         "trust_mode": "trusted_single_operator_no_signature",
         "claim": "trusted_empirical_capacity_not_formal_MEASURED",
         "public_inputs": "v03_content_path_spec_run_root_output_paths_only",
-        "bootstrap": "pre_doctor_deep_content_closure_then_doctor_then_BOUND_content",
+        "bootstrap": (
+            "prepublished_deep_content_replay_authority_then_pre_doctor_"
+            "metadata_replay_then_doctor_then_BOUND_content"
+        ),
+        "content_replay": (
+            "canonical_path_bound_authority_complete_namespace_vfs_and_mount_"
+            "identity_no_payload_fallback"
+        ),
         "initial_stage": "preflight",
         "current_physical_wave_high_water_bytes": (
             TRUSTED_SINGLE_OPERATOR_CELL_HIGH_WATER_BYTES
@@ -269,6 +278,8 @@ def _deep_content_from_path_spec(
     binding = CanonicalJsonProofBinding.bind(path)
     spec = load_trusted_single_operator_content_path_spec(path)
     require_formal_v03_content_path_spec(spec)
+    if spec.schema_version != 2 or spec.content_replay_authority_path is None:
+        raise ValueError("trusted capacity requires content replay authority")
     if binding.reopen() != spec.to_dict():
         raise ValueError("trusted capacity content path-spec binding differs")
     pending = build_trusted_single_operator_content_bundle(
@@ -280,6 +291,8 @@ def _deep_content_from_path_spec(
             row.name: row.absolute_path for row in spec.burstgpt_asset_paths
         },
         e0_task_native_specs=spec.e0_task_native_specs,
+        content_path_spec_path=path,
+        content_replay_authority_path=spec.content_replay_authority_path,
     )
     if (
         pending.runtime_binding_status != "PENDING_REMOTE_BINDING"
@@ -350,7 +363,7 @@ def _bind_roots(
 class TrustedSingleOperatorStageCapacityAuthority:
     """Unsigned path-bound authority for one exact initial physical wave."""
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     kind: Literal["trusted_single_operator_stage_capacity_authority"]
     protocol_sha256: str
     trust_mode: Literal["trusted_single_operator_no_signature"]
@@ -376,7 +389,7 @@ class TrustedSingleOperatorStageCapacityAuthority:
 
     def __post_init__(self) -> None:
         if (
-            self.schema_version != 3
+            self.schema_version != 4
             or self.kind != _AUTHORITY_KIND
             or self.protocol_sha256 != TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256
             or self.trust_mode != "trusted_single_operator_no_signature"
@@ -613,7 +626,7 @@ def _authority_from_paths(
         "AVAILABLE" if observed >= required else "BLOCKED"
     )
     return TrustedSingleOperatorStageCapacityAuthority(
-        schema_version=3,
+        schema_version=4,
         kind=_AUTHORITY_KIND,
         protocol_sha256=TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256,
         trust_mode="trusted_single_operator_no_signature",

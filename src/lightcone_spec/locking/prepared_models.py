@@ -106,6 +106,29 @@ PREPARED_MODEL_CONTENT_PROTOCOL_SHA256 = _canonical_sha256(
     }
 )
 
+PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256 = _canonical_sha256(
+    {
+        "schema_version": 2,
+        "kind": "lightcone_prepared_model_content_protocol",
+        "legacy_protocol_sha256": PREPARED_MODEL_CONTENT_PROTOCOL_SHA256,
+        "release_profiles": _CONTENT_PROFILE_PAYLOAD,
+        "generic_profile": _GENERIC_CONTENT_PROFILE_PAYLOAD,
+        "trusted_content": (
+            "runtime_bound_bundle_schema2_exact_logical_member_and_physical_"
+            "content_replay_closure"
+        ),
+        "filesystem": (
+            "complete_metadata_replay_before_and_after_bounded_prepared_reads"
+        ),
+        "lightweight_files": "bounded_bytes_sha256_equals_exact_member_file_row",
+        "weights": (
+            "exact_member_file_sha256_projection_plus_bounded_safetensors_"
+            "header_and_complete_tensor_inventory_without_payload_rehash"
+        ),
+        "failure": "metadata_or_bundle_or_member_or_closure_drift_blocks",
+    }
+)
+
 # Formal release pins are source-owned and reviewable.  A raw bundle or local
 # snapshot may mirror one of these digests but can never add an entry.  The
 # current release deliberately ships no audited prepared-snapshot manifest.
@@ -147,6 +170,47 @@ _SNAPSHOT_CONTENT_FIELDS = frozenset(
         "tensor_metadata_sha256",
     }
 )
+_TRUSTED_CONTENT_FILE_FIELDS = frozenset(
+    {
+        "relative_path",
+        "size",
+        "sha256",
+        "storage_kind",
+        "symlink_target",
+        "resolved_relative_path",
+    }
+)
+_TRUSTED_CONTENT_MEMBER_FIELDS = frozenset(
+    {
+        "model_id",
+        "revision",
+        "role",
+        "root",
+        "member_sha256",
+        "tree_sha256",
+        "content_sha256",
+        "storage_mode",
+        "content_cache_root",
+        "files",
+    }
+)
+_TRUSTED_CONTENT_REPLAY_FIELDS = frozenset(
+    {
+        "content_bundle_path",
+        "content_bundle_size",
+        "content_bundle_raw_sha256",
+        "content_bundle_semantic_sha256",
+        "content_bundle_runtime_binding_status",
+        "content_replay_path",
+        "content_replay_size",
+        "content_replay_raw_sha256",
+        "content_replay_semantic_sha256",
+        "content_replay_protocol_sha256",
+    }
+)
+_SNAPSHOT_CONTENT_FIELDS_V2 = _SNAPSHOT_CONTENT_FIELDS | frozenset(
+    {"trusted_content_member"}
+)
 _CONTENT_MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -156,6 +220,9 @@ _CONTENT_MANIFEST_FIELDS = frozenset(
         "prepared_model_set_sha256",
         "snapshots",
     }
+)
+_CONTENT_MANIFEST_FIELDS_V2 = _CONTENT_MANIFEST_FIELDS | frozenset(
+    {"trusted_content_replay"}
 )
 _RAW_MANIFEST_BINDING_FIELDS = frozenset(
     {
@@ -688,6 +755,253 @@ class PreparedModelContentFile:
 
 
 @dataclass(frozen=True)
+class PreparedModelTrustedContentFile:
+    """One exact file row projected from the trusted content replay closure."""
+
+    relative_path: str
+    size: int
+    sha256: str
+    storage_kind: Literal["regular", "symlinked_blob"]
+    symlink_target: str | None
+    resolved_relative_path: str | None
+
+    def __post_init__(self) -> None:
+        _safe_relative_path(
+            self.relative_path, label="trusted prepared content relative path"
+        )
+        _nonnegative_int("trusted prepared content file size", self.size)
+        _require_sha256("trusted prepared content file", self.sha256)
+        if self.storage_kind == "regular":
+            if (
+                self.symlink_target is not None
+                or self.resolved_relative_path is not None
+            ):
+                raise ValueError(
+                    "regular trusted prepared content carries link metadata"
+                )
+        elif self.storage_kind == "symlinked_blob":
+            _require_text(
+                "trusted prepared content symlink target", self.symlink_target
+            )
+            _safe_relative_path(
+                self.resolved_relative_path,
+                label="trusted prepared content resolved cache path",
+            )
+        else:
+            raise ValueError("trusted prepared content storage kind is unsupported")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "relative_path": self.relative_path,
+            "size": self.size,
+            "sha256": self.sha256,
+            "storage_kind": self.storage_kind,
+            "symlink_target": self.symlink_target,
+            "resolved_relative_path": self.resolved_relative_path,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> PreparedModelTrustedContentFile:
+        row = _strict_object(
+            "trusted prepared content file", value, _TRUSTED_CONTENT_FILE_FIELDS
+        )
+        return cls(
+            relative_path=row["relative_path"],
+            size=row["size"],
+            sha256=row["sha256"],
+            storage_kind=row["storage_kind"],
+            symlink_target=row["symlink_target"],
+            resolved_relative_path=row["resolved_relative_path"],
+        )
+
+
+@dataclass(frozen=True)
+class PreparedModelTrustedContentMember:
+    """Exact logical member identity used by one prepared snapshot."""
+
+    model_id: str
+    revision: str
+    role: Literal["target", "drafter"]
+    root: str
+    member_sha256: str
+    tree_sha256: str
+    content_sha256: str
+    storage_mode: Literal["regular_tree", "huggingface_cache_symlinks"]
+    content_cache_root: str | None
+    files: tuple[PreparedModelTrustedContentFile, ...]
+
+    def __post_init__(self) -> None:
+        _require_text("trusted prepared member model ID", self.model_id)
+        if len(self.revision) != 40 or any(
+            character not in "0123456789abcdef" for character in self.revision
+        ):
+            raise ValueError(
+                "trusted prepared member revision must be an immutable SHA"
+            )
+        if self.role not in {"target", "drafter"}:
+            raise ValueError("trusted prepared member role is unsupported")
+        _absolute_resolved_path(self.root, label="trusted prepared member root")
+        for label, value in (
+            ("member", self.member_sha256),
+            ("tree", self.tree_sha256),
+            ("content", self.content_sha256),
+        ):
+            _require_sha256(f"trusted prepared member {label}", value)
+        if self.storage_mode == "regular_tree":
+            if self.content_cache_root is not None:
+                raise ValueError("regular trusted prepared member names a cache root")
+        elif self.storage_mode == "huggingface_cache_symlinks":
+            if self.content_cache_root is None:
+                raise ValueError("trusted prepared cache member lacks a cache root")
+            cache = _absolute_resolved_path(
+                self.content_cache_root, label="trusted prepared member cache root"
+            )
+            try:
+                Path(self.root).relative_to(cache)
+            except ValueError as error:
+                raise ValueError(
+                    "trusted prepared member root leaves its cache root"
+                ) from error
+        else:
+            raise ValueError("trusted prepared member storage mode is unsupported")
+        if (
+            type(self.files) is not tuple
+            or not self.files
+            or any(
+                type(item) is not PreparedModelTrustedContentFile for item in self.files
+            )
+        ):
+            raise TypeError("trusted prepared member requires exact files")
+        paths = tuple(item.relative_path for item in self.files)
+        if paths != tuple(sorted(set(paths))):
+            raise ValueError("trusted prepared member files are not canonical")
+        expected_tree = _canonical_sha256(
+            {
+                "schema_version": 1,
+                "kind": "trusted_model_snapshot_tree",
+                "files": [item.to_dict() for item in self.files],
+            }
+        )
+        expected_content = _canonical_sha256(
+            {
+                "schema_version": 1,
+                "kind": "trusted_model_snapshot_content",
+                "files": [
+                    {"size": item.size, "sha256": item.sha256} for item in self.files
+                ],
+            }
+        )
+        if self.tree_sha256 != expected_tree or self.content_sha256 != expected_content:
+            raise ValueError("trusted prepared member file digests differ")
+
+    def file(self, relative_path: str) -> PreparedModelTrustedContentFile:
+        matches = tuple(
+            item for item in self.files if item.relative_path == relative_path
+        )
+        if len(matches) != 1:
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_required_files_unavailable",
+                f"trusted member {self.model_id} lacks exact file {relative_path!r}",
+            )
+        return matches[0]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "model_id": self.model_id,
+            "revision": self.revision,
+            "role": self.role,
+            "root": self.root,
+            "member_sha256": self.member_sha256,
+            "tree_sha256": self.tree_sha256,
+            "content_sha256": self.content_sha256,
+            "storage_mode": self.storage_mode,
+            "content_cache_root": self.content_cache_root,
+            "files": [item.to_dict() for item in self.files],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> PreparedModelTrustedContentMember:
+        row = _strict_object(
+            "trusted prepared content member", value, _TRUSTED_CONTENT_MEMBER_FIELDS
+        )
+        return cls(
+            model_id=row["model_id"],
+            revision=row["revision"],
+            role=row["role"],
+            root=row["root"],
+            member_sha256=row["member_sha256"],
+            tree_sha256=row["tree_sha256"],
+            content_sha256=row["content_sha256"],
+            storage_mode=row["storage_mode"],
+            content_cache_root=row["content_cache_root"],
+            files=tuple(
+                PreparedModelTrustedContentFile.from_dict(item)
+                for item in _strict_list("trusted prepared member files", row["files"])
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PreparedModelTrustedContentReplay:
+    """Path-bound trusted bundle and replay-authority identities."""
+
+    content_bundle_path: str
+    content_bundle_size: int
+    content_bundle_raw_sha256: str
+    content_bundle_semantic_sha256: str
+    content_bundle_runtime_binding_status: Literal["BOUND"]
+    content_replay_path: str
+    content_replay_size: int
+    content_replay_raw_sha256: str
+    content_replay_semantic_sha256: str
+    content_replay_protocol_sha256: str
+
+    def __post_init__(self) -> None:
+        _absolute_resolved_path(
+            self.content_bundle_path, label="trusted content bundle path"
+        )
+        _positive_int("trusted content bundle size", self.content_bundle_size)
+        _absolute_resolved_path(
+            self.content_replay_path, label="trusted content replay path"
+        )
+        _positive_int("trusted content replay size", self.content_replay_size)
+        for label, value in (
+            ("bundle raw", self.content_bundle_raw_sha256),
+            ("bundle semantic", self.content_bundle_semantic_sha256),
+            ("replay raw", self.content_replay_raw_sha256),
+            ("replay semantic", self.content_replay_semantic_sha256),
+            ("replay protocol", self.content_replay_protocol_sha256),
+        ):
+            _require_sha256(f"trusted content {label}", value)
+        if self.content_bundle_runtime_binding_status != "BOUND":
+            raise ValueError("trusted prepared content requires a BOUND bundle")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "content_bundle_path",
+                "content_bundle_size",
+                "content_bundle_raw_sha256",
+                "content_bundle_semantic_sha256",
+                "content_bundle_runtime_binding_status",
+                "content_replay_path",
+                "content_replay_size",
+                "content_replay_raw_sha256",
+                "content_replay_semantic_sha256",
+                "content_replay_protocol_sha256",
+            )
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> PreparedModelTrustedContentReplay:
+        row = _strict_object(
+            "trusted prepared content replay", value, _TRUSTED_CONTENT_REPLAY_FIELDS
+        )
+        return cls(**row)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
 class SnapshotTensorMetadata:
     name: str
     shape: tuple[int, ...]
@@ -824,6 +1138,7 @@ class PreparedModelSnapshotContent:
     weight_kind: Literal["sharded_safetensors", "single_safetensors"]
     weight_headers: tuple[SafetensorsHeaderBinding, ...]
     tensor_metadata_sha256: str
+    trusted_content_member: PreparedModelTrustedContentMember | None = None
 
     def __post_init__(self) -> None:
         _require_text("snapshot content model ID", self.model_id)
@@ -875,6 +1190,21 @@ class PreparedModelSnapshotContent:
             [item.to_dict() for item in self.tensors]
         ):
             raise ValueError("snapshot tensor metadata digest differs from headers")
+        if self.trusted_content_member is not None:
+            if (
+                type(self.trusted_content_member)
+                is not PreparedModelTrustedContentMember
+            ):
+                raise TypeError("snapshot trusted content member type differs")
+            member = self.trusted_content_member
+            if (
+                member.model_id != self.model_id
+                or member.revision != self.revision
+                or member.root != self.root
+            ):
+                raise ValueError(
+                    "snapshot content differs from its trusted logical member"
+                )
 
     @property
     def tensors(self) -> tuple[SnapshotTensorMetadata, ...]:
@@ -886,7 +1216,7 @@ class PreparedModelSnapshotContent:
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "model_id": self.model_id,
             "revision": self.revision,
             "root": self.root,
@@ -896,12 +1226,21 @@ class PreparedModelSnapshotContent:
             "weight_headers": [item.to_dict() for item in self.weight_headers],
             "tensor_metadata_sha256": self.tensor_metadata_sha256,
         }
+        if self.trusted_content_member is not None:
+            result["trusted_content_member"] = self.trusted_content_member.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> PreparedModelSnapshotContent:
-        row = _strict_object(
-            "prepared snapshot content", value, _SNAPSHOT_CONTENT_FIELDS
+        if type(value) is not dict:
+            raise TypeError("prepared snapshot content must be an object")
+        fields = (
+            _SNAPSHOT_CONTENT_FIELDS_V2
+            if "trusted_content_member" in value
+            else _SNAPSHOT_CONTENT_FIELDS
         )
+        row = _strict_object("prepared snapshot content", value, fields)
+        trusted = row.get("trusted_content_member")
         return cls(
             model_id=row["model_id"],
             revision=row["revision"],
@@ -921,6 +1260,11 @@ class PreparedModelSnapshotContent:
                 )
             ),
             tensor_metadata_sha256=row["tensor_metadata_sha256"],
+            trusted_content_member=(
+                None
+                if trusted is None
+                else PreparedModelTrustedContentMember.from_dict(trusted)
+            ),
         )
 
 
@@ -1260,6 +1604,274 @@ def revalidate_prepared_models(
     return {snapshot.model_id: snapshot.root for snapshot in prepared.snapshots}
 
 
+def _trusted_content_replay_from_bindings(
+    bundle_binding: object,
+    replay_binding: object,
+) -> PreparedModelTrustedContentReplay:
+    return PreparedModelTrustedContentReplay(
+        content_bundle_path=bundle_binding.absolute_path,
+        content_bundle_size=bundle_binding.size,
+        content_bundle_raw_sha256=bundle_binding.raw_sha256,
+        content_bundle_semantic_sha256=bundle_binding.semantic_sha256,
+        content_bundle_runtime_binding_status=(bundle_binding.runtime_binding_status),
+        content_replay_path=replay_binding.absolute_path,
+        content_replay_size=replay_binding.size,
+        content_replay_raw_sha256=replay_binding.raw_sha256,
+        content_replay_semantic_sha256=replay_binding.semantic_sha256,
+        content_replay_protocol_sha256=replay_binding.protocol_sha256,
+    )
+
+
+def _trusted_member_projection(member: object) -> PreparedModelTrustedContentMember:
+    return PreparedModelTrustedContentMember(
+        model_id=member.model_id,
+        revision=member.revision,
+        role=member.role,
+        root=member.local_snapshot_path,
+        member_sha256=member.sha256,
+        tree_sha256=member.tree_sha256,
+        content_sha256=member.content_sha256,
+        storage_mode=member.storage_mode,
+        content_cache_root=member.content_cache_root,
+        files=tuple(
+            PreparedModelTrustedContentFile(
+                relative_path=item.relative_path,
+                size=item.size,
+                sha256=item.sha256,
+                storage_kind=item.storage_kind,
+                symlink_target=item.symlink_target,
+                resolved_relative_path=item.resolved_relative_path,
+            )
+            for item in member.files
+        ),
+    )
+
+
+def _trusted_binding_matches_source(
+    binding: object,
+    source: PreparedModelTrustedContentReplay,
+) -> bool:
+    return (
+        binding.absolute_path == source.content_bundle_path
+        and binding.size == source.content_bundle_size
+        and binding.raw_sha256 == source.content_bundle_raw_sha256
+        and binding.semantic_sha256 == source.content_bundle_semantic_sha256
+        and binding.runtime_binding_status
+        == source.content_bundle_runtime_binding_status
+    )
+
+
+def _trusted_replay_binding_matches_source(
+    binding: object,
+    source: PreparedModelTrustedContentReplay,
+) -> bool:
+    return (
+        binding.absolute_path == source.content_replay_path
+        and binding.size == source.content_replay_size
+        and binding.raw_sha256 == source.content_replay_raw_sha256
+        and binding.semantic_sha256 == source.content_replay_semantic_sha256
+        and binding.protocol_sha256 == source.content_replay_protocol_sha256
+    )
+
+
+def _reopen_trusted_content_replay(
+    source: PreparedModelTrustedContentReplay,
+) -> tuple[object, object]:
+    """Reopen schema-2 bundle and metadata-only replay without model payload I/O."""
+
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundleBinding,
+        TrustedSingleOperatorContentReplayAuthorityBinding,
+    )
+
+    bundle_binding = TrustedSingleOperatorContentBundleBinding.bind(
+        source.content_bundle_path
+    )
+    if not _trusted_binding_matches_source(bundle_binding, source):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_bundle_changed",
+            "trusted content bundle binding differs from prepared authority",
+        )
+    bundle = bundle_binding.reopen()
+    if bundle.schema_version != 2 or bundle.runtime_binding_status != "BOUND":
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_bundle_changed",
+            "trusted prepared content requires one runtime-BOUND schema-2 bundle",
+        )
+    replay_binding = bundle.content_replay_authority
+    if (
+        type(replay_binding) is not TrustedSingleOperatorContentReplayAuthorityBinding
+        or not _trusted_replay_binding_matches_source(replay_binding, source)
+    ):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_replay_changed",
+            "trusted bundle replay binding differs from prepared authority",
+        )
+    replay = replay_binding.reopen()
+    if (
+        replay.semantic_sha256 != source.content_replay_semantic_sha256
+        or replay.protocol_sha256 != source.content_replay_protocol_sha256
+        or replay.absolute_path != source.content_replay_path
+    ):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_replay_changed",
+            "trusted content replay identity differs from prepared authority",
+        )
+    return bundle, replay
+
+
+def _project_trusted_prepared_members(
+    bundle: object,
+    replay: object,
+    prepared: PreparedModelSet,
+    expected_roles: Mapping[str, Literal["target", "drafter"]],
+) -> dict[str, PreparedModelTrustedContentMember]:
+    if (
+        type(expected_roles) is not dict
+        or set(expected_roles) != {snapshot.model_id for snapshot in prepared.snapshots}
+        or tuple(sorted(expected_roles.values())) != ("drafter", "target")
+    ):
+        raise ValueError(
+            "trusted prepared roles must cover one target and one drafter exactly"
+        )
+    projections: dict[str, PreparedModelTrustedContentMember] = {}
+    for snapshot in prepared.snapshots:
+        expected_role = expected_roles[snapshot.model_id]
+        matches = tuple(
+            item
+            for item in bundle.model_members
+            if item.model_id == snapshot.model_id
+            and item.revision == snapshot.revision
+            and item.local_snapshot_path == snapshot.root
+            and item.role == expected_role
+        )
+        if len(matches) != 1:
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_trusted_member_changed",
+                f"{snapshot.model_id} lacks its exact {expected_role} bundle member",
+            )
+        member = matches[0]
+        replay_member = replay.member(model_id=member.model_id, role=member.role)
+        closure = replay.closure_for_member(model_id=member.model_id, role=member.role)
+        if (
+            replay_member != member
+            or closure.local_snapshot_path != member.local_snapshot_path
+            or closure.storage_mode != member.storage_mode
+            or closure.content_cache_root != member.content_cache_root
+            or closure.files != member.files
+            or closure.tree_sha256 != member.tree_sha256
+            or closure.content_sha256 != member.content_sha256
+        ):
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_trusted_member_changed",
+                f"{snapshot.model_id} differs from its exact replay closure",
+            )
+        projections[snapshot.model_id] = _trusted_member_projection(member)
+    return projections
+
+
+@dataclass(frozen=True)
+class _TrustedPreparedContentContext:
+    source: PreparedModelTrustedContentReplay
+    members: Mapping[str, PreparedModelTrustedContentMember]
+    expected_roles: Mapping[str, Literal["target", "drafter"]]
+
+    def __post_init__(self) -> None:
+        if type(self.source) is not PreparedModelTrustedContentReplay:
+            raise TypeError("trusted prepared context source type differs")
+        if type(self.members) is not dict or any(
+            type(item) is not PreparedModelTrustedContentMember
+            for item in self.members.values()
+        ):
+            raise TypeError("trusted prepared context member type differs")
+        if (
+            type(self.expected_roles) is not dict
+            or set(self.expected_roles) != set(self.members)
+            or tuple(sorted(self.expected_roles.values())) != ("drafter", "target")
+            or any(
+                self.members[model_id].role != role
+                for model_id, role in self.expected_roles.items()
+            )
+        ):
+            raise ValueError("trusted prepared context role projection differs")
+
+    def finish(self, prepared: PreparedModelSet) -> None:
+        bundle, replay = _reopen_trusted_content_replay(self.source)
+        if (
+            _project_trusted_prepared_members(
+                bundle,
+                replay,
+                prepared,
+                self.expected_roles,
+            )
+            != self.members
+        ):
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_trusted_member_changed",
+                "trusted prepared members changed during bounded replay",
+            )
+
+
+def _trusted_prepared_context_from_source(
+    source: PreparedModelTrustedContentReplay,
+    prepared: PreparedModelSet,
+    expected_roles: Mapping[str, Literal["target", "drafter"]],
+) -> _TrustedPreparedContentContext:
+    bundle, replay = _reopen_trusted_content_replay(source)
+    return _TrustedPreparedContentContext(
+        source=source,
+        members=_project_trusted_prepared_members(
+            bundle,
+            replay,
+            prepared,
+            expected_roles,
+        ),
+        expected_roles=expected_roles,
+    )
+
+
+def _trusted_prepared_context_from_bundle(
+    bundle_binding: object,
+    prepared: PreparedModelSet,
+    expected_roles: Mapping[str, Literal["target", "drafter"]],
+) -> _TrustedPreparedContentContext:
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundleBinding,
+        TrustedSingleOperatorContentReplayAuthorityBinding,
+    )
+
+    if type(bundle_binding) is not TrustedSingleOperatorContentBundleBinding:
+        raise TypeError(
+            "trusted prepared content requires exact content bundle binding"
+        )
+    rebound = TrustedSingleOperatorContentBundleBinding.bind(
+        bundle_binding.absolute_path
+    )
+    if rebound != bundle_binding:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_bundle_changed",
+            "trusted content bundle changed before prepared materialization",
+        )
+    bundle = rebound.reopen()
+    replay_binding = bundle.content_replay_authority
+    if (
+        bundle.schema_version != 2
+        or bundle.runtime_binding_status != "BOUND"
+        or type(replay_binding)
+        is not TrustedSingleOperatorContentReplayAuthorityBinding
+    ):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_bundle_changed",
+            "trusted prepared materialization requires schema-2 replay bundle",
+        )
+    source = _trusted_content_replay_from_bindings(rebound, replay_binding)
+    return _trusted_prepared_context_from_source(
+        source,
+        prepared,
+        expected_roles,
+    )
+
+
 def _tensor_numel(shape: tuple[int, ...]) -> int:
     result = 1
     for dimension in shape:
@@ -1267,14 +1879,74 @@ def _tensor_numel(shape: tuple[int, ...]) -> int:
     return result
 
 
+def _require_opened_trusted_content_file(
+    *,
+    opened: os.stat_result,
+    source: _OpenedSnapshotSource,
+    member: PreparedModelTrustedContentMember,
+    expected: PreparedModelTrustedContentFile,
+    label: str,
+) -> None:
+    if opened.st_size != expected.size:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{label} size differs from the exact trusted file row",
+        )
+    if expected.storage_kind == "regular":
+        if source.link_text is not None:
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_trusted_member_changed",
+                f"{label} storage kind changed from regular to symlink",
+            )
+        return
+    if source.link_text != expected.symlink_target or member.content_cache_root is None:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{label} symlink identity differs from the exact trusted file row",
+        )
+    try:
+        resolved = Path(source.target_path).relative_to(member.content_cache_root)
+    except ValueError as error:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{label} resolved blob leaves the trusted cache root",
+        ) from error
+    if resolved.as_posix() != expected.resolved_relative_path:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{label} resolved blob path differs from the exact trusted file row",
+        )
+    if (
+        source.blob_name is not None
+        and len(source.blob_name) == 64
+        and source.blob_name != expected.sha256
+    ):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{label} blob name differs from the exact trusted payload digest",
+        )
+
+
 def _read_safetensors_header(
     root: Path,
     relative_path: str,
     *,
     label: str,
+    trusted_member: PreparedModelTrustedContentMember | None = None,
+    trusted_file: PreparedModelTrustedContentFile | None = None,
 ) -> SafetensorsHeaderBinding:
+    if (trusted_member is None) != (trusted_file is None):
+        raise TypeError("trusted safetensors member/file must be supplied together")
     descriptor, opened, source = _open_snapshot_file(root, relative_path, label=label)
     try:
+        if trusted_member is not None and trusted_file is not None:
+            _require_opened_trusted_content_file(
+                opened=opened,
+                source=source,
+                member=trusted_member,
+                expected=trusted_file,
+                label=label,
+            )
         prefix = os.read(descriptor, 8)
         if len(prefix) != 8:
             raise PreparedModelContentAuthorityBlocked(
@@ -1298,15 +1970,25 @@ def _read_safetensors_header(
                 "prepared_model_content_safetensors_layout_unsupported",
                 f"{label} safetensors header is truncated",
             )
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        payload_hasher = hashlib.sha256()
-        payload_bytes = 0
-        while True:
-            chunk = os.read(descriptor, 8 * 1024 * 1024)
-            if not chunk:
-                break
-            payload_hasher.update(chunk)
-            payload_bytes += len(chunk)
+        raw_sha256: str
+        if trusted_file is None:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            payload_hasher = hashlib.sha256()
+            payload_bytes = 0
+            while True:
+                chunk = os.read(descriptor, 8 * 1024 * 1024)
+                if not chunk:
+                    break
+                payload_hasher.update(chunk)
+                payload_bytes += len(chunk)
+            if payload_bytes != opened.st_size:
+                raise RuntimeError(f"{label} payload was truncated")
+            raw_sha256 = payload_hasher.hexdigest()
+        else:
+            # The trusted replay authority already performed the sole complete
+            # payload SHA-256 scan.  Prepared replay reads only the bounded
+            # safetensors header and projects the exact member file digest.
+            raw_sha256 = trusted_file.sha256
         _finish_stable_read(
             descriptor,
             opened,
@@ -1316,9 +1998,6 @@ def _read_safetensors_header(
             expected_bytes=opened.st_size,
             label=label,
         )
-        if payload_bytes != opened.st_size:
-            raise RuntimeError(f"{label} payload was truncated")
-        raw_sha256 = payload_hasher.hexdigest()
         if (
             source.blob_name is not None
             and len(source.blob_name) == 64
@@ -1396,6 +2075,7 @@ def _read_safetensors_header(
 def _critical_files(
     snapshot: PreparedModelSnapshot,
     profile: _ContentProfile,
+    trusted_member: PreparedModelTrustedContentMember | None = None,
 ) -> tuple[PreparedModelContentFile, ...]:
     root = relocated_evidence_path(snapshot.root)
     rows: list[PreparedModelContentFile] = []
@@ -1405,6 +2085,17 @@ def _critical_files(
             relative_path,
             label=f"prepared snapshot {snapshot.model_id}",
         )
+        if trusted_member is not None:
+            expected = trusted_member.file(relative_path)
+            if (
+                opened.st_size != expected.size
+                or hashlib.sha256(body).hexdigest() != expected.sha256
+            ):
+                raise PreparedModelContentAuthorityBlocked(
+                    "prepared_model_content_trusted_member_changed",
+                    f"{snapshot.model_id} file {relative_path!r} differs from "
+                    "the exact trusted member row",
+                )
         rows.append(
             PreparedModelContentFile(
                 relative_path=relative_path,
@@ -1417,6 +2108,7 @@ def _critical_files(
 
 def _generic_content_profile(
     snapshot: PreparedModelSnapshot,
+    trusted_member: PreparedModelTrustedContentMember | None = None,
 ) -> _ContentProfile:
     """Discover one complete lightweight manifest without model-name trust.
 
@@ -1473,6 +2165,13 @@ def _generic_content_profile(
             "prepared_model_content_required_files_unavailable",
             f"{snapshot.model_id} has no config.json",
         )
+    if trusted_member is not None and set(discovered) | set(safetensors) != {
+        item.relative_path for item in trusted_member.files
+    }:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{snapshot.model_id} file set differs from its exact trusted member",
+        )
     has_index = "model.safetensors.index.json" in discovered
     has_single = "model.safetensors" in safetensors
     if has_index == has_single:
@@ -1501,6 +2200,7 @@ def _generic_content_profile(
 def _sharded_headers(
     snapshot: PreparedModelSnapshot,
     critical: tuple[PreparedModelContentFile, ...],
+    trusted_member: PreparedModelTrustedContentMember | None = None,
 ) -> tuple[SafetensorsHeaderBinding, ...]:
     root = relocated_evidence_path(snapshot.root)
     index_file = next(
@@ -1521,6 +2221,16 @@ def _sharded_headers(
         index_file.relative_path,
         label=f"prepared snapshot {snapshot.model_id} index",
     )
+    if trusted_member is not None:
+        expected_index = trusted_member.file(index_file.relative_path)
+        if (
+            len(body) != expected_index.size
+            or hashlib.sha256(body).hexdigest() != expected_index.sha256
+        ):
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_trusted_member_changed",
+                f"{snapshot.model_id} index differs from its exact trusted file row",
+            )
     index = _strict_object(
         "safetensors index",
         _strict_json(body, label="safetensors index"),
@@ -1543,11 +2253,24 @@ def _sharded_headers(
         )
     if any(not name.endswith(".safetensors") for name in shard_names):
         raise ValueError("safetensors index must name only .safetensors shards")
+    if trusted_member is not None and shard_names != {
+        item.relative_path
+        for item in trusted_member.files
+        if item.relative_path.endswith(".safetensors")
+    }:
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_safetensors_layout_unsupported",
+            f"{snapshot.model_id} index does not cover exact trusted weight files",
+        )
     headers = tuple(
         _read_safetensors_header(
             root,
             relative_path,
             label=f"prepared snapshot {snapshot.model_id} shard {relative_path}",
+            trusted_member=trusted_member,
+            trusted_file=(
+                None if trusted_member is None else trusted_member.file(relative_path)
+            ),
         )
         for relative_path in sorted(shard_names)
     )
@@ -1569,6 +2292,7 @@ def _sharded_headers(
 def _scan_snapshot_content(
     snapshot: PreparedModelSnapshot,
     prepared: PreparedModelSet,
+    trusted_member: PreparedModelTrustedContentMember | None = None,
 ) -> PreparedModelSnapshotContent:
     if snapshot.model_id == _BANNED_MODEL_ID:
         raise PreparedModelContentAuthorityBlocked(
@@ -1577,7 +2301,7 @@ def _scan_snapshot_content(
         )
     profile = _CONTENT_PROFILES.get(snapshot.model_id)
     if profile is None:
-        profile = _generic_content_profile(snapshot)
+        profile = _generic_content_profile(snapshot, trusted_member)
     if profile.tokenizer_source is not None and profile.tokenizer_source not in {
         item.model_id for item in prepared.snapshots
     }:
@@ -1585,15 +2309,39 @@ def _scan_snapshot_content(
             "prepared_model_content_required_files_unavailable",
             f"{snapshot.model_id} requires tokenizer source {profile.tokenizer_source}",
         )
-    critical = _critical_files(snapshot, profile)
+    if trusted_member is not None and (
+        trusted_member.model_id != snapshot.model_id
+        or trusted_member.revision != snapshot.revision
+        or trusted_member.root != snapshot.root
+    ):
+        raise PreparedModelContentAuthorityBlocked(
+            "prepared_model_content_trusted_member_changed",
+            f"{snapshot.model_id} prepared identity differs from trusted content",
+        )
+    critical = _critical_files(snapshot, profile, trusted_member)
     if profile.weight_kind == "sharded_safetensors":
-        headers = _sharded_headers(snapshot, critical)
+        headers = _sharded_headers(snapshot, critical, trusted_member)
     else:
+        if trusted_member is not None and {
+            item.relative_path
+            for item in trusted_member.files
+            if item.relative_path.endswith(".safetensors")
+        } != {"model.safetensors"}:
+            raise PreparedModelContentAuthorityBlocked(
+                "prepared_model_content_safetensors_layout_unsupported",
+                f"{snapshot.model_id} single layout differs from trusted file set",
+            )
         headers = (
             _read_safetensors_header(
                 relocated_evidence_path(snapshot.root),
                 "model.safetensors",
                 label=f"prepared snapshot {snapshot.model_id} model.safetensors",
+                trusted_member=trusted_member,
+                trusted_file=(
+                    None
+                    if trusted_member is None
+                    else trusted_member.file("model.safetensors")
+                ),
             ),
         )
     tensors = tuple(
@@ -1613,39 +2361,70 @@ def _scan_snapshot_content(
         tensor_metadata_sha256=_canonical_sha256(
             [tensor.to_dict() for tensor in tensors]
         ),
+        trusted_content_member=trusted_member,
     )
 
 
 def _content_manifest(
     model_lock: ModelLock,
     prepared: PreparedModelSet,
+    *,
+    trusted_context: _TrustedPreparedContentContext | None = None,
 ) -> tuple[dict[str, object], tuple[PreparedModelSnapshotContent, ...]]:
     revalidate_prepared_models(model_lock, prepared)
     snapshots = tuple(
-        _scan_snapshot_content(snapshot, prepared) for snapshot in prepared.snapshots
+        _scan_snapshot_content(
+            snapshot,
+            prepared,
+            (
+                None
+                if trusted_context is None
+                else trusted_context.members[snapshot.model_id]
+            ),
+        )
+        for snapshot in prepared.snapshots
     )
+    if trusted_context is not None:
+        trusted_context.finish(prepared)
     manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 1 if trusted_context is None else 2,
         "kind": "lightcone_prepared_model_content_manifest",
-        "protocol_sha256": PREPARED_MODEL_CONTENT_PROTOCOL_SHA256,
+        "protocol_sha256": (
+            PREPARED_MODEL_CONTENT_PROTOCOL_SHA256
+            if trusted_context is None
+            else PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256
+        ),
         "model_lock_sha256": model_lock.sha256,
         "prepared_model_set_sha256": prepared.sha256,
         "snapshots": [snapshot.to_dict() for snapshot in snapshots],
     }
+    if trusted_context is not None:
+        manifest["trusted_content_replay"] = trusted_context.source.to_dict()
     return manifest, snapshots
 
 
 def _parse_content_manifest(
     value: object,
-) -> tuple[dict[str, Any], tuple[PreparedModelSnapshotContent, ...]]:
-    row = _strict_object(
-        "prepared model content manifest", value, _CONTENT_MANIFEST_FIELDS
+) -> tuple[
+    dict[str, Any],
+    tuple[PreparedModelSnapshotContent, ...],
+    PreparedModelTrustedContentReplay | None,
+]:
+    if type(value) is not dict:
+        raise TypeError("prepared model content manifest must be an object")
+    version = value.get("schema_version")
+    fields = _CONTENT_MANIFEST_FIELDS_V2 if version == 2 else _CONTENT_MANIFEST_FIELDS
+    row = _strict_object("prepared model content manifest", value, fields)
+    expected_protocol = (
+        PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256
+        if version == 2
+        else PREPARED_MODEL_CONTENT_PROTOCOL_SHA256
     )
     if (
         type(row["schema_version"]) is not int
-        or row["schema_version"] != 1
+        or version not in {1, 2}
         or row["kind"] != "lightcone_prepared_model_content_manifest"
-        or row["protocol_sha256"] != PREPARED_MODEL_CONTENT_PROTOCOL_SHA256
+        or row["protocol_sha256"] != expected_protocol
     ):
         raise ValueError("prepared model content manifest identity is invalid")
     _require_sha256("content manifest model lock", row["model_lock_sha256"])
@@ -1661,7 +2440,20 @@ def _parse_content_manifest(
         raise ValueError(
             "content manifest snapshots must be model-ID sorted and unique"
         )
-    return row, snapshots
+    trusted = (
+        None
+        if version == 1
+        else PreparedModelTrustedContentReplay.from_dict(row["trusted_content_replay"])
+    )
+    if (
+        version == 1
+        and any(snapshot.trusted_content_member is not None for snapshot in snapshots)
+    ) or (
+        version == 2
+        and any(snapshot.trusted_content_member is None for snapshot in snapshots)
+    ):
+        raise ValueError("prepared content trusted member/schema coverage differs")
+    return row, snapshots, trusted
 
 
 def materialize_prepared_model_content_manifest(
@@ -1678,6 +2470,58 @@ def materialize_prepared_model_content_manifest(
     return manifest
 
 
+def materialize_trusted_prepared_model_content_manifest(
+    model_lock: ModelLock,
+    prepared: PreparedModelSet,
+    *,
+    trusted_content_bundle_binding: object,
+    target_model_id: str,
+    drafter_model_id: str,
+) -> dict[str, object]:
+    """Project exact trusted members and read only bounded prepared metadata."""
+
+    if type(model_lock) is not ModelLock or type(prepared) is not PreparedModelSet:
+        raise TypeError(
+            "trusted prepared content materialization requires exact authority types"
+        )
+    _require_text("trusted prepared target model", target_model_id)
+    _require_text("trusted prepared drafter model", drafter_model_id)
+    if target_model_id == drafter_model_id:
+        raise ValueError("trusted prepared target and drafter must be distinct")
+    expected_roles: dict[str, Literal["target", "drafter"]] = {
+        target_model_id: "target",
+        drafter_model_id: "drafter",
+    }
+    context = _trusted_prepared_context_from_bundle(
+        trusted_content_bundle_binding,
+        prepared,
+        expected_roles,
+    )
+    manifest, _ = _content_manifest(
+        model_lock,
+        prepared,
+        trusted_context=context,
+    )
+    return manifest
+
+
+def _trusted_roles_from_snapshots(
+    snapshots: tuple[PreparedModelSnapshotContent, ...],
+) -> dict[str, Literal["target", "drafter"]]:
+    if any(snapshot.trusted_content_member is None for snapshot in snapshots):
+        raise ValueError("trusted prepared snapshots lack member roles")
+    roles: dict[str, Literal["target", "drafter"]] = {}
+    for snapshot in snapshots:
+        member = snapshot.trusted_content_member
+        assert member is not None
+        roles[snapshot.model_id] = member.role
+    if tuple(sorted(roles.values())) != ("drafter", "target"):
+        raise ValueError(
+            "trusted prepared snapshots must bind one target and one drafter"
+        )
+    return roles
+
+
 @dataclass(frozen=True)
 class PreparedModelContentAuthorityBinding:
     schema_version: int
@@ -1691,11 +2535,16 @@ class PreparedModelContentAuthorityBinding:
     def __post_init__(self) -> None:
         if (
             type(self.schema_version) is not int
-            or self.schema_version != 1
+            or self.schema_version not in {1, 2}
             or self.kind != "lightcone_prepared_model_content_authority"
         ):
             raise ValueError("prepared model content authority identity is invalid")
-        if self.protocol_sha256 != PREPARED_MODEL_CONTENT_PROTOCOL_SHA256:
+        expected_protocol = (
+            PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256
+            if self.schema_version == 2
+            else PREPARED_MODEL_CONTENT_PROTOCOL_SHA256
+        )
+        if self.protocol_sha256 != expected_protocol:
             raise ValueError("prepared model content authority protocol is unsupported")
         _require_sha256(
             "prepared content release manifest", self.release_manifest_sha256
@@ -1801,14 +2650,27 @@ def bind_prepared_model_content_authority(
     manifest = PreparedModelContentManifestBinding.from_path(manifest_path)
     if manifest.semantic_sha256 != expected:
         raise ValueError("prepared content manifest differs from the release digest")
-    serialized, _ = _parse_content_manifest(manifest.load())
-    observed, _ = _content_manifest(model_lock, prepared)
+    serialized, snapshots, trusted = _parse_content_manifest(manifest.load())
+    trusted_context = (
+        None
+        if trusted is None
+        else _trusted_prepared_context_from_source(
+            trusted,
+            prepared,
+            _trusted_roles_from_snapshots(snapshots),
+        )
+    )
+    observed, _ = _content_manifest(
+        model_lock,
+        prepared,
+        trusted_context=trusted_context,
+    )
     if serialized != observed:
         raise ValueError("prepared content manifest differs from live snapshot content")
     return PreparedModelContentAuthorityBinding(
-        schema_version=1,
+        schema_version=serialized["schema_version"],
         kind="lightcone_prepared_model_content_authority",
-        protocol_sha256=PREPARED_MODEL_CONTENT_PROTOCOL_SHA256,
+        protocol_sha256=serialized["protocol_sha256"],
         release_manifest_sha256=expected,
         model_lock_sha256=model_lock.sha256,
         prepared_model_set=prepared,
@@ -1856,13 +2718,33 @@ def revalidate_prepared_model_content_authority(
         or authority.model_lock_sha256 != model_lock.sha256
     ):
         raise ValueError("prepared content authority differs from release/model lock")
-    serialized, snapshots = _parse_content_manifest(authority.manifest.load())
-    observed, rescanned = _content_manifest(model_lock, authority.prepared_model_set)
+    serialized, snapshots, trusted = _parse_content_manifest(authority.manifest.load())
+    if (
+        authority.schema_version != serialized["schema_version"]
+        or authority.protocol_sha256 != serialized["protocol_sha256"]
+    ):
+        raise ValueError("prepared content authority differs from its manifest")
+    trusted_context = (
+        None
+        if trusted is None
+        else _trusted_prepared_context_from_source(
+            trusted,
+            authority.prepared_model_set,
+            _trusted_roles_from_snapshots(snapshots),
+        )
+    )
+    observed, rescanned = _content_manifest(
+        model_lock,
+        authority.prepared_model_set,
+        trusted_context=trusted_context,
+    )
     if serialized == observed and snapshots == rescanned:
         return PreparedModelContentAuthorityResult(
             binding=authority,
             snapshots=rescanned,
         )
+    if trusted is not None:
+        raise ValueError("prepared content authority differs from trusted replay")
     relocated = tuple(
         relocated_evidence_path(snapshot.root) != Path(snapshot.root)
         for snapshot in authority.prepared_model_set.snapshots
@@ -1913,7 +2795,7 @@ def _require_authorized_prepared_model_content_release(
         raise ValueError(
             "prepared content authorization differs from lock, set, or manifest"
         )
-    serialized, snapshots = _parse_content_manifest(manifest.load())
+    serialized, snapshots, _ = _parse_content_manifest(manifest.load())
     if (
         serialized["model_lock_sha256"] != model_lock.sha256
         or serialized["prepared_model_set_sha256"] != prepared.sha256
@@ -2015,6 +2897,7 @@ __all__ = [
     "PREPARED_MODEL_BINDING_PROTOCOL_SHA256",
     "PREPARED_MODEL_CONTENT_PROTOCOL_SHA256",
     "PREPARED_MODEL_CONTENT_RELEASE_MANIFEST_SHA256S",
+    "PREPARED_MODEL_CONTENT_TRUSTED_REPLAY_PROTOCOL_SHA256",
     "PreparedModelContentAuthorityBinding",
     "PreparedModelContentAuthorityBlocked",
     "PreparedModelContentAuthorityResult",
@@ -2023,6 +2906,9 @@ __all__ = [
     "PreparedModelSet",
     "PreparedModelSnapshot",
     "PreparedModelSnapshotContent",
+    "PreparedModelTrustedContentFile",
+    "PreparedModelTrustedContentMember",
+    "PreparedModelTrustedContentReplay",
     "SafetensorsHeaderBinding",
     "SnapshotTensorMetadata",
     "bind_authorized_prepared_model_content_authority",
@@ -2030,6 +2916,7 @@ __all__ = [
     "bind_prepared_models",
     "has_prepared_model_content_release_manifest_sha256",
     "materialize_prepared_model_content_manifest",
+    "materialize_trusted_prepared_model_content_manifest",
     "prepared_model_content_authority_from_dict",
     "prepared_model_content_authority_to_dict",
     "prepared_model_content_release_identity_sha256",

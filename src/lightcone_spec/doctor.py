@@ -1844,7 +1844,7 @@ def doctor_report(
         checks["disk"] = _check(
             "FAIL",
             expected={
-                "stage_capacity": "valid AVAILABLE schema-3 path-bound gate",
+                "stage_capacity": "valid AVAILABLE schema-4 path-bound gate",
                 "legacy_fallback_bytes": 100_000_000_000,
             },
             observed=capacity_report,
