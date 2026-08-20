@@ -180,7 +180,8 @@ def test_official_client_uses_raw_authorization_header() -> None:
     def opener(request, *, timeout):
         captured["authorization"] = request.get_header("Authorization")
         captured["method"] = request.get_method()
-        captured["body"] = json.loads(request.data)
+        captured["url"] = request.full_url
+        captured["body"] = request.data
         captured["timeout"] = timeout
         return Response()
 
@@ -190,7 +191,11 @@ def test_official_client_uses_raw_authorization_header() -> None:
     assert captured == {
         "authorization": "raw-token",
         "method": "GET",
-        "body": {"instance_uuid": INSTANCE},
+        "url": (
+            "https://api.autodl.com/api/v1/dev/instance/pro/status"
+            f"?instance_uuid={INSTANCE}"
+        ),
+        "body": None,
         "timeout": 30.0,
     }
 

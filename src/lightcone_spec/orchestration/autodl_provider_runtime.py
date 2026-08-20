@@ -17,6 +17,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -296,9 +297,16 @@ class AutoDlProApiClient:
         }[path]
         if method != expected_method:
             raise AutoDlProviderRuntimeError("AutoDL request method differs")
-        encoded = _canonical_bytes(dict(body))
+        request_url = self._base_url + path
+        encoded: bytes | None
+        if method == "GET":
+            query = urllib.parse.urlencode(tuple(sorted(body.items())))
+            request_url = f"{request_url}?{query}"
+            encoded = None
+        else:
+            encoded = _canonical_bytes(dict(body))
         request = urllib.request.Request(
-            self._base_url + path,
+            request_url,
             data=encoded,
             headers={
                 "Authorization": self._token,
