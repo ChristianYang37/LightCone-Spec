@@ -634,7 +634,7 @@ def derive_prepared_run_config(
     width = _trusted_expected_width(context, cell, prerequisite)
     load = _runtime_load(context, cell, prerequisite)
     runtime_update: dict[str, object] = {
-        "device_identity": gpu_uuids[0],
+        "device_identity": ",".join(gpu_uuids),
         "max_running_requests": load,
         "speculation_enabled": _method(cell) != "target_only",
         "speculative_num_draft_tokens": width,
@@ -676,6 +676,8 @@ def derive_prepared_run_config(
         adaptation = AdaptationConfig(
             weight_update_mode="full",
             parameter_scope="all",
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
             adaptation_group_id=_trusted_adaptation_group(cell, paired_tts_l0=True),
             optimizer=OptimizerConfig(
                 name="adam",
@@ -709,6 +711,8 @@ def derive_prepared_run_config(
         adaptation = AdaptationConfig(
             weight_update_mode=candidate.weight_update_mode,
             parameter_scope=candidate.parameter_scope,
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id=f"e0:{cell.cell_id}",
             optimizer=OptimizerConfig(
                 name="sgd",
@@ -1727,9 +1731,15 @@ def prepare_launch_draft(
     if execution_binding.reopen().get("execution_source_sha256") != source.sha256:
         raise ValueError("prepared producer execution source identity differs")
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="prepared producer execution materialization"
+        )
     )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(
+            label="prepared producer execution ProtocolLock"
+        )
+    )
     content_source = FormalContentSourceBinding.bind_trusted_single_operator(
         str(content_source_path)
     )

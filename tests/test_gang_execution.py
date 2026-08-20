@@ -81,6 +81,14 @@ def _rank_binding(
     method: str = "static",
 ) -> NativeTerminalRankBinding:
     identity = topology.receipt_for_rank(rank).topology
+    if method in {"target_only", "static"}:
+        reset_scope = None
+        request_admission_policy = None
+    elif method in {"onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"}:
+        reset_scope = "cohort"
+        request_admission_policy = "cohort_batching_v1"
+    else:
+        raise ValueError("test rank binding lacks an explicit method role")
     run = NativeTerminalRunBinding(
         run_id="run-0",
         run_nonce_sha256=SHA_A,
@@ -92,6 +100,10 @@ def _rank_binding(
         previous_run_id=None,
         challenge_nonce_sha256=SHA_C,
         method=method,
+        reset_scope=reset_scope,
+        request_admission_policy=request_admission_policy,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(),
         scored_request_ids=request_ids,
     )

@@ -289,6 +289,10 @@ def _resources(
         previous_run_id=None,
         challenge_nonce_sha256=_sha("challenge"),
         method="static",
+        reset_scope=None,
+        request_admission_policy=None,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=("warm-0",),
         scored_request_ids=("score-0",),
     )

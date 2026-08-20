@@ -972,6 +972,20 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
         run_nonce_sha256 = _sha({"nonce": cell.cell_id})
         output_seed_sha256 = _sha({"output": request_id})
         output_token_ids = (int(output_seed_sha256[:8], 16),)
+        scientific_role = registry.scientific_method_role_for_cell(cell).value
+        if scientific_role in {"target_only", "static"}:
+            reset_scope = None
+            request_admission_policy = None
+        elif scientific_role in {
+            "tts_calibration_candidate",
+            "tts",
+            "l0_naive",
+        }:
+            reset_scope = "request"
+            request_admission_policy = "serialized_native_scheduler_v1"
+        else:
+            reset_scope = "cohort"
+            request_admission_policy = "cohort_batching_v1"
         native_run_binding = NativeTerminalRunBinding(
             run_id=run_id,
             run_nonce_sha256=run_nonce_sha256,
@@ -983,6 +997,10 @@ def _serving_bundle(tmp_path: Path) -> dict[str, object]:
             previous_run_id=None,
             challenge_nonce_sha256=_sha({"challenge": cell.cell_id}),
             method=cell.identity.method,
+            reset_scope=reset_scope,
+            request_admission_policy=request_admission_policy,
+            runtime_trust_mode=None,
+            formal_measurement=None,
             warmup_request_ids=(),
             scored_request_ids=(request_id,),
         )

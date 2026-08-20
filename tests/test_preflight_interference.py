@@ -345,6 +345,10 @@ def _binding(mode: str, repetition: int, slot: int) -> NativeTerminalRunBinding:
         previous_run_id=None,
         challenge_nonce_sha256=_sha(f"challenge-{suffix}"),
         method="static",
+        reset_scope=None,
+        request_admission_policy=None,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=("warm-0",),
         scored_request_ids=("score-0",),
     )
@@ -1663,6 +1667,8 @@ def test_exact_eight_first_party_remote_phase_is_explicitly_incomplete(
             run_nonce_sha256=row.run_binding.run_nonce_sha256,
             attempt_id=row.run_binding.attempt_id,
             method="static",
+            runtime_trust_mode=row.run_binding.runtime_trust_mode,
+            formal_measurement=row.run_binding.formal_measurement,
         )
         raw_itl_path = str((tmp_path / f"raw-itl-{index}.json").resolve())
         publish_stage_itl_timestamp_raw_receipt(

@@ -294,6 +294,52 @@ def test_run_config_derives_target_static_and_tts_l0_without_callers(
     assert tts.runtime.device_identity == "GPU-0"
 
 
+@pytest.mark.parametrize("topology", ("tp2_dp1", "tp1_dp2"))
+def test_multirank_run_config_binds_the_ordered_gpu_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+) -> None:
+    from lightcone_spec.runtime.distributed import (
+        DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
+    )
+
+    monkeypatch.setattr(
+        producer, "_trusted_chain_recipe_context", lambda _source: _recipe_context()
+    )
+    capability = DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES[topology]
+    prerequisite = _base_config()
+    prerequisite = prerequisite.model_copy(
+        update={
+            "runtime": RuntimeConfig.model_validate(
+                {
+                    **prerequisite.runtime.model_dump(mode="json"),
+                    "tensor_parallel_size": 2 if topology == "tp2_dp1" else 1,
+                    "data_parallel_size": 2 if topology == "tp1_dp2" else 1,
+                    "router_identity": (
+                        "formal-sticky-router"
+                        if topology == "tp1_dp2"
+                        else "single-replica"
+                    ),
+                    "process_group_backend": capability.process_group_backend,
+                    "distributed_runtime_capability": "patched_two_gpu_v1",
+                    "distributed_release_capability_sha256": capability.sha256,
+                    "distributed_capability_receipt_sha256": _sha(
+                        f"{topology}:runtime-envelope"
+                    ),
+                }
+            )
+        }
+    )
+    config = producer.derive_prepared_run_config(
+        source=_source("e5_pilot"),
+        cell=_e5_cell(role="Static", block=0, topology=topology),
+        prerequisite=prerequisite,
+        gpu_uuids=("GPU-0", "GPU-1"),
+    )
+
+    assert config.runtime.device_identity == "GPU-0,GPU-1"
+
+
 def test_config_rejects_foreign_backend_prerequisite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,6 +382,8 @@ def test_profiler_config_is_exact_selected_local_clone(
         adaptation=AdaptationConfig(
             weight_update_mode="full",
             parameter_scope="all",
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id="selected-headline",
             optimizer=OptimizerConfig(name="adam", learning_rate=1e-5),
             stride=50,

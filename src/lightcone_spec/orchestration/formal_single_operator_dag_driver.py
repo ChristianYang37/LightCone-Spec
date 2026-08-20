@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
@@ -1239,6 +1239,272 @@ def load_retained_future_dependency_manifest(
     return manifest
 
 
+def _retained_preflight_qualification_dependencies(
+    actual_result_paths: Mapping[str, str],
+    *,
+    archive_candidate_root: str | Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Deep-bind the schema-4 qualification subtree before it can be archived."""
+
+    from lightcone_spec.experiments.formal_preflight_inputs import (
+        FormalPreflightExecutionInputs,
+        FormalSingleOperatorPreflightCompletion,
+        revalidate_formal_single_operator_preflight_completion,
+    )
+    from lightcone_spec.experiments.formal_single_operator_preflight_qualification import (
+        TRUSTED_PREFLIGHT_QUALIFICATION_SUITES,
+        load_formal_single_operator_preflight_qualification_plan,
+        load_formal_single_operator_preflight_qualification_plan_index,
+        load_trusted_qualification_launch_index,
+        revalidate_formal_single_operator_preflight_qualification_result,
+    )
+    from lightcone_spec.runtime.compile_runner import CompileLaunchManifest
+    from lightcone_spec.runtime.preflight_runner import (
+        ExactnessPreflightAssignment,
+        ExactnessPreflightResultPointer,
+    )
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    candidate = _existing_directory(
+        archive_candidate_root,
+        "preflight archive candidate root",
+    )
+
+    def candidate_file(value: str | Path, label: str) -> Path:
+        path = _existing_file(value, label)
+        if not path.is_relative_to(candidate):
+            raise ValueError(f"{label} escaped the preflight archive candidate")
+        return path
+
+    def exactness_file(value: str | Path, label: str, root: Path) -> Path:
+        path = candidate_file(value, label)
+        if not path.is_relative_to(root):
+            raise ValueError(f"{label} escaped retained preflight exactness")
+        return path
+
+    unique_actuals = tuple(sorted(set(actual_result_paths.values())))
+    exact_ten_sources: list[tuple[CanonicalJsonProofBinding, object]] = []
+    for path in unique_actuals:
+        binding = CanonicalJsonProofBinding.bind(path)
+        raw = binding.reopen()
+        if (
+            type(raw) is dict
+            and raw.get("kind")
+            == "formal_single_operator_exact_ten_preflight_completion"
+        ):
+            exact_ten_sources.append((binding, raw))
+    if not exact_ten_sources:
+        # Legacy preflight actual receipts do not carry schema-4 qualification.
+        return (), ()
+    if len(unique_actuals) != 1 or len(exact_ten_sources) != 1:
+        raise ValueError(
+            "schema-4 preflight retention requires one shared exact-ten completion"
+        )
+
+    completion_binding, raw_completion = exact_ten_sources[0]
+    candidate_file(
+        completion_binding.absolute_path,
+        "retained exact-ten preflight completion",
+    )
+    serialized = FormalSingleOperatorPreflightCompletion.from_dict(raw_completion)
+    completion = revalidate_formal_single_operator_preflight_completion(
+        completion_binding.absolute_path,
+        current_ns=serialized.finished_ns,
+    )
+    if completion != serialized or completion.status != "COMPLETE":
+        raise ValueError("retained preflight completion is not exact and COMPLETE")
+    inputs_path = candidate_file(
+        completion.execution_inputs.absolute_path,
+        "retained preflight execution inputs",
+    )
+    inputs = FormalPreflightExecutionInputs.from_dict(
+        completion.execution_inputs.reopen()
+    )
+    if inputs.schema_version != 4:
+        return (), ()
+    if (
+        completion.schema_version != 2
+        or inputs.sha256 != completion.execution_inputs.semantic_sha256
+        or inputs.qualification_plan_index is None
+    ):
+        raise ValueError("retained trusted preflight input identity differs")
+
+    exactness_assignment_path = candidate_file(
+        inputs.exactness_assignment.absolute_path,
+        "retained preflight exactness assignment",
+    )
+    exactness_assignment_sidecar = candidate_file(
+        f"{exactness_assignment_path}.sha256",
+        "retained preflight exactness assignment sidecar",
+    )
+    exactness = ExactnessPreflightAssignment.load(exactness_assignment_path)
+    if exactness.sha256 != inputs.exactness_assignment.semantic_sha256:
+        raise ValueError("retained preflight exactness assignment changed")
+    exactness_root = _existing_directory(
+        exactness.evidence_directory,
+        "retained preflight exactness evidence",
+    )
+    if not exactness_root.is_relative_to(candidate):
+        raise ValueError(
+            "retained preflight exactness evidence escaped the archive candidate"
+        )
+    base_exactness_result_path = exactness_file(
+        completion.exactness_result.absolute_path,
+        "retained base exactness result",
+        exactness_root,
+    )
+    base_exactness_result = ExactnessPreflightResultPointer.load(
+        base_exactness_result_path
+    )
+    if Path(base_exactness_result.assignment.absolute_path) != (
+        exactness_assignment_path
+    ):
+        raise ValueError("retained base exactness assignment lineage differs")
+    for label, binding in base_exactness_result.bindings().items():
+        if label == "assignment":
+            continue
+        exactness_file(
+            binding.absolute_path,
+            f"retained base exactness {label}",
+            exactness_root,
+        )
+
+    qualification_index_path = exactness_file(
+        inputs.qualification_plan_index.absolute_path,
+        "retained qualification plan index",
+        exactness_root,
+    )
+    qualification_index = (
+        load_formal_single_operator_preflight_qualification_plan_index(
+            qualification_index_path
+        )
+    )
+    if len(qualification_index.plans) != len(TRUSTED_PREFLIGHT_QUALIFICATION_SUITES):
+        raise ValueError("retained qualification plan index is not exact six")
+
+    plans = []
+    results = []
+    sampling_paths: set[Path] = set()
+    for plan_binding in qualification_index.plans:
+        exactness_file(
+            plan_binding.absolute_path,
+            "retained qualification plan",
+            exactness_root,
+        )
+        plan = load_formal_single_operator_preflight_qualification_plan(
+            plan_binding.absolute_path
+        )
+        if plan.exactness_assignment != inputs.exactness_assignment or not Path(
+            plan.evidence_directory
+        ).is_relative_to(exactness_root):
+            raise ValueError("retained qualification plan lineage differs")
+        for label, path in (
+            ("assignment", plan.assignment_path),
+            ("stdout", plan.stdout_path),
+            ("stderr", plan.stderr_path),
+            ("JUnit", plan.junit_path),
+            ("live observation", plan.observation_path),
+            ("result", plan.result_path),
+            ("dispatch", plan.dispatch_authority.absolute_path),
+            ("launch", plan.launch_manifest.absolute_path),
+        ):
+            exactness_file(
+                path,
+                f"retained qualification {label}",
+                exactness_root,
+            )
+        result = revalidate_formal_single_operator_preflight_qualification_result(
+            plan.result_path
+        )
+        if result.plan != plan_binding or result.status != "COMPLETE":
+            raise ValueError("retained qualification result lineage differs")
+        result_files = (
+            result.assignment,
+            result.before_gpu_snapshot,
+            result.after_gpu_snapshot,
+            result.stdout,
+            result.stderr,
+            result.junit_xml,
+            result.live_observation,
+            result.live_native_terminal,
+            result.live_native_itl,
+            result.live_graph,
+            result.live_worker_hook,
+            *result.live_rank_terminals,
+            result.live_server_receipt,
+            result.live_server_log,
+            result.empirical_proof,
+            result.runner_terminal,
+        )
+        for binding in result_files:
+            exactness_file(
+                binding.absolute_path,
+                "retained qualification result evidence",
+                exactness_root,
+            )
+        launch = CompileLaunchManifest.load(plan.launch_manifest.absolute_path)
+        sampling_paths.add(
+            candidate_file(
+                launch.sampling_profile_path,
+                "retained qualification sampling profile",
+            )
+        )
+        plans.append(plan)
+        results.append(result)
+
+    if tuple(plan.suite_id for plan in plans) != (
+        TRUSTED_PREFLIGHT_QUALIFICATION_SUITES
+    ) or len(results) != len(TRUSTED_PREFLIGHT_QUALIFICATION_SUITES):
+        raise ValueError("retained qualification suite coverage differs")
+    launch_roots = {
+        Path(plan.launch_manifest.absolute_path).parent.parent for plan in plans
+    }
+    if len(launch_roots) != 1:
+        raise ValueError("retained qualification launches lack one exact root")
+    launch_root = _existing_directory(
+        launch_roots.pop(),
+        "retained qualification launch root",
+    )
+    if launch_root.parent != exactness_root:
+        raise ValueError("retained qualification launch root escaped exactness")
+    launch_index_path = exactness_file(
+        launch_root / "launch-index.json",
+        "retained qualification launch index",
+        exactness_root,
+    )
+    launch_index = load_trusted_qualification_launch_index(launch_index_path)
+    if tuple(
+        (
+            entry.suite_id,
+            entry.dispatch_authority,
+            entry.launch_manifest,
+        )
+        for entry in launch_index.entries
+    ) != tuple(
+        (plan.suite_id, plan.dispatch_authority, plan.launch_manifest) for plan in plans
+    ):
+        raise ValueError("retained qualification launch index differs from plans")
+    if len(sampling_paths) != 1:
+        raise ValueError("retained qualification sampling profile is not exact")
+    sampling_path = sampling_paths.pop()
+    sampling_sidecar = candidate_file(
+        f"{sampling_path}.sha256",
+        "retained qualification sampling profile sidecar",
+    )
+    retained_files = tuple(
+        sorted(
+            {
+                str(inputs_path),
+                str(exactness_assignment_path),
+                str(exactness_assignment_sidecar),
+                str(sampling_path),
+                str(sampling_sidecar),
+            }
+        )
+    )
+    return retained_files, (str(exactness_root),)
+
+
 def _explicit_headline_metric_payload_rows(
     node: str,
     payload: Mapping[str, Any],
@@ -1969,7 +2235,6 @@ class DirectoryAuxiliaryPhysicalRuntime:
             "auxiliary input catalog directory",
         )
         self.root = Path(config.run_root) / "formal-dag-auxiliary"
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def _binding(
         self,
@@ -2001,12 +2266,6 @@ class DirectoryAuxiliaryPhysicalRuntime:
         latest = self.store.latest_controller_auxiliary_group(node)
         if latest is None:
             return 1
-        if (
-            latest["status"] == "FAILED"
-            and latest["failure_class"] == "INFRASTRUCTURE"
-            and int(latest["attempt"]) < 3
-        ):
-            return int(latest["attempt"]) + 1
         return int(latest["attempt"])
 
     @staticmethod
@@ -4516,6 +4775,75 @@ class FormalSingleOperatorDagDriver:
             lock.release()
 
 
+def _static_trusted_capacity_authority_binding_from_doctor(
+    doctor_report: DriverFileBinding,
+    *,
+    expected_run_root_path: str | Path,
+) -> Any:
+    """Bind persisted capacity identity without a filesystem-capacity probe."""
+
+    from lightcone_spec.experiments.formal_single_operator_capacity import (
+        TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256,
+        TRUSTED_SINGLE_OPERATOR_CAPACITY_SAFETY_MARGIN_BYTES,
+        TRUSTED_SINGLE_OPERATOR_MAXIMUM_AUTOMATIC_RETRIES,
+        TRUSTED_SINGLE_OPERATOR_RETRY_POLICY_SHA256,
+        TrustedSingleOperatorStageCapacityAuthority,
+    )
+    from lightcone_spec.experiments.registry import content_sha256
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    if type(doctor_report) is not DriverFileBinding:
+        raise TypeError("static capacity extraction requires a doctor binding")
+    doctor_binding = CanonicalJsonProofBinding.bind(doctor_report.absolute_path)
+    if (
+        doctor_binding.raw_sha256 != doctor_report.raw_sha256
+        or doctor_binding.size != doctor_report.size_bytes
+    ):
+        raise ValueError("static capacity doctor binding differs")
+    doctor = doctor_binding.reopen()
+    capacity = doctor.get("stage_capacity")
+    if type(capacity) is not dict or type(capacity.get("authority")) is not dict:
+        raise ValueError("static capacity authority binding is absent")
+    authority_binding = CanonicalJsonProofBinding.from_dict(capacity["authority"])
+    authority = authority_binding.reopen()
+    expected_fields = set(
+        TrustedSingleOperatorStageCapacityAuthority.__dataclass_fields__
+    )
+    expected_fields.add("authority_sha256")
+    if type(authority) is not dict or set(authority) != expected_fields:
+        raise ValueError("static capacity authority fields differ")
+    declared_sha256 = authority.get("authority_sha256")
+    payload = dict(authority)
+    payload.pop("authority_sha256")
+    run_root = authority.get("run_root")
+    if (
+        authority.get("schema_version") != 3
+        or authority.get("kind") != "trusted_single_operator_stage_capacity_authority"
+        or authority.get("protocol_sha256")
+        != TRUSTED_SINGLE_OPERATOR_CAPACITY_PROTOCOL_SHA256
+        or authority.get("trust_mode") != "trusted_single_operator_no_signature"
+        or authority.get("signature") is not None
+        or authority.get("formal_measured_authorization") is not False
+        or authority.get("initial_stage") != "preflight"
+        or authority.get("retry_policy_sha256")
+        != TRUSTED_SINGLE_OPERATOR_RETRY_POLICY_SHA256
+        or authority.get("maximum_automatic_infrastructure_retries")
+        != TRUSTED_SINGLE_OPERATOR_MAXIMUM_AUTOMATIC_RETRIES
+        or authority.get("retry_reserve_bytes") != 0
+        or authority.get("safety_margin_bytes")
+        != TRUSTED_SINGLE_OPERATOR_CAPACITY_SAFETY_MARGIN_BYTES
+        or type(declared_sha256) is not str
+        or content_sha256(payload) != declared_sha256
+        or authority_binding.semantic_sha256 != content_sha256(authority)
+        or capacity.get("authority_sha256") != declared_sha256
+        or type(run_root) is not dict
+        or run_root.get("role") != "run"
+        or Path(str(run_root.get("absolute_path"))) != Path(expected_run_root_path)
+    ):
+        raise ValueError("static capacity authority identity differs")
+    return authority_binding
+
+
 class ProductionFormalDagCallbackBuilder:
     """Build current materialize/plan/actual/reduce callbacks from paths."""
 
@@ -4557,8 +4885,64 @@ class ProductionFormalDagCallbackBuilder:
         self.python_executable = str(executable)
         self.run_root = Path(config.run_root)
         self.nodes_root = self.run_root / "formal-dag-nodes"
-        self.nodes_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._validate_identity_inputs()
+        static_capacity_binding = (
+            _static_trusted_capacity_authority_binding_from_doctor(
+                self.config.doctor_report,
+                expected_run_root_path=self.config.run_root,
+            )
+        )
+        self.capacity_authority_path = static_capacity_binding.absolute_path
+        from lightcone_spec.doctor import (
+            revalidate_trusted_single_operator_doctor_report,
+        )
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            require_trusted_single_operator_restart_capacity,
+            trusted_single_operator_capacity_authority_from_doctor,
+        )
+
+        active_nodes = tuple(
+            row for row in self.store.controller_nodes() if row["state"] != "REDUCED"
+        )
+        restart_stage = (
+            "preflight" if not active_nodes else str(active_nodes[0]["node"])
+        )
+        capacity_ready = False
+        try:
+            revalidate_trusted_single_operator_doctor_report(
+                self.config.doctor_report.absolute_path,
+                require_capacity_available=False,
+            )
+            capacity_binding, _capacity, _decision = (
+                trusted_single_operator_capacity_authority_from_doctor(
+                    self.config.doctor_report.absolute_path,
+                    expected_bound_content_source_path=(
+                        self.config.content_source.absolute_path
+                    ),
+                    expected_run_root_path=self.config.run_root,
+                    expected_output_path=self.nodes_root,
+                    require_available=False,
+                )
+            )
+            if capacity_binding != static_capacity_binding:
+                raise ValueError("dynamic capacity authority binding differs")
+            restart_capacity = require_trusted_single_operator_restart_capacity(
+                self.capacity_authority_path,
+                stage=restart_stage,
+                running_commands=self.store.physical_commands(status="RUNNING"),
+                store=self.store,
+            )
+        except (OSError, TypeError, RuntimeError, ValueError) as error:
+            self.store.set_dispatch_stop(
+                f"trusted_restart_capacity_probe_failed:{type(error).__name__}"
+            )
+        else:
+            if restart_capacity.status != "AVAILABLE":
+                self.store.set_dispatch_stop("trusted_restart_capacity_insufficient")
+            else:
+                capacity_ready = True
+        if capacity_ready:
+            self.nodes_root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def callbacks(self) -> DagControllerCallbacks:
         return DagControllerCallbacks(
@@ -4578,12 +4962,21 @@ class ProductionFormalDagCallbackBuilder:
         from lightcone_spec.experiments.formal_single_operator_content import (
             load_trusted_single_operator_content_bundle,
         )
+        from lightcone_spec.experiments.formal_single_operator_protocol_lock import (
+            revalidate_trusted_single_operator_protocol_lock,
+        )
 
         protocol_lock = protocol_lock_from_dict(
             _read_canonical_json(
                 self.config.protocol_lock.absolute_path,
                 label="ProtocolLock",
             )
+        )
+        revalidate_trusted_single_operator_protocol_lock(
+            protocol_lock,
+            expected_content_bundle_path=self.config.content_source.absolute_path,
+            require_capacity_available=False,
+            revalidate_runtime_observations=False,
         )
         content = load_trusted_single_operator_content_bundle(
             self.config.content_source.absolute_path
@@ -4749,6 +5142,8 @@ class ProductionFormalDagCallbackBuilder:
                     node_materialization_output_path=node_path,
                     created_ns=self._clock(root, "materialization-clock.json"),
                     auxiliary_source_paths=supplied,
+                    require_capacity_available=False,
+                    revalidate_runtime_observations=False,
                 )
             except FormalSingleOperatorStageBlocked as error:
                 # The predecessor's negative/power decision was already
@@ -4798,11 +5193,41 @@ class ProductionFormalDagCallbackBuilder:
         node: str,
         node_materialization: ControllerArtifactBinding,
     ) -> DagExecutionPlan:
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            require_trusted_single_operator_ordinary_capacity,
+        )
         from lightcone_spec.experiments.formal_single_operator_stages import (
+            build_formal_single_operator_execution_source,
             load_formal_single_operator_execution_source,
             publish_formal_single_operator_execution_source,
         )
 
+        expected_source = None
+        zero_launch_demand = False
+        if node in _PREPARED_NODES:
+            from lightcone_spec.experiments.formal_single_operator_prerequisite_launch_producer import (
+                execution_source_prerequisite_launch_demands,
+            )
+
+            expected_source = build_formal_single_operator_execution_source(
+                node_materialization.absolute_path
+            )
+            zero_launch_demand = not execution_source_prerequisite_launch_demands(
+                expected_source
+            )
+        if not zero_launch_demand:
+            try:
+                require_trusted_single_operator_ordinary_capacity(
+                    self.capacity_authority_path,
+                    stage=node,
+                    running_commands=self.store.physical_commands(status="RUNNING"),
+                    store=self.store,
+                )
+            except (OSError, TypeError, RuntimeError, ValueError) as error:
+                raise FormalExperimentDagBlocked(
+                    f"{node}: trusted capacity blocked before execution "
+                    f"materialization: {type(error).__name__}"
+                ) from error
         self._require_predecessor_archive_boundary(node)
         root = self._node_root(node) / "execution"
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -4824,8 +5249,21 @@ class ProductionFormalDagCallbackBuilder:
             source.node != node
             or source.materialization_source.absolute_path
             != self.store.controller_node(node)["materialization_path"]
+            or (expected_source is not None and source != expected_source)
         ):
             raise ExperimentOperatorError("execution source differs from current node")
+        if zero_launch_demand:
+            result = DagExecutionPlan(
+                execution_source=ControllerArtifactBinding.bind(execution_source_path),
+                prepared_launch=None,
+                launches=(),
+            )
+            self._publish_plan_journal(journal_path, result)
+            return self._load_plan_journal(
+                journal_path,
+                expected_node=node,
+                expected_node_materialization=node_materialization,
+            )
         work_root = root / "work"
         if work_root.exists():
             _preserve_partial_directory(
@@ -5161,6 +5599,24 @@ class ProductionFormalDagCallbackBuilder:
         ):
             raise ValueError("resident group received a non-initial TP1 headline")
 
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            require_trusted_single_operator_resident_group_capacity,
+        )
+
+        try:
+            require_trusted_single_operator_resident_group_capacity(
+                self.capacity_authority_path,
+                stage=node,
+                commands=tuple(row.command for row in launches),
+                running_commands=self.store.physical_commands(status="RUNNING"),
+                store=self.store,
+            )
+        except (OSError, TypeError, RuntimeError, ValueError) as error:
+            raise FormalExperimentDagBlocked(
+                f"{node}: trusted resident-group capacity blocked before group "
+                f"materialization: {type(error).__name__}"
+            ) from error
+
         authority_matches = []
         for authority_binding in self._session_reset_authority_bindings():
             rebound, authority = (
@@ -5482,6 +5938,11 @@ class ProductionFormalDagCallbackBuilder:
             publish_formal_single_operator_admission,
         )
 
+        preflight_inputs = self._preflight_inputs_path()
+        if not preflight_inputs.is_file():
+            raise FormalExperimentDagBlocked(
+                f"{node}: exact preflight execution inputs are unavailable"
+            )
         prerequisites = self.prerequisite_resolver.launch_manifest_paths(
             node=node,
             execution_source_path=source_path,
@@ -5609,6 +6070,7 @@ class ProductionFormalDagCallbackBuilder:
                 )
                 plan = materialize_formal_single_operator_e5_failure_run_plan(
                     failure_execution_descriptor_path=descriptor_path,
+                    preflight_inputs_path=preflight_inputs,
                 )
                 plan_path = cell_root / "formal-serving-run-plan.json"
                 publish_formal_single_operator_admission(
@@ -5627,7 +6089,8 @@ class ProductionFormalDagCallbackBuilder:
                     prepared_downstream_run_plan_inputs_path=(
                         cell_root
                         / "formal-single-operator-prepared-downstream-inputs.json"
-                    )
+                    ),
+                    preflight_inputs_path=preflight_inputs,
                 )
                 plan_path = cell_root / "formal-serving-run-plan.json"
             launch_row = self._cell_launch(
@@ -5788,6 +6251,16 @@ class ProductionFormalDagCallbackBuilder:
             raise ExperimentOperatorError("formal retry node identity is ambiguous")
         controller = candidates[0]
         node = str(controller["node"])
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            require_trusted_single_operator_retry_capacity,
+        )
+
+        require_trusted_single_operator_retry_capacity(
+            self.capacity_authority_path,
+            store=self.store,
+            previous_command=previous_command,
+            stage=node,
+        )
         if node == "preflight":
             raise ExperimentOperatorError(
                 "preflight physical-group retries require group authority"
@@ -5933,6 +6406,7 @@ class ProductionFormalDagCallbackBuilder:
                 )
                 run_plan = materialize_formal_single_operator_e5_failure_run_plan(
                     failure_execution_descriptor_path=descriptor_path,
+                    preflight_inputs_path=self._preflight_inputs_path(),
                 )
                 run_plan_path = retry_root / "formal-serving-run-plan.json"
                 publish_formal_single_operator_admission(
@@ -5958,7 +6432,8 @@ class ProductionFormalDagCallbackBuilder:
                     prepared_downstream_run_plan_inputs_path=(
                         retry_root
                         / "formal-single-operator-prepared-downstream-inputs.json"
-                    )
+                    ),
+                    preflight_inputs_path=self._preflight_inputs_path(),
                 )
                 run_plan_path = retry_root / "formal-serving-run-plan.json"
         else:
@@ -6356,6 +6831,19 @@ class ProductionFormalDagCallbackBuilder:
                     group_kind=raw.get("group_kind", "preflight_exact_ten"),
                 )
             )
+        if expected_node in _PREPARED_NODES:
+            from lightcone_spec.experiments.formal_single_operator_prerequisite_launch_producer import (
+                execution_source_prerequisite_launch_demands,
+            )
+
+            zero_launch_demand = not execution_source_prerequisite_launch_demands(
+                source
+            )
+            empty_plan = prepared is None and not launches and not groups
+            if zero_launch_demand != empty_plan:
+                raise ValueError(
+                    "prepared execution journal differs from exact launch demand"
+                )
         return DagExecutionPlan(
             execution_source=execution,
             prepared_launch=prepared,
@@ -6891,7 +7379,17 @@ class ProductionFormalDagCallbackBuilder:
         for cell in materialization.cells:
             dimensions = dict(cell.dimensions)
             if cell.method_role != "LightCone" or any(
-                dimensions.get(name) != value for name, value in criteria.items()
+                (
+                    cell.model
+                    if name == "model"
+                    else cell.task
+                    if name == "task"
+                    else cell.backend
+                    if name == "backend"
+                    else dimensions.get(name)
+                )
+                != value
+                for name, value in criteria.items()
             ):
                 continue
             latest = self.store.latest_attempt(cell.cell_id)
@@ -6905,6 +7403,8 @@ class ProductionFormalDagCallbackBuilder:
                     int(latest["attempt"]),
                 )
             )
+        if not candidates and criteria:
+            raise ValueError("reducer metric has no exact COMPLETE provenance anchor")
         if not candidates:
             # Some non-serving descriptive reducers have no LightCone role.
             for cell in materialization.cells:
@@ -7444,6 +7944,15 @@ class ProductionFormalDagCallbackBuilder:
                 # E6/E0 auxiliary materialization deep-replays the campaign and
                 # its raw proofs on every downstream predecessor rebuild.
                 retained_transitive_roots.add(output)
+        if node == "preflight":
+            qualification_files, qualification_roots = (
+                _retained_preflight_qualification_dependencies(
+                    actual_result_paths,
+                    archive_candidate_root=next(iter(archive_roots)),
+                )
+            )
+            retained_paths.update(qualification_files)
+            retained_transitive_roots.update(qualification_roots)
         execution_path = row.get("execution_source_path")
         if type(execution_path) is str:
             from lightcone_spec.experiments.formal_single_operator_stages import (
@@ -7518,6 +8027,29 @@ class ProductionFormalDagCallbackBuilder:
             raise FormalExperimentDagBlocked(
                 f"{node}: pre-materialization GPU auxiliary executor is unavailable"
             )
+        if node in {"e6_pilot", "e0_tuning"}:
+            latest = self.store.latest_controller_auxiliary_group(node)
+            if latest is not None and latest["status"] == "FAILED":
+                raise FormalExperimentDagBlocked(
+                    f"{node}: automatic auxiliary retry is disabled by the "
+                    "zero-reserve capacity policy"
+                )
+            if latest is None or latest["status"] == "PENDING":
+                from lightcone_spec.experiments.formal_single_operator_capacity import (
+                    require_trusted_single_operator_operator_wave_capacity,
+                )
+
+                try:
+                    require_trusted_single_operator_operator_wave_capacity(
+                        self.capacity_authority_path,
+                        stage=node,
+                        store=self.store,
+                    )
+                except (OSError, TypeError, RuntimeError, ValueError) as error:
+                    raise FormalExperimentDagBlocked(
+                        f"{node}: trusted auxiliary capacity blocked before attempt "
+                        f"materialization: {type(error).__name__}"
+                    ) from error
         return self.auxiliary_runtime.plan(node, predecessor)
 
     def auxiliary_launch(self, spec: AuxiliaryPhysicalGroupSpec) -> SpawnedProcess:
@@ -7602,12 +8134,22 @@ def build_production_formal_dag_driver(
         interference_gate_resolver=interference_gate_resolver,
     )
     lock_path = Path(config.run_root) / "formal-dag-driver.lock"
+    runtime_callbacks = ProductionSchedulerRuntime(retry_builder=None).callbacks()
+    from lightcone_spec.experiments.formal_single_operator_capacity import (
+        trusted_single_operator_capacity_free_bytes,
+    )
+
+    runtime_callbacks = replace(
+        runtime_callbacks,
+        free_disk_bytes=lambda path: trusted_single_operator_capacity_free_bytes(
+            builder.capacity_authority_path,
+            path,
+        ),
+    )
     scheduler = FormalExperimentSchedulerDaemon(
         store,
         lock_path=lock_path,
-        callbacks=ProductionSchedulerRuntime(
-            retry_builder=builder.retry_attempt
-        ).callbacks(),
+        callbacks=runtime_callbacks,
     )
     return FormalSingleOperatorDagDriver(
         store=store,

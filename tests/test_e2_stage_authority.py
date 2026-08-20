@@ -208,6 +208,8 @@ def test_e2_evidence_is_path_bound_and_rejects_reused_artifact(tmp_path: Path) -
         run_nonce_sha256=_sha("nonce"),
         attempt_id="attempt-0",
         method="l0",
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     row = E2CellExecutionEvidence(
         schema_version=1,

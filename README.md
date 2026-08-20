@@ -27,13 +27,13 @@ an experiment, and a historical measurement does not become a formal result.
 | Truth field | Value | Scope |
 |---|---|---|
 | `formal_industrial_gpu_evidence` | `UNMEASURED` | Current schema-v3 formal evidence; no industrial performance claim is released. |
-| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | The release public trust root is configured, but fresh root-authorized source, model, hardware, control, and mandatory-preflight receipts do not yet exist; execution fails closed before mutation. |
+| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | The release-attested lane has a configured public trust root, but fresh root-authorized source, model, hardware, control, and mandatory-preflight receipts do not yet exist; that lane fails closed before mutation. |
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | The numerical snapshot below is historical engineering evidence only. |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | Operational state at archive time; the instance was shut down but not released or deleted. |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | Full Git commit pinned by the current patch manifest. |
-| `current_patched_sglang_tree` | `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2` | Full Git tree expected after applying the current patch series. |
-| `current_patch_payload_sha256` | `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95` | SHA-256 of the latest semantic mail-patch bytes. |
-| `current_patch_manifest_sha256` | `cc8355703fe83c8a73ecdbf9cd656140e257e69570fbfd8d8bc08f657e72fd71` | SHA-256 of the current canonical patch-manifest JSON. |
+| `current_patched_sglang_tree` | `bb6371242e82592d1b8a2f5f4ba6d0630d8365cb` | Full Git tree expected after applying the current patch series. |
+| `current_patch_payload_sha256` | `0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874` | SHA-256 of the latest semantic mail-patch bytes. |
+| `current_patch_manifest_sha256` | `ff2fbc43c89e9f476a3fcf5690ba4287c00d434ba4a0f8c1a5d10d77bf79e716` | SHA-256 of the current canonical patch-manifest JSON. |
 | `historical_main_code_prefix` | `0db2ff4` | Short code prefix bound only to the preliminary snapshot. |
 | `historical_patched_tree_prefix` | `e795ecc` | Short tree prefix bound only to the preliminary snapshot. |
 
@@ -41,6 +41,15 @@ The current commit, tree, patch payload, and manifest digest are distinct
 identity domains. The two seven-character historical prefixes are not current
 release identities and cannot satisfy any formal identity gate.
 <!-- RESULT_TRUTH_GATE_END -->
+
+Execution and claim authority are separate lanes. The trusted
+`formal_single_operator_v1` lane can run the complete empirical DAG without an
+external signer once its exact source/content/runtime, fresh GPU qualification,
+capacity, terminal, and coverage gates pass. Its unsigned closure is always
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`. A release-root signature is required only to promote eligible
+evidence to `MEASURED`; it is not an empirical-execution prerequisite for this
+trusted lane.
 
 ## Scope
 
@@ -66,19 +75,36 @@ The historical `TTS-paper-reconstruction` baseline remains diagnostic and
 code/config, and the paper does not fix all numerical fields. The formal path
 therefore uses a separate preregistered TTS-Cal authority. It fixes Adam, one
 optimization step, `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero weight decay,
-no clipping, full-drafter/latest-round-only updates, a digest-bound
-drafter-native position/proximal loss recipe, per-request reset, side stream,
+no clipping, full-drafter/latest-update-round-only updates, the pinned DFlash
+position-weighted target-to-draft KL, per-request reset, side stream,
 learning rates `1e-7, 3e-7, ..., 1e-3`, and strides
-`{1,5,10,15,20,30,40,50}`. Four excluded pilots reduce that grid with the
-registered safety-first rule; only the signed winner may freeze TTS and
-L0-naive. Before that seal both remain `BLOCKED`. Neither may inherit an E1/E2
-winner, schema default, or historical AdamW configuration. TTS publication is
-independently fixed to the paper's synchronization barrier.
+`{1,5,10,15,20,30,40,50}`. The code-owned split hashes every exact
+LiveCodeBench-v6-hard problem ID under a versioned namespace, excludes the four
+smallest hashes as pilots, and uses the complete complement for tuning. The
+schema-4 split is a post-master artifact: the schema-2 content ceremony forbids
+it, and its publisher later deep-revalidates the durable master receipt and
+exact replay reservation before binding the receipt SHA, verification time,
+and reservation SHA. A raw workload authorization cannot substitute for that
+receipt; schema-1 receipts remain readable only for historical replay. The
+executable loss is bound to the pinned DFlash patch: float32 target-to-draft
+forward KL, valid-row masking, position weights `exp(-(k-1)/7)`, masked weighted
+normalization with a denominator clamped to at least one, and temperature one.
+Its source-point correction preserves the inference forward value while using
+the differentiable surrogate Jacobian; there is no independent proximal
+penalty or tunable $\lambda$. These are fixed implementation semantics, not new
+TTS-Cal axes. The canonical Qwen3-8B/DFlash full-drafter Adam plan remains
+mandatory and arbitrary valid plans are rejected. Results are classified as a
+project-calibrated runtime baseline, not a paper reproduction.
 The [provenance authority](manifests/provenance/tts_recipe_authority_v1.json)
 binds arXiv `2605.09329v2`, PDF SHA-256
 `7688b05bab7696f4a47a5987f2fcad13d46f1d84cec9f90caf661fb397f3ee20`,
 and source SHA-256
 `22c549c0297fc0a2a71af002c3721f71ddfd06d86bc46b2f41592bd6748afe59`.
+ChronoBelief separately binds the project preregistration PDF SHA-256
+`2e79b6d6414d40b38d405f8165d80bb4efd354bf03b2f9ca53df23220435fc7c`
+and TeX SHA-256
+`941b891e85f7551360133fe13131b88ab0412ecf7f617d3fb959126af43d7d08`;
+foreign bytes are rejected.
 
 The target industrial registry covers DFlash and DSpark first, followed by
 production load, multi-GPU topology, native NEXTN preflight, and breadth
@@ -95,12 +121,15 @@ inverse-square-root, and finite-horizon cosine schedules plus non-negative
 logical publication delay; DSpark binds its actual predecessor, W1/W2 and
 confidence head; NEXTN binds its MTP teacher/interface and TP2 shard authority.
 The patch also exposes exact begin/reset/finalize terminal evidence and the
-host validates its content. These are implementation claims, not GPU results:
-the repository ships no trusted hardware signer and no fresh dynamic GPU
-qualification receipt. Static/TTS/L0-naive/LightCone and every adaptive
-backend/topology therefore remain non-claimable and fail release preflight
-before mutation. Generic EAGLE is unsupported, and EAGLE3 combinations without
-an official signed compatibility decision remain N/A or `BLOCKED`. A requested
+host validates its content. These are implementation claims, not GPU results.
+The release-attested lane has neither a configured trusted hardware signer nor
+fresh dynamic GPU qualification receipts, so Static/TTS/L0-naive/LightCone and
+every adaptive backend/topology remain non-claimable and fail that lane's
+preflight before mutation. This release-claim block does not stop the trusted
+single-operator empirical lane, which uses source-owned unsigned authorities
+and still requires the exact dynamic GPU, capacity, terminal, and coverage
+proofs. Generic EAGLE is unsupported, and EAGLE3 combinations without the
+applicable compatibility decision remain N/A or `BLOCKED`. A requested
 quota-shadow row is identity- and quota-recorded; unsupported acquisition is
 rejected instead of fabricating a teacher row.
 
@@ -496,9 +525,14 @@ the unfinished Target-only reference has no final JSON and must be rerun. The
   cannot authorize them. Multi-host execution remains independent host-local
   work only; cross-host collectives, world size greater than two, Kubernetes,
   elastic membership, and automatic failover remain unsupported.
-- TTS and L0-naive require the signed TTS-Cal winner. LightCone additionally
-  requires the sealed E2 final recipe. No method may inherit a result-derived
-  or legacy diagnostic recipe.
+- TTS and L0-naive require the exact content-sealed TTS-Cal winner. The
+  release-attested lane additionally signs that seal; the trusted
+  single-operator lane consumes its reducer-owned content identity without an
+  external signer. LightCone additionally requires the sealed E2 final recipe.
+  No method may inherit a result-derived or legacy diagnostic recipe. TTS-Cal
+  itself is executable once its exact source, post-master split, canonical
+  plan, pinned DFlash loss descriptor, and registered runtime gates are present;
+  there is no separate proximal-loss input.
 - ChronoBelief is registered with exact equations and state semantics, but it
   still requires the same runtime/GPU qualification as every adaptive recipe.
 - Historical KV remains frozen by design. Recomputing it requires a new

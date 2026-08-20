@@ -131,6 +131,8 @@ def _evidence_rows(
             run_nonce_sha256=_sha(f"nonce:{cell.cell_id}"),
             attempt_id="attempt-0",
             method=method,
+            runtime_trust_mode=None,
+            formal_measurement=None,
         )
         rows.append(
             E3aCellExecutionEvidence(

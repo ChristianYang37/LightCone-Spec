@@ -192,7 +192,7 @@ class DistributedRuntimeReleaseCapability:
 
 # A caller-authored digest never mutates this table, and a source entry alone
 # authorizes only diagnostic smoke, never formal execution.  Both entries bind
-# semantic patch 0007 and its resulting complete SGLang tree.
+# the complete semantic patch series and its resulting SGLang tree.
 DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES: Mapping[
     RuntimeTopologyMode, DistributedRuntimeReleaseCapability
 ] = MappingProxyType(
@@ -201,9 +201,9 @@ DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES: Mapping[
             schema_version=1,
             topology_mode=mode,
             pinned_sglang_commit="3312645a307453893a00778592f105581e3d1c3d",
-            patched_sglang_tree="c6571336b70cd5f0e0f609d731a65fa98fd7e0b2",
+            patched_sglang_tree="bb6371242e82592d1b8a2f5f4ba6d0630d8365cb",
             semantic_patch_sha256=(
-                "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+                "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"
             ),
             native_terminal_protocol_sha256=(
                 "5c3113405e0646e0fa61bbd054e690d588996982e2f57ded94d77b6e0c072e02"

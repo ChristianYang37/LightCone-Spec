@@ -24,12 +24,14 @@
 - 不得把源码支持或合法配置解释为 `READY`。Formal execution 仍须取得新的 root-authorized
   deployment/hardware policy，以及准确的 prepared-content、workload、compile、qualification、
   terminal、interference 与 capacity authorities；checkout 本身刻意不携带这些 session evidence；
-- TTS-Cal 固定 reconstruction grid 与语义：Adam 单步、
+- TTS-Cal 固定已注册的 reconstruction grid 与结构语义：Adam 单步、
   `(beta1=.9, beta2=.999, epsilon=1e-8)`、零 decay、不裁剪、全 drafter 且仅最新 round
-  更新、source-point proximal anchor、逐请求 reset、side stream、已注册 learning-rate grid
-  与八种 stride。TTS 与 L0-naive 在独立 tuning window 封存准确 winner 前仍为 `BLOCKED`；
-  若继承 E1/E2 authority、schema default 或历史 AdamW recipe 必须拒绝。Candidate equality
-  只适用于 source-state 与 proposal-evidence digest 都完全相同的受控 replay；
+  更新、逐请求 reset、side stream、已注册 learning-rate grid 与八种 stride。其 pinned
+  DFlash loss 是 temperature 1 的 float32 target-to-draft forward KL，使用 valid-row mask、
+  `exp(-(k-1)/7)` position weight 与 masked weighted normalization。source-point value
+  correction 不是独立 proximal penalty，因此没有 `lambda` 输入或额外搜索轴。若继承 E1/E2
+  authority、schema default 或历史 AdamW recipe 必须拒绝。Candidate equality 只适用于 source-state 与 proposal-evidence
+  digest 都完全相同的受控 replay；
 - Adaptation 是 `last1`、`last3`、`last5` 或 `all` 上的 Full/LoRA。LoRA 要求注册 rank 与
   `alpha/r=1`。借用 target parameter、量化或不属于 backend 的 coordinate 不能训练；
 - DSpark layer-only 与 `*_native_heads` hybrid 是已实现的源码 contract，但必须提供覆盖真实
@@ -82,6 +84,14 @@ Durable index 拒绝重复 request/round/update/performance key。Checkpoint、W
 coverage、final shard schema/digest 与 completion-receipt counter 必须一致。不要 rename、
 combine、truncate 或手工编辑 segment。
 
+Trusted single-operator v03 路径使用独立的 unsigned empirical schema-3 authority。初始
+31 GiB admission 准确等于一个 16 GiB physical wave 加 15 GiB safety margin。Fresh free
+space 已经反映被接管 RUNNING process 写入的 byte，因此 restart 会在 durable ledger 中
+绑定该 process，而不会再次计入其完整 lifetime high-water。容量不足只会 STOP 新 dispatch
+或把当前 DAG node durable BLOCKED；已有 RUNNING physical 或 E6/E0 auxiliary process 仍可
+reconcile。由于该路径没有可达的 failed-attempt archive producer，automatic retry 被禁用；
+应保留失败 evidence 并显式解除 blocker。
+
 中断后保留 WAL/checkpoint/aborted marker 供审计，并从相同 immutable cell resume。只跳过
 一个有效 exclusive terminal receipt。没有 receipt 的 final Parquet file，或同一 run/rank
 存在多个 completed attempt，都不是有效证据。
@@ -111,12 +121,16 @@ combine、truncate 或手工编辑 segment。
 
 ## 意外的 `UNMEASURED`、`BLOCKED` 或 `UNDERPOWERED`
 
-`UNMEASURED` 表示不存在合格 content-bound GPU evidence/attestation。正向 diagnostics、
-CPU mock、历史 v2 result 或 acceptance change 都不能改变它。当前新 GPU phase 保持
-`UNMEASURED`；Stage B 因缺少 trusted hardware signer、provider credential、immutable
-model/data/trace lock、已注册硬件、GPU smoke 与 interference evidence 而 `BLOCKED`。
-Static/TTS/L0-naive/LightCone、全部 DSpark/EAGLE/EAGLE3/NEXTN adaptive cell 与全部 TP2/DP2 cell 都
-blocked；只有 TP1/DP1 Target-only 可端到端执行。
+`UNMEASURED` 表示不存在合格的 release-attested content-bound GPU evidence。正向
+diagnostics、CPU mock、历史 v2 result 或 acceptance change 都不能改变它。在
+release-attested lane，Stage B 会在 trusted hardware signer、provider credential、immutable
+model/data/trace lock、已注册硬件、GPU smoke、interference evidence 与 capacity/terminal gate
+齐备前保持 `BLOCKED`。Trusted `formal_single_operator_v1` lane 不要求 external signer，但仍必须
+通过相应 source/content/runtime、fresh GPU qualification、capacity、terminal 与 coverage gate；
+其结论只能是 `trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与
+`UNMEASURED`。TP2/DP2、DSpark、NEXTN、native ITL 与 session reuse 仍分别等待准确 dynamic
+proof；TTS/L0-naive 要求准确 TTS-Cal seal，LightCone 要求 E2 seal，EAGLE3 要求适用
+compatibility decision。Source capability 不能把任何一项重标为 READY。
 
 `BLOCKED` 也是 registered cell prerequisite 或 attested criterion 失败时的正确结果。
 `UNDERPOWERED` 表示四个 excluded pilot block 无法按注册 power 选择 12--20 个 final block，

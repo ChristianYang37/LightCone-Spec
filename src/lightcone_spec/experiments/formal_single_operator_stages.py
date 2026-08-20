@@ -3552,7 +3552,7 @@ def _reduce_single_operator_tts_calibration(
         or len(grouped) != 72
         or any(len(rows) != 4 for rows in grouped.values())
     ):
-        raise ValueError("TTS-Cal candidate/pilot coverage differs")
+        raise ValueError("TTS-Cal candidate/technical-replicate coverage differs")
     feasible: dict[str, Fraction] = {}
     candidate_rows = []
     for candidate_id in sorted(grouped):
@@ -3570,7 +3570,9 @@ def _reduce_single_operator_tts_calibration(
             )
         }
         if len(learning_rates) != 1 or len(strides) != 1 or blocks != {0, 1, 2, 3}:
-            raise ValueError("TTS-Cal candidate does not have four exact pilots")
+            raise ValueError(
+                "TTS-Cal candidate does not have four exact technical replicates"
+            )
         scores = tuple(slo.goodput_tokens_per_second for _cell, slo, _obs in rows)
         mean = sum(scores, Fraction()) / len(scores)
         if not reasons:
@@ -6441,9 +6443,16 @@ def materialize_formal_single_operator_node(
     node_materialization_output_path: str | Path,
     created_ns: int,
     auxiliary_source_paths: Mapping[str, str | Path] | None = None,
+    require_capacity_available: bool = True,
+    revalidate_runtime_observations: bool = True,
 ) -> RebuiltFormalSingleOperatorNodeMaterialization:
     """Dispatch the next node through the closed code-owned materializer map."""
 
+    if (
+        type(require_capacity_available) is not bool
+        or type(revalidate_runtime_observations) is not bool
+    ):
+        raise TypeError("single-operator runtime replay policies must be boolean")
     spec = formal_single_operator_node_spec(node)
     predecessor = (
         None
@@ -6482,10 +6491,26 @@ def materialize_formal_single_operator_node(
     protocol_lock = protocol_lock_from_dict(
         protocol_lock_source.reopen(label="single-operator ProtocolLock")
     )
+    if protocol_lock.schema_version != 5:
+        raise ValueError(
+            "legacy ProtocolLock schema 4 is read-only and cannot materialize nodes"
+        )
+    if protocol_lock.schema_version == 5 and spec.ordinal == 0:
+        from lightcone_spec.experiments.formal_single_operator_protocol_lock import (
+            revalidate_trusted_single_operator_protocol_lock,
+        )
+
+        if content_source_path is None:
+            raise ValueError("trusted preflight requires --content-source")
+        revalidate_trusted_single_operator_protocol_lock(
+            protocol_lock,
+            expected_content_bundle_path=content_source_path,
+            require_capacity_available=require_capacity_available,
+            revalidate_runtime_observations=revalidate_runtime_observations,
+        )
     if spec.ordinal == 0:
         if protocol_lock.schema_version == 5:
-            if content_source_path is None:
-                raise ValueError("trusted preflight requires --content-source")
+            assert content_source_path is not None
             content_source_binding = (
                 FormalContentSourceBinding.bind_trusted_single_operator(
                     str(content_source_path)
@@ -6500,6 +6525,24 @@ def materialize_formal_single_operator_node(
             raise ValueError("downstream node cannot replace inherited content")
         assert predecessor is not None
         content_source_binding = predecessor.node_materialization.content_source_binding
+    if protocol_lock.schema_version == 5 and spec.ordinal != 0:
+        from lightcone_spec.experiments.formal_single_operator_protocol_lock import (
+            revalidate_trusted_single_operator_protocol_lock,
+        )
+
+        if (
+            type(content_source_binding) is not FormalContentSourceBinding
+            or content_source_binding.trusted_single_operator is None
+        ):
+            raise ValueError("trusted materializer lacks path-bound content")
+        revalidate_trusted_single_operator_protocol_lock(
+            protocol_lock,
+            expected_content_bundle_path=(
+                content_source_binding.trusted_single_operator.absolute_path
+            ),
+            require_capacity_available=require_capacity_available,
+            revalidate_runtime_observations=revalidate_runtime_observations,
+        )
     auxiliary_sources = bind_formal_single_operator_auxiliary_sources(
         node=node,
         source_paths=auxiliary_source_paths,

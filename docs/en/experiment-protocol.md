@@ -69,7 +69,7 @@ serial and formal measurements remain blocked.
 |---|---|---|
 | Preflight | source/runtime/model/data identity, exactness, HBM, telemetry, inventory/topology, audit-only session-reset schema, cache/HTTP/writer, and interference calibration | runtime envelope |
 | E3a | Target-only/Static context, regime, concurrency, and draft-width capacity | reference load, matched width, crossover and drift witness |
-| TTS-Cal | 288 disjoint tuning-only rows: 9 learning rates x 8 strides x 4 excluded pilots | one frozen TTS recipe |
+| TTS-Cal | 288 registered cells: 9 learning rates x 8 strides x 4 technical replicate blocks; every block replays the same 76-problem LCB-hard tuning complement, while four holdout problem IDs remain unscheduled | one frozen TTS recipe |
 | E1 | exactly 68 rows after E3a/TTS-Cal sealing | safe LC Pareto set and common load |
 | E2 | four successively materialized rounds; `n0=105g`, `n(k+1)=max(ceil(nk/4),21)`, plus four anchors per round | one sealed LightCone recipe |
 | E4 | 48 strength-2 screen rows, 96 local-factorial rows, and 3 isolated profiler rows | mechanism gate |
@@ -90,18 +90,41 @@ predecessor; no candidate may re-enter. Four fixed role anchors are added to
 each round, so the complete E2 count is `16 + sum(n0..n3)` rather than an eager
 sentinel matrix.
 
-The TTS reconstruction authority fixes Adam `(beta1=.9, beta2=.999,
+The project reconstruction registers Adam `(beta1=.9, beta2=.999,
 epsilon=1e-8, weight_decay=0)`, one update step, full-drafter training, no
-clipping, latest-round-only supervision, drafter-native position weights, a
-source-point proximal term, request reset, and a side stream. TTS-Cal crosses
-learning rates `1e-7, 3e-7, ..., 1e-3` with strides
-`1,5,10,15,20,30,40,50` over four excluded pilots. Selection is safety-first,
-then maximum SLO-goodput, and is signed before E1. TTS publishes at a fixed
-barrier; L0-naive consumes the identical frozen recipe/candidate bytes and
-changes only publication to first-ready. Neither may inherit an E2 winner.
+clipping, latest-update-round-only supervision, the pinned DFlash
+position-weighted target-to-draft KL, request reset, and a side stream. It
+crosses learning rates `1e-7, 3e-7, ...,
+1e-3` with strides `1,5,10,15,20,30,40,50`. The identity domain is every exact
+LCB-v6-hard match under the signed revision. Rows are ranked by the SHA-256 of
+the versioned selector namespace and canonical problem ID; the four smallest
+are holdout problem IDs that remain unscheduled in TTS-Cal, and the complete
+76-problem complement is tuning. Each of four independently identified
+technical replicate blocks replays that same complement. The window binds the
+namespace, ordered-domain digest, both ID partitions, exact source
+descriptor, and prompts. It is deliberately absent from the schema-2 master
+content ceremony and is published only afterward from that durable master
+receipt plus the path-reopened workload authority. Its schema-4 identity binds
+the receipt digest, recorded verification time, and exact replay-reservation
+identity. A raw workload authorization, caller-authored time, arbitrary valid
+window, or arbitrary valid trainable plan is not accepted.
 
-ChronoBelief is a project-owned preregistered optimizer. Its identity binds the
-four update equations, PDF/TeX digests, standard update-count bias correction,
+The executable authority binds the pinned DFlash implementation: float32
+target-to-draft forward KL, valid-row masking, position weights
+`exp(-(k-1)/7)`, temperature one, and masked weighted normalization with a
+clamped denominator. Its source-point value correction is a forward-value/
+surrogate-Jacobian construction, not an independent proximal penalty; no
+proximal $\lambda$ is an experiment input. TTS-Cal therefore runs exactly the
+registered 9 learning rates by 8 strides by 4 technical replicate blocks (288
+cells) on the fixed 76-problem tuning complement, with no added loss axis. TTS
+publishes at a fixed barrier; L0-naive consumes the
+identical frozen recipe/candidate bytes and changes only publication to
+first-ready. Neither may inherit an E2 winner. The result is a
+project-calibrated runtime baseline, not paper reproduction.
+
+ChronoBelief is a project-owned preregistered optimizer, not an external-paper
+reproduction. Its identity binds the four update equations, exact PDF/TeX
+digests, standard update-count bias correction,
 decoupled weight decay, and safe-boundary age `d_r`. Skip and abort leave
 moments and the update counter byte-identical; only a committed proposal may
 advance optimizer state.

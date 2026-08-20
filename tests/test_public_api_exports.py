@@ -6,12 +6,17 @@ from lightcone_spec import experiments, orchestration
 from lightcone_spec.experiments import (
     completion_authority,
     formal_gpu_hour_proof,
+    formal_method_authority,
     formal_preflight_coverage,
     formal_preflight_execution,
+    formal_single_operator_capacity,
     formal_single_operator_early_execution,
     formal_single_operator_gpu_hours,
+    formal_single_operator_model_registry,
     formal_single_operator_profiler,
+    formal_single_operator_protocol_lock,
     formal_single_operator_stages,
+    formal_single_operator_trainable_plan,
     formal_slo_metrics,
     gpu_fleet,
     gpu_hour_authority,
@@ -126,6 +131,12 @@ def test_experiment_public_api_exports_industrial_planning_and_pool() -> None:
             "revalidate_formal_preflight_stage_coverage_proof_artifact": (
                 formal_preflight_coverage.revalidate_formal_preflight_stage_coverage_proof_artifact
             ),
+            "build_code_owned_trusted_tts_calibration_tuning_window": (
+                formal_method_authority.build_code_owned_trusted_tts_calibration_tuning_window
+            ),
+            "publish_code_owned_trusted_tts_calibration_tuning_window": (
+                formal_method_authority.publish_code_owned_trusted_tts_calibration_tuning_window
+            ),
         }
     )
     expected.update(
@@ -145,6 +156,24 @@ def test_experiment_public_api_exports_industrial_planning_and_pool() -> None:
     )
     expected.update(
         {
+            name: getattr(formal_single_operator_capacity, name)
+            for name in formal_single_operator_capacity.__all__
+        }
+    )
+    expected.update(
+        {
+            name: getattr(formal_single_operator_model_registry, name)
+            for name in formal_single_operator_model_registry.__all__
+        }
+    )
+    expected.update(
+        {
+            name: getattr(formal_single_operator_protocol_lock, name)
+            for name in formal_single_operator_protocol_lock.__all__
+        }
+    )
+    expected.update(
+        {
             name: getattr(formal_single_operator_profiler, name)
             for name in formal_single_operator_profiler.__all__
         }
@@ -153,6 +182,12 @@ def test_experiment_public_api_exports_industrial_planning_and_pool() -> None:
         {
             name: getattr(formal_single_operator_stages, name)
             for name in formal_single_operator_stages.__all__
+        }
+    )
+    expected.update(
+        {
+            name: getattr(formal_single_operator_trainable_plan, name)
+            for name in formal_single_operator_trainable_plan.__all__
         }
     )
 

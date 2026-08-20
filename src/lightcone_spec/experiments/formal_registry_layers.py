@@ -52,6 +52,7 @@ from lightcone_spec.experiments.stage_decisions import (
     SignedE1SurvivorSelectionReceipt,
 )
 from lightcone_spec.experiments.stage_materialization import (
+    TTS_CAL_MATERIALIZATION_RULE,
     SignedStageCoverageReceipt,
     SignedStageMaterializationReceipt,
     StageMaterializationReceipt,
@@ -937,7 +938,7 @@ def validate_formal_precoverage_registry_state(
 
     phase_rules = {
         ("E3a", "capacity"): "exact_360_row_capacity_width_and_drift_grid",
-        ("TTS-Cal", "calibration"): "72_candidates_x_4_disjoint_excluded_pilots",
+        ("TTS-Cal", "calibration"): TTS_CAL_MATERIALIZATION_RULE,
         ("E1", "selection"): ("four_fixed_anchors_plus_32_geometries_x_2_optimizers"),
         ("E2", "round0"): "e2_round_0_105_per_geometry_plus_four_anchors",
         ("E2", "round1"): "e2_quarter_retention_floor_21_plus_four_anchors",

@@ -5076,6 +5076,7 @@ class ExperimentOperatorStore:
         group_id: str,
         *,
         terminals: Mapping[str, TerminalEvidence],
+        automatic_infrastructure_retry: bool = True,
         finished_at_ns: int | None = None,
     ) -> None:
         """Atomically fan one validated parent result into all logical terminals."""
@@ -5085,6 +5086,8 @@ class ExperimentOperatorStore:
             type(value) is not TerminalEvidence for value in terminals.values()
         ):
             raise TypeError("physical group terminals require exact terminal evidence")
+        if type(automatic_infrastructure_retry) is not bool:
+            raise TypeError("physical group automatic-retry policy must be boolean")
         terminal_by_cell = dict(terminals)
         finished = self._validated_time(finished_at_ns)
         with self._transaction():
@@ -5173,6 +5176,9 @@ class ExperimentOperatorStore:
                         if group_kind == "preflight_exact_ten"
                         else "RETRY_INFRASTRUCTURE_AUTOMATIC"
                         if terminal.failure_class == "INFRASTRUCTURE"
+                        and automatic_infrastructure_retry
+                        else "NO_RETRY_BUILDER_OR_LIMIT"
+                        if terminal.failure_class == "INFRASTRUCTURE"
                         else "NO_SCIENTIFIC_RETRY"
                     )
                 self._connection.execute(
@@ -5237,12 +5243,15 @@ class ExperimentOperatorStore:
         group_id: str,
         *,
         exception_type: str,
+        automatic_infrastructure_retry: bool = True,
         finished_at_ns: int | None = None,
     ) -> None:
         """Terminalize every logical row after one parent spawn failure."""
 
         _require_text(group_id, "physical attempt group ID")
         _require_text(exception_type, "physical group spawn exception type")
+        if type(automatic_infrastructure_retry) is not bool:
+            raise TypeError("physical group automatic-retry policy must be boolean")
         finished = self._validated_time(finished_at_ns)
         with self._transaction():
             group = self._connection.execute(
@@ -5270,6 +5279,8 @@ class ExperimentOperatorStore:
             retry_decision = (
                 "NO_BLIND_GROUP_RETRY"
                 if group_kind == "preflight_exact_ten"
+                else "NO_RETRY_BUILDER_OR_LIMIT"
+                if not automatic_infrastructure_retry
                 else "RETRY_INFRASTRUCTURE_AUTOMATIC"
             )
             for row in rows:
@@ -5309,6 +5320,7 @@ class ExperimentOperatorStore:
         failure_code: str,
         exclusion_reason: str,
         evidence_files: Mapping[str, str] | None = None,
+        automatic_infrastructure_retry: bool = True,
         finished_at_ns: int | None = None,
     ) -> None:
         """Terminalize a dead shared process lease without fake terminals."""
@@ -5318,6 +5330,8 @@ class ExperimentOperatorStore:
         if not failure_code.startswith("INFRASTRUCTURE:"):
             raise ValueError("physical group failure must be infrastructure-classified")
         _require_text(exclusion_reason, "physical group exclusion reason")
+        if type(automatic_infrastructure_retry) is not bool:
+            raise TypeError("physical group automatic-retry policy must be boolean")
         evidence = dict(evidence_files or {})
         for path, digest in evidence.items():
             _require_text(path, "physical group partial evidence path")
@@ -5362,6 +5376,8 @@ class ExperimentOperatorStore:
             retry_decision = (
                 "NO_BLIND_GROUP_RETRY"
                 if group_kind == "preflight_exact_ten"
+                else "NO_RETRY_BUILDER_OR_LIMIT"
+                if not automatic_infrastructure_retry
                 else "RETRY_INFRASTRUCTURE_AUTOMATIC"
             )
             for row in rows:
@@ -7125,11 +7141,39 @@ class FormalExperimentSchedulerDaemon:
             if selected is None:
                 break
             command, gpu_uuids = selected
-            free_bytes = self.callbacks.free_disk_bytes(command.monitored_path)
+            running_wave_high_water_bytes = sum(
+                row.predicted_high_water_bytes
+                for row in self.store.physical_commands(status="RUNNING")
+            )
+            try:
+                free_bytes = self.callbacks.free_disk_bytes(command.monitored_path)
+                if type(free_bytes) is not int or free_bytes < 0:
+                    raise ValueError(
+                        "scheduler free-disk callback returned invalid bytes"
+                    )
+            except Exception as error:  # noqa: BLE001 - filesystem trust boundary
+                reason = f"disk_capacity_probe_failed:{type(error).__name__}"
+                self.store.record_watchdog_event(
+                    event_type="DISPATCH_STOP_DISK_CAPACITY_PROBE_FAILED",
+                    severity="CRITICAL",
+                    cell_id=command.cell_id,
+                    attempt=command.attempt,
+                    payload={
+                        "exception_type": type(error).__name__,
+                        "monitored_path": command.monitored_path,
+                        "running_wave_high_water_bytes": (
+                            running_wave_high_water_bytes
+                        ),
+                    },
+                    occurred_at_ns=self._now(),
+                )
+                self.store.set_dispatch_stop(reason, stopped_at_ns=self._now())
+                state = "STOP"
+                break
             decision = evaluate_dispatch_disk_gate(
                 free_bytes=free_bytes,
                 predicted_next_wave_high_water_bytes=(
-                    command.predicted_high_water_bytes
+                    command.predicted_high_water_bytes + running_wave_high_water_bytes
                 ),
             )
             if decision.action == "STOP":
@@ -7201,6 +7245,9 @@ class FormalExperimentSchedulerDaemon:
                     self.store.fail_physical_attempt_group_spawn(
                         str(group["group_id"]),
                         exception_type=type(error).__name__,
+                        automatic_infrastructure_retry=(
+                            self.callbacks.retry_builder is not None
+                        ),
                         finished_at_ns=self._now(),
                     )
                     self._materialize_serving_group_retries(
@@ -7401,6 +7448,9 @@ class FormalExperimentSchedulerDaemon:
                         self.store.fail_physical_attempt_group_spawn(
                             str(group["group_id"]),
                             exception_type="START_RECEIPT_NOT_PUBLISHED",
+                            automatic_infrastructure_retry=(
+                                self.callbacks.retry_builder is not None
+                            ),
                             finished_at_ns=now,
                         )
                     self.store.record_watchdog_event(
@@ -7973,6 +8023,9 @@ class FormalExperimentSchedulerDaemon:
                             "resident_wrapper_exited_without_atomic_close_fanout"
                         ),
                         evidence_files=evidence,
+                        automatic_infrastructure_retry=(
+                            self.callbacks.retry_builder is not None
+                        ),
                         finished_at_ns=now,
                     )
                     self._materialize_serving_group_retries(group, commands)
@@ -8004,6 +8057,9 @@ class FormalExperimentSchedulerDaemon:
                     self.store.finish_physical_attempt_group(
                         str(group["group_id"]),
                         terminals=terminals,
+                        automatic_infrastructure_retry=(
+                            self.callbacks.retry_builder is not None
+                        ),
                         finished_at_ns=now,
                     )
                 except Exception as error:  # noqa: BLE001 - group atomic boundary
@@ -8262,6 +8318,9 @@ class FormalExperimentSchedulerDaemon:
                     else exclusion
                 ),
                 evidence_files=evidence,
+                automatic_infrastructure_retry=(
+                    self.callbacks.retry_builder is not None
+                ),
                 finished_at_ns=now_ns,
             )
             self._materialize_serving_group_retries(group, group_commands)

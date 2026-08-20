@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from lightcone_spec.experiments.registry import content_sha256
+from lightcone_spec.orchestration import native_terminal as native_terminal_module
 from lightcone_spec.orchestration.formal_terminal_shards import (
     reopen_scalable_client_request_lifecycle,
     reopen_scalable_formal_gang_itl_bundle,
@@ -17,14 +18,19 @@ from lightcone_spec.orchestration.formal_terminal_shards import (
     reopen_scalable_unsigned_native_itl_bundle,
 )
 from lightcone_spec.orchestration.native_terminal import (
+    NativeRequestSourcePointResets,
     NativeTerminalResultProjection,
     NativeTerminalResultProofArtifact,
+    NativeTerminalRunBinding,
     TerminalRequestExpectation,
     build_native_terminal_external_control_binding,
     canonical_sha256,
     derive_native_terminal_result_projection_from_verified_formal_control,
     validate_native_terminal_artifact,
     validate_native_terminal_result_proof_artifact,
+)
+from lightcone_spec.orchestration.native_terminal_gang import (
+    _logical_request_reset_projection,
 )
 from lightcone_spec.runtime.attestation import NO_TRUSTED_ATTESTERS
 from lightcone_spec.runtime.control_attestation import (
@@ -146,7 +152,34 @@ _LEGACY_RANK_TERMINAL_FIELDS = {
 _CURRENT_RANK_TERMINAL_FIELDS = _LEGACY_RANK_TERMINAL_FIELDS | {
     "client_lifecycle_sha256",
     "non_submitted_request_ids_sha256",
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "runtime_trust_mode",
+    "formal_measurement",
 }
+_CURRENT_GANG_AGGREGATE_FIELDS = {
+    "schema_version",
+    "kind",
+    "hook",
+    "protocol_sha256",
+    "topology",
+    "world_size",
+    "action",
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "decision",
+    "published_ranks",
+    "reason_code",
+    "cross_replica_gradient_collective",
+    "runtime_trust_mode",
+    "formal_measurement",
+    "rank_terminals",
+    "rank_terminal_sha256s",
+    "aggregate_sha256",
+}
+_CURRENT_GANG_RESET_FIELDS = _CURRENT_GANG_AGGREGATE_FIELDS | {"rank_reset_sha256s"}
 _NATIVE_ITL_POINTER_FIELDS = {
     "schema_version",
     "kind",
@@ -2115,38 +2148,45 @@ def _validate_distributed_raw(
         raise ValueError("formal distributed proof requires TP2 or DP2")
     if plan.inventory_sha256 != expected_inventory_sha256:
         raise ValueError("formal distributed plan uses another inventory")
+    receipt_value = receipt_binding.reopen()
+    if type(receipt_value) is not dict:
+        raise TypeError("formal distributed run receipt must be an object")
+    current_wire = "formal_gang_reset" in receipt_value
+    receipt_fields = {
+        "schema_version",
+        "kind",
+        "protocol_sha256",
+        "formal_execution_authorized",
+        "plan_sha256",
+        "execution_binding_sha256",
+        "formal_launch_admission",
+        "formal_launch_consumption",
+        "budget_consumption",
+        "launch_manifest",
+        "request_schedule_receipt",
+        "terminal",
+        "native_itl_pointers",
+        "formal_gang_terminal",
+        "lifecycle_timing",
+        "before_gpu_snapshot",
+        "ready_gpu_snapshot",
+        "after_gpu_snapshot",
+        "server_log",
+        "server_stdout",
+        "server_stderr",
+        "junit",
+        "server_process_id",
+        "process_exit_code",
+        "cleanup_kind",
+        "process_group_empty",
+        "phase_edges_ns",
+    }
+    if current_wire:
+        receipt_fields.add("formal_gang_reset")
     receipt = _object(
         "formal distributed run receipt",
-        receipt_binding.reopen(),
-        {
-            "schema_version",
-            "kind",
-            "protocol_sha256",
-            "formal_execution_authorized",
-            "plan_sha256",
-            "execution_binding_sha256",
-            "formal_launch_admission",
-            "formal_launch_consumption",
-            "budget_consumption",
-            "launch_manifest",
-            "request_schedule_receipt",
-            "terminal",
-            "native_itl_pointers",
-            "formal_gang_terminal",
-            "lifecycle_timing",
-            "before_gpu_snapshot",
-            "ready_gpu_snapshot",
-            "after_gpu_snapshot",
-            "server_log",
-            "server_stdout",
-            "server_stderr",
-            "junit",
-            "server_process_id",
-            "process_exit_code",
-            "cleanup_kind",
-            "process_group_empty",
-            "phase_edges_ns",
-        },
+        receipt_value,
+        receipt_fields,
     )
     if (
         receipt["schema_version"] != 1
@@ -2182,6 +2222,11 @@ def _validate_distributed_raw(
     )
     request_terminal = CanonicalJsonProofBinding.from_dict(receipt["terminal"])
     gang_terminal = CanonicalJsonProofBinding.from_dict(receipt["formal_gang_terminal"])
+    gang_reset = (
+        CanonicalJsonProofBinding.from_dict(receipt["formal_gang_reset"])
+        if current_wire
+        else None
+    )
     pointer_bundle = CanonicalJsonProofBinding.from_dict(receipt["native_itl_pointers"])
     lifecycle_binding = CanonicalJsonProofBinding.from_dict(receipt["lifecycle_timing"])
     before_binding = CanonicalJsonProofBinding.from_dict(receipt["before_gpu_snapshot"])
@@ -2240,6 +2285,11 @@ def _validate_distributed_raw(
         or lifecycle.get("terminal_sha256") != request_terminal.semantic_sha256
         or lifecycle.get("native_itl_pointer_sha256") != pointer_bundle.semantic_sha256
         or lifecycle.get("formal_gang_terminal_sha256") != gang_terminal.semantic_sha256
+        or (
+            current_wire
+            and lifecycle.get("formal_gang_reset_sha256") != gang_reset.semantic_sha256
+        )
+        or (not current_wire and "formal_gang_reset_sha256" in lifecycle)
         or lifecycle.get("phase_edges_ns") != receipt["phase_edges_ns"]
         or type(server_process_id) is not int
         or server_process_id < 1
@@ -2269,25 +2319,28 @@ def _validate_distributed_raw(
         )
     ):
         raise ValueError("formal distributed lifecycle/GPU lineage differs")
+    terminal_fields = {
+        "schema_version",
+        "kind",
+        "protocol_sha256",
+        "formal_execution_authorized",
+        "plan_sha256",
+        "formal_launch_admission",
+        "formal_launch_consumption",
+        "budget_consumption",
+        "capability_sha256",
+        "begin_sha256",
+        "reset_sha256",
+        "finalize_sha256",
+        "warmup_requests",
+        "scored_requests",
+    }
+    if current_wire:
+        terminal_fields.add("formal_gang_reset")
     terminal = _object(
         "formal distributed request terminal",
         reopen_scalable_formal_gang_request_terminal(request_terminal.reopen()),
-        {
-            "schema_version",
-            "kind",
-            "protocol_sha256",
-            "formal_execution_authorized",
-            "plan_sha256",
-            "formal_launch_admission",
-            "formal_launch_consumption",
-            "budget_consumption",
-            "capability_sha256",
-            "begin_sha256",
-            "reset_sha256",
-            "finalize_sha256",
-            "warmup_requests",
-            "scored_requests",
-        },
+        terminal_fields,
     )
     gang = reopen_scalable_formal_gang_terminal(gang_terminal.reopen())
     if type(gang) is not dict:
@@ -2297,8 +2350,13 @@ def _validate_distributed_raw(
     unsigned_gang.pop("aggregate_sha256")
     if (
         content_sha256(unsigned_gang) != aggregate
-        or terminal["schema_version"] != 1
-        or terminal["kind"] != "unsigned_formal_gang_request_terminal"
+        or terminal["schema_version"] != (2 if current_wire else 1)
+        or terminal["kind"]
+        != (
+            "unsigned_formal_gang_request_terminal_v2"
+            if current_wire
+            else "unsigned_formal_gang_request_terminal"
+        )
         or terminal["protocol_sha256"]
         != FORMAL_SERVING_PHYSICAL_DISPATCH_PROTOCOL_SHA256
         or terminal["formal_execution_authorized"] is not False
@@ -2310,8 +2368,35 @@ def _validate_distributed_raw(
         or CanonicalJsonProofBinding.from_dict(terminal["budget_consumption"])
         != budget_consumption
         or terminal["finalize_sha256"] != aggregate
+        or (
+            current_wire
+            and (
+                terminal["formal_gang_reset"] != gang_reset.to_dict()
+                or terminal["reset_sha256"]
+                != reopen_scalable_formal_gang_terminal(gang_reset.reopen()).get(
+                    "aggregate_sha256"
+                )
+            )
+        )
         or gang.get("kind") != "sglang_formal_gang_all_rank_terminal"
         or gang.get("protocol_sha256") != FORMAL_GANG_SERVING_PROTOCOL_SHA256
+        or (
+            current_wire
+            and (
+                gang.get("schema_version") != 2
+                or tuple(
+                    gang.get(name)
+                    for name in (
+                        "reset_scope",
+                        "request_admission_policy",
+                        "request_source_point_reset_protocol_sha256",
+                        "runtime_trust_mode",
+                        "formal_measurement",
+                    )
+                )
+                != _current_gang_binding_identity(plan.native_terminal_binding)
+            )
+        )
         or gang.get("action") != "formal_gang_finalize"
         or gang.get("topology") != plan.topology_mode
         or gang.get("decision") != "COMMITTED"
@@ -2353,6 +2438,33 @@ def _validate_distributed_raw(
         launch_consumption=launch_consumption,
         budget_consumption=budget_consumption,
     )
+    if current_wire:
+        assert gang_reset is not None
+        native_by_id = {
+            row.request_id: {
+                "request_id": row.request_id,
+                "input_token_ids": list(row.input_token_ids),
+                "output_token_ids": list(row.output_token_ids),
+                "terminal_status": row.terminal_status,
+                "terminal_reason": row.terminal_reason,
+                "submitted_to_server": True,
+            }
+            for row in (*warmup_requests, *requests)
+        }
+        reset_gang = _object(
+            "formal distributed current warmup reset",
+            reopen_scalable_formal_gang_terminal(gang_reset.reopen()),
+            _CURRENT_GANG_RESET_FIELDS,
+        )
+        if reset_gang["aggregate_sha256"] != terminal["reset_sha256"]:
+            raise ValueError("formal distributed current warmup reset digest differs")
+        _validate_current_gang_warmup_reset(
+            reset_gang,
+            plan=plan,
+            schedule_rows=tuple(formal_serving_request_schedule_rows(schedule)),
+            native_by_id=native_by_id,
+            pointer_by_id=native_itl_by_request,
+        )
     by_request = {row.request_id: row for row in requests}
     full_schedule_rows = {
         phase: [
@@ -2378,6 +2490,7 @@ def _validate_distributed_raw(
     updates_by_rank: list[tuple[FormalDistributedTerminalUpdateResult, ...]] = []
     performance_by_rank: list[dict[str, object]] = []
     observed_rank_digests: list[str] = []
+    request_resets_by_rank: list[NativeRequestSourcePointResets] = []
     for expected_rank, raw_rank in enumerate(rank_values):
         if type(raw_rank) is not dict:
             raise TypeError("formal distributed rank terminal is not an object")
@@ -2403,7 +2516,7 @@ def _validate_distributed_raw(
         ]
         local_request_ids = [row.request.request_id for row in local_schedule]
         if (
-            rank.get("schema_version") != 1
+            rank.get("schema_version") != (2 if current_wire else 1)
             or rank.get("kind") != "sglang_formal_gang_rank_terminal"
             or rank.get("hook") != "sglang.lightcone_formal_gang_serving.v1"
             or rank.get("protocol_sha256") != FORMAL_GANG_SERVING_PROTOCOL_SHA256
@@ -2420,6 +2533,20 @@ def _validate_distributed_raw(
             or rank.get("run_nonce_sha256")
             != plan.native_terminal_binding.run_nonce_sha256
             or rank.get("method") != plan.method
+            or (
+                current_wire
+                and tuple(
+                    rank.get(name)
+                    for name in (
+                        "reset_scope",
+                        "request_admission_policy",
+                        "request_source_point_reset_protocol_sha256",
+                        "runtime_trust_mode",
+                        "formal_measurement",
+                    )
+                )
+                != _current_gang_binding_identity(plan.native_terminal_binding)
+            )
             or rank.get("phase") != "scored"
             or rank.get("full_schedule_sha256") != full_schedule_sha256
             or rank.get("local_request_routes_sha256") != content_sha256(local_routes)
@@ -2428,14 +2555,18 @@ def _validate_distributed_raw(
             != content_sha256(local_request_ids)
             or type(native_state) is not dict
             or set(native_state)
-            != {
-                "scheduler",
-                "round_rows",
-                "update_rows",
-                "performance_counters",
-                "historical_kv_source_versions",
-                "adaptation",
-            }
+            != (
+                _CURRENT_GANG_NATIVE_STATE_FIELDS
+                if current_wire
+                else {
+                    "scheduler",
+                    "round_rows",
+                    "update_rows",
+                    "performance_counters",
+                    "historical_kv_source_versions",
+                    "adaptation",
+                }
+            )
             or content_sha256(native_state) != native_sha
         ):
             raise ValueError("formal distributed rank/native identity differs")
@@ -2478,9 +2609,21 @@ def _validate_distributed_raw(
         ):
             raise ValueError("formal distributed rank native evidence is incomplete")
         allocation_free = plan.method in {"target_only", "static"}
-        if allocation_free != (not update_rows):
+        if not current_wire and allocation_free != (not update_rows):
             raise ValueError("formal distributed update allocation identity differs")
-        if plan.topology_mode == "tp2_dp1":
+        if current_wire:
+            current_requests = _current_gang_request_expectations(
+                tuple(local_request_ids),
+                native_by_id=native_by_id,
+            )
+            request_resets_by_rank.append(
+                _validate_current_gang_native_state(
+                    native_state,
+                    binding=plan.native_terminal_binding,
+                    requests=current_requests,
+                )
+            )
+        elif plan.topology_mode == "tp2_dp1":
             adaptation = native_state.get("adaptation")
             if type(adaptation) is not dict:
                 raise ValueError("formal TP2 adaptation evidence is unavailable")
@@ -2517,6 +2660,33 @@ def _validate_distributed_raw(
         if len(updates_by_rank[-1]) != len(update_rows):
             raise TypeError("formal distributed update row is not an object")
         performance_by_rank.append(dict(performance))
+    if current_wire:
+        if len(request_resets_by_rank) != 2:
+            raise RuntimeError("formal distributed current reset ranks differ")
+        if plan.topology_mode == "tp2_dp1":
+            if _logical_request_reset_projection(
+                request_resets_by_rank[0]
+            ) != _logical_request_reset_projection(request_resets_by_rank[1]):
+                raise RuntimeError(
+                    "formal distributed current TP2 logical resets differ"
+                )
+        else:
+            local_ids = tuple(row.request.request_id for row in scored_schedule)
+            receipt_ids = tuple(
+                receipt.request_id
+                for resets in request_resets_by_rank
+                for receipt in resets.receipts
+            )
+            if (
+                len(local_ids) != len(set(local_ids))
+                or len(receipt_ids) != len(set(receipt_ids))
+                or (
+                    request_resets_by_rank[0].reset_scope == "request"
+                    and set(receipt_ids) != set(local_ids)
+                )
+                or (request_resets_by_rank[0].reset_scope != "request" and receipt_ids)
+            ):
+                raise RuntimeError("formal distributed current DP2 reset union differs")
     if plan.topology_mode == "tp2_dp1":
         for field in (
             "target_calls",
@@ -2597,6 +2767,611 @@ def _validate_distributed_raw(
     )
 
 
+_CURRENT_GANG_NATIVE_STATE_FIELDS = {
+    "scheduler",
+    "round_rows",
+    "update_rows",
+    "performance_counters",
+    "historical_kv_source_versions",
+    "request_source_point_resets",
+    "adaptation",
+}
+_CURRENT_ADAPTATION_DIAGNOSTICS_BASE_FIELDS = {
+    "schema_version",
+    "adaptation_config_sha256",
+    "optimizer_schedule",
+    "schedule_total_published_updates",
+    "extra_logical_delay",
+    "adaptation_microbatch_size",
+    "adaptation_publication_coalescing",
+    "adaptation_stream_priority",
+    "teacher_row_policy",
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "quota_shadow_protocol_sha256",
+    "tts_fixed_boundary_protocol_sha256",
+    "enabled",
+    "disabled_reason",
+    "cohort_sha256",
+    "cohort_epoch",
+    "request_epoch",
+    "active_request_id",
+    "request_reset_in_progress",
+    "request_reset_failed",
+    "request_evidence_archive_sha256",
+    "slot_generation",
+    "active_version",
+    "round",
+    "resident_bytes",
+    "peak_bytes",
+    "reserved_hbm_budget_bytes",
+    "peak_hbm_bytes",
+    "optimizer_bytes",
+    "trainable_parameters",
+    "memory_ledger",
+    "parameter_layout_sha256",
+    "runtime_authority",
+    "tp2_last_publication_receipt",
+    "dp2_replica_state",
+    "batch_fill",
+    "max_batch_size",
+    "queue_occupancy",
+    "max_queue_occupancy",
+    "graph_replay_hit_rate",
+    "native_commit_event_protocol_sha256",
+    "hot_path_blocking_d2h_count",
+    "hot_path_host_synchronize_count",
+    "exposed_update_ms",
+    "main_side_overlap_ratio",
+    "counters",
+    "timings_ms",
+    "updates",
+    "teacher_row_acquisitions",
+    "rounds",
+    "kv_segments",
+    "request_source_point_reset_receipts",
+}
+_CURRENT_DFLASH_DIAGNOSTICS_EXTRA_FIELDS = {
+    "fixed_inference_address_sha256",
+    "fixed_staging_address_sha256",
+    "online_spec_state",
+}
+_CURRENT_NATIVE_BACKEND_DIAGNOSTICS_EXTRA_FIELDS = {
+    "fixed_inference_address_sha256",
+    "fixed_staging_address_sha256",
+    "native_backend",
+    "native_model_interface_sha256",
+    "native_live_launch_count",
+    "native_last_source_tensor_shapes",
+    "native_last_feedback_source_version",
+    "dspark_native_head_names",
+    "dspark_selector_authority_sha256",
+    "dspark_selector_size",
+    "dspark_selector_candidate_id",
+    "nextn_mtp_interface_sha256",
+    "nextn_target_revision",
+    "nextn_drafter_revision",
+    "nextn_topology",
+    "eagle3_official_selector_status",
+    "eagle3_selector_binding_sha256",
+    "eagle3_selector_authority_mode",
+    "eagle3_e0_execution_authority_sha256",
+    "eagle3_compatibility_authority_sha256",
+    "eagle3_model_selector_sha256",
+    "eagle3_native_gpu_proof_sha256",
+    "eagle3_qualification_assignment_sha256",
+    "eagle3_qualification_dispatch_sha256",
+    "eagle3_target_revision",
+    "eagle3_drafter_revision",
+    "eagle3_live_model_interface_sha256",
+    "eagle3_native_source_identity_sha256",
+    "native_selector_sha256",
+}
+_CURRENT_RUNTIME_AUTHORITY_FIELDS = {
+    "proof_sha256",
+    "source_identity_sha256",
+    "topology_mode",
+    "topology_sha256",
+    "gpu_uuids",
+    "backend_capabilities",
+    "trust_mode",
+    "formal_measurement",
+    "qualification_only",
+    "trusted_authority_kind",
+    "trusted_authority_source_sha256",
+    "trusted_consumer_identity_sha256",
+    "trusted_evidence_sha256s",
+    "trusted_role_lineages",
+}
+_CURRENT_TRUSTED_ROLE_LINEAGE_FIELDS = {
+    "role",
+    "source_suite_id",
+    "source_capability_sha256",
+    "role_source_identity_sha256",
+}
+
+
+def _validate_current_runtime_authority(
+    value: object,
+    *,
+    binding: NativeTerminalRunBinding,
+) -> dict[str, object] | None:
+    if value is None:
+        if (
+            binding.runtime_trust_mode is not None
+            or binding.formal_measurement is not None
+        ):
+            raise RuntimeError("current gang runtime authority is missing")
+        return None
+    raw = _object(
+        "current gang runtime authority",
+        value,
+        _CURRENT_RUNTIME_AUTHORITY_FIELDS,
+    )
+    trust_mode, formal_measurement = (
+        native_terminal_module._validate_runtime_trust_identity(
+            method=binding.method,
+            runtime_trust_mode=raw["trust_mode"],
+            formal_measurement=raw["formal_measurement"],
+            field="current gang runtime authority",
+        )
+    )
+    if (
+        trust_mode != binding.runtime_trust_mode
+        or formal_measurement is not binding.formal_measurement
+        or type(raw["qualification_only"]) is not bool
+        or raw["qualification_only"]
+        is not (trust_mode == "qualification_empirical_no_signature")
+        or type(raw["gpu_uuids"]) is not list
+        or not raw["gpu_uuids"]
+        or len(raw["gpu_uuids"]) != len(set(raw["gpu_uuids"]))
+        or any(type(value) is not str or not value for value in raw["gpu_uuids"])
+        or type(raw["backend_capabilities"]) is not dict
+        or type(raw["trusted_evidence_sha256s"]) is not list
+        or type(raw["trusted_role_lineages"]) is not list
+    ):
+        raise RuntimeError("current gang runtime authority identity differs")
+    for name in (
+        "proof_sha256",
+        "source_identity_sha256",
+        "topology_sha256",
+    ):
+        _sha(f"current gang runtime authority {name}", raw[name])
+    trusted_mode = trust_mode == "trusted_single_operator_empirical_no_signature"
+    trusted_scalars = (
+        raw["trusted_authority_kind"],
+        raw["trusted_authority_source_sha256"],
+        raw["trusted_consumer_identity_sha256"],
+    )
+    if trusted_mode:
+        if (
+            any(type(value) is not str or not value for value in trusted_scalars)
+            or not raw["trusted_role_lineages"]
+            or not raw["trusted_evidence_sha256s"]
+            or raw["trusted_authority_kind"]
+            not in {"preflight_qualification", "e6_nextn", "e0_eagle3"}
+        ):
+            raise RuntimeError("trusted gang runtime authority lineage is incomplete")
+        _sha("current gang trusted authority source", trusted_scalars[1])
+        _sha("current gang trusted consumer", trusted_scalars[2])
+    elif (
+        trusted_scalars != (None, None, None)
+        or raw["trusted_evidence_sha256s"] != []
+        or raw["trusted_role_lineages"] != []
+    ):
+        raise RuntimeError("release/qualification runtime authority claims trust")
+    for value_sha256 in raw["trusted_evidence_sha256s"]:
+        _sha("current gang trusted runtime evidence", value_sha256)
+    if raw["trusted_evidence_sha256s"] != sorted(set(raw["trusted_evidence_sha256s"])):
+        raise RuntimeError("current gang trusted runtime evidence is not canonical")
+    roles: list[str] = []
+    for lineage_value in raw["trusted_role_lineages"]:
+        lineage = _object(
+            "current gang trusted role lineage",
+            lineage_value,
+            _CURRENT_TRUSTED_ROLE_LINEAGE_FIELDS,
+        )
+        for name in ("role", "source_suite_id"):
+            if type(lineage[name]) is not str or not lineage[name]:
+                raise ValueError(f"current gang trusted role {name} is invalid")
+        for name in ("source_capability_sha256", "role_source_identity_sha256"):
+            _sha(f"current gang trusted role {name}", lineage[name])
+        roles.append(str(lineage["role"]))
+    if roles != sorted(set(roles)) or (
+        trusted_mode
+        and roles
+        != [
+            "distributed",
+            "native",
+        ]
+    ):
+        raise RuntimeError("current gang trusted role lineages are not canonical")
+    if raw["topology_mode"] not in {"tp1_dp1", "tp2_dp1", "tp1_dp2"}:
+        raise ValueError("current gang runtime authority topology mode is invalid")
+    return raw
+
+
+def _current_gang_request_expectations(
+    request_ids: tuple[str, ...],
+    *,
+    native_by_id: dict[str, dict[str, object]],
+) -> tuple[TerminalRequestExpectation, ...]:
+    values: list[TerminalRequestExpectation] = []
+    for request_id in request_ids:
+        row = native_by_id[request_id]
+        submitted = row["submitted_to_server"]
+        outputs = row["output_token_ids"]
+        if type(submitted) is not bool or (submitted and type(outputs) is not list):
+            raise TypeError("current gang request submission/output shape differs")
+        values.append(
+            TerminalRequestExpectation(
+                request_id=request_id,
+                input_token_ids=tuple(row["input_token_ids"]),
+                output_token_ids=(None if outputs is None else tuple(outputs)),
+                terminal_status=str(row["terminal_status"]),
+                terminal_reason=str(row["terminal_reason"]),
+                submitted_to_server=submitted,
+            )
+        )
+    return tuple(values)
+
+
+def _current_gang_binding_identity(
+    binding: NativeTerminalRunBinding,
+) -> tuple[str, str, str | None, str | None, bool | None]:
+    reset_scope, request_admission_policy = native_terminal_module._wire_reset_identity(
+        binding
+    )
+    return (
+        reset_scope,
+        request_admission_policy,
+        (
+            None
+            if binding.method in {"target_only", "static"}
+            else native_terminal_module.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+        ),
+        binding.runtime_trust_mode,
+        binding.formal_measurement,
+    )
+
+
+def _validate_current_gang_native_state(
+    native_state: object,
+    *,
+    binding: NativeTerminalRunBinding,
+    requests: tuple[TerminalRequestExpectation, ...],
+) -> NativeRequestSourcePointResets:
+    if type(native_state) is not dict or set(native_state) != (
+        _CURRENT_GANG_NATIVE_STATE_FIELDS
+    ):
+        raise ValueError("current distributed native state is incomplete")
+    scheduler = native_terminal_module._validate_current_state_snapshot(
+        native_state["scheduler"],
+        binding=binding,
+        field="current distributed scheduler state",
+        clean=False,
+    )
+    performance = native_state["performance_counters"]
+    if (
+        type(performance) is not dict
+        or type(performance.get("peak_hbm_bytes")) is not int
+        or scheduler["allocator_peak_hbm_bytes"] != performance["peak_hbm_bytes"]
+    ):
+        raise RuntimeError("current distributed scheduler/performance peak differs")
+    request_resets = native_terminal_module._validate_request_source_point_resets(
+        native_state["request_source_point_resets"],
+        binding=binding,
+        requests=requests,
+    )
+    rounds, _historical_kv = native_terminal_module._validate_rounds_and_kv(
+        native_state["round_rows"],
+        native_state["historical_kv_source_versions"],
+        binding=binding,
+        requests=requests,
+        performance=None,
+        request_resets=request_resets,
+    )
+    updates = native_terminal_module._validate_updates(
+        native_state["update_rows"],
+        binding=binding,
+        rounds=rounds,
+        performance=None,
+        request_resets=request_resets,
+    )
+    native_terminal_module._validate_request_reset_row_coverage(
+        request_resets,
+        requests=requests,
+        rounds=rounds,
+        updates=updates,
+    )
+    acquired_epochs = tuple(
+        receipt.request_epoch
+        for receipt in request_resets.receipts
+        if receipt.adaptation_state_acquired
+    )
+    expected_request_epoch = max(acquired_epochs, default=0)
+    if scheduler["adapter_request_epoch"] != expected_request_epoch:
+        raise RuntimeError("current gang scheduler request epoch differs")
+    if request_resets.reset_scope == "request" and (
+        scheduler["adapter_active_request_id"] is not None
+        or scheduler["adapter_active_version"] != 0
+        or scheduler["adapter_source_round"] != 0
+        or scheduler["optimizer_generation"] != 0
+    ):
+        raise RuntimeError("current request-scoped gang state is not at source point")
+    adaptation = native_state["adaptation"]
+    if binding.method in {"target_only", "static"}:
+        if adaptation is not None:
+            raise RuntimeError("allocation-free gang state carries adaptation")
+    else:
+        if type(adaptation) is not dict:
+            raise TypeError("current gang adaptation diagnostics are malformed")
+        fields = set(adaptation)
+        accepted_fields = (
+            _CURRENT_ADAPTATION_DIAGNOSTICS_BASE_FIELDS
+            | _CURRENT_DFLASH_DIAGNOSTICS_EXTRA_FIELDS,
+            _CURRENT_ADAPTATION_DIAGNOSTICS_BASE_FIELDS
+            | _CURRENT_NATIVE_BACKEND_DIAGNOSTICS_EXTRA_FIELDS,
+        )
+        if fields not in accepted_fields:
+            raise ValueError("current gang adaptation diagnostics fields differ")
+        runtime_authority = _validate_current_runtime_authority(
+            adaptation["runtime_authority"],
+            binding=binding,
+        )
+        if (
+            adaptation["schema_version"] != 3
+            or adaptation["reset_scope"] != request_resets.reset_scope
+            or adaptation["request_admission_policy"]
+            != request_resets.request_admission_policy
+            or adaptation["request_source_point_reset_protocol_sha256"]
+            != request_resets.protocol_sha256
+            or adaptation["request_source_point_reset_receipts"]
+            != [receipt.to_dict() for receipt in request_resets.receipts]
+            or adaptation["request_evidence_archive_sha256"]
+            != request_resets.final_archive_sha256
+            or adaptation["request_epoch"] != expected_request_epoch
+            or type(adaptation["request_reset_in_progress"]) is not bool
+            or type(adaptation["request_reset_failed"]) is not bool
+            or adaptation["request_reset_in_progress"]
+            or adaptation["request_reset_failed"]
+            or type(adaptation["rounds"]) is not list
+            or type(adaptation["updates"]) is not list
+            or len(adaptation["rounds"]) != len(rounds)
+            or len(adaptation["updates"]) != len(updates)
+        ):
+            raise RuntimeError("current gang adaptation/reset identity differs")
+        if request_resets.reset_scope == "request" and (
+            adaptation["active_request_id"] is not None
+            or adaptation["active_version"] != 0
+            or adaptation["round"] != 0
+        ):
+            raise RuntimeError(
+                "current request-scoped adaptation is not at source point"
+            )
+        if runtime_authority is None and (
+            adaptation["runtime_authority"] is not None
+        ):  # pragma: no cover - validator postcondition
+            raise RuntimeError("current gang runtime authority normalization differs")
+    return request_resets
+
+
+def _validate_current_gang_warmup_reset(
+    gang: dict[str, object],
+    *,
+    plan: FormalServingRunPlan,
+    schedule_rows: tuple[object, ...],
+    native_by_id: dict[str, dict[str, object]],
+    pointer_by_id: dict[str, tuple[str, str]],
+) -> str:
+    aggregate = gang["aggregate_sha256"]
+    unsigned_gang = dict(gang)
+    unsigned_gang.pop("aggregate_sha256")
+    if (
+        canonical_sha256(unsigned_gang) != aggregate
+        or gang["schema_version"] != 2
+        or gang["kind"] != "sglang_formal_gang_all_rank_terminal"
+        or gang["hook"] != "sglang.lightcone_formal_gang_serving.v1"
+        or gang["protocol_sha256"] != FORMAL_GANG_SERVING_PROTOCOL_SHA256
+        or gang["action"] != "formal_gang_reset"
+        or gang["topology"] != plan.topology_mode
+        or gang["world_size"] != 2
+        or tuple(
+            gang[name]
+            for name in (
+                "reset_scope",
+                "request_admission_policy",
+                "request_source_point_reset_protocol_sha256",
+                "runtime_trust_mode",
+                "formal_measurement",
+            )
+        )
+        != _current_gang_binding_identity(plan.native_terminal_binding)
+        or gang["decision"] != "COMMITTED"
+        or gang["published_ranks"] != [0, 1]
+        or gang["reason_code"] is not None
+        or gang["cross_replica_gradient_collective"] is not False
+    ):
+        raise ValueError("current distributed warmup reset aggregate differs")
+    rank_values = gang["rank_terminals"]
+    rank_digests = gang["rank_terminal_sha256s"]
+    rank_reset_digests = gang["rank_reset_sha256s"]
+    if (
+        type(rank_values) is not list
+        or type(rank_digests) is not list
+        or type(rank_reset_digests) is not list
+        or len(rank_values) != 2
+        or len(rank_digests) != 2
+        or len(rank_reset_digests) != 2
+    ):
+        raise ValueError("current distributed warmup rank coverage differs")
+    for value_sha256 in rank_reset_digests:
+        _sha("current distributed warmup rank reset", value_sha256)
+    full_schedule = {
+        phase: [
+            {
+                "request_id": row.request.request_id,
+                "cohort_sha256": row.request.cohort_sha256,
+                "routed_dp_rank": row.routed_dp_rank,
+            }
+            for row in schedule_rows
+            if row.phase == phase
+        ]
+        for phase in ("warmup", "scored")
+    }
+    full_schedule_sha256 = content_sha256(full_schedule)
+    sticky_sha256 = content_sha256(
+        sorted(
+            {
+                row.request.cohort_sha256: row.routed_dp_rank for row in schedule_rows
+            }.items()
+        )
+    )
+    warmup_schedule = tuple(row for row in schedule_rows if row.phase == "warmup")
+    request_resets_by_rank: list[NativeRequestSourcePointResets] = []
+    submitted_ids_by_rank: list[tuple[str, ...]] = []
+    runtime_authority_sha256s: list[str] = []
+    for rank_index, raw_rank in enumerate(rank_values):
+        rank = _object(
+            "current distributed warmup rank terminal",
+            raw_rank,
+            _CURRENT_RANK_TERMINAL_FIELDS,
+        )
+        digest = _rank_terminal_digest(rank, require_client_lifecycle=False)
+        local_schedule = tuple(
+            row
+            for row in warmup_schedule
+            if plan.topology_mode == "tp2_dp1" or row.routed_dp_rank == rank_index
+        )
+        local_routes = [
+            {
+                "request_id": row.request.request_id,
+                "cohort_sha256": row.request.cohort_sha256,
+                "routed_dp_rank": row.routed_dp_rank,
+            }
+            for row in local_schedule
+        ]
+        local_ids = tuple(row.request.request_id for row in local_schedule)
+        native_state = rank["native_state"]
+        if (
+            digest != rank_digests[rank_index]
+            or rank["schema_version"] != 2
+            or rank["kind"] != "sglang_formal_gang_rank_terminal"
+            or rank["hook"] != "sglang.lightcone_formal_gang_serving.v1"
+            or rank["protocol_sha256"] != FORMAL_GANG_SERVING_PROTOCOL_SHA256
+            or rank["topology"] != plan.topology_mode
+            or rank["rank"] != rank_index
+            or rank["world_size"] != 2
+            or rank["gpu_uuid"] != plan.gpu_uuids[rank_index]
+            or rank["execution_plan_sha256"]
+            != plan.native_terminal_binding.execution_plan_sha256
+            or rank["rank_config_sha256"]
+            != plan.native_terminal_binding.rank_config_sha256
+            or rank["run_nonce_sha256"] != plan.native_terminal_binding.run_nonce_sha256
+            or rank["method"] != plan.method
+            or tuple(
+                rank[name]
+                for name in (
+                    "reset_scope",
+                    "request_admission_policy",
+                    "request_source_point_reset_protocol_sha256",
+                    "runtime_trust_mode",
+                    "formal_measurement",
+                )
+            )
+            != _current_gang_binding_identity(plan.native_terminal_binding)
+            or rank["phase"] != "warmup"
+            or rank["full_schedule_sha256"] != full_schedule_sha256
+            or rank["local_request_routes_sha256"] != content_sha256(local_routes)
+            or rank["sticky_cohort_routes_sha256"] != sticky_sha256
+            or rank["expected_request_ids_sha256"] != content_sha256(list(local_ids))
+            or rank["client_lifecycle_sha256"] is not None
+            or rank["non_submitted_request_ids_sha256"] is not None
+            or rank["status"] != "COMPLETE"
+            or rank["reason_code"] is not None
+            or type(native_state) is not dict
+            or content_sha256(native_state) != rank["native_state_sha256"]
+        ):
+            raise ValueError("current distributed warmup rank identity differs")
+        rank_requests = rank["request_terminals"]
+        rank_request_digests = rank["request_terminal_sha256s"]
+        if (
+            type(rank_requests) is not list
+            or type(rank_request_digests) is not list
+            or tuple(row.get("request_id") for row in rank_requests) != local_ids
+            or [content_sha256(row) for row in rank_requests] != rank_request_digests
+        ):
+            raise ValueError("current distributed warmup rank requests differ")
+        for rank_request in rank_requests:
+            if type(rank_request) is not dict:
+                raise TypeError("current distributed warmup request is malformed")
+            request_id = str(rank_request.get("request_id"))
+            native = native_by_id[request_id]
+            outputs = native["output_token_ids"]
+            if (
+                rank_request.get("input_token_ids") != native["input_token_ids"]
+                or rank_request.get("output_token_ids") != outputs
+                or rank_request.get("terminal_status") != native["terminal_status"]
+                or rank_request.get("terminal_reason") != native["terminal_reason"]
+                or type(outputs) is not list
+                or rank_request.get("native_itl_event_count") != len(outputs)
+                or request_id not in pointer_by_id
+                or rank_request.get("native_itl_events_sha256")
+                != pointer_by_id[request_id][1]
+            ):
+                raise ValueError("current distributed warmup request content differs")
+        requests = _current_gang_request_expectations(
+            local_ids,
+            native_by_id=native_by_id,
+        )
+        request_resets_by_rank.append(
+            _validate_current_gang_native_state(
+                native_state,
+                binding=plan.native_terminal_binding,
+                requests=requests,
+            )
+        )
+        adaptation = native_state["adaptation"]
+        runtime_authority_sha256s.append(
+            canonical_sha256(
+                None if adaptation is None else adaptation["runtime_authority"]
+            )
+        )
+        submitted_ids_by_rank.append(local_ids)
+    if len(set(runtime_authority_sha256s)) != 1:
+        raise RuntimeError("current warmup runtime authority differs by rank")
+    if plan.topology_mode == "tp2_dp1":
+        if submitted_ids_by_rank[0] != submitted_ids_by_rank[
+            1
+        ] or _logical_request_reset_projection(
+            request_resets_by_rank[0]
+        ) != _logical_request_reset_projection(request_resets_by_rank[1]):
+            raise RuntimeError("current warmup TP2 logical resets differ by rank")
+    else:
+        flattened = tuple(
+            request_id for rows in submitted_ids_by_rank for request_id in rows
+        )
+        reset_ids = tuple(
+            receipt.request_id
+            for resets in request_resets_by_rank
+            for receipt in resets.receipts
+        )
+        if (
+            len(flattened) != len(set(flattened))
+            or len(reset_ids) != len(set(reset_ids))
+            or (
+                request_resets_by_rank[0].reset_scope == "request"
+                and (
+                    len(reset_ids) != len(flattened) or set(reset_ids) != set(flattened)
+                )
+            )
+            or (request_resets_by_rank[0].reset_scope != "request" and reset_ids)
+        ):
+            raise RuntimeError("current warmup DP2 reset union differs")
+    return runtime_authority_sha256s[0]
+
+
 def _validate_current_distributed_raw(
     *,
     plan_binding: CanonicalJsonProofBinding,
@@ -2646,6 +3421,7 @@ def _validate_current_distributed_raw(
             "client_request_lifecycle",
             "terminal",
             "native_itl_pointers",
+            "formal_gang_reset",
             "formal_gang_terminal",
             "lifecycle_timing",
             "before_gpu_snapshot",
@@ -2755,13 +3531,14 @@ def _validate_current_distributed_raw(
             "begin_sha256",
             "reset_sha256",
             "finalize_sha256",
+            "formal_gang_reset",
             "warmup_requests",
             "scored_requests",
         },
     )
     if (
-        terminal["schema_version"] != 1
-        or terminal["kind"] != "unsigned_formal_gang_request_terminal"
+        terminal["schema_version"] != 2
+        or terminal["kind"] != "unsigned_formal_gang_request_terminal_v2"
         or terminal["protocol_sha256"]
         != FORMAL_SERVING_PHYSICAL_DISPATCH_PROTOCOL_SHA256
         or terminal["formal_execution_authorized"] is not False
@@ -2777,6 +3554,14 @@ def _validate_current_distributed_raw(
         != launch_lineage
     ):
         raise ValueError("current distributed request terminal lineage differs")
+    reset_binding = CanonicalJsonProofBinding.from_dict(receipt["formal_gang_reset"])
+    if terminal["formal_gang_reset"] != reset_binding.to_dict():
+        raise ValueError("current distributed warmup reset binding differs")
+    reset_gang = _object(
+        "current distributed warmup reset",
+        reopen_scalable_formal_gang_terminal(reset_binding.reopen()),
+        _CURRENT_GANG_RESET_FIELDS,
+    )
     native_by_id: dict[str, dict[str, object]] = {}
     for phase in ("warmup", "scored"):
         raw_phase = terminal[f"{phase}_requests"]
@@ -2895,22 +3680,50 @@ def _validate_current_distributed_raw(
     if set(pointer_by_id) != completed_ids:
         raise ValueError("current distributed completed pointer coverage differs")
 
+    if reset_gang["aggregate_sha256"] != terminal["reset_sha256"]:
+        raise ValueError("current distributed warmup reset digest differs")
+    warmup_runtime_authority_sha256 = _validate_current_gang_warmup_reset(
+        reset_gang,
+        plan=plan,
+        schedule_rows=schedule_rows,
+        native_by_id=native_by_id,
+        pointer_by_id=pointer_by_id,
+    )
+
     gang_binding = CanonicalJsonProofBinding.from_dict(receipt["formal_gang_terminal"])
-    gang = reopen_scalable_formal_gang_terminal(gang_binding.reopen())
-    if type(gang) is not dict:
-        raise TypeError("current distributed gang terminal must be an object")
+    gang = _object(
+        "current distributed gang terminal",
+        reopen_scalable_formal_gang_terminal(gang_binding.reopen()),
+        _CURRENT_GANG_AGGREGATE_FIELDS,
+    )
     aggregate = gang.get("aggregate_sha256")
     unsigned_gang = dict(gang)
     unsigned_gang.pop("aggregate_sha256", None)
     if (
         type(aggregate) is not str
         or canonical_sha256(unsigned_gang) != aggregate
+        or gang.get("schema_version") != 2
+        or gang.get("kind") != "sglang_formal_gang_all_rank_terminal"
+        or gang.get("hook") != "sglang.lightcone_formal_gang_serving.v1"
         or gang.get("protocol_sha256") != FORMAL_GANG_SERVING_PROTOCOL_SHA256
         or gang.get("action") != "formal_gang_finalize"
         or gang.get("topology") != plan.topology_mode
+        or gang.get("world_size") != 2
+        or tuple(
+            gang[name]
+            for name in (
+                "reset_scope",
+                "request_admission_policy",
+                "request_source_point_reset_protocol_sha256",
+                "runtime_trust_mode",
+                "formal_measurement",
+            )
+        )
+        != _current_gang_binding_identity(plan.native_terminal_binding)
         or gang.get("decision") != "COMMITTED"
         or gang.get("published_ranks") != [0, 1]
         or gang.get("reason_code") is not None
+        or gang.get("cross_replica_gradient_collective") is not False
         or terminal["finalize_sha256"] != aggregate
     ):
         raise ValueError("current distributed gang aggregate differs")
@@ -2944,6 +3757,9 @@ def _validate_current_distributed_raw(
         )
     )
     scored_schedule = tuple(row for row in schedule_rows if row.phase == "scored")
+    request_resets_by_rank: list[NativeRequestSourcePointResets] = []
+    submitted_ids_by_rank: list[tuple[str, ...]] = []
+    runtime_authority_sha256s: list[str] = []
     for rank_index, raw_rank in enumerate(rank_values):
         rank = _object(
             "current distributed rank terminal",
@@ -2978,6 +3794,9 @@ def _validate_current_distributed_raw(
         native_state = rank["native_state"]
         if (
             digest != rank_digests[rank_index]
+            or rank["schema_version"] != 2
+            or rank["kind"] != "sglang_formal_gang_rank_terminal"
+            or rank["hook"] != "sglang.lightcone_formal_gang_serving.v1"
             or rank["protocol_sha256"] != FORMAL_GANG_SERVING_PROTOCOL_SHA256
             or rank["topology"] != plan.topology_mode
             or rank["rank"] != rank_index
@@ -2989,6 +3808,17 @@ def _validate_current_distributed_raw(
             != plan.native_terminal_binding.rank_config_sha256
             or rank["run_nonce_sha256"] != plan.native_terminal_binding.run_nonce_sha256
             or rank["method"] != plan.method
+            or tuple(
+                rank[name]
+                for name in (
+                    "reset_scope",
+                    "request_admission_policy",
+                    "request_source_point_reset_protocol_sha256",
+                    "runtime_trust_mode",
+                    "formal_measurement",
+                )
+            )
+            != _current_gang_binding_identity(plan.native_terminal_binding)
             or rank["phase"] != "scored"
             or rank["full_schedule_sha256"] != full_schedule_sha256
             or rank["local_request_routes_sha256"] != content_sha256(local_routes)
@@ -3037,15 +3867,58 @@ def _validate_current_distributed_raw(
                 "current distributed rank ITL events",
                 rank_request.get("native_itl_events_sha256"),
             )
-        if set(native_state) != {
-            "scheduler",
-            "round_rows",
-            "update_rows",
-            "performance_counters",
-            "historical_kv_source_versions",
-            "adaptation",
-        }:
-            raise ValueError("current distributed native state is incomplete")
+        requests = _current_gang_request_expectations(
+            local_ids,
+            native_by_id=native_by_id,
+        )
+        request_resets_by_rank.append(
+            _validate_current_gang_native_state(
+                native_state,
+                binding=plan.native_terminal_binding,
+                requests=requests,
+            )
+        )
+        adaptation = native_state["adaptation"]
+        runtime_authority_sha256s.append(
+            canonical_sha256(
+                None if adaptation is None else adaptation["runtime_authority"]
+            )
+        )
+        submitted_ids_by_rank.append(submitted_ids)
+
+    if (
+        len(set(runtime_authority_sha256s)) != 1
+        or runtime_authority_sha256s[0] != warmup_runtime_authority_sha256
+    ):
+        raise RuntimeError("current distributed runtime authority differs by rank")
+    if plan.topology_mode == "tp2_dp1":
+        if submitted_ids_by_rank[0] != submitted_ids_by_rank[
+            1
+        ] or _logical_request_reset_projection(
+            request_resets_by_rank[0]
+        ) != _logical_request_reset_projection(request_resets_by_rank[1]):
+            raise RuntimeError("current TP2 logical request resets differ by rank")
+    else:
+        flattened = tuple(
+            request_id for rows in submitted_ids_by_rank for request_id in rows
+        )
+        reset_ids = tuple(
+            receipt.request_id
+            for resets in request_resets_by_rank
+            for receipt in resets.receipts
+        )
+        if (
+            len(flattened) != len(set(flattened))
+            or len(reset_ids) != len(set(reset_ids))
+            or (
+                request_resets_by_rank[0].reset_scope == "request"
+                and (
+                    len(reset_ids) != len(flattened) or set(reset_ids) != set(flattened)
+                )
+            )
+            or (request_resets_by_rank[0].reset_scope != "request" and reset_ids)
+        ):
+            raise RuntimeError("current DP2 sticky request reset union differs")
 
     lifecycle_binding = CanonicalJsonProofBinding.from_dict(receipt["lifecycle_timing"])
     lifecycle = lifecycle_binding.reopen()
@@ -3055,6 +3928,7 @@ def _validate_current_distributed_raw(
         != client_binding.semantic_sha256
         or lifecycle.get("terminal_sha256") != terminal_binding.semantic_sha256
         or lifecycle.get("native_itl_pointer_sha256") != pointer_binding.semantic_sha256
+        or lifecycle.get("formal_gang_reset_sha256") != reset_binding.semantic_sha256
         or lifecycle.get("formal_gang_terminal_sha256") != gang_binding.semantic_sha256
     ):
         raise ValueError("current distributed lifecycle lineage differs")

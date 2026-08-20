@@ -37,18 +37,23 @@ from .parameters import (
 )
 from .plan_authority import (
     DSparkNativeHeadNames,
+    E1RecipeAnchorTrainablePlanSemantics,
     PreparedDrafterParameterInventory,
     PreparedParameterMetadata,
     TrainablePlanAuthorityBinding,
     TrainablePlanAuthorityResult,
     TrainablePlanRawJsonBinding,
+    TtsCalibrationTrainablePlanSemantics,
     audit_trainable_plan_authority_for_method,
     bind_trainable_plan_authority,
+    build_e1_recipe_anchor_trainable_plan_semantics,
+    build_tts_calibration_trainable_plan_semantics,
     materialize_trainable_plan_authority_manifest,
     replay_trainable_plan_authority,
     require_trainable_plan_authority_for_method,
     trainable_plan_authority_binding_from_dict,
     trainable_plan_authority_binding_to_dict,
+    trainable_plan_cell_source_to_dict,
 )
 
 __all__ = [
@@ -71,6 +76,7 @@ __all__ = [
     "DFlashParameterPlan",
     "DSparkNativeHeadNames",
     "DSparkParameterPlan",
+    "E1RecipeAnchorTrainablePlanSemantics",
     "FixedAddressBank",
     "FrozenKVHistory",
     "GPUOptimizer",
@@ -93,11 +99,15 @@ __all__ = [
     "TrainablePlanAuthorityBinding",
     "TrainablePlanAuthorityResult",
     "TrainablePlanRawJsonBinding",
+    "TtsCalibrationTrainablePlanSemantics",
     "audit_trainable_plan_authority_for_method",
     "bind_trainable_plan_authority",
+    "build_e1_recipe_anchor_trainable_plan_semantics",
+    "build_tts_calibration_trainable_plan_semantics",
     "materialize_trainable_plan_authority_manifest",
     "replay_trainable_plan_authority",
     "require_trainable_plan_authority_for_method",
     "trainable_plan_authority_binding_from_dict",
     "trainable_plan_authority_binding_to_dict",
+    "trainable_plan_cell_source_to_dict",
 ]

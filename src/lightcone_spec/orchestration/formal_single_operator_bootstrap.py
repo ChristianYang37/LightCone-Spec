@@ -284,6 +284,7 @@ class FormalSingleOperatorBootstrapSupervisor:
 
     def _publish_prerequisites(self) -> tuple[str, ...]:
         from lightcone_spec.experiments.formal_single_operator_prerequisite_launch_producer import (
+            execution_source_prerequisite_launch_demands,
             publish_formal_single_operator_prerequisite_launch_index,
         )
         from lightcone_spec.experiments.formal_single_operator_stages import (
@@ -300,6 +301,11 @@ class FormalSingleOperatorBootstrapSupervisor:
             if node not in _PREPARED_NODES or not source_path:
                 continue
             source = load_formal_single_operator_execution_source(source_path)
+            if not execution_source_prerequisite_launch_demands(source):
+                # The only legal empty demand is the deeply replayed E0 V=0
+                # chain.  It has no prerequisite index and creates no bootstrap
+                # publication/work directory.
+                continue
             if self._prerequisite_exists(
                 node=node,
                 source_sha256=source.sha256,
@@ -452,6 +458,9 @@ class FormalSingleOperatorBootstrapSupervisor:
     def _catalog_ready_blocked_nodes(self) -> tuple[str, ...]:
         """Recover the narrow publish-before-resume crash window."""
 
+        from lightcone_spec.experiments.formal_single_operator_prerequisite_launch_producer import (
+            execution_source_prerequisite_launch_demands,
+        )
         from lightcone_spec.experiments.formal_single_operator_stages import (
             load_formal_single_operator_execution_source,
         )
@@ -473,7 +482,9 @@ class FormalSingleOperatorBootstrapSupervisor:
                 if source_path is None:
                     continue
                 source = load_formal_single_operator_execution_source(source_path)
-                if self._prerequisite_exists(
+                if not execution_source_prerequisite_launch_demands(
+                    source
+                ) or self._prerequisite_exists(
                     node=node,
                     source_sha256=source.sha256,
                 ):

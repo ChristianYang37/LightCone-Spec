@@ -311,6 +311,8 @@ def _subject_and_binding(
         run_nonce_sha256=run_nonce_sha256,
         attempt_id=attempt_id,
         method=method,
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     subject = FormalServingExecutionSubject(
         schema_version=4,
@@ -382,6 +384,22 @@ def _subject_and_binding(
         previous_run_id=None,
         challenge_nonce_sha256=_sha(f"challenge:{suffix}"),
         method=method,
+        reset_scope=(
+            "request"
+            if cell.method_role in {"TTS", "L0-naive", "TTS-calibration-candidate"}
+            else "cohort"
+            if method not in {"target_only", "static"}
+            else None
+        ),
+        request_admission_policy=(
+            "serialized_native_scheduler_v1"
+            if cell.method_role in {"TTS", "L0-naive", "TTS-calibration-candidate"}
+            else "cohort_batching_v1"
+            if method not in {"target_only", "static"}
+            else None
+        ),
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(f"warmup-{suffix}",),
         scored_request_ids=(f"scored-{suffix}",),
     )
@@ -1353,7 +1371,7 @@ def test_staged_projection_protocol_covers_every_early_dag_stage(
                             {
                                 varying_dimension: index,
                                 **(
-                                    {"pilot_phase": "excluded"}
+                                    {"replicate_phase": "technical"}
                                     if stage == "TTS-Cal"
                                     else {}
                                 ),

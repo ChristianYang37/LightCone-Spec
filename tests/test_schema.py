@@ -22,6 +22,15 @@ from lightcone_spec.sglang_bridge.config import (
 
 
 def config_value(method: str = "tts") -> dict:
+    reset_scope, request_admission_policy = {
+        "tts": ("request", "serialized_native_scheduler_v1"),
+        "l0": ("cohort", "cohort_batching_v1"),
+        "onlinespec_ogd": ("cohort", "cohort_batching_v1"),
+        "onlinespec_opt": ("cohort", "cohort_batching_v1"),
+        "onlinespec_ens": ("cohort", "cohort_batching_v1"),
+        "target_only": ("cohort", "cohort_batching_v1"),
+        "static": ("cohort", "cohort_batching_v1"),
+    }[method]
     value = {
         "schema_version": 3,
         "method": method,
@@ -48,6 +57,8 @@ def config_value(method: str = "tts") -> dict:
             "parameter_scope": "all",
             "kv_history_policy": "frozen",
             "adaptation_scope": "cohort",
+            "reset_scope": reset_scope,
+            "request_admission_policy": request_admission_policy,
             "adaptation_group_id": "confirmation-a",
             "optimizer": {
                 "name": "adamw",
@@ -188,7 +199,42 @@ def test_formal_adaptation_payload_is_schema_v3(method: str) -> None:
     assert payload["method"] == method
     assert payload["algorithm"] == "DFLASH"
     assert payload["kv_history_policy"] == "frozen"
+    assert payload["reset_scope"] == ("request" if method == "tts" else "cohort")
+    assert payload["request_admission_policy"] == (
+        "serialized_native_scheduler_v1" if method == "tts" else "cohort_batching_v1"
+    )
     assert len(sglang_adaptation_sha256(config) or "") == 64
+
+
+def test_reset_scope_and_request_admission_policy_are_explicit_and_atomic() -> None:
+    missing = config_value("tts")
+    missing["adaptation"].pop("reset_scope")
+    with pytest.raises(ValidationError):
+        RunConfig.model_validate(missing)
+
+    mismatched = config_value("l0")
+    mismatched["adaptation"]["request_admission_policy"] = (
+        "serialized_native_scheduler_v1"
+    )
+    with pytest.raises(ValidationError, match="reset scope.*admission policy"):
+        RunConfig.model_validate(mismatched)
+
+    tts_cohort = config_value("tts")
+    tts_cohort["adaptation"].update(
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
+    )
+    with pytest.raises(ValidationError, match="TTS requires request-reset"):
+        RunConfig.model_validate(tts_cohort)
+
+    l0_request = config_value("l0")
+    l0_request["adaptation"].update(
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
+    )
+    parsed = RunConfig.model_validate(l0_request)
+    assert parsed.adaptation is not None
+    assert parsed.adaptation.reset_scope == "request"
 
 
 @pytest.mark.parametrize(

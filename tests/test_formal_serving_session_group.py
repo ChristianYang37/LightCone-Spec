@@ -77,6 +77,8 @@ def _config(
         adaptation = AdaptationConfig(
             weight_update_mode="full",
             parameter_scope="last1",
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id=adaptation_group_id or f"cell-{label}",
             optimizer=OptimizerConfig(
                 name="adam",

@@ -57,7 +57,7 @@ scheduling 保持 serial，正式测量继续 blocked。
 |---|---|---|
 | Preflight | source/runtime/model/data identity、exactness、HBM、telemetry、inventory/topology、仅审计用 session-reset schema、cache/HTTP/writer 与 interference calibration | runtime envelope |
 | E3a | Target-only/Static context、regime、concurrency 与 draft-width capacity | reference load、matched width、crossover 与 drift witness |
-| TTS-Cal | 288 个不相交 tuning-only row：9 个 learning rate x 8 个 stride x 4 个 excluded pilot | 一个 frozen TTS recipe |
+| TTS-Cal | 288 个注册 cell：9 个 learning rate x 8 个 stride x 4 个 technical replicate block；每个 block 都重放同一组 76 个 LCB-hard tuning problem，另有 4 个 holdout problem ID 始终不调度 | 一个 frozen TTS recipe |
 | E1 | E3a/TTS-Cal 封存后恰好 68 行 | safe LC Pareto set 与 common load |
 | E2 | 四轮 successive materialization；`n0=105g`、`n(k+1)=max(ceil(nk/4),21)`，每轮另加四个 anchor | 一个 sealed LightCone recipe |
 | E4 | 48 个 strength-2 screen、96 个 local-factorial 与 3 个隔离 profiler row | mechanism gate |
@@ -75,17 +75,33 @@ optimizer（`Adam`、`AdamW`、`SGDM`、`NAG`、`Muon`、`Lion` 与项目自有
 recipe。后续每轮必须是前一 sealed round 的准确子集，candidate 不得重新进入。每轮另加
 四个 fixed-role anchor，所以 E2 总数为 `16 + sum(n0..n3)`，不再展开 eager sentinel matrix。
 
-TTS reconstruction authority 固定 Adam `(beta1=.9, beta2=.999,
+项目 reconstruction 注册 Adam `(beta1=.9, beta2=.999,
 epsilon=1e-8, weight_decay=0)`、一次 update step、full-drafter training、无 clipping、
-latest-round-only supervision、drafter-native position weight、source-point proximal term、
-request reset 与 side stream。TTS-Cal 将 learning rate
-`1e-7, 3e-7, ..., 1e-3`、stride `1,5,10,15,20,30,40,50` 与四个 excluded pilot
-交叉；先安全、后最大化 SLO-goodput，并在 E1 前签名封存。TTS 使用 fixed barrier；
-L0-naive 消费相同的 frozen recipe/candidate byte，只把 publication 改为 first-ready；两者都
-不得继承 E2 winner。
+latest-update-round-only supervision、pinned DFlash position-weighted target-to-draft KL、
+request reset 与 side stream；
+learning rate 为 `1e-7, 3e-7, ..., 1e-3`，stride 为
+`1,5,10,15,20,30,40,50`。身份 domain 是 signed revision 下全部准确的 LCB-v6-hard match。
+代码以 versioned selector namespace 与 canonical problem ID 的 SHA-256 排序，最小四项作为
+holdout problem ID，始终不进入 TTS-Cal；其余完整的 76 个 problem complement 用于 tuning。
+四个独立标识的 technical replicate block 都重放同一组 complement。window 绑定 namespace、
+ordered-domain digest、两个 ID partition、准确 source descriptor 与 prompt。Schema-2 master content
+ceremony 明确不包含该 window；只能在 ceremony 完成后，从 durable master receipt 与
+path-reopened workload authority 发布。Schema-4 window 绑定 receipt digest、记录的
+verification time 与准确 replay-reservation identity。Raw workload authorization、caller-authored
+time、任意其他合法 window 或任意合法 trainable plan 都会被拒绝。
 
-ChronoBelief 是项目自有的 preregistered optimizer。其身份绑定四个更新方程、PDF/TeX
-digest、标准 update-count bias correction、decoupled weight decay 与 safe-boundary age
+该 executable authority 绑定 pinned DFlash 实现：float32 target-to-draft forward KL、
+valid-row mask、`exp(-(k-1)/7)` position weight、temperature 1，以及 denominator 至少为 1 的
+masked weighted normalization。source-point value correction 是 forward-value/
+surrogate-Jacobian 构造，并非独立 proximal penalty；proximal $\lambda$ 不是实验输入。TTS-Cal
+严格运行 9 个 learning rate × 8 个 stride × 4 个 technical replicate block，共 288 cells；
+每个 block 都使用固定的 76-problem tuning complement，不增加 loss 搜索轴。TTS 使用 fixed
+barrier；L0-naive 消费相同 frozen recipe/candidate byte，只把
+publication 改为 first-ready；两者都不得继承 E2 winner。结果分类为 project-calibrated
+runtime baseline，而不是 paper reproduction。
+
+ChronoBelief 是项目自有的 preregistered optimizer，不是外部论文复现。其身份绑定四个更新
+方程、准确 PDF/TeX digest、标准 update-count bias correction、decoupled weight decay 与 safe-boundary age
 `d_r`。Skip 与 abort 必须让 moments 和 update counter 保持 byte-identical；只有 committed
 proposal 可以推进 optimizer state。
 

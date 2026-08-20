@@ -15,6 +15,7 @@ authority. The schema-v3 and industrial commands are:
 | `revalidate-formal-workload-authority` | Reopen a diagnostic workload binding and replay its path, revision, bytes, and complete selection |
 | `build-industrial-registry` | Bind one or more stable logical rank slots and materialize the immutable experiment DAG |
 | `collect-gpu-inventory` | Collect a nonce-bound physical GPU/topology inventory and raw probe receipt |
+| `publish-tts-drafter-native-loss-source` | Publish the sole code-owned pinned DFlash loss descriptor |
 | `assemble-gpu-fleet-inventory` | Join repeated single-host inventory/interference pairs into one content-bound fleet inventory |
 | `build-interference-envelope` | Derive the current serial interference envelope and its inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | Derive the calibration-only two-way execution envelope from a raw preflight activation and exact inventory |
@@ -564,9 +565,19 @@ Before creating `ProtocolLock`, publish the three code-owned method inputs from
 their exact bound sources:
 
 ```bash
+lightcone-spec publish-tts-calibration-tuning-window \
+  --tuning-workload-authority /absolute/source/lcb-hard-authority.json \
+  --content-verification-receipt /absolute/evidence/content-master.json \
+  --output /absolute/source/tts-tuning-window.json
+
+lightcone-spec publish-tts-drafter-native-loss-source \
+  --output /absolute/source/drafter-native-loss.json
+
 lightcone-spec publish-tts-calibration-source-authority \
   --paper-pdf /absolute/source/tts-v2.pdf \
-  --paper-source /absolute/source/tts-v2.tex \
+  --paper-source /absolute/source/tts-v2-source.tar.gz \
+  --tuning-workload-authority /absolute/source/lcb-hard-authority.json \
+  --content-verification-receipt /absolute/evidence/content-master.json \
   --tuning-window /absolute/source/tts-tuning-window.json \
   --trainable-plan-authority /absolute/source/trainable-plan.json \
   --drafter-native-loss /absolute/source/drafter-native-loss.json \
@@ -578,15 +589,39 @@ lightcone-spec publish-chronobelief-source-authority \
   --output /absolute/evidence/chronobelief-authority.json
 
 lightcone-spec publish-e1-recipe-anchor-authority \
+  --trusted-content-bundle /absolute/source/trusted-content.json \
   --trainable-plan-authority /absolute/source/trainable-plan.json \
   --output /absolute/evidence/e1-recipe-anchor-authority.json
 ```
 
-These commands deep-read the named source files, derive the closed numerical
-or recipe authority, and publish with atomic no-replace semantics. They accept
-no caller-supplied authority digest or recipe override. The outputs are inputs
-to `create-protocol-lock`; they do not sign a result, authorize dispatch, or
-replace the later tuning and GPU evidence gates.
+The schema-2 master content ceremony must run first and explicitly forbids the
+TTS tuning window from its content set. These commands then deep-read the
+durable master receipt, its exact replay-reservation record, the original
+signed workload authorization at the receipt's recorded verification time,
+and the bound LCB authority. A raw or expired workload authorization is not a
+substitute for the receipt. The schema-4 window binds the receipt digest,
+verification time, and reservation identity and is published atomically
+without replacement. The commands accept no caller-supplied authority digest,
+tuning partition, time, or recipe override. The code-owned tuning selector
+hashes every exact LCB-hard problem ID under its versioned namespace, excludes
+the four smallest hashes, and binds the complete complement. The TTS source
+publisher reopens an exact descriptor of the pinned DFlash loss: float32
+target-to-draft forward KL, valid-row masking, position weights
+`exp(-(k-1)/7)`, temperature one, and masked weighted normalization. The
+source-point value correction is not an independent proximal penalty, so there
+is no proximal coefficient to supply or tune. With the exact source pins,
+post-master window, canonical plan, and loss descriptor, it can publish the
+`ProtocolLock` input. This is a project-calibrated runtime baseline rather than
+paper reproduction. The ChronoBelief command remains a separate project-owned
+preregistration.
+The current E1 publisher additionally requires one runtime-`BOUND` trusted
+content bundle. Its schema-3 artifact binds and reopens that exact bundle and
+joins the plan's target/drafter revisions and prepared roots to it. Historical
+schema-2 E1 artifacts remain load-only and cannot enter a trusted schema-5
+ProtocolLock. The E1 anchor publisher accepts only its explicit structural selector:
+the unique Qwen3-8B/DFlash LC-candidate `full`/`last1` AdamW anchor at the
+registered width-8, concurrency-4 slot. A different but otherwise valid plan
+is rejected; this selector does not encode an observed winner.
 
 After a stage's activated cells and dispositions are durable, seal them.
 `--inventory PATH` is the authority for the physical GPU identities and
@@ -664,11 +699,15 @@ receipt and never directory presence.
 The dispatch plan is target-protocol data, not proof that a cell is executable.
 The pinned tree implements the compile, exact native terminal, and coverage
 contracts, while the package pins only the offline public root. Generic
-activation records a diagnostic disposition; it does not create result
-pointers, a fresh dynamic hardware policy, execution authority, or a
-performance claim. Every role remains `BLOCKED` until its exact content,
-qualification, terminal, and control artifacts are present. The CLI does not
-silently provision hardware or start a GPU.
+release-attested activation records a diagnostic disposition; it does not
+create result pointers, a fresh dynamic hardware policy, execution authority,
+or a performance claim. Every role remains `BLOCKED` in that lane until its
+exact content, qualification, terminal, and control artifacts are present. The
+trusted `formal_single_operator_v1` CLI below is a separate empirical lane: it
+does not require an external signer, but it does require the exact
+source/content/runtime, fresh GPU qualification, capacity, terminal, and
+coverage artifacts. The CLI never silently provisions hardware or starts a
+GPU.
 
 ## Fleet inventory and remote host waves
 
@@ -794,8 +833,10 @@ requires one. The loaders validate canonical content, not only filenames.
 ## Core tuning and confirmation
 
 Target-only and Static render without adaptation state or reserve. TTS uses the
-recipe frozen by the signed TTS-Cal seal with fixed-barrier publication;
+recipe frozen by the exact TTS-Cal seal with fixed-barrier publication;
 L0-naive uses that same frozen recipe authority with first-ready publication.
+The release-attested lane signs that seal; the trusted single-operator lane
+uses the reducer-owned content identity without an external signer.
 The historical `TTS-paper-reconstruction` authority is diagnostic only. E1/E2 `l0`
 search recipes are LC-candidates, and only the exact E2-sealed winner is
 LightCone. Shared runtime code does not merge live candidate, optimizer, or
@@ -803,7 +844,9 @@ evidence identity. Rendering is pure planning and grants no role execution
 permission. TTS-Cal fixes the numeric reconstruction grid and semantics; TTS
 and L0-naive remain blocked until the disjoint tuning evidence seals one exact
 winner. All five roles still require their fresh content, runtime, terminal,
-capacity, and dynamic control authorities before an endpoint starts.
+capacity, and dynamic GPU authorities before an endpoint starts. Only
+release-level `MEASURED` promotion additionally requires the external
+attestation chain.
 
 The industrial E1/E2 commands are reducer-owned. E1 consumes sealed E3a and
 TTS-Cal receipts and materializes exactly 68 cells: four fixed roles plus two
@@ -941,8 +984,16 @@ The public supervisor commands are:
 | Command | Purpose |
 |---|---|
 | `formal-single-operator status` | Report source-code capability for all 21 nodes without reading run evidence or allocating a GPU |
+| `publish-v03-model-lock` | Publish the code-owned exact-19 model/revision lock without network resolution |
+| `write-v03-e0-raw-source-path-inputs` | Canonically publish the registry-exact seven raw E0 paths |
+| `publish-v03-e0-source-authorities` | Scan those seven sources and publish their typed authorities |
+| `write-v03-content-path-inputs` | Canonically publish exact model/data/E0/inventory and future-doctor paths |
+| `publish-v03-content-path-spec` | Derive the digest-free pre-doctor content path spec |
+| `publish-stage-capacity` | Bind the pre-doctor spec, run-root filesystem, and required free-byte threshold |
 | `publish-trusted-content` | Deep-bind one typed content path spec and its runtime observations into a BOUND bundle |
 | `publish-preflight-workload` | Derive the preflight workload authority from that exact BOUND bundle |
+| `publish-tts-cal-trainable-plan` | Derive the fixed trusted TTS-Cal plan from BOUND content |
+| `publish-e1-anchor-trainable-plan` | Derive the fixed trusted E1 anchor plan from BOUND content |
 | `publish-onlinespec-source-authority` | Bind the audited external OnlineSPEC checkout for E0 only |
 | `build-trusted-protocol-lock` | Build the schema-v5 trusted ProtocolLock from path-bound sources |
 | `write-dag-driver-config` | Publish one immutable path-only 21-node driver config |
@@ -957,17 +1008,152 @@ a second scheduler.
 
 ### Publish immutable inputs
 
-Publish the runtime and method source authorities from their exact files. These
-commands derive authority content; they do not accept a caller-entered digest:
+Pre-create a private source directory, an empty E0-authority directory, and the
+private run root outside Git. Then use this order. It deliberately publishes a
+pre-doctor path spec first, derives capacity from that spec, publishes the fresh
+doctor report, and only then seals the runtime-`BOUND` content bundle. No step
+depends on an artifact produced later in the sequence.
+
+If the exact 19 snapshots are not already present, publish the code-owned lock
+and let the existing model preparer fetch only those immutable revisions. The
+lock publisher takes no model, revision, digest, token, or network input. Use
+`--offline` when auditing an already-populated cache:
 
 ```bash
-lightcone-spec publish-formal-runtime-authority-manifest \
+lightcone-spec formal-single-operator publish-v03-model-lock \
+  --output /absolute/sources/formal-v03-model-lock.json
+
+lightcone-spec prepare-models \
+  --lockfile /absolute/sources/formal-v03-model-lock.json \
+  --model-cache /absolute/models \
+  --output /absolute/sources/formal-v03-prepared-model-roots.json
+```
+
+Collect the nonce-bound physical inventory, write the exact-seven E0 raw-source
+handoff, and derive the seven source authorities:
+
+```bash
+lightcone-spec collect-gpu-inventory \
+  --challenge-nonce-sha256 FRESH_64_LOWERCASE_HEX_NONCE_SHA256 \
+  --receipt-output /absolute/sources/gpu-inventory-receipt.json \
+  --output /absolute/sources/gpu-inventory.json
+
+lightcone-spec formal-single-operator write-v03-e0-raw-source-path-inputs \
+  --source AIME-2025=/absolute/cache/e0/aime25-test.jsonl \
+  --source Alpaca=/absolute/cache/e0/alpaca-eval.json \
+  --source Arena-Hard=/absolute/cache/e0/arena-hard-v2.0-question.jsonl \
+  --source GSM8K=/absolute/cache/e0/gsm8k-test.jsonl \
+  --source HumanEval=/absolute/cache/e0/humaneval.jsonl.gz \
+  --source MBPP=/absolute/cache/e0/mbpp-sanitized.json \
+  --source MT-Bench=/absolute/cache/e0/mt-bench-question.jsonl \
+  --output /absolute/sources/e0-raw-source-path-inputs.json
+
+lightcone-spec formal-single-operator publish-v03-e0-source-authorities \
+  --inputs /absolute/sources/e0-raw-source-path-inputs.json \
+  --output-directory /absolute/sources/e0-authorities
+```
+
+Next write the registry-complete content handoff. The 19 model keys and paths
+below are source-owned: the CLI accepts no revision or digest override. The six
+BurstGPT and seven E0 names must also appear exactly once. The doctor output
+must still be absent, although its resolved parent already exists.
+
+```bash
+lightcone-spec formal-single-operator write-v03-content-path-inputs \
   --repository-root /absolute/clean/lightcone-checkout \
-  --output /absolute/sources/runtime-authority.json
+  --model-snapshot gemma4_12b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_gemma4_12b_block7/snapshots/7490ce60c7630107917fe558e2bbe3dcec6195cb \
+  --model-snapshot gemma4_12b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_gemma4_12b_block7/snapshots/2fa72e765eec2965fc4d86a8663ce6769eba6218 \
+  --model-snapshot gemma4_12b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_gemma4_12b_ttt7/snapshots/0bc24c312350910419cf371e54082f040d65cc82 \
+  --model-snapshot gemma4_12b_target=/absolute/models/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7 \
+  --model-snapshot qwen35_122b_a10b_fp8_nextn=/absolute/models/models--Qwen--Qwen3.5-122B-A10B-FP8/snapshots/a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9 \
+  --model-snapshot qwen36_35b_a3b_nextn=/absolute/models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --model-snapshot qwen3_14b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_14b_block7/snapshots/ab0a8b28236654620bb41d64b336d00a14cb467f \
+  --model-snapshot qwen3_14b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_qwen3_14b_block7/snapshots/83207b416acf99f41c2184648923632fccea6dd0 \
+  --model-snapshot qwen3_14b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_14b_ttt7/snapshots/d7ea05d0b0009badfff0df2dcaedf82cce0f74f8 \
+  --model-snapshot qwen3_14b_target=/absolute/models/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18 \
+  --model-snapshot qwen3_4b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_4b_block7/snapshots/02d530b7962ea1412beaf41a05c0b8e36d5f9b1d \
+  --model-snapshot qwen3_4b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_qwen3_4b_block7/snapshots/3457dff1417cb84927f6098a5fcb7cee85c934b7 \
+  --model-snapshot qwen3_4b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_4b_ttt7/snapshots/b0b90fd15d052217c226be5e46d468d8d129e0cd \
+  --model-snapshot qwen3_4b_target=/absolute/models/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
+  --model-snapshot qwen3_8b_dflash_core=/absolute/models/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/9b41424b7109f9c5413454f481b09a82b85333f4 \
+  --model-snapshot qwen3_8b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_8b_block7/snapshots/9e44dbbb6cb68b0c943abf9c5fc3c17c00897cdf \
+  --model-snapshot qwen3_8b_dspark_e0_core=/absolute/models/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017 \
+  --model-snapshot qwen3_8b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_8b_ttt7/snapshots/f6485ba8d21e11942958617dbe7e71b467f38f38 \
+  --model-snapshot qwen3_8b_target=/absolute/models/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 \
+  --livecodebench-raw /absolute/cache/livecodebench/test6.jsonl \
+  --math500-raw /absolute/cache/math-500/test.jsonl \
+  --burstgpt-asset BurstGPT_1.csv=/absolute/cache/burstgpt/BurstGPT_1.csv \
+  --burstgpt-asset BurstGPT_2.csv=/absolute/cache/burstgpt/BurstGPT_2.csv \
+  --burstgpt-asset BurstGPT_3.csv=/absolute/cache/burstgpt/BurstGPT_3.csv \
+  --burstgpt-asset BurstGPT_without_fails_1.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_1.csv \
+  --burstgpt-asset BurstGPT_without_fails_2.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_2.csv \
+  --burstgpt-asset BurstGPT_without_fails_3.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_3.csv \
+  --e0-source-authority AIME-2025=/absolute/sources/e0-authorities/formal-v03-e0-aime_2025-source-authority.json \
+  --e0-source-authority Alpaca=/absolute/sources/e0-authorities/formal-v03-e0-alpaca-source-authority.json \
+  --e0-source-authority Arena-Hard=/absolute/sources/e0-authorities/formal-v03-e0-arena_hard-source-authority.json \
+  --e0-source-authority GSM8K=/absolute/sources/e0-authorities/formal-v03-e0-gsm8k-source-authority.json \
+  --e0-source-authority HumanEval=/absolute/sources/e0-authorities/formal-v03-e0-humaneval-source-authority.json \
+  --e0-source-authority MBPP=/absolute/sources/e0-authorities/formal-v03-e0-mbpp-source-authority.json \
+  --e0-source-authority MT-Bench=/absolute/sources/e0-authorities/formal-v03-e0-mt_bench-source-authority.json \
+  --inventory /absolute/sources/gpu-inventory.json \
+  --doctor-output /absolute/sources/doctor.json \
+  --output /absolute/sources/v03-content-path-inputs.json
+
+lightcone-spec formal-single-operator publish-v03-content-path-spec \
+  --inputs /absolute/sources/v03-content-path-inputs.json \
+  --output /absolute/sources/v03-content-path-spec.json
+```
+
+Derive capacity from that pre-doctor spec, then publish the fresh canonical
+doctor report directly. A non-`PASS` report is still retained and exits 42; it
+cannot be reused as `BOUND` content.
+
+```bash
+lightcone-spec formal-single-operator publish-stage-capacity \
+  --content-path-spec /absolute/sources/v03-content-path-spec.json \
+  --run-root /absolute/run/formal-v03-study \
+  --output /absolute/sources/v03-stage-capacity.json
+
+lightcone-spec doctor \
+  --project-root /absolute/clean/lightcone-checkout \
+  --sglang-root /absolute/runtime/patched-sglang \
+  --trusted-single-operator-capacity /absolute/sources/v03-stage-capacity.json \
+  --output /absolute/sources/doctor.json
+```
+
+Only after doctor `PASS`, bind content and derive every downstream workload,
+trainable plan, and method source. Trusted TTS and E1 authority commands
+consume the same BOUND bundle directly; release-signed workload/receipt
+arguments do not belong in this lane.
+
+```bash
+lightcone-spec formal-single-operator publish-trusted-content \
+  --spec /absolute/sources/v03-content-path-spec.json \
+  --output /absolute/sources/trusted-content.json
+
+lightcone-spec formal-single-operator publish-preflight-workload \
+  --content-source /absolute/sources/trusted-content.json \
+  --output /absolute/sources/preflight-workload.json
+
+lightcone-spec formal-single-operator publish-tts-cal-trainable-plan \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/tts-trainable-plan.json
+
+lightcone-spec formal-single-operator publish-e1-anchor-trainable-plan \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/e1-trainable-plan.json
+
+lightcone-spec publish-tts-calibration-tuning-window \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/tts-tuning-window.json
+
+lightcone-spec publish-tts-drafter-native-loss-source \
+  --output /absolute/sources/tts-native-loss.json
 
 lightcone-spec publish-tts-calibration-source-authority \
   --paper-pdf /absolute/sources/tts-paper.pdf \
-  --paper-source /absolute/sources/tts-paper.tex \
+  --paper-source /absolute/sources/tts-v2-source.tar.gz \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
   --tuning-window /absolute/sources/tts-tuning-window.json \
   --trainable-plan-authority /absolute/sources/tts-trainable-plan.json \
   --drafter-native-loss /absolute/sources/tts-native-loss.json \
@@ -979,6 +1165,7 @@ lightcone-spec publish-chronobelief-source-authority \
   --output /absolute/sources/chronobelief-authority.json
 
 lightcone-spec publish-e1-recipe-anchor-authority \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
   --trainable-plan-authority /absolute/sources/e1-trainable-plan.json \
   --output /absolute/sources/e1-recipe-anchor-authority.json
 
@@ -986,23 +1173,10 @@ lightcone-spec formal-single-operator publish-onlinespec-source-authority \
   --checkout /absolute/sources/onlinespec-checkout \
   --audit /absolute/sources/onlinespec-source-audit.json \
   --output /absolute/sources/onlinespec-source-authority.json
-```
 
-The typed `trusted_single_operator_content_path_spec` must name the clean
-checkout; every target, drafter, and tokenizer snapshot with immutable
-revision; locked LiveCodeBench, MATH-500, BurstGPT and E0 task-native sources;
-and the fresh inventory and doctor paths. Generate that typed spec from the
-source API rather than hand-entering content digests. Then publish the BOUND
-bundle and derive its preflight workload:
-
-```bash
-lightcone-spec formal-single-operator publish-trusted-content \
-  --spec /absolute/sources/content-path-spec.json \
-  --output /absolute/sources/trusted-content.json
-
-lightcone-spec formal-single-operator publish-preflight-workload \
-  --content-source /absolute/sources/trusted-content.json \
-  --output /absolute/sources/preflight-workload.json
+lightcone-spec publish-formal-runtime-authority-manifest \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --output /absolute/sources/runtime-authority.json
 
 lightcone-spec formal-single-operator build-trusted-protocol-lock \
   --protocol-id lightcone-v03-study \
@@ -1014,9 +1188,10 @@ lightcone-spec formal-single-operator build-trusted-protocol-lock \
   --output /absolute/sources/protocol-lock.json
 ```
 
-All source and output paths must be absolute and normalized. Outputs use
-atomic no-replace publication. Model/data payloads, provider state, credentials,
-and all run artifacts stay outside the checkout.
+All source and output paths must be absolute and normalized. Canonical outputs
+use atomic no-replace publication and are deep-reopened before the next step.
+Model/data payloads, provider state, credentials, and all run artifacts stay
+outside the checkout.
 
 ### Configure and cross the first GPU boundary
 
@@ -1052,6 +1227,12 @@ upstream receipts are ready:
 ```bash
 lightcone-spec formal-single-operator status
 ```
+
+The capacity and doctor steps above freshly join live GPU
+UUID/model/compute-capability rows to the exact path-spec inventory. This
+empirical mode admits one 16 GiB wave plus a 15 GiB safety margin, disables
+automatic physical and E6/E0 auxiliary retries, and never authorizes a formal
+`MEASURED` claim.
 
 A cold start has an intentionally inspectable boundary. The first cycle
 materializes preflight. The second plans the exact one compile, one exactness,

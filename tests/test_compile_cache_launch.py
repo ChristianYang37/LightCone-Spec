@@ -33,7 +33,17 @@ from lightcone_spec.runtime.compile_cache import (
     preflight_compile_cache_launch,
     start_compile_cache_launch,
 )
+from lightcone_spec.runtime.distributed import (
+    DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
+)
+from lightcone_spec.runtime.proof_artifact import publish_canonical_json_no_replace
+from lightcone_spec.sglang_bridge.config import (
+    sglang_adaptation_payload,
+    sglang_adaptation_sha256,
+)
 from lightcone_spec.sglang_bridge.launch import (
+    _bind_runtime_adaptation_config,
+    _raw_config_requires_formal_runtime_authority,
     _validate_compile_runtime_environment,
 )
 from lightcone_spec.sglang_bridge.launch import (
@@ -41,6 +51,59 @@ from lightcone_spec.sglang_bridge.launch import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_formal_runtime_authority_requirement_is_exactly_adaptive_native_or_multirank() -> (
+    None
+):
+    dflash_tp1 = config_value("tts")
+    assert _raw_config_requires_formal_runtime_authority(dflash_tp1) is False
+
+    dflash_tp2 = config_value("tts")
+    dflash_tp2["runtime"]["tensor_parallel_size"] = 2
+    assert _raw_config_requires_formal_runtime_authority(dflash_tp2) is True
+
+    dspark_tp1 = config_value("l0")
+    dspark_tp1["model"]["algorithm"] = "DSPARK"
+    assert _raw_config_requires_formal_runtime_authority(dspark_tp1) is True
+
+    static_dspark = config_value("static")
+    static_dspark["model"]["algorithm"] = "DSPARK"
+    assert _raw_config_requires_formal_runtime_authority(static_dspark) is False
+
+
+def test_launcher_binds_the_native_adaptation_payload_to_run_config(
+    tmp_path: Path,
+) -> None:
+    config = RunConfig.model_validate(config_value("tts"))
+    payload = sglang_adaptation_payload(config)
+    assert payload is not None
+    path = (tmp_path / "adaptation.json").resolve()
+    publish_canonical_json_no_replace(path, payload)
+
+    binding = _bind_runtime_adaptation_config(
+        config,
+        ["--speculative-adaptation-config", str(path)],
+    )
+    assert binding.semantic_sha256 == sglang_adaptation_sha256(config)
+
+    foreign = (tmp_path / "foreign-adaptation.json").resolve()
+    publish_canonical_json_no_replace(
+        foreign,
+        {**payload, "stride": int(payload["stride"]) + 1},
+    )
+    with pytest.raises(ValueError, match="differs from RunConfig"):
+        _bind_runtime_adaptation_config(
+            config,
+            ["--speculative-adaptation-config", str(foreign)],
+        )
+
+    static = RunConfig.model_validate(config_value("static"))
+    with pytest.raises(ValueError, match="allocation-free"):
+        _bind_runtime_adaptation_config(
+            static,
+            ["--speculative-adaptation-config", str(path)],
+        )
 
 
 def test_launcher_module_is_torch_free_in_a_fresh_interpreter() -> None:
@@ -386,14 +449,11 @@ def test_runtime_launcher_observes_exact_compile_toolchain_before_cache_mutation
         cache_mode="build",
     )
     config = _run_config(plan.key)
-    assert (
-        _validate_compile_runtime_environment(
-            plan,
-            config.model_dump(mode="json"),
-            _compile_server_argv(tmp_path, plan.key, config),
-        )
-        is None
-    )
+    assert _validate_compile_runtime_environment(
+        plan,
+        config.model_dump(mode="json"),
+        _compile_server_argv(tmp_path, plan.key, config),
+    ) == (None, ("GPU-test",))
     assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "backend:cudaMallocAsync"
     assert not Path(plan.cache_root).exists()
 
@@ -516,7 +576,7 @@ def test_runtime_launcher_rejects_caller_minted_compile_toolchain_fields(
         },
     ),
 )
-def test_runtime_launcher_requires_one_usable_torch_cuda_device_before_cache(
+def test_runtime_launcher_requires_exact_usable_torch_cuda_ranks_before_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     torch_runtime: dict[str, object],
@@ -532,13 +592,135 @@ def test_runtime_launcher_requires_one_usable_torch_cuda_device_before_cache(
         cache_mode="build",
     )
     config = _run_config(plan.key)
-    with pytest.raises(ValueError, match="one usable Torch CUDA device"):
+    with pytest.raises(ValueError, match="exact usable Torch CUDA ranks"):
         _validate_compile_runtime_environment(
             plan,
             config.model_dump(mode="json"),
             _compile_server_argv(tmp_path, plan.key, config),
         )
     assert "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+    assert not Path(plan.cache_root).exists()
+
+
+def test_runtime_launcher_accepts_exact_two_gpu_tp2_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _mock_compile_runtime_environment(monkeypatch)
+
+    def command(argv: list[str]) -> str | None:
+        if argv[0] == "nvidia-smi":
+            return (
+                "GPU-test-0, RTX PRO 6000 Blackwell Server Edition, 98304, "
+                "580.65.06, 12.0, 0000:01:00.0\n"
+                "GPU-test-1, RTX PRO 6000 Blackwell Server Edition, 98304, "
+                "580.65.06, 12.0, 0000:02:00.0"
+            )
+        if argv[0] == "nvcc":
+            return "Cuda compilation tools, release 13.0, V13.0.0"
+        return None
+
+    monkeypatch.setattr("lightcone_spec.sglang_bridge.launch._command", command)
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch._torch_runtime",
+        lambda: {
+            "importable": True,
+            "version": "2.11.0+cu130",
+            "cuda_build": "13.0",
+            "cuda_available": True,
+            "device_count": 2,
+        },
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test-0,GPU-test-1")
+    plan = CompileCacheLaunchPlan.issue(
+        key=_diagnostic_key(tensor_parallel_size=2),
+        cache_root=tmp_path / "must-not-exist",
+        cache_mode="build",
+    )
+    raw = config_value("static")
+    raw["model"]["target_revision"] = plan.key.target_revision
+    raw["model"]["drafter_revision"] = plan.key.drafter_revision
+    raw["runtime"].update(
+        {
+            "tensor_parallel_size": 2,
+            "max_running_requests": plan.key.max_running_requests,
+            "device_identity": "GPU-test-0,GPU-test-1",
+            "distributed_runtime_capability": "patched_two_gpu_v1",
+            "distributed_release_capability_sha256": (
+                DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES["tp2_dp1"].sha256
+            ),
+            "distributed_capability_receipt_sha256": "d" * 64,
+        }
+    )
+    config = RunConfig.model_validate(raw)
+    assert _validate_compile_runtime_environment(
+        plan,
+        config.model_dump(mode="json"),
+        _compile_server_argv(tmp_path, plan.key, config),
+    ) == (None, ("GPU-test-0", "GPU-test-1"))
+    assert not Path(plan.cache_root).exists()
+
+
+def test_runtime_launcher_accepts_exact_two_gpu_dp2_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _mock_compile_runtime_environment(monkeypatch)
+
+    def command(argv: list[str]) -> str | None:
+        if argv[0] == "nvidia-smi":
+            return (
+                "GPU-test-0, RTX PRO 6000 Blackwell Server Edition, 98304, "
+                "580.65.06, 12.0, 0000:01:00.0\n"
+                "GPU-test-1, RTX PRO 6000 Blackwell Server Edition, 98304, "
+                "580.65.06, 12.0, 0000:02:00.0"
+            )
+        if argv[0] == "nvcc":
+            return "Cuda compilation tools, release 13.0, V13.0.0"
+        return None
+
+    monkeypatch.setattr("lightcone_spec.sglang_bridge.launch._command", command)
+    monkeypatch.setattr(
+        "lightcone_spec.sglang_bridge.launch._torch_runtime",
+        lambda: {
+            "importable": True,
+            "version": "2.11.0+cu130",
+            "cuda_build": "13.0",
+            "cuda_available": True,
+            "device_count": 2,
+        },
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-test-0,GPU-test-1")
+    plan = CompileCacheLaunchPlan.issue(
+        key=_diagnostic_key(),
+        cache_root=tmp_path / "must-not-exist",
+        cache_mode="build",
+    )
+    raw = config_value("static")
+    raw["model"]["target_revision"] = plan.key.target_revision
+    raw["model"]["drafter_revision"] = plan.key.drafter_revision
+    raw["runtime"].update(
+        {
+            "data_parallel_size": 2,
+            "max_running_requests": plan.key.max_running_requests,
+            "device_identity": "GPU-test-0,GPU-test-1",
+            "router_identity": "preflight-qualified-sticky-router-v1",
+            "distributed_runtime_capability": "patched_two_gpu_v1",
+            "distributed_release_capability_sha256": (
+                DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES["tp1_dp2"].sha256
+            ),
+            "distributed_capability_receipt_sha256": "d" * 64,
+            "process_group_backend": "none",
+        }
+    )
+    config = RunConfig.model_validate(raw)
+    server_argv = _compile_server_argv(tmp_path, plan.key, config)
+    server_argv.extend(("--dp-size", "2"))
+    assert _validate_compile_runtime_environment(
+        plan,
+        config.model_dump(mode="json"),
+        server_argv,
+    ) == (None, ("GPU-test-0", "GPU-test-1"))
     assert not Path(plan.cache_root).exists()
 
 
@@ -1014,8 +1196,11 @@ def test_runtime_launcher_verifies_cache_before_import_and_seals_result(
         "lightcone_spec.sglang_bridge.launch.verify_patched_checkout", verify
     )
 
-    def validate(_plan: object, _config: object, _argv: object) -> None:
+    def validate(
+        _plan: object, _config: object, _argv: object
+    ) -> tuple[None, tuple[str, ...]]:
         observed_paths.append(os.environ.get("PATH"))
+        return None, ("GPU-fixture",)
 
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.launch._validate_compile_runtime_environment",
@@ -1202,7 +1387,7 @@ def test_runtime_launcher_rejects_diagnostic_reuse_before_sglang_import(
     )
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.launch._validate_compile_runtime_environment",
-        lambda _plan, _config, _argv: None,
+        lambda _plan, _config, _argv: (None, ("GPU-fixture",)),
     )
     with pytest.raises(RuntimeError, match="reuse_requires_model_content_authority"):
         launch_main(

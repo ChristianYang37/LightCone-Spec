@@ -4,7 +4,7 @@
     "repository": "https://github.com/sgl-project/sglang.git",
     "commit": "3312645a307453893a00778592f105581e3d1c3d"
   },
-  "expected_tree": "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2",
+  "expected_tree": "bb6371242e82592d1b8a2f5f4ba6d0630d8365cb",
   "patches": [
     {
       "file": "0001-feat-spec-add-schema-v3-native-online-adaptation.patch",
@@ -165,6 +165,30 @@
         "test/registered/unit/spec/test_terminal_speculative_evidence.py",
         "test/registered/unit/spec/test_tp1_dp2_live_gpu_qualification.py",
         "test/registered/unit/spec/test_tp2_dp1_live_gpu_qualification.py"
+      ]
+    },
+    {
+      "file": "0008-fix-spec-isolate-request-scoped-adaptation-state.patch",
+      "sha256": "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874",
+      "files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
+        "python/sglang/srt/speculative/dflash_online_adaptation.py",
+        "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
+        "python/sglang/srt/speculative/formal_gang_serving.py",
+        "python/sglang/srt/speculative/native_backend_online_adaptation.py",
+        "python/sglang/srt/speculative/native_runtime_release.py",
+        "python/sglang/srt/speculative/online_adaptation_config.py",
+        "python/sglang/srt/speculative/online_adaptation_runtime.py",
+        "python/sglang/srt/speculative/terminal_speculative_evidence.py",
+        "test/registered/unit/managers/test_scheduler_request_scoped_admission.py",
+        "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
+        "test/registered/unit/spec/test_eagle3_online_adaptation_contract.py",
+        "test/registered/unit/spec/test_formal_gang_serving.py",
+        "test/registered/unit/spec/test_native_runtime_release.py",
+        "test/registered/unit/spec/test_online_adaptation_protocol.py",
+        "test/registered/unit/spec/test_terminal_speculative_evidence.py"
       ]
     }
   ]

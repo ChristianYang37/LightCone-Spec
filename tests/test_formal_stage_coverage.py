@@ -128,7 +128,7 @@ def _sha(label: str) -> str:
 
 def _authority() -> TtsCalibrationAuthority:
     return TtsCalibrationAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="tts-primary-source-reconstruction-v2",
         primary_source_id="arXiv:2605.09329",
         primary_source_version="v2",
@@ -770,6 +770,8 @@ def _e4_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             run_nonce_sha256=_sha(f"nonce-{index}"),
             attempt_id=f"attempt-{index}",
             method="l0",
+            runtime_trust_mode=None,
+            formal_measurement=None,
         )
         binding_sha256 = _sha(f"execution-binding-{index}")
         subject = SimpleNamespace(
@@ -1292,6 +1294,57 @@ def _tts_raw_manifest(tmp_path: Path, authority: TtsCalibrationAuthority):
     )
 
 
+def test_tts_coverage_requires_exact_current_request_reset_receipts() -> None:
+    protocol = coverage_authority.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+    request = SimpleNamespace(request_id="scored-0", submitted_to_server=True)
+    second_request = SimpleNamespace(request_id="scored-1", submitted_to_server=True)
+    client_only = SimpleNamespace(request_id="scored-client", submitted_to_server=False)
+    warmup_resets = SimpleNamespace(
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
+        protocol_sha256=protocol,
+        receipts=(),
+    )
+    scored_resets = SimpleNamespace(
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
+        protocol_sha256=protocol,
+        # Native epoch/terminal order is authoritative and may differ from
+        # caller submission order.
+        receipts=(
+            SimpleNamespace(request_id=second_request.request_id),
+            SimpleNamespace(request_id=request.request_id),
+        ),
+    )
+    evidence = SimpleNamespace(
+        terminal_schema_version=2,
+        binding=SimpleNamespace(
+            method="tts",
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+        ),
+        reset_receipt=SimpleNamespace(
+            request_source_point_reset_protocol_sha256=protocol,
+            warmup_request_source_point_resets=warmup_resets,
+            warmup_requests=(),
+        ),
+        request_source_point_resets=scored_resets,
+        requests=(request, second_request, client_only),
+    )
+    coverage_authority._require_tts_calibration_request_reset_evidence(evidence)
+
+    missing = SimpleNamespace(
+        **{
+            **evidence.__dict__,
+            "request_source_point_resets": SimpleNamespace(
+                **{**scored_resets.__dict__, "receipts": ()}
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="scored reset coverage"):
+        coverage_authority._require_tts_calibration_request_reset_evidence(missing)
+
+
 def test_tts_coverage_derives_288_terminals_from_nonconsuming_controls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1345,17 +1398,51 @@ def test_tts_coverage_derives_288_terminals_from_nonconsuming_controls(
 
     def prepare(value, **_kwargs):
         cell_id = Path(value["path"]).stem.removeprefix("terminal-")
+        request_id = f"scored-{cell_id}"
+        warmup_resets = SimpleNamespace(
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+            protocol_sha256=(
+                coverage_authority.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            ),
+            receipts=(),
+        )
+        scored_resets = SimpleNamespace(
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+            protocol_sha256=(
+                coverage_authority.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            ),
+            receipts=(SimpleNamespace(request_id=request_id),),
+        )
         return SimpleNamespace(
             binding=SimpleNamespace(
                 canonical_raw_sha256=value["sha256"],
                 sha256=_sha(f"control-binding-{cell_id}"),
             ),
             evidence=SimpleNamespace(
+                terminal_schema_version=2,
                 binding=SimpleNamespace(
                     method="tts",
+                    reset_scope="request",
+                    request_admission_policy="serialized_native_scheduler_v1",
                     run_id=f"tts-{cell_id}",
                     run_nonce_sha256=_sha(f"run-nonce-{cell_id}"),
-                )
+                ),
+                reset_receipt=SimpleNamespace(
+                    request_source_point_reset_protocol_sha256=(
+                        coverage_authority.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                    ),
+                    warmup_request_source_point_resets=warmup_resets,
+                    warmup_requests=(),
+                ),
+                request_source_point_resets=scored_resets,
+                requests=(
+                    SimpleNamespace(
+                        request_id=request_id,
+                        submitted_to_server=True,
+                    ),
+                ),
             ),
         )
 

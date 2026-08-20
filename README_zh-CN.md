@@ -22,19 +22,26 @@ fail-closed 行为，但只有已注册且 attested 的 GPU 证据才能证明�
 | Truth field | 值 | 范围 |
 |---|---|---|
 | `formal_industrial_gpu_evidence` | `UNMEASURED` | 当前 schema-v3 formal 证据；没有发布任何 industrial 性能结论。 |
-| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | release public trust root 已配置，但新的 root-authorized source、model、hardware、control 与 mandatory-preflight receipt 尚未生成，因此在 mutation 前 fail closed。 |
+| `formal_industrial_execution` | `BLOCKED_PENDING_QUALIFICATION` | release-attested lane 已配置 public trust root，但新的 root-authorized source、model、hardware、control 与 mandatory-preflight receipt 尚未生成，因此该 lane 在 mutation 前 fail closed。 |
 | `historical_snapshot_evidence` | `PRELIMINARY_NON_FORMAL` | 下方数字 snapshot 仅为历史工程证据。 |
 | `historical_snapshot_host_at_archive` | `POWERED_OFF_NOT_RELEASED` | 归档时的运营状态；实例已经关机，但没有释放或删除。 |
 | `current_sglang_upstream_commit` | `3312645a307453893a00778592f105581e3d1c3d` | 当前 patch manifest 锁定的完整 Git commit。 |
-| `current_patched_sglang_tree` | `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2` | 应用当前 patch series 后预期的完整 Git tree。 |
-| `current_patch_payload_sha256` | `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
-| `current_patch_manifest_sha256` | `cc8355703fe83c8a73ecdbf9cd656140e257e69570fbfd8d8bc08f657e72fd71` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
+| `current_patched_sglang_tree` | `bb6371242e82592d1b8a2f5f4ba6d0630d8365cb` | 应用当前 patch series 后预期的完整 Git tree。 |
+| `current_patch_payload_sha256` | `0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874` | 最新 semantic mail-patch 原始字节的 SHA-256。 |
+| `current_patch_manifest_sha256` | `ff2fbc43c89e9f476a3fcf5690ba4287c00d434ba4a0f8c1a5d10d77bf79e716` | 当前 canonical patch-manifest JSON 的 SHA-256。 |
 | `historical_main_code_prefix` | `0db2ff4` | 仅绑定 preliminary snapshot 的短 code prefix。 |
 | `historical_patched_tree_prefix` | `e795ecc` | 仅绑定 preliminary snapshot 的短 tree prefix。 |
 
 当前 commit、tree、patch payload 与 manifest digest 是四个不同的身份域。两个七字符历史
 prefix 不是当前 release identity，不能满足任何 formal identity gate。
 <!-- RESULT_TRUTH_GATE_END -->
+
+执行权限与结论权限属于两条独立 lane。Trusted `formal_single_operator_v1` 在准确
+source/content/runtime、fresh GPU qualification、capacity、terminal 与 coverage gate 全部通过后，
+无需 external signer 即可运行完整 empirical DAG。其 unsigned closure 始终为
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与 `UNMEASURED`。
+Release-root signature 只用于把合格 evidence 提升为 `MEASURED`，不是这条 trusted lane 的
+empirical execution 前置条件。
 
 ## 研究范围
 
@@ -57,11 +64,12 @@ runtime 实现不代表配置、live candidate、optimizer state 或 evidence �
 的 primary-source 审计未找到作者官方代码/config，论文也没有固定全部数值字段。因此 formal
 路径使用独立的预注册 TTS-Cal authority：固定 Adam、一次 optimization step、
 `(beta1=.9, beta2=.999, epsilon=1e-8)`、zero weight decay、无 clipping、全 drafter/
-latest-round-only update、digest-bound drafter-native position/proximal loss recipe、逐 request
+latest-update-round-only update、digest-bound DFlash position-weighted target-to-draft KL、逐 request
 reset、side stream、learning-rate grid `1e-7, 3e-7, ..., 1e-3` 与 stride
-`{1,5,10,15,20,30,40,50}`。四个 excluded pilot 按注册的 safety-first 规则缩减网格；只有
-signed winner 才能冻结 TTS 与 L0-naive。在 seal 生成前二者保持 `BLOCKED`，且绝不能继承
-E1/E2 winner、schema default 或历史 AdamW configuration。TTS publication 独立固定为论文的
+`{1,5,10,15,20,30,40,50}`。Code-owned post-master split 覆盖完整 tuning domain 并排除准确
+四个 pilot；trusted single-operator reducer 以 content identity 封存 winner，无需 external
+signer。Release-attested lane 会额外签署同一 seal。TTS 与 L0-naive 绝不能继承 E1/E2 winner、
+schema default 或历史 AdamW configuration；TTS publication 独立固定为论文的
 synchronization barrier。
 [Provenance authority](manifests/provenance/tts_recipe_authority_v1.json) 绑定 arXiv
 `2605.09329v2`、PDF SHA-256
@@ -79,10 +87,13 @@ sticky 双 replica DP2 isolation。DFlash 执行注册的 constant、inverse-squ
 horizon cosine schedule 与非负 logical publication delay；DSpark 绑定真实 predecessor、
 W1/W2 与 confidence head；NEXTN 绑定 MTP teacher/interface 与 TP2 shard authority。Patch
 也提供准确 begin/reset/finalize terminal evidence，host adapter 会重验内容。但这些只是实现
-状态，不是 GPU 结果：仓库不携带 trusted hardware signer，也没有 fresh dynamic GPU
-qualification receipt。因此 Static/TTS/L0-naive/LightCone 以及所有 adaptive backend/topology
-仍不可用于结论，并在 release preflight、任何 mutation 之前 fail closed。Generic EAGLE 不受
-支持；没有 official signed compatibility decision 的 EAGLE3 组合保持 N/A 或 `BLOCKED`。
+状态，不是 GPU 结果。Release-attested lane 尚未配置 trusted hardware signer，也没有 fresh
+dynamic GPU qualification receipt，因此 Static/TTS/L0-naive/LightCone 以及所有 adaptive
+backend/topology 仍不可用于 release 结论，并在该 lane 的 preflight、任何 mutation 之前 fail
+closed。这个 release-claim blocker 不会阻止 trusted single-operator empirical lane；后者使用
+source-owned unsigned authority，但仍必须通过准确 dynamic GPU、capacity、terminal 与 coverage
+proof。Generic EAGLE 不受支持；没有适用 compatibility decision 的 EAGLE3 组合保持 N/A 或
+`BLOCKED`。
 请求 quota-shadow row 时会记录准确 identity 与 quota；不支持的 acquisition 会被拒绝，不会
 伪造 teacher row。
 
@@ -410,8 +421,10 @@ complete；未完成的 Target-only reference 没有最终 JSON，必须重新�
   device qualification。CPU contract 与 caller-provided key 不能授权它们。Multi-host 只执行
   independent host-local work；跨主机 collective、world size 大于二、Kubernetes、elastic
   membership 与自动 failover 仍不支持；
-- TTS 与 L0-naive 要求 signed TTS-Cal winner；LightCone 还要求 sealed E2 final recipe。任何
-  method 都不能继承 result-derived 或 legacy diagnostic recipe；
+- TTS 与 L0-naive 要求准确 content-sealed TTS-Cal winner；release-attested lane 会额外签署该
+  seal，trusted single-operator lane 则直接消费 reducer-owned content identity，不要求 external
+  signer。LightCone 还要求 sealed E2 final recipe。任何 method 都不能继承 result-derived 或
+  legacy diagnostic recipe；
 - ChronoBelief 已注册准确 equation 与 state semantics，但仍与其他 adaptive recipe 一样需要
   runtime/GPU qualification；
 - 历史 KV 按设计冻结。重新计算它需要新的算法、显存边界、协议与结论。

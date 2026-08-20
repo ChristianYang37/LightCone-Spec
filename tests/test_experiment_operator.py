@@ -1840,6 +1840,53 @@ def test_preflight_group_rejects_incomplete_coverage_and_mixed_publication(
         } == {"RUNNING"}
 
 
+def test_resident_group_records_no_automatic_retry_when_builder_is_disabled(
+    tmp_path: Path,
+) -> None:
+    group_id, members = _serving_group(tmp_path)
+    with _store(tmp_path) as store:
+        store.materialize_physical_attempt_group(
+            group_id=group_id,
+            members=members,
+            leader_cell_id=members[0].attempt.cell_id,
+            group_kind="tp1_serving_session",
+        )
+        store.start_physical_attempt_group_with_launcher(
+            group_id,
+            assigned_gpu_uuids=("GPU-0",),
+            launcher=lambda: SpawnedProcess(32_100, 32_100),
+            started_at_ns=10,
+        )
+        terminals = {
+            member.attempt.cell_id: TerminalEvidence(
+                status="FAILED",
+                exit_code=70,
+                atomic_publication_sha256=_sha("8"),
+                terminal_sha256=_sha("3"),
+                junit_sha256=_sha("4"),
+                raw_log_sha256=_sha("5"),
+                failure_class="INFRASTRUCTURE",
+                failure_code="FIXTURE_FAILURE",
+                included_in_analysis=False,
+                exclusion_reason="fixture infrastructure failure",
+                started_ns=11,
+                finished_ns=20,
+            )
+            for member in members
+        }
+        store.finish_physical_attempt_group(
+            group_id,
+            terminals=terminals,
+            automatic_infrastructure_retry=False,
+            finished_at_ns=30,
+        )
+
+        assert {
+            store.attempt(member.attempt.cell_id, 1)["retry_decision"]
+            for member in members
+        } == {"NO_RETRY_BUILDER_OR_LIMIT"}
+
+
 def test_scheduler_disk_stop_is_persistent_and_never_spawns(
     tmp_path: Path,
 ) -> None:
@@ -1866,6 +1913,51 @@ def test_scheduler_disk_stop_is_persistent_and_never_spawns(
         assert second.dispatch_state == "STOP"
         assert launches == []
         assert store.attempt(spec.cell_id, 1)["status"] == "PENDING"
+
+
+def test_scheduler_counts_running_wave_before_second_dispatch(
+    tmp_path: Path,
+) -> None:
+    launches: list[str] = []
+    with _store(tmp_path) as store:
+        store.configure_interference_envelope(
+            InterferenceEnvelope("DUAL_SINGLE", ("GPU-0", "GPU-1"), _sha("a"))
+        )
+        pairs = [
+            _queued_pair(tmp_path, cell_id=f"preflight:capacity-wave-{index}")
+            for index in range(2)
+        ]
+        for specification, original in pairs:
+            command = replace(original, predicted_high_water_bytes=16 * 1024**3)
+            specification = replace(
+                specification,
+                command_sha256=command.command_sha256,
+            )
+            store.materialize_attempt(specification)
+            store.enqueue_command(command)
+
+        def launch(command: QueuedCommandSpec, _gpu_uuids: tuple[str, ...]):
+            launches.append(command.cell_id)
+            pid = 30_000 + len(launches)
+            return SpawnedProcess(pid, pid)
+
+        daemon = FormalExperimentSchedulerDaemon(
+            store,
+            lock_path=tmp_path / "capacity-wave.scheduler.lock",
+            callbacks=_scheduler_callbacks(
+                launch=launch,
+                free_disk_bytes=lambda _path: 41_400_000_000,
+            ),
+            clock_ns=_TickClock(),
+        )
+        cycle = daemon.run_once()
+        assert len(cycle.dispatched) == 1
+        assert launches == ["preflight:capacity-wave-0"]
+        assert cycle.dispatch_state == "STOP"
+        assert cycle.stop_reason is not None
+        assert cycle.stop_reason.startswith("disk_high_water_gate:")
+        assert store.attempt("preflight:capacity-wave-0", 1)["status"] == "RUNNING"
+        assert store.attempt("preflight:capacity-wave-1", 1)["status"] == "PENDING"
 
 
 def test_scheduler_accepts_atomic_terminal_then_dispatches_next_compatible_cell(

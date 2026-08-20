@@ -4,13 +4,17 @@
 
 ## 目标函数与科学身份
 
-下列公式定义已注册目标 method，不表示本 release 可执行每一种 backend 或 topology。当前
-唯一可用于 claim 的 execution 仍是 TP1/DP1 Target-only。固定 patch 已包含 native
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，以及注册的
+下列公式定义已注册目标 method，不表示每一种 backend 或 topology 已有 release-attested GPU
+结果。当前唯一可用于 release claim 的 execution 仍是 TP1/DP1 Target-only。固定 patch 已包含 native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2` lifecycle，以及注册的
 DFlash、DSpark、NEXTN、compatible EAGLE3、TP2 与 sticky DP2 source implementation。但这些
-都不是 GPU 结果：准确 dynamic suite 与 trusted external-control proof 尚未生成，也没有配置
-trusted hardware signer。因此 Static/TTS/L0-naive/LightCone 会在 mutation 前 blocked，并且
-目前没有任何新 GPU 结果。
+都不是 GPU 结果：用于 release promotion 的准确 dynamic suite 与 trusted external-control
+proof 尚未生成，也没有配置 trusted hardware signer。因此 release-attested lane 会在 mutation
+前阻止 Static/TTS/L0-naive/LightCone。Trusted `formal_single_operator_v1` 是另一条 lane：external
+signature 不是执行前置条件；准确 source/content/runtime、fresh GPU qualification、capacity、
+terminal 与 coverage gate 通过后，它可以运行完整 empirical DAG。结果固定为
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与 `UNMEASURED`；目前
+仍没有新的 release GPU 结果。
 
 Recipe authority 与 publication policy 是不同的数学身份。Target-only 与 Static 在结构上
 保持零 adaptation state。TTS 使用 frozen TTS recipe 与 fixed barrier；L0-naive 使用同一个
@@ -39,10 +43,11 @@ $$
 w_k=\exp(-(k-1)/7).
 $$
 
-该 weight 不是 TTS default。Position weight、teacher-row policy、canvas width 与 source
-version 都属于 candidate 的 config/evidence 身份，不是从结果反推的选择。
+对 pinned project runtime 而言，该 weight 是固定 DFlash implementation identity，不是
+TTS-Cal 搜索轴。Position weight、teacher-row policy、canvas width 与 source version 都属于
+注册的 config/evidence 身份，不是从结果反推的选择。
 
-一手 TTS 论文定义从 source proposal $q_t$ 出发、只使用 latest-round row 的一次更新；
+仅作为论文背景，一手 TTS 论文定义从 source proposal $q_t$ 出发、只使用 latest-round row 的一次更新；
 objective 包含 target distillation 与 source-point proximal term：
 
 $$
@@ -51,16 +56,22 @@ $$
 +\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
 $$
 
+该论文公式不是注册的 runtime objective，也不表示项目 runtime 实现或调节其中的 proximal
+coefficient。
+
 经审计的 [arXiv v2 论文](https://arxiv.org/abs/2605.09329v2) 没有披露全部数值字段，因此历史
 `TTS-paper-reconstruction` authority 继续是 diagnostic 且不具备 formal eligibility。Formal
 TTS-Cal authority 是独立预注册 reconstruction：Adam、准确一步、
 `(beta1=.9, beta2=.999, epsilon=1e-8)`、zero decay、无 clipping、全 drafter/
-latest-round-only update、digest-bound drafter-native position/proximal loss recipe、逐 request
-reset、side stream、learning rate `1e-7, 3e-7, ..., 1e-3` 与 stride
-`{1,5,10,15,20,30,40,50}`。四个 excluded pilot 按注册的 safety-first reducer 选出 winner，并
-由 signed seal 冻结；在该 seal 存在前 TTS 与 L0-naive 保持 `BLOCKED`。二者不能继承上面的
-exponential weight、E1/E2 winner、schema default 或历史 AdamW recipe。与 recipe 正交，TTS
-publication 使用论文的 fixed synchronization barrier。
+latest-update-round-only update、逐 request reset、side stream、learning rate
+`1e-7, 3e-7, ..., 1e-3` 与 stride `{1,5,10,15,20,30,40,50}`。pinned executable loss
+把两组 logits 转为 float32，在 temperature 1 下计算 target-to-draft forward KL；valid rows
+按 `exp(-(k-1)/7)` 加权，再除以至少为 1 的 masked weight sum。source-point correction 保持
+inference forward value 并提供 surrogate Jacobian，并非独立 proximal term，因此不存在数值
+$\lambda$。这些固定语义不增加搜索维度。code-owned split 与 canonical trainable-plan
+selector 仍必须通过，不能由 E1/E2 winner、schema default、历史 AdamW recipe 或
+result-derived choice 替代。结果分类为 project-calibrated runtime baseline，而不是 paper
+reproduction；TTS publication 使用 fixed synchronization barrier。
 
 ## Backend 证据与重建
 

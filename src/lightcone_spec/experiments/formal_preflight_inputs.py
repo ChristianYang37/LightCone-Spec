@@ -2446,6 +2446,10 @@ def _materialize_exact_ten_inputs(
                 }
             ),
             method="static",
+            reset_scope=None,
+            request_admission_policy=None,
+            runtime_trust_mode=None,
+            formal_measurement=None,
             warmup_request_ids=tuple(row.request_id for row in warmup),
             scored_request_ids=tuple(row.request_id for row in scored),
         )
@@ -2613,6 +2617,20 @@ def materialize_formal_single_operator_preflight_execution_inputs(
         )
         if selected_content_source != source.content_source_binding:
             raise ValueError("trusted preflight content source differs from execution")
+        from lightcone_spec.doctor import (
+            revalidate_trusted_single_operator_doctor_report,
+        )
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            trusted_single_operator_capacity_authority_from_doctor,
+        )
+
+        requested_root = Path(private_output_root)
+        revalidate_trusted_single_operator_doctor_report(doctor_report_path)
+        trusted_single_operator_capacity_authority_from_doctor(
+            doctor_report_path,
+            expected_bound_content_source_path=content_source_path,
+            expected_output_path=requested_root,
+        )
     else:
         if content_verification_receipt_path is None or content_source_path is not None:
             raise ValueError("legacy preflight requires its signed content receipt")
@@ -2797,7 +2815,7 @@ def revalidate_formal_single_operator_preflight_execution_inputs(
         ):
             raise ValueError("trusted preflight content binding changed")
         (
-            _trusted_bundle,
+            trusted_bundle,
             workload_binding,
             _workload,
             _trusted_workload,
@@ -2807,6 +2825,27 @@ def revalidate_formal_single_operator_preflight_execution_inputs(
         ) = _trusted_content_sources(
             content_source_binding=artifact.content_source_binding,
             workload_authority_path=artifact.workload_authority.path,
+        )
+        from lightcone_spec.doctor import (
+            revalidate_trusted_single_operator_doctor_report,
+        )
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            trusted_single_operator_capacity_authority_from_doctor,
+        )
+
+        revalidate_trusted_single_operator_doctor_report(
+            artifact.doctor_report.absolute_path,
+            expected_bound_content_bundle=trusted_bundle,
+        )
+        trusted_content_binding = (
+            artifact.content_source_binding.trusted_single_operator
+        )
+        if trusted_content_binding is None:
+            raise ValueError("trusted preflight content path binding is absent")
+        trusted_single_operator_capacity_authority_from_doctor(
+            artifact.doctor_report.absolute_path,
+            expected_bound_content_source_path=(trusted_content_binding.absolute_path),
+            expected_output_path=artifact_binding.absolute_path,
         )
         if (
             workload_binding != artifact.workload_authority

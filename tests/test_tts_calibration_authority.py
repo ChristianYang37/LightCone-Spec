@@ -183,7 +183,7 @@ def _sign_tts_seal(
 
 def _authority() -> TtsCalibrationAuthority:
     return TtsCalibrationAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="tts-arxiv-v2-numeric-calibration",
         primary_source_id=TTS_PRIMARY_SOURCE_ID,
         primary_source_version=TTS_PRIMARY_SOURCE_VERSION,
@@ -614,17 +614,51 @@ def _publish_real_tts_coverage_proof(
 
     def prepare(value, **_kwargs):
         cell_id = Path(value["path"]).stem.removeprefix("terminal-")
+        request_id = f"scored-{cell_id}"
+        warmup_resets = SimpleNamespace(
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+            protocol_sha256=(
+                coverage_module.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            ),
+            receipts=(),
+        )
+        scored_resets = SimpleNamespace(
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+            protocol_sha256=(
+                coverage_module.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            ),
+            receipts=(SimpleNamespace(request_id=request_id),),
+        )
         return SimpleNamespace(
             binding=SimpleNamespace(
                 canonical_raw_sha256=value["sha256"],
                 sha256=_sha(f"control-binding-{cell_id}"),
             ),
             evidence=SimpleNamespace(
+                terminal_schema_version=2,
                 binding=SimpleNamespace(
                     method="tts",
+                    reset_scope="request",
+                    request_admission_policy="serialized_native_scheduler_v1",
                     run_id=f"tts-{cell_id}",
                     run_nonce_sha256=_sha(f"run-nonce-{cell_id}"),
-                )
+                ),
+                reset_receipt=SimpleNamespace(
+                    request_source_point_reset_protocol_sha256=(
+                        coverage_module.REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                    ),
+                    warmup_request_source_point_resets=warmup_resets,
+                    warmup_requests=(),
+                ),
+                request_source_point_resets=scored_resets,
+                requests=(
+                    SimpleNamespace(
+                        request_id=request_id,
+                        submitted_to_server=True,
+                    ),
+                ),
             ),
         )
 

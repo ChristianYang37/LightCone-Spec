@@ -94,6 +94,7 @@ _FRESH_REASONS = {
     "nextn_requires_fresh_process",
     "backend_session_reset_gate_unsupported",
     "adaptive_group_config_backend_unsupported",
+    "adaptive_runtime_authority_requires_fresh_process",
     "trusted_prepared_launch_required",
     "session_reset_gate_missing",
     "session_group_singleton",
@@ -551,6 +552,12 @@ def formal_serving_session_reuse_exclusion_reason(
         return "nextn_requires_fresh_process"
     if config.model.algorithm not in _REUSABLE_BACKENDS:
         return "backend_session_reset_gate_unsupported"
+    if config.adaptation is not None and config.model.algorithm != "DFLASH":
+        # The current trusted runtime token binds the exact per-cell launch
+        # manifest and RunConfig.  A resident adaptive group rewrites the
+        # adaptation namespace and argv, so it must remain fresh until a
+        # separately verified group-scoped token is registered.
+        return "adaptive_runtime_authority_requires_fresh_process"
     if (
         config.adaptation is not None
         and config.model.algorithm not in _ADAPTIVE_GROUP_CONFIG_BACKENDS

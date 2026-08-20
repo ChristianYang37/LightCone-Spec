@@ -24,8 +24,9 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -1148,19 +1149,52 @@ def _wait_server_ready(
 def _spawn_server(
     launch: CompileLaunchManifest,
     *,
+    child_environment_overlay: Mapping[str, str] | None,
     stdout_file,
     stderr_file,
 ) -> subprocess.Popen[bytes]:
+    environment = launch.child_environment()
+    if child_environment_overlay is not None:
+        if any(
+            type(name) is not str or not name or type(value) is not str or not value
+            for name, value in child_environment_overlay.items()
+        ):
+            raise ValueError("live serving child environment overlay differs")
+        environment.update(child_environment_overlay)
     return subprocess.Popen(
         launch.server_argv,
         cwd=launch.patched_sglang_checkout,
-        env=launch.child_environment(),
+        env=environment,
         stdin=subprocess.DEVNULL,
         stdout=stdout_file,
         stderr=stderr_file,
         start_new_session=True,
         close_fds=True,
     )
+
+
+def _require_source_owned_server_executable(value: str) -> Path:
+    """Accept the current interpreter, including its exact venv launcher link."""
+
+    executable = Path(value)
+    if (
+        not executable.is_absolute()
+        or executable.parent != executable.parent.resolve(strict=True)
+        or not executable.is_file()
+    ):
+        raise ValueError("live serving argv requires an absolute executable")
+    resolved = executable.resolve(strict=True)
+    current_launcher = Path(sys.executable)
+    current = current_launcher.resolve(strict=True)
+    if resolved != current or resolved.is_symlink():
+        raise ValueError("live serving argv uses another Python interpreter")
+    if executable.is_symlink():
+        if not current_launcher.is_symlink() or executable != current_launcher:
+            raise ValueError("live serving venv launcher differs from this process")
+        virtual_environment = executable.parent.parent / "pyvenv.cfg"
+        if not virtual_environment.is_file() or virtual_environment.is_symlink():
+            raise ValueError("live serving venv interpreter identity is unavailable")
+    return executable
 
 
 def _validate_phase_inputs(
@@ -4325,13 +4359,7 @@ async def execute_unsigned_native_serving_group(
             if len(row_paths) != expected_row_path_count or all_paths & row_paths:
                 raise ValueError("live serving group output paths overlap")
             all_paths.update(row_paths)
-            executable = Path(launch.server_argv[0])
-            if (
-                not executable.is_absolute()
-                or not executable.is_file()
-                or executable.is_symlink()
-            ):
-                raise ValueError("live serving group argv executable is invalid")
+            _require_source_owned_server_executable(launch.server_argv[0])
             _require_port_unused(launch.localhost_port)
             states.append(
                 _GroupLiveState(
@@ -4386,6 +4414,7 @@ async def execute_unsigned_native_serving_group(
             state.process = await asyncio.to_thread(
                 _spawn_server,
                 state.launch,
+                child_environment_overlay=None,
                 stdout_file=state.log_file,
                 stderr_file=state.log_file,
             )
@@ -4785,6 +4814,7 @@ async def execute_unsigned_native_serving_run(
     server_stdout_output_path: str | Path | None = None,
     server_stderr_output_path: str | Path | None = None,
     execution_policy: RegisteredServingExecutionPolicy | None = None,
+    child_environment_overlay: Mapping[str, str] | None = None,
 ) -> ValidatedUnsignedPinnedSglangServingRun:
     """Execute one exact TP1/DP1 run with no caller-injected live boundary."""
 
@@ -5009,13 +5039,7 @@ async def execute_unsigned_native_serving_run(
             expected_output_count += 2
         if len(outputs) != expected_output_count:
             raise ValueError("live serving output paths must be distinct")
-        executable = Path(launch.server_argv[0])
-        if (
-            not executable.is_absolute()
-            or not executable.is_file()
-            or executable.is_symlink()
-        ):
-            raise ValueError("live serving argv requires an absolute executable")
+        _require_source_owned_server_executable(launch.server_argv[0])
         _require_port_unused(launch.localhost_port)
     except BaseException as error:
         fatal = _publish_fatal_pointer(
@@ -5106,6 +5130,7 @@ async def execute_unsigned_native_serving_run(
         process = await asyncio.to_thread(
             _spawn_server,
             launch,
+            child_environment_overlay=child_environment_overlay,
             stdout_file=stdout_file,
             stderr_file=stderr_file,
         )

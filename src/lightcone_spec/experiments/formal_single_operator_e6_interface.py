@@ -75,6 +75,7 @@ FORMAL_SINGLE_OPERATOR_E6_INTERFACE_FIT_PROTOCOL_SHA256 = content_sha256(
         "topology": "tp2_dp1",
         "physical_runs": 2,
         "suite": "nextn_tp2_exact_8_of_8_zero_fail_error_skip",
+        "child_runtime_authority": "deep_replayed_interface_fit_plan_and_assignment",
         "reuse": "same_two_terminals_for_pilot_and_final",
     }
 )
@@ -92,6 +93,7 @@ FORMAL_SINGLE_OPERATOR_E6_BUILT_IN_MTP_INTERFACE_FIT_PROTOCOL_SHA256 = content_s
         ),
         "external_drafter": "forbidden",
         "suite": "nextn_tp2_exact_8_of_8_zero_fail_error_skip",
+        "child_runtime_authority": "deep_replayed_interface_fit_plan_and_assignment",
         "reuse": "same_two_terminals_for_pilot_and_final",
     }
 )
@@ -1022,6 +1024,15 @@ def revalidate_formal_single_operator_e6_interface_fit_plan(
     ):
         raise ValueError("E6 interface/fit trusted lineage differs")
     inventory = GpuInventory.from_dict(plan.inventory.reopen())
+    launch_binding = CanonicalJsonProofBinding.bind(plan.launch_manifest.absolute_path)
+    assignment_binding = CanonicalJsonProofBinding.bind(
+        plan.native_assignment.absolute_path
+    )
+    if (
+        launch_binding != plan.launch_manifest
+        or assignment_binding != plan.native_assignment
+    ):
+        raise ValueError("E6 interface/fit launch or assignment binding changed")
     launch = CompileLaunchManifest.load(plan.launch_manifest.absolute_path)
     assignment = NativeRuntimeQualificationAssignment.load(
         plan.native_assignment.absolute_path
@@ -1046,7 +1057,42 @@ def revalidate_formal_single_operator_e6_interface_fit_plan(
             member_id=plan.drafter_member_sha256,
             role="drafter",
         )
-    _doctor(plan.doctor, inventory=inventory, launch=launch)
+    python_path, nvidia_path = _doctor(
+        plan.doctor,
+        inventory=inventory,
+        launch=launch,
+    )
+    python_evidence = EvidenceFileBinding.bind(
+        python_path,
+        label="E6 interface/fit Python",
+    )
+    nvidia_evidence = EvidenceFileBinding.bind(
+        nvidia_path,
+        label="E6 interface/fit nvidia-smi",
+    )
+    devices = {row.uuid: row for row in inventory.devices}
+    if any(uuid not in devices for uuid in plan.gpu_uuids):
+        raise ValueError("E6 interface/fit GPU placement leaves inventory")
+    expected_hardware_envelope_sha256 = content_sha256(
+        {
+            "inventory": inventory.sha256,
+            "doctor": plan.doctor.semantic_sha256,
+            "gpus": list(plan.gpu_uuids),
+        }
+    )
+    expected_run_nonce_sha256 = content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "formal_single_operator_e6_interface_fit_run_nonce",
+            "protocol_lock_sha256": lock.sha256,
+            "predecessor_completion_sha256": (
+                plan.predecessor_completion.semantic_sha256
+            ),
+            "model": plan.model,
+            "launch_manifest_sha256": launch.sha256,
+            "physical_run_index": plan.physical_run_index,
+        }
+    )
     observations = bundle.runtime_observations
     assert observations is not None
     if (
@@ -1080,8 +1126,32 @@ def revalidate_formal_single_operator_e6_interface_fit_plan(
         or assignment.registry_sha256 != lock.registry_sha256
         or assignment.runtime_sha256 != lock.formal_runtime_authority_manifest_sha256
         or assignment.inventory_sha256 != inventory.sha256
+        or assignment.hardware_envelope_sha256 != expected_hardware_envelope_sha256
+        or assignment.run_nonce_sha256 != expected_run_nonce_sha256
         or assignment.gpu_uuids != plan.gpu_uuids
+        or assignment.gpu_models
+        != tuple(devices[uuid].model for uuid in plan.gpu_uuids)
         or assignment.topology_sha256 != plan.topology_sha256
+        or (
+            assignment.python_executable,
+            assignment.python_executable_raw_sha256,
+            assignment.python_executable_size,
+        )
+        != (
+            python_evidence.absolute_path,
+            python_evidence.raw_sha256,
+            python_evidence.size,
+        )
+        or (
+            assignment.nvidia_smi_executable,
+            assignment.nvidia_smi_raw_sha256,
+            assignment.nvidia_smi_size,
+        )
+        != (
+            nvidia_evidence.absolute_path,
+            nvidia_evidence.raw_sha256,
+            nvidia_evidence.size,
+        )
         or launch.schema_version != (3 if plan.schema_version == 2 else 2)
         or launch.formal_stage != "E6"
         or launch.content_source_binding != plan.content_source
@@ -1109,6 +1179,10 @@ def revalidate_formal_single_operator_e6_interface_fit_plan(
         or Path(plan.evidence_directory) != Path(binding.absolute_path).parent
         or Path(plan.native_assignment.absolute_path).parent
         != Path(plan.evidence_directory)
+        or CanonicalJsonProofBinding.bind(plan.launch_manifest.absolute_path)
+        != launch_binding
+        or CanonicalJsonProofBinding.bind(plan.native_assignment.absolute_path)
+        != assignment_binding
     ):
         raise ValueError("E6 interface/fit plan replay differs")
     return plan
@@ -1394,6 +1468,10 @@ def _execute_formal_single_operator_e6_interface_fit_plan_unlocked(
     """Execute one exact source-owned NEXTN TP2 8/8 live qualification."""
 
     plan = revalidate_formal_single_operator_e6_interface_fit_plan(plan_path)
+    plan_binding = CanonicalJsonProofBinding.bind(
+        plan_path,
+        semantic_sha256=plan.sha256,
+    )
     assignment = NativeRuntimeQualificationAssignment.load(
         plan.native_assignment.absolute_path
     )
@@ -1432,6 +1510,10 @@ def _execute_formal_single_operator_e6_interface_fit_plan_unlocked(
                 plan.native_assignment.absolute_path
             ),
             "LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_SHA256": assignment.sha256,
+            "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH": (
+                plan_binding.absolute_path
+            ),
+            "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_SHA256": plan.sha256,
             "LIGHTCONE_NATIVE_QUALIFICATION_RUNNER_PROTOCOL_SHA256": (
                 assignment.runner_protocol_sha256
             ),

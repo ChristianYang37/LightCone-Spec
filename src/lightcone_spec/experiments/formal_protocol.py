@@ -13,12 +13,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Literal
 
+from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
 from lightcone_spec.runtime.attestation import (
     AttestationChallenge,
     SignedAttestation,
@@ -432,7 +435,7 @@ def chronobelief_reference_transition(
 
 @dataclass(frozen=True)
 class TtsCalibrationAuthority:
-    """Numeric TTS reconstruction grid; tuning-only and disjoint by design."""
+    """Project-calibrated TTS grid bound to the pinned DFlash runtime recipe."""
 
     schema_version: int
     authority_id: str
@@ -453,9 +456,17 @@ class TtsCalibrationAuthority:
     gradient_clipping: str = "none"
     trainable_scope: str = "full_drafter"
     optimization_steps_per_update: int = 1
-    teacher_rows: str = "latest_round_only"
-    position_weights: str = "drafter_native"
-    proximal_anchor: str = "source_point"
+    teacher_rows: str = "latest_update_round_only"
+    loss_objective: str = "masked_position_weighted_target_to_draft_forward_kl"
+    loss_accumulation_precision: str = "float32"
+    loss_temperature: float = 1.0
+    position_weight_formula: str = "exp(-(k-1)/7)"
+    loss_position_decay: float = DFLASH_LOSS_POSITION_DECAY
+    loss_normalization: str = "masked_weighted_mean_denominator_clamped_min_1"
+    source_point_value_correction: str = (
+        "inference_forward_value_with_differentiable_surrogate_jacobian"
+    )
+    proximal_penalty: str = "absent"
     reset_scope: str = "request"
     execution_stream: str = "side_stream"
     excluded_pilot_blocks: tuple[int, ...] = (0, 1, 2, 3)
@@ -463,8 +474,8 @@ class TtsCalibrationAuthority:
     result_class: str = "tuning_only_not_formal"
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("only TTS calibration authority schema 1 is supported")
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            raise ValueError("only TTS calibration authority schema 2 is supported")
         _require_text("TTS calibration authority ID", self.authority_id)
         if (
             self.primary_source_id != TTS_PRIMARY_SOURCE_ID
@@ -492,9 +503,18 @@ class TtsCalibrationAuthority:
             or self.gradient_clipping != "none"
             or self.trainable_scope != "full_drafter"
             or self.optimization_steps_per_update != 1
-            or self.teacher_rows != "latest_round_only"
-            or self.position_weights != "drafter_native"
-            or self.proximal_anchor != "source_point"
+            or self.teacher_rows != "latest_update_round_only"
+            or self.loss_objective
+            != "masked_position_weighted_target_to_draft_forward_kl"
+            or self.loss_accumulation_precision != "float32"
+            or self.loss_temperature != 1.0
+            or self.position_weight_formula != "exp(-(k-1)/7)"
+            or self.loss_position_decay != DFLASH_LOSS_POSITION_DECAY
+            or self.loss_normalization
+            != "masked_weighted_mean_denominator_clamped_min_1"
+            or self.source_point_value_correction
+            != "inference_forward_value_with_differentiable_surrogate_jacobian"
+            or self.proximal_penalty != "absent"
             or self.reset_scope != "request"
             or self.execution_stream != "side_stream"
             or self.excluded_pilot_blocks != (0, 1, 2, 3)
@@ -535,6 +555,51 @@ class TtsCalibrationAuthority:
         ):
             raise ValueError(
                 "TTS runtime optimizer differs from the frozen no-clip recipe"
+            )
+
+    def validate_runtime_adaptation_config(
+        self,
+        config: object,
+        *,
+        learning_rate: float,
+        stride: int,
+        canvas_tokens: int,
+    ) -> None:
+        """Require the complete fixed TTS/L0 adaptation and loss configuration."""
+
+        from lightcone_spec.config.schema import AdaptationConfig
+
+        if type(config) is not AdaptationConfig:
+            raise TypeError("TTS runtime recipe requires an exact AdaptationConfig")
+        if learning_rate not in self.learning_rates or stride not in self.strides:
+            raise ValueError("TTS runtime candidate lies outside the sealed grid")
+        self.validate_runtime_optimizer_config(config.optimizer)
+        if (
+            config.optimizer.learning_rate != learning_rate
+            or config.weight_update_mode != "full"
+            or config.parameter_scope != "all"
+            or config.kv_history_policy != "frozen"
+            or config.adaptation_scope != "cohort"
+            or config.reset_scope != "request"
+            or config.request_admission_policy != "serialized_native_scheduler_v1"
+            or config.rank is not None
+            or config.lora_alpha is not None
+            or config.lora_matrix_policy != "registered_matrices_v1"
+            or config.native_head_policy != "frozen"
+            or config.stride != stride
+            or config.max_in_flight != 1
+            or config.canvas_tokens != canvas_tokens
+            or config.loss_position_decay != self.loss_position_decay
+            or config.extra_logical_delay != 0
+            or config.teacher_row_policy != "update_round"
+            or config.verification_mode != "native_scheduler"
+            or config.fixed_verification_budget is not None
+            or config.confidence_loss_weight is not None
+            or config.chronobelief_release_capability_sha256 is not None
+            or config.chronobelief_gpu_proof_sha256 is not None
+        ):
+            raise ValueError(
+                "TTS runtime adaptation differs from the frozen DFlash recipe"
             )
 
     @cached_property
@@ -1201,6 +1266,86 @@ class FormalRuntimeAuthorityManifest:
 
 
 @dataclass(frozen=True)
+class TrustedSingleOperatorProtocolSourceBinding:
+    """Path/raw/semantic identity for one trusted ProtocolLock source."""
+
+    absolute_path: str
+    raw_sha256: str
+    semantic_sha256: str
+    size: int
+
+    def __post_init__(self) -> None:
+        if type(self.absolute_path) is not str:
+            raise TypeError("trusted ProtocolLock source path must be exact text")
+        path = Path(self.absolute_path)
+        if not path.is_absolute() or path != Path(os.path.abspath(path)):
+            raise ValueError(
+                "trusted ProtocolLock source path must be absolute and normalized"
+            )
+        _require_sha256("trusted ProtocolLock source raw digest", self.raw_sha256)
+        _require_sha256(
+            "trusted ProtocolLock source semantic digest",
+            self.semantic_sha256,
+        )
+        if type(self.size) is not int or not 2 <= self.size <= 256 * 1024 * 1024:
+            raise ValueError("trusted ProtocolLock source size is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "absolute_path": self.absolute_path,
+            "raw_sha256": self.raw_sha256,
+            "semantic_sha256": self.semantic_sha256,
+            "size": self.size,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> TrustedSingleOperatorProtocolSourceBinding:
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise ValueError("trusted ProtocolLock source binding fields differ")
+        return cls(**value)
+
+
+@dataclass(frozen=True)
+class TrustedSingleOperatorProtocolSourceBindings:
+    """Complete path-bound replay inputs for a trusted schema-5 lock."""
+
+    trusted_content_bundle_source: TrustedSingleOperatorProtocolSourceBinding
+    formal_runtime_authority_manifest_source: TrustedSingleOperatorProtocolSourceBinding
+    tts_calibration_authority_source: TrustedSingleOperatorProtocolSourceBinding
+    chronobelief_authority_source: TrustedSingleOperatorProtocolSourceBinding
+    e1_recipe_anchor_authority_source: TrustedSingleOperatorProtocolSourceBinding
+
+    def __post_init__(self) -> None:
+        bindings = tuple(getattr(self, name) for name in self.__dataclass_fields__)
+        if any(
+            type(binding) is not TrustedSingleOperatorProtocolSourceBinding
+            for binding in bindings
+        ):
+            raise TypeError("trusted ProtocolLock sources must be exact bindings")
+        if len({binding.absolute_path for binding in bindings}) != len(bindings):
+            raise ValueError("trusted ProtocolLock source bindings alias inputs")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            name: getattr(self, name).to_dict() for name in self.__dataclass_fields__
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: object,
+    ) -> TrustedSingleOperatorProtocolSourceBindings:
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise ValueError("trusted ProtocolLock source bindings fields differ")
+        return cls(
+            **{
+                name: TrustedSingleOperatorProtocolSourceBinding.from_dict(value[name])
+                for name in cls.__dataclass_fields__
+            }
+        )
+
+
+@dataclass(frozen=True)
 class ProtocolLock:
     """Content identity for the complete formal protocol and code release."""
 
@@ -1247,6 +1392,12 @@ class ProtocolLock:
         default=None,
         metadata={"canonical_since_schema": 5},
     )
+    trusted_single_operator_source_bindings: (
+        TrustedSingleOperatorProtocolSourceBindings | None
+    ) = field(
+        default=None,
+        metadata={"canonical_since_schema": 5},
+    )
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version not in {4, 5}:
@@ -1288,6 +1439,7 @@ class ProtocolLock:
             if (
                 self.content_source_mode != "offline_root_signed"
                 or self.trusted_single_operator_content_bundle_sha256 is not None
+                or self.trusted_single_operator_source_bindings is not None
             ):
                 raise ValueError("legacy ProtocolLock content source tag differs")
             for name in signed_content_fields:
@@ -1296,12 +1448,20 @@ class ProtocolLock:
             if (
                 self.content_source_mode != "trusted_single_operator"
                 or self.trusted_single_operator_content_bundle_sha256 is None
+                or type(self.trusted_single_operator_source_bindings)
+                is not TrustedSingleOperatorProtocolSourceBindings
             ):
                 raise ValueError("trusted ProtocolLock content source tag differs")
             _require_sha256(
                 "ProtocolLock trusted single-operator content bundle",
                 self.trusted_single_operator_content_bundle_sha256,
             )
+            assert self.trusted_single_operator_source_bindings is not None
+            if (
+                self.trusted_single_operator_source_bindings.trusted_content_bundle_source.semantic_sha256
+                != self.trusted_single_operator_content_bundle_sha256
+            ):
+                raise ValueError("trusted ProtocolLock content source digest differs")
             if any(getattr(self, name) is not None for name in signed_content_fields):
                 raise ValueError(
                     "trusted ProtocolLock must not carry offline authorization claims"

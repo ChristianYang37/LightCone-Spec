@@ -5,3 +5,4 @@
 0005-feat-compile-source-owned-lifecycle.patch
 0006-fix-metrics-handle-target-only-draft-width.patch
 0007-feat-spec-bind-distributed-runtime-readiness.patch
+0008-fix-spec-isolate-request-scoped-adaptation-state.patch

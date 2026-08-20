@@ -1631,6 +1631,12 @@ def test_formal_serving_execution_proof_binds_exact_e3a_cell_and_replay(
     )
     object.__setattr__(binding, "hardware_envelope_sha256", HARDWARE_SHA256)
     payload = gpu_hour_authority._execution_proof_payload(binding)
+    invalid_measurement = payload.to_dict()
+    invalid_measurement["formal_measurement"] = 0
+    with pytest.raises(ValueError, match="runtime trust is invalid"):
+        gpu_hour_authority.FormalServingExecutionProofPayload.from_dict(
+            invalid_measurement
+        )
     lineage = gpu_hour_authority._execution_proof_lineage_sha256(
         protocol_lock_sha256=payload.protocol_lock_sha256,
         runtime_authority_manifest_sha256=(payload.runtime_authority_manifest_sha256),
@@ -1678,6 +1684,13 @@ def test_formal_serving_execution_proof_binds_exact_e3a_cell_and_replay(
         now_ns=NOW_NS + 1,
     )
     assert validated.execution_binding_sha256 == binding.sha256
+    assert (
+        validated.runtime_trust_mode,
+        validated.formal_measurement,
+    ) == (
+        binding.subject.execution_identity.runtime_trust_mode,
+        binding.subject.execution_identity.formal_measurement,
+    )
     with pytest.raises(ValueError, match="lineage differs"):
         validate_formal_serving_execution_proof_artifact(
             str(artifact_path),

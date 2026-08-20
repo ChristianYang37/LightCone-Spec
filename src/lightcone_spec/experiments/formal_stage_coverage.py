@@ -65,6 +65,7 @@ from lightcone_spec.experiments.itl_authority import (
 from lightcone_spec.experiments.stage_materialization import (
     E0_ALL_NA_MATERIALIZATION_RULE,
     E6_TASKS,
+    TTS_CAL_MATERIALIZATION_RULE,
     MaterializedCell,
     SignedStageCoverageReceipt,
     StageCellDisposition,
@@ -85,6 +86,7 @@ from lightcone_spec.orchestration.formal_terminal_result import (
     validate_formal_terminal_result_proof_artifact,
 )
 from lightcone_spec.orchestration.native_terminal import (
+    REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
     prepare_native_terminal_external_control,
     validate_candidate_state_replay_proof_artifact,
 )
@@ -112,7 +114,8 @@ FORMAL_STAGE_COVERAGE_PROTOCOL_SHA256 = content_sha256(
         "materialization": "every_and_only_materialized_cell",
         "serving": "sealed_execution_rebuild_plus_result_plus_native_itl",
         "tts_calibration": (
-            "raw_288_terminal_external_controls_and_qualification_locks"
+            "raw_288_terminal_external_controls_qualification_locks_and_"
+            "current_request_reset_evidence"
         ),
         "candidate_state": "path_bound_native_replay_proof_exact_pair_coverage",
         "failure_policy": "E5_final_requires_separate_failure_proof_adapter",
@@ -208,7 +211,7 @@ _STAGE_PHASES: frozenset[tuple[str, str]] = frozenset(
 _MATERIALIZATION_RULE_PHASES = {
     E0_ALL_NA_MATERIALIZATION_RULE: ("E0", "final"),
     "exact_360_row_capacity_width_and_drift_grid": ("E3a", "capacity"),
-    "72_candidates_x_4_disjoint_excluded_pilots": ("TTS-Cal", "calibration"),
+    TTS_CAL_MATERIALIZATION_RULE: ("TTS-Cal", "calibration"),
     "four_fixed_anchors_plus_32_geometries_x_2_optimizers": ("E1", "selection"),
     "strength2_8_rows_x_3_loads_x_2_traffic": ("E4", "screen"),
     "winner_neighborhood_2pow4_x_3_loads_x_2_traffic": ("E4", "local"),
@@ -1937,6 +1940,64 @@ def _validate_tts_qualification_lock(
         raise ValueError("TTS qualification request coverage differs")
 
 
+def _require_tts_calibration_request_reset_evidence(evidence: object) -> None:
+    """Require the deep-validated current request-reset contract for TTS-Cal.
+
+    Zero round/update rows are valid for short or aborted requests.  Coverage
+    is therefore joined to submitted server lifecycle rows through reset
+    receipts instead of manufacturing adaptation rows.
+    """
+
+    binding = getattr(evidence, "binding", None)
+    reset_receipt = getattr(evidence, "reset_receipt", None)
+    scored_resets = getattr(evidence, "request_source_point_resets", None)
+    warmup_resets = getattr(reset_receipt, "warmup_request_source_point_resets", None)
+    if (
+        getattr(evidence, "terminal_schema_version", None) != 2
+        or getattr(binding, "method", None) != "tts"
+        or getattr(binding, "reset_scope", None) != "request"
+        or getattr(binding, "request_admission_policy", None)
+        != "serialized_native_scheduler_v1"
+        or getattr(
+            reset_receipt,
+            "request_source_point_reset_protocol_sha256",
+            None,
+        )
+        != REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+    ):
+        raise ValueError("TTS coverage requires current request-reset identity")
+    for phase, resets, requests in (
+        (
+            "warmup",
+            warmup_resets,
+            getattr(reset_receipt, "warmup_requests", None),
+        ),
+        ("scored", scored_resets, getattr(evidence, "requests", None)),
+    ):
+        if (
+            resets is None
+            or getattr(resets, "reset_scope", None) != "request"
+            or getattr(resets, "request_admission_policy", None)
+            != "serialized_native_scheduler_v1"
+            or getattr(resets, "protocol_sha256", None)
+            != REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            or type(requests) is not tuple
+            or type(getattr(resets, "receipts", None)) is not tuple
+        ):
+            raise ValueError(f"TTS coverage {phase} reset envelope differs")
+        submitted_ids = tuple(
+            request.request_id for request in requests if request.submitted_to_server
+        )
+        receipt_ids = tuple(receipt.request_id for receipt in resets.receipts)
+        # Receipt order is the native acquire/terminal order (and therefore
+        # carries epoch semantics); it need not equal caller submission order.
+        # The deep terminal validator already proves both sequences unique.
+        if len(receipt_ids) != len(submitted_ids) or set(receipt_ids) != set(
+            submitted_ids
+        ):
+            raise ValueError(f"TTS coverage {phase} reset coverage differs")
+
+
 def reduce_tts_calibration_stage_coverage_from_proofs(
     *,
     protocol_lock: ProtocolLock,
@@ -2040,6 +2101,7 @@ def reduce_tts_calibration_stage_coverage_from_proofs(
                 expected_inventory_sha256=inventory.sha256,
                 expected_registry_sha256=registry.sha256,
             )
+            _require_tts_calibration_request_reset_evidence(prepared.evidence)
             verified_control = verify_release_control_artifact_attestation(
                 control,
                 expected_inventory_sha256=inventory.sha256,

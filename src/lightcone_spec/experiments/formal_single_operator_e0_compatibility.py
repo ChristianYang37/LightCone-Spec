@@ -1705,7 +1705,9 @@ class TrustedSingleOperatorEagle3ExecutionAuthority:
             self.execution_source.absolute_path
         )
         materialization = stage_materialization_receipt_from_dict(
-            source.materialization_source.reopen()
+            source.materialization_source.reopen(
+                label="E0 probe plan execution materialization"
+            )
         )
         cells = {cell.cell_id: cell for cell in materialization.cells}
         cell = cells.get(self.materialized_cell_id)
@@ -1888,7 +1890,9 @@ def derive_trusted_single_operator_eagle3_execution_authority(
     source_binding = CanonicalJsonProofBinding.bind(execution_source_path)
     source = load_formal_single_operator_execution_source(source_binding.absolute_path)
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="E0 EAGLE3 authority execution materialization"
+        )
     )
     cells = {cell.cell_id: cell for cell in materialization.cells}
     cell = cells.get(materialized_cell_id)

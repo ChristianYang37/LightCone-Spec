@@ -157,6 +157,278 @@ def test_publish_trusted_content_cli_accepts_only_spec_and_output_paths(
         )
 
 
+def test_publish_v03_model_lock_cli_is_code_owned_and_path_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_model_registry as models,
+    )
+
+    output = (tmp_path / "formal-v03-model-lock.json").resolve()
+    observed: dict[str, object] = {}
+    lock = SimpleNamespace(models=tuple(range(19)), sha256="a" * 64)
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return lock
+
+    monkeypatch.setattr(models, "publish_formal_v03_model_lock", publish)
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-v03-model-lock",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {"output_path": str(output)}
+    assert json.loads(capsys.readouterr().out) == {
+        "model_count": 19,
+        "path": str(output),
+        "sha256": "a" * 64,
+    }
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "formal-single-operator",
+                "publish-v03-model-lock",
+                "--output",
+                str(output),
+                "--revision",
+                "b" * 40,
+            ]
+        )
+
+
+def test_publish_v03_content_path_spec_cli_is_path_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_model_registry as models,
+    )
+
+    inputs = (tmp_path / "content-inputs.json").resolve()
+    output = (tmp_path / "content-path-spec.json").resolve()
+    observed: dict[str, object] = {}
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(to_dict=lambda: {"kind": "path-only-fixture"})
+
+    monkeypatch.setattr(
+        models,
+        "publish_formal_v03_content_path_spec_from_inputs",
+        publish,
+    )
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-v03-content-path-spec",
+                "--inputs",
+                str(inputs),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {"inputs_path": str(inputs), "output_path": str(output)}
+    assert json.loads(capsys.readouterr().out)["path"] == str(output)
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "formal-single-operator",
+                "publish-v03-content-path-spec",
+                "--inputs",
+                str(inputs),
+                "--output",
+                str(output),
+                "--content-sha256",
+                "a" * 64,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "publisher_name"),
+    (
+        (
+            "publish-tts-cal-trainable-plan",
+            "publish_trusted_tts_calibration_trainable_plan_authority",
+        ),
+        (
+            "publish-e1-anchor-trainable-plan",
+            "publish_trusted_e1_recipe_anchor_trainable_plan_authority",
+        ),
+    ),
+)
+def test_trainable_plan_cli_is_bundle_and_output_path_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    operation: str,
+    publisher_name: str,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_trainable_plan as plans,
+    )
+
+    bundle = (tmp_path / "bound-content.json").resolve()
+    output = (tmp_path / f"{operation}.json").resolve()
+    observed: dict[str, object] = {}
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            cell_id="canonical:representative:parameter-inventory-only",
+            sha256="a" * 64,
+            trainable_plan_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(plans, publisher_name, publish)
+    argv = [
+        "formal-single-operator",
+        operation,
+        "--trusted-content-bundle",
+        str(bundle),
+        "--output",
+        str(output),
+    ]
+    assert main(argv) == 0
+    assert observed == {
+        "trusted_content_bundle_path": str(bundle),
+        "output_path": str(output),
+    }
+    assert json.loads(capsys.readouterr().out)["path"] == str(output)
+    with pytest.raises(SystemExit):
+        _parser().parse_args([*argv, "--winner", "caller-selected"])
+
+
+def test_publish_stage_capacity_cli_is_path_only_and_empirical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_capacity as capacity,
+    )
+
+    content_spec = (tmp_path / "content-path-spec.json").resolve()
+    run_root = (tmp_path / "run").resolve()
+    output = (tmp_path / "stage-capacity.json").resolve()
+    observed: dict[str, object] = {}
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(sha256="a" * 64, status="AVAILABLE")
+
+    monkeypatch.setattr(
+        capacity,
+        "publish_trusted_single_operator_stage_capacity_authority",
+        publish,
+    )
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-stage-capacity",
+                "--content-path-spec",
+                str(content_spec),
+                "--run-root",
+                str(run_root),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "content_path_spec_path": str(content_spec),
+        "run_root_path": str(run_root),
+        "output_path": str(output),
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "authority_sha256": "a" * 64,
+        "formal_measured_authorization": False,
+        "path": str(output),
+        "status": "AVAILABLE",
+    }
+
+
+def test_publish_v03_e0_source_authorities_cli_is_exact_path_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_model_registry as models,
+    )
+
+    inputs = (tmp_path / "e0-inputs.json").resolve()
+    output = (tmp_path / "e0-authorities").resolve()
+    index = output / "formal-v03-e0-source-authorities.json"
+    observed: dict[str, object] = {}
+
+    def publish(**kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            absolute_path=str(index),
+            raw_sha256="a" * 64,
+            semantic_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(
+        models,
+        "publish_formal_v03_e0_source_authorities_from_inputs",
+        publish,
+    )
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-v03-e0-source-authorities",
+                "--inputs",
+                str(inputs),
+                "--output-directory",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "inputs_path": str(inputs),
+        "output_directory": str(output),
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "index_path": str(index),
+        "raw_sha256": "a" * 64,
+        "semantic_sha256": "b" * 64,
+    }
+
+    with pytest.raises(SystemExit):
+        _parser().parse_args(
+            [
+                "formal-single-operator",
+                "publish-v03-e0-source-authorities",
+                "--inputs",
+                str(inputs),
+                "--output-directory",
+                str(output),
+                "--revision",
+                "c" * 40,
+            ]
+        )
+
+
 def test_publish_preflight_workload_cli_derives_identity_from_content(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -241,22 +513,24 @@ def test_bootstrap_cli_is_path_only_and_closes_supervisor(
     assert json.loads(capsys.readouterr().out) == {"controller_action": "WAITING"}
 
 
-def test_single_operator_cli_materializes_current_node_and_pre_pilot_hours(
+def test_single_operator_cli_blocks_legacy_materialization_but_reads_archive(
     tmp_path: Path,
     capsys,
 ) -> None:
+    from lightcone_spec.experiments import formal_single_operator_stages as stages
+
     protocol_lock = _protocol_lock()
     lock_path = tmp_path / "protocol-lock.json"
     materialization_path = tmp_path / "preflight-materialization.json"
     node_path = tmp_path / "preflight-node-materialization.json"
     source_path = tmp_path / "preflight-execution-source.json"
     gpu_hours_path = tmp_path / "preflight-gpu-hours.json"
-    publish_formal_single_operator_json_artifact(
+    lock_source = publish_formal_single_operator_json_artifact(
         lock_path,
         protocol_lock_to_dict(protocol_lock),
     )
 
-    assert (
+    with pytest.raises(ValueError, match="schema 4 is read-only"):
         main(
             [
                 "formal-single-operator",
@@ -273,9 +547,25 @@ def test_single_operator_cli_materializes_current_node_and_pre_pilot_hours(
                 "10",
             ]
         )
-        == 0
+    assert not materialization_path.exists()
+    assert not node_path.exists()
+
+    # Preserve archived schema-4 replay coverage without reopening the public
+    # materialization boundary.
+    adapter = stages._CLOSED_NODE_ADAPTERS["preflight"].materializer
+    assert adapter is not None
+    stages._materialize_formal_single_operator_node_with_adapter(
+        node="preflight",
+        predecessor_completion_path=None,
+        protocol_lock_source=lock_source,
+        protocol_lock=protocol_lock,
+        content_source_binding=None,
+        auxiliary_sources=(),
+        adapter=adapter,
+        materialization_output_path=materialization_path,
+        node_materialization_output_path=node_path,
+        created_ns=10,
     )
-    assert len(capsys.readouterr().out.strip()) == 64
 
     assert (
         main(
@@ -684,6 +974,8 @@ def test_prepare_run_routes_e5_failure_through_public_one_shot_descriptor(
                 str(tmp_path / "execution-source.json"),
                 "--cell",
                 cell_id,
+                "--preflight-inputs",
+                str(tmp_path / "preflight-inputs.json"),
                 "--prepared-launch-bundle",
                 str(tmp_path / "bundle.json"),
                 "--output-root",
@@ -701,6 +993,9 @@ def test_prepare_run_routes_e5_failure_through_public_one_shot_descriptor(
     )
     assert observed["plan"]["failure_execution_descriptor_path"] == (  # type: ignore[index]
         run_root / "formal-single-operator-e5-failure-execution.json"
+    )
+    assert observed["plan"]["preflight_inputs_path"] == str(  # type: ignore[index]
+        tmp_path / "preflight-inputs.json"
     )
 
 

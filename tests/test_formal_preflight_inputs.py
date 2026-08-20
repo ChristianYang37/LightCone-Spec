@@ -9,7 +9,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_formal_single_operator_content import (
+    _fake_locked_workload,
+    _model_spec,
+    _source_repository,
+    _tiny_burstgpt_assets,
+)
 
+from lightcone_spec.experiments import (
+    formal_single_operator_content as content_module,
+)
+from lightcone_spec.experiments import (
+    formal_single_operator_protocol_lock as protocol_lock_module,
+)
 from lightcone_spec.experiments.formal_preflight_execution import (
     _execute_formal_preflight_interference_raw_core,
 )
@@ -29,10 +41,20 @@ from lightcone_spec.experiments.formal_preflight_inputs import (
     execute_formal_single_operator_preflight_exactness,
     execute_formal_single_operator_preflight_interference,
 )
-from lightcone_spec.experiments.formal_protocol import ProtocolLock
+from lightcone_spec.experiments.formal_protocol import (
+    ProtocolLock,
+    TrustedSingleOperatorProtocolSourceBinding,
+    TrustedSingleOperatorProtocolSourceBindings,
+)
 from lightcone_spec.experiments.formal_registry import (
     protocol_lock_to_dict,
     stage_materialization_receipt_from_dict,
+)
+from lightcone_spec.experiments.formal_single_operator_content import (
+    TrustedSingleOperatorContentBundleBinding,
+    bind_trusted_single_operator_runtime_observations,
+    build_trusted_single_operator_content_bundle,
+    publish_trusted_single_operator_content_bundle,
 )
 from lightcone_spec.experiments.formal_single_operator_stages import (
     load_formal_single_operator_execution_source,
@@ -62,9 +84,16 @@ def _canonical_json(path: Path, value: object) -> CanonicalJsonProofBinding:
     return CanonicalJsonProofBinding.bind(path.resolve())
 
 
-def _lock() -> ProtocolLock:
+def _lock(
+    *,
+    content_source: TrustedSingleOperatorProtocolSourceBinding,
+    runtime_source: TrustedSingleOperatorProtocolSourceBinding,
+    tts_source: TrustedSingleOperatorProtocolSourceBinding,
+    chronobelief_source: TrustedSingleOperatorProtocolSourceBinding,
+    e1_source: TrustedSingleOperatorProtocolSourceBinding,
+) -> ProtocolLock:
     return ProtocolLock(
-        schema_version=4,
+        schema_version=5,
         protocol_id="formal-preflight-input-test",
         code_git_head="1" * 40,
         code_git_tree="2" * 40,
@@ -72,16 +101,16 @@ def _lock() -> ProtocolLock:
         registry_sha256=build_industrial_registry().sha256,
         english_protocol_sha256=_sha("english"),
         chinese_protocol_sha256=_sha("chinese"),
-        tts_calibration_authority_sha256=_sha("tts"),
-        chronobelief_authority_sha256=_sha("chrono"),
-        e1_recipe_anchor_authority_sha256=_sha("e1"),
+        tts_calibration_authority_sha256=tts_source.semantic_sha256,
+        chronobelief_authority_sha256=chronobelief_source.semantic_sha256,
+        e1_recipe_anchor_authority_sha256=e1_source.semantic_sha256,
         e2_recipe_grid_authority_sha256=_sha("e2"),
-        formal_runtime_authority_manifest_sha256=_sha("runtime"),
-        offline_release_trust_root_sha256=_sha("root"),
-        prepared_model_content_authorization_sha256=_sha("prepared"),
-        formal_workload_e3a_authorization_sha256=_sha("e3a"),
-        formal_workload_e0_authorization_sha256=_sha("e0"),
-        burstgpt_shape_authorization_sha256=_sha("burst"),
+        formal_runtime_authority_manifest_sha256=runtime_source.semantic_sha256,
+        offline_release_trust_root_sha256=None,
+        prepared_model_content_authorization_sha256=None,
+        formal_workload_e3a_authorization_sha256=None,
+        formal_workload_e0_authorization_sha256=None,
+        burstgpt_shape_authorization_sha256=None,
         native_runtime_qualification_protocol_sha256=_sha("native-protocol"),
         native_runtime_qualification_runner_sha256=_sha("native-runner"),
         native_runtime_qualification_test_set_sha256=_sha("native-tests"),
@@ -91,6 +120,17 @@ def _lock() -> ProtocolLock:
         exactness_qualification_protocol_sha256=_sha("exact-protocol"),
         exactness_qualification_runner_sha256=_sha("exact-runner"),
         exactness_qualification_test_set_sha256=_sha("exact-tests"),
+        content_source_mode="trusted_single_operator",
+        trusted_single_operator_content_bundle_sha256=(content_source.semantic_sha256),
+        trusted_single_operator_source_bindings=(
+            TrustedSingleOperatorProtocolSourceBindings(
+                trusted_content_bundle_source=content_source,
+                formal_runtime_authority_manifest_source=runtime_source,
+                tts_calibration_authority_source=tts_source,
+                chronobelief_authority_source=chronobelief_source,
+                e1_recipe_anchor_authority_source=e1_source,
+            )
+        ),
     )
 
 
@@ -132,8 +172,98 @@ def _inventory() -> GpuInventory:
     )
 
 
-def _source(tmp_path: Path):
-    lock = _lock()
+def _trusted_content_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    repository = _source_repository(tmp_path)
+    workloads = {
+        workload_id: _fake_locked_workload(tmp_path, workload_id)
+        for workload_id in ("livecodebench_v6_hard", "math500_level5")
+    }
+    monkeypatch.setattr(
+        content_module,
+        "bind_trusted_locked_workload",
+        lambda workload_id, _path: workloads[workload_id],
+    )
+    bundle = build_trusted_single_operator_content_bundle(
+        repository_root=repository,
+        model_specs=tuple(
+            _model_spec(tmp_path, role) for role in ("target", "drafter", "tokenizer")
+        ),
+        livecodebench_raw_path=workloads["livecodebench_v6_hard"].raw_source_path,
+        math500_raw_path=workloads["math500_level5"].raw_source_path,
+        burstgpt_asset_paths=_tiny_burstgpt_assets(tmp_path, monkeypatch),
+    )
+    inventory = (tmp_path / "trusted-inventory.json").resolve()
+    doctor = (tmp_path / "trusted-doctor.json").resolve()
+    _canonical_json(inventory, {"kind": "trusted-test-inventory"})
+    _canonical_json(doctor, {"kind": "trusted-test-doctor"})
+    bound = bind_trusted_single_operator_runtime_observations(
+        bundle,
+        inventory_path=inventory,
+        doctor_path=doctor,
+    )
+    output = (tmp_path / "trusted-content-bundle.json").resolve()
+    publish_trusted_single_operator_content_bundle(bound, output)
+    return output
+
+
+def _protocol_source(
+    binding: CanonicalJsonProofBinding,
+) -> TrustedSingleOperatorProtocolSourceBinding:
+    return TrustedSingleOperatorProtocolSourceBinding(
+        absolute_path=binding.absolute_path,
+        raw_sha256=binding.raw_sha256,
+        semantic_sha256=binding.semantic_sha256,
+        size=binding.size,
+    )
+
+
+def _source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    content_path = _trusted_content_path(tmp_path, monkeypatch)
+    content_binding = TrustedSingleOperatorContentBundleBinding.bind(content_path)
+    content_source = TrustedSingleOperatorProtocolSourceBinding(
+        absolute_path=content_binding.absolute_path,
+        raw_sha256=content_binding.raw_sha256,
+        semantic_sha256=content_binding.semantic_sha256,
+        size=content_binding.size,
+    )
+    structural_sources = {
+        name: _protocol_source(
+            _canonical_json(
+                (tmp_path / f"{name}.json").resolve(),
+                {"kind": f"formal-preflight-{name}-fixture"},
+            )
+        )
+        for name in ("runtime", "tts", "chronobelief", "e1")
+    }
+    lock = _lock(
+        content_source=content_source,
+        runtime_source=structural_sources["runtime"],
+        tts_source=structural_sources["tts"],
+        chronobelief_source=structural_sources["chronobelief"],
+        e1_source=structural_sources["e1"],
+    )
+
+    def revalidate_trusted_lock(
+        candidate: ProtocolLock,
+        *,
+        expected_content_bundle_path: str | Path,
+        require_capacity_available: bool,
+        revalidate_runtime_observations: bool,
+    ) -> ProtocolLock:
+        assert candidate == lock
+        assert Path(expected_content_bundle_path) == content_path
+        assert require_capacity_available is True
+        assert revalidate_runtime_observations is True
+        return candidate
+
+    monkeypatch.setattr(
+        protocol_lock_module,
+        "revalidate_trusted_single_operator_protocol_lock",
+        revalidate_trusted_lock,
+    )
     lock_path = (tmp_path / "protocol-lock.json").resolve()
     publish_formal_single_operator_json_artifact(
         lock_path,
@@ -143,6 +273,7 @@ def _source(tmp_path: Path):
         node="preflight",
         predecessor_completion_path=None,
         protocol_lock_path=lock_path,
+        content_source_path=content_path,
         materialization_output_path=(tmp_path / "materialization.json").resolve(),
         node_materialization_output_path=(
             tmp_path / "node-materialization.json"
@@ -157,8 +288,11 @@ def _source(tmp_path: Path):
     return lock, load_formal_single_operator_execution_source(source_path)
 
 
-def test_trusted_current_source_projects_exact_ten_assignments(tmp_path: Path) -> None:
-    lock, source = _source(tmp_path)
+def test_trusted_current_source_projects_exact_ten_assignments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock, source = _source(tmp_path, monkeypatch)
     inventory = _inventory()
     rows = _trusted_preflight_bindings(
         source=source,
@@ -190,8 +324,9 @@ def test_trusted_current_source_projects_exact_ten_assignments(tmp_path: Path) -
 
 def test_trusted_projection_rejects_nonready_or_foreign_inventory(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock, source = _source(tmp_path)
+    lock, source = _source(tmp_path, monkeypatch)
     inventory = _inventory()
     unavailable = replace(
         inventory,
@@ -219,8 +354,11 @@ def test_trusted_projection_rejects_nonready_or_foreign_inventory(
         )
 
 
-def test_exact_ten_completion_codec_and_junit_are_fail_closed(tmp_path: Path) -> None:
-    lock, source = _source(tmp_path)
+def test_exact_ten_completion_codec_and_junit_are_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock, source = _source(tmp_path, monkeypatch)
     bindings = _trusted_preflight_bindings(
         source=source,
         protocol_lock=lock,

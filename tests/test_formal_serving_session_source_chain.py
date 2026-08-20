@@ -95,6 +95,10 @@ def _terminal(
         previous_run_id=previous_run_id,
         challenge_nonce_sha256=_sha(f"challenge-{epoch_index}"),
         method="static",
+        reset_scope=None,
+        request_admission_policy=None,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(warmup_id,),
         scored_request_ids=(scored_id,),
     )

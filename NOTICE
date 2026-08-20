@@ -9,8 +9,8 @@ distributed with this repository. The patches target:
 
   Repository: https://github.com/sgl-project/sglang.git
   Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: 38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95
-  Expected final tree: c6571336b70cd5f0e0f609d731a65fa98fd7e0b2
+  Latest semantic patch SHA-256: 0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874
+  Expected final tree: bb6371242e82592d1b8a2f5f4ba6d0630d8365cb
 
 The semantic patch changes SGLang to add strict schema-v3 preflight, focused
 DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
@@ -58,6 +58,13 @@ distributed modes remain implemented-pending-qualification until an exact
 locally root-authorized GPU proof exists. It also carries the first-party
 native ITL result pointer through the official benchmark output; the remote
 pointer and terminal remain unsigned raw evidence and cannot self-authorize.
+The eighth patch isolates every request-scoped TTS/L0 adaptation epoch at the
+same source point across DFlash, DSpark, EAGLE3, and NEXTN. It serializes only
+native adaptive ownership while preserving offered client concurrency, seals
+append-only reset/archive evidence for completion and abort paths, restores
+optimizer/inference/captured state before the next admission, and keeps
+cohort-scoped LightCone/OnlineSPEC plus allocation-free Target/Static behavior
+unchanged.
 The second patch adds only CPU host observations for already committed tokens;
 they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
 the benchmark emits null aggregate ITL statistics whenever client interval

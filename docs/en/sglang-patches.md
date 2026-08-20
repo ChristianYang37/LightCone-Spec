@@ -68,17 +68,20 @@ as a separate content-addressed unsigned bundle joined to the terminal; only a
 later local external-control proof can make either artifact formal evidence.
 
 The patch implements the content-bound
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2` capability
 and begin/reset/finalize endpoints. The exact latest-patch SHA-256 is
-`38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`
-and the final tree is `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`; the manifest remains the
+`0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874`
+and the final tree is `bb6371242e82592d1b8a2f5f4ba6d0630d8365cb`; the manifest remains the
 authority. The lifecycle binds run/nonce/plan/rank, process/session/reset
 lineage, expected request IDs, exact ordered token IDs, terminal coverage,
 Static aggregate safety, and adaptive-runtime request/round/update/KV/performance rows.
 It exposes a signer plugin boundary but bundles no trusted hardware key or
-release signer. Source implementations therefore remain fail-closed until the
-corresponding local external-control proof has been verified; CPU contract
-coverage alone cannot authorize a formal method run.
+release signer. The release-attested lane therefore remains fail-closed until
+the corresponding local external-control proof has been verified; CPU contract
+coverage alone cannot authorize a release-level method claim. The trusted
+`formal_single_operator_v1` lane does not require that external signer to run,
+but still requires its exact source/content/runtime, fresh GPU qualification,
+capacity, terminal, and coverage gates.
 
 The sixth patch makes speculative-width accounting target-aware. A true
 Target-only server (`spec_algorithm=none` with no draft width) never evaluates
@@ -106,6 +109,17 @@ non-submitted, and every warmup row must be offered, submitted, and completed.
 Rejected, timed-out, cancelled, and unfinished client outcomes therefore stay
 in the registered serving evidence without making an otherwise valid
 scientific run an incomplete distributed terminal.
+
+The eighth patch gives frozen TTS and L0-naive recipes a request-scoped native
+lifetime. Every acquired request begins from the same master/optimizer/
+inference source point and is atomically archived and restored before the next
+adaptive admission, including cancellation, timeout, preemption, OOM, and
+first-token terminal paths. Native adaptive ownership is serialized while
+client-offered concurrency remains queued and timed normally. DFlash, DSpark,
+EAGLE3, NEXTN, TP2, and sticky DP2 expose the same receipt protocol; the
+request archive is append-only and linear-time to validate. Cohort-scoped
+LightCone/OnlineSPEC and allocation-free Target/Static retain their existing
+semantics.
 
 The second patch exposes an opt-in native committed-token observation
 contract. Each timestamp is sampled by the CPU while the streamer enumerates
@@ -243,11 +257,15 @@ not GPU validation. A CPU package test or an older patched-tree receipt is
 insufficient. The patch implements registered DFlash, DSpark, NEXTN,
 compatible EAGLE3, TP2, and sticky DP2 source paths, but the release trust
 policy has no configured signer and none has a fresh exact dynamic GPU proof.
-Static/TTS/L0-naive/LightCone industrial cells are therefore `BLOCKED` before
-mutation rather than runnable `UNMEASURED` work. A test signer, provider object
-attribute, or caller-supplied verifier cannot unlock that policy. Generic
-EAGLE remains unsupported; incompatible EAGLE3 combinations remain N/A or
-`BLOCKED`. Target-only is the only currently claimable path.
+Static/TTS/L0-naive/LightCone are therefore `BLOCKED` before mutation in the
+release-attested lane. A test signer, provider object attribute, or
+caller-supplied verifier cannot unlock that release policy. This does not block
+the trusted single-operator empirical lane: after its exact dynamic GPU and
+other registered gates pass, it can run the complete DAG without an external
+signature, while remaining `trusted_single_operator_empirical_no_signature`,
+`formal_measured=false`, and `UNMEASURED`. Generic EAGLE remains unsupported;
+incompatible EAGLE3 combinations remain N/A or `BLOCKED`. Target-only remains
+the only currently claimable release-attested path.
 
 Historical shared-tuned-AdamW evidence remains a matched-recipe publication-
 policy diagnostic, not TTS-paper reproduction, and is useful for regression

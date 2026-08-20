@@ -338,14 +338,18 @@ def revalidate_formal_single_operator_e0_compatibility_decision(
     binding = source.auxiliary_source_binding("e0_compatibility")
     auxiliary = source.reopen_auxiliary_source("e0_compatibility")
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="E0 dispatch execution materialization"
+        )
     )
     if source.predecessor_completion_source is None:
         raise ValueError("E0 compatibility execution source lacks E6 completion")
     predecessor = rebuild_formal_single_operator_stage_completion(
         source.predecessor_completion_source.absolute_path
     )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(label="E0 dispatch execution ProtocolLock")
+    )
     validator = FormalSingleOperatorE0CompatibilityActualValidator(
         protocol_lock=protocol_lock,
         predecessor=predecessor,

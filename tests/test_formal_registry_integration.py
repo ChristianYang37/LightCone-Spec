@@ -199,6 +199,8 @@ def test_e4_source_authority_codecs_bind_paths_and_signed_winner(
         run_nonce_sha256=_sha("e4-run-nonce"),
         attempt_id="e4-screen-attempt",
         method="l0",
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     evidence = E4CellExecutionEvidence(
         schema_version=1,
@@ -351,7 +353,7 @@ def _protocol_lock() -> ProtocolLock:
 
 def _tts_authority() -> TtsCalibrationAuthority:
     return TtsCalibrationAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="formal-registry-tts-v2",
         primary_source_id=TTS_PRIMARY_SOURCE_ID,
         primary_source_version=TTS_PRIMARY_SOURCE_VERSION,

@@ -275,6 +275,8 @@ def test_trusted_chain_tts_l0_are_numeric_identical_except_method_policy() -> No
     adaptation = AdaptationConfig(
         weight_update_mode="full",
         parameter_scope="all",
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
         adaptation_group_id=_trusted_adaptation_group(tts, paired_tts_l0=True),
         optimizer=OptimizerConfig(
             name="adam",
@@ -299,6 +301,24 @@ def test_trusted_chain_tts_l0_are_numeric_identical_except_method_policy() -> No
             source=SimpleNamespace(node="e3b_pilot"),
             cell=cell,
             config=config,
+        )
+    cohort_l0 = adaptation.model_copy(
+        update={
+            "reset_scope": "cohort",
+            "request_admission_policy": "cohort_batching_v1",
+        }
+    )
+    with pytest.raises(ValueError, match="numeric RunConfig"):
+        _validate_trusted_chain_run_config(
+            context=context,
+            source=SimpleNamespace(node="e3b_pilot"),
+            cell=l0,
+            config=RunConfig(
+                method="l0",
+                model=_model(),
+                runtime=_runtime(),
+                adaptation=cohort_l0,
+            ),
         )
     mutated = AdaptationConfig(
         **{
@@ -345,6 +365,24 @@ def test_trusted_chain_rejects_lightcone_optimizer_and_recipe_mutations() -> Non
         cell=cell,
         config=config,
     )
+    request_scoped = expected.model_copy(
+        update={
+            "reset_scope": "request",
+            "request_admission_policy": "serialized_native_scheduler_v1",
+        }
+    )
+    with pytest.raises(ValueError, match="numeric RunConfig"):
+        _validate_trusted_chain_run_config(
+            context=context,
+            source=SimpleNamespace(node="e3b_pilot"),
+            cell=cell,
+            config=RunConfig(
+                method="l0",
+                model=_model(),
+                runtime=_runtime(),
+                adaptation=request_scoped,
+            ),
+        )
     with pytest.raises(ValueError, match="recipe differs"):
         _validate_trusted_chain_run_config(
             context=context,
@@ -401,6 +439,8 @@ def test_trusted_chain_requires_exact_e0_onlinespec_winner() -> None:
     adaptation = AdaptationConfig(
         weight_update_mode=candidate.weight_update_mode,  # type: ignore[arg-type]
         parameter_scope=candidate.parameter_scope,
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
         adaptation_group_id=f"e0:{cell.cell_id}",
         optimizer=OptimizerConfig(
             name="sgd",

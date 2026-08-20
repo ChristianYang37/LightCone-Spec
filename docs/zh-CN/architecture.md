@@ -8,18 +8,21 @@ LightCone-Spec 分离 Python 协议、面向一次性 SGLang checkout 的 semant
 集成，以及外部模型/数据/run artifact。唯一 runtime 源码身份是固定 upstream commit、
 完整 patch series 与 expected final Git tree。工作区 checkout 永远不是隐式依赖。
 
-CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。当前唯一可用于
-claim 的 execution 是 TP1/DP1 Target-only。固定 patch 现已实现准确的
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+CPU 测试只验证合同，不验证 GPU 速度。所有新 GPU cell 都是 `UNMEASURED`。Release-attested
+executor 当前唯一可用于 claim 的 execution 是 TP1/DP1 Target-only。固定 patch 现已实现准确的
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2`
 begin/reset/finalize hook，host 会验证其内容，而不信任 provider attribute。但本 release
-没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0-naive/LightCone 仍在任何 mutation 前
-fail closed。实证 Stage B 还会因 immutable model/data/trace 输入、provider access、已注册
-硬件与 interference evidence，以及 trusted signer 尚不可用而 `BLOCKED`。历史 v2
-evidence 仅可用于 regression/debugging，不能支撑新结论。
+没有 allowlist 内的 out-of-band 硬件 signer，因此 Static/TTS/L0-naive/LightCone 仍会在
+release-attested lane 的任何 mutation 前 fail closed。Trusted `formal_single_operator_v1` lane
+则无需 external signer：immutable source/content/runtime 输入、provider access、fresh GPU
+qualification/interference evidence、capacity、terminal 与 coverage gate 通过后，它可以运行完整
+empirical DAG。Closure 固定为 `trusted_single_operator_empirical_no_signature`、
+`formal_measured=false` 与 `UNMEASURED`；只有 release attestation 才能提升为 `MEASURED`。
+历史 v2 evidence 仅可用于 regression/debugging，不能支撑新结论。
 
 ## 统一 Decode 与 Candidate 生命周期
 
-Target-only 关闭 speculation，是当前唯一可用于 claim 的 path。Static 是
+Target-only 关闭 speculation，是当前唯一可用于 release claim 的 path。Static 是
 零 adaptation 分配的原生 speculative 目标 path，但 release preflight 会在 trusted
 terminal attestation 可用前阻止它。两者的 schema contract 都不导入 adaptation state，也不分配
 optimizer、gradient、candidate 或 adaptation trace。
@@ -197,7 +200,8 @@ segment 与 checkpoint；backpressure 与任何显式 drop 都有计数。Native
 rank identity 及准确 ordered token ID。Static 保持 round/update 详细 trace 零分配，只生成
 所需汇总 speculative safety/accounting；adaptive scientific role 还绑定 request、round、update、KV version、
 publication、performance 与 safety row。signer 不可用时，release verifier 仍在 mutation 前
-阻止这三种方法。
+阻止这三种方法；该 release-verifier decision 不会阻止上述 trusted single-operator empirical
+lane。
 
 仓库为相邻且兼容的 trace 定义了 immutable session key 及 reset/finalize receipt 数据
 契约；完整 key 包含 source/capability、RunConfig、model/drafter revision、method/backend、

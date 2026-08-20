@@ -867,6 +867,8 @@ def test_e2_caller_defaults_cannot_unlock_blocked_recipe_declaration(
     adaptation = AdaptationConfig(
         weight_update_mode="full",
         parameter_scope="last1",
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
         adaptation_group_id=identity.cohort,
         optimizer=OptimizerConfig(
             name="adamw",
@@ -964,7 +966,7 @@ def test_release_blocks_two_rank_cells_and_capability_digest_cannot_bypass(
     assert capability is not None
     for rank in range(2):
         rank_topology = topology.receipt_for_rank(rank).topology
-        runtime_value = single.runtime.model_dump(mode="json")
+        runtime_value = single.runtime.model_dump(mode="python")
         runtime_value.update(
             {
                 "tensor_parallel_size": 2,

@@ -197,6 +197,11 @@ def test_prerequisite_bootstrap_recovers_source_published_before_block(
         publish_index,
     )
     monkeypatch.setattr(
+        producer,
+        "execution_source_prerequisite_launch_demands",
+        lambda _source: (object(),),
+    )
+    monkeypatch.setattr(
         boot,
         "publish_prerequisite_index_catalog_binding",
         publish_binding,
@@ -206,6 +211,96 @@ def test_prerequisite_bootstrap_recovers_source_published_before_block(
     assert observed["producer"]["execution_source_path"] == str(source_path)  # type: ignore[index]
     assert observed["producer"]["base_environment_launch_manifest_path"] == str(tp2)  # type: ignore[index]
     assert observed["binding"]["node"] == node  # type: ignore[index]
+
+
+def test_e0_all_na_bootstrap_skips_three_prerequisite_publications_and_resumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_prerequisite_launch_producer as producer,
+    )
+    from lightcone_spec.experiments import (
+        formal_single_operator_stages as stages,
+    )
+
+    nodes = ("e0_tuning", "e0_pilot", "e0_final")
+    sources = {
+        node: SimpleNamespace(node=node, sha256=character * 64)
+        for node, character in zip(nodes, "abc", strict=True)
+    }
+    source_paths = {
+        node: str(_file(tmp_path / f"{node}-source.json", {"node": node}))
+        for node in nodes
+    }
+    rows = tuple(
+        {
+            "node": node,
+            "state": "MATERIALIZED",
+            "execution_source_path": source_paths[node],
+        }
+        for node in nodes
+    )
+    supervisor = object.__new__(boot.FormalSingleOperatorBootstrapSupervisor)
+    supervisor.root = (tmp_path / "bootstrap").resolve()
+    supervisor.root.mkdir()
+    supervisor.catalog = (tmp_path / "catalog").resolve()
+    supervisor.catalog.mkdir()
+    supervisor.driver = SimpleNamespace(
+        store=SimpleNamespace(controller_nodes=lambda: rows)
+    )
+    monkeypatch.setattr(
+        stages,
+        "load_formal_single_operator_execution_source",
+        lambda path: sources[
+            next(node for node in nodes if source_paths[node] == path)
+        ],
+    )
+    monkeypatch.setattr(
+        producer,
+        "execution_source_prerequisite_launch_demands",
+        lambda source: () if source in sources.values() else (object(),),
+    )
+    monkeypatch.setattr(
+        producer,
+        "publish_formal_single_operator_prerequisite_launch_index",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ALL_NA must not publish a prerequisite index")
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_prerequisite_exists",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ALL_NA has no prerequisite catalog")
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_preflight_launches",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("ALL_NA needs no base launch")
+        ),
+    )
+
+    assert supervisor._publish_prerequisites() == ()
+    assert tuple(supervisor.root.iterdir()) == ()
+
+    blocked_rows = tuple(
+        {
+            "node": node,
+            "state": "BLOCKED",
+            "blocker_reason": (
+                f"{node}: exact prerequisite index binding is unavailable"
+            ),
+            "execution_source_path": source_paths[node],
+        }
+        for node in nodes
+    )
+    supervisor.driver = SimpleNamespace(
+        store=SimpleNamespace(controller_nodes=lambda: blocked_rows)
+    )
+    assert supervisor._catalog_ready_blocked_nodes() == tuple(sorted(nodes))
 
 
 def test_e0_bootstrap_binds_exact_twelve_source_owned_descriptors(

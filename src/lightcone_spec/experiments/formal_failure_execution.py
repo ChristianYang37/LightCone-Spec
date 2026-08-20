@@ -766,9 +766,13 @@ def materialize_formal_single_operator_e5_failure_execution_descriptor(
     ):
         raise ValueError("single-operator E5 failure route differs")
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="E5 failure execution materialization"
+        )
     )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(label="E5 failure execution ProtocolLock")
+    )
     _require_exact_e5_final_failure_materialization(
         materialization,
         protocol_lock_sha256=protocol_lock.sha256,
@@ -895,7 +899,9 @@ def revalidate_formal_single_operator_e5_failure_execution_descriptor(
     materialization = stage_materialization_receipt_from_dict(
         descriptor.materialization.reopen(label="single-operator E5 materialization")
     )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(label="E5 failure replay ProtocolLock")
+    )
     runtime = formal_runtime_authority_manifest_from_dict(
         descriptor.runtime_authority_manifest.reopen()
     )

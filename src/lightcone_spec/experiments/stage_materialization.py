@@ -83,6 +83,9 @@ E0_TASKS = (
 )
 E0_LOADS = ("concurrency_one", "common_slo_load")
 E0_ALL_NA_MATERIALIZATION_RULE = "all_proof_backed_combinations_are_na"
+TTS_CAL_MATERIALIZATION_RULE = (
+    "72_candidates_x_4_technical_replicates_over_same_76_row_tuning_complement"
+)
 E0_ALL_NA_MATERIALIZATION_PROTOCOL_SHA256 = content_sha256(
     {
         "schema_version": 1,
@@ -754,7 +757,11 @@ def _cell(
     recipe_sha256: str | None,
     dimensions: dict[str, str | int | float],
 ) -> MaterializedCell:
-    if method_role in {"TTS", "L0-naive"} and "tts_l0_pair_id" not in dimensions:
+    if (
+        stage != "TTS-Cal"
+        and method_role in {"TTS", "L0-naive"}
+        and "tts_l0_pair_id" not in dimensions
+    ):
         if recipe_sha256 is None:
             raise ValueError("TTS/L0 matched pair requires the frozen recipe")
         dimensions = {
@@ -931,7 +938,7 @@ def _prefix_cell(stage: str, cell, *, recipe_sha256: str | None = None):
     role = {
         "target_only": "Target-only",
         "static": "Static",
-        "tts": "TTS-calibration-candidate",
+        "tts": "TTS",
     }.get(identity.method)
     if role is None:
         raise ValueError("staged prefix cell has an unknown method role")
@@ -953,7 +960,7 @@ def _prefix_cell(stage: str, cell, *, recipe_sha256: str | None = None):
         dimensions["stride"] = int(
             identity.variant.removeprefix("tts_calibration:stride=")
         )
-        dimensions["pilot_phase"] = "excluded"
+        dimensions["replicate_phase"] = "technical"
     return _cell(
         stage=stage,
         method_role=role,
@@ -1125,7 +1132,7 @@ def _materialize_tts_calibration_diagnostic(
         protocol_lock_sha256=protocol_lock_sha256,
         upstream_receipt_sha256s=(upstream_e3a_receipt_sha256,),
         source_decision_sha256=calibration_authority_sha256,
-        materialization_rule="72_candidates_x_4_disjoint_excluded_pilots",
+        materialization_rule=TTS_CAL_MATERIALIZATION_RULE,
         cells=cells,
         gpu_hours=gpu_hours,
     )
@@ -1922,6 +1929,8 @@ class E2RecipeGridAuthority:
             parameter_scope=candidate.geometry.scope,
             kv_history_policy="frozen",
             adaptation_scope="cohort",
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id=adaptation_group_id,
             optimizer=self.optimizer_config_for(candidate),
             rank=candidate.geometry.rank,
@@ -5941,6 +5950,16 @@ class StageCoverageReceipt:
             ):
                 raise ValueError(
                     "preflight candidate evidence does not bind the exactness cell"
+                )
+            return
+
+        # TTS-Cal contains four technical replicates of each TTS candidate,
+        # not the downstream matched TTS/L0 comparison pairs.  Its four
+        # holdout problem IDs are absent from this materialization entirely.
+        if self.stage == "TTS-Cal":
+            if candidate_coverages:
+                raise ValueError(
+                    "TTS-Cal technical replicates cannot attach TTS/L0 pair evidence"
                 )
             return
 

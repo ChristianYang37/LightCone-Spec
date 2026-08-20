@@ -20,10 +20,8 @@ from test_content_authorization_operator import (
 from test_formal_method_authority import _plan_source
 from test_offline_scientific_signing import (
     NOW_NS,
-    _authorization,
     _install_root,
     _root_binding,
-    _sign_and_finalize,
 )
 
 import lightcone_spec.cli.main as cli_module
@@ -39,29 +37,18 @@ from lightcone_spec.experiments.formal_method_authority import (
     publish_tts_calibration_authority_artifact,
 )
 from lightcone_spec.experiments.formal_protocol import content_sha256
-from lightcone_spec.experiments.formal_protocol_lock_proof import (
-    bind_formal_protocol_lock_source_proof_artifact,
-    publish_formal_protocol_lock_git_snapshot,
-    publish_formal_protocol_lock_source_proof_artifact,
-    revalidate_formal_protocol_lock_source_proof_artifact,
-)
 from lightcone_spec.experiments.formal_registry import (
-    protocol_lock_to_dict,
     publish_formal_runtime_authority_manifest,
-    reserve_formal_registry_verification_receipt,
-)
-from lightcone_spec.experiments.formal_registry_layers import (
-    bind_formal_registry_layer_artifact,
-    load_formal_registry_verification_receipt_path,
-    publish_formal_registry_layer_artifact,
 )
 from lightcone_spec.experiments.formal_runtime_manifest import (
     FORMAL_RUNTIME_SOURCE_LAYOUT,
     build_source_formal_runtime_authority_manifest,
 )
 from lightcone_spec.experiments.formal_stage_execution import (
-    build_source_e1_recipe_anchor_authority_artifact,
-    publish_e1_recipe_anchor_authority_artifact,
+    E1_RECIPE_ANCHOR_ARTIFACT_KIND,
+    E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
+    E1RecipeAnchorAuthorityArtifact,
+    _source_e1_recipe_anchor_authority,
 )
 from lightcone_spec.experiments.registry import build_industrial_registry
 from lightcone_spec.runtime import offline_signer
@@ -71,6 +58,7 @@ from lightcone_spec.runtime.attestation import (
     attestation_message,
 )
 from lightcone_spec.runtime.content_authorization import (
+    TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE,
     AuthorizedPreparedModel,
     ContentVerificationReceipt,
     DatasetContentReleaseAuthorization,
@@ -83,7 +71,6 @@ from lightcone_spec.runtime.content_authorization import (
     TtsCalibrationTuningWindowEntry,
 )
 from lightcone_spec.runtime.control_attestation import (
-    ChallengeReplayStore,
     ControlArtifactAttestation,
     ControlArtifactSubject,
 )
@@ -97,12 +84,6 @@ from lightcone_spec.runtime.proof_artifact import (
 from lightcone_spec.runtime.release_trust_root import (
     DeploymentPolicyAuthorization,
     SourceReleaseRootBinding,
-)
-from lightcone_spec.runtime.relocatable_evidence import (
-    materialize_relocatable_evidence_bundle,
-)
-from lightcone_spec.runtime.scientific_source_validation import (
-    publish_scientific_source_validation_artifact,
 )
 
 
@@ -245,6 +226,7 @@ def _publish_method_authorities(
     entries = tuple(
         TtsCalibrationTuningWindowEntry(
             workload_id="livecodebench_v6_hard",
+            source_problem_id=sample.source_row_id,
             source_sample_id=sample.sample_id,
             source_descriptor_sha256=workload_source.sha256,
             prompt_sha256=content_sha256(sample.prompt),
@@ -252,8 +234,24 @@ def _publish_method_authorities(
         for sample in samples
     )
     window = TtsCalibrationTuningWindow(
-        schema_version=2,
+        schema_version=3,
         kind=TTS_TUNING_WINDOW_SOURCE_KIND,
+        selector_namespace=TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE,
+        workload_authority_sha256=_sha("test workload authority"),
+        ordered_domain_sha256=content_sha256(
+            [
+                {
+                    "source_problem_id": row.source_problem_id,
+                    "source_sample_id": row.source_sample_id,
+                    "prompt_sha256": row.prompt_sha256,
+                }
+                for row in entries
+            ]
+        ),
+        tuning_problem_ids=tuple(sorted(row.source_problem_id for row in entries[:2])),
+        excluded_problem_ids=tuple(
+            sorted(row.source_problem_id for row in entries[2:])
+        ),
         tuning_entries=tuple(sorted(entries[:2], key=lambda row: row.entry_id)),
         excluded_pilot_entries=tuple(sorted(entries[2:], key=lambda row: row.entry_id)),
     )
@@ -265,6 +263,8 @@ def _publish_method_authorities(
     tts_artifact = build_source_tts_calibration_authority_artifact(
         paper_pdf_path=tts_pdf,
         paper_source_path=tts_source,
+        tuning_workload_authority_path=(remote / "unused-workload-authority.json"),
+        content_verification_receipt_path=(remote / "unused-content-receipt.json"),
         tuning_window_path=tuning,
         trainable_plan_authority_path=tts_plan_path,
         drafter_native_loss_path=loss,
@@ -273,13 +273,21 @@ def _publish_method_authorities(
         paper_pdf_path=chrono_pdf,
         tex_source_path=chrono_tex,
     )
-    e1_artifact = build_source_e1_recipe_anchor_authority_artifact(e1_plan_path)
+    e1_source = CanonicalJsonProofBinding.bind(e1_plan_path)
+    e1_artifact = E1RecipeAnchorAuthorityArtifact(
+        schema_version=2,
+        kind=E1_RECIPE_ANCHOR_ARTIFACT_KIND,
+        trainable_plan_selector_id=E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
+        trainable_plan_authority_source=e1_source,
+        trusted_content_bundle_source=None,
+        authority=_source_e1_recipe_anchor_authority(e1_source),
+    )
     tts_output = (remote / "tts-authority.json").resolve()
     chrono_output = (remote / "chronobelief-authority.json").resolve()
     e1_output = (remote / "e1-anchor-authority.json").resolve()
     publish_tts_calibration_authority_artifact(tts_artifact, tts_output)
     publish_chronobelief_authority_artifact(chrono_artifact, chrono_output)
-    publish_e1_recipe_anchor_authority_artifact(e1_artifact, e1_output)
+    publish_canonical_json_no_replace(e1_output, e1_artifact.to_dict())
     snapshot_roots = tuple(
         Path(snapshot.root)
         for binding in (tts_plan, e1_plan)
@@ -293,7 +301,6 @@ def _publish_content_master(
     *,
     root_private: Ed25519PrivateKey,
     root_binding: object,
-    tuning_window: Path,
 ) -> tuple[Path, Path]:
     content = remote / "content"
     content.mkdir(mode=0o700)
@@ -454,7 +461,6 @@ def _publish_content_master(
         f"dataset:e0_task_native:path_binding={e0_binding_path}",
         f"snapshot:shared:drafter={drafter_path}",
         f"snapshot:shared:target={target_path}",
-        f"tts_calibration_tuning_window={tuning_window}",
     ):
         argv.extend(("--content-artifact", specification))
     assert cli_module.main(argv) == 0
@@ -470,10 +476,12 @@ def _publish_content_master(
     return master, burst_output
 
 
-def test_protocol_lock_source_proof_is_portable_and_replayed_before_signing(
+def test_protocol_lock_source_proof_stops_before_publication_for_unregistered_tts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A foreign TTS source must stop the proof pipeline before any proof exists."""
+
     tmp_path.chmod(0o700)
     remote = (tmp_path / "remote-a").resolve()
     repository = (tmp_path / "repository-a").resolve()
@@ -483,7 +491,6 @@ def test_protocol_lock_source_proof_is_portable_and_replayed_before_signing(
     offline.mkdir(mode=0o700)
 
     root_private = Ed25519PrivateKey.generate()
-    signer_private = Ed25519PrivateKey.generate()
     fixture_root = _root_binding(root_private).root
     root_body = _canonical_body(fixture_root.to_dict())
     root_file_sha256 = hashlib.sha256(root_body).hexdigest()
@@ -540,141 +547,9 @@ def test_protocol_lock_source_proof_is_portable_and_replayed_before_signing(
     runtime = build_source_formal_runtime_authority_manifest(repository)
     runtime_path = (remote / "runtime-authority.json").resolve()
     publish_formal_runtime_authority_manifest(runtime_path, runtime)
-    (
-        tts_path,
-        chrono_path,
-        e1_path,
-        tuning_path,
-        snapshot_roots,
-    ) = _publish_method_authorities(remote)
-    content_path, burst_path = _publish_content_master(
-        remote,
-        root_private=root_private,
-        root_binding=root_binding,
-        tuning_window=tuning_path,
-    )
-    snapshot_path = (remote / "git-snapshot.json").resolve()
-    publish_formal_protocol_lock_git_snapshot(
-        project_root=repository,
-        chunk_output_directory=remote,
-        index_output_path=snapshot_path,
-    )
-    artifact = bind_formal_protocol_lock_source_proof_artifact(
-        protocol_id="formal-protocol-portable-test",
-        git_snapshot_path=snapshot_path,
-        patch_manifest_relative_path="patch.json",
-        english_protocol_relative_path="protocol-en.md",
-        chinese_protocol_relative_path="protocol-zh.md",
-        runtime_authority_path=runtime_path,
-        tts_calibration_authority_path=tts_path,
-        chronobelief_authority_path=chrono_path,
-        e1_recipe_anchor_authority_path=e1_path,
-        content_verification_receipt_path=content_path,
-        burstgpt_shape_authority_path=burst_path,
-        now_ns=NOW_NS,
-    )
-    proof_path = (remote / "protocol-lock-proof.json").resolve()
-    publish_formal_protocol_lock_source_proof_artifact(artifact, proof_path)
-    lock = revalidate_formal_protocol_lock_source_proof_artifact(
-        proof_path,
-        now_ns=NOW_NS,
-    )
-    hydrated = (tmp_path / "rehydrated-b").resolve()
-    hydrated.mkdir(mode=0o700)
-    directory_rebindings: dict[Path, Path] = {}
-    for index, source in enumerate(snapshot_roots):
-        destination = (
-            hydrated / f"model-{index}" / "snapshots" / source.name
-        ).resolve()
-        destination.parent.mkdir(parents=True, mode=0o700)
-        shutil.copytree(source, destination)
-        directory_rebindings[source] = destination
-    bundle = materialize_relocatable_evidence_bundle(
-        remote_root=remote,
-        entry_paths=(proof_path,),
-        local_root=offline,
-        directory_rebindings=directory_rebindings,
-    )
-    shutil.rmtree(remote)
-    shutil.rmtree(repository)
-
-    source_validation = (tmp_path / "protocol-lock-source-validation.json").resolve()
-    publish_scientific_source_validation_artifact(
-        artifact_type="protocol-lock",
-        proof_bundle_path=bundle.absolute_path,
-        proof_entry_remote_absolute_path=proof_path,
-        now_ns=NOW_NS,
-        output_path=source_validation,
-    )
-    authorization = _authorization(root_private, signer_private)
-    ledger = (tmp_path / "scientific-ledger").resolve()
-    ledger.mkdir(mode=0o700)
-    signed = _sign_and_finalize(
-        "protocol-lock",
-        protocol_lock_to_dict(lock),
-        authorization=authorization,
-        signer_private=signer_private,
-        ledger=ledger,
-        source_validation_artifact_path=str(source_validation),
-    )
-    assert signed.payload == lock
-    wrapper_path = next(tmp_path.glob("compact-protocol-lock-*.json"))
-    lineage = content_sha256(
-        {
-            "schema_version": 1,
-            "kind": "lightcone_formal_registry_control_lineage",
-            "protocol_lock_sha256": lock.sha256,
-            "registry_sha256": build_industrial_registry().sha256,
-            "signed_artifacts": ((signed.sha256, "dispatch"),),
-        }
-    )
-    control = _registry_control(
-        signer_private,
-        binding=root_binding,
-        authorization=authorization,
-        artifact_sha256=signed.sha256,
-        protocol_sha256=lock.sha256,
-        lineage_sha256=lineage,
-    )
-    replay_root = (tmp_path / "registry-replay").resolve()
-    replay_root.mkdir(mode=0o700)
-    receipt = reserve_formal_registry_verification_receipt(
-        signed,
-        control_attestation=control,
-        expected_inventory_sha256=_sha("inventory"),
-        replay_store=ChallengeReplayStore(str(replay_root)),
-        now_ns=NOW_NS,
-    )
-    layer = bind_formal_registry_layer_artifact(
-        receipt,
-        prior_layer_path=None,
-        signed_protocol_lock_path=wrapper_path,
-        signed_materialization_paths=(),
-        signed_coverage_paths=(),
-        formal_stage_prefix_paths=(),
-    )
-    layer_path = (tmp_path / "formal-registry-root-layer.json").resolve()
-    publish_formal_registry_layer_artifact(layer, layer_path)
-    assert (
-        load_formal_registry_verification_receipt_path(
-            layer_path,
-            now_ns=NOW_NS + 20_000_000_000,
-        )
-        == receipt
-    )
-    assert lock.code_git_head and lock.formal_runtime_authority_manifest_sha256 == (
-        runtime.sha256
-    )
-
-    altered_ledger = (tmp_path / "altered-ledger").resolve()
-    altered_ledger.mkdir(mode=0o700)
-    with pytest.raises(ValueError, match="differs from its proof reducer"):
-        _sign_and_finalize(
-            "protocol-lock",
-            protocol_lock_to_dict(replace(lock, protocol_id="altered")),
-            authorization=authorization,
-            signer_private=signer_private,
-            ledger=altered_ledger,
-            source_validation_artifact_path=str(source_validation),
-        )
-    assert content_sha256(lock) == lock.sha256
+    with pytest.raises(ValueError, match="registered primary-source bytes"):
+        _publish_method_authorities(remote)
+    assert not (remote / "tts-authority.json").exists()
+    assert not (remote / "chronobelief-authority.json").exists()
+    assert not (remote / "e1-anchor-authority.json").exists()
+    assert not (remote / "protocol-lock-proof.json").exists()

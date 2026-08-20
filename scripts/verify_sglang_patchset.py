@@ -79,7 +79,7 @@ def _literal_string_frozenset(tree: ast.Module, name: str) -> frozenset[str]:
 
 
 def _verify_native_terminal_contract(checkout: Path, changed_python: list[str]) -> None:
-    hook = "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
+    hook = "sglang.schema_v3.content_bound_terminal_speculative_evidence.v2"
     terminal = (
         checkout / "python/sglang/srt/speculative/terminal_speculative_evidence.py"
     ).read_text(encoding="utf-8")
@@ -96,6 +96,10 @@ def _verify_native_terminal_contract(checkout: Path, changed_python: list[str]) 
         '"completion_marker": "TERMINAL_COMPLETE"',
         "ADAPTIVE_TERMINAL_METHODS = frozenset(",
         "SUPPORTED_TERMINAL_METHODS = frozenset(",
+        "REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256 = hashlib.sha256(",
+        '"request_source_point_resets"',
+        '"serialized_native_scheduler_v1"',
+        '"state_untouched"',
         'attester_id.lower().startswith(("test", "fixture", "cpu"))',
     )
     if hook not in terminal or any(
@@ -1186,13 +1190,17 @@ def main() -> int:
                 "-m",
                 "pytest",
                 "-q",
+                "test/registered/unit/managers/test_scheduler_request_scoped_admission.py",
                 "test/registered/unit/spec/test_session_reset_evidence.py",
                 "test/registered/unit/spec/test_source_owned_http_accounting.py",
                 "test/registered/unit/spec/test_terminal_speculative_evidence.py",
                 "test/registered/unit/spec/test_compile_cache_evidence.py",
                 "test/registered/unit/spec/test_failure_actuator_runtime.py",
                 "test/registered/unit/spec/test_formal_gang_serving.py",
+                "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
                 "test/registered/unit/spec/test_eagle3_online_adaptation_contract.py",
+                "test/registered/unit/spec/test_native_runtime_release.py",
+                "test/registered/unit/spec/test_online_adaptation_protocol.py",
                 "test/registered/unit/spec/test_terminal_target_metrics.py",
             ],
             cwd=checkout,
@@ -1208,8 +1216,6 @@ def main() -> int:
                     "-q",
                     "test/registered/unit/benchmark/test_serving_output_token_ids.py",
                     "test/registered/unit/benchmark/test_native_token_timestamps.py",
-                    "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
-                    "test/registered/unit/spec/test_online_adaptation_protocol.py",
                 ],
                 cwd=checkout,
                 env=env,
@@ -1224,6 +1230,12 @@ def main() -> int:
                 str(patch_root / entry["file"]),
                 cwd=checkout,
             )
+        request_reset_test = (
+            checkout
+            / "test/registered/unit/managers/test_scheduler_request_scoped_admission.py"
+        )
+        if request_reset_test.exists():
+            raise SystemExit("reverse removal retained the patch-0008 contract")
         if (
             checkout / "test/registered/unit/spec/test_terminal_target_metrics.py"
         ).exists():

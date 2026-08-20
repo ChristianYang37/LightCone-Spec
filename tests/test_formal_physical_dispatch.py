@@ -55,6 +55,7 @@ from lightcone_spec.experiments.stage_materialization import (
     GpuHourEstimate,
     MaterializedCell,
     StageMaterializationReceipt,
+    _materialize_tts_calibration_diagnostic,
 )
 from lightcone_spec.experiments.workload_authority import (
     FORMAL_WORKLOAD_PROTOCOLS,
@@ -1106,7 +1107,7 @@ def test_tts_registry_window_label_maps_to_source_owned_closed_loop_arrival() ->
     source = build_industrial_registry().cells_for("TTS-Cal")[0]
     cell = MaterializedCell(
         stage="TTS-Cal",
-        method_role="TTS-candidate",
+        method_role="TTS",
         model=source.identity.model,
         backend=source.identity.backend,
         task=source.identity.task,
@@ -1122,6 +1123,149 @@ def test_tts_registry_window_label_maps_to_source_owned_closed_loop_arrival() ->
     assert protocol["arrival_policy"] == "closed_loop_zero_think"
     assert protocol["context_tokens"] == source.identity.context
     assert protocol["regime"] == source.identity.regime
+    assert dispatch._workload_id_for_cell(cell) == "livecodebench_v6_hard"
+
+
+def test_tts_four_blocks_replay_same_76_rows_and_never_schedule_four_holdouts(
+    tmp_path: Path,
+) -> None:
+    from lightcone_spec.runtime.content_authorization import (
+        TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE,
+        TtsCalibrationTuningWindow,
+        TtsCalibrationTuningWindowEntry,
+    )
+
+    descriptor_sha256 = _sha("trusted-locked-lcb-h80")
+    samples = tuple(
+        FormalWorkloadSample(
+            source_row_id=f"problem-{index:03d}",
+            sample_id=f"sample-{index:03d}",
+            prompt=f"Solve exact problem {index:03d}.",
+            seed=index + 1,
+        )
+        for index in range(80)
+    )
+    workload = FormalWorkloadAuthority(
+        schema_version=1,
+        kind="formal_workload_authority",
+        workload_id="livecodebench_v6_hard",
+        raw_source_path=str((tmp_path / "lcb-h80.json").resolve()),
+        raw_file_sha256=_sha("lcb-h80-raw"),
+        repository_revision="3" * 40,
+        raw_row_count=175,
+        selected_row_count=len(samples),
+        selected_rows_sha256=formal_workload_samples_sha256(samples),
+        source_lock_sha256=_sha("lcb-h80-lock"),
+        protocol_sha256=FORMAL_WORKLOAD_PROTOCOLS["livecodebench_v6_hard"].sha256,
+        samples=samples,
+    )
+    ranked = tuple(
+        sorted(
+            samples,
+            key=lambda row: (
+                dispatch._sha256(
+                    {
+                        "selector_namespace": (
+                            TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE
+                        ),
+                        "source_problem_id": row.source_row_id,
+                    }
+                ),
+                row.source_row_id,
+                row.sample_id,
+            ),
+        )
+    )
+    holdout_problem_ids = {row.source_row_id for row in ranked[:4]}
+
+    def entry(sample: FormalWorkloadSample) -> TtsCalibrationTuningWindowEntry:
+        return TtsCalibrationTuningWindowEntry(
+            workload_id="livecodebench_v6_hard",
+            source_problem_id=sample.source_row_id,
+            source_sample_id=sample.sample_id,
+            source_descriptor_sha256=descriptor_sha256,
+            prompt_sha256=dispatch._sha256(sample.prompt),
+        )
+
+    tuning_entries = tuple(
+        sorted(
+            (
+                entry(row)
+                for row in samples
+                if row.source_row_id not in holdout_problem_ids
+            ),
+            key=lambda row: row.entry_id,
+        )
+    )
+    holdout_entries = tuple(
+        sorted(
+            (entry(row) for row in samples if row.source_row_id in holdout_problem_ids),
+            key=lambda row: row.entry_id,
+        )
+    )
+    window = TtsCalibrationTuningWindow(
+        schema_version=5,
+        kind="lightcone_tts_disjoint_tuning_window_source",
+        tuning_entries=tuning_entries,
+        excluded_pilot_entries=holdout_entries,
+        selector_namespace=TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE,
+        workload_authority_sha256=workload.sha256,
+        ordered_domain_sha256=_sha("lcb-h80-ordered-domain"),
+        tuning_problem_ids=tuple(
+            sorted(str(row.source_problem_id) for row in tuning_entries)
+        ),
+        excluded_problem_ids=tuple(
+            sorted(str(row.source_problem_id) for row in holdout_entries)
+        ),
+        trusted_content_bundle_sha256=_sha("trusted-content-bundle"),
+        trusted_locked_workload_sha256=descriptor_sha256,
+    )
+    materialization = _materialize_tts_calibration_diagnostic(
+        protocol_lock_sha256=_sha("protocol-lock"),
+        upstream_e3a_receipt_sha256=_sha("e3a-selection"),
+        calibration_authority_sha256=_sha("tts-authority"),
+        gpu_hours=GpuHourEstimate.unmeasured(),
+    )
+    candidate = materialization.cells[0].recipe_sha256
+    cells = tuple(
+        cell for cell in materialization.cells if cell.recipe_sha256 == candidate
+    )
+    assert {dict(cell.dimensions)["block"] for cell in cells} == {0, 1, 2, 3}
+    assert all(cell.method_role == "TTS" for cell in cells)
+
+    schedules = tuple(
+        dispatch.rebuild_formal_serving_request_schedule_source(
+            subject_sha256=_sha(f"subject:{cell.cell_id}"),
+            workload_authority_sha256=workload.sha256,
+            topology_mode="tp1_dp1",
+            materialization=materialization,
+            materialized_cell_id=cell.cell_id,
+            workload_source=workload,
+            workload_source_descriptor_sha256=descriptor_sha256,
+            tts_tuning_window=window,
+            sampling_profile=SamplingProfile(),
+            max_running_requests=1,
+            server_context_limit=40_928,
+            tokenizer_content_member_id="tokenizer-member",
+            tokenizer_model_id="Qwen/Qwen3-8B",
+            tokenizer_revision="4" * 40,
+            tokenizer_content_authority_sha256=_sha("tokenizer-authority"),
+        )
+        for cell in cells
+    )
+    expected_tuning_samples = {row.source_sample_id for row in tuning_entries}
+    holdout_samples = {row.source_sample_id for row in holdout_entries}
+    expected_entry_ids = tuple(sorted(row.entry_id for row in tuning_entries))
+    assert len(expected_tuning_samples) == 76
+    assert len(holdout_samples) == 4
+    assert all(len(source.requests) == 76 for source in schedules)
+    assert all(
+        {row.source_sample_id for row in source.requests} == expected_tuning_samples
+        and not ({row.source_sample_id for row in source.requests} & holdout_samples)
+        and source.tts_tuning_entry_ids == expected_entry_ids
+        for source in schedules
+    )
+    assert len({source.requests[0].namespace for source in schedules}) == 4
 
 
 def test_tokenizer_worker_path_and_real_subprocess_no_replace(tmp_path) -> None:
@@ -1435,7 +1579,18 @@ def _install_materialization_fakes(
     SamplingProfile().write(sampling_path)
     diagnostic_config = SimpleNamespace(
         method=method,
-        adaptation=None,
+        adaptation=(
+            None
+            if method in {"static", "target_only"}
+            else SimpleNamespace(
+                reset_scope=("request" if method in {"tts", "l0"} else "cohort"),
+                request_admission_policy=(
+                    "serialized_native_scheduler_v1"
+                    if method in {"tts", "l0"}
+                    else "cohort_batching_v1"
+                ),
+            )
+        ),
         runtime=SimpleNamespace(
             topology_mode=topology,
             max_running_requests=max_running_requests,
@@ -1667,6 +1822,7 @@ def _install_materialization_fakes(
     launch_artifact.write(launch_path)
     launch_binding = CanonicalJsonProofBinding.bind(launch_path)
     launch = SimpleNamespace(
+        schema_version=1,
         tokenizer_content_member_id="tokenizer-member",
         tokenizer_model_id="example/tokenizer",
         tokenizer_revision="1" * 40,
@@ -2382,6 +2538,506 @@ def test_single_operator_early_inputs_materialize_and_execute_without_old_token(
     assert observed["execution_policy"] == plan.serving_execution_policy
 
 
+@pytest.mark.parametrize(
+    ("stage", "regime", "workload_id"),
+    (
+        ("E3a", "short_input_long_generation", "livecodebench_v6_hard"),
+        ("E3a", "long_input_short_output", "math500_level5"),
+        ("TTS-Cal", "short_input_long_generation", "livecodebench_v6_hard"),
+    ),
+)
+def test_trusted_direct_workload_source_is_rebuilt_from_bound_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+    regime: str,
+    workload_id: str,
+) -> None:
+    from lightcone_spec.experiments.formal_content_source import (
+        FormalContentSourceBinding,
+    )
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundle,
+        TrustedSingleOperatorContentBundleBinding,
+    )
+    from lightcone_spec.experiments.workload_authority import (
+        formal_workload_authority_artifact_id,
+        formal_workload_authority_from_cli_artifact,
+    )
+    from lightcone_spec.runtime.content_authorization import (
+        ContentJsonArtifactBinding,
+    )
+
+    raw_path = (tmp_path / f"{workload_id}-raw.json").resolve()
+    raw_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    samples = (
+        FormalWorkloadSample(
+            source_row_id="source-0",
+            sample_id="sample-0",
+            prompt="A source-owned prompt.",
+            seed=17,
+        ),
+    )
+    authority = FormalWorkloadAuthority(
+        schema_version=1,
+        kind="formal_workload_authority",
+        workload_id=workload_id,
+        raw_source_path=str(raw_path),
+        raw_file_sha256=hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+        repository_revision="a" * 40,
+        raw_row_count=1,
+        selected_row_count=1,
+        selected_rows_sha256=formal_workload_samples_sha256(samples),
+        source_lock_sha256=_sha(f"{workload_id}-source-lock"),
+        protocol_sha256=FORMAL_WORKLOAD_PROTOCOLS[workload_id].sha256,
+        samples=samples,
+    )
+    locked = SimpleNamespace(
+        workload_id=workload_id,
+        authority_sha256=authority.sha256,
+        raw_source_path=authority.raw_source_path,
+        raw_file_sha256=authority.raw_file_sha256,
+        repository_revision=authority.repository_revision,
+        raw_row_count=authority.raw_row_count,
+        selected_row_count=authority.selected_row_count,
+        formal_samples_sha256=authority.selected_rows_sha256,
+        source_lock_sha256=authority.source_lock_sha256,
+        protocol_sha256=authority.protocol_sha256,
+    )
+    bundle = object.__new__(TrustedSingleOperatorContentBundle)
+    object.__setattr__(bundle, "runtime_binding_status", "BOUND")
+    object.__setattr__(bundle, "semantic_sha256", _sha("trusted-workload-bundle"))
+    object.__setattr__(bundle, "locked_workloads", (locked,))
+    object.__setattr__(bundle, "e0_task_native_descriptors", ())
+    bundle_path = (tmp_path / "trusted-workload-bundle.json").resolve()
+    bundle_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    bundle_binding = TrustedSingleOperatorContentBundleBinding(
+        absolute_path=str(bundle_path),
+        size=bundle_path.stat().st_size,
+        raw_sha256=hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+        semantic_sha256=bundle.semantic_sha256,
+        runtime_binding_status="BOUND",
+    )
+    monkeypatch.setattr(
+        TrustedSingleOperatorContentBundleBinding,
+        "reopen",
+        lambda _self: bundle,
+    )
+    content_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=bundle_binding,
+    )
+    rebound: list[tuple[str, str]] = []
+
+    def bind_locked(selected_workload_id, selected_raw_path):
+        rebound.append((selected_workload_id, str(selected_raw_path)))
+        return authority
+
+    monkeypatch.setattr(dispatch, "bind_formal_workload_authority", bind_locked)
+    cell = MaterializedCell(
+        stage=stage,
+        method_role="TTS" if stage == "TTS-Cal" else "Static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="content_owned_workload_fixture",
+        publication_policy="fixed_barrier" if stage == "TTS-Cal" else "tuning_only",
+        recipe_sha256=_sha("tts-recipe") if stage == "TTS-Cal" else None,
+        dimensions=(("regime", regime),),
+    )
+
+    output = dispatch._materialize_trusted_single_operator_workload_source(
+        content_source_binding=content_source,
+        cell=cell,
+        private_output_root=tmp_path.resolve(),
+    )
+    assert output == (tmp_path / "trusted-workload-source.json").resolve()
+    binding = ContentJsonArtifactBinding.from_path(
+        formal_workload_authority_artifact_id(workload_id),
+        output,
+    )
+    assert formal_workload_authority_from_cli_artifact(binding.load()) == authority
+    assert rebound == [(workload_id, authority.raw_source_path)]
+
+    with pytest.raises(RuntimeError, match="target already exists"):
+        dispatch._materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=tmp_path.resolve(),
+        )
+
+    bad_root = (tmp_path / "tampered").resolve()
+    bad_root.mkdir(mode=0o700)
+    object.__setattr__(
+        bundle,
+        "locked_workloads",
+        (SimpleNamespace(**{**vars(locked), "authority_sha256": _sha("foreign")}),),
+    )
+    with pytest.raises(ValueError, match="differs from locked workload"):
+        dispatch._materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=bad_root,
+        )
+    assert not (bad_root / "trusted-workload-source.json").exists()
+
+
+def test_trusted_direct_e0_workload_uses_exact_content_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from lightcone_spec.experiments.formal_content_source import (
+        FormalContentSourceBinding,
+    )
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundle,
+        TrustedSingleOperatorContentBundleBinding,
+    )
+    from lightcone_spec.experiments.formal_single_operator_e0_workloads import (
+        E0TaskNativeSourceAuthority,
+    )
+
+    descriptor_path = (tmp_path / "gsm8k-source.json").resolve()
+    descriptor_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    descriptor = SimpleNamespace(
+        task="GSM8K",
+        source=SimpleNamespace(absolute_path=str(descriptor_path)),
+    )
+    bundle = object.__new__(TrustedSingleOperatorContentBundle)
+    object.__setattr__(bundle, "runtime_binding_status", "BOUND")
+    object.__setattr__(bundle, "semantic_sha256", _sha("trusted-e0-bundle"))
+    object.__setattr__(bundle, "locked_workloads", ())
+    object.__setattr__(bundle, "e0_task_native_descriptors", (descriptor,))
+    bundle_path = (tmp_path / "trusted-e0-bundle.json").resolve()
+    bundle_path.write_text('{"fixture":true}\n', encoding="utf-8")
+    bundle_binding = TrustedSingleOperatorContentBundleBinding(
+        absolute_path=str(bundle_path),
+        size=bundle_path.stat().st_size,
+        raw_sha256=hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+        semantic_sha256=bundle.semantic_sha256,
+        runtime_binding_status="BOUND",
+    )
+    monkeypatch.setattr(
+        TrustedSingleOperatorContentBundleBinding,
+        "reopen",
+        lambda _self: bundle,
+    )
+    content_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=bundle_binding,
+    )
+    authority = object.__new__(E0TaskNativeSourceAuthority)
+    object.__setattr__(authority, "task", "GSM8K")
+    object.__setattr__(authority, "support_status", "READY")
+    loaded: list[str] = []
+
+    def load_descriptor(path):
+        loaded.append(str(path))
+        return authority
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_single_operator_e0_workloads."
+        "load_e0_task_native_source_authority",
+        load_descriptor,
+    )
+    cell = MaterializedCell(
+        stage="E0",
+        method_role="Static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="GSM8K",
+        publication_policy="confirmation_only",
+        recipe_sha256=None,
+        dimensions=(),
+    )
+
+    assert (
+        dispatch._materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=tmp_path.resolve(),
+        )
+        == descriptor_path
+    )
+    assert loaded == [str(descriptor_path)]
+    assert not (tmp_path / "trusted-workload-source.json").exists()
+
+    object.__setattr__(bundle, "e0_task_native_descriptors", ())
+    with pytest.raises(ValueError, match="lacks one exact E0 descriptor"):
+        dispatch._materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=tmp_path.resolve(),
+        )
+
+    object.__setattr__(bundle, "e0_task_native_descriptors", (descriptor,))
+    object.__setattr__(authority, "support_status", "UNSUPPORTED")
+    with pytest.raises(ValueError, match="not serving-ready"):
+        dispatch._materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=tmp_path.resolve(),
+        )
+
+
+@pytest.mark.parametrize("stage", ("E3a", "TTS-Cal", "E1", "E2"))
+def test_schema4_early_schedule_uses_trusted_content_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_preflight_qualification as qualification_module,
+    )
+    from lightcone_spec.experiments import (
+        formal_single_operator_stages as stages_module,
+    )
+    from lightcone_spec.experiments.formal_content_source import (
+        FormalContentSourceBinding,
+    )
+    from lightcone_spec.experiments.formal_preflight_inputs import (
+        TRUSTED_SINGLE_OPERATOR_QUALIFIED_PREFLIGHT_INPUTS_PROTOCOL_SHA256,
+        FormalPreflightExecutionInputs,
+    )
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundleBinding,
+    )
+    from lightcone_spec.runtime.content_authorization import (
+        ContentJsonArtifactBinding,
+    )
+
+    def proof(name: str) -> CanonicalJsonProofBinding:
+        path = (tmp_path / f"{name}.json").resolve()
+        publish_canonical_json_no_replace(path, {"kind": name})
+        return CanonicalJsonProofBinding.bind(path)
+
+    bundle_path = (tmp_path / "trusted-content.json").resolve()
+    publish_canonical_json_no_replace(bundle_path, {"kind": "trusted-content"})
+    bundle_proof = CanonicalJsonProofBinding.bind(bundle_path)
+    bundle_binding = TrustedSingleOperatorContentBundleBinding(
+        absolute_path=str(bundle_path),
+        size=bundle_proof.size,
+        raw_sha256=bundle_proof.raw_sha256,
+        semantic_sha256=bundle_proof.semantic_sha256,
+        runtime_binding_status="BOUND",
+    )
+    reopen_calls: list[str] = []
+
+    def reopen_bundle(binding):
+        rebound = CanonicalJsonProofBinding.bind(binding.absolute_path)
+        if (
+            rebound.size != binding.size
+            or rebound.raw_sha256 != binding.raw_sha256
+            or rebound.semantic_sha256 != binding.semantic_sha256
+        ):
+            raise RuntimeError("trusted content bundle binding changed")
+        reopen_calls.append(binding.absolute_path)
+        return SimpleNamespace(
+            runtime_binding_status="BOUND",
+            semantic_sha256=binding.semantic_sha256,
+        )
+
+    monkeypatch.setattr(
+        TrustedSingleOperatorContentBundleBinding,
+        "reopen",
+        reopen_bundle,
+    )
+    content_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=bundle_binding,
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "load_formal_single_operator_preflight_qualification_plan_index",
+        lambda _path: object(),
+    )
+    workload_path = (tmp_path / "workload.json").resolve()
+    publish_canonical_json_no_replace(workload_path, {"kind": "workload"})
+    workload = ContentJsonArtifactBinding.from_path(
+        "formal_workload_authority:livecodebench_v6_hard",
+        workload_path,
+    )
+    common = proof("common")
+    request_bindings = tuple(proof(f"request-{index}") for index in range(8))
+    preflight = FormalPreflightExecutionInputs(
+        schema_version=4,
+        kind="formal_single_operator_exact_ten_preflight_inputs",
+        protocol_sha256=(
+            TRUSTED_SINGLE_OPERATOR_QUALIFIED_PREFLIGHT_INPUTS_PROTOCOL_SHA256
+        ),
+        authority_mode="formal_single_operator_v1",
+        execution_authority=common,
+        inventory=proof("inventory"),
+        content_receipt=None,
+        workload_authority=workload,
+        doctor_report=proof("doctor"),
+        compile_assignment_plan=proof("compile-assignment"),
+        exactness_assignment=proof("exactness-assignment"),
+        interference_manifest=proof("interference"),
+        request_schedule_sources=request_bindings,
+        tokenization_inputs=request_bindings,
+        tokenization_outputs=request_bindings,
+        content_source_binding=content_source,
+        qualification_plan_index=proof("qualification-index"),
+    )
+    execution_source = proof("execution-source")
+    launch_binding = proof("launch")
+    protocol_binding = SimpleNamespace(reopen=lambda **_kwargs: {"lock": "current"})
+    current_source = SimpleNamespace(
+        schema_version=3,
+        content_source_binding=content_source,
+        protocol_lock_source=protocol_binding,
+    )
+    monkeypatch.setattr(
+        stages_module,
+        "load_formal_single_operator_execution_source",
+        lambda _path: current_source,
+    )
+    tts_authority = proof("tts-authority")
+    trusted_sources = SimpleNamespace(
+        tts_calibration_authority_source=SimpleNamespace(
+            absolute_path=tts_authority.absolute_path
+        )
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_registry.protocol_lock_from_dict",
+        lambda _value: SimpleNamespace(
+            schema_version=5,
+            trusted_single_operator_source_bindings=trusted_sources,
+        ),
+    )
+    captured: dict[str, object] = {}
+    expected = object()
+
+    def trusted_materializer(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        dispatch,
+        "materialize_trusted_single_operator_request_schedule",
+        trusted_materializer,
+    )
+    resolved_workload_path = (tmp_path / "content-owned-workload.json").resolve()
+    publish_canonical_json_no_replace(
+        resolved_workload_path,
+        {"kind": "content-owned-workload"},
+    )
+    resolved: dict[str, object] = {}
+
+    def trusted_workload_resolver(**kwargs):
+        resolved.update(kwargs)
+        return resolved_workload_path
+
+    monkeypatch.setattr(
+        dispatch,
+        "_materialize_trusted_single_operator_workload_source",
+        trusted_workload_resolver,
+    )
+    inputs = SimpleNamespace(
+        execution_source=execution_source,
+        compile_launch_manifest=launch_binding,
+        private_output_root=str(tmp_path.resolve()),
+    )
+    cell = MaterializedCell(
+        stage=stage,
+        method_role="TTS" if stage == "TTS-Cal" else "Static",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="trusted_early_schedule_fixture",
+        publication_policy="fixed_barrier" if stage == "TTS-Cal" else "none",
+        recipe_sha256=_sha("tts-recipe") if stage == "TTS-Cal" else None,
+        dimensions=(
+            ("concurrency", 1),
+            ("context", 4096),
+            ("regime", "short_input_long_generation"),
+        ),
+    )
+    materialization = StageMaterializationReceipt(
+        schema_version=1,
+        stage=stage,
+        protocol_lock_sha256=_sha("trusted-protocol-lock"),
+        upstream_receipt_sha256s=(_sha("trusted-upstream"),),
+        source_decision_sha256=_sha("trusted-source-decision"),
+        materialization_rule="trusted_schema4_early_schedule_fixture",
+        expected_cell_count=1,
+        cells=(cell,),
+        gpu_hours=GpuHourEstimate.unmeasured(),
+    )
+    result = dispatch._materialize_single_operator_direct_schedule(
+        inputs=inputs,
+        preflight_inputs=preflight,
+        input_binding=proof("early-plan-inputs"),
+        launch=SimpleNamespace(schema_version=2),
+        materialization=materialization,
+        cell=cell,
+        subject_sha256=_sha(f"{stage}-subject"),
+    )
+    assert result is expected
+    assert captured["execution_source_path"] == execution_source.absolute_path
+    assert captured["workload_source_path"] == resolved_workload_path
+    assert captured["workload_source_path"] != workload.path
+    assert captured["materialized_cell_id"] == cell.cell_id
+    assert captured["tts_calibration_authority_path"] == (
+        tts_authority.absolute_path if stage == "TTS-Cal" else None
+    )
+    assert reopen_calls
+    assert resolved == {
+        "content_source_binding": content_source,
+        "cell": cell,
+        "private_output_root": inputs.private_output_root,
+    }
+
+    if stage != "E3a":
+        return
+    foreign_path = (tmp_path / "foreign-content.json").resolve()
+    publish_canonical_json_no_replace(foreign_path, {"kind": "foreign-content"})
+    foreign_proof = CanonicalJsonProofBinding.bind(foreign_path)
+    foreign_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=TrustedSingleOperatorContentBundleBinding(
+            absolute_path=foreign_proof.absolute_path,
+            size=foreign_proof.size,
+            raw_sha256=foreign_proof.raw_sha256,
+            semantic_sha256=foreign_proof.semantic_sha256,
+            runtime_binding_status="BOUND",
+        ),
+    )
+    foreign_preflight = replace(preflight, content_source_binding=foreign_source)
+    with pytest.raises(ValueError, match="content lineage differs"):
+        dispatch._materialize_single_operator_direct_schedule(
+            inputs=inputs,
+            preflight_inputs=foreign_preflight,
+            input_binding=proof("foreign-plan-inputs"),
+            launch=SimpleNamespace(schema_version=2),
+            materialization=materialization,
+            cell=cell,
+            subject_sha256=_sha("foreign-subject"),
+        )
+    bundle_path.write_text('{"kind":"tampered-content"}\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="bundle binding changed"):
+        dispatch._materialize_single_operator_direct_schedule(
+            inputs=inputs,
+            preflight_inputs=preflight,
+            input_binding=proof("tampered-plan-inputs"),
+            launch=SimpleNamespace(schema_version=2),
+            materialization=materialization,
+            cell=cell,
+            subject_sha256=_sha("tampered-subject"),
+        )
+
+
 def _run_tp1_operator_fixture(monkeypatch, tmp_path: Path):
     """Run one source-owned TP1 plan against a real local HTTP child."""
 
@@ -2609,6 +3265,181 @@ def _run_distributed_operator_fixture(
         )
         return CanonicalJsonProofBinding.bind(output_path)
 
+    native_identity = dispatch._formal_gang_native_identity(plan)
+    full_schedule = {
+        phase: [
+            {
+                "request_id": row.request.request_id,
+                "cohort_sha256": row.request.cohort_sha256,
+                "routed_dp_rank": row.routed_dp_rank,
+            }
+            for row in schedule.requests
+            if row.phase == phase
+        ]
+        for phase in ("warmup", "scored")
+    }
+    sticky_routes = sorted(
+        {
+            row.request.cohort_sha256: row.routed_dp_rank for row in schedule.requests
+        }.items()
+    )
+
+    def phase_request_rows(phase):
+        phase_rows = tuple(row for row in schedule.requests if row.phase == phase)
+        return [
+            {
+                "request_id": row.request.request_id,
+                "input_token_ids": list(row.request.input_token_ids),
+                "output_token_ids": [71, 72],
+                "native_itl_semantics": (
+                    "scheduler_committed_token_at_result_processor_v1"
+                ),
+                "native_itl_event_count": 2,
+                "native_itl_events_sha256": dispatch._sha256(
+                    [
+                        {
+                            "token_index": 0,
+                            "token_id": 71,
+                            "observed_ns": 120 + ordinal * 100,
+                        },
+                        {
+                            "token_index": 1,
+                            "token_id": 72,
+                            "observed_ns": 140 + ordinal * 100,
+                        },
+                    ]
+                ),
+                "terminal_status": "completed",
+                "terminal_reason": "FINISH_LENGTH",
+            }
+            for ordinal, row in enumerate(phase_rows)
+        ]
+
+    def allocation_free_native_state():
+        scheduler_state = {
+            "schema_version": 2,
+            "scheduler_idle": True,
+            "active_requests": 0,
+            "queued_requests": 0,
+            "request_pool_active_slots": 0,
+            "allocator_current_hbm_bytes": 32,
+            "allocator_reserved_hbm_bytes": 64,
+            "allocator_peak_hbm_bytes": 3072,
+            "kv_token_capacity": 1024,
+            "kv_available_tokens": 1024,
+            "kv_state_sha256": _sha("gang-kv-state"),
+            "rng_state_sha256": _sha("gang-rng-state"),
+            "adapter_state_sha256": _sha("gang-adapter-state"),
+            "adapter_reset_verified": True,
+            "adapter_reset_scope": native_identity[0],
+            "adapter_request_admission_policy": native_identity[1],
+            "adapter_request_source_point_reset_protocol_sha256": (native_identity[2]),
+            "adapter_runtime_trust_mode": native_identity[3],
+            "adapter_formal_measurement": native_identity[4],
+            "adapter_active_request_id": None,
+            "adapter_request_epoch": 0,
+            "adapter_source_round": 0,
+            "adapter_active_version": 0,
+            "adapter_epoch": 0,
+            "optimizer_generation": 0,
+            "telemetry_generation": 1,
+            "completion_event_generation": 1,
+            "completion_event_complete": True,
+        }
+        return {
+            "scheduler": scheduler_state,
+            "round_rows": [],
+            "update_rows": [],
+            "performance_counters": {
+                "target_calls": 0,
+                "peak_hbm_bytes": scheduler_state["allocator_peak_hbm_bytes"],
+                "updates_launched": 0,
+                "updates_published": 0,
+                "exposed_update_ms": None,
+                "exactness_violations": 0,
+                "version_mismatches": 0,
+                "fallbacks": 0,
+                "nonfinite_updates": 0,
+                "oom_events": 0,
+                "retractions": 0,
+                "communicator_failures": 0,
+            },
+            "historical_kv_source_versions": {},
+            "request_source_point_resets": {
+                "schema_version": 1,
+                "reset_scope": native_identity[0],
+                "request_admission_policy": native_identity[1],
+                "protocol_sha256": native_identity[2],
+                "final_archive_sha256": "0" * 64,
+                "receipts": [],
+            },
+            "adaptation": None,
+        }
+
+    def rank_terminals_for(phase, *, client_lifecycle_sha256):
+        request_rows = phase_request_rows(phase)
+        values = []
+        for rank, gpu_uuid in enumerate(plan.gpu_uuids):
+            local_routes = (
+                full_schedule[phase]
+                if plan.topology_mode == "tp2_dp1"
+                else [
+                    row for row in full_schedule[phase] if row["routed_dp_rank"] == rank
+                ]
+            )
+            local_ids = [row["request_id"] for row in local_routes]
+            local_request_rows = [
+                row for row in request_rows if row["request_id"] in set(local_ids)
+            ]
+            native_state = allocation_free_native_state()
+            rank_value = {
+                "schema_version": 2,
+                "kind": "sglang_formal_gang_rank_terminal",
+                "hook": "sglang.lightcone_formal_gang_serving.v1",
+                "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
+                "topology": plan.topology_mode,
+                "rank": rank,
+                "world_size": 2,
+                "gpu_uuid": gpu_uuid,
+                "execution_plan_sha256": (
+                    plan.native_terminal_binding.execution_plan_sha256
+                ),
+                "rank_config_sha256": (plan.native_terminal_binding.rank_config_sha256),
+                "run_nonce_sha256": plan.native_terminal_binding.run_nonce_sha256,
+                "method": plan.method,
+                "reset_scope": native_identity[0],
+                "request_admission_policy": native_identity[1],
+                "request_source_point_reset_protocol_sha256": native_identity[2],
+                "runtime_trust_mode": native_identity[3],
+                "formal_measurement": native_identity[4],
+                "phase": phase,
+                "full_schedule_sha256": dispatch._sha256(full_schedule),
+                "local_request_routes_sha256": dispatch._sha256(local_routes),
+                "sticky_cohort_routes_sha256": dispatch._sha256(sticky_routes),
+                "expected_request_ids_sha256": dispatch._sha256(local_ids),
+                "request_terminals": local_request_rows,
+                "request_terminal_sha256s": [
+                    dispatch._sha256(row) for row in local_request_rows
+                ],
+                "native_state": native_state,
+                "native_state_sha256": dispatch._sha256(native_state),
+                "client_lifecycle_sha256": client_lifecycle_sha256,
+                "non_submitted_request_ids_sha256": (
+                    None
+                    if phase == "warmup" or client_lifecycle_sha256 is None
+                    else dispatch._sha256([])
+                ),
+                "status": "COMPLETE",
+                "reason_code": None,
+            }
+            values.append(
+                {
+                    **rank_value,
+                    "terminal_sha256": dispatch._sha256(rank_value),
+                }
+            )
+        return values
+
     class FakeTransport:
         @classmethod
         def from_checkout(cls, checkout):
@@ -2628,21 +3459,46 @@ def _run_distributed_operator_fixture(
             assert path.endswith("/capability")
             rank_rows = [
                 {
+                    "schema_version": 2,
+                    "kind": "sglang_formal_gang_rank_capability",
+                    "hook": "sglang.lightcone_formal_gang_serving.v1",
+                    "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
+                    "execution_plan_sha256": (
+                        plan.native_terminal_binding.execution_plan_sha256
+                    ),
+                    "rank_config_sha256": (
+                        plan.native_terminal_binding.rank_config_sha256
+                    ),
+                    "run_nonce_sha256": plan.native_terminal_binding.run_nonce_sha256,
+                    "topology": plan.topology_mode,
                     "rank": rank,
+                    "world_size": 2,
+                    "method": plan.method,
+                    "reset_scope": native_identity[0],
+                    "request_admission_policy": native_identity[1],
+                    "request_source_point_reset_protocol_sha256": native_identity[2],
+                    "runtime_trust_mode": native_identity[3],
+                    "formal_measurement": native_identity[4],
                     "assignment_sha256": _sha("physical-assignment"),
                     "inventory_sha256": plan.inventory_sha256,
                     "gpu_uuid": gpu_uuid,
+                    "process_id": 10_000 + rank,
                 }
                 for rank, gpu_uuid in enumerate(plan.gpu_uuids)
             ]
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "sglang_formal_gang_capability",
                 "hook": "sglang.lightcone_formal_gang_serving.v1",
                 "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
                 "topology": plan.topology_mode,
                 "world_size": 2,
                 "method": plan.method,
+                "reset_scope": native_identity[0],
+                "request_admission_policy": native_identity[1],
+                "request_source_point_reset_protocol_sha256": native_identity[2],
+                "runtime_trust_mode": native_identity[3],
+                "formal_measurement": native_identity[4],
                 "execution_plan_sha256": plan.native_terminal_binding.execution_plan_sha256,
                 "rank_config_sha256": plan.native_terminal_binding.rank_config_sha256,
                 "run_nonce_sha256": plan.native_terminal_binding.run_nonce_sha256,
@@ -2655,7 +3511,7 @@ def _run_distributed_operator_fixture(
             observed.setdefault("actions", []).append(action)
             if action == "begin":
                 value = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "sglang_formal_gang_begin",
                     "hook": "sglang.lightcone_formal_gang_serving.v1",
                     "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
@@ -2663,165 +3519,47 @@ def _run_distributed_operator_fixture(
                     "world_size": 2,
                     "execution_plan_sha256": plan.native_terminal_binding.execution_plan_sha256,
                     "schedule_sha256": dispatch._sha256(payload),
+                    "reset_scope": native_identity[0],
+                    "request_admission_policy": native_identity[1],
+                    "request_source_point_reset_protocol_sha256": native_identity[2],
+                    "runtime_trust_mode": native_identity[3],
+                    "formal_measurement": native_identity[4],
                     "rank_begin_sha256s": [_sha("begin-0"), _sha("begin-1")],
                 }
                 return {**value, "begin_sha256": dispatch._sha256(value)}
-            rank_terminals = [{"rank": 0}, {"rank": 1}]
-            rank_terminal_sha256s = [_sha("terminal-0"), _sha("terminal-1")]
-            if action == "finalize":
-                scored_schedule_rows = tuple(
-                    row for row in schedule.requests if row.phase == "scored"
-                )
-                request_rows = [
-                    {
-                        "request_id": row.request.request_id,
-                        "input_token_ids": list(row.request.input_token_ids),
-                        "output_token_ids": [71, 72],
-                        "native_itl_semantics": (
-                            "scheduler_committed_token_at_result_processor_v1"
-                        ),
-                        "native_itl_event_count": 2,
-                        "native_itl_events_sha256": dispatch._sha256(
-                            [
-                                {
-                                    "token_index": 0,
-                                    "token_id": 71,
-                                    "observed_ns": 120 + ordinal * 100,
-                                },
-                                {
-                                    "token_index": 1,
-                                    "token_id": 72,
-                                    "observed_ns": 140 + ordinal * 100,
-                                },
-                            ]
-                        ),
-                        "terminal_status": "completed",
-                        "terminal_reason": "FINISH_LENGTH",
-                    }
-                    for ordinal, row in enumerate(scored_schedule_rows)
-                ]
-                full = {
-                    phase: [
-                        {
-                            "request_id": row.request.request_id,
-                            "cohort_sha256": row.request.cohort_sha256,
-                            "routed_dp_rank": row.routed_dp_rank,
-                        }
-                        for row in schedule.requests
-                        if row.phase == phase
-                    ]
-                    for phase in ("warmup", "scored")
-                }
-                sticky = sorted(
-                    {
-                        row.request.cohort_sha256: row.routed_dp_rank
-                        for row in schedule.requests
-                    }.items()
-                )
-                rank_terminals = []
-                for rank, gpu_uuid in enumerate(plan.gpu_uuids):
-                    performance = {
-                        "target_calls": len(request_rows),
-                        "peak_hbm_bytes": 1_000 + rank,
-                        "updates_launched": 0,
-                        "updates_published": 0,
-                        "exposed_update_ms": 0.0,
-                        "exactness_violations": 0,
-                        "version_mismatches": 0,
-                        "fallbacks": 0,
-                        "nonfinite_updates": 0,
-                        "oom_events": 0,
-                        "retractions": 0,
-                        "communicator_failures": 0,
-                    }
-                    native_state = {
-                        "scheduler": {"scheduler_idle": True},
-                        "round_rows": [],
-                        "update_rows": [],
-                        "performance_counters": performance,
-                        "historical_kv_source_versions": {},
-                        "adaptation": {},
-                    }
-                    local_routes = (
-                        full["scored"]
-                        if plan.topology_mode == "tp2_dp1"
-                        else [
-                            row
-                            for row in full["scored"]
-                            if row["routed_dp_rank"] == rank
-                        ]
-                    )
-                    local_request_ids = {row["request_id"] for row in local_routes}
-                    local_request_rows = [
-                        row
-                        for row in request_rows
-                        if row["request_id"] in local_request_ids
-                    ]
-                    adaptation = (
-                        {}
-                        if plan.topology_mode == "tp2_dp1"
-                        else {
-                            "dp2_replica_state": {
-                                "cross_replica_gradient_collective": False,
-                                "cross_replica_optimizer_state": False,
-                            }
-                        }
-                    )
-                    native_state["adaptation"] = adaptation
-                    rank_value = {
-                        "schema_version": 1,
-                        "kind": "sglang_formal_gang_rank_terminal",
-                        "hook": "sglang.lightcone_formal_gang_serving.v1",
-                        "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
-                        "topology": plan.topology_mode,
-                        "rank": rank,
-                        "world_size": 2,
-                        "gpu_uuid": gpu_uuid,
-                        "execution_plan_sha256": plan.native_terminal_binding.execution_plan_sha256,
-                        "rank_config_sha256": plan.native_terminal_binding.rank_config_sha256,
-                        "run_nonce_sha256": plan.native_terminal_binding.run_nonce_sha256,
-                        "method": plan.method,
-                        "phase": "scored",
-                        "full_schedule_sha256": dispatch._sha256(full),
-                        "local_request_routes_sha256": dispatch._sha256(local_routes),
-                        "sticky_cohort_routes_sha256": dispatch._sha256(sticky),
-                        "expected_request_ids_sha256": dispatch._sha256(
-                            [row["request_id"] for row in local_routes]
-                        ),
-                        "request_terminals": local_request_rows,
-                        "request_terminal_sha256s": [
-                            dispatch._sha256(row) for row in local_request_rows
-                        ],
-                        "native_state": native_state,
-                        "native_state_sha256": dispatch._sha256(native_state),
-                        "status": "COMPLETE",
-                        "reason_code": None,
-                    }
-                    rank_terminals.append(
-                        {
-                            **rank_value,
-                            "terminal_sha256": dispatch._sha256(rank_value),
-                        }
-                    )
-                rank_terminal_sha256s = [
-                    row["terminal_sha256"] for row in rank_terminals
-                ]
+            phase = "warmup" if action == "reset" else "scored"
+            lifecycle_sha256 = (
+                None
+                if action == "reset" or "client_lifecycle_rows" not in payload
+                else dispatch._sha256(payload["client_lifecycle_rows"])
+            )
+            rank_terminals = rank_terminals_for(
+                phase,
+                client_lifecycle_sha256=lifecycle_sha256,
+            )
+            rank_terminal_sha256s = [row["terminal_sha256"] for row in rank_terminals]
             value = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "sglang_formal_gang_all_rank_terminal",
                 "hook": "sglang.lightcone_formal_gang_serving.v1",
                 "protocol_sha256": dispatch.FORMAL_GANG_SERVING_PROTOCOL_SHA256,
                 "topology": plan.topology_mode,
                 "world_size": 2,
                 "action": f"formal_gang_{action}",
+                "reset_scope": native_identity[0],
+                "request_admission_policy": native_identity[1],
+                "request_source_point_reset_protocol_sha256": native_identity[2],
+                "runtime_trust_mode": native_identity[3],
+                "formal_measurement": native_identity[4],
                 "decision": "COMMITTED",
                 "published_ranks": [0, 1],
                 "reason_code": None,
                 "cross_replica_gradient_collective": False,
                 "rank_terminals": rank_terminals,
-                "rank_reset_sha256s": [_sha("reset-0"), _sha("reset-1")],
                 "rank_terminal_sha256s": rank_terminal_sha256s,
             }
+            if action == "reset":
+                value["rank_reset_sha256s"] = [_sha("reset-0"), _sha("reset-1")]
             return {**value, "aggregate_sha256": dispatch._sha256(value)}
 
     class FakeRequestResult:
@@ -2838,6 +3576,7 @@ def _run_distributed_operator_fixture(
 
     async def fake_phase(_phase, requests, **_kwargs):
         pointers = []
+        lifecycle_rows = []
         for ordinal, request in enumerate(requests):
             pointer = {
                 "schema_version": 1,
@@ -2859,17 +3598,37 @@ def _run_distributed_operator_fixture(
                     for index, token in enumerate((71, 72))
                 ],
             }
+            result_pointer_sha256 = dispatch._sha256(pointer)
             pointers.append(
                 json.dumps(
                     {
                         **pointer,
-                        "result_pointer_sha256": dispatch._sha256(pointer),
+                        "result_pointer_sha256": result_pointer_sha256,
                     }
                 )
+            )
+            lifecycle_rows.append(
+                {
+                    "request_id": request.request_id,
+                    "phase": _phase,
+                    "scheduled_arrival_us": ordinal,
+                    "offered": True,
+                    "offered_at_us": ordinal + 1,
+                    "admitted_at_us": ordinal + 1,
+                    "effective_deadline_us": 1_000_000,
+                    "cancellation_at_us": None,
+                    "terminal_at_us": ordinal + 2,
+                    "outcome_status": "completed",
+                    "outcome_code": "completed",
+                    "submitted_to_server": True,
+                    "native_terminal_status": "completed",
+                    "native_result_pointer_sha256": result_pointer_sha256,
+                }
             )
         return SimpleNamespace(
             requests=tuple(FakeRequestResult(request) for request in requests),
             native_result_pointer_json=tuple(pointers),
+            client_lifecycle_rows=tuple(lifecycle_rows),
         )
 
     monkeypatch.setattr(dispatch, "_capture_gpu_process_snapshot", fake_snapshot)

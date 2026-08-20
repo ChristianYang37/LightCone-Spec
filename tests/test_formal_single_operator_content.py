@@ -61,7 +61,7 @@ def _source_repository(tmp_path: Path) -> Path:
     patch_root = root / "patches" / "sglang"
     patch_root.mkdir(parents=True)
     patches: list[dict[str, object]] = []
-    for index in range(1, 8):
+    for index in range(1, 9):
         name = f"000{index}-test.patch"
         body = f"patch-{index}\n".encode()
         (patch_root / name).write_bytes(body)
@@ -378,14 +378,14 @@ def test_huggingface_snapshot_rejects_escaping_symlink(tmp_path: Path) -> None:
         bind_trusted_model_snapshot_member(spec)
 
 
-def test_source_snapshot_binds_clean_git_and_seven_patch_bytes(tmp_path: Path) -> None:
+def test_source_snapshot_binds_clean_git_and_eight_patch_bytes(tmp_path: Path) -> None:
     root = _source_repository(tmp_path)
     snapshot = bind_trusted_source_snapshot(root)
 
     assert snapshot.repository_root == str(root)
     assert snapshot.git_head == _git(root, "rev-parse", "HEAD")
     assert snapshot.git_tree == _git(root, "rev-parse", "HEAD^{tree}")
-    assert len(snapshot.patches) == 7
+    assert len(snapshot.patches) == 8
     assert TrustedSourceSnapshot.from_dict(snapshot.to_dict()) == snapshot
 
     (root / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
@@ -489,7 +489,7 @@ def test_bundle_codec_runtime_binding_no_replace_and_revalidation(
         reference.reopen()
 
 
-def test_path_only_spec_publishes_bound_bundle_without_caller_digests(
+def test_runtime_bound_publisher_rejects_incomplete_v03_spec_before_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -544,20 +544,14 @@ def test_path_only_spec_publishes_bound_bundle_without_caller_digests(
     )
     output = (tmp_path / "runtime-bound-content.json").resolve()
 
-    binding = publish_runtime_bound_trusted_single_operator_content_from_spec(
-        spec_path=spec_path,
-        output_path=output,
-    )
-
     assert load_trusted_single_operator_content_path_spec(spec_path) == spec
-    assert binding.runtime_binding_status == "BOUND"
-    assert binding.reopen().runtime_observations is not None
     assert "sha256" not in spec.to_dict()
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ValueError, match="model member coverage differs"):
         publish_runtime_bound_trusted_single_operator_content_from_spec(
             spec_path=spec_path,
             output_path=output,
         )
+    assert not output.exists()
 
     mutated = dict(spec.to_dict())
     mutated["inventory_path"] = str(doctor)

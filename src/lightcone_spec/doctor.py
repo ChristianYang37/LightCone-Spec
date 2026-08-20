@@ -504,6 +504,29 @@ def _parse_gpu_inventory(value: str | None) -> dict[str, Any]:
     return {"devices": devices, "parse_error": None}
 
 
+def _trusted_gpu_device_identity(value: object) -> tuple[tuple[str, str, str], ...]:
+    if type(value) is not dict or value.get("parse_error") is not None:
+        raise ValueError("trusted doctor live GPU inventory did not parse exactly")
+    devices = value.get("devices")
+    if type(devices) is not list or not devices:
+        raise ValueError("trusted doctor live GPU inventory is empty")
+    rows: list[tuple[str, str, str]] = []
+    for device in devices:
+        if type(device) is not dict:
+            raise ValueError("trusted doctor live GPU row is foreign")
+        row = (
+            device.get("uuid"),
+            device.get("name"),
+            device.get("compute_capability"),
+        )
+        if any(type(item) is not str or not item for item in row):
+            raise ValueError("trusted doctor live GPU identity is incomplete")
+        rows.append(row)  # type: ignore[arg-type]
+    if len(rows) != len(set(rows)) or len({row[0] for row in rows}) != len(rows):
+        raise ValueError("trusted doctor live GPU identity is duplicated")
+    return tuple(sorted(rows))
+
+
 def _parse_topology(value: str | None) -> dict[str, Any]:
     if not value:
         return {
@@ -1420,6 +1443,7 @@ def doctor_report(
     stage_capacity_attestation_path: str | Path | None = None,
     stage_capacity_activation_sha256: str | None = None,
     stage_capacity_now_ns: int | None = None,
+    trusted_single_operator_capacity_path: str | Path | None = None,
 ) -> dict[str, Any]:
     project = Path(project_root).resolve()
     sglang = Path(sglang_root).resolve() if sglang_root is not None else project
@@ -1427,13 +1451,128 @@ def doctor_report(
     evaluation_manifest = manifest
     capacity_report: dict[str, Any]
     capacity_error: str | None = None
+    trusted_capacity_active = False
+    trusted_inventory_binding: object | None = None
+    trusted_inventory_identity: tuple[tuple[str, str, str], ...] | None = None
     capacity_inputs = (
         stage_capacity_gate_path,
         stage_capacity_schedule_path,
         stage_capacity_attestation_path,
         stage_capacity_activation_sha256,
     )
-    if all(value is None for value in capacity_inputs):
+    if trusted_single_operator_capacity_path is not None and any(
+        value is not None for value in capacity_inputs
+    ):
+        capacity_report = {
+            "mode": "TRUSTED_SINGLE_OPERATOR_NO_SIGNATURE",
+            "status": "FAIL",
+            "reason_code": "trusted_and_signed_capacity_authorities_are_mutually_exclusive",
+            "required_free_bytes": None,
+            "authority": None,
+            "authority_sha256": None,
+            "formal_measured_authorization": False,
+        }
+        capacity_error = capacity_report["reason_code"]
+    elif trusted_single_operator_capacity_path is not None:
+        try:
+            from lightcone_spec.experiments.formal_single_operator_capacity import (
+                revalidate_trusted_single_operator_stage_capacity_authority,
+            )
+            from lightcone_spec.experiments.formal_single_operator_content import (
+                load_trusted_single_operator_content_path_spec,
+            )
+            from lightcone_spec.experiments.gpu_pool import GpuInventory
+            from lightcone_spec.runtime.proof_artifact import (
+                CanonicalJsonProofBinding,
+            )
+
+            authority_binding, authority, decision = (
+                revalidate_trusted_single_operator_stage_capacity_authority(
+                    trusted_single_operator_capacity_path,
+                    require_available=False,
+                )
+            )
+            content_spec = load_trusted_single_operator_content_path_spec(
+                authority.content_path_spec.absolute_path
+            )
+            if Path(content_spec.repository_root) != project:
+                raise ValueError(
+                    "trusted capacity content repository differs from doctor project"
+                )
+            inventory_binding = CanonicalJsonProofBinding.bind(
+                content_spec.inventory_path
+            )
+            inventory = GpuInventory.from_dict(inventory_binding.reopen())
+            if inventory_binding.semantic_sha256 != inventory.sha256:
+                raise ValueError("trusted capacity inventory binding differs")
+            trusted_inventory_binding = inventory_binding
+            trusted_inventory_identity = tuple(
+                sorted(
+                    (
+                        device.uuid,
+                        device.model,
+                        (
+                            f"{device.compute_capability[0]}."
+                            f"{device.compute_capability[1]}"
+                        ),
+                    )
+                    for device in inventory.devices
+                )
+            )
+            trusted_capacity_active = True
+            trusted_status = (
+                "AVAILABLE"
+                if authority.status == "AVAILABLE" and decision.status == "AVAILABLE"
+                else "BLOCKED"
+            )
+            capacity_report = {
+                "mode": "TRUSTED_SINGLE_OPERATOR_NO_SIGNATURE",
+                "status": trusted_status,
+                "reason_code": (
+                    "trusted_single_operator_capacity_available"
+                    if trusted_status == "AVAILABLE"
+                    else "trusted_single_operator_capacity_insufficient"
+                ),
+                "required_free_bytes": decision.required_free_bytes,
+                "observed_free_bytes": decision.observed_free_bytes,
+                "current_wave_high_water_bytes": (
+                    decision.current_wave_high_water_bytes
+                ),
+                "running_wave_high_water_bytes": (
+                    decision.running_wave_high_water_bytes
+                ),
+                "retry_reserve_mode": authority.retry_reserve_mode,
+                "retry_policy_sha256": authority.retry_policy_sha256,
+                "retry_reserve_bytes": decision.retry_reserve_bytes,
+                "safety_margin_bytes": decision.safety_margin_bytes,
+                "authority": authority_binding.to_dict(),
+                "authority_sha256": authority.sha256,
+                "content_path_spec": authority.content_path_spec.to_dict(),
+                "inventory": inventory_binding.to_dict(),
+                "inventory_sha256": inventory.sha256,
+                "formal_measured_authorization": False,
+            }
+            if manifest is not None:
+                evaluation_manifest = {
+                    **manifest,
+                    "disk": {
+                        **manifest["disk"],
+                        "minimum_free_bytes": decision.required_free_bytes,
+                    },
+                }
+        except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
+            capacity_error = f"{type(error).__name__}:{error}"
+            capacity_report = {
+                "mode": "TRUSTED_SINGLE_OPERATOR_NO_SIGNATURE",
+                "status": "FAIL",
+                "reason_code": "trusted_single_operator_capacity_authority_invalid",
+                "required_free_bytes": None,
+                "authority": None,
+                "authority_sha256": None,
+                "formal_measured_authorization": False,
+                "error": capacity_error,
+            }
+    elif all(value is None for value in capacity_inputs):
         capacity_report = {
             "mode": "LEGACY_100GB_FALLBACK",
             "status": "FALLBACK",
@@ -1612,6 +1751,95 @@ def doctor_report(
             project_root=project,
             sglang_root=sglang,
         )
+    if trusted_capacity_active and capacity_error is None:
+        try:
+            from lightcone_spec.experiments.formal_single_operator_content import (
+                load_trusted_single_operator_content_path_spec,
+            )
+            from lightcone_spec.experiments.gpu_pool import GpuInventory
+            from lightcone_spec.runtime.proof_artifact import (
+                CanonicalJsonProofBinding,
+            )
+
+            authority_binding, authority, decision = (
+                revalidate_trusted_single_operator_stage_capacity_authority(
+                    trusted_single_operator_capacity_path,
+                    require_available=False,
+                )
+            )
+            content_spec = load_trusted_single_operator_content_path_spec(
+                authority.content_path_spec.absolute_path
+            )
+            inventory_binding = CanonicalJsonProofBinding.bind(
+                content_spec.inventory_path
+            )
+            inventory = GpuInventory.from_dict(inventory_binding.reopen())
+            inventory_identity = tuple(
+                sorted(
+                    (
+                        device.uuid,
+                        device.model,
+                        (
+                            f"{device.compute_capability[0]}."
+                            f"{device.compute_capability[1]}"
+                        ),
+                    )
+                    for device in inventory.devices
+                )
+            )
+            live_identity = _trusted_gpu_device_identity(facts["gpu"]["inventory"])
+            if (
+                trusted_inventory_binding is None
+                or inventory_binding != trusted_inventory_binding
+                or inventory_binding.semantic_sha256 != inventory.sha256
+                or inventory_identity != trusted_inventory_identity
+                or live_identity != inventory_identity
+            ):
+                raise ValueError(
+                    "trusted doctor live GPU set differs from bound inventory"
+                )
+            trusted_status = (
+                "AVAILABLE"
+                if authority.status == "AVAILABLE" and decision.status == "AVAILABLE"
+                else "BLOCKED"
+            )
+            capacity_report.update(
+                {
+                    "status": trusted_status,
+                    "reason_code": (
+                        "trusted_single_operator_capacity_available"
+                        if trusted_status == "AVAILABLE"
+                        else "trusted_single_operator_capacity_insufficient"
+                    ),
+                    "observed_free_bytes": decision.observed_free_bytes,
+                    "required_free_bytes": decision.required_free_bytes,
+                    "authority": authority_binding.to_dict(),
+                    "authority_sha256": authority.sha256,
+                    "inventory": inventory_binding.to_dict(),
+                    "inventory_sha256": inventory.sha256,
+                }
+            )
+            checks["disk"] = _check(
+                "PASS" if trusted_status == "AVAILABLE" else "FAIL",
+                expected={
+                    "mode": "TRUSTED_SINGLE_OPERATOR_NO_SIGNATURE",
+                    "minimum_free_bytes": decision.required_free_bytes,
+                    "formal_measured_authorization": False,
+                },
+                observed=capacity_report,
+                reason_code="runtime_disk_capacity",
+            )
+        except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
+            capacity_error = f"{type(error).__name__}:{error}"
+            capacity_report.update(
+                {
+                    "status": "FAIL",
+                    "reason_code": (
+                        "trusted_single_operator_capacity_authority_changed"
+                    ),
+                    "error": capacity_error,
+                }
+            )
     if capacity_error is not None or capacity_report["status"] == "BLOCKED":
         checks["disk"] = _check(
             "FAIL",
@@ -1687,6 +1915,152 @@ def doctor_report(
     }
 
 
+def revalidate_trusted_single_operator_doctor_report(
+    path: str | Path,
+    *,
+    expected_bound_content_bundle: object | None = None,
+    require_capacity_available: bool = True,
+) -> object:
+    """Deep-replay one source-produced trusted-capacity PASS doctor report.
+
+    A caller-authored object with a convenient ``PASS`` flag is not a doctor
+    authority.  This verifier requires the exact registered check set from a
+    fresh source replay, requires every current check to remain PASS, and then
+    reopens the tagged capacity/content/filesystem lineage.  Dynamic observed
+    values may legitimately change between publication and replay, so their
+    *registered check contracts* are compared while the fresh replay supplies
+    the current runtime decision.
+    """
+
+    from lightcone_spec.experiments.formal_single_operator_capacity import (
+        require_trusted_single_operator_bound_content_closure,
+        trusted_single_operator_capacity_authority_from_doctor,
+    )
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    if type(require_capacity_available) is not bool:
+        raise TypeError("trusted doctor capacity availability policy must be boolean")
+
+    binding = CanonicalJsonProofBinding.bind(path)
+    persisted = binding.reopen()
+    if type(persisted) is not dict:
+        raise TypeError("trusted single-operator doctor report must be an object")
+    capacity_binding, authority, _decision = (
+        trusted_single_operator_capacity_authority_from_doctor(
+            path,
+            require_available=require_capacity_available,
+        )
+    )
+    roots = persisted.get("roots")
+    if type(roots) is not dict or set(roots) != {
+        "project",
+        "patched_sglang",
+        "distinct",
+    }:
+        raise ValueError("trusted doctor roots are incomplete")
+    replayed = doctor_report(
+        roots["project"],
+        roots["patched_sglang"],
+        trusted_single_operator_capacity_path=capacity_binding.absolute_path,
+    )
+    persisted_checks = persisted.get("checks")
+    replayed_checks = replayed.get("checks")
+    if (
+        (
+            replayed.get("status") != "PASS"
+            and not (
+                not require_capacity_available
+                and replayed.get("status") == "FAIL"
+                and isinstance(replayed.get("stage_capacity"), dict)
+                and replayed["stage_capacity"].get("status") == "BLOCKED"
+            )
+        )
+        or type(persisted_checks) is not dict
+        or type(replayed_checks) is not dict
+        or set(persisted_checks) != set(replayed_checks)
+        or set(persisted) != set(replayed)
+        or persisted.get("roots") != replayed.get("roots")
+        or persisted.get("runtime_manifest") != replayed.get("runtime_manifest")
+        or persisted.get("mode_gates") != replayed.get("mode_gates")
+        or persisted.get("project_source_tree") != replayed.get("project_source_tree")
+        or persisted.get("project_runtime_source")
+        != replayed.get("project_runtime_source")
+        or persisted.get("source_tree") != replayed.get("source_tree")
+        or not isinstance(persisted.get("gpu"), dict)
+        or not isinstance(replayed.get("gpu"), dict)
+        or persisted["gpu"].get("parsed_inventory")
+        != replayed["gpu"].get("parsed_inventory")
+    ):
+        raise ValueError("trusted doctor source replay identity differs")
+    for name in sorted(replayed_checks):
+        prior = persisted_checks[name]
+        current = replayed_checks[name]
+        capacity_blocked_disk = (
+            name == "disk"
+            and not require_capacity_available
+            and isinstance(current, dict)
+            and current.get("status") == "FAIL"
+            and current.get("reason_code") == "runtime_disk_capacity"
+            and isinstance(replayed.get("stage_capacity"), dict)
+            and replayed["stage_capacity"].get("status") == "BLOCKED"
+            and current.get("observed") == replayed["stage_capacity"]
+        )
+        if (
+            type(prior) is not dict
+            or type(current) is not dict
+            or set(prior) != {"status", "expected", "observed", "reason_code"}
+            or set(current) != set(prior)
+            or prior.get("status") != "PASS"
+            or (
+                not capacity_blocked_disk
+                and (
+                    current.get("status") != "PASS"
+                    or prior.get("expected") != current.get("expected")
+                    or prior.get("reason_code") != current.get("reason_code")
+                )
+            )
+        ):
+            raise ValueError(f"trusted doctor registered check differs: {name}")
+    persisted_capacity = persisted.get("stage_capacity")
+    replayed_capacity = replayed.get("stage_capacity")
+    stable_capacity_fields = {
+        "mode",
+        "retry_reserve_mode",
+        "retry_policy_sha256",
+        "retry_reserve_bytes",
+        "safety_margin_bytes",
+        "authority",
+        "authority_sha256",
+        "content_path_spec",
+        "inventory",
+        "inventory_sha256",
+        "formal_measured_authorization",
+    }
+    if (
+        type(persisted_capacity) is not dict
+        or type(replayed_capacity) is not dict
+        or any(
+            persisted_capacity.get(name) != replayed_capacity.get(name)
+            for name in stable_capacity_fields
+        )
+        or (
+            replayed_capacity.get("status") != "AVAILABLE"
+            and not (
+                not require_capacity_available
+                and replayed_capacity.get("status") == "BLOCKED"
+            )
+        )
+    ):
+        raise ValueError("trusted doctor capacity replay differs")
+    if expected_bound_content_bundle is not None:
+        require_trusted_single_operator_bound_content_closure(
+            authority,
+            bundle=expected_bound_content_bundle,
+            doctor_report_path=binding.absolute_path,
+        )
+    return binding
+
+
 def format_doctor(
     project_root: str | Path = ".",
     sglang_root: str | Path | None = None,
@@ -1696,6 +2070,7 @@ def format_doctor(
     stage_capacity_attestation_path: str | Path | None = None,
     stage_capacity_activation_sha256: str | None = None,
     stage_capacity_now_ns: int | None = None,
+    trusted_single_operator_capacity_path: str | Path | None = None,
 ) -> str:
     return json.dumps(
         doctor_report(
@@ -1706,7 +2081,10 @@ def format_doctor(
             stage_capacity_attestation_path=stage_capacity_attestation_path,
             stage_capacity_activation_sha256=stage_capacity_activation_sha256,
             stage_capacity_now_ns=stage_capacity_now_ns,
+            trusted_single_operator_capacity_path=(
+                trusted_single_operator_capacity_path
+            ),
         ),
-        indent=2,
         sort_keys=True,
+        separators=(",", ":"),
     )

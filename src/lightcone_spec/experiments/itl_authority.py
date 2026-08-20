@@ -1241,6 +1241,15 @@ class StageItlExecutionIdentity:
     run_nonce_sha256: str
     attempt_id: str
     method: StageItlMethod
+    runtime_trust_mode: (
+        Literal[
+            "release_verified_signature",
+            "qualification_empirical_no_signature",
+            "trusted_single_operator_empirical_no_signature",
+        ]
+        | None
+    )
+    formal_measurement: bool | None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or self.kind != "stage_itl_execution_identity":
@@ -1266,6 +1275,28 @@ class StageItlExecutionIdentity:
             "onlinespec_ens",
         }:
             raise ValueError("stage ITL method is unsupported")
+        if (
+            (
+                self.runtime_trust_mode is not None
+                and type(self.runtime_trust_mode) is not str
+            )
+            or (
+                self.formal_measurement is not None
+                and type(self.formal_measurement) is not bool
+            )
+            or (self.runtime_trust_mode, self.formal_measurement)
+            not in {
+                (None, None),
+                ("release_verified_signature", True),
+                ("qualification_empirical_no_signature", False),
+                ("trusted_single_operator_empirical_no_signature", False),
+            }
+        ):
+            raise ValueError("stage ITL runtime trust identity is invalid")
+        if self.method in {"target_only", "static"} and (
+            self.runtime_trust_mode is not None or self.formal_measurement is not None
+        ):
+            raise ValueError("allocation-free stage ITL identity carries runtime trust")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1280,6 +1311,8 @@ class StageItlExecutionIdentity:
             "run_nonce_sha256": self.run_nonce_sha256,
             "attempt_id": self.attempt_id,
             "method": self.method,
+            "runtime_trust_mode": self.runtime_trust_mode,
+            "formal_measurement": self.formal_measurement,
         }
 
     @classmethod
@@ -1300,6 +1333,8 @@ class StageItlExecutionIdentity:
                 "run_nonce_sha256",
                 "attempt_id",
                 "method",
+                "runtime_trust_mode",
+                "formal_measurement",
             },
         )
         return cls(**row)  # type: ignore[arg-type]

@@ -174,6 +174,10 @@ class AdaptationConfig(StrictModel):
     parameter_scope: str = Field(min_length=1, max_length=64)
     kv_history_policy: Literal["frozen"] = "frozen"
     adaptation_scope: Literal["cohort"] = "cohort"
+    reset_scope: Literal["request", "cohort"]
+    request_admission_policy: Literal[
+        "serialized_native_scheduler_v1", "cohort_batching_v1"
+    ]
     adaptation_group_id: str = Field(min_length=1, max_length=128)
     optimizer: OptimizerConfig
     rank: int | None = Field(default=None, ge=1)
@@ -216,6 +220,15 @@ class AdaptationConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_mode(self) -> AdaptationConfig:
+        expected_admission_policy = (
+            "serialized_native_scheduler_v1"
+            if self.reset_scope == "request"
+            else "cohort_batching_v1"
+        )
+        if self.request_admission_policy != expected_admission_policy:
+            raise ValueError(
+                "adaptation reset scope and request admission policy disagree"
+            )
         if self.weight_update_mode == "full":
             if self.rank is not None or self.lora_alpha is not None:
                 raise ValueError("full updates require rank and lora_alpha to be null")
@@ -533,12 +546,25 @@ class RunConfig(StrictModel):
                 raise ValueError(
                     "OnlineSPEC cannot inherit LightCone E4 mechanism tuning"
                 )
+            if (
+                self.adaptation.reset_scope != "cohort"
+                or self.adaptation.request_admission_policy != "cohort_batching_v1"
+            ):
+                raise ValueError(
+                    "OnlineSPEC requires cohort-persistent batched adaptation state"
+                )
             self._validate_onlinespec()
             return self
         if self.online_spec is not None:
             raise ValueError("online_spec state is only valid for OnlineSPEC methods")
         if not self.runtime.use_rejection_sampling:
             raise ValueError("TTS/L0 requires exact full-vocabulary rejection sampling")
+        if self.method == "tts" and (
+            self.adaptation.reset_scope != "request"
+            or self.adaptation.request_admission_policy
+            != "serialized_native_scheduler_v1"
+        ):
+            raise ValueError("TTS requires request-reset serialized native adaptation")
         if self.adaptation.optimizer.name not in {
             "adam",
             "adamw",

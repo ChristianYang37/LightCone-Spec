@@ -893,6 +893,8 @@ def test_onlinespec_protocol_rejects_runtime_and_loss_drift() -> None:
             "adaptation": {
                 "weight_update_mode": candidate.weight_update_mode,
                 "parameter_scope": candidate.parameter_scope,
+                "reset_scope": "cohort",
+                "request_admission_policy": "cohort_batching_v1",
                 "adaptation_group_id": "onlinespec-test",
                 "optimizer": {
                     "name": "sgd",

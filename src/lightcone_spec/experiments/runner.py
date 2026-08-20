@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -378,8 +379,12 @@ def _adaptation_fields(
     ):
         raise RuntimeError("adapted run lacks an expected config identity")
     diagnostics = snapshot.adaptation
-    if not isinstance(diagnostics, dict) or diagnostics.get("schema_version") != 2:
-        raise RuntimeError("adapted run lacks schema-v2 diagnostics")
+    if not isinstance(diagnostics, dict) or diagnostics.get("schema_version") not in {
+        2,
+        3,
+    }:
+        raise RuntimeError("adapted run lacks supported diagnostics")
+    current_reset_schema = diagnostics["schema_version"] == 3
     counters = diagnostics.get("counters")
     timings = diagnostics.get("timings_ms")
     updates = diagnostics.get("updates")
@@ -392,8 +397,29 @@ def _adaptation_fields(
         raise RuntimeError(  # noqa: TRY004 - malformed remote evidence
             "adaptation update evidence is missing"
         )
-    if not isinstance(rounds, list) or not rounds:
+    if not isinstance(rounds, list) or (not current_reset_schema and not rounds):
         raise RuntimeError("adaptation round evidence is missing")
+    if current_reset_schema:
+        from lightcone_spec.orchestration.native_terminal import (
+            REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
+        )
+
+        reset_scope = diagnostics.get("reset_scope")
+        request_admission_policy = diagnostics.get("request_admission_policy")
+        expected_policy = {
+            "request": "serialized_native_scheduler_v1",
+            "cohort": "cohort_batching_v1",
+        }.get(reset_scope)
+        if (
+            expected_policy is None
+            or request_admission_policy != expected_policy
+            or diagnostics.get("request_source_point_reset_protocol_sha256")
+            != REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            or not isinstance(
+                diagnostics.get("request_source_point_reset_receipts"), list
+            )
+        ):
+            raise RuntimeError("adaptation request reset identity is incomplete")
     missing_counters = set(_SAFETY_COUNTERS + _UPDATE_COUNTERS) - set(counters)
     missing_timings = set(_TIMING_LANES) - set(timings)
     if missing_counters or missing_timings:
@@ -670,11 +696,24 @@ def _write_updates(
         if diagnostics is not None or updates:
             raise RuntimeError("Static cannot contain update evidence")
         return
-    if diagnostics is None or not updates:
-        raise RuntimeError("adapted method requires non-empty update evidence")
+    if diagnostics is None:
+        raise RuntimeError("adapted method requires native diagnostics")
+    current_reset_schema = diagnostics.get("schema_version") == 3
+    if not updates:
+        if current_reset_schema:
+            return
+        raise RuntimeError("legacy adapted method requires non-empty update evidence")
     cohort = str(diagnostics["cohort_sha256"])
     layout = str(diagnostics["parameter_layout_sha256"])
     trainable = int(diagnostics["trainable_parameters"])
+    reset_scope = str(diagnostics.get("reset_scope", ""))
+    receipt_by_identity = {
+        (int(receipt["request_epoch"]), str(receipt["request_id"])): str(
+            receipt["receipt_sha256"]
+        )
+        for receipt in diagnostics.get("request_source_point_reset_receipts", [])
+        if isinstance(receipt, dict)
+    }
     for index, update in enumerate(updates):
         required = {
             "source_round",
@@ -688,6 +727,17 @@ def _write_updates(
             "reconstruction_max_abs",
             "supervision_nonempty",
         }
+        if current_reset_schema:
+            required.update(
+                {
+                    "request_epoch",
+                    "effective_learning_rate",
+                    "schedule_valid",
+                    "intrinsic_ready_round",
+                    "extra_logical_delay",
+                    "publication_round",
+                }
+            )
         if not isinstance(update, dict) or not required <= set(update):
             raise RuntimeError("update trace is incomplete")
         request_ids = update.get("request_ids")
@@ -704,6 +754,26 @@ def _write_updates(
             )
         ):
             raise RuntimeError("update trace lacks request-level prefix lengths")
+        request_epoch: int | None = None
+        request_reset_receipt_sha256: str | None = None
+        if current_reset_schema:
+            request_epoch = update.get("request_epoch")
+            if (
+                not isinstance(request_epoch, int)
+                or isinstance(request_epoch, bool)
+                or request_epoch < 0
+            ):
+                raise RuntimeError("update trace request epoch is invalid")
+            if reset_scope == "request":
+                if len(request_ids) != 1 or request_epoch < 1:
+                    raise RuntimeError("request-scoped update is not request-exclusive")
+                request_reset_receipt_sha256 = receipt_by_identity.get(
+                    (request_epoch, request_ids[0])
+                )
+                if request_reset_receipt_sha256 is None:
+                    raise RuntimeError("request-scoped update lacks its reset receipt")
+            elif reset_scope != "cohort" or request_epoch != 0:
+                raise RuntimeError("cohort update request epoch differs")
         loss = float(update["loss"])
         if not math.isfinite(loss) or loss < -1e-6:
             raise RuntimeError("update trace loss must be finite and non-negative")
@@ -899,6 +969,33 @@ def _write_updates(
                     if expert_gradient_norms is None
                     else json.dumps(expert_gradient_norms, separators=(",", ":"))
                 ),
+                cohort_epoch=int(diagnostics.get("cohort_epoch", 0)),
+                reset_scope=(reset_scope if current_reset_schema else None),
+                request_epoch=request_epoch,
+                request_reset_receipt_sha256=request_reset_receipt_sha256,
+                effective_learning_rate=(
+                    float(update["effective_learning_rate"])
+                    if current_reset_schema
+                    else None
+                ),
+                schedule_valid=(
+                    bool(update["schedule_valid"]) if current_reset_schema else None
+                ),
+                intrinsic_ready_round=(
+                    int(update["intrinsic_ready_round"])
+                    if current_reset_schema
+                    and update.get("intrinsic_ready_round") is not None
+                    else None
+                ),
+                extra_logical_delay=(
+                    int(update["extra_logical_delay"]) if current_reset_schema else None
+                ),
+                publication_round=(
+                    int(update["publication_round"])
+                    if current_reset_schema
+                    and update.get("publication_round") is not None
+                    else None
+                ),
             )
         )
 
@@ -914,13 +1011,22 @@ def _round_records(
         if rounds:
             raise RuntimeError("Static cannot contain round adaptation evidence")
         return ()
+    current_reset_schema = diagnostics.get("schema_version") == 3
+    reset_scope = str(diagnostics.get("reset_scope", ""))
+    receipt_by_identity = {
+        (int(receipt["request_epoch"]), str(receipt["request_id"])): str(
+            receipt["receipt_sha256"]
+        )
+        for receipt in diagnostics.get("request_source_point_reset_receipts", [])
+        if isinstance(receipt, dict)
+    }
     inputs = {result.request_id: result.input_tokens for result in results}
     completions = {result.request_id: result.completion_tokens for result in results}
     if len(inputs) != len(results):
         raise RuntimeError("request identities are not unique within a run")
     histories: dict[str, list[dict[str, int]]] = {}
-    flat: list[tuple[int, int, str, int, int, int, int]] = []
-    seen_rounds: set[int] = set()
+    flat: list[tuple[int, int, int, str, int, int, int, int]] = []
+    seen_rounds: set[tuple[int, int]] = set()
     for trace in rounds:
         required = {
             "round_index",
@@ -931,15 +1037,25 @@ def _round_records(
             "accepted_drafts",
             "committed_tokens",
         }
+        if current_reset_schema:
+            required.add("request_epoch")
         if not isinstance(trace, dict) or set(trace) != required:
             raise RuntimeError("round trace fields are incomplete")
         round_index = int(trace["round_index"])
         source_version = int(trace["source_version"])
-        if round_index < 1 or source_version < 0 or round_index in seen_rounds:
+        request_epoch = int(trace.get("request_epoch", 0))
+        round_identity = (request_epoch, round_index)
+        if (
+            round_index < 1
+            or source_version < 0
+            or request_epoch < 0
+            or round_identity in seen_rounds
+        ):
             raise RuntimeError("round trace identity is invalid or duplicated")
-        seen_rounds.add(round_index)
+        seen_rounds.add(round_identity)
         columns = tuple(
-            trace[name] for name in required - {"round_index", "source_version"}
+            trace[name]
+            for name in required - {"round_index", "source_version", "request_epoch"}
         )
         if any(not isinstance(column, list) for column in columns):
             raise RuntimeError("round trace columns must be arrays")
@@ -957,6 +1073,7 @@ def _round_records(
         ):
             flat.append(
                 (
+                    request_epoch,
                     round_index,
                     source_version,
                     str(request_id),
@@ -967,8 +1084,9 @@ def _round_records(
                 )
             )
     records: list[RoundRecord] = []
-    seen_cells: set[tuple[int, str]] = set()
+    seen_cells: set[tuple[int, int, str]] = set()
     for (
+        request_epoch,
         round_index,
         source_version,
         request_id,
@@ -977,7 +1095,7 @@ def _round_records(
         accepted,
         committed,
     ) in sorted(flat):
-        cell = (round_index, request_id)
+        cell = (request_epoch, round_index, request_id)
         if cell in seen_cells or request_id not in inputs:
             raise RuntimeError("round trace references a duplicate or unknown request")
         seen_cells.add(cell)
@@ -1033,6 +1151,13 @@ def _round_records(
                 kv_source_versions=json.dumps(
                     history, sort_keys=True, separators=(",", ":")
                 ),
+                reset_scope=(reset_scope if current_reset_schema else None),
+                request_epoch=(request_epoch if current_reset_schema else None),
+                request_reset_receipt_sha256=(
+                    receipt_by_identity.get((request_epoch, request_id))
+                    if current_reset_schema and reset_scope == "request"
+                    else None
+                ),
             )
         )
         end = prefix + committed
@@ -1047,14 +1172,19 @@ def _round_records(
                         "source_version": source_version,
                     }
                 )
-    if {record.request_id for record in records} != set(inputs):
+    if not current_reset_schema and {record.request_id for record in records} != set(
+        inputs
+    ):
         raise RuntimeError("round traces do not cover every completed request")
     for request_id, history in histories.items():
         expected_end = inputs[request_id] + completions[request_id]
         if history[-1]["end"] != expected_end:
             raise RuntimeError("round commits do not reconstruct request output length")
     runtime_segments = diagnostics["kv_segments"]
-    if set(runtime_segments) != set(inputs):
+    expected_segment_ids = {record.request_id for record in records}
+    if set(runtime_segments) != (
+        expected_segment_ids if current_reset_schema else set(inputs)
+    ):
         raise RuntimeError("KV-version evidence does not cover completed requests")
     for request_id, expected in histories.items():
         actual = runtime_segments[request_id]
@@ -1082,6 +1212,32 @@ def _round_records(
             )
         if clipped != expected:
             raise RuntimeError("round and KV-version evidence disagree")
+    if current_reset_schema:
+        for record in records:
+            if reset_scope == "request" and record.request_reset_receipt_sha256 is None:
+                raise RuntimeError("request round lacks its reset receipt identity")
+            if reset_scope == "cohort" and record.request_epoch != 0:
+                raise RuntimeError("cohort round carries a request epoch")
+            if reset_scope not in {"request", "cohort"}:
+                raise RuntimeError("round reset scope is unsupported")
+        records = [
+            replace(
+                record,
+                kv_source_versions=json.dumps(
+                    runtime_segments[record.request_id],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                historical_kv_source_versions_sha256=hashlib.sha256(
+                    json.dumps(
+                        runtime_segments[record.request_id],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            for record in records
+        ]
     return tuple(records)
 
 

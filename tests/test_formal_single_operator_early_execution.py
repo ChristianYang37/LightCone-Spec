@@ -5,11 +5,15 @@ import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
 from lightcone_spec.config import ModelPair, RunConfig, RuntimeConfig
+from lightcone_spec.experiments import (
+    formal_single_operator_early_execution as early_execution,
+)
 from lightcone_spec.experiments.formal_preflight_execution import (
     FormalPreflightInterferenceExecutionManifest,
     FormalPreflightInterferenceRunInput,
@@ -58,6 +62,7 @@ from lightcone_spec.experiments.stage_materialization import (
     GpuHourEstimate,
     MaterializedCell,
     StageMaterializationReceipt,
+    _materialize_tts_calibration_diagnostic,
     default_e2_recipe_grid_authority,
 )
 from lightcone_spec.experiments.workload_authority import (
@@ -430,6 +435,10 @@ def _publish_current_e3a_source(tmp_path: Path) -> dict[str, Path | str]:
                     previous_run_id=None,
                     challenge_nonce_sha256=_sha(f"challenge-{index}"),
                     method="static",
+                    reset_scope=None,
+                    request_admission_policy=None,
+                    runtime_trust_mode=None,
+                    formal_measurement=None,
                     warmup_request_ids=(),
                     scored_request_ids=(request_id,),
                 ),
@@ -835,3 +844,246 @@ def test_early_plan_inputs_are_not_a_legacy_sealed_run_plan() -> None:
         "preflight_inputs_path",
         "private_output_root",
     }
+
+
+def test_schema4_trusted_preflight_reuses_exact_bound_content_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from lightcone_spec.config import load_run_config
+    from lightcone_spec.experiments import (
+        formal_single_operator_preflight_qualification as qualification_module,
+    )
+    from lightcone_spec.experiments.formal_content_source import (
+        FormalContentSourceBinding,
+    )
+    from lightcone_spec.experiments.formal_preflight_inputs import (
+        TRUSTED_SINGLE_OPERATOR_QUALIFIED_PREFLIGHT_INPUTS_PROTOCOL_SHA256,
+    )
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundleBinding,
+    )
+    from lightcone_spec.runtime.compile_runner import (
+        TRUSTED_SINGLE_OPERATOR_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256,
+    )
+
+    fixture = _publish_current_e3a_source(tmp_path)
+    original_inputs = FormalPreflightExecutionInputs.from_dict(
+        CanonicalJsonProofBinding.bind(fixture["preflight_inputs"]).reopen()
+    )
+    bundle_path = (tmp_path / "trusted-content-bundle.json").resolve()
+    publish_canonical_json_no_replace(bundle_path, {"kind": "trusted-content"})
+    bundle_proof = CanonicalJsonProofBinding.bind(bundle_path)
+    bundle_binding = TrustedSingleOperatorContentBundleBinding(
+        absolute_path=bundle_proof.absolute_path,
+        size=bundle_proof.size,
+        raw_sha256=bundle_proof.raw_sha256,
+        semantic_sha256=bundle_proof.semantic_sha256,
+        runtime_binding_status="BOUND",
+    )
+    reopen_calls: list[str] = []
+
+    def reopen_bundle(binding):
+        rebound = CanonicalJsonProofBinding.bind(binding.absolute_path)
+        if (
+            rebound.size != binding.size
+            or rebound.raw_sha256 != binding.raw_sha256
+            or rebound.semantic_sha256 != binding.semantic_sha256
+        ):
+            raise RuntimeError("trusted content bundle binding changed")
+        reopen_calls.append(binding.absolute_path)
+        return SimpleNamespace(
+            runtime_binding_status="BOUND",
+            semantic_sha256=binding.semantic_sha256,
+        )
+
+    monkeypatch.setattr(
+        TrustedSingleOperatorContentBundleBinding,
+        "reopen",
+        reopen_bundle,
+    )
+    content_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=bundle_binding,
+    )
+    qualification_path = (tmp_path / "qualification-index.json").resolve()
+    publish_canonical_json_no_replace(
+        qualification_path,
+        {"kind": "qualification-index"},
+    )
+    monkeypatch.setattr(
+        qualification_module,
+        "load_formal_single_operator_preflight_qualification_plan_index",
+        lambda _path: object(),
+    )
+    trusted_inputs = replace(
+        original_inputs,
+        schema_version=4,
+        protocol_sha256=(
+            TRUSTED_SINGLE_OPERATOR_QUALIFIED_PREFLIGHT_INPUTS_PROTOCOL_SHA256
+        ),
+        content_receipt=None,
+        content_source_binding=content_source,
+        qualification_plan_index=CanonicalJsonProofBinding.bind(qualification_path),
+    )
+    trusted_inputs_path = (tmp_path / "trusted-preflight-inputs.json").resolve()
+    publish_canonical_json_no_replace(trusted_inputs_path, trusted_inputs.to_dict())
+
+    release_launch = CompileLaunchManifest.load(
+        tmp_path / "preflight-launch" / "compile-launch.json"
+    )
+    trusted_launch = replace(
+        release_launch,
+        schema_version=2,
+        protocol_sha256=(
+            TRUSTED_SINGLE_OPERATOR_COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256
+        ),
+        target_content_authority_sha256=None,
+        drafter_content_authority_sha256=None,
+        tokenizer_content_authority_sha256=None,
+        formal_stage="preflight",
+        content_source_binding=content_source,
+    )
+    monkeypatch.setattr(
+        early_execution.CompileLaunchManifest,
+        "load",
+        staticmethod(lambda _path: trusted_launch),
+    )
+    current = early_execution._CurrentEarlySource(
+        binding=SimpleNamespace(),
+        source=SimpleNamespace(
+            schema_version=3,
+            stage="E3a",
+            sha256=_sha("trusted-current-source"),
+            prepared_model_content_authorization_sha256=None,
+            content_source_binding=content_source,
+        ),
+        protocol_lock=SimpleNamespace(),
+        materialization=SimpleNamespace(sha256=_sha("trusted-materialization")),
+        cell=SimpleNamespace(
+            model=trusted_launch.target_model_id,
+            cell_id=_sha("trusted-cell"),
+        ),
+        predecessor=SimpleNamespace(),
+    )
+    sources = early_execution._preflight_launch_sources(
+        current,
+        preflight_inputs_path=trusted_inputs_path,
+    )
+    assert sources.inputs.schema_version == 4
+    assert sources.inputs.content_receipt is None
+    assert sources.template_launch.content_source_binding == content_source
+    assert reopen_calls
+
+    monkeypatch.setattr(
+        early_execution.CompileLaunchManifest,
+        "validate",
+        lambda _self, *, reopen_inputs: None,
+    )
+    cache_path = Path(trusted_launch.compile_cache_plan_path)
+    derived = early_execution._launch_value(
+        current=current,
+        sources=sources,
+        config=load_run_config(trusted_launch.run_config_path),
+        config_path=Path(trusted_launch.run_config_path),
+        cache_plan=CompileCacheLaunchPlan.load(cache_path),
+        cache_path=cache_path,
+        server_argv=trusted_launch.server_argv,
+    )
+    assert derived.schema_version == 2
+    assert derived.protocol_sha256 == trusted_launch.protocol_sha256
+    assert derived.formal_stage == "E3a"
+    assert derived.content_source_binding == content_source
+
+    foreign_path = (tmp_path / "foreign-content-bundle.json").resolve()
+    publish_canonical_json_no_replace(foreign_path, {"kind": "foreign-content"})
+    foreign_proof = CanonicalJsonProofBinding.bind(foreign_path)
+    foreign_source = FormalContentSourceBinding(
+        schema_version=1,
+        kind="formal_content_source_binding",
+        mode="trusted_single_operator",
+        offline_root_signed=None,
+        trusted_single_operator=TrustedSingleOperatorContentBundleBinding(
+            absolute_path=foreign_proof.absolute_path,
+            size=foreign_proof.size,
+            raw_sha256=foreign_proof.raw_sha256,
+            semantic_sha256=foreign_proof.semantic_sha256,
+            runtime_binding_status="BOUND",
+        ),
+    )
+    foreign_current = replace(
+        current,
+        source=SimpleNamespace(
+            schema_version=3,
+            stage="E3a",
+            sha256=_sha("foreign-current-source"),
+            prepared_model_content_authorization_sha256=None,
+            content_source_binding=foreign_source,
+        ),
+    )
+    with pytest.raises(ValueError, match="content lineage differs"):
+        early_execution._preflight_launch_sources(
+            foreign_current,
+            preflight_inputs_path=trusted_inputs_path,
+        )
+
+    bundle_path.write_text('{"kind":"tampered-content"}\n', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="bundle binding changed"):
+        early_execution._preflight_launch_sources(
+            current,
+            preflight_inputs_path=trusted_inputs_path,
+        )
+
+
+def test_tts_cal_formal_tts_role_builds_numeric_candidate_config(
+    tmp_path: Path,
+) -> None:
+    lock = _protocol_lock()
+    materialization = _materialize_tts_calibration_diagnostic(
+        protocol_lock_sha256=lock.sha256,
+        upstream_e3a_receipt_sha256=_sha("e3a-selection"),
+        calibration_authority_sha256=lock.tts_calibration_authority_sha256,
+        gpu_hours=GpuHourEstimate.unmeasured(),
+    )
+    cell = materialization.cells[0]
+    dimensions = dict(cell.dimensions)
+    predecessor = SimpleNamespace(
+        artifact=SimpleNamespace(node="e3a"),
+        decision=SimpleNamespace(payload={"common_load": 3}),
+        predecessor=None,
+    )
+    current = early_execution._CurrentEarlySource(
+        binding=SimpleNamespace(),
+        source=SimpleNamespace(stage="TTS-Cal"),
+        protocol_lock=lock,
+        materialization=materialization,
+        cell=cell,
+        predecessor=predecessor,
+    )
+    inventory = _inventory()
+    template_root = tmp_path / "tts-template"
+    template_root.mkdir()
+    template = _template_launch(
+        template_root,
+        inventory=inventory,
+        content_authority_sha256=lock.prepared_model_content_authorization_sha256,
+    )
+
+    config = early_execution._run_config(
+        current,
+        template=template,
+        gpu_uuid=inventory.devices[0].uuid,
+        preflight_inputs=SimpleNamespace(),
+    )
+
+    assert cell.method_role == "TTS"
+    assert config.method == "tts"
+    assert config.runtime.max_running_requests == 3
+    assert config.runtime.speculative_num_draft_tokens == dimensions["width"]
+    assert config.adaptation is not None
+    assert config.adaptation.optimizer.name == "adam"
+    assert config.adaptation.optimizer.learning_rate == dimensions["learning_rate"]
+    assert config.adaptation.stride == dimensions["stride"]

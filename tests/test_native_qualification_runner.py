@@ -536,3 +536,73 @@ def test_qualification_bridge_rejects_foreign_environment_identity(
             python_root=str(tmp_path),
             raw_config={},
         )
+
+
+def test_qualification_bridge_deep_replays_trusted_e6_plan_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from lightcone_spec.experiments import formal_single_operator_e6_interface as e6
+
+    assignment, assignment_binding, _dispatch_binding, _launch = _resources(
+        monkeypatch,
+        tmp_path,
+        suite_id="nextn_tp2",
+    )
+    trusted = _binding(
+        tmp_path / "e6-interface-fit-plan.json",
+        {
+            "schema_version": 1,
+            "kind": "formal_single_operator_e6_interface_fit_plan",
+        },
+    )
+    plan = SimpleNamespace(
+        sha256=trusted.semantic_sha256,
+        native_assignment=assignment_binding,
+        launch_manifest=assignment.launch_manifest,
+        inventory=SimpleNamespace(semantic_sha256=assignment.inventory_sha256),
+        gpu_uuids=assignment.gpu_uuids,
+        topology_sha256=assignment.topology_sha256,
+        evidence_directory=assignment.evidence_directory,
+    )
+    monkeypatch.setattr(
+        e6,
+        "revalidate_formal_single_operator_e6_interface_fit_plan",
+        lambda _path: plan,
+    )
+    monkeypatch.setenv(
+        "LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_PATH",
+        assignment_binding.absolute_path,
+    )
+    monkeypatch.setenv(
+        "LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_SHA256",
+        assignment.sha256,
+    )
+    monkeypatch.setenv(
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH",
+        trusted.absolute_path,
+    )
+    monkeypatch.setenv(
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_SHA256",
+        trusted.semantic_sha256,
+    )
+    monkeypatch.delenv("LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_PATH", raising=False)
+    monkeypatch.delenv("LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_SHA256", raising=False)
+
+    rebuilt, authority_sha256 = (
+        launch_module._load_qualification_runtime_bridge_environment()
+    )
+    assert rebuilt == assignment
+    assert authority_sha256 == trusted.semantic_sha256
+
+    monkeypatch.delenv("LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH")
+    with pytest.raises(RuntimeError, match="incomplete authority pair"):
+        launch_module._load_qualification_runtime_bridge_environment()
+    monkeypatch.setenv(
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH",
+        trusted.absolute_path,
+    )
+    foreign = _binding(tmp_path / "foreign-assignment.json", {"foreign": True})
+    plan.native_assignment = foreign
+    with pytest.raises(ValueError, match="differs from assignment"):
+        launch_module._load_qualification_runtime_bridge_environment()

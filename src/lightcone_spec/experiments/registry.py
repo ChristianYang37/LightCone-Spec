@@ -1292,6 +1292,8 @@ _ADAPTATION_RECIPE_FIELDS = frozenset(
     {
         "adaptation_group_id",
         "adaptation_scope",
+        "reset_scope",
+        "request_admission_policy",
         "stride",
         "canvas_tokens",
         "extra_logical_delay",
@@ -1311,6 +1313,8 @@ _FROZEN_TTS_DECLARATION_UNRESOLVED_FIELDS = frozenset(
     {
         "adaptation_group_id",
         "adaptation_scope",
+        "reset_scope",
+        "request_admission_policy",
         "canvas_tokens",
         "extra_logical_delay",
         "fixed_verification_budget",
@@ -1378,6 +1382,8 @@ class AdaptationRecipeDeclaration:
     parameter_scope: str | None
     kv_history_policy: str
     adaptation_scope: str | None
+    reset_scope: str | None
+    request_admission_policy: str | None
     adaptation_group_id: str | None
     optimizer: OptimizerRecipeDeclaration
     rank: int | None
@@ -1421,6 +1427,8 @@ class AdaptationRecipeDeclaration:
             "weight_update_mode",
             "parameter_scope",
             "adaptation_scope",
+            "reset_scope",
+            "request_admission_policy",
             "adaptation_group_id",
             "lora_matrix_policy",
             "native_head_policy",
@@ -1484,6 +1492,12 @@ class AdaptationRecipeDeclaration:
         if self.lookup_key.authority_kind == "frozen_tts":
             self._validate_frozen_tts_declaration()
             return
+        expected_admission_policy = {
+            "request": "serialized_native_scheduler_v1",
+            "cohort": "cohort_batching_v1",
+        }.get(self.reset_scope)
+        if expected_admission_policy != self.request_admission_policy:
+            raise ValueError("recipe reset scope and request admission policy disagree")
         if self.lookup_key.scope != self.parameter_scope:
             raise ValueError("recipe scope differs from its lookup key")
         if self.lookup_key.parameterization != self.weight_update_mode:
@@ -1607,6 +1621,8 @@ class AdaptationRecipeDeclaration:
             or self.parameter_scope is not None
             or self.kv_history_policy != "frozen"
             or self.adaptation_scope is not None
+            or self.reset_scope is not None
+            or self.request_admission_policy is not None
             or self.adaptation_group_id is not None
             or self.optimizer.name != "adam"
             or set(self.optimizer.unresolved_fields) != expected_optimizer_unresolved
@@ -1676,6 +1692,8 @@ class AdaptationRecipeDeclaration:
             parameter_scope=self.parameter_scope,
             kv_history_policy=self.kv_history_policy,
             adaptation_scope=self.adaptation_scope,
+            reset_scope=self.reset_scope,
+            request_admission_policy=self.request_admission_policy,
             adaptation_group_id=self.adaptation_group_id,
             optimizer=self.optimizer.to_optimizer_config(),
             rank=self.rank,
@@ -1780,6 +1798,8 @@ def _e1_recipe_declaration(
     fixed_semantics = {
         "kv_history_policy": "frozen",
         "adaptation_scope": "cohort",
+        "reset_scope": "cohort",
+        "request_admission_policy": "cohort_batching_v1",
         "lora_matrix_policy": "registered_matrices_v1",
         "native_head_policy": "frozen",
         "max_in_flight": 1,
@@ -1805,6 +1825,8 @@ def _e1_recipe_declaration(
         parameter_scope=candidate.parameter_scope,
         kv_history_policy="frozen",
         adaptation_scope="cohort",
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
         adaptation_group_id=key.cohort,
         optimizer=optimizer,
         rank=candidate.rank,
@@ -1943,6 +1965,8 @@ def _e2_recipe_declaration(
         parameter_scope=key.scope,
         kv_history_policy="frozen",
         adaptation_scope="cohort",
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
         adaptation_group_id=key.cohort,
         optimizer=optimizer,
         rank=key.rank,
@@ -2022,6 +2046,8 @@ def _frozen_tts_recipe_declaration(
         parameter_scope=None,
         kv_history_policy="frozen",
         adaptation_scope=None,
+        reset_scope=None,
+        request_admission_policy=None,
         adaptation_group_id=None,
         optimizer=optimizer,
         rank=None,

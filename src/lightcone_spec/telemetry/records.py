@@ -131,6 +131,12 @@ class RoundRecord:
     draft_executed_flops: float | None = None
     rejected_flops: float | None = None
     executed_hbm_bytes: int | None = None
+    # Schema-v4/current native evidence restarts round/version identity for
+    # every request-scoped source point. Historical rows leave these null.
+    reset_scope: str | None = None
+    request_epoch: int | None = None
+    request_reset_receipt_sha256: str | None = None
+    historical_kv_source_versions_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +204,16 @@ class UpdateRecord:
     nonfinite_candidate: bool | None = None
     oom_candidate: bool | None = None
     retracted_candidate: bool | None = None
+    # Current native updates are identified by request epoch in addition to
+    # their cumulative evidence index. Historical evidence leaves these null.
+    reset_scope: str | None = None
+    request_epoch: int | None = None
+    request_reset_receipt_sha256: str | None = None
+    effective_learning_rate: float | None = None
+    schedule_valid: bool | None = None
+    intrinsic_ready_round: int | None = None
+    extra_logical_delay: int | None = None
+    publication_round: int | None = None
 
 
 @dataclass(frozen=True)

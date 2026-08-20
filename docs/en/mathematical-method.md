@@ -5,15 +5,21 @@
 ## Objectives and scientific identities
 
 The equations below specify the registered target method. They do not imply
-that every backend or topology is executable in this release. The only
-currently claimable execution remains TP1/DP1 Target-only. The pinned patch
-contains the native
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle and
+that every backend or topology has a release-attested GPU result. TP1/DP1
+Target-only is the only currently claimable release-attested execution. The
+pinned patch contains the native
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2` lifecycle and
 source implementations for registered DFlash, DSpark, NEXTN, compatible
 EAGLE3, TP2, and sticky DP2 paths. None is a GPU result: the exact dynamic suite
-and trusted external-control proof have not yet been produced, and no trusted
-hardware signer is configured. Static/TTS/L0-naive/LightCone remain blocked
-before mutation, and no new GPU result is available.
+and trusted external-control proof for release promotion have not yet been
+produced, and no trusted hardware signer is configured. The release-attested
+lane therefore blocks Static/TTS/L0-naive/LightCone before mutation. The trusted
+`formal_single_operator_v1` lane is separate: an external signature is not an
+execution prerequisite, so it may run the complete empirical DAG after exact
+source/content/runtime, fresh GPU qualification, capacity, terminal, and
+coverage gates pass. Its result remains
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`; no new release GPU result is available.
 
 Recipe authority and publication policy are separate mathematical identities.
 Target-only and Static have structural zero adaptation state. TTS uses a frozen
@@ -46,11 +52,12 @@ $$
 w_k=\exp(-(k-1)/7).
 $$
 
-This weight is not a TTS default. Position weighting, teacher-row policy,
-canvas width, and source version are part of the candidate's registered
-configuration/evidence identity rather than result-derived choices.
+For the pinned project runtime this weight is a fixed DFlash implementation
+identity, not a TTS-Cal search axis. Position weighting, teacher-row policy,
+canvas width, and source version are registered configuration/evidence identity
+rather than result-derived choices.
 
-The primary-source TTS paper defines one latest-round update from source
+For paper context only, the primary-source TTS paper defines one latest-round update from source
 proposal $q_t$ toward the target rows $p$, with a source-point proximal term:
 
 $$
@@ -59,19 +66,27 @@ $$
 +\lambda\sum_k w_k\,\operatorname{KL}(q_{t,k}\|q'_k).
 $$
 
+This paper equation is not the registered runtime objective and does not imply
+that the project runtime implements or tunes its proximal coefficient.
+
 The audited [arXiv v2 paper](https://arxiv.org/abs/2605.09329v2) does not
 disclose every numerical field, so the historical
 `TTS-paper-reconstruction` authority remains diagnostic and non-formal. The
 formal TTS-Cal authority is a separate preregistered reconstruction: Adam,
 exactly one step, `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero decay, no
-clipping, full-drafter/latest-round-only updates, a digest-bound drafter-native
-position/proximal loss recipe, request-local reset, side stream, learning rates
-`1e-7, 3e-7, ..., 1e-3`, and strides `{1,5,10,15,20,30,40,50}`. Four excluded
-pilots apply the registered safety-first reduction and the winner is frozen by
-a signed seal. TTS and L0-naive remain `BLOCKED` until that seal exists. They
-cannot inherit the exponential weight above, an E1/E2 winner, schema defaults,
-or a historical AdamW recipe. Orthogonally, TTS publication uses the paper's
-fixed synchronization barrier.
+clipping, full-drafter/latest-update-round-only updates, request-local reset,
+side stream, learning rates `1e-7, 3e-7, ..., 1e-3`, and strides
+`{1,5,10,15,20,30,40,50}`. The pinned executable loss casts both logit tensors
+to float32 and computes target-to-draft forward KL at temperature one. Valid
+rows are weighted by `exp(-(k-1)/7)` and normalized by their masked weight sum,
+clamped to at least one. The source-point correction preserves the inference
+forward value while exposing the surrogate Jacobian; it is not an independent
+proximal term, so no numeric $\lambda$ exists. These fixed semantics introduce
+no new search dimension. The code-owned split and canonical trainable-plan
+selector remain mandatory and cannot be replaced by an E1/E2 winner, schema
+default, historical AdamW recipe, or result-derived choice. The claim is a
+project-calibrated runtime baseline, not paper reproduction; TTS publication
+uses the fixed synchronization barrier.
 
 ## Backend evidence and reconstruction
 

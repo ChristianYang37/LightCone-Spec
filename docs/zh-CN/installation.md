@@ -116,16 +116,19 @@ inventory 和 storage 可用，并记录脱敏 provisioning receipt。不得把 
 temporary URL、instance address 或 access token 写入 command、manifest、evidence、handoff
 document 或 Git。
 
-Source tree 本身不包含可直接宣称实测完成的 Stage B。Formal session 在取得 fresh provider
-state、root-authorized deployment/hardware policy、不可变 prepared-model/workload content
-receipt、精确 compile/exactness/interference terminal 以及 stage capacity control 前保持
-`BLOCKED`。固定 integration 已提供 first-party compile 与 non-serving terminal contract；
-checkout 中存在 source capability 并不等于已有 execution evidence，硬件或 test signer 也
-不能单独解除 speculative blocker。Formal TTS/L0-naive 还要求 sealed TTS-Cal winner，
-LightCone 要求准确 sealed E2 winner，二者都不能从 default 推断。TP2/DP2、DSpark、NEXTN、
-native ITL 与 session reuse 已实现，但必须等待各自精确的 dynamic GPU proof。EAGLE3 还要求
-独立签署的官方 model/selector compatibility decision；不支持或不兼容的组合保持 N/A 或
-`BLOCKED`。
+Source tree 本身不包含 empirical Stage B 所需的 external input 或 GPU evidence。
+Release-attested lane 在取得 fresh provider state、root-authorized deployment/hardware policy、
+不可变 prepared-model/workload content receipt、精确 compile/exactness/interference terminal
+以及 stage capacity control 前保持 `BLOCKED`。Trusted `formal_single_operator_v1` lane 不要求
+root signer：相同的实质 source/content/runtime、fresh GPU qualification、capacity、terminal 与
+coverage gate 通过后，它可以运行完整 empirical DAG，结果始终为
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与 `UNMEASURED`。
+Source capability、硬件 access 或 test signer 都不能单独解除 speculative blocker。
+TTS/L0-naive 还要求准确 content-sealed TTS-Cal winner，LightCone 要求准确 sealed E2 winner，
+二者都不能从 default 推断。TP2/DP2、DSpark、NEXTN、native ITL 与 session reuse 仍必须通过
+各自精确的 dynamic GPU proof。EAGLE3 要求适用的 post-probe model/selector compatibility
+authority；release-attested lane 还要求对应 signed official decision。不支持或不兼容的组合
+保持 N/A 或 `BLOCKED`。
 
 ## Trusted Attester Bundle
 

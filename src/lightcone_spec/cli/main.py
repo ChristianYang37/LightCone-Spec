@@ -123,6 +123,9 @@ from lightcone_spec.experiments.formal_method_authority import (
     load_chronobelief_authority_artifact,
     load_tts_calibration_authority_artifact,
     publish_chronobelief_authority_artifact,
+    publish_code_owned_trusted_tts_calibration_tuning_window,
+    publish_code_owned_tts_calibration_tuning_window,
+    publish_code_owned_tts_drafter_native_loss_source,
     publish_tts_calibration_authority_artifact,
 )
 from lightcone_spec.experiments.formal_protocol import (
@@ -575,6 +578,34 @@ def _write_json(path: str | Path, value: object) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _write_canonical_json_proof(
+    path: str | Path,
+    value: object,
+) -> CanonicalJsonProofBinding:
+    """Publish one canonical proof plus the legacy semantic-digest sidecar."""
+
+    output = Path(os.path.abspath(os.fspath(path)))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.parent.is_symlink() or output.parent.resolve() != output.parent:
+        raise ValueError("artifact parent must be an existing resolved directory")
+    publish_canonical_json_no_replace(output, value)
+    binding = CanonicalJsonProofBinding.bind(output)
+    digest = _canonical_sha256(value)
+    if binding.semantic_sha256 != digest or binding.reopen() != value:
+        raise RuntimeError("canonical JSON proof changed during publication")
+    _publish_immutable_bytes(
+        Path(f"{output}.sha256"),
+        f"{digest}\n".encode("ascii"),
+        label="canonical JSON proof sidecar",
+    )
+    directory = os.open(output.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return binding
 
 
 def _canonical_sha256(value: object) -> str:
@@ -2815,6 +2846,17 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="verification time for the path-bound raw capacity receipts",
     )
+    doctor.add_argument(
+        "--trusted-single-operator-capacity",
+        help=(
+            "path-only unsigned trusted-operator capacity authority; mutually "
+            "exclusive with the root-signed stage-capacity chain"
+        ),
+    )
+    doctor.add_argument(
+        "--output",
+        help="atomically publish the canonical no-replace doctor report",
+    )
 
     validate = commands.add_parser("validate-config")
     validate.add_argument("config")
@@ -2900,11 +2942,34 @@ def _parser() -> argparse.ArgumentParser:
     )
     build_industrial.add_argument("--output", required=True)
 
+    publish_tts_window = commands.add_parser(
+        "publish-tts-calibration-tuning-window", allow_abbrev=False
+    )
+    publish_tts_window_lane = publish_tts_window.add_mutually_exclusive_group(
+        required=True
+    )
+    publish_tts_window_lane.add_argument("--trusted-content-bundle")
+    publish_tts_window_lane.add_argument("--content-verification-receipt")
+    publish_tts_window.add_argument("--tuning-workload-authority")
+    publish_tts_window.add_argument("--output", required=True)
+
+    publish_tts_loss = commands.add_parser(
+        "publish-tts-drafter-native-loss-source",
+        allow_abbrev=False,
+    )
+    publish_tts_loss.add_argument("--output", required=True)
+
     publish_tts_authority = commands.add_parser(
         "publish-tts-calibration-source-authority", allow_abbrev=False
     )
     publish_tts_authority.add_argument("--paper-pdf", required=True)
     publish_tts_authority.add_argument("--paper-source", required=True)
+    publish_tts_authority_lane = publish_tts_authority.add_mutually_exclusive_group(
+        required=True
+    )
+    publish_tts_authority_lane.add_argument("--trusted-content-bundle")
+    publish_tts_authority_lane.add_argument("--content-verification-receipt")
+    publish_tts_authority.add_argument("--tuning-workload-authority")
     publish_tts_authority.add_argument("--tuning-window", required=True)
     publish_tts_authority.add_argument("--trainable-plan-authority", required=True)
     publish_tts_authority.add_argument("--drafter-native-loss", required=True)
@@ -2923,6 +2988,7 @@ def _parser() -> argparse.ArgumentParser:
     publish_e1_anchor_authority.add_argument(
         "--trainable-plan-authority", required=True
     )
+    publish_e1_anchor_authority.add_argument("--trusted-content-bundle", required=True)
     publish_e1_anchor_authority.add_argument("--output", required=True)
 
     publish_lock_git_snapshot = commands.add_parser(
@@ -6447,9 +6513,37 @@ def _require_expected_identity(label: str, expected: str | None, observed: str) 
 
 
 def _publish_tts_calibration_source_authority(args: argparse.Namespace) -> int:
+    trusted_content_bundle = getattr(args, "trusted_content_bundle", None)
+    tuning_workload_authority = getattr(args, "tuning_workload_authority", None)
+    content_verification_receipt = getattr(
+        args,
+        "content_verification_receipt",
+        None,
+    )
+    if trusted_content_bundle is not None and tuning_workload_authority is not None:
+        raise ValueError(
+            "trusted TTS source authority cannot accept a release workload source"
+        )
+    if trusted_content_bundle is None and tuning_workload_authority is None:
+        raise ValueError("release TTS source authority requires its workload authority")
     artifact = build_source_tts_calibration_authority_artifact(
         paper_pdf_path=Path(os.path.abspath(args.paper_pdf)),
         paper_source_path=Path(os.path.abspath(args.paper_source)),
+        trusted_content_bundle_path=(
+            None
+            if trusted_content_bundle is None
+            else Path(os.path.abspath(trusted_content_bundle))
+        ),
+        tuning_workload_authority_path=(
+            None
+            if tuning_workload_authority is None
+            else Path(os.path.abspath(tuning_workload_authority))
+        ),
+        content_verification_receipt_path=(
+            None
+            if content_verification_receipt is None
+            else Path(os.path.abspath(content_verification_receipt))
+        ),
         tuning_window_path=Path(os.path.abspath(args.tuning_window)),
         trainable_plan_authority_path=Path(
             os.path.abspath(args.trainable_plan_authority)
@@ -6461,6 +6555,44 @@ def _publish_tts_calibration_source_authority(args: argparse.Namespace) -> int:
         Path(os.path.abspath(args.output)),
     )
     print(artifact.authority.sha256)
+    return 0
+
+
+def _publish_tts_calibration_tuning_window(args: argparse.Namespace) -> int:
+    trusted_content_bundle = getattr(args, "trusted_content_bundle", None)
+    tuning_workload_authority = getattr(args, "tuning_workload_authority", None)
+    if trusted_content_bundle is not None:
+        if tuning_workload_authority is not None:
+            raise ValueError(
+                "trusted TTS tuning-window source cannot accept a release workload"
+            )
+        binding = publish_code_owned_trusted_tts_calibration_tuning_window(
+            trusted_content_bundle_path=Path(os.path.abspath(trusted_content_bundle)),
+            output_path=Path(os.path.abspath(args.output)),
+        )
+    else:
+        if tuning_workload_authority is None:
+            raise ValueError(
+                "release TTS tuning-window source requires its workload authority"
+            )
+        binding = publish_code_owned_tts_calibration_tuning_window(
+            tuning_workload_authority_path=Path(
+                os.path.abspath(tuning_workload_authority)
+            ),
+            content_verification_receipt_path=Path(
+                os.path.abspath(args.content_verification_receipt)
+            ),
+            output_path=Path(os.path.abspath(args.output)),
+        )
+    print(binding.semantic_sha256)
+    return 0
+
+
+def _publish_tts_drafter_native_loss_source(args: argparse.Namespace) -> int:
+    binding = publish_code_owned_tts_drafter_native_loss_source(
+        Path(os.path.abspath(args.output))
+    )
+    print(binding.semantic_sha256)
     return 0
 
 
@@ -6479,7 +6611,10 @@ def _publish_chronobelief_source_authority(args: argparse.Namespace) -> int:
 
 def _publish_e1_recipe_anchor_authority(args: argparse.Namespace) -> int:
     artifact = build_source_e1_recipe_anchor_authority_artifact(
-        Path(os.path.abspath(args.trainable_plan_authority))
+        trusted_content_bundle_path=Path(os.path.abspath(args.trusted_content_bundle)),
+        trainable_plan_authority_path=Path(
+            os.path.abspath(args.trainable_plan_authority)
+        ),
     )
     publish_e1_recipe_anchor_authority_artifact(
         artifact,
@@ -11324,7 +11459,9 @@ def _collect_gpu_inventory(args: argparse.Namespace) -> int:
     if inventory.source_receipt_sha256 != receipt.get("receipt_sha256"):
         raise RuntimeError("GPU inventory source receipt binding changed")
     _write_json(args.receipt_output, receipt)
-    _write_json(args.output, inventory.to_dict())
+    binding = _write_canonical_json_proof(args.output, inventory.to_dict())
+    if binding.reopen() != inventory.to_dict():
+        raise RuntimeError("written GPU inventory proof changed identity")
     reloaded = _load_gpu_inventory(args.output)
     if reloaded != inventory:
         raise RuntimeError("written GPU inventory changed identity")
@@ -12143,9 +12280,15 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "stage_capacity_now_ns": args.stage_capacity_now_ns,
             }
+        if args.trusted_single_operator_capacity is not None:
+            capacity_options["trusted_single_operator_capacity_path"] = (
+                args.trusted_single_operator_capacity
+            )
         formatted = format_doctor(project_root, sglang_root, **capacity_options)
-        print(formatted)
         report = json.loads(formatted)
+        if args.output is not None:
+            _write_canonical_json_proof(args.output, report)
+        print(formatted)
         return 0 if report.get("status") == "PASS" else 42
     if args.command == "validate-config":
         config = load_run_config(args.config)
@@ -12168,6 +12311,10 @@ def main(argv: list[str] | None = None) -> int:
         return _publish_burstgpt_shape_authority_cli(args)
     if args.command == "build-industrial-registry":
         return _build_industrial_registry(args)
+    if args.command == "publish-tts-calibration-tuning-window":
+        return _publish_tts_calibration_tuning_window(args)
+    if args.command == "publish-tts-drafter-native-loss-source":
+        return _publish_tts_drafter_native_loss_source(args)
     if args.command == "publish-tts-calibration-source-authority":
         return _publish_tts_calibration_source_authority(args)
     if args.command == "publish-chronobelief-source-authority":

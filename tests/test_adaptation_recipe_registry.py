@@ -137,6 +137,8 @@ def test_e1_source_authority_binds_explicit_canonical_epsilon(
             "fixed_semantics": {
                 "kv_history_policy": "frozen",
                 "adaptation_scope": "cohort",
+                "reset_scope": "cohort",
+                "request_admission_policy": "cohort_batching_v1",
                 "lora_matrix_policy": "registered_matrices_v1",
                 "native_head_policy": "frozen",
                 "max_in_flight": 1,

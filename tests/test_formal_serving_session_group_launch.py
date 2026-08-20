@@ -201,7 +201,7 @@ def test_adaptive_backend_without_group_config_support_is_forced_fresh(
             launch=launch,
             config=unsupported,
         )
-        == "adaptive_group_config_backend_unsupported"
+        == "adaptive_runtime_authority_requires_fresh_process"
     )
     launch = replace(
         launch,
@@ -229,4 +229,7 @@ def test_adaptive_backend_without_group_config_support_is_forced_fresh(
         dispatch_order_key=("0001",),
     )
     assert spec.normalized_process_key is None
-    assert spec.reuse_exclusion_reason == "adaptive_group_config_backend_unsupported"
+    assert (
+        spec.reuse_exclusion_reason
+        == "adaptive_runtime_authority_requires_fresh_process"
+    )

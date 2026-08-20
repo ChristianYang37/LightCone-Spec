@@ -33,12 +33,15 @@ that can be compared under the same speculative-decoding feedback and
 exactness contract: OGD, optimistic OGD, and Hedge over OGD experts.
 
 GPU status is `UNMEASURED`. This page describes an isolated source-level/CPU
-protocol and target implementation, not a performance result or current
-industrial executor support. Like every speculative method, an OnlineSPEC
-industrial run would require its own registered integration with the now
-implemented `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
-lifecycle and an allowlisted trusted hardware signer. Neither is a release
-capability; only Target-only is end-to-end executable there today.
+protocol and target implementation, not a performance result. The
+release-attested lane has no current OnlineSPEC execution authority: promotion
+would require its registered native lifecycle, exact GPU evidence, and an
+allowlisted trusted hardware signer. The trusted `formal_single_operator_v1`
+lane is separate. Its registered E0 comparison may execute without that signer
+after the audited OnlineSPEC source authority and exact content/runtime, fresh
+GPU qualification, capacity, terminal, and coverage gates pass. That evidence
+is always `trusted_single_operator_empirical_no_signature`,
+`formal_measured=false`, and `UNMEASURED`.
 
 ## Source audit
 
@@ -334,13 +337,15 @@ gates or establish a schema-v3 GPU result. `analyze-onlinespec-study` reports
 ## Reproduction claim
 
 LightCone-Spec claims a clean-room, paper-equation source implementation and
-CPU/runtime target contract for the OnlineSPEC online drafter learners. It does
-not claim current end-to-end industrial execution, a GPU result, byte-for-byte
-reproduction of the official scripts, or redistribution of their code. It also
+CPU/runtime target contract for the OnlineSPEC online drafter learners. The
+trusted single-operator E0 comparison is an unsigned empirical execution lane,
+not a GPU result or release claim. The project does not claim byte-for-byte
+reproduction of the official scripts or redistribution of their code, and it
 does not treat Online-LR's reasoning DPO pipeline as token-level draft-model
-adaptation. Any future executable extension requires the exact native terminal
-lifecycle integration, a trusted signer, and its own objective, data, memory
-contract, and registered comparison.
+adaptation. Any release-attested executable extension requires the exact native
+terminal lifecycle integration, a trusted signer, and its own objective, data,
+memory contract, GPU qualification, and registered comparison. The trusted
+single-operator lane requires the same substantive gates but not the signer.
 
 For a repeatable source audit, clone the official repository outside this
 project and detach at the recorded commit:

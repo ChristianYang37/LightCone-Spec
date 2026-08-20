@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from lightcone_spec.cli.main import _create_protocol_lock, _load_bound_json
-from lightcone_spec.config.schema import OptimizerConfig
+from lightcone_spec.config.schema import AdaptationConfig, OptimizerConfig
 from lightcone_spec.experiments.formal_protocol import (
     BANNED_MODEL,
     E6_MODELS,
@@ -48,6 +48,7 @@ from lightcone_spec.experiments.formal_registry import (
     publish_formal_runtime_authority_manifest,
     revalidate_formal_runtime_authority_manifest,
 )
+from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
 from lightcone_spec.experiments.stage_materialization import (
     default_e2_recipe_grid_authority,
 )
@@ -92,7 +93,7 @@ def test_candidate_terminal_source_round_is_one_based() -> None:
 
 def _authority() -> TtsCalibrationAuthority:
     return TtsCalibrationAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="tts-primary-source-reconstruction-v2",
         primary_source_id="arXiv:2605.09329",
         primary_source_version="v2",
@@ -513,6 +514,46 @@ def test_tts_authority_requires_literal_no_clip_runtime_recipe() -> None:
     with pytest.raises(ValueError, match="frozen no-clip recipe"):
         authority.validate_runtime_optimizer_config(
             OptimizerConfig(**{**config.model_dump(), "grad_clip": 1e30})
+        )
+
+    adaptation = AdaptationConfig(
+        weight_update_mode="full",
+        parameter_scope="all",
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
+        adaptation_group_id="tts-runtime-recipe-test",
+        optimizer=config,
+        stride=authority.strides[0],
+        canvas_tokens=16,
+        loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
+    )
+    authority.validate_runtime_adaptation_config(
+        adaptation,
+        learning_rate=authority.learning_rates[0],
+        stride=authority.strides[0],
+        canvas_tokens=16,
+    )
+    eagle3_extension = AdaptationConfig(
+        **{
+            **adaptation.model_dump(),
+            "eagle3_e0_execution_authority_sha256": _sha("eagle3-execution"),
+            "eagle3_compatibility_authority_sha256": _sha("eagle3-compatibility"),
+            "eagle3_model_selector_sha256": _sha("eagle3-model-selector"),
+            "eagle3_native_gpu_proof_sha256": _sha("eagle3-native-gpu"),
+        }
+    )
+    authority.validate_runtime_adaptation_config(
+        eagle3_extension,
+        learning_rate=authority.learning_rates[0],
+        stride=authority.strides[0],
+        canvas_tokens=16,
+    )
+    with pytest.raises(ValueError, match="frozen DFlash recipe"):
+        authority.validate_runtime_adaptation_config(
+            adaptation.model_copy(update={"loss_position_decay": 1.0}),
+            learning_rate=authority.learning_rates[0],
+            stride=authority.strides[0],
+            canvas_tokens=16,
         )
 
 

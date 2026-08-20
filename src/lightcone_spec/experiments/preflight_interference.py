@@ -204,6 +204,10 @@ def _run_binding_dict(binding: NativeTerminalRunBinding) -> dict[str, object]:
         "previous_run_id": binding.previous_run_id,
         "challenge_nonce_sha256": binding.challenge_nonce_sha256,
         "method": binding.method,
+        "reset_scope": binding.reset_scope,
+        "request_admission_policy": binding.request_admission_policy,
+        "runtime_trust_mode": binding.runtime_trust_mode,
+        "formal_measurement": binding.formal_measurement,
         "warmup_request_ids": list(binding.warmup_request_ids),
         "scored_request_ids": list(binding.scored_request_ids),
     }
@@ -225,6 +229,10 @@ def _run_binding_from_dict(value: object) -> NativeTerminalRunBinding:
                 "previous_run_id",
                 "challenge_nonce_sha256",
                 "method",
+                "reset_scope",
+                "request_admission_policy",
+                "runtime_trust_mode",
+                "formal_measurement",
                 "warmup_request_ids",
                 "scored_request_ids",
             }
@@ -2145,6 +2153,8 @@ def _revalidate_proof_row(
         run_nonce_sha256=row.run_binding.run_nonce_sha256,
         attempt_id=row.run_binding.attempt_id,
         method="static",
+        runtime_trust_mode=row.run_binding.runtime_trust_mode,
+        formal_measurement=row.run_binding.formal_measurement,
     )
     itl = validate_stage_itl_timestamp_proof_artifact(
         row.native_itl_proof.absolute_path,
@@ -2435,6 +2445,8 @@ def _derive_formal_preflight_interference_aggregate(
             run_nonce_sha256=raw_row.run_binding.run_nonce_sha256,
             attempt_id=raw_row.run_binding.attempt_id,
             method="static",
+            runtime_trust_mode=raw_row.run_binding.runtime_trust_mode,
+            formal_measurement=raw_row.run_binding.formal_measurement,
         )
         itl = validate_stage_itl_timestamp_proof_artifact(
             itl_binding.absolute_path,

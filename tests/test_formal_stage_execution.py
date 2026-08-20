@@ -31,6 +31,7 @@ from lightcone_spec.experiments.formal_runtime_manifest import (
     build_source_formal_runtime_authority_manifest,
 )
 from lightcone_spec.experiments.formal_stage_execution import (
+    E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
     FORMAL_SERVING_EXECUTION_BINDING_PROTOCOL_SHA256,
     FORMAL_SERVING_EXECUTION_RUNNER_SHA256,
     FORMAL_SERVING_EXECUTION_TEST_SET_SHA256,
@@ -42,6 +43,7 @@ from lightcone_spec.experiments.formal_stage_execution import (
     verify_formal_serving_execution_binding,
 )
 from lightcone_spec.experiments.itl_authority import StageItlExecutionIdentity
+from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
 from lightcone_spec.experiments.registry import build_industrial_registry
 from lightcone_spec.experiments.stage_materialization import (
     MaterializedCell,
@@ -136,6 +138,8 @@ def test_staged_reducer_dispatches_distributed_terminal_with_exact_topology(
         run_nonce_sha256=hashlib.sha256(b"distributed-nonce").hexdigest(),
         attempt_id="attempt-0",
         method="static",
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     binding_sha256 = hashlib.sha256(b"distributed-binding").hexdigest()
     binding = SimpleNamespace(
@@ -308,6 +312,8 @@ def _candidate_config(*, learning_rate: float, stride: int, gpu_uuid: str) -> Ru
         adaptation=AdaptationConfig(
             weight_update_mode="full",
             parameter_scope="all",
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
             adaptation_group_id="tts-cal-test",
             optimizer=OptimizerConfig(
                 name="adam",
@@ -320,6 +326,7 @@ def _candidate_config(*, learning_rate: float, stride: int, gpu_uuid: str) -> Ru
             ),
             stride=stride,
             canvas_tokens=16,
+            loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
         ),
     )
 
@@ -516,6 +523,18 @@ def test_tts_cal_execution_subject_derives_config_and_terminal_identity(
         subject.execution_plan_sha256
     )
     assert subject.execution_identity.rank_config_sha256 == subject.rank_config_sha256
+    assert (
+        subject.execution_identity.runtime_trust_mode,
+        subject.execution_identity.formal_measurement,
+    ) == (None, None)
+    trusted_provider_config = config.model_copy(
+        update={
+            "model": config.model.model_copy(update={"algorithm": "DSPARK"}),
+        }
+    )
+    assert formal_stage_execution._stage_itl_runtime_trust_identity(
+        trusted_provider_config
+    ) == ("release_verified_signature", True)
     assert subject.recipe_authority_sha256s == (authority.sha256,)
     assert subject.workload_authority_sha256 == authority.tuning_window_sha256
     assert subject.formal_runtime_authority_manifest_sha256 == (runtime_manifest.sha256)
@@ -718,8 +737,9 @@ def test_verifier_rebuilds_subject_and_rejects_directly_altered_workload(
 
 def test_e1_anchor_authority_is_complete_and_binding_is_unforgeable() -> None:
     authority = E1RecipeAnchorAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="e1-anchor-test",
+        trainable_plan_selector_id=E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
         trainable_plan_sha256="8" * 64,
         anchors=tuple(
             sorted(

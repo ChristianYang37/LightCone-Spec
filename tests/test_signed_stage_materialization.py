@@ -68,6 +68,7 @@ from lightcone_spec.experiments.stage_materialization import (
     E2_SCHEDULES,
     E4_SCREEN_FACTOR_LEVELS,
     E5_FAILURES,
+    TTS_CAL_MATERIALIZATION_RULE,
     E0CompatibilityDecision,
     E0CompatibilityReceipt,
     E2CandidateRecipe,
@@ -245,6 +246,8 @@ def _pilot_observation(
 def _candidate_state_coverages(
     materialization,
 ) -> tuple[TtsL0CandidateStateCoverage, ...]:
+    if materialization.stage == "TTS-Cal":
+        return ()
     grouped: dict[str, dict[str, object]] = {}
     for cell in materialization.cells:
         if cell.method_role in {"TTS", "L0-naive"}:
@@ -440,7 +443,7 @@ def _protocol_lock(*, registry_sha256: str, tts_authority_sha256: str) -> Protoc
 
 def _tts_authority() -> TtsCalibrationAuthority:
     return TtsCalibrationAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id="tts-arxiv-v2-numeric-calibration",
         primary_source_id=TTS_PRIMARY_SOURCE_ID,
         primary_source_version=TTS_PRIMARY_SOURCE_VERSION,
@@ -589,6 +592,7 @@ def test_prefix_materializers_cover_every_concrete_registered_cell() -> None:
         gpu_hours=_unmeasured(),
     )
     assert calibration.expected_cell_count == len(calibration.cells) == 288
+    assert calibration.materialization_rule == TTS_CAL_MATERIALIZATION_RULE
     assert len({cell.recipe_sha256 for cell in calibration.cells}) == 72
     assert {dict(cell.dimensions)["block"] for cell in calibration.cells} == {
         0,
@@ -597,10 +601,30 @@ def test_prefix_materializers_cover_every_concrete_registered_cell() -> None:
         3,
     }
     assert all(
-        dict(cell.dimensions)["pilot_phase"] == "excluded"
+        cell.method_role == "TTS"
+        and dict(cell.dimensions)["replicate_phase"] == "technical"
+        and "tts_l0_pair_id" not in dict(cell.dimensions)
         and cell.publication_policy == "fixed_barrier"
         for cell in calibration.cells
     )
+
+    coverage = StageCoverageReceipt(
+        schema_version=2,
+        stage="TTS-Cal",
+        protocol_lock_sha256=calibration.protocol_lock_sha256,
+        materialization_receipt_sha256=calibration.sha256,
+        dispositions=tuple(
+            StageCellDisposition(
+                stage="TTS-Cal",
+                cell_id=cell.cell_id,
+                status="COMPLETE",
+                reason_code="terminal_complete",
+                terminal_receipt_sha256=_sha(f"terminal:{cell.cell_id}"),
+            )
+            for cell in calibration.cells
+        ),
+    )
+    coverage.validate_against(calibration)
 
 
 def test_e4_two_stage_design_and_profiler_are_separate_exact_receipts() -> None:

@@ -319,6 +319,8 @@ def test_stage_itl_proof_deep_reopens_terminal_gpu_timing_and_replay(
         run_nonce_sha256=run_binding.run_nonce_sha256,
         attempt_id=run_binding.attempt_id,
         method=run_binding.method,
+        runtime_trust_mode=run_binding.runtime_trust_mode,
+        formal_measurement=run_binding.formal_measurement,
     )
     pointer_bundle = CanonicalJsonProofBinding.bind(
         plan.native_itl_pointer_output_path

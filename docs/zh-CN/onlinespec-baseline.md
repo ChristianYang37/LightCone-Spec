@@ -26,11 +26,12 @@ LightCone-Spec 实现的是能够在同一 speculative-decoding 反馈与 exactn
 三种在线学习规则：OGD、optimistic OGD，以及 OGD 专家上的 Hedge。
 
 GPU 状态为 `UNMEASURED`。本文描述隔离的 source-level/CPU protocol 与目标实现，不提供
-性能结果，也不表示当前 industrial executor support。与其他 speculative method 一样，
-OnlineSPEC industrial run 需要自行注册并接入已经实现的
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` lifecycle，还需要 allowlist
-内的 trusted hardware signer。二者都不是 release capability；目前只有 Target-only 可在该
-executor 中端到端执行。
+性能结果。Release-attested lane 当前没有 OnlineSPEC execution authority；若要提升结论，必须
+具备已注册 native lifecycle、准确 GPU evidence 与 allowlist 内的 trusted hardware signer。
+Trusted `formal_single_operator_v1` 是另一条 lane：其注册 E0 comparison 可在 audited
+OnlineSPEC source authority 与准确 content/runtime、fresh GPU qualification、capacity、terminal
+及 coverage gate 通过后无 signer 执行。该 evidence 始终为
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与 `UNMEASURED`。
 
 ## 源码审计
 
@@ -278,10 +279,12 @@ protocol，但不会绕过 industrial executor 的 release execution 与 trusted
 ## 复现声明
 
 LightCone-Spec 声明的是 OnlineSPEC 在线 drafter learner 论文公式的 clean-room 源码实现与
-CPU/runtime 目标 contract。它不声明当前端到端 industrial execution、GPU 结果、与官方脚本
-逐字节一致或重新分发其代码，也不把 Online-LR 的 reasoning DPO 流程当作 token-level
-draft-model adaptation。未来 executable extension 必须准确接入 native terminal lifecycle，
-配置 trusted signer，并另行定义 objective、数据、显存合同与已注册比较协议。
+CPU/runtime 目标 contract。Trusted single-operator E0 comparison 是 unsigned empirical
+execution lane，不是 GPU 结果或 release claim。项目不声明与官方脚本逐字节一致或重新分发其
+代码，也不把 Online-LR 的 reasoning DPO 流程当作 token-level draft-model adaptation。未来
+release-attested executable extension 必须准确接入 native terminal lifecycle、配置 trusted
+signer，并另行定义 objective、数据、显存合同、GPU qualification 与已注册比较协议；trusted
+single-operator lane 要求相同实质 gate，但不要求 signer。
 
 若要重复源码审计，应把官方仓库克隆到本项目之外，并 detached 到已记录 commit：
 

@@ -124,6 +124,10 @@ def _native(index: int) -> NativeTerminalRunBinding:
         previous_run_id=None,
         challenge_nonce_sha256=_sha(f"challenge-{index}"),
         method="static",
+        reset_scope=None,
+        request_admission_policy=None,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(f"warm-{index}",),
         scored_request_ids=(f"score-{index}",),
     )
@@ -155,6 +159,10 @@ def _native_dict(value: NativeTerminalRunBinding) -> dict[str, object]:
         "previous_run_id": value.previous_run_id,
         "challenge_nonce_sha256": value.challenge_nonce_sha256,
         "method": value.method,
+        "reset_scope": value.reset_scope,
+        "request_admission_policy": value.request_admission_policy,
+        "runtime_trust_mode": value.runtime_trust_mode,
+        "formal_measurement": value.formal_measurement,
         "warmup_request_ids": list(value.warmup_request_ids),
         "scored_request_ids": list(value.scored_request_ids),
     }

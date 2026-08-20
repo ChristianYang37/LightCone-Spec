@@ -118,82 +118,54 @@ def test_patch_manifest_binds_series_files_and_tree() -> None:
     )
 
 
-def test_latest_patch_binds_distributed_readiness_fail_closed() -> None:
+def test_latest_patch_binds_request_scoped_source_point_reset() -> None:
     manifest = json.loads((PATCH_ROOT / "manifest.json").read_text())
     latest = manifest["patches"][-1]
     assert latest == {
-        "file": "0007-feat-spec-bind-distributed-runtime-readiness.patch",
-        "sha256": ("38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"),
+        "file": "0008-fix-spec-isolate-request-scoped-adaptation-state.patch",
+        "sha256": ("0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"),
         "files": [
-            "python/sglang/benchmark/serving.py",
-            "python/sglang/srt/compilation/backend.py",
-            "python/sglang/srt/compilation/compilation_counter.py",
             "python/sglang/srt/entrypoints/http_server.py",
-            "python/sglang/srt/managers/io_struct.py",
-            "python/sglang/srt/managers/native_token_timestamps.py",
-            "python/sglang/srt/managers/schedule_batch.py",
             "python/sglang/srt/managers/scheduler.py",
             "python/sglang/srt/managers/scheduler_components/batch_result_processor.py",
-            "python/sglang/srt/managers/scheduler_components/output_streamer.py",
-            "python/sglang/srt/managers/tokenizer_manager.py",
-            "python/sglang/srt/server_args.py",
-            "python/sglang/srt/speculative/compile_cache_evidence.py",
             "python/sglang/srt/speculative/dflash_online_adaptation.py",
-            "python/sglang/srt/speculative/dspark_components/dspark_draft.py",
             "python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py",
-            "python/sglang/srt/speculative/eagle_worker_v2.py",
-            "python/sglang/srt/speculative/failure_actuator_runtime.py",
             "python/sglang/srt/speculative/formal_gang_serving.py",
-            "python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py",
             "python/sglang/srt/speculative/native_backend_online_adaptation.py",
             "python/sglang/srt/speculative/native_runtime_release.py",
             "python/sglang/srt/speculative/online_adaptation_config.py",
             "python/sglang/srt/speculative/online_adaptation_runtime.py",
-            "python/sglang/srt/speculative/online_parameter_plan.py",
-            "python/sglang/srt/speculative/session_reset_evidence.py",
             "python/sglang/srt/speculative/terminal_speculative_evidence.py",
-            "test/registered/unit/benchmark/test_native_token_timestamps.py",
-            "test/registered/unit/spec/lightcone_live_qualification.py",
-            "test/registered/unit/spec/test_chronobelief_gpu_parity_qualification.py",
-            "test/registered/unit/spec/test_compile_cache_evidence.py",
-            "test/registered/unit/spec/test_dspark_dp2_live_gpu_qualification.py",
-            "test/registered/unit/spec/test_dspark_live_gpu_qualification.py",
+            "test/registered/unit/managers/test_scheduler_request_scoped_admission.py",
             "test/registered/unit/spec/test_dspark_online_adaptation_contract.py",
-            "test/registered/unit/spec/test_dspark_tp2_live_gpu_qualification.py",
-            "test/registered/unit/spec/test_eagle3_live_gpu_qualification.py",
             "test/registered/unit/spec/test_eagle3_online_adaptation_contract.py",
-            "test/registered/unit/spec/test_failure_actuator_runtime.py",
             "test/registered/unit/spec/test_formal_gang_serving.py",
-            "test/registered/unit/spec/test_formal_preflight_gpu_qualification.py",
-            "test/registered/unit/spec/test_native_hot_path_live_gpu_qualification.py",
             "test/registered/unit/spec/test_native_runtime_release.py",
-            "test/registered/unit/spec/test_nextn_tp1_live_gpu_qualification.py",
-            "test/registered/unit/spec/test_nextn_tp2_live_gpu_qualification.py",
             "test/registered/unit/spec/test_online_adaptation_protocol.py",
-            "test/registered/unit/spec/test_session_reset_evidence.py",
-            "test/registered/unit/spec/test_session_reset_gpu_qualification.py",
             "test/registered/unit/spec/test_terminal_speculative_evidence.py",
-            "test/registered/unit/spec/test_tp1_dp2_live_gpu_qualification.py",
-            "test/registered/unit/spec/test_tp2_dp1_live_gpu_qualification.py",
         ],
     }
     patch = (PATCH_ROOT / latest["file"]).read_text()
-    assert '"tp_all_rank_two_phase"' in patch
-    assert '"dp_sticky_replica_local"' in patch
-    assert '"adaptation_collective_mode": "none"' in patch
-    assert "CPU_CONTRACT_ONLY" in patch
-    assert "test_dp2_is_sticky_replica_local_without_adaptation_collective" in patch
-    assert '"distributed_release_capability_sha256": None' in patch
-    assert "_merge_sglang_native_token_timestamp_result_pointer" in patch
-    assert "output.native_token_timestamp_result_pointer" in patch
+    assert '"serialized_native_scheduler_v1"' in patch
+    assert "REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256" in patch
+    assert "test_finish_and_abort_restore_identical_numeric_source_point" in patch
+    assert "test_eleven_thousand_request_archives_reuse_slots_without_drop" in patch
+    assert "test_real_spawn_reimports_and_restores_worker_proof_and_hook" in patch
+    assert "test_chunked_abort_resets_exactly_once_before_release" in patch
+    assert "test_decode_oom_sticky_disables_and_resets_exactly_once" in patch
 
-    metrics = (PATCH_ROOT / manifest["patches"][-2]["file"]).read_text()
+    metrics_entry = next(
+        entry
+        for entry in manifest["patches"]
+        if entry["file"] == "0006-fix-metrics-handle-target-only-draft-width.patch"
+    )
+    metrics = (PATCH_ROOT / metrics_entry["file"]).read_text()
     assert "def _terminal_verified_drafts(self, target_calls: int) -> int:" in metrics
     assert "test_speculative_metrics_reject_a_missing_draft_width" in metrics
 
     verifier = (ROOT / "scripts" / "verify_sglang_patchset.py").read_text()
     assert "test_terminal_target_metrics.py" in verifier
-    assert "reverse removal retained the patch-0007 contract" in verifier
+    assert "reverse removal retained the patch-0008 contract" in verifier
     assert "_verify_gpu_qualification_collection" in verifier
     assert "len(node_ids) != 96 or len(set(node_ids)) != 96" in verifier
 

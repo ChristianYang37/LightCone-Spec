@@ -22,6 +22,17 @@ from lightcone_spec.doctor import (
     _parse_topology,
     doctor_report,
 )
+from lightcone_spec.experiments.formal_single_operator_capacity import (
+    TRUSTED_SINGLE_OPERATOR_CAPACITY_SAFETY_MARGIN_BYTES,
+    TRUSTED_SINGLE_OPERATOR_CELL_HIGH_WATER_BYTES,
+    TRUSTED_SINGLE_OPERATOR_RETRY_POLICY_SHA256,
+)
+from lightcone_spec.experiments.gpu_pool import (
+    GpuAvailability,
+    GpuDevice,
+    GpuInventory,
+    GpuTopologyGroup,
+)
 from lightcone_spec.experiments.registry import (
     build_industrial_registry,
     content_sha256,
@@ -32,6 +43,7 @@ from lightcone_spec.experiments.stage_capacity import (
     StageCapacitySchedule,
 )
 from lightcone_spec.runtime.control_attestation import ControlArtifactAttestation
+from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MANIFEST = ROOT / "manifests/runtime/industrial_compatibility_v1.json"
@@ -344,6 +356,12 @@ def test_runtime_manifest_is_canonical_and_sidecar_bound() -> None:
                     "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
                 ),
             },
+            {
+                "file": ("0008-fix-spec-isolate-request-scoped-adaptation-state.patch"),
+                "sha256": (
+                    "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"
+                ),
+            },
         ],
         "repository": "https://github.com/sgl-project/sglang.git",
         "upstream_commit": PINNED_SGLANG_COMMIT,
@@ -537,6 +555,122 @@ def test_doctor_uses_path_bound_stage_capacity_below_100gb(
         20_000_000_000
     )
     assert report["stage_capacity"]["gate_sha256"] == gate_sha256
+
+
+def test_doctor_uses_trusted_path_capacity_at_41_point_4_gb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sglang = tmp_path / "patched-sglang"
+    facts = _passing_facts(ROOT, sglang)
+    facts["disk"].update(
+        {
+            "used_bytes": 258_600_000_000,
+            "free_bytes": 41_400_000_000,
+        }
+    )
+    authority_path = (tmp_path / "trusted-capacity.json").resolve()
+    path_spec_path = (tmp_path / "v03-content-path-spec.json").resolve()
+    inventory_path = (tmp_path / "inventory.json").resolve()
+    devices = tuple(
+        GpuDevice(
+            uuid=row["uuid"],
+            host_id="gpu-host",
+            model=row["name"],
+            memory_bytes=row["memory_total_mib"] * 1024**2,
+            compute_capability=(12, 0),
+            pci_bus_id=f"0000:{index + 1:02x}:00.0",
+            pci_root="root-0",
+            numa_node=0,
+            interconnects=("PCIe",),
+            peer_access_class="peer-enabled",
+            clock_policy="locked",
+            power_limit_watts=600.0,
+            thermal_limit_celsius=85.0,
+            availability=GpuAvailability.READY,
+            reserved_processes=(),
+            allowed_topology_groups=("pair",),
+        )
+        for index, row in enumerate(facts["gpu"]["inventory"]["devices"])
+    )
+    inventory = GpuInventory(
+        schema_version=1,
+        devices=devices,
+        topology_groups=(
+            GpuTopologyGroup(
+                group_id="pair",
+                host_id="gpu-host",
+                gpu_uuids=tuple(row.uuid for row in devices),
+                fabric="PCIe",
+                bandwidth_class="test",
+            ),
+        ),
+        source_receipt_sha256="f" * 64,
+    )
+    _canonical_doctor_source(inventory_path, inventory.to_dict())
+    required = (
+        TRUSTED_SINGLE_OPERATOR_CELL_HIGH_WATER_BYTES
+        + TRUSTED_SINGLE_OPERATOR_CAPACITY_SAFETY_MARGIN_BYTES
+    )
+    authority_binding = SimpleNamespace(
+        absolute_path=str(authority_path),
+        to_dict=lambda: {
+            "absolute_path": str(authority_path),
+            "raw_sha256": "a" * 64,
+            "semantic_sha256": "b" * 64,
+            "size": 1_024,
+        },
+    )
+    content_path_spec = SimpleNamespace(
+        absolute_path=str(path_spec_path),
+        to_dict=lambda: {
+            "absolute_path": str(path_spec_path),
+            "raw_sha256": "c" * 64,
+            "semantic_sha256": "d" * 64,
+            "size": 1_024,
+        },
+    )
+    authority = SimpleNamespace(
+        status="AVAILABLE",
+        sha256="e" * 64,
+        content_path_spec=content_path_spec,
+        retry_reserve_mode="AUTOMATIC_RETRY_DISABLED_ZERO_RESERVE",
+        retry_policy_sha256=TRUSTED_SINGLE_OPERATOR_RETRY_POLICY_SHA256,
+    )
+    decision = SimpleNamespace(
+        status="AVAILABLE",
+        required_free_bytes=required,
+        observed_free_bytes=41_400_000_000,
+        current_wave_high_water_bytes=(TRUSTED_SINGLE_OPERATOR_CELL_HIGH_WATER_BYTES),
+        running_wave_high_water_bytes=0,
+        retry_reserve_bytes=0,
+        safety_margin_bytes=TRUSTED_SINGLE_OPERATOR_CAPACITY_SAFETY_MARGIN_BYTES,
+    )
+    monkeypatch.setattr("lightcone_spec.doctor._collect_facts", lambda *_args: facts)
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_single_operator_capacity."
+        "revalidate_trusted_single_operator_stage_capacity_authority",
+        lambda *_args, **_kwargs: (authority_binding, authority, decision),
+    )
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_single_operator_content."
+        "load_trusted_single_operator_content_path_spec",
+        lambda _path: SimpleNamespace(
+            repository_root=str(ROOT.resolve()),
+            inventory_path=str(inventory_path),
+        ),
+    )
+
+    report = doctor_report(
+        ROOT,
+        sglang,
+        trusted_single_operator_capacity_path=authority_path,
+    )
+    assert report["status"] == "PASS"
+    assert report["checks"]["disk"]["status"] == "PASS"
+    assert report["stage_capacity"]["mode"] == ("TRUSTED_SINGLE_OPERATOR_NO_SIGNATURE")
+    assert report["stage_capacity"]["required_free_bytes"] == 31 * 1024**3
+    assert report["stage_capacity"]["formal_measured_authorization"] is False
 
 
 def test_doctor_never_falls_back_after_stage_capacity_tamper(
@@ -742,6 +876,26 @@ def test_cli_accepts_distinct_project_and_sglang_roots(
     )
     assert calls == [(str(project), str(sglang))]
     assert json.loads(capsys.readouterr().out) == {"status": "UNKNOWN"}
+
+
+def test_cli_can_publish_canonical_doctor_report_without_replacement(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    cli = importlib.import_module("lightcone_spec.cli.main")
+    report = {"schema_version": 2, "status": "PASS", "checks": {}}
+    monkeypatch.setattr(
+        cli, "format_doctor", lambda *_args, **_kwargs: json.dumps(report)
+    )
+    output = (tmp_path / "doctor.json").resolve()
+    argv = ["doctor", "--path", str(tmp_path), "--output", str(output)]
+
+    assert cli.main(argv) == 0
+    assert json.loads(capsys.readouterr().out) == report
+    assert CanonicalJsonProofBinding.bind(output).reopen() == report
+    assert Path(f"{output}.sha256").is_file()
+
+    with pytest.raises(RuntimeError, match="target already exists"):
+        cli.main(argv)
 
 
 def test_sidecar_bound_but_malformed_manifest_fails_closed(

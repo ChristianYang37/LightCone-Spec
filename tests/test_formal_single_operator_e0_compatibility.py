@@ -491,6 +491,8 @@ def test_trusted_eagle3_task_row_is_shared_across_methods_but_tokens_are_not(
             adaptation=AdaptationConfig(
                 weight_update_mode="full",
                 parameter_scope="all",
+                reset_scope="request",
+                request_admission_policy="serialized_native_scheduler_v1",
                 adaptation_group_id=f"{method}-group",
                 optimizer=OptimizerConfig(name="adam", learning_rate=1e-5),
                 canvas_tokens=4,
@@ -519,7 +521,9 @@ def test_trusted_eagle3_task_row_is_shared_across_methods_but_tokens_are_not(
     source = SimpleNamespace(
         sha256=_sha("current-source"),
         stage="E0",
-        materialization_source=SimpleNamespace(reopen=lambda: {"cells": "current"}),
+        materialization_source=SimpleNamespace(
+            reopen=lambda **_kwargs: {"cells": "current"}
+        ),
         content_source_binding=content_binding,
         auxiliary_source_binding=lambda kind: (
             SimpleNamespace(reopen=lambda **_kwargs: auxiliary_binding.reopen())

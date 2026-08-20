@@ -21,6 +21,81 @@ def add_formal_single_operator_parser(
     status = operations.add_parser("status", allow_abbrev=False)
     status.set_defaults(_formal_single_operator=True)
 
+    v03_model_lock = operations.add_parser(
+        "publish-v03-model-lock",
+        allow_abbrev=False,
+    )
+    v03_model_lock.add_argument("--output", required=True)
+    v03_model_lock.set_defaults(_formal_single_operator=True)
+
+    v03_e0_path_inputs = operations.add_parser(
+        "write-v03-e0-raw-source-path-inputs",
+        allow_abbrev=False,
+    )
+    v03_e0_path_inputs.add_argument(
+        "--source",
+        action="append",
+        required=True,
+        metavar="NAME=ABSOLUTE_PATH",
+    )
+    v03_e0_path_inputs.add_argument("--output", required=True)
+    v03_e0_path_inputs.set_defaults(_formal_single_operator=True)
+
+    v03_e0_sources = operations.add_parser(
+        "publish-v03-e0-source-authorities",
+        allow_abbrev=False,
+    )
+    v03_e0_sources.add_argument("--inputs", required=True)
+    v03_e0_sources.add_argument("--output-directory", required=True)
+    v03_e0_sources.set_defaults(_formal_single_operator=True)
+
+    v03_content_path_inputs = operations.add_parser(
+        "write-v03-content-path-inputs",
+        allow_abbrev=False,
+    )
+    v03_content_path_inputs.add_argument("--repository-root", required=True)
+    v03_content_path_inputs.add_argument(
+        "--model-snapshot",
+        action="append",
+        required=True,
+        metavar="KEY=ABSOLUTE_DIRECTORY",
+    )
+    v03_content_path_inputs.add_argument("--livecodebench-raw", required=True)
+    v03_content_path_inputs.add_argument("--math500-raw", required=True)
+    v03_content_path_inputs.add_argument(
+        "--burstgpt-asset",
+        action="append",
+        required=True,
+        metavar="NAME=ABSOLUTE_PATH",
+    )
+    v03_content_path_inputs.add_argument(
+        "--e0-source-authority",
+        action="append",
+        required=True,
+        metavar="NAME=ABSOLUTE_PATH",
+    )
+    v03_content_path_inputs.add_argument("--inventory", required=True)
+    v03_content_path_inputs.add_argument("--doctor-output", required=True)
+    v03_content_path_inputs.add_argument("--output", required=True)
+    v03_content_path_inputs.set_defaults(_formal_single_operator=True)
+
+    v03_content_spec = operations.add_parser(
+        "publish-v03-content-path-spec",
+        allow_abbrev=False,
+    )
+    v03_content_spec.add_argument("--inputs", required=True)
+    v03_content_spec.add_argument("--output", required=True)
+    v03_content_spec.set_defaults(_formal_single_operator=True)
+
+    stage_capacity = operations.add_parser(
+        "publish-stage-capacity",
+        allow_abbrev=False,
+    )
+    stage_capacity.add_argument("--content-path-spec", required=True)
+    stage_capacity.add_argument("--run-root", required=True)
+    stage_capacity.add_argument("--output", required=True)
+    stage_capacity.set_defaults(_formal_single_operator=True)
+
     trusted_content = operations.add_parser(
         "publish-trusted-content",
         allow_abbrev=False,
@@ -36,6 +111,15 @@ def add_formal_single_operator_parser(
     trusted_workload.add_argument("--content-source", required=True)
     trusted_workload.add_argument("--output", required=True)
     trusted_workload.set_defaults(_formal_single_operator=True)
+
+    for name in (
+        "publish-tts-cal-trainable-plan",
+        "publish-e1-anchor-trainable-plan",
+    ):
+        trainable_plan = operations.add_parser(name, allow_abbrev=False)
+        trainable_plan.add_argument("--trusted-content-bundle", required=True)
+        trainable_plan.add_argument("--output", required=True)
+        trainable_plan.set_defaults(_formal_single_operator=True)
 
     onlinespec_source = operations.add_parser(
         "publish-onlinespec-source-authority",
@@ -292,7 +376,7 @@ def add_formal_single_operator_parser(
     prepare_run.add_argument("--cell", required=True)
     prepare_run.add_argument(
         "--preflight-inputs",
-        help="required only by early stages and the current E4 headline mapper",
+        help="exact retained preflight source required by every serving/failure plan",
     )
     prepare_run.add_argument(
         "--prepared-launch-bundle",
@@ -332,6 +416,21 @@ def _timestamp(value: int | None) -> int:
     if type(observed) is not int or observed < 1:
         raise ValueError("single-operator timestamp must be a positive integer")
     return observed
+
+
+def _named_paths(values: list[str], *, label: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if separator != "=" or not name or not raw_path or name in result:
+            raise ValueError(
+                f"single-operator {label} rows must be unique NAME=ABSOLUTE_PATH values"
+            )
+        path = Path(raw_path)
+        if not path.is_absolute() or path != path.resolve(strict=False):
+            raise ValueError(f"single-operator {label} paths must be absolute")
+        result[name] = str(path)
+    return result
 
 
 def _actual_paths(values: list[str]) -> dict[str, str]:
@@ -438,6 +537,124 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
     from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
 
     operation = args.single_operator_operation
+    if operation == "publish-v03-model-lock":
+        from lightcone_spec.experiments.formal_single_operator_model_registry import (
+            publish_formal_v03_model_lock,
+        )
+
+        output = str(Path(args.output).resolve())
+        lock = publish_formal_v03_model_lock(output_path=output)
+        print(
+            json.dumps(
+                {
+                    "model_count": len(lock.models),
+                    "path": output,
+                    "sha256": lock.sha256,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if operation == "write-v03-e0-raw-source-path-inputs":
+        from lightcone_spec.experiments.formal_single_operator_model_registry import (
+            publish_formal_v03_e0_raw_source_path_inputs,
+        )
+
+        binding = publish_formal_v03_e0_raw_source_path_inputs(
+            source_paths=_named_paths(args.source, label="E0 raw-source"),
+            output_path=args.output,
+        )
+        print(json.dumps(binding.to_dict(), sort_keys=True))
+        return 0
+    if operation == "publish-v03-e0-source-authorities":
+        from lightcone_spec.experiments.formal_single_operator_model_registry import (
+            publish_formal_v03_e0_source_authorities_from_inputs,
+        )
+
+        index = publish_formal_v03_e0_source_authorities_from_inputs(
+            inputs_path=args.inputs,
+            output_directory=args.output_directory,
+        )
+        print(
+            json.dumps(
+                {
+                    "index_path": index.absolute_path,
+                    "raw_sha256": index.raw_sha256,
+                    "semantic_sha256": index.semantic_sha256,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if operation == "write-v03-content-path-inputs":
+        from lightcone_spec.experiments.formal_single_operator_model_registry import (
+            publish_formal_v03_content_path_inputs,
+        )
+
+        binding = publish_formal_v03_content_path_inputs(
+            repository_root=args.repository_root,
+            model_snapshot_paths=_named_paths(
+                args.model_snapshot,
+                label="model-snapshot",
+            ),
+            livecodebench_raw_path=args.livecodebench_raw,
+            math500_raw_path=args.math500_raw,
+            burstgpt_asset_paths=_named_paths(
+                args.burstgpt_asset,
+                label="BurstGPT asset",
+            ),
+            e0_source_authority_paths=_named_paths(
+                args.e0_source_authority,
+                label="E0 source-authority",
+            ),
+            inventory_path=args.inventory,
+            doctor_output_path=args.doctor_output,
+            output_path=args.output,
+        )
+        print(json.dumps(binding.to_dict(), sort_keys=True))
+        return 0
+    if operation == "publish-v03-content-path-spec":
+        from lightcone_spec.experiments.formal_protocol import content_sha256
+        from lightcone_spec.experiments.formal_single_operator_model_registry import (
+            publish_formal_v03_content_path_spec_from_inputs,
+        )
+
+        spec = publish_formal_v03_content_path_spec_from_inputs(
+            inputs_path=args.inputs,
+            output_path=args.output,
+        )
+        print(
+            json.dumps(
+                {
+                    "path": str(Path(args.output)),
+                    "semantic_sha256": content_sha256(spec.to_dict()),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if operation == "publish-stage-capacity":
+        from lightcone_spec.experiments.formal_single_operator_capacity import (
+            publish_trusted_single_operator_stage_capacity_authority,
+        )
+
+        authority = publish_trusted_single_operator_stage_capacity_authority(
+            content_path_spec_path=args.content_path_spec,
+            run_root_path=args.run_root,
+            output_path=args.output,
+        )
+        print(
+            json.dumps(
+                {
+                    "path": str(Path(args.output)),
+                    "authority_sha256": authority.sha256,
+                    "status": authority.status,
+                    "formal_measured_authorization": False,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if operation == "publish-onlinespec-source-authority":
         from lightcone_spec.experiments.formal_registry import (
             publish_e0_onlinespec_source_authority,
@@ -542,6 +759,36 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
                     "path": binding.absolute_path,
                     "raw_sha256": binding.raw_sha256,
                     "semantic_sha256": binding.semantic_sha256,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if operation in {
+        "publish-tts-cal-trainable-plan",
+        "publish-e1-anchor-trainable-plan",
+    }:
+        from lightcone_spec.experiments.formal_single_operator_trainable_plan import (
+            publish_trusted_e1_recipe_anchor_trainable_plan_authority,
+            publish_trusted_tts_calibration_trainable_plan_authority,
+        )
+
+        publisher = (
+            publish_trusted_tts_calibration_trainable_plan_authority
+            if operation == "publish-tts-cal-trainable-plan"
+            else publish_trusted_e1_recipe_anchor_trainable_plan_authority
+        )
+        binding = publisher(
+            trusted_content_bundle_path=args.trusted_content_bundle,
+            output_path=args.output,
+        )
+        print(
+            json.dumps(
+                {
+                    "cell_id": binding.cell_id,
+                    "path": str(Path(args.output)),
+                    "semantic_sha256": binding.sha256,
+                    "trainable_plan_sha256": binding.trainable_plan_sha256,
                 },
                 sort_keys=True,
             )
@@ -969,10 +1216,10 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
         profiler = route.physical_kind == "profiler"
         e5_failure = route.physical_kind == "e5_failure"
         e6_interface = route.physical_kind == "e6_interface_preflight"
-        if (early or e4_headline) and args.preflight_inputs is None:
-            raise ValueError(
-                "early/E4 headline preparation requires --preflight-inputs"
-            )
+        if (
+            early or e4_headline or prepared_serving or e5_failure
+        ) and args.preflight_inputs is None:
+            raise ValueError("serving/failure preparation requires --preflight-inputs")
         if (prepared_serving or e5_failure) and args.prepared_launch_bundle is None:
             from lightcone_spec.experiments.formal_single_operator_prepared_launch import (
                 FormalSingleOperatorPreparedLaunchBlocked,
@@ -1130,6 +1377,7 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
             )
             plan = materialize_formal_single_operator_e5_failure_run_plan(
                 failure_execution_descriptor_path=descriptor_path,
+                preflight_inputs_path=args.preflight_inputs,
             )
             admission = publish_formal_single_operator_admission(
                 plan_path=run_root / "formal-serving-run-plan.json",
@@ -1213,6 +1461,7 @@ def handle_formal_single_operator_command(args: argparse.Namespace) -> int | Non
                         run_root
                         / "formal-single-operator-prepared-downstream-inputs.json"
                     ),
+                    preflight_inputs_path=args.preflight_inputs,
                 )
             )
         print(

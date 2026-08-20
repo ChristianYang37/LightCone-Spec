@@ -15,6 +15,7 @@ industrial 命令包括：
 | `revalidate-formal-workload-authority` | 重开诊断性 workload binding，并重放其 path、revision、raw bytes 与完整筛选结果 |
 | `build-industrial-registry` | 绑定一个或更多稳定 logical rank slot 并生成不可变实验 DAG |
 | `collect-gpu-inventory` | 收集 nonce-bound physical GPU/topology inventory 与 raw probe receipt |
+| `publish-tts-drafter-native-loss-source` | 发布唯一 code-owned pinned DFlash loss descriptor |
 | `assemble-gpu-fleet-inventory` | 把重复传入的 single-host inventory/interference pair 组合成 content-bound fleet inventory |
 | `build-interference-envelope` | 派生当前 serial interference envelope 及其 inventory-bound raw receipt |
 | `materialize-interference-calibration-bootstrap` | 从 raw preflight activation 与准确 inventory 派生仅供校准的 two-way execution envelope |
@@ -467,9 +468,19 @@ execution seal 都不能替代它。
 创建 `ProtocolLock` 前，必须从准确 bound source 发布三个 code-owned 方法输入：
 
 ```bash
+lightcone-spec publish-tts-calibration-tuning-window \
+  --tuning-workload-authority /absolute/source/lcb-hard-authority.json \
+  --content-verification-receipt /absolute/evidence/content-master.json \
+  --output /absolute/source/tts-tuning-window.json
+
+lightcone-spec publish-tts-drafter-native-loss-source \
+  --output /absolute/source/drafter-native-loss.json
+
 lightcone-spec publish-tts-calibration-source-authority \
   --paper-pdf /absolute/source/tts-v2.pdf \
-  --paper-source /absolute/source/tts-v2.tex \
+  --paper-source /absolute/source/tts-v2-source.tar.gz \
+  --tuning-workload-authority /absolute/source/lcb-hard-authority.json \
+  --content-verification-receipt /absolute/evidence/content-master.json \
   --tuning-window /absolute/source/tts-tuning-window.json \
   --trainable-plan-authority /absolute/source/trainable-plan.json \
   --drafter-native-loss /absolute/source/drafter-native-loss.json \
@@ -481,14 +492,32 @@ lightcone-spec publish-chronobelief-source-authority \
   --output /absolute/evidence/chronobelief-authority.json
 
 lightcone-spec publish-e1-recipe-anchor-authority \
+  --trusted-content-bundle /absolute/source/trusted-content.json \
   --trainable-plan-authority /absolute/source/trainable-plan.json \
   --output /absolute/evidence/e1-recipe-anchor-authority.json
 ```
 
-这些命令会深读所列 source file，确定性派生封闭的 numeric/recipe authority，并使用
-atomic no-replace 发布。它们不接受 caller 提供的 authority digest 或 recipe override。
-输出只作为 `create-protocol-lock` 的输入；不会签署实验结果、授权 dispatch，也不能替代
-后续 tuning 与 GPU evidence gate。
+必须先完成 schema-2 master content ceremony，且该 ceremony 明确禁止把 TTS tuning
+window 放入 master content。随后这些命令会深读 durable master receipt、其准确
+replay-reservation record、在 receipt 记录的 verification time 上复核原始 signed
+workload authorization，并重开 bound LCB authority。Raw 或 expired workload authorization
+不能替代 receipt。Schema-4 window 绑定 receipt digest、verification time 与 reservation
+identity，并使用 atomic no-replace 发布。这些命令不接受 caller 提供的
+authority digest、tuning partition、time 或 recipe override。Code-owned selector 在 versioned
+namespace 下 hash 全部准确 LCB-hard problem ID，将最小四个作为 excluded pilot，并
+绑定完整 complement。TTS source publisher 会重开 pinned DFlash loss 的准确描述：float32
+target-to-draft forward KL、valid-row mask、`exp(-(k-1)/7)` position weight、
+temperature 1 与 masked weighted normalization。source-point value correction 不是独立
+proximal penalty，因此无需提供或调节 proximal coefficient。只要 exact source pin、post-master
+window、canonical plan 与 loss descriptor 均通过，就能发布 `ProtocolLock` input。该结果分类为
+project-calibrated runtime baseline，而非 paper reproduction。ChronoBelief 命令仍是独立的项目
+自有 preregistration。
+当前 E1 publisher 还要求一个 runtime-`BOUND` trusted content bundle。其 schema-3
+artifact 会绑定并重开该准确 bundle，并把 plan 的 target/drafter revision 与 prepared
+root 连接到同一 bundle。历史 schema-2 E1 artifact 仅可读取，不能进入 trusted
+schema-5 ProtocolLock。E1 anchor publisher 只接受显式 structural selector：registry 中唯一的
+Qwen3-8B/DFlash LC-candidate `full`/`last1` AdamW、width-8/concurrency-4 slot。其他即使合法的
+plan 也会被拒绝；该 selector 不编码 observed winner。
 
 Stage 的 activated cell 与 disposition durable 后再封存。`--inventory PATH` 是 completed
 evidence 所用 physical GPU identity 与 topology 的 authority。每次重复的
@@ -559,10 +588,11 @@ compile/download N/A 理由或 GPU accounting 都不能替换为零。Resume 只
 
 Dispatch plan 是目标 protocol 数据，不证明 cell 可执行。Library industrial executor 会在
 launch 前验证 provider state。固定 tree 已实现准确 native terminal begin/reset/finalize
-hook，但没有配置 trusted hardware signer。Generic activation 只记录 canonical blocked
-preflight disposition；它不会创造 compile runner、execution authority 或 performance claim。
-Static/TTS/L0-naive/LightCone 在缺少 validated native capability 与 trusted signer 时仍被阻止。CLI 不会
-静默 provision hardware，也不会启动 GPU。
+hook，但没有配置 trusted hardware signer。Generic release-attested activation 只记录 canonical
+blocked preflight disposition；它不会创造 compile runner、execution authority 或 performance
+claim。Trusted `formal_single_operator_v1` CLI 是另一条 empirical lane：它不要求 external
+signer，但仍要求准确 source/content/runtime、fresh GPU qualification、capacity、terminal 与
+coverage artifact。CLI 不会静默 provision hardware，也不会启动 GPU。
 
 ## Fleet Inventory 与 Remote Host Wave
 
@@ -668,15 +698,18 @@ canonical content，不只检查 filename。
 
 ## 核心 Tuning 与 Confirmation
 
-Target-only 与 Static 渲染时不含 adaptation state 或 reserve。TTS 使用 signed TTS-Cal seal
+Target-only 与 Static 渲染时不含 adaptation state 或 reserve。TTS 使用准确 TTS-Cal seal
 冻结的 recipe authority 与 fixed-barrier publication；L0-naive 使用同一个 frozen recipe
-authority 与 first-ready publication。历史 `TTS-paper-reconstruction` authority 只用于
+authority 与 first-ready publication。Release-attested lane 会签署该 seal；trusted
+single-operator lane 则直接消费 reducer-owned content identity，无需 external signer。历史
+`TTS-paper-reconstruction` authority 只用于
 diagnostic。E1/E2 中采用 `l0` search recipe 的是 LC-candidate，
 只有准确 E2-sealed winner 才是 LightCone。共享 runtime code 不会合并 live candidate、
-optimizer 或 evidence identity。Rendering 只是 pure planning；当前 release 只有 Target-only
-可以用于 claim。Static/TTS/L0-naive/LightCone 会在 endpoint 启动前因缺少 fresh dynamic
-GPU qualification 与 trusted external-control evidence 而 fail closed；TTS 与 L0-naive 还
-必须等待 disjoint TTS-Cal 的 signed winner seal。
+optimizer 或 evidence identity。Rendering 只是 pure planning；当前 release-attested lane 只有
+Target-only 可以用于 claim。Trusted single-operator lane 可在准确 source/content/runtime、fresh
+dynamic GPU qualification、capacity、terminal 与 coverage gate 通过后运行完整 empirical DAG；
+TTS 与 L0-naive 还必须等待 disjoint TTS-Cal 的准确 content-sealed winner。External signer 只
+决定能否提升为 release-level `MEASURED`。
 
 Industrial E1/E2 command 由 reducer 控制。E1 消费 sealed E3a 与 TTS-Cal receipt，恰好
 materialize 68 个 cell：四个 fixed role，加上 32 个 geometry、每个两个 LightCone
@@ -792,8 +825,16 @@ evidence。缺少当前 release-root attestation 时，finalization 必须报告
 | 命令 | 用途 |
 |---|---|
 | `formal-single-operator status` | 不读取 run evidence、不分配 GPU，只报告 21 个节点的源码 capability |
+| `publish-v03-model-lock` | 不经网络解析，发布由代码所有的准确 19 模型/revision lock |
+| `write-v03-e0-raw-source-path-inputs` | Canonical 发布 registry-accurate 七项 raw E0 path |
+| `publish-v03-e0-source-authorities` | 扫描七项 source 并发布 typed authority |
+| `write-v03-content-path-inputs` | Canonical 发布准确 model/data/E0/inventory 与 future-doctor path |
+| `publish-v03-content-path-spec` | 派生 digest-free pre-doctor content path spec |
+| `publish-stage-capacity` | 绑定 pre-doctor spec、run-root filesystem 与所需 free-byte threshold |
 | `publish-trusted-content` | 深度绑定 typed content path spec 与 runtime observation，发布 BOUND bundle |
 | `publish-preflight-workload` | 从该准确 BOUND bundle 派生 preflight workload authority |
+| `publish-tts-cal-trainable-plan` | 从 BOUND content 派生固定 trusted TTS-Cal plan |
+| `publish-e1-anchor-trainable-plan` | 从 BOUND content 派生固定 trusted E1 anchor plan |
 | `publish-onlinespec-source-authority` | 只为 E0 绑定已审计的外部 OnlineSPEC checkout |
 | `build-trusted-protocol-lock` | 从 path-bound source 构建 schema-v5 trusted ProtocolLock |
 | `write-dag-driver-config` | 发布一份不可变、只含路径的 21 节点 driver config |
@@ -807,17 +848,147 @@ evidence。缺少当前 release-root attestation 时，finalization 必须报告
 
 ### 发布不可变输入
 
-从准确文件发布 runtime 与 method source authority。以下命令会自行派生 authority content，
-不接受 caller 填写 digest：
+先在 Git 外创建 private source 目录、空的 E0-authority 目录和 private run root，然后严格按
+下列顺序执行。该顺序先发布 pre-doctor path spec，从该 spec 派生 capacity，再发布 fresh
+doctor report，最后才封存 runtime-`BOUND` content bundle；任何一步都不依赖后文才生成的
+artifact。
+
+若准确的 19 个 snapshot 尚未全部存在，先发布 code-owned lock，再让现有 model preparer
+只获取这些不可变 revision。lock publisher 不接受 model、revision、digest、token 或网络输入；
+审计已填充 cache 时给 `prepare-models` 加 `--offline`：
 
 ```bash
-lightcone-spec publish-formal-runtime-authority-manifest \
+lightcone-spec formal-single-operator publish-v03-model-lock \
+  --output /absolute/sources/formal-v03-model-lock.json
+
+lightcone-spec prepare-models \
+  --lockfile /absolute/sources/formal-v03-model-lock.json \
+  --model-cache /absolute/models \
+  --output /absolute/sources/formal-v03-prepared-model-roots.json
+```
+
+先收集 nonce-bound physical inventory，写入准确七项 E0 raw-source handoff，再派生七份
+source authority：
+
+```bash
+lightcone-spec collect-gpu-inventory \
+  --challenge-nonce-sha256 FRESH_64_LOWERCASE_HEX_NONCE_SHA256 \
+  --receipt-output /absolute/sources/gpu-inventory-receipt.json \
+  --output /absolute/sources/gpu-inventory.json
+
+lightcone-spec formal-single-operator write-v03-e0-raw-source-path-inputs \
+  --source AIME-2025=/absolute/cache/e0/aime25-test.jsonl \
+  --source Alpaca=/absolute/cache/e0/alpaca-eval.json \
+  --source Arena-Hard=/absolute/cache/e0/arena-hard-v2.0-question.jsonl \
+  --source GSM8K=/absolute/cache/e0/gsm8k-test.jsonl \
+  --source HumanEval=/absolute/cache/e0/humaneval.jsonl.gz \
+  --source MBPP=/absolute/cache/e0/mbpp-sanitized.json \
+  --source MT-Bench=/absolute/cache/e0/mt-bench-question.jsonl \
+  --output /absolute/sources/e0-raw-source-path-inputs.json
+
+lightcone-spec formal-single-operator publish-v03-e0-source-authorities \
+  --inputs /absolute/sources/e0-raw-source-path-inputs.json \
+  --output-directory /absolute/sources/e0-authorities
+```
+
+然后写入 registry-complete content handoff。以下 19 个 model key/path 由 source code 所有；
+CLI 不接受 revision 或 digest override。六个 BurstGPT name 与七个 E0 name 也必须各出现准确
+一次。此时 doctor output 必须尚不存在，但其 resolved parent 必须已存在。
+
+```bash
+lightcone-spec formal-single-operator write-v03-content-path-inputs \
   --repository-root /absolute/clean/lightcone-checkout \
-  --output /absolute/sources/runtime-authority.json
+  --model-snapshot gemma4_12b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_gemma4_12b_block7/snapshots/7490ce60c7630107917fe558e2bbe3dcec6195cb \
+  --model-snapshot gemma4_12b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_gemma4_12b_block7/snapshots/2fa72e765eec2965fc4d86a8663ce6769eba6218 \
+  --model-snapshot gemma4_12b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_gemma4_12b_ttt7/snapshots/0bc24c312350910419cf371e54082f040d65cc82 \
+  --model-snapshot gemma4_12b_target=/absolute/models/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7 \
+  --model-snapshot qwen35_122b_a10b_fp8_nextn=/absolute/models/models--Qwen--Qwen3.5-122B-A10B-FP8/snapshots/a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9 \
+  --model-snapshot qwen36_35b_a3b_nextn=/absolute/models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --model-snapshot qwen3_14b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_14b_block7/snapshots/ab0a8b28236654620bb41d64b336d00a14cb467f \
+  --model-snapshot qwen3_14b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_qwen3_14b_block7/snapshots/83207b416acf99f41c2184648923632fccea6dd0 \
+  --model-snapshot qwen3_14b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_14b_ttt7/snapshots/d7ea05d0b0009badfff0df2dcaedf82cce0f74f8 \
+  --model-snapshot qwen3_14b_target=/absolute/models/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18 \
+  --model-snapshot qwen3_4b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_4b_block7/snapshots/02d530b7962ea1412beaf41a05c0b8e36d5f9b1d \
+  --model-snapshot qwen3_4b_dspark_e0=/absolute/models/models--deepseek-ai--dspark_qwen3_4b_block7/snapshots/3457dff1417cb84927f6098a5fcb7cee85c934b7 \
+  --model-snapshot qwen3_4b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_4b_ttt7/snapshots/b0b90fd15d052217c226be5e46d468d8d129e0cd \
+  --model-snapshot qwen3_4b_target=/absolute/models/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
+  --model-snapshot qwen3_8b_dflash_core=/absolute/models/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/9b41424b7109f9c5413454f481b09a82b85333f4 \
+  --model-snapshot qwen3_8b_dflash_e0=/absolute/models/models--deepseek-ai--dflash_qwen3_8b_block7/snapshots/9e44dbbb6cb68b0c943abf9c5fc3c17c00897cdf \
+  --model-snapshot qwen3_8b_dspark_e0_core=/absolute/models/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017 \
+  --model-snapshot qwen3_8b_eagle3_e0=/absolute/models/models--deepseek-ai--eagle3_qwen3_8b_ttt7/snapshots/f6485ba8d21e11942958617dbe7e71b467f38f38 \
+  --model-snapshot qwen3_8b_target=/absolute/models/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 \
+  --livecodebench-raw /absolute/cache/livecodebench/test6.jsonl \
+  --math500-raw /absolute/cache/math-500/test.jsonl \
+  --burstgpt-asset BurstGPT_1.csv=/absolute/cache/burstgpt/BurstGPT_1.csv \
+  --burstgpt-asset BurstGPT_2.csv=/absolute/cache/burstgpt/BurstGPT_2.csv \
+  --burstgpt-asset BurstGPT_3.csv=/absolute/cache/burstgpt/BurstGPT_3.csv \
+  --burstgpt-asset BurstGPT_without_fails_1.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_1.csv \
+  --burstgpt-asset BurstGPT_without_fails_2.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_2.csv \
+  --burstgpt-asset BurstGPT_without_fails_3.csv=/absolute/cache/burstgpt/BurstGPT_without_fails_3.csv \
+  --e0-source-authority AIME-2025=/absolute/sources/e0-authorities/formal-v03-e0-aime_2025-source-authority.json \
+  --e0-source-authority Alpaca=/absolute/sources/e0-authorities/formal-v03-e0-alpaca-source-authority.json \
+  --e0-source-authority Arena-Hard=/absolute/sources/e0-authorities/formal-v03-e0-arena_hard-source-authority.json \
+  --e0-source-authority GSM8K=/absolute/sources/e0-authorities/formal-v03-e0-gsm8k-source-authority.json \
+  --e0-source-authority HumanEval=/absolute/sources/e0-authorities/formal-v03-e0-humaneval-source-authority.json \
+  --e0-source-authority MBPP=/absolute/sources/e0-authorities/formal-v03-e0-mbpp-source-authority.json \
+  --e0-source-authority MT-Bench=/absolute/sources/e0-authorities/formal-v03-e0-mt_bench-source-authority.json \
+  --inventory /absolute/sources/gpu-inventory.json \
+  --doctor-output /absolute/sources/doctor.json \
+  --output /absolute/sources/v03-content-path-inputs.json
+
+lightcone-spec formal-single-operator publish-v03-content-path-spec \
+  --inputs /absolute/sources/v03-content-path-inputs.json \
+  --output /absolute/sources/v03-content-path-spec.json
+```
+
+从该 pre-doctor spec 派生 capacity，再直接发布 fresh canonical doctor report。非 `PASS`
+report 仍会保留并返回 42，但不能作为 `BOUND` content 使用。
+
+```bash
+lightcone-spec formal-single-operator publish-stage-capacity \
+  --content-path-spec /absolute/sources/v03-content-path-spec.json \
+  --run-root /absolute/run/formal-v03-study \
+  --output /absolute/sources/v03-stage-capacity.json
+
+lightcone-spec doctor \
+  --project-root /absolute/clean/lightcone-checkout \
+  --sglang-root /absolute/runtime/patched-sglang \
+  --trusted-single-operator-capacity /absolute/sources/v03-stage-capacity.json \
+  --output /absolute/sources/doctor.json
+```
+
+只有 doctor `PASS` 后，才能绑定 content，并派生所有 downstream workload、trainable plan 与
+method source。Trusted TTS 和 E1 authority 命令直接消费同一个 BOUND bundle；
+release-signed workload/receipt 参数不属于该 lane。
+
+```bash
+lightcone-spec formal-single-operator publish-trusted-content \
+  --spec /absolute/sources/v03-content-path-spec.json \
+  --output /absolute/sources/trusted-content.json
+
+lightcone-spec formal-single-operator publish-preflight-workload \
+  --content-source /absolute/sources/trusted-content.json \
+  --output /absolute/sources/preflight-workload.json
+
+lightcone-spec formal-single-operator publish-tts-cal-trainable-plan \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/tts-trainable-plan.json
+
+lightcone-spec formal-single-operator publish-e1-anchor-trainable-plan \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/e1-trainable-plan.json
+
+lightcone-spec publish-tts-calibration-tuning-window \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
+  --output /absolute/sources/tts-tuning-window.json
+
+lightcone-spec publish-tts-drafter-native-loss-source \
+  --output /absolute/sources/tts-native-loss.json
 
 lightcone-spec publish-tts-calibration-source-authority \
   --paper-pdf /absolute/sources/tts-paper.pdf \
-  --paper-source /absolute/sources/tts-paper.tex \
+  --paper-source /absolute/sources/tts-v2-source.tar.gz \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
   --tuning-window /absolute/sources/tts-tuning-window.json \
   --trainable-plan-authority /absolute/sources/tts-trainable-plan.json \
   --drafter-native-loss /absolute/sources/tts-native-loss.json \
@@ -829,6 +1000,7 @@ lightcone-spec publish-chronobelief-source-authority \
   --output /absolute/sources/chronobelief-authority.json
 
 lightcone-spec publish-e1-recipe-anchor-authority \
+  --trusted-content-bundle /absolute/sources/trusted-content.json \
   --trainable-plan-authority /absolute/sources/e1-trainable-plan.json \
   --output /absolute/sources/e1-recipe-anchor-authority.json
 
@@ -836,21 +1008,10 @@ lightcone-spec formal-single-operator publish-onlinespec-source-authority \
   --checkout /absolute/sources/onlinespec-checkout \
   --audit /absolute/sources/onlinespec-source-audit.json \
   --output /absolute/sources/onlinespec-source-authority.json
-```
 
-Typed `trusted_single_operator_content_path_spec` 必须列出 clean checkout；每个 target、
-drafter、tokenizer snapshot 及 immutable revision；锁定的 LiveCodeBench、MATH-500、
-BurstGPT 与 E0 task-native source；以及 fresh inventory/doctor path。应通过 source API 生成
-typed spec，不能手工填写 content digest。随后发布 BOUND bundle 并派生 preflight workload：
-
-```bash
-lightcone-spec formal-single-operator publish-trusted-content \
-  --spec /absolute/sources/content-path-spec.json \
-  --output /absolute/sources/trusted-content.json
-
-lightcone-spec formal-single-operator publish-preflight-workload \
-  --content-source /absolute/sources/trusted-content.json \
-  --output /absolute/sources/preflight-workload.json
+lightcone-spec publish-formal-runtime-authority-manifest \
+  --repository-root /absolute/clean/lightcone-checkout \
+  --output /absolute/sources/runtime-authority.json
 
 lightcone-spec formal-single-operator build-trusted-protocol-lock \
   --protocol-id lightcone-v03-study \
@@ -862,9 +1023,9 @@ lightcone-spec formal-single-operator build-trusted-protocol-lock \
   --output /absolute/sources/protocol-lock.json
 ```
 
-所有 source/output path 必须 absolute 且 normalized。Output 使用 atomic no-replace
-publication。Model/data payload、provider state、credential 与全部 run artifact 都留在
-checkout 外。
+所有 source/output path 必须 absolute 且 normalized。Canonical output 使用 atomic
+no-replace publication，并在下一步前 deep-reopen。Model/data payload、provider state、
+credential 与全部 run artifact 都留在 checkout 外。
 
 ### 配置并到达第一个 GPU 边界
 
@@ -899,6 +1060,11 @@ upstream receipt 已就绪：
 ```bash
 lightcone-spec formal-single-operator status
 ```
+
+前文 capacity/doctor 步骤会把 live GPU 的 UUID/model/compute capability 与 path spec 中
+准确 inventory 做 fresh join。该 empirical 模式只允许一个 16 GiB wave 加 15 GiB safety
+margin，禁用 physical 与 E6/E0 auxiliary 的 automatic retry，且绝不授权 formal
+`MEASURED` claim。
 
 Cold start 刻意保留一个可检查边界。第一次 cycle materialize preflight；第二次规划准确
 一条 compile、一条 exactness 与八条 interference cell，并把十个 attempt 及其双卡 physical

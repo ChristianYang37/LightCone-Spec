@@ -22,7 +22,7 @@ yet been declared.
   writes. Live shared-session mutation remains blocked until a release-owned
   trusted durable boundary and continuous whole-inventory accounting exist.
 - Added the native
-  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+  `sglang.schema_v3.content_bound_terminal_speculative_evidence.v2`
   begin/reset/finalize hook and a strict host validator. Static retains zero
   detailed round/update tracing; adaptive `tts`/`l0` runtime paths carry exact
   request/round/update/KV evidence on the supported TP1/DP1 DFlash boundary
@@ -93,9 +93,16 @@ yet been declared.
   evaluates a missing draft width, preserves non-applicable terminal
   speculative fields, and reports zero verified drafts in the numeric
   server-info speed view. An active speculative algorithm with no draft width
-  still fails closed. The complete series ends at patch SHA-256
-  `38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`
-  and tree `c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`.
+  still fails closed.
+- Isolated request-scoped TTS/L0 adaptation at the same source point on every
+  completed, aborted, cancelled, timed-out, preempted, and OOM terminal path.
+  Native ownership is serialized without rewriting offered client schedules;
+  DFlash, DSpark, EAGLE3, NEXTN, TP2, and sticky DP2 now bind exact reset
+  receipts and append-only evidence archives, while cohort-scoped LightCone/
+  OnlineSPEC and allocation-free Target/Static semantics remain unchanged. The
+  complete series ends at patch SHA-256
+  `0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874`
+  and tree `bb6371242e82592d1b8a2f5f4ba6d0630d8365cb`.
 - Added source-owned CPU-audited TP2 and TP1/DP2 readiness identities. Formal
   launch additionally requires an exact root-signed, nonce/inventory/hardware/
   source/JUnit-bound two-card GPU proof; a config digest alone grants no authority.

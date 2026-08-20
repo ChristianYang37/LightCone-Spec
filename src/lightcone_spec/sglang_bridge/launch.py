@@ -56,6 +56,7 @@ _GPU_INVENTORY_ARGV = [
 ]
 _ALLOCATOR_ENVIRONMENT = "PYTORCH_CUDA_ALLOC_CONF"
 _ALLOCATOR_VALUE = "backend:cudaMallocAsync"
+_ADAPTATION_CONFIG_SHA256_ENVIRONMENT = "LIGHTCONE_FORMAL_ADAPTATION_CONFIG_SHA256"
 
 
 def _torch_preimported() -> bool:
@@ -89,27 +90,68 @@ def _validate_cuda_toolkit_environment() -> None:
             )
 
 
-def _selected_gpu(inventory: list[dict[str, object]]) -> dict[str, object]:
+def _selected_gpus(
+    inventory: list[dict[str, object]],
+    *,
+    expected_count: int,
+) -> tuple[dict[str, object], ...]:
+    if type(expected_count) is not int or expected_count < 1:
+        raise ValueError("compile-cache launch GPU count is invalid")
     selector = os.environ.get("CUDA_VISIBLE_DEVICES")
     if selector is None or not selector.strip():
-        if len(inventory) != 1:
+        if len(inventory) != expected_count:
             raise ValueError(
-                "compile-cache launch requires one unambiguous visible GPU"
+                "compile-cache launch lacks exact unambiguous visible GPUs"
             )
-        return inventory[0]
+        return tuple(inventory)
     selectors = [value.strip() for value in selector.split(",") if value.strip()]
-    if len(selectors) != 1:
-        raise ValueError("compile-cache launch requires exactly one visible GPU")
-    selected = selectors[0]
-    if selected.isdecimal():
-        index = int(selected)
-        if index >= len(inventory):
-            raise ValueError("CUDA_VISIBLE_DEVICES index is outside GPU inventory")
-        return inventory[index]
-    matches = [device for device in inventory if device.get("uuid") == selected]
-    if len(matches) != 1:
-        raise ValueError("CUDA_VISIBLE_DEVICES does not select one inventory GPU")
-    return matches[0]
+    if len(selectors) != expected_count or len(set(selectors)) != expected_count:
+        raise ValueError("compile-cache launch requires its exact visible GPU count")
+    selected_devices: list[dict[str, object]] = []
+    for selected in selectors:
+        if selected.isdecimal():
+            index = int(selected)
+            if index >= len(inventory):
+                raise ValueError("CUDA_VISIBLE_DEVICES index is outside GPU inventory")
+            device = inventory[index]
+        else:
+            matches = [device for device in inventory if device.get("uuid") == selected]
+            if len(matches) != 1:
+                raise ValueError(
+                    "CUDA_VISIBLE_DEVICES does not select one inventory GPU"
+                )
+            device = matches[0]
+        if any(device is prior for prior in selected_devices):
+            raise ValueError("CUDA_VISIBLE_DEVICES repeats one inventory GPU")
+        selected_devices.append(device)
+    return tuple(selected_devices)
+
+
+def _selected_gpu(inventory: list[dict[str, object]]) -> dict[str, object]:
+    """Compatibility wrapper for the single-GPU compile contract."""
+
+    return _selected_gpus(inventory, expected_count=1)[0]
+
+
+def _config_gpu_uuids(
+    config: object,
+    *,
+    expected_count: int,
+    allow_local_default: bool = False,
+) -> tuple[str, ...] | None:
+    identity = getattr(getattr(config, "runtime", None), "device_identity", None)
+    if type(identity) is not str:
+        raise ValueError("RunConfig lacks exact ordered GPU identity")
+    if allow_local_default and identity == "local-device-0":
+        return None
+    values = tuple(identity.split(","))
+    if (
+        len(values) != expected_count
+        or len(set(values)) != expected_count
+        or any(not value or value.strip() != value for value in values)
+    ):
+        raise ValueError("RunConfig ordered GPU identity differs from topology")
+    return values
 
 
 def _server_dtype(server_argv: list[str]) -> str:
@@ -145,6 +187,49 @@ def _positive_server_int(server_argv: list[str], flag: str) -> int:
     return int(value)
 
 
+def _bind_runtime_adaptation_config(config: object, server_argv: list[str]):
+    """Bind the independent native payload to the exact validated RunConfig."""
+
+    from lightcone_spec.config import RunConfig
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+    from lightcone_spec.sglang_bridge.config import (
+        sglang_adaptation_payload,
+        sglang_adaptation_sha256,
+    )
+
+    if type(config) is dict:
+        config = RunConfig.model_validate(config)
+    if type(config) is not RunConfig:
+        raise TypeError("adaptation payload requires an exact RunConfig")
+
+    flag = "--speculative-adaptation-config"
+    present = flag in server_argv or any(
+        argument.startswith(f"{flag}=") for argument in server_argv
+    )
+    expected = sglang_adaptation_payload(config)
+    if expected is None:
+        if present:
+            raise ValueError("allocation-free launch carries an adaptation payload")
+        return None
+    path = Path(_server_flag_value(server_argv, flag))
+    if (
+        not path.is_absolute()
+        or path != path.resolve(strict=False)
+        or not path.is_file()
+        or path.is_symlink()
+    ):
+        raise ValueError("adaptation payload path is unavailable")
+    binding = CanonicalJsonProofBinding.bind(path)
+    expected_sha256 = sglang_adaptation_sha256(config)
+    if (
+        binding.reopen() != expected
+        or expected_sha256 is None
+        or binding.semantic_sha256 != expected_sha256
+    ):
+        raise ValueError("adaptation payload differs from RunConfig")
+    return binding
+
+
 def _validate_model_revision_root(
     server_argv: list[str],
     *,
@@ -177,13 +262,19 @@ def _validate_compile_server_argv(
         for flag, expected in expected_ints.items()
     ):
         raise ValueError("SGLang launch dimensions differ from the compile-cache key")
-    if any(
+    carries_dp = any(
         argument == "--dp-size" or argument.startswith("--dp-size=")
         for argument in server_argv
+    )
+    if config.runtime.data_parallel_size == 1:
+        if carries_dp:
+            raise ValueError("TP1/DP1 compile-cache launch cannot carry DP argv")
+    elif (
+        not carries_dp
+        or _positive_server_int(server_argv, "--dp-size")
+        != config.runtime.data_parallel_size
     ):
-        raise ValueError(
-            "single-GPU compile-cache launch cannot carry data parallelism"
-        )
+        raise ValueError("distributed compile-cache launch DP argv differs")
     graph_switch = "--lightcone-fixed-address-publication-graph"
     graph_batches = "--lightcone-graph-batch-sizes"
     graph_no_fallback = "--lightcone-disable-graph-eager-fallback"
@@ -332,7 +423,7 @@ def _validate_compile_runtime_environment(
     plan: CompileCacheLaunchPlan,
     raw_config: dict[str, object],
     server_argv: list[str],
-) -> str | None:
+) -> tuple[str | None, tuple[str, ...]]:
     """Observe the child process environment before cache mutation or import."""
 
     key = plan.key
@@ -362,53 +453,71 @@ def _validate_compile_runtime_environment(
         if raw_config != config.model_dump(mode="json"):
             raise ValueError("run-config semantic identity differs after validation")
         _validate_compile_server_argv(plan, config, server_argv)
+        _bind_runtime_adaptation_config(config, server_argv)
         raw_inventory = _command(_GPU_INVENTORY_ARGV)
         parsed = _parse_gpu_inventory(raw_inventory)
         inventory = parsed.get("devices")
         if parsed.get("parse_error") is not None or not isinstance(inventory, list):
             raise ValueError("compile-cache launch lacks a valid GPU inventory")
-        selected = _selected_gpu(inventory)
-        capability = selected.get("compute_capability")
-        if not isinstance(capability, str):
-            raise TypeError("compile-cache launch lacks GPU compute capability")
-        components = capability.split(".")
-        if len(components) != 2 or any(
-            not component.isdecimal() for component in components
-        ):
-            raise ValueError("compile-cache launch has invalid GPU compute capability")
+        expected_devices = (
+            config.runtime.tensor_parallel_size * config.runtime.data_parallel_size
+        )
+        selected_devices = _selected_gpus(
+            inventory,
+            expected_count=expected_devices,
+        )
+        selected_gpu_uuids = tuple(device.get("uuid") for device in selected_devices)
+        expected_gpu_uuids = _config_gpu_uuids(
+            config,
+            expected_count=expected_devices,
+            allow_local_default=True,
+        )
+        if expected_gpu_uuids is not None and selected_gpu_uuids != expected_gpu_uuids:
+            raise ValueError("visible GPU UUID order differs from RunConfig")
         torch_runtime = _torch_runtime()
         if (
             torch_runtime.get("importable") is not True
             or torch_runtime.get("cuda_available") is not True
-            or torch_runtime.get("device_count") != 1
+            or torch_runtime.get("device_count") != expected_devices
         ):
             raise ValueError(
-                "compile-cache launch requires one usable Torch CUDA device"
+                "compile-cache launch requires its exact usable Torch CUDA ranks"
             )
-        validate_compile_runtime_toolchain(
-            key,
-            python_version=platform.python_version(),
-            torch_version=torch_runtime.get("version"),
-            triton_version=_package_version("triton"),
-            torch_cuda_version=torch_runtime.get("cuda_build"),
-            nvcc_cuda_version=_nvcc_release(_command(["nvcc", "--version"])),
-            driver_version=selected.get("driver_version"),
-            gpu_model=selected.get("name"),
-            sm_architecture="sm_" + "".join(components),
-        )
+        for selected in selected_devices:
+            capability = selected.get("compute_capability")
+            if not isinstance(capability, str):
+                raise TypeError("compile-cache launch lacks GPU compute capability")
+            components = capability.split(".")
+            if len(components) != 2 or any(
+                not component.isdecimal() for component in components
+            ):
+                raise ValueError(
+                    "compile-cache launch has invalid GPU compute capability"
+                )
+            validate_compile_runtime_toolchain(
+                key,
+                python_version=platform.python_version(),
+                torch_version=torch_runtime.get("version"),
+                triton_version=_package_version("triton"),
+                torch_cuda_version=torch_runtime.get("cuda_build"),
+                nvcc_cuda_version=_nvcc_release(_command(["nvcc", "--version"])),
+                driver_version=selected.get("driver_version"),
+                gpu_model=selected.get("name"),
+                sm_architecture="sm_" + "".join(components),
+            )
     except BaseException:
         if previous_allocator is None:
             os.environ.pop(_ALLOCATOR_ENVIRONMENT, None)
         else:
             os.environ[_ALLOCATOR_ENVIRONMENT] = previous_allocator
         raise
-    return previous_allocator
+    return previous_allocator, selected_gpu_uuids
 
 
 def _validate_qualification_runtime_environment(
     raw_config: dict[str, object],
     server_argv: list[str],
-) -> str | None:
+) -> tuple[str | None, tuple[str, ...]]:
     """Validate a root-dispatched live suite without the single-GPU cache key."""
 
     _validate_cuda_toolkit_environment()
@@ -424,6 +533,7 @@ def _validate_qualification_runtime_environment(
         config = RunConfig.model_validate(raw_config)
         if raw_config != config.model_dump(mode="json"):
             raise ValueError("qualification RunConfig identity changed")
+        _bind_runtime_adaptation_config(config, server_argv)
         expected_pairs = {
             "--host": "127.0.0.1",
             "--port": _server_flag_value(server_argv, "--port"),
@@ -476,10 +586,25 @@ def _validate_qualification_runtime_environment(
             or _server_flag_value(server_argv, "--cuda-graph-bs-decode") != "1"
         ):
             raise ValueError("qualification fixed-address graph argv differs")
-        torch_runtime = _torch_runtime()
         expected_devices = (
             config.runtime.tensor_parallel_size * config.runtime.data_parallel_size
         )
+        raw_inventory = _command(_GPU_INVENTORY_ARGV)
+        parsed = _parse_gpu_inventory(raw_inventory)
+        inventory = parsed.get("devices")
+        if parsed.get("parse_error") is not None or not isinstance(inventory, list):
+            raise ValueError("qualification launch lacks a valid GPU inventory")
+        selected_devices = _selected_gpus(
+            inventory,
+            expected_count=expected_devices,
+        )
+        selected_gpu_uuids = tuple(device.get("uuid") for device in selected_devices)
+        if selected_gpu_uuids != _config_gpu_uuids(
+            config,
+            expected_count=expected_devices,
+        ):
+            raise ValueError("qualification visible GPU UUID order differs")
+        torch_runtime = _torch_runtime()
         if (
             torch_runtime.get("importable") is not True
             or torch_runtime.get("cuda_available") is not True
@@ -492,13 +617,129 @@ def _validate_qualification_runtime_environment(
         else:
             os.environ[_ALLOCATOR_ENVIRONMENT] = previous_allocator
         raise
-    return previous_allocator
+    return previous_allocator, selected_gpu_uuids
+
+
+def _load_qualification_runtime_bridge_environment():
+    """Deep-reopen the exact qualification source inherited by a child."""
+
+    from lightcone_spec.experiments.formal_single_operator_preflight_qualification import (
+        load_formal_single_operator_preflight_qualification_plan,
+    )
+    from lightcone_spec.runtime.native_qualification_runner import (
+        NativeRuntimeQualificationAssignment,
+        NativeRuntimeQualificationDispatchAuthority,
+    )
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    assignment_path = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_PATH")
+    dispatch_path = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_PATH")
+    dispatch_sha256 = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_SHA256")
+    trusted_path = os.environ.get(
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH"
+    )
+    trusted_sha256 = os.environ.get(
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_SHA256"
+    )
+    if assignment_path is None:
+        raise RuntimeError("qualification launch lacks dispatch-bound inputs")
+    if (dispatch_path is None) != (dispatch_sha256 is None) or (
+        trusted_path is None
+    ) != (trusted_sha256 is None):
+        raise RuntimeError("qualification launch carries an incomplete authority pair")
+    assignment_binding = CanonicalJsonProofBinding.bind(assignment_path)
+    if assignment_binding.semantic_sha256 != os.environ.get(
+        "LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_SHA256"
+    ):
+        raise ValueError("qualification launch environment identity differs")
+    assignment = NativeRuntimeQualificationAssignment.load(
+        assignment_binding.absolute_path
+    )
+    if assignment.schema_version == 1 and dispatch_path is not None:
+        if trusted_path is not None:
+            raise RuntimeError("qualification launch mixes trust authorities")
+        dispatch_binding = CanonicalJsonProofBinding.bind(dispatch_path)
+        if dispatch_binding.semantic_sha256 != dispatch_sha256:
+            raise ValueError("qualification dispatch environment differs")
+        dispatch = NativeRuntimeQualificationDispatchAuthority.from_dict(
+            dispatch_binding.reopen()
+        )
+        dispatch.revalidate(assignment=assignment)
+        qualification_authority_sha256 = dispatch_binding.semantic_sha256
+    elif dispatch_path is None and trusted_path is not None:
+        trusted_binding = CanonicalJsonProofBinding.bind(trusted_path)
+        if trusted_binding.semantic_sha256 != trusted_sha256:
+            raise ValueError("trusted qualification authority environment differs")
+        trusted_value = trusted_binding.reopen()
+        trusted_kind = (
+            trusted_value.get("kind") if type(trusted_value) is dict else None
+        )
+        if trusted_kind == "formal_single_operator_preflight_qualification_plan":
+            if (
+                assignment.schema_version != 2
+                or trusted_binding != assignment.trusted_single_operator_authority
+            ):
+                raise ValueError("trusted preflight authority differs from assignment")
+            trusted_plan = load_formal_single_operator_preflight_qualification_plan(
+                trusted_binding.absolute_path
+            )
+            if (
+                trusted_plan.sha256 != trusted_binding.semantic_sha256
+                or trusted_plan.suite_id != assignment.suite_id
+                or trusted_plan.launch_manifest != assignment.launch_manifest
+                or Path(trusted_plan.assignment_path)
+                != Path(assignment_binding.absolute_path)
+            ):
+                raise ValueError("trusted qualification plan differs from assignment")
+            qualification_authority_sha256 = (
+                trusted_plan.dispatch_authority.semantic_sha256
+            )
+        elif trusted_kind == "formal_single_operator_e6_interface_fit_plan":
+            if assignment.schema_version != 1 or assignment.suite_id != "nextn_tp2":
+                raise ValueError("trusted E6 authority differs from assignment suite")
+            from lightcone_spec.experiments.formal_single_operator_e6_interface import (
+                revalidate_formal_single_operator_e6_interface_fit_plan,
+            )
+
+            trusted_plan = revalidate_formal_single_operator_e6_interface_fit_plan(
+                trusted_binding.absolute_path
+            )
+            if (
+                trusted_plan.sha256 != trusted_binding.semantic_sha256
+                or trusted_plan.native_assignment != assignment_binding
+                or trusted_plan.launch_manifest != assignment.launch_manifest
+                or trusted_plan.gpu_uuids != assignment.gpu_uuids
+                or trusted_plan.topology_sha256 != assignment.topology_sha256
+                or assignment.inventory_sha256 != trusted_plan.inventory.semantic_sha256
+                or Path(trusted_plan.evidence_directory)
+                != Path(assignment.evidence_directory)
+                or Path(assignment_binding.absolute_path).parent
+                != Path(assignment.evidence_directory)
+            ):
+                raise ValueError(
+                    "trusted E6 qualification plan differs from assignment"
+                )
+            qualification_authority_sha256 = trusted_plan.sha256
+        else:
+            raise ValueError("trusted qualification authority kind is unsupported")
+        if CanonicalJsonProofBinding.bind(trusted_path) != trusted_binding:
+            raise ValueError("trusted qualification authority changed during replay")
+    else:
+        if assignment.schema_version == 2:
+            raise RuntimeError(
+                "trusted qualification launch lacks exact no-signature authority"
+            )
+        raise RuntimeError("signed qualification launch lacks exact dispatch")
+    if CanonicalJsonProofBinding.bind(assignment_path) != assignment_binding:
+        raise ValueError("qualification assignment changed during replay")
+    return assignment, qualification_authority_sha256
 
 
 def _install_qualification_runtime_bridge(
     *,
     python_root: str,
     raw_config: dict[str, object],
+    verified_source=None,
 ) -> None:
     """Install an unsigned qualification-only provider after root dispatch replay."""
 
@@ -508,73 +749,16 @@ def _install_qualification_runtime_bridge(
     from lightcone_spec.runtime.distributed import (
         DISTRIBUTED_RUNTIME_RELEASE_CAPABILITIES,
     )
-    from lightcone_spec.runtime.native_qualification_runner import (
-        NativeRuntimeQualificationAssignment,
-        NativeRuntimeQualificationDispatchAuthority,
-    )
-    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
     from lightcone_spec.runtime.readiness import (
         NATIVE_RUNTIME_RELEASE_CAPABILITY,
         NATIVE_RUNTIME_SUITE_CAPABILITIES,
     )
 
-    assignment_path = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_PATH")
-    dispatch_path = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_PATH")
-    trusted_path = os.environ.get(
-        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH"
+    assignment, qualification_authority_sha256 = (
+        _load_qualification_runtime_bridge_environment()
+        if verified_source is None
+        else verified_source
     )
-    if assignment_path is None:
-        raise RuntimeError("qualification launch lacks dispatch-bound inputs")
-    assignment_binding = CanonicalJsonProofBinding.bind(assignment_path)
-    if assignment_binding.semantic_sha256 != os.environ.get(
-        "LIGHTCONE_NATIVE_QUALIFICATION_ASSIGNMENT_SHA256"
-    ):
-        raise ValueError("qualification launch environment identity differs")
-    assignment = NativeRuntimeQualificationAssignment.from_dict(
-        assignment_binding.reopen()
-    )
-    if assignment.schema_version == 1:
-        if dispatch_path is None or trusted_path is not None:
-            raise RuntimeError("signed qualification launch lacks exact dispatch")
-        dispatch_binding = CanonicalJsonProofBinding.bind(dispatch_path)
-        if dispatch_binding.semantic_sha256 != os.environ.get(
-            "LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_SHA256"
-        ):
-            raise ValueError("qualification dispatch environment differs")
-        dispatch = NativeRuntimeQualificationDispatchAuthority.from_dict(
-            dispatch_binding.reopen()
-        )
-        dispatch.revalidate(assignment=assignment)
-        qualification_authority_sha256 = dispatch_binding.semantic_sha256
-    else:
-        if dispatch_path is not None or trusted_path is None:
-            raise RuntimeError(
-                "trusted qualification launch lacks exact no-signature authority"
-            )
-        trusted_binding = CanonicalJsonProofBinding.bind(trusted_path)
-        if (
-            trusted_binding != assignment.trusted_single_operator_authority
-            or trusted_binding.semantic_sha256
-            != os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_SHA256")
-        ):
-            raise ValueError("trusted qualification authority environment differs")
-        trusted_value = trusted_binding.reopen()
-        raw_dispatch = trusted_value.get("dispatch_authority")
-        if type(raw_dispatch) is not dict:
-            raise ValueError("trusted qualification plan lacks dispatch authority")
-        dispatch_binding = CanonicalJsonProofBinding.from_dict(raw_dispatch)
-        dispatch_value = dispatch_binding.reopen()
-        if (
-            dispatch_value.get("kind")
-            != "trusted_single_operator_preflight_qualification_dispatch"
-            or dispatch_value.get("trust_mode")
-            != "trusted_single_operator_no_signature"
-            or dispatch_value.get("formal_measurement") is not False
-            or dispatch_value.get("suite_id") != assignment.suite_id
-            or dispatch_value.get("gpu_uuids") != list(assignment.gpu_uuids)
-        ):
-            raise ValueError("trusted qualification dispatch authority differs")
-        qualification_authority_sha256 = dispatch_binding.semantic_sha256
     config = RunConfig.model_validate(raw_config)
     topology_mode = config.runtime.topology_mode
     if topology_mode not in {"tp1_dp1", "tp2_dp1", "tp1_dp2"}:
@@ -632,6 +816,214 @@ def _install_qualification_runtime_bridge(
         )
 
 
+def _bind_formal_runtime_bridge_source_environment():
+    """Statically bind the production source before CUDA/runtime observation."""
+
+    from lightcone_spec.runtime.trusted_single_operator_runtime import (
+        TRUSTED_SINGLE_OPERATOR_RUNTIME_AUTHORITY_ENVIRONMENT,
+        bind_trusted_single_operator_runtime_authority_environment,
+    )
+
+    binding = bind_trusted_single_operator_runtime_authority_environment(os.environ)
+    qualification = os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_MODE") == "1"
+    if qualification and (
+        binding is not None
+        or any(
+            name in os.environ
+            for name in TRUSTED_SINGLE_OPERATOR_RUNTIME_AUTHORITY_ENVIRONMENT
+        )
+    ):
+        raise ValueError("qualification and formal runtime authority modes conflict")
+    return binding
+
+
+def _raw_config_requires_formal_runtime_authority(
+    raw_config: dict[str, object],
+) -> bool:
+    """Fail closed on the source-owned fields without importing Torch/config."""
+
+    model = raw_config.get("model")
+    runtime = raw_config.get("runtime")
+    if type(model) is not dict or type(runtime) is not dict:
+        raise ValueError("formal runtime authority RunConfig shape differs")
+    algorithm = model.get("algorithm")
+    tp = runtime.get("tensor_parallel_size")
+    # Schema-v3 keeps TP1/DP1 compact by omitting the default DP field.  This
+    # pre-import gate must mirror that exact source encoding without importing
+    # the pydantic config (and therefore Torch-adjacent runtime modules).
+    dp = runtime.get("data_parallel_size", 1)
+    if (
+        algorithm not in {"NONE", "DFLASH", "DSPARK", "NEXTN", "EAGLE3"}
+        or type(tp) is not int
+        or type(dp) is not int
+        or tp < 1
+        or dp < 1
+    ):
+        raise ValueError("formal runtime authority RunConfig identity differs")
+    adaptive = raw_config.get("adaptation") is not None
+    return adaptive and not (algorithm == "DFLASH" and (tp, dp) == (1, 1))
+
+
+def _expected_wrapper_argv(
+    *,
+    checkout: Path,
+    compile_cache_plan: CompileCacheLaunchPlan,
+    compile_cache_plan_path: str,
+    run_config_path: str,
+    run_config_sha256: str,
+    server_argv: list[str],
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-m",
+        "lightcone_spec.sglang_bridge.launch",
+        "--checkout",
+        str(checkout),
+        "--compile-cache-plan",
+        str(Path(compile_cache_plan_path).resolve(strict=False)),
+        "--compile-cache-plan-sha256",
+        compile_cache_plan.sha256,
+        "--compile-cache-key-sha256",
+        compile_cache_plan.key.sha256,
+        "--run-config",
+        str(Path(run_config_path).resolve(strict=False)),
+        "--run-config-sha256",
+        run_config_sha256,
+        "--",
+        *server_argv,
+    )
+
+
+def _revalidate_qualification_runtime_bridge_source(
+    *,
+    raw_config: dict[str, object],
+    compile_cache_plan: CompileCacheLaunchPlan,
+    compile_cache_plan_path: str,
+    run_config_path: str,
+    run_config_sha256: str,
+    checkout: Path,
+    server_argv: list[str],
+    selected_gpu_uuids: tuple[str, ...],
+):
+    """Join a qualification assignment to this exact wrapper invocation."""
+
+    from lightcone_spec.config import RunConfig, load_run_config
+    from lightcone_spec.runtime.compile_runner import CompileLaunchManifest
+
+    assignment, qualification_authority_sha256 = (
+        _load_qualification_runtime_bridge_environment()
+    )
+    config = RunConfig.model_validate(raw_config)
+    launch = CompileLaunchManifest.load(assignment.launch_manifest.absolute_path)
+    source_config = load_run_config(launch.run_config_path)
+    expected_wrapper_argv = _expected_wrapper_argv(
+        checkout=checkout,
+        compile_cache_plan=compile_cache_plan,
+        compile_cache_plan_path=compile_cache_plan_path,
+        run_config_path=run_config_path,
+        run_config_sha256=run_config_sha256,
+        server_argv=server_argv,
+    )
+    if (
+        source_config != config
+        or Path(launch.run_config_path) != Path(run_config_path).resolve(strict=False)
+        or launch.run_config_semantic_sha256 != run_config_sha256
+        or Path(launch.compile_cache_plan_path)
+        != Path(compile_cache_plan_path).resolve(strict=False)
+        or launch.compile_cache_plan_sha256 != compile_cache_plan.sha256
+        or Path(launch.patched_sglang_checkout) != checkout
+        or launch.server_argv != expected_wrapper_argv
+        or launch.gpu_uuids != assignment.gpu_uuids
+        or launch.gpu_uuids != selected_gpu_uuids
+    ):
+        raise ValueError("qualification authority differs from child invocation")
+    return assignment, qualification_authority_sha256
+
+
+def _revalidate_formal_runtime_bridge_source(
+    *,
+    source_binding,
+    raw_config: dict[str, object],
+    compile_cache_plan: CompileCacheLaunchPlan,
+    compile_cache_plan_path: str,
+    run_config_path: str,
+    run_config_sha256: str,
+    checkout: Path,
+    server_argv: list[str],
+    selected_gpu_uuids: tuple[str, ...],
+):
+    """Deep-replay one trusted authority against the exact child invocation."""
+
+    from lightcone_spec.config import RunConfig, load_run_config
+    from lightcone_spec.runtime.compile_runner import CompileLaunchManifest
+    from lightcone_spec.runtime.trusted_single_operator_runtime import (
+        verify_trusted_single_operator_runtime_authority_source,
+    )
+
+    config = RunConfig.model_validate(raw_config)
+    required = _raw_config_requires_formal_runtime_authority(raw_config)
+    if source_binding is None:
+        if required:
+            raise RuntimeError("adaptive runtime lacks trusted empirical authority")
+        return None
+    if not required:
+        raise ValueError("allocation-free runtime carries adaptive GPU authority")
+    source, tokens = verify_trusted_single_operator_runtime_authority_source(
+        source_binding.absolute_path,
+        expected_source_binding=source_binding,
+    )
+    launch = CompileLaunchManifest.load(source.launch_manifest.absolute_path)
+    source_config = load_run_config(launch.run_config_path)
+    expected_wrapper_argv = _expected_wrapper_argv(
+        checkout=checkout,
+        compile_cache_plan=compile_cache_plan,
+        compile_cache_plan_path=compile_cache_plan_path,
+        run_config_path=run_config_path,
+        run_config_sha256=run_config_sha256,
+        server_argv=server_argv,
+    )
+    if (
+        source_config != config
+        or source.algorithm != config.model.algorithm
+        or source.topology_mode != config.runtime.topology_mode
+        or Path(launch.run_config_path) != Path(run_config_path).resolve(strict=False)
+        or launch.run_config_semantic_sha256 != run_config_sha256
+        or Path(launch.compile_cache_plan_path)
+        != Path(compile_cache_plan_path).resolve(strict=False)
+        or launch.compile_cache_plan_sha256 != compile_cache_plan.sha256
+        or Path(launch.patched_sglang_checkout) != checkout
+        or launch.server_argv != expected_wrapper_argv
+        or launch.gpu_uuids != source.gpu_uuids
+        or launch.gpu_uuids != selected_gpu_uuids
+        or tuple(token.role for token in tokens)
+        != tuple(role.role for role in source.roles)
+    ):
+        raise ValueError("formal runtime authority differs from child invocation")
+    return source, tokens
+
+
+def _install_formal_runtime_bridge(*, python_root: str, verified_source) -> None:
+    """Install only deeply-issued trusted tokens into the patched runtime."""
+
+    if verified_source is None:
+        return
+    source, tokens = verified_source
+    original_path = list(sys.path)
+    sys.path.insert(0, python_root)
+    try:
+        from sglang.srt.speculative.native_runtime_release import (
+            formal_rank_publication_hook_provider,
+            register_rank_publication_hook_provider,
+            register_runtime_gpu_proof_provider,
+        )
+    finally:
+        sys.path[:] = original_path
+    supplied = {token.role: token for token in tokens}
+    register_runtime_gpu_proof_provider(lambda: dict(supplied))
+    if source.topology_mode == "tp2_dp1":
+        register_rank_publication_hook_provider(formal_rank_publication_hook_provider)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lightcone-sglang-launch")
     parser.add_argument("--checkout", required=True)
@@ -687,6 +1079,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("SGLang server arguments are required after --")
     if "sglang" in sys.modules:
         raise RuntimeError("sglang was imported before checkout verification")
+    if _ADAPTATION_CONFIG_SHA256_ENVIRONMENT in os.environ:
+        raise ValueError("caller injected an adaptation payload authority")
+    formal_source_binding = _bind_formal_runtime_bridge_source_environment()
     previous_path = os.environ.get("PATH")
     _bind_interpreter_tools()
     try:
@@ -698,20 +1093,61 @@ def main(argv: list[str] | None = None) -> int:
                 "compile-cache plan identity differs from launch authority"
             )
         config = _load_bound_run_config(args.run_config, args.run_config_sha256)
+        qualification_mode = (
+            os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_MODE") == "1"
+        )
+        if (
+            not qualification_mode
+            and formal_source_binding is None
+            and _raw_config_requires_formal_runtime_authority(config)
+        ):
+            raise RuntimeError("adaptive runtime lacks trusted empirical authority")
         if plan.cache_mode != "build":
             raise RuntimeError(
                 "diagnostic_compile_cache_reuse_requires_model_content_authority"
             )
         checkout = verify_patched_checkout(args.checkout)
-        qualification_mode = (
-            os.environ.get("LIGHTCONE_NATIVE_QUALIFICATION_MODE") == "1"
-        )
-        previous_allocator = (
+        previous_allocator, selected_gpu_uuids = (
             _validate_qualification_runtime_environment(config, server_argv)
             if qualification_mode
             else _validate_compile_runtime_environment(plan, config, server_argv)
         )
+        verified_qualification_source = (
+            _revalidate_qualification_runtime_bridge_source(
+                raw_config=config,
+                compile_cache_plan=plan,
+                compile_cache_plan_path=args.compile_cache_plan,
+                run_config_path=args.run_config,
+                run_config_sha256=args.run_config_sha256,
+                checkout=checkout,
+                server_argv=server_argv,
+                selected_gpu_uuids=selected_gpu_uuids,
+            )
+            if qualification_mode
+            else None
+        )
+        verified_formal_source = (
+            None
+            if qualification_mode
+            else _revalidate_formal_runtime_bridge_source(
+                source_binding=formal_source_binding,
+                raw_config=config,
+                compile_cache_plan=plan,
+                compile_cache_plan_path=args.compile_cache_plan,
+                run_config_path=args.run_config,
+                run_config_sha256=args.run_config_sha256,
+                checkout=checkout,
+                server_argv=server_argv,
+                selected_gpu_uuids=selected_gpu_uuids,
+            )
+        )
+        adaptation_config_binding = _bind_runtime_adaptation_config(config, server_argv)
+        if adaptation_config_binding is not None:
+            os.environ[_ADAPTATION_CONFIG_SHA256_ENVIRONMENT] = (
+                adaptation_config_binding.semantic_sha256
+            )
     except BaseException:
+        os.environ.pop(_ADAPTATION_CONFIG_SHA256_ENVIRONMENT, None)
         if previous_path is None:
             os.environ.pop("PATH", None)
         else:
@@ -727,6 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
             _release_builder_receipt=False,
         )
     except BaseException:
+        os.environ.pop(_ADAPTATION_CONFIG_SHA256_ENVIRONMENT, None)
         if previous_allocator is None:
             os.environ.pop(_ALLOCATOR_ENVIRONMENT, None)
         else:
@@ -746,16 +1183,26 @@ def main(argv: list[str] | None = None) -> int:
     }
     managed_environment[_ALLOCATOR_ENVIRONMENT] = previous_allocator
     managed_environment["PATH"] = previous_path
+    managed_environment[_ADAPTATION_CONFIG_SHA256_ENVIRONMENT] = None
     try:
         cache_environment = session.environment(os.environ)
         for name in cache_environment.keys() & managed_environment.keys():
             os.environ[name] = cache_environment[name]
         # A verified disposable checkout is source, never a bytecode cache.
+        if _bind_runtime_adaptation_config(config, server_argv) != (
+            adaptation_config_binding
+        ):
+            raise ValueError("adaptation payload changed before SGLang import")
         sys.dont_write_bytecode = True
         sys.path.insert(0, python_root)
         _install_qualification_runtime_bridge(
             python_root=python_root,
             raw_config=config,
+            verified_source=verified_qualification_source,
+        )
+        _install_formal_runtime_bridge(
+            python_root=python_root,
+            verified_source=verified_formal_source,
         )
         sys.argv = ["sglang.launch_server", *server_argv]
         runpy.run_module("sglang.launch_server", run_name="__main__")

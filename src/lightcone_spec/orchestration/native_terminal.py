@@ -10,6 +10,7 @@ through :class:`AsyncNativeTerminalAdminTransport`.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -47,20 +48,52 @@ from lightcone_spec.runtime.proof_artifact import (
 if TYPE_CHECKING:
     from lightcone_spec.experiments.serving import BoundServingRequest
 
-NATIVE_TERMINAL_EVIDENCE_HOOK = (
+LEGACY_NATIVE_TERMINAL_EVIDENCE_HOOK = (
     "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
+)
+NATIVE_TERMINAL_EVIDENCE_HOOK = (
+    "sglang.schema_v3.content_bound_terminal_speculative_evidence.v2"
 )
 PINNED_SGLANG_UPSTREAM_COMMIT = "3312645a307453893a00778592f105581e3d1c3d"
 PINNED_SGLANG_PATCH_SHA256 = (
-    "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+    "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"
 )
-PINNED_SGLANG_TREE = "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2"
+PINNED_SGLANG_TREE = "bb6371242e82592d1b8a2f5f4ba6d0630d8365cb"
 
 CAPABILITY_PATH = "/v1/lightcone-spec/terminal-evidence/capability"
 TERMINAL_EVIDENCE_PATH = "/v1/lightcone-spec/terminal-evidence"
-NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v1"
+LEGACY_NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v1"
+NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v2"
+_ZERO_SHA256 = "0" * 64
+REQUEST_SOURCE_POINT_RESET_PROTOCOL_CANONICAL_JSON = (
+    b'{"acquired_receipt":{"adaptation_state_acquired":true,'
+    b'"five_reset_predicates":true,"reset_required":true,'
+    b'"state_untouched":false},'
+    b'"admission":"serialized_native_scheduler_v1",'
+    b'"archive":{"canonical_payload":["schema_version",'
+    b'"previous_archive_sha256","request_epoch","request_id",'
+    b'"updates","rounds"],"initial_sha256":"64_zeroes",'
+    b'"order":"native_append_order"},'
+    b'"candidate":"discard_before_restore",'
+    b'"coverage":"every_server_submitted_completed_or_aborted_request",'
+    b'"evidence_key":["request_epoch","request_id","source_round",'
+    b'"source_version"],"epochs":"acquired_contiguous_from_1_unacquired_0",'
+    b'"failure":"sticky_disable_and_terminal_fail",'
+    b'"noop_receipt":{"adaptation_state_acquired":false,'
+    b'"five_reset_predicates":null,"reset_required":false,'
+    b'"state_untouched":true},'
+    b'"optimizer":"restore_initial_zero_moments",'
+    b'"phases":["warmup","scored"],"reset_scope":"request",'
+    b'"terminal_boundary":{"round":"exact_max_archived_or_zero",'
+    b'"version":"exact_max_published_or_zero"},'
+    b'"schema_version":2,"terminal_paths":["completed","aborted"],'
+    b'"zero_evidence_acquired_terminal":true}'
+)
+REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256 = hashlib.sha256(
+    REQUEST_SOURCE_POINT_RESET_PROTOCOL_CANONICAL_JSON
+).hexdigest()
 
-NATIVE_TERMINAL_EVIDENCE_FIELDS = (
+LEGACY_NATIVE_TERMINAL_EVIDENCE_FIELDS = (
     "schema_version",
     "hook",
     "run_id",
@@ -86,6 +119,17 @@ NATIVE_TERMINAL_EVIDENCE_FIELDS = (
     "terminal_sha256",
     "attestation",
 )
+NATIVE_TERMINAL_EVIDENCE_FIELDS = (
+    *LEGACY_NATIVE_TERMINAL_EVIDENCE_FIELDS[:14],
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "runtime_trust_mode",
+    "formal_measurement",
+    *LEGACY_NATIVE_TERMINAL_EVIDENCE_FIELDS[14:20],
+    "request_source_point_resets",
+    *LEGACY_NATIVE_TERMINAL_EVIDENCE_FIELDS[20:],
+)
 _CANDIDATE_METHODS = frozenset({"tts", "l0"})
 _ADAPTIVE_METHODS = frozenset(
     {
@@ -108,6 +152,13 @@ SUPPORTED_METHODS = frozenset(
     }
 )
 _ORDERED_SUPPORTED_METHODS = tuple(sorted(SUPPORTED_METHODS))
+_RUNTIME_TRUST_IDENTITIES = frozenset(
+    {
+        ("release_verified_signature", True),
+        ("qualification_empirical_no_signature", False),
+        ("trusted_single_operator_empirical_no_signature", False),
+    }
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,511}\Z")
@@ -123,8 +174,13 @@ _CAPABILITY_KEYS = {
     "method_evidence_supported",
     "topology_supported",
     "trusted_attester_configured",
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "runtime_trust_mode",
+    "formal_measurement",
 }
-_IDENTITY_KEYS = {
+_LEGACY_IDENTITY_KEYS = {
     "run_id",
     "run_nonce_sha256",
     "execution_plan_sha256",
@@ -136,6 +192,13 @@ _IDENTITY_KEYS = {
     "challenge_nonce_sha256",
     "method",
 }
+_IDENTITY_KEYS = {
+    *_LEGACY_IDENTITY_KEYS,
+    "reset_scope",
+    "request_admission_policy",
+    "runtime_trust_mode",
+    "formal_measurement",
+}
 _BEGIN_RECEIPT_KEYS = {
     "schema_version",
     "kind",
@@ -144,11 +207,19 @@ _BEGIN_RECEIPT_KEYS = {
     "server_process_id",
     "server_process_started_ns",
     "reset_generation",
+    "request_source_point_reset_protocol_sha256",
     "prior_state_sha256",
     "reset_state_sha256",
     "warmup_request_ids_sha256",
     "scored_request_ids_sha256",
     "begin_sha256",
+}
+_LEGACY_BEGIN_RECEIPT_KEYS = _BEGIN_RECEIPT_KEYS - {
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "runtime_trust_mode",
+    "formal_measurement",
 }
 _RESET_RECEIPT_KEYS = {
     "schema_version",
@@ -159,6 +230,7 @@ _RESET_RECEIPT_KEYS = {
     "server_process_started_ns",
     "begin_sha256",
     "reset_generation",
+    "request_source_point_reset_protocol_sha256",
     "prior_trace_run_id",
     "next_trace_run_id",
     "warmup_request_rows_sha256",
@@ -168,7 +240,30 @@ _RESET_RECEIPT_KEYS = {
     "reset_state_sha256",
     "expected_scored_request_ids_sha256",
     "completion_event_generation",
+    "warmup_request_rows",
+    "warmup_round_rows",
+    "warmup_update_rows",
+    "warmup_historical_kv_source_versions",
+    "warmup_request_source_point_resets",
+    "warmup_performance_counters",
+    "warmup_state",
+    "reset_state",
     "reset_sha256",
+}
+_LEGACY_RESET_RECEIPT_KEYS = _RESET_RECEIPT_KEYS - {
+    "reset_scope",
+    "request_admission_policy",
+    "request_source_point_reset_protocol_sha256",
+    "runtime_trust_mode",
+    "formal_measurement",
+    "warmup_request_rows",
+    "warmup_round_rows",
+    "warmup_update_rows",
+    "warmup_historical_kv_source_versions",
+    "warmup_request_source_point_resets",
+    "warmup_performance_counters",
+    "warmup_state",
+    "reset_state",
 }
 _SERVER_REQUEST_KEYS = {
     "request_id",
@@ -200,7 +295,7 @@ _RECONCILED_REQUEST_KEYS = {
     "output_tokens",
     "request_sha256",
 }
-_ROUND_KEYS = {
+_LEGACY_ROUND_KEYS = {
     "request_id",
     "round_index",
     "proposal_source_version",
@@ -212,7 +307,14 @@ _ROUND_KEYS = {
     "historical_kv_source_versions",
     "round_sha256",
 }
-_UPDATE_KEYS = {
+_ROUND_KEYS = {
+    *(_LEGACY_ROUND_KEYS - {"historical_kv_source_versions"}),
+    "historical_kv_source_versions_sha256",
+    "reset_scope",
+    "request_epoch",
+    "request_reset_receipt_sha256",
+}
+_LEGACY_UPDATE_KEYS = {
     "update_index",
     "cohort_sha256",
     "cohort_epoch",
@@ -243,6 +345,57 @@ _UPDATE_KEYS = {
     "optimizer_state_bytes_sha256",
     "proposal_evidence_sha256",
     "update_sha256",
+}
+_UPDATE_KEYS = {
+    *_LEGACY_UPDATE_KEYS,
+    "effective_learning_rate",
+    "schedule_valid",
+    "intrinsic_ready_round",
+    "extra_logical_delay",
+    "publication_round",
+    "reset_scope",
+    "request_epoch",
+    "request_reset_receipt_sha256",
+}
+_REQUEST_ARCHIVE_UPDATE_STRIP_KEYS = {
+    "update_index",
+    "reset_scope",
+    "request_reset_receipt_sha256",
+    "cohort_sha256",
+    "cohort_epoch",
+    "parameter_layout_sha256",
+    "update_sha256",
+}
+_REQUEST_SOURCE_POINT_RESET_KEYS = {
+    "schema_version",
+    "reset_scope",
+    "request_admission_policy",
+    "protocol_sha256",
+    "final_archive_sha256",
+    "receipts",
+}
+_REQUEST_SOURCE_POINT_RESET_RECEIPT_KEYS = {
+    "request_id",
+    "request_epoch",
+    "terminal_outcome",
+    "terminal_round",
+    "terminal_version",
+    "adaptation_state_acquired",
+    "reset_required",
+    "state_untouched",
+    "source_point_identity_sha256",
+    "master_reset",
+    "optimizer_reset",
+    "inference_reset",
+    "captured_state_empty",
+    "runtime_reset",
+    "sticky_disabled_reason",
+    "evidence_archive_sha256",
+    "archived_update_count",
+    "archived_round_count",
+    "previous_receipt_sha256",
+    "protocol_sha256",
+    "receipt_sha256",
 }
 _PERFORMANCE_KEYS = {
     "target_calls",
@@ -370,7 +523,7 @@ _ADAPTATION_MEMORY_LEDGER_KEYS = {
     "optimizer_bytes",
     "peak_bytes",
 }
-_STATE_KEYS = {
+_LEGACY_STATE_KEYS = {
     "schema_version",
     "scheduler_idle",
     "active_requests",
@@ -392,6 +545,17 @@ _STATE_KEYS = {
     "completion_event_generation",
     "completion_event_complete",
 }
+_STATE_KEYS = {
+    *_LEGACY_STATE_KEYS,
+    "adapter_reset_scope",
+    "adapter_request_admission_policy",
+    "adapter_request_source_point_reset_protocol_sha256",
+    "adapter_runtime_trust_mode",
+    "adapter_formal_measurement",
+    "adapter_active_request_id",
+    "adapter_request_epoch",
+    "adapter_source_round",
+}
 _ATTESTATION_KEYS = {
     "schema_version",
     "status",
@@ -401,6 +565,7 @@ _ATTESTATION_KEYS = {
     "trust_domain",
     "signature_hex",
 }
+_LEGACY_TERMINAL_KEYS = set(LEGACY_NATIVE_TERMINAL_EVIDENCE_FIELDS)
 _TERMINAL_KEYS = set(NATIVE_TERMINAL_EVIDENCE_FIELDS)
 _ARTIFACT_KEYS = {
     "schema_version",
@@ -418,7 +583,7 @@ _ARTIFACT_KEYS = {
     "reset",
     "terminal",
 }
-_ARTIFACT_BINDING_KEYS = {
+_LEGACY_ARTIFACT_BINDING_KEYS = {
     "run_id",
     "run_nonce_sha256",
     "execution_plan_sha256",
@@ -431,6 +596,13 @@ _ARTIFACT_BINDING_KEYS = {
     "method",
     "warmup_request_ids",
     "scored_request_ids",
+}
+_ARTIFACT_BINDING_KEYS = {
+    *_LEGACY_ARTIFACT_BINDING_KEYS,
+    "reset_scope",
+    "request_admission_policy",
+    "runtime_trust_mode",
+    "formal_measurement",
 }
 _ARTIFACT_REQUEST_KEYS = {
     "request_id",
@@ -584,8 +756,84 @@ def _token_ids(value: object, field: str) -> tuple[int, ...]:
     return tokens
 
 
-def _identity_values(binding: NativeTerminalRunBinding) -> dict[str, object]:
-    return {
+def _wire_reset_identity(binding: NativeTerminalRunBinding) -> tuple[str, str]:
+    """Map the typed host identity to the only accepted native wire pair."""
+
+    if binding.reset_scope is None and binding.request_admission_policy is None:
+        return "none", "allocation_free"
+    if binding.reset_scope == "request" and binding.request_admission_policy == (
+        "serialized_native_scheduler_v1"
+    ):
+        return binding.reset_scope, binding.request_admission_policy
+    if binding.reset_scope == "cohort" and binding.request_admission_policy == (
+        "cohort_batching_v1"
+    ):
+        return binding.reset_scope, binding.request_admission_policy
+    raise ValueError("native terminal reset identity is not an exact supported pair")
+
+
+def _validate_runtime_trust_identity(
+    *,
+    method: str,
+    runtime_trust_mode: object,
+    formal_measurement: object,
+    field: str,
+) -> tuple[str | None, bool | None]:
+    """Validate the source-owned runtime trust and measurement pair."""
+
+    if (runtime_trust_mode, formal_measurement) == (None, None):
+        return None, None
+    if method in {"target_only", "static"}:
+        raise ValueError(f"{field} allocation-free runtime trust must be null")
+    if (runtime_trust_mode, formal_measurement) not in _RUNTIME_TRUST_IDENTITIES:
+        raise ValueError(f"{field} runtime trust/formal measurement pair differs")
+    assert isinstance(runtime_trust_mode, str)
+    assert isinstance(formal_measurement, bool)
+    return runtime_trust_mode, formal_measurement
+
+
+def _validate_wire_reset_protocol(
+    *,
+    method: str,
+    reset_scope: object,
+    request_admission_policy: object,
+    protocol_sha256: object,
+    field: str,
+) -> str | None:
+    """Validate the source-owned reset identity against the pinned protocol."""
+
+    if method in {"target_only", "static"}:
+        if (
+            reset_scope != "none"
+            or request_admission_policy != "allocation_free"
+            or protocol_sha256 is not None
+        ):
+            raise ValueError(f"{field} allocation-free reset identity differs")
+        return None
+    if method == "tts":
+        expected_pairs = {("request", "serialized_native_scheduler_v1")}
+    elif method.startswith("onlinespec_"):
+        expected_pairs = {("cohort", "cohort_batching_v1")}
+    elif method == "l0":
+        expected_pairs = {
+            ("request", "serialized_native_scheduler_v1"),
+            ("cohort", "cohort_batching_v1"),
+        }
+    else:  # pragma: no cover - callers validate the method first
+        raise ValueError(f"{field} method is unsupported")
+    if (reset_scope, request_admission_policy) not in expected_pairs:
+        raise ValueError(f"{field} reset scope/admission identity differs")
+    if protocol_sha256 != REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256:
+        raise ValueError(f"{field} request reset protocol differs from the pin")
+    return REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+
+
+def _identity_values(
+    binding: NativeTerminalRunBinding,
+    *,
+    legacy: bool = False,
+) -> dict[str, object]:
+    values: dict[str, object] = {
         "run_id": binding.run_id,
         "run_nonce_sha256": binding.run_nonce_sha256,
         "execution_plan_sha256": binding.execution_plan_sha256,
@@ -597,12 +845,33 @@ def _identity_values(binding: NativeTerminalRunBinding) -> dict[str, object]:
         "challenge_nonce_sha256": binding.challenge_nonce_sha256,
         "method": binding.method,
     }
+    if not legacy:
+        reset_scope, request_admission_policy = _wire_reset_identity(binding)
+        runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+            method=binding.method,
+            runtime_trust_mode=binding.runtime_trust_mode,
+            formal_measurement=binding.formal_measurement,
+            field="native terminal binding",
+        )
+        values.update(
+            {
+                "reset_scope": reset_scope,
+                "request_admission_policy": request_admission_policy,
+                "runtime_trust_mode": runtime_trust_mode,
+                "formal_measurement": formal_measurement,
+            }
+        )
+    return values
 
 
 def _validate_bound_identity(
-    value: Mapping[str, object], binding: NativeTerminalRunBinding, field: str
+    value: Mapping[str, object],
+    binding: NativeTerminalRunBinding,
+    field: str,
+    *,
+    legacy: bool = False,
 ) -> None:
-    expected = _identity_values(binding)
+    expected = _identity_values(binding, legacy=legacy)
     if any(
         value.get(name) != expected_value for name, expected_value in expected.items()
     ):
@@ -621,6 +890,10 @@ class NativeTerminalRunBinding:
     previous_run_id: str | None
     challenge_nonce_sha256: str
     method: str
+    reset_scope: str | None
+    request_admission_policy: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     warmup_request_ids: tuple[str, ...]
     scored_request_ids: tuple[str, ...]
 
@@ -638,6 +911,36 @@ class NativeTerminalRunBinding:
         _integer(self.session_epoch, "session_epoch", minimum=1)
         if self.method not in SUPPORTED_METHODS:
             raise ValueError("terminal method is unsupported")
+        reset_scope, request_admission_policy = _wire_reset_identity(self)
+        runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+            method=self.method,
+            runtime_trust_mode=self.runtime_trust_mode,
+            formal_measurement=self.formal_measurement,
+            field="native terminal binding",
+        )
+        if self.method in {"target_only", "static"}:
+            if (reset_scope, request_admission_policy) != (
+                "none",
+                "allocation_free",
+            ) or (runtime_trust_mode, formal_measurement) != (None, None):
+                raise ValueError("allocation-free terminal has adaptation reset state")
+        elif self.method == "tts":
+            if (reset_scope, request_admission_policy) != (
+                "request",
+                "serialized_native_scheduler_v1",
+            ):
+                raise ValueError("TTS terminal requires request-scoped reset identity")
+        elif self.method.startswith("onlinespec_"):
+            if (reset_scope, request_admission_policy) != (
+                "cohort",
+                "cohort_batching_v1",
+            ):
+                raise ValueError("OnlineSPEC terminal requires cohort reset identity")
+        elif (reset_scope, request_admission_policy) not in {
+            ("request", "serialized_native_scheduler_v1"),
+            ("cohort", "cohort_batching_v1"),
+        }:
+            raise ValueError("L0 terminal reset identity is incomplete")
         if not self.scored_request_ids:
             raise ValueError("terminal binding requires scored request IDs")
         for field, request_ids in (
@@ -654,12 +957,50 @@ class NativeTerminalRunBinding:
     def begin_payload(self) -> dict[str, object]:
         self.validate()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             **_identity_values(self),
             "warmup_request_ids": list(self.warmup_request_ids),
             "scored_request_ids": list(self.scored_request_ids),
         }
+
+
+def _validate_legacy_run_binding(binding: NativeTerminalRunBinding) -> None:
+    """Validate a read-only v1 binding whose reset identity was never emitted."""
+
+    if any(
+        value is not None
+        for value in (
+            binding.reset_scope,
+            binding.request_admission_policy,
+            binding.runtime_trust_mode,
+            binding.formal_measurement,
+        )
+    ):
+        raise ValueError("legacy terminal binding cannot invent reset identity")
+    for name in ("run_id", "attempt_id", "session_id"):
+        _safe_id(getattr(binding, name), name)
+    _safe_id(binding.previous_run_id, "previous_run_id", nullable=True)
+    for name in (
+        "run_nonce_sha256",
+        "execution_plan_sha256",
+        "rank_config_sha256",
+        "challenge_nonce_sha256",
+    ):
+        _sha256(getattr(binding, name), name)
+    _integer(binding.session_epoch, "session_epoch", minimum=1)
+    if binding.method not in SUPPORTED_METHODS or not binding.scored_request_ids:
+        raise ValueError("legacy terminal method/request identity is unsupported")
+    for field, request_ids in (
+        ("warmup_request_ids", binding.warmup_request_ids),
+        ("scored_request_ids", binding.scored_request_ids),
+    ):
+        for request_id in request_ids:
+            _safe_id(request_id, field)
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError(f"{field} contains duplicate request IDs")
+    if set(binding.warmup_request_ids) & set(binding.scored_request_ids):
+        raise ValueError("warmup and scored request IDs must be disjoint")
 
 
 @dataclass(frozen=True)
@@ -906,6 +1247,11 @@ class NativeTerminalCapability:
     trusted_attester_configured: bool
     required_fields: tuple[str, ...]
     supported_methods: tuple[str, ...]
+    reset_scope: str
+    request_admission_policy: str
+    request_source_point_reset_protocol_sha256: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     raw_json: str
 
 
@@ -915,6 +1261,9 @@ class NativeTerminalBeginReceipt:
     server_process_id: int
     server_process_started_ns: int
     reset_generation: int
+    request_source_point_reset_protocol_sha256: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     begin_sha256: str
     raw_json: str
 
@@ -926,8 +1275,68 @@ class NativeTerminalResetReceipt:
     server_process_started_ns: int
     reset_generation: int
     completion_event_generation: int
+    request_source_point_reset_protocol_sha256: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     reset_sha256: str
     raw_json: str
+    warmup_requests: tuple[TerminalRequestExpectation, ...] = ()
+    warmup_request_source_point_resets: NativeRequestSourcePointResets | None = None
+
+
+@dataclass(frozen=True)
+class NativeRequestSourcePointResetReceipt:
+    request_id: str
+    request_epoch: int
+    terminal_outcome: str
+    terminal_round: int
+    terminal_version: int
+    adaptation_state_acquired: bool
+    reset_required: bool
+    state_untouched: bool
+    source_point_identity_sha256: str
+    master_reset: bool | None
+    optimizer_reset: bool | None
+    inference_reset: bool | None
+    captured_state_empty: bool | None
+    runtime_reset: bool | None
+    sticky_disabled_reason: str | None
+    evidence_archive_sha256: str
+    archived_update_count: int
+    archived_round_count: int
+    previous_receipt_sha256: str
+    protocol_sha256: str
+    receipt_sha256: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+@dataclass(frozen=True)
+class NativeRequestSourcePointResets:
+    reset_scope: str
+    request_admission_policy: str
+    protocol_sha256: str | None
+    final_archive_sha256: str
+    receipts: tuple[NativeRequestSourcePointResetReceipt, ...]
+
+    @property
+    def receipt_by_sha256(self) -> dict[str, NativeRequestSourcePointResetReceipt]:
+        return {row.receipt_sha256: row for row in self.receipts}
+
+    @property
+    def receipt_by_request_id(self) -> dict[str, NativeRequestSourcePointResetReceipt]:
+        return {row.request_id: row for row in self.receipts}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "reset_scope": self.reset_scope,
+            "request_admission_policy": self.request_admission_policy,
+            "protocol_sha256": self.protocol_sha256,
+            "final_archive_sha256": self.final_archive_sha256,
+            "receipts": [row.to_dict() for row in self.receipts],
+        }
 
 
 @dataclass(frozen=True)
@@ -1064,6 +1473,22 @@ class ValidatedNativeTerminalEvidence:
             raise TypeError("validated terminal JSON stopped being an object")
         return value
 
+    @property
+    def terminal_schema_version(self) -> int:
+        value = self.to_dict().get("schema_version")
+        if type(value) is not int:
+            raise TypeError("validated terminal schema version is malformed")
+        return value
+
+    @property
+    def request_source_point_resets(self) -> NativeRequestSourcePointResets | None:
+        if self.terminal_schema_version == 1:
+            return None
+        value = self.to_dict().get("request_source_point_resets")
+        if type(value) is not dict:  # validated current terminal invariant
+            raise TypeError("validated request reset evidence is malformed")
+        return _request_source_point_resets_from_validated(value)
+
     def to_artifact(
         self,
         *,
@@ -1072,6 +1497,8 @@ class ValidatedNativeTerminalEvidence:
     ) -> dict[str, object]:
         """Return one canonicalizable bundle for durable terminal publication."""
 
+        if self.terminal_schema_version != 2:
+            raise RuntimeError("legacy native terminal evidence is read-only")
         warmup = _validate_request_expectations(
             warmup_requests,
             expected_ids=self.binding.warmup_request_ids,
@@ -1083,7 +1510,7 @@ class ValidatedNativeTerminalEvidence:
             warmup=False,
         )
         artifact: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "artifact_kind": NATIVE_TERMINAL_ARTIFACT_KIND,
             "run_id": self.binding.run_id,
             "rank": rank,
@@ -1127,6 +1554,10 @@ class ValidatedNativeTerminalEvidence:
             request.request_id: len(request.input_token_ids)
             for request in self.requests
         }
+        current = self.terminal_schema_version == 2
+        historical_kv = envelope["historical_kv_source_versions"]
+        if not isinstance(historical_kv, dict):  # validated above
+            raise TypeError("validated historical KV container is malformed")
         rounds = tuple(
             RoundRecord(
                 run_id=self.binding.run_id,
@@ -1143,7 +1574,21 @@ class ValidatedNativeTerminalEvidence:
                 target_calls=int(row["target_calls"]),
                 proposal_source_version=int(row["proposal_source_version"]),
                 kv_source_versions=_canonical_json_text(
-                    row["historical_kv_source_versions"]
+                    historical_kv[str(row["request_id"])]
+                    if current
+                    else row["historical_kv_source_versions"]
+                ),
+                reset_scope=(str(row["reset_scope"]) if current else None),
+                request_epoch=(int(row["request_epoch"]) if current else None),
+                request_reset_receipt_sha256=(
+                    None
+                    if not current or row["request_reset_receipt_sha256"] is None
+                    else str(row["request_reset_receipt_sha256"])
+                ),
+                historical_kv_source_versions_sha256=(
+                    str(row["historical_kv_source_versions_sha256"])
+                    if current
+                    else None
                 ),
             )
             for row in request_round_rows["rounds"]
@@ -1253,6 +1698,30 @@ class ValidatedNativeTerminalEvidence:
                 exactness_violation=row["status"] == "reconstruction_mismatch",
                 stale_candidate=row["status"] == "version_conflict",
                 nonfinite_candidate=row["status"] == "nonfinite_update",
+                reset_scope=(str(row["reset_scope"]) if current else None),
+                request_epoch=(int(row["request_epoch"]) if current else None),
+                request_reset_receipt_sha256=(
+                    None
+                    if not current or row["request_reset_receipt_sha256"] is None
+                    else str(row["request_reset_receipt_sha256"])
+                ),
+                effective_learning_rate=(
+                    float(row["effective_learning_rate"]) if current else None
+                ),
+                schedule_valid=(bool(row["schedule_valid"]) if current else None),
+                intrinsic_ready_round=(
+                    int(row["intrinsic_ready_round"])
+                    if current and row["intrinsic_ready_round"] is not None
+                    else None
+                ),
+                extra_logical_delay=(
+                    int(row["extra_logical_delay"]) if current else None
+                ),
+                publication_round=(
+                    int(row["publication_round"])
+                    if current and row["publication_round"] is not None
+                    else None
+                ),
             )
             for row in envelope["update_rows"]
         )
@@ -1294,10 +1763,14 @@ class NativeTerminalExternalControlBinding:
     session_id: str
     session_epoch: int
     method: str
+    reset_scope: str | None
+    request_admission_policy: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     inventory_sha256: str
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != (
+        if self.schema_version != 2 or self.kind != (
             "native_terminal_external_control_binding"
         ):
             raise ValueError("native terminal control binding schema is unsupported")
@@ -1321,6 +1794,25 @@ class NativeTerminalExternalControlBinding:
         _integer(self.session_epoch, "terminal session epoch", minimum=1)
         if self.method not in SUPPORTED_METHODS:
             raise ValueError("native terminal control method is unsupported")
+        probe = NativeTerminalRunBinding(
+            run_id=self.run_id,
+            run_nonce_sha256=self.run_nonce_sha256,
+            execution_plan_sha256=self.execution_plan_sha256,
+            rank_config_sha256=self.rank_config_sha256,
+            attempt_id=self.attempt_id,
+            session_id=self.session_id,
+            session_epoch=self.session_epoch,
+            previous_run_id=None,
+            challenge_nonce_sha256=_ZERO_SHA256,
+            method=self.method,
+            reset_scope=self.reset_scope,
+            request_admission_policy=self.request_admission_policy,
+            runtime_trust_mode=self.runtime_trust_mode,
+            formal_measurement=self.formal_measurement,
+            warmup_request_ids=(),
+            scored_request_ids=("identity-probe",),
+        )
+        probe.validate()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1337,6 +1829,10 @@ class NativeTerminalExternalControlBinding:
             "session_id": self.session_id,
             "session_epoch": self.session_epoch,
             "method": self.method,
+            "reset_scope": self.reset_scope,
+            "request_admission_policy": self.request_admission_policy,
+            "runtime_trust_mode": self.runtime_trust_mode,
+            "formal_measurement": self.formal_measurement,
             "inventory_sha256": self.inventory_sha256,
         }
 
@@ -1348,7 +1844,7 @@ class NativeTerminalExternalControlBinding:
     def lineage_sha256(self) -> str:
         return canonical_sha256(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "native_terminal_external_control_lineage",
                 "terminal_binding_sha256": self.sha256,
                 "run_id": self.run_id,
@@ -1359,6 +1855,8 @@ class NativeTerminalExternalControlBinding:
                 "session_id": self.session_id,
                 "session_epoch": self.session_epoch,
                 "method": self.method,
+                "reset_scope": self.reset_scope,
+                "request_admission_policy": self.request_admission_policy,
                 "terminal_sha256": self.terminal_sha256,
                 "inventory_sha256": self.inventory_sha256,
             }
@@ -1413,6 +1911,9 @@ class CandidateStateByteIdentity:
     """One source-owned mechanism-replay update byte identity."""
 
     update_index: int
+    reset_scope: str
+    request_epoch: int
+    request_reset_receipt_sha256: str | None
     source_round: int
     source_version: int
     request_ids: tuple[str, ...]
@@ -1426,6 +1927,9 @@ class CandidateStateByteIdentity:
         self,
         *,
         update_index: int,
+        reset_scope: str,
+        request_epoch: int,
+        request_reset_receipt_sha256: str | None,
         source_round: int,
         source_version: int,
         request_ids: tuple[str, ...],
@@ -1454,11 +1958,30 @@ class CandidateStateByteIdentity:
             _safe_id(request_id, "candidate_state.request_id")
         for name, value, minimum in (
             ("update_index", update_index, 0),
+            ("request_epoch", request_epoch, 0),
             ("source_round", source_round, 1),
             ("source_version", source_version, 0),
         ):
             _integer(value, name, minimum=minimum)
         object.__setattr__(self, "update_index", update_index)
+        if reset_scope not in {"request", "cohort"}:
+            raise ValueError("candidate-state reset scope is invalid")
+        if reset_scope == "request":
+            _sha256(
+                request_reset_receipt_sha256,
+                "candidate-state request reset receipt",
+            )
+            if request_epoch < 1:
+                raise ValueError("candidate-state request epoch is invalid")
+        elif request_epoch != 0 or request_reset_receipt_sha256 is not None:
+            raise ValueError("cohort candidate-state carries request reset identity")
+        object.__setattr__(self, "reset_scope", reset_scope)
+        object.__setattr__(self, "request_epoch", request_epoch)
+        object.__setattr__(
+            self,
+            "request_reset_receipt_sha256",
+            request_reset_receipt_sha256,
+        )
         object.__setattr__(self, "source_round", source_round)
         object.__setattr__(self, "source_version", source_version)
         object.__setattr__(self, "request_ids", request_ids)
@@ -1473,6 +1996,9 @@ class CandidateStateByteIdentity:
     def to_dict(self) -> dict[str, object]:
         return {
             "update_index": self.update_index,
+            "reset_scope": self.reset_scope,
+            "request_epoch": self.request_epoch,
+            "request_reset_receipt_sha256": self.request_reset_receipt_sha256,
             "source_round": self.source_round,
             "source_version": self.source_version,
             "request_ids": list(self.request_ids),
@@ -1851,6 +2377,9 @@ class NativeTerminalUpdateResult:
     """Verifier-sealed update row projected from the validated native terminal."""
 
     update_index: int
+    reset_scope: str
+    request_epoch: int
+    request_reset_receipt_sha256: str | None
     status: str
     published_version: int | None
     reconstruction_ok: bool
@@ -1879,6 +2408,9 @@ class NativeTerminalUpdateResult:
             raise TypeError("native update result request IDs are malformed")
         values = {
             "update_index": int(update_row["update_index"]),
+            "reset_scope": str(update_row["reset_scope"]),
+            "request_epoch": int(update_row["request_epoch"]),
+            "request_reset_receipt_sha256": update_row["request_reset_receipt_sha256"],
             "status": str(update_row["status"]),
             "published_version": (
                 None
@@ -1906,6 +2438,9 @@ class NativeTerminalUpdateResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "update_index": self.update_index,
+            "reset_scope": self.reset_scope,
+            "request_epoch": self.request_epoch,
+            "request_reset_receipt_sha256": self.request_reset_receipt_sha256,
             "status": self.status,
             "published_version": self.published_version,
             "reconstruction_ok": self.reconstruction_ok,
@@ -1937,6 +2472,14 @@ class NativeTerminalResultProjection:
     kind: str
     run_id: str
     method: str
+    reset_scope: str | None
+    request_admission_policy: str | None
+    request_source_point_reset_protocol_sha256: str | None
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
+    request_evidence_archive_sha256: str
+    request_source_point_reset_receipt_count: int
+    request_source_point_resets_sha256: str
     run_nonce_sha256: str
     execution_plan_sha256: str
     rank_config_sha256: str
@@ -1971,6 +2514,8 @@ class NativeTerminalResultProjection:
             raise TypeError(
                 "native terminal result requires externally controlled evidence"
             )
+        if evidence.terminal_schema_version != 2:
+            raise RuntimeError("legacy terminal cannot authorize a current result")
         control_values = (
             evidence.external_control_binding_sha256,
             evidence.external_control_envelope_sha256,
@@ -1989,6 +2534,9 @@ class NativeTerminalResultProjection:
         updates = envelope["update_rows"]
         performance = envelope["performance_counters"]
         final_state = envelope["final_state"]
+        request_resets = evidence.request_source_point_resets
+        if request_resets is None:  # current schema invariant
+            raise RuntimeError("native terminal result lacks request reset identity")
         if (
             not isinstance(requests, list)
             or not isinstance(rounds, list)
@@ -2027,6 +2575,38 @@ class NativeTerminalResultProjection:
         object.__setattr__(self, "kind", "native_terminal_result_projection")
         object.__setattr__(self, "run_id", evidence.binding.run_id)
         object.__setattr__(self, "method", evidence.binding.method)
+        object.__setattr__(self, "reset_scope", evidence.binding.reset_scope)
+        object.__setattr__(
+            self,
+            "request_admission_policy",
+            evidence.binding.request_admission_policy,
+        )
+        object.__setattr__(
+            self,
+            "request_source_point_reset_protocol_sha256",
+            request_resets.protocol_sha256,
+        )
+        object.__setattr__(
+            self, "runtime_trust_mode", evidence.binding.runtime_trust_mode
+        )
+        object.__setattr__(
+            self, "formal_measurement", evidence.binding.formal_measurement
+        )
+        object.__setattr__(
+            self,
+            "request_evidence_archive_sha256",
+            request_resets.final_archive_sha256,
+        )
+        object.__setattr__(
+            self,
+            "request_source_point_reset_receipt_count",
+            len(request_resets.receipts),
+        )
+        object.__setattr__(
+            self,
+            "request_source_point_resets_sha256",
+            canonical_sha256(request_resets.to_dict()),
+        )
         object.__setattr__(self, "run_nonce_sha256", evidence.binding.run_nonce_sha256)
         object.__setattr__(
             self, "execution_plan_sha256", evidence.binding.execution_plan_sha256
@@ -2072,6 +2652,20 @@ class NativeTerminalResultProjection:
             "kind": self.kind,
             "run_id": self.run_id,
             "method": self.method,
+            "reset_scope": self.reset_scope,
+            "request_admission_policy": self.request_admission_policy,
+            "request_source_point_reset_protocol_sha256": (
+                self.request_source_point_reset_protocol_sha256
+            ),
+            "runtime_trust_mode": self.runtime_trust_mode,
+            "formal_measurement": self.formal_measurement,
+            "request_evidence_archive_sha256": self.request_evidence_archive_sha256,
+            "request_source_point_reset_receipt_count": (
+                self.request_source_point_reset_receipt_count
+            ),
+            "request_source_point_resets_sha256": (
+                self.request_source_point_resets_sha256
+            ),
             "run_nonce_sha256": self.run_nonce_sha256,
             "execution_plan_sha256": self.execution_plan_sha256,
             "rank_config_sha256": self.rank_config_sha256,
@@ -2356,6 +2950,8 @@ def derive_candidate_state_replay_pointer(
         raise TypeError("candidate-state replay requires exact native evidence")
     if not evidence.trusted_attestation:
         raise RuntimeError("candidate-state replay requires trusted attestation")
+    if evidence.terminal_schema_version != 2:
+        raise RuntimeError("legacy terminal cannot authorize candidate-state replay")
     envelope = evidence.to_dict()
     raw_updates = envelope.get("update_rows")
     if not isinstance(raw_updates, list) or not raw_updates:
@@ -2377,6 +2973,9 @@ def derive_candidate_state_replay_pointer(
         updates.append(
             CandidateStateByteIdentity(
                 update_index=int(raw["update_index"]),
+                reset_scope=str(raw["reset_scope"]),
+                request_epoch=int(raw["request_epoch"]),
+                request_reset_receipt_sha256=raw["request_reset_receipt_sha256"],
                 source_round=int(raw["source_round"]),
                 source_version=int(raw["source_version"]),
                 request_ids=tuple(str(value) for value in raw["request_ids"]),
@@ -2452,7 +3051,7 @@ def project_prepared_candidate_state_replay_pointer(
     )
     pointer = derive_candidate_state_replay_pointer(evidence)
     return CandidateStateReplayProjection(
-        schema_version=1,
+        schema_version=2,
         kind="native_candidate_state_replay_projection_untrusted",
         terminal_binding_sha256=prepared.binding.sha256,
         control_envelope_sha256=verified_control.envelope_sha256,
@@ -2548,18 +3147,47 @@ def _binding_artifact(binding: NativeTerminalRunBinding) -> dict[str, object]:
     }
 
 
-def _binding_from_artifact(value: object) -> NativeTerminalRunBinding:
-    raw = _exact_object(value, _ARTIFACT_BINDING_KEYS, "terminal artifact binding")
+def _binding_from_artifact(
+    value: object,
+    *,
+    legacy: bool = False,
+) -> NativeTerminalRunBinding:
+    raw = _exact_object(
+        value,
+        _LEGACY_ARTIFACT_BINDING_KEYS if legacy else _ARTIFACT_BINDING_KEYS,
+        "terminal artifact binding",
+    )
     warmup = raw.pop("warmup_request_ids")
     scored = raw.pop("scored_request_ids")
     if not isinstance(warmup, list) or not isinstance(scored, list):
         raise TypeError("terminal artifact request IDs must be JSON lists")
+    if legacy:
+        raw.update(
+            {
+                "reset_scope": None,
+                "request_admission_policy": None,
+                "runtime_trust_mode": None,
+                "formal_measurement": None,
+            }
+        )
+    else:
+        reset_scope = raw.get("reset_scope")
+        request_admission_policy = raw.get("request_admission_policy")
+        if (reset_scope, request_admission_policy) == (
+            "none",
+            "allocation_free",
+        ):
+            raw["reset_scope"] = None
+            raw["request_admission_policy"] = None
     binding = NativeTerminalRunBinding(
         **raw,
         warmup_request_ids=tuple(warmup),
         scored_request_ids=tuple(scored),
     )
-    binding.validate()
+    if legacy:
+        _validate_legacy_run_binding(binding)
+    else:
+        binding.validate()
     return binding
 
 
@@ -2610,16 +3238,26 @@ def validate_native_terminal_artifact(
     if type(trusted_attester_policy) is not TrustedAttesterPolicy:
         raise TypeError("terminal artifact requires an exact release policy")
     trusted_attester_policy.validate()
-    raw = _exact_object(
-        reopen_scalable_native_terminal_artifact(value),
-        _ARTIFACT_KEYS,
-        "native terminal artifact",
+    direct_current = (
+        type(value) is dict
+        and value.get("schema_version") == 2
+        and value.get("artifact_kind") == NATIVE_TERMINAL_ARTIFACT_KIND
     )
-    if (
-        raw["schema_version"] != 1
-        or raw["artifact_kind"] != NATIVE_TERMINAL_ARTIFACT_KIND
-        or raw["rank"] != 0
-    ):
+    reopened = (
+        dict(value)
+        if direct_current
+        else reopen_scalable_native_terminal_artifact(value)
+    )
+    raw = _exact_object(reopened, _ARTIFACT_KEYS, "native terminal artifact")
+    legacy = (
+        raw["schema_version"] == 1
+        and raw["artifact_kind"] == LEGACY_NATIVE_TERMINAL_ARTIFACT_KIND
+    )
+    current = (
+        raw["schema_version"] == 2
+        and raw["artifact_kind"] == NATIVE_TERMINAL_ARTIFACT_KIND
+    )
+    if (not legacy and not current) or raw["rank"] != 0:
         raise ValueError("native terminal artifact schema/rank is unsupported")
     policy_sha256 = _sha256(
         raw["trusted_attester_policy_sha256"],
@@ -2627,7 +3265,7 @@ def validate_native_terminal_artifact(
     )
     if policy_sha256 != trusted_attester_policy.sha256:
         raise ValueError("native terminal artifact uses another release policy")
-    binding = _binding_from_artifact(raw["binding"])
+    binding = _binding_from_artifact(raw["binding"], legacy=legacy)
     if raw["run_id"] != binding.run_id:
         raise ValueError("native terminal artifact changed its run identity")
     if expected_binding is not None and binding != expected_binding:
@@ -2655,7 +3293,9 @@ def validate_native_terminal_artifact(
     ):
         raise ValueError("native terminal artifact changed scored expectations")
     begin_raw = _exact_object(
-        raw["begin"], _BEGIN_RECEIPT_KEYS, "artifact begin receipt"
+        raw["begin"],
+        _LEGACY_BEGIN_RECEIPT_KEYS if legacy else _BEGIN_RECEIPT_KEYS,
+        "artifact begin receipt",
     )
     begin_generation = _integer(
         begin_raw["reset_generation"], "artifact begin reset_generation", minimum=1
@@ -2665,11 +3305,13 @@ def validate_native_terminal_artifact(
         binding=binding,
         prior_reset_generation=begin_generation - 1,
         prior_process=None,
+        legacy=legacy,
     )
     reset = _validate_reset_receipt(
         raw["reset"],
         begin=begin,
         warmup_requests=warmup,
+        legacy=legacy,
     )
     terminal = _validate_terminal(
         raw["terminal"],
@@ -2677,6 +3319,7 @@ def validate_native_terminal_artifact(
         reset=reset,
         requests=scored,
         trusted_attester_policy=trusted_attester_policy,
+        legacy=legacy,
     )
     if (
         _sha256(raw["begin_sha256"], "artifact begin_sha256") != begin.begin_sha256
@@ -2707,10 +3350,12 @@ def build_native_terminal_external_control_binding(
         expected_warmup_requests=expected_warmup_requests,
         expected_scored_requests=expected_scored_requests,
     )
+    if evidence.terminal_schema_version != 2:
+        raise RuntimeError("legacy terminal is read-only and cannot be controlled")
     canonical_body = canonical_json_bytes(value) + b"\n"
     binding = evidence.binding
     return NativeTerminalExternalControlBinding(
-        schema_version=1,
+        schema_version=2,
         kind="native_terminal_external_control_binding",
         canonical_raw_sha256=hashlib.sha256(canonical_body).hexdigest(),
         semantic_artifact_sha256=canonical_sha256(value),
@@ -2723,6 +3368,10 @@ def build_native_terminal_external_control_binding(
         session_id=binding.session_id,
         session_epoch=binding.session_epoch,
         method=binding.method,
+        reset_scope=binding.reset_scope,
+        request_admission_policy=binding.request_admission_policy,
+        runtime_trust_mode=binding.runtime_trust_mode,
+        formal_measurement=binding.formal_measurement,
         inventory_sha256=inventory_sha256,
     )
 
@@ -3285,7 +3934,7 @@ def _validate_capability(
     value: object, *, expected_method: str
 ) -> NativeTerminalCapability:
     raw = _exact_object(value, _CAPABILITY_KEYS, "terminal capability")
-    if raw["schema_version"] != 1 or raw["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK:
+    if raw["schema_version"] != 2 or raw["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK:
         raise ValueError("terminal capability schema/hook mismatch")
     required = raw["required_fields"]
     methods = raw["supported_methods"]
@@ -3306,6 +3955,19 @@ def _validate_capability(
     active_method = raw["active_method"]
     if active_method not in SUPPORTED_METHODS or active_method != expected_method:
         raise ValueError("terminal capability active method mismatch")
+    protocol_sha256 = _validate_wire_reset_protocol(
+        method=str(active_method),
+        reset_scope=raw["reset_scope"],
+        request_admission_policy=raw["request_admission_policy"],
+        protocol_sha256=raw["request_source_point_reset_protocol_sha256"],
+        field="terminal capability",
+    )
+    runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+        method=str(active_method),
+        runtime_trust_mode=raw["runtime_trust_mode"],
+        formal_measurement=raw["formal_measurement"],
+        field="terminal capability",
+    )
     if raw["enabled"] and not (
         raw["method_evidence_supported"] and raw["topology_supported"]
     ):
@@ -3320,6 +3982,11 @@ def _validate_capability(
         trusted_attester_configured=bool(raw["trusted_attester_configured"]),
         required_fields=tuple(required),
         supported_methods=tuple(methods),
+        reset_scope=str(raw["reset_scope"]),
+        request_admission_policy=str(raw["request_admission_policy"]),
+        request_source_point_reset_protocol_sha256=protocol_sha256,
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         raw_json=_canonical_json_text(raw),
     )
 
@@ -3330,15 +3997,49 @@ def _validate_begin_receipt(
     binding: NativeTerminalRunBinding,
     prior_reset_generation: int,
     prior_process: tuple[int, int] | None,
+    legacy: bool = False,
+    expected_protocol_sha256: str | None = None,
 ) -> NativeTerminalBeginReceipt:
-    raw = _exact_object(value, _BEGIN_RECEIPT_KEYS, "terminal begin receipt")
+    raw = _exact_object(
+        value,
+        _LEGACY_BEGIN_RECEIPT_KEYS if legacy else _BEGIN_RECEIPT_KEYS,
+        "terminal begin receipt",
+    )
+    expected_hook = (
+        LEGACY_NATIVE_TERMINAL_EVIDENCE_HOOK
+        if legacy
+        else NATIVE_TERMINAL_EVIDENCE_HOOK
+    )
     if (
-        raw["schema_version"] != 1
+        raw["schema_version"] != (1 if legacy else 2)
         or raw["kind"] != "lightcone_terminal_begin_receipt"
-        or raw["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK
+        or raw["hook"] != expected_hook
     ):
         raise ValueError("terminal begin receipt schema/hook mismatch")
-    _validate_bound_identity(raw, binding, "terminal begin receipt")
+    _validate_bound_identity(raw, binding, "terminal begin receipt", legacy=legacy)
+    protocol_sha256 = None
+    runtime_trust_mode: str | None = None
+    formal_measurement: bool | None = None
+    if not legacy:
+        reset_scope, request_admission_policy = _wire_reset_identity(binding)
+        protocol_sha256 = _validate_wire_reset_protocol(
+            method=binding.method,
+            reset_scope=reset_scope,
+            request_admission_policy=request_admission_policy,
+            protocol_sha256=raw["request_source_point_reset_protocol_sha256"],
+            field="terminal begin receipt",
+        )
+        if (
+            expected_protocol_sha256 is not None
+            and protocol_sha256 != expected_protocol_sha256
+        ):
+            raise ValueError("terminal begin protocol differs from capability")
+        runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+            method=binding.method,
+            runtime_trust_mode=raw["runtime_trust_mode"],
+            formal_measurement=raw["formal_measurement"],
+            field="terminal begin receipt",
+        )
     process_id = _integer(raw["server_process_id"], "server_process_id", minimum=1)
     process_started = _integer(
         raw["server_process_started_ns"], "server_process_started_ns", minimum=1
@@ -3371,6 +4072,9 @@ def _validate_begin_receipt(
         server_process_id=process_id,
         server_process_started_ns=process_started,
         reset_generation=generation,
+        request_source_point_reset_protocol_sha256=protocol_sha256,
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         begin_sha256=str(digest),
         raw_json=_canonical_json_text(raw),
     )
@@ -3456,16 +4160,51 @@ def _validate_reset_receipt(
     *,
     begin: NativeTerminalBeginReceipt,
     warmup_requests: tuple[TerminalRequestExpectation, ...],
+    legacy: bool = False,
 ) -> NativeTerminalResetReceipt:
-    raw = _exact_object(value, _RESET_RECEIPT_KEYS, "terminal reset receipt")
+    raw = _exact_object(
+        value,
+        _LEGACY_RESET_RECEIPT_KEYS if legacy else _RESET_RECEIPT_KEYS,
+        "terminal reset receipt",
+    )
     binding = begin.binding
+    expected_hook = (
+        LEGACY_NATIVE_TERMINAL_EVIDENCE_HOOK
+        if legacy
+        else NATIVE_TERMINAL_EVIDENCE_HOOK
+    )
     if (
-        raw["schema_version"] != 1
+        raw["schema_version"] != (1 if legacy else 2)
         or raw["kind"] != "lightcone_terminal_reset_receipt"
-        or raw["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK
+        or raw["hook"] != expected_hook
     ):
         raise ValueError("terminal reset receipt schema/hook mismatch")
-    _validate_bound_identity(raw, binding, "terminal reset receipt")
+    _validate_bound_identity(raw, binding, "terminal reset receipt", legacy=legacy)
+    protocol_sha256 = None
+    runtime_trust_mode: str | None = None
+    formal_measurement: bool | None = None
+    if not legacy:
+        reset_scope, request_admission_policy = _wire_reset_identity(binding)
+        protocol_sha256 = _validate_wire_reset_protocol(
+            method=binding.method,
+            reset_scope=reset_scope,
+            request_admission_policy=request_admission_policy,
+            protocol_sha256=raw["request_source_point_reset_protocol_sha256"],
+            field="terminal reset receipt",
+        )
+        if protocol_sha256 != begin.request_source_point_reset_protocol_sha256:
+            raise ValueError("terminal reset protocol differs from begin")
+        runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+            method=binding.method,
+            runtime_trust_mode=raw["runtime_trust_mode"],
+            formal_measurement=raw["formal_measurement"],
+            field="terminal reset receipt",
+        )
+        if (
+            runtime_trust_mode != begin.runtime_trust_mode
+            or formal_measurement is not begin.formal_measurement
+        ):
+            raise ValueError("terminal reset runtime trust differs from begin")
     if (
         raw["server_process_id"] != begin.server_process_id
         or raw["server_process_started_ns"] != begin.server_process_started_ns
@@ -3502,6 +4241,77 @@ def _validate_reset_receipt(
         "completion_event_generation",
         minimum=1,
     )
+    warmup_resets: NativeRequestSourcePointResets | None = None
+    if not legacy:
+        warmup_rows = _validate_request_rows(
+            raw["warmup_request_rows"],
+            binding=binding,
+            requests=warmup_requests,
+        )
+        if warmup_rows != expected_warmup_rows:
+            raise ValueError("terminal reset embedded warmup requests differ")
+        warmup_performance = _validate_performance(
+            raw["warmup_performance_counters"],
+            method=binding.method,
+            output_tokens=sum(int(row["output_tokens"]) for row in warmup_rows),
+        )
+        if raw["warmup_performance_sha256"] != canonical_sha256(warmup_performance):
+            raise ValueError("terminal reset embedded warmup performance differs")
+        warmup_resets = _validate_request_source_point_resets(
+            raw["warmup_request_source_point_resets"],
+            binding=binding,
+            requests=warmup_requests,
+        )
+        warmup_rounds, _ = _validate_rounds_and_kv(
+            raw["warmup_round_rows"],
+            raw["warmup_historical_kv_source_versions"],
+            binding=binding,
+            requests=warmup_requests,
+            performance=warmup_performance,
+            request_resets=warmup_resets,
+        )
+        warmup_updates = _validate_updates(
+            raw["warmup_update_rows"],
+            binding=binding,
+            rounds=warmup_rounds,
+            performance=warmup_performance,
+            request_resets=warmup_resets,
+        )
+        _validate_request_reset_row_coverage(
+            warmup_resets,
+            requests=warmup_requests,
+            rounds=warmup_rounds,
+            updates=warmup_updates,
+        )
+        warmup_state = _validate_current_state_snapshot(
+            raw["warmup_state"],
+            binding=binding,
+            field="terminal reset warmup state",
+            clean=False,
+        )
+        reset_state = _validate_current_state_snapshot(
+            raw["reset_state"],
+            binding=binding,
+            field="terminal reset clean state",
+            clean=True,
+        )
+        if raw["warmup_state_sha256"] != canonical_sha256(warmup_state) or raw[
+            "reset_state_sha256"
+        ] != canonical_sha256(reset_state):
+            raise ValueError("terminal reset embedded state digest differs")
+        if (
+            warmup_state["allocator_peak_hbm_bytes"]
+            != warmup_performance["peak_hbm_bytes"]
+            or reset_state["completion_event_generation"] != completion_generation
+            or reset_state["completion_event_generation"]
+            <= warmup_state["completion_event_generation"]
+        ):
+            raise RuntimeError("terminal reset embedded state transition differs")
+        if (
+            reset_state["adapter_request_epoch"] != 0
+            or reset_state["adapter_active_request_id"] is not None
+        ):
+            raise RuntimeError("terminal reset retained warmup request ownership")
     unsigned = dict(raw)
     digest = unsigned.pop("reset_sha256")
     if canonical_sha256(unsigned) != digest:
@@ -3512,9 +4322,198 @@ def _validate_reset_receipt(
         server_process_started_ns=begin.server_process_started_ns,
         reset_generation=generation,
         completion_event_generation=completion_generation,
+        request_source_point_reset_protocol_sha256=protocol_sha256,
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         reset_sha256=str(digest),
         raw_json=_canonical_json_text(raw),
+        warmup_requests=warmup_requests,
+        warmup_request_source_point_resets=warmup_resets,
     )
+
+
+def _request_source_point_resets_from_validated(
+    value: Mapping[str, object],
+) -> NativeRequestSourcePointResets:
+    receipts_value = value["receipts"]
+    assert isinstance(receipts_value, list)
+    receipts = tuple(
+        NativeRequestSourcePointResetReceipt(**row)  # type: ignore[arg-type]
+        for row in receipts_value
+    )
+    return NativeRequestSourcePointResets(
+        reset_scope=str(value["reset_scope"]),
+        request_admission_policy=str(value["request_admission_policy"]),
+        protocol_sha256=(
+            None if value["protocol_sha256"] is None else str(value["protocol_sha256"])
+        ),
+        final_archive_sha256=str(value["final_archive_sha256"]),
+        receipts=receipts,
+    )
+
+
+def _validate_request_source_point_resets(
+    value: object,
+    *,
+    binding: NativeTerminalRunBinding,
+    requests: tuple[TerminalRequestExpectation, ...],
+) -> NativeRequestSourcePointResets:
+    raw = _exact_object(
+        value,
+        _REQUEST_SOURCE_POINT_RESET_KEYS,
+        "request source-point resets",
+    )
+    if raw["schema_version"] != 1:
+        raise ValueError("request source-point reset schema is unsupported")
+    reset_scope, request_admission_policy = _wire_reset_identity(binding)
+    if (
+        raw["reset_scope"] != reset_scope
+        or raw["request_admission_policy"] != request_admission_policy
+    ):
+        raise ValueError("request source-point reset identity differs from binding")
+    final_archive = _sha256(raw["final_archive_sha256"], "request reset final archive")
+    receipt_values = raw["receipts"]
+    if not isinstance(receipt_values, list):
+        raise TypeError("request source-point reset receipts must be an array")
+    if reset_scope == "none":
+        if (
+            raw["protocol_sha256"] is not None
+            or receipt_values
+            or final_archive != (_ZERO_SHA256)
+        ):
+            raise RuntimeError("allocation-free terminal reports request reset state")
+        return _request_source_point_resets_from_validated(raw)
+    protocol = _validate_wire_reset_protocol(
+        method=binding.method,
+        reset_scope=reset_scope,
+        request_admission_policy=request_admission_policy,
+        protocol_sha256=raw["protocol_sha256"],
+        field="request source-point resets",
+    )
+    assert protocol is not None
+    if reset_scope == "cohort":
+        if receipt_values or final_archive != _ZERO_SHA256:
+            raise RuntimeError("cohort-scoped terminal reports per-request resets")
+        return _request_source_point_resets_from_validated(raw)
+
+    submitted = tuple(request for request in requests if request.submitted_to_server)
+    expected_by_id = {request.request_id: request for request in submitted}
+    if len(receipt_values) != len(expected_by_id):
+        raise RuntimeError("request reset receipt coverage differs from submission")
+    normalized: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    next_acquired_epoch = 1
+    previous_receipt = _ZERO_SHA256
+    previous_archive = _ZERO_SHA256
+    source_point_identity: str | None = None
+    for receipt_value in receipt_values:
+        receipt = _exact_object(
+            receipt_value,
+            _REQUEST_SOURCE_POINT_RESET_RECEIPT_KEYS,
+            "request source-point reset receipt",
+        )
+        request_id = _safe_id(receipt["request_id"], "request reset request_id")
+        if request_id not in expected_by_id or request_id in seen_ids:
+            raise RuntimeError("request reset receipt is duplicated or non-submitted")
+        seen_ids.add(str(request_id))
+        expectation = expected_by_id[str(request_id)]
+        if receipt["terminal_outcome"] != expectation.terminal_status or receipt[
+            "terminal_outcome"
+        ] not in {"completed", "aborted"}:
+            raise RuntimeError("request reset receipt terminal outcome differs")
+        request_epoch = _integer(
+            receipt["request_epoch"], "request reset epoch", minimum=0
+        )
+        terminal_round = _integer(
+            receipt["terminal_round"], "request reset terminal round", minimum=0
+        )
+        terminal_version = _integer(
+            receipt["terminal_version"], "request reset terminal version", minimum=0
+        )
+        archived_update_count = _integer(
+            receipt["archived_update_count"],
+            "request reset archived update count",
+            minimum=0,
+        )
+        archived_round_count = _integer(
+            receipt["archived_round_count"],
+            "request reset archived round count",
+            minimum=0,
+        )
+        acquired = _boolean(
+            receipt["adaptation_state_acquired"], "request reset acquired"
+        )
+        reset_required = _boolean(receipt["reset_required"], "request reset required")
+        state_untouched = _boolean(
+            receipt["state_untouched"], "request reset state untouched"
+        )
+        predicates = tuple(
+            receipt[name]
+            for name in (
+                "master_reset",
+                "optimizer_reset",
+                "inference_reset",
+                "captured_state_empty",
+                "runtime_reset",
+            )
+        )
+        sticky_reason = receipt["sticky_disabled_reason"]
+        if sticky_reason is not None and (
+            not isinstance(sticky_reason, str) or not sticky_reason
+        ):
+            raise ValueError("request reset sticky reason is malformed")
+        source_point = _sha256(
+            receipt["source_point_identity_sha256"],
+            "request reset source-point identity",
+        )
+        if source_point_identity is None:
+            source_point_identity = source_point
+        elif source_point != source_point_identity:
+            raise RuntimeError("request reset source-point identity changed")
+        evidence_archive = _sha256(
+            receipt["evidence_archive_sha256"], "request reset evidence archive"
+        )
+        if receipt["previous_receipt_sha256"] != previous_receipt:
+            raise RuntimeError("request reset receipt chain is not contiguous")
+        _sha256(receipt["previous_receipt_sha256"], "previous request reset receipt")
+        if receipt["protocol_sha256"] != protocol:
+            raise ValueError("request reset receipt protocol differs")
+        declared = _sha256(receipt["receipt_sha256"], "request reset receipt")
+        unsigned = dict(receipt)
+        unsigned.pop("receipt_sha256")
+        if canonical_sha256(unsigned) != declared:
+            raise ValueError("request reset receipt content digest differs")
+        if acquired:
+            if (
+                not reset_required
+                or state_untouched
+                or request_epoch != next_acquired_epoch
+                or any(value is not True for value in predicates)
+            ):
+                raise RuntimeError("acquired request lacks a required reset epoch")
+            next_acquired_epoch += 1
+        elif (
+            reset_required
+            or not state_untouched
+            or any(value is not None for value in predicates)
+            or request_epoch != 0
+            or receipt["terminal_outcome"] != "aborted"
+            or terminal_round != 0
+            or terminal_version != 0
+            or archived_update_count != 0
+            or archived_round_count != 0
+            or evidence_archive != previous_archive
+        ):
+            raise RuntimeError("unacquired submitted abort reset receipt is invalid")
+        previous_receipt = declared
+        previous_archive = evidence_archive
+        normalized.append(receipt)
+    if set(expected_by_id) != seen_ids:
+        raise RuntimeError("request reset receipt submission coverage is incomplete")
+    if final_archive != previous_archive:
+        raise RuntimeError("request reset final archive differs from receipt chain")
+    raw["receipts"] = normalized
+    return _request_source_point_resets_from_validated(raw)
 
 
 def _validate_request_rows(
@@ -3565,7 +4564,9 @@ def _validate_request_rows(
                 "terminal request tokens/status differ from caller evidence"
             )
         normalized.append(raw)
-    if not seen:  # pragma: no cover - scored IDs are non-empty
+    # Scored IDs are non-empty by binding invariant; a source-owned run may
+    # legitimately configure no warmup requests.
+    if not seen and requests:  # pragma: no cover - scored IDs are non-empty
         raise RuntimeError("terminal request evidence is empty")
     return normalized
 
@@ -3761,17 +4762,17 @@ def _require_ratio(value: object, expected: float | None, field: str) -> None:
         raise RuntimeError(f"{field} disagrees with exact aggregate counts")
 
 
-def _validate_state(
+def _validate_current_state_snapshot(
     value: object,
     *,
-    method: str,
-    reset: NativeTerminalResetReceipt,
-    performance: Mapping[str, object],
+    binding: NativeTerminalRunBinding,
+    field: str,
+    clean: bool,
 ) -> dict[str, object]:
-    raw = _exact_object(value, _STATE_KEYS, "terminal final state")
-    if raw["schema_version"] != 1:
-        raise ValueError("terminal final-state schema is unsupported")
-    for field in (
+    raw = _exact_object(value, _STATE_KEYS, field)
+    if raw["schema_version"] != 2:
+        raise ValueError(f"{field} schema is unsupported")
+    for integer_field in (
         "active_requests",
         "queued_requests",
         "request_pool_active_slots",
@@ -3785,16 +4786,115 @@ def _validate_state(
         "optimizer_generation",
         "telemetry_generation",
         "completion_event_generation",
+        "adapter_request_epoch",
+        "adapter_source_round",
     ):
-        _integer(raw[field], f"final_state.{field}")
-    for field in ("kv_state_sha256", "rng_state_sha256", "adapter_state_sha256"):
-        _sha256(raw[field], f"final_state.{field}")
-    for field in (
+        _integer(raw[integer_field], f"{field}.{integer_field}")
+    for digest_field in ("kv_state_sha256", "rng_state_sha256"):
+        _sha256(raw[digest_field], f"{field}.{digest_field}")
+    if raw["adapter_state_sha256"] is not None:
+        _sha256(raw["adapter_state_sha256"], f"{field}.adapter_state_sha256")
+    _safe_id(
+        raw["adapter_active_request_id"],
+        f"{field}.adapter_active_request_id",
+        nullable=True,
+    )
+    reset_scope, request_admission_policy = _wire_reset_identity(binding)
+    _validate_wire_reset_protocol(
+        method=binding.method,
+        reset_scope=raw["adapter_reset_scope"],
+        request_admission_policy=raw["adapter_request_admission_policy"],
+        protocol_sha256=raw["adapter_request_source_point_reset_protocol_sha256"],
+        field=field,
+    )
+    runtime_trust_mode, formal_measurement = _validate_runtime_trust_identity(
+        method=binding.method,
+        runtime_trust_mode=raw["adapter_runtime_trust_mode"],
+        formal_measurement=raw["adapter_formal_measurement"],
+        field=field,
+    )
+    if (
+        raw["adapter_reset_scope"] != reset_scope
+        or raw["adapter_request_admission_policy"] != request_admission_policy
+        or runtime_trust_mode != binding.runtime_trust_mode
+        or formal_measurement is not binding.formal_measurement
+    ):
+        raise RuntimeError(f"{field} reset/runtime trust identity differs")
+    for boolean_field in (
         "scheduler_idle",
         "adapter_reset_verified",
         "completion_event_complete",
     ):
-        _boolean(raw[field], f"final_state.{field}")
+        _boolean(raw[boolean_field], f"{field}.{boolean_field}")
+    if raw["allocator_peak_hbm_bytes"] < raw["allocator_current_hbm_bytes"]:
+        raise ValueError(f"{field} allocator peak is below current allocation")
+    if raw["kv_available_tokens"] > raw["kv_token_capacity"]:
+        raise ValueError(f"{field} KV availability exceeds capacity")
+    if clean and (
+        not raw["scheduler_idle"]
+        or raw["active_requests"] != 0
+        or raw["queued_requests"] != 0
+        or raw["request_pool_active_slots"] != 0
+        or raw["kv_available_tokens"] != raw["kv_token_capacity"]
+        or raw["adapter_active_version"] != 0
+        or raw["adapter_source_round"] != 0
+        or raw["adapter_active_request_id"] is not None
+        or raw["optimizer_generation"] != 0
+        or not raw["adapter_reset_verified"]
+        or not raw["completion_event_complete"]
+    ):
+        raise RuntimeError(f"{field} is not a clean server state")
+    return raw
+
+
+def _validate_state(
+    value: object,
+    *,
+    binding: NativeTerminalRunBinding,
+    reset: NativeTerminalResetReceipt,
+    performance: Mapping[str, object],
+    request_resets: NativeRequestSourcePointResets | None,
+    legacy: bool,
+) -> dict[str, object]:
+    if legacy:
+        raw = _exact_object(value, _LEGACY_STATE_KEYS, "terminal final state")
+        if raw["schema_version"] != 1:
+            raise ValueError("terminal final-state schema is unsupported")
+        for integer_field in (
+            "active_requests",
+            "queued_requests",
+            "request_pool_active_slots",
+            "allocator_current_hbm_bytes",
+            "allocator_reserved_hbm_bytes",
+            "allocator_peak_hbm_bytes",
+            "kv_token_capacity",
+            "kv_available_tokens",
+            "adapter_active_version",
+            "adapter_epoch",
+            "optimizer_generation",
+            "telemetry_generation",
+            "completion_event_generation",
+        ):
+            _integer(raw[integer_field], f"final_state.{integer_field}")
+        for digest_field in (
+            "kv_state_sha256",
+            "rng_state_sha256",
+            "adapter_state_sha256",
+        ):
+            _sha256(raw[digest_field], f"final_state.{digest_field}")
+        for boolean_field in (
+            "scheduler_idle",
+            "adapter_reset_verified",
+            "completion_event_complete",
+        ):
+            _boolean(raw[boolean_field], f"final_state.{boolean_field}")
+    else:
+        raw = _validate_current_state_snapshot(
+            value,
+            binding=binding,
+            field="terminal final state",
+            clean=False,
+        )
     if (
         not raw["scheduler_idle"]
         or raw["active_requests"] != 0
@@ -3807,12 +4907,9 @@ def _validate_state(
         raise RuntimeError(
             "terminal allocator peak differs from performance peak HBM evidence"
         )
-    if raw["allocator_peak_hbm_bytes"] < raw["allocator_current_hbm_bytes"]:
-        raise ValueError("terminal allocator peak is below current allocation")
-    if raw["kv_available_tokens"] > raw["kv_token_capacity"]:
-        raise ValueError("terminal KV availability exceeds capacity")
     if raw["completion_event_generation"] <= reset.completion_event_generation:
         raise ValueError("terminal completion event does not follow reset")
+    method = binding.method
     if method in {"target_only", "static"} and (
         raw["adapter_active_version"] != 0
         or raw["adapter_epoch"] != 0
@@ -3820,11 +4917,39 @@ def _validate_state(
         or not raw["adapter_reset_verified"]
     ):
         raise RuntimeError("allocation-free final state reports adaptation mutation")
-    if method in _ADAPTIVE_METHODS and (
-        raw["adapter_active_version"] != performance["updates_published"]
-        or raw["optimizer_generation"] != performance["updates_published"]
-    ):
-        raise RuntimeError("adapted final versions disagree with published updates")
+    if method in _ADAPTIVE_METHODS:
+        if not legacy and binding.reset_scope == "request":
+            if request_resets is None:
+                raise RuntimeError("request-scoped final state lacks reset evidence")
+            acquired_epoch = max(
+                (
+                    receipt.request_epoch
+                    for receipt in request_resets.receipts
+                    if receipt.adaptation_state_acquired
+                ),
+                default=0,
+            )
+            if (
+                raw["adapter_active_version"] != 0
+                or raw["optimizer_generation"] != 0
+                or not raw["adapter_reset_verified"]
+                or raw["adapter_active_request_id"] is not None
+                or raw["adapter_request_epoch"] != acquired_epoch
+                or raw["adapter_source_round"] != 0
+            ):
+                raise RuntimeError(
+                    "request-scoped final adaptation state is not at source point"
+                )
+        elif not legacy and (
+            raw["adapter_active_request_id"] is not None
+            or raw["adapter_request_epoch"] != 0
+        ):
+            raise RuntimeError("cohort-scoped final state reports request ownership")
+        elif (
+            raw["adapter_active_version"] != performance["updates_published"]
+            or raw["optimizer_generation"] != performance["updates_published"]
+        ):
+            raise RuntimeError("adapted final versions disagree with published updates")
     return raw
 
 
@@ -3834,7 +4959,9 @@ def _validate_rounds_and_kv(
     *,
     binding: NativeTerminalRunBinding,
     requests: tuple[TerminalRequestExpectation, ...],
-    performance: Mapping[str, object],
+    performance: Mapping[str, object] | None,
+    request_resets: NativeRequestSourcePointResets | None = None,
+    legacy: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     if not isinstance(rounds_value, list):
         raise TypeError("terminal round rows must be a JSON list")
@@ -3845,23 +4972,53 @@ def _validate_rounds_and_kv(
         if rounds_value or kv_value:
             raise RuntimeError("allocation-free evidence contains detailed rounds/KV")
         return [], {}
+    kv_segment_sha256s = {
+        str(request_id): canonical_sha256(segments)
+        for request_id, segments in kv_value.items()
+    }
     expectation = {request.request_id: request for request in requests}
     server_ids = {
         request.request_id for request in requests if request.submitted_to_server
     }
     rows: list[dict[str, object]] = []
-    identities: set[tuple[str, int]] = set()
+    identities: set[tuple[int, str, int]] = set()
     by_request: dict[str, list[dict[str, object]]] = {}
     for value in rounds_value:
-        raw = _exact_object(value, _ROUND_KEYS, "terminal round row")
+        raw = _exact_object(
+            value,
+            _LEGACY_ROUND_KEYS if legacy else _ROUND_KEYS,
+            "terminal round row",
+        )
         request_id = _safe_id(raw["request_id"], "round.request_id")
         if request_id not in server_ids:
             raise RuntimeError("terminal round references a non-submitted request")
         round_index = _integer(raw["round_index"], "round.round_index", minimum=1)
-        identity = (str(request_id), round_index)
+        request_epoch = 0
+        if not legacy:
+            request_epoch = _integer(
+                raw["request_epoch"], "round.request_epoch", minimum=0
+            )
+        identity = (request_epoch, str(request_id), round_index)
         if identity in identities:
             raise RuntimeError("terminal round identity is duplicated")
         identities.add(identity)
+        if not legacy:
+            assert request_resets is not None
+            row_scope = raw["reset_scope"]
+            receipt_sha256 = raw["request_reset_receipt_sha256"]
+            if row_scope != request_resets.reset_scope:
+                raise RuntimeError("terminal round reset scope differs")
+            if row_scope == "request":
+                receipt = request_resets.receipt_by_sha256.get(str(receipt_sha256))
+                if (
+                    receipt is None
+                    or receipt.request_id != request_id
+                    or not receipt.adaptation_state_acquired
+                    or receipt.request_epoch != request_epoch
+                ):
+                    raise RuntimeError("terminal round lacks its exact request reset")
+            elif request_epoch != 0 or receipt_sha256 is not None:
+                raise RuntimeError("cohort round carries request reset identity")
         for field in (
             "proposal_source_version",
             "prefix_len_before",
@@ -3877,10 +5034,17 @@ def _validate_rounds_and_kv(
         accepted = int(raw["accepted_drafts"])
         if committed not in {0, accepted, accepted + 1}:
             raise RuntimeError("terminal round commit/accept closure is inconsistent")
-        if not isinstance(raw["historical_kv_source_versions"], list):
-            raise TypeError("terminal round historical KV value is malformed")
-        if raw["historical_kv_source_versions"] != kv_value.get(request_id):
-            raise RuntimeError("terminal round historical KV differs from terminal map")
+        if legacy:
+            if not isinstance(raw["historical_kv_source_versions"], list):
+                raise TypeError("terminal round historical KV value is malformed")
+            if raw["historical_kv_source_versions"] != kv_value.get(request_id):
+                raise RuntimeError(
+                    "terminal round historical KV differs from terminal map"
+                )
+        elif raw["historical_kv_source_versions_sha256"] != kv_segment_sha256s.get(
+            str(request_id)
+        ):
+            raise RuntimeError("terminal round historical KV digest differs from map")
         digest = _sha256(raw["round_sha256"], "round_sha256")
         unsigned = dict(raw)
         unsigned.pop("round_sha256")
@@ -3888,17 +5052,27 @@ def _validate_rounds_and_kv(
             raise ValueError("terminal round content digest mismatch")
         rows.append(raw)
         by_request.setdefault(str(request_id), []).append(raw)
-    completed = {
-        request.request_id
-        for request in requests
-        if request.submitted_to_server and request.terminal_status == "completed"
-    }
-    if not completed.issubset(by_request):
-        raise RuntimeError("completed adapted request lacks round evidence")
     if set(kv_value) != set(by_request):
         raise RuntimeError("historical KV request coverage differs from rounds")
     for request_id, request_rows in by_request.items():
         request_rows.sort(key=lambda row: int(row["round_index"]))
+        if tuple(int(row["round_index"]) for row in request_rows) != tuple(
+            range(1, len(request_rows) + 1)
+        ):
+            raise RuntimeError("terminal request round indexes are not contiguous")
+        if (
+            not legacy
+            and request_resets is not None
+            and (request_resets.reset_scope == "request")
+        ):
+            versions = tuple(
+                int(row["proposal_source_version"]) for row in request_rows
+            )
+            if versions[0] != 0 or any(
+                right < left or right > left + 1
+                for left, right in itertools.pairwise(versions)
+            ):
+                raise RuntimeError("request-scoped proposal versions did not restart")
         request = expectation[request_id]
         if request.output_token_ids is None:  # submitted invariant
             raise RuntimeError("submitted request lost output token IDs")
@@ -3931,14 +5105,20 @@ def _validate_rounds_and_kv(
             previous_version = version
         if previous_end != prefix:
             raise RuntimeError("historical KV does not cover the reconstructed request")
-    for performance_field, round_field in (
-        ("target_calls", "target_calls"),
-        ("accepted_drafts", "accepted_drafts"),
-        ("committed_tokens", "committed_tokens"),
-        ("verified_drafts", "verify_len"),
-    ):
-        if performance[performance_field] != sum(int(row[round_field]) for row in rows):
-            raise RuntimeError("terminal round aggregates disagree with performance")
+    if performance is not None:
+        for performance_field, round_field in (
+            ("target_calls", "target_calls"),
+            ("accepted_drafts", "accepted_drafts"),
+            ("committed_tokens", "committed_tokens"),
+            ("verified_drafts", "verify_len"),
+        ):
+            observed = sum(int(row[round_field]) for row in rows)
+            if (legacy and performance[performance_field] != observed) or (
+                not legacy and performance[performance_field] < observed
+            ):
+                raise RuntimeError(
+                    "terminal round aggregates disagree with performance"
+                )
     return rows, dict(kv_value)
 
 
@@ -3947,7 +5127,9 @@ def _validate_updates(
     *,
     binding: NativeTerminalRunBinding,
     rounds: list[dict[str, object]],
-    performance: Mapping[str, object],
+    performance: Mapping[str, object] | None,
+    request_resets: NativeRequestSourcePointResets | None = None,
+    legacy: bool = False,
 ) -> list[dict[str, object]]:
     if not isinstance(value, list):
         raise TypeError("terminal update rows must be a JSON list")
@@ -3955,8 +5137,6 @@ def _validate_updates(
         if value:
             raise RuntimeError("allocation-free evidence contains update rows")
         return []
-    if not value:
-        raise RuntimeError("adapted evidence requires update rows")
     round_index = {
         (str(row["request_id"]), int(row["round_index"])): row for row in rounds
     }
@@ -3965,13 +5145,19 @@ def _validate_updates(
         "published",
         "version_conflict",
         "request_aborted",
+        "request_completed_before_publication",
         "no_supervision",
         "nonfinite_update",
         "reconstruction_mismatch",
     }
-    seen_source_identities: set[tuple[int, int]] = set()
+    seen_source_identities: set[tuple[int, int, int]] = set()
+    optimizer_steps_by_epoch: dict[int, list[int]] = {}
     for expected_index, value_row in enumerate(value):
-        raw = _exact_object(value_row, _UPDATE_KEYS, "terminal update row")
+        raw = _exact_object(
+            value_row,
+            _LEGACY_UPDATE_KEYS if legacy else _UPDATE_KEYS,
+            "terminal update row",
+        )
         if raw["update_index"] != expected_index:
             raise RuntimeError("terminal update indexes are not contiguous")
         _sha256(raw["cohort_sha256"], "update.cohort_sha256")
@@ -3994,6 +5180,31 @@ def _validate_updates(
             raise ValueError("terminal update request/prefix coverage is malformed")
         if len(request_ids) != len(set(request_ids)):
             raise RuntimeError("terminal update request IDs are duplicated")
+        request_epoch = 0
+        if not legacy:
+            assert request_resets is not None
+            request_epoch = _integer(
+                raw["request_epoch"], "update.request_epoch", minimum=0
+            )
+            receipt_sha256 = raw["request_reset_receipt_sha256"]
+            if raw["reset_scope"] != request_resets.reset_scope:
+                raise RuntimeError("terminal update reset scope differs")
+            if request_resets.reset_scope == "request":
+                if len(request_ids) != 1:
+                    raise RuntimeError("request-scoped update is not request-exclusive")
+                receipt = request_resets.receipt_by_sha256.get(str(receipt_sha256))
+                if (
+                    receipt is None
+                    or receipt.request_id != request_ids[0]
+                    or not receipt.adaptation_state_acquired
+                    or receipt.request_epoch != request_epoch
+                ):
+                    raise RuntimeError("terminal update lacks its exact request reset")
+                optimizer_steps_by_epoch.setdefault(request_epoch, []).append(
+                    int(raw["optimizer_step"])
+                )
+            elif request_epoch != 0 or receipt_sha256 is not None:
+                raise RuntimeError("cohort update carries request reset identity")
         for request_id, prefix in zip(request_ids, prefixes, strict=True):
             _safe_id(request_id, "update.request_id")
             _integer(prefix, "update.prefix_len_before")
@@ -4012,6 +5223,39 @@ def _validate_updates(
             _integer(published, "update.published_version", minimum=1)
         if (status == "published") != (published is not None):
             raise RuntimeError("terminal update publication identity is inconsistent")
+        if not legacy:
+            _number(
+                raw["effective_learning_rate"],
+                "update.effective_learning_rate",
+                minimum=0,
+            )
+            _boolean(raw["schedule_valid"], "update.schedule_valid")
+            intrinsic_ready_round = raw["intrinsic_ready_round"]
+            if intrinsic_ready_round is not None:
+                _integer(
+                    intrinsic_ready_round,
+                    "update.intrinsic_ready_round",
+                    minimum=0,
+                )
+            logical_delay = _integer(
+                raw["extra_logical_delay"],
+                "update.extra_logical_delay",
+                minimum=0,
+            )
+            publication_round = raw["publication_round"]
+            if publication_round is not None:
+                _integer(
+                    publication_round,
+                    "update.publication_round",
+                    minimum=0,
+                )
+            if status == "published" and (
+                not raw["schedule_valid"]
+                or intrinsic_ready_round is None
+                or publication_round is None
+                or publication_round < intrinsic_ready_round + logical_delay
+            ):
+                raise RuntimeError("published update violates its logical schedule")
         for field in ("reconstruction_ok", "supervision_nonempty"):
             _boolean(raw[field], f"update.{field}")
         _number(raw["loss"], "update.loss", minimum=-1e-6)
@@ -4046,7 +5290,11 @@ def _validate_updates(
         ):
             if digest_value is not None:
                 _sha256(digest_value, f"update.{field}")
-        source_identity = (int(raw["source_round"]), int(raw["source_version"]))
+        source_identity = (
+            request_epoch,
+            int(raw["source_round"]),
+            int(raw["source_version"]),
+        )
         if source_identity in seen_source_identities:
             raise RuntimeError(
                 "terminal update duplicates a source-round/version identity"
@@ -4073,22 +5321,134 @@ def _validate_updates(
         if canonical_sha256(unsigned) != digest:
             raise ValueError("terminal update content digest mismatch")
         rows.append(raw)
-    if performance["updates_launched"] != len(rows):
-        raise RuntimeError("terminal launched-update aggregate differs from rows")
-    published_count = sum(row["status"] == "published" for row in rows)
-    if performance["updates_published"] != published_count:
-        raise RuntimeError("terminal published-update aggregate differs from rows")
-    lower_bounds = {
-        "version_mismatches": sum(row["status"] == "version_conflict" for row in rows),
-        "nonfinite_updates": sum(row["status"] == "nonfinite_update" for row in rows),
-        "exactness_violations": sum(
-            row["status"] == "reconstruction_mismatch" for row in rows
-        ),
-        "fallbacks": sum(row["status"] == "reconstruction_mismatch" for row in rows),
-    }
-    if any(performance[field] < minimum for field, minimum in lower_bounds.items()):
-        raise RuntimeError("terminal safety aggregate undercounts update rows")
+    for request_epoch, optimizer_steps in optimizer_steps_by_epoch.items():
+        if optimizer_steps != list(range(1, len(optimizer_steps) + 1)):
+            raise RuntimeError(
+                f"request epoch {request_epoch} optimizer steps did not restart"
+            )
+    if performance is not None:
+        if performance["updates_launched"] != len(rows):
+            raise RuntimeError("terminal launched-update aggregate differs from rows")
+        published_count = sum(row["status"] == "published" for row in rows)
+        if performance["updates_published"] != published_count:
+            raise RuntimeError("terminal published-update aggregate differs from rows")
+        lower_bounds = {
+            "version_mismatches": sum(
+                row["status"] == "version_conflict" for row in rows
+            ),
+            "nonfinite_updates": sum(
+                row["status"] == "nonfinite_update" for row in rows
+            ),
+            "exactness_violations": sum(
+                row["status"] == "reconstruction_mismatch" for row in rows
+            ),
+            "fallbacks": sum(
+                row["status"] == "reconstruction_mismatch" for row in rows
+            ),
+        }
+        if any(performance[field] < minimum for field, minimum in lower_bounds.items()):
+            raise RuntimeError("terminal safety aggregate undercounts update rows")
     return rows
+
+
+def _validate_request_reset_row_coverage(
+    resets: NativeRequestSourcePointResets,
+    *,
+    requests: tuple[TerminalRequestExpectation, ...],
+    rounds: list[dict[str, object]],
+    updates: list[dict[str, object]],
+) -> None:
+    if resets.reset_scope != "request":
+        return
+    submitted_request_ids = {
+        row.request_id for row in requests if row.submitted_to_server
+    }
+    rounds_by_receipt: dict[str, list[dict[str, object]]] = {}
+    updates_by_receipt: dict[str, list[dict[str, object]]] = {}
+    for row in rounds:
+        rounds_by_receipt.setdefault(
+            str(row["request_reset_receipt_sha256"]), []
+        ).append(row)
+    for row in updates:
+        updates_by_receipt.setdefault(
+            str(row["request_reset_receipt_sha256"]), []
+        ).append(row)
+    known_receipts = resets.receipt_by_sha256
+    if not set(rounds_by_receipt) <= set(known_receipts) or not set(
+        updates_by_receipt
+    ) <= set(known_receipts):
+        raise RuntimeError("terminal rows reference an unknown request reset receipt")
+    archive_sha256 = _ZERO_SHA256
+    for receipt in resets.receipts:
+        if receipt.request_id not in submitted_request_ids:
+            raise RuntimeError("request reset receipt has a foreign submitted request")
+        receipt_rounds = rounds_by_receipt.get(receipt.receipt_sha256, [])
+        receipt_updates = updates_by_receipt.get(receipt.receipt_sha256, [])
+        if receipt.archived_round_count != len(
+            receipt_rounds
+        ) or receipt.archived_update_count != len(receipt_updates):
+            raise RuntimeError("request reset archived row counts differ")
+        terminal_round = max(
+            (int(row["round_index"]) for row in receipt_rounds), default=0
+        )
+        terminal_version = max(
+            (
+                int(row["published_version"])
+                for row in receipt_updates
+                if row["published_version"] is not None
+            ),
+            default=0,
+        )
+        if (
+            terminal_round != receipt.terminal_round
+            or terminal_version != receipt.terminal_version
+        ):
+            raise RuntimeError("request reset rows differ from their terminal boundary")
+        if not receipt.adaptation_state_acquired:
+            if receipt_rounds or receipt_updates:
+                raise RuntimeError("unacquired request carries archived rows")
+            if receipt.evidence_archive_sha256 != archive_sha256:
+                raise RuntimeError("unacquired request changed the evidence archive")
+            continue
+        if [int(row["round_index"]) for row in receipt_rounds] != list(
+            range(1, len(receipt_rounds) + 1)
+        ):
+            raise RuntimeError("request archive round order is not native append order")
+        archived_updates = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in _REQUEST_ARCHIVE_UPDATE_STRIP_KEYS
+            }
+            for row in receipt_updates
+        ]
+        archived_rounds = [
+            {
+                "request_epoch": receipt.request_epoch,
+                "round_index": row["round_index"],
+                "source_version": row["proposal_source_version"],
+                "request_ids": [receipt.request_id],
+                "prefix_len_before": [row["prefix_len_before"]],
+                "verify_len": [row["verify_len"]],
+                "accepted_drafts": [row["accepted_drafts"]],
+                "committed_tokens": [row["committed_tokens"]],
+            }
+            for row in receipt_rounds
+        ]
+        archive_sha256 = canonical_sha256(
+            {
+                "schema_version": 1,
+                "previous_archive_sha256": archive_sha256,
+                "request_epoch": receipt.request_epoch,
+                "request_id": receipt.request_id,
+                "updates": archived_updates,
+                "rounds": archived_rounds,
+            }
+        )
+        if receipt.evidence_archive_sha256 != archive_sha256:
+            raise RuntimeError("request evidence archive replay digest differs")
+    if resets.final_archive_sha256 != archive_sha256:
+        raise RuntimeError("final request evidence archive replay differs")
 
 
 def _attestation_message(envelope: Mapping[str, object]) -> dict[str, object]:
@@ -4194,12 +5554,34 @@ def _validate_terminal(
     reset: NativeTerminalResetReceipt,
     requests: tuple[TerminalRequestExpectation, ...],
     trusted_attester_policy: TrustedAttesterPolicy,
+    legacy: bool = False,
 ) -> ValidatedNativeTerminalEvidence:
-    raw = _exact_object(value, _TERMINAL_KEYS, "terminal evidence")
+    raw = _exact_object(
+        value,
+        _LEGACY_TERMINAL_KEYS if legacy else _TERMINAL_KEYS,
+        "terminal evidence",
+    )
     binding = begin.binding
-    if raw["schema_version"] != 1 or raw["hook"] != NATIVE_TERMINAL_EVIDENCE_HOOK:
+    expected_schema = 1 if legacy else 2
+    expected_hook = (
+        LEGACY_NATIVE_TERMINAL_EVIDENCE_HOOK
+        if legacy
+        else NATIVE_TERMINAL_EVIDENCE_HOOK
+    )
+    if raw["schema_version"] != expected_schema or raw["hook"] != expected_hook:
         raise ValueError("terminal evidence schema/hook mismatch")
-    _validate_bound_identity(raw, binding, "terminal evidence")
+    _validate_bound_identity(raw, binding, "terminal evidence", legacy=legacy)
+    if not legacy:
+        reset_scope, request_admission_policy = _wire_reset_identity(binding)
+        terminal_protocol = _validate_wire_reset_protocol(
+            method=binding.method,
+            reset_scope=reset_scope,
+            request_admission_policy=request_admission_policy,
+            protocol_sha256=raw["request_source_point_reset_protocol_sha256"],
+            field="terminal evidence",
+        )
+        if terminal_protocol != reset.request_source_point_reset_protocol_sha256:
+            raise ValueError("terminal request reset protocol differs from reset")
     if (
         raw["server_process_id"] != begin.server_process_id
         or raw["server_process_started_ns"] != begin.server_process_started_ns
@@ -4230,24 +5612,46 @@ def _validate_terminal(
         method=binding.method,
         output_tokens=output_tokens,
     )
+    request_resets = (
+        None
+        if legacy
+        else _validate_request_source_point_resets(
+            raw["request_source_point_resets"],
+            binding=binding,
+            requests=requests,
+        )
+    )
     rounds, _ = _validate_rounds_and_kv(
         request_round["rounds"],
         raw["historical_kv_source_versions"],
         binding=binding,
         requests=requests,
         performance=performance,
+        request_resets=request_resets,
+        legacy=legacy,
     )
-    _validate_updates(
+    updates = _validate_updates(
         raw["update_rows"],
         binding=binding,
         rounds=rounds,
         performance=performance,
+        request_resets=request_resets,
+        legacy=legacy,
     )
+    if request_resets is not None:
+        _validate_request_reset_row_coverage(
+            request_resets,
+            requests=requests,
+            rounds=rounds,
+            updates=updates,
+        )
     _validate_state(
         raw["final_state"],
-        method=binding.method,
+        binding=binding,
         reset=reset,
         performance=performance,
+        request_resets=request_resets,
+        legacy=legacy,
     )
     attestation = _validate_attestation(
         raw["attestation"],
@@ -4339,7 +5743,17 @@ class NativeTerminalProvider:
                 or binding.attempt_id in self._seen_attempts
             ):
                 raise ValueError("native terminal run/attempt identity was reused")
-            await self.capability(expected_method=binding.method)
+            capability = await self.capability(expected_method=binding.method)
+            reset_scope, request_admission_policy = _wire_reset_identity(binding)
+            if (
+                capability.reset_scope != reset_scope
+                or capability.request_admission_policy != request_admission_policy
+                or capability.runtime_trust_mode != binding.runtime_trust_mode
+                or capability.formal_measurement is not binding.formal_measurement
+            ):
+                raise ValueError(
+                    "native capability differs from the run reset/runtime identity"
+                )
             response = await self._transport.post_json(
                 TERMINAL_EVIDENCE_PATH,
                 {"action": "begin", "payload": binding.begin_payload()},
@@ -4349,6 +5763,9 @@ class NativeTerminalProvider:
                 binding=binding,
                 prior_reset_generation=self._reset_generation,
                 prior_process=self._process,
+                expected_protocol_sha256=(
+                    capability.request_source_point_reset_protocol_sha256
+                ),
             )
             self._binding = binding
             self._begin = receipt

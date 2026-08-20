@@ -9,7 +9,12 @@ from pathlib import Path
 import pyarrow.parquet as pq
 import pytest
 from test_compile_cache_launch import _build_base, _key
-from test_industrial_executor import _execution_fixture, _FakeHandle, _FakeTransport
+from test_industrial_executor import (
+    _clean_project_tree,
+    _execution_fixture,
+    _FakeHandle,
+    _FakeTransport,
+)
 
 from lightcone_spec.cli.main import (
     _canonical_sha256,
@@ -42,6 +47,18 @@ from lightcone_spec.runtime.compile_cache import (
     CompileCacheReceipt,
     start_compile_cache_launch,
 )
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_runtime_envelope_uses_clean_project_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep imported executor fixtures bound to their synthetic clean source."""
+
+    monkeypatch.setattr(
+        "lightcone_spec.doctor._project_tree",
+        _clean_project_tree,
+    )
 
 
 def _compile_source(tmp_path: Path, *, mode: str, label: str):

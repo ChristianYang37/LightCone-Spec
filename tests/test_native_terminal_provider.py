@@ -36,6 +36,7 @@ from lightcone_spec.orchestration.native_terminal import (
     NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256,
     PINNED_SGLANG_PATCH_SHA256,
     PINNED_SGLANG_TREE,
+    REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
     TERMINAL_EVIDENCE_PATH,
     NativeTerminalProvider,
     NativeTerminalResultProjection,
@@ -129,6 +130,15 @@ def _binding(
     identity_suffix: str = "0",
     run_nonce_sha256: str = SHA_A,
 ) -> NativeTerminalRunBinding:
+    if method in {"target_only", "static", "caller_defined"}:
+        reset_scope = None
+        request_admission_policy = None
+    elif method == "tts":
+        reset_scope = "request"
+        request_admission_policy = "serialized_native_scheduler_v1"
+    else:
+        reset_scope = "cohort"
+        request_admission_policy = "cohort_batching_v1"
     return NativeTerminalRunBinding(
         run_id=f"run-{identity_suffix}",
         run_nonce_sha256=run_nonce_sha256,
@@ -140,6 +150,10 @@ def _binding(
         previous_run_id=None,
         challenge_nonce_sha256=SHA_D,
         method=method,
+        reset_scope=reset_scope,
+        request_admission_policy=request_admission_policy,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=warmup,
         scored_request_ids=scored,
     )
@@ -236,6 +250,12 @@ def _client_request(
 
 
 def _identity(binding: NativeTerminalRunBinding) -> dict[str, object]:
+    reset_scope = "none" if binding.reset_scope is None else binding.reset_scope
+    request_admission_policy = (
+        "allocation_free"
+        if binding.request_admission_policy is None
+        else binding.request_admission_policy
+    )
     return {
         "run_id": binding.run_id,
         "run_nonce_sha256": binding.run_nonce_sha256,
@@ -247,6 +267,10 @@ def _identity(binding: NativeTerminalRunBinding) -> dict[str, object]:
         "previous_run_id": binding.previous_run_id,
         "challenge_nonce_sha256": binding.challenge_nonce_sha256,
         "method": binding.method,
+        "reset_scope": reset_scope,
+        "request_admission_policy": request_admission_policy,
+        "runtime_trust_mode": binding.runtime_trust_mode,
+        "formal_measurement": binding.formal_measurement,
     }
 
 
@@ -269,10 +293,24 @@ def _server_row(request: TerminalRequestExpectation) -> dict[str, object]:
     return row
 
 
-def _state(*, method: str, generation: int, published: int = 0) -> dict[str, object]:
-    adapted = method in ADAPTIVE_METHODS
+def _state(
+    *,
+    binding: NativeTerminalRunBinding,
+    generation: int,
+    published: int = 0,
+    request_epoch: int = 0,
+    clean: bool = False,
+) -> dict[str, object]:
+    adapted = binding.method in ADAPTIVE_METHODS
+    request_scoped = binding.reset_scope == "request"
+    reset_scope = "none" if binding.reset_scope is None else binding.reset_scope
+    request_admission_policy = (
+        "allocation_free"
+        if binding.request_admission_policy is None
+        else binding.request_admission_policy
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scheduler_idle": True,
         "active_requests": 0,
         "queued_requests": 0,
@@ -281,14 +319,24 @@ def _state(*, method: str, generation: int, published: int = 0) -> dict[str, obj
         "allocator_reserved_hbm_bytes": 64,
         "allocator_peak_hbm_bytes": 3072,
         "kv_token_capacity": 1024,
-        "kv_available_tokens": 1000 if adapted else 1024,
+        "kv_available_tokens": 1024 if clean or not adapted else 1000,
         "kv_state_sha256": SHA_A,
         "rng_state_sha256": SHA_B,
         "adapter_state_sha256": SHA_C,
         "adapter_reset_verified": True,
-        "adapter_active_version": published if adapted else 0,
+        "adapter_reset_scope": reset_scope,
+        "adapter_request_admission_policy": request_admission_policy,
+        "adapter_request_source_point_reset_protocol_sha256": (
+            REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256 if adapted else None
+        ),
+        "adapter_runtime_trust_mode": binding.runtime_trust_mode,
+        "adapter_formal_measurement": binding.formal_measurement,
+        "adapter_active_request_id": None,
+        "adapter_request_epoch": request_epoch if request_scoped else 0,
+        "adapter_source_round": 0 if request_scoped else published,
+        "adapter_active_version": 0 if request_scoped else published if adapted else 0,
         "adapter_epoch": 1 if adapted else 0,
-        "optimizer_generation": published if adapted else 0,
+        "optimizer_generation": 0 if request_scoped else published if adapted else 0,
         "telemetry_generation": 1 if adapted else 0,
         "completion_event_generation": generation,
         "completion_event_complete": True,
@@ -300,6 +348,7 @@ def _performance(
     method: str,
     output_tokens: int,
     target_calls: int | None = None,
+    update_count: int | None = None,
 ) -> dict[str, object]:
     target_calls = (
         output_tokens
@@ -309,10 +358,11 @@ def _performance(
         else target_calls
     )
     speculative = method != "target_only"
-    accepted = 1 if speculative else None
-    committed = 2 if speculative else None
-    verified = 1 if speculative else None
+    accepted = max(output_tokens - 1, 0) if speculative else None
+    committed = output_tokens if speculative else None
+    verified = accepted if speculative else None
     adapted = method in ADAPTIVE_METHODS
+    observed_update_count = int(adapted) if update_count is None else update_count
     return {
         "target_calls": target_calls,
         "accepted_drafts": accepted,
@@ -371,8 +421,8 @@ def _performance(
         "exposed_update_ms": 0.1 if adapted else None,
         "main_side_overlap_ratio": 0.8 if adapted else None,
         "graph_replay_hit_rate": 1.0,
-        "updates_launched": 1 if adapted else 0,
-        "updates_published": 1 if adapted else 0,
+        "updates_launched": observed_update_count,
+        "updates_published": observed_update_count,
         "exactness_violations": 0 if speculative else None,
         "version_mismatches": 0 if speculative else None,
         "fallbacks": 0 if speculative else None,
@@ -389,30 +439,45 @@ def _performance(
 
 
 def _round_and_update(
+    binding: NativeTerminalRunBinding,
     request: TerminalRequestExpectation,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[str, object],
+    dict[str, object],
+]:
     assert request.output_token_ids is not None
     prefix = len(request.input_token_ids)
     end = prefix + len(request.output_token_ids)
+    committed_tokens = len(request.output_token_ids)
+    accepted_drafts = max(committed_tokens - 1, 0)
     kv = {
         request.request_id: [
             {"start": 0, "end": end, "source_version": 0},
         ]
     }
     round_row: dict[str, object] = {
+        "reset_scope": binding.reset_scope,
+        "request_epoch": 1 if binding.reset_scope == "request" else 0,
+        "request_reset_receipt_sha256": None,
         "request_id": request.request_id,
         "round_index": 1,
         "proposal_source_version": 0,
         "prefix_len_before": prefix,
-        "verify_len": 1,
-        "accepted_drafts": 1,
-        "committed_tokens": 2,
+        "verify_len": accepted_drafts,
+        "accepted_drafts": accepted_drafts,
+        "committed_tokens": committed_tokens,
         "target_calls": 1,
-        "historical_kv_source_versions": kv[request.request_id],
+        "historical_kv_source_versions_sha256": canonical_sha256(
+            kv[request.request_id]
+        ),
     }
-    round_row["round_sha256"] = canonical_sha256(round_row)
     update: dict[str, object] = {
         "update_index": 0,
+        "reset_scope": binding.reset_scope,
+        "request_epoch": 1 if binding.reset_scope == "request" else 0,
+        "request_reset_receipt_sha256": None,
         "cohort_sha256": SHA_E,
         "cohort_epoch": 1,
         "parameter_layout_sha256": SHA_F,
@@ -423,6 +488,11 @@ def _round_and_update(
         "optimizer_step": 1,
         "published_version": 1,
         "status": "published",
+        "effective_learning_rate": 0.001,
+        "schedule_valid": True,
+        "intrinsic_ready_round": 1,
+        "extra_logical_delay": 0,
+        "publication_round": 1,
         "loss": 0.25,
         "gradient_norm": 0.5,
         "reconstruction_ok": True,
@@ -442,8 +512,104 @@ def _round_and_update(
         "optimizer_state_bytes_sha256": SHA_C,
         "proposal_evidence_sha256": SHA_D,
     }
+    if binding.reset_scope == "request":
+        archived_update = {
+            key: value
+            for key, value in update.items()
+            if key
+            not in {
+                "update_index",
+                "reset_scope",
+                "request_reset_receipt_sha256",
+                "cohort_sha256",
+                "cohort_epoch",
+                "parameter_layout_sha256",
+                "update_sha256",
+            }
+        }
+        archived_round = {
+            "request_epoch": 1,
+            "round_index": 1,
+            "source_version": 0,
+            "request_ids": [request.request_id],
+            "prefix_len_before": [prefix],
+            "verify_len": [accepted_drafts],
+            "accepted_drafts": [accepted_drafts],
+            "committed_tokens": [committed_tokens],
+        }
+        archive_sha256 = canonical_sha256(
+            {
+                "schema_version": 1,
+                "previous_archive_sha256": "0" * 64,
+                "request_epoch": 1,
+                "request_id": request.request_id,
+                "updates": [archived_update],
+                "rounds": [archived_round],
+            }
+        )
+        receipt: dict[str, object] = {
+            "request_id": request.request_id,
+            "request_epoch": 1,
+            "terminal_outcome": request.terminal_status,
+            "terminal_round": 1,
+            "terminal_version": 1,
+            "adaptation_state_acquired": True,
+            "reset_required": True,
+            "state_untouched": False,
+            "source_point_identity_sha256": SHA_A,
+            "master_reset": True,
+            "optimizer_reset": True,
+            "inference_reset": True,
+            "captured_state_empty": True,
+            "runtime_reset": True,
+            "sticky_disabled_reason": None,
+            "evidence_archive_sha256": archive_sha256,
+            "archived_update_count": 1,
+            "archived_round_count": 1,
+            "previous_receipt_sha256": "0" * 64,
+            "protocol_sha256": REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
+        }
+        receipt["receipt_sha256"] = canonical_sha256(receipt)
+        receipt_sha256 = receipt["receipt_sha256"]
+        round_row["request_reset_receipt_sha256"] = receipt_sha256
+        update["request_reset_receipt_sha256"] = receipt_sha256
+        receipts = [receipt]
+        final_archive_sha256 = archive_sha256
+    else:
+        receipts = []
+        final_archive_sha256 = "0" * 64
+    round_row["round_sha256"] = canonical_sha256(round_row)
     update["update_sha256"] = canonical_sha256(update)
-    return [round_row], [update], kv
+    resets = {
+        "schema_version": 1,
+        "reset_scope": binding.reset_scope,
+        "request_admission_policy": binding.request_admission_policy,
+        "protocol_sha256": REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
+        "final_archive_sha256": final_archive_sha256,
+        "receipts": receipts,
+    }
+    return [round_row], [update], kv, resets
+
+
+def _empty_request_resets(
+    binding: NativeTerminalRunBinding,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "reset_scope": "none" if binding.reset_scope is None else binding.reset_scope,
+        "request_admission_policy": (
+            "allocation_free"
+            if binding.request_admission_policy is None
+            else binding.request_admission_policy
+        ),
+        "protocol_sha256": (
+            REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            if binding.method in ADAPTIVE_METHODS
+            else None
+        ),
+        "final_archive_sha256": "0" * 64,
+        "receipts": [],
+    }
 
 
 class FakeAdminTransport:
@@ -481,13 +647,30 @@ class FakeAdminTransport:
 
     async def get_json(self, path: str) -> object:
         self.get_paths.append(path)
+        reset_scope = (
+            "none" if self.binding.reset_scope is None else self.binding.reset_scope
+        )
+        request_admission_policy = (
+            "allocation_free"
+            if self.binding.request_admission_policy is None
+            else self.binding.request_admission_policy
+        )
         value: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
             "supported_methods": sorted(SUPPORTED_METHODS),
             "enabled": True,
             "active_method": self.binding.method,
+            "reset_scope": reset_scope,
+            "request_admission_policy": request_admission_policy,
+            "request_source_point_reset_protocol_sha256": (
+                REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                if self.binding.method in ADAPTIVE_METHODS
+                else None
+            ),
+            "runtime_trust_mode": self.binding.runtime_trust_mode,
+            "formal_measurement": self.binding.formal_measurement,
             "method_evidence_supported": True,
             "topology_supported": True,
             "trusted_attester_configured": self.attester_id is not None,
@@ -518,13 +701,18 @@ class FakeAdminTransport:
     def _begin(self, payload: dict[str, object]) -> dict[str, object]:
         assert payload == self.binding.begin_payload()
         value: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "lightcone_terminal_begin_receipt",
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             **_identity(self.binding),
             "server_process_id": 1234,
             "server_process_started_ns": 1_000_000,
             "reset_generation": 1,
+            "request_source_point_reset_protocol_sha256": (
+                REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                if self.binding.method in ADAPTIVE_METHODS
+                else None
+            ),
             "prior_state_sha256": SHA_A,
             "reset_state_sha256": SHA_B,
             "warmup_request_ids_sha256": canonical_sha256(
@@ -544,8 +732,30 @@ class FakeAdminTransport:
             "run_id": self.binding.run_id,
             "begin_sha256": self.begin_receipt["begin_sha256"],
         }
+        warmup_rows = [_server_row(request) for request in self.warmup]
+        if self.binding.method in ADAPTIVE_METHODS and self.warmup:
+            warmup_rounds, warmup_updates, warmup_kv, warmup_resets = _round_and_update(
+                self.binding, self.warmup[0]
+            )
+        else:
+            warmup_rounds, warmup_updates, warmup_kv = [], [], {}
+            warmup_resets = _empty_request_resets(self.binding)
+        warmup_performance = _performance(
+            method=self.binding.method,
+            output_tokens=sum(
+                len(request.output_token_ids or ()) for request in self.warmup
+            ),
+            update_count=len(warmup_updates),
+        )
+        warmup_state = _state(
+            binding=self.binding,
+            generation=3,
+            published=sum(row["status"] == "published" for row in warmup_updates),
+            request_epoch=len(warmup_resets["receipts"]),
+        )
+        reset_state = _state(binding=self.binding, generation=4, clean=True)
         value: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "lightcone_terminal_reset_receipt",
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             **_identity(self.binding),
@@ -553,19 +763,30 @@ class FakeAdminTransport:
             "server_process_started_ns": 1_000_000,
             "begin_sha256": self.begin_receipt["begin_sha256"],
             "reset_generation": 2,
+            "request_source_point_reset_protocol_sha256": (
+                REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                if self.binding.method in ADAPTIVE_METHODS
+                else None
+            ),
             "prior_trace_run_id": self.binding.previous_run_id,
             "next_trace_run_id": self.binding.run_id,
-            "warmup_request_rows_sha256": canonical_sha256(
-                [_server_row(request) for request in self.warmup]
-            ),
-            "warmup_performance_sha256": SHA_C,
+            "warmup_request_rows_sha256": canonical_sha256(warmup_rows),
+            "warmup_performance_sha256": canonical_sha256(warmup_performance),
             "discarded_native_sha256": SHA_D,
-            "warmup_state_sha256": SHA_E,
-            "reset_state_sha256": SHA_F,
+            "warmup_state_sha256": canonical_sha256(warmup_state),
+            "reset_state_sha256": canonical_sha256(reset_state),
             "expected_scored_request_ids_sha256": canonical_sha256(
                 list(self.binding.scored_request_ids)
             ),
             "completion_event_generation": 4,
+            "warmup_request_rows": warmup_rows,
+            "warmup_round_rows": warmup_rounds,
+            "warmup_update_rows": warmup_updates,
+            "warmup_historical_kv_source_versions": warmup_kv,
+            "warmup_request_source_point_resets": warmup_resets,
+            "warmup_performance_counters": warmup_performance,
+            "warmup_state": warmup_state,
+            "reset_state": reset_state,
         }
         value["reset_sha256"] = canonical_sha256(value)
         return value
@@ -618,17 +839,26 @@ class FakeAdminTransport:
             request_rows.append(row)
         output_tokens = sum(int(row["output_tokens"]) for row in request_rows)
         if self.binding.method in ADAPTIVE_METHODS:
-            rounds, updates, kv = _round_and_update(self.scored[0])
+            rounds, updates, kv, request_resets = _round_and_update(
+                self.binding, self.scored[0]
+            )
         else:
             rounds, updates, kv = [], [], {}
+            request_resets = _empty_request_resets(self.binding)
         performance = _performance(
             method=self.binding.method,
             output_tokens=output_tokens,
+            update_count=len(updates),
         )
         value: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             **_identity(self.binding),
+            "request_source_point_reset_protocol_sha256": (
+                REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+                if self.binding.method in ADAPTIVE_METHODS
+                else None
+            ),
             "server_process_id": 1234,
             "server_process_started_ns": 1_000_000,
             "expected_request_ids": list(self.binding.scored_request_ids),
@@ -637,10 +867,12 @@ class FakeAdminTransport:
             "update_rows": updates,
             "performance_counters": performance,
             "historical_kv_source_versions": kv,
+            "request_source_point_resets": request_resets,
             "final_state": _state(
-                method=self.binding.method,
+                binding=self.binding,
                 generation=5,
                 published=1 if self.binding.method in ADAPTIVE_METHODS else 0,
+                request_epoch=len(request_resets["receipts"]),
             ),
             "completion_marker": "TERMINAL_COMPLETE",
         }
@@ -1816,11 +2048,11 @@ def test_writer_exclusively_persists_the_canonical_native_bundle(
 
 def test_final_hook_patch_and_tree_are_exactly_pinned() -> None:
     assert NATIVE_TERMINAL_EVIDENCE_HOOK == (
-        "sglang.schema_v3.content_bound_terminal_speculative_evidence.v1"
+        "sglang.schema_v3.content_bound_terminal_speculative_evidence.v2"
     )
     assert PINNED_SGLANG_PATCH_SHA256 == (
-        "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+        "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"
     )
-    assert PINNED_SGLANG_TREE == "c6571336b70cd5f0e0f609d731a65fa98fd7e0b2"
+    assert PINNED_SGLANG_TREE == "bb6371242e82592d1b8a2f5f4ba6d0630d8365cb"
     assert canonical_sha256({"b": 2, "a": 1}) == canonical_sha256({"a": 1, "b": 2})
     assert canonical_json_bytes({"b": 2, "a": 1}) == b'{"a":1,"b":2}'

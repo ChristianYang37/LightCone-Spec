@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
+from lightcone_spec.orchestration import formal_terminal_shards as shards_module
 from lightcone_spec.orchestration.formal_terminal_shards import (
+    LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
     SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
     SHARDED_UNSIGNED_NATIVE_ITL_BUNDLE_KIND,
     publish_scalable_client_request_lifecycle,
@@ -21,6 +24,20 @@ from lightcone_spec.orchestration.formal_terminal_shards import (
     reopen_scalable_native_terminal_artifact,
     reopen_scalable_unsigned_native_itl_bundle,
 )
+from lightcone_spec.orchestration.native_terminal import (
+    validate_native_terminal_artifact,
+)
+from lightcone_spec.runtime.attestation import NO_TRUSTED_ATTESTERS
+
+_RESET_FIXTURE_PATH = Path(__file__).with_name(
+    "test_native_terminal_request_reset_v2.py"
+)
+_RESET_FIXTURE_SPEC = importlib.util.spec_from_file_location(
+    "_lightcone_test_native_terminal_request_reset_v2", _RESET_FIXTURE_PATH
+)
+assert _RESET_FIXTURE_SPEC is not None and _RESET_FIXTURE_SPEC.loader is not None
+_RESET_FIXTURE_MODULE = importlib.util.module_from_spec(_RESET_FIXTURE_SPEC)
+_RESET_FIXTURE_SPEC.loader.exec_module(_RESET_FIXTURE_MODULE)
 
 
 def _large_terminal_artifact(request_count: int = 10_000) -> dict[str, object]:
@@ -136,17 +153,17 @@ def _assert_bounded_json_tree(root: Path) -> None:
     assert max(path.stat().st_size for path in paths) < 2_000_000
 
 
-def test_small_terminal_container_preserves_legacy_schema_and_bytes(
+def test_legacy_inline_terminal_is_read_only_compatible(
     tmp_path: Path,
 ) -> None:
     artifact = _large_terminal_artifact(request_count=1)
     output = tmp_path / "terminal.json"
-    binding = publish_scalable_native_terminal_artifact(
-        output_path=output,
-        legacy_artifact=artifact,
-    )
-    assert binding.reopen() == artifact
-    assert reopen_scalable_native_terminal_artifact(binding.reopen()) == artifact
+    assert reopen_scalable_native_terminal_artifact(artifact) == artifact
+    with pytest.raises(ValueError, match="current schema 2"):
+        publish_scalable_native_terminal_artifact(
+            output_path=output,
+            legacy_artifact=artifact,
+        )
 
 
 def test_ten_thousand_request_terminal_is_sharded_and_deep_reopened(
@@ -154,12 +171,12 @@ def test_ten_thousand_request_terminal_is_sharded_and_deep_reopened(
 ) -> None:
     artifact = _large_terminal_artifact()
     output = tmp_path / "terminal.json"
-    binding = publish_scalable_native_terminal_artifact(
+    binding = shards_module._publish_legacy_scalable_native_terminal_artifact(
         output_path=output,
         legacy_artifact=artifact,
     )
     header = binding.reopen()
-    assert header["artifact_kind"] == SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+    assert header["artifact_kind"] == LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
     assert reopen_scalable_native_terminal_artifact(header) == artifact
     _assert_bounded_json_tree(tmp_path)
 
@@ -168,6 +185,44 @@ def test_ten_thousand_request_terminal_is_sharded_and_deep_reopened(
     mutated = json.loads(first_shard.read_text())
     mutated["rows"][0]["terminal_reason"] = "changed"
     first_shard.write_text(
+        json.dumps(mutated, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    with pytest.raises((RuntimeError, ValueError), match="changed|binding|shard"):
+        reopen_scalable_native_terminal_artifact(header)
+
+
+def test_current_terminal_shards_reconstruct_warmup_and_scored_reset_archives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence, warmup, scored = _RESET_FIXTURE_MODULE.validated_zero_row_terminal()
+    artifact = evidence.to_artifact(warmup_requests=warmup)
+    monkeypatch.setattr(shards_module, "_INLINE_MAX_BYTES", 1)
+    output = tmp_path / "current-terminal.json"
+    binding = publish_scalable_native_terminal_artifact(
+        output_path=output,
+        legacy_artifact=artifact,
+    )
+    header = binding.reopen()
+    assert header["schema_version"] == 3
+    assert header["artifact_kind"] == SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+    reopened = reopen_scalable_native_terminal_artifact(header)
+    assert reopened == artifact
+    validated = validate_native_terminal_artifact(
+        reopened,
+        trusted_attester_policy=NO_TRUSTED_ATTESTERS,
+        expected_binding=evidence.binding,
+        expected_warmup_requests=warmup,
+        expected_scored_requests=scored,
+    )
+    assert validated.reset_receipt.warmup_request_source_point_resets is not None
+    assert validated.request_source_point_resets is not None
+
+    receipt_index = header["sequence_indexes"]["terminal_request_reset_receipts"]
+    receipt_shard = Path(receipt_index["absolute_path"]).parent / "shard-000000.json"
+    mutated = json.loads(receipt_shard.read_text())
+    mutated["rows"][0]["terminal_round"] = 1
+    receipt_shard.write_text(
         json.dumps(mutated, sort_keys=True, separators=(",", ":")) + "\n"
     )
     with pytest.raises((RuntimeError, ValueError), match="changed|binding|shard"):
@@ -369,3 +424,89 @@ def test_ten_thousand_request_gang_terminal_pointer_and_rank_rows_roundtrip(
     assert not tuple(tmp_path.rglob("warmup-events-*"))
     assert not tuple(tmp_path.rglob("scored-events-*"))
     _assert_bounded_json_tree(tmp_path)
+
+
+def test_current_formal_gang_shards_rank_reset_and_diagnostics_sequences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence, _warmup, _scored = _RESET_FIXTURE_MODULE.validated_zero_row_terminal()
+    terminal = evidence.to_dict()
+    resets = terminal["request_source_point_resets"]
+    rank_terminals = []
+    for rank in range(2):
+        native_state = {
+            "scheduler": {"idle": True},
+            "round_rows": terminal["request_round_rows"]["rounds"],
+            "update_rows": terminal["update_rows"],
+            "performance_counters": terminal["performance_counters"],
+            "historical_kv_source_versions": terminal["historical_kv_source_versions"],
+            "request_source_point_resets": resets,
+            "adaptation": {
+                "schema_version": 3,
+                "reset_scope": "request",
+                "request_admission_policy": "serialized_native_scheduler_v1",
+                "request_source_point_reset_protocol_sha256": resets["protocol_sha256"],
+                "request_source_point_reset_receipts": resets["receipts"],
+                "rounds": [],
+                "updates": [],
+            },
+        }
+        rank_terminals.append(
+            {
+                "schema_version": 2,
+                "kind": "sglang_formal_gang_rank_terminal",
+                "rank": rank,
+                "request_terminals": [],
+                "request_terminal_sha256s": [],
+                "native_state": native_state,
+            }
+        )
+    gang_terminal = {
+        "schema_version": 2,
+        "kind": "sglang_formal_gang_all_rank_terminal",
+        "action": "formal_gang_reset",
+        "rank_terminals": rank_terminals,
+        "rank_terminal_sha256s": ["7" * 64, "8" * 64],
+        "aggregate_sha256": "9" * 64,
+    }
+    monkeypatch.setattr(shards_module, "_INLINE_MAX_BYTES", 1)
+    binding = publish_scalable_formal_gang_terminal(
+        output_path=tmp_path / "current-gang.json",
+        legacy_terminal=gang_terminal,
+    )
+    header = binding.reopen()
+    assert header["schema_version"] == 3
+    assert header["kind"] == shards_module.SHARDED_FORMAL_GANG_TERMINAL_KIND
+    assert reopen_scalable_formal_gang_terminal(header) == gang_terminal
+
+    request_terminal = {
+        "schema_version": 2,
+        "kind": "unsigned_formal_gang_request_terminal_v2",
+        "protocol_sha256": "0" * 64,
+        "formal_execution_authorized": False,
+        "plan_sha256": "1" * 64,
+        "formal_launch_admission": None,
+        "formal_launch_consumption": None,
+        "budget_consumption": None,
+        "capability_sha256": "2" * 64,
+        "begin_sha256": "3" * 64,
+        "reset_sha256": gang_terminal["aggregate_sha256"],
+        "finalize_sha256": "4" * 64,
+        "formal_gang_reset": binding.to_dict(),
+        "warmup_requests": [{"request_id": "score-0"}],
+        "scored_requests": [{"request_id": "score-1"}],
+    }
+    request_binding = publish_scalable_formal_gang_request_terminal(
+        output_path=tmp_path / "current-gang-request.json",
+        legacy_terminal=request_terminal,
+    )
+    request_header = request_binding.reopen()
+    assert request_header["schema_version"] == 3
+    assert (
+        request_header["kind"]
+        == shards_module.SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND
+    )
+    assert (
+        reopen_scalable_formal_gang_request_terminal(request_header) == request_terminal
+    )

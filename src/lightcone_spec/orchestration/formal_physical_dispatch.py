@@ -65,6 +65,7 @@ from lightcone_spec.experiments.workload_authority import (
     FormalWorkloadAuthority,
     FormalWorkloadId,
     FormalWorkloadSample,
+    bind_formal_workload_authority,
     formal_workload_authority_artifact_id,
     formal_workload_authority_cli_artifact,
     formal_workload_authority_from_cli_artifact,
@@ -85,11 +86,15 @@ from lightcone_spec.orchestration.live_sglang import (
     _observe_live_server_execution_policy,
     _publish_gpu_snapshot_error,
     _require_port_unused,
+    _require_source_owned_server_executable,
     _terminate_process_group,
     _wait_server_ready,
     execute_unsigned_native_serving_run,
 )
-from lightcone_spec.orchestration.native_terminal import NativeTerminalRunBinding
+from lightcone_spec.orchestration.native_terminal import (
+    REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
+    NativeTerminalRunBinding,
+)
 from lightcone_spec.runtime.backend import (
     VerifiedEagle3E0ExecutionAuthority,
     VerifiedNextNTp2Authority,
@@ -2634,15 +2639,101 @@ def _workload_id_for_cell(cell: MaterializedCell) -> str:
         raise ValueError(
             "formal request schedule is BLOCKED: task_native_dataset_unsupported"
         )
+    if cell.stage == "TTS-Cal":
+        # The typed tuning window below owns the exact 76-row complement.  The
+        # workload router still has to select its root LiveCodeBench authority
+        # before that window can be reopened and reduced.
+        return "livecodebench_v6_hard"
     task = cell.task.casefold()
     regime = str(dict(cell.dimensions).get("regime", "")).casefold()
     if "math" in task or "long_input" in regime or "short_output" in regime:
         return "math500_level5"
-    if cell.stage == "TTS-Cal":
-        raise ValueError(
-            "formal request schedule is BLOCKED: tuning_window_reducer_required"
-        )
     return "livecodebench_v6_hard"
+
+
+def _materialize_trusted_single_operator_workload_source(
+    *,
+    content_source_binding: FormalContentSourceBinding,
+    cell: MaterializedCell,
+    private_output_root: str | Path,
+) -> Path:
+    """Resolve one cell's workload only from its deeply reopened content bundle."""
+
+    from lightcone_spec.experiments.formal_single_operator_content import (
+        TrustedSingleOperatorContentBundle,
+    )
+    from lightcone_spec.experiments.formal_single_operator_e0_workloads import (
+        E0TaskNativeSourceAuthority,
+        load_e0_task_native_source_authority,
+    )
+
+    if (
+        type(content_source_binding) is not FormalContentSourceBinding
+        or content_source_binding.mode != "trusted_single_operator"
+    ):
+        raise ValueError("trusted workload resolver requires tagged trusted content")
+    bundle = content_source_binding.reopen()
+    if (
+        type(bundle) is not TrustedSingleOperatorContentBundle
+        or bundle.runtime_binding_status != "BOUND"
+    ):
+        raise ValueError("trusted workload resolver requires one BOUND content bundle")
+
+    workload_id = _workload_id_for_cell(cell)
+    if workload_id in {"livecodebench_v6_hard", "math500_level5"}:
+        members = tuple(
+            row for row in bundle.locked_workloads if row.workload_id == workload_id
+        )
+        if len(members) != 1:
+            raise ValueError(
+                "trusted workload resolver lacks one exact locked workload"
+            )
+        member = members[0]
+        authority = bind_formal_workload_authority(
+            member.workload_id,
+            member.raw_source_path,
+        )
+        if (
+            authority.sha256 != member.authority_sha256
+            or authority.raw_source_path != member.raw_source_path
+            or authority.raw_file_sha256 != member.raw_file_sha256
+            or authority.repository_revision != member.repository_revision
+            or authority.raw_row_count != member.raw_row_count
+            or authority.selected_row_count != member.selected_row_count
+            or authority.selected_rows_sha256 != member.formal_samples_sha256
+            or authority.source_lock_sha256 != member.source_lock_sha256
+            or authority.protocol_sha256 != member.protocol_sha256
+        ):
+            raise ValueError("trusted workload resolver differs from locked workload")
+        output = (
+            _private_output_root(private_output_root) / "trusted-workload-source.json"
+        )
+        publish_canonical_json_no_replace(
+            output,
+            formal_workload_authority_cli_artifact(authority),
+        )
+        binding = ContentJsonArtifactBinding.from_path(
+            formal_workload_authority_artifact_id(authority.workload_id),
+            output,
+        )
+        if formal_workload_authority_from_cli_artifact(binding.load()) != authority:
+            raise RuntimeError("trusted workload publication changed")
+        return output
+
+    descriptors = tuple(
+        row for row in bundle.e0_task_native_descriptors if row.task == workload_id
+    )
+    if len(descriptors) != 1:
+        raise ValueError("trusted workload resolver lacks one exact E0 descriptor")
+    descriptor = descriptors[0]
+    workload = load_e0_task_native_source_authority(descriptor.source.absolute_path)
+    if (
+        type(workload) is not E0TaskNativeSourceAuthority
+        or workload.task != workload_id
+        or workload.support_status != "READY"
+    ):
+        raise ValueError("trusted workload resolver E0 source is not serving-ready")
+    return Path(descriptor.source.absolute_path)
 
 
 def _root_verified_workload_source(
@@ -2707,6 +2798,7 @@ def _tts_calibration_window_samples(
             entry.workload_id != workload.workload_id
             or entry.source_descriptor_sha256 != workload_descriptor_sha256
             or sample is None
+            or sample.source_row_id != entry.source_problem_id
             or _sha256(sample.prompt) != entry.prompt_sha256
         ):
             raise ValueError(
@@ -3200,6 +3292,7 @@ def rebuild_trusted_single_operator_request_schedule_source(
                 if (
                     entry.workload_id != workload_source.workload_id
                     or sample is None
+                    or sample.source_row_id != entry.source_problem_id
                     or _sha256(sample.prompt) != entry.prompt_sha256
                 ):
                     raise ValueError("trusted TTS tuning entry differs from workload")
@@ -4730,9 +4823,21 @@ def materialize_trusted_single_operator_request_schedule(
     if cell.stage == "TTS-Cal":
         if tts_calibration_authority_path is None:
             raise ValueError("trusted TTS schedule lacks method authority")
+        trusted_protocol_sources = protocol_lock.trusted_single_operator_source_bindings
+        if trusted_protocol_sources is None:
+            raise ValueError("trusted TTS schedule lacks ProtocolLock sources")
+        expected_tts_source = trusted_protocol_sources.tts_calibration_authority_source
         tts_authority_binding = CanonicalJsonProofBinding.bind(
             tts_calibration_authority_path
         )
+        if (
+            tts_authority_binding.absolute_path != expected_tts_source.absolute_path
+            or tts_authority_binding.raw_sha256 != expected_tts_source.raw_sha256
+            or tts_authority_binding.semantic_sha256
+            != expected_tts_source.semantic_sha256
+            or tts_authority_binding.size != expected_tts_source.size
+        ):
+            raise ValueError("trusted TTS method authority source differs")
         tts_artifact = load_tts_calibration_authority_artifact(
             tts_authority_binding.absolute_path
         )
@@ -5006,8 +5111,70 @@ def _materialize_single_operator_direct_schedule(
     cell: MaterializedCell,
     subject_sha256: str,
 ) -> FormalServingRequestScheduleReceipt:
-    """Create a local request schedule without replaying content signatures."""
+    """Create a local schedule from the exact release or trusted content lane."""
 
+    if preflight_inputs.schema_version in {3, 4}:
+        from lightcone_spec.experiments.formal_registry import (
+            protocol_lock_from_dict,
+        )
+        from lightcone_spec.experiments.formal_single_operator_stages import (
+            load_formal_single_operator_execution_source,
+        )
+
+        content_source = preflight_inputs.content_source_binding
+        if (
+            type(content_source) is not FormalContentSourceBinding
+            or content_source.mode != "trusted_single_operator"
+            or preflight_inputs.content_receipt is not None
+        ):
+            raise ValueError("single-operator trusted schedule content lane differs")
+        source_execution = load_formal_single_operator_execution_source(
+            inputs.execution_source.absolute_path
+        )
+        if (
+            source_execution.schema_version != 3
+            or source_execution.content_source_binding != content_source
+        ):
+            raise ValueError("single-operator trusted schedule content lineage differs")
+        # This deep-reopens the exact BOUND bundle carried by both schema-4
+        # preflight and the current execution source.  The schema-5 materializer
+        # below independently repeats that replay and binds workload/TTS inputs.
+        content_source.reopen()
+        protocol_lock = protocol_lock_from_dict(
+            source_execution.protocol_lock_source.reopen(
+                label="single-operator trusted schedule ProtocolLock"
+            )
+        )
+        trusted_sources = protocol_lock.trusted_single_operator_source_bindings
+        if protocol_lock.schema_version != 5 or trusted_sources is None:
+            raise ValueError("single-operator trusted schedule ProtocolLock differs")
+        tts_authority_path = (
+            trusted_sources.tts_calibration_authority_source.absolute_path
+            if cell.stage == "TTS-Cal"
+            else None
+        )
+        workload_source_path = _materialize_trusted_single_operator_workload_source(
+            content_source_binding=content_source,
+            cell=cell,
+            private_output_root=inputs.private_output_root,
+        )
+        return materialize_trusted_single_operator_request_schedule(
+            execution_source_path=inputs.execution_source.absolute_path,
+            materialized_cell_id=cell.cell_id,
+            compile_launch_manifest_path=(inputs.compile_launch_manifest.absolute_path),
+            workload_source_path=workload_source_path,
+            execution_binding_sha256=input_binding.semantic_sha256,
+            subject_sha256=subject_sha256,
+            private_output_root=inputs.private_output_root,
+            tts_calibration_authority_path=tts_authority_path,
+        )
+    if (
+        preflight_inputs.schema_version != 2
+        or preflight_inputs.content_source_binding is not None
+        or preflight_inputs.content_receipt is None
+        or launch.schema_version != 1
+    ):
+        raise ValueError("single-operator release schedule content lane differs")
     root = _private_output_root(inputs.private_output_root)
     content = ContentVerificationReceipt.from_dict(
         preflight_inputs.content_receipt.reopen()
@@ -5128,6 +5295,10 @@ def _native_binding_to_dict(value: NativeTerminalRunBinding) -> dict[str, object
         "previous_run_id": value.previous_run_id,
         "challenge_nonce_sha256": value.challenge_nonce_sha256,
         "method": value.method,
+        "reset_scope": value.reset_scope,
+        "request_admission_policy": value.request_admission_policy,
+        "runtime_trust_mode": value.runtime_trust_mode,
+        "formal_measurement": value.formal_measurement,
         "warmup_request_ids": list(value.warmup_request_ids),
         "scored_request_ids": list(value.scored_request_ids),
     }
@@ -5148,6 +5319,10 @@ def _native_binding_from_dict(value: object) -> NativeTerminalRunBinding:
             "previous_run_id",
             "challenge_nonce_sha256",
             "method",
+            "reset_scope",
+            "request_admission_policy",
+            "runtime_trust_mode",
+            "formal_measurement",
             "warmup_request_ids",
             "scored_request_ids",
         },
@@ -5535,6 +5710,7 @@ class FormalServingRunPlan:
     formal_gang_terminal_output_path: str | None
     fatal_output_path: str
     single_operator_execution_rebuild_source: CanonicalJsonProofBinding | None = None
+    trusted_runtime_authority_source: CanonicalJsonProofBinding | None = None
     nextn_mtp_mode: Literal["built_in_mtp"] | None = None
     target_snapshot_sha256: str | None = None
     mtp_component_sha256: str | None = None
@@ -5571,7 +5747,10 @@ class FormalServingRunPlan:
         ):
             raise ValueError("legacy physical plan carries current timing policy")
         if self.schema_version == 1:
-            if self.single_operator_execution_rebuild_source is not None:
+            if (
+                self.single_operator_execution_rebuild_source is not None
+                or self.trusted_runtime_authority_source is not None
+            ):
                 raise ValueError("legacy formal plan carries a current rebuild source")
         elif (
             type(self.single_operator_execution_rebuild_source)
@@ -5609,6 +5788,18 @@ class FormalServingRunPlan:
             != self.single_operator_execution_rebuild_source
         ):
             raise ValueError("formal physical plan execution rebuild source changed")
+        if (
+            self.schema_version != 4
+            and self.trusted_runtime_authority_source is not None
+        ):
+            raise ValueError("legacy physical plan carries trusted runtime authority")
+        if self.trusted_runtime_authority_source is not None and (
+            CanonicalJsonProofBinding.bind(
+                self.trusted_runtime_authority_source.absolute_path
+            )
+            != self.trusted_runtime_authority_source
+        ):
+            raise ValueError("formal physical runtime authority source changed")
         if (
             type(self.runtime_gpu_proof_sha256s) is not tuple
             or self.runtime_gpu_proof_sha256s
@@ -5686,6 +5877,14 @@ class FormalServingRunPlan:
                 raise ValueError(
                     "current formal plan rebuild source path differs from run root"
                 )
+        if (
+            self.trusted_runtime_authority_source is not None
+            and Path(self.trusted_runtime_authority_source.absolute_path)
+            != root / "trusted-single-operator-runtime-authority-source.json"
+        ):
+            raise ValueError(
+                "trusted runtime authority source path differs from run root"
+            )
         values = (
             self.terminal_output_path,
             self.native_itl_pointer_output_path,
@@ -5777,6 +5976,11 @@ class FormalServingRunPlan:
             assert self.serving_execution_policy is not None
             value["serving_execution_policy"] = self.serving_execution_policy.to_dict()
             value["process_hard_timeout_ns"] = self.process_hard_timeout_ns
+            value["trusted_runtime_authority_source"] = (
+                None
+                if self.trusted_runtime_authority_source is None
+                else self.trusted_runtime_authority_source.to_dict()
+            )
         return value
 
     @classmethod
@@ -5796,6 +6000,7 @@ class FormalServingRunPlan:
                 "mtp_component",
                 "serving_execution_policy",
                 "process_hard_timeout_ns",
+                "trusted_runtime_authority_source",
             }
         }
         if schema_version in {2, 3, 4}:
@@ -5810,7 +6015,13 @@ class FormalServingRunPlan:
                 }
             )
         if schema_version == 4:
-            expected.update({"serving_execution_policy", "process_hard_timeout_ns"})
+            expected.update(
+                {
+                    "serving_execution_policy",
+                    "process_hard_timeout_ns",
+                    "trusted_runtime_authority_source",
+                }
+            )
         row = _strict_object(
             "formal serving run plan",
             value,
@@ -5847,6 +6058,12 @@ class FormalServingRunPlan:
             row.pop("native_terminal_binding")
         )
         execution_policy_value = row.pop("serving_execution_policy", None)
+        trusted_runtime_source_value = row.pop("trusted_runtime_authority_source", None)
+        trusted_runtime_source = (
+            None
+            if trusted_runtime_source_value is None
+            else CanonicalJsonProofBinding.from_dict(trusted_runtime_source_value)
+        )
         if execution_policy_value is not None:
             from lightcone_spec.orchestration.executor import (
                 RegisteredServingExecutionPolicy,
@@ -5870,6 +6087,7 @@ class FormalServingRunPlan:
             single_operator_execution_rebuild_source=rebuild_source,
             mtp_component=mtp_component,
             serving_execution_policy=execution_policy,
+            trusted_runtime_authority_source=trusted_runtime_source,
             native_terminal_binding=native_terminal_binding,
         )
 
@@ -5967,6 +6185,11 @@ def formal_serving_process_runtime_contract(
             "inventory_sha256": plan.inventory_sha256,
             "gpu_uuids": list(plan.gpu_uuids),
             "runtime_gpu_proof_sha256s": list(plan.runtime_gpu_proof_sha256s),
+            "trusted_runtime_authority_source_sha256": (
+                None
+                if getattr(plan, "trusted_runtime_authority_source", None) is None
+                else plan.trusted_runtime_authority_source.semantic_sha256
+            ),
             "nextn_tp2_authority_sha256": plan.nextn_tp2_authority_sha256,
             "launch_manifest_sha256": launch.sha256,
             "request_schedule_sha256": schedule.sha256,
@@ -6113,6 +6336,11 @@ def _expected_native_terminal_binding(
     schedule: FormalServingRequestScheduleReceipt,
 ) -> NativeTerminalRunBinding:
     identity = execution_binding.subject.execution_identity
+    adaptation = execution_binding.run_config.adaptation
+    runtime_trust_mode, formal_measurement = _native_runtime_trust_identity(
+        execution_binding.run_config,
+        release=True,
+    )
     return NativeTerminalRunBinding(
         run_id=identity.run_id,
         run_nonce_sha256=identity.run_nonce_sha256,
@@ -6129,6 +6357,12 @@ def _expected_native_terminal_binding(
             }
         ),
         method=execution_binding.subject.method,
+        reset_scope=None if adaptation is None else adaptation.reset_scope,
+        request_admission_policy=(
+            None if adaptation is None else adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         warmup_request_ids=tuple(
             row.request.request_id
             for row in formal_serving_request_schedule_rows(schedule)
@@ -6140,6 +6374,59 @@ def _expected_native_terminal_binding(
             if row.phase == "scored"
         ),
     )
+
+
+def _trusted_runtime_authority_required(config: RunConfig) -> bool:
+    """Return the exact native/distributed proof-provider requirement."""
+
+    return config.adaptation is not None and not (
+        config.model.algorithm == "DFLASH" and config.runtime.topology_mode == "tp1_dp1"
+    )
+
+
+def _native_runtime_trust_identity(
+    config: RunConfig,
+    *,
+    release: bool,
+) -> tuple[str | None, bool | None]:
+    if not _trusted_runtime_authority_required(config):
+        return None, None
+    if release:
+        return "release_verified_signature", True
+    return "trusted_single_operator_empirical_no_signature", False
+
+
+def _publish_trusted_runtime_authority_for_plan(
+    *,
+    config: RunConfig,
+    consumer_source: CanonicalJsonProofBinding,
+    execution_source: CanonicalJsonProofBinding,
+    materialized_cell_id: str,
+    launch_manifest: CanonicalJsonProofBinding,
+    preflight_inputs_path: str | Path | None,
+    root: Path,
+) -> CanonicalJsonProofBinding | None:
+    """Project one child authority before publishing the consuming run plan."""
+
+    if not _trusted_runtime_authority_required(config):
+        return None
+    if preflight_inputs_path is None:
+        raise ValueError("trusted native runtime lacks exact preflight inputs")
+    from lightcone_spec.runtime.trusted_single_operator_runtime import (
+        publish_trusted_single_operator_runtime_authority_source,
+    )
+
+    binding = publish_trusted_single_operator_runtime_authority_source(
+        consumer_source_path=consumer_source.absolute_path,
+        execution_source_path=execution_source.absolute_path,
+        materialized_cell_id=materialized_cell_id,
+        launch_manifest_path=launch_manifest.absolute_path,
+        preflight_inputs_path=preflight_inputs_path,
+        output_path=(root / "trusted-single-operator-runtime-authority-source.json"),
+    )
+    if binding is None:
+        raise RuntimeError("required trusted runtime authority was not published")
+    return binding
 
 
 def _reopen_schedule_receipt(
@@ -6578,6 +6865,35 @@ def _load_formal_single_operator_trusted_run_plan(
 
     inventory = GpuInventory.from_dict(inventory_source.reopen())
     config = load_run_config(launch.run_config_path)
+    runtime_authority_required = _trusted_runtime_authority_required(config)
+    if runtime_authority_required:
+        if plan.trusted_runtime_authority_source is None:
+            raise ValueError("trusted adaptive run plan lacks runtime authority")
+        from lightcone_spec.runtime.trusted_single_operator_runtime import (
+            verify_trusted_single_operator_runtime_authority_source,
+        )
+
+        authority_source, authority_tokens = (
+            verify_trusted_single_operator_runtime_authority_source(
+                plan.trusted_runtime_authority_source.absolute_path,
+                expected_source_binding=plan.trusted_runtime_authority_source,
+                expected_consumer_source=source_binding,
+                expected_launch_manifest=plan.launch_manifest,
+            )
+        )
+        if (
+            authority_source.materialized_cell_id != plan.materialized_cell_id
+            or authority_source.inventory_sha256 != plan.inventory_sha256
+            or authority_source.gpu_uuids != plan.gpu_uuids
+            or tuple(token.role for token in authority_tokens)
+            != tuple(role.role for role in authority_source.roles)
+        ):
+            raise ValueError("trusted runtime authority differs from run plan")
+    elif plan.trusted_runtime_authority_source is not None:
+        raise ValueError("runtime-authority-free plan carries a trusted authority")
+    expected_runtime_trust, expected_formal_measurement = (
+        _native_runtime_trust_identity(config, release=False)
+    )
     _validate_formal_serving_plan_mtp_identity(
         plan=plan,
         launch=launch,
@@ -6625,6 +6941,9 @@ def _load_formal_single_operator_trusted_run_plan(
         or config.method != plan.method
         or config.runtime.topology_mode != plan.topology_mode
         or plan.native_terminal_binding.method != plan.method
+        or plan.native_terminal_binding.runtime_trust_mode != expected_runtime_trust
+        or plan.native_terminal_binding.formal_measurement
+        != expected_formal_measurement
         or plan.native_terminal_binding.warmup_request_ids != expected_warmup
         or plan.native_terminal_binding.scored_request_ids != expected_scored
     ):
@@ -6901,6 +7220,10 @@ def materialize_formal_single_operator_profiler_subject_run_plan(
         for row in formal_serving_request_schedule_rows(schedule)
         if row.phase == "scored"
     )
+    runtime_trust_mode, formal_measurement = _native_runtime_trust_identity(
+        config,
+        release=False,
+    )
     native_binding = NativeTerminalRunBinding(
         run_id=f"profile-{inputs.profiler_cell_id[:24]}",
         run_nonce_sha256=_sha256(
@@ -6929,6 +7252,16 @@ def materialize_formal_single_operator_profiler_subject_run_plan(
             }
         ),
         method=config.method,
+        reset_scope=(
+            None if config.adaptation is None else config.adaptation.reset_scope
+        ),
+        request_admission_policy=(
+            None
+            if config.adaptation is None
+            else config.adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         warmup_request_ids=warmup_ids,
         scored_request_ids=scored_ids,
     )
@@ -7049,6 +7382,7 @@ def _materialize_formal_single_operator_direct_serving_run_plan(
     inputs: object,
     input_binding: CanonicalJsonProofBinding,
     expected_input_name: str,
+    preflight_inputs_path: str | Path | None = None,
 ) -> FormalServingRunPlan:
     """Materialize one trusted plan from a validated direct input bundle."""
 
@@ -7059,6 +7393,7 @@ def _materialize_formal_single_operator_direct_serving_run_plan(
             inputs=inputs,
             input_binding=input_binding,
             expected_input_name=expected_input_name,
+            preflight_inputs_path=preflight_inputs_path,
         )
 
     from lightcone_spec.experiments.formal_preflight_inputs import (
@@ -7121,6 +7456,19 @@ def _materialize_formal_single_operator_direct_serving_run_plan(
         for row in formal_serving_request_schedule_rows(schedule)
         if row.phase == "scored"
     )
+    runtime_authority_source = _publish_trusted_runtime_authority_for_plan(
+        config=config,
+        consumer_source=input_binding,
+        execution_source=inputs.execution_source,
+        materialized_cell_id=cell.cell_id,
+        launch_manifest=inputs.compile_launch_manifest,
+        preflight_inputs_path=inputs.preflight_inputs.absolute_path,
+        root=root,
+    )
+    runtime_trust_mode, formal_measurement = _native_runtime_trust_identity(
+        config,
+        release=False,
+    )
     native_binding = NativeTerminalRunBinding(
         run_id=f"single-{cell.cell_id[:24]}",
         run_nonce_sha256=_sha256(
@@ -7149,6 +7497,16 @@ def _materialize_formal_single_operator_direct_serving_run_plan(
             }
         ),
         method=config.method,
+        reset_scope=(
+            None if config.adaptation is None else config.adaptation.reset_scope
+        ),
+        request_admission_policy=(
+            None
+            if config.adaptation is None
+            else config.adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         warmup_request_ids=warmup_ids,
         scored_request_ids=scored_ids,
     )
@@ -7196,6 +7554,7 @@ def _materialize_formal_single_operator_direct_serving_run_plan(
         ),
         fatal_output_path=str(root / "fatal.json"),
         single_operator_execution_rebuild_source=input_binding,
+        trusted_runtime_authority_source=runtime_authority_source,
         serving_execution_policy=execution_policy,
         process_hard_timeout_ns=_registered_process_hard_timeout_ns(
             policy=execution_policy,
@@ -7217,6 +7576,7 @@ def _materialize_formal_single_operator_prepared_direct_serving_run_plan(
     inputs: object,
     input_binding: CanonicalJsonProofBinding,
     expected_input_name: str,
+    preflight_inputs_path: str | Path | None,
 ) -> FormalServingRunPlan:
     """Materialize a trusted plan from an already tokenized source schedule."""
 
@@ -7311,6 +7671,19 @@ def _materialize_formal_single_operator_prepared_direct_serving_run_plan(
                 content_source=inputs.content_source_binding,
             ).sha256
         )
+    runtime_authority_source = _publish_trusted_runtime_authority_for_plan(
+        config=config,
+        consumer_source=input_binding,
+        execution_source=inputs.execution_source,
+        materialized_cell_id=cell.cell_id,
+        launch_manifest=inputs.compile_launch_manifest,
+        preflight_inputs_path=preflight_inputs_path,
+        root=root,
+    )
+    runtime_trust_mode, formal_measurement = _native_runtime_trust_identity(
+        config,
+        release=False,
+    )
     native_binding = NativeTerminalRunBinding(
         run_id=f"single-{cell.cell_id[:24]}",
         run_nonce_sha256=_sha256(
@@ -7339,6 +7712,16 @@ def _materialize_formal_single_operator_prepared_direct_serving_run_plan(
             }
         ),
         method=config.method,
+        reset_scope=(
+            None if config.adaptation is None else config.adaptation.reset_scope
+        ),
+        request_admission_policy=(
+            None
+            if config.adaptation is None
+            else config.adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         warmup_request_ids=warmup_ids,
         scored_request_ids=scored_ids,
     )
@@ -7387,6 +7770,7 @@ def _materialize_formal_single_operator_prepared_direct_serving_run_plan(
         ),
         fatal_output_path=str(root / "fatal.json"),
         single_operator_execution_rebuild_source=input_binding,
+        trusted_runtime_authority_source=runtime_authority_source,
         nextn_mtp_mode=("built_in_mtp" if launch_schema_version == 3 else None),
         target_snapshot_sha256=getattr(launch, "target_snapshot_sha256", None),
         mtp_component_sha256=getattr(launch, "mtp_component_sha256", None),
@@ -7415,6 +7799,7 @@ def _materialize_formal_single_operator_prepared_direct_serving_run_plan(
 def materialize_formal_single_operator_e5_failure_run_plan(
     *,
     failure_execution_descriptor_path: str | Path,
+    preflight_inputs_path: str | Path | None = None,
 ) -> FormalServingRunPlan:
     """Publish the serving plan consumed by one current E5 failure row."""
 
@@ -7491,6 +7876,19 @@ def materialize_formal_single_operator_e5_failure_run_plan(
         for row in formal_serving_request_schedule_rows(schedule)
         if row.phase == "scored"
     )
+    runtime_authority_source = _publish_trusted_runtime_authority_for_plan(
+        config=config,
+        consumer_source=input_binding,
+        execution_source=inputs.execution_source,
+        materialized_cell_id=cell.cell_id,
+        launch_manifest=inputs.compile_launch_manifest,
+        preflight_inputs_path=preflight_inputs_path,
+        root=root,
+    )
+    runtime_trust_mode, formal_measurement = _native_runtime_trust_identity(
+        config,
+        release=False,
+    )
     native_binding = NativeTerminalRunBinding(
         run_id=f"single-{cell.cell_id[:24]}",
         run_nonce_sha256=run_nonce,
@@ -7507,6 +7905,16 @@ def materialize_formal_single_operator_e5_failure_run_plan(
             }
         ),
         method=config.method,
+        reset_scope=(
+            None if config.adaptation is None else config.adaptation.reset_scope
+        ),
+        request_admission_policy=(
+            None
+            if config.adaptation is None
+            else config.adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
         warmup_request_ids=warmup_ids,
         scored_request_ids=scored_ids,
     )
@@ -7554,6 +7962,7 @@ def materialize_formal_single_operator_e5_failure_run_plan(
         ),
         fatal_output_path=str(root / "fatal.json"),
         single_operator_execution_rebuild_source=input_binding,
+        trusted_runtime_authority_source=runtime_authority_source,
         serving_execution_policy=execution_policy,
         process_hard_timeout_ns=_registered_process_hard_timeout_ns(
             policy=execution_policy,
@@ -7611,6 +8020,7 @@ def materialize_formal_single_operator_downstream_serving_run_plan(
 def materialize_formal_single_operator_prepared_downstream_serving_run_plan(
     *,
     prepared_downstream_run_plan_inputs_path: str | Path,
+    preflight_inputs_path: str | Path | None = None,
 ) -> FormalServingRunPlan:
     """Materialize one trusted plan from an exact prepared launch/schedule row."""
 
@@ -7628,6 +8038,7 @@ def materialize_formal_single_operator_prepared_downstream_serving_run_plan(
         inputs=inputs,
         input_binding=input_binding,
         expected_input_name=("formal-single-operator-prepared-downstream-inputs.json"),
+        preflight_inputs_path=preflight_inputs_path,
     )
 
 
@@ -8050,6 +8461,21 @@ def _trusted_single_operator_chronobelief_proof_from_plan(
     return proof
 
 
+def _trusted_runtime_child_environment(
+    plan: FormalServingRunPlan,
+) -> dict[str, str]:
+    """Render only the env binding already deep-replayed with this plan."""
+
+    binding = plan.trusted_runtime_authority_source
+    if binding is None:
+        return {}
+    from lightcone_spec.runtime.trusted_single_operator_runtime import (
+        trusted_single_operator_runtime_authority_environment,
+    )
+
+    return trusted_single_operator_runtime_authority_environment(binding)
+
+
 async def execute_formal_tp1_serving_run_plan(
     *,
     plan_path: str | Path,
@@ -8221,6 +8647,7 @@ async def execute_formal_tp1_serving_run_plan(
         ),
         lifecycle_timing_output_path=plan.lifecycle_timing_output_path,
         execution_policy=execution_policy,
+        child_environment_overlay=_trusted_runtime_child_environment(plan),
     )
     _publish_formal_serving_junit(
         output_path=plan.junit_output_path,
@@ -8343,6 +8770,7 @@ class ValidatedUnsignedFormalGangServingRun:
     receipt: CanonicalJsonProofBinding
     request_terminal: CanonicalJsonProofBinding
     native_itl_pointers: CanonicalJsonProofBinding
+    formal_gang_reset: CanonicalJsonProofBinding
     formal_gang_terminal: CanonicalJsonProofBinding
     lifecycle_timing: CanonicalJsonProofBinding
     client_request_lifecycle: CanonicalJsonProofBinding | None = None
@@ -8352,6 +8780,7 @@ class ValidatedUnsignedFormalGangServingRun:
             self.receipt,
             self.request_terminal,
             self.native_itl_pointers,
+            self.formal_gang_reset,
             self.formal_gang_terminal,
             self.lifecycle_timing,
             *(
@@ -8381,6 +8810,21 @@ def _formal_gang_schedule_rows(
     ]
 
 
+def _formal_gang_native_identity(
+    plan: FormalServingRunPlan,
+) -> tuple[str, str, str | None, str | None, bool | None]:
+    binding = plan.native_terminal_binding
+    if binding.reset_scope is None and binding.request_admission_policy is None:
+        return "none", "allocation_free", None, None, None
+    return (
+        str(binding.reset_scope),
+        str(binding.request_admission_policy),
+        REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
+        binding.runtime_trust_mode,
+        binding.formal_measurement,
+    )
+
+
 def _validate_formal_gang_capability(
     value: object,
     *,
@@ -8398,6 +8842,11 @@ def _validate_formal_gang_capability(
             "topology",
             "world_size",
             "method",
+            "reset_scope",
+            "request_admission_policy",
+            "request_source_point_reset_protocol_sha256",
+            "runtime_trust_mode",
+            "formal_measurement",
             "execution_plan_sha256",
             "rank_config_sha256",
             "run_nonce_sha256",
@@ -8407,14 +8856,26 @@ def _validate_formal_gang_capability(
     )
     rank_rows = row["rank_capabilities"]
     rank_digests = row["rank_capability_sha256s"]
+    native_identity = _formal_gang_native_identity(plan)
     if (
-        row["schema_version"] != 1
+        row["schema_version"] != 2
         or row["kind"] != "sglang_formal_gang_capability"
         or row["hook"] != "sglang.lightcone_formal_gang_serving.v1"
         or row["protocol_sha256"] != FORMAL_GANG_SERVING_PROTOCOL_SHA256
         or row["topology"] != plan.topology_mode
         or row["world_size"] != 2
         or row["method"] != plan.method
+        or tuple(
+            row[name]
+            for name in (
+                "reset_scope",
+                "request_admission_policy",
+                "request_source_point_reset_protocol_sha256",
+                "runtime_trust_mode",
+                "formal_measurement",
+            )
+        )
+        != native_identity
         or row["execution_plan_sha256"]
         != plan.native_terminal_binding.execution_plan_sha256
         or row["rank_config_sha256"] != plan.native_terminal_binding.rank_config_sha256
@@ -8427,12 +8888,57 @@ def _validate_formal_gang_capability(
         raise ValueError("formal gang capability differs from sealed plan")
     by_rank = {}
     for rank_row, digest in zip(rank_rows, rank_digests, strict=True):
+        rank_row = _strict_object(
+            "formal gang rank capability",
+            rank_row,
+            {
+                "schema_version",
+                "kind",
+                "hook",
+                "protocol_sha256",
+                "assignment_sha256",
+                "inventory_sha256",
+                "execution_plan_sha256",
+                "rank_config_sha256",
+                "run_nonce_sha256",
+                "topology",
+                "rank",
+                "world_size",
+                "method",
+                "reset_scope",
+                "request_admission_policy",
+                "request_source_point_reset_protocol_sha256",
+                "runtime_trust_mode",
+                "formal_measurement",
+                "gpu_uuid",
+                "process_id",
+            },
+        )
         if (
-            type(rank_row) is not dict
+            rank_row.get("schema_version") != 2
+            or rank_row.get("kind") != "sglang_formal_gang_rank_capability"
+            or rank_row.get("hook") != "sglang.lightcone_formal_gang_serving.v1"
+            or rank_row.get("protocol_sha256") != FORMAL_GANG_SERVING_PROTOCOL_SHA256
+            or rank_row.get("topology") != plan.topology_mode
+            or rank_row.get("world_size") != 2
+            or rank_row.get("method") != plan.method
+            or tuple(
+                rank_row[name]
+                for name in (
+                    "reset_scope",
+                    "request_admission_policy",
+                    "request_source_point_reset_protocol_sha256",
+                    "runtime_trust_mode",
+                    "formal_measurement",
+                )
+            )
+            != native_identity
             or rank_row.get("rank") not in {0, 1}
             or rank_row.get("assignment_sha256") != launch.physical_assignment_sha256
             or rank_row.get("inventory_sha256") != plan.inventory_sha256
             or rank_row.get("gpu_uuid") not in plan.gpu_uuids
+            or type(rank_row.get("process_id")) is not int
+            or rank_row["process_id"] < 1
             or _sha256(rank_row) != digest
         ):
             raise ValueError("formal gang rank capability differs")
@@ -8454,8 +8960,9 @@ def _validate_formal_gang_transition(
     if type(value) is not dict:
         raise TypeError("formal gang transition must be an object")
     row = dict(value)
+    native_identity = _formal_gang_native_identity(plan)
     if (
-        row.get("schema_version") != 1
+        row.get("schema_version") != 2
         or row.get("hook") != "sglang.lightcone_formal_gang_serving.v1"
         or row.get("protocol_sha256") != FORMAL_GANG_SERVING_PROTOCOL_SHA256
         or row.get("topology") != plan.topology_mode
@@ -8474,14 +8981,34 @@ def _validate_formal_gang_transition(
                 "world_size",
                 "execution_plan_sha256",
                 "schedule_sha256",
+                "reset_scope",
+                "request_admission_policy",
+                "request_source_point_reset_protocol_sha256",
+                "runtime_trust_mode",
+                "formal_measurement",
                 "rank_begin_sha256s",
                 "begin_sha256",
             }
             or row["kind"] != "sglang_formal_gang_begin"
             or row["execution_plan_sha256"]
             != plan.native_terminal_binding.execution_plan_sha256
+            or tuple(
+                row[name]
+                for name in (
+                    "reset_scope",
+                    "request_admission_policy",
+                    "request_source_point_reset_protocol_sha256",
+                    "runtime_trust_mode",
+                    "formal_measurement",
+                )
+            )
+            != native_identity
             or type(row["rank_begin_sha256s"]) is not list
             or len(row["rank_begin_sha256s"]) != 2
+            or any(
+                type(value) is not str or len(value) != 64
+                for value in row["rank_begin_sha256s"]
+            )
         ):
             raise ValueError("formal gang begin differs")
         unsigned = dict(row)
@@ -8489,17 +9016,91 @@ def _validate_formal_gang_transition(
         if _sha256(unsigned) != declared:
             raise ValueError("formal gang begin digest differs")
     else:
+        aggregate_fields = {
+            "schema_version",
+            "kind",
+            "hook",
+            "protocol_sha256",
+            "action",
+            "topology",
+            "world_size",
+            "reset_scope",
+            "request_admission_policy",
+            "request_source_point_reset_protocol_sha256",
+            "runtime_trust_mode",
+            "formal_measurement",
+            "rank_terminal_sha256s",
+            "rank_terminals",
+            "decision",
+            "published_ranks",
+            "reason_code",
+            "cross_replica_gradient_collective",
+            "aggregate_sha256",
+        }
+        if action == "reset":
+            aggregate_fields.add("rank_reset_sha256s")
+        rank_terminals = row.get("rank_terminals")
+        rank_terminal_sha256s = row.get("rank_terminal_sha256s")
         if (
-            row.get("kind") != "sglang_formal_gang_all_rank_terminal"
+            set(row) != aggregate_fields
+            or row.get("kind") != "sglang_formal_gang_all_rank_terminal"
             or row.get("action") != f"formal_gang_{action}"
+            or tuple(
+                row[name]
+                for name in (
+                    "reset_scope",
+                    "request_admission_policy",
+                    "request_source_point_reset_protocol_sha256",
+                    "runtime_trust_mode",
+                    "formal_measurement",
+                )
+            )
+            != native_identity
             or row.get("decision") != "COMMITTED"
             or row.get("published_ranks") != [0, 1]
             or row.get("reason_code") is not None
             or row.get("cross_replica_gradient_collective") is not False
-            or type(row.get("rank_terminals")) is not list
-            or len(row["rank_terminals"]) != 2
+            or type(rank_terminals) is not list
+            or type(rank_terminal_sha256s) is not list
+            or len(rank_terminals) != 2
+            or len(rank_terminal_sha256s) != 2
         ):
             raise RuntimeError("formal gang all-rank transition did not commit")
+        if action == "reset":
+            rank_reset_sha256s = row["rank_reset_sha256s"]
+            if type(rank_reset_sha256s) is not list or len(rank_reset_sha256s) != 2:
+                raise ValueError("formal gang reset rank receipt coverage differs")
+            for value_sha256 in rank_reset_sha256s:
+                _require_sha256("formal gang rank reset", value_sha256)
+        for rank, (rank_terminal, rank_digest) in enumerate(
+            zip(rank_terminals, rank_terminal_sha256s, strict=True)
+        ):
+            if type(rank_terminal) is not dict:
+                raise TypeError("formal gang rank terminal must be an object")
+            unsigned_rank = dict(rank_terminal)
+            declared_rank = unsigned_rank.pop("terminal_sha256", None)
+            if (
+                rank_terminal.get("schema_version") != 2
+                or rank_terminal.get("kind") != "sglang_formal_gang_rank_terminal"
+                or rank_terminal.get("rank") != rank
+                or rank_terminal.get("phase")
+                != ("warmup" if action == "reset" else "scored")
+                or rank_terminal.get("method") != plan.method
+                or tuple(
+                    rank_terminal.get(name)
+                    for name in (
+                        "reset_scope",
+                        "request_admission_policy",
+                        "request_source_point_reset_protocol_sha256",
+                        "runtime_trust_mode",
+                        "formal_measurement",
+                    )
+                )
+                != native_identity
+                or _sha256(unsigned_rank) != declared_rank
+                or declared_rank != rank_digest
+            ):
+                raise ValueError("formal gang rank terminal identity differs")
         unsigned = dict(row)
         declared = unsigned.pop("aggregate_sha256", None)
         if _sha256(unsigned) != declared:
@@ -8511,10 +9112,12 @@ def _spawn_formal_gang_server(
     launch: CompileLaunchManifest,
     *,
     binding: NativeTerminalRunBinding,
+    child_environment_overlay: dict[str, str],
     stdout_file,
     stderr_file,
 ) -> subprocess.Popen[bytes]:
     environment = launch.child_environment()
+    environment.update(child_environment_overlay)
     environment.update(
         {
             "LIGHTCONE_FORMAL_GANG_ENABLE": "1",
@@ -8682,6 +9285,9 @@ async def execute_formal_distributed_serving_run_plan(
     client_lifecycle_path = (
         Path(plan.private_output_root) / "client-request-lifecycle.json"
     )
+    formal_gang_reset_path = (
+        Path(plan.private_output_root) / "formal-gang-warmup-reset.json"
+    )
     output_paths = tuple(
         value
         for value in (
@@ -8699,18 +9305,13 @@ async def execute_formal_distributed_serving_run_plan(
             plan.formal_gang_terminal_output_path,
             plan.fatal_output_path,
             str(client_lifecycle_path),
+            str(formal_gang_reset_path),
         )
         if value is not None
     )
     if any(os.path.lexists(value) for value in output_paths):
         raise FileExistsError("distributed formal output already exists")
-    executable = Path(launch.server_argv[0])
-    if (
-        not executable.is_absolute()
-        or not executable.is_file()
-        or executable.is_symlink()
-    ):
-        raise ValueError("distributed formal server executable is invalid")
+    _require_source_owned_server_executable(launch.server_argv[0])
     execution_policy = plan.serving_execution_policy
     if plan.schema_version == 4:
         timeout = _registered_plan_process_hard_timeout_seconds(
@@ -8784,6 +9385,7 @@ async def execute_formal_distributed_serving_run_plan(
     cleanup_kind: str | None = None
     process_exited_ns: int | None = None
     client_lifecycle_binding: CanonicalJsonProofBinding | None = None
+    formal_gang_reset_binding: CanonicalJsonProofBinding | None = None
     phase_edges_ns: dict[str, int] = {"execution_started_ns": time.monotonic_ns()}
     execution_task = asyncio.current_task()
     if execution_task is None:  # pragma: no cover - asyncio always owns this call
@@ -8832,6 +9434,7 @@ async def execute_formal_distributed_serving_run_plan(
             _spawn_formal_gang_server,
             launch,
             binding=plan.native_terminal_binding,
+            child_environment_overlay=_trusted_runtime_child_environment(plan),
             stdout_file=stdout_file,
             stderr_file=stderr_file,
         )
@@ -8916,6 +9519,10 @@ async def execute_formal_distributed_serving_run_plan(
             action="reset",
             plan=plan,
         )
+        formal_gang_reset_binding = publish_scalable_formal_gang_terminal(
+            output_path=formal_gang_reset_path,
+            legacy_terminal=reset,
+        )
         phase_edges_ns["reset_finished_ns"] = time.monotonic_ns()
         phase_edges_ns["scored_started_ns"] = time.monotonic_ns()
         scored_result = await _execute_source_owned_phase(
@@ -8967,9 +9574,10 @@ async def execute_formal_distributed_serving_run_plan(
                 execution_policy_sha256=execution_policy.sha256,
                 rows=list(client_lifecycle_rows),
             )
+        assert formal_gang_reset_binding is not None
         terminal_value = {
-            "schema_version": 1,
-            "kind": "unsigned_formal_gang_request_terminal",
+            "schema_version": 2,
+            "kind": "unsigned_formal_gang_request_terminal_v2",
             "protocol_sha256": FORMAL_SERVING_PHYSICAL_DISPATCH_PROTOCOL_SHA256,
             "formal_execution_authorized": False,
             "plan_sha256": plan.sha256,
@@ -8980,6 +9588,7 @@ async def execute_formal_distributed_serving_run_plan(
             "begin_sha256": begin["begin_sha256"],
             "reset_sha256": reset["aggregate_sha256"],
             "finalize_sha256": final["aggregate_sha256"],
+            "formal_gang_reset": formal_gang_reset_binding.to_dict(),
             "warmup_requests": warmup_rows,
             "scored_requests": scored_rows,
         }
@@ -9104,6 +9713,7 @@ async def execute_formal_distributed_serving_run_plan(
                 plan.terminal_output_path,
                 plan.native_itl_pointer_output_path,
                 plan.formal_gang_terminal_output_path or "",
+                str(formal_gang_reset_path),
                 plan.before_gpu_snapshot_output_path,
                 plan.ready_gpu_snapshot_output_path,
                 plan.after_gpu_snapshot_output_path,
@@ -9126,6 +9736,7 @@ async def execute_formal_distributed_serving_run_plan(
     )
     assert plan.formal_gang_terminal_output_path is not None
     gang_binding = CanonicalJsonProofBinding.bind(plan.formal_gang_terminal_output_path)
+    assert formal_gang_reset_binding is not None
     phase_edges_ns["evidence_flush_started_ns"] = time.monotonic_ns()
     phase_edges_ns["evidence_flush_finished_ns"] = time.monotonic_ns()
     lifecycle_value = {
@@ -9141,6 +9752,7 @@ async def execute_formal_distributed_serving_run_plan(
         "terminal_sha256": terminal_binding.semantic_sha256,
         "native_itl_pointer_sha256": pointer_binding.semantic_sha256,
         "formal_gang_terminal_sha256": gang_binding.semantic_sha256,
+        "formal_gang_reset_sha256": formal_gang_reset_binding.semantic_sha256,
         "phase_edges_ns": phase_edges_ns,
     }
     if execution_policy is not None:
@@ -9188,6 +9800,7 @@ async def execute_formal_distributed_serving_run_plan(
         "terminal": terminal_binding.to_dict(),
         "native_itl_pointers": pointer_binding.to_dict(),
         "formal_gang_terminal": gang_binding.to_dict(),
+        "formal_gang_reset": formal_gang_reset_binding.to_dict(),
         "lifecycle_timing": lifecycle_binding.to_dict(),
         "before_gpu_snapshot": before_snapshot.to_dict(),
         "ready_gpu_snapshot": ready_snapshot.to_dict(),
@@ -9216,6 +9829,7 @@ async def execute_formal_distributed_serving_run_plan(
         receipt=receipt_binding,
         request_terminal=terminal_binding,
         native_itl_pointers=pointer_binding,
+        formal_gang_reset=formal_gang_reset_binding,
         formal_gang_terminal=gang_binding,
         lifecycle_timing=lifecycle_binding,
         client_request_lifecycle=client_lifecycle_binding,

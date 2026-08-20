@@ -57,6 +57,7 @@ from lightcone_spec.experiments.formal_protocol import (
     ProtocolLock,
     SignedProtocolLock,
     SignedTtsCalibrationSeal,
+    TrustedSingleOperatorProtocolSourceBindings,
     TtsCalibrationAuthority,
     TtsCalibrationSeal,
     TtsL0CandidateStateCoverage,
@@ -223,6 +224,7 @@ def protocol_lock_to_dict(value: ProtocolLock) -> dict[str, object]:
         # their dataclass defaults permit old in-process constructors.
         row.pop("content_source_mode")
         row.pop("trusted_single_operator_content_bundle_sha256")
+        row.pop("trusted_single_operator_source_bindings")
     return row
 
 
@@ -235,11 +237,19 @@ def protocol_lock_from_dict(value: object) -> ProtocolLock:
         expected -= {
             "content_source_mode",
             "trusted_single_operator_content_bundle_sha256",
+            "trusted_single_operator_source_bindings",
         }
     row = _strict("ProtocolLock", value, frozenset(expected))
     if schema_version == 4:
         row["content_source_mode"] = "offline_root_signed"
         row["trusted_single_operator_content_bundle_sha256"] = None
+        row["trusted_single_operator_source_bindings"] = None
+    else:
+        row["trusted_single_operator_source_bindings"] = (
+            TrustedSingleOperatorProtocolSourceBindings.from_dict(
+                row["trusted_single_operator_source_bindings"]
+            )
+        )
     for name in (
         "method_roles",
         "stage_dag",

@@ -54,15 +54,17 @@ result pointer。远端 collector 将其作为与 terminal 关联但独立内容
 发布；只有后续本地 external-control proof 才能把任一 artifact 提升为正式证据。
 
 Patch 已实现 content-bound
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1` capability 与
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2` capability 与
 begin/reset/finalize endpoint。当前最新 patch 的准确 SHA-256 为
-`38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95`，final tree 为
-`c6571336b70cd5f0e0f609d731a65fa98fd7e0b2`；manifest 仍是 authority。Lifecycle 绑定
+`0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874`，final tree 为
+`bb6371242e82592d1b8a2f5f4ba6d0630d8365cb`；manifest 仍是 authority。Lifecycle 绑定
 run/nonce/plan/rank、process/session/reset lineage、expected request ID、准确 ordered token ID、
 terminal coverage、Static aggregate safety，以及 adaptive-runtime request/round/update/KV/performance
 row。它暴露 signer plugin boundary，但不捆绑 trusted hardware key 或 release signer。因此
-所有 source implementation 在对应的本地 external-control proof 验证前仍 fail closed；仅有
-CPU contract coverage 不能授权 formal method run。
+release-attested lane 在对应的本地 external-control proof 验证前仍 fail closed；仅有 CPU
+contract coverage 不能授权 release-level method claim。Trusted `formal_single_operator_v1` lane
+运行时不要求该 external signer，但仍必须通过准确 source/content/runtime、fresh GPU
+qualification、capacity、terminal 与 coverage gate。
 
 第六个 patch 让 speculative width 计数识别 Target-only。真正的 Target-only server
 （`spec_algorithm=none` 且未设置 draft width）不会再执行 `int(None)`：terminal evidence
@@ -85,6 +87,14 @@ terminal，已经观察到的 native row 不能被降格为 non-submitted，所�
 offered、submitted 且 completed。因此 rejected、timed-out、cancelled 与 unfinished 等
 client outcome 会留在注册 serving 证据中，而不会让其他方面有效的 scientific run 变成
 不完整的 distributed terminal。
+
+第八个 patch 将冻结的 TTS 与 L0-naive recipe 绑定到 request-scoped native lifetime。每个已
+取得 adaptation state 的 request 都从相同 master/optimizer/inference source point 开始，且
+在下一个 adaptive admission 前原子封存 evidence 并恢复；cancel、timeout、preemption、OOM
+与首 token terminal path 也适用。Native adaptive ownership 会串行化，但 client 提供的并发
+仍按原计划排队并计时。DFlash、DSpark、EAGLE3、NEXTN、TP2 与 sticky DP2 共用同一 receipt
+protocol；request archive 只追加且可在线性时间内验证。Cohort-scoped LightCone/OnlineSPEC 与
+allocation-free Target/Static 保持原有语义。
 
 第二个 patch 还提供 opt-in native committed-token observation contract。每个 timestamp
 是在 stop handling 后，streamer 枚举已经 committed 的最终 token prefix 时由 CPU 采样；它
@@ -193,10 +203,13 @@ checkout。
 patch-integrity 结果，不是 GPU validation。CPU package test 或旧 patched-tree receipt
 不足以证明 GPU 能力。Patch 已实现注册的 DFlash、DSpark、NEXTN、compatible EAGLE3、TP2
 与 sticky DP2 source path，但 release trust policy 未配置 signer，且任何路径都没有 fresh
-exact dynamic GPU proof。因此 Static/TTS/L0-naive/LightCone industrial cell 会在任何
-mutation 前 `BLOCKED`，而不是可运行 `UNMEASURED` work。Test signer、provider object
-attribute 或 caller-supplied verifier 都不能解锁该 policy。Generic EAGLE 不受支持；不兼容
-的 EAGLE3 组合保持 N/A 或 `BLOCKED`。Target-only 是当前唯一可用于 claim 的 path。
+exact dynamic GPU proof。因此 Static/TTS/L0-naive/LightCone 会在 release-attested lane 的任何
+mutation 前 `BLOCKED`。Test signer、provider object attribute 或 caller-supplied verifier 都不能
+解锁该 release policy。这不会阻止 trusted single-operator empirical lane：准确 dynamic GPU
+与其他注册 gate 通过后，它无需 external signature 即可运行完整 DAG，但始终保持
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false` 与 `UNMEASURED`。
+Generic EAGLE 不受支持；不兼容的 EAGLE3 组合保持 N/A 或 `BLOCKED`。Target-only 是当前唯一
+可用于 release claim 的 path。
 
 历史 shared-tuned-AdamW evidence 只是 matched-recipe publication-policy diagnostic，不是
 TTS-paper reproduction，仅可用于 regression comparison。它不含新的 Target-only、backend-plan、

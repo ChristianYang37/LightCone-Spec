@@ -7,12 +7,14 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
+from importlib import import_module
 from pathlib import Path
 
 import pytest
-from test_formal_method_authority import _plan_source, _tts_window
 from test_formal_preflight_inputs import _inventory
 from test_formal_single_operator_content import _tiny_burstgpt_assets
+from test_trainable_plan_authority import _write_safetensors
 
 import lightcone_spec.experiments.formal_preflight_inputs as preflight_module
 import lightcone_spec.experiments.formal_single_operator_content as content_module
@@ -20,9 +22,6 @@ import lightcone_spec.experiments.workload_authority as workload_module
 import lightcone_spec.orchestration.formal_physical_dispatch as dispatch_module
 from lightcone_spec.cli.main import main
 from lightcone_spec.experiments import e0_stage_authority
-from lightcone_spec.experiments.formal_method_authority import (
-    TTS_DRAFTER_NATIVE_LOSS_SOURCE,
-)
 from lightcone_spec.experiments.formal_registry import (
     e0_onlinespec_source_authority_from_dict,
 )
@@ -30,14 +29,24 @@ from lightcone_spec.experiments.formal_runtime_manifest import (
     FORMAL_RUNTIME_SOURCE_LAYOUT,
 )
 from lightcone_spec.experiments.formal_single_operator_content import (
-    TrustedModelRuntimeBinding,
-    TrustedModelSnapshotSpec,
-    TrustedNamedInputPath,
-    TrustedSingleOperatorContentPathSpec,
+    TrustedSingleOperatorContentBundleBinding,
     bind_trusted_locked_workload,
+)
+from lightcone_spec.experiments.formal_single_operator_e0_workloads import (
+    E0_TASK_NATIVE_SOURCE_PINS,
+)
+from lightcone_spec.experiments.formal_single_operator_model_registry import (
+    FORMAL_V03_E0_SOURCE_AUTHORITY_INDEX_FILE_NAME,
+    FORMAL_V03_MODEL_SNAPSHOT_REGISTRY,
+    FormalV03NamedDirectoryPath,
+    FormalV03NamedFilePath,
+    load_formal_v03_e0_source_authority_index,
 )
 from lightcone_spec.experiments.formal_single_operator_stages import (
     FORMAL_SINGLE_OPERATOR_NODE_ORDER,
+)
+from lightcone_spec.experiments.formal_stage_execution import (
+    load_e1_recipe_anchor_authority_artifact,
 )
 from lightcone_spec.experiments.onlinespec import (
     ONLINE_SPEC_COMMIT,
@@ -46,6 +55,9 @@ from lightcone_spec.experiments.onlinespec import (
 from lightcone_spec.orchestration.experiment_operator import (
     ExperimentOperatorStore,
     default_formal_stage_plan,
+)
+from lightcone_spec.orchestration.experiment_operator_production import (
+    ProductionSchedulerRuntime,
 )
 from lightcone_spec.orchestration.formal_single_operator_bootstrap import (
     FormalSingleOperatorBootstrapSupervisor,
@@ -74,6 +86,8 @@ def _clean_runtime_fixture_checkout(tmp_path: Path) -> Path:
         "pyproject.toml",
         "docs/en/experiment-protocol.md",
         "docs/zh-CN/experiment-protocol.md",
+        "manifests/runtime/industrial_compatibility_v1.json",
+        "manifests/runtime/industrial_compatibility_v1.json.sha256",
         "src/lightcone_spec/experiments/formal_protocol.py",
         "patches/sglang/manifest.json",
         *(
@@ -124,15 +138,60 @@ def _cached_workload_sources() -> tuple[Path, Path]:
     return livecodebench.resolve(), math500.resolve()
 
 
+def _cold_start_inventory():
+    inventory = _inventory()
+    return replace(
+        inventory,
+        devices=tuple(
+            replace(
+                device,
+                model="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                memory_bytes=96_000 * 1024**2,
+            )
+            for device in inventory.devices
+        ),
+    )
+
+
 def _publish_runtime_inputs(
     tmp_path: Path,
     *,
     monkeypatch: pytest.MonkeyPatch,
+    capsys,
 ) -> tuple[Path, Path, Path, Path]:
-    inventory = _inventory()
+    inventory = _cold_start_inventory()
     inventory_path = (tmp_path / "sources/inventory.json").resolve()
     inventory_path.parent.mkdir(parents=True)
-    publish_canonical_json_no_replace(inventory_path, inventory.to_dict())
+    receipt_path = (tmp_path / "sources/inventory-receipt.json").resolve()
+    inventory_receipt = {
+        "schema_version": 1,
+        "kind": "code_owned_cold_start_gpu_inventory_receipt",
+        "receipt_sha256": inventory.source_receipt_sha256,
+    }
+    cli_module = import_module("lightcone_spec.cli.main")
+    monkeypatch.setattr(
+        cli_module,
+        "collect_gpu_inventory",
+        lambda **_kwargs: (inventory, inventory_receipt),
+    )
+    assert (
+        main(
+            [
+                "collect-gpu-inventory",
+                "--challenge-nonce-sha256",
+                "a" * 64,
+                "--receipt-output",
+                str(receipt_path),
+                "--output",
+                str(inventory_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert CanonicalJsonProofBinding.bind(inventory_path).reopen() == (
+        inventory.to_dict()
+    )
 
     cuda_home = (tmp_path / "runtime/cuda").resolve()
     bin_root = cuda_home / "bin"
@@ -146,113 +205,263 @@ def _publish_runtime_inputs(
 
     patched_sglang = (tmp_path / "runtime/patched-sglang").resolve()
     patched_sglang.mkdir()
-    devices = [
-        {
-            "uuid": device.uuid,
-            "name": device.model,
-            "compute_capability": (
-                f"{device.compute_capability[0]}.{device.compute_capability[1]}"
-            ),
-            "driver_version": "580.95.05",
-        }
-        for device in inventory.devices
-    ]
-    doctor = {
-        "schema_version": 2,
-        "status": "PASS",
-        "readiness": {
-            "status": "PASS",
-            "pass_count": 1,
-            "fail_count": 0,
-            "unknown_count": 0,
-        },
-        "checks": {"cold_start_fixture": {"status": "PASS"}},
-        "roots": {"patched_sglang": str(patched_sglang)},
-        "python": {"executable": sys.executable, "version": "3.12.13"},
-        "gpu": {
-            "torch": {"version": "2.7.1", "cuda_build": "12.8"},
-            "parsed_inventory": {"devices": devices},
-        },
-        "commands": {"nvcc": "Cuda compilation tools, release 12.8, V12.8.93"},
-        "packages": {"triton": "3.3.1"},
-    }
     doctor_path = (tmp_path / "sources/doctor.json").resolve()
-    publish_canonical_json_no_replace(doctor_path, doctor)
     return inventory_path, doctor_path, patched_sglang, cuda_home
 
 
-def _model_specs(tmp_path: Path) -> tuple[TrustedModelSnapshotSpec, ...]:
-    revision = {
-        "target": "1" * 40,
-        "dflash": "2" * 40,
-        "dspark": "3" * 40,
-    }
-    roots: dict[str, Path] = {}
-    for name in ("target", "dflash", "dspark"):
-        root = (tmp_path / "models" / name / revision[name]).resolve()
+def _publish_trusted_capacity_doctor(
+    *,
+    checkout: Path,
+    patched_sglang: Path,
+    content_spec_path: Path,
+    run_root: Path,
+    doctor_path: Path,
+    inventory_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> Path:
+    """Publish capacity, then a source-produced trusted PASS doctor report."""
+
+    from test_doctor_industrial import _passing_facts
+
+    capacity = (doctor_path.parent / "stage-capacity.json").resolve()
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-stage-capacity",
+                "--content-path-spec",
+                str(content_spec_path),
+                "--run-root",
+                str(run_root),
+                "--output",
+                str(capacity),
+            ]
+        )
+        == 0
+    )
+    capacity_result = json.loads(capsys.readouterr().out)
+    assert capacity_result["status"] == "AVAILABLE"
+    assert capacity_result["formal_measured_authorization"] is False
+
+    inventory = _cold_start_inventory()
+    assert json.loads(inventory_path.read_text(encoding="utf-8")) == (
+        inventory.to_dict()
+    )
+    facts = _passing_facts(checkout, patched_sglang)
+    facts["python"]["executable"] = sys.executable
+    facts["gpu"]["inventory"]["devices"] = [
+        {
+            "uuid": device.uuid,
+            "name": device.model,
+            "memory_total_mib": device.memory_bytes // (1024**2),
+            "driver_version": "580.95.05",
+            "compute_capability": (
+                f"{device.compute_capability[0]}.{device.compute_capability[1]}"
+            ),
+            "pci_bus_id": device.pci_bus_id,
+        }
+        for device in inventory.devices
+    ]
+    monkeypatch.setattr("lightcone_spec.doctor._collect_facts", lambda *_args: facts)
+    assert (
+        main(
+            [
+                "doctor",
+                "--project-root",
+                str(checkout),
+                "--sglang-root",
+                str(patched_sglang),
+                "--trusted-single-operator-capacity",
+                str(capacity),
+                "--output",
+                str(doctor_path),
+            ]
+        )
+        == 0
+    )
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["schema_version"] == 2
+    assert doctor["status"] == "PASS"
+    assert doctor["stage_capacity"]["status"] == "AVAILABLE"
+    assert doctor["stage_capacity"]["formal_measured_authorization"] is False
+    assert CanonicalJsonProofBinding.bind(doctor_path).reopen() == doctor
+    return capacity
+
+
+def _model_snapshot_paths(
+    tmp_path: Path,
+) -> tuple[FormalV03NamedDirectoryPath, ...]:
+    rows = []
+    for snapshot in FORMAL_V03_MODEL_SNAPSHOT_REGISTRY:
+        repository = "models--" + snapshot.snapshot_model_id.replace("/", "--")
+        cache_root = (tmp_path / "models" / repository).resolve()
+        root = (cache_root / "snapshots" / snapshot.revision).resolve()
         root.mkdir(parents=True)
         (root / "config.json").write_text(
-            json.dumps({"model_type": name}, sort_keys=True) + "\n",
+            json.dumps({"model_type": snapshot.snapshot_key}, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        roots[name] = root
-    rows = (
-        TrustedModelSnapshotSpec(
-            model_id="z-lab/Qwen3-8B-DFlash-b16",
-            revision=revision["dflash"],
-            role="drafter",
-            stages=("preflight",),
-            local_snapshot_path=str(roots["dflash"]),
-            runtime_bindings=(
-                TrustedModelRuntimeBinding(
-                    stage="preflight",
-                    target_model_id="Qwen/Qwen3-8B",
-                    backend="DFLASH",
-                    draft_depth=15,
+        if snapshot.snapshot_key == "qwen3_8b_target":
+            for name, body in {
+                "generation_config.json": b'{"do_sample":false}',
+                "merges.txt": b"#version: 0.2\na b\n",
+                "tokenizer.json": b'{"version":"1.0"}',
+                "tokenizer_config.json": b'{"model_max_length":40960}',
+                "vocab.json": b'{"a":0,"b":1}',
+            }.items():
+                (root / name).write_bytes(body)
+            target_shard = "model-00001-of-00001.safetensors"
+            _write_safetensors(
+                root / target_shard,
+                {"model.embed_tokens.weight": ("BF16", (4, 2))},
+            )
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"total_size": 16},
+                        "weight_map": {
+                            "model.embed_tokens.weight": target_shard,
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
-            ),
-        ),
-        TrustedModelSnapshotSpec(
-            model_id="z-lab/Qwen3-8B-DSpark",
-            revision=revision["dspark"],
-            role="drafter",
-            stages=("preflight",),
-            local_snapshot_path=str(roots["dspark"]),
-            runtime_bindings=(
-                TrustedModelRuntimeBinding(
-                    stage="preflight",
-                    target_model_id="Qwen/Qwen3-8B",
-                    backend="DSPARK",
-                    draft_depth=15,
-                ),
-            ),
-        ),
-        TrustedModelSnapshotSpec(
-            model_id="Qwen/Qwen3-8B",
-            revision=revision["target"],
-            role="target",
-            stages=("preflight",),
-            local_snapshot_path=str(roots["target"]),
-        ),
-        TrustedModelSnapshotSpec(
-            model_id="Qwen/Qwen3-8B",
-            revision=revision["target"],
-            role="tokenizer",
-            stages=("preflight",),
-            local_snapshot_path=str(roots["target"]),
-        ),
-    )
-    return tuple(
-        sorted(
-            rows,
-            key=lambda row: (
-                row.role,
-                row.model_id,
-                row.revision,
-                row.local_snapshot_path,
-            ),
+                encoding="utf-8",
+            )
+        elif snapshot.snapshot_key == "qwen3_8b_dflash_core":
+            for name, body in {
+                "dflash.py": b"class DFlash: pass\n",
+                "modeling_dflash.py": b"class DFlashModel: pass\n",
+                "utils.py": b"BLOCK_SIZE = 16\n",
+            }.items():
+                (root / name).write_bytes(body)
+            _write_safetensors(
+                root / "model.safetensors",
+                {
+                    "layers.0.input_layernorm.weight": ("F32", (4,)),
+                    "layers.0.self_attn.q_proj.weight": ("BF16", (8, 4)),
+                    "lm_head.weight": ("BF16", (32, 4)),
+                    "target_model.layers.0.weight": ("BF16", (4, 4)),
+                },
+            )
+        rows.append(
+            FormalV03NamedDirectoryPath(
+                name=snapshot.snapshot_key,
+                absolute_path=str(root),
+            )
         )
+    return tuple(sorted(rows))
+
+
+def _publish_v03_e0_source_authorities(
+    tmp_path: Path,
+    *,
+    capsys,
+) -> tuple[FormalV03NamedFilePath, ...]:
+    cache = Path(os.environ["LIGHTCONE_CONTENT_SOURCE_CACHE"]).resolve(strict=True)
+    raw_root = (cache / "e0-task-native").resolve(strict=True)
+    inputs_path = (tmp_path / "sources/e0-raw-source-paths.json").resolve()
+    writer_argv = [
+        "formal-single-operator",
+        "write-v03-e0-raw-source-path-inputs",
+        "--output",
+        str(inputs_path),
+    ]
+    for task, pin in sorted(E0_TASK_NATIVE_SOURCE_PINS.items()):
+        writer_argv.extend(
+            (
+                "--source",
+                f"{task}={(raw_root / pin.source_file_name).resolve(strict=True)}",
+            )
+        )
+    assert main(writer_argv) == 0
+    writer_result = json.loads(capsys.readouterr().out)
+    assert writer_result["absolute_path"] == str(inputs_path)
+    CanonicalJsonProofBinding.bind(inputs_path).reopen()
+    output = (tmp_path / "sources/e0-authorities").resolve()
+    output.mkdir()
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-v03-e0-source-authorities",
+                "--inputs",
+                str(inputs_path),
+                "--output-directory",
+                str(output),
+            ]
+        )
+        == 0
     )
+    result = json.loads(capsys.readouterr().out)
+    index_path = (output / FORMAL_V03_E0_SOURCE_AUTHORITY_INDEX_FILE_NAME).resolve(
+        strict=True
+    )
+    assert result["index_path"] == str(index_path)
+    index = load_formal_v03_e0_source_authority_index(index_path)
+    assert tuple(row.name for row in index.authority_paths) == tuple(
+        sorted(E0_TASK_NATIVE_SOURCE_PINS)
+    )
+    return index.authority_paths
+
+
+def _publish_v03_content_path_spec(
+    tmp_path: Path,
+    *,
+    repository_root: Path,
+    model_snapshot_paths: tuple[FormalV03NamedDirectoryPath, ...],
+    livecodebench: Path,
+    math500: Path,
+    burst: dict[str, Path],
+    e0_source_authority_paths: tuple[FormalV03NamedFilePath, ...],
+    inventory: Path,
+    doctor: Path,
+    capsys,
+) -> Path:
+    inputs_path = (tmp_path / "sources/content-path-inputs.json").resolve()
+    writer_argv = [
+        "formal-single-operator",
+        "write-v03-content-path-inputs",
+        "--repository-root",
+        str(repository_root),
+        "--livecodebench-raw",
+        str(livecodebench),
+        "--math500-raw",
+        str(math500),
+        "--inventory",
+        str(inventory),
+        "--doctor-output",
+        str(doctor),
+        "--output",
+        str(inputs_path),
+    ]
+    for row in model_snapshot_paths:
+        writer_argv.extend(("--model-snapshot", f"{row.name}={row.absolute_path}"))
+    for name, path in sorted(burst.items()):
+        writer_argv.extend(("--burstgpt-asset", f"{name}={path}"))
+    for row in e0_source_authority_paths:
+        writer_argv.extend(("--e0-source-authority", f"{row.name}={row.absolute_path}"))
+    assert main(writer_argv) == 0
+    writer_result = json.loads(capsys.readouterr().out)
+    assert writer_result["absolute_path"] == str(inputs_path)
+    CanonicalJsonProofBinding.bind(inputs_path).reopen()
+    output = (tmp_path / "sources/content-path-spec.json").resolve()
+    argv = [
+        "formal-single-operator",
+        "publish-v03-content-path-spec",
+        "--inputs",
+        str(inputs_path),
+        "--output",
+        str(output),
+    ]
+    assert main(argv) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["path"] == str(output)
+    with pytest.raises(FileExistsError):
+        main(argv)
+    capsys.readouterr()
+    return output
 
 
 def _install_code_owned_tokenizer_fixture(
@@ -312,17 +521,82 @@ def _install_code_owned_tokenizer_fixture(
     monkeypatch.setattr(preflight_module, "_invoke_tokenizer_worker", invoke)
 
 
-def _publish_method_authorities(tmp_path: Path, capsys) -> tuple[Path, Path, Path]:
-    tts_plan, _ = _plan_source(tmp_path / "tts-plan", scope="all")
-    e1_plan, _ = _plan_source(tmp_path / "e1-plan", scope="last1")
-    tts_pdf = (tmp_path / "sources/tts.pdf").resolve()
-    tts_tex = (tmp_path / "sources/tts.tex").resolve()
-    tts_pdf.write_bytes(b"%PDF-1.7\nsource-owned cold-start TTS\n")
-    tts_tex.write_text("source-owned cold-start TTS\n", encoding="utf-8")
+def _publish_method_authorities(
+    tmp_path: Path,
+    *,
+    trusted_content: Path,
+    capsys,
+) -> tuple[Path, Path, Path]:
+    cache = Path(os.environ["LIGHTCONE_CONTENT_SOURCE_CACHE"]).resolve(strict=True)
+    primary = cache / "method-primary-sources"
+    tts_pdf = (primary / "tts-2605.09329v2.pdf").resolve(strict=True)
+    tts_source = (primary / "tts-2605.09329v2-source.tar.gz").resolve(strict=True)
+    chrono_pdf = (primary / "chronobelief-project-preregistration-v1.pdf").resolve(
+        strict=True
+    )
+    chrono_tex = (primary / "chronobelief-project-preregistration-v1.tex").resolve(
+        strict=True
+    )
+
+    tts_plan = (tmp_path / "sources/tts-trainable-plan.json").resolve()
+    tts_plan_argv = [
+        "formal-single-operator",
+        "publish-tts-cal-trainable-plan",
+        "--trusted-content-bundle",
+        str(trusted_content),
+        "--output",
+        str(tts_plan),
+    ]
+    assert main(tts_plan_argv) == 0
+    tts_plan_result = json.loads(capsys.readouterr().out)
+    assert len(tts_plan_result["trainable_plan_sha256"]) == 64
+    with pytest.raises(FileExistsError, match="already exists"):
+        main(tts_plan_argv)
+    capsys.readouterr()
+
+    e1_plan = (tmp_path / "sources/e1-trainable-plan.json").resolve()
+    assert (
+        main(
+            [
+                "formal-single-operator",
+                "publish-e1-anchor-trainable-plan",
+                "--trusted-content-bundle",
+                str(trusted_content),
+                "--output",
+                str(e1_plan),
+            ]
+        )
+        == 0
+    )
+    e1_plan_result = json.loads(capsys.readouterr().out)
+    assert len(e1_plan_result["trainable_plan_sha256"]) == 64
+
     window = (tmp_path / "sources/tts-window.json").resolve()
+    assert (
+        main(
+            [
+                "publish-tts-calibration-tuning-window",
+                "--trusted-content-bundle",
+                str(trusted_content),
+                "--output",
+                str(window),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
     loss = (tmp_path / "sources/tts-loss.json").resolve()
-    publish_canonical_json_no_replace(window, _tts_window().to_dict())
-    publish_canonical_json_no_replace(loss, TTS_DRAFTER_NATIVE_LOSS_SOURCE)
+    assert (
+        main(
+            [
+                "publish-tts-drafter-native-loss-source",
+                "--output",
+                str(loss),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
     tts = (tmp_path / "sources/tts-authority.json").resolve()
     assert (
         main(
@@ -331,7 +605,9 @@ def _publish_method_authorities(tmp_path: Path, capsys) -> tuple[Path, Path, Pat
                 "--paper-pdf",
                 str(tts_pdf),
                 "--paper-source",
-                str(tts_tex),
+                str(tts_source),
+                "--trusted-content-bundle",
+                str(trusted_content),
                 "--tuning-window",
                 str(window),
                 "--trainable-plan-authority",
@@ -346,10 +622,6 @@ def _publish_method_authorities(tmp_path: Path, capsys) -> tuple[Path, Path, Pat
     )
     capsys.readouterr()
 
-    chrono_pdf = (tmp_path / "sources/chronobelief.pdf").resolve()
-    chrono_tex = (tmp_path / "sources/chronobelief.tex").resolve()
-    chrono_pdf.write_bytes(b"%PDF-1.7\nsource-owned ChronoBelief\n")
-    chrono_tex.write_text("equations 5.5--5.8\n", encoding="utf-8")
     chrono = (tmp_path / "sources/chronobelief-authority.json").resolve()
     assert (
         main(
@@ -374,6 +646,8 @@ def _publish_method_authorities(tmp_path: Path, capsys) -> tuple[Path, Path, Pat
                 "publish-e1-recipe-anchor-authority",
                 "--trainable-plan-authority",
                 str(e1_plan),
+                "--trusted-content-bundle",
+                str(trusted_content),
                 "--output",
                 str(e1),
             ]
@@ -381,6 +655,11 @@ def _publish_method_authorities(tmp_path: Path, capsys) -> tuple[Path, Path, Pat
         == 0
     )
     capsys.readouterr()
+    e1_artifact = load_e1_recipe_anchor_authority_artifact(e1)
+    assert e1_artifact.schema_version == 3
+    assert e1_artifact.trusted_content_bundle_source == (
+        TrustedSingleOperatorContentBundleBinding.bind(trusted_content)
+    )
     return tts, chrono, e1
 
 
@@ -447,11 +726,19 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
 ) -> None:
     """Replay the public handoff from paths through an exact-ten PENDING queue."""
 
+    gpu_spawn_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def reject_gpu_spawn(self, command, gpu_uuids):
+        gpu_spawn_calls.append((command.cell_id, gpu_uuids))
+        pytest.fail("cold-start boundary crossed into a GPU process spawn")
+
+    monkeypatch.setattr(ProductionSchedulerRuntime, "launch", reject_gpu_spawn)
     livecodebench, math500 = _cached_workload_sources()
     checkout = _clean_runtime_fixture_checkout(tmp_path)
-    inventory, doctor, _sglang, _cuda = _publish_runtime_inputs(
+    inventory, doctor, patched_sglang, _cuda = _publish_runtime_inputs(
         tmp_path,
         monkeypatch=monkeypatch,
+        capsys=capsys,
     )
 
     locked = {
@@ -482,24 +769,31 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
     burst_root.mkdir()
     burst = _tiny_burstgpt_assets(burst_root, monkeypatch)
     _install_code_owned_tokenizer_fixture(monkeypatch)
-
-    content_spec = TrustedSingleOperatorContentPathSpec(
-        schema_version=1,
-        kind="trusted_single_operator_content_path_spec",
-        repository_root=str(checkout),
-        model_specs=_model_specs(tmp_path),
-        livecodebench_raw_path=str(livecodebench),
-        math500_raw_path=str(math500),
-        burstgpt_asset_paths=tuple(
-            TrustedNamedInputPath(name=name, absolute_path=str(path))
-            for name, path in sorted(burst.items())
-        ),
-        e0_task_native_specs=(),
-        inventory_path=str(inventory),
-        doctor_path=str(doctor),
+    e0_authorities = _publish_v03_e0_source_authorities(tmp_path, capsys=capsys)
+    spec_path = _publish_v03_content_path_spec(
+        tmp_path,
+        repository_root=checkout,
+        model_snapshot_paths=_model_snapshot_paths(tmp_path),
+        livecodebench=livecodebench,
+        math500=math500,
+        burst=burst,
+        e0_source_authority_paths=e0_authorities,
+        inventory=inventory,
+        doctor=doctor,
+        capsys=capsys,
     )
-    spec_path = (tmp_path / "sources/content-path-spec.json").resolve()
-    publish_canonical_json_no_replace(spec_path, content_spec.to_dict())
+    run_root = (tmp_path / "formal-v03-cold-start").resolve()
+    run_root.mkdir()
+    capacity = _publish_trusted_capacity_doctor(
+        checkout=checkout,
+        patched_sglang=patched_sglang,
+        content_spec_path=spec_path,
+        run_root=run_root,
+        doctor_path=doctor,
+        inventory_path=inventory,
+        monkeypatch=monkeypatch,
+        capsys=capsys,
+    )
     content = (tmp_path / "sources/trusted-content.json").resolve()
     assert (
         main(
@@ -547,7 +841,11 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
         == 0
     )
     capsys.readouterr()
-    tts, chrono, e1 = _publish_method_authorities(tmp_path, capsys)
+    tts, chrono, e1 = _publish_method_authorities(
+        tmp_path,
+        trusted_content=content,
+        capsys=capsys,
+    )
     lock = (tmp_path / "sources/protocol-lock.json").resolve()
     assert (
         main(
@@ -579,9 +877,7 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
         capsys=capsys,
     )
 
-    run_root = (tmp_path / "formal-v03-cold-start").resolve()
     catalog = (tmp_path / "prerequisite-catalog").resolve()
-    run_root.mkdir()
     catalog.mkdir()
     driver_config = (run_root / "driver-config.json").resolve()
     driver_argv = [
@@ -716,6 +1012,11 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
         assert supervisor.config.onlinespec_source_authority.absolute_path == str(
             onlinespec_authority
         )
+        assert supervisor.driver_config.doctor_report.absolute_path == str(doctor)
+        doctor_value = CanonicalJsonProofBinding.bind(doctor).reopen()
+        assert doctor_value["stage_capacity"]["authority"]["absolute_path"] == str(
+            capacity
+        )
         assert supervisor.driver.store.controller_node("preflight")["state"] == (
             "PLANNED"
         )
@@ -723,7 +1024,11 @@ def test_v03_cold_start_reaches_exact_first_gpu_boundary_without_launch(
     finally:
         supervisor.close()
 
-    # This is the exact handoff boundary: another bootstrap cycle observes a
-    # PLANNED node, commits the two-GPU group RUNNING, and invokes its setsid
-    # child.  The cold-start test deliberately does not execute that cycle.
+    # A third cycle would commit the physical group RUNNING and invoke its
+    # setsid child.  This test proves the exact no-spawn handoff and stops.
+    assert gpu_spawn_calls == []
     assert all(not row["pid"] for row in ledger_rows)
+
+    content.write_bytes(content.read_bytes() + b" ")
+    with pytest.raises((RuntimeError, ValueError), match="canonical|changed"):
+        load_e1_recipe_anchor_authority_artifact(e1)

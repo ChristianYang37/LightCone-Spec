@@ -38,10 +38,12 @@ run nonce 派生新 seed。这些值是 preliminary GPU snapshot 实际使用的
 
 Target-only 与 Static schema config 都要求 `adaptation: null` 和 `online_spec: null`。
 Target-only 启动无 speculation 的 target path；Static 描述原生 speculative decoding。
-二者都不能分配 optimizer、gradient、master、candidate 或 cohort-adaptation state。当前
-只有 Target-only 可端到端执行。Static 必须保持 round/update 详细 trace 零分配，同时仍需
-content-bound request、performance 与汇总 speculative safety evidence，所以无法通过
-trusted-signer release preflight。
+二者都不能分配 optimizer、gradient、master、candidate 或 cohort-adaptation state，且都不能
+仅凭 config 获得执行权限。在 release-attested lane，Static 需要 content-bound request、
+performance、汇总 speculative safety 与 signed terminal evidence。Trusted
+`formal_single_operator_v1` 不要求 external signer，但同样必须通过实质 source/content/runtime、
+fresh GPU qualification、capacity、terminal 与 coverage gate；其结果保持 unsigned，且固定为
+`trusted_single_operator_empirical_no_signature`、`formal_measured=false`、`UNMEASURED`。
 
 Recipe 与 publication identity 正交。TTS 使用 frozen、primary-source-bound recipe 与 fixed
 barrier；L0-naive 使用同一个 frozen recipe authority 与 first-ready safe-boundary
@@ -83,9 +85,10 @@ Adaptive schema 可使用 DFlash、DSpark 或 NEXTN。DFlash 使用 native
 differentiable-canvas evidence；DSpark 要求实际 sampled predecessor、W1/W2、native
 confidence head 与准确的 56-candidate selector；NEXTN 要求 MTP hidden/interface、teacher
 row、valid mask、source version，并在 TP2 下要求 target/drafter shard authority。这些都是
-源码 contract；formal execution 仍必须提供 backend 专属 GPU qualification。EAGLE 不受
-支持。EAGLE3 只允许 signed official model/selector compatibility 判定通过的组合，不能作为
-generic fallback。
+源码 contract；execution 仍必须提供 backend 专属 GPU qualification。EAGLE 不受支持。
+EAGLE3 只允许 post-probe compatible model/selector 组合；release-attested lane 要求独立 signed
+official decision，trusted single-operator lane 则保留其 unsigned compatibility authority。它
+不能作为 generic fallback。
 
 DSpark layer-only scope 冻结 W1、W2 与 acceptance/confidence state。Hybrid scope
 `last1_native_heads`、`last3_native_heads`、`last5_native_heads` 选择命名 backbone scope，
@@ -104,13 +107,19 @@ scope，各自交叉 Full 加七个 LoRA rank。
 
 E1/E2 **LC-candidate** optimizer registry 包含 `adam`、`adamw`、`sgdm`、`nag`、`muon`、
 `lion` 与项目自有 `chronobelief`。它们生成 functional parameter/state proposal，只有 commit
-时才修改 active state。TTS 不搜索该 registry；TTS-Cal authority 固定 Adam、一步、
+时才修改 active state。TTS 不搜索该 registry；TTS-Cal reconstruction 注册 Adam、一步、
 `(beta1=.9, beta2=.999, epsilon=1e-8)`、zero decay、无 clipping、全 drafter/
-latest-round-only update、drafter-native position weight、source-point proximal anchor、
-request reset、side stream、注册的 learning-rate grid 与八个 stride。四个 excluded pilot 按
-safety-first reducer 生成 signed winner；在 seal 之前 TTS 与 L0-naive 保持 `BLOCKED`，且
-不能继承 schema default、历史 AdamW recipe 或 E1/E2 selection。Plain `sgd` 只用于
-OnlineSPEC。
+latest-update-round-only update、request reset、side stream、注册的 learning-rate grid 与八个
+stride。其 pinned DFlash loss 在 temperature 1 下计算 float32 target-to-draft forward KL，使用
+valid-row mask、`exp(-(k-1)/7)` position weight 与 masked weighted normalization。
+source-point value correction 不是独立 proximal term，因此 `lambda` 既不是输入也不是搜索轴。
+TTS 与 L0-naive 不得继承 schema default、历史 AdamW recipe 或 E1/E2 selection。Plain `sgd`
+只用于 OnlineSPEC。
+
+Code-owned TTS split 是 post-master artifact。新 content-verification producer 发布 schema 2，并在
+master ceremony 中拒绝 tuning window；window publisher 随后强制使用该准确 durable
+master receipt，发布绑定 receipt SHA-256、verification time 与 replay-reservation SHA-256 的
+schema-4 window。Schema-1 receipt 仍可解码以重放历史路径，但不能授权新 TTS window。
 
 | Optimizer | 必需身份 | 常驻 moment 规则 |
 |---|---|---|
@@ -179,8 +188,11 @@ scope；任何改变都需要新 config、load screen、selection 与 evidence r
 
 隔离的 OnlineSPEC protocol 要求额外 `online_spec` object，其 optimizer 必须为 plain
 SGD；其 declaration 在独立注册的 tuning protocol 中保持 TP1/DP1。这个单独的
-schema/runtime surface 不会提供 release-trusted hardware signer，也不会让 industrial
-speculative cell 变得可运行。
+schema/runtime surface 不会提供 release-trusted hardware signer，因此不能把 OnlineSPEC 结果
+提升为 release-level `MEASURED`。Trusted single-operator 的 E0 comparison 可在 audited source
+authority 与准确 content/runtime、GPU qualification、capacity、terminal、coverage gate 通过后
+无 signer 运行，但始终保持 `trusted_single_operator_empirical_no_signature`、
+`formal_measured=false` 与 `UNMEASURED`。
 
 | 字段 | 合同 |
 |---|---|

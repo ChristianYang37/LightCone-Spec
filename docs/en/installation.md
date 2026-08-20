@@ -138,19 +138,24 @@ sanitized provisioning receipt. Never place provider secrets, temporary URLs,
 instance addresses, or access tokens in commands, manifests, evidence, handoff
 documents, or Git.
 
-The source tree does not itself contain a runnable empirical Stage B. A formal
-session remains `BLOCKED` until it has fresh provider state, root-authorized
-deployment/hardware policy, immutable prepared-model and workload content
-receipts, exact compile/exactness/interference terminals, and a stage capacity
-control. The pinned integration contains first-party compile and non-serving
-terminal contracts, but their absence from a checkout is intentional: source
-capability is not execution evidence. Hardware access or a test signer alone
-does not unblock speculative work. Formal TTS/L0-naive additionally require a
-sealed TTS-Cal winner, and LightCone requires the exact sealed E2 winner;
+The source tree does not itself contain the external inputs or GPU evidence for
+an empirical Stage B. The release-attested lane remains `BLOCKED` until it has
+fresh provider state, root-authorized deployment/hardware policy, immutable
+prepared-model and workload content receipts, exact
+compile/exactness/interference terminals, and a stage capacity control. The
+trusted `formal_single_operator_v1` lane does not require the root signer: it
+may execute the complete empirical DAG when the same substantive
+source/content/runtime, fresh GPU qualification, capacity, terminal, and
+coverage gates pass, and its output remains
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`. Source capability, hardware access, or a test signer alone never
+unblocks speculative work. TTS/L0-naive additionally require the exact
+content-sealed TTS-Cal winner, and LightCone requires the exact sealed E2 winner;
 neither is inferred from defaults. TP2/DP2, DSpark, NEXTN, native ITL, and
-session reuse are implemented pending their exact dynamic GPU proofs. EAGLE3
-requires a separate signed official model/selector compatibility decision;
-unsupported or incompatible combinations stay N/A or `BLOCKED`.
+session reuse remain gated by their exact dynamic GPU proofs. EAGLE3 requires
+the applicable post-probe model/selector compatibility authority; the
+release-attested lane additionally requires its signed official decision.
+Unsupported or incompatible combinations stay N/A or `BLOCKED`.
 
 ## Trusted attester bundle
 

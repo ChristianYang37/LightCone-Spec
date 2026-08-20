@@ -77,6 +77,7 @@ def _two_trace_inputs(plan) -> tuple[SessionLiveTraceInput, SessionLiveTraceInpu
     traces = []
     prior = None
     for index, execution_plan in enumerate(plan.execution_plan_sha256s):
+        adaptation = plan.configs[index].adaptation
         warmup = (
             TerminalRequestExpectation(
                 request_id=f"warm-{index}",
@@ -108,6 +109,12 @@ def _two_trace_inputs(plan) -> tuple[SessionLiveTraceInput, SessionLiveTraceInpu
             previous_run_id=prior,
             challenge_nonce_sha256=_sha(f"challenge-{index}"),
             method=plan.traces[index].method,
+            reset_scope=None if adaptation is None else adaptation.reset_scope,
+            request_admission_policy=(
+                None if adaptation is None else adaptation.request_admission_policy
+            ),
+            runtime_trust_mode=None,
+            formal_measurement=None,
             warmup_request_ids=(f"warm-{index}",),
             scored_request_ids=(f"score-{index}",),
         )

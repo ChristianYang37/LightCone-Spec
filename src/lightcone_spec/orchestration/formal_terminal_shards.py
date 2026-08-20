@@ -33,17 +33,26 @@ _SHARD_MAX_ROWS = 256
 _INLINE_POINTER_EVENTS_MAX_BYTES = 200_000
 _SHA256_CHARS = frozenset("0123456789abcdef")
 
-SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v2_sharded"
+LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND = (
+    "native_terminal_evidence_bundle_v2_sharded"
+)
+SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND = "native_terminal_evidence_bundle_v3_sharded"
 SHARDED_UNSIGNED_NATIVE_ITL_BUNDLE_KIND = (
     "unsigned_native_itl_result_pointer_bundle_v2_sharded"
 )
-SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND = (
+LEGACY_SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND = (
     "unsigned_formal_gang_request_terminal_v2_sharded"
+)
+SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND = (
+    "unsigned_formal_gang_request_terminal_v3_sharded"
 )
 SHARDED_FORMAL_GANG_ITL_BUNDLE_KIND = (
     "unsigned_formal_gang_native_itl_pointer_bundle_v2_sharded"
 )
-SHARDED_FORMAL_GANG_TERMINAL_KIND = "sglang_formal_gang_all_rank_terminal_v2_sharded"
+LEGACY_SHARDED_FORMAL_GANG_TERMINAL_KIND = (
+    "sglang_formal_gang_all_rank_terminal_v2_sharded"
+)
+SHARDED_FORMAL_GANG_TERMINAL_KIND = "sglang_formal_gang_all_rank_terminal_v3_sharded"
 SHARDED_CLIENT_REQUEST_LIFECYCLE_KIND = "registered_client_request_lifecycle_v1_sharded"
 
 _TERMINAL_SEQUENCE_FIELDS = (
@@ -54,6 +63,22 @@ _TERMINAL_SEQUENCE_FIELDS = (
     "terminal_round_rows",
     "terminal_update_rows",
     "terminal_historical_kv_items",
+)
+
+_CURRENT_TERMINAL_SEQUENCE_FIELDS = (
+    "warmup_requests",
+    "scored_requests",
+    "reset_warmup_request_rows",
+    "reset_warmup_round_rows",
+    "reset_warmup_update_rows",
+    "reset_warmup_historical_kv_items",
+    "reset_warmup_request_reset_receipts",
+    "terminal_expected_request_ids",
+    "terminal_request_rows",
+    "terminal_round_rows",
+    "terminal_update_rows",
+    "terminal_historical_kv_items",
+    "terminal_request_reset_receipts",
 )
 
 
@@ -288,7 +313,7 @@ def reopen_scalable_client_request_lifecycle(
     return rows
 
 
-def publish_scalable_native_terminal_artifact(
+def _publish_legacy_scalable_native_terminal_artifact(
     *,
     output_path: str | Path,
     legacy_artifact: object,
@@ -387,7 +412,7 @@ def publish_scalable_native_terminal_artifact(
     }
     container = {
         "schema_version": 2,
-        "artifact_kind": SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
+        "artifact_kind": LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
         "legacy_artifact_sha256": legacy_sha256,
         "legacy_artifact_static": _copy_json(artifact),
         "terminal_static": _copy_json(terminal),
@@ -397,13 +422,15 @@ def publish_scalable_native_terminal_artifact(
         "sequence_indexes": indexes,
     }
     # Exercise the same deep reconstruction that all later consumers use.
-    if reopen_scalable_native_terminal_artifact(container) != legacy_artifact:
+    if _reopen_legacy_scalable_native_terminal_artifact(container) != legacy_artifact:
         raise RuntimeError("sharded native terminal reconstruction changed")
     publish_canonical_json_no_replace(output_path, container)
     return CanonicalJsonProofBinding.bind(output_path)
 
 
-def reopen_scalable_native_terminal_artifact(value: object) -> dict[str, object]:
+def _reopen_legacy_scalable_native_terminal_artifact(
+    value: object,
+) -> dict[str, object]:
     """Return the exact registered schema-1 terminal from either container."""
 
     if (
@@ -427,7 +454,7 @@ def reopen_scalable_native_terminal_artifact(value: object) -> dict[str, object]
     )
     if (
         row["schema_version"] != 2
-        or row["artifact_kind"] != SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+        or row["artifact_kind"] != LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
     ):
         raise ValueError("sharded native terminal container schema differs")
     legacy_sha256 = _require_sha256(
@@ -506,6 +533,245 @@ def reopen_scalable_native_terminal_artifact(value: object) -> dict[str, object]
     )
     if _sha256(artifact) != legacy_sha256:
         raise ValueError("sharded native terminal complete digest differs")
+    return artifact
+
+
+def _history_items(value: object, *, label: str) -> list[object]:
+    if type(value) is not dict or any(type(key) is not str for key in value):
+        raise TypeError(f"{label} must be a string-keyed object")
+    return [
+        {"request_id": request_id, "versions": versions}
+        for request_id, versions in sorted(value.items())
+    ]
+
+
+def _history_from_items(rows: list[object], *, label: str) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for raw_item in rows:
+        item = _strict(label, raw_item, {"request_id", "versions"})
+        request_id = item["request_id"]
+        if type(request_id) is not str or not request_id or request_id in result:
+            raise ValueError(f"{label} keys differ")
+        result[request_id] = item["versions"]
+    return result
+
+
+def publish_scalable_native_terminal_artifact(
+    *,
+    output_path: str | Path,
+    legacy_artifact: object,
+) -> CanonicalJsonProofBinding:
+    """Publish only the current schema-2 terminal, inline or as schema-3 shards.
+
+    The parameter name is retained for call compatibility.  A schema-1 bundle
+    remains reopenable below but is intentionally no longer publishable by a
+    production path.
+    """
+
+    artifact = _strict(
+        "current native terminal artifact",
+        _copy_json(legacy_artifact),
+        {
+            "schema_version",
+            "artifact_kind",
+            "run_id",
+            "rank",
+            "trusted_attester_policy_sha256",
+            "begin_sha256",
+            "reset_sha256",
+            "terminal_sha256",
+            "binding",
+            "warmup_requests",
+            "scored_requests",
+            "begin",
+            "reset",
+            "terminal",
+        },
+    )
+    if (
+        artifact["schema_version"] != 2
+        or artifact["artifact_kind"] != "native_terminal_evidence_bundle_v2"
+    ):
+        raise ValueError("production native terminal artifact must be current schema 2")
+    if len(_canonical_bytes(artifact)) + 1 <= _INLINE_MAX_BYTES:
+        publish_canonical_json_no_replace(output_path, artifact)
+        return CanonicalJsonProofBinding.bind(output_path)
+
+    reset = artifact.pop("reset")
+    terminal = artifact.pop("terminal")
+    if type(reset) is not dict or type(terminal) is not dict:
+        raise TypeError("current native terminal reset/terminal must be objects")
+    reset = dict(reset)
+    terminal = dict(terminal)
+    warmup_resets = reset.pop("warmup_request_source_point_resets", None)
+    terminal_resets = terminal.pop("request_source_point_resets", None)
+    request_round = terminal.pop("request_round_rows", None)
+    if (
+        type(warmup_resets) is not dict
+        or type(terminal_resets) is not dict
+        or type(request_round) is not dict
+        or set(request_round) != {"requests", "rounds"}
+    ):
+        raise ValueError("current native terminal reset/round envelopes differ")
+    warmup_resets = dict(warmup_resets)
+    terminal_resets = dict(terminal_resets)
+    sequences: dict[str, list[object]] = {
+        "warmup_requests": list(artifact.pop("warmup_requests")),
+        "scored_requests": list(artifact.pop("scored_requests")),
+        "reset_warmup_request_rows": list(reset.pop("warmup_request_rows")),
+        "reset_warmup_round_rows": list(reset.pop("warmup_round_rows")),
+        "reset_warmup_update_rows": list(reset.pop("warmup_update_rows")),
+        "reset_warmup_historical_kv_items": _history_items(
+            reset.pop("warmup_historical_kv_source_versions"),
+            label="warmup historical KV",
+        ),
+        "reset_warmup_request_reset_receipts": list(warmup_resets.pop("receipts")),
+        "terminal_expected_request_ids": list(terminal.pop("expected_request_ids")),
+        "terminal_request_rows": list(request_round["requests"]),
+        "terminal_round_rows": list(request_round["rounds"]),
+        "terminal_update_rows": list(terminal.pop("update_rows")),
+        "terminal_historical_kv_items": _history_items(
+            terminal.pop("historical_kv_source_versions"),
+            label="terminal historical KV",
+        ),
+        "terminal_request_reset_receipts": list(terminal_resets.pop("receipts")),
+    }
+    artifact_sha256 = _sha256(legacy_artifact)
+    root = _shard_root(output_path)
+    indexes = {
+        field: _publish_sequence(
+            rows=rows,
+            artifact_kind=f"formal_{field}",
+            artifact_id=artifact_sha256,
+            root=root,
+        )
+        for field, rows in sequences.items()
+    }
+    container = {
+        "schema_version": 3,
+        "artifact_kind": SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
+        "semantic_artifact_sha256": artifact_sha256,
+        "artifact_static": artifact,
+        "reset_static": reset,
+        "warmup_request_resets_static": warmup_resets,
+        "terminal_static": terminal,
+        "terminal_request_resets_static": terminal_resets,
+        "sequence_counts": {
+            field: len(sequences[field]) for field in _CURRENT_TERMINAL_SEQUENCE_FIELDS
+        },
+        "sequence_indexes": indexes,
+    }
+    if reopen_scalable_native_terminal_artifact(container) != legacy_artifact:
+        raise RuntimeError("sharded current native terminal reconstruction changed")
+    publish_canonical_json_no_replace(output_path, container)
+    return CanonicalJsonProofBinding.bind(output_path)
+
+
+def reopen_scalable_native_terminal_artifact(value: object) -> dict[str, object]:
+    """Deep-reopen current containers and read legacy containers compatibly."""
+
+    if type(value) is not dict:
+        raise TypeError("native terminal artifact must be an object")
+    if value.get("schema_version") == 1 or (
+        value.get("schema_version") == 2
+        and value.get("artifact_kind") == LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+    ):
+        return _reopen_legacy_scalable_native_terminal_artifact(value)
+    if (
+        value.get("schema_version") == 2
+        and value.get("artifact_kind") == "native_terminal_evidence_bundle_v2"
+    ):
+        return dict(value)
+    row = _strict(
+        "sharded current native terminal artifact",
+        value,
+        {
+            "schema_version",
+            "artifact_kind",
+            "semantic_artifact_sha256",
+            "artifact_static",
+            "reset_static",
+            "warmup_request_resets_static",
+            "terminal_static",
+            "terminal_request_resets_static",
+            "sequence_counts",
+            "sequence_indexes",
+        },
+    )
+    if (
+        row["schema_version"] != 3
+        or row["artifact_kind"] != SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+    ):
+        raise ValueError("sharded current native terminal container schema differs")
+    artifact_sha256 = _require_sha256(
+        "sharded current native terminal semantic artifact",
+        row["semantic_artifact_sha256"],
+    )
+    counts = _strict(
+        "sharded current native terminal sequence counts",
+        row["sequence_counts"],
+        set(_CURRENT_TERMINAL_SEQUENCE_FIELDS),
+    )
+    indexes = _strict(
+        "sharded current native terminal sequence indexes",
+        row["sequence_indexes"],
+        set(_CURRENT_TERMINAL_SEQUENCE_FIELDS),
+    )
+    sequences: dict[str, list[object]] = {}
+    for field in _CURRENT_TERMINAL_SEQUENCE_FIELDS:
+        count = counts[field]
+        if type(count) is not int or count < 0:
+            raise ValueError("sharded current native terminal sequence count differs")
+        sequences[field] = _reopen_sequence(
+            indexes[field],
+            artifact_kind=f"formal_{field}",
+            artifact_id=artifact_sha256,
+            expected_count=count,
+        )
+    artifact = dict(row["artifact_static"])
+    reset = dict(row["reset_static"])
+    warmup_resets = dict(row["warmup_request_resets_static"])
+    terminal = dict(row["terminal_static"])
+    terminal_resets = dict(row["terminal_request_resets_static"])
+    warmup_resets["receipts"] = sequences["reset_warmup_request_reset_receipts"]
+    terminal_resets["receipts"] = sequences["terminal_request_reset_receipts"]
+    reset.update(
+        {
+            "warmup_request_rows": sequences["reset_warmup_request_rows"],
+            "warmup_round_rows": sequences["reset_warmup_round_rows"],
+            "warmup_update_rows": sequences["reset_warmup_update_rows"],
+            "warmup_historical_kv_source_versions": _history_from_items(
+                sequences["reset_warmup_historical_kv_items"],
+                label="sharded warmup historical KV item",
+            ),
+            "warmup_request_source_point_resets": warmup_resets,
+        }
+    )
+    terminal.update(
+        {
+            "expected_request_ids": sequences["terminal_expected_request_ids"],
+            "request_round_rows": {
+                "requests": sequences["terminal_request_rows"],
+                "rounds": sequences["terminal_round_rows"],
+            },
+            "update_rows": sequences["terminal_update_rows"],
+            "historical_kv_source_versions": _history_from_items(
+                sequences["terminal_historical_kv_items"],
+                label="sharded terminal historical KV item",
+            ),
+            "request_source_point_resets": terminal_resets,
+        }
+    )
+    artifact.update(
+        {
+            "warmup_requests": sequences["warmup_requests"],
+            "scored_requests": sequences["scored_requests"],
+            "reset": reset,
+            "terminal": terminal,
+        }
+    )
+    if _sha256(artifact) != artifact_sha256:
+        raise ValueError("sharded current native terminal complete digest differs")
     return artifact
 
 
@@ -708,37 +974,57 @@ def publish_scalable_formal_gang_request_terminal(
     output_path: str | Path,
     legacy_terminal: object,
 ) -> CanonicalJsonProofBinding:
-    """Publish the distributed client terminal without dropping token IDs."""
+    """Publish legacy request rows or the current deep warmup-reset binding."""
 
+    common_fields = {
+        "schema_version",
+        "kind",
+        "protocol_sha256",
+        "formal_execution_authorized",
+        "plan_sha256",
+        "formal_launch_admission",
+        "formal_launch_consumption",
+        "budget_consumption",
+        "capability_sha256",
+        "begin_sha256",
+        "reset_sha256",
+        "finalize_sha256",
+        "warmup_requests",
+        "scored_requests",
+    }
+    if type(legacy_terminal) is not dict:
+        raise TypeError("formal gang request terminal must be an object")
+    current = (
+        legacy_terminal.get("schema_version") == 2
+        and legacy_terminal.get("kind") == "unsigned_formal_gang_request_terminal_v2"
+    )
     terminal = _strict(
         "formal gang request terminal",
         legacy_terminal,
-        {
-            "schema_version",
-            "kind",
-            "protocol_sha256",
-            "formal_execution_authorized",
-            "plan_sha256",
-            "formal_launch_admission",
-            "formal_launch_consumption",
-            "budget_consumption",
-            "capability_sha256",
-            "begin_sha256",
-            "reset_sha256",
-            "finalize_sha256",
-            "warmup_requests",
-            "scored_requests",
-        },
+        common_fields | ({"formal_gang_reset"} if current else set()),
     )
-    if (
-        terminal["schema_version"] != 1
-        or terminal["kind"] != "unsigned_formal_gang_request_terminal"
-    ):
-        raise ValueError("formal gang request terminal is not registered schema 1")
+    legacy = (
+        terminal["schema_version"] == 1
+        and terminal["kind"] == "unsigned_formal_gang_request_terminal"
+    )
+    if not current and not legacy:
+        raise ValueError("formal gang request terminal schema differs")
+    if current:
+        reset_binding = CanonicalJsonProofBinding.from_dict(
+            terminal["formal_gang_reset"]
+        )
+        reset = reopen_scalable_formal_gang_terminal(reset_binding.reopen())
+        if (
+            reset.get("schema_version") != 2
+            or reset.get("kind") != "sglang_formal_gang_all_rank_terminal"
+            or reset.get("action") != "formal_gang_reset"
+            or reset.get("aggregate_sha256") != terminal["reset_sha256"]
+        ):
+            raise ValueError("current formal gang warmup reset binding differs")
     if len(_canonical_bytes(terminal)) + 1 <= _INLINE_MAX_BYTES:
         publish_canonical_json_no_replace(output_path, terminal)
         return CanonicalJsonProofBinding.bind(output_path)
-    legacy_sha256 = _sha256(legacy_terminal)
+    terminal_sha256 = _sha256(legacy_terminal)
     root = _shard_root(output_path)
     sequences = {
         phase: list(terminal.pop(f"{phase}_requests")) for phase in ("warmup", "scored")
@@ -747,19 +1033,29 @@ def publish_scalable_formal_gang_request_terminal(
         phase: _publish_sequence(
             rows=rows,
             artifact_kind=f"formal_gang_{phase}_request_terminals",
-            artifact_id=legacy_sha256,
+            artifact_id=terminal_sha256,
             root=root,
         )
         for phase, rows in sequences.items()
     }
-    container = {
-        "schema_version": 2,
-        "kind": SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND,
-        "legacy_terminal_sha256": legacy_sha256,
-        "legacy_terminal_static": _copy_json(terminal),
-        "request_counts": {phase: len(rows) for phase, rows in sequences.items()},
-        "request_shard_indexes": indexes,
-    }
+    if current:
+        container = {
+            "schema_version": 3,
+            "kind": SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND,
+            "semantic_terminal_sha256": terminal_sha256,
+            "terminal_static": _copy_json(terminal),
+            "request_counts": {phase: len(rows) for phase, rows in sequences.items()},
+            "request_shard_indexes": indexes,
+        }
+    else:
+        container = {
+            "schema_version": 2,
+            "kind": LEGACY_SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND,
+            "legacy_terminal_sha256": terminal_sha256,
+            "legacy_terminal_static": _copy_json(terminal),
+            "request_counts": {phase: len(rows) for phase, rows in sequences.items()},
+            "request_shard_indexes": indexes,
+        }
     if reopen_scalable_formal_gang_request_terminal(container) != legacy_terminal:
         raise RuntimeError("sharded formal gang request terminal changed")
     publish_canonical_json_no_replace(output_path, container)
@@ -769,31 +1065,45 @@ def publish_scalable_formal_gang_request_terminal(
 def reopen_scalable_formal_gang_request_terminal(
     value: object,
 ) -> dict[str, object]:
-    if (
-        type(value) is dict
-        and value.get("schema_version") == 1
-        and value.get("kind") == "unsigned_formal_gang_request_terminal"
+    if type(value) is dict and (
+        (
+            value.get("schema_version") == 1
+            and value.get("kind") == "unsigned_formal_gang_request_terminal"
+        )
+        or (
+            value.get("schema_version") == 2
+            and value.get("kind") == "unsigned_formal_gang_request_terminal_v2"
+        )
     ):
         return dict(value)
+    if type(value) is not dict:
+        raise TypeError("sharded formal gang request terminal must be an object")
+    current = (
+        value.get("schema_version") == 3
+        and value.get("kind") == SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND
+    )
     row = _strict(
         "sharded formal gang request terminal",
         value,
         {
             "schema_version",
             "kind",
-            "legacy_terminal_sha256",
-            "legacy_terminal_static",
+            "semantic_terminal_sha256" if current else "legacy_terminal_sha256",
+            "terminal_static" if current else "legacy_terminal_static",
             "request_counts",
             "request_shard_indexes",
         },
     )
-    if (
-        row["schema_version"] != 2
-        or row["kind"] != SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND
-    ):
+    legacy = (
+        row["schema_version"] == 2
+        and row["kind"] == LEGACY_SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND
+    )
+    if not current and not legacy:
         raise ValueError("sharded formal gang request terminal schema differs")
-    legacy_sha256 = _require_sha256(
-        "sharded formal gang request terminal", row["legacy_terminal_sha256"]
+    digest_field = "semantic_terminal_sha256" if current else "legacy_terminal_sha256"
+    static_field = "terminal_static" if current else "legacy_terminal_static"
+    terminal_sha256 = _require_sha256(
+        "sharded formal gang request terminal", row[digest_field]
     )
     counts = _strict(
         "sharded formal gang request counts",
@@ -805,7 +1115,7 @@ def reopen_scalable_formal_gang_request_terminal(
         row["request_shard_indexes"],
         {"warmup", "scored"},
     )
-    terminal = dict(row["legacy_terminal_static"])
+    terminal = dict(row[static_field])
     for phase in ("warmup", "scored"):
         count = counts[phase]
         if type(count) is not int or count < 0:
@@ -813,10 +1123,10 @@ def reopen_scalable_formal_gang_request_terminal(
         terminal[f"{phase}_requests"] = _reopen_sequence(
             indexes[phase],
             artifact_kind=f"formal_gang_{phase}_request_terminals",
-            artifact_id=legacy_sha256,
+            artifact_id=terminal_sha256,
             expected_count=count,
         )
-    if _sha256(terminal) != legacy_sha256:
+    if _sha256(terminal) != terminal_sha256:
         raise ValueError("sharded formal gang request terminal digest differs")
     return terminal
 
@@ -1071,6 +1381,7 @@ def _publish_rank_terminal_sequences(
     rank_ordinal: int,
     legacy_sha256: str,
     root: Path,
+    current: bool,
 ) -> dict[str, object]:
     native_state = dict(rank.pop("native_state"))
     sequences = {
@@ -1085,6 +1396,36 @@ def _publish_rank_terminal_sequences(
             )
         ],
     }
+    if current:
+        resets = native_state.pop("request_source_point_resets")
+        if type(resets) is not dict:
+            raise TypeError("current formal gang request resets must be an object")
+        resets = dict(resets)
+        sequences["request_reset_receipts"] = list(resets.pop("receipts"))
+        native_state["request_source_point_resets"] = resets
+        adaptation = native_state.get("adaptation")
+        if adaptation is None:
+            sequences.update(
+                {
+                    "adaptation_rounds": [],
+                    "adaptation_updates": [],
+                    "adaptation_request_reset_receipts": [],
+                }
+            )
+        elif type(adaptation) is dict:
+            adaptation = dict(adaptation)
+            sequences.update(
+                {
+                    "adaptation_rounds": list(adaptation.pop("rounds")),
+                    "adaptation_updates": list(adaptation.pop("updates")),
+                    "adaptation_request_reset_receipts": list(
+                        adaptation.pop("request_source_point_reset_receipts")
+                    ),
+                }
+            )
+            native_state["adaptation"] = adaptation
+        else:
+            raise TypeError("current formal gang adaptation must be an object or null")
     published: dict[str, object] = {}
     for name, rows in sequences.items():
         published[name] = _publish_sequence(
@@ -1106,6 +1447,7 @@ def _reopen_rank_terminal_sequences(
     value: object,
     rank_ordinal: int,
     legacy_sha256: str,
+    current: bool,
 ) -> dict[str, object]:
     row = _strict(
         "sharded formal gang rank terminal",
@@ -1124,6 +1466,15 @@ def _reopen_rank_terminal_sequences(
         "update_rows",
         "historical_kv_items",
     }
+    if current:
+        names.update(
+            {
+                "request_reset_receipts",
+                "adaptation_rounds",
+                "adaptation_updates",
+                "adaptation_request_reset_receipts",
+            }
+        )
     counts = _strict("sharded formal gang rank counts", row["sequence_counts"], names)
     indexes = _strict(
         "sharded formal gang rank indexes", row["sequence_indexes"], names
@@ -1158,6 +1509,32 @@ def _reopen_rank_terminal_sequences(
             "historical_kv_source_versions": history,
         }
     )
+    if current:
+        resets = dict(native_state["request_source_point_resets"])
+        resets["receipts"] = sequences["request_reset_receipts"]
+        native_state["request_source_point_resets"] = resets
+        adaptation = native_state.get("adaptation")
+        if adaptation is not None:
+            adaptation = dict(adaptation)
+            adaptation.update(
+                {
+                    "rounds": sequences["adaptation_rounds"],
+                    "updates": sequences["adaptation_updates"],
+                    "request_source_point_reset_receipts": sequences[
+                        "adaptation_request_reset_receipts"
+                    ],
+                }
+            )
+            native_state["adaptation"] = adaptation
+        elif any(
+            sequences[name]
+            for name in (
+                "adaptation_rounds",
+                "adaptation_updates",
+                "adaptation_request_reset_receipts",
+            )
+        ):
+            raise ValueError("allocation-free formal gang carries adaptation shards")
     rank = dict(row["rank_static"])
     rank.update(
         {
@@ -1174,22 +1551,40 @@ def publish_scalable_formal_gang_terminal(
     output_path: str | Path,
     legacy_terminal: object,
 ) -> CanonicalJsonProofBinding:
-    """Publish all-rank gang terminal with rank-local raw rows in shards."""
+    """Publish legacy or current all-rank gang evidence with rank-local shards."""
 
     if type(legacy_terminal) is not dict:
         raise TypeError("formal gang terminal must be an object")
     terminal = dict(legacy_terminal)
-    if (
-        terminal.get("kind") != "sglang_formal_gang_all_rank_terminal"
-        or terminal.get("schema_version") != 1
+    schema_version = terminal.get("schema_version")
+    if terminal.get("kind") != "sglang_formal_gang_all_rank_terminal" or (
+        schema_version not in {1, 2}
     ):
-        raise ValueError("formal gang terminal is not registered schema 1")
+        raise ValueError("formal gang terminal schema differs")
+    raw_rank_values = terminal.get("rank_terminals")
+    current_flags = (
+        tuple(
+            type(rank) is dict
+            and type(rank.get("native_state")) is dict
+            and "request_source_point_resets" in rank["native_state"]
+            for rank in raw_rank_values
+        )
+        if type(raw_rank_values) is list
+        else ()
+    )
+    if (
+        not current_flags
+        or len(set(current_flags)) != 1
+        or (schema_version == 2) is not current_flags[0]
+    ):
+        raise ValueError("formal gang terminal schema/native-state generation differs")
     if len(_canonical_bytes(terminal)) + 1 <= _INLINE_MAX_BYTES:
         publish_canonical_json_no_replace(output_path, terminal)
         return CanonicalJsonProofBinding.bind(output_path)
     raw_ranks = terminal.pop("rank_terminals", None)
     if type(raw_ranks) is not list or not raw_ranks:
         raise ValueError("formal gang terminal has no rank terminals")
+    current = current_flags[0]
     legacy_sha256 = _sha256(legacy_terminal)
     root = _shard_root(output_path)
     rank_rows: list[object] = []
@@ -1202,6 +1597,7 @@ def publish_scalable_formal_gang_terminal(
                 rank_ordinal=ordinal,
                 legacy_sha256=legacy_sha256,
                 root=root,
+                current=current,
             )
         )
     rank_binding = _publish_sequence(
@@ -1212,8 +1608,12 @@ def publish_scalable_formal_gang_terminal(
     )
     assert rank_binding is not None
     container = {
-        "schema_version": 2,
-        "kind": SHARDED_FORMAL_GANG_TERMINAL_KIND,
+        "schema_version": 3 if current else 2,
+        "kind": (
+            SHARDED_FORMAL_GANG_TERMINAL_KIND
+            if current
+            else LEGACY_SHARDED_FORMAL_GANG_TERMINAL_KIND
+        ),
         "legacy_terminal_sha256": legacy_sha256,
         "legacy_terminal_static": _copy_json(terminal),
         "rank_count": len(rank_rows),
@@ -1228,7 +1628,7 @@ def publish_scalable_formal_gang_terminal(
 def reopen_scalable_formal_gang_terminal(value: object) -> dict[str, object]:
     if (
         type(value) is dict
-        and value.get("schema_version") == 1
+        and value.get("schema_version") in {1, 2}
         and value.get("kind") == "sglang_formal_gang_all_rank_terminal"
     ):
         return dict(value)
@@ -1244,7 +1644,14 @@ def reopen_scalable_formal_gang_terminal(value: object) -> dict[str, object]:
             "rank_terminals_shard_index",
         },
     )
-    if row["schema_version"] != 2 or row["kind"] != SHARDED_FORMAL_GANG_TERMINAL_KIND:
+    current = (
+        row["schema_version"] == 3 and row["kind"] == SHARDED_FORMAL_GANG_TERMINAL_KIND
+    )
+    legacy = (
+        row["schema_version"] == 2
+        and row["kind"] == LEGACY_SHARDED_FORMAL_GANG_TERMINAL_KIND
+    )
+    if not current and not legacy:
         raise ValueError("sharded formal gang terminal schema differs")
     legacy_sha256 = _require_sha256(
         "sharded formal gang terminal", row["legacy_terminal_sha256"]
@@ -1264,6 +1671,7 @@ def reopen_scalable_formal_gang_terminal(value: object) -> dict[str, object]:
             value=raw_rank,
             rank_ordinal=ordinal,
             legacy_sha256=legacy_sha256,
+            current=current,
         )
         for ordinal, raw_rank in enumerate(raw_ranks)
     ]
@@ -1273,6 +1681,9 @@ def reopen_scalable_formal_gang_terminal(value: object) -> dict[str, object]:
 
 
 __all__ = [
+    "LEGACY_SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND",
+    "LEGACY_SHARDED_FORMAL_GANG_TERMINAL_KIND",
+    "LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND",
     "SHARDED_FORMAL_GANG_ITL_BUNDLE_KIND",
     "SHARDED_FORMAL_GANG_REQUEST_TERMINAL_KIND",
     "SHARDED_FORMAL_GANG_TERMINAL_KIND",

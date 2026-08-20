@@ -5,7 +5,11 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_industrial_executor import _execution_fixture, _FakeTransport
+from test_industrial_executor import (
+    _clean_project_tree,
+    _execution_fixture,
+    _FakeTransport,
+)
 
 import lightcone_spec.orchestration.executor as executor_module
 from lightcone_spec.orchestration.executor import IndustrialExecutionResult
@@ -17,6 +21,18 @@ from lightcone_spec.orchestration.session import (
     execute_industrial_fresh_process_fallback,
     execute_industrial_server_session,
 )
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_runtime_envelope_uses_clean_project_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep imported executor fixtures bound to their synthetic clean source."""
+
+    monkeypatch.setattr(
+        "lightcone_spec.doctor._project_tree",
+        _clean_project_tree,
+    )
 
 
 def _session_plan(plans) -> IndustrialServerSessionPlan:

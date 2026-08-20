@@ -45,6 +45,8 @@ def baseline_config(method: str = "onlinespec_ogd") -> dict:
             "parameter_scope": "all",
             "kv_history_policy": "frozen",
             "adaptation_scope": "cohort",
+            "reset_scope": "cohort",
+            "request_admission_policy": "cohort_batching_v1",
             "adaptation_group_id": "onlinespec-baseline",
             "optimizer": {
                 "name": "sgd",

@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, is_dataclass
 from dataclasses import fields as dataclass_fields
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
@@ -250,11 +251,96 @@ _EXECUTION_SEMANTICS_PAYLOAD_FIELDS = frozenset(
         "expected_topology",
     }
 )
+_TTS_CALIBRATION_PLAN_SEMANTICS_KIND = "tts_calibration_trainable_plan_semantics"
+_TTS_CALIBRATION_REPRESENTATIVE_SLOT_POLICY = (
+    "first_registered_lr_first_registered_stride_block0_parameter_inventory_only"
+)
+_TTS_CALIBRATION_SELECTION_EFFECT = "none_not_a_calibration_winner"
+_TTS_CALIBRATION_PLAN_SEMANTICS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "execution_semantics_sha256",
+        "registry_sha256",
+        "cell_declaration_sha256",
+        "representative_slot_policy",
+        "selection_effect",
+        "adaptation_recipe_sha256",
+        "expected_method",
+        "expected_target_model_id",
+        "expected_drafter_model_id",
+        "expected_backend",
+        "expected_model_max_context_length",
+        "expected_runtime_context_length",
+        "source_plan_concurrency",
+        "expected_draft_width",
+        "expected_draft_depth",
+        "expected_parameter_scope",
+        "expected_weight_update_mode",
+        "expected_optimizer",
+        "expected_learning_rate",
+        "expected_schedule",
+        "expected_stride",
+        "expected_canvas_tokens",
+        "expected_loss_position_decay",
+        "expected_runtime_random_seed",
+        "expected_sampling_profile_sha256",
+        "expected_adaptation_config",
+    }
+)
+_TTS_CALIBRATION_PLAN_SEMANTICS_PAYLOAD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "registry_sha256",
+        "cell_declaration",
+        "cell_declaration_sha256",
+        "representative_slot_policy",
+        "selection_effect",
+        "adaptation_config",
+        "adaptation_recipe_sha256",
+        "expected_method",
+        "expected_target_model_id",
+        "expected_drafter_model_id",
+        "expected_backend",
+        "expected_model_max_context_length",
+        "expected_runtime_context_length",
+        "source_plan_concurrency",
+        "expected_draft_width",
+        "expected_draft_depth",
+        "expected_parameter_scope",
+        "expected_weight_update_mode",
+        "expected_optimizer",
+        "expected_learning_rate",
+        "expected_schedule",
+        "expected_stride",
+        "expected_canvas_tokens",
+        "expected_loss_position_decay",
+        "expected_runtime_random_seed",
+        "expected_sampling_profile_sha256",
+    }
+)
+_E1_RECIPE_ANCHOR_PLAN_SEMANTICS_KIND = "e1_recipe_anchor_trainable_plan_semantics"
+_E1_RECIPE_ANCHOR_REPRESENTATIVE_SLOT_POLICY = (
+    "qwen3_8b_dflash_l0_full_last1_adamw_width8_concurrency4_parameter_inventory_only"
+)
+_E1_RECIPE_ANCHOR_SELECTION_EFFECT = (
+    "none_structural_anchor_not_e1_activation_or_winner"
+)
+# The two code-owned structural plan overlays deliberately expose the same
+# closed field set.  Their exact values, kinds, cells, recipes, and split
+# payloads remain independently rebuilt and validated below.
+_E1_RECIPE_ANCHOR_PLAN_SEMANTICS_FIELDS = _TTS_CALIBRATION_PLAN_SEMANTICS_FIELDS
+_E1_RECIPE_ANCHOR_PLAN_SEMANTICS_PAYLOAD_FIELDS = (
+    _TTS_CALIBRATION_PLAN_SEMANTICS_PAYLOAD_FIELDS
+)
 _ADAPTATION_CONFIG_FIELDS = (
     "weight_update_mode",
     "parameter_scope",
     "kv_history_policy",
     "adaptation_scope",
+    "reset_scope",
+    "request_admission_policy",
     "adaptation_group_id",
     "optimizer",
     "rank",
@@ -874,6 +960,554 @@ class PreparedDrafterParameterInventory:
         return _content_sha256(self.to_dict())
 
 
+@dataclass(frozen=True)
+class TtsCalibrationTrainablePlanSemantics:
+    """Code-owned TTS-Cal semantics used only to derive parameter inventory.
+
+    The representative cell is the first preregistered LR/stride slot and
+    block zero.  It does not select, score, or imply a calibration winner; all
+    288 TTS-Cal cells remain governed by the calibration reducer.  The source
+    profile fixes concurrency to one only so the existing path-bound
+    ``RunConfig`` input can be replayed while deriving a structural plan.
+    """
+
+    schema_version: int
+    kind: Literal["tts_calibration_trainable_plan_semantics"]
+    registry_sha256: str
+    cell_declaration: object
+    cell_declaration_sha256: str
+    representative_slot_policy: Literal[
+        "first_registered_lr_first_registered_stride_block0_parameter_inventory_only"
+    ]
+    selection_effect: Literal["none_not_a_calibration_winner"]
+    adaptation_config: dict[str, Any]
+    adaptation_recipe_sha256: str
+    expected_method: Literal["tts"]
+    expected_target_model_id: Literal["Qwen/Qwen3-8B"]
+    expected_drafter_model_id: Literal["z-lab/Qwen3-8B-DFlash-b16"]
+    expected_backend: Literal["DFLASH"]
+    expected_model_max_context_length: int
+    expected_runtime_context_length: int
+    source_plan_concurrency: Literal[1]
+    expected_draft_width: Literal[16]
+    expected_draft_depth: Literal[15]
+    expected_parameter_scope: Literal["all"]
+    expected_weight_update_mode: Literal["full"]
+    expected_optimizer: Literal["adam"]
+    expected_learning_rate: float
+    expected_schedule: Literal["constant"]
+    expected_stride: int
+    expected_canvas_tokens: Literal[16]
+    expected_loss_position_decay: float
+    expected_runtime_random_seed: int
+    expected_sampling_profile_sha256: str
+
+    def __post_init__(self) -> None:
+        from lightcone_spec.config.schema import AdaptationConfig, RuntimeConfig
+        from lightcone_spec.experiments.formal_protocol import (
+            TTS_LEARNING_RATES,
+            TTS_STRIDES,
+        )
+        from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
+        from lightcone_spec.experiments.registry import ExperimentCell
+        from lightcone_spec.experiments.sampling import SamplingProfile
+
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != _TTS_CALIBRATION_PLAN_SEMANTICS_KIND
+            or self.representative_slot_policy
+            != _TTS_CALIBRATION_REPRESENTATIVE_SLOT_POLICY
+            or self.selection_effect != _TTS_CALIBRATION_SELECTION_EFFECT
+        ):
+            raise ValueError("TTS-Cal trainable-plan semantics schema differs")
+        if type(self.cell_declaration) is not ExperimentCell:
+            raise TypeError("TTS-Cal plan semantics require an exact registry cell")
+        if type(self.adaptation_config) is not dict:
+            raise TypeError("TTS-Cal plan semantics require a full adaptation config")
+        try:
+            adaptation = AdaptationConfig.model_validate(self.adaptation_config)
+        except ValueError as error:
+            raise ValueError("TTS-Cal plan adaptation config is invalid") from error
+        if adaptation.model_dump(mode="json") != self.adaptation_config:
+            raise ValueError("TTS-Cal plan adaptation config is not fully materialized")
+        cell = self.cell_declaration
+        identity = cell.identity
+        if (
+            self.cell_declaration_sha256 != cell.sha256
+            or identity.experiment != "TTS-Cal"
+            or identity.model != self.expected_target_model_id
+            or identity.backend != self.expected_backend
+            or identity.task != "disjoint_tts_numeric_calibration"
+            or identity.method != self.expected_method
+            or identity.scope != "full_drafter"
+            or identity.parameterization != "full"
+            or identity.rank is not None
+            or identity.alpha_over_rank is not None
+            or identity.optimizer != self.expected_optimizer
+            or identity.learning_rate != TTS_LEARNING_RATES[0]
+            or identity.learning_rate != self.expected_learning_rate
+            or identity.schedule != self.expected_schedule
+            or identity.context != self.expected_model_max_context_length
+            or identity.regime != "short_input_long_generation"
+            or identity.width != self.expected_draft_width
+            or identity.arrival != "disjoint_tuning_window"
+            or identity.slo != "safety_first_then_maximize_slo_goodput"
+            or identity.block != 0
+            or identity.variant != f"tts_calibration:stride={TTS_STRIDES[0]}"
+            or self.expected_stride != TTS_STRIDES[0]
+            or self.expected_canvas_tokens != self.expected_draft_width
+            or self.expected_draft_depth != self.expected_draft_width - 1
+        ):
+            raise ValueError("TTS-Cal representative cell identity differs")
+        if (
+            self.expected_method != "tts"
+            or self.expected_target_model_id != "Qwen/Qwen3-8B"
+            or self.expected_drafter_model_id != "z-lab/Qwen3-8B-DFlash-b16"
+            or self.expected_backend != "DFLASH"
+            or self.expected_parameter_scope != "all"
+            or self.expected_weight_update_mode != "full"
+            or self.expected_optimizer != "adam"
+            or self.expected_schedule != "constant"
+            or self.expected_runtime_context_length
+            != RuntimeConfig.model_fields["context_length"].default
+            or self.source_plan_concurrency != 1
+            or self.expected_runtime_random_seed
+            != RuntimeConfig.model_fields["random_seed"].default
+            or self.expected_sampling_profile_sha256 != SamplingProfile().sha256
+            or self.expected_loss_position_decay != DFLASH_LOSS_POSITION_DECAY
+        ):
+            raise ValueError("TTS-Cal source-plan profile differs")
+        optimizer = adaptation.optimizer
+        if (
+            adaptation.weight_update_mode != self.expected_weight_update_mode
+            or adaptation.parameter_scope != self.expected_parameter_scope
+            or adaptation.rank is not None
+            or adaptation.lora_alpha is not None
+            or adaptation.stride != self.expected_stride
+            or adaptation.canvas_tokens != self.expected_canvas_tokens
+            or adaptation.loss_position_decay != self.expected_loss_position_decay
+            or optimizer.name != self.expected_optimizer
+            or optimizer.learning_rate != self.expected_learning_rate
+            or optimizer.weight_decay != 0.0
+            or optimizer.beta1 != 0.9
+            or optimizer.beta2 != 0.999
+            or optimizer.epsilon != 1e-8
+            or optimizer.grad_clip is not None
+            or optimizer.momentum is not None
+            or optimizer.schedule != self.expected_schedule
+            or optimizer.schedule_total_published_updates is not None
+        ):
+            raise ValueError("TTS-Cal source-plan adaptation recipe differs")
+        expected_recipe = _content_sha256(
+            {
+                "schema_version": 1,
+                "kind": "tts_calibration_parameter_inventory_recipe",
+                "representative_cell_id": cell.cell_id,
+                "representative_slot_policy": self.representative_slot_policy,
+                "selection_effect": self.selection_effect,
+                "adaptation_config": self.adaptation_config,
+            }
+        )
+        if self.adaptation_recipe_sha256 != expected_recipe:
+            raise ValueError("TTS-Cal source-plan recipe digest differs")
+        _require_sha256("TTS-Cal registry", self.registry_sha256)
+        _require_sha256("TTS-Cal representative cell", self.cell_declaration_sha256)
+        _require_sha256("TTS-Cal plan recipe", self.adaptation_recipe_sha256)
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(_canonical_semantics_value(self))
+
+    def validate_run_config(self, config: object) -> None:
+        from lightcone_spec.config.schema import RunConfig
+
+        if type(config) is not RunConfig:
+            raise TypeError("TTS-Cal source plan requires an exact RunConfig")
+        if (
+            config.method != self.expected_method
+            or config.model.target != self.expected_target_model_id
+            or config.model.drafter != self.expected_drafter_model_id
+            or config.model.algorithm != self.expected_backend
+            or config.model.max_context_length != self.expected_model_max_context_length
+            or config.model.draft_depth != self.expected_draft_depth
+            or config.runtime.context_length != self.expected_runtime_context_length
+            or config.runtime.random_seed != self.expected_runtime_random_seed
+            or config.runtime.sampling_profile_sha256
+            != self.expected_sampling_profile_sha256
+            or config.runtime.speculation_enabled is not True
+            or config.runtime.speculative_num_draft_tokens != self.expected_draft_width
+            or config.runtime.max_running_requests != self.source_plan_concurrency
+            or config.runtime.tensor_parallel_size != 1
+            or config.runtime.data_parallel_size != 1
+            or config.runtime.node_count != 1
+            or config.runtime.adaptation_microbatch_size != 1
+            or config.runtime.adaptation_publication_coalescing != 1
+            or config.runtime.adaptation_stream_priority != "default"
+            or config.adaptation is None
+            or config.adaptation.model_dump(mode="json") != self.adaptation_config
+            or config.online_spec is not None
+        ):
+            raise ValueError("RunConfig differs from TTS-Cal source-plan semantics")
+
+
+def build_tts_calibration_trainable_plan_semantics() -> (
+    TtsCalibrationTrainablePlanSemantics
+):
+    """Build the sole code-owned TTS-Cal parameter-inventory representative."""
+
+    from lightcone_spec.config.schema import (
+        AdaptationConfig,
+        OptimizerConfig,
+        RuntimeConfig,
+    )
+    from lightcone_spec.experiments.formal_protocol import (
+        TTS_LEARNING_RATES,
+        TTS_STRIDES,
+    )
+    from lightcone_spec.experiments.protocol import DFLASH_LOSS_POSITION_DECAY
+    from lightcone_spec.experiments.registry import build_industrial_registry
+    from lightcone_spec.experiments.sampling import SamplingProfile
+
+    registry = build_industrial_registry()
+    matches = tuple(
+        cell
+        for cell in registry.cells_for("TTS-Cal")
+        if cell.identity.method == "tts"
+        and cell.identity.model == "Qwen/Qwen3-8B"
+        and cell.identity.backend == "DFLASH"
+        and cell.identity.scope == "full_drafter"
+        and cell.identity.parameterization == "full"
+        and cell.identity.optimizer == "adam"
+        and cell.identity.learning_rate == TTS_LEARNING_RATES[0]
+        and cell.identity.schedule == "constant"
+        and cell.identity.context == 40928
+        and cell.identity.width == 16
+        and cell.identity.variant == f"tts_calibration:stride={TTS_STRIDES[0]}"
+        and cell.identity.block == 0
+    )
+    if len(matches) != 1:
+        raise RuntimeError("canonical TTS-Cal plan representative is not unique")
+    cell = matches[0]
+    adaptation = AdaptationConfig(
+        weight_update_mode="full",
+        parameter_scope="all",
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
+        adaptation_group_id="tts-calibration-plan-representative",
+        optimizer=OptimizerConfig(
+            name="adam",
+            learning_rate=TTS_LEARNING_RATES[0],
+            weight_decay=0.0,
+            beta1=0.9,
+            beta2=0.999,
+            epsilon=1e-8,
+            grad_clip=None,
+            schedule="constant",
+        ),
+        rank=None,
+        lora_alpha=None,
+        stride=TTS_STRIDES[0],
+        canvas_tokens=16,
+        loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
+    )
+    recipe_sha256 = _content_sha256(
+        {
+            "schema_version": 1,
+            "kind": "tts_calibration_parameter_inventory_recipe",
+            "representative_cell_id": cell.cell_id,
+            "representative_slot_policy": (_TTS_CALIBRATION_REPRESENTATIVE_SLOT_POLICY),
+            "selection_effect": _TTS_CALIBRATION_SELECTION_EFFECT,
+            "adaptation_config": adaptation.model_dump(mode="json"),
+        }
+    )
+    return TtsCalibrationTrainablePlanSemantics(
+        schema_version=1,
+        kind=_TTS_CALIBRATION_PLAN_SEMANTICS_KIND,
+        registry_sha256=registry.sha256,
+        cell_declaration=cell,
+        cell_declaration_sha256=cell.sha256,
+        representative_slot_policy=(_TTS_CALIBRATION_REPRESENTATIVE_SLOT_POLICY),
+        selection_effect=_TTS_CALIBRATION_SELECTION_EFFECT,
+        adaptation_config=adaptation.model_dump(mode="json"),
+        adaptation_recipe_sha256=recipe_sha256,
+        expected_method="tts",
+        expected_target_model_id="Qwen/Qwen3-8B",
+        expected_drafter_model_id="z-lab/Qwen3-8B-DFlash-b16",
+        expected_backend="DFLASH",
+        expected_model_max_context_length=int(cell.identity.context),
+        expected_runtime_context_length=int(
+            RuntimeConfig.model_fields["context_length"].default
+        ),
+        source_plan_concurrency=1,
+        expected_draft_width=16,
+        expected_draft_depth=15,
+        expected_parameter_scope="all",
+        expected_weight_update_mode="full",
+        expected_optimizer="adam",
+        expected_learning_rate=TTS_LEARNING_RATES[0],
+        expected_schedule="constant",
+        expected_stride=TTS_STRIDES[0],
+        expected_canvas_tokens=16,
+        expected_loss_position_decay=DFLASH_LOSS_POSITION_DECAY,
+        expected_runtime_random_seed=int(
+            RuntimeConfig.model_fields["random_seed"].default
+        ),
+        expected_sampling_profile_sha256=SamplingProfile().sha256,
+    )
+
+
+@cache
+def _canonical_e1_recipe_anchor_cell_and_recipe() -> tuple[object, object, object]:
+    """Rebuild the sole structural E1 anchor slot and its registry recipe."""
+
+    from lightcone_spec.experiments.registry import (
+        build_legacy_industrial_registry,
+    )
+
+    registry = build_legacy_industrial_registry()
+    matches = tuple(
+        row
+        for row in registry.cells_for("E1")
+        if row.identity.model == "Qwen/Qwen3-8B"
+        and row.identity.backend == "DFLASH"
+        and row.identity.task == "LiveCodeBench_tuning"
+        and row.identity.method == "l0"
+        and row.identity.scope == "last1"
+        and row.identity.parameterization == "full"
+        and row.identity.rank is None
+        and row.identity.alpha_over_rank is None
+        and row.identity.optimizer == "adamw"
+        and row.identity.learning_rate is None
+        and row.identity.schedule == "constant"
+        and row.identity.context == 40928
+        and row.identity.width == 8
+        and row.identity.concurrency == 4
+        and row.identity.variant
+        == "lc_candidate:optimizer_anchor:width=8:concurrency=4"
+        and row.identity.block == 0
+    )
+    if len(matches) != 1:
+        raise RuntimeError("canonical E1 recipe-anchor plan slot is not unique")
+    cell = matches[0]
+    recipe = registry.adaptation_recipe_for_cell(cell)
+    if recipe.status != "AVAILABLE":
+        raise RuntimeError("canonical E1 recipe-anchor plan recipe is unavailable")
+    return registry, cell, recipe
+
+
+@dataclass(frozen=True)
+class E1RecipeAnchorTrainablePlanSemantics:
+    """Code-owned E1 anchor parameter-inventory semantics.
+
+    This overlay exists only so ProtocolLock can bind the exact parameter
+    inventory consumed by the two preregistered optimizer anchors.  It does
+    not authorize or replace E1 activation, E3a selection, an E1 measurement,
+    or any winner.  The existing onsite-reduced ``CellExecutionSemantics``
+    path remains the only E1 execution-semantics authority.
+    """
+
+    schema_version: int
+    kind: Literal["e1_recipe_anchor_trainable_plan_semantics"]
+    registry_sha256: str
+    cell_declaration: object
+    cell_declaration_sha256: str
+    representative_slot_policy: Literal[
+        "qwen3_8b_dflash_l0_full_last1_adamw_width8_concurrency4_"
+        "parameter_inventory_only"
+    ]
+    selection_effect: Literal["none_structural_anchor_not_e1_activation_or_winner"]
+    adaptation_config: dict[str, Any]
+    adaptation_recipe_sha256: str
+    expected_method: Literal["l0"]
+    expected_target_model_id: Literal["Qwen/Qwen3-8B"]
+    expected_drafter_model_id: Literal["z-lab/Qwen3-8B-DFlash-b16"]
+    expected_backend: Literal["DFLASH"]
+    expected_model_max_context_length: int
+    expected_runtime_context_length: int
+    source_plan_concurrency: Literal[4]
+    expected_draft_width: Literal[8]
+    expected_draft_depth: Literal[7]
+    expected_parameter_scope: Literal["last1"]
+    expected_weight_update_mode: Literal["full"]
+    expected_optimizer: Literal["adamw"]
+    expected_learning_rate: float
+    expected_schedule: Literal["constant"]
+    expected_stride: Literal[10]
+    expected_canvas_tokens: Literal[8]
+    expected_loss_position_decay: float
+    expected_runtime_random_seed: int
+    expected_sampling_profile_sha256: str
+
+    def __post_init__(self) -> None:
+        from lightcone_spec.config.schema import AdaptationConfig, RuntimeConfig
+        from lightcone_spec.experiments.registry import ExperimentCell
+        from lightcone_spec.experiments.sampling import SamplingProfile
+
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 1
+            or self.kind != _E1_RECIPE_ANCHOR_PLAN_SEMANTICS_KIND
+            or self.representative_slot_policy
+            != _E1_RECIPE_ANCHOR_REPRESENTATIVE_SLOT_POLICY
+            or self.selection_effect != _E1_RECIPE_ANCHOR_SELECTION_EFFECT
+        ):
+            raise ValueError("E1 recipe-anchor trainable-plan semantics differ")
+        if type(self.cell_declaration) is not ExperimentCell:
+            raise TypeError("E1 anchor plan semantics require an exact registry cell")
+        if type(self.adaptation_config) is not dict:
+            raise TypeError("E1 anchor plan semantics require an adaptation config")
+        try:
+            adaptation = AdaptationConfig.model_validate(self.adaptation_config)
+        except ValueError as error:
+            raise ValueError("E1 anchor plan adaptation config is invalid") from error
+        if adaptation.model_dump(mode="json") != self.adaptation_config:
+            raise ValueError("E1 anchor plan adaptation config is not materialized")
+
+        registry, source_cell, recipe = _canonical_e1_recipe_anchor_cell_and_recipe()
+        cell = self.cell_declaration
+        if (
+            cell != source_cell
+            or self.registry_sha256 != registry.sha256
+            or self.cell_declaration_sha256 != cell.sha256
+            or self.adaptation_recipe_sha256 != recipe.sha256
+            or self.adaptation_config
+            != recipe.to_adaptation_config().model_dump(mode="json")
+        ):
+            raise ValueError("E1 anchor plan differs from its code-owned registry")
+        identity = cell.identity
+        if (
+            identity.experiment != "E1"
+            or identity.model != self.expected_target_model_id
+            or identity.backend != self.expected_backend
+            or identity.task != "LiveCodeBench_tuning"
+            or identity.method != self.expected_method
+            or identity.scope != self.expected_parameter_scope
+            or identity.parameterization != self.expected_weight_update_mode
+            or identity.rank is not None
+            or identity.alpha_over_rank is not None
+            or identity.optimizer != self.expected_optimizer
+            or identity.learning_rate is not None
+            or identity.schedule != self.expected_schedule
+            or identity.context != self.expected_model_max_context_length
+            or identity.width != self.expected_draft_width
+            or identity.concurrency != self.source_plan_concurrency
+            or identity.block != 0
+        ):
+            raise ValueError("E1 anchor representative cell identity differs")
+        optimizer = adaptation.optimizer
+        if (
+            self.expected_method != "l0"
+            or self.expected_target_model_id != "Qwen/Qwen3-8B"
+            or self.expected_drafter_model_id != "z-lab/Qwen3-8B-DFlash-b16"
+            or self.expected_backend != "DFLASH"
+            or self.expected_runtime_context_length
+            != RuntimeConfig.model_fields["context_length"].default
+            or self.expected_runtime_random_seed
+            != RuntimeConfig.model_fields["random_seed"].default
+            or self.expected_sampling_profile_sha256 != SamplingProfile().sha256
+            or adaptation.weight_update_mode != self.expected_weight_update_mode
+            or adaptation.parameter_scope != self.expected_parameter_scope
+            or adaptation.rank is not None
+            or adaptation.lora_alpha is not None
+            or adaptation.stride != self.expected_stride
+            or adaptation.canvas_tokens != self.expected_canvas_tokens
+            or adaptation.loss_position_decay != self.expected_loss_position_decay
+            or optimizer.name != self.expected_optimizer
+            or optimizer.learning_rate != self.expected_learning_rate
+            or optimizer.schedule != self.expected_schedule
+        ):
+            raise ValueError("E1 anchor source-plan profile differs")
+        for label, value in (
+            ("registry", self.registry_sha256),
+            ("cell", self.cell_declaration_sha256),
+            ("recipe", self.adaptation_recipe_sha256),
+            ("sampling profile", self.expected_sampling_profile_sha256),
+        ):
+            _require_sha256(f"E1 anchor {label}", value)
+
+    @property
+    def sha256(self) -> str:
+        return _content_sha256(_canonical_semantics_value(self))
+
+    def validate_run_config(self, config: object) -> None:
+        from lightcone_spec.config.schema import RunConfig
+
+        if type(config) is not RunConfig:
+            raise TypeError("E1 anchor source plan requires an exact RunConfig")
+        if (
+            config.method != self.expected_method
+            or config.model.target != self.expected_target_model_id
+            or config.model.drafter != self.expected_drafter_model_id
+            or config.model.algorithm != self.expected_backend
+            or config.model.max_context_length != self.expected_model_max_context_length
+            or config.model.draft_depth != self.expected_draft_depth
+            or config.runtime.context_length != self.expected_runtime_context_length
+            or config.runtime.random_seed != self.expected_runtime_random_seed
+            or config.runtime.sampling_profile_sha256
+            != self.expected_sampling_profile_sha256
+            or config.runtime.speculation_enabled is not True
+            or config.runtime.speculative_num_draft_tokens != self.expected_draft_width
+            or config.runtime.max_running_requests != self.source_plan_concurrency
+            or config.runtime.tensor_parallel_size != 1
+            or config.runtime.data_parallel_size != 1
+            or config.runtime.node_count != 1
+            or config.runtime.adaptation_microbatch_size != 1
+            or config.runtime.adaptation_publication_coalescing != 1
+            or config.runtime.adaptation_stream_priority != "default"
+            or config.adaptation is None
+            or config.adaptation.model_dump(mode="json") != self.adaptation_config
+            or config.online_spec is not None
+        ):
+            raise ValueError("RunConfig differs from E1 anchor source-plan semantics")
+
+
+def build_e1_recipe_anchor_trainable_plan_semantics() -> (
+    E1RecipeAnchorTrainablePlanSemantics
+):
+    """Build the sole code-owned E1 anchor parameter-inventory slot."""
+
+    from lightcone_spec.config.schema import RuntimeConfig
+    from lightcone_spec.experiments.sampling import SamplingProfile
+
+    registry, cell, recipe = _canonical_e1_recipe_anchor_cell_and_recipe()
+    adaptation = recipe.to_adaptation_config()
+    return E1RecipeAnchorTrainablePlanSemantics(
+        schema_version=1,
+        kind=_E1_RECIPE_ANCHOR_PLAN_SEMANTICS_KIND,
+        registry_sha256=registry.sha256,
+        cell_declaration=cell,
+        cell_declaration_sha256=cell.sha256,
+        representative_slot_policy=(_E1_RECIPE_ANCHOR_REPRESENTATIVE_SLOT_POLICY),
+        selection_effect=_E1_RECIPE_ANCHOR_SELECTION_EFFECT,
+        adaptation_config=adaptation.model_dump(mode="json"),
+        adaptation_recipe_sha256=recipe.sha256,
+        expected_method="l0",
+        expected_target_model_id="Qwen/Qwen3-8B",
+        expected_drafter_model_id="z-lab/Qwen3-8B-DFlash-b16",
+        expected_backend="DFLASH",
+        expected_model_max_context_length=int(cell.identity.context),
+        expected_runtime_context_length=int(
+            RuntimeConfig.model_fields["context_length"].default
+        ),
+        source_plan_concurrency=4,
+        expected_draft_width=8,
+        expected_draft_depth=7,
+        expected_parameter_scope="last1",
+        expected_weight_update_mode="full",
+        expected_optimizer="adamw",
+        expected_learning_rate=adaptation.optimizer.learning_rate,
+        expected_schedule="constant",
+        expected_stride=10,
+        expected_canvas_tokens=8,
+        expected_loss_position_decay=adaptation.loss_position_decay,
+        expected_runtime_random_seed=int(
+            RuntimeConfig.model_fields["random_seed"].default
+        ),
+        expected_sampling_profile_sha256=SamplingProfile().sha256,
+    )
+
+
 def _validate_execution_semantics_identity(value: object) -> dict[str, Any]:
     row = _strict_object(
         "trainable-plan execution semantics", value, _EXECUTION_SEMANTICS_FIELDS
@@ -1044,6 +1678,19 @@ def _execution_semantics_payload(value: object) -> dict[str, Any]:
     return payload
 
 
+def trainable_plan_cell_source_to_dict(value: object) -> dict[str, object]:
+    """Serialize one exact registry cell for a path-bound plan raw source."""
+
+    from lightcone_spec.experiments.registry import ExperimentCell
+
+    if type(value) is not ExperimentCell:
+        raise TypeError("trainable-plan cell source requires an exact registry cell")
+    payload = _canonical_semantics_value(value)
+    if type(payload) is not dict or set(payload) != _CELL_FIELDS:
+        raise RuntimeError("trainable-plan cell serialization changed")
+    return payload
+
+
 def _validate_execution_semantics_payload(
     value: object,
     *,
@@ -1103,6 +1750,193 @@ def _validate_execution_semantics_payload(
             "execution adaptation config differs from the registered recipe payload"
         )
     return payload
+
+
+def _structural_execution_semantics_identity(value: object) -> dict[str, Any]:
+    if type(value) not in {
+        TtsCalibrationTrainablePlanSemantics,
+        E1RecipeAnchorTrainablePlanSemantics,
+    }:
+        raise TypeError("structural plan semantics require an exact code-owned type")
+    value.__post_init__()
+    return {
+        "schema_version": 1,
+        "kind": value.kind,
+        "execution_semantics_sha256": value.sha256,
+        "registry_sha256": value.registry_sha256,
+        "cell_declaration_sha256": value.cell_declaration_sha256,
+        "representative_slot_policy": value.representative_slot_policy,
+        "selection_effect": value.selection_effect,
+        "adaptation_recipe_sha256": value.adaptation_recipe_sha256,
+        "expected_method": value.expected_method,
+        "expected_target_model_id": value.expected_target_model_id,
+        "expected_drafter_model_id": value.expected_drafter_model_id,
+        "expected_backend": value.expected_backend,
+        "expected_model_max_context_length": (value.expected_model_max_context_length),
+        "expected_runtime_context_length": value.expected_runtime_context_length,
+        "source_plan_concurrency": value.source_plan_concurrency,
+        "expected_draft_width": value.expected_draft_width,
+        "expected_draft_depth": value.expected_draft_depth,
+        "expected_parameter_scope": value.expected_parameter_scope,
+        "expected_weight_update_mode": value.expected_weight_update_mode,
+        "expected_optimizer": value.expected_optimizer,
+        "expected_learning_rate": value.expected_learning_rate,
+        "expected_schedule": value.expected_schedule,
+        "expected_stride": value.expected_stride,
+        "expected_canvas_tokens": value.expected_canvas_tokens,
+        "expected_loss_position_decay": value.expected_loss_position_decay,
+        "expected_runtime_random_seed": value.expected_runtime_random_seed,
+        "expected_sampling_profile_sha256": (value.expected_sampling_profile_sha256),
+        "expected_adaptation_config": value.adaptation_config,
+    }
+
+
+def _tts_calibration_execution_semantics_identity(
+    value: TtsCalibrationTrainablePlanSemantics,
+) -> dict[str, Any]:
+    if type(value) is not TtsCalibrationTrainablePlanSemantics:
+        raise TypeError("TTS-Cal plan semantics require the exact code-owned type")
+    return _structural_execution_semantics_identity(value)
+
+
+def _e1_recipe_anchor_execution_semantics_identity(
+    value: E1RecipeAnchorTrainablePlanSemantics,
+) -> dict[str, Any]:
+    if type(value) is not E1RecipeAnchorTrainablePlanSemantics:
+        raise TypeError("E1 anchor plan semantics require the exact code-owned type")
+    return _structural_execution_semantics_identity(value)
+
+
+def _validate_tts_calibration_execution_semantics_identity(
+    value: object,
+) -> dict[str, Any]:
+    row = _strict_object(
+        "TTS-Cal trainable-plan execution semantics",
+        value,
+        _TTS_CALIBRATION_PLAN_SEMANTICS_FIELDS,
+    )
+    expected = _tts_calibration_execution_semantics_identity(
+        build_tts_calibration_trainable_plan_semantics()
+    )
+    if row != expected or any(
+        type(row[name]) is not type(expected[name]) for name in expected
+    ):
+        raise ValueError(
+            "TTS-Cal trainable-plan semantics differ from the code-owned source"
+        )
+    return row
+
+
+def _validate_tts_calibration_execution_semantics_payload(
+    value: object,
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _strict_object(
+        "TTS-Cal trainable-plan execution semantics payload",
+        value,
+        _TTS_CALIBRATION_PLAN_SEMANTICS_PAYLOAD_FIELDS,
+    )
+    _validate_json_value(payload)
+    source = build_tts_calibration_trainable_plan_semantics()
+    expected = _execution_semantics_payload(source)
+    if payload != expected or any(
+        type(payload[name]) is not type(expected[name]) for name in expected
+    ):
+        raise ValueError(
+            "TTS-Cal semantics payload differs from the code-owned representative"
+        )
+    if _content_sha256(payload) != identity[
+        "execution_semantics_sha256"
+    ] or identity != _tts_calibration_execution_semantics_identity(source):
+        raise ValueError("TTS-Cal semantics identity differs from its payload")
+    return payload
+
+
+def _validate_e1_recipe_anchor_execution_semantics_identity(
+    value: object,
+) -> dict[str, Any]:
+    row = _strict_object(
+        "E1 anchor trainable-plan execution semantics",
+        value,
+        _E1_RECIPE_ANCHOR_PLAN_SEMANTICS_FIELDS,
+    )
+    expected = _e1_recipe_anchor_execution_semantics_identity(
+        build_e1_recipe_anchor_trainable_plan_semantics()
+    )
+    if row != expected or any(
+        type(row[name]) is not type(expected[name]) for name in expected
+    ):
+        raise ValueError(
+            "E1 anchor trainable-plan semantics differ from the code-owned source"
+        )
+    return row
+
+
+def _validate_e1_recipe_anchor_execution_semantics_payload(
+    value: object,
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _strict_object(
+        "E1 anchor trainable-plan execution semantics payload",
+        value,
+        _E1_RECIPE_ANCHOR_PLAN_SEMANTICS_PAYLOAD_FIELDS,
+    )
+    _validate_json_value(payload)
+    source = build_e1_recipe_anchor_trainable_plan_semantics()
+    expected = _execution_semantics_payload(source)
+    if payload != expected or any(
+        type(payload[name]) is not type(expected[name]) for name in expected
+    ):
+        raise ValueError(
+            "E1 anchor semantics payload differs from the code-owned representative"
+        )
+    if _content_sha256(payload) != identity[
+        "execution_semantics_sha256"
+    ] or identity != _e1_recipe_anchor_execution_semantics_identity(source):
+        raise ValueError("E1 anchor semantics identity differs from its payload")
+    return payload
+
+
+def _is_tts_calibration_semantics_identity(value: object) -> bool:
+    return type(value) is dict and value.get("kind") == (
+        _TTS_CALIBRATION_PLAN_SEMANTICS_KIND
+    )
+
+
+def _is_e1_recipe_anchor_semantics_identity(value: object) -> bool:
+    return type(value) is dict and value.get("kind") == (
+        _E1_RECIPE_ANCHOR_PLAN_SEMANTICS_KIND
+    )
+
+
+def _validate_serialized_execution_semantics_identity(
+    value: object,
+) -> dict[str, Any]:
+    if _is_tts_calibration_semantics_identity(value):
+        return _validate_tts_calibration_execution_semantics_identity(value)
+    if _is_e1_recipe_anchor_semantics_identity(value):
+        return _validate_e1_recipe_anchor_execution_semantics_identity(value)
+    return _validate_execution_semantics_identity(value)
+
+
+def _validate_serialized_execution_semantics_payload(
+    value: object,
+    *,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    if _is_tts_calibration_semantics_identity(identity):
+        return _validate_tts_calibration_execution_semantics_payload(
+            value,
+            identity=identity,
+        )
+    if _is_e1_recipe_anchor_semantics_identity(identity):
+        return _validate_e1_recipe_anchor_execution_semantics_payload(
+            value,
+            identity=identity,
+        )
+    return _validate_execution_semantics_payload(value, identity=identity)
 
 
 @dataclass(frozen=True)
@@ -1172,18 +2006,30 @@ def _execution_identity(
 
     semantic_authority = (
         execution_semantics
-        if type(execution_semantics) is CellExecutionSemantics
+        if type(execution_semantics)
+        in {
+            CellExecutionSemantics,
+            TtsCalibrationTrainablePlanSemantics,
+            E1RecipeAnchorTrainablePlanSemantics,
+        }
         else None
     )
-    if semantic_authority is not None:
+    if type(semantic_authority) is CellExecutionSemantics:
         semantics = _execution_semantics_identity(semantic_authority)
+    elif type(semantic_authority) is TtsCalibrationTrainablePlanSemantics:
+        semantics = _tts_calibration_execution_semantics_identity(semantic_authority)
+    elif type(semantic_authority) is E1RecipeAnchorTrainablePlanSemantics:
+        semantics = _e1_recipe_anchor_execution_semantics_identity(semantic_authority)
     elif serialized_execution_semantics_payload is not None:
-        semantics = _validate_execution_semantics_identity(execution_semantics)
+        semantics = _validate_serialized_execution_semantics_identity(
+            execution_semantics
+        )
     else:
         raise ValueError(
-            "adapted E1 authority requires onsite-reduced execution semantics"
+            "adapted authority requires onsite-reduced execution semantics for E1 "
+            "or code-owned E1-anchor/TTS-Cal structural semantics"
         )
-    semantics_payload = _validate_execution_semantics_payload(
+    semantics_payload = _validate_serialized_execution_semantics_payload(
         (
             _execution_semantics_payload(semantic_authority)
             if semantic_authority is not None
@@ -1291,9 +2137,126 @@ def _execution_identity(
         raise ValueError("trainable-plan cell declaration is not canonical")
     if not registered_cell.runnable:
         raise ValueError("trainable-plan authority requires a runnable registry cell")
+    if _is_tts_calibration_semantics_identity(semantics):
+        source_semantics = build_tts_calibration_trainable_plan_semantics()
+        if (
+            identity["experiment"] != "TTS-Cal"
+            or registered_cell != source_semantics.cell_declaration
+            or semantics["registry_sha256"] != source_semantics.registry_sha256
+            or semantics["cell_declaration_sha256"] != registered_cell.sha256
+            or (
+                semantic_authority is not None
+                and semantic_authority != source_semantics
+            )
+        ):
+            raise ValueError(
+                "registry cell differs from canonical TTS-Cal plan semantics"
+            )
+        try:
+            source_semantics.validate_run_config(config)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "RunConfig differs from canonical TTS-Cal plan semantics"
+            ) from error
+        expected_split = {
+            "schema_version": 1,
+            "kind": "tts_calibration_trainable_plan_split",
+            "cell_id": registered_cell.cell_id,
+            "run_config_sha256": run_config.semantic_sha256,
+            "purpose": "parameter_inventory_only_not_calibration_selection",
+        }
+        raw_split = split.load()
+        if raw_split != expected_split or any(
+            type(raw_split[name]) is not type(expected_split[name])
+            for name in expected_split
+        ):
+            raise ValueError(
+                "TTS-Cal source-plan split differs from the registered payload"
+            )
+        return _ExecutionIdentity(
+            method=config.method,
+            backend=config.model.algorithm,
+            mode=adaptation.weight_update_mode,
+            scope=adaptation.parameter_scope,
+            rank=adaptation.rank,
+            lora_alpha=adaptation.lora_alpha,
+            optimizer=optimizer,
+            target_model_id=config.model.target,
+            target_revision=config.model.target_revision,
+            drafter_model_id=config.model.drafter,
+            drafter_revision=config.model.drafter_revision,
+            run_config_sha256=run_config.semantic_sha256,
+            split_sha256=split.semantic_sha256,
+            cell_id=registered_cell.cell_id,
+            cell_declaration_sha256=registered_cell.sha256,
+            execution_semantics=semantics,
+            execution_semantics_payload=semantics_payload,
+            execution_semantics_sha256=semantics["execution_semantics_sha256"],
+            execution_semantics_identity_sha256=_content_sha256(semantics),
+        )
+    if _is_e1_recipe_anchor_semantics_identity(semantics):
+        source_semantics = build_e1_recipe_anchor_trainable_plan_semantics()
+        if (
+            identity["experiment"] != "E1"
+            or registered_cell != source_semantics.cell_declaration
+            or semantics["registry_sha256"] != source_semantics.registry_sha256
+            or semantics["cell_declaration_sha256"] != registered_cell.sha256
+            or (
+                semantic_authority is not None
+                and semantic_authority != source_semantics
+            )
+        ):
+            raise ValueError(
+                "registry cell differs from canonical E1 anchor plan semantics"
+            )
+        try:
+            source_semantics.validate_run_config(config)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(
+                "RunConfig differs from canonical E1 anchor plan semantics"
+            ) from error
+        expected_split = {
+            "schema_version": 1,
+            "kind": "e1_recipe_anchor_trainable_plan_split",
+            "cell_id": registered_cell.cell_id,
+            "run_config_sha256": run_config.semantic_sha256,
+            "purpose": (
+                "parameter_inventory_only_not_e1_activation_selection_or_winner"
+            ),
+        }
+        raw_split = split.load()
+        if raw_split != expected_split or any(
+            type(raw_split[name]) is not type(expected_split[name])
+            for name in expected_split
+        ):
+            raise ValueError(
+                "E1 anchor source-plan split differs from the registered payload"
+            )
+        return _ExecutionIdentity(
+            method=config.method,
+            backend=config.model.algorithm,
+            mode=adaptation.weight_update_mode,
+            scope=adaptation.parameter_scope,
+            rank=adaptation.rank,
+            lora_alpha=adaptation.lora_alpha,
+            optimizer=optimizer,
+            target_model_id=config.model.target,
+            target_revision=config.model.target_revision,
+            drafter_model_id=config.model.drafter,
+            drafter_revision=config.model.drafter_revision,
+            run_config_sha256=run_config.semantic_sha256,
+            split_sha256=split.semantic_sha256,
+            cell_id=registered_cell.cell_id,
+            cell_declaration_sha256=registered_cell.sha256,
+            execution_semantics=semantics,
+            execution_semantics_payload=semantics_payload,
+            execution_semantics_sha256=semantics["execution_semantics_sha256"],
+            execution_semantics_identity_sha256=_content_sha256(semantics),
+        )
     if identity["experiment"] != "E1":
         raise ValueError(
-            "trainable-plan execution semantics support only activated E1 cells"
+            "trainable-plan execution semantics support only activated E1 or "
+            "canonical E1-anchor/TTS-Cal cells"
         )
     if semantics["cell_declaration_sha256"] != registered_cell.sha256 or (
         semantic_authority is not None
@@ -1749,8 +2712,10 @@ def _selector_from_manifest(
         "trainable_plan_sha256",
     ):
         _require_sha256(f"manifest {name}", row[name])
-    semantics = _validate_execution_semantics_identity(row["execution_semantics"])
-    _validate_execution_semantics_payload(
+    semantics = _validate_serialized_execution_semantics_identity(
+        row["execution_semantics"]
+    )
+    _validate_serialized_execution_semantics_payload(
         row["execution_semantics_payload"], identity=semantics
     )
     if row["execution_semantics_sha256"] != semantics[
@@ -2615,16 +3580,21 @@ def require_trainable_plan_authority_for_method(
 
 __all__ = [
     "DSparkNativeHeadNames",
+    "E1RecipeAnchorTrainablePlanSemantics",
     "PreparedDrafterParameterInventory",
     "PreparedParameterMetadata",
     "TrainablePlanAuthorityBinding",
     "TrainablePlanAuthorityResult",
     "TrainablePlanRawJsonBinding",
+    "TtsCalibrationTrainablePlanSemantics",
     "audit_trainable_plan_authority_for_method",
     "bind_trainable_plan_authority",
+    "build_e1_recipe_anchor_trainable_plan_semantics",
+    "build_tts_calibration_trainable_plan_semantics",
     "materialize_trainable_plan_authority_manifest",
     "replay_trainable_plan_authority",
     "require_trainable_plan_authority_for_method",
     "trainable_plan_authority_binding_from_dict",
     "trainable_plan_authority_binding_to_dict",
+    "trainable_plan_cell_source_to_dict",
 ]

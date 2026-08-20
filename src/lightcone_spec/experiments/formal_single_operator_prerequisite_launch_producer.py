@@ -19,6 +19,7 @@ from typing import Literal, Self
 from lightcone_spec.config import RunConfig, load_run_config
 from lightcone_spec.experiments.formal_protocol import content_sha256
 from lightcone_spec.experiments.formal_registry import (
+    e0_compatibility_receipt_from_dict,
     protocol_lock_from_dict,
     stage_materialization_receipt_from_dict,
 )
@@ -38,7 +39,12 @@ from lightcone_spec.experiments.formal_single_operator_stages import (
     rebuild_formal_single_operator_stage_completion,
 )
 from lightcone_spec.experiments.gpu_pool import GpuInventory
-from lightcone_spec.experiments.stage_materialization import StageMaterializationReceipt
+from lightcone_spec.experiments.stage_materialization import (
+    E0_BACKENDS,
+    E0_MODELS,
+    E0_TASKS,
+    StageMaterializationReceipt,
+)
 from lightcone_spec.locking.models import LockedModel, ModelLock
 from lightcone_spec.orchestration.runtime import derive_diagnostic_compile_cache_key
 from lightcone_spec.runtime.compile_cache import CompileCacheLaunchPlan
@@ -461,8 +467,219 @@ def materialized_prerequisite_launch_demands(
             )
         )
     if not demands:
+        if _is_registered_e0_zero_launch_demand(
+            source=source,
+            materialization=materialization,
+        ):
+            return ()
         raise ValueError("current materialization has no launch demand")
     return tuple(sorted(demands))
+
+
+def execution_source_prerequisite_launch_demands(
+    source: FormalSingleOperatorExecutionSource,
+) -> tuple[PrerequisiteLaunchDemand, ...]:
+    """Deep-reopen one execution source and replay its exact launch demands."""
+
+    if type(source) is not FormalSingleOperatorExecutionSource:
+        raise TypeError("prerequisite demand replay requires an exact execution source")
+    materialization = stage_materialization_receipt_from_dict(
+        source.materialization_source.reopen(
+            label="prerequisite demand execution materialization"
+        )
+    )
+    return materialized_prerequisite_launch_demands(
+        source=source,
+        materialization=materialization,
+    )
+
+
+def _all_na_compatibility_from_payload(payload: object) -> bool:
+    if type(payload) is not dict:
+        return False
+    raw = payload.get("compatibility")
+    try:
+        compatibility = e0_compatibility_receipt_from_dict(raw)
+    except (TypeError, ValueError):
+        return False
+    expected = {
+        (model, backend, task)
+        for model in E0_MODELS
+        for backend in E0_BACKENDS
+        for task in E0_TASKS
+    }
+    observed = {(row.model, row.backend, row.task) for row in compatibility.decisions}
+    return (
+        compatibility.valid_count == 0
+        and len(compatibility.decisions) == 108
+        and observed == expected
+        and all(row.disposition == "N/A" for row in compatibility.decisions)
+    )
+
+
+def _is_exact_e0_na_decision_cell(
+    cell: object,
+    *,
+    bundle_sha256: str,
+) -> bool:
+    from lightcone_spec.experiments.stage_materialization import MaterializedCell
+
+    if type(cell) is not MaterializedCell:
+        return False
+    dimensions = dict(cell.dimensions)
+    expected_fields = {
+        "compatibility_decision_id",
+        "deployment_task",
+        "disposition",
+        "reason_code",
+        "interface_sha256",
+        "task_native_workload_sha256",
+        "compatibility_receipt_sha256",
+        "compatibility_evidence_manifest_sha256",
+        "e0_compatibility_bundle_sha256",
+    }
+    for name in (
+        "compatibility_decision_id",
+        "interface_sha256",
+        "task_native_workload_sha256",
+        "compatibility_receipt_sha256",
+        "compatibility_evidence_manifest_sha256",
+        "e0_compatibility_bundle_sha256",
+    ):
+        try:
+            _require_sha256(f"E0 zero-demand {name}", dimensions.get(name))
+        except ValueError:
+            return False
+    return (
+        set(dimensions) == expected_fields
+        and cell.method_role == "Compatibility"
+        and cell.task == "compatibility_decision"
+        and cell.publication_policy == "decision_only"
+        and cell.recipe_sha256 is None
+        and dimensions.get("deployment_task") in E0_TASKS
+        and dimensions.get("disposition") == "N/A"
+        and type(dimensions.get("reason_code")) is str
+        and bool(dimensions["reason_code"])
+        and dimensions.get("compatibility_decision_id")
+        == content_sha256((cell.model, cell.backend, dimensions["deployment_task"]))
+        and dimensions.get("e0_compatibility_bundle_sha256") == bundle_sha256
+    )
+
+
+def _is_registered_e0_zero_launch_demand(
+    *,
+    source: FormalSingleOperatorExecutionSource,
+    materialization: StageMaterializationReceipt,
+) -> bool:
+    """Recognize only the registered E0 V=0 auxiliary/zero-cell chain.
+
+    This is intentionally narrower than "no routed cells".  The source and
+    materialization identities, exact E0 node/rule, and immediate ALL_NA
+    decision are replayed before an empty launch set can become authoritative.
+    """
+
+    if (
+        type(source) is not FormalSingleOperatorExecutionSource
+        or type(materialization) is not StageMaterializationReceipt
+        or source.node not in {"e0_tuning", "e0_pilot", "e0_final"}
+    ):
+        return False
+    rebound = stage_materialization_receipt_from_dict(
+        source.materialization_source.reopen(
+            label="registered E0 zero-demand materialization"
+        )
+    )
+    if (
+        rebound != materialization
+        or source.stage != "E0"
+        or materialization.stage != source.stage
+        or materialization.sha256 != source.materialization_sha256
+        or materialization.source_decision_sha256
+        != source.materialization_source_decision_sha256
+        or materialization.upstream_receipt_sha256s
+        != source.materialization_upstream_receipt_sha256s
+    ):
+        raise ValueError("registered E0 zero-demand materialization identity differs")
+
+    if source.node == "e0_tuning":
+        expected = {
+            (model, backend, task)
+            for model in E0_MODELS
+            for backend in E0_BACKENDS
+            for task in E0_TASKS
+        }
+        observed = {
+            (
+                cell.model,
+                cell.backend,
+                dict(cell.dimensions).get("deployment_task"),
+            )
+            for cell in materialization.cells
+        }
+        return (
+            source.phase == "tuning"
+            and materialization.materialization_rule
+            == "108_compatibility_decisions_plus_239_rows_per_valid"
+            and materialization.expected_cell_count == 108
+            and observed == expected
+            and all(
+                _is_exact_e0_na_decision_cell(
+                    cell,
+                    bundle_sha256=materialization.source_decision_sha256,
+                )
+                and route_formal_single_operator_materialized_cell(
+                    node=source.node,
+                    phase=source.phase,
+                    cell=cell,
+                ).physical_kind
+                == "e0_compatibility_decision"
+                for cell in materialization.cells
+            )
+        )
+
+    predecessor_binding = source.predecessor_completion_source
+    if predecessor_binding is None:
+        raise ValueError("registered E0 zero-demand source lacks predecessor")
+    predecessor = rebuild_formal_single_operator_stage_completion(
+        predecessor_binding.absolute_path
+    )
+    if (
+        predecessor.artifact.sha256 != source.predecessor_completion_sha256
+        or predecessor.decision.sha256 != source.predecessor_decision_sha256
+        or predecessor.decision.next_materialization_source_decision_sha256
+        != materialization.source_decision_sha256
+        or predecessor.decision.next_materialization_upstream_receipt_sha256s
+        != materialization.upstream_receipt_sha256s
+        or materialization.upstream_receipt_sha256s
+        != (predecessor.materialization.sha256,)
+    ):
+        raise ValueError("registered E0 zero-demand predecessor identity differs")
+    payload = predecessor.decision.payload
+    if not _all_na_compatibility_from_payload(payload):
+        return False
+    if source.node == "e0_pilot":
+        return (
+            source.phase == "excluded_pilot"
+            and predecessor.artifact.node == "e0_tuning"
+            and predecessor.decision.decision_kind == "e0_tuning_actual_reduced"
+            and payload.get("status") == "ALL_NA"
+            and payload.get("valid_count") == 0
+            and materialization.materialization_rule
+            == "valid_x_8_roles_x_2_loads_x_4_excluded_pilots"
+            and materialization.expected_cell_count == 0
+            and not materialization.cells
+        )
+    return (
+        source.phase == "final"
+        and predecessor.artifact.node == "e0_pilot"
+        and predecessor.decision.decision_kind == "e0_pilot_all_na"
+        and payload.get("status") == "ALL_NA"
+        and payload.get("selected_final_blocks") == 0
+        and materialization.materialization_rule
+        == "valid_x_8_roles_x_2_loads_x_powered_final_blocks"
+        and materialization.expected_cell_count == 0
+        and not materialization.cells
+    )
 
 
 def _completion_chain(
@@ -1215,9 +1432,15 @@ def publish_formal_single_operator_prerequisite_launch_index(
     if source.stage not in _SUPPORTED_STAGES:
         raise ValueError("current stage has no prerequisite launch producer")
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="prerequisite producer execution materialization"
+        )
     )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(
+            label="prerequisite producer execution ProtocolLock"
+        )
+    )
     inventory, _inventory_binding, doctor, doctor_binding = _runtime_inputs(source)
     base = CompileLaunchManifest.load(base_environment_launch_manifest_path)
     base_binding = CanonicalJsonProofBinding.bind(
@@ -1367,7 +1590,9 @@ def load_formal_single_operator_prerequisite_launch_index(
         index.execution_source.absolute_path
     )
     materialization = stage_materialization_receipt_from_dict(
-        source.materialization_source.reopen()
+        source.materialization_source.reopen(
+            label="prerequisite index execution materialization"
+        )
     )
     expected = {
         (row.model, row.backend, row.topology_mode)
@@ -1394,6 +1619,7 @@ __all__ = [
     "FormalSingleOperatorPrerequisiteLaunchEntry",
     "FormalSingleOperatorPrerequisiteLaunchIndex",
     "PrerequisiteLaunchDemand",
+    "execution_source_prerequisite_launch_demands",
     "load_formal_single_operator_prerequisite_launch_index",
     "materialized_prerequisite_launch_demands",
     "publish_formal_single_operator_prerequisite_launch_index",

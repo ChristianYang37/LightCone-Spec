@@ -40,6 +40,9 @@ from lightcone_spec.runtime.release_trust_root import (
 )
 
 _WORKLOAD_IDS = ("livecodebench_v6_hard", "math500_level5")
+TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE = (
+    "lightcone_tts_calibration_lcb_v6_hard_sha256_problem_id_smallest4_excluded_v1"
+)
 _MODEL_ROLES = frozenset({"target", "drafter", "tokenizer"})
 _DATASET_DOMAINS = frozenset({"burstgpt_six_source", "e0_task_native"})
 _DATASET_FORMATS = frozenset(
@@ -63,6 +66,7 @@ _MAX_DATASET_SOURCE_BYTES = 512 * 1024 * 1024
 _MAX_DATASET_DERIVED_BYTES = 512 * 1024 * 1024
 _VERIFICATION_SEAL = object()
 _MASTER_CONTENT_ARTIFACT_ID = "content:master_verification_receipt"
+_POST_MASTER_DERIVED_CONTENT_IDS = ("tts_calibration_tuning_window",)
 _POST_MASTER_DERIVED_CONTENT_PREFIXES = (
     "derived_formal_serving_request_schedule:",
     "formal_workload_authority:",
@@ -72,6 +76,15 @@ _MASTER_AUTHORIZATION_IDS = (
     "dataset:e0_task_native",
     "prepared:formal_dag",
     "workload:e3a",
+)
+_MASTER_REQUIRED_CONTENT_IDS = (
+    "dataset:burstgpt_six_source:path_binding",
+    "dataset:e0_task_native:path_binding",
+)
+_FORMAL_CONTENT_CHILD_SCOPES = (
+    ("prepared:formal_dag",),
+    ("dataset:e0_task_native", "prepared:formal_dag"),
+    ("prepared:formal_dag", "workload:e3a"),
 )
 
 
@@ -85,6 +98,26 @@ def _canonical_sha256(value: object) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+CONTENT_VERIFICATION_PROTOCOL_SHA256 = _canonical_sha256(
+    {
+        "schema_version": 2,
+        "kind": "lightcone_content_verification_protocol",
+        "master_authorization_ids": list(_MASTER_AUTHORIZATION_IDS),
+        "master_required_content_ids": list(_MASTER_REQUIRED_CONTENT_IDS),
+        "master_dynamic_content": [
+            "one_snapshot_binding_per_prepared_model_member",
+            "official_eagle3_selector_binding_when_present",
+        ],
+        "post_master_derived_content_ids": list(_POST_MASTER_DERIVED_CONTENT_IDS),
+        "post_master_derived_content_prefixes": list(
+            _POST_MASTER_DERIVED_CONTENT_PREFIXES
+        ),
+        "formal_child_scopes": [list(row) for row in _FORMAL_CONTENT_CHILD_SCOPES],
+        "replay_semantics": "one_atomic_exact_challenge_reservation",
+    }
+)
 
 
 def _require_sha256(label: str, value: object) -> str:
@@ -322,6 +355,19 @@ def _reject_post_master_derived_content(
     content: tuple[ContentJsonArtifactBinding, ...],
 ) -> None:
     if any(
+        row.artifact_id in _POST_MASTER_DERIVED_CONTENT_IDS
+        or row.artifact_id.startswith(_POST_MASTER_DERIVED_CONTENT_PREFIXES)
+        for row in content
+    ):
+        raise ValueError(
+            "content verification cannot pre-authorize a post-master derived artifact"
+        )
+
+
+def _reject_legacy_post_master_derived_content(
+    content: tuple[ContentJsonArtifactBinding, ...],
+) -> None:
+    if any(
         row.artifact_id.startswith(_POST_MASTER_DERIVED_CONTENT_PREFIXES)
         for row in content
     ):
@@ -393,53 +439,132 @@ class AuthorizedWorkloadSource:
 
 @dataclass(frozen=True)
 class TtsCalibrationTuningWindowEntry:
-    """One disjoint TTS request bound to a root-authorized workload row."""
+    """One disjoint TTS request bound to an exact workload source row."""
 
     workload_id: str
     source_sample_id: str
     source_descriptor_sha256: str
     prompt_sha256: str
+    source_problem_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.workload_id not in _WORKLOAD_IDS:
             raise ValueError("TTS window workload is not registered")
+        if self.source_problem_id is not None:
+            _require_text("TTS window source problem", self.source_problem_id)
         _require_text("TTS window source sample", self.source_sample_id)
         _require_sha256("TTS window source descriptor", self.source_descriptor_sha256)
         _require_sha256("TTS window prompt", self.prompt_sha256)
 
     @cached_property
     def entry_id(self) -> str:
-        return _canonical_sha256(asdict(self))
+        return _canonical_sha256(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        row: dict[str, object] = {
+            "workload_id": self.workload_id,
+            "source_sample_id": self.source_sample_id,
+            "source_descriptor_sha256": self.source_descriptor_sha256,
+            "prompt_sha256": self.prompt_sha256,
+        }
+        if self.source_problem_id is not None:
+            row["source_problem_id"] = self.source_problem_id
+        return row
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
-        return cls(
-            **_strict_object(
-                "TTS calibration tuning-window entry",
-                value,
-                set(cls.__dataclass_fields__),
-            )
+        if type(value) is not dict:
+            raise TypeError("TTS calibration tuning-window entry must be an object")
+        expected = {
+            "workload_id",
+            "source_sample_id",
+            "source_descriptor_sha256",
+            "prompt_sha256",
+        }
+        if "source_problem_id" in value:
+            expected.add("source_problem_id")
+        row = _strict_object(
+            "TTS calibration tuning-window entry",
+            value,
+            expected,
         )
+        return cls(**row)
 
 
 @dataclass(frozen=True)
 class TtsCalibrationTuningWindow:
-    """Disjoint tuning/exclusion rows; prompts remain in signed raw sources."""
+    """Disjoint tuning/exclusion rows; prompts remain in bound raw sources."""
 
-    schema_version: Literal[2]
+    schema_version: int
     kind: Literal["lightcone_tts_disjoint_tuning_window_source"]
     tuning_entries: tuple[TtsCalibrationTuningWindowEntry, ...]
     excluded_pilot_entries: tuple[TtsCalibrationTuningWindowEntry, ...]
+    selector_namespace: str | None = None
+    workload_authority_sha256: str | None = None
+    ordered_domain_sha256: str | None = None
+    tuning_problem_ids: tuple[str, ...] | None = None
+    excluded_problem_ids: tuple[str, ...] | None = None
+    content_verification_receipt_sha256: str | None = None
+    content_verification_verified_ns: int | None = None
+    content_verification_reservation_sha256: str | None = None
+    trusted_content_bundle_sha256: str | None = None
+    trusted_locked_workload_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.schema_version != 2
-            or self.kind != "lightcone_tts_disjoint_tuning_window_source"
+        if self.schema_version not in {2, 3, 4, 5} or self.kind != (
+            "lightcone_tts_disjoint_tuning_window_source"
         ):
             raise ValueError("TTS calibration tuning-window schema differs")
+        legacy_fields = (
+            self.selector_namespace,
+            self.workload_authority_sha256,
+            self.ordered_domain_sha256,
+            self.tuning_problem_ids,
+            self.excluded_problem_ids,
+        )
+        receipt_fields = (
+            self.content_verification_receipt_sha256,
+            self.content_verification_verified_ns,
+            self.content_verification_reservation_sha256,
+        )
+        trusted_fields = (
+            self.trusted_content_bundle_sha256,
+            self.trusted_locked_workload_sha256,
+        )
+        if (
+            (
+                self.schema_version == 2
+                and any(
+                    value is not None
+                    for value in (*legacy_fields, *receipt_fields, *trusted_fields)
+                )
+            )
+            or (
+                self.schema_version == 3
+                and (
+                    any(value is None for value in legacy_fields)
+                    or any(
+                        value is not None
+                        for value in (*receipt_fields, *trusted_fields)
+                    )
+                )
+            )
+            or (
+                self.schema_version == 4
+                and (
+                    any(value is None for value in (*legacy_fields, *receipt_fields))
+                    or any(value is not None for value in trusted_fields)
+                )
+            )
+            or (
+                self.schema_version == 5
+                and (
+                    any(value is None for value in (*legacy_fields, *trusted_fields))
+                    or any(value is not None for value in receipt_fields)
+                )
+            )
+        ):
+            raise ValueError("TTS calibration tuning-window fields differ from schema")
         for label, rows in (
             ("tuning", self.tuning_entries),
             ("excluded pilot", self.excluded_pilot_entries),
@@ -466,6 +591,76 @@ class TtsCalibrationTuningWindow:
             raise ValueError("TTS calibration window reuses a source sample")
         if len({row.workload_id for row in self.entries}) != 1:
             raise ValueError("TTS calibration window must use one exact workload")
+        if self.schema_version == 2:
+            if any(row.source_problem_id is not None for row in self.entries):
+                raise ValueError("legacy TTS window cannot declare problem IDs")
+            return
+        if self.selector_namespace != TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE:
+            raise ValueError("TTS calibration tuning selector differs")
+        _require_sha256(
+            "TTS calibration workload authority", self.workload_authority_sha256
+        )
+        _require_sha256("TTS calibration ordered domain", self.ordered_domain_sha256)
+        if self.schema_version == 4:
+            _require_sha256(
+                "TTS calibration content receipt",
+                self.content_verification_receipt_sha256,
+            )
+            _positive_int(
+                "TTS calibration content verification time",
+                self.content_verification_verified_ns,
+            )
+            _require_sha256(
+                "TTS calibration replay reservation",
+                self.content_verification_reservation_sha256,
+            )
+        elif self.schema_version == 5:
+            _require_sha256(
+                "TTS calibration trusted content bundle",
+                self.trusted_content_bundle_sha256,
+            )
+            _require_sha256(
+                "TTS calibration trusted locked workload",
+                self.trusted_locked_workload_sha256,
+            )
+        if {row.workload_id for row in self.entries} != {"livecodebench_v6_hard"}:
+            raise ValueError("TTS calibration window must use LiveCodeBench v6 hard")
+        if len({row.source_descriptor_sha256 for row in self.entries}) != 1:
+            raise ValueError("TTS calibration window descriptor is not exact")
+        if self.schema_version == 5 and (
+            len(self.tuning_entries) != 76
+            or len(self.entries) != 80
+            or {row.source_descriptor_sha256 for row in self.entries}
+            != {self.trusted_locked_workload_sha256}
+        ):
+            raise ValueError("trusted TTS calibration window must bind exact H=80")
+        if any(row.source_problem_id is None for row in self.entries):
+            raise ValueError("TTS calibration window lacks problem identities")
+        for label, declared, observed in (
+            (
+                "tuning problem",
+                self.tuning_problem_ids,
+                tuple(sorted(row.source_problem_id for row in self.tuning_entries)),
+            ),
+            (
+                "excluded problem",
+                self.excluded_problem_ids,
+                tuple(
+                    sorted(row.source_problem_id for row in self.excluded_pilot_entries)
+                ),
+            ),
+        ):
+            if (
+                type(declared) is not tuple
+                or not declared
+                or declared != tuple(sorted(set(declared)))
+                or declared != observed
+            ):
+                raise ValueError(f"TTS calibration {label} IDs are not canonical")
+        if set(self.tuning_problem_ids) & set(self.excluded_problem_ids):
+            raise ValueError("TTS calibration problem-ID partitions overlap")
+        if len(self.problem_ids) != len(set(self.problem_ids)):
+            raise ValueError("TTS calibration window reuses a source problem")
 
     @cached_property
     def sha256(self) -> str:
@@ -475,8 +670,14 @@ class TtsCalibrationTuningWindow:
     def entries(self) -> tuple[TtsCalibrationTuningWindowEntry, ...]:
         return self.tuning_entries + self.excluded_pilot_entries
 
+    @property
+    def problem_ids(self) -> tuple[str, ...]:
+        if self.tuning_problem_ids is None or self.excluded_problem_ids is None:
+            return ()
+        return self.tuning_problem_ids + self.excluded_problem_ids
+
     def to_dict(self) -> dict[str, object]:
-        return {
+        row: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "tuning_entries": [row.to_dict() for row in self.tuning_entries],
@@ -484,20 +685,106 @@ class TtsCalibrationTuningWindow:
                 row.to_dict() for row in self.excluded_pilot_entries
             ],
         }
+        if self.schema_version >= 3:
+            row.update(
+                {
+                    "selector_namespace": self.selector_namespace,
+                    "workload_authority_sha256": self.workload_authority_sha256,
+                    "ordered_domain_sha256": self.ordered_domain_sha256,
+                    "tuning_problem_ids": list(self.tuning_problem_ids or ()),
+                    "excluded_problem_ids": list(self.excluded_problem_ids or ()),
+                }
+            )
+        if self.schema_version == 4:
+            row.update(
+                {
+                    "content_verification_receipt_sha256": (
+                        self.content_verification_receipt_sha256
+                    ),
+                    "content_verification_verified_ns": (
+                        self.content_verification_verified_ns
+                    ),
+                    "content_verification_reservation_sha256": (
+                        self.content_verification_reservation_sha256
+                    ),
+                }
+            )
+        elif self.schema_version == 5:
+            row.update(
+                {
+                    "trusted_content_bundle_sha256": (
+                        self.trusted_content_bundle_sha256
+                    ),
+                    "trusted_locked_workload_sha256": (
+                        self.trusted_locked_workload_sha256
+                    ),
+                }
+            )
+        return row
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
+        if type(value) is not dict:
+            raise TypeError("TTS calibration tuning window must be an object")
+        schema_version = value.get("schema_version")
+        fields = {
+            "schema_version",
+            "kind",
+            "tuning_entries",
+            "excluded_pilot_entries",
+        }
+        if schema_version in {3, 4, 5}:
+            fields.update(
+                {
+                    "selector_namespace",
+                    "workload_authority_sha256",
+                    "ordered_domain_sha256",
+                    "tuning_problem_ids",
+                    "excluded_problem_ids",
+                }
+            )
+        if schema_version == 4:
+            fields.update(
+                {
+                    "content_verification_receipt_sha256",
+                    "content_verification_verified_ns",
+                    "content_verification_reservation_sha256",
+                }
+            )
+        elif schema_version == 5:
+            fields.update(
+                {
+                    "trusted_content_bundle_sha256",
+                    "trusted_locked_workload_sha256",
+                }
+            )
         row = _strict_object(
             "TTS calibration tuning window",
             value,
-            set(cls.__dataclass_fields__),
+            fields,
         )
         tuning = row.pop("tuning_entries")
         excluded = row.pop("excluded_pilot_entries")
-        if type(tuning) is not list or type(excluded) is not list:
+        tuning_problem_ids = row.pop("tuning_problem_ids", None)
+        excluded_problem_ids = row.pop("excluded_problem_ids", None)
+        if (
+            type(tuning) is not list
+            or type(excluded) is not list
+            or schema_version in {3, 4, 5}
+            and (
+                type(tuning_problem_ids) is not list
+                or type(excluded_problem_ids) is not list
+            )
+        ):
             raise TypeError("TTS calibration tuning-window rows are not arrays")
         return cls(
             **row,
+            tuning_problem_ids=(
+                None if tuning_problem_ids is None else tuple(tuning_problem_ids)
+            ),
+            excluded_problem_ids=(
+                None if excluded_problem_ids is None else tuple(excluded_problem_ids)
+            ),
             tuning_entries=tuple(
                 TtsCalibrationTuningWindowEntry.from_dict(item) for item in tuning
             ),
@@ -2055,6 +2342,8 @@ def _reverify_content_authorization_artifact(
 def _validate_master_content_use_universe(
     verified_rows: tuple[object, ...],
     content: tuple[ContentJsonArtifactBinding, ...],
+    *,
+    schema_version: int,
 ) -> None:
     """Require every immutable master member to have one registered consumer."""
 
@@ -2081,7 +2370,7 @@ def _validate_master_content_use_universe(
     allowed_ids = {
         "dataset:burstgpt_six_source:path_binding",
         "dataset:e0_task_native:path_binding",
-        "tts_calibration_tuning_window",
+        *(() if schema_version == 2 else ("tts_calibration_tuning_window",)),
         *(f"snapshot:{member_id}" for member_id in models),
         *(
             f"eagle3_official_selector:{member_id}"
@@ -2091,25 +2380,25 @@ def _validate_master_content_use_universe(
     }
     observed_ids = {row.artifact_id for row in content}
     required_ids = {
-        "dataset:burstgpt_six_source:path_binding",
-        "dataset:e0_task_native:path_binding",
-        "tts_calibration_tuning_window",
+        *_MASTER_REQUIRED_CONTENT_IDS,
+        *(() if schema_version == 2 else ("tts_calibration_tuning_window",)),
     }
     if not required_ids <= observed_ids or not observed_ids <= allowed_ids:
         raise ValueError("master content contains an unknown or unused artifact")
 
     by_id = {row.artifact_id: row for row in content}
-    workload = workload_rows[0]
-    tuning_window = TtsCalibrationTuningWindow.from_dict(
-        by_id["tts_calibration_tuning_window"].load()
-    )
-    if any(
-        entry.source_descriptor_sha256 != workload.source(entry.workload_id).sha256
-        for entry in tuning_window.entries
-    ):
-        raise ValueError(
-            "TTS calibration window differs from root-authorized workload sources"
+    if schema_version == 1:
+        workload = workload_rows[0]
+        tuning_window = TtsCalibrationTuningWindow.from_dict(
+            by_id["tts_calibration_tuning_window"].load()
         )
+        if any(
+            entry.source_descriptor_sha256 != workload.source(entry.workload_id).sha256
+            for entry in tuning_window.entries
+        ):
+            raise ValueError(
+                "TTS calibration window differs from root-authorized workload sources"
+            )
     for domain, verified in datasets.items():
         artifact_id = f"dataset:{domain}:path_binding"
         path_binding = DatasetContentPathBinding.from_dict(by_id[artifact_id].load())
@@ -2165,6 +2454,7 @@ class ContentVerificationReceipt:
 
     schema_version: int
     kind: Literal["lightcone_content_verification_receipt"]
+    protocol_sha256: str | None
     verified_ns: int
     root_binding_sha256: str
     authorization_artifacts: tuple[ContentJsonArtifactBinding, ...]
@@ -2173,11 +2463,19 @@ class ContentVerificationReceipt:
     reservation: ChallengeReplayReservationBinding
 
     def __post_init__(self) -> None:
-        if (
-            self.schema_version != 1
-            or self.kind != "lightcone_content_verification_receipt"
+        if self.kind != "lightcone_content_verification_receipt" or not (
+            (self.schema_version == 1 and self.protocol_sha256 is None)
+            or (
+                self.schema_version == 2
+                and self.protocol_sha256 == CONTENT_VERIFICATION_PROTOCOL_SHA256
+            )
         ):
             raise ValueError("content verification receipt schema is unsupported")
+        if self.protocol_sha256 is not None:
+            _require_sha256(
+                "content verification protocol",
+                self.protocol_sha256,
+            )
         _positive_int("content verification time", self.verified_ns)
         _require_sha256("content verification root binding", self.root_binding_sha256)
         for label, rows in (
@@ -2194,7 +2492,10 @@ class ContentVerificationReceipt:
                 raise ValueError(
                     f"content verification {label} artifacts are not canonical"
                 )
-        _reject_post_master_derived_content(self.content_artifacts)
+        if self.schema_version == 1:
+            _reject_legacy_post_master_derived_content(self.content_artifacts)
+        else:
+            _reject_post_master_derived_content(self.content_artifacts)
         if (
             type(self.authorization_challenge_sha256s) is not tuple
             or not self.authorization_challenge_sha256s
@@ -2214,7 +2515,7 @@ class ContentVerificationReceipt:
             )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        row: dict[str, object] = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "verified_ns": self.verified_ns,
@@ -2228,6 +2529,9 @@ class ContentVerificationReceipt:
             ),
             "reservation": self.reservation.to_dict(),
         }
+        if self.schema_version == 2:
+            row["protocol_sha256"] = self.protocol_sha256
+        return row
 
     @cached_property
     def sha256(self) -> str:
@@ -2235,19 +2539,25 @@ class ContentVerificationReceipt:
 
     @classmethod
     def from_dict(cls, value: object) -> Self:
+        if type(value) is not dict:
+            raise TypeError("content verification receipt must be an object")
+        schema_version = value.get("schema_version")
+        fields = {
+            "schema_version",
+            "kind",
+            "verified_ns",
+            "root_binding_sha256",
+            "authorization_artifacts",
+            "content_artifacts",
+            "authorization_challenge_sha256s",
+            "reservation",
+        }
+        if schema_version == 2:
+            fields.add("protocol_sha256")
         row = _strict_object(
             "content verification receipt",
             value,
-            {
-                "schema_version",
-                "kind",
-                "verified_ns",
-                "root_binding_sha256",
-                "authorization_artifacts",
-                "content_artifacts",
-                "authorization_challenge_sha256s",
-                "reservation",
-            },
+            fields,
         )
         raw_authorizations = row.pop("authorization_artifacts")
         raw_content = row.pop("content_artifacts")
@@ -2259,8 +2569,10 @@ class ContentVerificationReceipt:
         reservation = ChallengeReplayReservationBinding.from_dict(
             row.pop("reservation")
         )
+        protocol_sha256 = row.pop("protocol_sha256") if schema_version == 2 else None
         return cls(
             **row,
+            protocol_sha256=protocol_sha256,
             authorization_artifacts=tuple(
                 ContentJsonArtifactBinding.from_dict(item)
                 for item in raw_authorizations
@@ -2304,6 +2616,7 @@ class ContentVerificationReceipt:
             _validate_master_content_use_universe(
                 tuple(row[2] for row in verified_rows),
                 self.content_artifacts,
+                schema_version=self.schema_version,
             )
         for artifact in self.content_artifacts:
             artifact.load()
@@ -2322,12 +2635,7 @@ class ContentVerificationReceipt:
             ):
                 raise ValueError("content verification master reservation is not exact")
             return verified_rows
-        allowed_scopes = {
-            ("prepared:formal_dag",),
-            ("dataset:e0_task_native", "prepared:formal_dag"),
-            ("prepared:formal_dag", "workload:e3a"),
-        }
-        if authorization_ids not in allowed_scopes:
+        if authorization_ids not in _FORMAL_CONTENT_CHILD_SCOPES:
             raise ValueError("content verification child scope is unsupported")
         master_artifacts = tuple(
             row
@@ -2353,7 +2661,9 @@ class ContentVerificationReceipt:
             if row.artifact_id != _MASTER_CONTENT_ARTIFACT_ID
         )
         if (
-            self.verified_ns != master.verified_ns
+            self.schema_version != master.schema_version
+            or self.protocol_sha256 != master.protocol_sha256
+            or self.verified_ns != master.verified_ns
             or self.root_binding_sha256 != master.root_binding_sha256
             or self.reservation != master.reservation
             or any(
@@ -2392,13 +2702,15 @@ def build_content_verification_receipt(
         _validate_master_content_use_universe(
             tuple(row[2] for row in verified_rows),
             content,
+            schema_version=2,
         )
     roots = {row[1] for row in verified_rows}
     if len(roots) != 1:
         raise ValueError("content authorizations do not share one source root")
     receipt = ContentVerificationReceipt(
-        schema_version=1,
+        schema_version=2,
         kind="lightcone_content_verification_receipt",
+        protocol_sha256=CONTENT_VERIFICATION_PROTOCOL_SHA256,
         verified_ns=verified_ns,
         root_binding_sha256=next(iter(roots)),
         authorization_artifacts=authorizations,
@@ -2445,6 +2757,7 @@ def verify_and_reserve_content_authorizations(
     _validate_master_content_use_universe(
         tuple(row[2] for row in verified_rows),
         content,
+        schema_version=2,
     )
     challenge_sha256s = tuple(sorted(row[0] for row in verified_rows))
     if len(challenge_sha256s) != len(set(challenge_sha256s)):
@@ -2501,8 +2814,11 @@ def derive_stage_content_verification_receipt(
         )
     )
     child = ContentVerificationReceipt(
-        schema_version=1,
+        schema_version=master.schema_version,
         kind="lightcone_content_verification_receipt",
+        protocol_sha256=(
+            CONTENT_VERIFICATION_PROTOCOL_SHA256 if master.schema_version == 2 else None
+        ),
         verified_ns=master.verified_ns,
         root_binding_sha256=master.root_binding_sha256,
         authorization_artifacts=scoped_authorizations,
@@ -2521,6 +2837,8 @@ def derive_stage_content_verification_receipt(
 
 __all__ = [
     "CONTENT_AUTHORIZATION_SOURCE_TYPES",
+    "CONTENT_VERIFICATION_PROTOCOL_SHA256",
+    "TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE",
     "AuthorizedDatasetContentMember",
     "AuthorizedPreparedModel",
     "AuthorizedWorkloadSource",

@@ -211,10 +211,31 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _reset_identity_for_scientific_role(
+    scientific_role: str,
+) -> tuple[str | None, str | None]:
+    if scientific_role in {"target_only", "static"}:
+        return None, None
+    if scientific_role in {"tts_calibration_candidate", "tts", "l0_naive"}:
+        return "request", "serialized_native_scheduler_v1"
+    if scientific_role in {
+        "lc_candidate",
+        "lightcone_template",
+        "lightcone",
+        "onlinespec_ogd",
+        "onlinespec_opt",
+        "onlinespec_ens",
+    }:
+        return "cohort", "cohort_batching_v1"
+    raise ValueError("test terminal lacks a registered scientific method role")
+
+
 def _persist_native_terminal_artifact(
     writer: EvidenceWriter,
     *,
     method: str,
+    reset_scope: str | None,
+    request_admission_policy: str | None,
     run_nonce_sha256: str,
     execution_plan_sha256: str,
     rank_config_sha256: str,
@@ -236,6 +257,10 @@ def _persist_native_terminal_artifact(
             {"challenge": writer.run_id, "attempt": writer.attempt_id}
         ),
         method=method,
+        reset_scope=reset_scope,
+        request_admission_policy=request_admission_policy,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(),
         scored_request_ids=(request_id,),
     )
@@ -1096,9 +1121,14 @@ def _build_evidence(
                 ),
                 registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
             )
+            reset_scope, request_admission_policy = _reset_identity_for_scientific_role(
+                scientific_role
+            )
             native_artifact_binding = _persist_native_terminal_artifact(
                 writer,
                 method=method,
+                reset_scope=reset_scope,
+                request_admission_policy=request_admission_policy,
                 run_nonce_sha256=run_nonce_sha256,
                 execution_plan_sha256=str(contract["execution_plan_sha256"]),
                 rank_config_sha256=rank_config_sha256,
@@ -1511,9 +1541,14 @@ def _build_e2_stage_evidence(
             process_id=10_000 + index,
             registered_policy=DEFAULT_EVIDENCE_WRITER_POLICY,
         )
+        reset_scope, request_admission_policy = _reset_identity_for_scientific_role(
+            registry.scientific_method_role_for_cell(cell).value
+        )
         native_artifact_binding = _persist_native_terminal_artifact(
             writer,
             method=method,
+            reset_scope=reset_scope,
+            request_admission_policy=request_admission_policy,
             run_nonce_sha256=run_nonce_sha256,
             execution_plan_sha256=runtime_sha256,
             rank_config_sha256=rank_config_sha256,

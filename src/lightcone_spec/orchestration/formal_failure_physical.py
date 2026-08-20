@@ -61,6 +61,7 @@ from lightcone_spec.orchestration.formal_physical_dispatch import (
     _publish_gpu_snapshot_error,
     _require_port_unused,
     _terminate_process_group,
+    _trusted_runtime_child_environment,
     _wait_server_ready,
     load_formal_serving_run_plan,
     rebuild_formal_single_operator_execution_binding_from_plan,
@@ -69,6 +70,7 @@ from lightcone_spec.orchestration.formal_physical_dispatch import (
 from lightcone_spec.orchestration.live_sglang import (
     PINNED_SGLANG_LIVE_SERVING_PROTOCOL_SHA256,
     PinnedNvidiaSmiTool,
+    _require_source_owned_server_executable,
 )
 from lightcone_spec.runtime.compile_runner import CompileLaunchManifest
 from lightcone_spec.runtime.control_attestation import (
@@ -705,12 +707,14 @@ def _spawn_failure_server(
     launch: CompileLaunchManifest,
     *,
     failure: FormalFailurePhysicalExecutionBinding,
+    child_environment_overlay: dict[str, str],
     quota_root: Path,
     stdout_file,
     stderr_file,
 ) -> subprocess.Popen[bytes]:
     subject = failure.subject
     environment = launch.child_environment()
+    environment.update(child_environment_overlay)
     environment.update(
         {
             "LIGHTCONE_FAILURE_ACTUATOR_ENABLE": "1",
@@ -1489,13 +1493,7 @@ async def execute_formal_e5_failure_run_plan(
     )
     if any(os.path.lexists(path) for path in output_paths):
         raise FileExistsError("formal failure physical output already exists")
-    executable = Path(launch.server_argv[0])
-    if (
-        not executable.is_absolute()
-        or not executable.is_file()
-        or executable.is_symlink()
-    ):
-        raise ValueError("formal failure server executable is invalid")
+    _require_source_owned_server_executable(launch.server_argv[0])
     admission_binding = CanonicalJsonProofBinding.bind(launch_admission_path)
     admission_value = admission_binding.reopen()
     if admission_value.get("kind") == "formal_single_operator_admission":
@@ -1614,6 +1612,7 @@ async def execute_formal_e5_failure_run_plan(
             _spawn_failure_server,
             launch,
             failure=failure,
+            child_environment_overlay=_trusted_runtime_child_environment(plan),
             quota_root=quota_root,
             stdout_file=stdout_file,
             stderr_file=stderr_file,

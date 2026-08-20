@@ -228,6 +228,10 @@ def _terminal_binding_to_dict(value: NativeTerminalRunBinding) -> dict[str, obje
         "previous_run_id": value.previous_run_id,
         "challenge_nonce_sha256": value.challenge_nonce_sha256,
         "method": value.method,
+        "reset_scope": value.reset_scope,
+        "request_admission_policy": value.request_admission_policy,
+        "runtime_trust_mode": value.runtime_trust_mode,
+        "formal_measurement": value.formal_measurement,
         "warmup_request_ids": list(value.warmup_request_ids),
         "scored_request_ids": list(value.scored_request_ids),
     }
@@ -245,6 +249,10 @@ def _terminal_binding_from_dict(value: object) -> NativeTerminalRunBinding:
         "previous_run_id",
         "challenge_nonce_sha256",
         "method",
+        "reset_scope",
+        "request_admission_policy",
+        "runtime_trust_mode",
+        "formal_measurement",
         "warmup_request_ids",
         "scored_request_ids",
     }

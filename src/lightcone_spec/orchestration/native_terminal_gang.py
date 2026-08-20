@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, Protocol, TypeVar
 
 from lightcone_spec.orchestration.formal_terminal_shards import (
+    LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
     SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND,
     publish_scalable_native_terminal_artifact,
     reopen_scalable_native_terminal_artifact,
@@ -643,6 +644,10 @@ class NativeTerminalGangBinding:
             first.run.previous_run_id,
             first.run.challenge_nonce_sha256,
             first.run.method,
+            first.run.reset_scope,
+            first.run.request_admission_policy,
+            first.run.runtime_trust_mode,
+            first.run.formal_measurement,
             first.topology_sha256,
             first.tensor_parallel_size,
             first.data_parallel_size,
@@ -661,6 +666,10 @@ class NativeTerminalGangBinding:
                 rank.run.previous_run_id,
                 rank.run.challenge_nonce_sha256,
                 rank.run.method,
+                rank.run.reset_scope,
+                rank.run.request_admission_policy,
+                rank.run.runtime_trust_mode,
+                rank.run.formal_measurement,
                 rank.topology_sha256,
                 rank.tensor_parallel_size,
                 rank.data_parallel_size,
@@ -831,6 +840,10 @@ def _run_binding_to_dict(binding: NativeTerminalRunBinding) -> dict[str, object]
         "previous_run_id": binding.previous_run_id,
         "challenge_nonce_sha256": binding.challenge_nonce_sha256,
         "method": binding.method,
+        "reset_scope": binding.reset_scope,
+        "request_admission_policy": binding.request_admission_policy,
+        "runtime_trust_mode": binding.runtime_trust_mode,
+        "formal_measurement": binding.formal_measurement,
         "warmup_request_ids": list(binding.warmup_request_ids),
         "scored_request_ids": list(binding.scored_request_ids),
     }
@@ -852,6 +865,10 @@ def _run_binding_from_dict(value: object) -> NativeTerminalRunBinding:
                 "previous_run_id",
                 "challenge_nonce_sha256",
                 "method",
+                "reset_scope",
+                "request_admission_policy",
+                "runtime_trust_mode",
+                "formal_measurement",
                 "warmup_request_ids",
                 "scored_request_ids",
             }
@@ -868,6 +885,10 @@ def _run_binding_from_dict(value: object) -> NativeTerminalRunBinding:
         previous_run_id=row["previous_run_id"],
         challenge_nonce_sha256=row["challenge_nonce_sha256"],
         method=row["method"],
+        reset_scope=row["reset_scope"],
+        request_admission_policy=row["request_admission_policy"],
+        runtime_trust_mode=row["runtime_trust_mode"],
+        formal_measurement=row["formal_measurement"],
         warmup_request_ids=tuple(
             _strict_list("run warmup request IDs", row["warmup_request_ids"])
         ),
@@ -1704,6 +1725,146 @@ def _coverage_sha256(binding: NativeTerminalGangBinding, *, warmup: bool) -> str
     )
 
 
+_TP_LOGICAL_RESET_RECEIPT_FIELDS = (
+    "request_id",
+    "request_epoch",
+    "terminal_outcome",
+    "terminal_round",
+    "terminal_version",
+    "adaptation_state_acquired",
+    "reset_required",
+    "state_untouched",
+    "source_point_identity_sha256",
+    "master_reset",
+    "optimizer_reset",
+    "inference_reset",
+    "captured_state_empty",
+    "runtime_reset",
+    "sticky_disabled_reason",
+    "archived_update_count",
+    "archived_round_count",
+    "protocol_sha256",
+)
+
+
+def _logical_request_reset_projection(resets: object) -> tuple[object, ...]:
+    if resets is None:
+        raise RuntimeError("distributed current terminal lacks request reset evidence")
+    return (
+        resets.reset_scope,
+        resets.request_admission_policy,
+        resets.protocol_sha256,
+        tuple(
+            tuple(getattr(receipt, field) for field in _TP_LOGICAL_RESET_RECEIPT_FIELDS)
+            for receipt in resets.receipts
+        ),
+    )
+
+
+def _validate_distributed_request_reset_evidence(
+    *,
+    binding: NativeTerminalGangBinding,
+    evidences: Sequence[ValidatedNativeTerminalEvidence],
+    expected_warmup_requests: Mapping[int, Sequence[TerminalRequestExpectation]],
+    expected_scored_requests: Mapping[int, Sequence[TerminalRequestExpectation]],
+) -> None:
+    """Bind TP logical equality and DP sticky-local reset coverage.
+
+    Rank-local archive/receipt digests deliberately remain outside the TP
+    logical projection: shard-local mechanism bytes can differ while the
+    request epoch, source point, reset predicates, terminal fence, and counts
+    must agree exactly.
+    """
+
+    if len(evidences) != binding.world_size or any(
+        evidence.terminal_schema_version != 2 for evidence in evidences
+    ):
+        raise RuntimeError("distributed terminal requires current all-rank evidence")
+    first = binding.ranks[0]
+    phase_rows = (
+        (
+            "warmup",
+            tuple(
+                evidence.reset_receipt.warmup_request_source_point_resets
+                for evidence in evidences
+            ),
+            expected_warmup_requests,
+        ),
+        (
+            "scored",
+            tuple(evidence.request_source_point_resets for evidence in evidences),
+            expected_scored_requests,
+        ),
+    )
+    for phase, resets_by_rank, expected_by_rank in phase_rows:
+        expected_submitted_by_rank = tuple(
+            tuple(
+                row.request_id
+                for row in expected_by_rank[rank]
+                if row.submitted_to_server
+            )
+            for rank in range(binding.world_size)
+        )
+        actual_by_rank = tuple(
+            tuple(receipt.request_id for receipt in resets.receipts)
+            if resets is not None and resets.reset_scope == "request"
+            else ()
+            for resets in resets_by_rank
+        )
+        for rank, (resets, expected_ids, actual_ids) in enumerate(
+            zip(
+                resets_by_rank,
+                expected_submitted_by_rank,
+                actual_by_rank,
+                strict=True,
+            )
+        ):
+            if resets is None:
+                raise RuntimeError(f"distributed {phase} rank {rank} lacks resets")
+            if resets.reset_scope == "request":
+                # Receipt order is native terminal/acquire order.  An epoch-0
+                # submitted abort may legally interleave with acquired epochs,
+                # so bind exact unique coverage without imposing caller order.
+                if len(actual_ids) != len(expected_ids) or set(actual_ids) != set(
+                    expected_ids
+                ):
+                    raise RuntimeError(
+                        f"distributed {phase} rank {rank} reset coverage differs"
+                    )
+            elif resets.receipts:
+                raise RuntimeError(
+                    f"distributed {phase} cohort/allocation-free resets are nonempty"
+                )
+        if first.tensor_parallel_size == 2:
+            logical = tuple(
+                _logical_request_reset_projection(resets) for resets in resets_by_rank
+            )
+            if len(set(logical)) != 1:
+                raise RuntimeError(
+                    f"TP2 {phase} logical request reset evidence differs across ranks"
+                )
+            if len(set(expected_submitted_by_rank)) != 1:
+                raise RuntimeError(
+                    f"TP2 {phase} submitted coverage differs across ranks"
+                )
+        else:
+            flattened_actual = tuple(
+                request_id for rows in actual_by_rank for request_id in rows
+            )
+            flattened_expected = tuple(
+                request_id for rows in expected_submitted_by_rank for request_id in rows
+            )
+            if (
+                len(flattened_actual) != len(set(flattened_actual))
+                or len(flattened_expected) != len(set(flattened_expected))
+                or len(flattened_actual) != len(flattened_expected)
+                or set(flattened_actual) != set(flattened_expected)
+            ):
+                raise RuntimeError(
+                    f"DP2 {phase} sticky-local reset union coverage differs"
+                )
+
+
 def publish_native_terminal_gang_aggregate(
     *,
     output_path: str | Path,
@@ -1756,6 +1917,14 @@ def publish_native_terminal_gang_aggregate(
             != transition.server_process_started_ns
         ):
             raise ValueError("rank evidence differs from gang binding/transition")
+    _validate_distributed_request_reset_evidence(
+        binding=binding,
+        evidences=rank_artifacts,
+        expected_warmup_requests=warmup_requests,
+        expected_scored_requests={
+            rank: evidence.requests for rank, evidence in enumerate(rank_artifacts)
+        },
+    )
     rows: list[NativeTerminalRankArtifactBinding] = []
     for rank, evidence in enumerate(rank_artifacts):
         expected = binding.ranks[rank]
@@ -1864,6 +2033,7 @@ def reopen_native_terminal_gang_aggregate_diagnostic(
         or body != canonical_json_bytes(value)
     ):
         raise RuntimeError("native terminal gang aggregate identity changed")
+    validated_evidences: list[ValidatedNativeTerminalEvidence] = []
     for row, rank_binding in zip(
         receipt.rank_artifacts, expected_binding.ranks, strict=True
     ):
@@ -1881,10 +2051,17 @@ def reopen_native_terminal_gang_aggregate_diagnostic(
         ):
             raise RuntimeError("bound native terminal rank artifact changed")
         rank_value = _strict_json(rank_body, label="native terminal rank artifact")
-        is_sharded = (
-            type(rank_value) is dict
-            and rank_value.get("schema_version") == 2
-            and rank_value.get("artifact_kind") == SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+        is_sharded = type(rank_value) is dict and (
+            (
+                rank_value.get("schema_version") == 2
+                and rank_value.get("artifact_kind")
+                == LEGACY_SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+            )
+            or (
+                rank_value.get("schema_version") == 3
+                and rank_value.get("artifact_kind")
+                == SHARDED_NATIVE_TERMINAL_ARTIFACT_KIND
+            )
         )
         if is_sharded:
             canonical_binding = CanonicalJsonProofBinding.bind(row.path)
@@ -1900,6 +2077,7 @@ def reopen_native_terminal_gang_aggregate_diagnostic(
             expected_warmup_requests=expected_warmup_requests[row.global_rank],
             expected_scored_requests=expected_scored_requests[row.global_rank],
         )
+        validated_evidences.append(evidence)
         transition_receipts = tuple(
             transition.ranks[row.global_rank].phase_receipt_sha256
             for transition in receipt.transitions
@@ -1919,6 +2097,12 @@ def reopen_native_terminal_gang_aggregate_diagnostic(
             != row.trusted_attester_policy_sha256
         ):
             raise RuntimeError("rank artifact terminal/process authority changed")
+    _validate_distributed_request_reset_evidence(
+        binding=expected_binding,
+        evidences=validated_evidences,
+        expected_warmup_requests=expected_warmup_requests,
+        expected_scored_requests=expected_scored_requests,
+    )
     return receipt
 
 

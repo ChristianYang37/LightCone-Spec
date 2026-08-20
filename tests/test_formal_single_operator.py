@@ -362,6 +362,10 @@ def test_tp1_source_owned_fatal_pointer_projects_failed_provenance(
         previous_run_id=None,
         challenge_nonce_sha256="4" * 64,
         method="static",
+        reset_scope=None,
+        request_admission_policy=None,
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(),
         scored_request_ids=("scored-0",),
     )

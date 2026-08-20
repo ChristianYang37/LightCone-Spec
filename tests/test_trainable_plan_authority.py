@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import struct
+from copy import deepcopy
 from dataclasses import replace
 from functools import cache
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_execution_semantics import (
@@ -15,12 +17,17 @@ from test_execution_semantics import (
     _load_binding,
 )
 
+import lightcone_spec.experiments.formal_single_operator_trainable_plan as plan_producer
 from lightcone_spec.adaptation import (
     TRAINABLE_PLAN_REDUCER_PROTOCOL_SHA256,
+    E1RecipeAnchorTrainablePlanSemantics,
     PreparedDrafterParameterInventory,
     TrainablePlanAuthorityBinding,
+    TtsCalibrationTrainablePlanSemantics,
     audit_trainable_plan_authority_for_method,
     bind_trainable_plan_authority,
+    build_e1_recipe_anchor_trainable_plan_semantics,
+    build_tts_calibration_trainable_plan_semantics,
     materialize_trainable_plan_authority_manifest,
     replay_trainable_plan_authority,
     require_trainable_plan_authority_for_method,
@@ -30,6 +37,7 @@ from lightcone_spec.adaptation import (
 from lightcone_spec.adaptation.parameters import DFlashParameterPlan, ParameterEntry
 from lightcone_spec.config import run_config_sha256
 from lightcone_spec.config.schema import (
+    AdaptationConfig,
     ModelPair,
     RunConfig,
     RuntimeConfig,
@@ -176,13 +184,100 @@ def _inputs(
     drafter_id: str = "z-lab/Qwen3-8B-DFlash-b16",
     target_revision: str = "1" * 40,
     drafter_revision: str = "2" * 40,
+    tts_calibration: bool = False,
+    e1_recipe_anchor: bool = False,
 ) -> dict[str, object]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    execution_semantics = _e1_execution_semantics(method, mode, scope)
-    if target_id != execution_semantics.expected_model:
-        raise ValueError("test model differs from registered E1 execution semantics")
-    recipe = execution_semantics.adaptation_recipe
-    assert recipe is not None
+    if tts_calibration and e1_recipe_anchor:
+        raise ValueError("test plan semantics must select one structural source")
+    if tts_calibration:
+        execution_semantics = build_tts_calibration_trainable_plan_semantics()
+        assert isinstance(
+            execution_semantics,
+            TtsCalibrationTrainablePlanSemantics,
+        )
+        method = execution_semantics.expected_method
+        mode = execution_semantics.expected_weight_update_mode
+        scope = execution_semantics.expected_parameter_scope
+        if (
+            target_id != execution_semantics.expected_target_model_id
+            or drafter_id != execution_semantics.expected_drafter_model_id
+        ):
+            raise ValueError("test model differs from canonical TTS-Cal semantics")
+        recipe_config = AdaptationConfig.model_validate(
+            execution_semantics.adaptation_config
+        )
+        expected_backend = execution_semantics.expected_backend
+        expected_model_max_context_length = (
+            execution_semantics.expected_model_max_context_length
+        )
+        expected_draft_depth = execution_semantics.expected_draft_depth
+        expected_runtime_context_length = (
+            execution_semantics.expected_runtime_context_length
+        )
+        expected_runtime_random_seed = execution_semantics.expected_runtime_random_seed
+        expected_sampling_profile_sha256 = (
+            execution_semantics.expected_sampling_profile_sha256
+        )
+        expected_speculation_enabled = True
+        expected_draft_width = execution_semantics.expected_draft_width
+        expected_concurrency = execution_semantics.source_plan_concurrency
+    elif e1_recipe_anchor:
+        execution_semantics = build_e1_recipe_anchor_trainable_plan_semantics()
+        assert isinstance(
+            execution_semantics,
+            E1RecipeAnchorTrainablePlanSemantics,
+        )
+        method = execution_semantics.expected_method
+        mode = execution_semantics.expected_weight_update_mode
+        scope = execution_semantics.expected_parameter_scope
+        if (
+            target_id != execution_semantics.expected_target_model_id
+            or drafter_id != execution_semantics.expected_drafter_model_id
+        ):
+            raise ValueError("test model differs from canonical E1 anchor semantics")
+        recipe_config = AdaptationConfig.model_validate(
+            execution_semantics.adaptation_config
+        )
+        expected_backend = execution_semantics.expected_backend
+        expected_model_max_context_length = (
+            execution_semantics.expected_model_max_context_length
+        )
+        expected_draft_depth = execution_semantics.expected_draft_depth
+        expected_runtime_context_length = (
+            execution_semantics.expected_runtime_context_length
+        )
+        expected_runtime_random_seed = execution_semantics.expected_runtime_random_seed
+        expected_sampling_profile_sha256 = (
+            execution_semantics.expected_sampling_profile_sha256
+        )
+        expected_speculation_enabled = True
+        expected_draft_width = execution_semantics.expected_draft_width
+        expected_concurrency = execution_semantics.source_plan_concurrency
+    else:
+        execution_semantics = _e1_execution_semantics(method, mode, scope)
+        if target_id != execution_semantics.expected_model:
+            raise ValueError(
+                "test model differs from registered E1 execution semantics"
+            )
+        recipe = execution_semantics.adaptation_recipe
+        assert recipe is not None
+        recipe_config = recipe.to_adaptation_config()
+        expected_backend = execution_semantics.expected_backend
+        expected_model_max_context_length = (
+            execution_semantics.expected_model_max_context_length
+        )
+        expected_draft_depth = execution_semantics.expected_draft_depth
+        expected_runtime_context_length = (
+            execution_semantics.expected_runtime_context_length
+        )
+        expected_runtime_random_seed = execution_semantics.expected_runtime_random_seed
+        expected_sampling_profile_sha256 = (
+            execution_semantics.expected_sampling_profile_sha256
+        )
+        expected_speculation_enabled = execution_semantics.expected_speculation_enabled
+        expected_draft_width = execution_semantics.expected_draft_width
+        expected_concurrency = execution_semantics.expected_concurrency
     model_lock = ModelLock(
         schema_version=2,
         models=(
@@ -260,21 +355,19 @@ def _inputs(
             drafter=drafter_id,
             target_revision=target_revision,
             drafter_revision=drafter_revision,
-            algorithm=execution_semantics.expected_backend,
-            max_context_length=(execution_semantics.expected_model_max_context_length),
-            draft_depth=execution_semantics.expected_draft_depth,
+            algorithm=expected_backend,
+            max_context_length=expected_model_max_context_length,
+            draft_depth=expected_draft_depth,
         ),
         runtime=RuntimeConfig(
-            context_length=execution_semantics.expected_runtime_context_length,
-            random_seed=execution_semantics.expected_runtime_random_seed,
-            sampling_profile_sha256=(
-                execution_semantics.expected_sampling_profile_sha256
-            ),
-            speculation_enabled=(execution_semantics.expected_speculation_enabled),
-            speculative_num_draft_tokens=(execution_semantics.expected_draft_width),
-            max_running_requests=execution_semantics.expected_concurrency,
+            context_length=expected_runtime_context_length,
+            random_seed=expected_runtime_random_seed,
+            sampling_profile_sha256=expected_sampling_profile_sha256,
+            speculation_enabled=expected_speculation_enabled,
+            speculative_num_draft_tokens=expected_draft_width,
+            max_running_requests=expected_concurrency,
         ),
-        adaptation=recipe.to_adaptation_config(),
+        adaptation=recipe_config,
     )
     run_config_path = (tmp_path / "run-config.json").resolve()
     _write_bound_json(run_config_path, config.model_dump(mode="json"))
@@ -283,13 +376,32 @@ def _inputs(
     cell_path = (tmp_path / "cell.json").resolve()
     _write_bound_json(cell_path, _cell_to_dict(cell))
 
-    split = {
-        "schema_version": 1,
-        "kind": "authority_test_execution_split",
-        "cell_id": cell.cell_id,
-        "run_config_sha256": run_config_sha256(config),
-        "split_population_sha256": "4" * 64,
-    }
+    if tts_calibration:
+        split = {
+            "schema_version": 1,
+            "kind": "tts_calibration_trainable_plan_split",
+            "cell_id": cell.cell_id,
+            "run_config_sha256": run_config_sha256(config),
+            "purpose": "parameter_inventory_only_not_calibration_selection",
+        }
+    elif e1_recipe_anchor:
+        split = {
+            "schema_version": 1,
+            "kind": "e1_recipe_anchor_trainable_plan_split",
+            "cell_id": cell.cell_id,
+            "run_config_sha256": run_config_sha256(config),
+            "purpose": (
+                "parameter_inventory_only_not_e1_activation_selection_or_winner"
+            ),
+        }
+    else:
+        split = {
+            "schema_version": 1,
+            "kind": "authority_test_execution_split",
+            "cell_id": cell.cell_id,
+            "run_config_sha256": run_config_sha256(config),
+            "split_population_sha256": "4" * 64,
+        }
     split_path = (tmp_path / "split.json").resolve()
     _write_bound_json(split_path, split)
 
@@ -424,6 +536,205 @@ def test_raw_authority_replays_selector_state_memory_and_strict_codec(
         trainable_plan_authority_binding_from_dict({**encoded, "summary": {}})
     with pytest.raises(ValueError, match="binding identity"):
         trainable_plan_authority_binding_from_dict({**encoded, "schema_version": True})
+
+
+def test_canonical_tts_cal_plan_replays_without_selecting_a_winner(
+    tmp_path: Path,
+) -> None:
+    values = _inputs(tmp_path, tts_calibration=True)
+    semantics = values["execution_semantics"]
+    binding = values["binding"]
+    assert isinstance(semantics, TtsCalibrationTrainablePlanSemantics)
+    assert isinstance(binding, TrainablePlanAuthorityBinding)
+    assert semantics.selection_effect == "none_not_a_calibration_winner"
+    assert semantics.representative_slot_policy.endswith("parameter_inventory_only")
+    assert values["cell"] == semantics.cell_declaration
+    assert binding.cell_id == semantics.cell_declaration.cell_id
+    assert binding.execution_semantics_sha256 == semantics.sha256
+    assert binding.method == "tts"
+    assert binding.backend == "DFLASH"
+    assert binding.mode == "full"
+    assert binding.scope == "all"
+    assert binding.optimizer == "adam"
+    replayed = replay_trainable_plan_authority(binding)
+    assert replayed.binding == binding
+    assert replayed.plan.sha256 == binding.trainable_plan_sha256
+    assert tuple(entry.name for entry in replayed.plan.entries) == (
+        "layers.0.input_layernorm.weight",
+        "layers.0.self_attn.q_proj.weight",
+    )
+
+    with pytest.raises(ValueError, match="representative cell identity differs"):
+        replace(
+            semantics,
+            expected_learning_rate=semantics.expected_learning_rate * 10,
+        )
+
+    tampered = deepcopy(values["manifest"])
+    tampered_semantics = tampered["execution_semantics"]
+    assert isinstance(tampered_semantics, dict)
+    tampered_semantics["selection_effect"] = "caller_selected_winner"
+    tampered_path = (tmp_path / "tampered-tts-plan-manifest.json").resolve()
+    _write_bound_json(tampered_path, tampered)
+    with pytest.raises(ValueError, match="code-owned source"):
+        bind_trainable_plan_authority(
+            tampered_path,
+            prepared_model_content_authority=(
+                values["prepared_model_content_authority"]
+            ),
+            expected_execution_semantics_sha256=semantics.sha256,
+        )
+
+    foreign_split = {
+        **values["split"],
+        "purpose": "caller_selected_calibration_winner",
+    }
+    _write_bound_json(values["split_path"], foreign_split)
+    with pytest.raises(ValueError, match="registered payload"):
+        materialize_trainable_plan_authority_manifest(
+            model_lock_artifact=values["model_lock_path"],
+            prepared_drafter_artifact=values["prepared_path"],
+            run_config_artifact=values["run_config_path"],
+            split_artifact=values["split_path"],
+            cell_artifact=values["cell_path"],
+            prepared_model_content_authority=(
+                values["prepared_model_content_authority"]
+            ),
+            execution_semantics=semantics,
+        )
+
+
+def test_canonical_e1_anchor_plan_is_structural_and_not_an_activation(
+    tmp_path: Path,
+) -> None:
+    values = _inputs(tmp_path, e1_recipe_anchor=True)
+    semantics = values["execution_semantics"]
+    binding = values["binding"]
+    assert isinstance(semantics, E1RecipeAnchorTrainablePlanSemantics)
+    assert isinstance(binding, TrainablePlanAuthorityBinding)
+    assert semantics.selection_effect == (
+        "none_structural_anchor_not_e1_activation_or_winner"
+    )
+    assert semantics.representative_slot_policy.endswith("parameter_inventory_only")
+    assert binding.method == "l0"
+    assert binding.backend == "DFLASH"
+    assert binding.mode == "full"
+    assert binding.scope == "last1"
+    assert binding.optimizer == "adamw"
+    replayed = replay_trainable_plan_authority(binding)
+    assert replayed.binding == binding
+    assert tuple(entry.name for entry in replayed.plan.entries) == (
+        "layers.0.input_layernorm.weight",
+        "layers.0.self_attn.q_proj.weight",
+    )
+
+    foreign_split = {
+        **values["split"],
+        "purpose": "caller_selected_e1_winner",
+    }
+    _write_bound_json(values["split_path"], foreign_split)
+    with pytest.raises(ValueError, match="registered payload"):
+        materialize_trainable_plan_authority_manifest(
+            model_lock_artifact=values["model_lock_path"],
+            prepared_drafter_artifact=values["prepared_path"],
+            run_config_artifact=values["run_config_path"],
+            split_artifact=values["split_path"],
+            cell_artifact=values["cell_path"],
+            prepared_model_content_authority=(
+                values["prepared_model_content_authority"]
+            ),
+            execution_semantics=semantics,
+        )
+
+
+def test_public_structural_plan_producers_no_replace_foreign_and_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _inputs(tmp_path / "prepared", tts_calibration=True)
+    authority = values["prepared_model_content_authority"]
+    snapshots = {row.model_id: row for row in authority.prepared_model_set.snapshots}
+    expected_revisions = {
+        "Qwen/Qwen3-8B": "1" * 40,
+        "z-lab/Qwen3-8B-DFlash-b16": "2" * 40,
+    }
+
+    def install_content(*, foreign_target_revision: bool = False) -> None:
+        members = tuple(
+            SimpleNamespace(
+                model_id=model_id,
+                revision=(
+                    "f" * 40
+                    if foreign_target_revision and model_id == "Qwen/Qwen3-8B"
+                    else snapshot.revision
+                ),
+                role=("target" if model_id == "Qwen/Qwen3-8B" else "drafter"),
+                local_snapshot_path=snapshot.root,
+            )
+            for model_id, snapshot in sorted(snapshots.items())
+        )
+        bundle = SimpleNamespace(model_members=members)
+        binding = SimpleNamespace(
+            runtime_binding_status="BOUND",
+            reopen=lambda: bundle,
+        )
+        monkeypatch.setattr(
+            plan_producer.TrustedSingleOperatorContentBundleBinding,
+            "bind",
+            classmethod(lambda _cls, _path: binding),
+        )
+
+        def require_formal(candidate) -> None:
+            observed = {row.model_id: row.revision for row in candidate.model_members}
+            if observed != expected_revisions:
+                raise ValueError("formal v03 content has a foreign model revision")
+
+        monkeypatch.setattr(
+            plan_producer,
+            "require_formal_v03_bound_content_bundle",
+            require_formal,
+        )
+
+    bundle_path = (tmp_path / "bound-content.json").resolve()
+    bundle_path.write_text("{}\n", encoding="utf-8")
+    install_content()
+    published = []
+    for name, publisher in (
+        (
+            "tts-plan.json",
+            plan_producer.publish_trusted_tts_calibration_trainable_plan_authority,
+        ),
+        (
+            "e1-plan.json",
+            plan_producer.publish_trusted_e1_recipe_anchor_trainable_plan_authority,
+        ),
+    ):
+        output = (tmp_path / name).resolve()
+        binding = publisher(
+            trusted_content_bundle_path=bundle_path,
+            output_path=output,
+        )
+        assert binding.revalidate().binding == binding
+        with pytest.raises(FileExistsError, match="already exists"):
+            publisher(
+                trusted_content_bundle_path=bundle_path,
+                output_path=output,
+            )
+        published.append(binding)
+
+    Path(published[0].split.path).write_bytes(b'{"tampered":true}')
+    with pytest.raises(RuntimeError, match="changed"):
+        published[0].revalidate()
+
+    install_content(foreign_target_revision=True)
+    foreign_output = (tmp_path / "foreign-revision-plan.json").resolve()
+    with pytest.raises(ValueError, match="foreign model revision"):
+        plan_producer.publish_trusted_tts_calibration_trainable_plan_authority(
+            trusted_content_bundle_path=bundle_path,
+            output_path=foreign_output,
+        )
+    assert not foreign_output.exists()
+    assert not foreign_output.with_name(f"{foreign_output.name}.sources").exists()
 
 
 def test_core_method_gate_requires_exact_raw_identity_and_no_baseline_state(

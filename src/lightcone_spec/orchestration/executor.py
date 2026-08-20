@@ -2984,14 +2984,74 @@ class NativeEvidenceBatch:
     def validate(self, *, run_id: str, method: str) -> None:
         if any(row.run_id != run_id for row in (*self.rounds, *self.updates)):
             raise ValueError("native evidence contains a cross-run row")
-        if len({(row.request_id, row.round_index) for row in self.rounds}) != len(
-            self.rounds
-        ):
+        if len(
+            {
+                (row.request_epoch, row.request_id, row.round_index)
+                for row in self.rounds
+            }
+        ) != len(self.rounds):
             raise ValueError("native round evidence contains duplicate identities")
-        if len({(row.cohort_sha256, row.update_index) for row in self.updates}) != len(
-            self.updates
-        ):
+        if len(
+            {
+                (row.request_epoch, row.cohort_sha256, row.update_index)
+                for row in self.updates
+            }
+        ) != len(self.updates):
             raise ValueError("native update evidence contains duplicate identities")
+        for row in self.rounds:
+            reset_values = (
+                row.reset_scope,
+                row.request_epoch,
+                row.historical_kv_source_versions_sha256,
+            )
+            if any(value is not None for value in reset_values):
+                if any(value is None for value in reset_values):
+                    raise ValueError("native round reset identity is incomplete")
+                if row.reset_scope == "request":
+                    if (
+                        not isinstance(row.request_epoch, int)
+                        or isinstance(row.request_epoch, bool)
+                        or row.request_epoch < 1
+                        or row.request_reset_receipt_sha256 is None
+                    ):
+                        raise ValueError("request-scoped native round reset differs")
+                elif row.reset_scope == "cohort":
+                    if (
+                        row.request_epoch != 0
+                        or row.request_reset_receipt_sha256 is not None
+                    ):
+                        raise ValueError("cohort-scoped native round reset differs")
+                else:
+                    raise ValueError("native round reset scope is unsupported")
+        for row in self.updates:
+            reset_values = (
+                row.reset_scope,
+                row.request_epoch,
+                row.effective_learning_rate,
+                row.schedule_valid,
+                row.extra_logical_delay,
+            )
+            if any(value is not None for value in reset_values):
+                if any(value is None for value in reset_values):
+                    raise ValueError(
+                        "native update reset/schedule identity is incomplete"
+                    )
+                if row.reset_scope == "request":
+                    if (
+                        not isinstance(row.request_epoch, int)
+                        or isinstance(row.request_epoch, bool)
+                        or row.request_epoch < 1
+                        or row.request_reset_receipt_sha256 is None
+                    ):
+                        raise ValueError("request-scoped native update reset differs")
+                elif row.reset_scope == "cohort":
+                    if (
+                        row.request_epoch != 0
+                        or row.request_reset_receipt_sha256 is not None
+                    ):
+                        raise ValueError("cohort-scoped native update reset differs")
+                else:
+                    raise ValueError("native update reset scope is unsupported")
         keys = tuple(key for key, _ in self.performance_overrides)
         if len(keys) != len(set(keys)):
             raise ValueError("performance override fields must be unique")
@@ -3053,16 +3113,15 @@ class NativeEvidenceBatch:
         ):
             raise ValueError("allocation-free methods cannot report adaptation state")
         if method not in {"target_only", "static"} and (
-            not self.rounds or not self.updates
-        ):
-            raise ValueError("adapted execution requires native round/update evidence")
-        if method not in {"target_only", "static"} and (
             not isinstance(overrides.get("updates_launched"), int)
             or not isinstance(overrides.get("updates_published"), int)
-            or int(overrides["updates_launched"]) < 1
-            or int(overrides["updates_published"]) < 1
+            or int(overrides["updates_launched"]) < 0
+            or int(overrides["updates_published"]) < 0
+            or int(overrides["updates_launched"]) != len(self.updates)
+            or int(overrides["updates_published"])
+            != sum(row.published_version is not None for row in self.updates)
         ):
-            raise ValueError("adapted execution requires positive update counters")
+            raise ValueError("adapted execution update counters differ from evidence")
 
 
 @dataclass(frozen=True)
@@ -3477,6 +3536,8 @@ def _native_terminal_binding(
     run_nonce_sha256: str,
     session_binding: SessionExecutionBinding | None,
 ) -> NativeTerminalRunBinding:
+    config = plan.runtime_plan.rank_configs[0]
+    adaptation = config.adaptation
     if session_binding is None:
         session_id = content_sha256(
             {
@@ -3502,7 +3563,13 @@ def _native_terminal_binding(
         session_epoch=session_epoch,
         previous_run_id=previous_run_id,
         challenge_nonce_sha256=hashlib.sha256(os.urandom(32)).hexdigest(),
-        method=plan.runtime_plan.rank_configs[0].method,
+        method=config.method,
+        reset_scope=None if adaptation is None else adaptation.reset_scope,
+        request_admission_policy=(
+            None if adaptation is None else adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=tuple(
             request.request_id for request in plan.warmup_requests
         ),
@@ -4707,6 +4774,18 @@ def _validate_resumed_native_terminal(
         or binding.session_epoch != expected_session_epoch
         or binding.previous_run_id != expected_previous_run_id
         or binding.method != plan.runtime_plan.rank_configs[0].method
+        or binding.reset_scope
+        != (
+            None
+            if plan.runtime_plan.rank_configs[0].adaptation is None
+            else plan.runtime_plan.rank_configs[0].adaptation.reset_scope
+        )
+        or binding.request_admission_policy
+        != (
+            None
+            if plan.runtime_plan.rank_configs[0].adaptation is None
+            else plan.runtime_plan.rank_configs[0].adaptation.request_admission_policy
+        )
         or binding.warmup_request_ids
         != tuple(request.request_id for request in plan.warmup_requests)
         or binding.scored_request_ids

@@ -10,6 +10,24 @@ PROTOCOL_PATHS = (
     ROOT / "docs/en/experiment-protocol.md",
     ROOT / "docs/zh-CN/experiment-protocol.md",
 )
+LANE_BOUNDARY_PATHS = (
+    *README_PATHS,
+    ROOT / "docs/en/mathematical-method.md",
+    ROOT / "docs/zh-CN/mathematical-method.md",
+    ROOT / "docs/en/sglang-patches.md",
+    ROOT / "docs/zh-CN/sglang-patches.md",
+    ROOT / "docs/en/architecture.md",
+    ROOT / "docs/zh-CN/architecture.md",
+    ROOT / "docs/en/installation.md",
+    ROOT / "docs/zh-CN/installation.md",
+    ROOT / "docs/en/troubleshooting.md",
+    ROOT / "docs/zh-CN/troubleshooting.md",
+    *CLI_PATHS,
+    ROOT / "docs/en/configuration.md",
+    ROOT / "docs/zh-CN/configuration.md",
+    ROOT / "docs/en/onlinespec-baseline.md",
+    ROOT / "docs/zh-CN/onlinespec-baseline.md",
+)
 
 EN_TRUSTED_HEADING = "## Trusted single-operator formal workflow"
 ZH_TRUSTED_HEADING = "## 单可信操作者正式实验链"
@@ -32,7 +50,17 @@ EXPECTED_ZH_SUBHEADINGS = (
 )
 
 REQUIRED_COMMANDS = (
+    "publish-v03-model-lock",
+    "collect-gpu-inventory",
+    "write-v03-e0-raw-source-path-inputs",
+    "publish-v03-e0-source-authorities",
+    "write-v03-content-path-inputs",
+    "publish-v03-content-path-spec",
+    "publish-stage-capacity",
     "publish-formal-runtime-authority-manifest",
+    "publish-tts-cal-trainable-plan",
+    "publish-e1-anchor-trainable-plan",
+    "publish-tts-drafter-native-loss-source",
     "publish-tts-calibration-source-authority",
     "publish-chronobelief-source-authority",
     "publish-e1-recipe-anchor-authority",
@@ -84,6 +112,57 @@ def test_trusted_v03_cli_docs_have_parallel_structure_and_public_commands() -> N
         assert 'code=="Success"' in section
         assert "formal_measured=false" in section
         assert "trusted_single_operator_empirical_no_signature" in section
+
+
+def test_trusted_v03_examples_follow_one_acyclic_public_ceremony() -> None:
+    sequence = (
+        "publish-v03-model-lock",
+        "collect-gpu-inventory",
+        "write-v03-e0-raw-source-path-inputs",
+        "publish-v03-e0-source-authorities",
+        "write-v03-content-path-inputs",
+        "publish-v03-content-path-spec",
+        "publish-stage-capacity",
+        "lightcone-spec doctor",
+        "publish-trusted-content",
+        "publish-preflight-workload",
+        "publish-tts-cal-trainable-plan",
+        "publish-e1-anchor-trainable-plan",
+        "publish-tts-calibration-tuning-window",
+        "publish-tts-drafter-native-loss-source",
+        "publish-tts-calibration-source-authority",
+        "publish-chronobelief-source-authority",
+        "publish-e1-recipe-anchor-authority",
+        "publish-onlinespec-source-authority",
+        "publish-formal-runtime-authority-manifest",
+        "build-trusted-protocol-lock",
+        "write-dag-driver-config",
+        "write-bootstrap-config",
+        "formal-single-operator status",
+        "bootstrap-once",
+    )
+    for path, heading in zip(
+        CLI_PATHS,
+        (EN_TRUSTED_HEADING, ZH_TRUSTED_HEADING),
+        strict=True,
+    ):
+        section = _trusted_section(path, heading)
+        examples = "\n".join(_bash_blocks(section))
+        e1_blocks = tuple(
+            block
+            for block in _bash_blocks(section)
+            if "publish-e1-recipe-anchor-authority" in block
+        )
+        assert len(e1_blocks) == 1
+        assert "--trusted-content-bundle" in e1_blocks[0]
+        cursor = 0
+        for command in sequence:
+            position = examples.find(command, cursor)
+            assert position >= cursor, f"{path.relative_to(ROOT)} misorders {command}"
+            cursor = position + len(command)
+        assert "--output /absolute/sources/doctor.json" in examples
+        assert "--tuning-workload-authority" not in section
+        assert "--content-verification-receipt" not in section
 
 
 def test_trusted_v03_examples_use_only_placeholder_absolute_paths() -> None:
@@ -141,3 +220,34 @@ def test_readme_trusted_v03_summaries_match_the_implemented_boundaries() -> None
         assert "mtp.*" in content
         assert "12" in content
         assert "108" in content
+
+
+def test_docs_separate_release_attestation_from_trusted_empirical_execution() -> None:
+    stale_unqualified_claims = (
+        "only currently claimable execution remains TP1/DP1 Target-only",
+        "Static/TTS/L0-naive/LightCone industrial cells are therefore `BLOCKED`",
+        "只有 TP1/DP1 Target-only 可端到端执行",
+        "目前只有 Target-only 可在该\nexecutor 中端到端执行",
+        "trusted hardware signer。因此 Static/TTS/L0-naive/LightCone",
+    )
+    required = (
+        "release-attested",
+        "formal_single_operator_v1",
+        "trusted_single_operator_empirical_no_signature",
+        "formal_measured=false",
+        "UNMEASURED",
+        "MEASURED",
+        "GPU qualification",
+        "capacity",
+        "terminal",
+        "coverage",
+    )
+
+    for path in LANE_BOUNDARY_PATHS:
+        content = path.read_text(encoding="utf-8")
+        for token in required:
+            assert token in content, f"{path.relative_to(ROOT)} lacks {token}"
+        for stale in stale_unqualified_claims:
+            assert stale not in content, (
+                f"{path.relative_to(ROOT)} retains an unscoped signer blocker: {stale}"
+            )

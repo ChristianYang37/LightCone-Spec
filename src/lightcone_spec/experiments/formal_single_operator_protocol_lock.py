@@ -10,10 +10,13 @@ from lightcone_spec.experiments.formal_method_authority import (
 )
 from lightcone_spec.experiments.formal_protocol import (
     ProtocolLock,
+    TrustedSingleOperatorProtocolSourceBinding,
+    TrustedSingleOperatorProtocolSourceBindings,
     code_owned_qualification_source_identities,
 )
 from lightcone_spec.experiments.formal_registry import (
     formal_runtime_authority_manifest_from_dict,
+    protocol_lock_from_dict,
     protocol_lock_to_dict,
 )
 from lightcone_spec.experiments.formal_runtime_manifest import (
@@ -48,6 +51,32 @@ def _tracked_sha256(bundle: object, relative_path: str) -> str:
     return matches[0].sha256
 
 
+def _canonical_source_binding(
+    binding: CanonicalJsonProofBinding,
+) -> TrustedSingleOperatorProtocolSourceBinding:
+    if type(binding) is not CanonicalJsonProofBinding:
+        raise TypeError("trusted ProtocolLock canonical source binding differs")
+    return TrustedSingleOperatorProtocolSourceBinding(
+        absolute_path=binding.absolute_path,
+        raw_sha256=binding.raw_sha256,
+        semantic_sha256=binding.semantic_sha256,
+        size=binding.size,
+    )
+
+
+def _content_source_binding(
+    binding: TrustedSingleOperatorContentBundleBinding,
+) -> TrustedSingleOperatorProtocolSourceBinding:
+    if type(binding) is not TrustedSingleOperatorContentBundleBinding:
+        raise TypeError("trusted ProtocolLock content source binding differs")
+    return TrustedSingleOperatorProtocolSourceBinding(
+        absolute_path=binding.absolute_path,
+        raw_sha256=binding.raw_sha256,
+        semantic_sha256=binding.semantic_sha256,
+        size=binding.size,
+    )
+
+
 def build_trusted_single_operator_protocol_lock(
     *,
     protocol_id: str,
@@ -56,8 +85,15 @@ def build_trusted_single_operator_protocol_lock(
     tts_calibration_authority_path: str | Path,
     chronobelief_authority_path: str | Path,
     e1_recipe_anchor_authority_path: str | Path,
+    require_capacity_available: bool = True,
+    revalidate_runtime_observations: bool = True,
 ) -> ProtocolLock:
     """Rebuild a schema-5 lock from paths and code-owned authorities only."""
+
+    # Reopen the source-owned TTS authority before content, runtime, doctor,
+    # planning, or GPU-facing work.
+    tts_binding = CanonicalJsonProofBinding.bind(tts_calibration_authority_path)
+    tts = load_tts_calibration_authority_artifact(tts_binding.absolute_path)
 
     content_binding = TrustedSingleOperatorContentBundleBinding.bind(
         trusted_content_bundle_path
@@ -65,6 +101,35 @@ def build_trusted_single_operator_protocol_lock(
     if content_binding.runtime_binding_status != "BOUND":
         raise ValueError("trusted ProtocolLock requires a runtime-BOUND content bundle")
     bundle = content_binding.reopen()
+    from lightcone_spec.experiments.formal_single_operator_model_registry import (
+        require_formal_v03_bound_content_bundle,
+    )
+
+    require_formal_v03_bound_content_bundle(
+        bundle,
+        require_capacity_available=require_capacity_available,
+        revalidate_runtime_observations=revalidate_runtime_observations,
+    )
+    if (
+        tts.schema_version != 4
+        or type(tts.trusted_content_bundle_source)
+        is not TrustedSingleOperatorContentBundleBinding
+        or tts.trusted_content_bundle_source != content_binding
+    ):
+        raise ValueError(
+            "trusted ProtocolLock TTS authority binds another content bundle"
+        )
+    e1_binding = CanonicalJsonProofBinding.bind(e1_recipe_anchor_authority_path)
+    e1 = load_e1_recipe_anchor_authority_artifact(e1_binding.absolute_path)
+    if (
+        e1.schema_version != 3
+        or type(e1.trusted_content_bundle_source)
+        is not TrustedSingleOperatorContentBundleBinding
+        or e1.trusted_content_bundle_source != content_binding
+    ):
+        raise ValueError(
+            "trusted ProtocolLock E1 authority binds another content bundle"
+        )
     source = bind_trusted_source_snapshot(bundle.source_snapshot.repository_root)
     if source != bundle.source_snapshot:
         raise RuntimeError("trusted ProtocolLock source checkout changed")
@@ -79,9 +144,10 @@ def build_trusted_single_operator_protocol_lock(
     if runtime != rebuilt_runtime:
         raise ValueError("trusted ProtocolLock runtime authority differs from source")
 
-    tts = load_tts_calibration_authority_artifact(tts_calibration_authority_path)
-    chronobelief = load_chronobelief_authority_artifact(chronobelief_authority_path)
-    e1 = load_e1_recipe_anchor_authority_artifact(e1_recipe_anchor_authority_path)
+    chronobelief_binding = CanonicalJsonProofBinding.bind(chronobelief_authority_path)
+    chronobelief = load_chronobelief_authority_artifact(
+        chronobelief_binding.absolute_path
+    )
     qualifications = code_owned_qualification_source_identities()
     native = qualifications["native_runtime"]
     compile_identity = qualifications["compile"]
@@ -118,6 +184,23 @@ def build_trusted_single_operator_protocol_lock(
         exactness_qualification_test_set_sha256=exactness[2],
         content_source_mode="trusted_single_operator",
         trusted_single_operator_content_bundle_sha256=(content_binding.semantic_sha256),
+        trusted_single_operator_source_bindings=(
+            TrustedSingleOperatorProtocolSourceBindings(
+                trusted_content_bundle_source=_content_source_binding(content_binding),
+                formal_runtime_authority_manifest_source=(
+                    _canonical_source_binding(runtime_binding)
+                ),
+                tts_calibration_authority_source=(
+                    _canonical_source_binding(tts_binding)
+                ),
+                chronobelief_authority_source=(
+                    _canonical_source_binding(chronobelief_binding)
+                ),
+                e1_recipe_anchor_authority_source=(
+                    _canonical_source_binding(e1_binding)
+                ),
+            )
+        ),
     )
     # Close the read window over every external method/runtime input.
     if (
@@ -125,6 +208,10 @@ def build_trusted_single_operator_protocol_lock(
         != content_binding
         or CanonicalJsonProofBinding.bind(formal_runtime_authority_manifest_path)
         != runtime_binding
+        or CanonicalJsonProofBinding.bind(tts_calibration_authority_path) != tts_binding
+        or CanonicalJsonProofBinding.bind(chronobelief_authority_path)
+        != chronobelief_binding
+        or CanonicalJsonProofBinding.bind(e1_recipe_anchor_authority_path) != e1_binding
         or load_tts_calibration_authority_artifact(tts_calibration_authority_path)
         != tts
         or load_chronobelief_authority_artifact(chronobelief_authority_path)
@@ -137,22 +224,111 @@ def build_trusted_single_operator_protocol_lock(
     return lock
 
 
+def revalidate_trusted_single_operator_protocol_lock(
+    lock: ProtocolLock,
+    *,
+    expected_content_bundle_path: str | Path | None = None,
+    require_capacity_available: bool = True,
+    revalidate_runtime_observations: bool = True,
+) -> ProtocolLock:
+    """Deep-rebuild one trusted lock exclusively from its embedded paths."""
+
+    if (
+        type(lock) is not ProtocolLock
+        or lock.schema_version != 5
+        or lock.content_source_mode != "trusted_single_operator"
+        or type(lock.trusted_single_operator_source_bindings)
+        is not TrustedSingleOperatorProtocolSourceBindings
+    ):
+        raise TypeError(
+            "trusted ProtocolLock revalidation requires schema 5 source bindings"
+        )
+    sources = lock.trusted_single_operator_source_bindings
+    content_source = sources.trusted_content_bundle_source
+    if (
+        expected_content_bundle_path is not None
+        and str(expected_content_bundle_path) != content_source.absolute_path
+    ):
+        raise ValueError("trusted ProtocolLock content source path differs")
+    canonical_sources = (
+        (
+            "runtime authority",
+            sources.formal_runtime_authority_manifest_source,
+        ),
+        ("TTS authority", sources.tts_calibration_authority_source),
+        ("ChronoBelief authority", sources.chronobelief_authority_source),
+        ("E1 recipe-anchor authority", sources.e1_recipe_anchor_authority_source),
+    )
+    for label, source in canonical_sources:
+        rebound = CanonicalJsonProofBinding.bind(source.absolute_path)
+        if _canonical_source_binding(rebound) != source:
+            raise ValueError(f"trusted ProtocolLock {label} source identity changed")
+    # This is intentionally before the content bundle reopens its runtime doctor.
+    load_tts_calibration_authority_artifact(
+        sources.tts_calibration_authority_source.absolute_path
+    )
+    rebound_content = TrustedSingleOperatorContentBundleBinding.bind(
+        content_source.absolute_path
+    )
+    if _content_source_binding(rebound_content) != content_source:
+        raise ValueError("trusted ProtocolLock content source identity changed")
+    rebuilt = build_trusted_single_operator_protocol_lock(
+        protocol_id=lock.protocol_id,
+        trusted_content_bundle_path=content_source.absolute_path,
+        formal_runtime_authority_manifest_path=(
+            sources.formal_runtime_authority_manifest_source.absolute_path
+        ),
+        tts_calibration_authority_path=(
+            sources.tts_calibration_authority_source.absolute_path
+        ),
+        chronobelief_authority_path=(
+            sources.chronobelief_authority_source.absolute_path
+        ),
+        e1_recipe_anchor_authority_path=(
+            sources.e1_recipe_anchor_authority_source.absolute_path
+        ),
+        require_capacity_available=require_capacity_available,
+        revalidate_runtime_observations=revalidate_runtime_observations,
+    )
+    if rebuilt != lock:
+        raise ValueError("trusted ProtocolLock differs from source-owned replay")
+    return lock
+
+
 def publish_trusted_single_operator_protocol_lock(
     lock: ProtocolLock,
     output_path: str | Path,
 ) -> FormalSingleOperatorJsonBinding:
     if type(lock) is not ProtocolLock or lock.schema_version != 5:
         raise TypeError("trusted ProtocolLock publisher requires schema 5")
+    revalidate_trusted_single_operator_protocol_lock(
+        lock,
+        require_capacity_available=True,
+        revalidate_runtime_observations=True,
+    )
     binding = publish_formal_single_operator_json_artifact(
         output_path,
         protocol_lock_to_dict(lock),
     )
     if binding.semantic_sha256 != lock.sha256:
         raise RuntimeError("trusted ProtocolLock publication digest differs")
+    reopened = protocol_lock_from_dict(
+        binding.reopen(label="trusted ProtocolLock publication")
+    )
+    if (
+        revalidate_trusted_single_operator_protocol_lock(
+            reopened,
+            require_capacity_available=True,
+            revalidate_runtime_observations=True,
+        )
+        != lock
+    ):
+        raise RuntimeError("published trusted ProtocolLock source replay differs")
     return binding
 
 
 __all__ = [
     "build_trusted_single_operator_protocol_lock",
     "publish_trusted_single_operator_protocol_lock",
+    "revalidate_trusted_single_operator_protocol_lock",
 ]

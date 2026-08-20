@@ -27,6 +27,7 @@ from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Literal, Self
 
+from lightcone_spec import PINNED_SGLANG_PATCH_COUNT
 from lightcone_spec.experiments.formal_single_operator_loads import (
     BURSTGPT_V2_ACTIVE_ASSET,
     BURSTGPT_V2_ASSETS,
@@ -194,6 +195,20 @@ def _resolved_file(path_value: str | Path, *, label: str) -> Path:
         raise ValueError(f"{label} path is missing") from error
     if resolved != path or path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} path must be a resolved regular non-symlink file")
+    return path
+
+
+def _normalized_future_file(path_value: str | Path, *, label: str) -> Path:
+    """Validate an output path before its producer has created the file."""
+
+    path = Path(path_value)
+    if not path.is_absolute() or Path(os.path.abspath(path)) != path or not path.name:
+        raise ValueError(f"{label} path must be absolute and normalized")
+    _resolved_directory(path.parent, label=f"{label} parent")
+    if path.is_symlink():
+        raise ValueError(f"{label} path must not be a symlink")
+    if path.exists():
+        return _resolved_file(path, label=label)
     return path
 
 
@@ -831,12 +846,14 @@ class TrustedSourceSnapshot:
             raise ValueError("trusted source snapshot digest differs")
         if (
             type(self.patches) is not tuple
-            or len(self.patches) != 7
+            or len(self.patches) != PINNED_SGLANG_PATCH_COUNT
             or any(type(row) is not TrustedSglangPatch for row in self.patches)
             or tuple(row.relative_path for row in self.patches)
             != tuple(sorted({row.relative_path for row in self.patches}))
         ):
-            raise ValueError("trusted SGLang patch series must contain seven patches")
+            raise ValueError(
+                "trusted SGLang patch series must contain the pinned patch count"
+            )
 
     @cached_property
     def sha256(self) -> str:
@@ -943,9 +960,12 @@ def bind_trusted_source_snapshot(repository_root: str | Path) -> TrustedSourceSn
         {"repository", "commit"},
     )
     patch_values = _strict_list("trusted SGLang patch series", manifest["patches"])
-    if manifest["schema_version"] != 2 or len(patch_values) != 7:
+    if (
+        manifest["schema_version"] != 2
+        or len(patch_values) != PINNED_SGLANG_PATCH_COUNT
+    ):
         raise ValueError(
-            "trusted SGLang patch manifest must be schema 2 with seven patches"
+            "trusted SGLang patch manifest must be schema 2 with the pinned patch count"
         )
     patches: list[TrustedSglangPatch] = []
     for raw_patch in patch_values:
@@ -1585,7 +1605,10 @@ class TrustedSingleOperatorContentPathSpec:
             self.inventory_path,
             label="trusted remote inventory",
         )
-        doctor = _resolved_file(self.doctor_path, label="trusted remote doctor")
+        doctor = _normalized_future_file(
+            self.doctor_path,
+            label="trusted remote doctor",
+        )
         if inventory == doctor:
             raise ValueError("trusted inventory and doctor paths must differ")
 
@@ -2125,6 +2148,29 @@ def load_trusted_single_operator_content_path_spec(
     return spec
 
 
+def publish_trusted_single_operator_content_path_spec(
+    spec: TrustedSingleOperatorContentPathSpec,
+    output_path: str | Path,
+) -> Path:
+    """No-replace publish one source-registered, digest-free v03 path recipe."""
+
+    if type(spec) is not TrustedSingleOperatorContentPathSpec:
+        raise TypeError("trusted content path publisher requires an exact spec")
+    from lightcone_spec.experiments.formal_single_operator_model_registry import (
+        require_formal_v03_content_path_spec,
+    )
+
+    require_formal_v03_content_path_spec(spec)
+    output = Path(output_path)
+    body = _canonical_bytes(spec.to_dict()) + b"\n"
+    _atomic_publish_no_replace(output, body)
+    rebound = load_trusted_single_operator_content_path_spec(output)
+    require_formal_v03_content_path_spec(rebound)
+    if rebound != spec:
+        raise RuntimeError("published trusted content path spec differs")
+    return output
+
+
 def publish_runtime_bound_trusted_single_operator_content_from_spec(
     *,
     spec_path: str | Path,
@@ -2132,7 +2178,15 @@ def publish_runtime_bound_trusted_single_operator_content_from_spec(
 ) -> TrustedSingleOperatorContentBundleBinding:
     """Build, runtime-bind, and no-replace publish from one path-only spec."""
 
+    from lightcone_spec.experiments.formal_single_operator_model_registry import (
+        require_formal_v03_bound_content_bundle,
+        require_formal_v03_content_path_spec,
+        require_formal_v03_pass_runtime_doctor,
+    )
+
     spec = load_trusted_single_operator_content_path_spec(spec_path)
+    require_formal_v03_content_path_spec(spec)
+    require_formal_v03_pass_runtime_doctor(spec.doctor_path)
     pending = build_trusted_single_operator_content_bundle(
         repository_root=spec.repository_root,
         model_specs=spec.model_specs,
@@ -2148,6 +2202,7 @@ def publish_runtime_bound_trusted_single_operator_content_from_spec(
         inventory_path=spec.inventory_path,
         doctor_path=spec.doctor_path,
     )
+    require_formal_v03_bound_content_bundle(bound)
     publish_trusted_single_operator_content_bundle(bound, output_path)
     binding = TrustedSingleOperatorContentBundleBinding.bind(output_path)
     if (
@@ -2266,6 +2321,7 @@ __all__ = [
     "publish_runtime_bound_trusted_single_operator_content_from_spec",
     "publish_trusted_preflight_workload_authority_from_content",
     "publish_trusted_single_operator_content_bundle",
+    "publish_trusted_single_operator_content_path_spec",
     "revalidate_trusted_json_artifact",
     "revalidate_trusted_model_snapshot_member",
     "revalidate_trusted_single_operator_content_bundle",

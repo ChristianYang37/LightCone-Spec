@@ -237,7 +237,7 @@ STAGED_PROSPECTIVE_GPU_HOUR_PROTOCOL_SHA256 = content_sha256(
         "stratum": ("all_scientific_cell_identity_except_registered_repeat_dimensions"),
         "registered_repeat_dimensions": (
             ("E3a", ("registry_cell_id",)),
-            ("TTS-Cal", ("block", "pilot_phase", "registry_cell_id")),
+            ("TTS-Cal", ("block", "registry_cell_id", "replicate_phase")),
             ("E1", ()),
             ("E2", ()),
             ("E4", ()),
@@ -340,6 +340,10 @@ def _run_binding_to_dict(value: NativeTerminalRunBinding) -> dict[str, object]:
         "previous_run_id": value.previous_run_id,
         "challenge_nonce_sha256": value.challenge_nonce_sha256,
         "method": value.method,
+        "reset_scope": value.reset_scope,
+        "request_admission_policy": value.request_admission_policy,
+        "runtime_trust_mode": value.runtime_trust_mode,
+        "formal_measurement": value.formal_measurement,
         "warmup_request_ids": list(value.warmup_request_ids),
         "scored_request_ids": list(value.scored_request_ids),
     }
@@ -359,6 +363,10 @@ def _run_binding_from_dict(value: object) -> NativeTerminalRunBinding:
         "previous_run_id",
         "challenge_nonce_sha256",
         "method",
+        "reset_scope",
+        "request_admission_policy",
+        "runtime_trust_mode",
+        "formal_measurement",
         "warmup_request_ids",
         "scored_request_ids",
     }
@@ -411,6 +419,8 @@ class FormalServingExecutionProofPayload:
     materialized_cell_id: str
     stage: str
     method: str
+    runtime_trust_mode: str | None
+    formal_measurement: bool | None
     run_config_sha256: str
     recipe_authority_sha256s: tuple[str, ...]
     subject_sha256: str
@@ -459,6 +469,30 @@ class FormalServingExecutionProofPayload:
                 raise ValueError(f"formal serving execution proof {label} is invalid")
         if self.topology_mode not in {"tp1_dp1", "tp2_dp1", "tp1_dp2"}:
             raise ValueError("formal serving execution proof topology is unsupported")
+        if (
+            (
+                self.runtime_trust_mode is not None
+                and type(self.runtime_trust_mode) is not str
+            )
+            or (
+                self.formal_measurement is not None
+                and type(self.formal_measurement) is not bool
+            )
+            or (self.runtime_trust_mode, self.formal_measurement)
+            not in {
+                (None, None),
+                ("release_verified_signature", True),
+                ("qualification_empirical_no_signature", False),
+                ("trusted_single_operator_empirical_no_signature", False),
+            }
+        ):
+            raise ValueError("formal serving execution proof runtime trust is invalid")
+        if self.method in {"target_only", "static"} and (
+            self.runtime_trust_mode is not None or self.formal_measurement is not None
+        ):
+            raise ValueError(
+                "allocation-free serving execution proof carries runtime trust"
+            )
         expected_gpu_count = 1 if self.topology_mode == "tp1_dp1" else 2
         if (
             type(self.gpu_uuids) is not tuple
@@ -526,6 +560,8 @@ class FormalServingExecutionProofPayload:
             "materialized_cell_id": self.materialized_cell_id,
             "stage": self.stage,
             "method": self.method,
+            "runtime_trust_mode": self.runtime_trust_mode,
+            "formal_measurement": self.formal_measurement,
             "run_config_sha256": self.run_config_sha256,
             "recipe_authority_sha256s": list(self.recipe_authority_sha256s),
             "subject_sha256": self.subject_sha256,
@@ -684,6 +720,8 @@ def _execution_proof_payload(
         materialized_cell_id=subject.materialized_cell_id,
         stage=subject.stage,
         method=subject.method,
+        runtime_trust_mode=identity.runtime_trust_mode,
+        formal_measurement=identity.formal_measurement,
         run_config_sha256=run_config_sha256(verified.run_config),
         recipe_authority_sha256s=subject.recipe_authority_sha256s,
         subject_sha256=subject.sha256,
@@ -3294,6 +3332,8 @@ def _validate_inputs(
             or native.rank_config_sha256 != subject.rank_config_sha256
             or native.attempt_id != identity.attempt_id
             or native.method != subject.method
+            or native.runtime_trust_mode != identity.runtime_trust_mode
+            or native.formal_measurement is not identity.formal_measurement
         ):
             raise ValueError("formal GPU-hour execution/run identity differs")
         execution_proof_binding = CanonicalJsonProofBinding.bind(
@@ -3322,6 +3362,9 @@ def _validate_inputs(
             or execution_proof_payload.run_id != identity.run_id
             or execution_proof_payload.run_nonce_sha256 != identity.run_nonce_sha256
             or execution_proof_payload.attempt_id != identity.attempt_id
+            or execution_proof_payload.runtime_trust_mode != identity.runtime_trust_mode
+            or execution_proof_payload.formal_measurement
+            is not identity.formal_measurement
         ):
             raise ValueError("formal serving execution proof differs from binding")
         proof_binding, lifecycle_reservation, verified = (
@@ -3594,7 +3637,7 @@ def _staged_actual_cost(
 
 _STAGED_REPEAT_DIMENSIONS_BY_STAGE = {
     "E3a": frozenset({"registry_cell_id"}),
-    "TTS-Cal": frozenset({"block", "pilot_phase", "registry_cell_id"}),
+    "TTS-Cal": frozenset({"block", "registry_cell_id", "replicate_phase"}),
     "E1": frozenset(),
     "E2": frozenset(),
     "E4": frozenset(),
@@ -5838,6 +5881,8 @@ def revalidate_persisted_stage_gpu_hour_source_manifest(
             or execution.run_nonce_sha256 != native.run_nonce_sha256
             or execution.attempt_id != native.attempt_id
             or execution.method != native.method
+            or execution.runtime_trust_mode != native.runtime_trust_mode
+            or execution.formal_measurement is not native.formal_measurement
             or execution.gpu_uuids != observation.gpu_uuids
             or execution.hardware_envelope_sha256 != persisted.hardware_envelope_sha256
             or lifecycle_reservation != observation.lifecycle_replay_reservation

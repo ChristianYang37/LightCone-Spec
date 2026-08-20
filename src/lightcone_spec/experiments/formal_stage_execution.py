@@ -15,7 +15,7 @@ registry mapper is never used as a fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cache, cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
 
@@ -33,9 +33,17 @@ from lightcone_spec.experiments.formal_protocol import (
     content_sha256,
     reject_banned_model_identity,
 )
+from lightcone_spec.experiments.formal_single_operator_content import (
+    TrustedSingleOperatorContentBundle,
+    TrustedSingleOperatorContentBundleBinding,
+)
 from lightcone_spec.experiments.gpu_pool import GpuInventory
 from lightcone_spec.experiments.itl_authority import StageItlExecutionIdentity
-from lightcone_spec.experiments.registry import build_industrial_registry
+from lightcone_spec.experiments.registry import (
+    ExperimentCell,
+    build_industrial_registry,
+    build_legacy_industrial_registry,
+)
 from lightcone_spec.experiments.stage_materialization import (
     E1_OPTIMIZER_ANCHORS,
     E1A_FIXED_VERIFICATION_BUDGET,
@@ -1995,18 +2003,21 @@ class E1RecipeAnchorAuthority:
 
     schema_version: int
     authority_id: str
+    trainable_plan_selector_id: str
     trainable_plan_sha256: str
     anchors: tuple[FormalOptimizerRecipe, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only E1 recipe-anchor authority schema 1 is supported")
+        if self.schema_version != 2:
+            raise ValueError("only E1 recipe-anchor authority schema 2 is supported")
         if (
             type(self.authority_id) is not str
             or not self.authority_id
             or self.authority_id.strip() != self.authority_id
         ):
             raise ValueError("E1 recipe-anchor authority ID must be canonical text")
+        if self.trainable_plan_selector_id != E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID:
+            raise ValueError("E1 recipe-anchor plan selector differs")
         _require_sha256("E1 recipe-anchor trainable plan", self.trainable_plan_sha256)
         if (
             type(self.anchors) is not tuple
@@ -2031,6 +2042,7 @@ class E1RecipeAnchorAuthority:
             {
                 "schema_version": self.schema_version,
                 "authority_id": self.authority_id,
+                "trainable_plan_selector_id": self.trainable_plan_selector_id,
                 "trainable_plan_sha256": self.trainable_plan_sha256,
                 "anchors": tuple(
                     {
@@ -2044,13 +2056,68 @@ class E1RecipeAnchorAuthority:
         )
 
 
-E1_RECIPE_ANCHOR_AUTHORITY_ID = "lightcone-e1-recipe-anchor-authority-v1"
+E1_RECIPE_ANCHOR_AUTHORITY_ID = "lightcone-e1-recipe-anchor-authority-v2"
 E1_RECIPE_ANCHOR_ARTIFACT_KIND = "lightcone_e1_recipe_anchor_authority_artifact"
+E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID = (
+    "e1_qwen3_8b_dflash_lc_candidate_full_last1_adamw_width8_c4_v1"
+)
 
 
-def _source_e1_recipe_anchor_authority(
+@cache
+def _canonical_e1_recipe_anchor_plan_cell() -> ExperimentCell:
+    matches = tuple(
+        row
+        for row in build_legacy_industrial_registry().cells_for("E1")
+        if row.identity.model == "Qwen/Qwen3-8B"
+        and row.identity.backend == "DFLASH"
+        and row.identity.task == "LiveCodeBench_tuning"
+        and row.identity.method == "l0"
+        and row.identity.scope == "last1"
+        and row.identity.parameterization == "full"
+        and row.identity.rank is None
+        and row.identity.alpha_over_rank is None
+        and row.identity.optimizer == "adamw"
+        and row.identity.learning_rate is None
+        and row.identity.schedule == "constant"
+        and row.identity.width == 8
+        and row.identity.concurrency == 4
+        and row.identity.variant
+        == "lc_candidate:optimizer_anchor:width=8:concurrency=4"
+    )
+    if len(matches) != 1:
+        raise RuntimeError("canonical E1 recipe-anchor plan slot is not unique")
+    return matches[0]
+
+
+def _validate_e1_recipe_anchor_plan_selection(
+    binding: object,
+    plan: object,
+) -> None:
+    cell = _canonical_e1_recipe_anchor_plan_cell()
+    if (
+        getattr(binding, "cell_id", None) != cell.cell_id
+        or getattr(binding, "cell_declaration_sha256", None) != cell.sha256
+        or getattr(binding, "method", None) != "l0"
+        or getattr(binding, "backend", None) != "DFLASH"
+        or getattr(binding, "mode", None) != "full"
+        or getattr(binding, "scope", None) != "last1"
+        or getattr(binding, "rank", None) is not None
+        or getattr(binding, "lora_alpha", None) is not None
+        or getattr(binding, "optimizer", None) != "adamw"
+        or getattr(binding, "target_model_id", None) != "Qwen/Qwen3-8B"
+        or getattr(binding, "drafter_model_id", None) != "z-lab/Qwen3-8B-DFlash-b16"
+        or getattr(plan, "backend", None) != "DFLASH"
+        or getattr(plan, "mode", None) != "full"
+        or getattr(plan, "scope", None) != "last1"
+    ):
+        raise ValueError(
+            "E1 recipe anchors require the code-owned canonical structural plan"
+        )
+
+
+def _reopen_e1_recipe_anchor_plan(
     source: CanonicalJsonProofBinding,
-) -> E1RecipeAnchorAuthority:
+) -> tuple[object, object]:
     from lightcone_spec.adaptation.plan_authority import (
         TrainablePlanAuthorityBinding,
         trainable_plan_authority_binding_from_dict,
@@ -2070,6 +2137,14 @@ def _source_e1_recipe_anchor_authority(
     result = binding.revalidate()
     if result.binding != binding or result.plan.sha256 != binding.trainable_plan_sha256:
         raise ValueError("E1 recipe-anchor trainable plan did not replay exactly")
+    _validate_e1_recipe_anchor_plan_selection(binding, result.plan)
+    return binding, result.plan
+
+
+def _source_e1_recipe_anchor_authority(
+    source: CanonicalJsonProofBinding,
+) -> E1RecipeAnchorAuthority:
+    _binding, plan = _reopen_e1_recipe_anchor_plan(source)
     anchors = tuple(
         sorted(
             (
@@ -2097,11 +2172,83 @@ def _source_e1_recipe_anchor_authority(
         )
     )
     return E1RecipeAnchorAuthority(
-        schema_version=1,
+        schema_version=2,
         authority_id=E1_RECIPE_ANCHOR_AUTHORITY_ID,
-        trainable_plan_sha256=result.plan.sha256,
+        trainable_plan_selector_id=E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
+        trainable_plan_sha256=plan.sha256,
         anchors=anchors,
     )
+
+
+def _validate_e1_plan_against_trusted_content(
+    binding: object,
+    bundle: TrustedSingleOperatorContentBundle,
+) -> None:
+    """Join the canonical E1 plan to one exact BOUND content bundle."""
+
+    from lightcone_spec.adaptation.plan_authority import TrainablePlanAuthorityBinding
+
+    if type(binding) is not TrainablePlanAuthorityBinding:
+        raise TypeError("trusted E1 plan requires an exact plan binding")
+    if type(bundle) is not TrustedSingleOperatorContentBundle:
+        raise TypeError("trusted E1 plan requires an exact content bundle")
+    target_matches = tuple(
+        row
+        for row in bundle.model_members
+        if row.role == "target" and row.model_id == binding.target_model_id
+    )
+    drafter_matches = tuple(
+        row
+        for row in bundle.model_members
+        if row.role == "drafter" and row.model_id == binding.drafter_model_id
+    )
+    if len(target_matches) != 1 or len(drafter_matches) != 1:
+        raise ValueError("trusted E1 plan models differ from content bundle")
+    target = target_matches[0]
+    drafter = drafter_matches[0]
+    prepared = {
+        row.model_id: row
+        for row in binding.prepared_model_content_authority.prepared_model_set.snapshots
+    }
+    prepared_target = prepared.get(binding.target_model_id)
+    prepared_drafter = prepared.get(binding.drafter_model_id)
+    if (
+        set(prepared) != {binding.target_model_id, binding.drafter_model_id}
+        or binding.target_model_id != "Qwen/Qwen3-8B"
+        or binding.drafter_model_id != "z-lab/Qwen3-8B-DFlash-b16"
+        or target.revision != binding.target_revision
+        or drafter.revision != binding.prepared_drafter_revision
+        or "E1" not in target.stages
+        or "E1" not in drafter.stages
+        or prepared_target is None
+        or prepared_drafter is None
+        or prepared_target.revision != target.revision
+        or prepared_drafter.revision != drafter.revision
+        or prepared_target.root != target.local_snapshot_path
+        or prepared_drafter.root != drafter.local_snapshot_path
+        or not any(
+            row.stage == "preflight"
+            and row.target_model_id == binding.target_model_id
+            and row.backend == "DFLASH"
+            and row.draft_depth == 15
+            for row in drafter.runtime_bindings
+        )
+    ):
+        raise ValueError(
+            "trusted E1 trainable plan differs from bundle model/runtime identity"
+        )
+
+
+def _require_publishable_e1_content(
+    bundle: TrustedSingleOperatorContentBundle,
+) -> None:
+    """Require the complete formal-v03 BOUND closure at producer boundaries."""
+
+    from lightcone_spec.experiments.formal_single_operator_model_registry import (
+        require_formal_v03_bound_content_bundle,
+    )
+
+    require_formal_v03_bound_content_bundle(bundle)
 
 
 def e1_recipe_anchor_authority_to_dict(
@@ -2113,6 +2260,7 @@ def e1_recipe_anchor_authority_to_dict(
     return {
         "schema_version": value.schema_version,
         "authority_id": value.authority_id,
+        "trainable_plan_selector_id": value.trainable_plan_selector_id,
         "trainable_plan_sha256": value.trainable_plan_sha256,
         "anchors": [
             {
@@ -2132,6 +2280,7 @@ def e1_recipe_anchor_authority_from_dict(
     if type(value) is not dict or set(value) != {
         "schema_version",
         "authority_id",
+        "trainable_plan_selector_id",
         "trainable_plan_sha256",
         "anchors",
         "authority_sha256",
@@ -2160,6 +2309,7 @@ def e1_recipe_anchor_authority_from_dict(
     authority = E1RecipeAnchorAuthority(
         schema_version=value["schema_version"],  # type: ignore[arg-type]
         authority_id=value["authority_id"],  # type: ignore[arg-type]
+        trainable_plan_selector_id=value["trainable_plan_selector_id"],  # type: ignore[arg-type]
         trainable_plan_sha256=value["trainable_plan_sha256"],  # type: ignore[arg-type]
         anchors=tuple(anchors),
     )
@@ -2172,18 +2322,47 @@ def e1_recipe_anchor_authority_from_dict(
 class E1RecipeAnchorAuthorityArtifact:
     """Durable source proof for the deterministic two-anchor authority."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[2, 3]
     kind: Literal["lightcone_e1_recipe_anchor_authority_artifact"]
+    trainable_plan_selector_id: Literal[
+        "e1_qwen3_8b_dflash_lc_candidate_full_last1_adamw_width8_c4_v1"
+    ]
     trainable_plan_authority_source: CanonicalJsonProofBinding
+    trusted_content_bundle_source: TrustedSingleOperatorContentBundleBinding | None
     authority: E1RecipeAnchorAuthority
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.kind != E1_RECIPE_ANCHOR_ARTIFACT_KIND:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version not in {2, 3}
+            or self.kind != E1_RECIPE_ANCHOR_ARTIFACT_KIND
+            or self.trainable_plan_selector_id != E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID
+        ):
             raise ValueError("E1 recipe-anchor artifact schema is unsupported")
         if type(self.trainable_plan_authority_source) is not CanonicalJsonProofBinding:
             raise TypeError("E1 recipe-anchor artifact requires a bound plan source")
         if type(self.authority) is not E1RecipeAnchorAuthority:
             raise TypeError("E1 recipe-anchor artifact requires an exact authority")
+        plan_binding, _plan = _reopen_e1_recipe_anchor_plan(
+            self.trainable_plan_authority_source
+        )
+        if self.schema_version == 2:
+            if self.trusted_content_bundle_source is not None:
+                raise ValueError("legacy E1 artifact cannot bind trusted content")
+        else:
+            if (
+                type(self.trusted_content_bundle_source)
+                is not TrustedSingleOperatorContentBundleBinding
+                or self.trusted_content_bundle_source.runtime_binding_status != "BOUND"
+            ):
+                raise ValueError("trusted E1 artifact requires a BOUND content bundle")
+            rebound_content = TrustedSingleOperatorContentBundleBinding.bind(
+                self.trusted_content_bundle_source.absolute_path
+            )
+            if rebound_content != self.trusted_content_bundle_source:
+                raise ValueError("trusted E1 content bundle source changed")
+            bundle = self.trusted_content_bundle_source.reopen()
+            _validate_e1_plan_against_trusted_content(plan_binding, bundle)
         expected = _source_e1_recipe_anchor_authority(
             self.trainable_plan_authority_source
         )
@@ -2198,32 +2377,56 @@ class E1RecipeAnchorAuthorityArtifact:
         value = {
             "schema_version": self.schema_version,
             "kind": self.kind,
+            "trainable_plan_selector_id": self.trainable_plan_selector_id,
             "trainable_plan_authority_source": (
                 self.trainable_plan_authority_source.to_dict()
             ),
             "authority": e1_recipe_anchor_authority_to_dict(self.authority),
         }
+        if self.schema_version == 3:
+            assert self.trusted_content_bundle_source is not None
+            value["trusted_content_bundle_source"] = (
+                self.trusted_content_bundle_source.to_dict()
+            )
         if include_sha256:
             value["artifact_sha256"] = self.sha256
         return value
 
     @classmethod
     def from_dict(cls, value: object) -> E1RecipeAnchorAuthorityArtifact:
-        if type(value) is not dict or set(value) != {
+        if (
+            type(value) is not dict
+            or type(value.get("schema_version")) is not int
+            or value.get("schema_version") not in {2, 3}
+        ):
+            raise ValueError("E1 recipe-anchor artifact fields differ")
+        expected_fields = {
             "schema_version",
             "kind",
+            "trainable_plan_selector_id",
             "trainable_plan_authority_source",
             "authority",
             "artifact_sha256",
-        }:
+        }
+        if value["schema_version"] == 3:
+            expected_fields.add("trusted_content_bundle_source")
+        if set(value) != expected_fields:
             raise ValueError("E1 recipe-anchor artifact fields differ")
         declared = value["artifact_sha256"]
         _require_sha256("E1 recipe-anchor artifact", declared)
         artifact = cls(
             schema_version=value["schema_version"],  # type: ignore[arg-type]
             kind=value["kind"],  # type: ignore[arg-type]
+            trainable_plan_selector_id=value["trainable_plan_selector_id"],  # type: ignore[arg-type]
             trainable_plan_authority_source=CanonicalJsonProofBinding.from_dict(
                 value["trainable_plan_authority_source"]
+            ),
+            trusted_content_bundle_source=(
+                None
+                if value["schema_version"] == 2
+                else TrustedSingleOperatorContentBundleBinding.from_dict(
+                    value["trusted_content_bundle_source"]
+                )
             ),
             authority=e1_recipe_anchor_authority_from_dict(value["authority"]),
         )
@@ -2233,13 +2436,23 @@ class E1RecipeAnchorAuthorityArtifact:
 
 
 def build_source_e1_recipe_anchor_authority_artifact(
+    *,
+    trusted_content_bundle_path: str | Path,
     trainable_plan_authority_path: str | Path,
 ) -> E1RecipeAnchorAuthorityArtifact:
+    content_source = TrustedSingleOperatorContentBundleBinding.bind(
+        trusted_content_bundle_path
+    )
+    if content_source.runtime_binding_status != "BOUND":
+        raise ValueError("E1 recipe-anchor producer requires BOUND trusted content")
+    _require_publishable_e1_content(content_source.reopen())
     source = CanonicalJsonProofBinding.bind(trainable_plan_authority_path)
     return E1RecipeAnchorAuthorityArtifact(
-        schema_version=1,
+        schema_version=3,
         kind=E1_RECIPE_ANCHOR_ARTIFACT_KIND,
+        trainable_plan_selector_id=E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID,
         trainable_plan_authority_source=source,
+        trusted_content_bundle_source=content_source,
         authority=_source_e1_recipe_anchor_authority(source),
     )
 
@@ -2250,6 +2463,10 @@ def publish_e1_recipe_anchor_authority_artifact(
 ) -> CanonicalJsonProofBinding:
     if type(artifact) is not E1RecipeAnchorAuthorityArtifact:
         raise TypeError("E1 recipe-anchor publisher requires an exact artifact")
+    if artifact.schema_version != 3:
+        raise ValueError("E1 recipe-anchor publisher requires schema 3 trusted content")
+    assert artifact.trusted_content_bundle_source is not None
+    _require_publishable_e1_content(artifact.trusted_content_bundle_source.reopen())
     artifact.__post_init__()
     publish_canonical_json_no_replace(output_path, artifact.to_dict())
     binding = CanonicalJsonProofBinding.bind(output_path)
@@ -2464,6 +2681,18 @@ class FormalServingExecutionSubject:
         return subject
 
 
+def _stage_itl_runtime_trust_identity(
+    config: RunConfig,
+) -> tuple[str | None, bool | None]:
+    """Project the release runtime-provider identity into stage-neutral proofs."""
+
+    if config.adaptation is None or (
+        config.model.algorithm == "DFLASH" and config.runtime.topology_mode == "tp1_dp1"
+    ):
+        return None, None
+    return "release_verified_signature", True
+
+
 _VERIFIED_FORMAL_SERVING_EXECUTION_SEAL = object()
 
 
@@ -2550,6 +2779,12 @@ class VerifiedFormalServingExecutionBinding:
         )
         if requires_nextn_tp2 != (verified_nextn_tp2_authority is not None):
             raise ValueError("formal serving NEXTN TP2 authority coverage is not exact")
+        expected_runtime_trust = _stage_itl_runtime_trust_identity(run_config)
+        if (
+            subject.execution_identity.runtime_trust_mode,
+            subject.execution_identity.formal_measurement,
+        ) != expected_runtime_trust:
+            raise ValueError("formal serving stage ITL runtime trust identity differs")
         if verified_nextn_tp2_authority is not None:
             nextn_native = tuple(
                 row for row in verified_native_gpu_proofs if row.suite_id == "nextn_tp2"
@@ -3301,16 +3536,27 @@ def _validate_tts_calibration_config(
     dimensions = dict(cell.dimensions)
     learning_rate = dimensions.get("learning_rate")
     stride = dimensions.get("stride")
-    if type(learning_rate) is not float or type(stride) is not int:
-        raise ValueError("TTS-Cal cell lacks exact learning-rate/stride identity")
-    authority.validate_runtime_optimizer_config(config.adaptation.optimizer)
+    width = dimensions.get("width")
     if (
-        config.adaptation.weight_update_mode != "full"
-        or config.adaptation.parameter_scope != "all"
-        or config.adaptation.rank is not None
-        or config.adaptation.lora_alpha is not None
-        or config.adaptation.stride != stride
-        or config.adaptation.optimizer.learning_rate != learning_rate
+        type(learning_rate) is not float
+        or type(stride) is not int
+        or type(width) is not int
+    ):
+        raise ValueError("TTS-Cal cell lacks exact learning-rate/stride/width identity")
+    authority.validate_runtime_adaptation_config(
+        config.adaptation,
+        learning_rate=learning_rate,
+        stride=stride,
+        canvas_tokens=width,
+    )
+    if (
+        config.model.drafter != "z-lab/Qwen3-8B-DFlash-b16"
+        or config.model.draft_depth != width - 1
+        or config.runtime.speculative_num_draft_tokens != width
+        or config.runtime.adaptation_microbatch_size != 1
+        or config.runtime.adaptation_publication_coalescing != 1
+        or config.runtime.adaptation_stream_priority != "default"
+        or config.online_spec is not None
         or cell.recipe_sha256
         != authority.candidate_id(learning_rate=learning_rate, stride=stride)
     ):
@@ -3327,8 +3573,21 @@ def _validate_tts_calibration_config(
     if (
         identity.model != cell.model
         or identity.backend != cell.backend
+        or identity.task != "disjoint_tts_numeric_calibration"
         or identity.method != "tts"
+        or identity.scope != "full_drafter"
+        or identity.parameterization != "full"
+        or identity.rank is not None
+        or identity.alpha_over_rank is not None
+        or identity.optimizer != "adam"
+        or identity.schedule != "constant"
         or identity.learning_rate != learning_rate
+        or identity.context != 40928
+        or identity.regime != "short_input_long_generation"
+        or identity.width != width
+        or identity.arrival != "disjoint_tuning_window"
+        or identity.slo != "safety_first_then_maximize_slo_goodput"
+        or identity.seed != 20260811
         or identity.block != dimensions.get("block")
         or int(identity.variant.removeprefix("tts_calibration:stride=")) != stride
     ):
@@ -3428,7 +3687,12 @@ def _validate_e1_config(
     elif cell.method_role in {"TTS", "L0-naive"}:
         if config.adaptation is None:
             raise ValueError("E1 frozen TTS/L0 anchor lacks adaptation config")
-        tts_authority.validate_runtime_optimizer_config(config.adaptation.optimizer)
+        tts_authority.validate_runtime_adaptation_config(
+            config.adaptation,
+            learning_rate=seal.selected_learning_rate,
+            stride=seal.selected_stride,
+            canvas_tokens=config.runtime.speculative_num_draft_tokens,
+        )
         if (
             cell.recipe_sha256 != seal.selected_candidate_id
             or config.adaptation.optimizer.learning_rate != seal.selected_learning_rate
@@ -3449,6 +3713,8 @@ def _validate_e1_config(
         if (
             adaptation.optimizer != anchor.optimizer
             or adaptation.stride != anchor.stride
+            or adaptation.reset_scope != "cohort"
+            or adaptation.request_admission_policy != "cohort_batching_v1"
             or adaptation.weight_update_mode != dimensions.get("parameterization")
             or adaptation.parameter_scope != dimensions.get("scope")
             or adaptation.rank != rank
@@ -3573,7 +3839,12 @@ def _validate_e2_config(
         adaptation = config.adaptation
         if adaptation is None:
             raise ValueError("E2 frozen TTS/L0 anchor lacks adaptation config")
-        tts_authority.validate_runtime_optimizer_config(adaptation.optimizer)
+        tts_authority.validate_runtime_adaptation_config(
+            adaptation,
+            learning_rate=seal.selected_learning_rate,
+            stride=seal.selected_stride,
+            canvas_tokens=matched_width,
+        )
         if (
             cell.recipe_sha256 != seal.selected_candidate_id
             or adaptation.optimizer.learning_rate != seal.selected_learning_rate
@@ -3586,6 +3857,13 @@ def _validate_e2_config(
         adaptation = config.adaptation
         if adaptation is None:
             raise ValueError("E2 LightCone candidate lacks adaptation config")
+        if (
+            adaptation.reset_scope != "cohort"
+            or adaptation.request_admission_policy != "cohort_batching_v1"
+        ):
+            raise ValueError(
+                "E2 LightCone candidate requires cohort-persistent batching"
+            )
         rank_value = dimensions.get("rank")
         rank = None if rank_value == "none" else rank_value
         alpha_value = dimensions.get("alpha_over_rank")
@@ -3686,7 +3964,12 @@ def _validate_downstream_config(
             now_ns=now_ns,
         )
         adaptation = config.adaptation
-        tts_authority.validate_runtime_optimizer_config(adaptation.optimizer)
+        tts_authority.validate_runtime_adaptation_config(
+            adaptation,
+            learning_rate=seal.selected_learning_rate,
+            stride=seal.selected_stride,
+            canvas_tokens=config.runtime.speculative_num_draft_tokens,
+        )
         if (
             seal.protocol_lock_sha256 != protocol_lock.sha256
             or cell.recipe_sha256 != seal.selected_candidate_id
@@ -3705,6 +3988,11 @@ def _validate_downstream_config(
             raise ValueError(
                 "downstream LightCone cell lacks isolated adaptation state"
             )
+        if (
+            adaptation.reset_scope != "cohort"
+            or adaptation.request_admission_policy != "cohort_batching_v1"
+        ):
+            raise ValueError("downstream LightCone requires cohort-persistent batching")
         if type(e2_recipe_grid_authority) is not E2RecipeGridAuthority:
             raise TypeError("downstream LightCone requires exact E2 numeric grid")
         if e2_recipe_grid_authority.sha256 != (
@@ -4424,6 +4712,9 @@ def prepare_formal_serving_execution_subject(
             "process_group_backend": run_config.runtime.process_group_backend,
         }
     )
+    runtime_trust_mode, formal_measurement = _stage_itl_runtime_trust_identity(
+        run_config
+    )
     execution_identity = StageItlExecutionIdentity(
         schema_version=1,
         kind="stage_itl_execution_identity",
@@ -4436,6 +4727,8 @@ def prepare_formal_serving_execution_subject(
         run_nonce_sha256=run_nonce_sha256,
         attempt_id=attempt_id,
         method=method,
+        runtime_trust_mode=runtime_trust_mode,
+        formal_measurement=formal_measurement,
     )
     return FormalServingExecutionSubject(
         schema_version=4,
@@ -5367,6 +5660,7 @@ def verify_formal_single_operator_execution_binding(
 __all__ = [
     "E1_RECIPE_ANCHOR_ARTIFACT_KIND",
     "E1_RECIPE_ANCHOR_AUTHORITY_ID",
+    "E1_RECIPE_ANCHOR_PLAN_SELECTOR_ID",
     "FORMAL_SERVING_EXECUTION_BINDING_PROTOCOL_SHA256",
     "FORMAL_SERVING_EXECUTION_REBUILD_PROTOCOL_SHA256",
     "FORMAL_SERVING_EXECUTION_RUNNER_SHA256",

@@ -916,6 +916,10 @@ def test_historical_matched_recipe_diagnostic_binds_old_selected_candidate() -> 
     for method in ("tts", "l0"):
         value = config_value(method)
         value["adaptation"].update(
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
+        )
+        value["adaptation"].update(
             weight_update_mode=selected.weight_update_mode,
             parameter_scope=selected.parameter_scope,
             rank=selected.rank,
@@ -1569,7 +1573,7 @@ def test_target_only_renderer_never_resolves_or_launches_a_drafter(
     )
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.launch._validate_compile_runtime_environment",
-        lambda _plan, _config, _argv: None,
+        lambda _plan, _config, _argv: (None, ()),
     )
     monkeypatch.setattr(
         "lightcone_spec.sglang_bridge.launch.runpy.run_module",

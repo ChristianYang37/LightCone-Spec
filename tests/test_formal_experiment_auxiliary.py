@@ -335,18 +335,26 @@ def test_e0_exact_108_auxiliary_decisions_materialize_no_future_sentinels(
         store.initialize_stage_plan(
             (StagePlanEntry("e0_tuning", 0, "E0", "tuning", "108", 108),)
         )
+        callbacks = _callbacks(
+            tmp_path,
+            store=store,
+            node="e0_tuning",
+            stage="E0",
+            phase="tuning",
+            source_kind="e0_compatibility",
+            count=108,
+            launch_count=launch_count,
+        )
+        actual = _binding(tmp_path, "e0-all-na-compatibility-actual.json")
+        callbacks = replace(
+            callbacks,
+            actual_results=lambda _node, attempts: {
+                str(row["cell_id"]): actual.absolute_path for row in attempts
+            },
+        )
         controller = FormalExperimentDagController(
             store=store,
-            callbacks=_callbacks(
-                tmp_path,
-                store=store,
-                node="e0_tuning",
-                stage="E0",
-                phase="tuning",
-                source_kind="e0_compatibility",
-                count=108,
-                launch_count=launch_count,
-            ),
+            callbacks=callbacks,
         )
         assert controller.run_once().action == "WAITING"
         assert store.latest_stage_attempts("e0_tuning") == ()
@@ -358,6 +366,9 @@ def test_e0_exact_108_auxiliary_decisions_materialize_no_future_sentinels(
         assert controller.run_once().action == "PLANNED"
         assert store.queued_commands() == ()
         assert launch_count == [1]
+        assert controller.run_once().action == "REDUCED"
+        assert store.controller_node("e0_tuning")["state"] == "REDUCED"
+        assert len(store.latest_stage_attempts("e0_tuning")) == 108
 
 
 def test_running_auxiliary_restart_never_respawns_or_creates_cells(

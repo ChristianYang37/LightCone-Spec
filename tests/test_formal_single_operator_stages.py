@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +14,14 @@ from lightcone_spec.experiments.formal_protocol import (
     CandidateStateReplay,
     CandidateStateTerminalPair,
     ProtocolLock,
+    TrustedSingleOperatorProtocolSourceBinding,
+    TrustedSingleOperatorProtocolSourceBindings,
     TtsL0CandidateStateCoverage,
 )
 from lightcone_spec.experiments.formal_registry import protocol_lock_to_dict
+from lightcone_spec.experiments.formal_single_operator_protocol_lock import (
+    publish_trusted_single_operator_protocol_lock,
+)
 from lightcone_spec.experiments.formal_single_operator_stages import (
     FORMAL_SINGLE_OPERATOR_NODE_ORDER,
     FORMAL_SINGLE_OPERATOR_NODE_SPECS,
@@ -24,10 +30,8 @@ from lightcone_spec.experiments.formal_single_operator_stages import (
     FormalSingleOperatorStageDecision,
     build_formal_single_operator_execution_source,
     formal_single_operator_node_readiness,
-    load_formal_single_operator_execution_source,
     materialize_formal_single_operator_node,
     next_formal_single_operator_node,
-    publish_formal_single_operator_execution_source,
     publish_formal_single_operator_json_artifact,
     publish_formal_single_operator_preflight_actual,
     rebuild_formal_single_operator_stage_completion,
@@ -39,6 +43,7 @@ from lightcone_spec.experiments.stage_materialization import (
     StageCellDisposition,
     StageCoverageReceipt,
     StageMaterializationReceipt,
+    _materialize_tts_calibration_diagnostic,
 )
 
 
@@ -46,6 +51,71 @@ def _sha(label: str) -> str:
     import hashlib
 
     return hashlib.sha256(label.encode()).hexdigest()
+
+
+def test_tts_cal_materialization_reaches_four_replicate_reducer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    materialization = _materialize_tts_calibration_diagnostic(
+        protocol_lock_sha256=_sha("protocol-lock"),
+        upstream_e3a_receipt_sha256=_sha("e3a-selection"),
+        calibration_authority_sha256=_sha("tts-authority"),
+        gpu_hours=GpuHourEstimate.unmeasured(),
+    )
+    actuals = tuple(
+        SimpleNamespace(
+            cell_id=cell.cell_id,
+            result_identity_sha256=_sha(f"actual:{cell.cell_id}"),
+        )
+        for cell in materialization.cells
+    )
+    monkeypatch.setattr(
+        stages,
+        "_serving_observation",
+        lambda _actual, _cell: {"inventory_sha256": _sha("inventory")},
+    )
+    monkeypatch.setattr(
+        stages,
+        "_single_operator_slo_goodput",
+        lambda _observation: SimpleNamespace(
+            status="PASS",
+            goodput_tokens_per_second=Fraction(100),
+            sha256=_sha("slo"),
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "_adaptive_safety_reasons",
+        lambda _observation, **_kwargs: (),
+    )
+    e3a_selection_sha256 = _sha("e3a-selection-payload")
+    predecessor = SimpleNamespace(
+        artifact=SimpleNamespace(node="e3a"),
+        decision=SimpleNamespace(
+            payload={
+                "selection_sha256": e3a_selection_sha256,
+                "model": "Qwen/Qwen3-8B",
+                "matched_width": 8,
+                "common_load": 1,
+            }
+        ),
+    )
+
+    decision = stages._reduce_single_operator_tts_calibration(
+        predecessor,
+        materialization,
+        actuals,
+    )
+
+    assert {cell.method_role for cell in materialization.cells} == {"TTS"}
+    assert len({cell.recipe_sha256 for cell in materialization.cells}) == 72
+    assert decision.decision_kind == "tts_calibration_actual_288_reduced"
+    assert decision.payload["status"] == "READY"
+    assert len(decision.payload["candidate_evaluations"]) == 72
+    assert all(
+        row["blocks"] == [0, 1, 2, 3]
+        for row in decision.payload["candidate_evaluations"]
+    )
 
 
 def test_l0_anchor_safety_is_recorded_but_does_not_gate_lightcone_ranking(
@@ -229,6 +299,165 @@ def _protocol_lock() -> ProtocolLock:
     )
 
 
+def _trusted_protocol_sources(
+    *,
+    content_sha256: str,
+    content_path: Path | None = None,
+    runtime_source: TrustedSingleOperatorProtocolSourceBinding | None = None,
+) -> TrustedSingleOperatorProtocolSourceBindings:
+    root = Path("/trusted-protocol-fixture")
+
+    def source(label: str) -> TrustedSingleOperatorProtocolSourceBinding:
+        return TrustedSingleOperatorProtocolSourceBinding(
+            absolute_path=str(root / f"{label}.json"),
+            raw_sha256=_sha(f"raw:{label}"),
+            semantic_sha256=_sha(f"semantic:{label}"),
+            size=2,
+        )
+
+    return TrustedSingleOperatorProtocolSourceBindings(
+        trusted_content_bundle_source=TrustedSingleOperatorProtocolSourceBinding(
+            absolute_path=str(content_path or root / "trusted-content-bundle.json"),
+            raw_sha256=_sha("raw:trusted-content"),
+            semantic_sha256=content_sha256,
+            size=2,
+        ),
+        formal_runtime_authority_manifest_source=(
+            runtime_source or source("runtime-authority")
+        ),
+        tts_calibration_authority_source=source("tts-authority"),
+        chronobelief_authority_source=source("chronobelief-authority"),
+        e1_recipe_anchor_authority_source=source("e1-authority"),
+    )
+
+
+def _trusted_protocol_lock(
+    *,
+    content_path: Path | None = None,
+    runtime_source: TrustedSingleOperatorProtocolSourceBinding | None = None,
+) -> ProtocolLock:
+    content_sha256 = _sha("trusted-content")
+    return replace(
+        _protocol_lock(),
+        schema_version=5,
+        offline_release_trust_root_sha256=None,
+        prepared_model_content_authorization_sha256=None,
+        formal_workload_e3a_authorization_sha256=None,
+        formal_workload_e0_authorization_sha256=None,
+        burstgpt_shape_authorization_sha256=None,
+        content_source_mode="trusted_single_operator",
+        trusted_single_operator_content_bundle_sha256=content_sha256,
+        trusted_single_operator_source_bindings=_trusted_protocol_sources(
+            content_sha256=content_sha256,
+            content_path=content_path,
+            runtime_source=runtime_source,
+        ),
+    )
+
+
+def test_trusted_schema5_lock_requires_path_bound_source_bindings() -> None:
+    with pytest.raises(ValueError, match="content source tag differs"):
+        replace(
+            _protocol_lock(),
+            schema_version=5,
+            offline_release_trust_root_sha256=None,
+            prepared_model_content_authorization_sha256=None,
+            formal_workload_e3a_authorization_sha256=None,
+            formal_workload_e0_authorization_sha256=None,
+            burstgpt_shape_authorization_sha256=None,
+            content_source_mode="trusted_single_operator",
+            trusted_single_operator_content_bundle_sha256=_sha("trusted-content"),
+        )
+
+
+def test_forged_schema5_lock_is_rejected_before_preflight_materialization(
+    tmp_path: Path,
+) -> None:
+    content_path = (tmp_path / "forged-content.json").resolve()
+    lock = _trusted_protocol_lock(content_path=content_path)
+    lock_path = (tmp_path / "forged-protocol-lock.json").resolve()
+    publish_formal_single_operator_json_artifact(
+        lock_path,
+        protocol_lock_to_dict(lock),
+    )
+    materialization_path = tmp_path / "forged-preflight-materialization.json"
+    node_path = tmp_path / "forged-preflight-node.json"
+
+    with pytest.raises(ValueError, match="GPU proof"):
+        materialize_formal_single_operator_node(
+            node="preflight",
+            predecessor_completion_path=None,
+            protocol_lock_path=lock_path,
+            content_source_path=content_path,
+            materialization_output_path=materialization_path,
+            node_materialization_output_path=node_path,
+            created_ns=10,
+        )
+
+    assert not materialization_path.exists()
+    assert not node_path.exists()
+
+
+def test_trusted_lock_publisher_rejects_handwritten_source_identity(
+    tmp_path: Path,
+) -> None:
+    output = (tmp_path / "published-forged-lock.json").resolve()
+
+    with pytest.raises(ValueError, match="GPU proof"):
+        publish_trusted_single_operator_protocol_lock(
+            _trusted_protocol_lock(
+                content_path=(tmp_path / "forged-content.json").resolve()
+            ),
+            output,
+        )
+
+    assert not output.exists()
+
+
+def test_trusted_lock_source_tamper_is_rejected_before_preflight(
+    tmp_path: Path,
+) -> None:
+    runtime_path = (tmp_path / "runtime-authority.json").resolve()
+    runtime_binding = publish_formal_single_operator_json_artifact(
+        runtime_path,
+        {"kind": "positive-shaped-runtime-authority"},
+    )
+    runtime_source = TrustedSingleOperatorProtocolSourceBinding(
+        absolute_path=runtime_binding.absolute_path,
+        raw_sha256=runtime_binding.raw_sha256,
+        semantic_sha256=runtime_binding.semantic_sha256,
+        size=runtime_binding.size_bytes,
+    )
+    content_path = (tmp_path / "forged-content.json").resolve()
+    lock = _trusted_protocol_lock(
+        content_path=content_path,
+        runtime_source=runtime_source,
+    )
+    lock_path = (tmp_path / "tampered-source-lock.json").resolve()
+    publish_formal_single_operator_json_artifact(
+        lock_path,
+        protocol_lock_to_dict(lock),
+    )
+    runtime_path.chmod(0o600)
+    runtime_path.write_bytes(b'{"kind":"tampered-runtime-authority"}\n')
+    materialization_path = tmp_path / "tampered-preflight-materialization.json"
+    node_path = tmp_path / "tampered-preflight-node.json"
+
+    with pytest.raises(ValueError, match="runtime authority source identity changed"):
+        materialize_formal_single_operator_node(
+            node="preflight",
+            predecessor_completion_path=None,
+            protocol_lock_path=lock_path,
+            content_source_path=content_path,
+            materialization_output_path=materialization_path,
+            node_materialization_output_path=node_path,
+            created_ns=10,
+        )
+
+    assert not materialization_path.exists()
+    assert not node_path.exists()
+
+
 def test_trusted_preflight_derives_real_e3a_workload_sha_from_bound_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,6 +478,9 @@ def test_trusted_preflight_derives_real_e3a_workload_sha_from_bound_inputs(
         burstgpt_shape_authorization_sha256=None,
         content_source_mode="trusted_single_operator",
         trusted_single_operator_content_bundle_sha256=content_sha256,
+        trusted_single_operator_source_bindings=_trusted_protocol_sources(
+            content_sha256=content_sha256
+        ),
     )
     workload_binding = SimpleNamespace(
         identity="workload-binding",
@@ -406,16 +638,24 @@ def _preflight_coverage(materialization) -> StageCoverageReceipt:
 
 
 def _initial_materialization(tmp_path: Path):
+    """Create archived schema-4 fixture bytes through the internal codec only."""
+
     protocol_lock = _protocol_lock()
     lock_path = tmp_path / "protocol-lock.json"
-    publish_formal_single_operator_json_artifact(
+    protocol_lock_source = publish_formal_single_operator_json_artifact(
         lock_path,
         protocol_lock_to_dict(protocol_lock),
     )
-    rebuilt = materialize_formal_single_operator_node(
+    adapter = stages._CLOSED_NODE_ADAPTERS["preflight"].materializer
+    assert adapter is not None
+    rebuilt = stages._materialize_formal_single_operator_node_with_adapter(
         node="preflight",
         predecessor_completion_path=None,
-        protocol_lock_path=lock_path,
+        protocol_lock_source=protocol_lock_source,
+        protocol_lock=protocol_lock,
+        content_source_binding=None,
+        auxiliary_sources=(),
+        adapter=adapter,
         materialization_output_path=tmp_path / "preflight-materialization.json",
         node_materialization_output_path=(
             tmp_path / "preflight-node-materialization.json"
@@ -423,6 +663,29 @@ def _initial_materialization(tmp_path: Path):
         created_ns=10,
     )
     return protocol_lock, lock_path, rebuilt
+
+
+def test_public_materializer_keeps_legacy_schema4_read_only(tmp_path: Path) -> None:
+    lock_path = tmp_path / "legacy-protocol-lock.json"
+    publish_formal_single_operator_json_artifact(
+        lock_path,
+        protocol_lock_to_dict(_protocol_lock()),
+    )
+    materialization_path = tmp_path / "legacy-preflight-materialization.json"
+    node_path = tmp_path / "legacy-preflight-node.json"
+
+    with pytest.raises(ValueError, match="schema 4 is read-only"):
+        materialize_formal_single_operator_node(
+            node="preflight",
+            predecessor_completion_path=None,
+            protocol_lock_path=lock_path,
+            materialization_output_path=materialization_path,
+            node_materialization_output_path=node_path,
+            created_ns=10,
+        )
+
+    assert not materialization_path.exists()
+    assert not node_path.exists()
 
 
 def _publish_preflight_actual(
@@ -539,11 +802,11 @@ def test_preflight_rejects_caller_authored_complete_json(tmp_path: Path) -> None
     assert not (tmp_path / "must-not-exist-completion.json").exists()
 
 
-def test_actual_preflight_unlocks_only_e3a_and_exports_current_source(
+def test_historical_preflight_completion_rebuilds_but_schema4_cannot_advance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    protocol_lock, lock_path, preflight = _initial_materialization(tmp_path)
+    protocol_lock, _lock_path, preflight = _initial_materialization(tmp_path)
     coverage = _preflight_coverage(preflight.materialization)
     actual_path = _publish_preflight_actual(
         monkeypatch,
@@ -571,75 +834,34 @@ def test_actual_preflight_unlocks_only_e3a_and_exports_current_source(
         coverage.sha256,
     )
 
-    e3a = materialize_formal_single_operator_node(
-        node="e3a",
-        predecessor_completion_path=preflight_completion_path,
-        protocol_lock_path=None,
-        materialization_output_path=tmp_path / "e3a-materialization.json",
-        node_materialization_output_path=tmp_path / "e3a-node-materialization.json",
-        created_ns=21,
-    )
-    assert e3a.materialization.stage == "E3a"
-    assert e3a.materialization.expected_cell_count == 360
-    assert e3a.materialization.source_decision_sha256 == (
-        protocol_lock.formal_workload_e3a_authorization_sha256
-    )
-    assert e3a.materialization.upstream_receipt_sha256s == (coverage.sha256,)
-
-    source = build_formal_single_operator_execution_source(
-        tmp_path / "e3a-node-materialization.json"
-    )
-    assert source.schema_version == 2
-    assert source.auxiliary_sources == ()
-    assert source.predecessor_completion_sha256 == completed.artifact.sha256
-    assert source.predecessor_decision_sha256 == completed.decision.sha256
-    assert source.protocol_lock_source.absolute_path == str(lock_path)
-    assert source.runtime_authority_manifest_sha256 == (
-        protocol_lock.formal_runtime_authority_manifest_sha256
-    )
-    source_path = tmp_path / "e3a-execution-source.json"
-    publish_formal_single_operator_execution_source(
-        node_materialization_path=tmp_path / "e3a-node-materialization.json",
-        output_path=source_path,
-    )
-    assert load_formal_single_operator_execution_source(source_path) == source
-
-    with pytest.raises(
-        FormalSingleOperatorStageBlocked,
-        match="lacks exact current actual-result coverage",
-    ):
-        reduce_formal_single_operator_node(
-            node_materialization_path=tmp_path / "e3a-node-materialization.json",
-            actual_result_paths={},
-            repository_root=tmp_path,
-            decision_output_path=tmp_path / "e3a-decision.json",
-            completion_output_path=tmp_path / "e3a-completion.json",
-            completed_ns=30,
-        )
-    with pytest.raises(ValueError, match="not the next DAG node"):
+    e3a_materialization_path = tmp_path / "e3a-materialization.json"
+    e3a_node_path = tmp_path / "e3a-node-materialization.json"
+    with pytest.raises(ValueError, match="schema 4 is read-only"):
         materialize_formal_single_operator_node(
-            node="tts_cal",
+            node="e3a",
             predecessor_completion_path=preflight_completion_path,
             protocol_lock_path=None,
-            materialization_output_path=tmp_path / "skip-materialization.json",
-            node_materialization_output_path=tmp_path / "skip-node.json",
-            created_ns=30,
+            materialization_output_path=e3a_materialization_path,
+            node_materialization_output_path=e3a_node_path,
+            created_ns=21,
         )
+    assert not e3a_materialization_path.exists()
+    assert not e3a_node_path.exists()
 
 
 def test_stage_artifacts_are_no_replace_and_tamper_evident(tmp_path: Path) -> None:
     _lock, lock_path, _preflight = _initial_materialization(tmp_path)
-    with pytest.raises(RuntimeError, match="target already exists"):
+    second_node_path = tmp_path / "preflight-node-materialization-2.json"
+    with pytest.raises(ValueError, match="schema 4 is read-only"):
         materialize_formal_single_operator_node(
             node="preflight",
             predecessor_completion_path=None,
             protocol_lock_path=lock_path,
             materialization_output_path=tmp_path / "preflight-materialization.json",
-            node_materialization_output_path=(
-                tmp_path / "preflight-node-materialization-2.json"
-            ),
+            node_materialization_output_path=second_node_path,
             created_ns=10,
         )
+    assert not second_node_path.exists()
     materialization = tmp_path / "preflight-materialization.json"
     materialization.chmod(0o600)
     body = materialization.read_bytes()
@@ -722,15 +944,19 @@ def test_reduced_stage_can_rebuild_after_nonretained_transitive_raw_is_archived(
         rebuild_formal_single_operator_stage_completion(completion_path).artifact.node
         == "preflight"
     )
-    e3a = materialize_formal_single_operator_node(
-        node="e3a",
-        predecessor_completion_path=completion_path,
-        protocol_lock_path=None,
-        materialization_output_path=tmp_path / "archive-safe-e3a-materialization.json",
-        node_materialization_output_path=tmp_path / "archive-safe-e3a-node.json",
-        created_ns=21,
-    )
-    assert e3a.materialization.expected_cell_count == 360
+    materialization_path = tmp_path / "archive-safe-e3a-materialization.json"
+    node_path = tmp_path / "archive-safe-e3a-node.json"
+    with pytest.raises(ValueError, match="schema 4 is read-only"):
+        materialize_formal_single_operator_node(
+            node="e3a",
+            predecessor_completion_path=completion_path,
+            protocol_lock_path=None,
+            materialization_output_path=materialization_path,
+            node_materialization_output_path=node_path,
+            created_ns=21,
+        )
+    assert not materialization_path.exists()
+    assert not node_path.exists()
 
 
 def test_structurally_valid_preflight_receipt_cannot_self_authorize(

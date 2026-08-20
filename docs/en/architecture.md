@@ -11,20 +11,26 @@ patch series and expected final Git tree. A workspace checkout is never an
 implicit dependency.
 
 CPU tests validate contracts, not GPU speed. Every new GPU cell is
-`UNMEASURED`. The current end-to-end industrial executor supports only
-TP1/DP1 Target-only. The pinned patch now implements the exact
-`sglang.schema_v3.content_bound_terminal_speculative_evidence.v1`
+`UNMEASURED`. The release-attested executor currently supports only TP1/DP1
+Target-only as a claimable path. The pinned patch now implements the exact
+`sglang.schema_v3.content_bound_terminal_speculative_evidence.v2`
 begin/reset/finalize hook, and the host validates its content rather than
 trusting provider attributes. The release contains no allowlisted, out-of-band
-hardware signer, however, so Static/TTS/L0-naive/LightCone still fail closed before mutation.
-Empirical Stage B is also `BLOCKED` until immutable model/data/trace inputs,
-provider access, registered hardware and interference evidence, and the trusted
-signer are available. Historical v2 evidence is usable for regression and
-debugging only and cannot support a new claim.
+hardware signer, however, so Static/TTS/L0-naive/LightCone still fail closed
+before mutation in that release-attested lane. The trusted
+`formal_single_operator_v1` lane separately runs the complete empirical DAG
+without an external signer once immutable source/content/runtime inputs,
+provider access, fresh GPU qualification and interference evidence, capacity,
+terminal, and coverage gates pass. Its closure is fixed to
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`; only release attestation can promote it to `MEASURED`. Historical
+v2 evidence is usable for regression and debugging only and cannot support a
+new claim.
 
 ## One decode and candidate lifecycle
 
-Target-only disables speculation and is the only currently claimable path.
+Target-only disables speculation and is the only currently claimable
+release-attested path.
 Static is an allocation-free native speculative target path, but release
 preflight blocks it pending trusted terminal attestation.
 Neither method's schema contract imports adaptation state or allocates
@@ -251,7 +257,8 @@ token IDs. Static retains zero round/update detailed-trace allocation and emits
 only the required aggregate speculative safety/accounting. Adaptive scientific roles additionally
 bind request, round, update, KV-version, publication, performance, and safety
 rows. The release verifier still blocks all three methods before mutation when
-the signer is unavailable.
+the signer is unavailable. That release-verifier decision does not block the
+trusted single-operator empirical lane described above.
 
 The repository defines immutable session-key and reset/finalize receipt data
 contracts for compatible adjacent traces. The complete key includes

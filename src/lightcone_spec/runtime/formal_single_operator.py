@@ -2046,7 +2046,9 @@ def finalize_formal_single_operator_resident_run(
         raise ValueError("resident run root differs from registered plan")
     snapshots = {
         "execution_source": inputs.execution_source.reopen(),
-        "protocol_lock": execution_source.protocol_lock_source.reopen(),
+        "protocol_lock": execution_source.protocol_lock_source.reopen(
+            label="resident execution ProtocolLock snapshot"
+        ),
         "materialization": schedule.materialization.reopen(),
         "inventory": inputs.inventory.reopen(),
         "run_plan_inputs": inputs_binding.reopen(),

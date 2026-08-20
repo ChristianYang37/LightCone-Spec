@@ -112,6 +112,7 @@ from lightcone_spec.orchestration.industrial import (
 )
 from lightcone_spec.orchestration.native_terminal import (
     NATIVE_TERMINAL_EVIDENCE_FIELDS,
+    REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256,
     SUPPORTED_METHODS,
     NativeTerminalProvider,
     NativeTerminalRunBinding,
@@ -178,6 +179,18 @@ def _clean_project_tree(root: Path) -> dict[str, object]:
     if root.resolve() == PROJECT_ROOT:
         value["dirty"] = False
     return value
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_runtime_envelope_uses_clean_project_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the synthetic doctor source identity stable in a dirty dev tree."""
+
+    monkeypatch.setattr(
+        "lightcone_spec.doctor._project_tree",
+        _clean_project_tree,
+    )
 
 
 class _FakeTraceConfig:
@@ -1220,8 +1233,10 @@ class _FakeTransport(PinnedBenchServingTransport):
         if self._native_admin is not None:
             return await self._native_admin.get_json(path)
         assert method in SUPPORTED_METHODS
+        adaptation = self.plan.runtime_plan.rank_configs[0].adaptation
+        allocation_free = adaptation is None
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
             "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
             "supported_methods": sorted(SUPPORTED_METHODS),
@@ -1230,6 +1245,17 @@ class _FakeTransport(PinnedBenchServingTransport):
             "method_evidence_supported": True,
             "topology_supported": True,
             "trusted_attester_configured": False,
+            "reset_scope": "none" if allocation_free else adaptation.reset_scope,
+            "request_admission_policy": (
+                "allocation_free"
+                if allocation_free
+                else adaptation.request_admission_policy
+            ),
+            "request_source_point_reset_protocol_sha256": (
+                None if allocation_free else REQUEST_SOURCE_POINT_RESET_PROTOCOL_SHA256
+            ),
+            "runtime_trust_mode": None,
+            "formal_measurement": None,
         }
 
     def _terminal_expectations(
@@ -1274,6 +1300,12 @@ class _FakeTransport(PinnedBenchServingTransport):
         payload = body.get("payload")
         assert isinstance(payload, dict)
         if action == "begin":
+            wire_reset_scope = payload["reset_scope"]
+            wire_request_admission_policy = payload["request_admission_policy"]
+            allocation_free = (wire_reset_scope, wire_request_admission_policy) == (
+                "none",
+                "allocation_free",
+            )
             binding = NativeTerminalRunBinding(
                 run_id=str(payload["run_id"]),
                 run_nonce_sha256=str(payload["run_nonce_sha256"]),
@@ -1285,6 +1317,16 @@ class _FakeTransport(PinnedBenchServingTransport):
                 previous_run_id=payload["previous_run_id"],
                 challenge_nonce_sha256=str(payload["challenge_nonce_sha256"]),
                 method=str(payload["method"]),
+                reset_scope=(None if allocation_free else str(wire_reset_scope)),
+                request_admission_policy=(
+                    None if allocation_free else str(wire_request_admission_policy)
+                ),
+                runtime_trust_mode=(
+                    None
+                    if payload["runtime_trust_mode"] is None
+                    else str(payload["runtime_trust_mode"])
+                ),
+                formal_measurement=payload["formal_measurement"],
                 warmup_request_ids=tuple(payload["warmup_request_ids"]),
                 scored_request_ids=tuple(payload["scored_request_ids"]),
             )

@@ -26,6 +26,8 @@ def sglang_adaptation_payload(config: RunConfig) -> dict | None:
         "parameter_scope": adaptation.parameter_scope,
         "kv_history_policy": adaptation.kv_history_policy,
         "adaptation_scope": adaptation.adaptation_scope,
+        "reset_scope": adaptation.reset_scope,
+        "request_admission_policy": adaptation.request_admission_policy,
         "adaptation_group_id": adaptation.adaptation_group_id,
         "tenant_id": config.tenant_id,
         "optimizer": adaptation.optimizer.model_dump(mode="json"),

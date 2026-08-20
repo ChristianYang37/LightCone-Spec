@@ -12,6 +12,7 @@ import pytest
 
 from lightcone_spec import PINNED_SGLANG_COMMIT, PINNED_SGLANG_TREE
 from lightcone_spec.config import ModelPair, RunConfig, RuntimeConfig, run_config_sha256
+from lightcone_spec.experiments import formal_single_operator_stages as stages
 from lightcone_spec.experiments.formal_preflight_inputs import (
     FORMAL_SINGLE_OPERATOR_PREFLIGHT_INPUTS_PROTOCOL_SHA256,
     FormalPreflightExecutionInputs,
@@ -39,7 +40,6 @@ from lightcone_spec.experiments.formal_single_operator_stages import (
     FormalSingleOperatorValidatedActual,
     _e2_recipe_payload,
     formal_single_operator_node_spec,
-    materialize_formal_single_operator_node,
     publish_formal_single_operator_execution_source,
     publish_formal_single_operator_json_artifact,
 )
@@ -445,6 +445,10 @@ def _run_plan(
         previous_run_id=None,
         challenge_nonce_sha256=_sha(f"challenge:{cell_id}"),
         method="l0",
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(),
         scored_request_ids=("request-0",),
     )
@@ -955,15 +959,47 @@ def _fixture(tmp_path: Path):
     }
 
 
+def _materialize_archived_schema4_node(
+    *,
+    node,
+    predecessor_completion_path: Path,
+    protocol_lock: ProtocolLock,
+    materialization_output_path: Path,
+    node_materialization_output_path: Path,
+    created_ns: int,
+):
+    """Rebuild archived schema-4 fixture bytes through the internal codec only."""
+
+    assert protocol_lock.schema_version == 4
+    predecessor = stages.rebuild_formal_single_operator_stage_completion(
+        predecessor_completion_path
+    )
+    adapter_entry = stages._CLOSED_NODE_ADAPTERS[node]
+    assert adapter_entry.materializer is not None
+    assert adapter_entry.blocked_reason is None
+    return stages._materialize_formal_single_operator_node_with_adapter(
+        node=node,
+        predecessor_completion_path=predecessor_completion_path,
+        protocol_lock_source=predecessor.node_materialization.protocol_lock_source,
+        protocol_lock=protocol_lock,
+        content_source_binding=None,
+        auxiliary_sources=(),
+        adapter=adapter_entry.materializer,
+        materialization_output_path=materialization_output_path,
+        node_materialization_output_path=node_materialization_output_path,
+        created_ns=created_ns,
+    )
+
+
 def test_e4_screen_mapper_derives_exact_config_argv_and_port_from_current_chain(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
     chain_root = fixture["chain_root"]
-    screen = materialize_formal_single_operator_node(
+    screen = _materialize_archived_schema4_node(
         node="e4_screen",
         predecessor_completion_path=fixture["e2_completion_path"],
-        protocol_lock_path=None,
+        protocol_lock=fixture["protocol_lock"],
         materialization_output_path=chain_root / "e4-screen-materialization.json",
         node_materialization_output_path=chain_root / "e4-screen-node.json",
         created_ns=300,
@@ -1037,10 +1073,10 @@ def test_e4_local_mapper_uses_same_stratum_screen_winner_actual(
 ) -> None:
     fixture = _fixture(tmp_path)
     chain_root = fixture["chain_root"]
-    screen = materialize_formal_single_operator_node(
+    screen = _materialize_archived_schema4_node(
         node="e4_screen",
         predecessor_completion_path=fixture["e2_completion_path"],
-        protocol_lock_path=None,
+        protocol_lock=fixture["protocol_lock"],
         materialization_output_path=chain_root / "screen-materialization.json",
         node_materialization_output_path=chain_root / "screen-node.json",
         created_ns=300,
@@ -1173,10 +1209,10 @@ def test_e4_local_mapper_uses_same_stratum_screen_winner_actual(
     )
     completion_path = chain_root / "screen-completion.json"
     publish_formal_single_operator_json_artifact(completion_path, completion.to_dict())
-    local = materialize_formal_single_operator_node(
+    local = _materialize_archived_schema4_node(
         node="e4_local",
         predecessor_completion_path=completion_path,
-        protocol_lock_path=None,
+        protocol_lock=fixture["protocol_lock"],
         materialization_output_path=chain_root / "local-materialization.json",
         node_materialization_output_path=chain_root / "local-node.json",
         created_ns=340,
@@ -1212,10 +1248,10 @@ def test_e4_mapper_rejects_profiler_foreign_cell_and_tampered_launch(
 ) -> None:
     fixture = _fixture(tmp_path)
     chain_root = fixture["chain_root"]
-    screen = materialize_formal_single_operator_node(
+    screen = _materialize_archived_schema4_node(
         node="e4_screen",
         predecessor_completion_path=fixture["e2_completion_path"],
-        protocol_lock_path=None,
+        protocol_lock=fixture["protocol_lock"],
         materialization_output_path=chain_root / "screen-materialization.json",
         node_materialization_output_path=chain_root / "screen-node.json",
         created_ns=300,
@@ -1477,10 +1513,10 @@ def _downstream_finalizer_case(
 ) -> dict[str, object]:
     fixture = _fixture(tmp_path)
     chain_root = fixture["chain_root"]
-    screen = materialize_formal_single_operator_node(
+    screen = _materialize_archived_schema4_node(
         node="e4_screen",
         predecessor_completion_path=fixture["e2_completion_path"],
-        protocol_lock_path=None,
+        protocol_lock=fixture["protocol_lock"],
         materialization_output_path=chain_root / "finalizer-materialization.json",
         node_materialization_output_path=chain_root / "finalizer-node.json",
         created_ns=300,
@@ -1591,6 +1627,7 @@ def _downstream_finalizer_case(
             run_root / "formal-single-operator-downstream-run-plan-inputs.json"
         )
     publish_canonical_json_no_replace(descriptor_path, descriptor.to_dict())
+    adaptation = context.run_config.adaptation
     native_binding = NativeTerminalRunBinding(
         run_id=f"single-{cell.cell_id[:24]}",
         run_nonce_sha256=_sha("finalizer-run-nonce"),
@@ -1602,6 +1639,12 @@ def _downstream_finalizer_case(
         previous_run_id=None,
         challenge_nonce_sha256=_sha("finalizer-challenge"),
         method=context.run_config.method,
+        reset_scope=None if adaptation is None else adaptation.reset_scope,
+        request_admission_policy=(
+            None if adaptation is None else adaptation.request_admission_policy
+        ),
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=(),
         scored_request_ids=("scored-0",),
     )

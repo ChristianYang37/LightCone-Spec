@@ -1702,7 +1702,11 @@ def _trusted_chain_recipe_context(
         raise FormalSingleOperatorPreparedLaunchBlocked(
             "trusted_frozen_recipe_chain_incomplete"
         )
-    protocol_lock = protocol_lock_from_dict(source.protocol_lock_source.reopen())
+    protocol_lock = protocol_lock_from_dict(
+        source.protocol_lock_source.reopen(
+            label="prepared launch execution ProtocolLock"
+        )
+    )
     e3a = chain["e3a"].decision.payload
     tts = chain["tts_cal"].decision.payload
     e2 = chain["e2_r3"].decision.payload
@@ -2122,6 +2126,8 @@ def _validate_trusted_chain_run_config(
         expected = AdaptationConfig(
             weight_update_mode="full",
             parameter_scope="all",
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
             adaptation_group_id=_trusted_adaptation_group(cell, paired_tts_l0=True),
             optimizer=OptimizerConfig(
                 name="adam",
@@ -2166,6 +2172,8 @@ def _validate_trusted_chain_run_config(
         expected_adaptation = AdaptationConfig(
             weight_update_mode=candidate.weight_update_mode,
             parameter_scope=candidate.parameter_scope,
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id=f"e0:{cell.cell_id}",
             optimizer=OptimizerConfig(
                 name="sgd",

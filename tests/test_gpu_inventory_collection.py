@@ -11,6 +11,7 @@ from lightcone_spec.experiments.inventory import (
     build_serial_interference_envelope,
     collect_gpu_inventory,
 )
+from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
 
 
 def _probe_environment(tmp_path: Path, *, gpu_count: int) -> tuple[Path, Path]:
@@ -290,6 +291,18 @@ def test_inventory_and_serial_envelope_cli_write_bound_artifacts(
         == 0
     )
     assert json.loads(inventory_path.read_text(encoding="utf-8")) == inventory.to_dict()
+    inventory_binding = CanonicalJsonProofBinding.bind(inventory_path)
+    assert inventory_binding.reopen() == inventory.to_dict()
+    assert inventory_path.read_bytes() == (
+        json.dumps(
+            inventory.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
     assert Path(f"{inventory_path}.sha256").is_file()
 
     envelope_path = tmp_path / "interference.json"

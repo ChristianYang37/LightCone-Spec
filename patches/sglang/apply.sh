@@ -4,7 +4,7 @@ set -euo pipefail
 PATCH_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 CHECKOUT=${1:-.}
 UPSTREAM=3312645a307453893a00778592f105581e3d1c3d
-EXPECTED_TREE=c6571336b70cd5f0e0f609d731a65fa98fd7e0b2
+EXPECTED_TREE=bb6371242e82592d1b8a2f5f4ba6d0630d8365cb
 
 git -C "$CHECKOUT" rev-parse --is-inside-work-tree >/dev/null
 test "$(git -C "$CHECKOUT" rev-parse HEAD)" = "$UPSTREAM" || {

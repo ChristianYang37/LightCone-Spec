@@ -87,6 +87,8 @@ def formal_serving_stage_itl_execution_identity(
         run_nonce_sha256=binding.run_nonce_sha256,
         attempt_id=binding.attempt_id,
         method=binding.method,  # type: ignore[arg-type]
+        runtime_trust_mode=binding.runtime_trust_mode,
+        formal_measurement=binding.formal_measurement,
     )
 
 

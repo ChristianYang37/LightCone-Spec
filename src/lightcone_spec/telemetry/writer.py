@@ -505,8 +505,14 @@ def _validate_native_terminal_artifact_binding(
         or body != canonical
         or type(value) is not dict
         or set(value) != _NATIVE_TERMINAL_ARTIFACT_FIELDS
-        or value.get("schema_version") != 1
-        or value.get("artifact_kind") != "native_terminal_evidence_bundle_v1"
+        or (
+            value.get("schema_version"),
+            value.get("artifact_kind"),
+        )
+        not in {
+            (1, "native_terminal_evidence_bundle_v1"),
+            (2, "native_terminal_evidence_bundle_v2"),
+        }
         or value.get("run_id") != run_id
         or value.get("rank") != rank
         or value.get("terminal_sha256") != terminal_sha256
@@ -1679,8 +1685,8 @@ class EvidenceWriter:
         value = dict(artifact)
         if (
             set(value) != _NATIVE_TERMINAL_ARTIFACT_FIELDS
-            or value.get("schema_version") != 1
-            or value.get("artifact_kind") != "native_terminal_evidence_bundle_v1"
+            or value.get("schema_version") != 2
+            or value.get("artifact_kind") != "native_terminal_evidence_bundle_v2"
             or value.get("run_id") != self.run_id
             or value.get("rank") != self.rank
         ):
@@ -1733,9 +1739,17 @@ class EvidenceWriter:
         if table == "request":
             return (row["request_id"],)
         if table == "round":
-            return (row["request_id"], row["round_index"])
+            return (
+                row.get("request_epoch"),
+                row["request_id"],
+                row["round_index"],
+            )
         if table == "update":
-            return (row["cohort_sha256"], row["update_index"])
+            return (
+                row.get("request_epoch"),
+                row["cohort_sha256"],
+                row["update_index"],
+            )
         return (
             row["prompt_id"],
             row["method"],

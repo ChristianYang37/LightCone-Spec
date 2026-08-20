@@ -253,6 +253,8 @@ def test_stage_itl_identity_binds_materialized_execution_and_rejects_forgery() -
         run_nonce_sha256="6" * 64,
         attempt_id="attempt-e1-0",
         method="l0",
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     assert StageItlExecutionIdentity.from_dict(identity.to_dict()) == identity
     assert identity.sha256 == itl_authority.content_sha256(identity.to_dict())
@@ -260,6 +262,29 @@ def test_stage_itl_identity_binds_materialized_execution_and_rejects_forgery() -
     forged["materialized_cell_id"] = "not-a-digest"
     with pytest.raises(ValueError, match="materialized cell"):
         StageItlExecutionIdentity.from_dict(forged)
+
+    for runtime_trust_mode, formal_measurement in (
+        (None, False),
+        ("release_verified_signature", False),
+        ("release_verified_signature", 1),
+        ("qualification_empirical_no_signature", True),
+    ):
+        invalid_trust = {
+            **identity.to_dict(),
+            "runtime_trust_mode": runtime_trust_mode,
+            "formal_measurement": formal_measurement,
+        }
+        with pytest.raises(ValueError, match="runtime trust identity"):
+            StageItlExecutionIdentity.from_dict(invalid_trust)
+
+    allocation_free = {
+        **identity.to_dict(),
+        "method": "static",
+        "runtime_trust_mode": "release_verified_signature",
+        "formal_measurement": True,
+    }
+    with pytest.raises(ValueError, match="allocation-free"):
+        StageItlExecutionIdentity.from_dict(allocation_free)
 
 
 @pytest.mark.parametrize(
@@ -281,6 +306,8 @@ def test_stage_itl_identity_accepts_only_registered_onlinespec_methods(
         run_nonce_sha256="6" * 64,
         attempt_id=f"attempt-{method}",
         method=method,  # type: ignore[arg-type]
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     assert StageItlExecutionIdentity.from_dict(value.to_dict()) == value
 
@@ -303,6 +330,8 @@ def test_stage_itl_authority_cannot_be_constructed_from_caller_timestamps() -> N
         run_nonce_sha256="6" * 64,
         attempt_id="attempt-e1-0",
         method="l0",
+        runtime_trust_mode=None,
+        formal_measurement=None,
     )
     with pytest.raises(TypeError, match="first-party validation"):
         StageItlTimestampAuthority(

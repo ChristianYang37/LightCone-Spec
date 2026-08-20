@@ -17,6 +17,7 @@ from test_formal_dispatch import _protocol_lock
 import lightcone_spec.runtime.content_authorization as content_module
 from lightcone_spec.cli import main as cli_module
 from lightcone_spec.config import ModelPair, RunConfig, RuntimeConfig
+from lightcone_spec.experiments import formal_method_authority as method_module
 from lightcone_spec.experiments import formal_stage_execution
 from lightcone_spec.experiments import workload_authority as workload_module
 from lightcone_spec.experiments.formal_protocol import (
@@ -33,6 +34,7 @@ from lightcone_spec.experiments.stage_materialization import (
 from lightcone_spec.orchestration import formal_physical_dispatch as physical_dispatch
 from lightcone_spec.runtime import offline_signer
 from lightcone_spec.runtime.content_authorization import (
+    TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE,
     AuthorizedDatasetContentMember,
     AuthorizedPreparedModel,
     ContentVerificationReceipt,
@@ -46,7 +48,6 @@ from lightcone_spec.runtime.content_authorization import (
     ReleaseWorkloadSourceAuthorization,
     ReleaseWorkloadSourceAuthorizationSource,
     TtsCalibrationTuningWindow,
-    TtsCalibrationTuningWindowEntry,
 )
 from lightcone_spec.runtime.preflight_runner import BurstGptShapeAuthority
 from lightcone_spec.runtime.proof_artifact import (
@@ -378,40 +379,6 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
     )
     e0_binding_path = _publish(tmp_path / "e0-path-binding.json", e0_binding.to_dict())
 
-    workload_envelope = json.loads(lcb_path.read_text(encoding="utf-8"))
-    samples = workload_module._select_all_rows(
-        workload_module.FORMAL_WORKLOAD_PROTOCOLS["livecodebench_v6_hard"],
-        workload_envelope["rows"],
-    )
-    window_entries = tuple(
-        TtsCalibrationTuningWindowEntry(
-            workload_id="livecodebench_v6_hard",
-            source_sample_id=sample.sample_id,
-            source_descriptor_sha256=lcb.sha256,
-            prompt_sha256=content_sha256(sample.prompt),
-        )
-        for sample in samples[:6]
-    )
-    tuning_window = TtsCalibrationTuningWindow(
-        schema_version=2,
-        kind="lightcone_tts_disjoint_tuning_window_source",
-        tuning_entries=tuple(sorted(window_entries[:2], key=lambda row: row.entry_id)),
-        excluded_pilot_entries=tuple(
-            sorted(window_entries[2:6], key=lambda row: row.entry_id)
-        ),
-    )
-    tuning_path = _publish(tmp_path / "tts-window.json", tuning_window.to_dict())
-    tts_authority = TtsCalibrationAuthority(
-        schema_version=1,
-        authority_id="tts-arxiv-v2-numeric-calibration",
-        primary_source_id="arXiv:2605.09329",
-        primary_source_version="v2",
-        paper_pdf_sha256=_sha("paper-pdf"),
-        paper_source_sha256=_sha("paper-source"),
-        tuning_window_sha256=tuning_window.sha256,
-        trainable_plan_sha256=_sha("trainable-plan"),
-        drafter_native_loss_recipe_sha256=_sha("native-loss"),
-    )
     replay_root = (tmp_path / "replay").resolve()
     replay_root.mkdir(mode=0o700)
     master_path = (tmp_path / "content-master.json").resolve()
@@ -420,7 +387,6 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
         f"dataset:e0_task_native:path_binding={e0_binding_path}",
         f"snapshot:shared:drafter={drafter_path}",
         f"snapshot:shared:target={target_path}",
-        f"tts_calibration_tuning_window={tuning_path}",
     )
     argv = [
         "verify-content-authorizations",
@@ -441,10 +407,24 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
     ]
     for specification in content_specs:
         argv.extend(("--content-artifact", specification))
+    forbidden_tuning = _publish(
+        tmp_path / "forbidden-pre-master-tts-window.json",
+        {"post_master_derived": True},
+    )
+    with pytest.raises(ValueError, match="post-master derived"):
+        cli_module.main(
+            [
+                *argv,
+                "--content-artifact",
+                f"tts_calibration_tuning_window={forbidden_tuning}",
+            ]
+        )
     assert cli_module.main(argv) == 0
     master = ContentVerificationReceipt.from_dict(
         CanonicalJsonProofBinding.bind(master_path).reopen()
     )
+    assert master.schema_version == 2
+    assert master.protocol_sha256 == content_module.CONTENT_VERIFICATION_PROTOCOL_SHA256
     assert len(master.revalidate_formal_scope(current_ns=now_ns)) == 4
     forged_schedule_binding = replace(
         master.content_artifacts[0],
@@ -466,6 +446,232 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
     )
     with pytest.raises(ValueError, match="already consumed"):
         cli_module.main(replay_argv)
+
+    assert (
+        len(
+            master.revalidate_formal_scope(
+                current_ns=workload_authorization.challenge.expires_ns + 1
+            )
+        )
+        == 4
+    )
+    workload_output = (tmp_path / "workload-authority.json").resolve()
+    assert (
+        cli_module.main(
+            [
+                "bind-formal-workload-authority",
+                "--workload",
+                "livecodebench_v6_hard",
+                "--source",
+                str(lcb_path),
+                "--content-verification-receipt",
+                str(master_path),
+                "--now-ns",
+                str(now_ns),
+                "--output",
+                str(workload_output),
+            ]
+        )
+        == 0
+    )
+    tuning_path = (tmp_path / "tts-window.json").resolve()
+    assert (
+        cli_module.main(
+            [
+                "publish-tts-calibration-tuning-window",
+                "--tuning-workload-authority",
+                str(workload_output),
+                "--content-verification-receipt",
+                str(master_path),
+                "--output",
+                str(tuning_path),
+            ]
+        )
+        == 0
+    )
+    tuning_window = TtsCalibrationTuningWindow.from_dict(
+        CanonicalJsonProofBinding.bind(tuning_path).reopen()
+    )
+    workload_authority = workload_module.formal_workload_authority_from_cli_artifact(
+        CanonicalJsonProofBinding.bind(workload_output).reopen()
+    )
+    assert tuning_window.schema_version == 4
+    assert tuning_window.content_verification_receipt_sha256 == master.sha256
+    assert tuning_window.content_verification_verified_ns == master.verified_ns
+    assert (
+        tuning_window.content_verification_reservation_sha256
+        == master.reservation.reservation_sha256
+    )
+    assert len(tuning_window.excluded_pilot_entries) == 4
+    assert set(tuning_window.problem_ids) == {
+        row.source_row_id for row in workload_authority.samples
+    }
+    expected_excluded = {
+        row.source_row_id
+        for row in sorted(
+            workload_authority.samples,
+            key=lambda row: (
+                content_sha256(
+                    {
+                        "selector_namespace": (
+                            TTS_CALIBRATION_TUNING_SELECTOR_NAMESPACE
+                        ),
+                        "source_problem_id": row.source_row_id,
+                    }
+                ),
+                row.source_row_id,
+                row.sample_id,
+            ),
+        )[:4]
+    }
+    assert set(tuning_window.excluded_problem_ids or ()) == expected_excluded
+
+    legacy_window = TtsCalibrationTuningWindow(
+        schema_version=2,
+        kind=tuning_window.kind,
+        tuning_entries=tuple(
+            sorted(
+                (
+                    replace(row, source_problem_id=None)
+                    for row in tuning_window.tuning_entries
+                ),
+                key=lambda row: row.entry_id,
+            )
+        ),
+        excluded_pilot_entries=tuple(
+            sorted(
+                (
+                    replace(row, source_problem_id=None)
+                    for row in tuning_window.excluded_pilot_entries
+                ),
+                key=lambda row: row.entry_id,
+            )
+        ),
+    )
+    legacy_window_path = _publish(
+        tmp_path / "legacy-schema-2-tts-window.json",
+        legacy_window.to_dict(),
+    )
+    legacy_master = replace(
+        master,
+        schema_version=1,
+        protocol_sha256=None,
+        content_artifacts=tuple(
+            sorted(
+                (
+                    *master.content_artifacts,
+                    content_module.ContentJsonArtifactBinding.from_path(
+                        "tts_calibration_tuning_window",
+                        legacy_window_path,
+                    ),
+                ),
+                key=lambda row: row.artifact_id,
+            )
+        ),
+    )
+    decoded_legacy_master = ContentVerificationReceipt.from_dict(
+        legacy_master.to_dict()
+    )
+    assert decoded_legacy_master == legacy_master
+    assert (
+        len(
+            decoded_legacy_master.revalidate_formal_scope(
+                current_ns=workload_authorization.challenge.expires_ns + 1
+            )
+        )
+        == 4
+    )
+    with pytest.raises(ValueError, match="schema-2 content receipt"):
+        method_module.build_code_owned_tts_calibration_tuning_window(
+            workload_authority,
+            content_verification_receipt=decoded_legacy_master,
+        )
+
+    raw_authorization_output = (tmp_path / "raw-authorization-window.json").resolve()
+    with pytest.raises(ValueError, match="content verification receipt"):
+        cli_module.main(
+            [
+                "publish-tts-calibration-tuning-window",
+                "--tuning-workload-authority",
+                str(workload_output),
+                "--content-verification-receipt",
+                str(authorization_paths["workload"]),
+                "--output",
+                str(raw_authorization_output),
+            ]
+        )
+    assert not raw_authorization_output.exists()
+
+    tampered_receipt_value = master.to_dict()
+    tampered_reservation = tampered_receipt_value["reservation"]
+    assert isinstance(tampered_reservation, dict)
+    tampered_reservation["raw_sha256"] = "0" * 64
+    tampered_receipt_path = _publish(
+        tmp_path / "tampered-content-receipt.json",
+        tampered_receipt_value,
+    )
+    with pytest.raises(ValueError, match="reservation binding changed"):
+        cli_module.main(
+            [
+                "publish-tts-calibration-tuning-window",
+                "--tuning-workload-authority",
+                str(workload_output),
+                "--content-verification-receipt",
+                str(tampered_receipt_path),
+                "--output",
+                str((tmp_path / "tampered-receipt-window.json").resolve()),
+            ]
+        )
+
+    displaced_tuning = tuning_window.tuning_entries[0]
+    displaced_pilot = tuning_window.excluded_pilot_entries[0]
+    foreign_tuning = tuple(
+        sorted(
+            (*tuning_window.tuning_entries[1:], displaced_pilot),
+            key=lambda row: row.entry_id,
+        )
+    )
+    foreign_excluded = tuple(
+        sorted(
+            (displaced_tuning, *tuning_window.excluded_pilot_entries[1:]),
+            key=lambda row: row.entry_id,
+        )
+    )
+    foreign_window = replace(
+        tuning_window,
+        tuning_problem_ids=tuple(
+            sorted(str(row.source_problem_id) for row in foreign_tuning)
+        ),
+        excluded_problem_ids=tuple(
+            sorted(str(row.source_problem_id) for row in foreign_excluded)
+        ),
+        tuning_entries=foreign_tuning,
+        excluded_pilot_entries=foreign_excluded,
+    )
+    foreign_window_path = _publish(
+        tmp_path / "foreign-tts-window.json",
+        foreign_window.to_dict(),
+    )
+    with pytest.raises(ValueError, match="differs from code-owned selector"):
+        method_module._reopen_tuning_window(
+            CanonicalJsonProofBinding.bind(foreign_window_path),
+            workload_source=CanonicalJsonProofBinding.bind(workload_output),
+            content_verification_receipt_source=CanonicalJsonProofBinding.bind(
+                master_path
+            ),
+        )
+
+    tts_authority = TtsCalibrationAuthority(
+        schema_version=2,
+        authority_id="tts-arxiv-v2-numeric-calibration",
+        primary_source_id="arXiv:2605.09329",
+        primary_source_version="v2",
+        paper_pdf_sha256=_sha("paper-pdf"),
+        paper_source_sha256=_sha("paper-source"),
+        tuning_window_sha256=tuning_window.sha256,
+        trainable_plan_sha256=_sha("trainable-plan"),
+        drafter_native_loss_recipe_sha256=_sha("native-loss"),
+    )
 
     scoped: dict[str, ContentVerificationReceipt] = {}
     for stage in ("E3a", "TTS-Cal", "E0"):
@@ -530,18 +736,16 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
     )
     assert len(prepared_sha256s) == 3
     assert len(workload_sha256s) == 2
-    _prepared, tts_workload = formal_stage_execution._verified_content_identity(
-        receipt=scoped["TTS-Cal"],
-        protocol_lock=lock,
-        stage="TTS-Cal",
-        cell=replace(basic_cell, stage="TTS-Cal"),
-        run_config=config,
-        tts_authority=tts_authority,
-        now_ns=now_ns,
-    )
-    assert tts_workload == tuple(
-        sorted((tts_authority.tuning_window_sha256, lcb.sha256))
-    )
+    with pytest.raises(ValueError, match="not path-reopened"):
+        formal_stage_execution._verified_content_identity(
+            receipt=scoped["TTS-Cal"],
+            protocol_lock=lock,
+            stage="TTS-Cal",
+            cell=replace(basic_cell, stage="TTS-Cal"),
+            run_config=config,
+            tts_authority=tts_authority,
+            now_ns=now_ns,
+        )
     e0_member = e0_source.members[0]
     _prepared, e0_workload = formal_stage_execution._verified_content_identity(
         receipt=scoped["E0"],
@@ -561,25 +765,6 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
     )
     assert e0_authorization.sha256 in e0_workload
 
-    workload_output = (tmp_path / "workload-authority.json").resolve()
-    assert (
-        cli_module.main(
-            [
-                "bind-formal-workload-authority",
-                "--workload",
-                "livecodebench_v6_hard",
-                "--source",
-                str(lcb_path),
-                "--content-verification-receipt",
-                str((tmp_path / "content-E3a.json").resolve()),
-                "--now-ns",
-                str(now_ns),
-                "--output",
-                str(workload_output),
-            ]
-        )
-        == 0
-    )
     assert all(
         row.artifact_id != "formal_workload_authority:livecodebench_v6_hard"
         for row in scoped["E3a"].content_artifacts
@@ -705,7 +890,7 @@ def test_offline_content_ceremony_master_scopes_consumers_and_burst_shape(
         tuning_window,
         tuning_entries=tuple(
             sorted(
-                (forged_entry, tuning_window.tuning_entries[1]),
+                (forged_entry, *tuning_window.tuning_entries[1:]),
                 key=lambda row: row.entry_id,
             )
         ),

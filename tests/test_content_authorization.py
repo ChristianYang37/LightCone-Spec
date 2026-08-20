@@ -935,11 +935,24 @@ def test_content_verification_receipt_survives_expiry_but_reopens_bytes(
         content_artifacts=(content_binding,),
         reservation=reservation,
     )
+    assert receipt.schema_version == 2
+    assert receipt.protocol_sha256 == (
+        content_module.CONTENT_VERIFICATION_PROTOCOL_SHA256
+    )
     decoded = ContentVerificationReceipt.from_dict(receipt.to_dict())
     verified_rows = decoded.revalidate(
         current_ns=authorization.challenge.expires_ns + 10**12
     )
     assert verified_rows[0].authorization_sha256 == authorization.sha256
+    legacy = replace(receipt, schema_version=1, protocol_sha256=None)
+    decoded_legacy = ContentVerificationReceipt.from_dict(legacy.to_dict())
+    assert decoded_legacy == legacy
+    assert (
+        decoded_legacy.revalidate(
+            current_ns=authorization.challenge.expires_ns + 10**12
+        )[0].authorization_sha256
+        == authorization.sha256
+    )
     with pytest.raises(ValueError, match="reservation time"):
         build_content_verification_receipt(
             verified_ns=now_ns - 1,

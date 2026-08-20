@@ -11,7 +11,12 @@ import lightcone_spec.experiments.formal_single_operator_e6_interface as e6
 from lightcone_spec.cli.formal_single_operator import _e6_launch_paths
 from lightcone_spec.cli.main import main
 from lightcone_spec.experiments import formal_single_operator_downstream as downstream
-from lightcone_spec.experiments.formal_protocol import E6_MODELS, ProtocolLock
+from lightcone_spec.experiments.formal_protocol import (
+    E6_MODELS,
+    ProtocolLock,
+    TrustedSingleOperatorProtocolSourceBinding,
+    TrustedSingleOperatorProtocolSourceBindings,
+)
 from lightcone_spec.experiments.formal_single_operator_stages import (
     FormalSingleOperatorE6InterfacePreflightActualValidator,
     formal_single_operator_node_spec,
@@ -129,6 +134,16 @@ def _protocol_lock() -> ProtocolLock:
             "exactness_qualification_test_set_sha256",
         )
     }
+    content_sha256 = _sha("trusted-content")
+
+    def source(label: str, *, semantic_sha256: str | None = None):
+        return TrustedSingleOperatorProtocolSourceBinding(
+            absolute_path=f"/trusted-e6-fixture/{label}.json",
+            raw_sha256=_sha(f"raw:{label}"),
+            semantic_sha256=semantic_sha256 or _sha(f"semantic:{label}"),
+            size=2,
+        )
+
     return ProtocolLock(
         schema_version=5,
         protocol_id="trusted-e6-test",
@@ -140,7 +155,19 @@ def _protocol_lock() -> ProtocolLock:
         formal_workload_e0_authorization_sha256=None,
         burstgpt_shape_authorization_sha256=None,
         content_source_mode="trusted_single_operator",
-        trusted_single_operator_content_bundle_sha256=_sha("trusted-content"),
+        trusted_single_operator_content_bundle_sha256=content_sha256,
+        trusted_single_operator_source_bindings=(
+            TrustedSingleOperatorProtocolSourceBindings(
+                trusted_content_bundle_source=source(
+                    "content",
+                    semantic_sha256=content_sha256,
+                ),
+                formal_runtime_authority_manifest_source=source("runtime"),
+                tts_calibration_authority_source=source("tts"),
+                chronobelief_authority_source=source("chronobelief"),
+                e1_recipe_anchor_authority_source=source("e1"),
+            )
+        ),
         **fields,
     )
 
@@ -582,6 +609,16 @@ def test_physical_executor_routes_exact_eight_tests_and_is_no_replace(
         tuple(item.split("::")[-1] for item in command[4:12])
         == (NATIVE_RUNTIME_GPU_TEST_NAMES["nextn_tp2"])
     )
+    assert observed["environment"][
+        "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_PATH"
+    ] == str(plan_path)
+    assert (
+        observed["environment"][
+            "LIGHTCONE_NATIVE_QUALIFICATION_TRUSTED_AUTHORITY_SHA256"
+        ]
+        == plan.sha256
+    )
+    assert "LIGHTCONE_NATIVE_QUALIFICATION_DISPATCH_PATH" not in observed["environment"]
     assert terminal.model == E6_MODELS[0]
     assert terminal.physical_execution_count == 1
     assert terminal.status == "COMPLETE"
@@ -1116,6 +1153,7 @@ def test_prepared_e6_serving_plan_binds_derived_empirical_authority(
         method="target_only",
         model=SimpleNamespace(algorithm="NEXTN"),
         runtime=SimpleNamespace(topology_mode="tp2_dp1"),
+        adaptation=None,
     )
     warmup_request = SimpleNamespace(request_id="warmup-request-0")
     request = SimpleNamespace(request_id="request-0")
@@ -1201,11 +1239,17 @@ def test_prepared_e6_serving_plan_binds_derived_empirical_authority(
         "derive_formal_single_operator_trusted_nextn_tp2_serving_authority",
         derive,
     )
+    monkeypatch.setattr(
+        physical,
+        "_publish_trusted_runtime_authority_for_plan",
+        lambda **_kwargs: None,
+    )
     plan = (
         physical._materialize_formal_single_operator_prepared_direct_serving_run_plan(
             inputs=inputs,
             input_binding=input_binding,
             expected_input_name=input_path.name,
+            preflight_inputs_path=(tmp_path / "preflight-inputs.json").resolve(),
         )
     )
     assert plan.nextn_tp2_authority_sha256 == authority_sha

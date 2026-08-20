@@ -36,6 +36,7 @@ from lightcone_spec.orchestration.formal_experiment_controller import (
     DagMaterialization,
     DagReduction,
     FormalExperimentDagBlocked,
+    FormalExperimentDagController,
 )
 from lightcone_spec.orchestration.formal_single_operator_dag_driver import (
     AuxiliaryInputCatalogBinding,
@@ -51,6 +52,7 @@ from lightcone_spec.orchestration.formal_single_operator_dag_driver import (
     _preserve_partial_directory,
     _publish_no_replace,
     _resolve_completed_e0_onlinespec_authority,
+    _retained_preflight_qualification_dependencies,
     formal_single_operator_dag_code_capabilities,
     load_retained_future_dependency_manifest,
 )
@@ -213,6 +215,197 @@ def test_e0_valid_probe_requires_and_deep_opens_bound_authority(
         _resolve_completed_e0_onlinespec_authority(descriptor=descriptor) is authority
     )
     assert revalidated == [True]
+
+
+def test_e0_all_na_three_node_production_plans_skip_capacity_and_workdirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lightcone_spec.experiments import (
+        formal_single_operator_capacity as capacity,
+    )
+    from lightcone_spec.experiments import (
+        formal_single_operator_prerequisite_launch_producer as prerequisite,
+    )
+    from lightcone_spec.experiments import (
+        formal_single_operator_stages as stages,
+    )
+
+    nodes = ("e0_tuning", "e0_pilot", "e0_final")
+    builder = object.__new__(ProductionFormalDagCallbackBuilder)
+    builder.nodes_root = (tmp_path / "formal-dag-nodes").resolve()
+    builder.nodes_root.mkdir()
+    builder.capacity_authority_path = str((tmp_path / "unused-capacity.json").resolve())
+    materialization_paths = {
+        node: _binding(tmp_path, f"{node}/materialization.json").absolute_path
+        for node in nodes
+    }
+    node_bindings = {
+        node: _binding(tmp_path, f"{node}/node-materialization.json") for node in nodes
+    }
+    node_by_binding = {
+        binding.absolute_path: node for node, binding in node_bindings.items()
+    }
+    sources = {
+        node: SimpleNamespace(
+            node=node,
+            materialization_source=SimpleNamespace(
+                absolute_path=materialization_paths[node]
+            ),
+        )
+        for node in nodes
+    }
+    source_by_path: dict[str, object] = {}
+    store_calls: list[str] = []
+    builder.store = SimpleNamespace(
+        controller_node=lambda node: {
+            "materialization_path": materialization_paths[node],
+            "node_materialization_path": node_bindings[node].absolute_path,
+        },
+        physical_commands=lambda **_kwargs: store_calls.append("capacity") or (),
+    )
+    builder.prerequisite_resolver = SimpleNamespace(
+        launch_manifest_paths=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("zero demand must not resolve prerequisite launches")
+        ),
+        chronobelief_gpu_parity_proof_paths=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("zero demand must not resolve parity proofs")
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_require_predecessor_archive_boundary",
+        lambda node: store_calls.append(f"archive:{node}"),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "require_trusted_single_operator_ordinary_capacity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("zero demand must bypass ordinary capacity")
+        ),
+    )
+    monkeypatch.setattr(
+        prerequisite,
+        "execution_source_prerequisite_launch_demands",
+        lambda source: (
+            ()
+            if source in sources.values()
+            else (_ for _ in ()).throw(AssertionError("foreign execution source"))
+        ),
+    )
+    monkeypatch.setattr(
+        stages,
+        "build_formal_single_operator_execution_source",
+        lambda path: sources[node_by_binding[path]],
+    )
+
+    def publish_source(*, node_materialization_path: str, output_path: Path) -> None:
+        node = node_by_binding[node_materialization_path]
+        _publish_no_replace(output_path, {"node": node})
+        source_by_path[str(output_path)] = sources[node]
+
+    monkeypatch.setattr(
+        stages,
+        "publish_formal_single_operator_execution_source",
+        publish_source,
+    )
+    monkeypatch.setattr(
+        stages,
+        "load_formal_single_operator_execution_source",
+        lambda path: source_by_path[str(path)],
+    )
+
+    for node in nodes:
+        first = builder.plan(node, node_bindings[node])
+        restarted = builder.plan(node, node_bindings[node])
+        assert first == restarted
+        assert first.prepared_launch is None
+        assert first.launches == ()
+        assert first.physical_attempt_groups == ()
+        execution_root = builder._node_root(node) / "execution"
+        assert {path.name for path in execution_root.iterdir()} == {
+            "execution-plan-journal.json",
+            "execution-source.json",
+        }
+        assert not (execution_root / "work").exists()
+        assert not (execution_root / "prepared").exists()
+    assert store_calls == [
+        "archive:e0_tuning",
+        "archive:e0_tuning",
+        "archive:e0_pilot",
+        "archive:e0_pilot",
+        "archive:e0_final",
+        "archive:e0_final",
+    ]
+
+
+def test_e6_metric_anchor_uses_cell_model_task_and_fails_closed() -> None:
+    from lightcone_spec.experiments.stage_materialization import MaterializedCell
+
+    first = MaterializedCell(
+        stage="E6",
+        method_role="LightCone",
+        model="Qwen/Qwen3.6-35B-A3B",
+        backend="NEXTN",
+        task="LiveCodeBench",
+        publication_policy="first_ready",
+        recipe_sha256=_sha("a"),
+        dimensions=(("block", 4), ("context", 4096), ("load", "common_slo_load")),
+    )
+    second = MaterializedCell(
+        stage="E6",
+        method_role="LightCone",
+        model="Qwen/Qwen3.5-122B-A10B-FP8",
+        backend="NEXTN",
+        task="MATH-500",
+        publication_policy="first_ready",
+        recipe_sha256=_sha("b"),
+        dimensions=(("block", 4), ("context", 4096), ("load", "common_slo_load")),
+    )
+    attempts = {
+        first.cell_id: {"status": "COMPLETE", "attempt": 3},
+        second.cell_id: {"status": "COMPLETE", "attempt": 7},
+    }
+    builder = object.__new__(ProductionFormalDagCallbackBuilder)
+    builder.store = SimpleNamespace(latest_attempt=attempts.get)
+    materialization = SimpleNamespace(cells=(second, first))
+
+    assert builder._metric_anchor(
+        materialization,
+        {
+            "dimensions": [
+                ["context", 4096],
+                ["model", first.model],
+                ["task", first.task],
+            ]
+        },
+    ) == (first.cell_id, 3)
+    assert builder._metric_anchor(
+        materialization,
+        {
+            "dimensions": [
+                ["backend", second.backend],
+                ["context", 4096],
+                ["model", second.model],
+                ["task", second.task],
+            ]
+        },
+    ) == (second.cell_id, 7)
+    with pytest.raises(ValueError, match="no exact COMPLETE provenance anchor"):
+        builder._metric_anchor(
+            materialization,
+            {"dimensions": [["model", "Qwen/unknown-model"]]},
+        )
+    with pytest.raises(ValueError, match="no exact COMPLETE provenance anchor"):
+        builder._metric_anchor(
+            materialization,
+            {
+                "dimensions": [
+                    ["model", first.model],
+                    ["task", "MATH-500"],
+                ]
+            },
+        )
 
 
 def _launch(root: Path, *, node: str, stage: str) -> DagCellLaunch:
@@ -927,7 +1120,25 @@ def test_prepared_tp1_group_requires_authority_then_materializes_one_shared_comm
 
     builder = object.__new__(ProductionFormalDagCallbackBuilder)
     builder.config = SimpleNamespace(session_reset_authority_directory=None)
+    builder.capacity_authority_path = str(tmp_path / "fixture-capacity.json")
+    builder.store = SimpleNamespace(physical_commands=lambda **_kwargs: ())
     builder.python_executable = str(Path(sys.executable).resolve(strict=True))
+    resident_capacity_calls: list[int] = []
+
+    def require_resident_capacity(
+        _authority_path: str,
+        *,
+        commands: tuple[QueuedCommandSpec, ...],
+        **_kwargs: object,
+    ) -> object:
+        resident_capacity_calls.append(len(commands))
+        return object()
+
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_single_operator_capacity."
+        "require_trusted_single_operator_resident_group_capacity",
+        require_resident_capacity,
+    )
     monkeypatch.setattr(builder, "_inventory_gpu_uuids", lambda: ("GPU-A", "GPU-B"))
     preflight_path = (tmp_path / "preflight-inputs.json").resolve()
     _publish_no_replace(preflight_path, {"kind": "test-preflight-inputs"})
@@ -1006,6 +1217,7 @@ def test_prepared_tp1_group_requires_authority_then_materializes_one_shared_comm
     assert production.spec.shared_evidence_bound_bytes == (
         formal_serving_session_group_shared_evidence_bound_bytes(member_count)
     )
+    assert resident_capacity_calls == [member_count]
 
 
 def test_cell_launch_consumes_deep_runtime_contract_for_outer_timeout(
@@ -1128,7 +1340,7 @@ def test_cell_launch_consumes_deep_runtime_contract_for_outer_timeout(
     ) == list(progress_logs)
 
 
-def test_retry_builder_uses_fresh_paths_and_stable_scientific_digest(
+def test_retry_builder_is_disabled_before_fresh_path_materialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1189,6 +1401,7 @@ def test_retry_builder_uses_fresh_paths_and_stable_scientific_digest(
     builder.config = SimpleNamespace(repository_root=str(repository))
     builder.nodes_root = run_root / "formal-dag-nodes"
     builder.nodes_root.mkdir()
+    builder.capacity_authority_path = str(tmp_path / "fixture-capacity.json")
     builder.python_executable = str(Path(sys.executable).resolve(strict=True))
     cell = SimpleNamespace(cell_id=previous_command.cell_id)
     monkeypatch.setattr(
@@ -1254,20 +1467,79 @@ def test_retry_builder_uses_fresh_paths_and_stable_scientific_digest(
 
     monkeypatch.setattr(builder, "_cell_launch", cell_launch)
 
-    retry_attempt, retry_command = builder.retry_attempt(previous_command, 2)
+    from lightcone_spec.experiments.formal_single_operator_capacity import (
+        TrustedSingleOperatorAutomaticRetryDisabled,
+    )
 
-    assert retry_attempt.attempt == retry_command.attempt == 2
-    assert retry_attempt.scientific_command_sha256 == scientific_sha
-    assert retry_attempt.output_directory != str(old_root)
-    assert not {
-        previous_command.log_path,
-        previous_command.expected_terminal_path,
-        previous_command.expected_raw_log_path,
-    } & {
-        retry_command.log_path,
-        retry_command.expected_terminal_path,
-        retry_command.expected_raw_log_path,
-    }
+    monkeypatch.setattr(
+        "lightcone_spec.experiments.formal_single_operator_capacity."
+        "require_trusted_single_operator_retry_capacity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TrustedSingleOperatorAutomaticRetryDisabled("fixture disabled")
+        ),
+    )
+    with pytest.raises(
+        TrustedSingleOperatorAutomaticRetryDisabled,
+        match="fixture disabled",
+    ):
+        builder.retry_attempt(previous_command, 2)
+    assert not tuple(builder.nodes_root.rglob("attempt-0002"))
+
+
+def test_auxiliary_capacity_failure_blocks_before_runtime_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_calls: list[str] = []
+    with ExperimentOperatorStore(
+        tmp_path / "auxiliary-capacity-block.sqlite3",
+        run_id="auxiliary-capacity-block",
+    ) as store:
+        store.initialize_stage_plan(
+            (StagePlanEntry("e6_pilot", 0, "E6", "pilot", "2", 2),)
+        )
+        builder = object.__new__(ProductionFormalDagCallbackBuilder)
+        builder.store = store
+        builder.capacity_authority_path = str(
+            (tmp_path / "fixture-capacity.json").resolve()
+        )
+        builder.auxiliary_runtime = SimpleNamespace(
+            plan=lambda *_args: runtime_calls.append("materialized")
+        )
+        monkeypatch.setattr(
+            "lightcone_spec.experiments.formal_single_operator_capacity."
+            "require_trusted_single_operator_operator_wave_capacity",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("fixture capacity probe failed")
+            ),
+        )
+        callbacks = DagControllerCallbacks(
+            materialize=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("materializer ran before auxiliary capacity")
+            ),
+            plan=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("planner ran before auxiliary capacity")
+            ),
+            actual_results=lambda *_args: {},
+            reduce=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("reducer ran before auxiliary capacity")
+            ),
+            auxiliary_plan=builder.auxiliary_plan,
+            auxiliary_launch=lambda _spec: (_ for _ in ()).throw(
+                AssertionError("launcher ran before auxiliary capacity")
+            ),
+            auxiliary_terminal=lambda *_args: None,
+            auxiliary_adoptions=lambda *_args: (),
+        )
+        step = FormalExperimentDagController(
+            store=store,
+            callbacks=callbacks,
+        ).run_once()
+
+        assert step.action == "BLOCKED"
+        assert "capacity blocked before attempt materialization" in step.detail
+        assert store.controller_node("e6_pilot")["state"] == "BLOCKED"
+        assert runtime_calls == []
 
 
 def test_interference_fallback_never_authorizes_concurrent_headline(
@@ -1492,6 +1764,423 @@ def test_unresolved_and_excluded_headline_rows_do_not_require_fake_ci() -> None:
     with pytest.raises(ValueError, match="contrast status differs"):
         _explicit_headline_metric_payload_rows(
             "e3b_final", {"family_results": [family]}
+        )
+
+
+def _patch_schema4_preflight_retention_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> SimpleNamespace:
+    from lightcone_spec.experiments import formal_preflight_inputs
+    from lightcone_spec.experiments import (
+        formal_single_operator_preflight_qualification as qualification,
+    )
+    from lightcone_spec.runtime import compile_runner, preflight_runner
+    from lightcone_spec.runtime.proof_artifact import CanonicalJsonProofBinding
+
+    run_root = (tmp_path / "formal-run").resolve()
+    archive_root = run_root / "formal-dag-nodes" / "00-preflight" / "execution" / "work"
+    inputs_root = archive_root / "preflight-inputs"
+    exactness_root = inputs_root / "exactness"
+    qualification_root = exactness_root / "qualification"
+    launch_root = exactness_root / "qualification-launches"
+    qualification_root.mkdir(parents=True)
+    launch_root.mkdir()
+
+    def proof(path: Path, label: str) -> CanonicalJsonProofBinding:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _publish_no_replace(path, {"kind": "fixture-proof", "label": label})
+        return CanonicalJsonProofBinding.bind(path)
+
+    actual = proof(
+        inputs_root / "formal-single-operator-preflight-completion.json",
+        "formal_single_operator_exact_ten_preflight_completion",
+    )
+    actual_path = Path(actual.absolute_path)
+    actual_path.unlink()
+    _publish_no_replace(
+        actual_path,
+        {"kind": "formal_single_operator_exact_ten_preflight_completion"},
+    )
+    actual = CanonicalJsonProofBinding.bind(actual_path)
+    inputs_binding = proof(
+        inputs_root / "formal-preflight-execution-inputs.json",
+        "schema4-inputs",
+    )
+    exactness_assignment = proof(
+        inputs_root / "exactness-assignment.json",
+        "exactness-assignment",
+    )
+    exactness_assignment_sidecar = Path(f"{exactness_assignment.absolute_path}.sha256")
+    exactness_assignment_sidecar.write_text(_sha("b") + "\n", encoding="utf-8")
+    base_exactness_result = proof(
+        exactness_root / "result.json",
+        "base-exactness-result",
+    )
+    base_exactness_bindings = {
+        name: proof(exactness_root / f"base-{name}.json", f"base:{name}")
+        for name in ("before", "after", "log", "terminal", "rank-0", "rank-1", "junit")
+    }
+    sampling_path = inputs_root / "sampling-profile.json"
+    proof(sampling_path, "sampling-profile")
+    sampling_sidecar = Path(f"{sampling_path}.sha256")
+    sampling_sidecar.write_text(_sha("a") + "\n", encoding="utf-8")
+    plan_index_binding = proof(
+        qualification_root / "plan-index.json",
+        "qualification-plan-index",
+    )
+    proof(launch_root / "launch-index.json", "qualification-launch-index")
+
+    plans = []
+    plan_bindings = []
+    results = {}
+    launches = {}
+    retained_markers = [
+        base_exactness_result.absolute_path,
+        *(binding.absolute_path for binding in base_exactness_bindings.values()),
+    ]
+    for suite_id in qualification.TRUSTED_PREFLIGHT_QUALIFICATION_SUITES:
+        suite_root = qualification_root / suite_id
+        evidence_root = suite_root / "evidence"
+        launch_suite_root = launch_root / suite_id
+        evidence_root.mkdir(parents=True)
+        launch_suite_root.mkdir()
+        plan_binding = proof(suite_root / "plan.json", f"plan:{suite_id}")
+        launch_binding = proof(
+            launch_suite_root / "compile-launch.json",
+            f"launch:{suite_id}",
+        )
+        proof(
+            Path(f"{launch_binding.absolute_path}.sha256"),
+            f"launch-sidecar:{suite_id}",
+        )
+        dispatch_binding = proof(
+            launch_suite_root / "dispatch.json",
+            f"dispatch:{suite_id}",
+        )
+        evidence = {
+            name: proof(evidence_root / f"{name}.json", f"{suite_id}:{name}")
+            for name in (
+                "assignment",
+                "before",
+                "after",
+                "stdout",
+                "stderr",
+                "junit",
+                "live-observation",
+                "live-native-terminal",
+                "live-native-itl",
+                "live-graph",
+                "live-worker-hook",
+                "rank-0",
+                "rank-1",
+                "live-server-receipt",
+                "live-server-log",
+                "empirical-proof",
+                "runner-terminal",
+                "result",
+            )
+        }
+        plan = SimpleNamespace(
+            suite_id=suite_id,
+            exactness_assignment=exactness_assignment,
+            evidence_directory=str(evidence_root),
+            assignment_path=evidence["assignment"].absolute_path,
+            stdout_path=evidence["stdout"].absolute_path,
+            stderr_path=evidence["stderr"].absolute_path,
+            junit_path=evidence["junit"].absolute_path,
+            observation_path=evidence["live-observation"].absolute_path,
+            result_path=evidence["result"].absolute_path,
+            dispatch_authority=dispatch_binding,
+            launch_manifest=launch_binding,
+        )
+        result = SimpleNamespace(
+            plan=plan_binding,
+            status="COMPLETE",
+            assignment=evidence["assignment"],
+            before_gpu_snapshot=evidence["before"],
+            after_gpu_snapshot=evidence["after"],
+            stdout=evidence["stdout"],
+            stderr=evidence["stderr"],
+            junit_xml=evidence["junit"],
+            live_observation=evidence["live-observation"],
+            live_native_terminal=evidence["live-native-terminal"],
+            live_native_itl=evidence["live-native-itl"],
+            live_graph=evidence["live-graph"],
+            live_worker_hook=evidence["live-worker-hook"],
+            live_rank_terminals=(evidence["rank-0"], evidence["rank-1"]),
+            live_server_receipt=evidence["live-server-receipt"],
+            live_server_log=evidence["live-server-log"],
+            empirical_proof=evidence["empirical-proof"],
+            runner_terminal=evidence["runner-terminal"],
+        )
+        plans.append(plan)
+        plan_bindings.append(plan_binding)
+        results[plan.result_path] = result
+        launches[launch_binding.absolute_path] = SimpleNamespace(
+            sampling_profile_path=str(sampling_path)
+        )
+        retained_markers.extend(
+            (
+                plan_binding.absolute_path,
+                launch_binding.absolute_path,
+                evidence["assignment"].absolute_path,
+                evidence["junit"].absolute_path,
+                evidence["live-native-terminal"].absolute_path,
+                evidence["result"].absolute_path,
+            )
+        )
+
+    plan_index = SimpleNamespace(plans=tuple(plan_bindings))
+    plan_by_path = dict(zip((row.absolute_path for row in plan_bindings), plans))
+    launch_index = SimpleNamespace(
+        entries=tuple(
+            SimpleNamespace(
+                suite_id=plan.suite_id,
+                dispatch_authority=plan.dispatch_authority,
+                launch_manifest=plan.launch_manifest,
+            )
+            for plan in plans
+        )
+    )
+    inputs = SimpleNamespace(
+        schema_version=4,
+        sha256=inputs_binding.semantic_sha256,
+        exactness_assignment=exactness_assignment,
+        qualification_plan_index=plan_index_binding,
+    )
+    completion = SimpleNamespace(
+        schema_version=2,
+        status="COMPLETE",
+        finished_ns=101,
+        execution_inputs=inputs_binding,
+        exactness_result=base_exactness_result,
+    )
+    exactness = SimpleNamespace(
+        sha256=exactness_assignment.semantic_sha256,
+        evidence_directory=str(exactness_root),
+    )
+    base_result = SimpleNamespace(
+        assignment=exactness_assignment,
+        bindings=lambda: {
+            "assignment": exactness_assignment,
+            **base_exactness_bindings,
+        },
+    )
+
+    class CompletionCodec:
+        @classmethod
+        def from_dict(cls, value: object) -> object:
+            assert value == {
+                "kind": "formal_single_operator_exact_ten_preflight_completion"
+            }
+            return completion
+
+    class InputsCodec:
+        @classmethod
+        def from_dict(cls, value: object) -> object:
+            assert value == {"kind": "fixture-proof", "label": "schema4-inputs"}
+            return inputs
+
+    revalidated_results: list[str] = []
+    monkeypatch.setattr(
+        formal_preflight_inputs,
+        "FormalSingleOperatorPreflightCompletion",
+        CompletionCodec,
+    )
+    monkeypatch.setattr(
+        formal_preflight_inputs,
+        "FormalPreflightExecutionInputs",
+        InputsCodec,
+    )
+    monkeypatch.setattr(
+        formal_preflight_inputs,
+        "revalidate_formal_single_operator_preflight_completion",
+        lambda path, *, current_ns: (
+            completion
+            if (path, current_ns) == (actual.absolute_path, completion.finished_ns)
+            else (_ for _ in ()).throw(AssertionError("foreign completion"))
+        ),
+    )
+    monkeypatch.setattr(
+        preflight_runner.ExactnessPreflightAssignment,
+        "load",
+        staticmethod(
+            lambda path: (
+                exactness
+                if str(path) == exactness_assignment.absolute_path
+                else (_ for _ in ()).throw(AssertionError("foreign exactness"))
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        preflight_runner.ExactnessPreflightResultPointer,
+        "load",
+        staticmethod(
+            lambda path: (
+                base_result
+                if Path(path) == Path(base_exactness_result.absolute_path)
+                else (_ for _ in ()).throw(AssertionError("foreign base result"))
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "load_formal_single_operator_preflight_qualification_plan_index",
+        lambda path: (
+            plan_index
+            if str(path) == plan_index_binding.absolute_path
+            else (_ for _ in ()).throw(AssertionError("foreign plan index"))
+        ),
+    )
+    monkeypatch.setattr(
+        qualification,
+        "load_formal_single_operator_preflight_qualification_plan",
+        lambda path: plan_by_path[str(path)],
+    )
+
+    def revalidate_result(path: str) -> object:
+        revalidated_results.append(str(path))
+        return results[str(path)]
+
+    monkeypatch.setattr(
+        qualification,
+        "revalidate_formal_single_operator_preflight_qualification_result",
+        revalidate_result,
+    )
+    monkeypatch.setattr(
+        qualification,
+        "load_trusted_qualification_launch_index",
+        lambda path: (
+            launch_index
+            if Path(path) == launch_root / "launch-index.json"
+            else (_ for _ in ()).throw(AssertionError("foreign launch index"))
+        ),
+    )
+    monkeypatch.setattr(
+        compile_runner.CompileLaunchManifest,
+        "load",
+        staticmethod(lambda path: launches[str(path)]),
+    )
+    return SimpleNamespace(
+        run_root=run_root,
+        archive_root=archive_root,
+        exactness_root=exactness_root,
+        actual=actual,
+        plan_index=plan_index,
+        expected_files={
+            inputs_binding.absolute_path,
+            exactness_assignment.absolute_path,
+            str(exactness_assignment_sidecar),
+            str(sampling_path),
+            str(sampling_sidecar),
+        },
+        retained_markers=tuple(retained_markers),
+        revalidated_results=revalidated_results,
+    )
+
+
+def test_schema4_preflight_retention_survives_archive_and_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _patch_schema4_preflight_retention_graph(tmp_path, monkeypatch)
+    builder = object.__new__(ProductionFormalDagCallbackBuilder)
+    builder.nodes_root = graph.run_root / "formal-dag-nodes"
+    prerequisite_catalog = graph.run_root / "prerequisite-catalog"
+    prerequisite_catalog.mkdir()
+
+    def driver_file(name: str) -> DriverFileBinding:
+        path = graph.run_root / "config" / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _publish_no_replace(path, {"kind": name})
+        return DriverFileBinding.bind(path)
+
+    builder.config = SimpleNamespace(
+        run_root=str(graph.run_root),
+        protocol_lock=driver_file("protocol-lock"),
+        content_source=driver_file("content-source"),
+        runtime_authority_manifest=driver_file("runtime-authority"),
+        inventory=driver_file("inventory"),
+        doctor_report=driver_file("doctor"),
+        preflight_workload_authority=driver_file("workload"),
+        profiler_tools=(),
+        session_reset_authority_directory=None,
+        prerequisite_index_catalog_directory=str(prerequisite_catalog),
+    )
+    builder.store = SimpleNamespace(
+        controller_node=lambda _node: {},
+        latest_controller_auxiliary_group=lambda _node: None,
+    )
+    decision = _binding(
+        graph.run_root, "formal-dag-nodes/00-preflight/reduction/decision.json"
+    )
+    completion = _binding(
+        graph.run_root,
+        "formal-dag-nodes/00-preflight/reduction/completion.json",
+    )
+    reduction = DagReduction(decision=decision, completion=completion)
+    actuals = {
+        f"preflight-cell-{index}": graph.actual.absolute_path for index in range(10)
+    }
+
+    manifest = builder._publish_retained_dependency_manifest(
+        node="preflight",
+        reduction=reduction,
+        actual_result_paths=actuals,
+    )
+
+    retained_files = {row.absolute_path for row in manifest.retained_files}
+    assert graph.expected_files <= retained_files
+    assert graph.actual.absolute_path in retained_files
+    assert manifest.retained_transitive_roots == (str(graph.exactness_root),)
+    assert len(graph.revalidated_results) == 6
+    assert all(
+        Path(path).is_relative_to(graph.exactness_root)
+        for path in graph.retained_markers
+    )
+
+    orphan = graph.archive_root / "row-interference" / "large-raw.log"
+    orphan.parent.mkdir()
+    orphan.write_text("archive me\n", encoding="utf-8")
+    for path in tuple(graph.archive_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path in map(Path, retained_files) or any(
+            path.is_relative_to(Path(root))
+            for root in manifest.retained_transitive_roots
+        ):
+            continue
+        path.unlink()
+    assert not orphan.exists()
+    assert all(Path(path).is_file() for path in graph.retained_markers)
+    assert (
+        load_retained_future_dependency_manifest(
+            builder._retained_manifest_path("preflight")
+        )
+        == manifest
+    )
+
+    restarted = builder._publish_retained_dependency_manifest(
+        node="preflight",
+        reduction=reduction,
+        actual_result_paths=actuals,
+    )
+    assert restarted == manifest
+    assert len(graph.revalidated_results) == 12
+
+
+def test_schema4_preflight_retention_rejects_non_exact_six(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _patch_schema4_preflight_retention_graph(tmp_path, monkeypatch)
+    graph.plan_index.plans = graph.plan_index.plans[:-1]
+
+    with pytest.raises(ValueError, match="not exact six"):
+        _retained_preflight_qualification_dependencies(
+            {"preflight-cell": graph.actual.absolute_path},
+            archive_candidate_root=graph.archive_root,
         )
 
 

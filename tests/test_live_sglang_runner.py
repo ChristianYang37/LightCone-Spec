@@ -57,9 +57,12 @@ from lightcone_spec.orchestration.live_sglang import (
     validate_unsigned_pinned_sglang_serving_run_receipt,
 )
 from lightcone_spec.orchestration.native_terminal import (
+    NATIVE_TERMINAL_EVIDENCE_FIELDS,
+    NATIVE_TERMINAL_EVIDENCE_HOOK,
     NATIVE_TERMINAL_EXTERNAL_CONTROL_PROTOCOL_SHA256,
     NativeTerminalRunBinding,
     build_native_terminal_external_control_binding,
+    canonical_sha256,
     publish_native_terminal_result_proof_artifact,
 )
 from lightcone_spec.runtime.attestation import (
@@ -348,6 +351,12 @@ def _binding(
         previous_run_id=None,
         challenge_nonce_sha256=SHA_D,
         method=method,
+        reset_scope=("request" if method == "tts" else None),
+        request_admission_policy=(
+            "serialized_native_scheduler_v1" if method == "tts" else None
+        ),
+        runtime_trust_mode=None,
+        formal_measurement=None,
         warmup_request_ids=warmup_request_ids,
         scored_request_ids=(
             (f"score-{suffix}",) if scored_request_ids is None else scored_request_ids
@@ -457,10 +466,11 @@ def _fake_live_server_configuration(
     scored_outputs: tuple[int, ...] = (6, 7),
 ) -> tuple[dict[str, object], tuple[object, ...], tuple[object, ...]]:
     from test_native_terminal_provider import (
-        FakeAdminTransport,
         _bound_request,
         _native_itl_pointer,
+        _performance,
         _server_request,
+        _server_row,
     )
 
     assert len(binding.warmup_request_ids) == 1
@@ -473,30 +483,193 @@ def _fake_live_server_configuration(
     scored_expected = (
         _server_request(scored_id, inputs=scored_inputs, outputs=scored_outputs),
     )
-    admin = FakeAdminTransport(
-        binding=binding,
-        warmup=warmup_expected,
-        scored=scored_expected,
-    )
-    begin = admin._begin(binding.begin_payload())
-    admin.begin_receipt = begin
-    reset = admin._reset(
-        {
-            "hook": begin["hook"],
-            "run_id": binding.run_id,
-            "begin_sha256": begin["begin_sha256"],
+    if binding.method not in {"target_only", "static"}:
+        raise ValueError("live fake admin requires an allocation-free binding")
+    identity: dict[str, object] = {
+        "run_id": binding.run_id,
+        "run_nonce_sha256": binding.run_nonce_sha256,
+        "execution_plan_sha256": binding.execution_plan_sha256,
+        "rank_config_sha256": binding.rank_config_sha256,
+        "attempt_id": binding.attempt_id,
+        "session_id": binding.session_id,
+        "session_epoch": binding.session_epoch,
+        "previous_run_id": binding.previous_run_id,
+        "challenge_nonce_sha256": binding.challenge_nonce_sha256,
+        "method": binding.method,
+        "reset_scope": "none",
+        "request_admission_policy": "allocation_free",
+        "runtime_trust_mode": None,
+        "formal_measurement": None,
+    }
+
+    def state(*, generation: int) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "scheduler_idle": True,
+            "active_requests": 0,
+            "queued_requests": 0,
+            "request_pool_active_slots": 0,
+            "allocator_current_hbm_bytes": 32,
+            "allocator_reserved_hbm_bytes": 64,
+            "allocator_peak_hbm_bytes": 3072,
+            "kv_token_capacity": 1024,
+            "kv_available_tokens": 1024,
+            "kv_state_sha256": SHA_A,
+            "rng_state_sha256": SHA_B,
+            "adapter_state_sha256": SHA_C,
+            "adapter_reset_verified": True,
+            "adapter_reset_scope": "none",
+            "adapter_request_admission_policy": "allocation_free",
+            "adapter_request_source_point_reset_protocol_sha256": None,
+            "adapter_runtime_trust_mode": None,
+            "adapter_formal_measurement": None,
+            "adapter_active_request_id": None,
+            "adapter_request_epoch": 0,
+            "adapter_source_round": 0,
+            "adapter_active_version": 0,
+            "adapter_epoch": 0,
+            "optimizer_generation": 0,
+            "telemetry_generation": 0,
+            "completion_event_generation": generation,
+            "completion_event_complete": True,
         }
+
+    empty_resets = {
+        "schema_version": 1,
+        "reset_scope": "none",
+        "request_admission_policy": "allocation_free",
+        "protocol_sha256": None,
+        "final_archive_sha256": "0" * 64,
+        "receipts": [],
+    }
+    warmup_rows = [_server_row(request) for request in warmup_expected]
+    scored_rows = [_server_row(request) for request in scored_expected]
+    warmup_performance = _performance(
+        method=binding.method,
+        output_tokens=sum(
+            len(request.output_token_ids or ()) for request in warmup_expected
+        ),
     )
-    admin.reset_receipt = reset
-    terminal = admin._terminal(
-        {
-            "hook": begin["hook"],
-            "run_id": binding.run_id,
-            "reset_sha256": reset["reset_sha256"],
-            "client_terminal_rows": [],
-        }
+    scored_performance = _performance(
+        method=binding.method,
+        output_tokens=sum(
+            len(request.output_token_ids or ()) for request in scored_expected
+        ),
     )
-    capability = asyncio.run(admin.get_json("/capability"))
+    warmup_state = state(generation=3)
+    reset_state = state(generation=4)
+    begin: dict[str, object] = {
+        "schema_version": 2,
+        "kind": "lightcone_terminal_begin_receipt",
+        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+        **identity,
+        "server_process_id": 1234,
+        "server_process_started_ns": 1_000_000,
+        "reset_generation": 1,
+        "request_source_point_reset_protocol_sha256": None,
+        "prior_state_sha256": SHA_A,
+        "reset_state_sha256": SHA_B,
+        "warmup_request_ids_sha256": canonical_sha256(list(binding.warmup_request_ids)),
+        "scored_request_ids_sha256": canonical_sha256(list(binding.scored_request_ids)),
+    }
+    begin["begin_sha256"] = canonical_sha256(begin)
+    reset: dict[str, object] = {
+        "schema_version": 2,
+        "kind": "lightcone_terminal_reset_receipt",
+        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+        **identity,
+        "server_process_id": 1234,
+        "server_process_started_ns": 1_000_000,
+        "begin_sha256": begin["begin_sha256"],
+        "reset_generation": 2,
+        "request_source_point_reset_protocol_sha256": None,
+        "prior_trace_run_id": binding.previous_run_id,
+        "next_trace_run_id": binding.run_id,
+        "warmup_request_rows_sha256": canonical_sha256(warmup_rows),
+        "warmup_performance_sha256": canonical_sha256(warmup_performance),
+        "discarded_native_sha256": SHA_D,
+        "warmup_state_sha256": canonical_sha256(warmup_state),
+        "reset_state_sha256": canonical_sha256(reset_state),
+        "expected_scored_request_ids_sha256": canonical_sha256(
+            list(binding.scored_request_ids)
+        ),
+        "completion_event_generation": 4,
+        "warmup_request_rows": warmup_rows,
+        "warmup_round_rows": [],
+        "warmup_update_rows": [],
+        "warmup_historical_kv_source_versions": {},
+        "warmup_request_source_point_resets": empty_resets,
+        "warmup_performance_counters": warmup_performance,
+        "warmup_state": warmup_state,
+        "reset_state": reset_state,
+    }
+    reset["reset_sha256"] = canonical_sha256(reset)
+    terminal: dict[str, object] = {
+        "schema_version": 2,
+        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+        **identity,
+        "request_source_point_reset_protocol_sha256": None,
+        "server_process_id": 1234,
+        "server_process_started_ns": 1_000_000,
+        "expected_request_ids": list(binding.scored_request_ids),
+        "reset_receipt_sha256": reset["reset_sha256"],
+        "request_round_rows": {"requests": scored_rows, "rounds": []},
+        "update_rows": [],
+        "performance_counters": scored_performance,
+        "historical_kv_source_versions": {},
+        "request_source_point_resets": empty_resets,
+        "final_state": state(generation=5),
+        "completion_marker": "TERMINAL_COMPLETE",
+    }
+    terminal["terminal_sha256"] = canonical_sha256(terminal)
+    terminal["attestation"] = {
+        "schema_version": 1,
+        "status": "UNAVAILABLE",
+        "challenge_nonce_sha256": binding.challenge_nonce_sha256,
+        "message_sha256": canonical_sha256(
+            {
+                "schema_version": 1,
+                "kind": "lightcone_terminal_attestation_challenge",
+                "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+                "challenge_nonce_sha256": binding.challenge_nonce_sha256,
+                "terminal_sha256": terminal["terminal_sha256"],
+                "run_id": binding.run_id,
+                "run_nonce_sha256": binding.run_nonce_sha256,
+                "server_process_id": 1234,
+                "server_process_started_ns": 1_000_000,
+                "session_id": binding.session_id,
+                "session_epoch": binding.session_epoch,
+                "attempt_id": binding.attempt_id,
+            }
+        ),
+        "attester_id": None,
+        "trust_domain": None,
+        "signature_hex": None,
+    }
+    capability = {
+        "schema_version": 2,
+        "hook": NATIVE_TERMINAL_EVIDENCE_HOOK,
+        "required_fields": list(NATIVE_TERMINAL_EVIDENCE_FIELDS),
+        "supported_methods": [
+            "l0",
+            "onlinespec_ens",
+            "onlinespec_ogd",
+            "onlinespec_opt",
+            "static",
+            "target_only",
+            "tts",
+        ],
+        "enabled": True,
+        "active_method": binding.method,
+        "reset_scope": "none",
+        "request_admission_policy": "allocation_free",
+        "request_source_point_reset_protocol_sha256": None,
+        "runtime_trust_mode": None,
+        "formal_measurement": None,
+        "method_evidence_supported": True,
+        "topology_supported": True,
+        "trusted_attester_configured": False,
+    }
     server_info = ControlledExecutionPolicy().server_info_fields(role="speculative")
     server_info.update(
         {

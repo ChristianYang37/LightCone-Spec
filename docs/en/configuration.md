@@ -49,10 +49,13 @@ Target-only and Static schema configs require both `adaptation: null` and
 `online_spec: null`. Target-only launches the target path without speculation;
 Static describes native speculative decoding. Neither may allocate optimizer,
 gradient, master, candidate, or cohort-adaptation state. Neither role becomes
-formally executable from configuration alone. Static requires content-bound
-request, performance, and aggregate speculative safety evidence, while
-preserving zero round/update detailed-trace allocation; missing fresh terminal
-control leaves it `BLOCKED` before serving.
+executable from configuration alone. In the release-attested lane, Static
+requires content-bound request, performance, aggregate speculative safety, and
+signed terminal evidence. In trusted `formal_single_operator_v1`, an external
+signer is not required, but the same substantive source/content/runtime, fresh
+GPU qualification, capacity, terminal, and coverage gates still apply; its
+result remains `trusted_single_operator_empirical_no_signature`,
+`formal_measured=false`, and `UNMEASURED`.
 
 Recipe and publication identities are orthogonal. TTS uses the frozen,
 primary-source-bound recipe with the fixed barrier. L0-naive uses the same
@@ -100,10 +103,12 @@ native differentiable-canvas evidence. DSpark requires the actual sampled
 predecessor, W1/W2 and native confidence head plus the exact 56-candidate
 selector. NEXTN requires its MTP hidden/interface, teacher rows, valid mask,
 source version, and (for TP2) exact target/drafter shard authority. These are
-source contracts; formal execution still requires their backend-specific GPU
+source contracts; execution still requires their backend-specific GPU
 qualification artifacts. Adaptive EAGLE remains unsupported. EAGLE3 is
-available only to an officially compatible model/selector combination under a
-separate signed decision; it is not a generic adaptation fallback.
+available only to a post-probe compatible model/selector combination; the
+release-attested lane requires a separate signed official decision, while the
+trusted single-operator lane retains its unsigned compatibility authority. It
+is not a generic adaptation fallback.
 
 DSpark layer-only scopes freeze W1, W2, and acceptance/confidence state. Hybrid
 scopes `last1_native_heads`, `last3_native_heads`, and `last5_native_heads`
@@ -126,16 +131,24 @@ scopes and three hybrid scopes, each crossed with Full plus seven LoRA ranks.
 The E1/E2 **LC-candidate** optimizer registry contains `adam`, `adamw`, `sgdm`,
 `nag`, `muon`, `lion`, and project-owned `chronobelief`. They make a functional
 parameter/state proposal and mutate active state only on commit. TTS does not
-search this registry. Its
-TTS-Cal authority fixes Adam, one step, `(beta1=.9, beta2=.999, epsilon=1e-8)`,
-zero weight decay, no clipping, full-drafter updates, latest-round-only
-teacher rows, drafter-native position weights, source-point proximal anchor,
-request reset, side stream, the learning-rate grid `1e-7` through `1e-3`, and
-strides `{1,5,10,15,20,30,40,50}`. The only run-specific numeric choice is the
-safety-first TTS-Cal winner. Until that disjoint tuning window and its four
-excluded pilots produce a signed seal, TTS and L0-naive remain `BLOCKED`; they
-may not inherit a schema default, historical AdamW recipe, or E1/E2 selection.
+search this registry. The TTS-Cal reconstruction registers Adam, one step,
+`(beta1=.9, beta2=.999, epsilon=1e-8)`, zero weight decay, no clipping,
+full-drafter/latest-update-round-only updates, request reset, side stream, the
+learning-rate grid `1e-7` through `1e-3`, and strides
+`{1,5,10,15,20,30,40,50}`. Its pinned DFlash loss uses float32 target-to-draft
+forward KL at temperature one, valid-row masking, `exp(-(k-1)/7)` position
+weights, and masked weighted normalization. The source-point value correction
+is not an independent proximal term, so `lambda` is neither an input nor a
+search axis. TTS and L0-naive may not inherit a schema default, historical
+AdamW recipe, or E1/E2 selection.
 Plain `sgd` is reserved for OnlineSPEC.
+
+The code-owned TTS split is a post-master artifact. New content-verification
+producers emit schema 2 and reject the tuning window during the master
+ceremony; the window publisher then requires that exact durable master receipt
+and emits schema 4 with the receipt SHA-256, verification time, and replay
+reservation SHA-256. Schema-1 receipts remain decodable for historical replay,
+but cannot authorize a new TTS window.
 
 | Optimizer | Required identity | Resident moment rule |
 |---|---|---|
@@ -219,8 +232,13 @@ evidence root.
 The isolated OnlineSPEC protocol adds a required `online_spec` object. Its
 optimizer must be plain SGD, and its declarations remain TP1/DP1 under a
 separately registered tuning protocol. This separate schema/runtime surface
-does not supply a release-trusted hardware signer and does not make an
-industrial speculative cell runnable.
+does not supply a release-trusted hardware signer and therefore cannot promote
+an OnlineSPEC result to release-level `MEASURED`. The trusted single-operator
+E0 comparison may run without that signer only after its audited source
+authority and exact content/runtime, GPU qualification, capacity, terminal, and
+coverage gates pass; it remains
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`.
 
 | Field | Contract |
 |---|---|

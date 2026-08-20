@@ -229,9 +229,9 @@ class NativeRuntimeReleaseCapability:
 NATIVE_RUNTIME_RELEASE_CAPABILITY = NativeRuntimeReleaseCapability(
     schema_version=1,
     pinned_sglang_commit="3312645a307453893a00778592f105581e3d1c3d",
-    patched_sglang_tree="c6571336b70cd5f0e0f609d731a65fa98fd7e0b2",
+    patched_sglang_tree="bb6371242e82592d1b8a2f5f4ba6d0630d8365cb",
     semantic_patch_sha256=(
-        "38b5ec81b9d75950558f8c72c1297bab47badf89d855b3e13dc1ad1c639f7d95"
+        "0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874"
     ),
     suite_protocol_sha256=_sha256(
         {

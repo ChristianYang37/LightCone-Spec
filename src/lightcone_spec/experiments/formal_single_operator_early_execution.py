@@ -67,7 +67,6 @@ from lightcone_spec.runtime.compile_cache import (
     validate_compile_key_for_run_config,
 )
 from lightcone_spec.runtime.compile_runner import (
-    COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256,
     CompileLaunchManifest,
 )
 from lightcone_spec.runtime.proof_artifact import (
@@ -272,7 +271,26 @@ def _preflight_launch_sources(
         raise ValueError("single-operator preflight input digest differs")
     # These local inputs are the exact files used by the completed preflight.
     # The early mapper accepts no independent model, workload, or inventory path.
-    inputs.content_receipt.reopen()
+    trusted_content = inputs.content_source_binding
+    if inputs.schema_version == 2:
+        if (
+            current.source.schema_version == 3
+            or current.source.content_source_binding is not None
+            or inputs.content_receipt is None
+        ):
+            raise ValueError("single-operator preflight content lane differs")
+        inputs.content_receipt.reopen()
+    elif (
+        inputs.schema_version not in {3, 4}
+        or current.source.schema_version != 3
+        or trusted_content is None
+        or current.source.content_source_binding != trusted_content
+    ):
+        raise ValueError("single-operator trusted preflight content lineage differs")
+    else:
+        # Reopen the same BOUND bundle here before selecting a preflight launch;
+        # CompileLaunchManifest.load below independently reopens that binding.
+        trusted_content.reopen()
     inputs.workload_authority.load()
     inventory = GpuInventory.from_dict(inputs.inventory.reopen())
     if inventory.sha256 != inputs.inventory.semantic_sha256:
@@ -285,8 +303,13 @@ def _preflight_launch_sources(
     launches: list[tuple[str, CompileLaunchManifest]] = []
     for row in manifest.inputs:
         launch = CompileLaunchManifest.load(row.launch_manifest_path)
+        expected_launch_schema = 2 if trusted_content is not None else 1
+        expected_formal_stage = "preflight" if trusted_content is not None else None
         if (
-            len(launch.gpu_uuids) != 1
+            launch.schema_version != expected_launch_schema
+            or launch.formal_stage != expected_formal_stage
+            or launch.content_source_binding != trusted_content
+            or len(launch.gpu_uuids) != 1
             or launch.inventory_sha256 != inventory.sha256
             or launch.target_model_id != current.cell.model
             or launch.target_content_authority_sha256
@@ -353,6 +376,8 @@ def _tts_adaptation(
     return AdaptationConfig(
         weight_update_mode="full",
         parameter_scope="all",
+        reset_scope="request",
+        request_admission_policy="serialized_native_scheduler_v1",
         adaptation_group_id=f"formal-single-{stage.lower()}-{cell.cell_id[:24]}",
         optimizer=OptimizerConfig(
             name="adam",
@@ -421,6 +446,8 @@ def _e1_candidate_adaptation(
     return AdaptationConfig(
         weight_update_mode=geometry.parameterization,
         parameter_scope=geometry.scope,
+        reset_scope="cohort",
+        request_admission_policy="cohort_batching_v1",
         adaptation_group_id=f"e1:{cell.cell_id}",
         optimizer=optimizer,
         rank=geometry.rank,
@@ -559,7 +586,9 @@ def _run_config(
         }
     )
     adaptation: AdaptationConfig | None = None
-    if role == "TTS-calibration-candidate":
+    if current.source.stage == "TTS-Cal":
+        if role != "TTS":
+            raise ValueError("single-operator TTS-Cal method role differs")
         learning_rate = dimensions.get("learning_rate")
         stride = dimensions.get("stride")
         if type(learning_rate) is not float or type(stride) is not int:
@@ -649,7 +678,6 @@ def _launch_value(
     target_only = config.method == "target_only"
     launch = replace(
         template,
-        protocol_sha256=COMPILE_LAUNCH_MANIFEST_PROTOCOL_SHA256,
         run_config_path=str(config_path),
         run_config_raw_sha256=config_binding.raw_sha256,
         run_config_semantic_sha256=run_config_sha256(config),
@@ -687,6 +715,7 @@ def _launch_value(
         budget_materialization_authority_sha256=current.source.sha256,
         inventory_sha256=sources.inventory.sha256,
         gpu_uuids=template.gpu_uuids,
+        formal_stage=(current.source.stage if template.schema_version == 2 else None),
     )
     launch.validate(reopen_inputs=True)
     return launch

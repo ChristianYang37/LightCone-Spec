@@ -442,6 +442,8 @@ def _render_server(
             str(port),
         )
     )
+    if config.runtime.data_parallel_size > 1:
+        argv.extend(("--dp-size", str(config.runtime.data_parallel_size)))
     argv.extend(_execution_argv(config.runtime, role=_execution_role(method)))
     if method != "target_only":
         argv.extend(("--speculative-algorithm", config.model.algorithm))
@@ -599,6 +601,8 @@ def _render_choice_plan(
         adaptation = AdaptationConfig(
             weight_update_mode=selected.weight_update_mode,
             parameter_scope=selected.parameter_scope,
+            reset_scope="request",
+            request_admission_policy="serialized_native_scheduler_v1",
             adaptation_group_id=str(adaptation_group_id),
             optimizer=optimizer,
             rank=selected.rank,
@@ -930,6 +934,8 @@ def _onlinespec_run_config(
         adaptation=AdaptationConfig(
             weight_update_mode=candidate.weight_update_mode,
             parameter_scope=candidate.parameter_scope,
+            reset_scope="cohort",
+            request_admission_policy="cohort_batching_v1",
             adaptation_group_id=adaptation_group_id,
             optimizer=OptimizerConfig(
                 name="sgd",

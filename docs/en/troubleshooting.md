@@ -28,14 +28,17 @@
   prepared-content, workload, compile, qualification, terminal, interference,
   and capacity authorities. A checkout deliberately contains none of that
   session evidence.
-- TTS-Cal fixes the reconstruction grid and semantics: Adam, one step,
+- TTS-Cal fixes the registered reconstruction grid and structural semantics: Adam, one step,
   `(beta1=.9, beta2=.999, epsilon=1e-8)`, zero decay, no clipping,
-  full-drafter/latest-round-only update, source-point proximal anchor,
-  request reset, side stream, the registered learning-rate grid, and eight
-  strides. TTS and L0-naive are still `BLOCKED` until a disjoint tuning window
-  seals the exact winner. Reject inheritance from E1/E2, schema defaults, or a
-  historical AdamW recipe. Candidate equality is valid only for controlled
-  replay with identical source-state and proposal-evidence digests.
+  full-drafter/latest-update-round-only update, request reset, side stream, the
+  learning-rate grid, and eight strides. Its exact pinned DFlash loss is
+  float32 target-to-draft forward KL at temperature one with valid-row masking,
+  `exp(-(k-1)/7)` position weights, and masked weighted normalization. The
+  source-point value correction is not an independent proximal penalty, so
+  there is no `lambda` input or additional search axis. Reject inheritance from
+  E1/E2, schema defaults, or a historical AdamW recipe.
+  Candidate equality is valid only for controlled replay with identical
+  source-state and proposal-evidence digests.
 - Adaptation is Full or LoRA over `last1`, `last3`, `last5`, or `all`. LoRA
   requires a registered rank and `alpha/r=1`. Borrowed target parameters and
   quantized/unowned coordinates cannot become trainable.
@@ -93,6 +96,16 @@ fail-closed fallback. Adding 30 GB does not itself authorize a stage; rerun the
 raw capacity reducer and obtain a fresh local `capacity` control attestation.
 Never delete user data to force the gate.
 
+The trusted single-operator v03 path uses a separate unsigned empirical
+schema-3 authority. Its 31 GiB initial admission is exactly one 16 GiB physical
+wave plus a 15 GiB safety margin. Fresh free space already includes bytes
+written by an adopted RUNNING process, so restart binds that process in the
+durable ledger without charging its full lifetime high-water twice. Capacity
+loss stops new dispatch or durably blocks the current DAG node; reconciliation
+of an existing RUNNING physical or E6/E0 auxiliary process remains available.
+Automatic retries are disabled because this path has no reachable failed-attempt
+archive producer. Retain the failed evidence and resolve the block explicitly.
+
 For slab exhaustion, inspect tenant quota, active references, replica identity,
 generation counters, and optional cold-offload timers. Only inactive cohorts
 can be reclaimed. Reusing a slab without a matching reclamation/transfer
@@ -148,15 +161,20 @@ for one run/rank, is not valid evidence.
 
 ## Unexpected `UNMEASURED`, `BLOCKED`, or `UNDERPOWERED`
 
-`UNMEASURED` means no eligible content-bound GPU evidence/attestation exists.
-Positive diagnostics, CPU mocks, historical v2 results, or acceptance changes
-do not alter it. A fresh campaign is `BLOCKED` until its provider state,
-root-authorized dynamic hardware policy, immutable content locks, GPU smoke,
-compile/exactness/interference terminals, and stage capacity control all
-verify. TP2/DP2, DSpark, NEXTN, native ITL, and session reuse specifically
-remain `implemented_pending_dynamic_gpu_proof`; TTS/L0-naive require the
-TTS-Cal seal, LightCone the E2 seal, and EAGLE3 an official compatibility
-decision. None of these may be relabelled READY from source capability alone.
+`UNMEASURED` means no eligible release-attested, content-bound GPU evidence
+exists. Positive diagnostics, CPU mocks, historical v2 results, or acceptance
+changes do not alter it. In the release-attested lane, a fresh campaign is
+`BLOCKED` until its provider state, root-authorized dynamic hardware policy,
+immutable content locks, GPU smoke, compile/exactness/interference terminals,
+and stage capacity control all verify. The trusted
+`formal_single_operator_v1` lane does not need the external signer, but it still
+requires the corresponding source/content/runtime, fresh GPU qualification,
+capacity, terminal, and coverage gates and can conclude only
+`trusted_single_operator_empirical_no_signature`, `formal_measured=false`, and
+`UNMEASURED`. TP2/DP2, DSpark, NEXTN, native ITL, and session reuse specifically
+remain `implemented_pending_dynamic_gpu_proof`; TTS/L0-naive require the exact
+TTS-Cal seal, LightCone the E2 seal, and EAGLE3 an applicable compatibility
+decision. None may be relabelled READY from source capability alone.
 
 `BLOCKED` is also the correct outcome for a registered cell whose prerequisite
 or attested criterion failed. `UNDERPOWERED` means four excluded pilot blocks

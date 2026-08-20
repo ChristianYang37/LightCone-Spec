@@ -40,6 +40,7 @@ from .compile_cache import (
 
 __all__ = [
     "COMPILE_CACHE_ENVIRONMENT_VARIABLES",
+    "CONTENT_VERIFICATION_PROTOCOL_SHA256",
     "DISTRIBUTED_RUNTIME_SUITE_RUNNER_PROTOCOL_SHA256S",
     "EAGLE3_COMPATIBILITY_PROTOCOL_SHA256",
     "EAGLE3_E0_EXECUTION_PROTOCOL_SHA256",
@@ -248,6 +249,7 @@ def __getattr__(name: str) -> object:
         "position_weighted_kl",
     }
     content_authorization_exports = {
+        "CONTENT_VERIFICATION_PROTOCOL_SHA256",
         "ContentVerificationReceipt",
         "derive_stage_content_verification_receipt",
     }

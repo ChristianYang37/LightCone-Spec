@@ -62,7 +62,12 @@ def test_declared_two_gpu_host_supports_nccl_collective(tmp_path: Path) -> None:
 
     manifest = json.loads(_RUNTIME_MANIFEST.read_text(encoding="utf-8"))
     expected = manifest["gpu"]
-    blocked_modes = {row["mode"] for row in manifest["release_capabilities"]["blocked"]}
+    blocked_modes = {
+        row["mode"]
+        for row in manifest["release_capabilities"][
+            "implemented_pending_dynamic_gpu_proof"
+        ]
+    }
     assert {"tp2", "dp2"}.issubset(blocked_modes)
 
     assert torch.cuda.is_available(), "the registered system host requires CUDA"
