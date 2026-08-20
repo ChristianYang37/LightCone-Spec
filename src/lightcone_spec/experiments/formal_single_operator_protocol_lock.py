@@ -230,8 +230,9 @@ def revalidate_trusted_single_operator_protocol_lock(
     expected_content_bundle_path: str | Path | None = None,
     require_capacity_available: bool = True,
     revalidate_runtime_observations: bool = True,
+    deep_replay: bool = False,
 ) -> ProtocolLock:
-    """Deep-rebuild one trusted lock exclusively from its embedded paths."""
+    """Reopen exact source bindings, optionally rebuilding the full lock once."""
 
     if (
         type(lock) is not ProtocolLock
@@ -251,6 +252,7 @@ def revalidate_trusted_single_operator_protocol_lock(
     ):
         raise ValueError("trusted ProtocolLock content source path differs")
     canonical_sources = (
+        ("content bundle", content_source),
         (
             "runtime authority",
             sources.formal_runtime_authority_manifest_source,
@@ -263,15 +265,12 @@ def revalidate_trusted_single_operator_protocol_lock(
         rebound = CanonicalJsonProofBinding.bind(source.absolute_path)
         if _canonical_source_binding(rebound) != source:
             raise ValueError(f"trusted ProtocolLock {label} source identity changed")
-    # This is intentionally before the content bundle reopens its runtime doctor.
-    load_tts_calibration_authority_artifact(
-        sources.tts_calibration_authority_source.absolute_path
-    )
-    rebound_content = TrustedSingleOperatorContentBundleBinding.bind(
-        content_source.absolute_path
-    )
-    if _content_source_binding(rebound_content) != content_source:
-        raise ValueError("trusted ProtocolLock content source identity changed")
+    if not deep_replay:
+        return lock
+    # Full replay remains available for explicit audit. Normal publication
+    # already receives a lock from the code-owned deep builder, while DAG
+    # reopen/materialization must remain proportional to the small lock and
+    # source artifacts rather than recursively replaying model namespaces.
     rebuilt = build_trusted_single_operator_protocol_lock(
         protocol_id=lock.protocol_id,
         trusted_content_bundle_path=content_source.absolute_path,
@@ -305,6 +304,7 @@ def publish_trusted_single_operator_protocol_lock(
         lock,
         require_capacity_available=True,
         revalidate_runtime_observations=True,
+        deep_replay=False,
     )
     binding = publish_formal_single_operator_json_artifact(
         output_path,
@@ -320,6 +320,7 @@ def publish_trusted_single_operator_protocol_lock(
             reopened,
             require_capacity_available=True,
             revalidate_runtime_observations=True,
+            deep_replay=False,
         )
         != lock
     ):

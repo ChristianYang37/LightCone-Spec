@@ -365,6 +365,16 @@ def test_lock_revalidator_forwards_identity_only_runtime_policy(
         )
         == lock
     )
+    assert observed == {}
+    assert (
+        lock_module.revalidate_trusted_single_operator_protocol_lock(
+            lock,
+            require_capacity_available=False,
+            revalidate_runtime_observations=False,
+            deep_replay=True,
+        )
+        == lock
+    )
     assert observed["require_capacity_available"] is False
     assert observed["revalidate_runtime_observations"] is False
 
@@ -375,13 +385,14 @@ def test_publisher_and_root_materializer_require_dynamic_runtime_replay(
 ) -> None:
     content_path = (tmp_path / "content.json").resolve()
     lock = _trusted_protocol_lock(content_path=content_path)
-    policies: list[tuple[bool, bool]] = []
+    policies: list[tuple[bool, bool, bool]] = []
 
     def revalidate(value, **kwargs):
         policies.append(
             (
                 kwargs["require_capacity_available"],
                 kwargs["revalidate_runtime_observations"],
+                kwargs["deep_replay"],
             )
         )
         return value
@@ -395,7 +406,7 @@ def test_publisher_and_root_materializer_require_dynamic_runtime_replay(
         lock,
         tmp_path / "published-lock.json",
     )
-    assert policies == [(True, True), (True, True)]
+    assert policies == [(True, True, False), (True, True, False)]
 
     lock_path = (tmp_path / "root-lock.json").resolve()
     publish_formal_single_operator_json_artifact(
@@ -412,6 +423,7 @@ def test_publisher_and_root_materializer_require_dynamic_runtime_replay(
             (
                 kwargs["require_capacity_available"],
                 kwargs["revalidate_runtime_observations"],
+                kwargs.get("deep_replay", False),
             )
         )
         raise RootReplayObserved
@@ -431,7 +443,7 @@ def test_publisher_and_root_materializer_require_dynamic_runtime_replay(
             node_materialization_output_path=tmp_path / "unused-node.json",
             created_ns=10,
         )
-    assert policies == [(True, True)]
+    assert policies == [(True, True, False)]
 
 
 def test_dag_identity_consumer_uses_identity_only_runtime_replay(
