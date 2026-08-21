@@ -578,27 +578,51 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +                            torch.arange(self.gamma, device=device)[None, :]
 +                            < layout.verify_lens[:microbatch, None]
 +                        )
-+                    row_loss = F.kl_div(
-+                        F.log_softmax(corrected.float(), dim=-1),
-+                        F.softmax(teacher_logits.detach().float(), dim=-1),
-+                        reduction="none",
-+                    ).sum(-1)
-+                    loss = (row_loss * valid_mask).sum() / valid_mask.sum().clamp_min(1)
-+                    if (
-+                        "native_heads" in online_adapter.config.parameter_scope
-+                        and confidence is not None
-+                    ):
-+                        confidence_rows = confidence[:microbatch]
-+                        accepted = valid_mask.to(confidence_rows.dtype)
-+                        confidence_loss = F.binary_cross_entropy(
-+                            confidence_rows.clamp(1e-6, 1 - 1e-6),
-+                            accepted,
-+                            reduction="none",
++                    target_probabilities = F.softmax(
++                        teacher_logits.detach().float(), dim=-1
++                    )
++                    temperatures = draft_block.temperatures[:microbatch]
++                    exact_proposal = proposal_probabilities(
++                        corrected.detach(),
++                        temperatures,
++                        greedy_mask=draft_block.greedy_mask[:microbatch],
++                    )
++                    composite = "native_heads" in online_adapter.config.parameter_scope
++                    confidence_rows = (
++                        confidence[:microbatch] if composite and confidence is not None else None
++                    )
++                    losses = dspark_composite_loss(
++                        target_probabilities=target_probabilities,
++                        corrected_proposal_logits=corrected,
++                        temperatures=temperatures,
++                        valid_mask=valid_mask,
++                        position_decay=online_adapter.config.loss_position_decay,
++                        confidence_logits=(
++                            torch.logit(confidence_rows.clamp(1e-6, 1 - 1e-6))
++                            if confidence_rows is not None
++                            else None
++                        ),
++                        frozen_confidence_temperature=(
++                            torch.ones(self.gamma, device=device)
++                            if confidence_rows is not None
++                            else None
++                        ),
++                        confidence_loss_weight=(
++                            online_adapter.config.confidence_loss_weight
++                            if confidence_rows is not None
++                            else None
++                        ),
++                        exact_proposal_probabilities=(
++                            exact_proposal if confidence_rows is not None else None
++                        ),
++                    )
++                    if confidence_rows is not None:
++                        online_adapter.runtime.record_confidence(
++                            confidence_rows,
++                            losses.conditional_survival,
++                            valid_mask,
 +                        )
-+                        loss = loss + online_adapter.config.confidence_loss_weight * (
-+                            (confidence_loss * valid_mask).sum()
-+                            / valid_mask.sum().clamp_min(1)
-+                        )
++                    loss = losses.total
 +                    online_adapter.launch(
 +                        loss=loss,
 +                        request_ids=tuple(

@@ -9,6 +9,6 @@
 - [ ] Disabled SGLang path remains compatible and allocation-free
 - [ ] Exactness and parameter-layout implications are documented
 - [ ] No credentials, results, artifacts, models, datasets, or local paths are included
-- [ ] SGLang changes, if any, are patch-first and update all integrity metadata
+- [ ] SGLang changes, if any, are patch-first and preserve measured behavior
 
 ## Compatibility and memory impact

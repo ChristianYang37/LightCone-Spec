@@ -112,6 +112,22 @@ class StateStore:
                 (node, len(jobs)),
             )
 
+    def add_internal_jobs(self, jobs: tuple[Job, ...]) -> None:
+        """Persist resumable calibration work without adding a paper DAG node."""
+        with self.connect() as connection:
+            for job in jobs:
+                payload = json.dumps(job.to_dict(), sort_keys=True)
+                row = connection.execute(
+                    "SELECT config_json FROM jobs WHERE job_id=?", (job.job_id,)
+                ).fetchone()
+                if row is not None and row["config_json"] != payload:
+                    raise RuntimeError(f"internal job {job.job_id} changed")
+                connection.execute(
+                    "INSERT OR IGNORE INTO jobs(job_id,node,ordinal,config_json,status) "
+                    "VALUES(?,?,?,?, 'pending')",
+                    (job.job_id, job.node, job.ordinal, payload),
+                )
+
     def pending_jobs(self, node: str) -> tuple[Job, ...]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -201,13 +217,13 @@ class StateStore:
             )
             return changed
 
-    def finish_stage(self, node: str, *, allow_failed: bool = False) -> str:
+    def finish_stage(self, node: str) -> str:
         counts = self.status_counts(node)
         status = (
             "completed"
             if not counts.get("pending")
             and not counts.get("running")
-            and (allow_failed or not counts.get("failed"))
+            and not counts.get("failed")
             else "failed"
         )
         with self.connect() as connection:

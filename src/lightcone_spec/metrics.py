@@ -217,7 +217,15 @@ def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.Da
             continue
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        rows.append({**config, **metrics, "attempt_dir": str(directory)})
+        rows.append(
+            {
+                **config,
+                **metrics,
+                "attempt": directory.name,
+                "attempt_dir": str(directory),
+                "reducer": "attempt_summary_v1",
+            }
+        )
     frame = pd.DataFrame(rows)
     output_root.mkdir(parents=True, exist_ok=True)
     frame.to_csv(output_root / "summary.csv", index=False)
@@ -228,8 +236,20 @@ def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.Da
 def paired_block_statistics(
     rows: Iterable[tuple[dict[str, object], dict[str, object]]],
 ) -> list[dict[str, object]]:
-    axes = ("regime", "width_panel", "topology", "cohorts", "popularity")
-    groups: dict[str, dict[str, dict[int, float]]] = {}
+    axes = (
+        "regime",
+        "width_panel",
+        "topology",
+        "cohorts",
+        "popularity",
+        "traffic",
+        "workload",
+        "registered_load",
+        "effective_load",
+    )
+    groups: dict[
+        str, dict[str, dict[int, tuple[float, int, dict[str, object]]]]
+    ] = {}
     descriptions: dict[str, dict[str, object]] = {}
     for config, metrics in rows:
         block = config.get("block")
@@ -240,15 +260,29 @@ def paired_block_statistics(
         parameters = parameters if isinstance(parameters, dict) else {}
         condition = {
             name: config.get(name)
-            for name in ("model", "backend", "task", "context", "load")
+            for name in ("model", "task", "context", "load")
         }
+        condition["comparison_backend"] = parameters.get(
+            "comparison_backend", config.get("backend")
+        )
         condition.update({name: parameters.get(name) for name in axes})
         key = json.dumps(condition, sort_keys=True)
         descriptions[key] = condition
-        groups.setdefault(key, {}).setdefault(method, {})[block] = float(
-            metrics["goodput"]
+        source = {
+            "job_id": config.get("job_id"),
+            "attempt": metrics.get("source_attempt"),
+            "attempt_dir": metrics.get("source_attempt_dir"),
+        }
+        method_rows = groups.setdefault(key, {}).setdefault(method, {})
+        if block in method_rows:
+            raise ValueError(f"duplicate paired row for {method} block {block}")
+        method_rows[block] = (
+            float(metrics["goodput"]),
+            int(metrics.get("request_count", 0)),
+            {**source, "stimulus_id": parameters.get("stimulus_id")},
         )
     comparisons = (
+        ("lightcone", "target_only"),
         ("lightcone", "static"),
         ("lightcone", "tts"),
         ("l0_naive", "tts"),
@@ -268,11 +302,24 @@ def paired_block_statistics(
             )
             if len(blocks) < 3:
                 continue
-            candidate = [methods[candidate_name][block] for block in blocks]
-            baseline = [methods[baseline_name][block] for block in blocks]
-            estimate, low, high = paired_bca_interval(candidate, baseline)
+            candidate = [methods[candidate_name][block][0] for block in blocks]
+            baseline = [methods[baseline_name][block][0] for block in blocks]
+            if any(
+                methods[candidate_name][block][2]["stimulus_id"]
+                != methods[baseline_name][block][2]["stimulus_id"]
+                for block in blocks
+            ):
+                raise ValueError(
+                    f"paired methods received different stimuli for {key}"
+                )
+            if any(value <= 0 for value in (*candidate, *baseline)):
+                continue
+            log_ratios = np.log(candidate) - np.log(baseline)
+            estimate, low, high = paired_bca_interval(
+                log_ratios, np.zeros_like(log_ratios)
+            )
             p_value = float(
-                ttest_rel(candidate, baseline, alternative="greater").pvalue
+                ttest_rel(log_ratios, np.zeros_like(log_ratios), alternative="greater").pvalue
             )
             if not math.isfinite(p_value):
                 p_value = 1.0
@@ -282,9 +329,34 @@ def paired_block_statistics(
                     "candidate": candidate_name,
                     "baseline": baseline_name,
                     "blocks": blocks,
-                    "mean_goodput_difference": estimate,
-                    "ci95_low": low,
-                    "ci95_high": high,
+                    "pairing_key": key,
+                    "paired_unit_keys": [
+                        json.dumps(
+                            {**descriptions[key], "block": block}, sort_keys=True
+                        )
+                        for block in blocks
+                    ],
+                    "request_counts": {
+                        candidate_name: sum(
+                            methods[candidate_name][block][1] for block in blocks
+                        ),
+                        baseline_name: sum(
+                            methods[baseline_name][block][1] for block in blocks
+                        ),
+                    },
+                    "source_attempts": {
+                        candidate_name: [
+                            methods[candidate_name][block][2] for block in blocks
+                        ],
+                        baseline_name: [
+                            methods[baseline_name][block][2] for block in blocks
+                        ],
+                    },
+                    "reducer": "paired_log_goodput_bca",
+                    "mean_log_ratio": estimate,
+                    "relative_effect": math.exp(estimate) - 1.0,
+                    "ci95_relative_low": math.exp(low) - 1.0,
+                    "ci95_relative_high": math.exp(high) - 1.0,
                     "p_value": p_value,
                 }
             )

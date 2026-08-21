@@ -11,6 +11,8 @@ Implemented locally:
 - plain SGLang diffs preserving GPU-resident adaptation, fused optimizer work,
   fixed-address publication, backend adapters, native timing, and strict metrics;
 - raw attempt outputs, CSV/Parquet summaries, and paired statistics;
+- resumable E1 load, per-method width, DSpark confidence, E5 p99, and E6 load
+  calibration without changing registered row counts;
 - focused CPU tests and default CI.
 
 Pending manual GPU acceptance:

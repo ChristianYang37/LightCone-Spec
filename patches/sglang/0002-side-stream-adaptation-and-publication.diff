@@ -2840,6 +2840,11 @@ new file mode 100644
 +        self.waiting_requests_max = 0
 +        self.controlled_reference: tuple[torch.Tensor, ...] | None = None
 +        self.controlled_candidate_equal = True
++        self.confidence_brier_sum = torch.zeros((), device=device)
++        self.confidence_count = torch.zeros((), device=device)
++        self.confidence_bin_count = torch.zeros(10, device=device)
++        self.confidence_bin_prediction = torch.zeros(10, device=device)
++        self.confidence_bin_survival = torch.zeros(10, device=device)
 +
 +    @property
 +    def telemetry_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -2849,7 +2854,40 @@ new file mode 100644
 +            self.trace_optimizer_steps,
 +            self.trace_online_experts,
 +            self.round_metrics,
++            self.confidence_brier_sum,
++            self.confidence_count,
++            self.confidence_bin_count,
++            self.confidence_bin_prediction,
++            self.confidence_bin_survival,
 +        )
++
++    def record_confidence(
++        self,
++        prediction: torch.Tensor,
++        survival: torch.Tensor,
++        valid_mask: torch.Tensor,
++    ) -> None:
++        valid = valid_mask.to(torch.float32)
++        prediction = prediction.detach().to(torch.float32)
++        survival = survival.detach().to(torch.float32)
++        self.confidence_brier_sum.add_(((prediction - survival) ** 2 * valid).sum())
++        self.confidence_count.add_(valid.sum())
++        bins = torch.clamp((prediction * 10).to(torch.int64), max=9)
++        indexes = bins[valid_mask]
++        ones = torch.ones_like(indexes, dtype=torch.float32)
++        self.confidence_bin_count.scatter_add_(0, indexes, ones)
++        self.confidence_bin_prediction.scatter_add_(0, indexes, prediction[valid_mask])
++        self.confidence_bin_survival.scatter_add_(0, indexes, survival[valid_mask])
++
++    def _confidence_ece(self) -> float | None:
++        total = float(self.confidence_count.item())
++        if total == 0:
++            return None
++        nonempty = self.confidence_bin_count > 0
++        counts = self.confidence_bin_count[nonempty]
++        prediction = self.confidence_bin_prediction[nonempty] / counts
++        survival = self.confidence_bin_survival[nonempty] / counts
++        return float(((prediction - survival).abs() * counts).sum().item() / total)
 +
 +    def bind_parameter_layout(
 +        self,
@@ -3139,11 +3177,14 @@ new file mode 100644
 +            trace_index=trace_index,
 +        )
 +        if self.config.controlled_candidate_replay:
-+            if self.controlled_reference is None:
++            role = self.config.controlled_candidate_role
++            if role == "capture":
 +                self.controlled_reference = tuple(
 +                    tensor.detach().clone() for tensor in inference_bank.staging
 +                )
-+            else:
++            elif role == "compare":
++                if self.controlled_reference is None:
++                    raise RuntimeError("controlled replay has no TTS reference")
 +                self.controlled_candidate_equal = self.controlled_candidate_equal and all(
 +                    torch.equal(candidate, reference)
 +                    for candidate, reference in zip(
@@ -3153,6 +3194,8 @@ new file mode 100644
 +                    )
 +                )
 +                self.controlled_reference = None
++            else:
++                raise RuntimeError("controlled replay requires capture or compare role")
 +        if reservation is not None:
 +            self.reserved = None
 +        self.counters["updates_launched"] += 1
@@ -3586,8 +3629,14 @@ new file mode 100644
 +        self.running_requests_max = 0
 +        self.waiting_requests_sum = 0
 +        self.waiting_requests_max = 0
-+        self.controlled_reference = None
++        if self.config.controlled_candidate_role != "compare":
++            self.controlled_reference = None
 +        self.controlled_candidate_equal = True
++        self.confidence_brier_sum.zero_()
++        self.confidence_count.zero_()
++        self.confidence_bin_count.zero_()
++        self.confidence_bin_prediction.zero_()
++        self.confidence_bin_survival.zero_()
 +
 +    def reload_config(self, config: OnlineAdaptationConfig) -> None:
 +        if config.stream_priority != self.config.stream_priority:
@@ -3857,6 +3906,12 @@ new file mode 100644
 +            "enabled": self.disabled_reason is None,
 +            "disabled_reason": self.disabled_reason,
 +            "controlled_candidate_equal": self.controlled_candidate_equal,
++            "confidence_brier": (
++                float((self.confidence_brier_sum / self.confidence_count).item())
++                if self.confidence_count.item() > 0
++                else None
++            ),
++            "confidence_ece": self._confidence_ece(),
 +            "cohort_epoch": self.epoch,
 +            "slot_generation": self.slot_generation,
 +            "active_version": self.active_version,

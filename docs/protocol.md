@@ -35,10 +35,10 @@ continue, and no absent row is converted into a result.
 
 Each E0 compatibility row runs the registered Static interface, then restarts
 the same model/backend as adaptive LightCone and requires a finite published
-update. E3 context intervals resample blocks and requests within each selected
-block before evaluating the fixed 4K/16K/32K spline. Matched width uses the
-E3a winner; deployment width uses the Static E3a winner and the registered
-width-16 TTS/L0/LightCone tuning configurations.
+update. E3 refits a natural cubic spline with fixed 4K/16K/32K interior knots
+inside each block--request resample. Matched width uses the E3a winner; an
+excluded tuning substage independently freezes deployment width for Static,
+TTS, L0, and LightCone.
 
 Methods in a paired block run sequentially on the same device. Independent
 single-GPU blocks may run on GPUs 0 and 1 concurrently. TP2, DP2, E5, and E6
@@ -49,18 +49,24 @@ width, and profiler mode reuse it after an idle configure/reset. Incompatible
 layouts restart normally. Preflight disables parallel final blocks when measured
 two-GPU interference exceeds 1%.
 
-TTS uses the fixed paper recipe: Adam, zero weight decay, no gradient clipping,
+E1 first runs all 68 rows at `c1`, then probes the E3a load grid for the anchors
+and two-optimizer Pareto union. Its highest common safe load caps E2 and is
+reused by E3/E4. TTS uses the fixed paper recipe: Adam, zero weight decay, no gradient clipping,
 the complete drafter, one update step, latest-round-only teacher rows,
 `exp(-1/7)` positional decay, and request reset. TTS and L0-naive share the
 candidate update and differ only in publication policy. TTS-Cal uses 76 tuning
 problems from an explicit tuning split and never executes the four explicit
 holdout IDs. E2
 uses the registered `(B,L)` points as closed-loop concurrency and generated
-history length. E4 factors map directly to runtime arguments and its profiling
+history length. E1a selects one confidence weight from `0.05/0.1/0.25/0.5` on
+an excluded `last5_native_heads/full` calibration before its 116 rows. E4 factors map directly to runtime arguments and its profiling
 rows invoke NVTX, Nsight Systems, and Nsight Compute. E5 maps the registered
 arrival traces, sticky cohorts, popularity, topology, and eleven failures to
 runtime behavior; BurstGPT replays both arrival times and input/output lengths.
-Every E6 role, including Target-only, runs TP2.
+E5 uses 10 s warm-up, 60 s headline, 300 s soak, 120 s request deadlines and
+180 s drain; a separate 11,000-request boundary extension resolves p99 only
+after 10,000 completions. Every E6 role, including Target-only, runs TP2 and
+each model freezes its own common load from `c1` through `c256`.
 
 Required correctness checks are limited to:
 
@@ -71,9 +77,11 @@ Required correctness checks are limited to:
 - loss, gradients, and updates are finite;
 - OOM, fallback, retraction, and stale-publication events are counted;
 - goodput uses committed tokens and comparisons share an HBM-feasible load;
-- native token timestamps, rank-local metrics, and TP/DP sum/max/min aggregates
-  are present rather than reconstructed from HTTP delivery time;
+- scheduler committed-token timestamps, rank-local metrics, and TP/DP
+  sum/max/min aggregates are present rather than reconstructed from HTTP delivery time;
 - pilot rows never enter final estimates; statistics operate on paired blocks.
 
-Process and network failures retry at most once. OOM, numerical errors,
-exactness violations, and failed scientific criteria are terminal for the cell.
+Process and network failures retry at most once. Numerical errors, exactness
+violations, and failed scientific criteria are terminal for the cell. OOM in a
+declared capacity screen is an ordinary completed `feasible=false` outcome;
+OOM elsewhere remains terminal.

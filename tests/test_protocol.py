@@ -1,10 +1,18 @@
 import json
 import math
 
+import pytest
+
 from lightcone_spec.config import ExperimentConfig
-from lightcone_spec.data import load_tts_calibration
-from lightcone_spec.protocol import PAPER_NODES, default_row_counts, materialize, paper_plan
-from lightcone_spec.runner import _e5_execution_phases, _request_count, _runtime_job
+from lightcone_spec.data import load_prompt_records, load_tts_calibration
+from lightcone_spec.protocol import (
+    PAPER_NODES,
+    default_row_counts,
+    e2_candidates,
+    materialize,
+    paper_plan,
+)
+from lightcone_spec.runner import _e5_execution_phases, _e5_reference, _runtime_job
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 
@@ -65,12 +73,26 @@ def test_registered_axes_reach_runtime_parameters():
     assert {job.parameters["regime"] for job in rounds} == {
         "short_input_long_generation"
     }
+    state = type(
+        "State",
+        (),
+        {"selection": lambda self, name, default: {"e1_common_load": "c4"}.get(name, default)},
+    )()
+    capped = _runtime_job(state, rounds[-1])
+    assert capped.load == "c4"
+    assert capped.parameters["registered_load"] == "c16"
+    assert capped.parameters["effective_load"] == "c4"
     screen = materialize("E4-screen")
     assert len(screen) == 48
     assert {job.parameters["stride"] for job in screen} == {1, 50}
     assert {job.parameters["traffic"] for job in screen} == {
         "pure_decode", "mixed_prefill_decode"
     }
+
+    geometries = ({"scope": "all", "parameterization": "full", "rank": None},) * 2
+    candidates = e2_candidates(geometries)
+    assert len(candidates) == 210
+    assert len(materialize("E2-r0", e2_rows=candidates)) == 214
 
 
 def test_session_key_reuses_scalar_recipe_but_not_layout():
@@ -99,20 +121,90 @@ def test_e5_anchors_execute_before_dependent_rows():
     assert all(job.job_id not in {anchor.job_id for anchor in anchors} for job in dependent)
 
 
+def test_e5_reference_uses_faster_slo_baseline(monkeypatch):
+    anchor = materialize("E5-pilot")[0]
+    rows = []
+    for method, rate, concurrency in (
+        ("target_only", 10.0, 8),
+        ("static", 12.0, 16),
+    ):
+        rows.append(
+            (
+                {
+                    "block": anchor.block,
+                    "backend": anchor.backend,
+                    "method": method,
+                    "load": f"closed_loop_c{concurrency}",
+                },
+                {"slo_pass": True, "request_rate": rate},
+            )
+        )
+    monkeypatch.setattr("lightcone_spec.runner._metric_rows", lambda state, node: rows)
+    assert _e5_reference(object(), anchor) == (12.0, 16)
+
+
 def test_exact_draft_mapping_and_explicit_tts_split(tmp_path):
     example = ExperimentConfig.load("examples/paper.yaml")
     assert len(example.drafts) == 12
     assert all("|" in key for key in example.drafts)
     rows = []
     for index in range(76):
-        rows.append({"problem_id": f"t-{index}", "split": "tuning", "prompt": "p"})
+        rows.append(
+            {
+                "problem_id": f"t-{index}",
+                "split": "tuning",
+                "prompt": "p",
+                "reference": "r",
+            }
+        )
     for index in range(4):
-        rows.append({"problem_id": f"h-{index}", "split": "holdout", "prompt": "p"})
+        rows.append(
+            {
+                "problem_id": f"h-{index}",
+                "split": "holdout",
+                "prompt": "p",
+                "reference": "r",
+            }
+        )
     path = tmp_path / "tts.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in rows))
     tuning, holdout = load_tts_calibration(path)
     assert len(tuning) == 76
     assert holdout == ("h-0", "h-1", "h-2", "h-3")
+
+
+def test_dataset_split_and_template_are_explicit(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "problem_id": "p1",
+                "split": "pilot",
+                "question": "2+2",
+                "template": "Question: {question}",
+                "reference": "4",
+            }
+        )
+        + "\n"
+    )
+    rows = load_prompt_records(path, limit=1, split="pilot")
+    assert rows[0]["prompt"] == "Question: 2+2"
+    missing = tmp_path / "missing.jsonl"
+    missing.write_text(json.dumps({"problem_id": "p2", "prompt": "x"}) + "\n")
+    with pytest.raises(ValueError, match="explicit split"):
+        load_prompt_records(missing, limit=1, split="pilot")
+    missing_metadata = tmp_path / "missing-metadata.jsonl"
+    missing_metadata.write_text(
+        json.dumps({"problem_id": "p3", "split": "pilot", "prompt": "x"}) + "\n"
+    )
+    with pytest.raises(ValueError, match="reference or test metadata"):
+        load_prompt_records(missing_metadata, limit=1, split="pilot")
+
+    repeated = load_prompt_records(
+        path, limit=3, split="pilot", selection_seed=0, allow_repeat=True
+    )
+    assert [row["problem_id"] for row in repeated] == ["p1", "p1", "p1"]
+    assert [row["repeat_index"] for row in repeated] == [0, 1, 2]
 
 
 def test_e3_uses_three_explicit_strata_without_filler():
@@ -145,20 +237,13 @@ def test_e3_uses_three_explicit_strata_without_filler():
     assert _runtime_job(state, next(job for job in rows if job.method == "lightcone")).width == 16
 
 
-def test_final_tail_gate_has_registered_request_mass():
+def test_final_tail_gate_uses_separate_extension_without_changing_rows():
+    from lightcone_spec.protocol import E5_P99_EXTENSION_REQUESTS, E5_P99_MIN_COMPLETED
+
     final_rows = materialize("E5-final", final_blocks=12)
     saturation = [
         job for job in final_rows if job.load == "saturation_soak"
     ]
     assert len(saturation) == 5 * 2 * 12
-    assert _request_count(_MinimalConfig(), saturation[0]) == 840
-    assert 12 * 840 >= 10_000
-
-
-class _MinimalServer:
-    requests_per_cell = 16
-    max_new_tokens = 256
-
-
-class _MinimalConfig:
-    server = _MinimalServer()
+    assert E5_P99_EXTENSION_REQUESTS == 11_000
+    assert E5_P99_EXTENSION_REQUESTS > E5_P99_MIN_COMPLETED

@@ -235,6 +235,7 @@ new file mode 100644
 +    telemetry_detail: str
 +    seed: int
 +    controlled_candidate_replay: bool
++    controlled_candidate_role: str | None
 +    reset_scope: str
 +    fixed_total_token_budget: int | None
 +    adaptation_microbatch_size: int = 1
@@ -324,6 +325,9 @@ new file mode 100644
 +            not isinstance(fixed_budget, int) or fixed_budget < 1
 +        ):
 +            raise ValueError("fixed_total_token_budget must be a positive integer")
++        controlled_role = value.get("controlled_candidate_role")
++        if controlled_role not in {None, "capture", "compare"}:
++            raise ValueError("controlled_candidate_role must be capture or compare")
 +        if (tp_size, dp_size) not in {(1, 1), (2, 1), (1, 2)}:
 +            raise ValueError("online adaptation supports TP1, TP2, and two TP1 replicas")
 +        return cls(
@@ -346,6 +350,7 @@ new file mode 100644
 +            telemetry_detail=str(value.get("telemetry_detail", "headline")),
 +            seed=int(value.get("seed", 0)),
 +            controlled_candidate_replay=bool(value.get("controlled_candidate_replay", False)),
++            controlled_candidate_role=controlled_role,
 +            reset_scope=reset_scope,
 +            fixed_total_token_budget=fixed_budget,
 +            adaptation_microbatch_size=microbatch,

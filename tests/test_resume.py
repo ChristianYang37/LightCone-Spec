@@ -35,7 +35,6 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     assert state.skip_pending("preflight", "dependency unavailable") == 1
     assert state.status_counts("preflight") == {"completed": 1, "failed": 1, "skipped": 1}
     assert state.finish_stage("preflight") == "failed"
-    assert state.finish_stage("preflight", allow_failed=True) == "completed"
 
 
 def test_node_can_expand_without_changing_existing_rows(tmp_path: Path):
@@ -45,6 +44,18 @@ def test_node_can_expand_without_changing_existing_rows(tmp_path: Path):
     state.add_jobs("E0-tune", probes)
     state.add_jobs("E0-tune", expanded)
     assert state.status_counts("E0-tune") == {"pending": 108 + 239}
+
+
+def test_internal_jobs_resume_without_adding_a_paper_stage(tmp_path: Path):
+    state = StateStore(tmp_path)
+    job = replace(
+        materialize("E1a")[0],
+        job_id="e1a-confidence-weight-0p1",
+        node="E1a-confidence-calibration",
+    )
+    state.add_internal_jobs((job,))
+    assert state.pending_jobs(job.node) == (job,)
+    assert all(row["node"] != job.node for row in state.stage_rows())
 
 
 def _config(tmp_path: Path) -> ExperimentConfig:

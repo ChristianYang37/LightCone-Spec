@@ -1,16 +1,17 @@
 import json
 import math
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from lightcone_spec.client import SGLangClient
+from lightcone_spec.client import GenerationResult, SGLangClient
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
 from lightcone_spec.protocol import materialize
-from lightcone_spec.runner import _fault_action_passed
+from lightcone_spec.runner import _canonical_accuracy, _fault_action_passed
 from lightcone_spec.server import (
     ServerProcess,
     StickyReplicaClient,
@@ -21,6 +22,7 @@ from lightcone_spec.server import (
 
 class Handler(BaseHTTPRequestHandler):
     fail = False
+    delay = 0.0
 
     def log_message(self, format, *args):
         return
@@ -48,7 +50,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
-        request = json.loads(self.rfile.read(length))
+        body = self.rfile.read(length)
+        if self.path in {"/start_profile", "/stop_profile"}:
+            self.send_response(200)
+            self.end_headers()
+            return
+        request = json.loads(body)
         if self.path == "/tokenize":
             body = json.dumps({"input_ids": [1, 2, 3]}).encode()
             self.send_response(200)
@@ -60,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
+        if Handler.delay:
+            time.sleep(Handler.delay)
         chunks = []
         for index, rid in enumerate(request["rid"]):
             chunks.append(
@@ -70,8 +79,8 @@ class Handler(BaseHTTPRequestHandler):
                         "id": rid, "prompt_tokens": 3, "completion_tokens": 2,
                         "finish_reason": {"type": "length"},
                         "native_token_timestamp_events": [
-                            {"token_index": 0, "token_id": 10, "observed_ns": 100},
-                            {"token_index": 1, "token_id": 11, "observed_ns": 100},
+                            {"token_index": 0, "token_id": 10, "committed_ns": 100},
+                            {"token_index": 1, "token_id": 11, "committed_ns": 100},
                         ],
                     },
                 }) + "\n\n"
@@ -93,6 +102,7 @@ def fake_server():
         yield server.server_address[1]
     finally:
         Handler.fail = False
+        Handler.delay = 0.0
         server.shutdown()
         thread.join()
 
@@ -119,11 +129,27 @@ def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     _, lengths = load_arrival_trace(trace, limit=3)
     assert lengths == ((32, 8), (64, 16), (128, 32))
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
-    rows, elapsed = client.run_scheduled(
+    run = client.run_scheduled(
         ("a", "b", "c"), offsets, max_new_tokens=2, seed=0
     )
-    assert len(rows) == 3
-    assert elapsed >= offsets[-1]
+    assert len(run.results) == 3
+    assert {row.status for row in run.outcomes} == {"completed"}
+    assert run.elapsed_seconds >= offsets[-1]
+
+
+def test_scheduled_dispatcher_does_not_queue_behind_worker_pool(fake_server):
+    Handler.delay = 0.05
+    client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
+    run = client.run_scheduled(
+        ("a", "b", "c"),
+        (0.0, 0.0, 0.0),
+        max_new_tokens=2,
+        seed=0,
+        max_in_flight=1,
+    )
+    assert [row.status for row in run.outcomes].count("completed") == 1
+    assert [row.status for row in run.outcomes].count("unfinished") == 2
+    assert sum(row.admitted_ns is not None for row in run.outcomes) == 1
 
 
 def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
@@ -196,9 +222,12 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert payload["optimizer"]["schedule_total_published_updates"] == max(
         8, math.ceil((16384 - 128) / 20)
     )
-    e1a = adaptation_payload(materialize("E1a")[0], {"optimizer": "adamw"})
+    e1a = adaptation_payload(
+        materialize("E1a")[0],
+        {"optimizer": "adamw", "confidence_loss_weight": 0.25},
+    )
     assert e1a["fixed_total_token_budget"] == 8
-    assert e1a["confidence_loss_weight"] == 0.1
+    assert e1a["confidence_loss_weight"] == 0.25
 
 
 def test_sticky_replica_routing_is_repeatable():
@@ -216,6 +245,8 @@ def test_fake_reset_tokenize_and_abort(fake_server):
     assert client.tokenize("hello") == (1, 2, 3)
     client.reset()
     client.abort("request-id")
+    client.start_profile(cuda_range=True)
+    client.stop_profile()
     metrics = {
         "nonfinite_updates": 1,
         "oom_events": 0,
@@ -245,3 +276,28 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     )
     assert command[command.index("--max-running-requests") + 1] == "256"
     assert "--disable-overlap-schedule" not in command
+
+
+def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("lightcone_spec.runner.shutil.which", lambda name: None)
+    result = GenerationResult(
+        request_id="r",
+        input_tokens=1,
+        completion_tokens=1,
+        ttft_ms=1.0,
+        inter_token_ms=(),
+        elapsed_seconds=1.0,
+        stop_reason="length",
+        output_ids=(1,),
+        output_text="open('/root/should-not-exist', 'w')",
+        native_token_timestamps_ns=(1,),
+    )
+    score, scorer, verdicts = _canonical_accuracy(
+        "HumanEval",
+        (result,),
+        {"examples": ({"test_metadata": "assert True"},)},
+        tmp_path / "python",
+    )
+    assert score is None
+    assert "bubblewrap" in scorer
+    assert verdicts == []

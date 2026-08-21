@@ -41,6 +41,7 @@ REGIMES = (
     "multi_turn_shared_prefix",
 )
 E3_STRATA = ("controlled_baseline", "LiveCodeBench", "MATH-500")
+E3_TASK_BY_REGIME = dict(zip(REGIMES, E3_STRATA, strict=True))
 CONCURRENCY = (1, 2, 4, 8, 16, 32, 64)
 WIDTHS = (4, 8, 16)
 ROLES = ("target_only", "static", "tts", "l0_naive", "lightcone")
@@ -72,6 +73,15 @@ E5_FAILURES = (
     "replica_drain",
     "replica_restart",
 )
+E5_WARMUP_SECONDS = 10
+E5_HEADLINE_SECONDS = 60
+E5_SOAK_SECONDS = 300
+E5_REQUEST_DEADLINE_SECONDS = 120
+E5_DRAIN_SECONDS = 180
+E5_P99_MIN_COMPLETED = 10_000
+E5_P99_EXTENSION_REQUESTS = 11_000
+E1_REFERENCE_LOAD = "c1"
+CONFIDENCE_WEIGHTS = (0.05, 0.1, 0.25, 0.5)
 E4_LOADS = ("low", "moderate", "saturation")
 E4_TRAFFIC = ("pure_decode", "mixed_prefill_decode")
 E4_SCREEN_LEVELS = {
@@ -204,15 +214,13 @@ def _e3a() -> Iterator[dict[str, Any]]:
     for context_index, context in enumerate(
         value for value in CONTEXTS if value not in LONG_CONTEXTS
     ):
-        for regime_index, (regime, method) in enumerate(
-            itertools.product(REGIMES, ("target_only", "static"))
-        ):
-            task = E3_STRATA[(context_index + regime_index // 2) % len(E3_STRATA)]
+        for regime, method in itertools.product(REGIMES, ("target_only", "static")):
+            task = E3_TASK_BY_REGIME[regime]
             yield dict(method=method, model="Qwen/Qwen3-8B", backend="NONE" if method == "target_only" else "DFLASH", task=task, context=context, load="c1", width=None if method == "target_only" else 8, regime=regime)
-    for condition_index, (context, regime, concurrency) in enumerate(
-        itertools.product(LONG_CONTEXTS, REGIMES, CONCURRENCY)
+    for context, regime, concurrency in itertools.product(
+        LONG_CONTEXTS, REGIMES, CONCURRENCY
     ):
-        task = E3_STRATA[condition_index % len(E3_STRATA)]
+        task = E3_TASK_BY_REGIME[regime]
         yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task=task, context=context, load=f"c{concurrency}", regime=regime)
         for width in WIDTHS:
             yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task=task, context=context, load=f"c{concurrency}", width=width, regime=regime)
@@ -236,9 +244,12 @@ def e2_candidates(geometries: Iterable[dict[str, Any]] | None = None) -> tuple[d
 
 
 def _e2(round_index: int, candidates: Iterable[dict[str, Any]] | None) -> Iterator[dict[str, Any]]:
-    rows = list(candidates if candidates is not None else e2_candidates())
-    target = [3360, 840, 210, 53][round_index]
-    for candidate in rows[:target]:
+    rows = (
+        list(candidates)
+        if candidates is not None
+        else list(e2_candidates())[: (3360, 840, 210, 53)[round_index]]
+    )
+    for candidate in rows:
         recipe = {
             key: value
             for key, value in candidate.items()
@@ -336,10 +347,10 @@ def _e3b(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
         )
     )
     for block in blocks:
-        for condition_index, (context, regime, load, panel) in enumerate(conditions):
-            task = E3_STRATA[condition_index % len(E3_STRATA)]
+        for context, regime, load, panel in conditions:
+            task = E3_TASK_BY_REGIME[regime]
             for role in ROLES:
-                yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", task=task, context=context, load=load, block=block, regime=regime, width_panel=panel)
+                yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", comparison_backend="DFLASH", task=task, context=context, load=load, block=block, regime=regime, width_panel=panel)
 
 
 def _e1a() -> Iterator[dict[str, Any]]:
@@ -374,7 +385,7 @@ def _e5_failures() -> Iterator[dict[str, Any]]:
 
 def _e6(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
     for block, model, role, task, context in itertools.product(blocks, E6_MODELS, ROLES, ("LiveCodeBench", "MATH-500"), (4096, 16384, 32768)):
-        yield dict(method=role, model=model, backend="NONE" if role == "target_only" else "NEXTN", task=task, context=context, load="common_slo_load", block=block, gpu_count=2)
+        yield dict(method=role, model=model, backend="NONE" if role == "target_only" else "NEXTN", comparison_backend="NEXTN", task=task, context=context, load="common_slo_load", block=block, gpu_count=2)
 
 
 def _e0_probes() -> tuple[tuple[str, str, str], ...]:

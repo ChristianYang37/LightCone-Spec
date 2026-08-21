@@ -18,6 +18,12 @@ The intended machine is one host with two RTX PRO 6000 Blackwell 96 GB GPUs.
 Models, datasets, the Python environment, profilers, and a local SGLang checkout
 must already exist at the absolute paths in the configuration.
 
+Raw benchmark downloads are converted once with
+`scripts/prepare_datasets.py` and an explicit `task,problem_id,split` CSV.
+Code benchmarks require `bwrap` and `prlimit`. Chat benchmarks use judge
+credentials from `LIGHTCONE_JUDGE_*` environment variables; credentials are
+never stored in the experiment package.
+
 ```bash
 cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 # Edit only the absolute local paths and runtime settings.
@@ -27,7 +33,8 @@ cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 On the first invocation, `run_paper.sh` checks and applies the four SGLang
 diffs in lexical order, writes `.lightcone-spec-patched` in the SGLang checkout,
 and starts the paper runner. Later invocations use the marker and resume the
-same `run_name` from `state.sqlite`. A dirty project or SGLang worktree does not
+same `run_name` from `state.sqlite`; a small import smoke confirms the required
+runtime APIs. A dirty project or SGLang worktree does not
 block execution, although a conflicting SGLang edit can make `git apply
 --check` fail with a normal patch conflict.
 
@@ -78,11 +85,13 @@ exactness violations, and failed scientific gates do not retry automatically.
 
 ```text
 results/run-name/
+├── environment.json
 ├── paper.yaml
 ├── state.sqlite
 ├── jobs/<readable-job-id>/attempt-01/
 │   ├── config.json
 │   ├── requests.jsonl
+│   ├── request_outcomes.jsonl
 │   ├── cycles.jsonl
 │   ├── metrics.json
 │   ├── server.log
@@ -99,7 +108,7 @@ reuse the model process through an idle-only configure/reset endpoint; a layout,
 parallelism, model, backend, width, profiler, or fault-device change starts a new
 process. Paired methods stay ordered on the same GPU. Two independent single-GPU
 queues may overlap; TP2, DP2, E5, and E6 cells reserve both devices. Preflight
-measures paired goodput and ITL interference with relative BCa intervals.
+measures paired goodput and scheduler-commit ITL interference with relative BCa intervals.
 Headline blocks overlap only when both mean effects are within 1% and both
 intervals include zero.
 
@@ -107,7 +116,7 @@ intervals include zero.
 
 ```bash
 python -m pip install -e '.[dev]'
-ruff check src tests scripts/gpu_acceptance.py
+ruff check src tests scripts
 pytest -q
 lightcone-spec --help
 ```

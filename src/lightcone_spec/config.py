@@ -220,13 +220,18 @@ class ExperimentConfig:
     def draft_path(self, model: str, backend: str) -> Path | None:
         if backend in {"NONE", "TARGET_ONLY"}:
             return None
-        for key in (f"{model}|{backend}", backend, model):
-            if key in self.drafts:
-                return self.drafts[key]
+        key = f"{model}|{backend}"
+        if key in self.drafts:
+            return self.drafts[key]
         raise KeyError(f"no local draft path configured for {model} with {backend}")
 
+    def has_exact_draft(self, model: str, backend: str) -> bool:
+        if backend in {"NONE", "TARGET_ONLY", "NEXTN"}:
+            return True
+        return f"{model}|{backend}" in self.drafts
+
     def dataset_path(self, task: str) -> Path:
-        for key in (task, task.lower(), task.replace("-", "").lower()):
-            if key in self.datasets:
-                return self.datasets[key]
-        raise KeyError(f"no local dataset path configured for {task}")
+        try:
+            return self.datasets[task]
+        except KeyError as error:
+            raise KeyError(f"no exact local dataset path configured for {task}") from error

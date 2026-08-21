@@ -101,44 +101,30 @@ new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/managers/native_token_timestamps.py
 @@ -0,0 +1,61 @@
-+"""CPU observation times for committed output tokens.
-+
-+This hook records host observation time after stop handling, when
-+``Req.output_ids_through_stop`` is authoritative. It is not a CUDA event and
-+must never be described as the token's device production time.
-+"""
++"""Scheduler commit times for output tokens."""
 +
 +from __future__ import annotations
 +
-+import time
-+from typing import Any, Callable, Optional, Sequence
++from typing import Any, Optional, Sequence
 +
 +
 +NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
-+NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "cpu_committed_token_observed_at_streamer_v1"
-+NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_OBSERVATION_ONLY"
++NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "scheduler_committed_token_v1"
++NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "SCHEDULER_COMMIT"
 +
 +
-+def observe_committed_output_tokens(
-+    req: Any,
-+    *,
-+    clock: Callable[[], int] = time.monotonic_ns,
++def record_committed_output_tokens(
++    req: Any, token_ids: Sequence[int], committed_ns: int
 +) -> None:
-+    """Append one ordered host observation for every newly committed token."""
++    """Record one scheduler time for every token in the same commit."""
 +
 +    if not getattr(req, "return_native_token_timestamps", False):
 +        return
-+    output_ids = tuple(int(token) for token in req.output_ids_through_stop)
 +    events = req.native_token_timestamp_events
-+    if len(output_ids) < len(events):
-+        raise RuntimeError("committed output-token coverage moved backwards")
-+    if tuple(event[0] for event in events) != output_ids[: len(events)]:
-+        raise RuntimeError("committed output-token prefix changed after observation")
-+    for token_id in output_ids[len(events) :]:
-+        observed_ns = int(clock())
-+        if observed_ns < 0 or (events and observed_ns <= events[-1][1]):
-+            raise RuntimeError("native token timestamps must be strictly increasing")
-+        events.append((token_id, observed_ns))
++    committed_ns = int(committed_ns)
++    if committed_ns < 0 or (events and committed_ns < events[-1][1]):
++        raise RuntimeError("native token timestamps moved backwards")
++    events.extend((int(token_id), committed_ns) for token_id in token_ids)
 +
 +
 +def slice_native_token_timestamp_events(
@@ -158,7 +144,7 @@ new file mode 100644
 +        {
 +            "token_index": start + offset,
 +            "token_id": int(token_id),
-+            "observed_ns": int(observed_ns),
++            "committed_ns": int(observed_ns),
 +        }
 +        for offset, (token_id, observed_ns) in enumerate(selected)
 +    ]
@@ -270,6 +256,25 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
 +                "controlled_candidate_equal": online.get(
 +                    "controlled_candidate_equal", False
 +                ),
++                "confidence_brier": online.get("confidence_brier"),
++                "confidence_ece": online.get("confidence_ece"),
++                "resident_bytes": online.get("resident_bytes", 0),
++                "peak_bytes": online.get("peak_bytes", 0),
++                "optimizer_bytes": online.get("optimizer_bytes", 0),
++                "trainable_parameters": online.get("trainable_parameters", 0),
++                "memory_ledger": online.get("memory_ledger", {}),
++                "parameter_layout": online.get("parameter_layout"),
++                "graph_replay_hit_rate": online.get("graph_replay_hit_rate"),
++                "main_side_overlap_ratio": online.get("main_side_overlap_ratio"),
++                "max_batch_size": online.get("max_batch_size", 0),
++                "max_queue_occupancy": online.get("max_queue_occupancy", 0),
++                "timings_ms": online.get("timings_ms", {}),
++                "updates": online.get("updates", []),
++                "rounds": online.get("rounds", []),
++                "teacher_row_acquisitions": online.get(
++                    "teacher_row_acquisitions", []
++                ),
++                "active_version": online.get("active_version", 0),
 +            }
 +            for name in counter_names:
 +                speed[name] = int(counters[name])
@@ -281,10 +286,27 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -2,6 +2,7 @@
+ 
+ import logging
++import time
+ from dataclasses import dataclass
+ from typing import (
+@@ -13,6 +14,9 @@
+ 
+ import torch
+ 
++from sglang.srt.managers.native_token_timestamps import (
++    record_committed_output_tokens,
++)
+ from sglang.srt.disaggregation.utils import DisaggregationMode
 @@ -232,6 +232,8 @@ class SchedulerBatchResultProcessor:
  
                      # req output_ids are set here
                      req.output_ids.append(next_token_id)
++                    record_committed_output_tokens(
++                        req, (next_token_id,), time.monotonic_ns()
++                    )
 +                    if self.metrics_reporter.speed_study_enabled:
 +                        self.metrics_reporter.speed_study_committed_tokens += 1
  
@@ -294,6 +316,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_proces
  
              req.output_ids.extend(next_token_id)
              new_accept_len = len(next_token_id)
++            record_committed_output_tokens(req, next_token_id, time.monotonic_ns())
 +            if self.metrics_reporter.speed_study_enabled:
 +                self.metrics_reporter.speed_study_committed_tokens += new_accept_len
  
@@ -354,7 +377,6 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
      wrap_as_pickle,
  )
 +from sglang.srt.managers.native_token_timestamps import (
-+    observe_committed_output_tokens,
 +    slice_native_token_timestamp_events,
 +)
  from sglang.srt.managers.schedule_batch import (
@@ -372,9 +394,6 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
              self.output_token_sampling_logprobs = []
  
      def accept(self, *, req: Req) -> None:
-+        # Observe after finish/stop handling has made output_ids_through_stop
-+        # authoritative, even when this scheduler step is not emitted as SSE.
-+        observe_committed_output_tokens(req)
          if req.finished():
              assert not req.finished_output
              req.finished_output = True
@@ -445,10 +464,10 @@ diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt
 +                                "sglang.schema_v3.native_per_token_timestamp.v1"
 +                            ),
 +                            "native_token_timestamp_semantics": (
-+                                "cpu_committed_token_observed_at_streamer_v1"
++                                "scheduler_committed_token_v1"
 +                            ),
 +                            "native_token_timestamp_release_status": (
-+                                "CPU_OBSERVATION_ONLY"
++                                "SCHEDULER_COMMIT"
 +                            ),
 +                            "native_token_timestamp_request_id": recv_obj.rids[i],
 +                            "native_token_timestamp_request_started_ns": (

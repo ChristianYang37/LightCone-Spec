@@ -11,6 +11,7 @@ import pandas as pd
 
 PROMPT_FIELDS = ("prompt", "problem", "question", "text", "instruction", "input")
 ID_FIELDS = ("problem_id", "question_id", "id", "task_id")
+SPLITS = {"tuning", "pilot", "final", "holdout"}
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -33,66 +34,103 @@ def _rows(path: Path) -> list[dict[str, Any]]:
 
 
 def load_prompt_records(
-    path: Path, *, limit: int, selection_seed: int = 0
+    path: Path,
+    *,
+    limit: int,
+    split: str,
+    selection_seed: int = 0,
+    allow_repeat: bool = False,
 ) -> tuple[dict[str, Any], ...]:
-    available = load_prompt_pool(path)
-    if len(available) < limit:
+    available = tuple(row for row in load_prompt_pool(path) if row["split"] == split)
+    if not available:
+        raise ValueError(f"dataset {path} supplied no {split} prompts")
+    if len(available) < limit and not allow_repeat:
         raise ValueError(f"dataset {path} supplied {len(available)} prompts; {limit} required")
-    indexes = list(range(len(available)))
-    random.Random(selection_seed).shuffle(indexes)
-    return tuple(available[index] for index in indexes[:limit])
+    selected: list[dict[str, Any]] = []
+    cycle = 0
+    while len(selected) < limit:
+        indexes = list(range(len(available)))
+        random.Random(selection_seed + cycle).shuffle(indexes)
+        for index in indexes:
+            row = dict(available[index])
+            row["repeat_index"] = cycle
+            selected.append(row)
+            if len(selected) == limit:
+                break
+        cycle += 1
+    return tuple(selected)
 
 
 def load_prompt_pool(path: Path) -> tuple[dict[str, Any], ...]:
     available: list[dict[str, Any]] = []
     for index, row in enumerate(_rows(path)):
         value = next((row[field] for field in PROMPT_FIELDS if isinstance(row.get(field), str) and row[field].strip()), None)
-        if value is not None:
-            identity = next(
-                (str(row[field]) for field in ID_FIELDS if row.get(field) is not None),
-                f"row-{index:06d}",
-            )
-            available.append(
-                {
-                    "problem_id": identity,
-                    "split": row.get("split"),
-                    "prompt": value,
-                    "template": row.get("template"),
-                    "reference": row.get("reference", row.get("answer")),
-                    "test_metadata": row.get("test_metadata", row.get("tests")),
-                }
-            )
-    return tuple(available)
-
-
-def load_prompts(path: Path, *, limit: int, offset: int = 0) -> tuple[str, ...]:
-    return tuple(
-        row["prompt"]
-        for row in load_prompt_records(path, limit=limit, selection_seed=offset)
-    )
-
-
-def load_tts_calibration(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    identified: list[tuple[str, str, str]] = []
-    for index, row in enumerate(_rows(path)):
-        prompt = next(
-            (
-                row[field]
-                for field in PROMPT_FIELDS
-                if isinstance(row.get(field), str) and row[field].strip()
-            ),
-            None,
-        )
-        if prompt is None:
-            continue
         identity = next(
             (str(row[field]) for field in ID_FIELDS if row.get(field) is not None),
             None,
         )
         split = row.get("split")
-        if identity is None or split not in {"tuning", "holdout"}:
-            continue
-        identified.append((identity, prompt, split))
+        if identity is None or split not in SPLITS:
+            raise ValueError(
+                f"dataset row {index} requires problem_id and an explicit split"
+            )
+        if value is None:
+            raise ValueError(f"dataset row {index} requires a prompt or template input")
+        if not any(
+            field in row for field in ("reference", "answer", "test_metadata", "tests")
+        ):
+            raise ValueError(
+                f"dataset row {index} requires explicit reference or test metadata"
+            )
+        template = row.get("template")
+        if template is not None:
+            if not isinstance(template, str):
+                raise ValueError(f"dataset row {index} template must be text")
+            try:
+                value = template.format(**row)
+            except (KeyError, ValueError) as error:
+                raise ValueError(
+                    f"dataset row {index} template cannot be rendered: {error}"
+                ) from error
+        turns = row.get("turns")
+        if turns is not None:
+            if not isinstance(turns, list) or not all(
+                isinstance(turn, str) and turn.strip() for turn in turns
+            ):
+                raise ValueError(f"dataset row {index} turns must be non-empty text")
+            value = "\n".join(turns)
+        available.append(
+            {
+                "problem_id": identity,
+                "split": split,
+                "prompt": value,
+                "template": template,
+                "turns": turns,
+                "reference": row.get("reference", row.get("answer")),
+                "test_metadata": row.get("test_metadata", row.get("tests")),
+            }
+        )
+    return tuple(available)
+
+
+def load_prompts(
+    path: Path, *, limit: int, split: str, offset: int = 0
+) -> tuple[str, ...]:
+    return tuple(
+        row["prompt"]
+        for row in load_prompt_records(
+            path, limit=limit, split=split, selection_seed=offset
+        )
+    )
+
+
+def load_tts_calibration(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    identified = tuple(
+        (row["problem_id"], row["prompt"], row["split"])
+        for row in load_prompt_pool(path)
+    )
+    if any(split not in {"tuning", "holdout"} for _, _, split in identified):
+        raise ValueError("TTS-Cal rows must use only tuning or holdout splits")
     tuning_rows = sorted(
         ((identity, prompt) for identity, prompt, split in identified if split == "tuning")
     )

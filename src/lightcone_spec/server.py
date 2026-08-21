@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .client import SGLangClient
+from .client import ScheduledRun, SGLangClient
 from .config import ExperimentConfig
 from .protocol import Job
 
@@ -108,12 +108,15 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "telemetry_detail": "profile" if job.node == "E4-profile" else "headline",
         "verification_mode": chosen.get("verification", "native_scheduler"),
         "controlled_candidate_replay": bool(chosen.get("controlled_replay", False)),
+        "controlled_candidate_role": chosen.get("controlled_candidate_role"),
         "failure_injection": chosen.get("failure"),
     }
     if job.node == "E1a" and chosen.get("verification") == "fixed_budget":
         payload["fixed_total_token_budget"] = 8
     if job.node == "E1a":
-        payload["confidence_loss_weight"] = 0.1
+        payload["confidence_loss_weight"] = float(
+            chosen.get("confidence_loss_weight", 0.1)
+        )
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
             "projection_radius": chosen.get("projection_radius"),
@@ -212,6 +215,8 @@ def server_command(
             str(config.profiler_tools["nsys"]),
             "profile",
             "--force-overwrite=true",
+            "--capture-range=cudaProfilerApi",
+            "--capture-range-end=stop",
             "-o",
             str(output_dir / "nsys"),
             *argv,
@@ -221,6 +226,8 @@ def server_command(
             str(config.profiler_tools["ncu"]),
             "--target-processes",
             "all",
+            "--profile-from-start",
+            "off",
             "--export",
             str(output_dir / "ncu"),
             *argv,
@@ -291,7 +298,11 @@ class GpuSampler:
 
     def start(self) -> None:
         if not self.output.exists():
-            self.output.write_text("timestamp,index,memory_used_mb,power_w,temperature_c,sm_clock_mhz\n", encoding="utf-8")
+            self.output.write_text(
+                "timestamp,index,memory_used_mb,gpu_util_pct,memory_util_pct,"
+                "power_w,energy_mj,temperature_c,sm_clock_mhz,pstate,throttle\n",
+                encoding="utf-8",
+            )
         self.thread.start()
         self.started = True
 
@@ -303,7 +314,9 @@ class GpuSampler:
     def _run(self) -> None:
         command = [
             "nvidia-smi",
-            "--query-gpu=timestamp,index,memory.used,power.draw,temperature.gpu,clocks.sm",
+            "--query-gpu=timestamp,index,memory.used,utilization.gpu,utilization.memory,"
+            "power.draw,total_energy_consumption,temperature.gpu,clocks.sm,pstate,"
+            "clocks_event_reasons.active",
             "--format=csv,noheader,nounits",
             "-i",
             ",".join(map(str, self.gpus)),
@@ -313,6 +326,25 @@ class GpuSampler:
             if result.returncode == 0:
                 with self.output.open("a", encoding="utf-8") as stream:
                     stream.write(result.stdout)
+            else:
+                fallback = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=timestamp,index,memory.used,utilization.gpu,"
+                        "utilization.memory,power.draw,temperature.gpu,clocks.sm,pstate",
+                        "--format=csv,noheader,nounits",
+                        "-i",
+                        ",".join(map(str, self.gpus)),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if fallback.returncode == 0:
+                    with self.output.open("a", encoding="utf-8") as stream:
+                        for line in fallback.stdout.splitlines():
+                            fields = [part.strip() for part in line.split(",")]
+                            stream.write(",".join((*fields[:6], "N/A", *fields[6:], "N/A")) + "\n")
             self.stop_event.wait(1.0)
 
 
@@ -483,6 +515,16 @@ class StickyReplicaClient:
         for replica in self.replicas:
             replica.reset()
 
+    def warmup(self, prompt, *, max_new_tokens: int, seed: int) -> None:
+        for index, replica in enumerate(self.replicas):
+            replica.run_batch(
+                (prompt,),
+                max_new_tokens=max_new_tokens,
+                seed=seed + index,
+                routing_key=f"replica-warmup-{index}",
+            )
+        self.reset()
+
     def server_info(self) -> dict[str, object]:
         states = []
         for replica in self.replicas:
@@ -512,6 +554,9 @@ class StickyReplicaClient:
         seed: int,
         temperature: float = 0.0,
         routing_keys=None,
+        max_in_flight: int = 256,
+        deadline_seconds: float = 120.0,
+        drain_seconds: float = 180.0,
     ):
         prompt_rows = tuple(prompts)
         offsets = tuple(arrival_offsets)
@@ -521,25 +566,42 @@ class StickyReplicaClient:
             if isinstance(max_new_tokens, int)
             else tuple(max_new_tokens)
         )
+        groups: list[list[int]] = [[], []]
+        for index, key in enumerate(keys):
+            groups[self.replicas.index(self._replica(key))].append(index)
         started = time.perf_counter()
 
-        def submit(index: int):
-            delay = started + offsets[index] - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            rows, _ = self.run_batch(
-                (prompt_rows[index],),
-                max_new_tokens=budgets[index],
-                seed=seed + index,
+        def run_group(replica_index: int) -> ScheduledRun:
+            indexes = groups[replica_index]
+            return self.replicas[replica_index].run_scheduled(
+                (prompt_rows[index] for index in indexes),
+                (offsets[index] for index in indexes),
+                max_new_tokens=tuple(budgets[index] for index in indexes),
+                seed=seed,
                 temperature=temperature,
-                routing_key=keys[index],
-                request_ids=(f"scheduled-{index:05d}",),
+                routing_keys=(keys[index] for index in indexes),
+                request_ids=tuple(f"scheduled-{index:05d}" for index in indexes),
+                max_in_flight=max(1, max_in_flight // 2),
+                deadline_seconds=deadline_seconds,
+                drain_seconds=drain_seconds,
             )
-            return rows[0]
 
-        with ThreadPoolExecutor(max_workers=min(256, len(prompt_rows))) as pool:
-            rows = tuple(pool.map(submit, range(len(prompt_rows))))
-        return rows, time.perf_counter() - started
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            runs = tuple(
+                future.result()
+                for future in (
+                    pool.submit(run_group, index) for index in range(2) if groups[index]
+                )
+            )
+        results = sorted(
+            (result for run in runs for result in run.results),
+            key=lambda row: row.request_id,
+        )
+        outcomes = sorted(
+            (outcome for run in runs for outcome in run.outcomes),
+            key=lambda row: row.request_id,
+        )
+        return ScheduledRun(tuple(results), tuple(outcomes), time.perf_counter() - started)
 
 
 class ReplicaServerProcess:

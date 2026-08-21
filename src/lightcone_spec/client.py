@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 
 
@@ -31,17 +32,41 @@ class GenerationResult:
         return value
 
 
+@dataclass(frozen=True)
+class RequestOutcome:
+    request_id: str
+    status: str
+    offered_ns: int
+    admitted_ns: int | None
+    finished_ns: int | None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ScheduledRun:
+    results: tuple[GenerationResult, ...]
+    outcomes: tuple[RequestOutcome, ...]
+    elapsed_seconds: float
+
+
 def _native_events(meta: dict, output_ids: list[int]) -> tuple[int, ...]:
     events = meta.get("native_token_timestamp_events")
     if not isinstance(events, list) or len(events) != len(output_ids):
         raise RuntimeError("final response lacks complete native token timestamps")
     timestamps: list[int] = []
     for index, (event, token_id) in enumerate(zip(events, output_ids, strict=True)):
-        if not isinstance(event, dict) or set(event) != {"token_index", "token_id", "observed_ns"}:
+        if not isinstance(event, dict) or set(event) != {
+            "token_index",
+            "token_id",
+            "committed_ns",
+        }:
             raise RuntimeError("native token timestamp event is malformed")
         if event["token_index"] != index or event["token_id"] != token_id:
             raise RuntimeError("native token timestamps changed token trajectory")
-        observed = event["observed_ns"]
+        observed = event["committed_ns"]
         if not isinstance(observed, int) or observed < 0 or (timestamps and observed < timestamps[-1]):
             raise RuntimeError("native token timestamps are not monotone")
         timestamps.append(observed)
@@ -149,6 +174,34 @@ class SGLangClient:
             if response.status != 200:
                 raise RuntimeError("SGLang cache reset failed")
 
+    def start_profile(
+        self, *, output_dir: str | None = None, cuda_range: bool = False
+    ) -> None:
+        body: dict[str, object] = {
+            "activities": ["CUDA_PROFILER"] if cuda_range else ["CPU", "GPU"],
+            "with_stack": False,
+            "record_shapes": False,
+        }
+        if output_dir is not None:
+            body["output_dir"] = output_dir
+        request = urllib.request.Request(
+            f"{self.base_url}/start_profile",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            if response.status != 200:
+                raise RuntimeError("SGLang profiler start failed")
+
+    def stop_profile(self) -> None:
+        request = urllib.request.Request(
+            f"{self.base_url}/stop_profile", data=b"", method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            if response.status != 200:
+                raise RuntimeError("SGLang profiler stop failed")
+
     def server_info(self) -> dict[str, object]:
         with urllib.request.urlopen(f"{self.base_url}/server_info", timeout=self.timeout_seconds) as response:
             payload = json.loads(response.read())
@@ -180,6 +233,7 @@ class SGLangClient:
         request_id_prefix: str = "request",
         routing_key: str | None = None,
         request_ids: Sequence[str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[tuple[GenerationResult, ...], float]:
         prompt_rows = tuple(prompts)
         if not prompt_rows:
@@ -225,7 +279,9 @@ class SGLangClient:
             method="POST",
         )
         started = time.perf_counter()
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+        with urllib.request.urlopen(
+            request, timeout=timeout_seconds or self.timeout_seconds
+        ) as response:
             results = _consume_stream(response, request_ids, started)
         return results, time.perf_counter() - started
 
@@ -249,7 +305,11 @@ class SGLangClient:
         seed: int,
         temperature: float = 0.0,
         routing_keys: Iterable[str] | None = None,
-    ) -> tuple[tuple[GenerationResult, ...], float]:
+        request_ids: Sequence[str] | None = None,
+        max_in_flight: int = 256,
+        deadline_seconds: float = 120.0,
+        drain_seconds: float = 180.0,
+    ) -> ScheduledRun:
         prompt_rows = tuple(prompts)
         offsets = tuple(float(value) for value in arrival_offsets)
         if len(prompt_rows) != len(offsets) or not prompt_rows:
@@ -259,6 +319,13 @@ class SGLangClient:
         keys = tuple(routing_keys) if routing_keys is not None else (None,) * len(prompt_rows)
         if len(keys) != len(prompt_rows):
             raise ValueError("scheduled requests need one routing key per prompt")
+        ids = (
+            tuple(request_ids)
+            if request_ids is not None
+            else tuple(f"scheduled-{index:05d}" for index in range(len(prompt_rows)))
+        )
+        if len(ids) != len(prompt_rows) or len(set(ids)) != len(ids):
+            raise ValueError("scheduled requests need unique request IDs")
         budgets = (
             (max_new_tokens,) * len(prompt_rows)
             if isinstance(max_new_tokens, int)
@@ -266,22 +333,110 @@ class SGLangClient:
         )
         if len(budgets) != len(prompt_rows):
             raise ValueError("scheduled requests need one output length per prompt")
+        if max_in_flight < 1 or deadline_seconds <= 0 or drain_seconds < 0:
+            raise ValueError("scheduled request limits must be positive")
         started = time.perf_counter()
+        outcomes: list[RequestOutcome | None] = [None] * len(prompt_rows)
+        results: dict[int, GenerationResult] = {}
 
-        def submit(index: int) -> GenerationResult:
-            delay = started + offsets[index] - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
+        def submit(index: int, request_id: str) -> GenerationResult:
             rows, _ = self.run_batch(
                 (prompt_rows[index],),
                 max_new_tokens=budgets[index],
                 seed=seed + index,
                 temperature=temperature,
-                request_id_prefix=f"scheduled-{index:05d}",
                 routing_key=keys[index],
+                request_ids=(request_id,),
+                timeout_seconds=deadline_seconds,
             )
             return rows[0]
 
-        with ThreadPoolExecutor(max_workers=min(256, len(prompt_rows))) as pool:
-            results = tuple(pool.map(submit, range(len(prompt_rows))))
-        return results, time.perf_counter() - started
+        active: dict[Future[GenerationResult], tuple[int, str, int, int]] = {}
+
+        def finish(future: Future[GenerationResult]) -> None:
+            index, request_id, offered_ns, admitted_ns = active.pop(future)
+            finished_ns = time.monotonic_ns()
+            try:
+                results[index] = future.result()
+                outcomes[index] = RequestOutcome(
+                    request_id, "completed", offered_ns, admitted_ns, finished_ns
+                )
+            except TimeoutError as error:
+                outcomes[index] = RequestOutcome(
+                    request_id,
+                    "timed_out",
+                    offered_ns,
+                    admitted_ns,
+                    finished_ns,
+                    f"{type(error).__name__}: {error}",
+                )
+            except urllib.error.URLError as error:
+                status = "timed_out" if isinstance(error.reason, TimeoutError) else "error"
+                outcomes[index] = RequestOutcome(
+                    request_id,
+                    status,
+                    offered_ns,
+                    admitted_ns,
+                    finished_ns,
+                    f"{type(error).__name__}: {error}",
+                )
+            except Exception as error:
+                outcomes[index] = RequestOutcome(
+                    request_id,
+                    "error",
+                    offered_ns,
+                    admitted_ns,
+                    finished_ns,
+                    f"{type(error).__name__}: {error}",
+                )
+
+        with ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+            for index, offset in enumerate(offsets):
+                delay = started + offset - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                for future in tuple(active):
+                    if future.done():
+                        finish(future)
+                request_id = ids[index]
+                offered_ns = time.monotonic_ns()
+                if len(active) >= max_in_flight:
+                    outcomes[index] = RequestOutcome(
+                        request_id, "unfinished", offered_ns, None, None, "admission limit"
+                    )
+                    continue
+                admitted_ns = time.monotonic_ns()
+                future = pool.submit(submit, index, request_id)
+                active[future] = (index, request_id, offered_ns, admitted_ns)
+
+            drain_deadline = time.perf_counter() + drain_seconds
+            while active and time.perf_counter() < drain_deadline:
+                done, _ = wait(
+                    tuple(active),
+                    timeout=min(0.1, max(0.0, drain_deadline - time.perf_counter())),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    finish(future)
+            for future, (index, request_id, offered_ns, admitted_ns) in tuple(
+                active.items()
+            ):
+                future.cancel()
+                try:
+                    self.abort(request_id)
+                except Exception:
+                    pass
+                outcomes[index] = RequestOutcome(
+                    request_id,
+                    "unfinished",
+                    offered_ns,
+                    admitted_ns,
+                    time.monotonic_ns(),
+                    "drain deadline",
+                )
+                active.pop(future)
+        return ScheduledRun(
+            tuple(results[index] for index in sorted(results)),
+            tuple(outcome for outcome in outcomes if outcome is not None),
+            time.perf_counter() - started,
+        )

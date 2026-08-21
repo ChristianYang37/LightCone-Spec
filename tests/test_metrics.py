@@ -15,6 +15,7 @@ from lightcone_spec.metrics import (
     paired_relative_bca_interval,
     validate_scientific_metrics,
 )
+from lightcone_spec.runner import _natural_spline_fit
 
 
 def test_goodput_bootstrap_holm_and_power():
@@ -76,14 +77,15 @@ def test_final_block_statistics_are_paired_and_corrected():
                         "block": block,
                         "parameters": {"regime": "long"},
                     },
-                    {"goodput": goodput},
+                    {"goodput": goodput, "request_count": 10},
                 )
             )
     result = paired_block_statistics(rows)
     assert len(result) == 1
     assert result[0]["candidate"] == "lightcone"
     assert result[0]["blocks"] == list(range(4, 16))
-    assert result[0]["ci95_low"] > 0
+    assert result[0]["ci95_relative_low"] > 0
+    assert result[0]["reducer"] == "paired_log_goodput_bca"
     assert result[0]["holm_reject"] is True
 
 
@@ -100,7 +102,54 @@ def test_holm_only_marks_two_confirmatory_comparisons():
                 "method": method, "model": "m", "backend": "DFLASH",
                 "task": "t", "context": 4096, "load": "c1", "block": block,
                 "parameters": {},
-            }, {"goodput": goodput + block * slope}))
+            }, {"goodput": goodput + block * slope, "request_count": 10}))
     result = paired_block_statistics(rows)
     corrected = {(row["candidate"], row["baseline"]) for row in result if row["holm_reject"] is not None}
     assert corrected == {("lightcone", "static"), ("lightcone", "tts")}
+
+
+def test_pairing_uses_block_stimulus_but_ignores_runtime_backend_and_width():
+    rows = []
+    for block in range(4):
+        stimulus = f"shared-block-{block}"
+        for method, backend, width, goodput in (
+            ("target_only", "NONE", None, 100.0),
+            ("lightcone", "DFLASH", 16, 104.0 + block / 100),
+        ):
+            rows.append(
+                (
+                    {
+                        "method": method,
+                        "model": "m",
+                        "backend": backend,
+                        "task": "t",
+                        "context": 40928,
+                        "load": "c4",
+                        "width": width,
+                        "block": block,
+                        "parameters": {
+                            "comparison_backend": "DFLASH",
+                            "width_panel": "deployment_optimal",
+                            "stimulus_id": stimulus,
+                        },
+                    },
+                    {"goodput": goodput, "request_count": 10},
+                )
+            )
+    result = paired_block_statistics(rows)
+    assert [(row["candidate"], row["baseline"]) for row in result] == [
+        ("lightcone", "target_only")
+    ]
+
+
+def test_natural_spline_uses_fixed_interior_knots_and_natural_boundaries():
+    contexts = pytest.importorskip("numpy").array(
+        [1024, 2048, 4096, 8192, 16384, 24576, 32768, 40928], dtype=float
+    )
+    x = pytest.importorskip("numpy").log(contexts)
+    y = 0.2 * x + 0.01 * x**2
+    fitted, elasticity, curvature = _natural_spline_fit(x, y, x)
+    assert len(fitted) == len(contexts)
+    assert len(elasticity) == len(contexts)
+    assert abs(curvature[0]) < 1e-8
+    assert abs(curvature[-1]) < 1e-8

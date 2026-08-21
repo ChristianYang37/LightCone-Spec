@@ -52,13 +52,15 @@ if [[ ! -e "$marker" ]]; then
     echo "no SGLang patches found" >&2
     exit 1
   fi
-  git -C "$sglang_root" apply --check "${patches[@]}"
-  git -C "$sglang_root" apply "${patches[@]}"
+  git -C "$sglang_root" apply --recount --check "${patches[@]}"
+  git -C "$sglang_root" apply --recount "${patches[@]}"
   touch "$marker"
 else
   for module in \
     python/sglang/srt/speculative/online_adaptation_runtime.py \
     python/sglang/srt/speculative/dflash_online_adaptation.py \
+    python/sglang/srt/speculative/dspark_online_adaptation.py \
+    python/sglang/srt/speculative/online_adaptation_config.py \
     python/sglang/srt/managers/native_token_timestamps.py; do
     if [[ ! -f "$sglang_root/$module" ]]; then
       echo "patched SGLang is missing $module; remove $marker and restore a clean checkout" >&2
@@ -70,6 +72,16 @@ else
   grep -q 'native_token_timestamp_events' \
     "$sglang_root/python/sglang/srt/managers/native_token_timestamps.py"
 fi
+
+PYTHONPATH="$sglang_root/python" "$python_bin" - <<'PY'
+from sglang.srt.managers.native_token_timestamps import record_committed_output_tokens
+from sglang.srt.speculative.dspark_online_adaptation import dspark_composite_loss
+from sglang.srt.speculative.online_adaptation_config import OnlineAdaptationConfig
+
+assert callable(record_committed_output_tokens)
+assert callable(dspark_composite_loss)
+assert OnlineAdaptationConfig is not None
+PY
 
 exec env PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \
   "$python_bin" -m lightcone_spec.cli run --config "$config_path"
