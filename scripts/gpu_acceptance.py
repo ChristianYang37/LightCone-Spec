@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from lightcone_spec.data import load_prompts
 from lightcone_spec.metrics import SAFETY_COUNTERS, committed_goodput
 from lightcone_spec.protocol import Job
 from lightcone_spec.runner import _speed_metrics
-from lightcone_spec.server import ServerProcess
+from lightcone_spec.server import ReplicaServerProcess, ServerProcess, StickyReplicaClient
 
 
 def _write(path: Path, value: object) -> None:
@@ -32,7 +33,10 @@ def _job(
     block: int,
     model: str = "Qwen/Qwen3-8B",
     tp2: bool = False,
+    dp2: bool = False,
 ) -> Job:
+    if tp2 and dp2:
+        raise ValueError("TP2 and DP2 are separate acceptance cases")
     parameters: dict[str, object] = {
         "regime": "short_input_long_generation",
         "optimizer": "adam",
@@ -45,6 +49,8 @@ def _job(
     }
     if tp2:
         parameters["topology"] = "tp2_dp1"
+    if dp2:
+        parameters["topology"] = "two_replica_tp1_dp2"
     return Job(
         job_id=f"gpu-acceptance-{ordinal:03d}-{method}",
         node="E6-acceptance" if backend == "NEXTN" else "gpu-acceptance",
@@ -57,7 +63,7 @@ def _job(
         load="c8",
         width=None if method == "target_only" else 16,
         block=block,
-        gpu_count=2 if tp2 or backend == "NEXTN" else 1,
+        gpu_count=2 if tp2 or dp2 or backend == "NEXTN" else 1,
         parameters=parameters,
     )
 
@@ -72,7 +78,12 @@ def _measure(
     gpus = config.gpu_ids if job.gpu_count == 2 else (config.gpu_ids[0],)
     port = config.server.base_port + (2 if job.gpu_count == 2 else 0)
     output.mkdir(parents=True, exist_ok=True)
-    process = ServerProcess(
+    process_type = (
+        ReplicaServerProcess
+        if job.parameters.get("topology") == "two_replica_tp1_dp2"
+        else ServerProcess
+    )
+    process = process_type(
         config,
         job,
         gpus=gpus,
@@ -87,15 +98,36 @@ def _measure(
             offset=(job.block or 0) * 16,
         )
         prompts = tuple(tuple(client.tokenize(prompt)[-128:]) for prompt in raw)
-        client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
-        client.reset()
+        if isinstance(client, StickyReplicaClient):
+            client.warmup(prompts[0], max_new_tokens=16, seed=0)
+        else:
+            client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
+            client.reset()
         topology = str(job.parameters.get("topology", "tp1_dp1"))
         before = _speed_metrics(client.server_info(), topology)
-        results, elapsed = client.run_batch(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            seed=job.block or 0,
-        )
+        if isinstance(client, StickyReplicaClient):
+            routing_keys = tuple(f"cohort-{index % 4}" for index in range(len(prompts)))
+            run = client.run_scheduled(
+                prompts,
+                (0.0,) * len(prompts),
+                max_new_tokens=max_new_tokens,
+                seed=job.block or 0,
+                routing_keys=routing_keys,
+                max_in_flight=8,
+                deadline_seconds=config.server.request_timeout_seconds,
+                drain_seconds=config.server.request_timeout_seconds,
+            )
+            results, elapsed = run.results, run.elapsed_seconds
+            if len(run.outcomes) != len(prompts) or any(
+                outcome.status != "completed" for outcome in run.outcomes
+            ):
+                raise RuntimeError("DP2 acceptance did not complete every request")
+        else:
+            results, elapsed = client.run_batch(
+                prompts,
+                max_new_tokens=max_new_tokens,
+                seed=job.block or 0,
+            )
         after = _speed_metrics(client.server_info(), topology)
     intervals = [value for result in results for value in result.inter_token_ms]
     committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
@@ -112,11 +144,18 @@ def _measure(
         "committed_tokens": committed,
         "trajectories": [list(result.output_ids) for result in results],
         "counters": counters,
+        "rank_local": after["rank_local"],
+        "rank_aggregates": after["rank_aggregates"],
     }
     if any(counters.values()):
         raise RuntimeError(f"{job.method} reported nonzero safety counters: {counters}")
     if job.method not in {"target_only", "static"} and int(after["updates_published"]) < 1:
         raise RuntimeError(f"{job.method} did not publish an update")
+    if job.backend == "DSPARK":
+        for name in ("confidence_brier", "confidence_ece"):
+            value = after.get(name)
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise RuntimeError(f"DSpark did not report finite {name}")
     _write(output / "acceptance.json", row)
     return row
 
@@ -157,13 +196,22 @@ def smoke(args: argparse.Namespace) -> None:
         _job(4, "lightcone", "DFLASH", block=0),
         _job(5, "onlinespec_ogd", "DFLASH", block=0),
         _job(6, "lightcone", "DFLASH", block=0, tp2=True),
-        _job(7, "lightcone", "DSPARK", block=0),
+        _job(7, "lightcone", "DFLASH", block=0, dp2=True),
+        _job(8, "lightcone", "DSPARK", block=0),
         _job(
-            8,
-            "static",
+            9,
+            "lightcone",
             "NEXTN",
             block=0,
             model="Qwen/Qwen3.6-35B-A3B",
+            tp2=True,
+        ),
+        _job(
+            10,
+            "lightcone",
+            "NEXTN",
+            block=0,
+            model="Qwen/Qwen3.5-122B-A10B-FP8",
             tp2=True,
         ),
     )
