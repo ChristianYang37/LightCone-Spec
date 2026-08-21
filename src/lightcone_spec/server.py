@@ -158,6 +158,7 @@ def server_command(
         str(config.server.mem_fraction_static),
         "--random-seed",
         str(config.protocol.seed),
+        "--skip-server-warmup",
         "--speculative-speed-study-metrics",
     ]
     if job.parameters.get("regime") != "multi_turn_shared_prefix" and not job.parameters.get(

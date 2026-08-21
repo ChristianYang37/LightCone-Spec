@@ -285,6 +285,7 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     )
     assert command[command.index("--max-running-requests") + 1] == "256"
     assert "--disable-overlap-schedule" not in command
+    assert "--skip-server-warmup" in command
 
 
 def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Path):

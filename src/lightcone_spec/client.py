@@ -157,13 +157,11 @@ class SGLangClient:
         self.timeout_seconds = timeout_seconds
 
     def health(self) -> bool:
-        for endpoint in ("/health_generate", "/health"):
-            try:
-                with urllib.request.urlopen(self.base_url + endpoint, timeout=5) as response:
-                    if response.status == 200:
-                        return True
-            except Exception:
-                pass
+        try:
+            with urllib.request.urlopen(self.base_url + "/health", timeout=5) as response:
+                return response.status == 200
+        except Exception:
+            pass
         return False
 
     def reset(self) -> None:
