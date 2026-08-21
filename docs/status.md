@@ -1,6 +1,6 @@
 # Current status
 
-Empirical status: **UNMEASURED**.
+Empirical status: **GPU ACCEPTANCE INCOMPLETE**.
 
 Implemented locally:
 
@@ -15,9 +15,16 @@ Implemented locally:
   calibration without changing registered row counts;
 - focused CPU tests and default CI.
 
-Pending manual GPU acceptance:
+GPU acceptance completed on 2026-08-22:
 
-- Target-only, Static, TTS, L0-naive, LightCone, and OnlineSPEC smoke;
+- Target-only and Static/DFlash model-load, generation, native timing, HBM/KV,
+  and zero safety-counter smoke passed;
+- TTS/DFlash full-drafter startup and serialized warm-up passed after correcting
+  memory planning and side-effecting health checks.
+
+Still pending GPU acceptance:
+
+- TTS scored batch, L0-naive, LightCone, and OnlineSPEC smoke;
 - TP2 model load and publication check;
 - one DSpark adaptation cell;
 - one NEXTN interface cell;
@@ -29,5 +36,5 @@ Last read-only remote check: two idle RTX PRO 6000 Blackwell Server Edition
 GPUs (97,887 MiB each), driver 580.95.05, Python 3.12.3, Torch 2.11/CUDA 12.9,
 SGLang dev5, and FlashInfer 0.6.15. `nsys` and `ncu` are under
 `/root/lightcone-tts-runtime/cuda-12.9/bin`. The writable root volume had about
-32 GB free; the public NFS was read-only. No GPU experiment was executed, and
-the instance is shut down.
+32 GB free; the public NFS was read-only. No formal paper cell was executed.
+The last retry stopped after repeated SSH timeouts, and the instance is shut down.
