@@ -68,36 +68,43 @@ def main() -> None:
                 if split is None:
                     continue
                 found.add(problem_id)
+                reference = _first(
+                    row,
+                    (
+                        "reference",
+                        "answer",
+                        "solution",
+                        "canonical_solution",
+                        "output",
+                        "code",
+                    ),
+                )
+                test_metadata = _first(
+                    row,
+                    (
+                        "test_metadata",
+                        "tests",
+                        "test",
+                        "test_code",
+                        "test_list",
+                    ),
+                )
+                if reference is None and test_metadata is None:
+                    if task not in {"controlled_baseline", "TTS-Cal"}:
+                        raise ValueError(f"{task}:{problem_id} lacks reference or tests")
+                    test_metadata = {
+                        "scorer": "N/A",
+                        "reason": "protocol control task is not accuracy-scored",
+                    }
                 normalized = {
                     "problem_id": problem_id,
                     "split": split,
                     "prompt": prompt,
                     "template": row.get("template"),
                     "turns": turns,
-                    "reference": _first(
-                        row,
-                        (
-                            "reference",
-                            "answer",
-                            "solution",
-                            "canonical_solution",
-                            "output",
-                            "code",
-                        ),
-                    ),
-                    "test_metadata": _first(
-                        row,
-                        (
-                            "test_metadata",
-                            "tests",
-                            "test",
-                            "test_code",
-                            "test_list",
-                        ),
-                    ),
+                    "reference": reference,
+                    "test_metadata": test_metadata,
                 }
-                if normalized["reference"] is None and normalized["test_metadata"] is None:
-                    raise ValueError(f"{task}:{problem_id} lacks reference or tests")
                 stream.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         expected = {
             problem_id

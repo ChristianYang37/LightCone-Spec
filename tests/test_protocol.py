@@ -1,5 +1,7 @@
 import json
 import math
+import subprocess
+import sys
 
 import pytest
 
@@ -219,6 +221,30 @@ def test_dataset_split_and_template_are_explicit(tmp_path):
         + "\n"
     )
     assert load_prompt_records(native, limit=1, split="final")[0]["problem_id"] == "math-1"
+
+
+def test_control_dataset_conversion_does_not_invent_an_accuracy_target(tmp_path):
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps({"problem_id": "p1", "prompt": "hello"}) + "\n")
+    splits = tmp_path / "splits.csv"
+    splits.write_text("task,problem_id,split\ncontrolled_baseline,p1,tuning\n")
+    output = tmp_path / "prepared"
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/prepare_datasets.py",
+            "--task",
+            f"controlled_baseline={source}",
+            "--splits",
+            str(splits),
+            "--output-root",
+            str(output),
+        ],
+        check=True,
+    )
+    row = json.loads((output / "controlled_baseline.jsonl").read_text())
+    assert row["reference"] is None
+    assert row["test_metadata"]["scorer"] == "N/A"
 
 
 def test_e3_uses_three_explicit_strata_without_filler():
