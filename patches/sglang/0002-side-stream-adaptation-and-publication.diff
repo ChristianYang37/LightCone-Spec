@@ -539,9 +539,7 @@ new file mode 100644
 +        )
 +        trainable_bytes = sum(value.nbytes for value in self.optimizer.master)
 +        base_bytes = sum(value.nbytes for value in self.base.values())
-+        merge_bytes = (
-+            trainable_bytes if config.weight_update_mode == "full" else 2 * base_bytes
-+        )
++        merge_bytes = 0 if config.weight_update_mode == "full" else 2 * base_bytes
 +        candidate_scratch = estimate_functional_optimizer_scratch_bytes(
 +            self.optimizer,
 +            merge_bytes=merge_bytes,
@@ -1621,11 +1619,9 @@ new file mode 100644
 +) -> int:
 +    """Peak candidate state outside gradients and model activations.
 +
-+    The functional path retains trainable leaves, an optimizer proposal, and
-+    the validity-guarded proposal copied into the pending candidate. Backend
-+    publication may additionally materialize merged/staged inference tensors.
-+    Counting actual moment layouts keeps one-state optimizers from inheriting
-+    Adam's two-state reserve while still preventing Adam under-accounting.
++    The functional path retains one optimizer proposal. The pending candidate
++    owns references to those same tensors; it does not copy them. Backend
++    publication may additionally materialize merged inference tensors.
 +    """
 +
 +    if merge_bytes < 0:
@@ -1636,7 +1632,7 @@ new file mode 100644
 +
 +    master = bytes_of(optimizer.master)
 +    moments = bytes_of(optimizer.first) + bytes_of(optimizer.second)
-+    return master + 2 * (master + moments) + int(merge_bytes)
++    return master + moments + int(merge_bytes)
 +
 +
 +def _clip_fp32_gradients(

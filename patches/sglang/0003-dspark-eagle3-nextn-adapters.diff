@@ -2099,6 +2099,7 @@ new file mode 100644
 +            or getattr(model.config, "max_position_embeddings", config.canvas_tokens)
 +        )
 +        max_batch = max(1, int(server_args.max_running_requests))
++        training_batch = min(max_batch, config.adaptation_microbatch_size)
 +        self.runtime = OnlineCohortRuntime(
 +            config,
 +            device=self.device,
@@ -2133,12 +2134,12 @@ new file mode 100644
 +            )
 +        )
 +        activation_bytes = estimate_full_vocab_training_scratch_bytes(
-+            batch_tokens=max_batch * config.canvas_tokens,
++            batch_tokens=training_batch * config.canvas_tokens,
 +            vocab_size=vocab,
 +        )
 +        candidate_bytes = estimate_functional_optimizer_scratch_bytes(
 +            self.optimizer,
-+            merge_bytes=parameter_bytes,
++            merge_bytes=0,
 +        )
 +        scratch = parameter_bytes + activation_bytes + candidate_bytes
 +        self.runtime.bind_memory(

@@ -31,7 +31,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     base_port: int = 30000
     mem_fraction_static: float = 0.90
-    adaptation_reserve_mb: int = 16384
+    adaptation_reserve_mb: int = 32768
     startup_timeout_seconds: int = 900
     request_timeout_seconds: int = 900
     requests_per_cell: int = 16
@@ -106,7 +106,7 @@ class ExperimentConfig:
             host=host,
             base_port=int(server_data.get("base_port", 30000)),
             mem_fraction_static=float(server_data.get("mem_fraction_static", 0.90)),
-            adaptation_reserve_mb=int(server_data.get("adaptation_reserve_mb", 16384)),
+            adaptation_reserve_mb=int(server_data.get("adaptation_reserve_mb", 32768)),
             startup_timeout_seconds=int(server_data.get("startup_timeout_seconds", 900)),
             request_timeout_seconds=int(server_data.get("request_timeout_seconds", 900)),
             requests_per_cell=int(server_data.get("requests_per_cell", 16)),
