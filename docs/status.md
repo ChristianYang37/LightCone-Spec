@@ -17,14 +17,17 @@ Implemented locally:
 
 GPU acceptance completed on 2026-08-22:
 
-- Target-only and Static/DFlash model-load, generation, native timing, HBM/KV,
-  and zero safety-counter smoke passed;
+- Target-only model-load, generation, native timing, HBM/KV, and zero
+  safety-counter smoke passed;
+- Static/DFlash completed generation with zero safety counters but reported 536
+  committed tokens for a nominal 512-token batch; this remains unresolved;
 - TTS/DFlash full-drafter startup and serialized warm-up passed after correcting
   memory planning and side-effecting health checks.
 
 Still pending GPU acceptance:
 
-- TTS scored batch, L0-naive, LightCone, and OnlineSPEC smoke;
+- Static committed-token accounting, TTS scored batch, L0-naive, LightCone,
+  and OnlineSPEC smoke;
 - TP2 model load and publication check;
 - one DSpark adaptation cell;
 - one NEXTN interface cell;

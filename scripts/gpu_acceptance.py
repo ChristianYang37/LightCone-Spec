@@ -25,6 +25,16 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _validate_token_accounting(results, committed: int, budget: int) -> None:
+    output_tokens = sum(result.completion_tokens for result in results)
+    if any(result.completion_tokens != budget for result in results):
+        raise RuntimeError("generation did not honor the output-token budget")
+    if committed != output_tokens:
+        raise RuntimeError(
+            f"runtime committed {committed} tokens for {output_tokens} output tokens"
+        )
+
+
 def _job(
     ordinal: int,
     method: str,
@@ -140,6 +150,7 @@ def _measure(
         after = _speed_metrics(client.server_info(), topology)
     intervals = [value for result in results for value in result.inter_token_ms]
     committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+    _validate_token_accounting(results, committed, max_new_tokens)
     counters = {
         name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
     }
