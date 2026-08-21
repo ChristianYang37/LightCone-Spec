@@ -8,8 +8,9 @@ fi
 
 project_root="$(cd "$(dirname "$0")" && pwd)"
 config_path="$1"
+launcher_python="$(command -v python3 || command -v python)"
 
-runtime_paths="$(python3 - "$config_path" <<'PY'
+runtime_paths="$("$launcher_python" - "$config_path" <<'PY'
 import ast
 import sys
 
