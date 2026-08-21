@@ -413,6 +413,16 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  from sglang.srt.distributed.parallel_state_wrapper import ParallelState
  from sglang.srt.environ import envs
  from sglang.srt.managers.schedule_batch import ScheduleBatch
+@@ -53,6 +53,9 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
+     TargetVerifyExecutor,
+     verify_logits_adjustments_are_noop,
+ )
++from sglang.srt.speculative.dspark_online_adaptation import (
++    resolve_dspark_verification,
++)
+ from sglang.srt.speculative.spec_utils import (
+     GrammarTree,
+     build_grammar_vocab_mask,
 @@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
  
  
@@ -520,7 +530,25 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
              )
          draft_block_ids = proposal.draft_block_ids
          draft_block = proposal.draft_block
-@@ -681,6 +731,64 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -547,6 +593,17 @@ class DSparkWorkerV2(BaseSpecWorker):
+             prefix_lens=prefix_lens,
+             req_pool_indices=batch.req_pool_indices,
+         )
++        if (
++            online_adapter is not None
++            and online_adapter.config.verification_mode == "fixed_budget"
++        ):
++            verify_token_budget = resolve_dspark_verification(
++                mode="fixed_budget",
++                batch_size=bs,
++                verify_width=self.verify_num_draft_tokens,
++                fixed_total_token_budget=online_adapter.config.fixed_total_token_budget,
++                native_total_token_budget=None,
++            ).total_token_budget
+ 
+         global_num_reqs = (
+             max(batch.global_num_tokens)
+@@ -681,6 +742,79 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
@@ -556,6 +584,21 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +                        reduction="none",
 +                    ).sum(-1)
 +                    loss = (row_loss * valid_mask).sum() / valid_mask.sum().clamp_min(1)
++                    if (
++                        "native_heads" in online_adapter.config.parameter_scope
++                        and confidence is not None
++                    ):
++                        confidence_rows = confidence[:microbatch]
++                        accepted = valid_mask.to(confidence_rows.dtype)
++                        confidence_loss = F.binary_cross_entropy(
++                            confidence_rows.clamp(1e-6, 1 - 1e-6),
++                            accepted,
++                            reduction="none",
++                        )
++                        loss = loss + online_adapter.config.confidence_loss_weight * (
++                            (confidence_loss * valid_mask).sum()
++                            / valid_mask.sum().clamp_min(1)
++                        )
 +                    online_adapter.launch(
 +                        loss=loss,
 +                        request_ids=tuple(
@@ -1419,7 +1462,7 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
          # Adaptive speculative
          self.adaptive_controller: Optional[AdaptiveController] = None
          if server_args.speculative_adaptive:
-@@ -1034,6 +1090,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
+@@ -1034,5 +1090,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
  
          self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
  
@@ -1437,7 +1480,6 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
 +
      @property
      def war_fastpath_runner(self):
-         # Per the base contract: the step's last shared-buffer-reading phase is
 @@ -1102,6 +1170,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
              # Publish before draft_extend so the fence is at target-end.
              if on_publish is not None:
@@ -1878,7 +1920,7 @@ diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b
 new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,386 @@
 +"""Online updates shared by DSpark, EAGLE3, and NEXTN workers."""
 +
 +from __future__ import annotations
@@ -2208,10 +2250,17 @@ new file mode 100644
 +        self.runtime.record_device_commit(request_ids, new_seq_lens)
 +
 +    def finish_request(self, request_id: str) -> None:
-+        self.runtime.finish_request(request_id)
++        if self.runtime.finish_request(request_id):
++            self._restore_request_source()
 +
 +    def abort_request(self, request_id: str) -> None:
-+        self.runtime.abort_request(request_id)
++        if self.runtime.abort_request(request_id):
++            self._restore_request_source()
++
++    def _restore_request_source(self) -> None:
++        self.optimizer.reset(self.initial)
++        self.inference.stage(self.initial)
++        self.inference.publish()
 +
 +    def reset(self) -> None:
 +        self.runtime.reset()
@@ -2224,7 +2273,7 @@ new file mode 100644
 +        if config is None or adaptation_layout(config) != adaptation_layout(self.config):
 +            raise ValueError("native adaptation layout changed; restart the server")
 +        self.config = config
-+        self.runtime.config = config
++        self.runtime.reload_config(config)
 +        reconfigure_parameter_optimizer(self.optimizer, config)
 +
 +    def diagnostics(self) -> dict[str, object]:

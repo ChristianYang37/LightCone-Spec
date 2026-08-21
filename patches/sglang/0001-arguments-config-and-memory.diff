@@ -146,7 +146,7 @@ diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/
 new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,241 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -235,6 +235,8 @@ new file mode 100644
 +    telemetry_detail: str
 +    seed: int
 +    controlled_candidate_replay: bool
++    reset_scope: str
++    fixed_total_token_budget: int | None
 +    adaptation_microbatch_size: int = 1
 +    update_coalescing: int = 1
 +    stream_priority: str = "default"
@@ -314,6 +316,14 @@ new file mode 100644
 +            raise ValueError("confidence_loss_weight cannot be negative")
 +        if stream_priority not in {"default", "high"}:
 +            raise ValueError("stream_priority must be default or high")
++        reset_scope = str(value.get("reset_scope", "cohort"))
++        if reset_scope not in {"cohort", "request"}:
++            raise ValueError("reset_scope must be cohort or request")
++        fixed_budget = value.get("fixed_total_token_budget")
++        if fixed_budget is not None and (
++            not isinstance(fixed_budget, int) or fixed_budget < 1
++        ):
++            raise ValueError("fixed_total_token_budget must be a positive integer")
 +        if (tp_size, dp_size) not in {(1, 1), (2, 1), (1, 2)}:
 +            raise ValueError("online adaptation supports TP1, TP2, and two TP1 replicas")
 +        return cls(
@@ -336,6 +346,8 @@ new file mode 100644
 +            telemetry_detail=str(value.get("telemetry_detail", "headline")),
 +            seed=int(value.get("seed", 0)),
 +            controlled_candidate_replay=bool(value.get("controlled_candidate_replay", False)),
++            reset_scope=reset_scope,
++            fixed_total_token_budget=fixed_budget,
 +            adaptation_microbatch_size=microbatch,
 +            update_coalescing=coalescing,
 +            stream_priority=stream_priority,

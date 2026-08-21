@@ -11,11 +11,21 @@ paths:
     Qwen/Qwen3.6-35B-A3B: /root/models/Qwen3.6-35B-A3B
     Qwen/Qwen3.5-122B-A10B-FP8: /root/models/Qwen3.5-122B-A10B-FP8
   drafts:
-    DFLASH: /root/models/Qwen3-0.6B
-    DSPARK: /root/models/Qwen3-0.6B
-    EAGLE3: /root/models/Qwen3-8B-EAGLE3
+    Qwen/Qwen3-4B|DFLASH: /root/models/Qwen3-4B-DFLASH
+    Qwen/Qwen3-4B|DSPARK: /root/models/Qwen3-4B-DSPARK
+    Qwen/Qwen3-4B|EAGLE3: /root/models/Qwen3-4B-EAGLE3
+    Qwen/Qwen3-8B|DFLASH: /root/models/Qwen3-8B-DFLASH
+    Qwen/Qwen3-8B|DSPARK: /root/models/Qwen3-8B-DSPARK
+    Qwen/Qwen3-8B|EAGLE3: /root/models/Qwen3-8B-EAGLE3
+    Qwen/Qwen3-14B|DFLASH: /root/models/Qwen3-14B-DFLASH
+    Qwen/Qwen3-14B|DSPARK: /root/models/Qwen3-14B-DSPARK
+    Qwen/Qwen3-14B|EAGLE3: /root/models/Qwen3-14B-EAGLE3
+    Gemma4-12B|DFLASH: /root/models/Gemma4-12B-DFLASH
+    Gemma4-12B|DSPARK: /root/models/Gemma4-12B-DSPARK
+    Gemma4-12B|EAGLE3: /root/models/Gemma4-12B-EAGLE3
   datasets:
     controlled_baseline: /root/datasets/controlled-baseline.jsonl
+    TTS-Cal: /root/datasets/tts-cal.jsonl
     LiveCodeBench: /root/datasets/livecodebench.jsonl
     MATH-500: /root/datasets/math500.jsonl
     GSM8K: /root/datasets/gsm8k.jsonl

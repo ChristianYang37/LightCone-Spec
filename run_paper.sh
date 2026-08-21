@@ -65,6 +65,10 @@ else
       exit 1
     fi
   done
+  grep -q 'reset_scope' \
+    "$sglang_root/python/sglang/srt/speculative/online_adaptation_config.py"
+  grep -q 'native_token_timestamp_events' \
+    "$sglang_root/python/sglang/srt/managers/native_token_timestamps.py"
 fi
 
 exec env PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \

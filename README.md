@@ -56,7 +56,8 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 
 The registered row counts are 10, 360, 288, 68, 3364, 844, 214, 57, 48, 96,
 3, 1920, `480N`, 116, 2064, `450N`, 242, `60N`, `108+239V`, `64V`, and
-`16VN`, where four excluded pilot blocks select `N` in 12--20 and `V` is the
+`16VN`, where the four excluded E3b pilot blocks select one global `N` in
+12--20 and `V` is the
 number of executable E0 model/backend/task combinations.
 
 The runner preserves the paper gates that matter scientifically: proposal
@@ -98,8 +99,9 @@ reuse the model process through an idle-only configure/reset endpoint; a layout,
 parallelism, model, backend, width, profiler, or fault-device change starts a new
 process. Paired methods stay ordered on the same GPU. Two independent single-GPU
 queues may overlap; TP2, DP2, E5, and E6 cells reserve both devices. Preflight
-measures two-GPU interference and makes final headline blocks serial if the
-relative effect exceeds 1%.
+measures paired goodput and ITL interference with relative BCa intervals.
+Headline blocks overlap only when both mean effects are within 1% and both
+intervals include zero.
 
 ## Development checks
 

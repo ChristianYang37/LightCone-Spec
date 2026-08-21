@@ -40,6 +40,7 @@ REGIMES = (
     "short_input_long_generation",
     "multi_turn_shared_prefix",
 )
+E3_STRATA = ("controlled_baseline", "LiveCodeBench", "MATH-500")
 CONCURRENCY = (1, 2, 4, 8, 16, 32, 64)
 WIDTHS = (4, 8, 16)
 ROLES = ("target_only", "static", "tts", "l0_naive", "lightcone")
@@ -193,25 +194,33 @@ def _parameter_geometries() -> tuple[dict[str, Any], ...]:
 
 
 def _preflight() -> Iterator[dict[str, Any]]:
-    yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", preflight_kind="runtime_load", distribution_check=True)
+    yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", preflight_kind="runtime_load", distribution_check=True, controlled_pair_baseline=True)
     yield dict(method="l0_naive", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", controlled_replay=True, distribution_check=True, preflight_kind="exactness_memory")
     for block, mode, gpu in itertools.product(range(2), ("isolated", "concurrent"), range(2)):
-        yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="interference", context=4096, block=block, mode=mode, gpu_index=gpu)
+        yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", context=4096, block=block, mode=mode, gpu_index=gpu, workload="interference")
 
 
 def _e3a() -> Iterator[dict[str, Any]]:
-    for context in (value for value in CONTEXTS if value not in LONG_CONTEXTS):
-        for regime, method in itertools.product(REGIMES, ("target_only", "static")):
-            yield dict(method=method, model="Qwen/Qwen3-8B", backend="NONE" if method == "target_only" else "DFLASH", task="controlled_baseline", context=context, load="c1", width=None if method == "target_only" else 8, regime=regime)
-    for context, regime, concurrency in itertools.product(LONG_CONTEXTS, REGIMES, CONCURRENCY):
-        yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task="controlled_baseline", context=context, load=f"c{concurrency}", regime=regime)
+    for context_index, context in enumerate(
+        value for value in CONTEXTS if value not in LONG_CONTEXTS
+    ):
+        for regime_index, (regime, method) in enumerate(
+            itertools.product(REGIMES, ("target_only", "static"))
+        ):
+            task = E3_STRATA[(context_index + regime_index // 2) % len(E3_STRATA)]
+            yield dict(method=method, model="Qwen/Qwen3-8B", backend="NONE" if method == "target_only" else "DFLASH", task=task, context=context, load="c1", width=None if method == "target_only" else 8, regime=regime)
+    for condition_index, (context, regime, concurrency) in enumerate(
+        itertools.product(LONG_CONTEXTS, REGIMES, CONCURRENCY)
+    ):
+        task = E3_STRATA[condition_index % len(E3_STRATA)]
+        yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task=task, context=context, load=f"c{concurrency}", regime=regime)
         for width in WIDTHS:
-            yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", context=context, load=f"c{concurrency}", width=width, regime=regime)
+            yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task=task, context=context, load=f"c{concurrency}", width=width, regime=regime)
 
 
 def _tts_cal() -> Iterator[dict[str, Any]]:
     for lr, stride, block in itertools.product(TTS_LEARNING_RATES, TTS_STRIDES, PILOT_BLOCKS):
-        yield dict(method="tts", model="Qwen/Qwen3-8B", backend="DFLASH", task="tts_calibration", context=40928, width=16, block=block, learning_rate=lr, stride=stride, optimizer="adam", parameterization="full", scope="all")
+        yield dict(method="tts", model="Qwen/Qwen3-8B", backend="DFLASH", task="TTS-Cal", context=40928, width=16, block=block, learning_rate=lr, stride=stride, optimizer="adam", parameterization="full", scope="all", workload="tts_calibration")
 
 
 def _e1() -> Iterator[dict[str, Any]]:
@@ -259,7 +268,7 @@ def _e4_screen() -> Iterator[dict[str, Any]]:
                 method="lightcone",
                 model="Qwen/Qwen3-8B",
                 backend="DFLASH",
-                task="systems_screen",
+                task="controlled_baseline",
                 context=40928,
                 width=16,
                 load=load,
@@ -267,6 +276,7 @@ def _e4_screen() -> Iterator[dict[str, Any]]:
                 traffic=traffic,
                 chunked_prefill=traffic == "mixed_prefill_decode",
                 prefix_reuse=traffic == "mixed_prefill_decode",
+                workload="systems_screen",
                 **factors,
             )
 
@@ -286,7 +296,7 @@ def _e4_local(neighborhoods: dict[str, tuple[object, object]] | None) -> Iterato
                 method="lightcone",
                 model="Qwen/Qwen3-8B",
                 backend="DFLASH",
-                task="systems_local_factorial",
+                task="controlled_baseline",
                 context=40928,
                 width=16,
                 load=load,
@@ -295,6 +305,7 @@ def _e4_local(neighborhoods: dict[str, tuple[object, object]] | None) -> Iterato
                 chunked_prefill=traffic == "mixed_prefill_decode",
                 prefix_reuse=traffic == "mixed_prefill_decode",
                 graph_replay=True,
+                workload="systems_local_factorial",
                 **factors,
             )
 
@@ -305,18 +316,30 @@ def _e4_profiles() -> Iterator[dict[str, Any]]:
             method="lightcone",
             model="Qwen/Qwen3-8B",
             backend="DFLASH",
-            task="isolated_profile",
+            task="controlled_baseline",
             context=40928,
             width=16,
             gpu_count=2,
             profiler=profiler,
             graph_replay=True,
+            workload="isolated_profile",
         )
 
 
 def _e3b(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
-    for block, role, context, regime, load, panel in itertools.product(blocks, ROLES, CONTEXTS, REGIMES, ("concurrency_one", "common_load"), ("matched", "deployment_optimal")):
-        yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", task="long_context_confirmation", context=context, load=load, block=block, regime=regime, width_panel=panel)
+    conditions = tuple(
+        itertools.product(
+            CONTEXTS,
+            REGIMES,
+            ("concurrency_one", "common_load"),
+            ("matched", "deployment_optimal"),
+        )
+    )
+    for block in blocks:
+        for condition_index, (context, regime, load, panel) in enumerate(conditions):
+            task = E3_STRATA[condition_index % len(E3_STRATA)]
+            for role in ROLES:
+                yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", task=task, context=context, load=load, block=block, regime=regime, width_panel=panel)
 
 
 def _e1a() -> Iterator[dict[str, Any]]:
@@ -333,20 +356,20 @@ def _e1a() -> Iterator[dict[str, Any]]:
 def _e5_blocks(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
     for block, backend in itertools.product(blocks, ("DFLASH", "DSPARK")):
         for concurrency, role in itertools.product(E5_CONCURRENCY, ROLES):
-            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="production_crossover", context=40928, load=f"closed_loop_c{concurrency}", block=block, gpu_count=2)
+            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="LiveCodeBench", context=40928, load=f"closed_loop_c{concurrency}", block=block, gpu_count=2, workload="production_crossover")
         for factor, role in itertools.product(E5_LOADS, ROLES):
-            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="production_crossover", context=40928, load=f"lambda_{factor}", block=block, gpu_count=2)
+            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="LiveCodeBench", context=40928, load=f"lambda_{factor}", block=block, gpu_count=2, workload="production_crossover")
         for trace, role in itertools.product(E5_TRACES, ROLES):
-            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="production_crossover", context=40928, load=trace, block=block, gpu_count=2)
+            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="LiveCodeBench", context=40928, load=trace, block=block, gpu_count=2, workload="production_crossover")
         for topology, cohorts, popularity, role in itertools.product(
             E5_TOPOLOGIES, E5_COHORTS, E5_POPULARITY, ROLES
         ):
-            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="topology_cohort_capacity", context=40928, load="saturation", block=block, topology=topology, cohorts=cohorts, popularity=popularity, gpu_count=2)
+            yield dict(method=role, model="Qwen/Qwen3-8B", backend=backend, task="LiveCodeBench", context=40928, load="saturation", block=block, topology=topology, cohorts=cohorts, popularity=popularity, gpu_count=2, workload="topology_cohort_capacity")
 
 
 def _e5_failures() -> Iterator[dict[str, Any]]:
     for failure, backend, topology, cohorts in itertools.product(E5_FAILURES, ("DFLASH", "DSPARK"), E5_TOPOLOGIES, E5_COHORTS):
-        yield dict(method="lightcone", model="Qwen/Qwen3-8B", backend=backend, task="failure_injection", context=40928, load="c256" if failure == "queue_saturation" else "c1", gpu_count=2, failure=failure, topology=topology, cohorts=cohorts)
+        yield dict(method="lightcone", model="Qwen/Qwen3-8B", backend=backend, task="controlled_baseline", context=40928, load="c256" if failure == "queue_saturation" else "c1", gpu_count=2, failure=failure, topology=topology, cohorts=cohorts, workload="failure_injection")
 
 
 def _e6(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
@@ -446,11 +469,14 @@ def materialize(
         rows = itertools.chain(
             (
                 dict(
-                    method="static",
+                    method="lightcone",
                     model=model,
                     backend="NEXTN",
-                    task="interface_fit",
+                    task="LiveCodeBench",
+                    load="c1",
                     gpu_count=2,
+                    interface_fit=True,
+                    minimum_updates=1,
                 )
                 for model in E6_MODELS
             ),
@@ -470,6 +496,7 @@ def materialize(
                         backend=backend,
                         task=task,
                         probe=True,
+                        adaptive_probe=True,
                         gpu_count=2,
                     )
                     for model, backend, task in _e0_probes()

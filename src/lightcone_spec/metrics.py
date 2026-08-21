@@ -102,6 +102,25 @@ def paired_bca_interval(
     return observed, float(low), float(high)
 
 
+def paired_relative_bca_interval(
+    candidate: Iterable[float],
+    baseline: Iterable[float],
+    *,
+    resamples: int = 5000,
+    seed: int = 0,
+) -> tuple[float, float, float]:
+    left = np.asarray(tuple(candidate), dtype=np.float64)
+    right = np.asarray(tuple(baseline), dtype=np.float64)
+    if np.any(right <= 0):
+        raise ValueError("relative BCa requires positive baselines")
+    return paired_bca_interval(
+        left / right - 1.0,
+        np.zeros_like(right),
+        resamples=resamples,
+        seed=seed,
+    )
+
+
 def holm_decisions(p_values: Iterable[float], alpha: float = 0.05) -> tuple[bool, ...]:
     values = tuple(float(value) for value in p_values)
     if any(not 0 <= value <= 1 for value in values):
@@ -146,6 +165,47 @@ def block_bootstrap_interval(
     draws = np.mean(rows[indexes], axis=1)
     low, high = np.quantile(draws, (0.025, 0.975))
     return float(np.mean(rows)), float(low), float(high)
+
+
+def hierarchical_request_interval(
+    blocks: dict[int, Iterable[tuple[int, float]]],
+    *,
+    resamples: int = 1000,
+    seed: int = 0,
+) -> tuple[float, float, float]:
+    if len(blocks) < 3:
+        raise ValueError("hierarchical bootstrap requires at least three blocks")
+    samples = []
+    for rows in blocks.values():
+        array = np.asarray(tuple(rows), dtype=np.float64)
+        if (
+            array.ndim != 2
+            or array.shape[0] == 0
+            or array.shape[1] != 2
+            or np.any(~np.isfinite(array))
+            or np.any(array[:, 0] < 0)
+            or np.any(array[:, 1] <= 0)
+        ):
+            raise ValueError("request rows require non-negative tokens and positive time")
+        samples.append(array)
+    rng = np.random.default_rng(seed)
+    within = np.empty((resamples, len(samples)), dtype=np.float64)
+    points = []
+    for block_index, rows in enumerate(samples):
+        points.append(float(np.sum(rows[:, 0]) / np.max(rows[:, 1])))
+        indexes = rng.integers(0, len(rows), size=(resamples, len(rows)))
+        draws = rows[indexes]
+        within[:, block_index] = np.sum(draws[:, :, 0], axis=1) / np.max(
+            draws[:, :, 1], axis=1
+        )
+    block_indexes = rng.integers(
+        0, len(samples), size=(resamples, len(samples))
+    )
+    draws = np.mean(
+        within[np.arange(resamples)[:, None], block_indexes], axis=1
+    )
+    low, high = np.quantile(draws, (0.025, 0.975))
+    return float(np.mean(points)), float(low), float(high)
 
 
 def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.DataFrame:
@@ -198,7 +258,7 @@ def paired_block_statistics(
         ("onlinespec_ens", "static"),
     )
     results: list[dict[str, object]] = []
-    p_values: list[float] = []
+    confirmatory: list[tuple[int, float]] = []
     for key, methods in groups.items():
         for candidate_name, baseline_name in comparisons:
             if candidate_name not in methods or baseline_name not in methods:
@@ -228,8 +288,14 @@ def paired_block_statistics(
                     "p_value": p_value,
                 }
             )
-            p_values.append(p_value)
-    decisions = holm_decisions(p_values) if p_values else ()
-    for row, decision in zip(results, decisions, strict=True):
-        row["holm_reject"] = decision
+            if (candidate_name, baseline_name) in {
+                ("lightcone", "static"),
+                ("lightcone", "tts"),
+            }:
+                confirmatory.append((len(results) - 1, p_value))
+    decisions = holm_decisions([row[1] for row in confirmatory]) if confirmatory else ()
+    for row in results:
+        row["holm_reject"] = None
+    for (index, _), decision in zip(confirmatory, decisions, strict=True):
+        results[index]["holm_reject"] = decision
     return results

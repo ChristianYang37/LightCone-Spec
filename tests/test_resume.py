@@ -1,6 +1,11 @@
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import materialize
+from lightcone_spec.runner import _node_final_blocks, _save_or_validate_run_config
 from lightcone_spec.state import StateStore
 
 
@@ -40,3 +45,35 @@ def test_node_can_expand_without_changing_existing_rows(tmp_path: Path):
     state.add_jobs("E0-tune", probes)
     state.add_jobs("E0-tune", expanded)
     assert state.status_counts("E0-tune") == {"pending": 108 + 239}
+
+
+def _config(tmp_path: Path) -> ExperimentConfig:
+    return ExperimentConfig(
+        source=tmp_path / "source.yaml",
+        run_name="run",
+        sglang_root=tmp_path / "sglang",
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+
+
+def test_plain_config_resume_and_global_final_n(tmp_path: Path):
+    config = _config(tmp_path)
+    config.run_dir.mkdir()
+    _save_or_validate_run_config(config)
+    _save_or_validate_run_config(config)
+    changed = replace(config, server=replace(config.server, max_new_tokens=128))
+    with pytest.raises(RuntimeError, match="different experiment config"):
+        _save_or_validate_run_config(changed)
+
+    state = StateStore(config.run_dir)
+    state.set_selection("global_final_blocks", 17)
+    assert _node_final_blocks(config, state, "E3b-final") == 17
+    assert _node_final_blocks(config, state, "E5-final") == 17
+    assert _node_final_blocks(config, state, "E6-final") == 17
+    assert _node_final_blocks(config, state, "E0-final") == 17

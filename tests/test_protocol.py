@@ -1,7 +1,10 @@
+import json
 import math
 
+from lightcone_spec.config import ExperimentConfig
+from lightcone_spec.data import load_tts_calibration
 from lightcone_spec.protocol import PAPER_NODES, default_row_counts, materialize, paper_plan
-from lightcone_spec.runner import _request_count
+from lightcone_spec.runner import _e5_execution_phases, _request_count
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 
@@ -36,10 +39,13 @@ def test_readable_ids_and_dynamic_e0_grid():
 
 def test_two_gpu_exclusivity_and_real_interface_probes():
     assert {job.gpu_count for job in materialize("E5-pilot")} == {2}
-    assert {job.method for job in materialize("E6-pilot")[:2]} == {"static"}
-    assert {job.method for job in materialize("E0-tune", valid_e0=[])[:108]} == {
-        "static"
-    }
+    interfaces = materialize("E6-pilot")[:2]
+    assert {job.method for job in interfaces} == {"lightcone"}
+    assert all(job.parameters["interface_fit"] for job in interfaces)
+    assert all(job.parameters["minimum_updates"] == 1 for job in interfaces)
+    probes = materialize("E0-tune", valid_e0=[])[:108]
+    assert {job.method for job in probes} == {"static"}
+    assert all(job.parameters["adaptive_probe"] for job in probes)
 
 
 def test_registered_axes_reach_runtime_parameters():
@@ -73,6 +79,48 @@ def test_session_key_reuses_scalar_recipe_but_not_layout():
     lora = materialize("E1")[4]
     full = materialize("E1")[5]
     assert server_session_key(lora) != server_session_key(full)
+    context = materialize("E3a")[-1]
+    assert server_session_key(context) == server_session_key(
+        context.__class__(**{**context.to_dict(), "context": 4096, "load": "c1"})
+    )
+    high_priority = first.__class__(
+        **{
+            **first.to_dict(),
+            "parameters": {**first.parameters, "stream_priority": "high"},
+        }
+    )
+    assert server_session_key(first) == server_session_key(high_priority)
+
+
+def test_e5_anchors_execute_before_dependent_rows():
+    anchors, dependent = _e5_execution_phases(materialize("E5-pilot"))
+    assert len(anchors) == 4 * 2 * 9 * 2
+    assert all(job.method in {"target_only", "static"} for job in anchors)
+    assert all(job.job_id not in {anchor.job_id for anchor in anchors} for job in dependent)
+
+
+def test_exact_draft_mapping_and_explicit_tts_split(tmp_path):
+    example = ExperimentConfig.load("examples/paper.yaml")
+    assert len(example.drafts) == 12
+    assert all("|" in key for key in example.drafts)
+    rows = []
+    for index in range(76):
+        rows.append({"problem_id": f"t-{index}", "split": "tuning", "prompt": "p"})
+    for index in range(4):
+        rows.append({"problem_id": f"h-{index}", "split": "holdout", "prompt": "p"})
+    path = tmp_path / "tts.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows))
+    tuning, holdout = load_tts_calibration(path)
+    assert len(tuning) == 76
+    assert holdout == ("h-0", "h-1", "h-2", "h-3")
+
+
+def test_e3_uses_three_explicit_strata_without_filler():
+    assert {job.task for job in materialize("E3a")} == {
+        "controlled_baseline",
+        "LiveCodeBench",
+        "MATH-500",
+    }
 
 
 def test_final_tail_gate_has_registered_request_mass():
@@ -87,6 +135,7 @@ def test_final_tail_gate_has_registered_request_mass():
 
 class _MinimalServer:
     requests_per_cell = 16
+    max_new_tokens = 256
 
 
 class _MinimalConfig:

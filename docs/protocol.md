@@ -24,18 +24,24 @@ representation at runtime.
 | E5-final | `450N` | 2 | production/topology confirmation |
 | E6-pilot | 242 | 2 | two interface/fit probes plus four 60-row pilots |
 | E6-final | `60N` | 2 | two-model transfer confirmation |
-| E0-tune | `108+239V` | 2 | compatibility and independent OnlineSPEC tuning |
+| E0-tune | `108+239V` | 2 | Static/adaptive compatibility and independent OnlineSPEC tuning |
 | E0-pilot | `64V` | 2 | four excluded breadth blocks |
 | E0-final | `16VN` | 2 | breadth confirmation |
 
-`N` is selected independently for each powered family from four excluded pilot
-blocks and must be in 12--20. `V` is read from completed E0 compatibility
+`N` is selected once from the four excluded E3b pilot blocks and must be in
+12--20; E5, E6, and E0 reuse that same final-block prefix. `V` is read from completed E0 compatibility
 probes. A missing selection skips only dependent nodes. Independent diagnostics
 continue, and no absent row is converted into a result.
 
+Each E0 compatibility row runs the registered Static interface, then restarts
+the same model/backend as adaptive LightCone and requires a finite published
+update. E3 context intervals resample blocks and requests within each selected
+block before evaluating the fixed 4K/16K/32K spline.
+
 Methods in a paired block run sequentially on the same device. Independent
 single-GPU blocks may run on GPUs 0 and 1 concurrently. TP2, DP2, E5, and E6
-cells use both devices exclusively. Every independent block gets a clean server;
+cells use both devices exclusively. DP2 uses two independent TP1 servers with
+sticky cohort routing. Every independent block gets a clean server;
 cells with the same model/backend, parallel layout, optimizer-state layout,
 width, and profiler mode reuse it after an idle configure/reset. Incompatible
 layouts restart normally. Preflight disables parallel final blocks when measured
@@ -45,12 +51,14 @@ TTS uses the fixed paper recipe: Adam, zero weight decay, no gradient clipping,
 the complete drafter, one update step, latest-round-only teacher rows,
 `exp(-1/7)` positional decay, and request reset. TTS and L0-naive share the
 candidate update and differ only in publication policy. TTS-Cal uses 76 tuning
-problems and keeps four fixed ID-sorted problems out of every tuning cell. E2
+problems from an explicit tuning split and never executes the four explicit
+holdout IDs. E2
 uses the registered `(B,L)` points as closed-loop concurrency and generated
 history length. E4 factors map directly to runtime arguments and its profiling
 rows invoke NVTX, Nsight Systems, and Nsight Compute. E5 maps the registered
 arrival traces, sticky cohorts, popularity, topology, and eleven failures to
-runtime behavior. Every E6 role, including Target-only, runs TP2.
+runtime behavior; BurstGPT replays both arrival times and input/output lengths.
+Every E6 role, including Target-only, runs TP2.
 
 Required correctness checks are limited to:
 

@@ -9,6 +9,7 @@ import signal
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -27,12 +28,13 @@ ADAPTIVE_METHODS = {
     "onlinespec_ens",
 }
 
+E2_MINIMUM_UPDATES = (2, 4, 8, 16)
+
 
 def _topology(job: Job) -> tuple[int, int]:
     topology = str(job.parameters.get("topology", "tp1_dp1"))
     tp = 2 if topology == "tp2_dp1" or job.node.startswith("E6") else 1
-    dp = 2 if topology == "two_replica_tp1_dp2" else 1
-    return tp, dp
+    return tp, 1
 
 
 def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -59,6 +61,26 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     parameterization = chosen.get("parameterization", "lora")
     if parameterization == "none":
         return None
+    stride = int(chosen.get("stride", 10))
+    coalescing = int(chosen.get("coalescing", 1))
+    optimizer = {
+        "name": chosen.get("optimizer", "adam"),
+        "learning_rate": float(chosen.get("learning_rate", 1e-3)),
+        "weight_decay": float(chosen.get("weight_decay", 0.0)),
+        "beta1": float(chosen.get("beta1", 0.9)),
+        "beta2": float(chosen.get("beta2", 0.999)),
+        "epsilon": float(chosen.get("epsilon", 1e-8)),
+        "grad_clip": float(chosen.get("grad_clip", 1.0)),
+        "momentum": chosen.get("momentum"),
+        "schedule": chosen.get("schedule", "constant"),
+    }
+    if optimizer["schedule"] == "cosine_to_zero":
+        round_index = int(chosen.get("round", 0))
+        expected_rounds = max(1, (job.context or 128) - 128)
+        optimizer["schedule_total_published_updates"] = max(
+            E2_MINIMUM_UPDATES[round_index],
+            math.ceil(expected_rounds / (stride * coalescing)),
+        )
     payload = {
         "schema_version": 1,
         "method": method,
@@ -66,18 +88,8 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "parameter_scope": chosen.get("scope", "all"),
         "weight_update_mode": parameterization,
         "rank": rank if parameterization == "lora" else None,
-        "optimizer": {
-            "name": chosen.get("optimizer", "adam"),
-            "learning_rate": float(chosen.get("learning_rate", 1e-3)),
-            "weight_decay": float(chosen.get("weight_decay", 0.0)),
-            "beta1": float(chosen.get("beta1", 0.9)),
-            "beta2": float(chosen.get("beta2", 0.999)),
-            "epsilon": float(chosen.get("epsilon", 1e-8)),
-            "grad_clip": float(chosen.get("grad_clip", 1.0)),
-            "momentum": chosen.get("momentum"),
-            "schedule": chosen.get("schedule", "constant"),
-        },
-        "stride": int(chosen.get("stride", 10)),
+        "optimizer": optimizer,
+        "stride": stride,
         "canvas_tokens": int(job.width or 16),
         "loss_position_decay": float(
             chosen.get("loss_position_decay", math.exp(-1.0 / 7.0))
@@ -87,7 +99,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         ),
         "extra_logical_delay": int(chosen.get("logical_delay", 0)),
         "adaptation_microbatch_size": int(chosen.get("microbatch", 1)),
-        "update_coalescing": int(chosen.get("coalescing", 1)),
+        "update_coalescing": coalescing,
         "stream_priority": chosen.get("stream_priority", "default"),
         "max_in_flight": 1,
         "kv_history_policy": "frozen",
@@ -98,6 +110,10 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "controlled_candidate_replay": bool(chosen.get("controlled_replay", False)),
         "failure_injection": chosen.get("failure"),
     }
+    if job.node == "E1a" and chosen.get("verification") == "fixed_budget":
+        payload["fixed_total_token_budget"] = 8
+    if job.node == "E1a":
+        payload["confidence_loss_weight"] = 0.1
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
             "projection_radius": chosen.get("projection_radius"),
@@ -134,7 +150,7 @@ def server_command(
         "--context-length",
         str(max(40960, job.context or 0)),
         "--max-running-requests",
-        str(_concurrency(job)),
+        "256",
         "--mem-fraction-static",
         str(config.server.mem_fraction_static),
         "--random-seed",
@@ -154,7 +170,6 @@ def server_command(
         ]
     )
     if job.method == "target_only" or job.backend == "NONE":
-        argv.append("--disable-overlap-schedule")
         return argv
     argv.extend(
         [
@@ -224,21 +239,24 @@ def server_session_key(
     else:
         optimizer = adaptation["optimizer"]
         online = adaptation.get("online_spec") or {}
+        optimizer_state = (
+            "two_moment"
+            if optimizer["name"] in {"adam", "adamw", "chronobelief"}
+            else "one_moment"
+        )
         adaptation_layout = (
             "online" if str(adaptation["method"]).startswith("onlinespec_") else "adaptive",
             adaptation["weight_update_mode"],
             adaptation["parameter_scope"],
             adaptation["rank"],
-            optimizer["name"],
+            optimizer_state,
             len(online.get("additional_learning_rates", ())),
-            adaptation["stream_priority"],
         )
     return (
         job.model,
         job.backend,
+        job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
-        job.context,
-        _concurrency(job),
         job.width,
         bool(job.parameters.get("graph_replay")),
         bool(job.parameters.get("chunked_prefill")),
@@ -391,6 +409,18 @@ class ServerProcess:
         self.sampler = GpuSampler(self.gpus, self.output_dir / "gpu.csv")
         return self.start()
 
+    def restart_for(
+        self, job: Job, selection: dict[str, Any] | None
+    ) -> SGLangClient:
+        self.stop()
+        self.job = job
+        self.adaptation = adaptation_payload(job, selection)
+        self.session_key = server_session_key(job, selection)
+        self.process = None
+        self.log = None
+        self.sampler = GpuSampler(self.gpus, self.output_dir / "gpu.csv")
+        return self.start()
+
     def inject_failure(self, kind: str) -> SGLangClient:
         if self.process is None or self.process.poll() is not None:
             raise RuntimeError("cannot inject a fault into a stopped server")
@@ -431,6 +461,155 @@ class ServerProcess:
         except Exception:
             self.stop()
             raise
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.stop()
+
+
+class StickyReplicaClient:
+    def __init__(self, replicas: tuple[SGLangClient, SGLangClient]):
+        self.replicas = replicas
+
+    def _replica(self, routing_key: str | None) -> SGLangClient:
+        if routing_key is None:
+            return self.replicas[0]
+        index = sum((offset + 1) * ord(value) for offset, value in enumerate(routing_key)) % 2
+        return self.replicas[index]
+
+    def health(self) -> bool:
+        return all(replica.health() for replica in self.replicas)
+
+    def reset(self) -> None:
+        for replica in self.replicas:
+            replica.reset()
+
+    def server_info(self) -> dict[str, object]:
+        states = []
+        for replica in self.replicas:
+            info = replica.server_info()
+            nested = info.get("internal_states")
+            states.extend(nested if isinstance(nested, list) else [info.get("internal_state", info)])
+        return {"internal_states": states}
+
+    def tokenize(self, text: str) -> tuple[int, ...]:
+        return self.replicas[0].tokenize(text)
+
+    def run_batch(self, prompts, *, routing_key=None, **kwargs):
+        return self._replica(routing_key).run_batch(
+            prompts, routing_key=routing_key, **kwargs
+        )
+
+    def abort(self, request_id: str) -> None:
+        for replica in self.replicas:
+            replica.abort(request_id)
+
+    def run_scheduled(
+        self,
+        prompts,
+        arrival_offsets,
+        *,
+        max_new_tokens,
+        seed: int,
+        temperature: float = 0.0,
+        routing_keys=None,
+    ):
+        prompt_rows = tuple(prompts)
+        offsets = tuple(arrival_offsets)
+        keys = tuple(routing_keys) if routing_keys is not None else (None,) * len(prompt_rows)
+        budgets = (
+            (max_new_tokens,) * len(prompt_rows)
+            if isinstance(max_new_tokens, int)
+            else tuple(max_new_tokens)
+        )
+        started = time.perf_counter()
+
+        def submit(index: int):
+            delay = started + offsets[index] - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            rows, _ = self.run_batch(
+                (prompt_rows[index],),
+                max_new_tokens=budgets[index],
+                seed=seed + index,
+                temperature=temperature,
+                routing_key=keys[index],
+                request_ids=(f"scheduled-{index:05d}",),
+            )
+            return rows[0]
+
+        with ThreadPoolExecutor(max_workers=min(256, len(prompt_rows))) as pool:
+            rows = tuple(pool.map(submit, range(len(prompt_rows))))
+        return rows, time.perf_counter() - started
+
+
+class ReplicaServerProcess:
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        job: Job,
+        *,
+        gpus: tuple[int, int],
+        port: int,
+        output_dir: Path,
+        selection: dict[str, Any] | None,
+    ):
+        second_dir = output_dir / "replica-1"
+        second_dir.mkdir(parents=True, exist_ok=True)
+        self.replicas = (
+            ServerProcess(config, job, gpus=(gpus[0],), port=port, output_dir=output_dir, selection=selection),
+            ServerProcess(config, job, gpus=(gpus[1],), port=port + 1, output_dir=second_dir, selection=selection),
+        )
+        self.output_dir = output_dir
+
+    @property
+    def process(self):
+        return self.replicas[0].process
+
+    @property
+    def client(self) -> StickyReplicaClient:
+        return StickyReplicaClient(tuple(replica.client for replica in self.replicas))
+
+    def start(self) -> StickyReplicaClient:
+        started = []
+        try:
+            for replica in self.replicas:
+                replica.start()
+                started.append(replica)
+            return self.client
+        except Exception:
+            for replica in started:
+                replica.stop()
+            raise
+
+    def configure(self, job: Job, selection: dict[str, Any] | None):
+        for replica in self.replicas:
+            replica.configure(job, selection)
+        return self.client
+
+    def restart(self):
+        self.stop()
+        return self.start()
+
+    def restart_for(self, job: Job, selection: dict[str, Any] | None):
+        for replica in self.replicas:
+            replica.restart_for(job, selection)
+        return self.client
+
+    def inject_failure(self, kind: str):
+        if kind in {"replica_restart", "replica_drain"}:
+            self.replicas[1].restart()
+        elif kind == "communicator_failure":
+            self.replicas[0].restart()
+        else:
+            self.replicas[0].inject_failure(kind)
+        return self.client
+
+    def stop(self) -> None:
+        for replica in self.replicas:
+            replica.stop()
+
+    def __enter__(self):
+        return self.start()
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.stop()

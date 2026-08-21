@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import shutil
+import re
 import signal
 import subprocess
 import threading
@@ -19,22 +19,37 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 from scipy.interpolate import CubicSpline
 
+from .client import GenerationResult
 from .config import ExperimentConfig
-from .data import load_arrival_offsets, load_prompts, load_tts_calibration
+from .data import (
+    load_arrival_offsets,
+    load_arrival_trace,
+    load_prompt_pool,
+    load_prompt_records,
+    load_tts_calibration,
+)
 from .metrics import (
     SAFETY_COUNTERS,
     benjamini_hochberg,
     block_bootstrap_interval,
     choose_final_blocks,
     committed_goodput,
+    hierarchical_request_interval,
     paired_block_statistics,
+    paired_relative_bca_interval,
     summarize_attempts,
     validate_scientific_metrics,
 )
 from .protocol import PAPER_NODES, Job, e2_candidates, materialize
-from .server import ServerProcess, server_session_key
+from .server import (
+    ReplicaServerProcess,
+    ServerProcess,
+    adaptation_payload,
+    server_session_key,
+)
 from .state import StateStore
 
 
@@ -73,14 +88,25 @@ def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, A
             if isinstance(online, dict):
                 metrics = {**metrics, **online}
         rank_metrics.append(metrics)
-    required = {"committed_tokens", "peak_hbm_bytes", "kv_token_capacity", *SAFETY_COUNTERS}
+    required = {
+        "committed_tokens",
+        "peak_hbm_bytes",
+        "peak_hbm_reserved_bytes",
+        "kv_token_capacity",
+        *SAFETY_COUNTERS,
+    }
     for rank, metrics in enumerate(rank_metrics):
         missing = sorted(required - metrics.keys())
         if missing:
             raise ScientificFailure(f"SGLang rank {rank} metrics are missing {missing}")
     combined: dict[str, Any] = {}
     keys = set().union(*(row.keys() for row in rank_metrics))
-    max_fields = {"peak_hbm_bytes", "exposed_update_ms", *SAFETY_COUNTERS}
+    max_fields = {
+        "peak_hbm_bytes",
+        "peak_hbm_reserved_bytes",
+        "exposed_update_ms",
+        *SAFETY_COUNTERS,
+    }
     min_fields = {"kv_token_capacity"}
     mean_fields = {"batch_fill", "queue_occupancy"}
     for key in keys:
@@ -124,11 +150,14 @@ def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, A
     return combined
 
 
-def _peak_hbm_from_csv(path: Path) -> int:
+def _peak_hbm_from_csv(path: Path, offset: int = 0) -> int:
     if not path.is_file():
         return 0
     peak = 0.0
-    for line in path.read_text(encoding="utf-8").splitlines()[1:]:
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        lines = stream.read().decode("utf-8").splitlines()
+    for line in lines:
         fields = [part.strip() for part in line.split(",")]
         if len(fields) >= 3:
             try:
@@ -139,11 +168,9 @@ def _peak_hbm_from_csv(path: Path) -> int:
 
 
 def _task_for_data(config: ExperimentConfig, job: Job) -> str:
-    candidates = (job.task, "LiveCodeBench", "livecodebench", "MATH-500", "math500")
-    for candidate in candidates:
-        if candidate in config.datasets:
-            return candidate
-    return next(iter(config.datasets))
+    if job.task not in config.datasets:
+        raise ScientificFailure(f"job requires an explicit dataset path for {job.task}")
+    return job.task
 
 
 def _prompt_offset(job: Job, limit: int) -> int:
@@ -181,8 +208,12 @@ def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -
         raise ScientificFailure("a context cell has no room for a prompt")
     if len(tokens) >= length:
         return tokens[-length:]
-    repeats = (length - len(tokens) + len(filler) - 1) // len(filler)
-    return (filler * repeats)[: length - len(tokens)] + tokens
+    needed = length - len(tokens)
+    if len(filler) < needed:
+        raise ScientificFailure(
+            f"dataset-native context has {len(filler)} tokens; {needed} required"
+        )
+    return filler[:needed] + tokens
 
 
 def _cell_inputs(
@@ -197,15 +228,26 @@ def _cell_inputs(
         prompts, holdout = load_tts_calibration(config.dataset_path(dataset_key))
         metadata["holdout_problem_ids"] = holdout
     else:
-        prompts = load_prompts(
+        records = load_prompt_records(
             config.dataset_path(dataset_key),
             limit=count,
-            offset=_prompt_offset(job, count),
+            selection_seed=_prompt_offset(job, count),
         )
+        prompts = tuple(str(row["prompt"]) for row in records)
+        metadata["examples"] = records
     if job.context is None:
         return prompts, config.server.max_new_tokens, metadata
     tokenized = tuple(client.tokenize(prompt) for prompt in prompts)
-    filler = client.tokenize("\n# retained context\n") or (0,)
+    if job.node == "TTS-Cal":
+        pool_prompts = prompts
+    else:
+        pool_prompts = tuple(
+            str(row["prompt"])
+            for row in load_prompt_pool(config.dataset_path(dataset_key))
+        )
+    filler = tuple(
+        token for prompt in pool_prompts for token in client.tokenize(prompt + "\n")
+    )
     regime = str(job.parameters.get("regime", "long_input_short_output"))
     if regime == "short_input_long_generation":
         inputs = tuple(tokens[-min(len(tokens), 128) :] for tokens in tokenized)
@@ -224,6 +266,24 @@ def _cell_inputs(
             )
         else:
             inputs = tuple(_fit_prompt(tokens, filler, prompt_length) for tokens in tokenized)
+    if job.load == "burstgpt_shape":
+        trace_path = config.datasets.get("BurstGPT")
+        if trace_path is None:
+            raise ScientificFailure("BurstGPT row lacks its explicit trace")
+        _, lengths = load_arrival_trace(
+            trace_path,
+            limit=count,
+            offset=_prompt_offset(job, count),
+        )
+        inputs = tuple(
+            _fit_prompt(tokens, filler, min(input_length, job.context - 1))
+            for tokens, (input_length, _) in zip(tokenized, lengths, strict=True)
+        )
+        max_new_tokens = tuple(
+            min(output_length, job.context - len(tokens))
+            for tokens, (_, output_length) in zip(inputs, lengths, strict=True)
+        )
+        metadata["trace_lengths"] = lengths
     metadata.update(
         regime=regime,
         prompt_tokens=[len(tokens) for tokens in inputs],
@@ -257,10 +317,16 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
         raise ScientificFailure(
             f"{job.node} lacks SLO-feasible Target-only/Static load anchors"
         )
-    return max(row for rows in by_method.values() for row in rows)
+    per_method = [max(rows) for rows in by_method.values()]
+    return min(per_method, key=lambda row: row[0])
 
 
 def _runtime_job(state: StateStore, job: Job) -> Job:
+    if job.node == "E1" and job.load is None:
+        capacity = state.selection("e3a", None)
+        if not isinstance(capacity, dict) or not isinstance(capacity.get("load"), str):
+            raise ScientificFailure("E1 cell lacks the frozen common load")
+        job = replace(job, load=capacity["load"])
     if job.node.startswith("E4") and job.load in {"low", "moderate", "saturation"}:
         capacity = state.selection("e3a", None)
         if not isinstance(capacity, dict) or not isinstance(capacity.get("load"), str):
@@ -277,13 +343,20 @@ def _runtime_job(state: StateStore, job: Job) -> Job:
             parameters={**job.parameters, "registered_load": job.load},
         )
     if job.parameters.get("width_panel") in {"matched", "deployment_optimal"}:
-        panel = job.parameters["width_panel"]
         capacity = state.selection("e3a", None)
-        if panel == "deployment_optimal" and not isinstance(capacity, dict):
+        if not isinstance(capacity, dict):
             raise ScientificFailure("width-panel cell lacks the E3a width selection")
         width = None
         if job.method != "target_only":
-            width = 16 if panel == "matched" else int(capacity.get("width", 16))
+            if job.parameters["width_panel"] == "deployment_optimal":
+                widths = state.selection("deployment_widths", None)
+                if not isinstance(widths, dict) or job.method not in widths:
+                    raise ScientificFailure(
+                        f"deployment width is not frozen for {job.method}"
+                    )
+                width = int(widths[job.method])
+            else:
+                width = int(capacity.get("width", 16))
         job = replace(job, width=width)
     if job.load not in {"common_load", "common_slo_load"}:
         if job.node.startswith("E5") and isinstance(job.load, str) and (
@@ -297,6 +370,15 @@ def _runtime_job(state: StateStore, job: Job) -> Job:
                 parameters={**job.parameters, "registered_load": job.load},
             )
         return job
+    if job.node.startswith("E6"):
+        loads = state.selection("e6_common_loads", None)
+        if not isinstance(loads, dict) or not isinstance(loads.get(job.model), str):
+            raise ScientificFailure(f"E6 lacks a feasible common load for {job.model}")
+        return replace(
+            job,
+            load=loads[job.model],
+            parameters={**job.parameters, "registered_load": job.load},
+        )
     capacity = state.selection("e3a", None)
     if not isinstance(capacity, dict) or not isinstance(capacity.get("load"), str):
         raise ScientificFailure("common-load cell lacks a feasible E3a selection")
@@ -319,9 +401,10 @@ def _arrival_offsets(
     count: int,
 ) -> tuple[float, ...] | None:
     registered = runtime_job.parameters.get("registered_load")
-    if original_job.task == "topology_cohort_capacity":
+    workload = original_job.parameters.get("workload")
+    if workload == "topology_cohort_capacity":
         return (0.0,) * count
-    if original_job.task != "production_crossover" or not isinstance(registered, str):
+    if workload != "production_crossover" or not isinstance(registered, str):
         return None
     reference_rate, _ = _e5_reference(state, original_job)
     if registered == "immediate_burst":
@@ -379,7 +462,7 @@ def _slo_metrics(results: Iterable[Any]) -> tuple[float, bool]:
     return pass_rate, pass_rate >= 0.99
 
 
-def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -> None:
+def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -> bool:
     if failure == "cancellation":
         request_id = "fault-cancellation"
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -396,6 +479,7 @@ def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -
                 future.result()
             except Exception:
                 pass
+        return True
     elif failure == "duplicate_retry":
         request_id = "fault-duplicate-retry"
         for _ in range(2):
@@ -405,29 +489,120 @@ def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -
                 seed=0,
                 request_ids=(request_id,),
             )
+        return True
+    return True
 
 
-def _run_multi_turn(client, prompts, max_new_tokens: int, seed: int):
+def _fault_action_passed(
+    failure: str, request_action_passed: bool, metrics: dict[str, Any]
+) -> bool:
+    if failure == "nonfinite_candidate":
+        return metrics["nonfinite_updates"] > 0
+    if failure == "oom_candidate":
+        return metrics["oom_events"] > 0
+    if failure in {"telemetry_backpressure", "disk_quota"}:
+        return metrics["fallbacks"] > 0
+    if failure == "queue_saturation":
+        outcomes = metrics["request_outcomes"]
+        return outcomes["offered"] == 256 and outcomes["unfinished"] == 0
+    return request_action_passed
+
+
+def _run_multi_turn(
+    client, prompts, max_new_tokens: int, seed: int, *, request_scoped: bool
+):
     histories = [tuple(prompt) for prompt in prompts]
-    results = []
+    turns_by_request: list[list[GenerationResult]] = [[] for _ in prompts]
     elapsed = 0.0
     remaining = max_new_tokens
     for turn in range(4):
         turns_left = 4 - turn
         budget = max(1, remaining // turns_left)
-        turn_results, turn_elapsed = client.run_batch(
-            histories,
-            max_new_tokens=budget,
-            seed=seed + turn,
-        )
+        if request_scoped:
+            turn_results, turn_elapsed = _run_request_scoped(
+                client, histories, budget, seed + turn
+            )
+        else:
+            turn_results, turn_elapsed = client.run_batch(
+                histories,
+                max_new_tokens=budget,
+                seed=seed + turn,
+            )
         elapsed += turn_elapsed
-        results.extend(turn_results)
+        for index, result in enumerate(turn_results):
+            turns_by_request[index].append(result)
         histories = [
             (*history, *result.output_ids)
             for history, result in zip(histories, turn_results, strict=True)
         ]
         remaining -= budget
-    return results, elapsed
+    results = []
+    for index, rows in enumerate(turns_by_request):
+        timestamps = tuple(
+            value for row in rows for value in row.native_token_timestamps_ns
+        )
+        results.append(
+            GenerationResult(
+                request_id=f"multi-turn-{index:05d}",
+                input_tokens=rows[0].input_tokens,
+                completion_tokens=sum(row.completion_tokens for row in rows),
+                ttft_ms=rows[0].ttft_ms,
+                inter_token_ms=tuple(
+                    (right - left) / 1_000_000
+                    for left, right in zip(timestamps, timestamps[1:])
+                ),
+                elapsed_seconds=sum(row.elapsed_seconds for row in rows),
+                stop_reason=rows[-1].stop_reason,
+                output_ids=tuple(value for row in rows for value in row.output_ids),
+                output_text="".join(row.output_text for row in rows),
+                native_token_timestamps_ns=timestamps,
+            )
+        )
+    return tuple(results), elapsed
+
+
+def _run_request_scoped(
+    client, prompts, max_new_tokens: int, seed: int, *, same_seed: bool = False
+):
+    started = time.perf_counter()
+    results = []
+    for index, prompt in enumerate(prompts):
+        rows, _ = client.run_batch(
+            (prompt,),
+            max_new_tokens=max_new_tokens,
+            seed=seed if same_seed else seed + index,
+            request_ids=(f"request-scoped-{index:05d}",),
+        )
+        results.append(rows[0])
+    return tuple(results), time.perf_counter() - started
+
+
+def _answer_value(text: object) -> str | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    boxed = re.findall(r"\\boxed\{([^{}]+)\}", text)
+    if boxed:
+        return boxed[-1].replace(" ", "")
+    numbers = re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    return numbers[-1] if numbers else None
+
+
+def _canonical_accuracy(
+    task: str, results: tuple[GenerationResult, ...], workload: dict[str, object]
+) -> tuple[float | None, str]:
+    if task not in {"GSM8K", "MATH-500", "AIME-2025"}:
+        return None, "N/A: no local official scorer"
+    examples = workload.get("examples")
+    if not isinstance(examples, tuple) or len(examples) != len(results):
+        return None, "N/A: scorer metadata unavailable"
+    pairs = [
+        (_answer_value(result.output_text), _answer_value(example.get("reference")))
+        for result, example in zip(results, examples, strict=True)
+        if isinstance(example, dict)
+    ]
+    if len(pairs) != len(results) or any(None in pair for pair in pairs):
+        return None, "N/A: canonical answer unavailable"
+    return sum(left == right for left, right in pairs) / len(pairs), "exact_final_answer"
 
 
 def _execute_cell(
@@ -465,16 +640,61 @@ def _execute_cell(
             (output_dir / "server.pid").write_text(
                 f"{server.process.pid}\n", encoding="utf-8"
             )
+        offered = 0
         try:
             runtime_job = _runtime_job(state, job)
-            _write_json(output_dir / "config.json", runtime_job.to_dict())
+            raw_config = runtime_job.to_dict()
+            raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
+            _write_json(output_dir / "config.json", raw_config)
             client = server.configure(runtime_job, selection)
             prompts, max_new_tokens, workload = _cell_inputs(config, client, job)
+            offered = len(prompts)
+            if runtime_job.parameters.get("controlled_replay") or runtime_job.parameters.get(
+                "controlled_pair_baseline"
+            ):
+                prompts = (prompts[0], prompts[0])
+                workload["controlled_pair"] = {
+                    "same_teacher_rows": True,
+                    "same_seed": config.protocol.seed + (job.block or 0),
+                }
+                if runtime_job.parameters.get("controlled_replay"):
+                    workload["controlled_pair"]["candidate_policies"] = ["tts", "l0"]
             _write_json(output_dir / "workload.json", workload)
+            static_interface_passed = False
+            if runtime_job.parameters.get("probe"):
+                probe_budget = (
+                    max_new_tokens[0]
+                    if isinstance(max_new_tokens, tuple)
+                    else max_new_tokens
+                )
+                static_rows, _ = client.run_batch(
+                    prompts[:1],
+                    max_new_tokens=min(8, probe_budget),
+                    seed=config.protocol.seed,
+                )
+                _write_json(
+                    output_dir / "static_probe.json",
+                    static_rows[0].to_dict(),
+                )
+                static_interface_passed = True
+                runtime_job = replace(runtime_job, method="lightcone_candidate")
+                client = server.restart_for(runtime_job, selection)
+                if server.process is not None:
+                    (output_dir / "server.pid").write_text(
+                        f"{server.process.pid}\n", encoding="utf-8"
+                    )
+                raw_config["adaptive_probe"] = runtime_job.to_dict()
+                raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
+                _write_json(output_dir / "config.json", raw_config)
             if config.server.warmup_requests:
+                warmup_budget = (
+                    max_new_tokens[0]
+                    if isinstance(max_new_tokens, tuple)
+                    else max_new_tokens
+                )
                 client.run_batch(
                     prompts[: config.server.warmup_requests],
-                    max_new_tokens=min(16, max_new_tokens),
+                    max_new_tokens=min(16, warmup_budget),
                     seed=config.protocol.seed,
                 )
                 client.reset()
@@ -483,7 +703,14 @@ def _execute_cell(
                 client = server.inject_failure(failure)
                 if not client.health():
                     raise RuntimeError(f"server did not recover from {failure}")
-                _exercise_request_fault(client, failure, prompts[0], max_new_tokens)
+                fault_action_passed = _exercise_request_fault(
+                    client,
+                    failure,
+                    prompts[0],
+                    max(max_new_tokens)
+                    if isinstance(max_new_tokens, tuple)
+                    else max_new_tokens,
+                )
             topology = str(runtime_job.parameters.get("topology", "tp1_dp1"))
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
@@ -495,13 +722,28 @@ def _execute_cell(
                     prompts,
                     max_new_tokens,
                     config.protocol.seed + (job.block or 0),
+                    request_scoped=runtime_job.method in {"tts", "l0_naive"},
                 )
             elif arrivals is None:
-                results, elapsed = client.run_batch(
-                    prompts,
-                    max_new_tokens=max_new_tokens,
-                    seed=config.protocol.seed + (job.block or 0),
+                seed = config.protocol.seed + (job.block or 0)
+                serial = runtime_job.method in {"tts", "l0_naive"} or (
+                    runtime_job.node == "E1a"
+                    and runtime_job.parameters.get("verification") == "fixed_budget"
                 )
+                if serial:
+                    results, elapsed = _run_request_scoped(
+                        client,
+                        prompts,
+                        max_new_tokens,
+                        seed,
+                        same_seed=bool(runtime_job.parameters.get("controlled_replay")),
+                    )
+                else:
+                    results, elapsed = client.run_batch(
+                        prompts,
+                        max_new_tokens=max_new_tokens,
+                        seed=seed,
+                    )
             else:
                 results, elapsed = client.run_scheduled(
                     prompts,
@@ -541,6 +783,10 @@ def _execute_cell(
                 cycles.write_text("", encoding="utf-8")
             committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
             peak_hbm = int(after["peak_hbm_bytes"])
+            reserved_hbm = int(after["peak_hbm_reserved_bytes"])
+            nvml_hbm = _peak_hbm_from_csv(
+                server.output_dir / "gpu.csv", session_offsets["gpu.csv"]
+            )
             kv_capacity = after.get("kv_token_capacity")
             native_intervals = [
                 value for result in results for value in result.inter_token_ms
@@ -564,8 +810,20 @@ def _execute_cell(
                 "duration_seconds": elapsed,
                 "goodput": committed_goodput(committed, elapsed),
                 "peak_hbm_bytes": peak_hbm,
+                "allocated_peak_hbm_bytes": peak_hbm,
+                "reserved_peak_hbm_bytes": reserved_hbm,
+                "nvml_peak_hbm_bytes": nvml_hbm,
                 "kv_capacity": int(kv_capacity),
                 "request_count": len(results),
+                "request_outcomes": {
+                    "offered": len(prompts),
+                    "admitted": len(results),
+                    "completed": len(results),
+                    "error": 0,
+                    "timeout": 0,
+                    "cancelled": 0,
+                    "unfinished": 0,
+                },
                 "output_tokens": sum(result.completion_tokens for result in results),
                 "ttft_p50_ms": float(np.median([result.ttft_ms for result in results])),
                 "itl_p99_ms": float(native_itl),
@@ -574,6 +832,18 @@ def _execute_cell(
                 "rank_aggregates_before": before["rank_aggregates"],
                 "rank_aggregates_after": after["rank_aggregates"],
             }
+            accuracy, scorer = _canonical_accuracy(job.task, results, workload)
+            metrics["canonical_accuracy"] = accuracy
+            metrics["scorer"] = scorer
+            if runtime_job.parameters.get("probe"):
+                metrics["compatible"] = True
+                metrics["static_interface_passed"] = static_interface_passed
+                metrics["adaptive_interface_passed"] = True
+            if job.node == "E1a":
+                metrics["fixed_verification_budget"] = (
+                    8 if job.parameters.get("verification") == "fixed_budget" else None
+                )
+                metrics["confidence_loss_weight"] = 0.1
             slo_pass_rate, slo_pass = _slo_metrics(results)
             metrics["request_rate"] = len(results) / elapsed
             metrics["slo_pass_rate"] = slo_pass_rate
@@ -586,9 +856,6 @@ def _execute_cell(
                 )
             for counter in SAFETY_COUNTERS:
                 metrics[counter] = int(after[counter]) - int(before[counter])
-            if isinstance(runtime_job.parameters.get("failure"), str):
-                metrics["failure_injected"] = runtime_job.parameters["failure"]
-                metrics["recovery_health_passed"] = True
             for name in (
                 "target_calls",
                 "accepted_drafts",
@@ -603,9 +870,17 @@ def _execute_cell(
                 if name in after:
                     value = after[name]
                     metrics[name] = value - before.get(name, 0) if isinstance(value, (int, float)) else value
+            if isinstance(runtime_job.parameters.get("failure"), str):
+                failure_name = runtime_job.parameters["failure"]
+                metrics["failure_injected"] = failure_name
+                metrics["recovery_health_passed"] = True
+                metrics["expected_action_passed"] = _fault_action_passed(
+                    failure_name, fault_action_passed, metrics
+                )
             if (
-                job.task != "failure_injection"
-                and job.method in {"tts", "l0_naive", "lightcone", "lightcone_candidate"}
+                job.parameters.get("workload") != "failure_injection"
+                and runtime_job.method
+                in {"tts", "l0_naive", "lightcone", "lightcone_candidate"}
                 and metrics.get("updates_published", 0)
                 < int(job.parameters.get("minimum_updates", 1))
             ):
@@ -614,29 +889,49 @@ def _execute_cell(
                 if after.get("controlled_candidate_equal") is not True:
                     raise ScientificFailure("controlled replay changed the staged candidate")
                 metrics["controlled_candidate_equal"] = True
-            if job.task != "failure_injection":
+            if job.parameters.get("workload") != "failure_injection":
                 validate_scientific_metrics(metrics)
-            elif not metrics.get("recovery_health_passed"):
-                raise ScientificFailure("fault diagnostic did not recover serving")
+            elif not (
+                metrics.get("recovery_health_passed")
+                and metrics.get("expected_action_passed")
+            ):
+                raise ScientificFailure("fault diagnostic did not complete its expected action")
             _write_json(output_dir / "metrics.json", metrics)
             state.complete(job.job_id, attempt)
             return
         except ScientificFailure as error:
             if job.parameters.get("probe"):
-                _write_json(output_dir / "metrics.json", {"compatible": False, "error": str(error)})
+                _write_json(
+                    output_dir / "metrics.json",
+                    {
+                        "compatible": False,
+                        "error": str(error),
+                        "request_outcomes": {
+                            "offered": offered,
+                            "completed": 0,
+                            "error": int(offered > 0),
+                            "unfinished": max(0, offered - 1),
+                        },
+                    },
+                )
                 state.complete(job.job_id, attempt)
                 return
             state.fail(job.job_id, attempt, str(error), retry=False)
             _write_json(
                 output_dir / "metrics.json",
-                {"status": "failed", "error": str(error)},
+                {
+                    "status": "failed",
+                    "error": str(error),
+                    "request_outcomes": {
+                        "offered": offered,
+                        "completed": 0,
+                        "error": int(offered > 0),
+                        "unfinished": max(0, offered - 1),
+                    },
+                },
             )
             return
         except Exception as error:
-            if job.parameters.get("probe"):
-                _write_json(output_dir / "metrics.json", {"compatible": False, "error": f"{type(error).__name__}: {error}"})
-                state.complete(job.job_id, attempt)
-                return
             retry = (
                 _retryable_process_error(error)
                 and state.failed_attempts(job.job_id)
@@ -648,6 +943,12 @@ def _execute_cell(
                     "status": "failed",
                     "error": f"{type(error).__name__}: {error}",
                     "retry_scheduled": retry,
+                    "request_outcomes": {
+                        "offered": offered,
+                        "completed": 0,
+                        "error": int(offered > 0),
+                        "unfinished": max(0, offered - 1),
+                    },
                 },
             )
             state.fail(job.job_id, attempt, f"{type(error).__name__}: {error}", retry=retry)
@@ -674,6 +975,8 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
     if job.method == "lightcone":
         name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
         return state.selection(name, {})
+    if job.node == "E1a" and job.method == "lightcone_candidate":
+        return state.selection("lightcone_recipe", {})
     return None
 
 
@@ -704,13 +1007,27 @@ def _assigned_gpu(config: ExperimentConfig, job: Job) -> int:
     return config.gpu_ids[job.ordinal % 2]
 
 
-def _run_node_jobs(
+def _e5_execution_phases(
+    jobs: tuple[Job, ...],
+) -> tuple[tuple[Job, ...], tuple[Job, ...]]:
+    anchors = tuple(
+        job
+        for job in jobs
+        if job.method in {"target_only", "static"}
+        and isinstance(job.load, str)
+        and job.load.startswith("closed_loop_c")
+    )
+    anchor_ids = {job.job_id for job in anchors}
+    return anchors, tuple(job for job in jobs if job.job_id not in anchor_ids)
+
+
+def _run_pending_jobs(
     config: ExperimentConfig,
     state: StateStore,
     node: str,
     stop_event: threading.Event,
+    pending: tuple[Job, ...],
 ) -> None:
-    pending = state.pending_jobs(node)
     exclusive = tuple(job for job in pending if job.gpu_count == 2)
     singles = tuple(job for job in pending if job.gpu_count == 1)
 
@@ -723,7 +1040,8 @@ def _run_node_jobs(
         for job in jobs:
             runtime_job = _runtime_job(state, job)
             selection = _selection_for_job(state, job)
-            key = (job.block, *server_session_key(runtime_job, selection))
+            probe = job.job_id if job.parameters.get("adaptive_probe") else None
+            key = (job.block, probe, *server_session_key(runtime_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
         keys = list(grouped)
         rng = np.random.default_rng(config.protocol.seed + sum(gpus) + len(node))
@@ -745,7 +1063,13 @@ def _run_node_jobs(
             (session_dir / "cycles.jsonl").touch()
             startup_attempt = 0
             while True:
-                process = ServerProcess(
+                process_type = (
+                    ReplicaServerProcess
+                    if first_runtime.parameters.get("topology")
+                    == "two_replica_tp1_dp2"
+                    else ServerProcess
+                )
+                process = process_type(
                     config,
                     first_runtime,
                     gpus=gpus,
@@ -834,6 +1158,41 @@ def _run_node_jobs(
         futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
         for future in futures:
             future.result()
+
+
+def _run_node_jobs(
+    config: ExperimentConfig,
+    state: StateStore,
+    node: str,
+    stop_event: threading.Event,
+) -> None:
+    pending = state.pending_jobs(node)
+    if node.startswith("E5"):
+        anchors, _ = _e5_execution_phases(pending)
+        if anchors:
+            _run_pending_jobs(config, state, node, stop_event, anchors)
+        if stop_event.is_set():
+            return
+        pending = state.pending_jobs(node)
+    if node == "E6-pilot":
+        interfaces = tuple(
+            job for job in pending if job.parameters.get("interface_fit")
+        )
+        if interfaces:
+            _run_pending_jobs(config, state, node, stop_event, interfaces)
+            rows = [
+                (item, metrics)
+                for item, metrics in _metric_rows(state, node)
+                if item.get("parameters", {}).get("interface_fit")
+                and metrics.get("slo_pass") is True
+            ]
+            loads = {item["model"]: str(item["load"]) for item, _ in rows}
+            if len(loads) == 2:
+                state.set_selection("e6_common_loads", loads)
+        if stop_event.is_set():
+            return
+        pending = state.pending_jobs(node)
+    _run_pending_jobs(config, state, node, stop_event, pending)
 
 
 def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -932,7 +1291,7 @@ def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, 
 
 
 def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
-    grouped: dict[str, tuple[dict[str, Any], list[dict[str, float]]]] = {}
+    grouped: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     for config, metrics in _metric_rows(state, "E1"):
         if config["method"] != "lightcone_candidate":
             continue
@@ -948,6 +1307,7 @@ def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
                 "goodput": float(metrics["goodput"]),
                 "hbm": float(metrics["peak_hbm_bytes"]),
                 "itl": float(metrics["itl_p99_ms"]),
+                "optimizer": config["parameters"].get("optimizer"),
             }
         )
     points = [
@@ -958,6 +1318,7 @@ def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
             float(np.max([row["itl"] for row in values])),
         )
         for parameters, values in grouped.values()
+        if {row["optimizer"] for row in values} == {"adamw", "sgdm"}
     ]
     pareto = [
         row
@@ -1024,6 +1385,36 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         grouped.setdefault(key, {}).setdefault(context, []).append(
             float(metrics["goodput"])
         )
+    request_groups: dict[
+        tuple[object, ...], dict[int, dict[int, list[tuple[int, float]]]]
+    ] = {}
+    for directory in state.completed_attempt_dirs(node):
+        config_path = directory / "config.json"
+        requests_path = directory / "requests.jsonl"
+        if not config_path.is_file() or not requests_path.is_file():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        context, block = config.get("context"), config.get("block")
+        if not isinstance(context, int) or not isinstance(block, int):
+            continue
+        parameters = config["parameters"]
+        key = (
+            config["method"],
+            parameters.get("regime"),
+            config.get("load"),
+            parameters.get("width_panel"),
+        )
+        rows = []
+        for line in requests_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                request = json.loads(line)
+                rows.append(
+                    (
+                        int(request["completion_tokens"]),
+                        float(request["elapsed_seconds"]),
+                    )
+                )
+        request_groups.setdefault(key, {}).setdefault(context, {})[block] = rows
     result = []
     for key, values in grouped.items():
         if len(values) < 4:
@@ -1032,7 +1423,23 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         goodput = np.asarray(
             [np.mean(values[int(context)]) for context in contexts], dtype=np.float64
         )
-        spline = CubicSpline(np.log(contexts), np.log(goodput), bc_type="natural")
+        fixed = np.asarray([4096, 16384, 32768], dtype=np.float64)
+        if not all(int(value) in values for value in fixed):
+            continue
+        fixed_goodput = np.asarray(
+            [np.mean(values[int(context)]) for context in fixed], dtype=np.float64
+        )
+        spline = CubicSpline(np.log(fixed), np.log(fixed_goodput))
+        request_intervals = {}
+        for context in fixed.astype(int):
+            blocks = request_groups.get(key, {}).get(int(context), {})
+            if len(blocks) >= 3:
+                point, low, high = hierarchical_request_interval(blocks)
+                request_intervals[str(context)] = {
+                    "point": point,
+                    "ci95_low": low,
+                    "ci95_high": high,
+                }
         result.append(
             {
                 "method": key[0],
@@ -1041,6 +1448,8 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
                 "width_panel": key[3],
                 "contexts": contexts.astype(int).tolist(),
                 "goodput": goodput.tolist(),
+                "spline_knots": fixed.astype(int).tolist(),
+                "hierarchical_request_goodput": request_intervals,
                 "elasticity": spline(np.log(contexts), 1).tolist(),
                 "curvature": spline(np.log(contexts), 2).tolist(),
             }
@@ -1049,16 +1458,31 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
 
 
 def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]:
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for config, metrics in _metric_rows(state, node):
+    grouped: dict[tuple[str, str, str], dict[int, list[float]]] = {}
+    request_counts: Counter[tuple[str, str, str]] = Counter()
+    for directory in state.completed_attempt_dirs(node):
+        config_path = directory / "config.json"
+        requests_path = directory / "requests.jsonl"
+        if not config_path.is_file() or not requests_path.is_file():
+            continue
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         parameters = config.get("parameters", {})
         load = parameters.get("registered_load", config.get("load"))
         key = (config["method"], config["backend"], str(load))
-        grouped.setdefault(key, []).append(metrics)
+        for line in requests_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            request = json.loads(line)
+            request_counts[key] += 1
+            stamps = request.get("native_token_timestamps_ns", [])
+            intervals = request.get("inter_token_ms", [])
+            if stamps and intervals:
+                time_block = int(stamps[0]) // 10_000_000_000
+                grouped.setdefault(key, {}).setdefault(time_block, []).extend(intervals)
     result = []
-    for (method, backend, load), rows in grouped.items():
-        request_count = sum(int(row.get("request_count", 0)) for row in rows)
-        values = [float(row["itl_p99_ms"]) for row in rows]
+    for (method, backend, load), blocks in grouped.items():
+        request_count = request_counts[(method, backend, load)]
+        values = [float(np.quantile(rows, 0.99)) for rows in blocks.values() if rows]
         resolved = request_count >= 10_000 and len(values) >= 3
         estimate = block_bootstrap_interval(values) if resolved else (None, None, None)
         result.append(
@@ -1067,7 +1491,7 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
                 "backend": backend,
                 "load": load,
                 "request_count": request_count,
-                "block_count": len(values),
+                "time_block_count": len(values),
                 "resolved": resolved,
                 "p99_point_ms": estimate[0],
                 "p99_ci95_low_ms": estimate[1],
@@ -1174,14 +1598,20 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             statistics,
         )
         if node == "E0-final":
+            secondary = [
+                row
+                for row in statistics
+                if (row["candidate"], row["baseline"])
+                not in {("lightcone", "static"), ("lightcone", "tts")}
+            ]
             decisions = benjamini_hochberg(
-                [float(row["p_value"]) for row in statistics]
-            ) if statistics else ()
+                [float(row["p_value"]) for row in secondary]
+            ) if secondary else ()
             _write_json(
                 summary_dir / "breadth_fdr.json",
                 [
                     {**row, "fdr_reject": decision}
-                    for row, decision in zip(statistics, decisions, strict=True)
+                    for row, decision in zip(secondary, decisions, strict=True)
                 ],
             )
     if node in {"E3a", "E3b-pilot", "E3b-final"}:
@@ -1194,7 +1624,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         _check_greedy_trajectories(state, node)
     if node == "preflight":
         _check_stochastic_exactness(state, node)
-        timings: dict[tuple[int, int], dict[str, float]] = {}
+        timings: dict[tuple[int, int], dict[str, dict[str, float]]] = {}
         for item, metrics in _metric_rows(state, node):
             mode = item["parameters"].get("mode")
             gpu = item["parameters"].get("gpu_index")
@@ -1204,18 +1634,31 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                 and isinstance(gpu, int)
                 and isinstance(block, int)
             ):
-                timings.setdefault((gpu, block), {})[mode] = float(metrics["goodput"])
-        differences = [
-            rows["concurrent"] / rows["isolated"] - 1
+                timings.setdefault((gpu, block), {})[mode] = {
+                    "goodput": float(metrics["goodput"]),
+                    "itl": float(metrics["itl_p99_ms"]),
+                }
+        pairs = [
+            rows
             for rows in timings.values()
             if {"isolated", "concurrent"} <= rows.keys()
         ]
+        calibrations = {
+            metric: paired_relative_bca_interval(
+                [rows["concurrent"][metric] for rows in pairs],
+                [rows["isolated"][metric] for rows in pairs],
+            )
+            for metric in ("goodput", "itl")
+        } if len(pairs) >= 3 else {}
         state.set_selection(
             "headline_parallel",
             {
-                "enabled": len(differences) == 4
-                and max(abs(value) for value in differences) <= 0.01,
-                "relative_differences": differences,
+                "enabled": len(pairs) == 4
+                and all(
+                    abs(point) <= 0.01 and low <= 0 <= high
+                    for point, low, high in calibrations.values()
+                ),
+                "paired_relative_bca": calibrations,
             },
         )
     if node == "E3a":
@@ -1274,6 +1717,13 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         state.set_selection(
             "e3a", {"width": selected_width, "load": common_load}
         )
+        state.set_selection(
+            "deployment_widths",
+            {
+                method: selected_width
+                for method in ("static", "tts", "l0_naive", "lightcone")
+            },
+        )
     elif node == "TTS-Cal":
         winners = _rank_candidates(state, node, 1)
         if not winners:
@@ -1298,12 +1748,12 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             state.set_selection(f"{node}_no_feasible_candidate", True)
         else:
             state.set_selection("lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}", winners[0] if round_index == 3 else winners)
-    elif node in {"E3b-pilot", "E5-pilot", "E6-pilot", "E0-pilot"} and config.protocol.final_blocks is None:
+    elif node == "E3b-pilot" and config.protocol.final_blocks is None:
         selected = _pilot_final_blocks(state, node)
         if selected is None:
             state.set_selection(f"{node}_underpowered", True)
         else:
-            state.set_selection(f"{node}_final_blocks", selected)
+            state.set_selection("global_final_blocks", selected)
     elif node == "E1a":
         winners = _rank_candidates(state, node, 1)
         if winners:
@@ -1338,23 +1788,29 @@ def _cleanup_interrupted_servers(run_dir: Path) -> None:
             continue
 
 
+def _save_or_validate_run_config(config: ExperimentConfig) -> None:
+    saved = config.run_dir / "paper.yaml"
+    normalized = config.normalized()
+    if saved.exists():
+        if yaml.safe_load(saved.read_text(encoding="utf-8")) != normalized:
+            raise RuntimeError("run directory belongs to a different experiment config")
+        return
+    saved.write_text(yaml.safe_dump(normalized, sort_keys=True), encoding="utf-8")
+
+
 def _node_final_blocks(config: ExperimentConfig, state: StateStore, node: str) -> int:
     if config.protocol.final_blocks is not None:
         return config.protocol.final_blocks
-    pilot = {
-        "E3b-final": "E3b-pilot_final_blocks",
-        "E5-final": "E5-pilot_final_blocks",
-        "E6-final": "E6-pilot_final_blocks",
-        "E0-final": "E0-pilot_final_blocks",
-    }.get(node)
-    return int(state.selection(pilot, 12)) if pilot else 12
+    if node in {"E3b-final", "E5-final", "E6-final", "E0-final"}:
+        return int(state.selection("global_final_blocks", 12))
+    return 12
 
 
 def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -> str | None:
     if node != "preflight" and state.stage_status("preflight") != "completed":
         return "preflight did not complete"
     requirements = {
-        "E1": ("tts_recipe",),
+        "E1": ("tts_recipe", "e3a"),
         "E2-r0": ("e1_geometries",),
         "E2-r1": ("e2_round_0",),
         "E2-r2": ("e2_round_1",),
@@ -1372,15 +1828,12 @@ def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -
     for selection in requirements.get(node, ()):
         if state.selection(selection, None) is None:
             return f"required selection {selection} is unavailable"
-    pilot = {
-        "E3b-final": "E3b-pilot",
-        "E5-final": "E5-pilot",
-        "E6-final": "E6-pilot",
-        "E0-final": "E0-pilot",
-    }.get(node)
-    if pilot and config.protocol.final_blocks is None:
-        if state.selection(f"{pilot}_final_blocks", None) is None:
-            return f"{pilot} did not select N in 12-20"
+    if (
+        node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
+        and config.protocol.final_blocks is None
+        and state.selection("global_final_blocks", None) is None
+    ):
+        return "E3b-pilot did not select global N in 12-20"
     return None
 
 
@@ -1398,7 +1851,7 @@ class PaperRunner:
         _cleanup_interrupted_servers(self.config.run_dir)
         self.state.recover_interrupted()
         self.config.run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.config.source, self.config.run_dir / "paper.yaml")
+        _save_or_validate_run_config(self.config)
         old_term = signal.signal(signal.SIGTERM, self._signal)
         old_int = signal.signal(signal.SIGINT, self._signal)
         try:

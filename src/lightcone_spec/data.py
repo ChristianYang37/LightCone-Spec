@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +15,7 @@ ID_FIELDS = ("problem_id", "question_id", "id", "task_id")
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     if path.is_dir():
-        candidates = sorted(
-            item
-            for pattern in ("*.jsonl", "*.json", "*.parquet", "*.csv")
-            for item in path.rglob(pattern)
-        )
-        if not candidates:
-            raise FileNotFoundError(f"no JSON, JSONL, or Parquet data under {path}")
-        path = candidates[0]
+        raise ValueError(f"dataset path must name one explicit file: {path}")
     if path.suffix == ".parquet":
         return pd.read_parquet(path).to_dict(orient="records")
     if path.suffix == ".csv":
@@ -38,21 +32,48 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     raise ValueError(f"dataset {path} does not contain row objects")
 
 
-def load_prompts(path: Path, *, limit: int, offset: int = 0) -> tuple[str, ...]:
-    rows = _rows(path)
-    available: list[str] = []
-    for row in rows:
-        value = next((row[field] for field in PROMPT_FIELDS if isinstance(row.get(field), str) and row[field].strip()), None)
-        if value is not None:
-            available.append(value)
+def load_prompt_records(
+    path: Path, *, limit: int, selection_seed: int = 0
+) -> tuple[dict[str, Any], ...]:
+    available = load_prompt_pool(path)
     if len(available) < limit:
         raise ValueError(f"dataset {path} supplied {len(available)} prompts; {limit} required")
-    start = offset % len(available)
-    return tuple(available[(start + index) % len(available)] for index in range(limit))
+    indexes = list(range(len(available)))
+    random.Random(selection_seed).shuffle(indexes)
+    return tuple(available[index] for index in indexes[:limit])
+
+
+def load_prompt_pool(path: Path) -> tuple[dict[str, Any], ...]:
+    available: list[dict[str, Any]] = []
+    for index, row in enumerate(_rows(path)):
+        value = next((row[field] for field in PROMPT_FIELDS if isinstance(row.get(field), str) and row[field].strip()), None)
+        if value is not None:
+            identity = next(
+                (str(row[field]) for field in ID_FIELDS if row.get(field) is not None),
+                f"row-{index:06d}",
+            )
+            available.append(
+                {
+                    "problem_id": identity,
+                    "split": row.get("split"),
+                    "prompt": value,
+                    "template": row.get("template"),
+                    "reference": row.get("reference", row.get("answer")),
+                    "test_metadata": row.get("test_metadata", row.get("tests")),
+                }
+            )
+    return tuple(available)
+
+
+def load_prompts(path: Path, *, limit: int, offset: int = 0) -> tuple[str, ...]:
+    return tuple(
+        row["prompt"]
+        for row in load_prompt_records(path, limit=limit, selection_seed=offset)
+    )
 
 
 def load_tts_calibration(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    identified: list[tuple[str, str]] = []
+    identified: list[tuple[str, str, str]] = []
     for index, row in enumerate(_rows(path)):
         prompt = next(
             (
@@ -66,21 +87,35 @@ def load_tts_calibration(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
             continue
         identity = next(
             (str(row[field]) for field in ID_FIELDS if row.get(field) is not None),
-            f"row-{index:06d}",
+            None,
         )
-        identified.append((identity, prompt))
-    identified.sort(key=lambda row: row[0])
-    if len(identified) < 80:
-        raise ValueError("TTS-Cal requires at least 80 identified LCB-v6-hard problems")
-    domain = identified[:80]
-    holdout = tuple(identity for identity, _ in domain[:4])
-    tuning = tuple(prompt for _, prompt in domain[4:])
+        split = row.get("split")
+        if identity is None or split not in {"tuning", "holdout"}:
+            continue
+        identified.append((identity, prompt, split))
+    tuning_rows = sorted(
+        ((identity, prompt) for identity, prompt, split in identified if split == "tuning")
+    )
+    holdout_rows = sorted(
+        ((identity, prompt) for identity, prompt, split in identified if split == "holdout")
+    )
+    if len(tuning_rows) != 76 or len(holdout_rows) != 4:
+        raise ValueError("TTS-Cal requires explicit 76 tuning and 4 holdout rows")
+    holdout = tuple(identity for identity, _ in holdout_rows)
+    tuning = tuple(prompt for _, prompt in tuning_rows)
     return tuning, holdout
 
 
 def load_arrival_offsets(path: Path, *, limit: int, offset: int = 0) -> tuple[float, ...]:
+    offsets, _ = load_arrival_trace(path, limit=limit, offset=offset)
+    return offsets
+
+
+def load_arrival_trace(
+    path: Path, *, limit: int, offset: int = 0
+) -> tuple[tuple[float, ...], tuple[tuple[int, int], ...]]:
     rows = _rows(path)
-    values: list[float] = []
+    values: list[tuple[float, int, int]] = []
     for row in rows:
         raw = next(
             (
@@ -92,16 +127,37 @@ def load_arrival_offsets(path: Path, *, limit: int, offset: int = 0) -> tuple[fl
             ),
             None,
         )
-        if raw is not None:
-            values.append(float(raw))
+        input_length = next(
+            (
+                value
+                for name, value in row.items()
+                if name.lower() in {"input_length", "prompt_length", "input_tokens"}
+                and isinstance(value, int)
+                and value > 0
+            ),
+            None,
+        )
+        output_length = next(
+            (
+                value
+                for name, value in row.items()
+                if name.lower() in {"output_length", "completion_length", "output_tokens"}
+                and isinstance(value, int)
+                and value > 0
+            ),
+            None,
+        )
+        if raw is not None and input_length is not None and output_length is not None:
+            values.append((float(raw), input_length, output_length))
     if len(values) < limit:
         raise ValueError(
-            f"arrival trace {path} supplied {len(values)} timestamps; {limit} required"
+            f"arrival trace {path} supplied {len(values)} complete rows; {limit} required"
         )
-    start = offset % (len(values) - limit + 1)
+    start = random.Random(offset).randrange(len(values) - limit + 1)
     selected = values[start : start + limit]
-    origin = selected[0]
-    offsets = tuple(value - origin for value in selected)
+    origin = selected[0][0]
+    offsets = tuple(value[0] - origin for value in selected)
     if offsets[0] != 0 or any(right < left for left, right in zip(offsets, offsets[1:])):
         raise ValueError(f"arrival trace {path} is not monotone")
-    return offsets
+    lengths = tuple((value[1], value[2]) for value in selected)
+    return offsets, lengths

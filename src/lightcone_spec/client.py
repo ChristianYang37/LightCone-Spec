@@ -20,6 +20,7 @@ class GenerationResult:
     elapsed_seconds: float
     stop_reason: str | None
     output_ids: tuple[int, ...]
+    output_text: str
     native_token_timestamps_ns: tuple[int, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -41,8 +42,8 @@ def _native_events(meta: dict, output_ids: list[int]) -> tuple[int, ...]:
         if event["token_index"] != index or event["token_id"] != token_id:
             raise RuntimeError("native token timestamps changed token trajectory")
         observed = event["observed_ns"]
-        if not isinstance(observed, int) or observed < 0 or (timestamps and observed <= timestamps[-1]):
-            raise RuntimeError("native token timestamps are not strictly increasing")
+        if not isinstance(observed, int) or observed < 0 or (timestamps and observed < timestamps[-1]):
+            raise RuntimeError("native token timestamps are not monotone")
         timestamps.append(observed)
     return tuple(timestamps)
 
@@ -118,6 +119,7 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> t
                 elapsed_seconds=float(finished[index] - started),
                 stop_reason=None if reason is None else str(reason),
                 output_ids=tuple(int(value) for value in output_ids),
+                output_text=str(final.get("text", "")),
                 native_token_timestamps_ns=native_timestamps,
             )
         )
@@ -243,7 +245,7 @@ class SGLangClient:
         prompts: Iterable[str | Sequence[int]],
         arrival_offsets: Iterable[float],
         *,
-        max_new_tokens: int,
+        max_new_tokens: int | Sequence[int],
         seed: int,
         temperature: float = 0.0,
         routing_keys: Iterable[str] | None = None,
@@ -257,6 +259,13 @@ class SGLangClient:
         keys = tuple(routing_keys) if routing_keys is not None else (None,) * len(prompt_rows)
         if len(keys) != len(prompt_rows):
             raise ValueError("scheduled requests need one routing key per prompt")
+        budgets = (
+            (max_new_tokens,) * len(prompt_rows)
+            if isinstance(max_new_tokens, int)
+            else tuple(max_new_tokens)
+        )
+        if len(budgets) != len(prompt_rows):
+            raise ValueError("scheduled requests need one output length per prompt")
         started = time.perf_counter()
 
         def submit(index: int) -> GenerationResult:
@@ -265,7 +274,7 @@ class SGLangClient:
                 time.sleep(delay)
             rows, _ = self.run_batch(
                 (prompt_rows[index],),
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=budgets[index],
                 seed=seed + index,
                 temperature=temperature,
                 request_id_prefix=f"scheduled-{index:05d}",
@@ -273,6 +282,6 @@ class SGLangClient:
             )
             return rows[0]
 
-        with ThreadPoolExecutor(max_workers=len(prompt_rows)) as pool:
+        with ThreadPoolExecutor(max_workers=min(256, len(prompt_rows))) as pool:
             results = tuple(pool.map(submit, range(len(prompt_rows))))
         return results, time.perf_counter() - started

@@ -14,6 +14,10 @@
    completed attempts remain complete, an interrupted attempt remains visible,
    and its job is returned to `pending` for a new attempt directory.
 
+The first invocation stores a normalized plain `paper.yaml` in the run
+directory. A later invocation with different experiment values stops instead
+of mixing configurations in one SQLite run.
+
 SIGINT and SIGTERM stop new work at the next cell boundary. A process/network
 failure is retried once, including server startup. OOM, non-finite adaptation,
 trajectory mismatch, missing native timing or counters, and scientific-gate

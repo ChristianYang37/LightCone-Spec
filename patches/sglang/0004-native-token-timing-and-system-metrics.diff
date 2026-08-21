@@ -16,7 +16,7 @@ diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/manager
      return_flat_raw_top_logprobs_b64: bool = False
      # Whether to stream output.
      stream: bool = False
-+    # CPU-only LightCone contract: committed-token observations at the streamer.
++    # CPU observation time for committed tokens.
 +    return_native_token_timestamps: bool = False
      # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
      log_metrics: bool = True
@@ -42,7 +42,7 @@ diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/manager
      token_ids_logprob: Optional[List[int]]
      # Whether to stream output
      stream: bool
-+    # CPU-only committed-token host observation contract.
++    # CPU host observation time for committed tokens.
 +    return_native_token_timestamps: bool = False
      # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
      return_sampling_mask: bool = False
@@ -101,7 +101,7 @@ new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/managers/native_token_timestamps.py
 @@ -0,0 +1,61 @@
-+"""CPU-only native observation contract for committed output tokens.
++"""CPU observation times for committed output tokens.
 +
 +This hook records host observation time after stop handling, when
 +``Req.output_ids_through_stop`` is authoritative. It is not a CUDA event and
@@ -116,7 +116,7 @@ new file mode 100644
 +
 +NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
 +NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "cpu_committed_token_observed_at_streamer_v1"
-+NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_CONTRACT_ONLY"
++NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_OBSERVATION_ONLY"
 +
 +
 +def observe_committed_output_tokens(
@@ -193,7 +193,15 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
                  stream=recv_req.stream,
                  lora_id=recv_req.lora_id,
                  session_id=recv_req.session_id,
-@@ -4029,6 +4030,75 @@ class Scheduler(
+@@ -3975,6 +3976,7 @@ class Scheduler(
+ 
+             if empty_cache:
+                 current_platform.empty_cache()
++                torch.cuda.reset_peak_memory_stats(self.device)
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
+@@ -4029,6 +4031,76 @@ class Scheduler(
              if info_record is not None:
                  ret["dspark_info_record"] = info_record
  
@@ -254,6 +262,7 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
 +                )
 +                * int(self.server_args.speculative_num_draft_tokens or 0),
 +                "peak_hbm_bytes": int(torch.cuda.max_memory_allocated(self.device)),
++                "peak_hbm_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)),
 +                "kv_token_capacity": int(self.max_total_num_tokens),
 +                "batch_fill": online.get("batch_fill", 0.0),
 +                "queue_occupancy": online.get("queue_occupancy", 0.0),
@@ -439,7 +448,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt
 +                                "cpu_committed_token_observed_at_streamer_v1"
 +                            ),
 +                            "native_token_timestamp_release_status": (
-+                                "CPU_CONTRACT_ONLY"
++                                "CPU_OBSERVATION_ONLY"
 +                            ),
 +                            "native_token_timestamp_request_id": recv_obj.rids[i],
 +                            "native_token_timestamp_request_started_ns": (

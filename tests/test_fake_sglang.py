@@ -1,4 +1,5 @@
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -7,9 +8,15 @@ import pytest
 
 from lightcone_spec.client import SGLangClient
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
-from lightcone_spec.data import load_arrival_offsets
+from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
 from lightcone_spec.protocol import materialize
-from lightcone_spec.server import ServerProcess, adaptation_payload
+from lightcone_spec.runner import _fault_action_passed
+from lightcone_spec.server import (
+    ServerProcess,
+    StickyReplicaClient,
+    adaptation_payload,
+    server_command,
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -64,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
                         "finish_reason": {"type": "length"},
                         "native_token_timestamp_events": [
                             {"token_index": 0, "token_id": 10, "observed_ns": 100},
-                            {"token_index": 1, "token_id": 11, "observed_ns": 200},
+                            {"token_index": 1, "token_id": 11, "observed_ns": 100},
                         ],
                     },
                 }) + "\n\n"
@@ -95,7 +102,7 @@ def test_raw_token_output_and_failure_propagation(fake_server):
     rows, elapsed = client.run_batch(["a", "b"], max_new_tokens=2, seed=0)
     assert elapsed > 0
     assert [row.output_ids for row in rows] == [(10, 11), (10, 11)]
-    assert [row.inter_token_ms for row in rows] == [(0.0001,), (0.0001,)]
+    assert [row.inter_token_ms for row in rows] == [(0.0,), (0.0,)]
     Handler.fail = True
     with pytest.raises(Exception):
         client.run_batch(["a"], max_new_tokens=2, seed=0)
@@ -103,9 +110,14 @@ def test_raw_token_output_and_failure_propagation(fake_server):
 
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     trace = tmp_path / "trace.csv"
-    trace.write_text("Timestamp\n10.0\n10.01\n10.03\n")
+    trace.write_text(
+        "Timestamp,input_length,output_length\n"
+        "10.0,32,8\n10.01,64,16\n10.03,128,32\n"
+    )
     offsets = load_arrival_offsets(trace, limit=3)
     assert offsets == pytest.approx((0.0, 0.01, 0.03))
+    _, lengths = load_arrival_trace(trace, limit=3)
+    assert lengths == ((32, 8), (64, 16), (128, 32))
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
     rows, elapsed = client.run_scheduled(
         ("a", "b", "c"), offsets, max_new_tokens=2, seed=0
@@ -133,7 +145,8 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     model.mkdir()
     config = ExperimentConfig(
         source=tmp_path / "paper.yaml", run_name="run", sglang_root=tmp_path,
-        results_root=tmp_path, models={"Qwen/Qwen3-8B": model}, drafts={},
+        results_root=tmp_path, models={"Qwen/Qwen3-8B": model},
+        drafts={"Qwen/Qwen3-8B|DFLASH": model},
         datasets={}, gpu_ids=(0, 1), server=ServerConfig(python=python),
         protocol=ProtocolConfig(),
     )
@@ -142,6 +155,16 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     process = ServerProcess(config, materialize("preflight")[0], gpus=(0, 1), port=30000, output_dir=output, selection=None)
     with process:
         assert (output / "server.pid").read_text().strip() == "12345"
+        adaptive = next(
+            job
+            for job in materialize("E0-tune", valid_e0=[])
+            if job.model == "Qwen/Qwen3-8B" and job.backend == "DFLASH"
+        )
+        adaptive = adaptive.__class__(
+            **{**adaptive.to_dict(), "method": "lightcone_candidate"}
+        )
+        process.restart_for(adaptive, None)
+        assert process.adaptation is not None
     assert (output / "server.stopped").is_file()
 
 
@@ -156,8 +179,69 @@ def test_onlinespec_payload_contains_independent_learner_settings():
     assert payload["online_spec"]["hedge_learning_rate"] > 0
 
 
+def test_cosine_horizon_and_e1a_fixed_settings():
+    job = materialize("E2-r2")[0]
+    job = job.__class__(
+        **{
+            **job.to_dict(),
+            "parameters": {
+                **job.parameters,
+                "schedule": "cosine_to_zero",
+                "stride": 10,
+                "coalescing": 2,
+            },
+        }
+    )
+    payload = adaptation_payload(job)
+    assert payload["optimizer"]["schedule_total_published_updates"] == max(
+        8, math.ceil((16384 - 128) / 20)
+    )
+    e1a = adaptation_payload(materialize("E1a")[0], {"optimizer": "adamw"})
+    assert e1a["fixed_total_token_budget"] == 8
+    assert e1a["confidence_loss_weight"] == 0.1
+
+
+def test_sticky_replica_routing_is_repeatable():
+    left, right = object(), object()
+    client = StickyReplicaClient((left, right))
+    assert client._replica("cohort-0001") is client._replica("cohort-0001")
+    assert {client._replica(f"cohort-{index:04d}") for index in range(8)} == {
+        left,
+        right,
+    }
+
+
 def test_fake_reset_tokenize_and_abort(fake_server):
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
     assert client.tokenize("hello") == (1, 2, 3)
     client.reset()
     client.abort("request-id")
+    metrics = {
+        "nonfinite_updates": 1,
+        "oom_events": 0,
+        "fallbacks": 0,
+        "request_outcomes": {"offered": 1, "unfinished": 0},
+    }
+    assert _fault_action_passed("nonfinite_candidate", True, metrics)
+    assert not _fault_action_passed("oom_candidate", True, metrics)
+
+
+def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
+    python = tmp_path / "python"
+    python.write_text("")
+    model = tmp_path / "model"
+    model.mkdir()
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml", run_name="run", sglang_root=tmp_path,
+        results_root=tmp_path, models={"Qwen/Qwen3-8B": model}, drafts={},
+        datasets={}, gpu_ids=(0, 1), server=ServerConfig(python=python),
+        protocol=ProtocolConfig(),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    command = server_command(
+        config, materialize("preflight")[0], port=30000, output_dir=output,
+        adaptation=None,
+    )
+    assert command[command.index("--max-running-requests") + 1] == "256"
+    assert "--disable-overlap-schedule" not in command

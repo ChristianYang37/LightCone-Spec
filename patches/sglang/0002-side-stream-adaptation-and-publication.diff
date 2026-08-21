@@ -141,7 +141,7 @@ diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/
 new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1092 @@
+@@ -0,0 +1,1100 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -954,7 +954,7 @@ new file mode 100644
 +            return
 +        if not has_supervision:
 +            if self.config.teacher_row_policy == "quota_shadow":
-+                # The ledger records the exact request/source identity before
++                # Runtime state records the request/source pair before
 +                # consulting the backend capability. DFlash currently exposes
 +                # update-round target rows only, so a real shadow need blocks
 +                # rather than fabricating or reusing a teacher row.
@@ -1181,11 +1181,19 @@ new file mode 100644
 +        )
 +        self.runtime.record_device_commit(request_ids, new_seq_lens)
 +
-+    def finish_request(self, request_id: str) -> None:
-+        self.runtime.finish_request(request_id)
++    def finish_request(self, request_id: str) -> bool:
++        if self.runtime.finish_request(request_id):
++            self._restore_request_source()
 +
 +    def abort_request(self, request_id: str) -> None:
-+        self.runtime.abort_request(request_id)
++        if self.runtime.abort_request(request_id):
++            self._restore_request_source()
++
++    def _restore_request_source(self) -> None:
++        self.optimizer.reset(self.initial_trainable)
++        effective = self._effective_parameters(self.optimizer.master)
++        self.inference.stage(tuple(effective[name] for name in self.names))
++        self.inference.publish()
 +
 +    def reset(self) -> None:
 +        self.runtime.reset()
@@ -1204,7 +1212,7 @@ new file mode 100644
 +        if config is None or adaptation_layout(config) != adaptation_layout(self.config):
 +            raise ValueError("DFlash adaptation layout changed; restart the server")
 +        self.config = config
-+        self.runtime.config = config
++        self.runtime.reload_config(config)
 +        reconfigure_parameter_optimizer(self.optimizer, config)
 +
 +    def note_load(
@@ -1513,7 +1521,7 @@ diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python
 new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2452 @@
+@@ -0,0 +1,2497 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -2498,7 +2506,6 @@ new file mode 100644
 +        config.canvas_tokens,
 +        config.topology.tensor_parallel_size,
 +        config.topology.data_parallel_size,
-+        config.stream_priority,
 +        moment_layout,
 +        config.method.startswith("onlinespec_"),
 +        online_experts,
@@ -2742,6 +2749,7 @@ new file mode 100644
 +            (3,), dtype=torch.uint8, device="cpu", pin_memory=True
 +        )
 +        self.epoch = 0
++        self.active_request_id: str | None = None
 +        self.active_version = 0
 +        self.slot_generation = 0
 +        self.round = 0
@@ -3131,9 +3139,20 @@ new file mode 100644
 +            trace_index=trace_index,
 +        )
 +        if self.config.controlled_candidate_replay:
-+            self.controlled_reference = tuple(
-+                tensor.detach().clone() for tensor in inference_bank.staging
-+            )
++            if self.controlled_reference is None:
++                self.controlled_reference = tuple(
++                    tensor.detach().clone() for tensor in inference_bank.staging
++                )
++            else:
++                self.controlled_candidate_equal = self.controlled_candidate_equal and all(
++                    torch.equal(candidate, reference)
++                    for candidate, reference in zip(
++                        inference_bank.staging,
++                        self.controlled_reference,
++                        strict=True,
++                    )
++                )
++                self.controlled_reference = None
 +        if reservation is not None:
 +            self.reserved = None
 +        self.counters["updates_launched"] += 1
@@ -3318,16 +3337,6 @@ new file mode 100644
 +            candidate.inference_bank.publish()
 +            if self.config.topology.tensor_parallel_size * self.config.topology.data_parallel_size > 1:
 +                dist.barrier()
-+            if self.controlled_reference is not None:
-+                self.controlled_candidate_equal = self.controlled_candidate_equal and all(
-+                    torch.equal(active, expected)
-+                    for active, expected in zip(
-+                        candidate.inference_bank.active,
-+                        self.controlled_reference,
-+                        strict=True,
-+                    )
-+                )
-+                self.controlled_reference = None
 +        for tensor in candidate.candidate_tensors:
 +            tensor.record_stream(main)
 +        self.active_version += 1
@@ -3348,6 +3357,16 @@ new file mode 100644
 +        request_ids = tuple(request_ids)
 +        if not request_ids:
 +            raise ValueError("round telemetry requires a non-empty request batch")
++        if self.config.reset_scope == "request":
++            if len(request_ids) != 1:
++                raise RuntimeError(
++                    "request-scoped adaptation requires serialized requests"
++                )
++            request_id = request_ids[0]
++            if self.active_request_id is None:
++                self.active_request_id = request_id
++            elif self.active_request_id != request_id:
++                raise RuntimeError("request-scoped adaptation has another active owner")
 +        if prefix_lens.ndim != 1 or prefix_lens.shape[0] != len(request_ids):
 +            raise ValueError("one prefix length is required per round request")
 +        repeated = set(request_ids) & self.active_round_rows.keys()
@@ -3496,13 +3515,14 @@ new file mode 100644
 +        # Keep compact version metadata until diagnostics are flushed. Tensor
 +        # canvas state is owned and released by the backend adapter.
 +        if request_id not in self.requests:
-+            return
++            return False
 +        self._discard_active_round(request_id)
 +        self._archive_latest_device_lengths((request_id,))
++        return self._reset_request_scope(request_id)
 +
-+    def abort_request(self, request_id: str) -> None:
++    def abort_request(self, request_id: str) -> bool:
 +        if request_id not in self.requests:
-+            return
++            return False
 +        self._discard_active_round(request_id)
 +        self._archive_latest_device_lengths((request_id,))
 +        self.slot_generation += 1
@@ -3512,10 +3532,37 @@ new file mode 100644
 +            self.update_traces[candidate.trace_index].status = "request_aborted"
 +            self.counters["updates_discarded"] += 1
 +            self.pending = None
++        return self._reset_request_scope(request_id)
++
++    def _reset_request_scope(self, request_id: str) -> bool:
++        if self.config.reset_scope != "request":
++            return False
++        if self.active_request_id != request_id:
++            raise RuntimeError("terminal request differs from adaptation owner")
++        self.side_stream.synchronize()
++        self.diagnostics()
++        self.epoch += 1
++        self.active_version = 0
++        self.slot_generation += 1
++        self.round = 0
++        self.pending = None
++        self.reserved = None
++        self.requests.clear()
++        self.device_commits.clear()
++        self.latest_device_lengths.clear()
++        self.pending_timings.clear()
++        self.update_traces.clear()
++        self.round_traces.clear()
++        self.active_round_rows.clear()
++        self.disabled_reason = None
++        self.quota_shadow.reset()
++        self.active_request_id = None
++        return True
 +
 +    def reset(self) -> None:
 +        self.side_stream.synchronize()
 +        self.epoch += 1
++        self.active_request_id = None
 +        self.active_version = 0
 +        self.slot_generation += 1
 +        self.round = 0
@@ -3541,6 +3588,15 @@ new file mode 100644
 +        self.waiting_requests_max = 0
 +        self.controlled_reference = None
 +        self.controlled_candidate_equal = True
++
++    def reload_config(self, config: OnlineAdaptationConfig) -> None:
++        if config.stream_priority != self.config.stream_priority:
++            self.side_stream.synchronize()
++            self.side_stream = torch.cuda.Stream(
++                device=self.device,
++                priority=-1 if config.stream_priority == "high" else 0,
++            )
++        self.config = config
 +
 +    def _discard_active_round(self, request_id: str) -> None:
 +        active = self.active_round_rows.pop(request_id, None)
@@ -3636,9 +3692,9 @@ new file mode 100644
 +            )
 +        )
 +        if resident_from_categories != resident:
-+            raise ValueError("resident adaptation memory ledger does not sum")
++            raise ValueError("resident adaptation memory accounting does not sum")
 +        if scratch_from_categories != int(peak_scratch_bytes):
-+            raise ValueError("peak adaptation memory ledger does not sum")
++            raise ValueError("peak adaptation memory accounting does not sum")
 +        self.optimizer_bytes = sum(
 +            int(categories[name])
 +            for name in (
@@ -3960,9 +4016,6 @@ new file mode 100644
 +            payload.update(extra)
 +        if self.telemetry_path is not None:
 +            self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
-+            temporary = self.telemetry_path.with_suffix(
-+                self.telemetry_path.suffix + ".tmp"
-+            )
-+            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-+            temporary.replace(self.telemetry_path)
++            with self.telemetry_path.open("a", encoding="utf-8") as stream:
++                stream.write(json.dumps(payload, sort_keys=True) + "\n")
 +        return payload

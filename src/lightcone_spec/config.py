@@ -116,8 +116,8 @@ class ExperimentConfig:
             or server.adaptation_reserve_mb < 0
         ):
             raise ValueError("server request counts and token budget are invalid")
-        if not 1024 <= server.base_port <= 65532:
-            raise ValueError("server.base_port must leave three valid local ports")
+        if not 1024 <= server.base_port <= 65531:
+            raise ValueError("server.base_port must leave four valid local ports")
         if server.startup_timeout_seconds < 1 or server.request_timeout_seconds < 1:
             raise ValueError("server timeouts must be positive")
         protocol = ProtocolConfig(
@@ -138,6 +138,20 @@ class ExperimentConfig:
             raise ValueError("max_process_retries must be zero or one")
         if protocol.final_blocks is not None and not 12 <= protocol.final_blocks <= 20:
             raise ValueError("final_blocks must be between 12 and 20")
+        from .protocol import PAPER_NODES
+
+        for name, value in (
+            ("start_stage", protocol.start_stage),
+            ("end_stage", protocol.end_stage),
+        ):
+            if value is not None and value not in PAPER_NODES:
+                raise ValueError(f"protocol.{name} must name a paper stage")
+        if (
+            protocol.start_stage is not None
+            and protocol.end_stage is not None
+            and PAPER_NODES.index(protocol.start_stage) > PAPER_NODES.index(protocol.end_stage)
+        ):
+            raise ValueError("protocol.start_stage must not follow end_stage")
         profilers = {
             str(name): _absolute(value, f"profiler_tools.{name}")
             for name, value in _mapping(root.get("profiler_tools", {}), "profiler_tools").items()
@@ -162,6 +176,27 @@ class ExperimentConfig:
     @property
     def run_dir(self) -> Path:
         return self.results_root / self.run_name
+
+    def normalized(self) -> dict[str, Any]:
+        return {
+            "run_name": self.run_name,
+            "gpu_ids": list(self.gpu_ids),
+            "paths": {
+                "sglang_root": str(self.sglang_root),
+                "results_root": str(self.results_root),
+                "models": {name: str(path) for name, path in self.models.items()},
+                "drafts": {name: str(path) for name, path in self.drafts.items()},
+                "datasets": {name: str(path) for name, path in self.datasets.items()},
+            },
+            "server": {
+                name: str(value) if isinstance(value, Path) else value
+                for name, value in vars(self.server).items()
+            },
+            "protocol": dict(vars(self.protocol)),
+            "profiler_tools": {
+                name: str(path) for name, path in self.profiler_tools.items()
+            },
+        }
 
     def validate_local_paths(self) -> None:
         required = {
