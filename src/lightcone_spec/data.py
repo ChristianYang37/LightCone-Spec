@@ -9,8 +9,16 @@ from typing import Any
 
 import pandas as pd
 
-PROMPT_FIELDS = ("prompt", "problem", "question", "text", "instruction", "input")
-ID_FIELDS = ("problem_id", "question_id", "id", "task_id")
+PROMPT_FIELDS = (
+    "prompt",
+    "problem",
+    "question",
+    "question_content",
+    "text",
+    "instruction",
+    "input",
+)
+ID_FIELDS = ("problem_id", "question_id", "unique_id", "uid", "id", "task_id")
 SPLITS = {"tuning", "pilot", "final", "holdout"}
 
 

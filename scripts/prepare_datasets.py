@@ -58,6 +58,9 @@ def main() -> None:
             for row in _rows(source):
                 problem_id = _first(row, ID_FIELDS)
                 prompt = _first(row, PROMPT_FIELDS)
+                turns = row.get("turns")
+                if prompt is None and isinstance(turns, list) and turns:
+                    prompt = "\n".join(str(turn) for turn in turns)
                 if problem_id is None or prompt is None:
                     continue
                 problem_id = str(problem_id)
@@ -70,9 +73,28 @@ def main() -> None:
                     "split": split,
                     "prompt": prompt,
                     "template": row.get("template"),
-                    "turns": row.get("turns"),
-                    "reference": _first(row, ("reference", "answer", "solution", "output")),
-                    "test_metadata": _first(row, ("test_metadata", "tests", "test", "test_code")),
+                    "turns": turns,
+                    "reference": _first(
+                        row,
+                        (
+                            "reference",
+                            "answer",
+                            "solution",
+                            "canonical_solution",
+                            "output",
+                            "code",
+                        ),
+                    ),
+                    "test_metadata": _first(
+                        row,
+                        (
+                            "test_metadata",
+                            "tests",
+                            "test",
+                            "test_code",
+                            "test_list",
+                        ),
+                    ),
                 }
                 if normalized["reference"] is None and normalized["test_metadata"] is None:
                     raise ValueError(f"{task}:{problem_id} lacks reference or tests")

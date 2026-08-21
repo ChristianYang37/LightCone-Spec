@@ -95,6 +95,7 @@ def _measure(
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
             limit=16,
+            split="tuning",
             offset=(job.block or 0) * 16,
         )
         prompts = tuple(tuple(client.tokenize(prompt)[-128:]) for prompt in raw)

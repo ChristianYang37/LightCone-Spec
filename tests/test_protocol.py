@@ -206,6 +206,20 @@ def test_dataset_split_and_template_are_explicit(tmp_path):
     assert [row["problem_id"] for row in repeated] == ["p1", "p1", "p1"]
     assert [row["repeat_index"] for row in repeated] == [0, 1, 2]
 
+    native = tmp_path / "native.jsonl"
+    native.write_text(
+        json.dumps(
+            {
+                "unique_id": "math-1",
+                "split": "final",
+                "question_content": "Solve it",
+                "answer": "42",
+            }
+        )
+        + "\n"
+    )
+    assert load_prompt_records(native, limit=1, split="final")[0]["problem_id"] == "math-1"
+
 
 def test_e3_uses_three_explicit_strata_without_filler():
     assert {job.task for job in materialize("E3a")} == {
