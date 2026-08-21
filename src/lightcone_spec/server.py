@@ -422,6 +422,7 @@ class ServerProcess:
             roots.append(environment["PYTHONPATH"])
         environment["PYTHONPATH"] = os.pathsep.join(roots)
         environment["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpus))
+        environment["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "false"
         (self.output_dir / "server.stopped").unlink(missing_ok=True)
         self.log = (self.output_dir / "server.log").open("a", encoding="utf-8")
         self.process = subprocess.Popen(

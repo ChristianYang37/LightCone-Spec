@@ -162,6 +162,8 @@ def test_scheduled_dispatcher_does_not_queue_behind_worker_pool(fake_server):
 
 
 def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
+    launched = {}
+
     class Process:
         pid = 12345
         returncode = None
@@ -169,7 +171,11 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
         def poll(self): return self.returncode
         def wait(self, timeout=None): self.returncode = 0
 
-    monkeypatch.setattr("lightcone_spec.server.subprocess.Popen", lambda *a, **k: Process())
+    def launch(*args, **kwargs):
+        launched.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr("lightcone_spec.server.subprocess.Popen", launch)
     monkeypatch.setattr("lightcone_spec.server.GpuSampler.start", lambda self: None)
     monkeypatch.setattr("lightcone_spec.server.GpuSampler.stop", lambda self: None)
     monkeypatch.setattr("lightcone_spec.server.SGLangClient.health", lambda self: True)
@@ -190,6 +196,7 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     process = ServerProcess(config, materialize("preflight")[0], gpus=(0, 1), port=30000, output_dir=output, selection=None)
     with process:
         assert (output / "server.pid").read_text().strip() == "12345"
+        assert launched["env"]["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] == "false"
         adaptive = next(
             job
             for job in materialize("E0-tune", valid_e0=[])
