@@ -4,7 +4,7 @@ import math
 from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.data import load_tts_calibration
 from lightcone_spec.protocol import PAPER_NODES, default_row_counts, materialize, paper_plan
-from lightcone_spec.runner import _e5_execution_phases, _request_count
+from lightcone_spec.runner import _e5_execution_phases, _request_count, _runtime_job
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 
@@ -121,6 +121,28 @@ def test_e3_uses_three_explicit_strata_without_filler():
         "LiveCodeBench",
         "MATH-500",
     }
+    state = type(
+        "State",
+        (),
+        {
+            "selection": lambda self, name, default: {
+                "e3a": {"width": 8, "load": "c4"},
+                "deployment_widths": {
+                    "static": 8,
+                    "tts": 16,
+                    "l0_naive": 16,
+                    "lightcone": 16,
+                },
+            }.get(name, default)
+        },
+    )()
+    rows = [
+        job
+        for job in materialize("E3b-pilot")
+        if job.parameters["width_panel"] == "deployment_optimal"
+    ]
+    assert _runtime_job(state, next(job for job in rows if job.method == "static")).width == 8
+    assert _runtime_job(state, next(job for job in rows if job.method == "lightcone")).width == 16
 
 
 def test_final_tail_gate_has_registered_request_mass():

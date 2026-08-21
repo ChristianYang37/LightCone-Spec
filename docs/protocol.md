@@ -36,7 +36,9 @@ continue, and no absent row is converted into a result.
 Each E0 compatibility row runs the registered Static interface, then restarts
 the same model/backend as adaptive LightCone and requires a finite published
 update. E3 context intervals resample blocks and requests within each selected
-block before evaluating the fixed 4K/16K/32K spline.
+block before evaluating the fixed 4K/16K/32K spline. Matched width uses the
+E3a winner; deployment width uses the Static E3a winner and the registered
+width-16 TTS/L0/LightCone tuning configurations.
 
 Methods in a paired block run sequentially on the same device. Independent
 single-GPU blocks may run on GPUs 0 and 1 concurrently. TP2, DP2, E5, and E6

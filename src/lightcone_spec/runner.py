@@ -1720,8 +1720,10 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         state.set_selection(
             "deployment_widths",
             {
-                method: selected_width
-                for method in ("static", "tts", "l0_naive", "lightcone")
+                "static": selected_width,
+                "tts": 16,
+                "l0_naive": 16,
+                "lightcone": 16,
             },
         )
     elif node == "TTS-Cal":
