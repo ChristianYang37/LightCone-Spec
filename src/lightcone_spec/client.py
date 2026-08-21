@@ -259,7 +259,7 @@ class SGLangClient:
                     "temperature": temperature,
                     "max_new_tokens": max_new_tokens,
                     "ignore_eos": True,
-                    "seed": seed + index,
+                    "sampling_seed": seed + index,
                 }
                 for index in range(len(prompt_rows))
             ],

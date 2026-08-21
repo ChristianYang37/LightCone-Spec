@@ -72,6 +72,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if Handler.delay:
             time.sleep(Handler.delay)
+        if any(
+            "sampling_seed" not in params or "seed" in params
+            for params in request["sampling_params"]
+        ):
+            self.send_error(400)
+            return
         chunks = []
         for index, rid in enumerate(request["rid"]):
             chunks.append(
