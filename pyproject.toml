@@ -1,79 +1,42 @@
 [build-system]
-requires = ["setuptools==83.0.0"]
+requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "lightcone-spec"
-version = "0.3.0"
-description = "Evidence-first Static, TTS, and L0 speculative decoding research."
+version = "1.0.0"
+description = "Direct research runner for LightCone-Spec experiments."
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "LightCone contributors" }]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-]
 dependencies = [
-    "cryptography>=45,<51",
     "numpy>=1.24",
-    "scipy>=1.10",
-    "torch==2.11.0",
-    "pydantic>=2.5",
-    "pyyaml>=6.0",
-    "pyarrow>=14.0",
     "pandas>=2.0",
-    "huggingface_hub>=0.20",
+    "pyarrow>=14.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "scipy>=1.10",
 ]
 
 [project.optional-dependencies]
-gpu = [
-    "datasets>=2.16",
-    "flashinfer-python[cu13]==0.6.15.post1; sys_platform == 'linux'",
-]
-dev = [
-    "build>=1.2",
-    "pytest>=7.4",
-    "ruff>=0.8",
-    "twine>=5.1",
-    "pip-audit>=2.9",
-]
-
-[project.urls]
-Homepage = "https://github.com/ChristianYang37/LightCone-Spec"
-Documentation = "https://github.com/ChristianYang37/LightCone-Spec/tree/main/docs/en"
-Issues = "https://github.com/ChristianYang37/LightCone-Spec/issues"
-Source = "https://github.com/ChristianYang37/LightCone-Spec"
+gpu = ["torch>=2.6", "datasets>=2.16"]
+dev = ["pytest>=7.4", "ruff>=0.8"]
 
 [project.scripts]
-lightcone-spec = "lightcone_spec.cli.main:main"
+lightcone-spec = "lightcone_spec.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-"lightcone_spec.runtime" = [
-    "trust/release_ed25519_root_v1.json",
-    "trust/release_ed25519_root_v1.json.sha256",
-]
-
-[tool.setuptools.data-files]
-"share/lightcone-spec/manifests/provenance" = [
-    "manifests/provenance/tts_recipe_authority_v1.json",
-    "manifests/provenance/tts_recipe_authority_v1.json.sha256",
-]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "gpu: requires NVIDIA GPU and the pinned patched SGLang checkout",
-    "system: multi-GPU system-level tests on declared hardware",
-    "integration: requires the pinned patched SGLang checkout importable",
-]
-addopts = "-m 'not gpu and not system and not integration'"
 
 [tool.ruff]
-target-version = "py312"
-line-length = 88
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

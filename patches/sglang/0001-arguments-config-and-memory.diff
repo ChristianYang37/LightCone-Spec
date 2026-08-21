@@ -1,0 +1,750 @@
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -143,6 +143,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
+     if algo is not None:
+         algo.handle_server_args(server_args)
+ 
++    from sglang.srt.speculative.online_adaptation_config import (
++        validate_online_adaptation,
++    )
++
++    validate_online_adaptation(server_args)
++
+ 
+ def _handle_dflash(server_args: ServerArgs) -> None:
+     from sglang.srt.arg_groups.overrides import resolved_view
+diff --git a/python/sglang/srt/mem_cache/allocation_sizing.py b/python/sglang/srt/mem_cache/allocation_sizing.py
+--- a/python/sglang/srt/mem_cache/allocation_sizing.py
++++ b/python/sglang/srt/mem_cache/allocation_sizing.py
+@@ -43,18 +43,44 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
+     return 2 * get_alloc_len_per_decode(server_args)
+ 
+ 
++def bounded_speculative_kv_reservation(
++    *,
++    algorithm: str,
++    committed_len: int,
++    allocated_len: int,
++    verify_len: int,
++    reserve_len: int,
++    row_capacity: int,
++) -> int:
++    """Return an in-row reservation or fail before an out-of-bounds write."""
++    if allocated_len > row_capacity:
++        raise RuntimeError(
++            f"{algorithm} allocation watermark exceeds req_to_token row capacity: "
++            f"allocated={allocated_len}, capacity={row_capacity}."
++        )
++    if committed_len + verify_len > row_capacity:
++        raise RuntimeError(
++            f"{algorithm} verify block exceeds req_to_token row capacity: "
++            f"committed={committed_len}, block={verify_len}, "
++            f"capacity={row_capacity}."
++        )
++    return min(max(allocated_len, committed_len + reserve_len), row_capacity)
++
++
+ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+     """req_to_token row headroom beyond the model context length.
+ 
+-    Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
+-    draft footprint can outgrow the default num_draft_tokens headroom.
++    Sized to hold the complete decode over-allocation.  The allocator reserves
++    two decode blocks even for token-granular pools, while page-granular pools
++    can additionally overshoot by one partial page.
+     """
+     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
+     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+-    if server_args.speculative_algorithm is not None and server_args.page_size > 1:
+-        # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
+-        # the context limit the aligned reserve can overshoot by page_size - 1;
+-        # without the headroom the row write silently lands in the neighbor row.
++    if server_args.speculative_algorithm is not None:
++        # Without the full double-buffer reserve, a token-granular DFLASH row
++        # can also overflow near the context limit: prepare_for_decode reserves
++        # 2 * num_draft_tokens, not num_draft_tokens.  Page-aligned allocation
++        # may overshoot that reserve by a further page_size - 1 slots.
+         extra = max(
+             extra,
+             get_alloc_reserve_per_decode(server_args) + server_args.page_size - 1,
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
+                 )
+                 / 1024,
+             )
+-        rest_memory = available_gpu_memory - slack_gb
++        adaptation_reserve_bytes = int(
++            getattr(
++                self.server_args,
++                "speculative_adaptation_reserve_mb",
++                0,
++            )
++        ) * 1024 * 1024
++        adaptation_resident_bytes = int(
++            getattr(
++                self.server_args,
++                "_speculative_adaptation_resident_bytes",
++                0,
++            )
++        )
++        adaptation_headroom_bytes = max(
++            adaptation_reserve_bytes - adaptation_resident_bytes, 0
++        )
++        adaptation_headroom_gb = adaptation_headroom_bytes / (1 << 30)
++        rest_memory = (
++            available_gpu_memory - slack_gb - adaptation_headroom_gb
++        )
+         if self.mambaish_config is not None:
+             rest_memory = self._handle_max_mamba_cache(rest_memory)
+ 
+@@ -1569,7 +1589,9 @@ class KVCacheConfigurator:
+                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
+             )
+             raise ValueError(
+-                f"Loaded weights leave no GPU memory for the KV cache under "
++                f"Loaded weights and the {adaptation_headroom_gb:.3f} GiB "
++                f"unallocated adaptation headroom leave no GPU memory for the "
++                f"KV cache under "
+                 f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
+                 f"Raise --mem-fraction-static above "
+                 f"{suggested_mem_fraction_static:.3f} "
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2157,6 +2157,27 @@ class ServerArgs:
+         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+         NS("spec"),
+     ] = None
++    speculative_adaptation_config: A[
++        Optional[str],
++        "Path to a LightCone online adaptation JSON.",
++        NS("spec"),
++    ] = None
++    speculative_adaptation_reserve_mb: A[
++        int,
++        "HBM reserved before KV-pool sizing for resident adaptation state.",
++        NS("spec"),
++    ] = 0
++    speculative_adaptation_telemetry_path: A[
++        Optional[str],
++        "Process-unique output path for asynchronous adaptation telemetry.",
++        NS("spec"),
++    ] = None
++    speculative_speed_study_metrics: A[
++        bool,
++        "Enable the explicit Static/TTS/L0 speed-study counters. The default "
++        "native speculative path performs no LightCone metric work.",
++        NS("spec"),
++    ] = False
+ 
+     # Decoupled speculative decoding: draft and verify run as
+     # separate engines, currently connected by a ZMQ IPC mesh.
+diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_adaptation_config.py
+@@ -0,0 +1,229 @@
++"""Small JSON configuration for online speculative adaptation."""
++
++from __future__ import annotations
++
++import json
++import math
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++LORA_RANKS = (1, 2, 4, 8, 16, 32, 64)
++LAYER_SCOPES = ("last1", "last3", "last5", "all", "last1_native_heads", "last3_native_heads", "last5_native_heads")
++DSPARK_HYBRID_SCOPES = ("last1_native_heads", "last3_native_heads", "last5_native_heads")
++BACKEND_ADAPTATION_CAPABILITIES = {
++    "DFLASH": "native_layers",
++    "DSPARK": "native_heads",
++    "EAGLE3": "selector",
++    "NEXTN": "native_mtp",
++}
++TEACHER_ROW_ACQUISITION_CAPABILITIES = {
++    name: "verification_rows" for name in BACKEND_ADAPTATION_CAPABILITIES
++}
++
++
++def _mapping(value: object, name: str) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        raise TypeError(f"{name} must be an object")
++    return {str(key): item for key, item in value.items()}
++
++
++def _finite(value: object, name: str) -> float:
++    result = float(value)
++    if not math.isfinite(result):
++        raise ValueError(f"{name} must be finite")
++    return result
++
++
++@dataclass(frozen=True)
++class OnlineOptimizerConfig:
++    name: str
++    learning_rate: float
++    weight_decay: float
++    beta1: float
++    beta2: float
++    epsilon: float
++    grad_clip: float
++    momentum: float | None = None
++    muon_ns_steps: int | None = None
++    muon_auxiliary_learning_rate: float | None = None
++    muon_auxiliary_weight_decay: float | None = None
++    schedule: str = "constant"
++    schedule_total_published_updates: int | None = None
++
++
++@dataclass(frozen=True)
++class OnlineSpecLearnerConfig:
++    projection_radius: float | None
++    additional_learning_rates: tuple[float, ...]
++    hedge_learning_rate: float | None
++
++
++@dataclass(frozen=True)
++class TopologyConfig:
++    tensor_parallel_size: int
++    data_parallel_size: int
++
++
++@dataclass(frozen=True)
++class OnlineAdaptationConfig:
++    method: str
++    algorithm: str
++    weight_update_mode: str
++    parameter_scope: str
++    optimizer: OnlineOptimizerConfig
++    rank: int | None
++    lora_alpha: int | None
++    stride: int
++    canvas_tokens: int
++    loss_position_decay: float
++    extra_logical_delay: int
++    teacher_row_policy: str
++    verification_mode: str
++    topology: TopologyConfig
++    online_spec: OnlineSpecLearnerConfig | None
++    adaptation_group_id: str
++    telemetry_detail: str
++    seed: int
++    controlled_candidate_replay: bool
++    adaptation_microbatch_size: int = 1
++    update_coalescing: int = 1
++    stream_priority: str = "default"
++    confidence_loss_weight: float = 0.1
++    lora_matrix_policy: str = "linear_weights"
++    native_head_policy: str = "include_for_hybrid_scope"
++    failure_injection: str | None = None
++
++    @classmethod
++    def load(
++        cls, path: str | Path, *, tp_size: int = 1, dp_size: int = 1
++    ) -> OnlineAdaptationConfig:
++        value = _mapping(json.loads(Path(path).read_text(encoding="utf-8")), "adaptation")
++        method = str(value.get("method", "l0"))
++        if method not in {"tts", "l0", "onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"}:
++            raise ValueError(f"unsupported adaptation method {method}")
++        algorithm = str(value.get("algorithm", "")).upper()
++        if algorithm not in BACKEND_ADAPTATION_CAPABILITIES:
++            raise ValueError(f"unsupported adaptation backend {algorithm}")
++        mode = str(value.get("weight_update_mode", "lora"))
++        if mode not in {"full", "lora"}:
++            raise ValueError("weight_update_mode must be full or lora")
++        scope = str(value.get("parameter_scope", "all"))
++        if scope not in LAYER_SCOPES:
++            raise ValueError(f"unsupported parameter scope {scope}")
++        rank = value.get("rank")
++        if mode == "lora":
++            rank = int(rank)
++            if rank not in LORA_RANKS:
++                raise ValueError("unsupported LoRA rank")
++        else:
++            rank = None
++        raw = _mapping(value.get("optimizer", {}), "optimizer")
++        optimizer = OnlineOptimizerConfig(
++            name=str(raw.get("name", "adam")),
++            learning_rate=_finite(raw.get("learning_rate", 1e-3), "learning_rate"),
++            weight_decay=_finite(raw.get("weight_decay", 0.0), "weight_decay"),
++            beta1=_finite(raw.get("beta1", 0.9), "beta1"),
++            beta2=_finite(raw.get("beta2", 0.999), "beta2"),
++            epsilon=_finite(raw.get("epsilon", 1e-8), "epsilon"),
++            grad_clip=_finite(raw.get("grad_clip", 1.0), "grad_clip"),
++            momentum=None if raw.get("momentum") is None else _finite(raw["momentum"], "momentum"),
++            muon_ns_steps=raw.get("muon_ns_steps"),
++            muon_auxiliary_learning_rate=raw.get("muon_auxiliary_learning_rate"),
++            muon_auxiliary_weight_decay=raw.get("muon_auxiliary_weight_decay"),
++            schedule=str(raw.get("schedule", "constant")),
++            schedule_total_published_updates=raw.get("schedule_total_published_updates"),
++        )
++        if optimizer.learning_rate <= 0 or optimizer.epsilon <= 0 or optimizer.grad_clip < 0:
++            raise ValueError(
++                "optimizer learning rate and epsilon must be positive; clipping cannot be negative"
++            )
++        if optimizer.weight_decay < 0 or not 0 < optimizer.beta1 < 1 or not 0 < optimizer.beta2 < 1:
++            raise ValueError("optimizer decay and beta values are invalid")
++        online_raw = value.get("online_spec")
++        online_spec = None
++        if online_raw is not None:
++            online = _mapping(online_raw, "online_spec")
++            online_spec = OnlineSpecLearnerConfig(
++                projection_radius=online.get("projection_radius"),
++                additional_learning_rates=tuple(float(item) for item in online.get("additional_learning_rates", ())),
++                hedge_learning_rate=online.get("hedge_learning_rate"),
++            )
++        stride = int(value.get("stride", 10))
++        canvas = int(value.get("canvas_tokens", 16))
++        microbatch = int(value.get("adaptation_microbatch_size", 1))
++        coalescing = int(value.get("update_coalescing", 1))
++        stream_priority = str(value.get("stream_priority", "default"))
++        confidence_weight = _finite(
++            value.get("confidence_loss_weight", 0.1), "confidence_loss_weight"
++        )
++        if stride < 1 or canvas < 1 or microbatch < 1 or coalescing < 1:
++            raise ValueError(
++                "stride, canvas_tokens, and adaptation_microbatch_size must be positive"
++            )
++        if confidence_weight < 0:
++            raise ValueError("confidence_loss_weight cannot be negative")
++        if stream_priority not in {"default", "high"}:
++            raise ValueError("stream_priority must be default or high")
++        if (tp_size, dp_size) not in {(1, 1), (2, 1), (1, 2)}:
++            raise ValueError("online adaptation supports TP1, TP2, and two TP1 replicas")
++        return cls(
++            method=method,
++            algorithm=algorithm,
++            weight_update_mode=mode,
++            parameter_scope=scope,
++            optimizer=optimizer,
++            rank=rank,
++            lora_alpha=None if rank is None else int(value.get("lora_alpha", rank)),
++            stride=stride,
++            canvas_tokens=canvas,
++            loss_position_decay=_finite(value.get("loss_position_decay", 1.0), "loss_position_decay"),
++            extra_logical_delay=int(value.get("extra_logical_delay", 0)),
++            teacher_row_policy=str(value.get("teacher_row_policy", "verification_rows")),
++            verification_mode=str(value.get("verification_mode", "native_scheduler")),
++            topology=TopologyConfig(tp_size, dp_size),
++            online_spec=online_spec,
++            adaptation_group_id=str(value.get("adaptation_group_id", "default")),
++            telemetry_detail=str(value.get("telemetry_detail", "headline")),
++            seed=int(value.get("seed", 0)),
++            controlled_candidate_replay=bool(value.get("controlled_candidate_replay", False)),
++            adaptation_microbatch_size=microbatch,
++            update_coalescing=coalescing,
++            stream_priority=stream_priority,
++            confidence_loss_weight=confidence_weight,
++            failure_injection=value.get("failure_injection"),
++        )
++
++
++def load_online_adaptation(server_args) -> OnlineAdaptationConfig | None:
++    path = getattr(server_args, "speculative_adaptation_config", None)
++    if not path:
++        return None
++    return OnlineAdaptationConfig.load(
++        path,
++        tp_size=int(getattr(server_args, "tp_size", 1)),
++        dp_size=int(getattr(server_args, "dp_size", 1)),
++    )
++
++
++def validate_online_adaptation(server_args) -> None:
++    config = load_online_adaptation(server_args)
++    reserve_mb = int(getattr(server_args, "speculative_adaptation_reserve_mb", 0))
++    if reserve_mb < 0:
++        raise ValueError("speculative_adaptation_reserve_mb cannot be negative")
++    if config is None:
++        if reserve_mb or getattr(server_args, "speculative_adaptation_telemetry_path", None):
++            raise ValueError("adaptation reserve and telemetry require an adaptation config")
++        return
++    if not bool(getattr(server_args, "speculative_speed_study_metrics", False)):
++        raise ValueError("online adaptation requires speed-study metrics")
++    backend = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
++    if backend != config.algorithm:
++        raise ValueError(f"adaptation backend mismatch: {config.algorithm} != {backend}")
++    width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
++    if config.canvas_tokens != width:
++        raise ValueError("canvas_tokens must equal speculative_num_draft_tokens")
++    if reserve_mb <= 0:
++        raise ValueError("online adaptation requires a positive HBM reserve")
++    if not bool(getattr(server_args, "speculative_use_rejection_sampling", False)):
++        raise ValueError("online adaptation requires exact rejection sampling")
+diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_parameter_plan.py
+@@ -0,0 +1,186 @@
++"""Backend-native, deterministic LightCone trainable-parameter selectors."""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Iterable
++from dataclasses import dataclass
++
++import torch
++from sglang.srt.speculative.online_adaptation_config import (
++    DSPARK_HYBRID_SCOPES,
++    LAYER_SCOPES,
++    OnlineAdaptationConfig,
++)
++
++_LAYER = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
++_LORA_MATRIX = re.compile(
++    r"(?:^|\.)(?:fc|q_proj|k_proj|v_proj|qkv_proj|o_proj|gate_proj|"
++    r"gate_up_proj|up_proj|down_proj)\.weight$"
++)
++_BORROWED = frozenset({"embed_tokens", "lm_head", "target_model"})
++_DSPARK_W1 = re.compile(r"(?:^|\.)markov_head\.markov_w1\.weight$")
++_DSPARK_W2 = re.compile(r"(?:^|\.)markov_head\.markov_w2\.weight$")
++_DSPARK_ACCEPTANCE = re.compile(r"(?:^|\.)confidence_head\.proj\.(?:weight|bias)$")
++
++
++@dataclass(frozen=True)
++class ParameterSelection:
++    algorithm: str
++    scope: str
++    mode: str
++    selected_names: tuple[str, ...]
++    lora_names: tuple[str, ...]
++    full_names: tuple[str, ...]
++    frozen_names: tuple[str, ...]
++    native_head_names: tuple[str, ...]
++
++
++def _canonical_items(
++    named_parameters: Iterable[tuple[str, torch.Tensor]],
++) -> tuple[tuple[str, torch.Tensor], ...]:
++    rows = []
++    seen = set()
++    for raw_name, parameter in named_parameters:
++        name = raw_name.removeprefix("model.")
++        if name in seen:
++            raise ValueError(f"duplicate canonical parameter name: {name}")
++        seen.add(name)
++        rows.append((name, parameter))
++    if not rows:
++        raise ValueError("backend exposes no parameters")
++    return tuple(sorted(rows, key=lambda row: row[0]))
++
++
++def _selected_layers(
++    rows: tuple[tuple[str, torch.Tensor], ...], scope: str
++) -> frozenset[int]:
++    indices = sorted(
++        {
++            int(match.group(1))
++            for name, _ in rows
++            if (match := _LAYER.search(name)) is not None
++        }
++    )
++    if not indices or indices != list(range(indices[-1] + 1)):
++        raise ValueError("backend layer indices must be contiguous from zero")
++    if scope == "all":
++        return frozenset(indices)
++    count = int(scope.removeprefix("last"))
++    if count > len(indices):
++        raise ValueError(f"parameter scope {scope} exceeds backend depth")
++    return frozenset(indices[-count:])
++
++
++def _owned(name: str) -> bool:
++    return _BORROWED.isdisjoint(name.split("."))
++
++
++def _dspark_heads(rows: tuple[tuple[str, torch.Tensor], ...]) -> tuple[str, ...]:
++    w1 = [name for name, _ in rows if _DSPARK_W1.search(name)]
++    w2 = [name for name, _ in rows if _DSPARK_W2.search(name)]
++    acceptance = [name for name, _ in rows if _DSPARK_ACCEPTANCE.search(name)]
++    if len(w1) != 1 or len(w2) != 1:
++        raise ValueError("DSpark selector requires exact Markov W1 and W2 parameters")
++    acceptance_weights = [name for name in acceptance if name.endswith(".weight")]
++    if len(acceptance_weights) != 1:
++        raise ValueError(
++            "DSpark selector requires one scalar-output acceptance projection"
++        )
++    by_name = dict(rows)
++    w1_weight = by_name[w1[0]]
++    w2_weight = by_name[w2[0]]
++    if (
++        w1_weight.ndim != 2
++        or w2_weight.ndim != 2
++        or w1_weight.shape != w2_weight.shape
++    ):
++        raise ValueError(
++            "DSpark W1 embedding and W2 projection must share [vocab, rank]"
++        )
++    weight = by_name[acceptance_weights[0]]
++    if (
++        weight.ndim != 2
++        or weight.shape[0] != 1
++        or weight.shape[1] <= w1_weight.shape[1]
++    ):
++        raise ValueError(
++            "DSpark acceptance projection must consume hidden plus Markov W1"
++        )
++    acceptance_biases = [name for name in acceptance if name.endswith(".bias")]
++    if len(acceptance_biases) > 1:
++        raise ValueError("DSpark selector permits at most one acceptance bias")
++    if acceptance_biases and by_name[acceptance_biases[0]].shape != (1,):
++        raise ValueError("DSpark acceptance projection bias must be scalar-output")
++    return tuple(sorted((*w1, *w2, *acceptance)))
++
++
++def build_native_parameter_plan(
++    named_parameters: Iterable[tuple[str, torch.Tensor]],
++    config: OnlineAdaptationConfig,
++) -> ParameterSelection:
++    """Select one exact backend layout before allocating optimizer state."""
++    algorithm = config.algorithm
++    if algorithm not in {"DFLASH", "DSPARK", "EAGLE3", "NEXTN"}:
++        raise ValueError(f"{algorithm} has no implemented parameter selector")
++    scope = config.parameter_scope
++    allowed = (
++        {*LAYER_SCOPES, *DSPARK_HYBRID_SCOPES}
++        if algorithm == "DSPARK"
++        else set(LAYER_SCOPES)
++    )
++    if scope not in allowed:
++        raise ValueError(f"unregistered {algorithm} parameter scope")
++    rows = _canonical_items(named_parameters)
++    hybrid = scope in DSPARK_HYBRID_SCOPES
++    layer_scope = scope.removesuffix("_native_heads")
++    layer_ids = _selected_layers(rows, layer_scope)
++    native_heads = _dspark_heads(rows) if algorithm == "DSPARK" else ()
++    native_head_set = frozenset(native_heads)
++    selected: list[str] = []
++    lora: list[str] = []
++    full: list[str] = []
++    frozen: list[str] = []
++    for name, parameter in rows:
++        match = _LAYER.search(name)
++        in_selected_layer = match is not None and int(match.group(1)) in layer_ids
++        eligible = _owned(name) and parameter.is_floating_point() and in_selected_layer
++        parameterization = "full"
++        if config.weight_update_mode == "lora":
++            eligible = (
++                eligible
++                and parameter.ndim == 2
++                and _LORA_MATRIX.search(name) is not None
++            )
++            parameterization = "lora"
++        if hybrid and name in native_head_set:
++            if not parameter.is_floating_point():
++                raise ValueError("DSpark native heads must be floating point")
++            eligible = True
++            parameterization = "full"
++        if eligible:
++            selected.append(name)
++            (lora if parameterization == "lora" else full).append(name)
++        else:
++            frozen.append(name)
++    if not selected:
++        raise ValueError("backend-native parameter selection is empty")
++    selected_set = frozenset(selected)
++    if algorithm == "DSPARK":
++        if hybrid and not native_head_set <= selected_set:
++            raise AssertionError("DSpark hybrid selection lost a native head")
++        if not hybrid and native_head_set & selected_set:
++            raise AssertionError("DSpark layer-only selection changed a native head")
++    return ParameterSelection(
++        algorithm=algorithm,
++        scope=scope,
++        mode=config.weight_update_mode,
++        selected_names=tuple(selected),
++        lora_names=tuple(lora),
++        full_names=tuple(full),
++        frozen_names=tuple(sorted(frozen)),
++        native_head_names=native_heads,
++    )
++
++
++__all__ = ("ParameterSelection", "build_native_parameter_plan")
+diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/speculative/online_valid_mask.py
+@@ -0,0 +1,176 @@
++"""Shared semantic proposal mask for linear speculative backends."""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import torch
++
++
++def request_boundary_metadata(
++    requests: Sequence[object],
++    *,
++    prefix_lens: torch.Tensor | None = None,
++) -> tuple[torch.Tensor | list[int], list[tuple[int, ...]], list[bool]]:
++    """Extract request-boundary semantics without trusting delayed host state.
++
++    Under overlap scheduling, ``Req.output_ids`` trails the committed device
++    prefix by one speculative step.  Adapted workers therefore pass their
++    device-resident prefix lengths so the request budget remains exact without
++    a device-to-host synchronization.
++    """
++    if prefix_lens is not None and (
++        prefix_lens.ndim != 1 or prefix_lens.shape[0] != len(requests)
++    ):
++        raise ValueError("prefix_lens must have one value per request")
++    remaining_host: list[int] = []
++    boundaries: list[tuple[int, int]] = []
++    terminal_ids: list[tuple[int, ...]] = []
++    ignore_eos: list[bool] = []
++    for request in requests:
++        sampling = request.sampling_params
++        maximum = int(sampling.max_new_tokens)
++        if prefix_lens is None:
++            remaining_host.append(max(maximum - len(request.output_ids), 0))
++        else:
++            boundaries.append((len(request.origin_input_ids), maximum))
++        stops = set(getattr(request, "eos_token_ids", None) or ())
++        stops.update(getattr(sampling, "stop_token_ids", None) or ())
++        terminal_ids.append(tuple(sorted(int(token) for token in stops)))
++        ignore_eos.append(bool(getattr(sampling, "ignore_eos", False)))
++    if prefix_lens is None:
++        remaining: torch.Tensor | list[int] = remaining_host
++    else:
++        bounds = torch.tensor(
++            boundaries,
++            device=prefix_lens.device,
++            dtype=prefix_lens.dtype,
++        ).reshape(-1, 2)
++        generated = prefix_lens.detach() - bounds[:, 0]
++        remaining = (bounds[:, 1] - generated).clamp_min(0)
++    return remaining, terminal_ids, ignore_eos
++
++
++def semantic_proposal_semantics(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    remaining_output_tokens: Sequence[int] | torch.Tensor,
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return full-canvas teachers, accepted drafts, and semantic commits.
++
++    Verification reveals a teacher distribution for every token in the
++    sampled canvas, including the counterfactual suffix after the first
++    rejection.  That suffix is training evidence even though it is not
++    committed to the live request.  Only a request limit or a terminal token
++    truncates the distillation canvas.
++    """
++    if proposal_tokens.ndim != 2:
++        raise ValueError("proposal_tokens must have shape (batch, depth)")
++    batch, depth = proposal_tokens.shape
++    if correct_len.shape != (batch,):
++        raise ValueError("correct_len must have one value per request")
++    if isinstance(remaining_output_tokens, torch.Tensor):
++        remaining_count = (
++            remaining_output_tokens.shape[0]
++            if remaining_output_tokens.ndim == 1
++            else -1
++        )
++    else:
++        remaining_count = len(remaining_output_tokens)
++    if not (remaining_count == len(terminal_token_ids) == len(ignore_eos) == batch):
++        raise ValueError("request-boundary metadata length mismatch")
++    positions = torch.arange(
++        depth, device=proposal_tokens.device, dtype=correct_len.dtype
++    )[None, :]
++    if isinstance(remaining_output_tokens, torch.Tensor):
++        if remaining_output_tokens.device != proposal_tokens.device:
++            raise ValueError("remaining budget must stay on the proposal device")
++        remaining = remaining_output_tokens.detach().to(dtype=correct_len.dtype)
++    else:
++        remaining = torch.tensor(
++            remaining_output_tokens,
++            device=proposal_tokens.device,
++            dtype=correct_len.dtype,
++        )
++    valid = positions < remaining[:, None]
++    # The target bonus is committed only when the accepted draft prefix and
++    # request boundary leave room for it.
++    committed = torch.minimum(correct_len + 1, remaining)
++    for index, terminal_ids in enumerate(terminal_token_ids):
++        if ignore_eos[index] or not terminal_ids:
++            continue
++        terminals = torch.tensor(
++            tuple(terminal_ids),
++            device=proposal_tokens.device,
++            dtype=proposal_tokens.dtype,
++        )
++        hit = (proposal_tokens[index, :, None] == terminals).any(-1)
++        earlier_canvas_terminal = (
++            torch.cat(
++                (
++                    torch.zeros((1,), device=proposal_tokens.device, dtype=torch.bool),
++                    hit[:-1],
++                )
++            ).cumsum(0)
++            > 0
++        )
++        valid[index] &= ~earlier_canvas_terminal
++        accepted_hit = hit & (positions[0] < correct_len[index])
++        terminal_positions = torch.where(
++            accepted_hit,
++            positions[0] + 1,
++            torch.full_like(positions[0], depth + 1),
++        )
++        committed[index] = torch.minimum(committed[index], terminal_positions.min())
++    accepted = torch.minimum(correct_len, committed)
++    return valid, accepted, committed
++
++
++def semantic_valid_mask(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> torch.Tensor:
++    """Keep the sampled canvas; mask request and terminal boundaries only."""
++    valid, _, _ = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
++    return valid
++
++
++def semantic_outcome_lengths(
++    *,
++    proposal_tokens: torch.Tensor,
++    correct_len: torch.Tensor,
++    bonus_tokens: torch.Tensor,
++    remaining_output_tokens: Sequence[int],
++    terminal_token_ids: Sequence[Sequence[int]],
++    ignore_eos: Sequence[bool],
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return accepted drafts and committed tokens after request semantics.
++
++    A normal verification commits ``correct_len`` drafts plus one target bonus.
++    A request boundary may cut inside the accepted prefix, while an accepted
++    terminal token commits that token but neither its suffix nor the bonus.
++    """
++    batch = proposal_tokens.shape[0] if proposal_tokens.ndim == 2 else -1
++    if bonus_tokens.shape != (batch,):
++        raise ValueError("outcome lengths require one value per request")
++    _, accepted, committed = semantic_proposal_semantics(
++        proposal_tokens=proposal_tokens,
++        correct_len=correct_len,
++        remaining_output_tokens=remaining_output_tokens,
++        terminal_token_ids=terminal_token_ids,
++        ignore_eos=ignore_eos,
++    )
++    return accepted, committed

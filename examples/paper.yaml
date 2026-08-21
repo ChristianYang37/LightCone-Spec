@@ -1,0 +1,46 @@
+run_name: paper-v1-main
+gpu_ids: [0, 1]
+paths:
+  sglang_root: /root/sglang
+  results_root: /root/lightcone-results
+  models:
+    Qwen/Qwen3-4B: /root/models/Qwen3-4B
+    Qwen/Qwen3-8B: /root/models/Qwen3-8B
+    Qwen/Qwen3-14B: /root/models/Qwen3-14B
+    Gemma4-12B: /root/models/Gemma4-12B
+    Qwen/Qwen3.6-35B-A3B: /root/models/Qwen3.6-35B-A3B
+    Qwen/Qwen3.5-122B-A10B-FP8: /root/models/Qwen3.5-122B-A10B-FP8
+  drafts:
+    DFLASH: /root/models/Qwen3-0.6B
+    DSPARK: /root/models/Qwen3-0.6B
+    EAGLE3: /root/models/Qwen3-8B-EAGLE3
+  datasets:
+    controlled_baseline: /root/datasets/controlled-baseline.jsonl
+    LiveCodeBench: /root/datasets/livecodebench.jsonl
+    MATH-500: /root/datasets/math500.jsonl
+    GSM8K: /root/datasets/gsm8k.jsonl
+    AIME-2025: /root/datasets/aime2025.jsonl
+    MBPP: /root/datasets/mbpp.jsonl
+    HumanEval: /root/datasets/humaneval.jsonl
+    MT-Bench: /root/datasets/mtbench.jsonl
+    Alpaca: /root/datasets/alpaca.jsonl
+    Arena-Hard: /root/datasets/arena-hard.jsonl
+    BurstGPT: /root/datasets/BurstGPT.csv
+server:
+  python: /root/lightcone-tts-runtime/bin/python
+  host: 127.0.0.1
+  base_port: 30000
+  mem_fraction_static: 0.88
+  adaptation_reserve_mb: 16384
+  startup_timeout_seconds: 900
+  request_timeout_seconds: 900
+  requests_per_cell: 16
+  max_new_tokens: 256
+  warmup_requests: 1
+protocol:
+  preset: paper-v1
+  max_process_retries: 1
+  seed: 0
+profiler_tools:
+  nsys: /usr/local/cuda/bin/nsys
+  ncu: /usr/local/cuda/bin/ncu

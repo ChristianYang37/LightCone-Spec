@@ -3,6 +3,7 @@
 *.py text eol=lf
 *.json text eol=lf
 *.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof
+*.diff text eol=lf whitespace=-blank-at-eol,-blank-at-eof
 *.png binary
 *.jpg binary
 *.jpeg binary

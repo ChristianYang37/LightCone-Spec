@@ -1,8 +1,3 @@
-"""LightCone-Spec: online adaptation for speculative decoding."""
+"""LightCone-Spec direct experiment runner."""
 
-__version__ = "0.3.0"
-SCHEMA_VERSION = 3
-PINNED_SGLANG_COMMIT = "3312645a307453893a00778592f105581e3d1c3d"
-PINNED_SGLANG_TREE = "bb6371242e82592d1b8a2f5f4ba6d0630d8365cb"
-PINNED_SGLANG_PATCH_COUNT = 8
-TTS_ARXIV_ID = "2605.09329v2"
+__version__ = "1.0.0"

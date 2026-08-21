@@ -3,92 +3,15 @@ Copyright 2026 LightCone contributors
 
 Licensed under the Apache License, Version 2.0. See LICENSE.
 
-This distribution contains original LightCone-Spec code and an auditable
-patch series for SGLang. SGLang is licensed under Apache-2.0 and is not
-distributed with this repository. The patches target:
+This distribution contains original LightCone-Spec code and plain unified
+diffs for SGLang. SGLang is licensed under Apache-2.0 and is not distributed
+with this repository. The diffs add the experimental online-adaptation,
+backend, distributed-publication, reset, and telemetry paths used by the paper
+protocol.
 
-  Repository: https://github.com/sgl-project/sglang.git
-  Upstream commit: 3312645a307453893a00778592f105581e3d1c3d
-  Latest semantic patch SHA-256: 0c4db4f8798645c0ba65e97031030fb5e891d15f63cd75105fc1e1656c1a2874
-  Expected final tree: bb6371242e82592d1b8a2f5f4ba6d0630d8365cb
-
-The semantic patch changes SGLang to add strict schema-v3 preflight, focused
-DFlash native-layer Full/LoRA updates, deterministic backend parameter plans,
-resident optimizer choices, memory-bounded LoRA-coordinate Hedge decisions,
-versioned frozen-KV lifecycle, event-fenced fixed-address publication,
-memory accounting, and lower-level adaptation/evidence fields for the
-Static/TTS/L0 target study and isolated OnlineSPEC comparison. It also carries
-an exact single-GPU session-reset qualification suite; the remote suite emits
-unsigned raw evidence and never receives the offline release signing key. The
-series carries server-provided ordered output token IDs through SGLang's official serving
-benchmark adapter without retokenizing generated text, supports a caller-owned
-HTTP session, and implements the content-bound begin/reset/finalize terminal
-evidence hook for the limited TP1/DP1 DFlash surface. Distributed finalize
-binds the complete ordered client lifecycle: only exact digest-bound,
-non-submitted scored IDs may omit native rank rows; every submitted request
-and every warmup request still requires matching native terminal evidence. It
-also adds a
-source-owned all-reset capability/state/receipt producer whose GPU semantics
-remain `IMPLEMENTED_PENDING_DYNAMIC_GPU_PROOF` and whose failures require a
-fresh process. The
-third patch counts actual protocol connection create/close events on the
-supported single-tokenizer HTTP/1.1 uvicorn paths, binds cumulative process/
-generation/created/closed/current totals, and rejects scheduler counters,
-headers, or caller-authored substitutes. Granian HTTP/2 and multiple-tokenizer
-HTTP-process paths fail closed before this capability can be produced.
-The fourth patch binds each ordered reset to the existing native terminal
-begin/reset/finalize lifecycle, mints excluded-warm-up and independent scored-
-clock receipts from scheduler-owned monotonic state, and seals the complete
-native digest chain with a lifecycle-terminal receipt. That receipt truthfully
-marks transport close as pending because its own HTTP response connection has
-not yet emitted `connection_lost`. GPU reset semantics and live reuse remain
-explicitly PENDING/BLOCKED.
-The fifth patch adds a source-owned ordered compile/prewarm lifecycle. Its
-native scheduler receipts bind the plan, cache/model/sampling/assignment/
-budget/inventory identities and observed request terminals. It is strictly a
-`CPU_CONTRACT_ONLY`: GPU JIT, graph, and cache counters remain null with a
-named unavailable reason, and no formal compile source is release-authorized.
-The sixth patch makes draft-width accounting target-aware: Target-only keeps
-terminal speculative fields non-applicable and reports zero verified drafts in
-the numeric server-info view, while malformed speculative configurations still
-fail closed when their draft width is missing.
-The seventh patch binds distinct TP2 and two-replica TP1/DP2 control contracts.
-TP1/DP2 has no adaptation collective or cross-replica gradient averaging; both
-distributed modes remain implemented-pending-qualification until an exact
-locally root-authorized GPU proof exists. It also carries the first-party
-native ITL result pointer through the official benchmark output; the remote
-pointer and terminal remain unsigned raw evidence and cannot self-authorize.
-The eighth patch isolates every request-scoped TTS/L0 adaptation epoch at the
-same source point across DFlash, DSpark, EAGLE3, and NEXTN. It serializes only
-native adaptive ownership while preserving offered client concurrency, seals
-append-only reset/archive evidence for completion and abort paths, restores
-optimizer/inference/captured state before the next admission, and keeps
-cohort-scoped LightCone/OnlineSPEC plus allocation-free Target/Static behavior
-unchanged.
-The second patch adds only CPU host observations for already committed tokens;
-they are labelled `CPU_CONTRACT_ONLY`, cannot enter formal p99 authority, and
-the benchmark emits null aggregate ITL statistics whenever client interval
-coverage is incomplete rather than reducing a sparse subset.
-Its focused protocol test loads only the patched modules and does not import
-unrelated SGLang optional dependencies. The hook has no bundled
-trusted hardware signer. The release verifier therefore keeps Static/TTS/L0
-non-claimable and only Target-only release-supported. DSpark, EAGLE/EAGLE3,
-NEXTN, and all TP2/DP2 execution fail before model loading. The patch includes
-a CPU-only DSpark reconstruction/selector/loss/verification contract; it does
-not include or authorize the DSpark CUDA adaptation worker.
-See patches/sglang/manifest.json for the exact patch and tree identities.
-
-The registered OnlineSPEC comparison is a clean-room implementation of online
-learner equations described by:
-
-  Paper: https://arxiv.org/abs/2603.12617v2
-  Reference repository: https://github.com/ZinYY/OnlineSPEC
-  Audited commit: e58f82eb3f3adca3a686211236bf4f6e9e7e3a2b
-
-The reference repository did not contain a project-level license file at the
-audited commit. Some individual files carry their own notices; no OnlineSPEC
-source code or checkpoint utility is copied or distributed here. The reference
-is recorded for scientific provenance only.
+The OnlineSPEC comparison is an independent implementation based on the paper
+and public reference project at https://github.com/ZinYY/OnlineSPEC. No
+OnlineSPEC source code is copied into this repository.
 
 Models and datasets are external artifacts. They are not distributed by this
 repository and remain subject to their respective licenses and terms.

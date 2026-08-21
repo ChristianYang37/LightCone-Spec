@@ -1,0 +1,235 @@
+"""Scientific metrics, paired uncertainty, and stage summaries."""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Iterable
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm, ttest_rel
+
+SAFETY_COUNTERS = (
+    "exactness_violations",
+    "version_mismatches",
+    "fallbacks",
+    "nonfinite_updates",
+    "oom_events",
+    "retractions",
+    "stale_publications",
+)
+
+
+def committed_goodput(committed_tokens: int, duration_seconds: float) -> float:
+    if committed_tokens < 0 or not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("goodput requires non-negative tokens and positive finite time")
+    return committed_tokens / duration_seconds
+
+
+def validate_scientific_metrics(metrics: dict[str, object]) -> None:
+    required = (
+        "committed_tokens",
+        "duration_seconds",
+        "goodput",
+        "peak_hbm_bytes",
+        "kv_capacity",
+        "itl_p99_ms",
+        *SAFETY_COUNTERS,
+    )
+    missing = [name for name in required if name not in metrics]
+    if missing:
+        raise ValueError(f"metrics are missing {missing}")
+    numeric = [value for value in metrics.values() if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    if any(not math.isfinite(float(value)) for value in numeric):
+        raise ValueError("metrics contain a non-finite number")
+    for counter in SAFETY_COUNTERS:
+        value = metrics[counter]
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(f"{counter} must be a non-negative integer")
+        if value:
+            raise RuntimeError(f"scientific safety failure: {counter}={value}")
+
+
+def benjamini_hochberg(p_values: Iterable[float], alpha: float = 0.05) -> tuple[bool, ...]:
+    values = tuple(float(value) for value in p_values)
+    if any(not 0 <= value <= 1 for value in values):
+        raise ValueError("p-values must be in [0, 1]")
+    order = sorted(range(len(values)), key=values.__getitem__)
+    cutoff = -1
+    for rank, index in enumerate(order, start=1):
+        if values[index] <= alpha * rank / len(values):
+            cutoff = rank
+    decisions = [False] * len(values)
+    if cutoff > 0:
+        for index in order[:cutoff]:
+            decisions[index] = True
+    return tuple(decisions)
+
+
+def paired_bca_interval(
+    candidate: Iterable[float],
+    baseline: Iterable[float],
+    *,
+    confidence: float = 0.95,
+    resamples: int = 5000,
+    seed: int = 0,
+) -> tuple[float, float, float]:
+    left = np.asarray(tuple(candidate), dtype=np.float64)
+    right = np.asarray(tuple(baseline), dtype=np.float64)
+    if left.shape != right.shape or left.ndim != 1 or left.size < 3:
+        raise ValueError("paired BCa requires equal one-dimensional samples of size at least three")
+    if np.any(~np.isfinite(left)) or np.any(~np.isfinite(right)):
+        raise ValueError("paired samples must be finite")
+    differences = left - right
+    observed = float(np.mean(differences))
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, differences.size, size=(resamples, differences.size))
+    boot = np.mean(differences[indices], axis=1)
+    less = np.mean(boot < observed)
+    z0 = norm.ppf(np.clip(less, 1 / (2 * resamples), 1 - 1 / (2 * resamples)))
+    jack = np.asarray([np.mean(np.delete(differences, index)) for index in range(differences.size)])
+    centered = np.mean(jack) - jack
+    denominator = 6 * np.sum(centered**2) ** 1.5
+    acceleration = 0.0 if denominator == 0 else float(np.sum(centered**3) / denominator)
+    alpha = (1 - confidence) / 2
+    adjusted = []
+    for probability in (alpha, 1 - alpha):
+        z = norm.ppf(probability)
+        adjusted.append(norm.cdf(z0 + (z0 + z) / (1 - acceleration * (z0 + z))))
+    low, high = np.quantile(boot, np.clip(adjusted, 0, 1))
+    return observed, float(low), float(high)
+
+
+def holm_decisions(p_values: Iterable[float], alpha: float = 0.05) -> tuple[bool, ...]:
+    values = tuple(float(value) for value in p_values)
+    if any(not 0 <= value <= 1 for value in values):
+        raise ValueError("p-values must be in [0, 1]")
+    order = sorted(range(len(values)), key=values.__getitem__)
+    decisions = [False] * len(values)
+    active = True
+    for rank, index in enumerate(order):
+        threshold = alpha / (len(values) - rank)
+        if active and values[index] <= threshold:
+            decisions[index] = True
+        else:
+            active = False
+    return tuple(decisions)
+
+
+def choose_final_blocks(
+    paired_log_differences: Iterable[float],
+    *,
+    effect: float = math.log(1.03),
+    power: float = 0.80,
+    alpha: float = 0.025,
+) -> int | None:
+    values = np.asarray(tuple(paired_log_differences), dtype=np.float64)
+    if values.size < 4 or np.any(~np.isfinite(values)):
+        raise ValueError("power selection requires four finite pilot blocks")
+    sigma = float(np.std(values, ddof=1))
+    if sigma == 0:
+        return 12
+    required = math.ceil(((norm.ppf(1 - alpha / 2) + norm.ppf(power)) * sigma / effect) ** 2)
+    return max(12, required) if required <= 20 else None
+
+
+def block_bootstrap_interval(
+    values: Iterable[float], *, resamples: int = 5000, seed: int = 0
+) -> tuple[float, float, float]:
+    rows = np.asarray(tuple(values), dtype=np.float64)
+    if rows.size < 3 or np.any(~np.isfinite(rows)):
+        raise ValueError("block bootstrap requires at least three finite blocks")
+    rng = np.random.default_rng(seed)
+    indexes = rng.integers(0, rows.size, size=(resamples, rows.size))
+    draws = np.mean(rows[indexes], axis=1)
+    low, high = np.quantile(draws, (0.025, 0.975))
+    return float(np.mean(rows)), float(low), float(high)
+
+
+def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for directory in attempt_dirs:
+        metrics_path = directory / "metrics.json"
+        config_path = directory / "config.json"
+        if not metrics_path.is_file() or not config_path.is_file():
+            continue
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        rows.append({**config, **metrics, "attempt_dir": str(directory)})
+    frame = pd.DataFrame(rows)
+    output_root.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output_root / "summary.csv", index=False)
+    frame.to_parquet(output_root / "summary.parquet", index=False)
+    return frame
+
+
+def paired_block_statistics(
+    rows: Iterable[tuple[dict[str, object], dict[str, object]]],
+) -> list[dict[str, object]]:
+    axes = ("regime", "width_panel", "topology", "cohorts", "popularity")
+    groups: dict[str, dict[str, dict[int, float]]] = {}
+    descriptions: dict[str, dict[str, object]] = {}
+    for config, metrics in rows:
+        block = config.get("block")
+        method = config.get("method")
+        if not isinstance(block, int) or not isinstance(method, str):
+            continue
+        parameters = config.get("parameters")
+        parameters = parameters if isinstance(parameters, dict) else {}
+        condition = {
+            name: config.get(name)
+            for name in ("model", "backend", "task", "context", "load")
+        }
+        condition.update({name: parameters.get(name) for name in axes})
+        key = json.dumps(condition, sort_keys=True)
+        descriptions[key] = condition
+        groups.setdefault(key, {}).setdefault(method, {})[block] = float(
+            metrics["goodput"]
+        )
+    comparisons = (
+        ("lightcone", "static"),
+        ("lightcone", "tts"),
+        ("l0_naive", "tts"),
+        ("lightcone", "l0_naive"),
+        ("onlinespec_ogd", "static"),
+        ("onlinespec_opt", "static"),
+        ("onlinespec_ens", "static"),
+    )
+    results: list[dict[str, object]] = []
+    p_values: list[float] = []
+    for key, methods in groups.items():
+        for candidate_name, baseline_name in comparisons:
+            if candidate_name not in methods or baseline_name not in methods:
+                continue
+            blocks = sorted(
+                methods[candidate_name].keys() & methods[baseline_name].keys()
+            )
+            if len(blocks) < 3:
+                continue
+            candidate = [methods[candidate_name][block] for block in blocks]
+            baseline = [methods[baseline_name][block] for block in blocks]
+            estimate, low, high = paired_bca_interval(candidate, baseline)
+            p_value = float(
+                ttest_rel(candidate, baseline, alternative="greater").pvalue
+            )
+            if not math.isfinite(p_value):
+                p_value = 1.0
+            results.append(
+                {
+                    **descriptions[key],
+                    "candidate": candidate_name,
+                    "baseline": baseline_name,
+                    "blocks": blocks,
+                    "mean_goodput_difference": estimate,
+                    "ci95_low": low,
+                    "ci95_high": high,
+                    "p_value": p_value,
+                }
+            )
+            p_values.append(p_value)
+    decisions = holm_decisions(p_values) if p_values else ()
+    for row, decision in zip(results, decisions, strict=True):
+        row["holm_reject"] = decision
+    return results

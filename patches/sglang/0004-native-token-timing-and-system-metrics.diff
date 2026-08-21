@@ -1,0 +1,500 @@
+diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+--- a/python/sglang/srt/managers/detokenizer_manager.py
++++ b/python/sglang/srt/managers/detokenizer_manager.py
+@@ -442,6 +442,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+             finished_reasons=recv_obj.finished_reasons,
+             output_strs=output_strs,
+             output_ids=recv_obj.output_ids,
++            native_token_timestamp_events=recv_obj.native_token_timestamp_events,
+             prompt_tokens=recv_obj.prompt_tokens,
+             reasoning_tokens=recv_obj.reasoning_tokens,
+             completion_tokens=recv_obj.completion_tokens,
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -215,6 +215,8 @@ class GenerateReqInput:
+     return_flat_raw_top_logprobs_b64: bool = False
+     # Whether to stream output.
+     stream: bool = False
++    # CPU-only LightCone contract: committed-token observations at the streamer.
++    return_native_token_timestamps: bool = False
+     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+     log_metrics: bool = True
+     # Whether to return hidden states
+@@ -364,6 +366,8 @@ class GenerateReqInput:
+ 
+     def _validate_inputs(self):
+         """Validate that the input configuration is valid."""
++        if type(self.return_native_token_timestamps) is not bool:
++            raise ValueError("return_native_token_timestamps must be a boolean")
+         if (
+             self.text is None and self.input_ids is None and self.input_embeds is None
+         ) or (
+@@ -744,6 +748,7 @@ class GenerateReqInput:
+             top_logprobs_num=self.top_logprobs_num[i],
+             token_ids_logprob=self.token_ids_logprob[i],
+             return_sampling_mask=self.return_sampling_mask[i],
++            return_native_token_timestamps=self.return_native_token_timestamps,
+             return_text_in_logprobs=self.return_text_in_logprobs,
+             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
+             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
+@@ -829,6 +834,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+     token_ids_logprob: Optional[List[int]]
+     # Whether to stream output
+     stream: bool
++    # CPU-only committed-token host observation contract.
++    return_native_token_timestamps: bool = False
+     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
+     return_sampling_mask: bool = False
+ 
+@@ -1287,6 +1294,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
+ 
++    # CPU-only host observations for opt-in requests. Kept optional so existing
++    # internal constructors retain their wire-compatible defaults.
++    native_token_timestamp_events: Optional[
++        List[Optional[List[Dict[str, int]]]]
++    ] = None
++
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
+@@ -1369,6 +1382,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
+     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
+ 
++    # CPU-only host observations for opt-in requests. Kept optional so existing
++    # internal constructors retain their wire-compatible defaults.
++    native_token_timestamp_events: Optional[
++        List[Optional[List[Dict[str, int]]]]
++    ] = None
++
+     # Number of times each request was retracted.
+     retraction_counts: Optional[List[int]] = None
+ 
+diff --git a/python/sglang/srt/managers/multi_tokenizer_mixin.py b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+--- a/python/sglang/srt/managers/multi_tokenizer_mixin.py
++++ b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+@@ -176,6 +176,9 @@ def _handle_output_by_index(output, i):
+             decode_ids=_extract_field_by_index(output, "decode_ids", i),
+             read_offsets=_extract_field_by_index(output, "read_offsets", i),
+             output_ids=_extract_field_by_index(output, "output_ids", i),
++            native_token_timestamp_events=_extract_field_by_index(
++                output, "native_token_timestamp_events", i, check_length=False
++            ),
+             skip_special_tokens=_extract_field_by_index(
+                 output, "skip_special_tokens", i
+             ),
+@@ -291,6 +294,9 @@ def _handle_output_by_index(output, i):
+             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
+             output_strs=_extract_field_by_index(output, "output_strs", i),
+             output_ids=_extract_field_by_index(output, "output_ids", i),
++            native_token_timestamp_events=_extract_field_by_index(
++                output, "native_token_timestamp_events", i, check_length=False
++            ),
+             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
+             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
+             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
+diff --git a/python/sglang/srt/managers/native_token_timestamps.py b/python/sglang/srt/managers/native_token_timestamps.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/managers/native_token_timestamps.py
+@@ -0,0 +1,61 @@
++"""CPU-only native observation contract for committed output tokens.
++
++This hook records host observation time after stop handling, when
++``Req.output_ids_through_stop`` is authoritative. It is not a CUDA event and
++must never be described as the token's device production time.
++"""
++
++from __future__ import annotations
++
++import time
++from typing import Any, Callable, Optional, Sequence
++
++
++NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
++NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "cpu_committed_token_observed_at_streamer_v1"
++NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "CPU_CONTRACT_ONLY"
++
++
++def observe_committed_output_tokens(
++    req: Any,
++    *,
++    clock: Callable[[], int] = time.monotonic_ns,
++) -> None:
++    """Append one ordered host observation for every newly committed token."""
++
++    if not getattr(req, "return_native_token_timestamps", False):
++        return
++    output_ids = tuple(int(token) for token in req.output_ids_through_stop)
++    events = req.native_token_timestamp_events
++    if len(output_ids) < len(events):
++        raise RuntimeError("committed output-token coverage moved backwards")
++    if tuple(event[0] for event in events) != output_ids[: len(events)]:
++        raise RuntimeError("committed output-token prefix changed after observation")
++    for token_id in output_ids[len(events) :]:
++        observed_ns = int(clock())
++        if observed_ns < 0 or (events and observed_ns <= events[-1][1]):
++            raise RuntimeError("native token timestamps must be strictly increasing")
++        events.append((token_id, observed_ns))
++
++
++def slice_native_token_timestamp_events(
++    events: Sequence[tuple[int, int]],
++    *,
++    start: int,
++    output_ids: Sequence[int],
++) -> Optional[list[dict[str, int]]]:
++    """Return exact delta events aligned to the streamer's output-token slice."""
++
++    if not events:
++        return None
++    selected = events[start : start + len(output_ids)]
++    if tuple(event[0] for event in selected) != tuple(int(v) for v in output_ids):
++        raise RuntimeError("native token timestamps differ from streamed output IDs")
++    return [
++        {
++            "token_index": start + offset,
++            "token_id": int(token_id),
++            "observed_ns": int(observed_ns),
++        }
++        for offset, (token_id, observed_ns) in enumerate(selected)
++    ]
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -724,6 +724,7 @@ class Req(ReqDllmMixin):
+         dllm_config: Optional[DllmConfig] = None,
+         token_ids_logprob: List[int] = None,
+         return_sampling_mask: bool = False,
++        return_native_token_timestamps: bool = False,
+         stream: bool = False,
+         origin_input_ids_unpadded: Optional[array[int]] = None,
+         lora_id: Optional[str] = None,
+@@ -771,6 +772,8 @@ class Req(ReqDllmMixin):
+         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+         # that preserve length would silently corrupt fill_ids.
+         self.output_ids = array("q")
++        self.return_native_token_timestamps = return_native_token_timestamps
++        self.native_token_timestamp_events: list[tuple[int, int]] = []
+         # Full untruncated sequence: origin + output (+ DLLM mask block).
+         # Kept in sync by _refresh_fill_ids; admission only updates
+         # extend_range, never mutates this array's length.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -2183,6 +2183,7 @@ class Scheduler(
+                 top_logprobs_num=recv_req.top_logprobs_num,
+                 token_ids_logprob=recv_req.token_ids_logprob,
+                 return_sampling_mask=recv_req.return_sampling_mask,
++                return_native_token_timestamps=recv_req.return_native_token_timestamps,
+                 stream=recv_req.stream,
+                 lora_id=recv_req.lora_id,
+                 session_id=recv_req.session_id,
+@@ -4029,6 +4030,75 @@ class Scheduler(
+             if info_record is not None:
+                 ret["dspark_info_record"] = info_record
+ 
++        if self.server_args.speculative_speed_study_metrics:
++            info_record = None
++            provider = getattr(self.draft_worker, "dump_info_records", None)
++            if callable(provider):
++                info_record = provider()
++                if info_record is not None:
++                    ret["speculative_adaptation_info_record"] = info_record
++            online = (
++                info_record.get("online_adaptation", {})
++                if isinstance(info_record, dict)
++                else {}
++            )
++            counter_names = (
++                "updates_launched",
++                "updates_published",
++                "fallbacks",
++                "nonfinite_updates",
++                "oom_events",
++                "retractions",
++                "version_mismatches",
++                "exactness_violations",
++                "stale_publications",
++            )
++            if isinstance(online, dict) and online:
++                counters = online.get("counters")
++            elif self.server_args.speculative_algorithm is None:
++                counters = {name: 0 for name in counter_names}
++            else:
++                provider = getattr(
++                    self.draft_worker, "terminal_static_safety_counters", None
++                )
++                counters = provider() if callable(provider) else None
++                if isinstance(counters, dict):
++                    counters = {
++                        "updates_launched": 0,
++                        "updates_published": 0,
++                        **counters,
++                    }
++            if not isinstance(counters, dict):
++                raise RuntimeError("speculative runtime did not expose safety counters")
++            missing_counters = set(counter_names) - counters.keys()
++            if missing_counters:
++                raise RuntimeError(
++                    f"speculative runtime is missing counters {sorted(missing_counters)}"
++                )
++            speed = {
++                "committed_tokens": self.metrics_reporter.speed_study_committed_tokens,
++                "target_calls": self.metrics_reporter.spec_total_num_forward_ct
++                + self.metrics_reporter.spec_num_forward_ct,
++                "accepted_drafts": self.metrics_reporter.spec_total_num_accept_tokens
++                + self.metrics_reporter.spec_num_accept_tokens,
++                "verified_drafts": (
++                    self.metrics_reporter.spec_total_num_forward_ct
++                    + self.metrics_reporter.spec_num_forward_ct
++                )
++                * int(self.server_args.speculative_num_draft_tokens or 0),
++                "peak_hbm_bytes": int(torch.cuda.max_memory_allocated(self.device)),
++                "kv_token_capacity": int(self.max_total_num_tokens),
++                "batch_fill": online.get("batch_fill", 0.0),
++                "queue_occupancy": online.get("queue_occupancy", 0.0),
++                "exposed_update_ms": online.get("exposed_update_ms", 0.0),
++                "controlled_candidate_equal": online.get(
++                    "controlled_candidate_equal", False
++                ),
++            }
++            for name in counter_names:
++                speed[name] = int(counters[name])
++            ret["speed_study_metrics"] = speed
++
+         # These fields are not msgpack-serializable (a config object and a bound
+         # signal handler); no reader consumes them.
+         ret.pop("model_config", None)
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -232,6 +232,8 @@ class SchedulerBatchResultProcessor:
+ 
+                     # req output_ids are set here
+                     req.output_ids.append(next_token_id)
++                    if self.metrics_reporter.speed_study_enabled:
++                        self.metrics_reporter.speed_study_committed_tokens += 1
+ 
+                     self._maybe_update_reasoning_tokens(req, next_token_id)
+ 
+@@ -780,6 +782,8 @@ class SchedulerBatchResultProcessor:
+ 
+             req.output_ids.extend(next_token_id)
+             new_accept_len = len(next_token_id)
++            if self.metrics_reporter.speed_study_enabled:
++                self.metrics_reporter.speed_study_committed_tokens += new_accept_len
+ 
+             self._maybe_update_reasoning_tokens(req, next_token_id)
+             req.time_stats.set_last_decode_finish_time()
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -141,6 +141,17 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        self.speed_study_enabled = bool(
++            self.scheduler.server_args.speculative_speed_study_metrics
++        )
++        self.speed_study_committed_tokens = 0
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+         # For PD disaggregation
+         self.kv_transfer_speed_gb_s: float = 0.0
+@@ -524,6 +535,13 @@ class SchedulerMetricsReporter:
+         self.spec_total_num_forward_ct = 0
+         self.spec_num_block_accept_tokens = 0
+         self.spec_num_cap_tokens = 0
++        if self.speed_study_enabled:
++            self.speed_study_graph_hits = 0
++            self.speed_study_graph_total = 0
++            self.speed_study_batch_sum = 0
++            self.speed_study_queue_sum = 0
++            self.speed_study_retractions = 0
++            self.speed_study_oom_events = 0
+ 
+     def report_prefill_stats(
+         self,
+@@ -697,6 +715,11 @@ class SchedulerMetricsReporter:
+         num_correct_drafts: int = 0,
+     ):
+         batch = running_batch or self.scheduler.running_batch
++        if self.speed_study_enabled:
++            self.speed_study_graph_total += 1
++            self.speed_study_graph_hits += int(can_run_cuda_graph)
++            self.speed_study_batch_sum += len(batch.reqs)
++            self.speed_study_queue_sum += len(self.scheduler.waiting_queue)
+ 
+         # Every-iteration work: realtime token counting + status logger
+         if self.current_scheduler_metrics_enabled:
+diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -21,6 +21,10 @@ from sglang.srt.managers.io_struct import (
+     CachedTokensDetails,
+     wrap_as_pickle,
+ )
++from sglang.srt.managers.native_token_timestamps import (
++    observe_committed_output_tokens,
++    slice_native_token_timestamp_events,
++)
+ from sglang.srt.managers.schedule_batch import (
+     BaseFinishReason,
+     Req,
+@@ -268,6 +272,7 @@ class _GenerationStreamAccumulator:
+     decode_ids_list: list = field(default_factory=list)
+     read_offsets: list = field(default_factory=list)
+     output_ids: list = field(default_factory=list)
++    native_token_timestamp_events: list = field(default_factory=list)
+     skip_special_tokens: list = field(default_factory=list)
+     spaces_between_special_tokens: list = field(default_factory=list)
+     no_stop_trim: list = field(default_factory=list)
+@@ -334,6 +339,9 @@ class _GenerationStreamAccumulator:
+             self.output_token_sampling_logprobs = []
+ 
+     def accept(self, *, req: Req) -> None:
++        # Observe after finish/stop handling has made output_ids_through_stop
++        # authoritative, even when this scheduler step is not emitted as SSE.
++        observe_committed_output_tokens(req)
+         if req.finished():
+             assert not req.finished_output
+             req.finished_output = True
+@@ -382,6 +390,13 @@ class _GenerationStreamAccumulator:
+         req.send_decode_id_offset = len(decode_ids)
+         self.read_offsets.append(read_offset)
+         self.output_ids.append(output_ids_[send_token_offset:])
++        self.native_token_timestamp_events.append(
++            slice_native_token_timestamp_events(
++                req.native_token_timestamp_events,
++                start=send_token_offset,
++                output_ids=self.output_ids[-1],
++            )
++        )
+         req.send_token_offset = len(output_ids_)
+         self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+         self.spaces_between_special_tokens.append(
+@@ -573,6 +588,11 @@ class _GenerationStreamAccumulator:
+             decode_ids=self.decode_ids_list,
+             read_offsets=self.read_offsets,
+             output_ids=self.output_ids,
++            native_token_timestamp_events=(
++                self.native_token_timestamp_events
++                if any(self.native_token_timestamp_events)
++                else None
++            ),
+             skip_special_tokens=self.skip_special_tokens,
+             spaces_between_special_tokens=self.spaces_between_special_tokens,
+             no_stop_trim=self.no_stop_trim,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -166,6 +166,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
+     "output_token_ids_logprobs",
+     "output_token_sampling_mask",
+     "output_token_sampling_logprobs",
++    "native_token_timestamp_events",
+ )
+ 
+ 
+@@ -226,6 +227,10 @@ class ReqState:
+     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+     output_token_sampling_mask: List = dataclasses.field(default_factory=list)
+     output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
++    native_token_timestamp_events: List[Dict[str, int]] = dataclasses.field(
++        default_factory=list
++    )
++    native_token_timestamp_request_started_ns: Optional[int] = None
+ 
+     # Cached flat-format prompt top logprob fields; rebuilt only when more
+     # prefill chunks arrive, so streaming decode chunks reuse the payload.
+@@ -1273,6 +1278,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 top_logprobs_num=obj.top_logprobs_num,
+                 token_ids_logprob=obj.token_ids_logprob,
+                 return_sampling_mask=obj.return_sampling_mask,
++                return_native_token_timestamps=obj.return_native_token_timestamps,
+                 stream=obj.stream,
+                 rid=obj.rid,
+                 http_worker_ipc=obj.http_worker_ipc,
+@@ -2057,6 +2063,39 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                         "cached_tokens": recv_obj.cached_tokens[i],
+                     }
+                 )
++                if state.native_token_timestamp_request_started_ns is not None:
++                    meta_info.update(
++                        {
++                            "native_token_timestamp_hook": (
++                                "sglang.schema_v3.native_per_token_timestamp.v1"
++                            ),
++                            "native_token_timestamp_semantics": (
++                                "cpu_committed_token_observed_at_streamer_v1"
++                            ),
++                            "native_token_timestamp_release_status": (
++                                "CPU_CONTRACT_ONLY"
++                            ),
++                            "native_token_timestamp_request_id": recv_obj.rids[i],
++                            "native_token_timestamp_request_started_ns": (
++                                state.native_token_timestamp_request_started_ns
++                            ),
++                        }
++                    )
++                native_events = getattr(
++                    recv_obj, "native_token_timestamp_events", None
++                )
++                if native_events is not None and native_events[i] is not None:
++                    expected_index = len(state.native_token_timestamp_events)
++                    for event in native_events[i]:
++                        if event.get("token_index") != expected_index:
++                            raise RuntimeError(
++                                "native token timestamp stream coverage is invalid"
++                            )
++                        state.native_token_timestamp_events.append(event)
++                        expected_index += 1
++                    meta_info["native_token_timestamp_events"] = (
++                        state.native_token_timestamp_events
++                    )
+                 # Add detailed cache breakdown if available
+                 if (
+                     hasattr(recv_obj, "cached_tokens_details")
+@@ -2106,6 +2145,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+ 
+             state.finished = recv_obj.finished_reasons[i] is not None
++            if (
++                state.finished
++                and state.native_token_timestamp_request_started_ns is not None
++            ):
++                finish_reason = recv_obj.finished_reasons[i]
++                reason_type = finish_reason.get("type", "unknown")
++                meta_info.update(
++                    {
++                        "native_token_timestamp_request_terminal_ns": (
++                            time.monotonic_ns()
++                        ),
++                        "native_token_timestamp_terminal_status": (
++                            "aborted" if reason_type == "abort" else "completed"
++                        ),
++                        "native_token_timestamp_terminal_reason": reason_type,
++                    }
++                )
+             if isinstance(recv_obj, BatchStrOutput):
+                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+                 is_stream = getattr(state.obj, "stream", False)
+@@ -3141,6 +3197,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 raise ValueError(f"Duplicate request ID detected: {rid}")
+             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
++            if getattr(sub_obj, "return_native_token_timestamps", False):
++                state.native_token_timestamp_request_started_ns = time.monotonic_ns()
+             self.rid_to_state[rid] = state
+             if self.enable_trace:
+                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
