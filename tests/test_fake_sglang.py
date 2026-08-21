@@ -57,7 +57,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         request = json.loads(body)
         if self.path == "/tokenize":
-            body = json.dumps({"input_ids": [1, 2, 3]}).encode()
+            if request != {"prompt": "hello", "add_special_tokens": True}:
+                self.send_error(400)
+                return
+            body = json.dumps({"tokens": [1, 2, 3], "count": 3}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

@@ -212,13 +212,13 @@ class SGLangClient:
     def tokenize(self, text: str) -> tuple[int, ...]:
         request = urllib.request.Request(
             f"{self.base_url}/tokenize",
-            data=json.dumps({"text": text}).encode(),
+            data=json.dumps({"prompt": text, "add_special_tokens": True}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             payload = json.loads(response.read())
-        values = payload.get("input_ids") if isinstance(payload, dict) else None
+        values = payload.get("tokens") if isinstance(payload, dict) else None
         if not isinstance(values, list) or any(not isinstance(value, int) for value in values):
             raise RuntimeError("SGLang tokenize response lacks input_ids")
         return tuple(values)
