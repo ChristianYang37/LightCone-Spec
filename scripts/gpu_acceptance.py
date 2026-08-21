@@ -16,7 +16,7 @@ from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.data import load_prompts
 from lightcone_spec.metrics import SAFETY_COUNTERS, committed_goodput
 from lightcone_spec.protocol import Job
-from lightcone_spec.runner import _speed_metrics
+from lightcone_spec.runner import _run_request_scoped, _speed_metrics
 from lightcone_spec.server import ReplicaServerProcess, ServerProcess, StickyReplicaClient
 
 
@@ -123,6 +123,14 @@ def _measure(
                 outcome.status != "completed" for outcome in run.outcomes
             ):
                 raise RuntimeError("DP2 acceptance did not complete every request")
+        elif job.method in {"tts", "l0_naive"}:
+            results, elapsed = _run_request_scoped(
+                client,
+                prompts,
+                max_new_tokens,
+                job.block or 0,
+                request_prefix=f"acceptance-{job.method}",
+            )
         else:
             results, elapsed = client.run_batch(
                 prompts,

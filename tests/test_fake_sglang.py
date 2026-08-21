@@ -11,7 +11,11 @@ from lightcone_spec.client import GenerationResult, SGLangClient
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
 from lightcone_spec.protocol import materialize
-from lightcone_spec.runner import _canonical_accuracy, _fault_action_passed
+from lightcone_spec.runner import (
+    _canonical_accuracy,
+    _fault_action_passed,
+    _run_request_scoped,
+)
 from lightcone_spec.server import (
     ServerProcess,
     StickyReplicaClient,
@@ -23,6 +27,7 @@ from lightcone_spec.server import (
 class Handler(BaseHTTPRequestHandler):
     fail = False
     delay = 0.0
+    batch_sizes = []
 
     def log_message(self, format, *args):
         return
@@ -72,6 +77,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if Handler.delay:
             time.sleep(Handler.delay)
+        Handler.batch_sizes.append(len(request["rid"]))
         if any(
             "sampling_seed" not in params or "seed" in params
             for params in request["sampling_params"]
@@ -112,6 +118,7 @@ def fake_server():
     finally:
         Handler.fail = False
         Handler.delay = 0.0
+        Handler.batch_sizes = []
         server.shutdown()
         thread.join()
 
@@ -144,6 +151,13 @@ def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     assert len(run.results) == 3
     assert {row.status for row in run.outcomes} == {"completed"}
     assert run.elapsed_seconds >= offsets[-1]
+
+
+def test_request_scoped_generation_is_serial(fake_server):
+    client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
+    rows, _ = _run_request_scoped(client, ("a", "b", "c"), 2, 0)
+    assert len(rows) == 3
+    assert Handler.batch_sizes[-3:] == [1, 1, 1]
 
 
 def test_scheduled_dispatcher_does_not_queue_behind_worker_pool(fake_server):

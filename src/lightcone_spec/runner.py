@@ -744,6 +744,7 @@ def _run_request_scoped(
     *,
     same_seed: bool = False,
     request_prefix: str = "request-scoped",
+    temperature: float = 0.0,
 ):
     started = time.perf_counter()
     results = []
@@ -752,6 +753,7 @@ def _run_request_scoped(
             (prompt,),
             max_new_tokens=max_new_tokens,
             seed=seed if same_seed else seed + index,
+            temperature=temperature,
             request_ids=(f"{request_prefix}-{index:05d}",),
         )
         results.append(rows[0])
@@ -1155,7 +1157,9 @@ def _execute_cell(
                     max_new_tokens=max_new_tokens,
                     seed=config.protocol.seed + (job.block or 0),
                     routing_keys=_routing_keys(config, runtime_job, len(prompts)),
-                    max_in_flight=256,
+                    max_in_flight=(
+                        1 if runtime_job.method in {"tts", "l0_naive"} else 256
+                    ),
                     deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     drain_seconds=E5_DRAIN_SECONDS,
                 )
@@ -1166,12 +1170,23 @@ def _execute_cell(
             stochastic_rows: list[dict[str, int]] = []
             if runtime_job.parameters.get("distribution_check"):
                 for sample in range(16):
-                    sampled, _ = client.run_batch(
-                        prompts,
-                        max_new_tokens=1,
-                        seed=config.protocol.seed + 10000 + sample * len(prompts),
-                        temperature=0.8,
-                    )
+                    sample_seed = config.protocol.seed + 10000 + sample * len(prompts)
+                    if runtime_job.method in {"tts", "l0_naive"}:
+                        sampled, _ = _run_request_scoped(
+                            client,
+                            prompts,
+                            1,
+                            sample_seed,
+                            request_prefix=f"stochastic-{sample:02d}",
+                            temperature=0.8,
+                        )
+                    else:
+                        sampled, _ = client.run_batch(
+                            prompts,
+                            max_new_tokens=1,
+                            seed=sample_seed,
+                            temperature=0.8,
+                        )
                     stochastic_rows.extend(
                         {
                             "request_index": index,
