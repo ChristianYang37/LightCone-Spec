@@ -406,6 +406,16 @@ class ServerProcess:
             json.dumps(argv, indent=2) + "\n", encoding="utf-8"
         )
         environment = dict(os.environ)
+        if self.config.server.cuda_home is not None:
+            cuda_home = self.config.server.cuda_home
+            environment["CUDA_HOME"] = str(cuda_home)
+            environment["CUDA_PATH"] = str(cuda_home)
+            environment["PATH"] = os.pathsep.join(
+                (str(cuda_home / "bin"), environment.get("PATH", ""))
+            )
+            environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+                (str(cuda_home / "lib64"), environment.get("LD_LIBRARY_PATH", ""))
+            )
         roots = [str(self.config.sglang_root / "python"), str(Path(__file__).parents[1])]
         if environment.get("PYTHONPATH"):
             roots.append(environment["PYTHONPATH"])

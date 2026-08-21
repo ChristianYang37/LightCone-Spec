@@ -27,6 +27,7 @@ def _absolute(value: object, name: str) -> Path:
 @dataclass(frozen=True)
 class ServerConfig:
     python: Path
+    cuda_home: Path | None = None
     host: str = "127.0.0.1"
     base_port: int = 30000
     mem_fraction_static: float = 0.90
@@ -97,6 +98,11 @@ class ExperimentConfig:
             raise ValueError("server.host must bind only to loopback")
         server = ServerConfig(
             python=_absolute(server_data.get("python"), "server.python"),
+            cuda_home=(
+                _absolute(server_data["cuda_home"], "server.cuda_home")
+                if server_data.get("cuda_home") is not None
+                else None
+            ),
             host=host,
             base_port=int(server_data.get("base_port", 30000)),
             mem_fraction_static=float(server_data.get("mem_fraction_static", 0.90)),
@@ -207,6 +213,8 @@ class ExperimentConfig:
             **{f"dataset {name}": path for name, path in self.datasets.items()},
             **{f"profiler {name}": path for name, path in self.profiler_tools.items()},
         }
+        if self.server.cuda_home is not None:
+            required["CUDA toolkit"] = self.server.cuda_home
         missing = [f"{name}: {path}" for name, path in required.items() if not path.exists()]
         if missing:
             raise FileNotFoundError("missing configured paths:\n" + "\n".join(missing))

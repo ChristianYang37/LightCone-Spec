@@ -2,6 +2,7 @@ import json
 import math
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -147,6 +148,7 @@ def test_e5_reference_uses_faster_slo_baseline(monkeypatch):
 
 def test_exact_draft_mapping_and_explicit_tts_split(tmp_path):
     example = ExperimentConfig.load("examples/paper.yaml")
+    assert example.server.cuda_home == Path("/usr/local/cuda-12.9")
     assert len(example.drafts) == 12
     assert all("|" in key for key in example.drafts)
     rows = []

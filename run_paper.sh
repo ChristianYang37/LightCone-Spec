@@ -14,7 +14,7 @@ runtime_paths="$("$launcher_python" - "$config_path" <<'PY'
 import ast
 import sys
 
-wanted = {("paths", "sglang_root"), ("server", "python")}
+wanted = {("paths", "sglang_root"), ("server", "python"), ("server", "cuda_home")}
 found = {}
 section = None
 for raw in open(sys.argv[1], encoding="utf-8"):
@@ -38,10 +38,17 @@ if missing:
     raise SystemExit(f"paper.yaml is missing launcher paths: {sorted(missing)}")
 print(found[("paths", "sglang_root")])
 print(found[("server", "python")])
+print(found[("server", "cuda_home")])
 PY
 )"
 sglang_root="${runtime_paths%%$'\n'*}"
-python_bin="${runtime_paths#*$'\n'}"
+remaining="${runtime_paths#*$'\n'}"
+python_bin="${remaining%%$'\n'*}"
+cuda_home="${remaining#*$'\n'}"
+export CUDA_HOME="$cuda_home"
+export CUDA_PATH="$cuda_home"
+export PATH="$cuda_home/bin:$PATH"
+export LD_LIBRARY_PATH="$cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 marker="$sglang_root/.lightcone-spec-patched"
 
 if [[ ! -e "$marker" ]]; then

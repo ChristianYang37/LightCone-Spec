@@ -2,8 +2,8 @@
 
 1. Copy `examples/paper.yaml` outside the checkout and fill in absolute local
    paths. The file contains only runtime paths, two GPU IDs, ports, memory
-   settings, the `paper-v1` preset, one process retry, profiler paths, and
-   optional stage bounds.
+   settings, the CUDA toolkit path, the `paper-v1` preset, one process retry,
+   profiler paths, and optional stage bounds.
    Convert raw datasets with `scripts/prepare_datasets.py --splits splits.csv`
    when the configured files are not already normalized. The split CSV is the
    sole source of tuning/pilot/final/holdout membership.
