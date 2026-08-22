@@ -375,6 +375,32 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     assert "--skip-server-warmup" in command
 
 
+def test_preflight_interference_only_captures_registered_request_batch(tmp_path: Path):
+    python = tmp_path / "python"
+    python.write_text("")
+    model = tmp_path / "model"
+    model.mkdir()
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path,
+        results_root=tmp_path,
+        models={"Qwen/Qwen3-8B": model},
+        drafts={"Qwen/Qwen3-8B|DFLASH": draft},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=python, requests_per_cell=16),
+        protocol=ProtocolConfig(),
+    )
+    job = materialize("preflight")[2]
+    command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
+    assert command[command.index("--max-running-requests") + 1] == "256"
+    graph_index = command.index("--cuda-graph-bs-decode")
+    assert command[graph_index + 1 : graph_index + 6] == ["1", "2", "4", "8", "16"]
+
+
 def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("lightcone_spec.runner.shutil.which", lambda name: None)
     result = GenerationResult(

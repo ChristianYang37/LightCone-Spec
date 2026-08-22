@@ -178,8 +178,13 @@ def server_command(
     if job.parameters.get("graph_replay", True) is False:
         argv.append("--disable-cuda-graph")
     else:
+        graph_limit = (
+            min(max_running, config.server.requests_per_cell)
+            if job.node == "preflight" and job.parameters.get("workload") == "interference"
+            else max_running
+        )
         graph_sizes = tuple(
-            size for size in (1, 2, 4, 8, 16, 32, 64, 128, 256) if size <= max_running
+            size for size in (1, 2, 4, 8, 16, 32, 64, 128, 256) if size <= graph_limit
         )
         argv.extend(
             [
