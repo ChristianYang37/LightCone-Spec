@@ -158,10 +158,11 @@ def _measure(
     max_new_tokens: int,
     exactness_tokens: int = 0,
 ) -> dict[str, object]:
+    dflash_exactness = bool(exactness_tokens and job.backend == "DFLASH")
     separate_exactness = bool(
-        exactness_tokens and job.backend == "DFLASH" and job.method not in {"target_only", "static"}
+        dflash_exactness and job.method not in {"target_only", "static"}
     )
-    if exactness_tokens and not separate_exactness:
+    if dflash_exactness and not separate_exactness:
         job = replace(
             job,
             parameters={**job.parameters, "deterministic_exactness": True},
@@ -207,7 +208,7 @@ def _measure(
                 request_id_prefix="warmup",
             )
             client.reset()
-        if exactness_tokens and not separate_exactness:
+        if dflash_exactness and not separate_exactness:
             exactness_before = _speed_metrics(
                 client.server_info(), str(job.parameters.get("topology", "tp1_dp1"))
             )
