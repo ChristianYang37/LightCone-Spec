@@ -645,6 +645,7 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     assert "record_device_commit(request_ids, committed_tokens)" in patch
     assert "new_seq_lens=semantic_new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch
+    assert "+    @torch.no_grad()\n     def __call__(self, hidden_states, input_ids=None):" in patch
 
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):

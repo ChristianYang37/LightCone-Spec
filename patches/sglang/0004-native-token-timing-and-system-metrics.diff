@@ -613,6 +613,15 @@ diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/s
 index 2dcf226a..7842235f 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -125,7 +125,8 @@ class _DflashDraftSampler:
+             self.selected_ids = torch.empty(
+                 (1, max_tokens), dtype=torch.int64, device=device
+             )
+ 
++    @torch.no_grad()
+     def __call__(self, hidden_states, input_ids=None):
+         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
+         bs = hidden_states.shape[0] // self.block_size
 @@ -1972,9 +1972,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                  terminal_token_ids=terminal_ids,
                  ignore_eos=ignore_eos,
