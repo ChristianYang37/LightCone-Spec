@@ -442,7 +442,9 @@ def test_tp2_dflash_gathers_full_vocab_before_online_loss():
         Path(__file__).parents[1]
         / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
     ).read_text(encoding="utf-8")
-    assert "differentiable_all_gather" in patch
+    assert "class _TensorParallelAllGather" in patch
+    assert "class _TensorParallelSum" in patch
     assert "local_inference_logits, target.shape[-1]" in patch
     assert "local_draft_logits, target.shape[-1]" in patch
-    assert "member_loss / self.tp_group.world_size" in patch
+    assert "attention_output, self.tp_group.device_group" in patch
+    assert "_TensorParallelSum.apply(output, self.tp_group.device_group)" in patch

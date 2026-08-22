@@ -156,8 +156,8 @@ index 00000000..20e93274
 +from dataclasses import dataclass
 +
 +import torch
++import torch.distributed as dist
 +import torch.nn.functional as F
-+from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 +
 +from sglang.srt.distributed.parallel_state import get_tp_group
 +from sglang.srt.speculative.online_adaptation_config import (
@@ -186,6 +186,32 @@ index 00000000..20e93274
 +class _CapturedHistory:
 +    locations: torch.Tensor
 +    valid_mask: torch.Tensor
++
++
++class _TensorParallelAllGather(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, local: torch.Tensor, group) -> torch.Tensor:
++        ctx.rank = dist.get_rank(group)
++        ctx.world_size = dist.get_world_size(group)
++        shards = [torch.empty_like(local) for _ in range(ctx.world_size)]
++        dist.all_gather(shards, local.contiguous(), group=group)
++        return torch.cat(shards, dim=-1)
++
++    @staticmethod
++    def backward(ctx, gradient: torch.Tensor):
++        return gradient.chunk(ctx.world_size, dim=-1)[ctx.rank].contiguous(), None
++
++
++class _TensorParallelSum(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, local: torch.Tensor, group) -> torch.Tensor:
++        output = local.contiguous().clone()
++        dist.all_reduce(output, group=group)
++        return output
++
++    @staticmethod
++    def backward(ctx, gradient: torch.Tensor):
++        return gradient, None
 +
 +
 +def _rms(hidden: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -847,6 +873,10 @@ index 00000000..20e93274
 +                attention.o_proj.bias,
 +            ),
 +        )
++        if self.tp_group.world_size > 1:
++            attention_output = _TensorParallelSum.apply(
++                attention_output, self.tp_group.device_group
++            )
 +        residual = residual + attention_output
 +        post_weight = self._parameter(
 +            values,
@@ -882,18 +912,18 @@ index 00000000..20e93274
 +            f"{prefix}.mlp.down_proj.weight",
 +            layer.mlp.down_proj.weight,
 +        )
-+        return (
-+            _linear(
-+                activated,
-+                down_weight,
-+                self._bias(
-+                    values,
-+                    f"{prefix}.mlp.down_proj.bias",
-+                    layer.mlp.down_proj.bias,
-+                ),
++        output = _linear(
++            activated,
++            down_weight,
++            self._bias(
++                values,
++                f"{prefix}.mlp.down_proj.bias",
++                layer.mlp.down_proj.bias,
 +            ),
-+            residual,
 +        )
++        if self.tp_group.world_size > 1:
++            output = _TensorParallelSum.apply(output, self.tp_group.device_group)
++        return output, residual
 +
 +    def _surrogate_hidden(
 +        self,
@@ -955,10 +985,9 @@ index 00000000..20e93274
 +    ) -> torch.Tensor:
 +        if self.tp_group.world_size == 1:
 +            return local_logits[..., :vocab_size]
-+        shards = differentiable_all_gather(
-+            local_logits, group=self.tp_group.device_group
-+        )
-+        return torch.cat(shards, dim=-1)[..., :vocab_size]
++        return _TensorParallelAllGather.apply(
++            local_logits, self.tp_group.device_group
++        )[..., :vocab_size]
 +
 +    def maybe_launch(
 +        self,
@@ -1091,13 +1120,6 @@ index 00000000..20e93274
 +                                target,
 +                                owned_mask[:microbatch],
 +                            )
-+                            if self.tp_group.world_size > 1:
-+                                # Every TP rank evaluates the same full-vocab loss;
-+                                # all-gather backward sums those replicated gradients.
-+                                member_loss = anchor_forward_value(
-+                                    member_loss / self.tp_group.world_size,
-+                                    member_loss,
-+                                )
 +                            return torch.where(
 +                                reconstruction_ok,
 +                                member_loss,
