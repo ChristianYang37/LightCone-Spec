@@ -562,11 +562,15 @@ class StickyReplicaClient:
     def __init__(self, replicas: tuple[SGLangClient, SGLangClient]):
         self.replicas = replicas
 
-    def _replica(self, routing_key: str | None) -> SGLangClient:
+    def replica_index(self, routing_key: str | None) -> int:
         if routing_key is None:
-            return self.replicas[0]
-        index = sum((offset + 1) * ord(value) for offset, value in enumerate(routing_key)) % 2
-        return self.replicas[index]
+            return 0
+        return sum(
+            (offset + 1) * ord(value) for offset, value in enumerate(routing_key)
+        ) % 2
+
+    def _replica(self, routing_key: str | None) -> SGLangClient:
+        return self.replicas[self.replica_index(routing_key)]
 
     def health(self) -> bool:
         return all(replica.health() for replica in self.replicas)
@@ -629,7 +633,7 @@ class StickyReplicaClient:
         )
         groups: list[list[int]] = [[], []]
         for index, key in enumerate(keys):
-            groups[self.replicas.index(self._replica(key))].append(index)
+            groups[self.replica_index(key)].append(index)
         started = time.perf_counter()
 
         def run_group(replica_index: int) -> ScheduledRun:

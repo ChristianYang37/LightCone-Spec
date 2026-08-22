@@ -317,6 +317,7 @@ def test_sticky_replica_routing_is_repeatable():
     left, right = object(), object()
     client = StickyReplicaClient((left, right))
     assert client._replica("cohort-0001") is client._replica("cohort-0001")
+    assert client.replica_index("cohort-0001") == client.replica_index("cohort-0001")
     assert {client._replica(f"cohort-{index:04d}") for index in range(8)} == {
         left,
         right,

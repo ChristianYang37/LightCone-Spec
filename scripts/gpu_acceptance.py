@@ -184,6 +184,7 @@ def _measure(
     )
     exactness_trajectory = None
     exactness_evidence = None
+    sticky_routing = None
     if separate_exactness:
         exactness_trajectory, exactness_evidence = _native_exactness(
             config, job, output / "exactness-bootstrap", exactness_tokens
@@ -241,6 +242,20 @@ def _measure(
         before = _speed_metrics(client.server_info(), topology)
         if isinstance(client, StickyReplicaClient):
             routing_keys = tuple(f"cohort-{index % 4:04d}" for index in range(len(prompts)))
+            routing_rows = [
+                {
+                    "request_id": f"scheduled-{index:05d}",
+                    "routing_key": key,
+                    "replica_index": client.replica_index(key),
+                }
+                for index, key in enumerate(routing_keys)
+            ]
+            sticky_routing = {
+                "requests": len(routing_rows),
+                "cohorts": len(set(routing_keys)),
+                "replicas_used": sorted({row["replica_index"] for row in routing_rows}),
+            }
+            _write(output / "sticky-routing.json", routing_rows)
             run = client.run_scheduled(
                 prompts,
                 (0.0,) * len(prompts),
@@ -306,6 +321,8 @@ def _measure(
         "rank_local": after["rank_local"],
         "rank_aggregates": after["rank_aggregates"],
     }
+    if sticky_routing is not None:
+        row["sticky_routing"] = sticky_routing
     if any(counters.values()):
         raise RuntimeError(f"{job.method} reported nonzero safety counters: {counters}")
     if job.method not in {"target_only", "static"} and int(after["updates_published"]) < 1:
