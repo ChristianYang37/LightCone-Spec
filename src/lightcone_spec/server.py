@@ -171,6 +171,21 @@ def server_command(
         argv.append("--disable-radix-cache")
     if job.parameters.get("graph_replay", True) is False:
         argv.append("--disable-cuda-graph")
+    else:
+        argv.extend(
+            [
+                "--cuda-graph-bs-decode",
+                "1",
+                "2",
+                "4",
+                "8",
+                "16",
+                "32",
+                "64",
+                "128",
+                "256",
+            ]
+        )
     argv.extend(
         [
             "--chunked-prefill-size",

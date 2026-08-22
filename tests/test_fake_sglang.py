@@ -350,6 +350,10 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     assert command[command.index("--max-running-requests") + 1] == "256"
     assert "--disable-overlap-schedule" not in command
     assert "--disable-cuda-graph" not in command
+    graph_index = command.index("--cuda-graph-bs-decode")
+    assert command[graph_index + 1 : graph_index + 10] == [
+        "1", "2", "4", "8", "16", "32", "64", "128", "256",
+    ]
     assert "--skip-server-warmup" in command
 
 
