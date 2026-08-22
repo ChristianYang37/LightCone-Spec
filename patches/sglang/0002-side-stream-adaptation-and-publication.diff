@@ -64,7 +64,7 @@ index 9e2f191a..45d4117c 100644
 +            versions.dtype != torch.int64
 +            or versions.ndim != 1
 +            or versions.shape[0] != indices.shape[0]
-+            or versions.device != self.device
++            or versions.device != self.output_tokens_buf.device
 +        ):
 +            raise ValueError(
 +                "EAGLE source versions must be same-device int64 per request"
