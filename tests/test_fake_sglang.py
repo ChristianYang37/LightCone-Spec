@@ -718,6 +718,7 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     assert '"greedy_token_checks": 0' in patch
     assert "out_tokens[checked] != target_predict[checked]" in patch
     assert "verification_counters.get(name, 0)" in patch
+    assert 'self.server_args.speculative_algorithm == "DFLASH"' in patch
     adaptation_patch = (
         Path(__file__).parents[1]
         / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
