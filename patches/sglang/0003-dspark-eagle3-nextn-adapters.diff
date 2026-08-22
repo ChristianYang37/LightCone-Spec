@@ -798,6 +798,7 @@ index ae778ee..ca2e0b2 100644
 +                        ),
 +                        feedback_source_version=online_adapter.source_adapter_version,
 +                    )
++        if online_adapter is not None:
 +            verified_drafts = (
 +                torch.full((bs,), self.gamma, dtype=torch.int64, device=device)
 +                if layout is None
