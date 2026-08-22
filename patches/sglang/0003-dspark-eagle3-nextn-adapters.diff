@@ -2402,7 +2402,7 @@ new file mode 100644
 index 0000000..748bbdf
 --- /dev/null
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,414 @@
 +"""Online updates shared by DSpark, EAGLE3, and NEXTN workers."""
 +
 +from __future__ import annotations
@@ -2675,6 +2675,14 @@ index 0000000..748bbdf
 +                            exactness=True,
 +                        )
 +                        return
++                    if self.config.algorithm == "NEXTN" and any(
++                        gradient is None for gradient in raw
++                    ):
++                        self.runtime.disable(
++                            "native_backend_trainables_partially_disconnected",
++                            exactness=True,
++                        )
++                        return
 +                    has_nonzero = torch.stack(
 +                        [torch.count_nonzero(gradient) > 0 for gradient in connected]
 +                    ).any()
@@ -2842,18 +2850,39 @@ index e8f91bd5..13dfb4fb 100644
  
  from .parallel_state import (
      get_attn_tp_group,
-@@ -17,7 +18,10 @@ from .parallel_state import (
+@@ -17,7 +18,13 @@ from .parallel_state import (
  
- def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-     """All-reduce the input tensor across model parallel group."""
--    return get_tp_group().all_reduce(input_)
-+    group = get_tp_group()
++def _all_reduce(input_: torch.Tensor, group) -> torch.Tensor:
 +    if torch.is_grad_enabled() and input_.requires_grad and group.world_size > 1:
 +        return differentiable_all_reduce(input_, group=group.device_group)
 +    return group.all_reduce(input_)
++
++
+ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     """All-reduce the input tensor across model parallel group."""
+-    return get_tp_group().all_reduce(input_)
++    return _all_reduce(input_, get_tp_group())
  
  
  def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+@@ -87,7 +93,7 @@ def broadcast_tensor_dict(
+ 
+ def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     """All-reduce the input tensor across attention parallel group."""
+-    return get_attn_tp_group().all_reduce(input_)
++    return _all_reduce(input_, get_attn_tp_group())
+ 
+ 
+ def attention_tensor_model_parallel_quant_all_reduce(
+@@ -99,7 +105,7 @@ def attention_tensor_model_parallel_quant_all_reduce(
+ 
+ def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+     """All-reduce the input tensor across moe parallel group."""
+-    return get_moe_tp_group().all_reduce(input_)
++    return _all_reduce(input_, get_moe_tp_group())
+ 
+ 
+ def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
 index 641644c7..8901ab06 100644
 --- a/python/sglang/srt/layers/logits_processor.py
