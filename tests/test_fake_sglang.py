@@ -452,6 +452,7 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert 'getattr(spec_info, "draft_token_num", self.num_draft_tokens)' in patch
     assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
     assert "int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16" in patch
+    assert "if online_adapter is not None and online_update:" in patch
 
 
 def test_tp2_dflash_gathers_full_vocab_before_online_loss():

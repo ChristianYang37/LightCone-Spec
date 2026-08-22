@@ -696,7 +696,7 @@ index ae778ee..ca2e0b2 100644
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
-+        if online_adapter is not None:
++        if online_adapter is not None and online_update:
 +            if draft_block.corrected_logits is None:
 +                online_adapter.runtime.disable(
 +                    "dspark_live_proposal_graph_unavailable", exactness=True
