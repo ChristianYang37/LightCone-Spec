@@ -1,4 +1,5 @@
 diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/srt/managers/detokenizer_manager.py
+index 7b3ca52e..598f7006 100644
 --- a/python/sglang/srt/managers/detokenizer_manager.py
 +++ b/python/sglang/srt/managers/detokenizer_manager.py
 @@ -442,6 +442,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -10,6 +11,7 @@ diff --git a/python/sglang/srt/managers/detokenizer_manager.py b/python/sglang/s
              reasoning_tokens=recv_obj.reasoning_tokens,
              completion_tokens=recv_obj.completion_tokens,
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 32486141..11aa3c39 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -215,6 +215,8 @@ class GenerateReqInput:
@@ -74,6 +76,7 @@ diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/manager
      retraction_counts: Optional[List[int]] = None
  
 diff --git a/python/sglang/srt/managers/multi_tokenizer_mixin.py b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+index dcd88eb1..84a3e65a 100644
 --- a/python/sglang/srt/managers/multi_tokenizer_mixin.py
 +++ b/python/sglang/srt/managers/multi_tokenizer_mixin.py
 @@ -176,6 +176,9 @@ def _handle_output_by_index(output, i):
@@ -98,9 +101,10 @@ diff --git a/python/sglang/srt/managers/multi_tokenizer_mixin.py b/python/sglang
              reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
 diff --git a/python/sglang/srt/managers/native_token_timestamps.py b/python/sglang/srt/managers/native_token_timestamps.py
 new file mode 100644
+index 00000000..8babb9af
 --- /dev/null
 +++ b/python/sglang/srt/managers/native_token_timestamps.py
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,53 @@
 +"""Scheduler commit times for output tokens."""
 +
 +from __future__ import annotations
@@ -155,6 +159,7 @@ new file mode 100644
 +        for offset, (token_id, observed_ns) in enumerate(selected)
 +    ]
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 4b3548de..8b6b80a0 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -724,6 +724,7 @@ class Req(ReqDllmMixin):
@@ -175,6 +180,7 @@ diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/ma
          # Kept in sync by _refresh_fill_ids; admission only updates
          # extend_range, never mutates this array's length.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 861c13fb..c25f1073 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -2183,6 +2183,7 @@ class Scheduler(
@@ -185,7 +191,7 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
                  stream=recv_req.stream,
                  lora_id=recv_req.lora_id,
                  session_id=recv_req.session_id,
-@@ -3975,6 +3976,7 @@ class Scheduler(
+@@ -3974,6 +3975,7 @@ class Scheduler(
  
              if empty_cache:
                  current_platform.empty_cache()
@@ -193,7 +199,7 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4029,6 +4031,76 @@ class Scheduler(
+@@ -4029,6 +4031,95 @@ class Scheduler(
              if info_record is not None:
                  ret["dspark_info_record"] = info_record
  
@@ -290,15 +296,18 @@ diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/manager
          # signal handler); no reader consumes them.
          ret.pop("model_config", None)
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 248a9293..b7bde555 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-@@ -2,6 +2,7 @@
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
  
  import logging
 +import time
  from dataclasses import dataclass
  from typing import (
-@@ -13,6 +14,9 @@
+     TYPE_CHECKING,
+@@ -13,6 +14,10 @@ from typing import (
  
  import torch
  
@@ -307,7 +316,10 @@ diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_proces
 +    record_committed_output_tokens,
 +)
  from sglang.srt.disaggregation.utils import DisaggregationMode
-@@ -232,10 +232,20 @@ class SchedulerBatchResultProcessor:
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+@@ -231,11 +236,22 @@ class SchedulerBatchResultProcessor:
+                     req.time_stats.set_prefill_finished_time()
  
                      # req output_ids are set here
 +                    previous_output_len = len(req.output_ids_through_stop)
@@ -327,7 +339,11 @@ diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_proces
 +                            committed_tokens
 +                        )
                      if req.finished():
-@@ -780,10 +790,20 @@ class SchedulerBatchResultProcessor:
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
+@@ -778,12 +794,21 @@ class SchedulerBatchResultProcessor:
+             next_token_id = next_token_ids[i]
+             is_spec = not batch.spec_algorithm.is_none()
  
 +            previous_output_len = len(req.output_ids_through_stop)
              req.output_ids.extend(next_token_id)
@@ -346,7 +362,9 @@ diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_proces
 +                )
  
              self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+ 
 diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 15e1b814..35f76dae 100644
 --- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 +++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 @@ -141,6 +141,17 @@ class SchedulerMetricsReporter:
@@ -394,9 +412,10 @@ diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
          # Every-iteration work: realtime token counting + status logger
          if self.current_scheduler_metrics_enabled:
 diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+index 278ccf42..3b27f7f6 100644
 --- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
 +++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
-@@ -21,6 +21,10 @@ from sglang.srt.managers.io_struct import (
+@@ -21,6 +21,9 @@ from sglang.srt.managers.io_struct import (
      CachedTokensDetails,
      wrap_as_pickle,
  )
@@ -406,7 +425,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
  from sglang.srt.managers.schedule_batch import (
      BaseFinishReason,
      Req,
-@@ -268,6 +272,7 @@ class _GenerationStreamAccumulator:
+@@ -268,6 +271,7 @@ class _GenerationStreamAccumulator:
      decode_ids_list: list = field(default_factory=list)
      read_offsets: list = field(default_factory=list)
      output_ids: list = field(default_factory=list)
@@ -414,14 +433,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
      skip_special_tokens: list = field(default_factory=list)
      spaces_between_special_tokens: list = field(default_factory=list)
      no_stop_trim: list = field(default_factory=list)
-@@ -334,6 +339,9 @@ class _GenerationStreamAccumulator:
-             self.output_token_sampling_logprobs = []
- 
-     def accept(self, *, req: Req) -> None:
-         if req.finished():
-             assert not req.finished_output
-             req.finished_output = True
-@@ -382,6 +390,13 @@ class _GenerationStreamAccumulator:
+@@ -382,6 +386,13 @@ class _GenerationStreamAccumulator:
          req.send_decode_id_offset = len(decode_ids)
          self.read_offsets.append(read_offset)
          self.output_ids.append(output_ids_[send_token_offset:])
@@ -435,7 +447,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
          req.send_token_offset = len(output_ids_)
          self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
          self.spaces_between_special_tokens.append(
-@@ -573,6 +588,11 @@ class _GenerationStreamAccumulator:
+@@ -573,6 +584,11 @@ class _GenerationStreamAccumulator:
              decode_ids=self.decode_ids_list,
              read_offsets=self.read_offsets,
              output_ids=self.output_ids,
@@ -448,6 +460,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/output_streamer.py 
              spaces_between_special_tokens=self.spaces_between_special_tokens,
              no_stop_trim=self.no_stop_trim,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index c8934b27..accb6bc3 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -166,6 +166,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (

@@ -1,4 +1,5 @@
 diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/managers/overlap_utils.py
+index 9e2f191a..45d4117c 100644
 --- a/python/sglang/srt/managers/overlap_utils.py
 +++ b/python/sglang/srt/managers/overlap_utils.py
 @@ -120,7 +120,6 @@ CONFIDENCE_RELAY_RING_DEPTH: int = CONFIDENCE_RELAY_RING_LAG + 1
@@ -87,6 +88,7 @@ diff --git a/python/sglang/srt/managers/overlap_utils.py b/python/sglang/srt/man
              self.dsa_topk_indices_buf is not None
              and payload.dsa_topk_indices is not None
 diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+index eb211941..e887ef0b 100644
 --- a/python/sglang/srt/speculative/base_spec_worker.py
 +++ b/python/sglang/srt/speculative/base_spec_worker.py
 @@ -172,6 +172,10 @@ class BaseSpecWorker(ABC):
@@ -101,6 +103,7 @@ diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/s
          """Activate the optimal adaptive step for the current batch size.
  
 diff --git a/python/sglang/srt/speculative/dflash_info_v2.py b/python/sglang/srt/speculative/dflash_info_v2.py
+index 72162ba5..ec8a267d 100644
 --- a/python/sglang/srt/speculative/dflash_info_v2.py
 +++ b/python/sglang/srt/speculative/dflash_info_v2.py
 @@ -9,6 +9,9 @@ import torch
@@ -139,9 +142,10 @@ diff --git a/python/sglang/srt/speculative/dflash_info_v2.py b/python/sglang/srt
              batch_seq_lens_cpu_t[i] = committed_len
 diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
 new file mode 100644
+index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1100 @@
+@@ -0,0 +1,1101 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -1244,6 +1248,7 @@ new file mode 100644
 +        return None
 +    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 0bfd3b24..2dcf226a 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py
 +++ b/python/sglang/srt/speculative/dflash_worker_v2.py
 @@ -86,7 +86,14 @@ class _DflashDraftSampler:
@@ -1520,9 +1525,10 @@ diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/s
              new_seq_lens=new_seq_lens,
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 new file mode 100644
+index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2497 @@
+@@ -0,0 +1,2550 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations

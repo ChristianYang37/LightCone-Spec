@@ -1,4 +1,5 @@
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
+index 2b01ec2e..d6d56645 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -78,7 +78,6 @@ def apply_rotary_emb(
@@ -100,6 +101,7 @@ diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/
          mapped_rest = rest
          mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
+index a1ca3f14..45f90763 100644
 --- a/python/sglang/srt/models/dspark.py
 +++ b/python/sglang/srt/models/dspark.py
 @@ -65,7 +65,6 @@ def run_markov_block(
@@ -174,6 +176,7 @@ diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspar
  
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index acdbd745..6cb9c161 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 @@ -21,6 +21,10 @@ from sglang.srt.runtime_context import get_parallel
@@ -247,20 +250,24 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
      if getattr(draft_model, "markov_head", None) is None:
          return _eager("no markov head")
      if tp_rank == 0:
-@@ -275,7 +282,12 @@ class DraftBlockProposer:
+@@ -275,6 +282,8 @@ class DraftBlockProposer:
          device: str,
          target_model,
          sampling_info,
 +        source_adapter_version: Optional[torch.Tensor] = None,
++        online_update: bool = False,
      ) -> DraftProposal:
-+        if source_adapter_version is not None:
-+            raise ValueError(
-+                "DSpark adaptation is capability-gated before proposal execution"
-+            )
          embed_module = target_model.get_input_embeddings()
          fwd = self._run_forward(
-             batch=batch,
-@@ -291,8 +303,13 @@ class DraftBlockProposer:
+@@ -284,6 +293,7 @@ class DraftBlockProposer:
+             bs=bs,
+             device=device,
+             embed_module=embed_module,
++            online_update=online_update,
+         )
+         draft_block_ids = fwd.draft_block_ids
+ 
+@@ -291,8 +301,14 @@ class DraftBlockProposer:
          all_greedy = sampling_info is None or sampling_info.is_all_greedy
          folded_confidence = None
          confidence_tap = None
@@ -271,11 +278,12 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
 +            draft_sampler is not None
 +            and fwd.can_run_graph
 +            and all_greedy
++            and not online_update
 +        ):
              folded = True
              if sampling_info is None:
                  temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-@@ -309,19 +326,21 @@ class DraftBlockProposer:
+@@ -309,27 +325,33 @@ class DraftBlockProposer:
                      bs=bs, sampling_info=sampling_info, device=device
                  ),
                  temperatures=temperatures,
@@ -284,23 +292,36 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
              if draft_sampler.confidence_out is not None:
                  folded_confidence = draft_sampler.confidence_out[:bs]
          else:
-             with self._base_logits_context():
+-            with self._base_logits_context():
 -                base_logits, confidence_tap = self.draft_model.compute_base_logits(
 -                    fwd.raw_hidden
-+                base_logits, confidence_tap, head_hidden = compute_dspark_projection(
-+                    self.draft_model, fwd.raw_hidden
-                 )
-                 base_logits = base_logits.view(bs, self.gamma, -1)
-+                head_hidden = head_hidden.view(bs, self.gamma, -1)
-             draft_block = sample_draft_block(
-                 base_logits=base_logits,
-                 anchor_tokens=draft_block_ids[:, 0],
+-                )
+-                base_logits = base_logits.view(bs, self.gamma, -1)
+-            draft_block = sample_draft_block(
+-                base_logits=base_logits,
+-                anchor_tokens=draft_block_ids[:, 0],
 -                draft_hidden=fwd.draft_hidden_3d,
-+                draft_hidden=fwd.markov_hidden_3d,
-                 sampling_info=sampling_info,
-                 markov_head=self.draft_model.markov_head,
-                 device=device,
-@@ -329,7 +348,7 @@ class DraftBlockProposer:
+-                sampling_info=sampling_info,
+-                markov_head=self.draft_model.markov_head,
+-                device=device,
++            grad_context = (
++                torch.enable_grad() if online_update else torch.inference_mode()
+             )
++            with grad_context:
++                with self._base_logits_context():
++                    base_logits, confidence_tap, head_hidden = compute_dspark_projection(
++                        self.draft_model, fwd.raw_hidden
++                    )
++                    base_logits = base_logits.view(bs, self.gamma, -1)
++                    head_hidden = head_hidden.view(bs, self.gamma, -1)
++                draft_block = sample_draft_block(
++                    base_logits=base_logits,
++                    anchor_tokens=draft_block_ids[:, 0],
++                    draft_hidden=fwd.markov_hidden_3d,
++                    sampling_info=sampling_info,
++                    markov_head=self.draft_model.markov_head,
++                    device=device,
++                )
          return DraftProposal(
              draft_block_ids=draft_block_ids,
              draft_block=draft_block,
@@ -309,7 +330,23 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
              confidence=folded_confidence,
              confidence_tap=confidence_tap,
              folded=folded,
-@@ -417,11 +436,11 @@ class DraftBlockProposer:
+@@ -367,6 +389,7 @@ class DraftBlockProposer:
+         bs: int,
+         device: str,
+         embed_module,
++        online_update: bool,
+     ) -> DraftForwardResult:
+         gamma = self.gamma
+         prefix_lens = batch.seq_lens
+@@ -411,17 +434,18 @@ class DraftBlockProposer:
+             capture_hidden_mode=CaptureHiddenMode.NULL,
+         )
+         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+-        with torch.inference_mode():
++        grad_context = torch.enable_grad() if online_update else torch.inference_mode()
++        with grad_context:
+             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+         logits_output = draft_out.logits_output
          raw_hidden = logits_output.hidden_states
          if raw_hidden is None:
              raise RuntimeError("DSpark draft model returned no hidden states.")
@@ -325,6 +362,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/p
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_proposal.py b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 new file mode 100644
+index 00000000..318bcf25
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 @@ -0,0 +1,45 @@
@@ -374,6 +412,7 @@ new file mode 100644
 +    "compute_dspark_projection",
 +)
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+index 4d5478cd..ab2114d9 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 @@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
@@ -402,6 +441,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/
          self,
          *,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index ae778ee1..eb4cacb9 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 @@ -4,7 +4,7 @@ from dataclasses import replace
@@ -423,7 +463,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  from sglang.srt.speculative.spec_utils import (
      GrammarTree,
      build_grammar_vocab_mask,
-@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
+@@ -64,7 +67,6 @@ logger = logging.getLogger(__name__)
  
  
  class DSparkWorkerV2(BaseSpecWorker):
@@ -431,7 +471,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
      def __init__(
          self,
          server_args: ServerArgs,
-@@ -254,6 +253,18 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -254,6 +256,18 @@ class DSparkWorkerV2(BaseSpecWorker):
              device=self.device,
              simulate_acc_len=self._simulate_acc_len,
          )
@@ -450,7 +490,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  
      def _resolve_target_embed_tokens(self, target_model):
          if hasattr(target_model, "get_input_embeddings"):
-@@ -339,16 +350,29 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -339,16 +353,29 @@ class DSparkWorkerV2(BaseSpecWorker):
              ),
          )
  
@@ -483,7 +523,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
      def clear_info_records(self) -> None:
          self._observers.clear_info_records()
  
-@@ -357,6 +381,21 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -357,6 +384,21 @@ class DSparkWorkerV2(BaseSpecWorker):
  
      def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
          self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
@@ -505,7 +545,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  
      def forward_batch_generation(
          self,
-@@ -508,6 +547,13 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -508,6 +550,13 @@ class DSparkWorkerV2(BaseSpecWorker):
          prefix_lens = batch.seq_lens
  
          self._observers.begin_step()
@@ -519,7 +559,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  
          target_model = self.target_worker.model_runner.model
  
-@@ -530,6 +576,10 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -530,6 +579,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                  device=device,
                  target_model=target_model,
                  sampling_info=sampling_info,
@@ -530,7 +570,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
              )
          draft_block_ids = proposal.draft_block_ids
          draft_block = proposal.draft_block
-@@ -547,6 +593,17 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -550,6 +603,17 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              req_pool_indices=batch.req_pool_indices,
          )
@@ -548,7 +588,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
  
          global_num_reqs = (
              max(batch.global_num_tokens)
-@@ -681,6 +742,79 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -681,6 +745,103 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
@@ -654,6 +694,7 @@ diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
              new_seq_lens=accept.new_seq_lens,
 diff --git a/python/sglang/srt/speculative/dspark_online_adaptation.py b/python/sglang/srt/speculative/dspark_online_adaptation.py
 new file mode 100644
+index 00000000..128c6983
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_online_adaptation.py
 @@ -0,0 +1,540 @@
@@ -1198,6 +1239,7 @@ new file mode 100644
 +    "resolve_dspark_verification",
 +)
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index 4184fe46..ba7a0390 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
 +++ b/python/sglang/srt/speculative/eagle_info.py
 @@ -30,6 +30,7 @@ class EagleVerifyInput(SpecInput):
@@ -1255,6 +1297,7 @@ diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/spe
  
  @dataclass
 diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
+index 880545b5..8ee2ed59 100644
 --- a/python/sglang/srt/speculative/eagle_worker_common.py
 +++ b/python/sglang/srt/speculative/eagle_worker_common.py
 @@ -397,6 +397,7 @@ def build_eagle_verify_input(
@@ -1266,6 +1309,7 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglan
  
  
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index ee435757..52c00f34 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
 @@ -5,6 +5,7 @@ from dataclasses import replace
@@ -1486,7 +1530,7 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
          # Adaptive speculative
          self.adaptive_controller: Optional[AdaptiveController] = None
          if server_args.speculative_adaptive:
-@@ -1034,5 +1090,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
+@@ -1034,6 +1090,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
  
          self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
  
@@ -1504,6 +1548,7 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
 +
      @property
      def war_fastpath_runner(self):
+         # Per the base contract: the step's last shared-buffer-reading phase is
 @@ -1102,6 +1170,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
              # Publish before draft_extend so the fence is at target-end.
              if on_publish is not None:
@@ -1684,6 +1729,7 @@ diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/sr
  
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+index 98c210b4..dbd12c77 100644
 --- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 +++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 @@ -26,7 +26,7 @@ from dataclasses import replace
@@ -1942,9 +1988,10 @@ diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/s
 +        }
 diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
 new file mode 100644
+index 00000000..26042dd1
 --- /dev/null
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,387 @@
 +"""Online updates shared by DSpark, EAGLE3, and NEXTN workers."""
 +
 +from __future__ import annotations

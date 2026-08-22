@@ -1,4 +1,5 @@
 diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 427acdd3..771a175d 100644
 --- a/python/sglang/srt/arg_groups/speculative_hook.py
 +++ b/python/sglang/srt/arg_groups/speculative_hook.py
 @@ -143,6 +143,12 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
@@ -15,6 +16,7 @@ diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/sr
  def _handle_dflash(server_args: ServerArgs) -> None:
      from sglang.srt.arg_groups.overrides import resolved_view
 diff --git a/python/sglang/srt/mem_cache/allocation_sizing.py b/python/sglang/srt/mem_cache/allocation_sizing.py
+index 10d08d62..bd0e7c24 100644
 --- a/python/sglang/srt/mem_cache/allocation_sizing.py
 +++ b/python/sglang/srt/mem_cache/allocation_sizing.py
 @@ -43,18 +43,44 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
@@ -69,6 +71,7 @@ diff --git a/python/sglang/srt/mem_cache/allocation_sizing.py b/python/sglang/sr
              extra,
              get_alloc_reserve_per_decode(server_args) + server_args.page_size - 1,
 diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index bc4cf815..d18d814f 100644
 --- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
 +++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
 @@ -1556,7 +1556,27 @@ class KVCacheConfigurator:
@@ -112,6 +115,7 @@ diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglan
                  f"Raise --mem-fraction-static above "
                  f"{suggested_mem_fraction_static:.3f} "
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 1182ccbb..42bdf3ba 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -2157,6 +2157,27 @@ class ServerArgs:
@@ -144,9 +148,10 @@ diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
      # separate engines, currently connected by a ZMQ IPC mesh.
 diff --git a/python/sglang/srt/speculative/online_adaptation_config.py b/python/sglang/srt/speculative/online_adaptation_config.py
 new file mode 100644
+index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,246 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -395,6 +400,7 @@ new file mode 100644
 +        raise ValueError("online adaptation requires exact rejection sampling")
 diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
 new file mode 100644
+index 00000000..56c428c6
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_parameter_plan.py
 @@ -0,0 +1,186 @@
@@ -586,6 +592,7 @@ new file mode 100644
 +__all__ = ("ParameterSelection", "build_native_parameter_plan")
 diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
 new file mode 100644
+index 00000000..91fca3a6
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_valid_mask.py
 @@ -0,0 +1,176 @@
