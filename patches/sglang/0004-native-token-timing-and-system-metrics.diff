@@ -571,31 +571,6 @@ index c8934b27..accb6bc3 100644
              self.rid_to_state[rid] = state
              if self.enable_trace:
                  time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
-diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
-index 2dcf226a..4184c5cf 100644
---- a/python/sglang/srt/speculative/dflash_worker_v2.py
-+++ b/python/sglang/srt/speculative/dflash_worker_v2.py
-@@ -1952,6 +1952,7 @@ class DFlashWorkerV2(BaseSpecWorker):
-         if online_adapter is not None:
-             from sglang.srt.speculative.online_valid_mask import (
-                 request_boundary_metadata,
-+                semantic_committed_prefix_lengths,
-                 semantic_proposal_semantics,
-             )
- 
-@@ -1972,8 +1973,10 @@ class DFlashWorkerV2(BaseSpecWorker):
-                 terminal_token_ids=terminal_ids,
-                 ignore_eos=ignore_eos,
-             )
--            semantic_new_seq_lens = prefix_lens + semantic_committed.to(
--                prefix_lens.dtype
-+            semantic_new_seq_lens = semantic_committed_prefix_lengths(
-+                physical_new_seq_lens=new_seq_lens,
-+                physical_committed_tokens=commit_lens,
-+                semantic_committed_tokens=semantic_committed,
-             )
-             online_adapter.maybe_launch(
-                 draft_hidden=online_draft_hidden,
 diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
 index 13e8db93..231692d7 100644
 --- a/python/sglang/srt/speculative/online_adaptation_runtime.py
@@ -608,26 +583,150 @@ index 13e8db93..231692d7 100644
              "controlled_candidate_equal": self.controlled_candidate_equal,
              "controlled_candidate_compared": self.controlled_candidate_compared,
              "confidence_brier": (
-diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
-index 91fca3a6..f589d257 100644
---- a/python/sglang/srt/speculative/online_valid_mask.py
-+++ b/python/sglang/srt/speculative/online_valid_mask.py
-@@ -129,6 +129,18 @@ def semantic_proposal_semantics(
-     return valid, accepted, committed
+diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
+index 18418d7e..d64614e6 100644
+--- a/python/sglang/srt/speculative/dflash_online_adaptation.py
++++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
+@@ -1075,20 +1075,19 @@ class DFlashDrafterAdapter:
+     def after_commit(
+         self,
+         batch,
+-        new_seq_lens: torch.Tensor,
+         *,
+         accepted_drafts: torch.Tensor,
+         verified_drafts: torch.Tensor,
+         committed_tokens: torch.Tensor,
+     ) -> None:
+         request_ids = tuple(request.rid for request in batch.reqs)
++        self.runtime.record_device_commit(request_ids, committed_tokens)
+         self.runtime.record_round_outcome(
+             request_ids,
+             verified_drafts=verified_drafts,
+             accepted_drafts=accepted_drafts,
+             committed_tokens=committed_tokens,
+         )
+-        self.runtime.record_device_commit(request_ids, new_seq_lens)
  
+     def finish_request(self, request_id: str) -> bool:
+         if self.runtime.finish_request(request_id):
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 2dcf226a..7842235f 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1972,9 +1972,6 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 terminal_token_ids=terminal_ids,
+                 ignore_eos=ignore_eos,
+             )
+-            semantic_new_seq_lens = prefix_lens + semantic_committed.to(
+-                prefix_lens.dtype
+-            )
+             online_adapter.maybe_launch(
+                 draft_hidden=online_draft_hidden,
+                 target_logits=logits_output.next_token_logits,
+@@ -1997,7 +1994,6 @@ class DFlashWorkerV2(BaseSpecWorker):
+         if online_adapter is not None:
+             online_adapter.after_commit(
+                 batch,
+-                semantic_new_seq_lens,
+                 accepted_drafts=semantic_accepted,
+                 verified_drafts=torch.full_like(accept_len, int(self.block_size) - 1),
+                 committed_tokens=semantic_committed,
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index eb8fe29a..b0d0b914 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -874,7 +874,6 @@ class DSparkWorkerV2(BaseSpecWorker):
+             )
+             online_adapter.after_commit(
+                 request_ids,
+-                new_seq_lens=accept.new_seq_lens,
+                 verified_drafts=verified_drafts,
+                 accepted_drafts=(accept.commit_lens.to(torch.int64) - 1).clamp_min(0),
+                 committed_tokens=accept.commit_lens.to(torch.int64),
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 0e3741fb..be5902f1 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1344,12 +1344,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                         )
+             if online_adapter is not None and not batch.forward_mode.is_idle():
+                 committed = batch_output.accept_lens.to(torch.int64)
+-                semantic_new_seq_lens = round_prefix_lens + committed.to(
+-                    round_prefix_lens.dtype
+-                )
+                 online_adapter.after_commit(
+                     round_request_ids,
+-                    new_seq_lens=semantic_new_seq_lens,
+                     verified_drafts=torch.full(
+                         (len(round_request_ids),),
+                         self.speculative_num_draft_tokens,
+diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+index c4aa5404..7fc522e2 100644
+--- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
++++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+@@ -886,12 +886,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
+             if online_adapter is not None and not batch.forward_mode.is_idle():
+                 batch_size = len(round_request_ids)
+                 committed = batch_output.accept_lens.to(torch.int64)
+-                semantic_new_seq_lens = round_prefix_lens + committed.to(
+-                    round_prefix_lens.dtype
+-                )
+                 online_adapter.after_commit(
+                     round_request_ids,
+-                    new_seq_lens=semantic_new_seq_lens,
+                     verified_drafts=torch.full(
+                         (batch_size,),
+                         self.speculative_num_draft_tokens,
+diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+index 748bbdff..87857b6a 100644
+--- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
++++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+@@ -332,19 +332,18 @@ class NativeBackendOnlineAdapter:
+         self,
+         request_ids: Sequence[str],
+         *,
+-        new_seq_lens: torch.Tensor,
+         verified_drafts: torch.Tensor,
+         accepted_drafts: torch.Tensor,
+         committed_tokens: torch.Tensor,
+     ) -> None:
+         request_ids = tuple(request_ids)
++        self.runtime.record_device_commit(request_ids, committed_tokens)
+         self.runtime.record_round_outcome(
+             request_ids,
+             verified_drafts=verified_drafts,
+             accepted_drafts=accepted_drafts,
+             committed_tokens=committed_tokens,
+         )
+-        self.runtime.record_device_commit(request_ids, new_seq_lens)
  
-+def semantic_committed_prefix_lengths(
-+    *,
-+    physical_new_seq_lens: torch.Tensor,
-+    physical_committed_tokens: torch.Tensor,
-+    semantic_committed_tokens: torch.Tensor,
-+) -> torch.Tensor:
-+    """Remove request-boundary overrun from the backend's committed length."""
-+    return physical_new_seq_lens - (
-+        physical_committed_tokens - semantic_committed_tokens
-+    ).to(physical_new_seq_lens.dtype)
-+
-+
- def semantic_valid_mask(
-     *,
-     proposal_tokens: torch.Tensor,
+     def finish_request(self, request_id: str) -> None:
+         if self.runtime.finish_request(request_id):
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index 231692d7..388a9542 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -1988,16 +1988,16 @@ class OnlineCohortRuntime:
+             state.append(int(length), state.version)
+ 
+     def record_device_commit(
+-        self, request_ids: Sequence[str], new_lengths: torch.Tensor
++        self, request_ids: Sequence[str], committed_tokens: torch.Tensor
+     ) -> None:
+-        if not new_lengths.is_cuda:
+-            self.commit_lengths(request_ids, new_lengths.tolist())
+-            return
+         request_ids = tuple(request_ids)
+-        if new_lengths.ndim != 1 or new_lengths.shape[0] != len(request_ids):
+-            raise ValueError("one committed length is required per request")
++        prefixes = []
++        for request_id in request_ids:
++            trace, trace_index = self.active_round_rows[request_id]
++            prefixes.append(self.round_metrics[trace.buffer_index, trace_index, 0])
+         main = torch.cuda.current_stream(self.device)
+-        owned = new_lengths.detach().to(torch.int64).clone()
++        owned = torch.stack(prefixes) + committed_tokens.detach().to(torch.int64)
++        owned = owned.clone()
+         owned.record_stream(main)
+         for index, request_id in enumerate(request_ids):
+             self.latest_device_lengths[request_id] = (

@@ -567,7 +567,6 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert patch.count("torch.inference_mode(not online_update)") == 5
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
     assert patch.count("with torch.inference_mode(False), torch.enable_grad():") >= 6
-    assert patch.count("semantic_new_seq_lens = round_prefix_lens + committed.to(") == 2
     assert patch.count("round_request_ids = tuple(request.rid for request in batch.reqs)") == 2
     assert patch.count("request_ids=round_request_ids[:microbatch]") == 2
     assert "def begin_round(\n+        self, request_ids: Sequence[str]" in patch
@@ -626,13 +625,14 @@ def test_prefill_terminal_request_releases_request_scoped_owner():
     assert "natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)" in patch
 
 
-def test_dflash_uses_backend_committed_length_for_request_boundaries():
+def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     patch = (
         Path(__file__).parents[1]
         / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
     ).read_text(encoding="utf-8")
-    assert "def semantic_committed_prefix_lengths(" in patch
-    assert "physical_new_seq_lens=new_seq_lens" in patch
+    assert "prefixes.append(self.round_metrics[trace.buffer_index, trace_index, 0])" in patch
+    assert "record_device_commit(request_ids, committed_tokens)" in patch
+    assert "new_seq_lens=semantic_new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch
 
 
