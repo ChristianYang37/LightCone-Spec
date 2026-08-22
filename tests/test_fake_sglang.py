@@ -470,6 +470,13 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     )
     index = command.index("--speculative-eagle-topk")
     assert command[index + 1] == "1"
+    steps = command.index("--speculative-num-steps")
+    assert command[steps + 1] == "15"
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0001-arguments-config-and-memory.diff"
+    ).read_text(encoding="utf-8")
+    assert '\"EAGLE\" if config.algorithm == \"NEXTN\"' in patch
 
 
 def test_triton_graph_uses_ragged_layout_and_draft_width():

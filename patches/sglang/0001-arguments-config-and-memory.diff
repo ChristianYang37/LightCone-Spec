@@ -389,7 +389,7 @@ index 00000000..8ec8b2c7
 +    if not bool(getattr(server_args, "speculative_speed_study_metrics", False)):
 +        raise ValueError("online adaptation requires speed-study metrics")
 +    backend = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
-+    if backend != config.algorithm:
++    if backend != ("EAGLE" if config.algorithm == "NEXTN" else config.algorithm):
 +        raise ValueError(f"adaptation backend mismatch: {config.algorithm} != {backend}")
 +    width = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
 +    if config.canvas_tokens != width:

@@ -206,7 +206,7 @@ def server_command(
             "--speculative-num-draft-tokens",
             str(_speculative_canvas(job)),
             "--speculative-num-steps",
-            "1",
+            str(_speculative_canvas(job) - 1 if job.backend == "NEXTN" else 1),
             "--speculative-draft-window-size",
             str(_speculative_canvas(job)),
             "--speculative-use-rejection-sampling",
