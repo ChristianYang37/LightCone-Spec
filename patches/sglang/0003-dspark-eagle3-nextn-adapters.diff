@@ -2665,7 +2665,7 @@ index 02bc8e6d..822ab05e 100644
 -            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 +            workspace_mb = (
 +                1024
-+                if model_runner.server_args.speculative_num_draft_tokens >= 16
++                if int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16
 +                else 512
 +            )
 +            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(workspace_mb * 1024 * 1024)
