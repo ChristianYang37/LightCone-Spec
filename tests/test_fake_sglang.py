@@ -482,6 +482,7 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
         '\"EAGLE3\" if self.speculative_algorithm.is_eagle3() else \"NEXTN\"'
         in nextn_patch
     )
+    assert "self._online_drafter_adapter.source_adapter_version" in nextn_patch
     acceptance = acceptance_job(
         0,
         "lightcone",

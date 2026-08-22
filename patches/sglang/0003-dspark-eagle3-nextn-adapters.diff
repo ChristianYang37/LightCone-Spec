@@ -1678,7 +1678,14 @@ index ee43575..52c00f3 100644
              if on_publish is not None:
                  on_publish(batch_output.new_seq_lens)
 +            source_adapter_version = None
- 
++            if self._online_drafter_adapter is not None:
++                source_adapter_version = torch.full(
++                    (len(batch.reqs),),
++                    self._online_drafter_adapter.source_adapter_version,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
+
              # Draft prefill
              with (
 @@ -1118,11 +1187,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
