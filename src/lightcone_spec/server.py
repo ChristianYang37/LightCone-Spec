@@ -534,6 +534,7 @@ class StickyReplicaClient:
                 max_new_tokens=max_new_tokens,
                 seed=seed + index,
                 routing_key=f"replica-warmup-{index}",
+                request_id_prefix=f"replica-warmup-{index}",
             )
         self.reset()
 

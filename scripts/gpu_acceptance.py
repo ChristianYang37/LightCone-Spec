@@ -113,7 +113,12 @@ def _measure(
         if isinstance(client, StickyReplicaClient):
             client.warmup(prompts[0], max_new_tokens=16, seed=0)
         else:
-            client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
+            client.run_batch(
+                prompts[:1],
+                max_new_tokens=16,
+                seed=0,
+                request_id_prefix="warmup",
+            )
             client.reset()
         exactness_trajectory = None
         if exactness_tokens:
@@ -157,6 +162,7 @@ def _measure(
                 prompts,
                 max_new_tokens=max_new_tokens,
                 seed=job.block or 0,
+                request_id_prefix=f"acceptance-{job.method}",
             )
         after = _speed_metrics(client.server_info(), topology)
     intervals = [value for result in results for value in result.inter_token_ms]

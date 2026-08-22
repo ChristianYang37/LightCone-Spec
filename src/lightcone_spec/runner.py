@@ -704,13 +704,18 @@ def _run_multi_turn(
         budget = max(1, remaining // turns_left)
         if request_scoped:
             turn_results, turn_elapsed = _run_request_scoped(
-                client, histories, budget, seed + turn
+                client,
+                histories,
+                budget,
+                seed + turn,
+                request_prefix=f"multi-turn-{turn}",
             )
         else:
             turn_results, turn_elapsed = client.run_batch(
                 histories,
                 max_new_tokens=budget,
                 seed=seed + turn,
+                request_id_prefix=f"multi-turn-{turn}",
             )
         elapsed += turn_elapsed
         for index, result in enumerate(turn_results):
@@ -1024,6 +1029,7 @@ def _execute_cell(
                     prompts[:1],
                     max_new_tokens=min(8, probe_budget),
                     seed=config.protocol.seed,
+                    request_id_prefix=f"{job.job_id}-probe",
                 )
                 _write_json(
                     output_dir / "static_probe.json",
@@ -1052,6 +1058,7 @@ def _execute_cell(
                     if job.node.startswith("E5")
                     else None
                 )
+                warmup_index = 0
                 while True:
                     if hasattr(client, "warmup"):
                         client.warmup(
@@ -1064,8 +1071,10 @@ def _execute_cell(
                             prompts[: config.server.warmup_requests],
                             max_new_tokens=min(16, warmup_budget),
                             seed=config.protocol.seed,
+                            request_id_prefix=f"{job.job_id}-warmup-{warmup_index}",
                         )
                         client.reset()
+                    warmup_index += 1
                     if warmup_deadline is None or time.monotonic() >= warmup_deadline:
                         break
             failure = runtime_job.parameters.get("failure")
@@ -1152,12 +1161,14 @@ def _execute_cell(
                         max_new_tokens,
                         seed,
                         same_seed=bool(runtime_job.parameters.get("controlled_replay")),
+                        request_prefix=f"{job.job_id}-measure",
                     )
                 else:
                     results, elapsed = client.run_batch(
                         prompts,
                         max_new_tokens=max_new_tokens,
                         seed=seed,
+                        request_id_prefix=f"{job.job_id}-measure",
                     )
             else:
                 scheduled = client.run_scheduled(
@@ -1166,6 +1177,10 @@ def _execute_cell(
                     max_new_tokens=max_new_tokens,
                     seed=config.protocol.seed + (job.block or 0),
                     routing_keys=_routing_keys(config, runtime_job, len(prompts)),
+                    request_ids=tuple(
+                        f"{job.job_id}-scheduled-{index:05d}"
+                        for index in range(len(prompts))
+                    ),
                     max_in_flight=(
                         1 if runtime_job.method in {"tts", "l0_naive"} else 256
                     ),
@@ -1195,6 +1210,7 @@ def _execute_cell(
                             max_new_tokens=1,
                             seed=sample_seed,
                             temperature=0.8,
+                            request_id_prefix=f"{job.job_id}-stochastic-{sample:02d}",
                         )
                     stochastic_rows.extend(
                         {
