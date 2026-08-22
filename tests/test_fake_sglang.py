@@ -518,6 +518,13 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
     assert "int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16" in patch
     assert "if online_adapter is not None and online_update:" in patch
+    assert patch.count("online_update = online_adapter.update_due") >= 2
+    assert """+            if online_adapter is not None and online_update:
++                hidden_rows = self.draft_worker._online_hidden_rows
+""" in patch
+    assert """+            if online_adapter is not None and not batch.forward_mode.is_idle():
++                committed = batch_output.accept_lens.to(torch.int64)
+""" in patch
     assert """+        if online_adapter is not None:
 +            verified_drafts = (
 """ in patch

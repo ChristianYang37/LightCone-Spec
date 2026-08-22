@@ -1699,9 +1699,11 @@ index ee43575..52c00f3 100644
          else:
              self.activate_step_by_batch(batch.seq_lens.shape[0])
 +            online_adapter = self._online_drafter_adapter
++            online_update = False
 +            source_adapter_version = None
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                source_version = online_adapter.begin_round(batch)
++                online_update = online_adapter.update_due
 +                source_adapter_version = torch.full(
 +                    (len(batch.reqs),),
 +                    source_version,
@@ -1741,7 +1743,7 @@ index ee43575..52c00f3 100644
 +                        source_adapter_version=source_adapter_version,
 +                    )
 +
-+            if online_adapter is not None and not batch.forward_mode.is_idle():
++            if online_adapter is not None and online_update:
 +                hidden_rows = self.draft_worker._online_hidden_rows
 +                logit_rows = self.draft_worker._online_logit_rows
 +                if not hidden_rows or not logit_rows:
@@ -1795,6 +1797,7 @@ index ee43575..52c00f3 100644
 +                                online_adapter.source_adapter_version
 +                            ),
 +                        )
++            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                committed = batch_output.accept_lens.to(torch.int64)
 +                online_adapter.after_commit(
 +                    batch,
