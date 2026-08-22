@@ -14,7 +14,7 @@ import threading
 import time
 import urllib.error
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -85,6 +85,15 @@ CANDIDATE_METHODS = {
 
 def _screening_job(job: Job) -> bool:
     return job.node in {"E3a", "E1-common-load", "E6-common-load"}
+
+
+def _validate_committed_tokens(results: Sequence[GenerationResult], committed: int) -> int:
+    output_tokens = sum(result.completion_tokens for result in results)
+    if committed != output_tokens:
+        raise ScientificFailure(
+            f"runtime committed {committed} tokens for {output_tokens} output tokens"
+        )
+    return output_tokens
 
 
 def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, Any]:
@@ -1227,6 +1236,7 @@ def _execute_cell(
             if not cycles.exists():
                 cycles.write_text("", encoding="utf-8")
             committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+            output_tokens = _validate_committed_tokens(results, committed)
             peak_hbm = int(after["peak_hbm_bytes"])
             reserved_hbm = int(after["peak_hbm_reserved_bytes"])
             nvml_hbm = _peak_hbm_from_csv(
@@ -1272,7 +1282,7 @@ def _execute_cell(
                     "cancelled": sum(row["status"] == "cancelled" for row in outcome_rows),
                     "unfinished": sum(row["status"] == "unfinished" for row in outcome_rows),
                 },
-                "output_tokens": sum(result.completion_tokens for result in results),
+                "output_tokens": output_tokens,
                 "ttft_p50_ms": float(np.median([result.ttft_ms for result in results])),
                 "itl_p99_ms": float(native_itl),
                 "rank_local_before": before["rank_local"],

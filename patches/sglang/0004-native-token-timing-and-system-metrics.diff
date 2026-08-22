@@ -100,7 +100,7 @@ diff --git a/python/sglang/srt/managers/native_token_timestamps.py b/python/sgla
 new file mode 100644
 --- /dev/null
 +++ b/python/sglang/srt/managers/native_token_timestamps.py
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,67 @@
 +"""Scheduler commit times for output tokens."""
 +
 +from __future__ import annotations
@@ -111,6 +111,12 @@ new file mode 100644
 +NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
 +NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "scheduler_committed_token_v1"
 +NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "SCHEDULER_COMMIT"
++
++
++def newly_committed_output_tokens(req: Any, previous_length: int) -> Sequence[int]:
++    """Return the newly exposed logical output-token prefix."""
++
++    return req.output_ids_through_stop[previous_length:]
 +
 +
 +def record_committed_output_tokens(
@@ -297,31 +303,49 @@ diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_proces
  import torch
  
 +from sglang.srt.managers.native_token_timestamps import (
++    newly_committed_output_tokens,
 +    record_committed_output_tokens,
 +)
  from sglang.srt.disaggregation.utils import DisaggregationMode
-@@ -232,6 +232,8 @@ class SchedulerBatchResultProcessor:
+@@ -232,10 +232,20 @@ class SchedulerBatchResultProcessor:
  
                      # req output_ids are set here
++                    previous_output_len = len(req.output_ids_through_stop)
                      req.output_ids.append(next_token_id)
-+                    record_committed_output_tokens(
-+                        req, (next_token_id,), time.monotonic_ns()
-+                    )
-+                    if self.metrics_reporter.speed_study_enabled:
-+                        self.metrics_reporter.speed_study_committed_tokens += 1
  
                      self._maybe_update_reasoning_tokens(req, next_token_id)
  
-@@ -780,6 +782,8 @@ class SchedulerBatchResultProcessor:
+                     req.update_finish_state()
++                    committed_tokens = newly_committed_output_tokens(
++                        req, previous_output_len
++                    )
++                    record_committed_output_tokens(
++                        req, committed_tokens, time.monotonic_ns()
++                    )
++                    if self.metrics_reporter.speed_study_enabled:
++                        self.metrics_reporter.speed_study_committed_tokens += len(
++                            committed_tokens
++                        )
+                     if req.finished():
+@@ -780,10 +790,20 @@ class SchedulerBatchResultProcessor:
  
++            previous_output_len = len(req.output_ids_through_stop)
              req.output_ids.extend(next_token_id)
              new_accept_len = len(next_token_id)
-+            record_committed_output_tokens(req, next_token_id, time.monotonic_ns())
-+            if self.metrics_reporter.speed_study_enabled:
-+                self.metrics_reporter.speed_study_committed_tokens += new_accept_len
  
              self._maybe_update_reasoning_tokens(req, next_token_id)
              req.time_stats.set_last_decode_finish_time()
+             req.update_finish_state(new_accept_len)
++            committed_tokens = newly_committed_output_tokens(req, previous_output_len)
++            record_committed_output_tokens(
++                req, committed_tokens, time.monotonic_ns()
++            )
++            if self.metrics_reporter.speed_study_enabled:
++                self.metrics_reporter.speed_study_committed_tokens += len(
++                    committed_tokens
++                )
+ 
+             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 --- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
 +++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py

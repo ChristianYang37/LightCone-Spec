@@ -15,6 +15,7 @@ from lightcone_spec.runner import (
     _canonical_accuracy,
     _fault_action_passed,
     _run_request_scoped,
+    _validate_committed_tokens,
 )
 from lightcone_spec.server import (
     ServerProcess,
@@ -285,6 +286,24 @@ def test_fake_reset_tokenize_and_abort(fake_server):
     }
     assert _fault_action_passed("nonfinite_candidate", True, metrics)
     assert not _fault_action_passed("oom_candidate", True, metrics)
+
+
+def test_committed_tokens_match_visible_outputs():
+    result = GenerationResult(
+        request_id="r",
+        input_tokens=1,
+        completion_tokens=32,
+        ttft_ms=1.0,
+        inter_token_ms=(0.0,) * 31,
+        elapsed_seconds=1.0,
+        stop_reason="length",
+        output_ids=tuple(range(32)),
+        output_text="",
+        native_token_timestamps_ns=tuple(range(32)),
+    )
+    assert _validate_committed_tokens((result,), 32) == 32
+    with pytest.raises(RuntimeError, match="committed 34 tokens for 32 output"):
+        _validate_committed_tokens((result,), 34)
 
 
 def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):

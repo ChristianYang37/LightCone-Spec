@@ -16,7 +16,11 @@ from lightcone_spec.config import ExperimentConfig
 from lightcone_spec.data import load_prompts
 from lightcone_spec.metrics import SAFETY_COUNTERS, committed_goodput
 from lightcone_spec.protocol import Job
-from lightcone_spec.runner import _run_request_scoped, _speed_metrics
+from lightcone_spec.runner import (
+    _run_request_scoped,
+    _speed_metrics,
+    _validate_committed_tokens,
+)
 from lightcone_spec.server import ReplicaServerProcess, ServerProcess, StickyReplicaClient
 
 
@@ -26,13 +30,9 @@ def _write(path: Path, value: object) -> None:
 
 
 def _validate_token_accounting(results, committed: int, budget: int) -> None:
-    output_tokens = sum(result.completion_tokens for result in results)
     if any(result.completion_tokens != budget for result in results):
         raise RuntimeError("generation did not honor the output-token budget")
-    if committed != output_tokens:
-        raise RuntimeError(
-            f"runtime committed {committed} tokens for {output_tokens} output tokens"
-        )
+    _validate_committed_tokens(results, committed)
 
 
 def _job(
