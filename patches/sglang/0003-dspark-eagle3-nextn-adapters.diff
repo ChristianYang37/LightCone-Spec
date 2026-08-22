@@ -1,3 +1,15 @@
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index ecb500b5..13465b5c 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -399,7 +399,6 @@ class DFlashDraftModel(nn.Module):
+             )
+         return self.hidden_norm(self.fc(target_hidden))
+ 
+-    @torch.no_grad()
+     def forward(
+         self,
+         input_ids: torch.Tensor,
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
 index 2b01ec2e..d6d56645 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
