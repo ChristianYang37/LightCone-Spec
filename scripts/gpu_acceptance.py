@@ -94,7 +94,11 @@ def _native_exactness(
     exact_job = replace(
         job,
         method="static",
-        parameters={**job.parameters, "deterministic_exactness": True},
+        parameters={
+            **job.parameters,
+            "deterministic_exactness": True,
+            "exactness_bootstrap": True,
+        },
     )
     gpus = config.gpu_ids if exact_job.gpu_count == 2 else (config.gpu_ids[0],)
     port = config.server.base_port + (2 if exact_job.gpu_count == 2 else 0)
