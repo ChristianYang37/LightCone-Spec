@@ -229,6 +229,7 @@ def _measure(
         "committed_tokens": committed,
         "trajectories": [list(result.output_ids) for result in results],
         "exactness_trajectory": exactness_trajectory,
+        "exactness_evidence": exactness_evidence,
         "counters": counters,
         "rank_local": after["rank_local"],
         "rank_aggregates": after["rank_aggregates"],
