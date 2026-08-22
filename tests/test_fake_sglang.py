@@ -459,16 +459,10 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
         drafts={},
         datasets={},
         gpu_ids=(0, 1),
-        server=ServerConfig(python=python),
+        server=ServerConfig(python=python, adaptation_reserve_mb=45056),
         protocol=ProtocolConfig(),
     )
-    command = server_command(
-        config,
-        job,
-        port=30000,
-        output_dir=tmp_path,
-        adaptation=None,
-    )
+    command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
     index = command.index("--speculative-eagle-topk")
     assert command[index + 1] == "1"
     steps = command.index("--speculative-num-steps")
@@ -496,6 +490,15 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     )
     assert acceptance.parameters["parameterization"] == "lora"
     assert acceptance.parameters["rank"] == 1
+    adaptive_command = server_command(
+        config,
+        acceptance,
+        port=30000,
+        output_dir=tmp_path,
+        adaptation=adaptation_payload(acceptance),
+    )
+    reserve = adaptive_command.index("--speculative-adaptation-reserve-mb")
+    assert adaptive_command[reserve + 1] == "8192"
 
 
 def test_triton_graph_uses_ragged_layout_and_draft_width():

@@ -227,6 +227,9 @@ def server_command(
             ]
         )
     if adaptation is not None:
+        reserve_mb = config.server.adaptation_reserve_mb
+        if job.backend == "NEXTN" and adaptation["weight_update_mode"] == "lora":
+            reserve_mb = min(reserve_mb, 8192)
         adaptation_path = output_dir / "adaptation.json"
         adaptation_path.write_text(json.dumps(adaptation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         telemetry_path = (
@@ -242,7 +245,7 @@ def server_command(
                 "--speculative-adaptation-telemetry-path",
                 str(telemetry_path),
                 "--speculative-adaptation-reserve-mb",
-                str(config.server.adaptation_reserve_mb),
+                str(reserve_mb),
             ]
         )
     profile = job.parameters.get("profiler")
