@@ -1,3 +1,4 @@
+import json
 import math
 
 import pytest
@@ -13,6 +14,7 @@ from lightcone_spec.metrics import (
     paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
+    summarize_attempts,
     validate_scientific_metrics,
 )
 from lightcone_spec.runner import _natural_spline_fit
@@ -153,3 +155,20 @@ def test_natural_spline_uses_fixed_interior_knots_and_natural_boundaries():
     assert len(elasticity) == len(contexts)
     assert abs(curvature[0]) < 1e-8
     assert abs(curvature[-1]) < 1e-8
+
+
+def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
+    pytest.importorskip("pyarrow")
+    attempts = []
+    for index, layout in enumerate(([["weight", [4, 4]]], "N/A")):
+        directory = tmp_path / f"attempt-{index:02d}"
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({"method": "static"}))
+        (directory / "metrics.json").write_text(
+            json.dumps({"parameter_layout": layout})
+        )
+        attempts.append(directory)
+    output = tmp_path / "summary"
+    summarize_attempts(attempts, output)
+    assert (output / "summary.csv").is_file()
+    assert (output / "summary.parquet").is_file()

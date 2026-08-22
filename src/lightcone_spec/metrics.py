@@ -229,7 +229,16 @@ def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.Da
     frame = pd.DataFrame(rows)
     output_root.mkdir(parents=True, exist_ok=True)
     frame.to_csv(output_root / "summary.csv", index=False)
-    frame.to_parquet(output_root / "summary.parquet", index=False)
+    parquet = frame.copy()
+    for name in parquet.columns:
+        if parquet[name].dtype != object:
+            continue
+        parquet[name] = parquet[name].map(
+            lambda value: value
+            if value is None or isinstance(value, str)
+            else json.dumps(value, sort_keys=True)
+        )
+    parquet.to_parquet(output_root / "summary.parquet", index=False)
     return frame
 
 
