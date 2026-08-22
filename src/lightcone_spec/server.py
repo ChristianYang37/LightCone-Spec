@@ -169,7 +169,7 @@ def server_command(
         "prefix_reuse"
     ):
         argv.append("--disable-radix-cache")
-    if not job.parameters.get("graph_replay", False):
+    if job.parameters.get("graph_replay", True) is False:
         argv.append("--disable-cuda-graph")
     argv.extend(
         [
@@ -277,7 +277,7 @@ def server_session_key(
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
         _speculative_canvas(job),
-        bool(job.parameters.get("graph_replay")),
+        bool(job.parameters.get("graph_replay", True)),
         bool(job.parameters.get("chunked_prefill")),
         bool(job.parameters.get("prefix_reuse"))
         or job.parameters.get("regime") == "multi_turn_shared_prefix",
