@@ -259,6 +259,7 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     )
     assert e1a["fixed_total_token_budget"] == 8
     assert e1a["confidence_loss_weight"] == 0.25
+    assert e1a["canvas_tokens"] == 8
 
 
 def test_sticky_replica_routing_is_repeatable():

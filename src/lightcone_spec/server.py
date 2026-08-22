@@ -37,6 +37,10 @@ def _topology(job: Job) -> tuple[int, int]:
     return tp, 1
 
 
+def _speculative_canvas(job: Job) -> int:
+    return 8 if job.backend == "DSPARK" else int(job.width or 16)
+
+
 def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if job.method not in ADAPTIVE_METHODS:
         return None
@@ -90,7 +94,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "rank": rank if parameterization == "lora" else None,
         "optimizer": optimizer,
         "stride": stride,
-        "canvas_tokens": int(job.width or 16),
+        "canvas_tokens": _speculative_canvas(job),
         "loss_position_decay": float(
             chosen.get("loss_position_decay", math.exp(-1.0 / 7.0))
         ),
@@ -180,11 +184,11 @@ def server_command(
             "--speculative-algorithm",
             job.backend,
             "--speculative-num-draft-tokens",
-            str(job.width or 16),
+            str(_speculative_canvas(job)),
             "--speculative-num-steps",
             "1",
             "--speculative-draft-window-size",
-            str(job.width or 16),
+            str(_speculative_canvas(job)),
             "--speculative-use-rejection-sampling",
         ]
     )
@@ -265,7 +269,7 @@ def server_session_key(
         job.backend,
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
-        job.width,
+        _speculative_canvas(job),
         bool(job.parameters.get("graph_replay")),
         bool(job.parameters.get("chunked_prefill")),
         bool(job.parameters.get("prefix_reuse"))
