@@ -1131,6 +1131,7 @@ def _execute_cell(
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
+            controlled_rows: list[dict[str, object]] = []
             if runtime_job.parameters.get("controlled_replay"):
                 pair_seed = config.protocol.seed + (job.block or 0)
                 capture = replace(
@@ -1169,6 +1170,10 @@ def _execute_cell(
                 )
                 results = (*tts_results, *l0_results)
                 elapsed = tts_elapsed + l0_elapsed
+                controlled_rows = [
+                    {"policy": policy, **result.to_dict()}
+                    for policy, result in zip(("tts", "l0_naive"), results, strict=True)
+                ]
             elif runtime_job.parameters.get("regime") == "multi_turn_shared_prefix":
                 if arrivals is not None:
                     raise ScientificFailure("multi-turn rows cannot use an open-loop trace")
@@ -1224,6 +1229,17 @@ def _execute_cell(
             if runtime_job.method in {"tts", "l0_naive"}:
                 _wait_request_scope_release(client)
             after = _speed_metrics(client.server_info(), topology)
+            if runtime_job.parameters.get("controlled_pair_baseline"):
+                pair_seed = config.protocol.seed + (job.block or 0)
+                controlled, _ = client.run_batch(
+                    prompts[:1],
+                    max_new_tokens=max_new_tokens,
+                    seed=pair_seed,
+                    request_id_prefix="controlled-target",
+                )
+                controlled_rows = [
+                    {"policy": "target_only", **controlled[0].to_dict()}
+                ]
             stochastic_rows: list[dict[str, int]] = []
             if runtime_job.parameters.get("distribution_check"):
                 for sample in range(16):
@@ -1280,6 +1296,10 @@ def _execute_cell(
             if stochastic_rows:
                 with (output_dir / "stochastic.jsonl").open("w", encoding="utf-8") as stream:
                     for row in stochastic_rows:
+                        stream.write(json.dumps(row, sort_keys=True) + "\n")
+            if controlled_rows:
+                with (output_dir / "controlled.jsonl").open("w", encoding="utf-8") as stream:
+                    for row in controlled_rows:
                         stream.write(json.dumps(row, sort_keys=True) + "\n")
             cycles = output_dir / "cycles.jsonl"
             if not cycles.exists():
@@ -2314,6 +2334,7 @@ def _trajectory_group(config: dict[str, Any]) -> tuple[Any, ...]:
 
 def _check_greedy_trajectories(state: StateStore, node: str) -> None:
     groups: dict[tuple[Any, ...], list[tuple[str, tuple[tuple[int, ...], ...]]]] = {}
+    preflight_policies: set[str] = set()
     for directory in state.completed_attempt_dirs(node):
         config_path, requests_path = directory / "config.json", directory / "requests.jsonl"
         if not config_path.is_file() or not requests_path.is_file():
@@ -2321,12 +2342,29 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         if config.get("parameters", {}).get("probe"):
             continue
+        if node == "preflight":
+            controlled_path = directory / "controlled.jsonl"
+            if not controlled_path.is_file():
+                continue
+            for line in controlled_path.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                preflight_policies.add(str(row["policy"]))
+                groups.setdefault(_trajectory_group(config), []).append(
+                    (str(row["policy"]), (tuple(row["output_ids"]),))
+                )
+            continue
         trajectories = tuple(
             tuple(json.loads(line)["output_ids"])
             for line in requests_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
         groups.setdefault(_trajectory_group(config), []).append((config["method"], trajectories))
+    if node == "preflight" and preflight_policies != {
+        "target_only",
+        "tts",
+        "l0_naive",
+    }:
+        raise ScientificFailure("preflight lacks aligned target/TTS/L0 trajectories")
     for group, rows in groups.items():
         baselines = [trajectory for method, trajectory in rows if method == "target_only"]
         if not baselines:

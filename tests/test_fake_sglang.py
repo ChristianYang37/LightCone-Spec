@@ -14,6 +14,7 @@ from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
 from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _canonical_accuracy,
+    _check_greedy_trajectories,
     _fault_action_passed,
     _request_scope_released,
     _run_request_scoped,
@@ -633,6 +634,55 @@ def test_dflash_uses_backend_committed_length_for_request_boundaries():
     assert "def semantic_committed_prefix_lengths(" in patch
     assert "physical_new_seq_lens=new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch
+
+
+def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
+    class State:
+        def completed_attempt_dirs(self, node):
+            assert node == "preflight"
+            return tuple(tmp_path.iterdir())
+
+    config = {
+        "model": "m",
+        "task": "controlled",
+        "context": None,
+        "load": None,
+        "block": None,
+        "parameters": {"topology": "tp2_dp1"},
+    }
+    for name, method, policies in (
+        ("target", "target_only", (("target_only", [1, 2, 3]),)),
+        (
+            "adaptive",
+            "l0_naive",
+            (("tts", [1, 2, 3]), ("l0_naive", [1, 2, 3])),
+        ),
+    ):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "config.json").write_text(
+            json.dumps({**config, "method": method}), encoding="utf-8"
+        )
+        (directory / "requests.jsonl").write_text(
+            json.dumps({"output_ids": [9]}) + "\n", encoding="utf-8"
+        )
+        (directory / "controlled.jsonl").write_text(
+            "".join(
+                json.dumps({"policy": policy, "output_ids": output_ids}) + "\n"
+                for policy, output_ids in policies
+            ),
+            encoding="utf-8",
+        )
+    _check_greedy_trajectories(State(), "preflight")
+    (tmp_path / "adaptive" / "controlled.jsonl").write_text(
+        json.dumps({"policy": "tts", "output_ids": [1, 2, 3]})
+        + "\n"
+        + json.dumps({"policy": "l0_naive", "output_ids": [1, 2, 4]})
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="l0_naive"):
+        _check_greedy_trajectories(State(), "preflight")
 
 
 def test_launcher_applies_one_plain_patch_stream():
