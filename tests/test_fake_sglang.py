@@ -657,8 +657,9 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
         Path(__file__).parents[1]
         / "patches/sglang/0001-arguments-config-and-memory.diff"
     ).read_text(encoding="utf-8")
-    assert 'by_name.get("fc.weight")' in parameter_patch
-    assert 'algorithm == "NEXTN" and name in native_head_set' in parameter_patch
+    assert "_NEXTN_MATRIX" in parameter_patch
+    assert 'algorithm == "NEXTN"' in parameter_patch
+    assert "mlp\\.shared_expert" in parameter_patch
     assert patch.count("-    @torch.no_grad()") == 3
     assert """-    @torch.no_grad()
      def forward(
