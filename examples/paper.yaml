@@ -43,7 +43,7 @@ server:
   host: 127.0.0.1
   base_port: 30000
   mem_fraction_static: 0.88
-  adaptation_reserve_mb: 32768
+  adaptation_reserve_mb: 45056
   startup_timeout_seconds: 900
   request_timeout_seconds: 900
   requests_per_cell: 16
