@@ -518,9 +518,10 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
     assert "int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16" in patch
     assert "if online_adapter is not None and online_update:" in patch
-    assert patch.count("online_update = online_adapter.update_due") >= 2
+    assert patch.count("online_update = online_adapter.update_due") >= 3
     assert patch.count("torch.inference_mode(not online_update)") == 5
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
+    assert patch.count("with torch.inference_mode(False), torch.enable_grad():") >= 6
     assert "qwen3_5_mtp.py" in patch
     assert "qwen3_5.py" in patch
     assert patch.count("-    @torch.no_grad()") == 3

@@ -1769,12 +1769,15 @@ index ee43575..52c00f3 100644
 +                        online_adapter.config.adaptation_microbatch_size,
 +                    )
 +                    steps = min(len(hidden_rows), len(logit_rows))
-+                    hidden = torch.cat(
-+                        tuple(row[:microbatch] for row in hidden_rows[:steps]), dim=0
-+                    )
-+                    draft_logits = torch.cat(
-+                        tuple(row[:microbatch] for row in logit_rows[:steps]), dim=0
-+                    )
++                    with torch.inference_mode(False), torch.enable_grad():
++                        hidden = torch.cat(
++                            tuple(row[:microbatch] for row in hidden_rows[:steps]),
++                            dim=0,
++                        )
++                        draft_logits = torch.cat(
++                            tuple(row[:microbatch] for row in logit_rows[:steps]),
++                            dim=0,
++                        )
 +                    target_logits = batch_output.logits_output.next_token_logits.reshape(
 +                        len(batch.reqs), self.speculative_num_draft_tokens, -1
 +                    )
@@ -1791,14 +1794,17 @@ index ee43575..52c00f3 100644
 +                            "eagle3_teacher_interface_mismatch", exactness=True
 +                        )
 +                    else:
-+                        hidden = hidden[:row_count]
-+                        draft_logits = draft_logits[:row_count]
-+                        teacher_logits = teacher_logits[:row_count].detach()
-+                        loss = F.kl_div(
-+                            F.log_softmax(draft_logits.float(), dim=-1),
-+                            F.softmax(teacher_logits.float(), dim=-1),
-+                            reduction="batchmean",
-+                        )
++                        with torch.inference_mode(False), torch.enable_grad():
++                            hidden = hidden[:row_count]
++                            draft_logits = draft_logits[:row_count]
++                            teacher_logits = (
++                                teacher_logits[:row_count].detach().clone()
++                            )
++                            loss = F.kl_div(
++                                F.log_softmax(draft_logits.float(), dim=-1),
++                                F.softmax(teacher_logits.float(), dim=-1),
++                                reduction="batchmean",
++                            )
 +                        online_adapter.launch(
 +                            loss=loss,
 +                            request_ids=tuple(
@@ -2024,8 +2030,10 @@ index 98c210b..dbd12c7 100644
              self.activate_step_by_batch(batch.seq_lens.shape[0])
  
 +            online_adapter = self._online_drafter_adapter
++            online_update = False
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                online_adapter.begin_round(batch)
++                online_update = online_adapter.update_due
 +
              if batch.spec_info is None:
                  batch.spec_info = self.draft_worker._idle_seed()
@@ -2034,7 +2042,7 @@ index 98c210b..dbd12c7 100644
              ):
                  self.draft_worker._draft_extend_for_decode(batch, batch_output)
  
-+            if online_adapter is not None and not batch.forward_mode.is_idle():
++            if online_adapter is not None and online_update:
 +                hidden_rows = self.draft_worker._online_hidden_rows
 +                logit_rows = self.draft_worker._online_logit_rows
 +                if not hidden_rows or not logit_rows:
@@ -2046,12 +2054,13 @@ index 98c210b..dbd12c7 100644
 +                        len(batch.reqs),
 +                        online_adapter.config.adaptation_microbatch_size,
 +                    )
-+                    hidden = torch.cat(
-+                        tuple(row[:microbatch] for row in hidden_rows), dim=0
-+                    )
-+                    draft_logits = torch.cat(
-+                        tuple(row[:microbatch] for row in logit_rows), dim=0
-+                    )
++                    with torch.inference_mode(False), torch.enable_grad():
++                        hidden = torch.cat(
++                            tuple(row[:microbatch] for row in hidden_rows), dim=0
++                        )
++                        draft_logits = torch.cat(
++                            tuple(row[:microbatch] for row in logit_rows), dim=0
++                        )
 +                    teacher_logits = batch_output.logits_output.next_token_logits[
 +                        :microbatch
 +                    ]
@@ -2065,14 +2074,17 @@ index 98c210b..dbd12c7 100644
 +                            "nextn_teacher_interface_mismatch", exactness=True
 +                        )
 +                    else:
-+                        hidden = hidden[:row_count]
-+                        draft_logits = draft_logits[:row_count]
-+                        teacher_logits = teacher_logits[:row_count].detach()
-+                        loss = F.kl_div(
-+                            F.log_softmax(draft_logits.float(), dim=-1),
-+                            F.softmax(teacher_logits.float(), dim=-1),
-+                            reduction="batchmean",
-+                        )
++                        with torch.inference_mode(False), torch.enable_grad():
++                            hidden = hidden[:row_count]
++                            draft_logits = draft_logits[:row_count]
++                            teacher_logits = (
++                                teacher_logits[:row_count].detach().clone()
++                            )
++                            loss = F.kl_div(
++                                F.log_softmax(draft_logits.float(), dim=-1),
++                                F.softmax(teacher_logits.float(), dim=-1),
++                                reduction="batchmean",
++                            )
 +                        online_adapter.launch(
 +                            loss=loss,
 +                            request_ids=tuple(
@@ -2084,6 +2096,7 @@ index 98c210b..dbd12c7 100644
 +                                online_adapter.source_adapter_version
 +                            ),
 +                        )
++            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                batch_size = len(batch.reqs)
 +                committed = batch_output.accept_lens.to(torch.int64)
 +                online_adapter.after_commit(
