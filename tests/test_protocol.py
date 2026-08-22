@@ -115,6 +115,9 @@ def test_session_key_reuses_scalar_recipe_but_not_layout():
         }
     )
     assert server_session_key(first) == server_session_key(high_priority)
+    e6 = next(job for job in materialize("E6-pilot") if job.backend == "NEXTN")
+    e6_higher_load = e6.__class__(**{**e6.to_dict(), "load": "c2"})
+    assert server_session_key(e6) != server_session_key(e6_higher_load)
 
 
 def test_e5_anchors_execute_before_dependent_rows():

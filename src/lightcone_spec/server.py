@@ -145,6 +145,7 @@ def server_command(
         if job.backend == "DSPARK"
         else config.server.mem_fraction_static
     )
+    max_running = _concurrency(job) if job.node.startswith("E6") else 256
     argv = [
         str(config.server.python),
         "-m",
@@ -162,7 +163,7 @@ def server_command(
         "--context-length",
         str(max(40960, job.context or 0)),
         "--max-running-requests",
-        "256",
+        str(max_running),
         "--mem-fraction-static",
         str(memory_fraction),
         "--random-seed",
@@ -177,18 +178,13 @@ def server_command(
     if job.parameters.get("graph_replay", True) is False:
         argv.append("--disable-cuda-graph")
     else:
+        graph_sizes = tuple(
+            size for size in (1, 2, 4, 8, 16, 32, 64, 128, 256) if size <= max_running
+        )
         argv.extend(
             [
                 "--cuda-graph-bs-decode",
-                "1",
-                "2",
-                "4",
-                "8",
-                "16",
-                "32",
-                "64",
-                "128",
-                "256",
+                *map(str, graph_sizes),
             ]
         )
     argv.extend(
@@ -303,6 +299,7 @@ def server_session_key(
         job.backend,
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
+        _concurrency(job) if job.node.startswith("E6") else 256,
         _speculative_canvas(job),
         bool(job.parameters.get("graph_replay", True)),
         bool(job.parameters.get("chunked_prefill")),

@@ -463,6 +463,8 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
         protocol=ProtocolConfig(),
     )
     command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
+    maximum = command.index("--max-running-requests")
+    assert command[maximum + 1] == "1"
     index = command.index("--speculative-eagle-topk")
     assert command[index + 1] == "1"
     steps = command.index("--speculative-num-steps")
@@ -499,6 +501,10 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     )
     reserve = adaptive_command.index("--speculative-adaptation-reserve-mb")
     assert adaptive_command[reserve + 1] == "8192"
+    maximum = adaptive_command.index("--max-running-requests")
+    assert adaptive_command[maximum + 1] == "8"
+    graphs = adaptive_command.index("--cuda-graph-bs-decode")
+    assert adaptive_command[graphs + 1 : graphs + 5] == ["1", "2", "4", "8"]
 
 
 def test_triton_graph_uses_ragged_layout_and_draft_width():
