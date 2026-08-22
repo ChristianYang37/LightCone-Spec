@@ -571,3 +571,63 @@ index c8934b27..accb6bc3 100644
              self.rid_to_state[rid] = state
              if self.enable_trace:
                  time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 2dcf226a..4184c5cf 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1952,6 +1952,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+         if online_adapter is not None:
+             from sglang.srt.speculative.online_valid_mask import (
+                 request_boundary_metadata,
++                semantic_committed_prefix_lengths,
+                 semantic_proposal_semantics,
+             )
+ 
+@@ -1972,8 +1973,10 @@ class DFlashWorkerV2(BaseSpecWorker):
+                 terminal_token_ids=terminal_ids,
+                 ignore_eos=ignore_eos,
+             )
+-            semantic_new_seq_lens = prefix_lens + semantic_committed.to(
+-                prefix_lens.dtype
++            semantic_new_seq_lens = semantic_committed_prefix_lengths(
++                physical_new_seq_lens=new_seq_lens,
++                physical_committed_tokens=commit_lens,
++                semantic_committed_tokens=semantic_committed,
+             )
+             online_adapter.maybe_launch(
+                 draft_hidden=online_draft_hidden,
+diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python/sglang/srt/speculative/online_adaptation_runtime.py
+index 13e8db93..231692d7 100644
+--- a/python/sglang/srt/speculative/online_adaptation_runtime.py
++++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
+@@ -2389,6 +2389,7 @@ class OnlineCohortRuntime:
+             "teacher_row_policy": self.config.teacher_row_policy,
+             "enabled": self.disabled_reason is None,
+             "disabled_reason": self.disabled_reason,
++            "active_request_id": self.active_request_id,
+             "controlled_candidate_equal": self.controlled_candidate_equal,
+             "controlled_candidate_compared": self.controlled_candidate_compared,
+             "confidence_brier": (
+diff --git a/python/sglang/srt/speculative/online_valid_mask.py b/python/sglang/srt/speculative/online_valid_mask.py
+index 91fca3a6..f589d257 100644
+--- a/python/sglang/srt/speculative/online_valid_mask.py
++++ b/python/sglang/srt/speculative/online_valid_mask.py
+@@ -129,6 +129,18 @@ def semantic_proposal_semantics(
+     return valid, accepted, committed
+ 
+ 
++def semantic_committed_prefix_lengths(
++    *,
++    physical_new_seq_lens: torch.Tensor,
++    physical_committed_tokens: torch.Tensor,
++    semantic_committed_tokens: torch.Tensor,
++) -> torch.Tensor:
++    """Remove request-boundary overrun from the backend's committed length."""
++    return physical_new_seq_lens - (
++        physical_committed_tokens - semantic_committed_tokens
++    ).to(physical_new_seq_lens.dtype)
++
++
+ def semantic_valid_mask(
+     *,
+     proposal_tokens: torch.Tensor,

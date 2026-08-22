@@ -15,6 +15,7 @@ from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _canonical_accuracy,
     _fault_action_passed,
+    _request_scope_released,
     _run_request_scoped,
     _validate_committed_tokens,
 )
@@ -161,6 +162,23 @@ def test_request_scoped_generation_is_serial(fake_server):
     rows, _ = _run_request_scoped(client, ("a", "b", "c"), 2, 0)
     assert len(rows) == 3
     assert Handler.batch_sizes[-3:] == [1, 1, 1]
+
+
+def test_request_scope_waits_for_every_rank():
+    def info(*owners):
+        return {
+            "internal_states": [
+                {
+                    "speculative_adaptation_info_record": {
+                        "online_adaptation": {"active_request_id": owner}
+                    }
+                }
+                for owner in owners
+            ]
+        }
+
+    assert _request_scope_released(info(None, None))
+    assert not _request_scope_released(info(None, "request-1"))
 
 
 def test_scheduled_dispatcher_does_not_queue_behind_worker_pool(fake_server):
@@ -605,6 +623,16 @@ def test_prefill_terminal_request_releases_request_scoped_owner():
     ).read_text(encoding="utf-8")
     assert patch.count("self.draft_worker.note_request_finished(") == 1
     assert "natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)" in patch
+
+
+def test_dflash_uses_backend_committed_length_for_request_boundaries():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
+    ).read_text(encoding="utf-8")
+    assert "def semantic_committed_prefix_lengths(" in patch
+    assert "physical_new_seq_lens=new_seq_lens" in patch
+    assert '"active_request_id": self.active_request_id' in patch
 
 
 def test_launcher_applies_one_plain_patch_stream():

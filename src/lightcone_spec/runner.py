@@ -174,6 +174,37 @@ def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, A
     return combined
 
 
+def _request_scope_released(server_info: dict[str, object]) -> bool:
+    states = server_info.get("internal_states")
+    rank_states = (
+        states
+        if isinstance(states, list) and states
+        else [server_info.get("internal_state", server_info)]
+    )
+    found = False
+    for state in rank_states:
+        if not isinstance(state, dict):
+            continue
+        record = state.get("speculative_adaptation_info_record")
+        online = record.get("online_adaptation") if isinstance(record, dict) else None
+        if not isinstance(online, dict):
+            continue
+        found = True
+        if online.get("active_request_id") is not None:
+            return False
+    if not found:
+        raise ScientificFailure("SGLang did not expose request-scope state")
+    return True
+
+
+def _wait_request_scope_release(client, timeout_seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while not _request_scope_released(client.server_info()):
+        if time.monotonic() >= deadline:
+            raise ScientificFailure("request-scoped adaptation did not reach terminal state")
+        time.sleep(0.01)
+
+
 def _peak_hbm_from_csv(path: Path, offset: int = 0) -> int:
     if not path.is_file():
         return 0
@@ -1190,6 +1221,8 @@ def _execute_cell(
                 results, elapsed = scheduled.results, scheduled.elapsed_seconds
             if profiler in {"nvtx", "nsys", "ncu"}:
                 client.stop_profile()
+            if runtime_job.method in {"tts", "l0_naive"}:
+                _wait_request_scope_release(client)
             after = _speed_metrics(client.server_info(), topology)
             stochastic_rows: list[dict[str, int]] = []
             if runtime_job.parameters.get("distribution_check"):
