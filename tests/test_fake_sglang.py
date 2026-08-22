@@ -24,6 +24,7 @@ from lightcone_spec.server import (
     adaptation_payload,
     server_command,
 )
+from scripts.gpu_acceptance import _job as acceptance_job
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -485,6 +486,16 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
         '\"EAGLE3\" if self.speculative_algorithm.is_eagle3() else \"NEXTN\"'
         in nextn_patch
     )
+    acceptance = acceptance_job(
+        0,
+        "lightcone",
+        "NEXTN",
+        block=0,
+        model=job.model,
+        tp2=True,
+    )
+    assert acceptance.parameters["parameterization"] == "lora"
+    assert acceptance.parameters["rank"] == 1
 
 
 def test_triton_graph_uses_ragged_layout_and_draft_width():
