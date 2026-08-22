@@ -161,6 +161,16 @@ def _measure(
         after = _speed_metrics(client.server_info(), topology)
     intervals = [value for result in results for value in result.inter_token_ms]
     committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+    _write(
+        output / "raw.json",
+        {
+            "results": [result.to_dict() for result in results],
+            "exactness_trajectory": exactness_trajectory,
+            "before": before,
+            "after": after,
+            "elapsed_seconds": elapsed,
+        },
+    )
     _validate_token_accounting(results, committed, max_new_tokens)
     counters = {
         name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
