@@ -403,7 +403,7 @@ new file mode 100644
 index 00000000..56c428c6
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_parameter_plan.py
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,208 @@
 +"""Backend-native, deterministic LightCone trainable-parameter selectors."""
 +
 +from __future__ import annotations
@@ -521,6 +521,15 @@ index 00000000..56c428c6
 +    return tuple(sorted((*w1, *w2, *acceptance)))
 +
 +
++def _nextn_heads(rows: tuple[tuple[str, torch.Tensor], ...]) -> tuple[str, ...]:
++    """The native MTP fusion projection remains differentiable in SGLang."""
++    by_name = dict(rows)
++    weight = by_name.get("fc.weight")
++    if weight is None or weight.ndim != 2 or not weight.is_floating_point():
++        raise ValueError("NEXTN selector requires its native fc.weight projection")
++    return ("fc.weight",)
++
++
 +def build_native_parameter_plan(
 +    named_parameters: Iterable[tuple[str, torch.Tensor]],
 +    config: OnlineAdaptationConfig,
@@ -541,7 +550,13 @@ index 00000000..56c428c6
 +    hybrid = scope in DSPARK_HYBRID_SCOPES
 +    layer_scope = scope.removesuffix("_native_heads")
 +    layer_ids = _selected_layers(rows, layer_scope)
-+    native_heads = _dspark_heads(rows) if algorithm == "DSPARK" else ()
++    native_heads = (
++        _dspark_heads(rows)
++        if algorithm == "DSPARK"
++        else _nextn_heads(rows)
++        if algorithm == "NEXTN"
++        else ()
++    )
 +    native_head_set = frozenset(native_heads)
 +    selected: list[str] = []
 +    lora: list[str] = []
@@ -564,6 +579,11 @@ index 00000000..56c428c6
 +                raise ValueError("DSpark native heads must be floating point")
 +            eligible = True
 +            parameterization = "full"
++        if algorithm == "NEXTN" and name in native_head_set:
++            eligible = True
++            parameterization = config.weight_update_mode
++            if parameterization == "lora" and parameter.ndim != 2:
++                raise ValueError("NEXTN native projection must be a matrix for LoRA")
 +        if eligible:
 +            selected.append(name)
 +            (lora if parameterization == "lora" else full).append(name)
@@ -577,6 +597,8 @@ index 00000000..56c428c6
 +            raise AssertionError("DSpark hybrid selection lost a native head")
 +        if not hybrid and native_head_set & selected_set:
 +            raise AssertionError("DSpark layer-only selection changed a native head")
++    if algorithm == "NEXTN" and not native_head_set <= selected_set:
++        raise AssertionError("NEXTN selection lost its native fusion projection")
 +    return ParameterSelection(
 +        algorithm=algorithm,
 +        scope=scope,

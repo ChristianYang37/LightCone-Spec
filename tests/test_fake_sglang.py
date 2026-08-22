@@ -649,6 +649,13 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert "native_backend_zero_gradient" in patch
     assert "qwen3_5_mtp.py" in patch
     assert "qwen3_5.py" in patch
+
+    parameter_patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0001-arguments-config-and-memory.diff"
+    ).read_text(encoding="utf-8")
+    assert 'by_name.get("fc.weight")' in parameter_patch
+    assert 'algorithm == "NEXTN" and name in native_head_set' in parameter_patch
     assert patch.count("-    @torch.no_grad()") == 3
     assert """-    @torch.no_grad()
      def forward(
