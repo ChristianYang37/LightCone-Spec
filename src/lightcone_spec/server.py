@@ -192,6 +192,8 @@ def server_command(
             "--speculative-use-rejection-sampling",
         ]
     )
+    if job.backend == "DSPARK":
+        argv.extend(["--attention-backend", "triton"])
     draft = None if job.backend == "NEXTN" else config.draft_path(job.model, job.backend)
     if draft is not None:
         argv.extend(["--speculative-draft-model-path", str(draft)])

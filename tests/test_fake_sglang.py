@@ -418,3 +418,4 @@ def test_dspark_server_uses_profiled_sps_table(tmp_path: Path):
     )
     index = command.index("--speculative-dspark-sps-table-path")
     assert command[index + 1] == str(table)
+    assert command[command.index("--attention-backend") + 1] == "triton"
