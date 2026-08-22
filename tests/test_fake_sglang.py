@@ -372,9 +372,12 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     python.write_text("")
     model = tmp_path / "model"
     model.mkdir()
+    draft = tmp_path / "draft"
+    draft.mkdir()
     config = ExperimentConfig(
         source=tmp_path / "paper.yaml", run_name="run", sglang_root=tmp_path,
-        results_root=tmp_path, models={"Qwen/Qwen3-8B": model}, drafts={},
+        results_root=tmp_path, models={"Qwen/Qwen3-8B": model},
+        drafts={"Qwen/Qwen3-8B|DFLASH": draft},
         datasets={}, gpu_ids=(0, 1), server=ServerConfig(python=python),
         protocol=ProtocolConfig(),
     )
@@ -392,6 +395,14 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
         "1", "2", "4", "8", "16", "32", "64", "128", "256",
     ]
     assert "--skip-server-warmup" in command
+    assert "--enable-deterministic-inference" in command
+
+    performance_job = materialize("preflight")[2]
+    performance_command = server_command(
+        config, performance_job, port=30001, output_dir=output,
+        adaptation=None,
+    )
+    assert "--enable-deterministic-inference" not in performance_command
 
 
 def test_preflight_interference_only_captures_registered_request_batch(tmp_path: Path):

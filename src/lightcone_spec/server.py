@@ -171,6 +171,8 @@ def server_command(
         "--skip-server-warmup",
         "--speculative-speed-study-metrics",
     ]
+    if job.parameters.get("deterministic_exactness"):
+        argv.append("--enable-deterministic-inference")
     if job.parameters.get("regime") != "multi_turn_shared_prefix" and not job.parameters.get(
         "prefix_reuse"
     ):
@@ -310,6 +312,7 @@ def server_session_key(
         bool(job.parameters.get("chunked_prefill")),
         bool(job.parameters.get("prefix_reuse"))
         or job.parameters.get("regime") == "multi_turn_shared_prefix",
+        bool(job.parameters.get("deterministic_exactness")),
         job.parameters.get("profiler"),
         (
             "full-device"
