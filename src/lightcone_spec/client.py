@@ -258,6 +258,9 @@ class SGLangClient:
             "sampling_params": [
                 {
                     "temperature": temperature,
+                    "top_k": 1 if temperature == 0 else -1,
+                    "top_p": 1.0,
+                    "min_p": 0.0,
                     "max_new_tokens": max_new_tokens,
                     "ignore_eos": True,
                     "sampling_seed": seed + index,

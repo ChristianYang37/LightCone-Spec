@@ -34,6 +34,7 @@ class Handler(BaseHTTPRequestHandler):
     fail = False
     delay = 0.0
     batch_sizes = []
+    sampling_params = []
 
     def log_message(self, format, *args):
         return
@@ -84,6 +85,7 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.delay:
             time.sleep(Handler.delay)
         Handler.batch_sizes.append(len(request["rid"]))
+        Handler.sampling_params.append(request["sampling_params"])
         if any(
             "sampling_seed" not in params or "seed" in params
             for params in request["sampling_params"]
@@ -125,6 +127,7 @@ def fake_server():
         Handler.fail = False
         Handler.delay = 0.0
         Handler.batch_sizes = []
+        Handler.sampling_params = []
         server.shutdown()
         thread.join()
 
@@ -135,6 +138,11 @@ def test_raw_token_output_and_failure_propagation(fake_server):
     assert elapsed > 0
     assert [row.output_ids for row in rows] == [(10, 11), (10, 11)]
     assert [row.inter_token_ms for row in rows] == [(0.0,), (0.0,)]
+    assert Handler.sampling_params[0][0]["top_k"] == 1
+    assert Handler.sampling_params[0][0]["top_p"] == 1.0
+    client.run_batch(["a"], max_new_tokens=1, seed=0, temperature=0.8)
+    assert Handler.sampling_params[1][0]["top_k"] == -1
+    assert Handler.sampling_params[1][0]["top_p"] == 1.0
     Handler.fail = True
     with pytest.raises(Exception):
         client.run_batch(["a"], max_new_tokens=2, seed=0)
