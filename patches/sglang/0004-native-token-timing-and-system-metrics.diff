@@ -321,7 +321,7 @@ index 248a9293..b7bde555 100644
  from sglang.srt.disaggregation.utils import DisaggregationMode
  from sglang.srt.environ import envs
  from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-@@ -231,11 +236,22 @@ class SchedulerBatchResultProcessor:
+@@ -231,11 +236,27 @@ class SchedulerBatchResultProcessor:
                      req.time_stats.set_prefill_finished_time()
  
                      # req output_ids are set here
@@ -342,6 +342,11 @@ index 248a9293..b7bde555 100644
 +                            committed_tokens
 +                        )
                      if req.finished():
++                        if isinstance(self.draft_worker, BaseSpecWorker):
++                            self.draft_worker.note_request_finished(
++                                rid=req.rid,
++                                natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
++                            )
                          self._maybe_collect_routed_experts(req)
                          self._maybe_collect_indexer_topk(req)
 @@ -778,12 +794,21 @@ class SchedulerBatchResultProcessor:

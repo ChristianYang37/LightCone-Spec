@@ -572,6 +572,15 @@ def test_controlled_replay_compares_the_first_real_candidate_once():
     assert "self.controlled_candidate_compared = True" in patch
 
 
+def test_prefill_terminal_request_releases_request_scoped_owner():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
+    ).read_text(encoding="utf-8")
+    assert patch.count("self.draft_worker.note_request_finished(") == 1
+    assert "natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)" in patch
+
+
 def test_launcher_applies_one_plain_patch_stream():
     launcher = (Path(__file__).parents[1] / "run_paper.sh").read_text(encoding="utf-8")
     assert "--recount" not in launcher
