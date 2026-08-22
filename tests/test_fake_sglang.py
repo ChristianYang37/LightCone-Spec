@@ -704,7 +704,9 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
         Path(__file__).parents[1]
         / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
     ).read_text(encoding="utf-8")
-    assert "prefixes.append(self.round_metrics[trace.buffer_index, trace_index, 0])" in patch
+    assert "prefix = self.round_metrics[trace.buffer_index, trace_index, 0]" in patch
+    assert "prefix.add_(committed_tokens[index].detach().to(torch.int64))" in patch
+    assert "+                prefix," in patch
     assert "record_device_commit(request_ids, committed_tokens)" in patch
     assert "new_seq_lens=semantic_new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch

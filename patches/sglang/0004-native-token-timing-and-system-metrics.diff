@@ -689,7 +689,7 @@ diff --git a/python/sglang/srt/speculative/online_adaptation_runtime.py b/python
 index 13e8db9389..388a9542c2 100644
 --- a/python/sglang/srt/speculative/online_adaptation_runtime.py
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -1988,16 +1988,16 @@ class OnlineCohortRuntime:
+@@ -1988,20 +1988,15 @@ class OnlineCohortRuntime:
              state.append(int(length), state.version)
  
      def record_device_commit(
@@ -702,17 +702,19 @@ index 13e8db9389..388a9542c2 100644
          request_ids = tuple(request_ids)
 -        if new_lengths.ndim != 1 or new_lengths.shape[0] != len(request_ids):
 -            raise ValueError("one committed length is required per request")
-+        prefixes = []
-+        for request_id in request_ids:
-+            trace, trace_index = self.active_round_rows[request_id]
-+            prefixes.append(self.round_metrics[trace.buffer_index, trace_index, 0])
-         main = torch.cuda.current_stream(self.device)
+-        main = torch.cuda.current_stream(self.device)
 -        owned = new_lengths.detach().to(torch.int64).clone()
-+        owned = torch.stack(prefixes) + committed_tokens.detach().to(torch.int64)
-+        owned = owned.clone()
-         owned.record_stream(main)
+-        owned.record_stream(main)
          for index, request_id in enumerate(request_ids):
++            trace, trace_index = self.active_round_rows[request_id]
++            prefix = self.round_metrics[trace.buffer_index, trace_index, 0]
++            prefix.add_(committed_tokens[index].detach().to(torch.int64))
              self.latest_device_lengths[request_id] = (
+-                owned[index],
++                prefix,
+                 self.active_version,
+             )
+ 
 @@ -2389,6 +2389,7 @@ class OnlineCohortRuntime:
              "teacher_row_policy": self.config.teacher_row_policy,
              "enabled": self.disabled_reason is None,
