@@ -1088,9 +1088,25 @@ def _execute_cell(
                     raise ScientificFailure(
                         f"deterministic verification raised safety counters: {bootstrap_safety}"
                     )
+                checked_tokens = int(bootstrap_after.get("greedy_token_checks", 0)) - int(
+                    bootstrap_before.get("greedy_token_checks", 0)
+                )
+                mismatched_tokens = int(
+                    bootstrap_after.get("greedy_token_mismatches", 0)
+                ) - int(bootstrap_before.get("greedy_token_mismatches", 0))
+                unchecked_prefill_tokens = bootstrap_committed - checked_tokens
+                if unchecked_prefill_tokens not in {0, 1} or mismatched_tokens:
+                    raise ScientificFailure(
+                        "deterministic verification did not match every speculative token "
+                        f"to its same-logit target argmax ({checked_tokens} checked, "
+                        f"{unchecked_prefill_tokens} prefill, {mismatched_tokens} mismatched)"
+                    )
                 exactness_evidence = {
                     "mode": "deterministic_verification_kernel",
                     "committed_tokens": bootstrap_committed,
+                    "greedy_token_checks": checked_tokens,
+                    "greedy_token_mismatches": mismatched_tokens,
+                    "prefill_tokens": unchecked_prefill_tokens,
                     "safety_counters": bootstrap_safety,
                 }
                 exactness_rows.append(
@@ -2445,18 +2461,43 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
         required = {"target_only", "speculative_verify", "tts", "l0_naive"}
         if preflight_policies != required:
             raise ScientificFailure("preflight lacks target/verify/TTS/L0 trajectories")
+    diagnostics: list[dict[str, object]] = []
     for group, rows in groups.items():
         baselines = [trajectory for method, trajectory in rows if method == "target_only"]
         if not baselines:
             continue
         baseline = baselines[0]
-        mismatches = [
-            method
-            for method, trajectory in rows
-            if method == "speculative_verify" and trajectory != baseline
-        ]
-        if mismatches:
-            raise ScientificFailure(f"{node} greedy token trajectory mismatch for {group}: {mismatches}")
+        for method, trajectory in rows:
+            if method == "target_only":
+                continue
+            mismatch_count = 0
+            first_mismatch = None
+            request_count = max(len(baseline), len(trajectory))
+            for request_index in range(request_count):
+                left = baseline[request_index] if request_index < len(baseline) else ()
+                right = trajectory[request_index] if request_index < len(trajectory) else ()
+                token_count = max(len(left), len(right))
+                for token_index in range(token_count):
+                    left_token = left[token_index] if token_index < len(left) else None
+                    right_token = right[token_index] if token_index < len(right) else None
+                    if left_token != right_token:
+                        mismatch_count += 1
+                        if first_mismatch is None:
+                            first_mismatch = {
+                                "request_index": request_index,
+                                "token_index": token_index,
+                                "target_token": left_token,
+                                "method_token": right_token,
+                            }
+            diagnostics.append(
+                {
+                    "group": list(group),
+                    "method": method,
+                    "equal": mismatch_count == 0,
+                    "mismatch_count": mismatch_count,
+                    "first_mismatch": first_mismatch,
+                }
+            )
         if node == "preflight":
             adaptive = {
                 method: trajectory
@@ -2465,6 +2506,18 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
             }
             if adaptive.get("tts") != adaptive.get("l0_naive"):
                 raise ScientificFailure("preflight TTS/l0_naive controlled trajectories differ")
+    diagnostic_path = state.run_dir / "stages" / node / "greedy_trajectory_diagnostics.json"
+    diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        diagnostic_path,
+        {
+            "interpretation": (
+                "cross-kernel bitwise comparison is diagnostic; greedy exactness is gated "
+                "against same-logit target argmax in preflight"
+            ),
+            "comparisons": diagnostics,
+        },
+    )
 
 
 def _categorical_distance(left: list[tuple[int, int]], right: list[tuple[int, int]]) -> float:

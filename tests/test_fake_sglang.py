@@ -688,10 +688,14 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     assert "new_seq_lens=semantic_new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch
     assert "+    @torch.no_grad()\n     def __call__(self, hidden_states, input_ids=None):" in patch
+    assert '"greedy_token_checks": 0' in patch
+    assert "out_tokens[checked] != target_predict[checked]" in patch
 
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
     class State:
+        run_dir = tmp_path
+
         def completed_attempt_dirs(self, node):
             assert node == "preflight"
             return tuple(tmp_path.iterdir())
@@ -710,7 +714,7 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
             "adaptive",
             "l0_naive",
             (
-                ("speculative_verify", [1, 2, 3]),
+                ("speculative_verify", [1, 2, 4]),
                 ("tts", [1, 2, 3]),
                 ("l0_naive", [1, 2, 3]),
             ),
@@ -732,6 +736,16 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
             encoding="utf-8",
         )
     _check_greedy_trajectories(State(), "preflight")
+    diagnostics = json.loads(
+        (tmp_path / "stages/preflight/greedy_trajectory_diagnostics.json").read_text()
+    )
+    verify = next(
+        row
+        for row in diagnostics["comparisons"]
+        if row["method"] == "speculative_verify"
+    )
+    assert verify["equal"] is False
+    assert verify["first_mismatch"]["token_index"] == 2
     (tmp_path / "adaptive" / "controlled.jsonl").write_text(
         json.dumps({"policy": "speculative_verify", "output_ids": [1, 2, 3]})
         + "\n"
