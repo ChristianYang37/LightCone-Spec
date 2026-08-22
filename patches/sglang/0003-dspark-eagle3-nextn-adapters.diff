@@ -2654,3 +2654,21 @@ index 948a9d60..26179fbf 100644
  
      @classmethod
      def torch(
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index 02bc8e6d..822ab05e 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -393,7 +393,12 @@ class FlashInferAttnBackend(AttentionBackend):
+             or "Qwen3VLMoeForConditionalGeneration"
+             in model_runner.model_config.hf_config.architectures
+         ):
+-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
++            workspace_mb = (
++                1024
++                if model_runner.server_args.speculative_num_draft_tokens >= 16
++                else 512
++            )
++            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(workspace_mb * 1024 * 1024)
+ 
+         # When deterministic inference is enabled, tensor cores should be used for decode
+         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph

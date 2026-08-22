@@ -434,3 +434,4 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert "padded_layout.qo_indptr_device" in patch
     assert 'getattr(spec_info, "draft_token_num", self.num_draft_tokens)' in patch
     assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
+    assert "speculative_num_draft_tokens >= 16" in patch
