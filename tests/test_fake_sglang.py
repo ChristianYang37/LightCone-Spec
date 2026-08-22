@@ -15,6 +15,7 @@ from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _canonical_accuracy,
     _check_greedy_trajectories,
+    _exactness_bootstrap,
     _fault_action_passed,
     _request_scope_released,
     _run_request_scoped,
@@ -405,6 +406,16 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     assert "--enable-deterministic-inference" not in performance_command
 
 
+def test_preflight_adaptive_exactness_uses_static_deterministic_bootstrap():
+    job = materialize("preflight")[1]
+    assert job.parameters["deterministic_verify"] is True
+    assert "deterministic_exactness" not in job.parameters
+    bootstrap = _exactness_bootstrap(job)
+    assert bootstrap.method == "static"
+    assert bootstrap.parameters["deterministic_exactness"] is True
+    assert bootstrap.parameters["controlled_replay"] is False
+
+
 def test_preflight_interference_only_captures_registered_request_batch(tmp_path: Path):
     python = tmp_path / "python"
     python.write_text("")
@@ -667,7 +678,11 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
         (
             "adaptive",
             "l0_naive",
-            (("tts", [1, 2, 3]), ("l0_naive", [1, 2, 3])),
+            (
+                ("speculative_verify", [1, 2, 3]),
+                ("tts", [1, 2, 3]),
+                ("l0_naive", [1, 2, 3]),
+            ),
         ),
     ):
         directory = tmp_path / name
@@ -687,7 +702,9 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
         )
     _check_greedy_trajectories(State(), "preflight")
     (tmp_path / "adaptive" / "controlled.jsonl").write_text(
-        json.dumps({"policy": "tts", "output_ids": [1, 2, 3]})
+        json.dumps({"policy": "speculative_verify", "output_ids": [1, 2, 3]})
+        + "\n"
+        + json.dumps({"policy": "tts", "output_ids": [1, 2, 3]})
         + "\n"
         + json.dumps({"policy": "l0_naive", "output_ids": [1, 2, 4]})
         + "\n",

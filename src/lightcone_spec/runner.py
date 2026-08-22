@@ -87,6 +87,21 @@ def _screening_job(job: Job) -> bool:
     return job.node in {"E3a", "E1-common-load", "E6-common-load"}
 
 
+def _exactness_bootstrap(job: Job) -> Job:
+    if not job.parameters.get("deterministic_verify"):
+        return job
+    return replace(
+        job,
+        method="static",
+        parameters={
+            **job.parameters,
+            "controlled_replay": False,
+            "distribution_check": False,
+            "deterministic_exactness": True,
+        },
+    )
+
+
 def _validate_committed_tokens(results: Sequence[GenerationResult], committed: int) -> int:
     output_tokens = sum(result.completion_tokens for result in results)
     if committed != output_tokens:
@@ -1034,11 +1049,73 @@ def _execute_cell(
             raw_config["parameters"]["stimulus_id"] = _stimulus_id(runtime_job)
             raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
             _write_json(output_dir / "config.json", raw_config)
-            client = server.configure(runtime_job, selection)
+            bootstrap_job = _exactness_bootstrap(runtime_job)
+            client = server.configure(bootstrap_job, selection)
             prompts, max_new_tokens, workload = _cell_inputs(
                 config, state, client, job
             )
             offered = len(prompts)
+            exactness_rows: list[dict[str, object]] = []
+            exactness_evidence: dict[str, object] | None = None
+            if bootstrap_job is not runtime_job:
+                pair_seed = config.protocol.seed + (job.block or 0)
+                bootstrap_topology = str(
+                    bootstrap_job.parameters.get("topology", "tp1_dp1")
+                )
+                bootstrap_before = _speed_metrics(
+                    client.server_info(), bootstrap_topology
+                )
+                verified, _ = client.run_batch(
+                    prompts[:1],
+                    max_new_tokens=max_new_tokens,
+                    seed=pair_seed,
+                    request_id_prefix="controlled-speculative-verify",
+                )
+                bootstrap_after = _speed_metrics(
+                    client.server_info(), bootstrap_topology
+                )
+                bootstrap_committed = int(bootstrap_after["committed_tokens"]) - int(
+                    bootstrap_before["committed_tokens"]
+                )
+                _validate_committed_tokens(verified, bootstrap_committed)
+                bootstrap_safety = {
+                    counter: int(bootstrap_after[counter])
+                    - int(bootstrap_before[counter])
+                    for counter in SAFETY_COUNTERS
+                }
+                if any(bootstrap_safety.values()):
+                    raise ScientificFailure(
+                        f"deterministic verification raised safety counters: {bootstrap_safety}"
+                    )
+                exactness_evidence = {
+                    "mode": "deterministic_verification_kernel",
+                    "committed_tokens": bootstrap_committed,
+                    "safety_counters": bootstrap_safety,
+                }
+                exactness_rows.append(
+                    {
+                        "policy": "speculative_verify",
+                        "exactness_scope": "deterministic_verification_kernel",
+                        **verified[0].to_dict(),
+                    }
+                )
+                runtime_job = replace(
+                    runtime_job,
+                    parameters={
+                        key: value
+                        for key, value in runtime_job.parameters.items()
+                        if key != "deterministic_verify"
+                    },
+                )
+                client = server.restart_for(runtime_job, selection)
+                raw_config["exactness_bootstrap"] = bootstrap_job.to_dict()
+                raw_config["runtime"] = runtime_job.to_dict()
+                raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
+                _write_json(output_dir / "config.json", raw_config)
+                if server.process is not None:
+                    (output_dir / "server.pid").write_text(
+                        f"{server.process.pid}\n", encoding="utf-8"
+                    )
             if runtime_job.parameters.get("controlled_replay") or runtime_job.parameters.get(
                 "controlled_pair_baseline"
             ):
@@ -1131,7 +1208,7 @@ def _execute_cell(
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
-            controlled_rows: list[dict[str, object]] = []
+            controlled_rows: list[dict[str, object]] = list(exactness_rows)
             if runtime_job.parameters.get("controlled_replay"):
                 pair_seed = config.protocol.seed + (job.block or 0)
                 capture = replace(
@@ -1170,10 +1247,10 @@ def _execute_cell(
                 )
                 results = (*tts_results, *l0_results)
                 elapsed = tts_elapsed + l0_elapsed
-                controlled_rows = [
+                controlled_rows.extend(
                     {"policy": policy, **result.to_dict()}
                     for policy, result in zip(("tts", "l0_naive"), results, strict=True)
-                ]
+                )
             elif runtime_job.parameters.get("regime") == "multi_turn_shared_prefix":
                 if arrivals is not None:
                     raise ScientificFailure("multi-turn rows cannot use an open-loop trace")
@@ -1371,6 +1448,8 @@ def _execute_cell(
                 "executed_flops": "N/A",
                 "hbm_bytes_per_committed_token": "N/A",
             }
+            if exactness_evidence is not None:
+                metrics["exactness_bootstrap"] = exactness_evidence
             accuracy, scorer, scorer_verdicts = _canonical_accuracy(
                 job.task, results, workload, config.server.python
             )
@@ -2026,7 +2105,8 @@ def _run_pending_jobs(
             runtime_job = _runtime_job(state, job)
             selection = _selection_for_job(state, job)
             probe = job.job_id if job.parameters.get("adaptive_probe") else None
-            key = (job.block, probe, *server_session_key(runtime_job, selection))
+            process_job = _exactness_bootstrap(runtime_job)
+            key = (job.block, probe, *server_session_key(process_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
         keys = []
         blocks = sorted({key[0] for key in grouped}, key=lambda value: (-1 if value is None else value))
@@ -2042,6 +2122,7 @@ def _run_pending_jobs(
                 return
             rows = grouped[key]
             first_job, first_runtime, first_selection = rows[0]
+            first_process_job = _exactness_bootstrap(first_runtime)
             block = "none" if first_job.block is None else f"{first_job.block:02d}"
             session_dir = (
                 config.run_dir
@@ -2062,7 +2143,7 @@ def _run_pending_jobs(
                 )
                 process = process_type(
                     config,
-                    first_runtime,
+                    first_process_job,
                     gpus=gpus,
                     port=port,
                     output_dir=session_dir,
@@ -2359,20 +2440,30 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
             if line.strip()
         )
         groups.setdefault(_trajectory_group(config), []).append((config["method"], trajectories))
-    if node == "preflight" and preflight_policies != {
-        "target_only",
-        "tts",
-        "l0_naive",
-    }:
-        raise ScientificFailure("preflight lacks aligned target/TTS/L0 trajectories")
+    if node == "preflight":
+        required = {"target_only", "speculative_verify", "tts", "l0_naive"}
+        if preflight_policies != required:
+            raise ScientificFailure("preflight lacks target/verify/TTS/L0 trajectories")
     for group, rows in groups.items():
         baselines = [trajectory for method, trajectory in rows if method == "target_only"]
         if not baselines:
             continue
         baseline = baselines[0]
-        mismatches = [method for method, trajectory in rows if trajectory != baseline]
+        mismatches = [
+            method
+            for method, trajectory in rows
+            if method == "speculative_verify" and trajectory != baseline
+        ]
         if mismatches:
             raise ScientificFailure(f"{node} greedy token trajectory mismatch for {group}: {mismatches}")
+        if node == "preflight":
+            adaptive = {
+                method: trajectory
+                for method, trajectory in rows
+                if method in {"tts", "l0_naive"}
+            }
+            if adaptive.get("tts") != adaptive.get("l0_naive"):
+                raise ScientificFailure("preflight TTS/l0_naive controlled trajectories differ")
 
 
 def _categorical_distance(left: list[tuple[int, int]], right: list[tuple[int, int]]) -> float:

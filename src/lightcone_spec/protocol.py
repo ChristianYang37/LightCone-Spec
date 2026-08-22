@@ -205,7 +205,7 @@ def _parameter_geometries() -> tuple[dict[str, Any], ...]:
 
 def _preflight() -> Iterator[dict[str, Any]]:
     yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", preflight_kind="runtime_load", distribution_check=True, controlled_pair_baseline=True, deterministic_exactness=True)
-    yield dict(method="l0_naive", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", controlled_replay=True, distribution_check=True, preflight_kind="exactness_memory", deterministic_exactness=True)
+    yield dict(method="l0_naive", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", controlled_replay=True, distribution_check=True, preflight_kind="exactness_memory", deterministic_verify=True)
     for block, mode, gpu in itertools.product(range(2), ("isolated", "concurrent"), range(2)):
         yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", context=4096, block=block, mode=mode, gpu_index=gpu, workload="interference")
 
