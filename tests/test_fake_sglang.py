@@ -725,6 +725,7 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
 def test_gpu_smoke_uses_native_exactness_and_staged_cases():
     source = (Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py").read_text()
     assert "_validate_greedy_verify_counts" in source
+    assert '"deterministic_exactness": True' in source
     assert '"greedy_token_mismatches"' in source
     assert '"nextn122"' in source
     assert "cross_kernel_trajectory_equal" in source

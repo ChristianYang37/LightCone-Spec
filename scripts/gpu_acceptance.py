@@ -8,6 +8,7 @@ import json
 import math
 import statistics
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -92,6 +93,11 @@ def _measure(
     max_new_tokens: int,
     exactness_tokens: int = 0,
 ) -> dict[str, object]:
+    if exactness_tokens:
+        job = replace(
+            job,
+            parameters={**job.parameters, "deterministic_exactness": True},
+        )
     gpus = config.gpu_ids if job.gpu_count == 2 else (config.gpu_ids[0],)
     port = config.server.base_port + (2 if job.gpu_count == 2 else 0)
     output.mkdir(parents=True, exist_ok=True)
