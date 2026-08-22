@@ -85,6 +85,67 @@ def _job(
     )
 
 
+def _native_exactness(
+    config: ExperimentConfig,
+    job: Job,
+    output: Path,
+    tokens: int,
+) -> tuple[list[int], dict[str, int]]:
+    exact_job = replace(
+        job,
+        method="static",
+        parameters={**job.parameters, "deterministic_exactness": True},
+    )
+    gpus = config.gpu_ids if exact_job.gpu_count == 2 else (config.gpu_ids[0],)
+    port = config.server.base_port + (2 if exact_job.gpu_count == 2 else 0)
+    output.mkdir(parents=True, exist_ok=True)
+    process_type = (
+        ReplicaServerProcess
+        if exact_job.parameters.get("topology") == "two_replica_tp1_dp2"
+        else ServerProcess
+    )
+    process = process_type(
+        config,
+        exact_job,
+        gpus=gpus,
+        port=port,
+        output_dir=output,
+        selection=None,
+    )
+    with process as client:
+        raw = load_prompts(
+            config.dataset_path("controlled_baseline"),
+            limit=1,
+            split="tuning",
+            offset=(job.block or 0) * 16,
+        )
+        prompt = tuple(client.tokenize(raw[0])[-128:])
+        client.run_batch((prompt,), max_new_tokens=16, seed=0, request_id_prefix="warmup")
+        client.reset()
+        topology = str(exact_job.parameters.get("topology", "tp1_dp1"))
+        before = _speed_metrics(client.server_info(), topology)
+        results, _ = client.run_batch(
+            (prompt,),
+            max_new_tokens=tokens,
+            seed=job.block or 0,
+            request_id_prefix="exactness",
+        )
+        after = _speed_metrics(client.server_info(), topology)
+    committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+    _validate_token_accounting(results, committed, tokens)
+    checked = int(after.get("greedy_token_checks", 0)) - int(before.get("greedy_token_checks", 0))
+    mismatched = int(after.get("greedy_token_mismatches", 0)) - int(
+        before.get("greedy_token_mismatches", 0)
+    )
+    evidence = {
+        "committed_tokens": committed,
+        "greedy_token_checks": checked,
+        "greedy_token_mismatches": mismatched,
+        **_validate_greedy_verify_counts(committed, checked, mismatched),
+    }
+    return list(results[0].output_ids), evidence
+
+
 def _measure(
     config: ExperimentConfig,
     job: Job,
@@ -93,7 +154,10 @@ def _measure(
     max_new_tokens: int,
     exactness_tokens: int = 0,
 ) -> dict[str, object]:
-    if exactness_tokens:
+    separate_exactness = bool(
+        exactness_tokens and job.backend == "DFLASH" and job.method not in {"target_only", "static"}
+    )
+    if exactness_tokens and not separate_exactness:
         job = replace(
             job,
             parameters={**job.parameters, "deterministic_exactness": True},
@@ -114,6 +178,12 @@ def _measure(
         output_dir=output,
         selection=None,
     )
+    exactness_trajectory = None
+    exactness_evidence = None
+    if separate_exactness:
+        exactness_trajectory, exactness_evidence = _native_exactness(
+            config, job, output / "exactness-bootstrap", exactness_tokens
+        )
     with process as client:
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
@@ -132,9 +202,7 @@ def _measure(
                 request_id_prefix="warmup",
             )
             client.reset()
-        exactness_trajectory = None
-        exactness_evidence = None
-        if exactness_tokens:
+        if exactness_tokens and not separate_exactness:
             exactness_before = _speed_metrics(
                 client.server_info(), str(job.parameters.get("topology", "tp1_dp1"))
             )
