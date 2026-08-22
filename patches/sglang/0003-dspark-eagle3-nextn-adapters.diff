@@ -1553,8 +1553,10 @@ index ee43575..52c00f3 100644
 -                canary_index_ctx,
 -            ):
 -                logits_output = self.draft_runner.forward(forward_batch).logits_output
-+            grad_context = torch.enable_grad() if online_update else torch.inference_mode()
-+            with grad_context:
++            with (
++                torch.inference_mode(not online_update),
++                torch.set_grad_enabled(online_update),
++            ):
 +                with (
 +                    forward_context(
 +                        ForwardContext(
@@ -1929,8 +1931,10 @@ index 98c210b..dbd12c7 100644
 -            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
 -        ):
 -            seed_output = self.draft_model_runner.forward(forward_batch).logits_output
-+        grad_context = torch.enable_grad() if online_update else torch.inference_mode()
-+        with grad_context:
++        with (
++            torch.inference_mode(not online_update),
++            torch.set_grad_enabled(online_update),
++        ):
 +            with (
 +                self._target_kv_pool_view(forward_batch),
 +                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
@@ -1955,10 +1959,10 @@ index 98c210b..dbd12c7 100644
 -                logits_output = self.draft_model_runner.forward(
 -                    forward_batch
 -                ).logits_output
-+            grad_context = (
-+                torch.enable_grad() if online_update else torch.inference_mode()
-+            )
-+            with grad_context:
++            with (
++                torch.inference_mode(not online_update),
++                torch.set_grad_enabled(online_update),
++            ):
 +                with (
 +                    self._target_kv_pool_view(forward_batch),
 +                    forward_context(
