@@ -702,6 +702,7 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     ) in patch
     assert '"greedy_token_checks": 0' in patch
     assert "out_tokens[checked] != target_predict[checked]" in patch
+    assert 'counters.get(name, 0)' in patch
 
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
