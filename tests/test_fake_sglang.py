@@ -435,3 +435,14 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert 'getattr(spec_info, "draft_token_num", self.num_draft_tokens)' in patch
     assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
     assert "int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16" in patch
+
+
+def test_tp2_dflash_gathers_full_vocab_before_online_loss():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
+    ).read_text(encoding="utf-8")
+    assert "differentiable_all_gather" in patch
+    assert "local_inference_logits, target.shape[-1]" in patch
+    assert "local_draft_logits, target.shape[-1]" in patch
+    assert "member_loss / self.tp_group.world_size" in patch

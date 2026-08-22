@@ -157,6 +157,9 @@ index 00000000..20e93274
 +
 +import torch
 +import torch.nn.functional as F
++from torch.distributed.nn.functional import all_gather as differentiable_all_gather
++
++from sglang.srt.distributed.parallel_state import get_tp_group
 +from sglang.srt.speculative.online_adaptation_config import (
 +    load_online_adaptation,
 +)
@@ -344,6 +347,7 @@ index 00000000..20e93274
 +            )
 +        self.config = config
 +        self.worker = worker
++        self.tp_group = get_tp_group()
 +        if worker.draft_window_size is None:
 +            raise ValueError(
 +                "DFlash adaptation requires a bounded --speculative-draft-window-size"
@@ -946,6 +950,16 @@ index 00000000..20e93274
 +            * weights
 +        ).sum() / weights.sum().clamp_min(1.0)
 +
++    def _full_vocab_logits(
++        self, local_logits: torch.Tensor, vocab_size: int
++    ) -> torch.Tensor:
++        if self.tp_group.world_size == 1:
++            return local_logits[..., :vocab_size]
++        shards = differentiable_all_gather(
++            local_logits, group=self.tp_group.device_group
++        )
++        return torch.cat(shards, dim=-1)[..., :vocab_size]
++
 +    def maybe_launch(
 +        self,
 +        *,
@@ -1004,13 +1018,16 @@ index 00000000..20e93274
 +                    target = owned_target.view(batch_size, block, -1)[
 +                        :microbatch, : block - 1
 +                    ]
-+                    inference_logits = (
++                    local_inference_logits = (
 +                        owned_draft.view(batch_size, block, -1)[
 +                            :microbatch, 1:, :
 +                        ].to(
 +                            lm_head_weight.dtype
 +                        )
 +                        @ lm_head_weight.T
++                    )
++                    inference_logits = self._full_vocab_logits(
++                        local_inference_logits, target.shape[-1]
 +                    )
 +                    active_values = self._effective_parameters(self.optimizer.master)
 +                    active_surrogate = self._surrogate_hidden(
@@ -1020,10 +1037,13 @@ index 00000000..20e93274
 +                        self._captured_request_ids,
 +                        self._captured_history,
 +                    )
-+                    active_logits = (
++                    local_active_logits = (
 +                        active_surrogate[:, 1:, :].to(lm_head_weight.dtype)
 +                        @ lm_head_weight.T
 +                    )[:microbatch]
++                    active_logits = self._full_vocab_logits(
++                        local_active_logits, target.shape[-1]
++                    )
 +                    (
 +                        reconstruction_ok,
 +                        reconstruction_max_abs,
@@ -1049,10 +1069,13 @@ index 00000000..20e93274
 +                                self._captured_request_ids,
 +                                self._captured_history,
 +                            )
-+                            draft_logits = (
++                            local_draft_logits = (
 +                                surrogate[:, 1:, :].to(lm_head_weight.dtype)
 +                                @ lm_head_weight.T
 +                            )[:microbatch]
++                            draft_logits = self._full_vocab_logits(
++                                local_draft_logits, target.shape[-1]
++                            )
 +                            if align_to_inference:
 +                                # The inference and differentiable kernels use
 +                                # different reduction orders.  Anchor the
@@ -1068,6 +1091,13 @@ index 00000000..20e93274
 +                                target,
 +                                owned_mask[:microbatch],
 +                            )
++                            if self.tp_group.world_size > 1:
++                                # Every TP rank evaluates the same full-vocab loss;
++                                # all-gather backward sums those replicated gradients.
++                                member_loss = anchor_forward_value(
++                                    member_loss / self.tp_group.world_size,
++                                    member_loss,
++                                )
 +                            return torch.where(
 +                                reconstruction_ok,
 +                                member_loss,
