@@ -647,6 +647,8 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert 'self.disabled_reason = "invalid_logical_prefix"' in patch
     assert "native_backend_trainables_disconnected" in patch
     assert "native_backend_zero_gradient" in patch
+    assert "differentiable_all_reduce" in patch
+    assert "differentiable_all_gather" in patch
     assert "qwen3_5_mtp.py" in patch
     assert "qwen3_5.py" in patch
 
