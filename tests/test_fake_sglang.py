@@ -386,3 +386,34 @@ def test_dspark_loss_retains_graph_inside_inference_scheduler():
             loss = proposal.float().square().mean()
     gradient = torch.autograd.grad(loss, parameter)[0]
     assert torch.isfinite(gradient).all()
+
+
+def test_dspark_server_uses_profiled_sps_table(tmp_path: Path):
+    python = tmp_path / "python"
+    python.write_text("")
+    model = tmp_path / "model"
+    model.mkdir()
+    table = tmp_path / "dspark-sps.json"
+    table.write_text("{}")
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path,
+        results_root=tmp_path,
+        models={"Qwen/Qwen3-8B": model},
+        drafts={"Qwen/Qwen3-8B|DSPARK": model},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=python, dspark_sps_table=table),
+        protocol=ProtocolConfig(),
+    )
+    job = next(item for item in materialize("E1a") if item.backend == "DSPARK")
+    command = server_command(
+        config,
+        job,
+        port=30000,
+        output_dir=tmp_path,
+        adaptation=None,
+    )
+    index = command.index("--speculative-dspark-sps-table-path")
+    assert command[index + 1] == str(table)

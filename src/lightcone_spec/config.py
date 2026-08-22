@@ -28,6 +28,7 @@ def _absolute(value: object, name: str) -> Path:
 class ServerConfig:
     python: Path
     cuda_home: Path | None = None
+    dspark_sps_table: Path | None = None
     host: str = "127.0.0.1"
     base_port: int = 30000
     mem_fraction_static: float = 0.90
@@ -101,6 +102,14 @@ class ExperimentConfig:
             cuda_home=(
                 _absolute(server_data["cuda_home"], "server.cuda_home")
                 if server_data.get("cuda_home") is not None
+                else None
+            ),
+            dspark_sps_table=(
+                _absolute(
+                    server_data["dspark_sps_table"],
+                    "server.dspark_sps_table",
+                )
+                if server_data.get("dspark_sps_table") is not None
                 else None
             ),
             host=host,
@@ -215,6 +224,8 @@ class ExperimentConfig:
         }
         if self.server.cuda_home is not None:
             required["CUDA toolkit"] = self.server.cuda_home
+        if self.server.dspark_sps_table is not None:
+            required["DSpark SPS table"] = self.server.dspark_sps_table
         missing = [f"{name}: {path}" for name, path in required.items() if not path.exists()]
         if missing:
             raise FileNotFoundError("missing configured paths:\n" + "\n".join(missing))

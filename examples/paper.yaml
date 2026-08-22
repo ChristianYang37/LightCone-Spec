@@ -39,6 +39,7 @@ paths:
 server:
   python: /root/lightcone-tts-runtime/bin/python
   cuda_home: /usr/local/cuda-12.9
+  dspark_sps_table: /root/lightcone-tts-runtime/dspark-sps.json
   host: 127.0.0.1
   base_port: 30000
   mem_fraction_static: 0.88

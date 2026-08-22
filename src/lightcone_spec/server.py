@@ -195,6 +195,13 @@ def server_command(
     draft = None if job.backend == "NEXTN" else config.draft_path(job.model, job.backend)
     if draft is not None:
         argv.extend(["--speculative-draft-model-path", str(draft)])
+    if job.backend == "DSPARK" and config.server.dspark_sps_table is not None:
+        argv.extend(
+            [
+                "--speculative-dspark-sps-table-path",
+                str(config.server.dspark_sps_table),
+            ]
+        )
     if adaptation is not None:
         adaptation_path = output_dir / "adaptation.json"
         adaptation_path.write_text(json.dumps(adaptation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
