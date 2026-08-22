@@ -521,6 +521,7 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert patch.count("online_update = online_adapter.update_due") >= 2
     assert patch.count("torch.inference_mode(not online_update)") == 5
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
+    assert "qwen3_5_mtp.py" in patch
     assert """-    @torch.no_grad()
      def forward(
 """ in patch

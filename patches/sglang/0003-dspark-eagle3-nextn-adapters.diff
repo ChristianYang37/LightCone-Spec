@@ -2688,12 +2688,12 @@ index 02bc8e6d..822ab05e 100644
  
          # When deterministic inference is enabled, tensor cores should be used for decode
          # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
-diff --git a/python/sglang/srt/models/qwen3_moe_mtp.py b/python/sglang/srt/models/qwen3_moe_mtp.py
---- a/python/sglang/srt/models/qwen3_moe_mtp.py
-+++ b/python/sglang/srt/models/qwen3_moe_mtp.py
-@@ -91,7 +91,6 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
-         torch.cuda.empty_cache()
-         torch.cuda.synchronize()
+diff --git a/python/sglang/srt/models/qwen3_5_mtp.py b/python/sglang/srt/models/qwen3_5_mtp.py
+--- a/python/sglang/srt/models/qwen3_5_mtp.py
++++ b/python/sglang/srt/models/qwen3_5_mtp.py
+@@ -140,7 +140,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+ 
+         self.lm_head = target_lm_head
  
 -    @torch.no_grad()
      def forward(
