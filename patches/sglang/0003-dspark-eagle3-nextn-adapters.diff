@@ -543,7 +543,7 @@ index ae778ee1..eb4cacb9 100644
 +        if adapter is not None:
 +            adapter.reload_config(self.server_args)
 +            adapter.reset()
-+        return self._draft_worker.clear_cache_pool()
++        return None
  
      def forward_batch_generation(
          self,
