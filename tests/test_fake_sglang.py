@@ -423,3 +423,13 @@ def test_dspark_server_uses_profiled_sps_table(tmp_path: Path):
     index = command.index("--speculative-dspark-sps-table-path")
     assert command[index + 1] == str(table)
     assert command[command.index("--attention-backend") + 1] == "triton"
+    assert command[command.index("--mem-fraction-static") + 1] == "0.8"
+
+
+def test_triton_graph_uses_ragged_layout_and_draft_width():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0003-dspark-eagle3-nextn-adapters.diff"
+    ).read_text(encoding="utf-8")
+    assert "padded_layout.qo_indptr_device" in patch
+    assert 'getattr(spec_info, "draft_token_num", self.num_draft_tokens)' in patch

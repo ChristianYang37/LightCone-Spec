@@ -140,6 +140,11 @@ def server_command(
 ) -> list[str]:
     target = config.model_path(job.model)
     tp, dp = _topology(job)
+    memory_fraction = (
+        min(config.server.mem_fraction_static, 0.80)
+        if job.backend == "DSPARK"
+        else config.server.mem_fraction_static
+    )
     argv = [
         str(config.server.python),
         "-m",
@@ -159,7 +164,7 @@ def server_command(
         "--max-running-requests",
         "256",
         "--mem-fraction-static",
-        str(config.server.mem_fraction_static),
+        str(memory_fraction),
         "--random-seed",
         str(config.protocol.seed),
         "--skip-server-warmup",
