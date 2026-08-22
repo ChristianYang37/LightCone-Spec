@@ -688,6 +688,10 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     assert "new_seq_lens=semantic_new_seq_lens" in patch
     assert '"active_request_id": self.active_request_id' in patch
     assert "+    @torch.no_grad()\n     def __call__(self, hidden_states, input_ids=None):" in patch
+    assert (
+        "diff --git a/python/sglang/srt/managers/native_token_timestamps.py "
+        "b/python/sglang/srt/managers/native_token_timestamps.py"
+    ) in patch
     assert '"greedy_token_checks": 0' in patch
     assert "out_tokens[checked] != target_predict[checked]" in patch
 

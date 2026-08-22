@@ -711,3 +711,62 @@ index 13e8db9389..388a9542c2 100644
              "controlled_candidate_equal": self.controlled_candidate_equal,
              "controlled_candidate_compared": self.controlled_candidate_compared,
              "confidence_brier": (
+diff --git a/python/sglang/srt/managers/native_token_timestamps.py b/python/sglang/srt/managers/native_token_timestamps.py
+new file mode 100644
+index 0000000000..8babb9afa4
+--- /dev/null
++++ b/python/sglang/srt/managers/native_token_timestamps.py
+@@ -0,0 +1,53 @@
++"""Scheduler commit times for output tokens."""
++
++from __future__ import annotations
++
++from typing import Any, Optional, Sequence
++
++
++NATIVE_TOKEN_TIMESTAMP_HOOK = "sglang.schema_v3.native_per_token_timestamp.v1"
++NATIVE_TOKEN_TIMESTAMP_SEMANTICS = "scheduler_committed_token_v1"
++NATIVE_TOKEN_TIMESTAMP_RELEASE_STATUS = "SCHEDULER_COMMIT"
++
++
++def newly_committed_output_tokens(req: Any, previous_length: int) -> Sequence[int]:
++    """Return the newly exposed logical output-token prefix."""
++
++    return req.output_ids_through_stop[previous_length:]
++
++
++def record_committed_output_tokens(
++    req: Any, token_ids: Sequence[int], committed_ns: int
++) -> None:
++    """Record one scheduler time for every token in the same commit."""
++
++    if not getattr(req, "return_native_token_timestamps", False):
++        return
++    events = req.native_token_timestamp_events
++    committed_ns = int(committed_ns)
++    if committed_ns < 0 or (events and committed_ns < events[-1][1]):
++        raise RuntimeError("native token timestamps moved backwards")
++    events.extend((int(token_id), committed_ns) for token_id in token_ids)
++
++
++def slice_native_token_timestamp_events(
++    events: Sequence[tuple[int, int]],
++    *,
++    start: int,
++    output_ids: Sequence[int],
++) -> Optional[list[dict[str, int]]]:
++    """Return exact delta events aligned to the streamer's output-token slice."""
++
++    if not events:
++        return None
++    selected = events[start : start + len(output_ids)]
++    if tuple(event[0] for event in selected) != tuple(int(v) for v in output_ids):
++        raise RuntimeError("native token timestamps differ from streamed output IDs")
++    return [
++        {
++            "token_index": start + offset,
++            "token_id": int(token_id),
++            "committed_ns": int(observed_ns),
++        }
++        for offset, (token_id, observed_ns) in enumerate(selected)
++    ]
