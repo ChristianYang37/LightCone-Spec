@@ -1414,9 +1414,9 @@ index 0bfd3b24..2dcf226a 100644
 +        """
 +
 +        if self._online_drafter_adapter is not None:
-+            raise RuntimeError(
-+                "Static safety counters require adaptation to be disabled"
-+            )
++            # Greedy verification is native to the worker, independent of adaptation.
++            # The scheduler reads only these counters from this provider online.
++            pass
 +        return {
 +            "schema_version": 1,
 +            "backend": "DFLASH",

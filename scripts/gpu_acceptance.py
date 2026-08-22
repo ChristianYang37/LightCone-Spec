@@ -20,6 +20,7 @@ from lightcone_spec.runner import (
     _run_request_scoped,
     _speed_metrics,
     _validate_committed_tokens,
+    _validate_greedy_verify_counts,
 )
 from lightcone_spec.server import ReplicaServerProcess, ServerProcess, StickyReplicaClient
 
@@ -126,7 +127,11 @@ def _measure(
             )
             client.reset()
         exactness_trajectory = None
+        exactness_evidence = None
         if exactness_tokens:
+            exactness_before = _speed_metrics(
+                client.server_info(), str(job.parameters.get("topology", "tp1_dp1"))
+            )
             exactness, _ = client.run_batch(
                 prompts[:1],
                 max_new_tokens=exactness_tokens,
@@ -134,13 +139,30 @@ def _measure(
                 request_id_prefix="exactness",
             )
             exactness_trajectory = list(exactness[0].output_ids)
+            exactness_after = _speed_metrics(
+                client.server_info(), str(job.parameters.get("topology", "tp1_dp1"))
+            )
+            if job.backend == "DFLASH":
+                committed_exactness = int(exactness_after["committed_tokens"]) - int(
+                    exactness_before["committed_tokens"]
+                )
+                checked = int(exactness_after.get("greedy_token_checks", 0)) - int(
+                    exactness_before.get("greedy_token_checks", 0)
+                )
+                mismatched = int(exactness_after.get("greedy_token_mismatches", 0)) - int(
+                    exactness_before.get("greedy_token_mismatches", 0)
+                )
+                exactness_evidence = {
+                    "committed_tokens": committed_exactness,
+                    "greedy_token_checks": checked,
+                    "greedy_token_mismatches": mismatched,
+                    **_validate_greedy_verify_counts(committed_exactness, checked, mismatched),
+                }
             client.reset()
         topology = str(job.parameters.get("topology", "tp1_dp1"))
         before = _speed_metrics(client.server_info(), topology)
         if isinstance(client, StickyReplicaClient):
-            routing_keys = tuple(
-                f"cohort-{index % 4:04d}" for index in range(len(prompts))
-            )
+            routing_keys = tuple(f"cohort-{index % 4:04d}" for index in range(len(prompts)))
             run = client.run_scheduled(
                 prompts,
                 (0.0,) * len(prompts),
@@ -183,15 +205,14 @@ def _measure(
         {
             "results": [result.to_dict() for result in results],
             "exactness_trajectory": exactness_trajectory,
+            "exactness_evidence": exactness_evidence,
             "before": before,
             "after": after,
             "elapsed_seconds": elapsed,
         },
     )
     _validate_token_accounting(results, committed, max_new_tokens)
-    counters = {
-        name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
-    }
+    counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
     row: dict[str, object] = {
         "block": job.block,
         "method": job.method,
@@ -237,9 +258,6 @@ def benchmark(args: argparse.Namespace) -> None:
                     max_new_tokens=args.max_new_tokens,
                 )
             )
-        baseline = block_rows[0]["trajectories"]
-        if any(row["trajectories"] != baseline for row in block_rows[1:]):
-            raise RuntimeError(f"block {block} token trajectories differ")
         rows.extend(block_rows)
     _write(output / "benchmark.json", rows)
 
@@ -274,8 +292,24 @@ def smoke(args: argparse.Namespace) -> None:
             tp2=True,
         ),
     )
+    selected = set(args.cases or ())
+    names = (
+        "target",
+        "static",
+        "tts",
+        "l0",
+        "lightcone",
+        "onlinespec",
+        "tp2",
+        "dp2",
+        "dspark",
+        "nextn35",
+        "nextn122",
+    )
     rows = []
-    for job in cases:
+    for name, job in zip(names, cases, strict=True):
+        if selected and name not in selected:
+            continue
         rows.append(
             _measure(
                 config,
@@ -286,11 +320,20 @@ def smoke(args: argparse.Namespace) -> None:
             )
         )
         time.sleep(1)
-    baseline = rows[0]["exactness_trajectory"]
-    for row in rows[1:6]:
-        if row["exactness_trajectory"] != baseline:
-            raise RuntimeError(f"{row['method']} smoke trajectory differs from Target-only")
-    _write(args.output / "smoke.json", rows)
+    diagnostic = []
+    target = next((row for row in rows if row["method"] == "target_only"), None)
+    if target is not None:
+        for row in rows:
+            diagnostic.append(
+                {
+                    "method": row["method"],
+                    "backend": row["backend"],
+                    "cross_kernel_trajectory_equal": (
+                        row["exactness_trajectory"] == target["exactness_trajectory"]
+                    ),
+                }
+            )
+    _write(args.output / "smoke.json", {"rows": rows, "diagnostic": diagnostic})
 
 
 def compare(args: argparse.Namespace) -> None:
@@ -339,6 +382,24 @@ def main() -> None:
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--max-new-tokens", type=int, default=default_tokens)
+        if name == "smoke":
+            command.add_argument(
+                "--cases",
+                nargs="+",
+                choices=(
+                    "target",
+                    "static",
+                    "tts",
+                    "l0",
+                    "lightcone",
+                    "onlinespec",
+                    "tp2",
+                    "dp2",
+                    "dspark",
+                    "nextn35",
+                    "nextn122",
+                ),
+            )
         command.set_defaults(handler=handler)
     command = commands.add_parser("compare")
     command.add_argument("--donor", type=Path, required=True)

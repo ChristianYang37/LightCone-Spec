@@ -140,7 +140,7 @@ index 861c13fb4e..e906f2e02a 100644
              # Per-DP-group leader logs once: ranks within a DP group are
              # state-synchronous, but DP groups may diverge.
              if self.metrics_reporter.is_stats_logging_rank:
-@@ -4029,6 +4031,100 @@ class Scheduler(
+@@ -4029,6 +4031,108 @@ class Scheduler(
              if info_record is not None:
                  ret["dspark_info_record"] = info_record
  
@@ -184,6 +184,14 @@ index 861c13fb4e..e906f2e02a 100644
 +                    }
 +            if not isinstance(counters, dict):
 +                raise RuntimeError("speculative runtime did not expose safety counters")
++            verification_counters = counters
++            if isinstance(online, dict) and online:
++                provider = getattr(
++                    self.draft_worker, "terminal_static_safety_counters", None
++                )
++                verification_counters = provider() if callable(provider) else {}
++                if not isinstance(verification_counters, dict):
++                    verification_counters = {}
 +            missing_counters = set(counter_names) - counters.keys()
 +            if missing_counters:
 +                raise RuntimeError(
@@ -235,7 +243,7 @@ index 861c13fb4e..e906f2e02a 100644
 +            for name in counter_names:
 +                speed[name] = int(counters[name])
 +            for name in ("greedy_token_checks", "greedy_token_mismatches"):
-+                speed[name] = int(counters.get(name, 0))
++                speed[name] = int(verification_counters.get(name, 0))
 +            ret["speed_study_metrics"] = speed
 +
          # These fields are not msgpack-serializable (a config object and a bound

@@ -714,7 +714,20 @@ def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
     ) in patch
     assert '"greedy_token_checks": 0' in patch
     assert "out_tokens[checked] != target_predict[checked]" in patch
-    assert 'counters.get(name, 0)' in patch
+    assert "verification_counters.get(name, 0)" in patch
+    adaptation_patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
+    ).read_text(encoding="utf-8")
+    assert "Greedy verification is native to the worker" in adaptation_patch
+
+
+def test_gpu_smoke_uses_native_exactness_and_staged_cases():
+    source = (Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py").read_text()
+    assert "_validate_greedy_verify_counts" in source
+    assert '"greedy_token_mismatches"' in source
+    assert '"nextn122"' in source
+    assert "cross_kernel_trajectory_equal" in source
 
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
