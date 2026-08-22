@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import torch
 
 from lightcone_spec.client import GenerationResult, SGLangClient
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
@@ -374,3 +375,14 @@ def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Pa
     assert score is None
     assert "bubblewrap" in scorer
     assert verdicts == []
+
+
+def test_dspark_loss_retains_graph_inside_inference_scheduler():
+    parameter = torch.nn.Parameter(torch.ones(2, 2))
+    with torch.inference_mode():
+        with torch.inference_mode(False), torch.enable_grad():
+            proposal = parameter @ torch.ones(2, 2)
+        with torch.inference_mode(False), torch.enable_grad():
+            loss = proposal.float().square().mean()
+    gradient = torch.autograd.grad(loss, parameter)[0]
+    assert torch.isfinite(gradient).all()

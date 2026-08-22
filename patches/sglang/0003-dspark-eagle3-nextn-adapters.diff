@@ -1,17 +1,5 @@
-diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
-index ecb500b5..13465b5c 100644
---- a/python/sglang/srt/models/dflash.py
-+++ b/python/sglang/srt/models/dflash.py
-@@ -399,7 +399,6 @@ class DFlashDraftModel(nn.Module):
-             )
-         return self.hidden_norm(self.fc(target_hidden))
- 
--    @torch.no_grad()
-     def forward(
-         self,
-         input_ids: torch.Tensor,
 diff --git a/python/sglang/srt/models/deepseek_v4_dspark.py b/python/sglang/srt/models/deepseek_v4_dspark.py
-index 2b01ec2e..d6d56645 100644
+index 2b01ec2..d6d5664 100644
 --- a/python/sglang/srt/models/deepseek_v4_dspark.py
 +++ b/python/sglang/srt/models/deepseek_v4_dspark.py
 @@ -78,7 +78,6 @@ def apply_rotary_emb(
@@ -112,8 +100,20 @@ index 2b01ec2e..d6d56645 100644
  
          mapped_rest = rest
          mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index 69c01c7..b1b0163 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -399,7 +399,6 @@ class DFlashDraftModel(nn.Module):
+             )
+         return self.hidden_norm(self.fc(target_hidden))
+ 
+-    @torch.no_grad()
+     def forward(
+         self,
+         input_ids: torch.Tensor,
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
-index a1ca3f14..45f90763 100644
+index a1ca3f1..45f9076 100644
 --- a/python/sglang/srt/models/dspark.py
 +++ b/python/sglang/srt/models/dspark.py
 @@ -65,7 +65,6 @@ def run_markov_block(
@@ -188,7 +188,7 @@ index a1ca3f14..45f90763 100644
  
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
-index acdbd745..6cb9c161 100644
+index acdbd74..763b655 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 @@ -21,6 +21,10 @@ from sglang.srt.runtime_context import get_parallel
@@ -374,7 +374,7 @@ index acdbd745..6cb9c161 100644
  
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_proposal.py b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 new file mode 100644
-index 00000000..318bcf25
+index 0000000..318bcf2
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_proposal.py
 @@ -0,0 +1,45 @@
@@ -424,7 +424,7 @@ index 00000000..318bcf25
 +    "compute_dspark_projection",
 +)
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
-index 4d5478cd..ab2114d9 100644
+index 4d5478c..ab2114d 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
 @@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
@@ -453,7 +453,7 @@ index 4d5478cd..ab2114d9 100644
          self,
          *,
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
-index ae778ee1..eb4cacb9 100644
+index ae778ee..ca2e0b2 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 +++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
 @@ -4,7 +4,7 @@ from dataclasses import replace
@@ -477,7 +477,7 @@ index ae778ee1..eb4cacb9 100644
  from sglang.srt.speculative.spec_utils import (
      GrammarTree,
      build_grammar_vocab_mask,
-@@ -64,7 +67,6 @@ logger = logging.getLogger(__name__)
+@@ -64,7 +69,6 @@ logger = logging.getLogger(__name__)
  
  
  class DSparkWorkerV2(BaseSpecWorker):
@@ -485,7 +485,7 @@ index ae778ee1..eb4cacb9 100644
      def __init__(
          self,
          server_args: ServerArgs,
-@@ -254,6 +256,18 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -254,6 +258,18 @@ class DSparkWorkerV2(BaseSpecWorker):
              device=self.device,
              simulate_acc_len=self._simulate_acc_len,
          )
@@ -504,7 +504,7 @@ index ae778ee1..eb4cacb9 100644
  
      def _resolve_target_embed_tokens(self, target_model):
          if hasattr(target_model, "get_input_embeddings"):
-@@ -339,16 +353,29 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -339,16 +355,29 @@ class DSparkWorkerV2(BaseSpecWorker):
              ),
          )
  
@@ -537,7 +537,7 @@ index ae778ee1..eb4cacb9 100644
      def clear_info_records(self) -> None:
          self._observers.clear_info_records()
  
-@@ -357,6 +384,21 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -357,6 +386,21 @@ class DSparkWorkerV2(BaseSpecWorker):
  
      def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
          self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
@@ -559,32 +559,69 @@ index ae778ee1..eb4cacb9 100644
  
      def forward_batch_generation(
          self,
-@@ -508,6 +550,13 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -508,6 +552,15 @@ class DSparkWorkerV2(BaseSpecWorker):
          prefix_lens = batch.seq_lens
  
          self._observers.begin_step()
 +        online_adapter = self._online_drafter_adapter
++        online_update = False
 +        source_adapter_version = None
 +        if online_adapter is not None:
 +            source_version = online_adapter.begin_round(batch)
++            online_update = online_adapter.update_due
 +            source_adapter_version = torch.full(
 +                (bs,), source_version, dtype=torch.int64, device=device
 +            )
  
          target_model = self.target_worker.model_runner.model
  
-@@ -530,6 +579,10 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -530,19 +583,39 @@ class DSparkWorkerV2(BaseSpecWorker):
                  device=device,
                  target_model=target_model,
                  sampling_info=sampling_info,
 +                source_adapter_version=source_adapter_version,
-+                online_update=(
-+                    online_adapter is not None and online_adapter.update_due
-+                ),
++                online_update=online_update,
              )
          draft_block_ids = proposal.draft_block_ids
          draft_block = proposal.draft_block
-@@ -550,6 +603,17 @@ class DSparkWorkerV2(BaseSpecWorker):
+         draft_tokens = draft_block.draft_tokens
+ 
+         confidence = proposal.confidence
++        update_confidence = confidence
+         if confidence is None:
+-            confidence = self._verify_planner.compute_confidence_tensor(
+-                draft_hidden=proposal.draft_hidden,
+-                anchor_tokens=draft_block_ids[:, 0],
+-                draft_tokens=draft_tokens,
+-                confidence_tap=proposal.confidence_tap,
+-            )
++            if online_update:
++                with torch.inference_mode(False), torch.enable_grad():
++                    update_confidence = (
++                        self._verify_planner.compute_confidence_tensor(
++                            draft_hidden=proposal.draft_hidden,
++                            anchor_tokens=draft_block_ids[:, 0],
++                            draft_tokens=draft_tokens,
++                            confidence_tap=proposal.confidence_tap,
++                        )
++                    )
++                confidence = (
++                    None
++                    if update_confidence is None
++                    else update_confidence.detach()
++                )
++            else:
++                confidence = self._verify_planner.compute_confidence_tensor(
++                    draft_hidden=proposal.draft_hidden,
++                    anchor_tokens=draft_block_ids[:, 0],
++                    draft_tokens=draft_tokens,
++                    confidence_tap=proposal.confidence_tap,
++                )
++                update_confidence = confidence
+ 
+         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+             draft_input=draft_input,
+@@ -550,6 +623,17 @@ class DSparkWorkerV2(BaseSpecWorker):
              prefix_lens=prefix_lens,
              req_pool_indices=batch.req_pool_indices,
          )
@@ -602,7 +639,7 @@ index ae778ee1..eb4cacb9 100644
  
          global_num_reqs = (
              max(batch.global_num_tokens)
-@@ -681,6 +745,103 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -681,6 +765,121 @@ class DSparkWorkerV2(BaseSpecWorker):
              dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
          )
  
@@ -624,52 +661,70 @@ index ae778ee1..eb4cacb9 100644
 +                        "dspark_teacher_shape_mismatch", exactness=True
 +                    )
 +                else:
-+                    valid_mask = torch.ones(
-+                        corrected.shape[:2], dtype=torch.bool, device=device
-+                    )
-+                    if layout is not None:
-+                        valid_mask = (
-+                            torch.arange(self.gamma, device=device)[None, :]
-+                            < layout.verify_lens[:microbatch, None]
++                    with torch.inference_mode(False), torch.enable_grad():
++                        valid_mask = torch.ones(
++                            corrected.shape[:2], dtype=torch.bool, device=device
 +                        )
-+                    target_probabilities = F.softmax(
-+                        teacher_logits.detach().float(), dim=-1
-+                    )
-+                    temperatures = draft_block.temperatures[:microbatch]
-+                    exact_proposal = proposal_probabilities(
-+                        corrected.detach(),
-+                        temperatures,
-+                        greedy_mask=draft_block.greedy_mask[:microbatch],
-+                    )
-+                    composite = "native_heads" in online_adapter.config.parameter_scope
-+                    confidence_rows = (
-+                        confidence[:microbatch] if composite and confidence is not None else None
-+                    )
-+                    losses = dspark_composite_loss(
-+                        target_probabilities=target_probabilities,
-+                        corrected_proposal_logits=corrected,
-+                        temperatures=temperatures,
-+                        valid_mask=valid_mask,
-+                        position_decay=online_adapter.config.loss_position_decay,
-+                        confidence_logits=(
-+                            torch.logit(confidence_rows.clamp(1e-6, 1 - 1e-6))
-+                            if confidence_rows is not None
++                        if layout is not None:
++                            valid_mask = (
++                                torch.arange(self.gamma, device=device)[None, :]
++                                < layout.verify_lens[:microbatch, None]
++                            )
++                        target_probabilities = F.softmax(
++                            teacher_logits.detach().clone().float(), dim=-1
++                        )
++                        temperatures = (
++                            draft_block.temperatures[:microbatch].detach().clone()
++                        )
++                        exact_proposal = proposal_probabilities(
++                            corrected.detach(),
++                            temperatures,
++                            greedy_mask=(
++                                draft_block.greedy_mask[:microbatch]
++                                .detach()
++                                .clone()
++                            ),
++                        )
++                        composite = (
++                            "native_heads"
++                            in online_adapter.config.parameter_scope
++                        )
++                        confidence_rows = (
++                            update_confidence[:microbatch]
++                            if composite and update_confidence is not None
 +                            else None
-+                        ),
-+                        frozen_confidence_temperature=(
-+                            torch.ones(self.gamma, device=device)
-+                            if confidence_rows is not None
-+                            else None
-+                        ),
-+                        confidence_loss_weight=(
-+                            online_adapter.config.confidence_loss_weight
-+                            if confidence_rows is not None
-+                            else None
-+                        ),
-+                        exact_proposal_probabilities=(
-+                            exact_proposal if confidence_rows is not None else None
-+                        ),
-+                    )
++                        )
++                        losses = dspark_composite_loss(
++                            target_probabilities=target_probabilities,
++                            corrected_proposal_logits=corrected,
++                            temperatures=temperatures,
++                            valid_mask=valid_mask,
++                            position_decay=(
++                                online_adapter.config.loss_position_decay
++                            ),
++                            confidence_logits=(
++                                torch.logit(
++                                    confidence_rows.clamp(1e-6, 1 - 1e-6)
++                                )
++                                if confidence_rows is not None
++                                else None
++                            ),
++                            frozen_confidence_temperature=(
++                                torch.ones(self.gamma, device=device)
++                                if confidence_rows is not None
++                                else None
++                            ),
++                            confidence_loss_weight=(
++                                online_adapter.config.confidence_loss_weight
++                                if confidence_rows is not None
++                                else None
++                            ),
++                            exact_proposal_probabilities=(
++                                exact_proposal
++                                if confidence_rows is not None
++                                else None
++                            ),
++                        )
 +                    if confidence_rows is not None:
 +                        online_adapter.runtime.record_confidence(
 +                            confidence_rows,
@@ -708,7 +763,7 @@ index ae778ee1..eb4cacb9 100644
              new_seq_lens=accept.new_seq_lens,
 diff --git a/python/sglang/srt/speculative/dspark_online_adaptation.py b/python/sglang/srt/speculative/dspark_online_adaptation.py
 new file mode 100644
-index 00000000..128c6983
+index 0000000..128c698
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dspark_online_adaptation.py
 @@ -0,0 +1,540 @@
@@ -1253,7 +1308,7 @@ index 00000000..128c6983
 +    "resolve_dspark_verification",
 +)
 diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
-index 4184fe46..ba7a0390 100644
+index 4184fe4..ba7a039 100644
 --- a/python/sglang/srt/speculative/eagle_info.py
 +++ b/python/sglang/srt/speculative/eagle_info.py
 @@ -30,6 +30,7 @@ class EagleVerifyInput(SpecInput):
@@ -1311,7 +1366,7 @@ index 4184fe46..ba7a0390 100644
  
  @dataclass
 diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
-index 880545b5..8ee2ed59 100644
+index 880545b..8ee2ed5 100644
 --- a/python/sglang/srt/speculative/eagle_worker_common.py
 +++ b/python/sglang/srt/speculative/eagle_worker_common.py
 @@ -397,6 +397,7 @@ def build_eagle_verify_input(
@@ -1323,7 +1378,7 @@ index 880545b5..8ee2ed59 100644
  
  
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index ee435757..52c00f34 100644
+index ee43575..52c00f3 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
 @@ -5,6 +5,7 @@ from dataclasses import replace
@@ -1743,7 +1798,7 @@ index ee435757..52c00f34 100644
  
      def _stub_skipped_draft_extend(
 diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
-index 98c210b4..dbd12c77 100644
+index 98c210b..dbd12c7 100644
 --- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 +++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 @@ -26,7 +26,7 @@ from dataclasses import replace
@@ -2002,7 +2057,7 @@ index 98c210b4..dbd12c77 100644
 +        }
 diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
 new file mode 100644
-index 00000000..26042dd1
+index 0000000..26042dd
 --- /dev/null
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
 @@ -0,0 +1,387 @@
