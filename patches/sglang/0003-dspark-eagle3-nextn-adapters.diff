@@ -162,6 +162,17 @@ index 69c01c7..b1b0163 100644
      def forward(
          self,
          input_ids: torch.Tensor,
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1402,7 +1402,6 @@ class Qwen3_5ForCausalLM(nn.Module):
+     def end_layer(self) -> int:
+         return self._end_layer
+ 
+-    @torch.no_grad()
+     def forward(
+         self,
+         input_ids: torch.Tensor,
 diff --git a/python/sglang/srt/models/dspark.py b/python/sglang/srt/models/dspark.py
 index a1ca3f1..45f9076 100644
 --- a/python/sglang/srt/models/dspark.py
