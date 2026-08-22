@@ -293,6 +293,23 @@ def test_sticky_replica_routing_is_repeatable():
     }
 
 
+def test_sticky_scheduled_load_is_split_between_replicas(fake_server):
+    replicas = tuple(
+        SGLangClient(f"http://127.0.0.1:{fake_server}", 2) for _ in range(2)
+    )
+    client = StickyReplicaClient(replicas)
+    run = client.run_scheduled(
+        ("prompt",) * 8,
+        (0.0,) * 8,
+        max_new_tokens=2,
+        seed=0,
+        routing_keys=tuple(f"cohort-{index % 4:04d}" for index in range(8)),
+        max_in_flight=8,
+    )
+    assert len(run.results) == 8
+    assert {outcome.status for outcome in run.outcomes} == {"completed"}
+
+
 def test_fake_reset_tokenize_and_abort(fake_server):
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
     assert client.tokenize("hello") == (1, 2, 3)

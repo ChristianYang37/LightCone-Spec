@@ -107,7 +107,7 @@ def _measure(
     with process as client:
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
-            limit=16,
+            limit=8 if isinstance(client, StickyReplicaClient) else 16,
             split="tuning",
             offset=(job.block or 0) * 16,
         )
@@ -135,7 +135,9 @@ def _measure(
         topology = str(job.parameters.get("topology", "tp1_dp1"))
         before = _speed_metrics(client.server_info(), topology)
         if isinstance(client, StickyReplicaClient):
-            routing_keys = tuple(f"cohort-{index % 4}" for index in range(len(prompts)))
+            routing_keys = tuple(
+                f"cohort-{index % 4:04d}" for index in range(len(prompts))
+            )
             run = client.run_scheduled(
                 prompts,
                 (0.0,) * len(prompts),
@@ -147,6 +149,10 @@ def _measure(
                 drain_seconds=config.server.request_timeout_seconds,
             )
             results, elapsed = run.results, run.elapsed_seconds
+            _write(
+                output / "request-outcomes.json",
+                [outcome.to_dict() for outcome in run.outcomes],
+            )
             if len(run.outcomes) != len(prompts) or any(
                 outcome.status != "completed" for outcome in run.outcomes
             ):
