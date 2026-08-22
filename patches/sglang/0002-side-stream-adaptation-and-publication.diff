@@ -60,21 +60,21 @@ index 9e2f191a..45d4117c 100644
              self._lazy_init_forward_buf(payload)
          self._maybe_init_dsa_topk_indices_buf(payload)
 +        versions = payload.source_adapter_version
-+        if self.source_adapter_version_buf is not None:
-+            if (
-+                versions is None
-+                or versions.dtype != torch.int64
-+                or versions.ndim != 1
-+                or versions.shape[0] != indices.shape[0]
-+                or versions.device != self.source_adapter_version_buf.device
-+            ):
-+                raise ValueError(
-+                    "EAGLE source versions must be same-device int64 per request"
-+                )
-+        elif versions is not None:
-+            raise RuntimeError(
-+                "EAGLE adaptation cannot be enabled after relay initialization"
++        if versions is not None and (
++            versions.dtype != torch.int64
++            or versions.ndim != 1
++            or versions.shape[0] != indices.shape[0]
++            or versions.device != self.device
++        ):
++            raise ValueError(
++                "EAGLE source versions must be same-device int64 per request"
 +            )
++        if self.source_adapter_version_buf is None and versions is not None:
++            self.source_adapter_version_buf = torch.empty(
++                (self.req_pool_size,), dtype=torch.int64, device=self.device
++            )
++        elif self.source_adapter_version_buf is not None and versions is None:
++            raise ValueError("EAGLE source version is missing after relay activation")
          self.output_tokens_buf[indices] = payload.bonus_tokens.to(
              self.output_tokens_buf.dtype
          )

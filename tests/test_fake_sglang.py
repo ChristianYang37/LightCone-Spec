@@ -533,3 +533,13 @@ def test_tp2_dflash_gathers_full_vocab_before_online_loss():
     assert "local_draft_logits, target.shape[-1]" in patch
     assert "attention_output, self.tp_group.device_group" in patch
     assert "_TensorParallelSum.apply(output, self.tp_group.device_group)" in patch
+
+
+def test_eagle_relay_accepts_first_version_after_prefill():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
+    ).read_text(encoding="utf-8")
+    assert "EAGLE adaptation cannot be enabled after relay initialization" not in patch
+    assert "self.source_adapter_version_buf is None and versions is not None" in patch
+    assert "EAGLE source version is missing after relay activation" in patch
