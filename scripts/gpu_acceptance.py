@@ -84,6 +84,7 @@ def _measure(
     output: Path,
     *,
     max_new_tokens: int,
+    exactness_tokens: int = 0,
 ) -> dict[str, object]:
     gpus = config.gpu_ids if job.gpu_count == 2 else (config.gpu_ids[0],)
     port = config.server.base_port + (2 if job.gpu_count == 2 else 0)
@@ -113,6 +114,16 @@ def _measure(
             client.warmup(prompts[0], max_new_tokens=16, seed=0)
         else:
             client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
+            client.reset()
+        exactness_trajectory = None
+        if exactness_tokens:
+            exactness, _ = client.run_batch(
+                prompts[:1],
+                max_new_tokens=exactness_tokens,
+                seed=job.block or 0,
+                request_id_prefix="exactness",
+            )
+            exactness_trajectory = list(exactness[0].output_ids)
             client.reset()
         topology = str(job.parameters.get("topology", "tp1_dp1"))
         before = _speed_metrics(client.server_info(), topology)
@@ -163,6 +174,7 @@ def _measure(
         "peak_hbm_bytes": int(after["peak_hbm_bytes"]),
         "committed_tokens": committed,
         "trajectories": [list(result.output_ids) for result in results],
+        "exactness_trajectory": exactness_trajectory,
         "counters": counters,
         "rank_local": after["rank_local"],
         "rank_aggregates": after["rank_aggregates"],
@@ -243,12 +255,13 @@ def smoke(args: argparse.Namespace) -> None:
                 job,
                 args.output / f"{job.ordinal:02d}-{job.method}-{job.backend.lower()}",
                 max_new_tokens=args.max_new_tokens,
+                exactness_tokens=args.max_new_tokens,
             )
         )
         time.sleep(1)
-    baseline = rows[0]["trajectories"]
+    baseline = rows[0]["exactness_trajectory"]
     for row in rows[1:6]:
-        if row["trajectories"] != baseline:
+        if row["exactness_trajectory"] != baseline:
             raise RuntimeError(f"{row['method']} smoke trajectory differs from Target-only")
     _write(args.output / "smoke.json", rows)
 
