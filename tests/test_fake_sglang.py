@@ -523,6 +523,10 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
     assert patch.count("with torch.inference_mode(False), torch.enable_grad():") >= 6
     assert patch.count("semantic_new_seq_lens = round_prefix_lens + committed.to(") == 2
+    assert patch.count("round_request_ids = tuple(request.rid for request in batch.reqs)") == 2
+    assert patch.count("request_ids=round_request_ids[:microbatch]") == 2
+    assert "def begin_round(\n+        self, request_ids: Sequence[str]" in patch
+    assert 'self.disabled_reason = "invalid_logical_prefix"' in patch
     assert "native_backend_trainables_disconnected" in patch
     assert "native_backend_zero_gradient" in patch
     assert "qwen3_5_mtp.py" in patch
