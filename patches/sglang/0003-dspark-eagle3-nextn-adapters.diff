@@ -2619,3 +2619,38 @@ index 925ac1ac..b6da733e 100644
                  num_kv_splits=None,
                  kv_indptr=self.kv_indptr[: bs + 1],
                  kv_indices=self.cuda_graph_kv_indices,
+diff --git a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+index 948a9d60..26179fbf 100644
+--- a/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
++++ b/python/sglang/kernels/ops/speculative/dspark/dspark_accept.py
+@@ -248,12 +248,25 @@ except ImportError:
+ 
+ class SoftmaxTemp:
+     @classmethod
+-    def execute(cls, *args, **kwargs) -> torch.Tensor:
+-        if not inputs_on_cuda(*args, **kwargs):
+-            return cls.torch(*args, **kwargs)
++    def execute(
++        cls,
++        *,
++        logits: torch.Tensor,
++        temperatures: torch.Tensor,
++        rows_per_request: int,
++    ) -> torch.Tensor:
++        kwargs = {
++            "logits": logits,
++            "temperatures": temperatures,
++            "rows_per_request": rows_per_request,
++        }
++        if not logits.is_cuda:
++            return cls.torch(**kwargs)
++        if torch.cuda.get_device_capability(logits.device)[0] == 12:
++            return cls.triton(**kwargs)
+         if _flashinfer_softmax is not None:
+-            return cls.flashinfer(*args, **kwargs)
+-        return cls.triton(*args, **kwargs)
++            return cls.flashinfer(**kwargs)
++        return cls.triton(**kwargs)
+ 
+     @classmethod
+     def torch(
