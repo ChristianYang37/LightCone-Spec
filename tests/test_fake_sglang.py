@@ -559,6 +559,12 @@ def test_tp2_dflash_gathers_full_vocab_before_online_loss():
     assert "_TensorParallelSum.apply(output, self.tp_group.device_group)" in patch
 
 
+def test_launcher_applies_one_plain_patch_stream():
+    launcher = (Path(__file__).parents[1] / "run_paper.sh").read_text(encoding="utf-8")
+    assert "--recount" not in launcher
+    assert launcher.count('done | git -C "$sglang_root" apply') == 2
+
+
 def test_eagle_relay_accepts_first_version_after_prefill():
     patch = (
         Path(__file__).parents[1]

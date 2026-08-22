@@ -35,8 +35,8 @@ lightcone-spec status --run-dir /root/lightcone-results/paper-v1-main
 lightcone-spec summarize --run-dir /root/lightcone-results/paper-v1-main
 ```
 
-The initial SGLang patch application uses ordinary `git apply --recount
---check` followed by `git apply --recount`. Repository state is not inspected.
+The initial SGLang patch application uses ordinary `git apply --check`
+followed by `git apply`. Repository state is not inspected.
 If a local SGLang change
 overlaps a diff, resolve that ordinary patch conflict before running again.
 

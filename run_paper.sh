@@ -60,8 +60,12 @@ if [[ ! -e "$marker" ]]; then
     echo "no SGLang patches found" >&2
     exit 1
   fi
-  git -C "$sglang_root" apply --recount --check "${patches[@]}"
-  git -C "$sglang_root" apply --recount "${patches[@]}"
+  for patch in "${patches[@]}"; do
+    sed -n '1,$p' "$patch"
+  done | git -C "$sglang_root" apply --check -
+  for patch in "${patches[@]}"; do
+    sed -n '1,$p' "$patch"
+  done | git -C "$sglang_root" apply -
   touch "$marker"
 else
   for module in \

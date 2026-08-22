@@ -15,29 +15,27 @@ Implemented locally:
   calibration without changing registered row counts;
 - focused CPU tests and default CI.
 
-GPU acceptance completed on 2026-08-22:
+GPU acceptance completed on 2026-08-22--23:
 
-- Target-only model-load, generation, native timing, HBM/KV, and zero
-  safety-counter smoke passed;
-- Static/DFlash completed generation with zero safety counters but reported 536
-  committed tokens for a nominal 512-token batch; this remains unresolved;
-- TTS/DFlash full-drafter startup and serialized warm-up passed after correcting
-  memory planning and side-effecting health checks.
+- Target-only, Static, TTS, L0-naive, LightCone, and OnlineSPEC smoke passed;
+- TP2 DFlash publication/reset, DP2 sticky routing, and DSpark finite-update
+  smoke passed;
+- Qwen3.6-35B-A3B TP2 NEXTN generation passed, but its exact training interface
+  was rejected before publication: the fused MoE/TP inference operators expose
+  no autograd path to the registered native LoRA tensors. The row is therefore
+  blocked, not a positive E6 result.
 
 Still pending GPU acceptance:
 
-- Static committed-token accounting, TTS scored batch, L0-naive, LightCone,
-  and OnlineSPEC smoke;
-- TP2 model load and publication check;
-- one DSpark adaptation cell;
-- one NEXTN interface cell;
 - kill/restart resume exercise;
 - three-block donor/rebuild performance comparison;
-- then the registered full protocol.
+- ten-cell preflight;
+- the registered full protocol, with unsupported E6 models retained as visible
+  rejected interface rows and their dependent cells skipped.
 
 Last read-only remote check: two idle RTX PRO 6000 Blackwell Server Edition
 GPUs (97,887 MiB each), driver 580.95.05, Python 3.12.3, Torch 2.11/CUDA 12.9,
 SGLang dev5, and FlashInfer 0.6.15. `nsys` and `ncu` are under
 `/root/lightcone-tts-runtime/cuda-12.9/bin`. The writable root volume had about
 32 GB free; the public NFS was read-only. No formal paper cell was executed.
-The last retry stopped after repeated SSH timeouts, and the instance is shut down.
+The instance is shut down.
