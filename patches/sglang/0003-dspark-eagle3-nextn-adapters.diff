@@ -453,11 +453,12 @@ index ae778ee1..eb4cacb9 100644
  from sglang.srt.distributed.parallel_state_wrapper import ParallelState
  from sglang.srt.environ import envs
  from sglang.srt.managers.schedule_batch import ScheduleBatch
-@@ -53,6 +53,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
+@@ -53,6 +53,11 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
      TargetVerifyExecutor,
      verify_logits_adjustments_are_noop,
  )
 +from sglang.srt.speculative.dspark_online_adaptation import (
++    dspark_composite_loss,
 +    proposal_probabilities,
 +    resolve_dspark_verification,
 +)
