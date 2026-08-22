@@ -1441,8 +1441,11 @@ def _execute_cell(
             ):
                 raise ScientificFailure("adaptive cell did not publish the required updates")
             if runtime_job.parameters.get("controlled_replay"):
+                if after.get("controlled_candidate_compared") is not True:
+                    raise ScientificFailure("controlled replay did not compare a candidate")
                 if after.get("controlled_candidate_equal") is not True:
                     raise ScientificFailure("controlled replay changed the staged candidate")
+                metrics["controlled_candidate_compared"] = True
                 metrics["controlled_candidate_equal"] = True
             if job.parameters.get("workload") != "failure_injection":
                 validate_scientific_metrics(metrics)

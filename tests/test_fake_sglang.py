@@ -559,6 +559,19 @@ def test_tp2_dflash_gathers_full_vocab_before_online_loss():
     assert "_TensorParallelSum.apply(output, self.tp_group.device_group)" in patch
 
 
+def test_controlled_replay_compares_the_first_real_candidate_once():
+    patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
+    ).read_text(encoding="utf-8")
+    assert 'if role == "capture":' in patch
+    assert "if self.controlled_reference is None:" in patch
+    assert 'elif role == "compare":' in patch
+    assert "if not self.controlled_candidate_compared:" in patch
+    assert "torch.equal(candidate, reference)" in patch
+    assert "self.controlled_candidate_compared = True" in patch
+
+
 def test_launcher_applies_one_plain_patch_stream():
     launcher = (Path(__file__).parents[1] / "run_paper.sh").read_text(encoding="utf-8")
     assert "--recount" not in launcher

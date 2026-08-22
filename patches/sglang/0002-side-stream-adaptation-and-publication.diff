@@ -1580,7 +1580,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2550 @@
+@@ -0,0 +1,2556 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -2897,6 +2897,7 @@ index 00000000..7b2cb5db
 +        self.waiting_requests_max = 0
 +        self.controlled_reference: tuple[torch.Tensor, ...] | None = None
 +        self.controlled_candidate_equal = True
++        self.controlled_candidate_compared = False
 +        self.confidence_brier_sum = torch.zeros((), device=device)
 +        self.confidence_count = torch.zeros((), device=device)
 +        self.confidence_bin_count = torch.zeros(10, device=device)
@@ -3236,21 +3237,24 @@ index 00000000..7b2cb5db
 +        if self.config.controlled_candidate_replay:
 +            role = self.config.controlled_candidate_role
 +            if role == "capture":
-+                self.controlled_reference = tuple(
-+                    tensor.detach().clone() for tensor in inference_bank.staging
-+                )
-+            elif role == "compare":
 +                if self.controlled_reference is None:
-+                    raise RuntimeError("controlled replay has no TTS reference")
-+                self.controlled_candidate_equal = self.controlled_candidate_equal and all(
-+                    torch.equal(candidate, reference)
-+                    for candidate, reference in zip(
-+                        inference_bank.staging,
-+                        self.controlled_reference,
-+                        strict=True,
++                    self.controlled_reference = tuple(
++                        tensor.detach().clone() for tensor in inference_bank.staging
 +                    )
-+                )
-+                self.controlled_reference = None
++            elif role == "compare":
++                if not self.controlled_candidate_compared:
++                    if self.controlled_reference is None:
++                        raise RuntimeError("controlled replay has no TTS reference")
++                    self.controlled_candidate_equal = self.controlled_candidate_equal and all(
++                        torch.equal(candidate, reference)
++                        for candidate, reference in zip(
++                            inference_bank.staging,
++                            self.controlled_reference,
++                            strict=True,
++                        )
++                    )
++                    self.controlled_reference = None
++                    self.controlled_candidate_compared = True
 +            else:
 +                raise RuntimeError("controlled replay requires capture or compare role")
 +        if reservation is not None:
@@ -3689,6 +3693,7 @@ index 00000000..7b2cb5db
 +        if self.config.controlled_candidate_role != "compare":
 +            self.controlled_reference = None
 +        self.controlled_candidate_equal = True
++        self.controlled_candidate_compared = False
 +        self.confidence_brier_sum.zero_()
 +        self.confidence_count.zero_()
 +        self.confidence_bin_count.zero_()
@@ -3963,6 +3968,7 @@ index 00000000..7b2cb5db
 +            "enabled": self.disabled_reason is None,
 +            "disabled_reason": self.disabled_reason,
 +            "controlled_candidate_equal": self.controlled_candidate_equal,
++            "controlled_candidate_compared": self.controlled_candidate_compared,
 +            "confidence_brier": (
 +                float((self.confidence_brier_sum / self.confidence_count).item())
 +                if self.confidence_count.item() > 0
