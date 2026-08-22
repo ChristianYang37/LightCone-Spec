@@ -140,12 +140,15 @@ def server_command(
 ) -> list[str]:
     target = config.model_path(job.model)
     tp, dp = _topology(job)
-    memory_fraction = (
-        min(config.server.mem_fraction_static, 0.80)
-        if job.backend == "DSPARK"
-        else config.server.mem_fraction_static
-    )
-    max_running = _concurrency(job) if job.node.startswith("E6") else 256
+    memory_fraction = config.server.mem_fraction_static
+    if job.backend == "DSPARK" or job.parameters.get("exactness_bootstrap"):
+        memory_fraction = min(memory_fraction, 0.80)
+    if job.parameters.get("exactness_bootstrap"):
+        max_running = 1
+    elif job.node.startswith("E6"):
+        max_running = _concurrency(job)
+    else:
+        max_running = 256
     argv = [
         str(config.server.python),
         "-m",

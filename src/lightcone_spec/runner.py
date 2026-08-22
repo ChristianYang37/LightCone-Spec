@@ -98,6 +98,7 @@ def _exactness_bootstrap(job: Job) -> Job:
             "controlled_replay": False,
             "distribution_check": False,
             "deterministic_exactness": True,
+            "exactness_bootstrap": True,
         },
     )
 

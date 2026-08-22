@@ -414,6 +414,37 @@ def test_preflight_adaptive_exactness_uses_static_deterministic_bootstrap():
     assert bootstrap.method == "static"
     assert bootstrap.parameters["deterministic_exactness"] is True
     assert bootstrap.parameters["controlled_replay"] is False
+    assert bootstrap.parameters["exactness_bootstrap"] is True
+
+
+def test_exactness_bootstrap_only_captures_single_request_graph(tmp_path: Path):
+    python = tmp_path / "python"
+    python.write_text("")
+    model = tmp_path / "model"
+    model.mkdir()
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml", run_name="run", sglang_root=tmp_path,
+        results_root=tmp_path, models={"Qwen/Qwen3-8B": model},
+        drafts={"Qwen/Qwen3-8B|DFLASH": draft}, datasets={}, gpu_ids=(0, 1),
+        server=ServerConfig(python=python, mem_fraction_static=0.88),
+        protocol=ProtocolConfig(),
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    command = server_command(
+        config,
+        _exactness_bootstrap(materialize("preflight")[1]),
+        port=30000,
+        output_dir=output,
+        adaptation=None,
+    )
+    assert command[command.index("--max-running-requests") + 1] == "1"
+    assert command[command.index("--mem-fraction-static") + 1] == "0.8"
+    graph = command.index("--cuda-graph-bs-decode")
+    assert command[graph + 1] == "1"
+    assert command[graph + 2] == "--chunked-prefill-size"
 
 
 def test_preflight_interference_only_captures_registered_request_batch(tmp_path: Path):
