@@ -1714,7 +1714,9 @@ index ee43575..52c00f3 100644
 +            online_adapter = self._online_drafter_adapter
 +            online_update = False
 +            source_adapter_version = None
++            round_prefix_lens = None
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
++                round_prefix_lens = batch.seq_lens.detach().clone()
 +                source_version = online_adapter.begin_round(batch)
 +                online_update = online_adapter.update_due
 +                source_adapter_version = torch.full(
@@ -1818,9 +1820,12 @@ index ee43575..52c00f3 100644
 +                        )
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                committed = batch_output.accept_lens.to(torch.int64)
++                semantic_new_seq_lens = round_prefix_lens + committed.to(
++                    round_prefix_lens.dtype
++                )
 +                online_adapter.after_commit(
 +                    batch,
-+                    new_seq_lens=batch_output.new_seq_lens,
++                    new_seq_lens=semantic_new_seq_lens,
 +                    verified_drafts=torch.full(
 +                        (len(batch.reqs),),
 +                        self.speculative_num_draft_tokens,
@@ -2031,7 +2036,9 @@ index 98c210b..dbd12c7 100644
  
 +            online_adapter = self._online_drafter_adapter
 +            online_update = False
++            round_prefix_lens = None
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
++                round_prefix_lens = batch.seq_lens.detach().clone()
 +                online_adapter.begin_round(batch)
 +                online_update = online_adapter.update_due
 +
@@ -2099,9 +2106,12 @@ index 98c210b..dbd12c7 100644
 +            if online_adapter is not None and not batch.forward_mode.is_idle():
 +                batch_size = len(batch.reqs)
 +                committed = batch_output.accept_lens.to(torch.int64)
++                semantic_new_seq_lens = round_prefix_lens + committed.to(
++                    round_prefix_lens.dtype
++                )
 +                online_adapter.after_commit(
 +                    batch,
-+                    new_seq_lens=batch_output.new_seq_lens,
++                    new_seq_lens=semantic_new_seq_lens,
 +                    verified_drafts=torch.full(
 +                        (batch_size,),
 +                        self.speculative_num_draft_tokens,
@@ -2416,6 +2426,24 @@ index 0000000..26042dd
 +                        self.trainable,
 +                        allow_unused=True,
 +                    )
++                    connected = tuple(
++                        gradient for gradient in raw if gradient is not None
++                    )
++                    if not connected:
++                        self.runtime.disable(
++                            "native_backend_trainables_disconnected",
++                            exactness=True,
++                        )
++                        return
++                    has_nonzero = torch.stack(
++                        [torch.count_nonzero(gradient) > 0 for gradient in connected]
++                    ).any()
++                    if not bool(has_nonzero.item()):
++                        self.runtime.disable(
++                            "native_backend_zero_gradient",
++                            exactness=True,
++                        )
++                        return
 +                    gradients = tuple(
 +                        torch.zeros_like(parameter) if gradient is None else gradient
 +                        for parameter, gradient in zip(self.trainable, raw, strict=True)

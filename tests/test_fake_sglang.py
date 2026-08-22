@@ -522,6 +522,9 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert patch.count("torch.inference_mode(not online_update)") == 5
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
     assert patch.count("with torch.inference_mode(False), torch.enable_grad():") >= 6
+    assert patch.count("semantic_new_seq_lens = round_prefix_lens + committed.to(") == 2
+    assert "native_backend_trainables_disconnected" in patch
+    assert "native_backend_zero_gradient" in patch
     assert "qwen3_5_mtp.py" in patch
     assert "qwen3_5.py" in patch
     assert patch.count("-    @torch.no_grad()") == 3
