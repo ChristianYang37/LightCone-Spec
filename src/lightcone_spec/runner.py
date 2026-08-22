@@ -112,6 +112,25 @@ def _validate_committed_tokens(results: Sequence[GenerationResult], committed: i
     return output_tokens
 
 
+def _validate_greedy_verify_counts(
+    committed: int, checked: int, mismatched: int
+) -> dict[str, int]:
+    missing_output_tokens = max(committed - checked, 0)
+    extra_checked_tokens = max(checked - committed, 0)
+    if missing_output_tokens > 1 or mismatched:
+        raise ScientificFailure(
+            "deterministic verification did not match every speculative output token "
+            f"to its same-logit target argmax ({checked} checked, "
+            f"{missing_output_tokens} unverified prefill, "
+            f"{extra_checked_tokens} checked beyond streamed output, "
+            f"{mismatched} mismatched)"
+        )
+    return {
+        "unverified_prefill_tokens": missing_output_tokens,
+        "extra_checked_tokens": extra_checked_tokens,
+    }
+
+
 def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, Any]:
     states = server_info.get("internal_states")
     rank_states = states if isinstance(states, list) and states else [server_info.get("internal_state", server_info)]
@@ -1094,19 +1113,15 @@ def _execute_cell(
                 mismatched_tokens = int(
                     bootstrap_after.get("greedy_token_mismatches", 0)
                 ) - int(bootstrap_before.get("greedy_token_mismatches", 0))
-                unchecked_prefill_tokens = bootstrap_committed - checked_tokens
-                if unchecked_prefill_tokens not in {0, 1} or mismatched_tokens:
-                    raise ScientificFailure(
-                        "deterministic verification did not match every speculative token "
-                        f"to its same-logit target argmax ({checked_tokens} checked, "
-                        f"{unchecked_prefill_tokens} prefill, {mismatched_tokens} mismatched)"
-                    )
+                coverage = _validate_greedy_verify_counts(
+                    bootstrap_committed, checked_tokens, mismatched_tokens
+                )
                 exactness_evidence = {
                     "mode": "deterministic_verification_kernel",
                     "committed_tokens": bootstrap_committed,
                     "greedy_token_checks": checked_tokens,
                     "greedy_token_mismatches": mismatched_tokens,
-                    "prefill_tokens": unchecked_prefill_tokens,
+                    **coverage,
                     "safety_counters": bootstrap_safety,
                 }
                 exactness_rows.append(

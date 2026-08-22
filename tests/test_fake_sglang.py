@@ -20,6 +20,7 @@ from lightcone_spec.runner import (
     _request_scope_released,
     _run_request_scoped,
     _validate_committed_tokens,
+    _validate_greedy_verify_counts,
 )
 from lightcone_spec.server import (
     ServerProcess,
@@ -374,6 +375,17 @@ def test_committed_tokens_match_visible_outputs():
     assert _validate_committed_tokens((result,), 32) == 32
     with pytest.raises(RuntimeError, match="committed 34 tokens for 32 output"):
         _validate_committed_tokens((result,), 34)
+
+
+def test_greedy_verify_allows_block_overshoot_but_not_mismatch():
+    assert _validate_greedy_verify_counts(256, 259, 0) == {
+        "unverified_prefill_tokens": 0,
+        "extra_checked_tokens": 3,
+    }
+    with pytest.raises(RuntimeError, match="2 unverified prefill"):
+        _validate_greedy_verify_counts(256, 254, 0)
+    with pytest.raises(RuntimeError, match="1 mismatched"):
+        _validate_greedy_verify_counts(256, 259, 1)
 
 
 def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
