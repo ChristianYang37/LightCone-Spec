@@ -55,7 +55,7 @@ def _job(
         "grad_clip": 0.0,
         "parameterization": "full",
         "scope": "all",
-        "stride": 80,
+        "stride": 10,
     }
     if tp2:
         parameters["topology"] = "tp2_dp1"
