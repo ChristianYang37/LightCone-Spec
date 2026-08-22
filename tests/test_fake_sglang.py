@@ -562,6 +562,8 @@ def test_tp2_dflash_gathers_full_vocab_before_online_loss():
 def test_launcher_applies_one_plain_patch_stream():
     launcher = (Path(__file__).parents[1] / "run_paper.sh").read_text(encoding="utf-8")
     assert "--recount" not in launcher
+    assert "command -v python" not in launcher
+    assert "runtime_paths=\"$(awk" in launcher
     assert launcher.count('done | git -C "$sglang_root" apply') == 2
 
 

@@ -8,39 +8,43 @@ fi
 
 project_root="$(cd "$(dirname "$0")" && pwd)"
 config_path="$1"
-launcher_python="$(command -v python3 || command -v python)"
-
-runtime_paths="$("$launcher_python" - "$config_path" <<'PY'
-import ast
-import sys
-
-wanted = {("paths", "sglang_root"), ("server", "python"), ("server", "cuda_home")}
-found = {}
-section = None
-for raw in open(sys.argv[1], encoding="utf-8"):
-    if not raw.strip() or raw.lstrip().startswith("#"):
-        continue
-    indent = len(raw) - len(raw.lstrip(" "))
-    text = raw.strip()
-    if indent == 0 and text.endswith(":"):
-        section = text[:-1]
-        continue
-    if indent != 2 or ":" not in text:
-        continue
-    key, value = (part.strip() for part in text.split(":", 1))
-    if (section, key) not in wanted:
-        continue
-    if value[:1] in {'"', "'"}:
-        value = ast.literal_eval(value)
-    found[(section, key)] = value
-missing = wanted - found.keys()
-if missing:
-    raise SystemExit(f"paper.yaml is missing launcher paths: {sorted(missing)}")
-print(found[("paths", "sglang_root")])
-print(found[("server", "python")])
-print(found[("server", "cuda_home")])
-PY
-)"
+if ! runtime_paths="$(awk '
+function value_of(line, value, first, last) {
+  value = line
+  sub(/^[^:]*:[[:space:]]*/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  first = substr(value, 1, 1)
+  last = substr(value, length(value), 1)
+  if ((first == "\"" && last == "\"") || (first == sprintf("%c", 39) && last == first))
+    value = substr(value, 2, length(value) - 2)
+  return value
+}
+/^[^[:space:]#][^:]*:[[:space:]]*$/ {
+  section = $0
+  sub(/:.*/, "", section)
+  next
+}
+/^  [^[:space:]#][^:]*:/ {
+  line = $0
+  sub(/^  /, "", line)
+  key = line
+  sub(/:.*/, "", key)
+  if (section == "paths" && key == "sglang_root") sglang = value_of(line)
+  if (section == "server" && key == "python") python = value_of(line)
+  if (section == "server" && key == "cuda_home") cuda = value_of(line)
+}
+END {
+  if (sglang == "" || python == "" || cuda == "") {
+    print "paper.yaml is missing paths.sglang_root, server.python, or server.cuda_home" > "/dev/stderr"
+    exit 1
+  }
+  print sglang
+  print python
+  print cuda
+}
+' "$config_path")"; then
+  exit 1
+fi
 sglang_root="${runtime_paths%%$'\n'*}"
 remaining="${runtime_paths#*$'\n'}"
 python_bin="${remaining%%$'\n'*}"
