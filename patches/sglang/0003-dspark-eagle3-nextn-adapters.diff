@@ -1637,16 +1637,17 @@ index ee43575..52c00f3 100644
          )
 +        self._online_drafter_adapter = None
 +        if getattr(server_args, "speculative_adaptation_config", None):
-+            if not self.speculative_algorithm.is_eagle3():
-+                raise ValueError("native EAGLE adaptation is unavailable")
 +            from sglang.srt.speculative.native_backend_online_adaptation import (
 +                maybe_build_native_backend_adapter,
 +            )
- 
+
++            algorithm = (
++                "EAGLE3" if self.speculative_algorithm.is_eagle3() else "NEXTN"
++            )
 +            self._online_drafter_adapter = maybe_build_native_backend_adapter(
 +                server_args,
 +                self,
-+                algorithm="EAGLE3",
++                algorithm=algorithm,
 +                model=self._draft_worker.draft_runner.model,
 +            )
 +            self._draft_worker._online_adapter = self._online_drafter_adapter

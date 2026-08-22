@@ -477,6 +477,14 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
         / "patches/sglang/0001-arguments-config-and-memory.diff"
     ).read_text(encoding="utf-8")
     assert '\"EAGLE\" if config.algorithm == \"NEXTN\"' in patch
+    nextn_patch = (
+        Path(__file__).parents[1]
+        / "patches/sglang/0003-dspark-eagle3-nextn-adapters.diff"
+    ).read_text(encoding="utf-8")
+    assert (
+        '\"EAGLE3\" if self.speculative_algorithm.is_eagle3() else \"NEXTN\"'
+        in nextn_patch
+    )
 
 
 def test_triton_graph_uses_ragged_layout_and_draft_width():
