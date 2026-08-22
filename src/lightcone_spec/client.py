@@ -23,6 +23,7 @@ class GenerationResult:
     output_ids: tuple[int, ...]
     output_text: str
     native_token_timestamps_ns: tuple[int, ...]
+    stop_details: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -127,8 +128,9 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> t
         if not isinstance(prompt_tokens, int) or prompt_tokens < 1:
             raise RuntimeError("final response lacks prompt-token count")
         reason = meta.get("finish_reason")
-        if isinstance(reason, dict):
-            reason = reason.get("type")
+        stop_details = dict(reason) if isinstance(reason, dict) else None
+        if stop_details is not None:
+            reason = stop_details.get("type")
         native_timestamps = _native_events(meta, output_ids)
         native_intervals = tuple(
             (right - left) / 1_000_000
@@ -146,6 +148,7 @@ def _consume_stream(response, request_ids: tuple[str, ...], started: float) -> t
                 output_ids=tuple(int(value) for value in output_ids),
                 output_text=str(final.get("text", "")),
                 native_token_timestamps_ns=native_timestamps,
+                stop_details=stop_details,
             )
         )
     return tuple(results)

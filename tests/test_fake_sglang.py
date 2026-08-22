@@ -274,6 +274,8 @@ def test_sticky_replica_routing_is_repeatable():
 def test_fake_reset_tokenize_and_abort(fake_server):
     client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
     assert client.tokenize("hello") == (1, 2, 3)
+    results, _ = client.run_batch(((1, 2, 3),), max_new_tokens=2, seed=0)
+    assert results[0].stop_details == {"type": "length"}
     client.reset()
     client.abort("request-id")
     client.start_profile(cuda_range=True)
