@@ -521,6 +521,9 @@ def test_triton_graph_uses_ragged_layout_and_draft_width():
     assert patch.count("online_update = online_adapter.update_due") >= 2
     assert patch.count("torch.inference_mode(not online_update)") == 5
     assert patch.count("torch.set_grad_enabled(online_update)") == 5
+    assert """-    @torch.no_grad()
+     def forward(
+""" in patch
     assert """+            if online_adapter is not None and online_update:
 +                hidden_rows = self.draft_worker._online_hidden_rows
 """ in patch
