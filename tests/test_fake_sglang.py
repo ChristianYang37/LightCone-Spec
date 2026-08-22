@@ -224,6 +224,26 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
         assert process.adaptation is not None
     assert (output / "server.stopped").is_file()
 
+    config.drafts["Qwen/Qwen3-8B|DSPARK"] = model
+    dspark_job = next(
+        job
+        for job in materialize("E1a")
+        if job.backend == "DSPARK"
+        and job.method == "lightcone_candidate"
+        and "native_heads" in job.parameters["scope"]
+    )
+    dspark = ServerProcess(
+        config,
+        dspark_job,
+        gpus=(0,),
+        port=30001,
+        output_dir=output,
+        selection=None,
+    )
+    with dspark:
+        assert launched["env"]["SGLANG_RAGGED_VERIFY_MODE"] == "compact"
+        assert "native_heads" in dspark.adaptation["parameter_scope"]
+
 
 def test_onlinespec_payload_contains_independent_learner_settings():
     job = materialize(

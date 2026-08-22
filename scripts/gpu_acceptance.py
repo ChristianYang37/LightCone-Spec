@@ -61,6 +61,8 @@ def _job(
         parameters["topology"] = "tp2_dp1"
     if dp2:
         parameters["topology"] = "two_replica_tp1_dp2"
+    if backend == "DSPARK":
+        parameters["scope"] = "last5_native_heads"
     return Job(
         job_id=f"gpu-acceptance-{ordinal:03d}-{method}",
         node="E6-acceptance" if backend == "NEXTN" else "gpu-acceptance",
