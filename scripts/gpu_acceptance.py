@@ -563,11 +563,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
         "9",
         "--lora-backend",
         "triton",
-        "--cuda-graph-bs-decode",
-        "1",
-        "2",
-        "4",
-        "8",
+        "--disable-cuda-graph",
         "--disable-radix-cache",
         "--skip-server-warmup",
     ]
@@ -720,6 +716,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
             output / "excluded-adapter-batching.json",
             {
                 "registered_paper_experiment": False,
+                "cuda_graph": False,
                 "base": base,
                 "solo": solo,
                 "blocks": blocks,
