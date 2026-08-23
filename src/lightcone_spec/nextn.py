@@ -285,22 +285,23 @@ def ragged_kl_loss(
     teacher_logits: torch.Tensor,
     ledger: RequestLedger,
 ) -> torch.Tensor:
-    pairs = []
-    for rid in ledger.order:
-        row = ledger.rows[rid]
-        if row.teacher_start is None or row.teacher_end is None:
-            continue
-        draft = draft_logits[row.draft_start : row.draft_end]
-        teacher = teacher_logits[row.teacher_start : row.teacher_end]
-        count = min(draft.shape[0], teacher.shape[0])
-        if count:
-            pairs.append((draft[:count], teacher[:count]))
-    if not pairs:
-        raise ValueError("NEXTN replay has no joined teacher rows")
-    draft = torch.cat([pair[0] for pair in pairs])
-    teacher = torch.cat([pair[1] for pair in pairs])
-    return F.kl_div(
-        F.log_softmax(draft.float(), dim=-1),
-        F.softmax(teacher.detach().float(), dim=-1),
-        reduction="batchmean",
-    )
+    with torch.inference_mode(False), torch.enable_grad():
+        pairs = []
+        for rid in ledger.order:
+            row = ledger.rows[rid]
+            if row.teacher_start is None or row.teacher_end is None:
+                continue
+            draft = draft_logits[row.draft_start : row.draft_end]
+            teacher = teacher_logits[row.teacher_start : row.teacher_end]
+            count = min(draft.shape[0], teacher.shape[0])
+            if count:
+                pairs.append((draft[:count], teacher[:count]))
+        if not pairs:
+            raise ValueError("NEXTN replay has no joined teacher rows")
+        draft = torch.cat([pair[0] for pair in pairs])
+        teacher = torch.cat([pair[1] for pair in pairs])
+        return F.kl_div(
+            F.log_softmax(draft.float(), dim=-1),
+            F.softmax(teacher.detach().float(), dim=-1),
+            reduction="batchmean",
+        )

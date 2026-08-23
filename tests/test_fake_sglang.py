@@ -19,6 +19,7 @@ from lightcone_spec.nextn import (
     RequestLedger,
     grad_enabled_forwards,
     gradient_leaves,
+    ragged_kl_loss,
     torch_native_moe,
     torch_native_selected_moe,
     torch_native_shared_expert_add,
@@ -270,6 +271,23 @@ def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
     (weight,) = gradient_leaves(master)
     loss = (torch.ones(1, 2) @ weight).square().mean()
     (gradient,) = torch.autograd.grad(loss, (weight,))
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient)
+
+
+def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():
+    ledger = RequestLedger()
+    assert ledger.begin(("request",), (0,), (0, 2))
+    assert ledger.bind_verify(("request",), (0,), (2,))
+    weight = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    teacher = torch.zeros(2, 4)
+    with torch.inference_mode():
+        with torch.inference_mode(False), torch.enable_grad():
+            draft = hidden @ weight
+        loss = ragged_kl_loss(draft, teacher, ledger)
+    (gradient,) = torch.autograd.grad(loss, (weight,))
+    assert loss.requires_grad
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient)
 
