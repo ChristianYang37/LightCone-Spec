@@ -18,4 +18,6 @@ jobs:
       - run: ruff check src tests scripts/gpu_acceptance.py
       - run: pytest -q tests/test_protocol.py tests/test_resume.py tests/test_metrics.py tests/test_fake_sglang.py
       - run: lightcone-spec --help
-      - run: lightcone-spec plan --config "$PWD/examples/paper.yaml"
+      - run: |
+          sed 's#/root/#/tmp/lightcone/#g' examples/paper.yaml > /tmp/paper.yaml
+          lightcone-spec plan --config /tmp/paper.yaml
