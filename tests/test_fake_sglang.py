@@ -18,6 +18,7 @@ from lightcone_spec.nextn import (
     PublicationSlot,
     RequestLedger,
     grad_enabled_forwards,
+    gradient_leaves,
     torch_native_moe,
     torch_native_selected_moe,
 )
@@ -261,6 +262,15 @@ def test_nextn_shadow_bypasses_model_no_grad_decorator():
     assert draft.weight.grad is not None
     assert torch.count_nonzero(draft.weight.grad)
     assert not draft(value).requires_grad
+
+
+def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
+    master = (torch.ones(2, 2),)
+    (weight,) = gradient_leaves(master)
+    loss = (torch.ones(1, 2) @ weight).square().mean()
+    (gradient,) = torch.autograd.grad(loss, (weight,))
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient)
 
 
 def test_nextn_merge_publication_and_ragged_rid_join():
