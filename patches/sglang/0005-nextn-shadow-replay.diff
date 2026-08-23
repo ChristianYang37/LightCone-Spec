@@ -476,7 +476,7 @@ index 7fc522e2..e64b827d 100644
                          (batch_size,),
                          self.speculative_num_draft_tokens,
 diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-index f1da6d2d..192c17af 100644
+index f1da6d2d..404e3cca 100644
 --- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
 @@ -4,7 +4,8 @@ from __future__ import annotations
@@ -520,7 +520,7 @@ index f1da6d2d..192c17af 100644
          if weight.ndim != 2 or rank > min(weight.shape):
              raise ValueError("native LoRA rank exceeds its backend matrix")
          generator = torch.Generator(device=weight.device)
-@@ -60,10 +70,113 @@ class _LowRankDelta(torch.nn.Module):
+@@ -60,10 +70,122 @@ class _LowRankDelta(torch.nn.Module):
          )
          torch.nn.init.kaiming_uniform_(self.a, a=math.sqrt(5), generator=generator)
  
@@ -619,8 +619,8 @@ index f1da6d2d..192c17af 100644
 +        hidden_states,
 +        top_weights,
 +        top_ids,
-+        module.w13_weight,
-+        module.w2_weight,
++        getattr(module, "_lightcone_shadow_w13_weight", module.w13_weight),
++        getattr(module, "_lightcone_shadow_w2_weight", module.w2_weight),
 +        w13_scale=_moe_scale(module, "w13"),
 +        w2_scale=_moe_scale(module, "w2"),
 +    )
@@ -628,13 +628,22 @@ index f1da6d2d..192c17af 100644
 +
 +def _shadow_linear_apply(method, layer, inputs, bias=None, **kwargs):
 +    del method, kwargs
-+    return torch.nn.functional.linear(inputs, layer.weight.to(inputs.dtype), bias)
++    weight = getattr(layer, "_lightcone_shadow_weight", layer.weight)
++    return torch.nn.functional.linear(inputs, weight.to(inputs.dtype), bias)
++
++
++def _shadow_torch_linear_forward(module, inputs):
++    return torch.nn.functional.linear(
++        inputs,
++        module._lightcone_shadow_weight.to(inputs.dtype),
++        module.bias,
++    )
 +
 +
  def _canonical_named_parameters(model) -> tuple[tuple[str, str, torch.Tensor], ...]:
      rows = []
      seen = set()
-@@ -97,16 +210,37 @@ class NativeBackendOnlineAdapter:
+@@ -97,16 +219,39 @@ class NativeBackendOnlineAdapter:
          self.live_launch_count = 0
          self.last_source_tensor_shapes: tuple[tuple[int, ...], ...] = ()
          self.last_feedback_source_version: int | None = None
@@ -645,6 +654,7 @@ index f1da6d2d..192c17af 100644
 +        self.round_alignment_ok = True
 +        publication_slots: list[PublicationSlot] = []
 +        functional_parameters: dict[str, tuple[int, ...]] = {}
++        functional_modules: dict[str, torch.nn.Module] = {}
          trainable_names: list[str] = []
          trainable: list[torch.Tensor] = []
          if config.weight_update_mode == "full":
@@ -673,10 +683,11 @@ index f1da6d2d..192c17af 100644
 +                trainable.append(master)
 +                publication_slots.append(slot)
 +                functional_parameters[raw_name] = slot.parameter_indices
++                functional_modules[raw_name] = module
          else:
              if config.rank is None:
                  raise AssertionError("validated native LoRA config has no rank")
-@@ -116,37 +250,86 @@ class NativeBackendOnlineAdapter:
+@@ -116,37 +261,79 @@ class NativeBackendOnlineAdapter:
                  if leaf != "weight":
                      raise ValueError("native LoRA selector named a non-weight tensor")
                  module = model.get_submodule(parent_name) if parent_name else model
@@ -721,6 +732,7 @@ index f1da6d2d..192c17af 100644
 +                    )
 +                )
 +                functional_parameters[raw_name] = parameter_indices
++                functional_modules[raw_name] = module
              for name in self.plan.full_names:
 -                parameter = by_name[name][1]
 -                parameter.requires_grad_(True)
@@ -746,22 +758,14 @@ index f1da6d2d..192c17af 100644
 +                trainable.append(master)
 +                publication_slots.append(slot)
 +                functional_parameters[raw_name] = slot.parameter_indices
++                functional_modules[raw_name] = module
          if not trainable:
              raise RuntimeError("native backend trainable layout is empty")
          self.names = tuple(trainable_names)
          self.trainable = tuple(trainable)
 +        self.functional_parameters = functional_parameters
++        self.functional_modules = functional_modules
 +        self.publication_slots = tuple(publication_slots)
-+        self.shadow_linear_modules = tuple(
-+            module
-+            for module in self.model.modules()
-+            if getattr(module, "quant_method", None) is not None
-+            and any(
-+                slot.quantize is not None
-+                and slot.live_weight is getattr(module, "weight", None)
-+                for slot in publication_slots
-+            )
-+        )
          self.initial = tuple(value.detach().clone() for value in self.trainable)
          self.optimizer = build_parameter_optimizer(
              self.trainable,
@@ -777,7 +781,7 @@ index f1da6d2d..192c17af 100644
          context_capacity = int(
              server_args.context_length
              or getattr(model.config, "max_position_embeddings", config.canvas_tokens)
-@@ -192,7 +375,9 @@ class NativeBackendOnlineAdapter:
+@@ -192,7 +379,9 @@ class NativeBackendOnlineAdapter:
          )
          candidate_bytes = estimate_functional_optimizer_scratch_bytes(
              self.optimizer,
@@ -788,7 +792,7 @@ index f1da6d2d..192c17af 100644
          )
          scratch = parameter_bytes + activation_bytes + candidate_bytes
          self.runtime.bind_memory(
-@@ -228,12 +413,42 @@ class NativeBackendOnlineAdapter:
+@@ -228,12 +417,42 @@ class NativeBackendOnlineAdapter:
      def begin_round(
          self, request_ids: Sequence[str], prefix_lens: torch.Tensor
      ) -> int:
@@ -833,7 +837,7 @@ index f1da6d2d..192c17af 100644
          request_ids: Sequence[str],
          prefix_lens: torch.Tensor,
          source_tensors: Sequence[torch.Tensor],
-@@ -241,10 +456,8 @@ class NativeBackendOnlineAdapter:
+@@ -241,10 +460,8 @@ class NativeBackendOnlineAdapter:
      ) -> None:
          if not self.runtime.update_due():
              return
@@ -846,7 +850,7 @@ index f1da6d2d..192c17af 100644
              return
          self.live_launch_count += 1
          self.last_source_tensor_shapes = tuple(
-@@ -256,9 +469,25 @@ class NativeBackendOnlineAdapter:
+@@ -256,9 +473,25 @@ class NativeBackendOnlineAdapter:
          try:
              with self.runtime.side_update(tuple(source_tensors)):
                  with self.runtime.timing("training"):
@@ -873,7 +877,7 @@ index f1da6d2d..192c17af 100644
                          allow_unused=True,
                      )
                      connected = tuple(
-@@ -336,6 +565,93 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +569,110 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -921,6 +925,7 @@ index f1da6d2d..192c17af 100644
 +        for name in sorted(parents):
 +            module = self.model.get_submodule(name) if name else self.model
 +            hooks.append(module.register_forward_hook(capture(name)))
++        replacements = self.shadow_parameters(parameters)
 +        native_ops = [
 +            module
 +            for module in self.model.modules()
@@ -928,29 +933,41 @@ index f1da6d2d..192c17af 100644
 +        ]
 +        for module in native_ops:
 +            module.enter_torch_compile(1)
++        temporary_weights = []
++        torch_linear_forwards = []
++        linear_methods = []
++        seen_methods = set()
++        for raw_name, replacement in replacements.items():
++            module = self.functional_modules[raw_name]
++            leaf = raw_name.rpartition(".")[2]
++            attribute = f"_lightcone_shadow_{leaf}"
++            setattr(module, attribute, replacement)
++            temporary_weights.append((module, attribute))
++            if isinstance(module, torch.nn.Linear):
++                torch_linear_forwards.append((module, module.forward))
++                module.forward = types.MethodType(
++                    _shadow_torch_linear_forward, module
++                )
++            elif getattr(module, "quant_method", None) is not None:
++                method = module.quant_method
++                if id(method) not in seen_methods:
++                    seen_methods.add(id(method))
++                    linear_methods.append((method, method.apply))
++                    method.apply = types.MethodType(_shadow_linear_apply, method)
++            elif leaf not in {"w13_weight", "w2_weight"}:
++                raise RuntimeError(f"NEXTN shadow cannot bind {raw_name}")
 +        moe_forwards = []
 +        for module in self.model.modules():
 +            if hasattr(module, "w13_weight") and hasattr(module, "w2_weight"):
 +                moe_forwards.append((module, module.forward))
 +                module.forward = types.MethodType(_shadow_moe_forward, module)
-+        linear_methods = []
-+        for module in self.shadow_linear_modules:
-+            method = module.quant_method
-+            linear_methods.append((method, method.apply))
-+            method.apply = types.MethodType(_shadow_linear_apply, method)
 +        from sglang.srt.models import qwen2_moe
 +
 +        fused_shared_add = qwen2_moe.fused_gate_sigmoid_mul_add
 +        qwen2_moe.fused_gate_sigmoid_mul_add = torch_native_shared_expert_add
 +        try:
 +            with grad_enabled_forwards(self.model):
-+                output = torch.func.functional_call(
-+                    self.model,
-+                    self.shadow_parameters(parameters),
-+                    args,
-+                    kwargs,
-+                    strict=False,
-+                )
++                output = self.model(*args, **kwargs)
 +                self.last_shadow_grad["logits"] = output.next_token_logits.requires_grad
 +                return output
 +        finally:
@@ -959,6 +976,10 @@ index f1da6d2d..192c17af 100644
 +            qwen2_moe.fused_gate_sigmoid_mul_add = fused_shared_add
 +            for method, forward in reversed(linear_methods):
 +                method.apply = forward
++            for module, forward in reversed(torch_linear_forwards):
++                module.forward = forward
++            for module, attribute in reversed(temporary_weights):
++                delattr(module, attribute)
 +            for module, forward in reversed(moe_forwards):
 +                module.forward = forward
 +            for module in reversed(native_ops):
@@ -967,7 +988,7 @@ index f1da6d2d..192c17af 100644
      def after_commit(
          self,
          request_ids: Sequence[str],
-@@ -345,6 +661,14 @@ class NativeBackendOnlineAdapter:
+@@ -345,6 +682,14 @@ class NativeBackendOnlineAdapter:
          committed_tokens: torch.Tensor,
      ) -> None:
          request_ids = tuple(request_ids)
@@ -982,7 +1003,7 @@ index f1da6d2d..192c17af 100644
          self.runtime.record_device_commit(request_ids, committed_tokens)
          self.runtime.record_round_outcome(
              request_ids,
-@@ -354,10 +678,12 @@ class NativeBackendOnlineAdapter:
+@@ -354,10 +699,12 @@ class NativeBackendOnlineAdapter:
          )
  
      def finish_request(self, request_id: str) -> None:
@@ -995,7 +1016,7 @@ index f1da6d2d..192c17af 100644
          if self.runtime.abort_request(request_id):
              self._restore_request_source()
  
-@@ -388,6 +714,7 @@ class NativeBackendOnlineAdapter:
+@@ -388,6 +735,7 @@ class NativeBackendOnlineAdapter:
                  "native_last_source_tensor_shapes": self.last_source_tensor_shapes,
                  "native_last_feedback_source_version": self.last_feedback_source_version,
                  "native_parameter_names": self.names,
