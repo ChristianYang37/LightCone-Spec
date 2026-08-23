@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index be5902f1..97dea203 100644
+index be5902f1..7d81d009 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
 @@ -1,4 +1,5 @@
@@ -92,9 +92,9 @@ index be5902f1..97dea203 100644
 +                        forward_batch,
 +                    )
 +                logits.append(output.next_token_logits)
-+        if not logits:
-+            raise RuntimeError("NEXTN current-block replay is empty")
-+        return torch.stack(logits, dim=1)
++            if not logits:
++                raise RuntimeError("NEXTN current-block replay is empty")
++            return torch.stack(logits, dim=1)
 +
      def draft_extend(self):
          pass
@@ -250,7 +250,7 @@ index be5902f1..97dea203 100644
                  committed = batch_output.accept_lens.to(torch.int64)
                  online_adapter.after_commit(
 diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
-index 7fc522e2..0e296cc0 100644
+index 7fc522e2..e64b827d 100644
 --- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 +++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 @@ -21,12 +21,12 @@ start of the next draft.
@@ -318,9 +318,9 @@ index 7fc522e2..0e296cc0 100644
 +                        forward_batch,
 +                    )
 +                logits.append(output.next_token_logits)
-+        if not logits:
-+            raise RuntimeError("NEXTN current-block replay is empty")
-+        return torch.stack(logits, dim=1)
++            if not logits:
++                raise RuntimeError("NEXTN current-block replay is empty")
++            return torch.stack(logits, dim=1)
 +
      def draft(self, batch: ScheduleBatch):
          if batch.forward_mode.is_idle():
