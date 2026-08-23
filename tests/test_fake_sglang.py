@@ -290,7 +290,7 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     assert ledger.order == ("replacement",)
 
 
-def test_adapter_tensor_payload_round_trips_without_process_sharing():
+def test_adapter_tensor_payload_round_trips_and_preserves_request_ownership(monkeypatch):
     import base64
     import importlib.util
     import pickle
@@ -303,6 +303,17 @@ def test_adapter_tensor_payload_round_trips_without_process_sharing():
     original = {"layer.lora_A.weight": torch.arange(8).reshape(2, 4)}
     restored = pickle.loads(base64.b64decode(module._portable_tensor_payload(original)))
     assert torch.equal(restored["layer.lora_A.weight"], original["layer.lora_A.weight"])
+
+    monkeypatch.setattr(
+        module,
+        "_post_json",
+        lambda *_: [
+            {"meta_info": {"id": "mixed-01"}, "output_ids": [2]},
+            {"meta_info": {"id": "mixed-00"}, "output_ids": [1]},
+        ],
+    )
+    rows, _ = module._adapter_generate("http://unused", "p", ("a", "b"), "mixed", 1, 1)
+    assert [row["output_ids"] for row in rows] == [[1], [2]]
 
 
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):

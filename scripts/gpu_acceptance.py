@@ -109,6 +109,7 @@ def _adapter_observation(row: dict[str, object]) -> dict[str, object]:
     if not isinstance(events, list):
         raise RuntimeError("adapter-batching response has no native timestamps")
     return {
+        "rid": str(meta["id"]),
         "output_ids": [int(value) for value in row["output_ids"]],
         "logprobs": [float(value[0]) for value in raw_logprobs],
         "timestamps_ns": [int(value["committed_ns"]) for value in events],
@@ -127,13 +128,15 @@ def _adapter_generate(
     base_url: str,
     prompt: str,
     adapters: tuple[str | None, ...],
+    label: str,
     max_new_tokens: int,
     timeout: float,
 ) -> tuple[list[dict[str, object]], float]:
+    rids = [f"{label}-{index:02d}" for index in range(len(adapters))]
     body = {
         "text": [prompt] * len(adapters),
         "lora_path": list(adapters),
-        "rid": [f"adapter-{index:02d}" for index in range(len(adapters))],
+        "rid": rids,
         "sampling_params": [
             {
                 "temperature": 0.0,
@@ -155,7 +158,10 @@ def _adapter_generate(
     rows = payload if isinstance(payload, list) else [payload]
     if len(rows) != len(adapters) or any(not isinstance(row, dict) for row in rows):
         raise RuntimeError("adapter-batching response has the wrong batch size")
-    return rows, elapsed
+    by_rid = {str(row["meta_info"]["id"]): row for row in rows}
+    if len(by_rid) != len(rids) or set(by_rid) != set(rids):
+        raise RuntimeError("adapter-batching response has wrong request ownership")
+    return [by_rid[rid] for rid in rids], elapsed
 
 
 def _gpu_memory_mb(gpu: int) -> float:
@@ -617,6 +623,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
             base_url,
             prompt,
             (None,),
+            "base",
             args.max_new_tokens,
             config.server.request_timeout_seconds,
         )
@@ -627,6 +634,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
                 base_url,
                 prompt,
                 (name,),
+                f"solo-{name}",
                 args.max_new_tokens,
                 config.server.request_timeout_seconds,
             )
@@ -639,19 +647,55 @@ def adapter_batching(args: argparse.Namespace) -> None:
         blocks = []
         for count in (1, 2, 4, 8):
             active = names[:count]
+            repeated_rows, _ = _adapter_generate(
+                base_url,
+                prompt,
+                (names[0],) * count,
+                f"repeated-{count}",
+                args.max_new_tokens,
+                config.server.request_timeout_seconds,
+            )
+            repeated = [_adapter_observation(row) for row in repeated_rows]
+            if any(not _observations_match(row, solo[names[0]]) for row in repeated):
+                _write(
+                    output / "failure.json",
+                    {
+                        "kind": "batch_shape_mismatch",
+                        "adapter_count": count,
+                        "solo": solo[names[0]],
+                        "batched": repeated,
+                    },
+                )
+                raise RuntimeError("repeated adapter batch changed a request result")
             for block in range(3):
                 rows, elapsed = _adapter_generate(
                     base_url,
                     prompt,
                     active,
+                    f"mixed-{count}-{block}",
                     args.max_new_tokens,
                     config.server.request_timeout_seconds,
                 )
                 observations = [_adapter_observation(row) for row in rows]
-                if any(
-                    not _observations_match(observation, solo[name])
+                mismatches = [
+                    {
+                        "adapter": name,
+                        "solo": solo[name],
+                        "mixed": observation,
+                    }
                     for name, observation in zip(active, observations, strict=True)
-                ):
+                    if not _observations_match(observation, solo[name])
+                ]
+                if mismatches:
+                    _write(
+                        output / "failure.json",
+                        {
+                            "kind": "mixed_adapter_mismatch",
+                            "adapter_count": count,
+                            "block": block,
+                            "mismatches": mismatches,
+                        },
+                    )
                     raise RuntimeError("mixed adapter batch changed a request result")
                 intervals = [
                     (right - left) / 1_000_000
