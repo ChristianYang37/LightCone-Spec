@@ -513,7 +513,7 @@ index 7fc522e2..27410fb2 100644
  
      def alloc_memory_pool(
          self,
-@@ -406,6 +409,39 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
+@@ -406,6 +409,40 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
          stashed.num_tokens_for_logprob_per_req = 1
          return stashed
  
@@ -521,6 +521,7 @@ index 7fc522e2..27410fb2 100644
 +        replay = copy.copy(forward_batch)
 +        replay.input_ids = forward_batch.input_ids.detach().clone()
 +        replay.positions = forward_batch.positions.detach().clone()
++        replay.next_token_logits_buffer = None
 +        replay.spec_info = copy.copy(forward_batch.spec_info)
 +        replay.spec_info.hidden_states = (
 +            forward_batch.spec_info.hidden_states.detach().clone()
