@@ -564,6 +564,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
         "--lora-backend",
         "torch_native",
         "--disable-cuda-graph",
+        "--enable-deterministic-inference",
         "--disable-radix-cache",
         "--skip-server-warmup",
     ]
