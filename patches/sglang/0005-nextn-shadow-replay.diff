@@ -1,3 +1,254 @@
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index be5902f1..97dea203 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1,4 +1,5 @@
+ import contextlib
++import copy
+ import logging
+ import time
+ from dataclasses import replace
+@@ -7,6 +8,7 @@ from typing import List, Optional
+ import torch
+ import torch.nn.functional as F
+ 
++from lightcone_spec.nextn import ragged_kl_loss
+ from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
+@@ -148,6 +150,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         self._online_adapter = None
+         self._online_hidden_rows: tuple[torch.Tensor, ...] = ()
+         self._online_logit_rows: tuple[torch.Tensor, ...] = ()
++        self._online_replay_batches: tuple[tuple[ForwardBatch, int], ...] = ()
+ 
+         self._rebuild_topk1_chain_buffers()
+ 
+@@ -575,6 +578,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         )
+         online_hidden_rows: list[torch.Tensor] = []
+         online_logit_rows: list[torch.Tensor] = []
++        online_replay_batches: list[tuple[ForwardBatch, int]] = []
+         if self.server_args.speculative_use_rejection_sampling:
+             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+ 
+@@ -644,9 +648,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                 if (c := self.draft_runner.canary_manager) is not None
+                 else contextlib.nullcontext()
+             )
++            nextn_replay = (
++                online_update and self._online_adapter.config.algorithm == "NEXTN"
++            )
++            if nextn_replay:
++                online_replay_batches.append(
++                    (self._capture_replay_batch(forward_batch), i)
++                )
+             with (
+-                torch.inference_mode(not online_update),
+-                torch.set_grad_enabled(online_update),
++                torch.inference_mode(not online_update or nextn_replay),
++                torch.set_grad_enabled(online_update and not nextn_replay),
+             ):
+                 with (
+                     forward_context(
+@@ -712,6 +723,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+ 
+         self._online_hidden_rows = tuple(online_hidden_rows)
+         self._online_logit_rows = tuple(online_logit_rows)
++        self._online_replay_batches = tuple(online_replay_batches)
+ 
+         draft_probs = (
+             torch.stack(draft_probs_list, dim=1)
+@@ -739,6 +751,39 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+ 
+         return parent_list, top_scores_index, draft_tokens, draft_probs
+ 
++    def _capture_replay_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
++        replay = copy.copy(forward_batch)
++        replay.input_ids = forward_batch.input_ids.detach().clone()
++        replay.positions = forward_batch.positions.detach().clone()
++        replay.next_token_logits_buffer = None
++        replay.spec_info = copy.copy(forward_batch.spec_info)
++        replay.spec_info.hidden_states = (
++            forward_batch.spec_info.hidden_states.detach().clone()
++        )
++        if forward_batch.mm_input_embeds is not None:
++            replay.mm_input_embeds = forward_batch.mm_input_embeds.detach().clone()
++        return replay
++
++    def replay_current_block(self, adapter, parameters) -> torch.Tensor:
++        logits = []
++        with torch.inference_mode(False), torch.enable_grad():
++            for forward_batch, step in self._online_replay_batches:
++                with forward_context(
++                    ForwardContext(
++                        attn_backend=self.draft_attn_backend.attn_backends[step]
++                    )
++                ):
++                    output = adapter.shadow_forward(
++                        parameters,
++                        forward_batch.input_ids,
++                        forward_batch.positions,
++                        forward_batch,
++                    )
++                logits.append(output.next_token_logits)
++        if not logits:
++            raise RuntimeError("NEXTN current-block replay is empty")
++        return torch.stack(logits, dim=1)
++
+     def draft_extend(self):
+         pass
+ 
+@@ -1296,52 +1341,110 @@ class EAGLEWorkerV2(BaseSpecWorker):
+                         len(round_request_ids),
+                         online_adapter.config.adaptation_microbatch_size,
+                     )
+-                    steps = min(len(hidden_rows), len(logit_rows))
+-                    with torch.inference_mode(False), torch.enable_grad():
+-                        hidden = torch.cat(
+-                            tuple(row[:microbatch] for row in hidden_rows[:steps]),
+-                            dim=0,
++                    update_ids = round_request_ids[:microbatch]
++                    if online_adapter.config.algorithm == "NEXTN":
++                        verify_ids = tuple(request.rid for request in batch.reqs)
++                        width = self.speculative_num_draft_tokens
++                        verify_slots = {
++                            rid: index for index, rid in enumerate(verify_ids)
++                        }
++                        same_requests = all(rid in verify_slots for rid in update_ids)
++                        starts = (
++                            tuple(verify_slots[rid] * width for rid in update_ids)
++                            if same_requests
++                            else ()
+                         )
+-                        draft_logits = torch.cat(
+-                            tuple(row[:microbatch] for row in logit_rows[:steps]),
+-                            dim=0,
+-                        )
+-                    target_logits = batch_output.logits_output.next_token_logits.reshape(
+-                        len(round_request_ids), self.speculative_num_draft_tokens, -1
+-                    )
+-                    teacher_logits = (
+-                        target_logits[:microbatch, :steps]
+-                        .transpose(0, 1)
+-                        .reshape(-1, target_logits.shape[-1])
+-                    )
+-                    row_count = min(
+-                        hidden.shape[0], draft_logits.shape[0], teacher_logits.shape[0]
+-                    )
+-                    if row_count < 1 or draft_logits.shape[-1] != teacher_logits.shape[-1]:
+-                        online_adapter.runtime.disable(
+-                            "eagle3_teacher_interface_mismatch", exactness=True
++                        ends = tuple(start + width for start in starts)
++                        aligned = same_requests and online_adapter.bind_verify(
++                            update_ids,
++                            starts,
++                            ends,
++                            len(self.draft_worker._online_replay_batches),
+                         )
++                        teacher = batch_output.logits_output.next_token_logits
++                        expected = len(verify_ids) * width
++                        if not aligned or teacher.shape[0] < expected:
++                            online_adapter.runtime.disable(
++                                "nextn_teacher_interface_mismatch", exactness=True
++                            )
++                        else:
++                            baseline = torch.stack(logit_rows, dim=1)[:microbatch]
++
++                            def replay_loss(parameters):
++                                replay = self.draft_worker.replay_current_block(
++                                    online_adapter, parameters
++                                )[:microbatch]
++                                return ragged_kl_loss(
++                                    replay.flatten(0, 1),
++                                    teacher[:expected],
++                                    online_adapter.request_ledger,
++                                )
++
++                            online_adapter.launch(
++                                replay=replay_loss,
++                                request_ids=update_ids,
++                                prefix_lens=round_prefix_lens[:microbatch],
++                                source_tensors=(baseline, teacher),
++                                feedback_source_version=(
++                                    online_adapter.source_adapter_version
++                                ),
++                            )
+                     else:
++                        steps = min(len(hidden_rows), len(logit_rows))
+                         with torch.inference_mode(False), torch.enable_grad():
+-                            hidden = hidden[:row_count]
+-                            draft_logits = draft_logits[:row_count]
+-                            teacher_logits = (
+-                                teacher_logits[:row_count].detach().clone()
++                            hidden = torch.cat(
++                                tuple(row[:microbatch] for row in hidden_rows[:steps]),
++                                dim=0,
++                            )
++                            draft_logits = torch.cat(
++                                tuple(row[:microbatch] for row in logit_rows[:steps]),
++                                dim=0,
+                             )
+-                            loss = F.kl_div(
+-                                F.log_softmax(draft_logits.float(), dim=-1),
+-                                F.softmax(teacher_logits.float(), dim=-1),
+-                                reduction="batchmean",
++                        target_logits = (
++                            batch_output.logits_output.next_token_logits.reshape(
++                                len(round_request_ids),
++                                self.speculative_num_draft_tokens,
++                                -1,
+                             )
+-                        online_adapter.launch(
+-                            loss=loss,
+-                            request_ids=round_request_ids[:microbatch],
+-                            prefix_lens=round_prefix_lens[:microbatch],
+-                            source_tensors=(hidden, draft_logits, teacher_logits),
+-                            feedback_source_version=(
+-                                online_adapter.source_adapter_version
+-                            ),
+                         )
++                        teacher_logits = (
++                            target_logits[:microbatch, :steps]
++                            .transpose(0, 1)
++                            .reshape(-1, target_logits.shape[-1])
++                        )
++                        row_count = min(
++                            hidden.shape[0],
++                            draft_logits.shape[0],
++                            teacher_logits.shape[0],
++                        )
++                        if (
++                            row_count < 1
++                            or draft_logits.shape[-1] != teacher_logits.shape[-1]
++                        ):
++                            online_adapter.runtime.disable(
++                                "eagle3_teacher_interface_mismatch", exactness=True
++                            )
++                        else:
++                            with torch.inference_mode(False), torch.enable_grad():
++                                hidden = hidden[:row_count]
++                                draft_logits = draft_logits[:row_count]
++                                teacher_logits = (
++                                    teacher_logits[:row_count].detach().clone()
++                                )
++                                loss = F.kl_div(
++                                    F.log_softmax(draft_logits.float(), dim=-1),
++                                    F.softmax(teacher_logits.float(), dim=-1),
++                                    reduction="batchmean",
++                                )
++                            online_adapter.launch(
++                                loss=loss,
++                                request_ids=update_ids,
++                                prefix_lens=round_prefix_lens[:microbatch],
++                                source_tensors=(hidden, draft_logits, teacher_logits),
++                                feedback_source_version=(
++                                    online_adapter.source_adapter_version
++                                ),
++                            )
+             if online_adapter is not None and not batch.forward_mode.is_idle():
+                 committed = batch_output.accept_lens.to(torch.int64)
+                 online_adapter.after_commit(
 diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 index 7fc522e2..0e296cc0 100644
 --- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
