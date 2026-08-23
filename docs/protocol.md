@@ -53,7 +53,9 @@ E1 first runs all 68 rows at `c1`, then probes the E3a load grid for the anchors
 and two-optimizer Pareto union. Its highest common safe load caps E2 and is
 reused by E3/E4. TTS uses the fixed paper recipe: Adam, zero weight decay, no gradient clipping,
 the complete drafter, one update step, latest-round-only teacher rows,
-`exp(-1/7)` positional decay, and request reset. TTS and L0-naive share the
+and `exp(-1/7)` positional decay. TTS-Cal and single-request mechanism rows
+reset per request; registered multi-request blocks reset once and share one cohort
+state. TTS and L0-naive share the
 candidate update and differ only in publication policy. TTS-Cal uses 76 tuning
 problems from an explicit tuning split and never executes the four explicit
 holdout IDs. E2
@@ -65,7 +67,9 @@ arrival traces, sticky cohorts, popularity, topology, and eleven failures to
 runtime behavior; BurstGPT replays both arrival times and input/output lengths.
 E5 uses 10 s warm-up, 60 s headline, 300 s soak, 120 s request deadlines and
 180 s drain; a separate 11,000-request boundary extension resolves p99 only
-after 10,000 completions. Every E6 role, including Target-only, runs TP2 and
+after 10,000 completions. Each E6 interface row runs separate LoRA and Full
+finite-update gates; an infeasible Full `c1` gate remains blocked. Every E6
+role, including Target-only, runs TP2 and
 each model freezes its own common load from `c1` through `c256`.
 
 Required correctness checks are limited to:

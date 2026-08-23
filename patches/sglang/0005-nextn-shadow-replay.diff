@@ -1,0 +1,720 @@
+diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+--- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
++++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
+@@ -4,6 +4,7 @@
+ 
+ import logging
+ import math
++import types
+-from collections.abc import Sequence
++from collections.abc import Callable, Sequence
+ 
+ import torch
+@@ -26,4 +27,11 @@
+     build_native_parameter_plan,
+ )
++
++from lightcone_spec.nextn import (
++    MergedPublicationBank,
++    PublicationSlot,
++    RequestLedger,
++    torch_native_selected_moe,
++)
+ 
+ logger = logging.getLogger(__name__)
+@@ -33,11 +41,10 @@
+     return sum(value.numel() * value.element_size() for value in tensors)
+ 
+ 
+-class _LowRankDelta(torch.nn.Module):
+-    """Fixed-address LoRA factors over one frozen backend matrix."""
++class _LowRankFactors:
++    """Side-stream LoRA factors; serving reads only the merged live weight."""
+ 
+     def __init__(self, weight: torch.Tensor, *, rank: int, seed: int) -> None:
+-        super().__init__()
+         if weight.ndim != 2 or rank > min(weight.shape):
+             raise ValueError("native LoRA rank exceeds its backend matrix")
+         generator = torch.Generator(device=weight.device)
+@@ -60,10 +67,113 @@
+         )
+         torch.nn.init.kaiming_uniform_(self.a, a=math.sqrt(5), generator=generator)
+ 
++
++class _LowRankDelta(torch.nn.Module):
++    def __init__(self, weight: torch.Tensor, *, rank: int, seed: int) -> None:
++        super().__init__()
++        factors = _LowRankFactors(weight, rank=rank, seed=seed)
++        self.a = factors.a
++        self.b = factors.b
++
+     def forward(self, original: torch.Tensor) -> torch.Tensor:
+         return original + (self.b @ self.a).to(original.dtype)
+ 
+ 
++
++def _block_fp8_slot(
++    name: str,
++    raw_name: str,
++    module: torch.nn.Module,
++    weight: torch.Tensor,
++    parameter_indices: tuple[int, ...],
++) -> PublicationSlot:
++    parent_name, _, leaf = raw_name.rpartition(".")
++    scale_attribute = (
++        "weight_scale_inv" if leaf == "weight" else f"{leaf}_scale_inv"
++    )
++    scale = getattr(module, scale_attribute, None)
++    if scale is None or scale.ndim != weight.ndim:
++        raise ValueError(f"{name} uses an unsupported FP8 publication layout")
++    block_n = math.ceil(weight.shape[-2] / scale.shape[-2])
++    block_k = math.ceil(weight.shape[-1] / scale.shape[-1])
++
++    def expanded_scale(value: torch.Tensor) -> torch.Tensor:
++        return (
++            value.repeat_interleave(block_n, dim=-2)
++            .repeat_interleave(block_k, dim=-1)[..., : weight.shape[-2], : weight.shape[-1]]
++        )
++
++    base = weight.float() * expanded_scale(scale.float())
++
++    def quantize(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        rows, columns = value.shape[-2:]
++        padded_rows = scale.shape[-2] * block_n
++        padded_columns = scale.shape[-1] * block_k
++        padded = torch.nn.functional.pad(
++            value.float(), (0, padded_columns - columns, 0, padded_rows - rows)
++        )
++        grouped = padded.reshape(
++            *value.shape[:-2], scale.shape[-2], block_n, scale.shape[-1], block_k
++        )
++        candidate_scale = grouped.abs().amax(dim=(-3, -1)).clamp_min(1e-12) / 448.0
++        quantized = (value.float() / expanded_scale(candidate_scale)).clamp(-448, 448)
++        return quantized.to(weight.dtype), candidate_scale.to(scale.dtype)
++
++    return PublicationSlot(
++        name=name,
++        live_weight=weight,
++        base_master=base,
++        parameter_indices=parameter_indices,
++        live_scale=scale,
++        scale_name=f"{parent_name}.{scale_attribute}",
++        quantize=quantize,
++    )
++
++
++def _publication_slot(
++    name: str,
++    raw_name: str,
++    module: torch.nn.Module,
++    weight: torch.Tensor,
++    base: torch.Tensor,
++    parameter_indices: tuple[int, ...],
++) -> PublicationSlot:
++    if weight.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
++        return _block_fp8_slot(
++            name, raw_name, module, weight, parameter_indices
++        )
++    return PublicationSlot(name, weight, base.float(), parameter_indices)
++
++
++def _moe_scale(module: torch.nn.Module, stem: str) -> torch.Tensor | None:
++    scale = getattr(module, f"{stem}_weight_scale_inv", None)
++    return scale if scale is not None else getattr(module, f"{stem}_weight_scale", None)
++
++
++def _shadow_moe_forward(
++    module: torch.nn.Module,
++    hidden_states: torch.Tensor,
++    topk_output,
++    pre_quant_input=None,
++):
++    del pre_quant_input
++    top_weights, top_ids, _ = topk_output
++    return torch_native_selected_moe(
++        hidden_states,
++        top_weights,
++        top_ids,
++        module.w13_weight,
++        module.w2_weight,
++        w13_scale=_moe_scale(module, "w13"),
++        w2_scale=_moe_scale(module, "w2"),
++    )
++
++
++def _shadow_linear_apply(method, layer, inputs, bias=None, **kwargs):
++    del method, kwargs
++    return torch.nn.functional.linear(inputs, layer.weight.to(inputs.dtype), bias)
++
++
+ def _canonical_named_parameters(model) -> tuple[tuple[str, str, torch.Tensor], ...]:
+     rows = []
+     seen = set()
+@@ -98,15 +208,35 @@
+         self.last_source_tensor_shapes: tuple[tuple[int, ...], ...] = ()
+         self.last_feedback_source_version: int | None = None
+         by_name = {name: (raw_name, parameter) for name, raw_name, parameter in rows}
+-        self._parametrizations: list[_LowRankDelta] = []
++        self.request_ledger = RequestLedger()
++        self.round_alignment_ok = True
++        publication_slots: list[PublicationSlot] = []
++        functional_parameters: dict[str, tuple[int, ...]] = {}
+         trainable_names: list[str] = []
+         trainable: list[torch.Tensor] = []
+         if config.weight_update_mode == "full":
+             for name in self.plan.full_names:
+-                parameter = by_name[name][1]
+-                parameter.requires_grad_(True)
++                raw_name, parameter = by_name[name]
++                if algorithm != "NEXTN":
++                    parameter.requires_grad_(True)
++                    trainable_names.append(name)
++                    trainable.append(parameter)
++                    continue
++                parent_name, _, _ = raw_name.rpartition(".")
++                module = model.get_submodule(parent_name) if parent_name else model
++                slot = _publication_slot(
++                    name,
++                    raw_name,
++                    module,
++                    parameter,
++                    parameter.detach().float().clone(),
++                    (len(trainable),),
++                )
++                master = torch.nn.Parameter(slot.base_master.detach().clone())
+                 trainable_names.append(name)
+-                trainable.append(parameter)
++                trainable.append(master)
++                publication_slots.append(slot)
++                functional_parameters[raw_name] = slot.parameter_indices
+         else:
+             if config.rank is None:
+                 raise AssertionError("validated native LoRA config has no rank")
+@@ -116,37 +246,86 @@
+                 if leaf != "weight":
+                     raise ValueError("native LoRA selector named a non-weight tensor")
+                 module = model.get_submodule(parent_name) if parent_name else model
+-                parameter.requires_grad_(False)
+-                parametrization = _LowRankDelta(
++                if algorithm != "NEXTN":
++                    parametrization = _LowRankDelta(
++                        parameter,
++                        rank=config.rank,
++                        seed=config.seed + index,
++                    )
++                    torch.nn.utils.parametrize.register_parametrization(
++                        module, leaf, parametrization, unsafe=True
++                    )
++                    trainable_names.extend((f"{name}.lora_a", f"{name}.lora_b"))
++                    trainable.extend((parametrization.a, parametrization.b))
++                    continue
++                factors = _LowRankFactors(
+                     parameter,
+                     rank=config.rank,
+                     seed=config.seed + index,
+                 )
+-                torch.nn.utils.parametrize.register_parametrization(
+-                    module,
+-                    leaf,
+-                    parametrization,
+-                    unsafe=True,
+-                )
+-                self._parametrizations.append(parametrization)
+                 trainable_names.extend((f"{name}.lora_a", f"{name}.lora_b"))
+-                trainable.extend((parametrization.a, parametrization.b))
+-            for name in self.plan.full_names:
+-                parameter = by_name[name][1]
+-                parameter.requires_grad_(True)
++                parameter_indices = (len(trainable), len(trainable) + 1)
++                trainable.extend((factors.a, factors.b))
++                publication_slots.append(
++                    _publication_slot(
++                        name,
++                        raw_name,
++                        module,
++                        parameter,
++                        parameter.detach().float().clone(),
++                        parameter_indices,
++                    )
++                )
++                functional_parameters[raw_name] = parameter_indices
++            for name in self.plan.full_names:
++                raw_name, parameter = by_name[name]
++                if algorithm != "NEXTN":
++                    parameter.requires_grad_(True)
++                    trainable_names.append(name)
++                    trainable.append(parameter)
++                    continue
++                parent_name, _, _ = raw_name.rpartition(".")
++                module = model.get_submodule(parent_name) if parent_name else model
++                slot = _publication_slot(
++                    name,
++                    raw_name,
++                    module,
++                    parameter,
++                    parameter.detach().float().clone(),
++                    (len(trainable),),
++                )
++                master = torch.nn.Parameter(slot.base_master.detach().clone())
+                 trainable_names.append(name)
+-                trainable.append(parameter)
++                trainable.append(master)
++                publication_slots.append(slot)
++                functional_parameters[raw_name] = slot.parameter_indices
+         if not trainable:
+             raise RuntimeError("native backend trainable layout is empty")
+         self.names = tuple(trainable_names)
+         self.trainable = tuple(trainable)
++        self.functional_parameters = functional_parameters
++        self.publication_slots = tuple(publication_slots)
++        self.shadow_linear_modules = tuple(
++            module
++            for module in self.model.modules()
++            if getattr(module, "quant_method", None) is not None
++            and any(
++                slot.quantize is not None
++                and slot.live_weight is getattr(module, "weight", None)
++                for slot in publication_slots
++            )
++        )
+         self.initial = tuple(value.detach().clone() for value in self.trainable)
+         self.optimizer = build_parameter_optimizer(
+             self.trainable,
+             config,
+             projection_origin=self.initial,
+         )
+-        self.inference = FixedInferenceBank(self.trainable)
++        self.inference = (
++            MergedPublicationBank(publication_slots)
++            if publication_slots
++            else FixedInferenceBank(self.trainable)
++        )
+         context_capacity = int(
+             server_args.context_length
+             or getattr(model.config, "max_position_embeddings", config.canvas_tokens)
+@@ -192,7 +371,9 @@
+         )
+         candidate_bytes = estimate_functional_optimizer_scratch_bytes(
+             self.optimizer,
+-            merge_bytes=0,
++            merge_bytes=_bytes(self.inference.weight_staging)
++            if isinstance(self.inference, MergedPublicationBank)
++            else 0,
+         )
+         scratch = parameter_bytes + activation_bytes + candidate_bytes
+         self.runtime.bind_memory(
+@@ -228,12 +409,42 @@
+     def begin_round(
+         self, request_ids: Sequence[str], prefix_lens: torch.Tensor
+     ) -> int:
+-        return self.runtime.begin_round(request_ids, prefix_lens)
++        version = self.runtime.begin_round(request_ids, prefix_lens)
++        if self.runtime.update_due():
++            count = min(len(request_ids), self.config.adaptation_microbatch_size)
++            selected_ids = tuple(request_ids[:count])
++            width = (
++                max(1, self.config.canvas_tokens - 1)
++                if self.config.algorithm == "NEXTN"
++                else self.config.canvas_tokens
++            )
++            self.round_alignment_ok = self.request_ledger.begin(
++                selected_ids,
++                prefix_lens[:count].detach().to("cpu").tolist(),
++                tuple(index * width for index in range(count + 1)),
++            )
++        return version
+ 
++    def bind_verify(
++        self,
++        request_ids: Sequence[str],
++        teacher_starts: Sequence[int],
++        teacher_ends: Sequence[int],
++        draft_rows_per_request: int,
++    ) -> bool:
++        for row in self.request_ledger.rows.values():
++            row.draft_start = row.proposal_slot * draft_rows_per_request
++            row.draft_end = row.draft_start + draft_rows_per_request
++        self.round_alignment_ok = self.round_alignment_ok and self.request_ledger.bind_verify(
++            request_ids, teacher_starts, teacher_ends
++        )
++        return self.round_alignment_ok
++
+     def launch(
+         self,
+         *,
+-        loss: torch.Tensor,
++        loss: torch.Tensor | None = None,
++        replay: Callable[[], torch.Tensor] | None = None,
+         request_ids: Sequence[str],
+         prefix_lens: torch.Tensor,
+         source_tensors: Sequence[torch.Tensor],
+@@ -241,10 +452,8 @@
+     ) -> None:
+         if not self.runtime.update_due():
+             return
+-        if loss.numel() != 1 or not loss.requires_grad:
+-            self.runtime.disable(
+-                "native_backend_loss_not_differentiable", exactness=True
+-            )
++        if not self.round_alignment_ok or tuple(request_ids) != self.request_ledger.order:
++            self.runtime.counters["exactness_violations"] += 1
+             return
+         self.live_launch_count += 1
+         self.last_source_tensor_shapes = tuple(
+@@ -256,6 +465,13 @@
+         try:
+             with self.runtime.side_update(tuple(source_tensors)):
+                 with self.runtime.timing("training"):
++                    if replay is not None:
++                        loss = replay()
++                    if loss is None or loss.numel() != 1 or not loss.requires_grad:
++                        self.runtime.disable(
++                            "native_backend_loss_not_differentiable", exactness=True
++                        )
++                        return
+                     raw = torch.autograd.grad(
+                         loss,
+                         self.trainable,
+@@ -336,6 +552,60 @@
+             self.runtime.counters["fallbacks"] += 1
+             self.runtime.disable(f"native_update_failed:{type(error).__name__}")
+ 
++    def shadow_parameters(self) -> dict[str, torch.Tensor]:
++        values = self.optimizer.master
++        slots = {slot.name: slot for slot in self.publication_slots}
++        replacements = {}
++        for canonical, raw_name, _ in _canonical_named_parameters(self.model):
++            indices = self.functional_parameters.get(raw_name)
++            if indices is None:
++                continue
++            slot = slots[canonical]
++            if len(indices) == 1:
++                replacement = values[indices[0]]
++            else:
++                a, b = (values[index] for index in indices)
++                replacement = slot.base_master + b @ a
++            if slot.quantize is None:
++                replacements[raw_name] = replacement.to(slot.live_weight.dtype)
++            else:
++                replacements[raw_name] = replacement
++        return replacements
++
++    def shadow_forward(self, *args, **kwargs):
++        native_ops = [
++            module
++            for module in self.model.modules()
++            if hasattr(module, "enter_torch_compile")
++        ]
++        for module in native_ops:
++            module.enter_torch_compile(1)
++        moe_forwards = []
++        for module in self.model.modules():
++            if hasattr(module, "w13_weight") and hasattr(module, "w2_weight"):
++                moe_forwards.append((module, module.forward))
++                module.forward = types.MethodType(_shadow_moe_forward, module)
++        linear_methods = []
++        for module in self.shadow_linear_modules:
++            method = module.quant_method
++            linear_methods.append((method, method.apply))
++            method.apply = types.MethodType(_shadow_linear_apply, method)
++        try:
++            return torch.func.functional_call(
++                self.model,
++                self.shadow_parameters(),
++                args,
++                kwargs,
++                strict=False,
++            )
++        finally:
++            for method, forward in reversed(linear_methods):
++                method.apply = forward
++            for module, forward in reversed(moe_forwards):
++                module.forward = forward
++            for module in reversed(native_ops):
++                module.leave_torch_compile()
++
+     def after_commit(
+         self,
+         request_ids: Sequence[str],
+@@ -345,6 +615,14 @@
+         committed_tokens: torch.Tensor,
+     ) -> None:
+         request_ids = tuple(request_ids)
++        if self.runtime.update_due():
++            joined = self.request_ledger.join_accept_lens(
++                request_ids,
++                accepted_drafts.detach().to("cpu").tolist(),
++            )
++            if joined is None:
++                self.round_alignment_ok = False
++                self.runtime.counters["exactness_violations"] += 1
+         self.runtime.record_device_commit(request_ids, committed_tokens)
+         self.runtime.record_round_outcome(
+             request_ids,
+@@ -354,10 +632,12 @@
+         )
+ 
+     def finish_request(self, request_id: str) -> None:
++        self.request_ledger.terminal(request_id, "finished")
+         if self.runtime.finish_request(request_id):
+             self._restore_request_source()
+ 
+     def abort_request(self, request_id: str) -> None:
++        self.request_ledger.terminal(request_id, "aborted")
+         if self.runtime.abort_request(request_id):
+             self._restore_request_source()
+ 
+diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+--- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
++++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
+@@ -21,12 +21,12 @@
+ 
+ from __future__ import annotations
+ 
++import copy
+ import logging
+ from dataclasses import replace
+ from typing import Optional
+ 
+ import torch
+-import torch.nn.functional as F
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.layers.moe.utils import (
+     speculative_moe_a2a_backend_context,
+@@ -77,6 +77,8 @@
+     maybe_detect_oob,
+ )
+ 
++from lightcone_spec.nextn import ragged_kl_loss
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -164,6 +166,7 @@
+         self._online_adapter = None
+         self._online_hidden_rows: tuple[torch.Tensor, ...] = ()
+         self._online_logit_rows: tuple[torch.Tensor, ...] = ()
++        self._online_replay_batches: tuple[ForwardBatch, ...] = ()
+ 
+     def alloc_memory_pool(
+         self,
+@@ -406,6 +409,38 @@
+         stashed.num_tokens_per_req = 1
+         stashed.num_tokens_for_logprob_per_req = 1
+         return stashed
++
++    def _capture_replay_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
++        replay = copy.copy(forward_batch)
++        replay.input_ids = forward_batch.input_ids.detach().clone()
++        replay.positions = forward_batch.positions.detach().clone()
++        replay.spec_info = copy.copy(forward_batch.spec_info)
++        replay.spec_info.hidden_states = (
++            forward_batch.spec_info.hidden_states.detach().clone()
++        )
++        if forward_batch.mm_input_embeds is not None:
++            replay.mm_input_embeds = forward_batch.mm_input_embeds.detach().clone()
++        return replay
++
++    def replay_current_block(self, adapter) -> torch.Tensor:
++        logits = []
++        with torch.inference_mode(False), torch.enable_grad():
++            for forward_batch in self._online_replay_batches:
++                with (
++                    self._target_kv_pool_view(forward_batch),
++                    forward_context(
++                        ForwardContext(attn_backend=self.draft_attn_backend)
++                    ),
++                ):
++                    output = adapter.shadow_forward(
++                        forward_batch.input_ids,
++                        forward_batch.positions,
++                        forward_batch,
++                    )
++                logits.append(output.next_token_logits)
++        if not logits:
++            raise RuntimeError("NEXTN current-block replay is empty")
++        return torch.stack(logits, dim=1)
+ 
+     def draft(self, batch: ScheduleBatch):
+         if batch.forward_mode.is_idle():
+@@ -508,6 +543,7 @@
+         )
+         online_hidden_rows: list[torch.Tensor] = []
+         online_logit_rows: list[torch.Tensor] = []
++        online_replay_batches: list[ForwardBatch] = []
+ 
+         # Seed + recurrent iters share the same `seq_lens - 1` rope position,
+         # so one init covers the loop. Must run even at num_steps == 1.
+@@ -530,10 +566,9 @@
+         forward_batch.spec_info.hidden_states = seed_prev_hidden
+         self._set_positions(forward_batch)
+ 
+-        with (
+-            torch.inference_mode(not online_update),
+-            torch.set_grad_enabled(online_update),
+-        ):
++        if online_update:
++            online_replay_batches.append(self._capture_replay_batch(forward_batch))
++        with torch.inference_mode():
+             with (
+                 self._target_kv_pool_view(forward_batch),
+                 forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+@@ -582,10 +617,9 @@
+             forward_batch.spec_info.hidden_states = hidden_states
+             self._set_positions(forward_batch)
+ 
+-            with (
+-                torch.inference_mode(not online_update),
+-                torch.set_grad_enabled(online_update),
+-            ):
++            if online_update:
++                online_replay_batches.append(self._capture_replay_batch(forward_batch))
++            with torch.inference_mode():
+                 with (
+                     self._target_kv_pool_view(forward_batch),
+                     forward_context(
+@@ -617,6 +651,7 @@
+ 
+         self._online_hidden_rows = tuple(online_hidden_rows)
+         self._online_logit_rows = tuple(online_logit_rows)
++        self._online_replay_batches = tuple(online_replay_batches)
+         return organize_draft_results(
+             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+         )
+@@ -818,6 +853,7 @@
+             assert verify_input.is_verify_input()
+             batch.spec_info = verify_input
+             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
++            verify_request_ids = tuple(request.rid for request in batch.reqs)
+             # Publish before draft-extend so the fence is at verify-end.
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+@@ -843,51 +879,68 @@
+                         len(round_request_ids),
+                         online_adapter.config.adaptation_microbatch_size,
+                     )
+-                    with torch.inference_mode(False), torch.enable_grad():
+-                        hidden = torch.cat(
+-                            tuple(row[:microbatch] for row in hidden_rows), dim=0
++                    update_ids = round_request_ids[:microbatch]
++                    rows_per_request = int(verify_input.num_tokens_per_req)
++                    teacher = batch_output.logits_output.next_token_logits
++                    expected_rows = len(verify_request_ids) * rows_per_request
++                    verify_slots = {
++                        rid: index for index, rid in enumerate(verify_request_ids)
++                    }
++                    aligned = (
++                        len(verify_slots) == len(verify_request_ids)
++                        and all(rid in verify_slots for rid in update_ids)
++                    )
++                    teacher_starts = (
++                        tuple(
++                            verify_slots[rid] * rows_per_request
++                            for rid in update_ids
++                        )
++                        if aligned
++                        else ()
++                    )
++                    teacher_ends = tuple(
++                        start + rows_per_request for start in teacher_starts
++                    )
++                    if (
++                        teacher.shape[0] < expected_rows
++                        or not aligned
++                        or not online_adapter.bind_verify(
++                            update_ids,
++                            teacher_starts,
++                            teacher_ends,
++                            len(self.draft_worker._online_replay_batches),
+                         )
+-                        draft_logits = torch.cat(
+-                            tuple(row[:microbatch] for row in logit_rows), dim=0
+-                        )
+-                    teacher_logits = batch_output.logits_output.next_token_logits[
+-                        :microbatch
+-                    ]
+-                    row_count = min(
+-                        hidden.shape[0],
+-                        draft_logits.shape[0],
+-                        teacher_logits.shape[0],
+-                    )
+-                    if row_count < 1 or draft_logits.shape[-1] != teacher_logits.shape[-1]:
++                    ):
+                         online_adapter.runtime.disable(
+                             "nextn_teacher_interface_mismatch", exactness=True
+                         )
+                     else:
+-                        with torch.inference_mode(False), torch.enable_grad():
+-                            hidden = hidden[:row_count]
+-                            draft_logits = draft_logits[:row_count]
+-                            teacher_logits = (
+-                                teacher_logits[:row_count].detach().clone()
+-                            )
+-                            loss = F.kl_div(
+-                                F.log_softmax(draft_logits.float(), dim=-1),
+-                                F.softmax(teacher_logits.float(), dim=-1),
+-                                reduction="batchmean",
+-                            )
++                        baseline = torch.stack(logit_rows, dim=1)[:microbatch]
++
++                        def replay_loss():
++                            replay = self.draft_worker.replay_current_block(
++                                online_adapter
++                            )[:microbatch]
++                            return ragged_kl_loss(
++                                replay.flatten(0, 1),
++                                teacher[:expected_rows],
++                                online_adapter.request_ledger,
++                            )
++
+                         online_adapter.launch(
+-                            loss=loss,
+-                            request_ids=round_request_ids[:microbatch],
++                            replay=replay_loss,
++                            request_ids=update_ids,
+                             prefix_lens=round_prefix_lens[:microbatch],
+-                            source_tensors=(hidden, draft_logits, teacher_logits),
++                            source_tensors=(baseline, teacher),
+                             feedback_source_version=(
+                                 online_adapter.source_adapter_version
+                             ),
+                         )
+             if online_adapter is not None and not batch.forward_mode.is_idle():
+-                batch_size = len(round_request_ids)
++                batch_size = len(verify_request_ids)
+                 committed = batch_output.accept_lens.to(torch.int64)
+                 online_adapter.after_commit(
+-                    round_request_ids,
++                    verify_request_ids,
+                     verified_drafts=torch.full(
+                         (batch_size,),
+                         self.speculative_num_draft_tokens,
+diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
+--- a/python/sglang/srt/speculative/online_parameter_plan.py
++++ b/python/sglang/srt/speculative/online_parameter_plan.py
+@@ -22,11 +22,6 @@
+ _DSPARK_W1 = re.compile(r"(?:^|\.)markov_head\.markov_w1\.weight$")
+ _DSPARK_W2 = re.compile(r"(?:^|\.)markov_head\.markov_w2\.weight$")
+ _DSPARK_ACCEPTANCE = re.compile(r"(?:^|\.)confidence_head\.proj\.(?:weight|bias)$")
+-_NEXTN_MATRIX = re.compile(
+-    r"(?:^|\.)layers\.\d+\.mlp\.shared_expert\.(?:gate_up_proj|down_proj)\.weight$"
+-)
+-
+-
+ @dataclass(frozen=True)
+ class ParameterSelection:
+     algorithm: str
+@@ -149,7 +144,12 @@
+         in_selected_layer = match is not None and int(match.group(1)) in layer_ids
+         eligible = _owned(name) and parameter.is_floating_point() and in_selected_layer
+         if algorithm == "NEXTN":
+-            eligible = eligible and _NEXTN_MATRIX.search(name) is not None
++            eligible = (
++                _owned(name)
++                and parameter.is_floating_point()
++                and "scale" not in name
++                and (in_selected_layer or match is None)
++            )
+         parameterization = "full"
+         if config.weight_update_mode == "lora":
+             eligible = (

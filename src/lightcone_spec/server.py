@@ -41,6 +41,18 @@ def _speculative_canvas(job: Job) -> int:
     return 8 if job.backend == "DSPARK" else int(job.width or 16)
 
 
+def _request_scoped_adaptation(job: Job) -> bool:
+    return (
+        job.method in {"tts", "l0_naive"}
+        and not job.node.startswith("E5")
+        and (
+            job.node == "TTS-Cal"
+            or bool(job.parameters.get("controlled_replay"))
+            or _concurrency(job) == 1
+        )
+    )
+
+
 def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if job.method not in ADAPTIVE_METHODS:
         return None
@@ -107,7 +119,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "stream_priority": chosen.get("stream_priority", "default"),
         "max_in_flight": 1,
         "kv_history_policy": "frozen",
-        "reset_scope": "request" if job.method in {"tts", "l0_naive"} else "cohort",
+        "reset_scope": "request" if _request_scoped_adaptation(job) else "cohort",
         "adaptation_group_id": f"{job.node}-{job.ordinal}",
         "telemetry_detail": "profile" if job.node == "E4-profile" else "headline",
         "verification_mode": chosen.get("verification", "native_scheduler"),
@@ -609,6 +621,16 @@ class StickyReplicaClient:
     def abort(self, request_id: str) -> None:
         for replica in self.replicas:
             replica.abort(request_id)
+
+    def run_bounded(self, prompts, **kwargs):
+        from .client import _run_bounded
+
+        return _run_bounded(self, prompts, **kwargs)
+
+    def run_closed_loop(self, prompts, **kwargs):
+        from .client import _run_closed_loop
+
+        return _run_closed_loop(self, prompts, **kwargs)
 
     def run_scheduled(
         self,

@@ -5,7 +5,7 @@ in speculative decoding. It compares six distinct roles: Target-only, Static,
 TTS, L0-naive, LightCone, and an independently tuned OnlineSPEC baseline.
 
 The repository is intentionally small. The paper protocol is ordinary Python,
-the run state is SQLite, and the SGLang changes are four plain unified diffs.
+the run state is SQLite, and the SGLang changes are five plain unified diffs.
 Repository state and source/model/data byte identity are not inspected in the
 execution path.
 
@@ -20,9 +20,10 @@ must already exist at the absolute paths in the configuration.
 
 Raw benchmark downloads are converted once with
 `scripts/prepare_datasets.py` and an explicit `task,problem_id,split` CSV.
-Code benchmarks require `bwrap` and `prlimit`. Chat benchmarks use judge
-credentials from `LIGHTCONE_JUDGE_*` environment variables; credentials are
-never stored in the experiment package.
+Code benchmarks require `bwrap` and `prlimit`. Chat benchmarks run the
+task-specific official evaluator command named by `LIGHTCONE_MT_BENCH_EVALUATOR`,
+`LIGHTCONE_ALPACA_EVALUATOR`, or `LIGHTCONE_ARENA_HARD_EVALUATOR`. Evaluator
+credentials remain process environment variables and are never stored.
 
 ```bash
 cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
@@ -30,8 +31,9 @@ cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 ./run_paper.sh /root/lightcone-tts-runtime/paper.yaml
 ```
 
-On the first invocation, `run_paper.sh` checks and applies the four SGLang
-diffs in lexical order, writes `.lightcone-spec-patched` in the SGLang checkout,
+On the first invocation, `run_paper.sh` checks and applies the five SGLang
+diffs in lexical order, writes `paper-v1-nextn-shadow-v1` to
+`.lightcone-spec-patched` in the SGLang checkout,
 and starts the paper runner. Later invocations use the marker and resume the
 same `run_name` from `state.sqlite`; a small import smoke confirms the required
 runtime APIs. A dirty project or SGLang worktree does not

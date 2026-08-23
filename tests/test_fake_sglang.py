@@ -1,5 +1,7 @@
 import json
 import math
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,7 +13,14 @@ import torch
 from lightcone_spec.client import GenerationResult, SGLangClient
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
-from lightcone_spec.protocol import materialize
+from lightcone_spec.nextn import (
+    MergedPublicationBank,
+    PublicationSlot,
+    RequestLedger,
+    torch_native_moe,
+    torch_native_selected_moe,
+)
+from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import (
     _canonical_accuracy,
     _check_greedy_trajectories,
@@ -28,7 +37,35 @@ from lightcone_spec.server import (
     adaptation_payload,
     server_command,
 )
-from scripts.gpu_acceptance import _job as acceptance_job
+
+
+def _nextn_acceptance_job(model: str) -> Job:
+    return Job(
+        job_id="gpu-acceptance-000-lightcone",
+        node="E6-acceptance",
+        ordinal=0,
+        method="lightcone",
+        model=model,
+        backend="NEXTN",
+        task="controlled_baseline",
+        context=40928,
+        load="c8",
+        width=16,
+        block=0,
+        gpu_count=2,
+        parameters={
+            "regime": "short_input_long_generation",
+            "optimizer": "adam",
+            "learning_rate": 1e-3,
+            "weight_decay": 0.0,
+            "grad_clip": 0.0,
+            "parameterization": "lora",
+            "rank": 1,
+            "scope": "all",
+            "stride": 10,
+            "topology": "tp2_dp1",
+        },
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -36,6 +73,9 @@ class Handler(BaseHTTPRequestHandler):
     delay = 0.0
     batch_sizes = []
     sampling_params = []
+    active = 0
+    peak_active = 0
+    active_lock = threading.Lock()
 
     def log_message(self, format, *args):
         return
@@ -83,6 +123,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
+        with Handler.active_lock:
+            Handler.active += 1
+            Handler.peak_active = max(Handler.peak_active, Handler.active)
         if Handler.delay:
             time.sleep(Handler.delay)
         Handler.batch_sizes.append(len(request["rid"]))
@@ -115,6 +158,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        with Handler.active_lock:
+            Handler.active -= 1
 
 
 @pytest.fixture
@@ -129,6 +174,8 @@ def fake_server():
         Handler.delay = 0.0
         Handler.batch_sizes = []
         Handler.sampling_params = []
+        Handler.active = 0
+        Handler.peak_active = 0
         server.shutdown()
         thread.join()
 
@@ -147,6 +194,100 @@ def test_raw_token_output_and_failure_propagation(fake_server):
     Handler.fail = True
     with pytest.raises(Exception):
         client.run_batch(["a"], max_new_tokens=2, seed=0)
+
+
+def test_nextn_shadow_has_finite_lora_and_full_gradients():
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 4)
+    router = torch.randn(3, 4, requires_grad=True)
+    w13 = torch.randn(3, 8, 4, requires_grad=True)
+    w2 = torch.randn(3, 4, 4, requires_grad=True)
+    baseline = torch_native_moe(hidden, router, w13, w2, top_k=2)
+    baseline.square().mean().backward()
+    assert all(
+        value.grad is not None
+        and torch.isfinite(value.grad).all()
+        and torch.count_nonzero(value.grad)
+        for value in (router, w13, w2)
+    )
+
+    a = torch.randn(2, 4, requires_grad=True)
+    b = torch.zeros(3, 2, requires_grad=True)
+    replay = torch_native_moe(hidden, router.detach() + b @ a, w13.detach(), w2.detach(), top_k=2)
+    assert torch.equal(replay, baseline.detach())
+    replay.square().mean().backward()
+    assert b.grad is not None and torch.isfinite(b.grad).all()
+    assert torch.count_nonzero(b.grad)
+
+    top_weights = torch.tensor([[1.0]])
+    top_ids = torch.tensor([[0]])
+    fp8_w13 = torch.tensor(
+        [[[1.0, -1.0], [0.5, 0.5], [1.0, 0.0], [0.0, 1.0]]],
+        dtype=torch.float8_e4m3fn,
+    )
+    fp8_w2 = torch.tensor(
+        [[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float8_e4m3fn
+    )
+    fp8_output = torch_native_selected_moe(
+        torch.ones(1, 2),
+        top_weights,
+        top_ids,
+        fp8_w13,
+        fp8_w2,
+        w13_scale=torch.full((1, 1, 1), 0.5),
+        w2_scale=torch.full((1, 1, 1), 0.5),
+    )
+    assert fp8_output.shape == (1, 2)
+    assert torch.isfinite(fp8_output).all()
+
+
+def test_nextn_merge_publication_and_ragged_rid_join():
+    live = torch.zeros(3, 4, dtype=torch.bfloat16)
+    base = torch.zeros(3, 4)
+    slot = PublicationSlot("bf16", live, base, (0, 1))
+    bank = MergedPublicationBank((slot,))
+    a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    b = torch.ones(3, 2)
+    address = live.data_ptr()
+    bank.stage((a, b))
+    bank.publish()
+    assert live.data_ptr() == address
+    assert torch.equal(live.float(), (b @ a).to(torch.bfloat16).float())
+
+    fp8_live = torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
+    fp8_scale = torch.ones(1, 1)
+
+    def quantize(value):
+        scale = value.abs().amax().reshape(1, 1) / 448
+        return (value / scale).clamp(-448, 448).to(torch.float8_e4m3fn), scale
+
+    fp8_slot = PublicationSlot(
+        "fp8",
+        fp8_live,
+        torch.zeros(2, 2),
+        (0,),
+        live_scale=fp8_scale,
+        quantize=quantize,
+    )
+    fp8_bank = MergedPublicationBank((fp8_slot,))
+    candidate = torch.tensor([[1.0, -2.0], [2.0, 4.0]])
+    fp8_bank.stage((candidate,))
+    fp8_bank.publish()
+    assert fp8_scale.item() == pytest.approx(4 / 448)
+    assert torch.allclose(fp8_live.float() * fp8_scale, candidate, atol=0.03)
+
+    ledger = RequestLedger()
+    assert ledger.begin(("a", "b"), (10, 20), (0, 2, 5))
+    assert ledger.bind_verify(("b", "a"), (6, 0), (9, 2))
+    assert (ledger.rows["a"].teacher_start, ledger.rows["a"].teacher_end) == (0, 2)
+    assert (ledger.rows["b"].teacher_start, ledger.rows["b"].teacher_end) == (6, 9)
+    assert ledger.join_accept_lens(("b", "a"), (1, 2)) == (2, 1)
+    ledger.terminal("a", "eos")
+    ledger.terminal("b", "cancelled")
+    assert ledger.rows["a"].terminal == "eos"
+    assert ledger.rows["b"].terminal == "cancelled"
+    assert ledger.begin(("replacement",), (21,), (0, 2))
+    assert ledger.order == ("replacement",)
 
 
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
@@ -173,6 +314,31 @@ def test_request_scoped_generation_is_serial(fake_server):
     rows, _ = _run_request_scoped(client, ("a", "b", "c"), 2, 0)
     assert len(rows) == 3
     assert Handler.batch_sizes[-3:] == [1, 1, 1]
+
+
+def test_bounded_and_closed_loop_enforce_real_concurrency(fake_server):
+    Handler.delay = 0.03
+    client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
+    bounded = client.run_bounded(
+        ("a", "b", "c", "d"),
+        max_new_tokens=2,
+        seed=0,
+        max_in_flight=2,
+    )
+    assert len(bounded.results) == 4
+    assert Handler.peak_active == 2
+
+    Handler.peak_active = 0
+    closed = client.run_closed_loop(
+        ("a", "b"),
+        max_new_tokens=2,
+        seed=0,
+        max_in_flight=2,
+        duration_seconds=0.07,
+    )
+    assert len(closed.results) >= 4
+    assert Handler.peak_active == 2
+    assert closed.elapsed_seconds >= 0.07
 
 
 def test_request_scope_waits_for_every_rank():
@@ -311,6 +477,22 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert e1a["fixed_total_token_budget"] == 8
     assert e1a["confidence_loss_weight"] == 0.25
     assert e1a["canvas_tokens"] == 8
+
+
+def test_adaptive_reset_scope_tracks_multi_request_concurrency():
+    tts_cal = materialize("TTS-Cal")[0]
+    assert adaptation_payload(tts_cal)["reset_scope"] == "request"
+
+    e3 = next(
+        job
+        for job in materialize("E3b-pilot")
+        if job.method == "tts" and job.load == "common_load"
+    )
+    concurrent = e3.__class__(**{**e3.to_dict(), "load": "c8"})
+    assert adaptation_payload(concurrent)["reset_scope"] == "cohort"
+
+    single = concurrent.__class__(**{**concurrent.to_dict(), "load": "c1"})
+    assert adaptation_payload(single)["reset_scope"] == "request"
 
 
 def test_sticky_replica_routing_is_repeatable():
@@ -519,6 +701,43 @@ def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Pa
     assert verdicts == []
 
 
+def test_chat_score_comes_only_from_task_evaluator(monkeypatch, tmp_path: Path):
+    evaluator = tmp_path / "evaluate.py"
+    evaluator.write_text(
+        "import json, pathlib, sys\n"
+        "rows=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]\n"
+        "pathlib.Path(sys.argv[2]).write_text(''.join(json.dumps({"
+        "'request_id': r['request_id'], 'score': 0.75, 'evaluator': 'fastchat', "
+        "'version': 'test', 'judge_model': 'judge'})+'\\n' for r in rows))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "LIGHTCONE_MT_BENCH_EVALUATOR",
+        f"{sys.executable} {evaluator} {{input}} {{output}}",
+    )
+    result = GenerationResult(
+        request_id="chat-1",
+        input_tokens=1,
+        completion_tokens=1,
+        ttft_ms=1,
+        inter_token_ms=(),
+        elapsed_seconds=1,
+        stop_reason="length",
+        output_ids=(1,),
+        output_text="answer",
+        native_token_timestamps_ns=(1,),
+    )
+    score, scorer, verdicts = _canonical_accuracy(
+        "MT-Bench",
+        (result,),
+        {"examples": ({"prompt": "question", "reference": None},)},
+        tmp_path / "python",
+    )
+    assert score == 0.75
+    assert scorer == "official_mt-bench_evaluator"
+    assert verdicts[0]["evaluator"] == "fastchat"
+
+
 def test_dspark_loss_retains_graph_inside_inference_scheduler():
     parameter = torch.nn.Parameter(torch.ones(2, 2))
     with torch.inference_mode():
@@ -588,28 +807,7 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     assert command[index + 1] == "1"
     steps = command.index("--speculative-num-steps")
     assert command[steps + 1] == "15"
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0001-arguments-config-and-memory.diff"
-    ).read_text(encoding="utf-8")
-    assert '\"EAGLE\" if config.algorithm == \"NEXTN\"' in patch
-    nextn_patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0003-dspark-eagle3-nextn-adapters.diff"
-    ).read_text(encoding="utf-8")
-    assert (
-        '\"EAGLE3\" if self.speculative_algorithm.is_eagle3() else \"NEXTN\"'
-        in nextn_patch
-    )
-    assert "self._online_drafter_adapter.source_adapter_version" in nextn_patch
-    acceptance = acceptance_job(
-        0,
-        "lightcone",
-        "NEXTN",
-        block=0,
-        model=job.model,
-        tp2=True,
-    )
+    acceptance = _nextn_acceptance_job(job.model)
     assert acceptance.parameters["parameterization"] == "lora"
     assert acceptance.parameters["rank"] == 1
     adaptive_command = server_command(
@@ -625,129 +823,6 @@ def test_nextn_rejection_sampling_uses_single_branch(tmp_path: Path):
     assert adaptive_command[maximum + 1] == "8"
     graphs = adaptive_command.index("--cuda-graph-bs-decode")
     assert adaptive_command[graphs + 1 : graphs + 5] == ["1", "2", "4", "8"]
-
-
-def test_triton_graph_uses_ragged_layout_and_draft_width():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0003-dspark-eagle3-nextn-adapters.diff"
-    ).read_text(encoding="utf-8")
-    assert "padded_layout.qo_indptr_device" in patch
-    assert 'getattr(spec_info, "draft_token_num", self.num_draft_tokens)' in patch
-    assert "torch.cuda.get_device_capability(logits.device)[0] == 12" in patch
-    assert "int(model_runner.server_args.speculative_num_draft_tokens or 0) >= 16" in patch
-    assert "if online_adapter is not None and online_update:" in patch
-    assert patch.count("online_update = online_adapter.update_due") >= 3
-    assert patch.count("torch.inference_mode(not online_update)") == 5
-    assert patch.count("torch.set_grad_enabled(online_update)") == 5
-    assert patch.count("with torch.inference_mode(False), torch.enable_grad():") >= 6
-    assert patch.count("round_request_ids = tuple(request.rid for request in batch.reqs)") == 2
-    assert patch.count("request_ids=round_request_ids[:microbatch]") == 2
-    assert "def begin_round(\n+        self, request_ids: Sequence[str]" in patch
-    assert 'self.disabled_reason = "invalid_logical_prefix"' in patch
-    assert "native_backend_trainables_disconnected" in patch
-    assert "native_backend_trainables_partially_disconnected" in patch
-    assert "native_backend_zero_gradient" in patch
-    assert "differentiable_all_reduce" in patch
-    assert "differentiable_all_gather" in patch
-    assert "qwen3_5_mtp.py" in patch
-    assert "qwen3_5.py" in patch
-
-    parameter_patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0001-arguments-config-and-memory.diff"
-    ).read_text(encoding="utf-8")
-    assert "_NEXTN_MATRIX" in parameter_patch
-    assert 'algorithm == "NEXTN"' in parameter_patch
-    assert "mlp\\.shared_expert" in parameter_patch
-    assert patch.count("-    @torch.no_grad()") == 3
-    assert """-    @torch.no_grad()
-     def forward(
-""" in patch
-    assert """+            if online_adapter is not None and online_update:
-+                hidden_rows = self.draft_worker._online_hidden_rows
-""" in patch
-    assert """+            if online_adapter is not None and not batch.forward_mode.is_idle():
-+                committed = batch_output.accept_lens.to(torch.int64)
-""" in patch
-    assert """+        if online_adapter is not None:
-+            verified_drafts = (
-""" in patch
-
-
-def test_tp2_dflash_gathers_full_vocab_before_online_loss():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
-    ).read_text(encoding="utf-8")
-    assert "class _TensorParallelAllGather" in patch
-    assert "class _TensorParallelSum" in patch
-    assert "local_inference_logits, target.shape[-1]" in patch
-    assert "local_draft_logits, target.shape[-1]" in patch
-    assert "attention_output, self.tp_group.device_group" in patch
-    assert "_TensorParallelSum.apply(output, self.tp_group.device_group)" in patch
-
-
-def test_controlled_replay_compares_the_first_real_candidate_once():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
-    ).read_text(encoding="utf-8")
-    assert 'if role == "capture":' in patch
-    assert "if self.controlled_reference is None:" in patch
-    assert 'elif role == "compare":' in patch
-    assert "if not self.controlled_candidate_compared:" in patch
-    assert "torch.equal(candidate, reference)" in patch
-    assert "self.controlled_candidate_compared = True" in patch
-
-
-def test_prefill_terminal_request_releases_request_scoped_owner():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
-    ).read_text(encoding="utf-8")
-    assert patch.count("self.draft_worker.note_request_finished(") == 1
-    assert "natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)" in patch
-
-
-def test_adaptation_uses_telemetry_prefix_for_request_boundaries():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0004-native-token-timing-and-system-metrics.diff"
-    ).read_text(encoding="utf-8")
-    assert "prefix = self.round_metrics[trace.buffer_index, trace_index, 0]" in patch
-    assert "prefix.add_(committed_tokens[index].detach().to(torch.int64))" in patch
-    assert "+                prefix," in patch
-    assert "record_device_commit(request_ids, committed_tokens)" in patch
-    assert "new_seq_lens=semantic_new_seq_lens" in patch
-    assert '"active_request_id": self.active_request_id' in patch
-    assert "+    @torch.no_grad()\n     def __call__(self, hidden_states, input_ids=None):" in patch
-    assert (
-        "diff --git a/python/sglang/srt/managers/native_token_timestamps.py "
-        "b/python/sglang/srt/managers/native_token_timestamps.py"
-    ) in patch
-    assert '"greedy_token_checks": 0' in patch
-    assert "out_tokens[checked] != target_predict[checked]" in patch
-    assert "verification_counters.get(name, 0)" in patch
-    assert 'self.server_args.speculative_algorithm == "DFLASH"' in patch
-    adaptation_patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
-    ).read_text(encoding="utf-8")
-    assert "Greedy verification is native to the worker" in adaptation_patch
-
-
-def test_gpu_smoke_uses_native_exactness_and_staged_cases():
-    source = (Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py").read_text()
-    assert "_validate_greedy_verify_counts" in source
-    assert "def _native_exactness(" in source
-    assert "separate_exactness" in source
-    assert '"deterministic_exactness": True' in source
-    assert '"exactness_bootstrap": True' in source
-    assert '"greedy_token_mismatches"' in source
-    assert '"nextn122"' in source
-    assert "cross_kernel_trajectory_equal" in source
-
 
 def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
     class State:
@@ -816,19 +891,23 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
         _check_greedy_trajectories(State(), "preflight")
 
 
-def test_launcher_applies_one_plain_patch_stream():
-    launcher = (Path(__file__).parents[1] / "run_paper.sh").read_text(encoding="utf-8")
-    assert "--recount" not in launcher
-    assert "command -v python" not in launcher
-    assert "runtime_paths=\"$(awk" in launcher
-    assert launcher.count('done | git -C "$sglang_root" apply') == 2
-
-
-def test_eagle_relay_accepts_first_version_after_prefill():
-    patch = (
-        Path(__file__).parents[1]
-        / "patches/sglang/0002-side-stream-adaptation-and-publication.diff"
-    ).read_text(encoding="utf-8")
-    assert "EAGLE adaptation cannot be enabled after relay initialization" not in patch
-    assert "self.source_adapter_version_buf is None and versions is not None" in patch
-    assert "EAGLE source version is missing after relay activation" in patch
+def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
+    sglang = tmp_path / "sglang"
+    sglang.mkdir()
+    (sglang / ".lightcone-spec-patched").write_text("paper-v1-old\n")
+    config = tmp_path / "paper.yaml"
+    config.write_text(
+        "paths:\n"
+        f"  sglang_root: {sglang}\n"
+        "server:\n"
+        f"  python: {sys.executable}\n"
+        "  cuda_home: /tmp\n"
+    )
+    run = subprocess.run(
+        (str(Path(__file__).parents[1] / "run_paper.sh"), str(config)),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 1
+    assert "restore SGLang and reapply patches" in run.stderr

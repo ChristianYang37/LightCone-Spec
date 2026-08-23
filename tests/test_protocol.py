@@ -15,7 +15,12 @@ from lightcone_spec.protocol import (
     materialize,
     paper_plan,
 )
-from lightcone_spec.runner import _e5_execution_phases, _e5_reference, _runtime_job
+from lightcone_spec.runner import (
+    _e5_execution_phases,
+    _e5_reference,
+    _e6_interface_jobs,
+    _runtime_job,
+)
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 
@@ -54,6 +59,11 @@ def test_two_gpu_exclusivity_and_real_interface_probes():
     assert {job.method for job in interfaces} == {"lightcone"}
     assert all(job.parameters["interface_fit"] for job in interfaces)
     assert all(job.parameters["minimum_updates"] == 1 for job in interfaces)
+    interface_components = _e6_interface_jobs(interfaces)
+    assert len(interface_components) == 4
+    assert {
+        job.parameters["parameterization"] for job in interface_components
+    } == {"lora", "full"}
     probes = materialize("E0-tune", valid_e0=[])[:108]
     assert {job.method for job in probes} == {"static"}
     assert all(job.parameters["adaptive_probe"] for job in probes)

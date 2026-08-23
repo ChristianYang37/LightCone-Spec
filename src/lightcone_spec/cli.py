@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 from .config import ExperimentConfig
 from .metrics import summarize_attempts
-from .protocol import paper_plan
+from .protocol import PAPER_NODES, Job, materialize, paper_plan
 from .runner import PaperRunner
 from .state import StateStore
 
@@ -43,6 +44,77 @@ def _plan(config: ExperimentConfig) -> None:
     print("node\trows\tgpus\tdescription")
     for row in paper_plan(final_blocks=config.protocol.final_blocks):
         print(f"{row.name}\t{row.rows}\t{row.gpu_count}\t{row.description}")
+    jobs = tuple(
+        job
+        for node in PAPER_NODES
+        for job in materialize(node, final_blocks=config.protocol.final_blocks or 12)
+    )
+    finite_requests = sum(
+        _request_floor(job, config.server.requests_per_cell)
+        for job in jobs
+        if not _time_driven(job)
+    )
+    print("\ninternal_substage\tjobs\trequest_basis")
+    print("E1-common-load\tdynamic\t7 loads * (2 baselines + 2 * safe geometries)")
+    print("E3-width-calibration\t36\t4 methods * 3 widths * 3 regimes")
+    print("E1a-confidence-calibration\t4\t4 confidence weights")
+    print("E6-common-load\t90\t2 models * 9 loads * 5 roles")
+    print("E5-p99-extension\tdynamic\t11,000 offered requests per selected boundary")
+    print(
+        f"registered finite-request floor\t{finite_requests}\t"
+        f"requests_per_cell={config.server.requests_per_cell}; E5 time-driven rows excluded"
+    )
+    acceptance = config.results_root / "acceptance"
+    if acceptance.is_dir():
+        files = tuple(path for path in acceptance.rglob("*") if path.is_file())
+        attempts = sum(path.name == "metrics.json" for path in files)
+        request_files = tuple(
+            path
+            for path in files
+            if path.name in {"requests.jsonl", "request_outcomes.jsonl", "cycles.jsonl"}
+        )
+        request_rows = sum(
+            len(path.read_text(encoding="utf-8").splitlines())
+            for path in request_files
+        )
+        variable_bytes = sum(path.stat().st_size for path in request_files)
+        fixed_bytes = sum(path.stat().st_size for path in files) - variable_bytes
+        if attempts and request_rows:
+            projected = (
+                len(jobs) * fixed_bytes // attempts
+                + finite_requests * variable_bytes // request_rows
+            )
+            free = shutil.disk_usage(config.results_root).free
+            print(
+                f"result capacity lower bound\t{projected}\t"
+                f"free={free}; source={acceptance}"
+            )
+    else:
+        print(
+            "result capacity lower bound\tUNMEASURED\t"
+            f"place acceptance raw attempts under {acceptance}"
+        )
+
+
+def _time_driven(job: Job) -> bool:
+    load = job.load or ""
+    registered = str(job.parameters.get("registered_load", load))
+    return job.node.startswith("E5") and (
+        load.startswith("closed_loop_c")
+        or registered.startswith("lambda_")
+        or registered.endswith("_soak")
+    )
+
+
+def _request_floor(job: Job, base: int) -> int:
+    if job.node == "TTS-Cal":
+        return 76
+    load = job.load or ""
+    if load.startswith("closed_loop_c"):
+        return max(base, int(load.removeprefix("closed_loop_c")))
+    if load.startswith("c") and load[1:].isdigit():
+        return max(base, int(load[1:]))
+    return base
 
 
 def _status(run_dir: Path) -> None:

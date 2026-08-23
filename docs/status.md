@@ -37,5 +37,5 @@ Last read-only remote check: two idle RTX PRO 6000 Blackwell Server Edition
 GPUs (97,887 MiB each), driver 580.95.05, Python 3.12.3, Torch 2.11/CUDA 12.9,
 SGLang dev5, and FlashInfer 0.6.15. `nsys` and `ncu` are under
 `/root/lightcone-tts-runtime/cuda-12.9/bin`. The writable root volume had about
-32 GB free; the public NFS was read-only. No formal paper cell was executed.
+32 GB free; the public NFS was read-only. No registered paper cell was executed.
 The instance is shut down.

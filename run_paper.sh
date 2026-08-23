@@ -54,6 +54,7 @@ export CUDA_PATH="$cuda_home"
 export PATH="$cuda_home/bin:$PATH"
 export LD_LIBRARY_PATH="$cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 marker="$sglang_root/.lightcone-spec-patched"
+patch_version="paper-v1-nextn-shadow-v1"
 
 if [[ ! -e "$marker" ]]; then
   patches=()
@@ -70,8 +71,12 @@ if [[ ! -e "$marker" ]]; then
   for patch in "${patches[@]}"; do
     sed -n '1,$p' "$patch"
   done | git -C "$sglang_root" apply -
-  touch "$marker"
+  printf '%s\n' "$patch_version" > "$marker"
 else
+  if [[ "$(<"$marker")" != "$patch_version" ]]; then
+    echo "patched SGLang version changed; restore SGLang and reapply patches" >&2
+    exit 1
+  fi
   for module in \
     python/sglang/srt/speculative/online_adaptation_runtime.py \
     python/sglang/srt/speculative/dflash_online_adaptation.py \
@@ -89,7 +94,8 @@ else
     "$sglang_root/python/sglang/srt/managers/native_token_timestamps.py"
 fi
 
-PYTHONPATH="$sglang_root/python" "$python_bin" - <<'PY'
+PYTHONPATH="$project_root/src:$sglang_root/python" "$python_bin" - <<'PY'
+from lightcone_spec.nextn import MergedPublicationBank, RequestLedger
 from sglang.srt.managers.native_token_timestamps import record_committed_output_tokens
 from sglang.srt.speculative.dspark_online_adaptation import dspark_composite_loss
 from sglang.srt.speculative.online_adaptation_config import OnlineAdaptationConfig
@@ -97,6 +103,8 @@ from sglang.srt.speculative.online_adaptation_config import OnlineAdaptationConf
 assert callable(record_committed_output_tokens)
 assert callable(dspark_composite_loss)
 assert OnlineAdaptationConfig is not None
+assert MergedPublicationBank is not None
+assert RequestLedger is not None
 PY
 
 exec env PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}" \

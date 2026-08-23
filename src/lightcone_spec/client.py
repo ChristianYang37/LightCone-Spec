@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +52,188 @@ class ScheduledRun:
     results: tuple[GenerationResult, ...]
     outcomes: tuple[RequestOutcome, ...]
     elapsed_seconds: float
+
+
+def _request_error(error: Exception) -> str:
+    if isinstance(error, TimeoutError):
+        return "timed_out"
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError):
+        return "timed_out"
+    return "error"
+
+
+def _run_bounded(
+    client,
+    prompts: Iterable[str | Sequence[int]],
+    *,
+    max_new_tokens: int | Sequence[int],
+    seed: int,
+    temperature: float,
+    routing_keys: Iterable[str] | None,
+    request_ids: Sequence[str] | None,
+    max_in_flight: int,
+    deadline_seconds: float,
+) -> ScheduledRun:
+    prompt_rows = tuple(prompts)
+    if not prompt_rows or max_in_flight < 1:
+        raise ValueError("bounded requests need prompts and positive concurrency")
+    keys = tuple(routing_keys) if routing_keys is not None else (None,) * len(prompt_rows)
+    ids = (
+        tuple(request_ids)
+        if request_ids is not None
+        else tuple(f"bounded-{index:05d}" for index in range(len(prompt_rows)))
+    )
+    budgets = (
+        (max_new_tokens,) * len(prompt_rows)
+        if isinstance(max_new_tokens, int)
+        else tuple(max_new_tokens)
+    )
+    if not (len(keys) == len(ids) == len(budgets) == len(prompt_rows)):
+        raise ValueError("bounded requests need one key, ID, and budget per prompt")
+    if len(set(ids)) != len(ids):
+        raise ValueError("bounded request IDs must be unique")
+
+    started = time.perf_counter()
+    results: dict[int, GenerationResult] = {}
+    outcomes: list[RequestOutcome | None] = [None] * len(prompt_rows)
+
+    def submit(index: int) -> GenerationResult:
+        rows, _ = client.run_batch(
+            (prompt_rows[index],),
+            max_new_tokens=budgets[index],
+            seed=seed + index,
+            temperature=temperature,
+            routing_key=keys[index],
+            request_ids=(ids[index],),
+            timeout_seconds=deadline_seconds,
+        )
+        return rows[0]
+
+    active: dict[Future[GenerationResult], tuple[int, int, int]] = {}
+    next_index = 0
+    with ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+        while next_index < len(prompt_rows) or active:
+            while next_index < len(prompt_rows) and len(active) < max_in_flight:
+                offered_ns = time.monotonic_ns()
+                admitted_ns = time.monotonic_ns()
+                active[pool.submit(submit, next_index)] = (
+                    next_index,
+                    offered_ns,
+                    admitted_ns,
+                )
+                next_index += 1
+            done, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+            for future in done:
+                index, offered_ns, admitted_ns = active.pop(future)
+                finished_ns = time.monotonic_ns()
+                try:
+                    results[index] = future.result()
+                    outcomes[index] = RequestOutcome(
+                        ids[index], "completed", offered_ns, admitted_ns, finished_ns
+                    )
+                except Exception as error:
+                    outcomes[index] = RequestOutcome(
+                        ids[index],
+                        _request_error(error),
+                        offered_ns,
+                        admitted_ns,
+                        finished_ns,
+                        f"{type(error).__name__}: {error}",
+                    )
+    return ScheduledRun(
+        tuple(results[index] for index in sorted(results)),
+        tuple(outcome for outcome in outcomes if outcome is not None),
+        time.perf_counter() - started,
+    )
+
+
+def _run_closed_loop(
+    client,
+    prompts: Iterable[str | Sequence[int]],
+    *,
+    max_new_tokens: int | Sequence[int],
+    seed: int,
+    temperature: float,
+    routing_keys: Iterable[str] | None,
+    max_in_flight: int,
+    duration_seconds: float,
+    deadline_seconds: float,
+    request_id_prefix: str,
+) -> ScheduledRun:
+    prompt_rows = tuple(prompts)
+    if not prompt_rows or max_in_flight < 1 or duration_seconds <= 0:
+        raise ValueError("closed-loop requests need prompts, concurrency, and duration")
+    keys = tuple(routing_keys) if routing_keys is not None else (None,) * len(prompt_rows)
+    budgets = (
+        (max_new_tokens,) * len(prompt_rows)
+        if isinstance(max_new_tokens, int)
+        else tuple(max_new_tokens)
+    )
+    if len(keys) != len(prompt_rows) or len(budgets) != len(prompt_rows):
+        raise ValueError("closed-loop corpus needs one key and budget per prompt")
+
+    started = time.perf_counter()
+    stop_at = started + duration_seconds
+    lock = threading.Lock()
+    failed = threading.Event()
+    sequence = 0
+    results: dict[int, GenerationResult] = {}
+    outcomes: dict[int, RequestOutcome] = {}
+
+    def worker() -> None:
+        nonlocal sequence
+        while not failed.is_set() and time.perf_counter() < stop_at:
+            with lock:
+                index = sequence
+                sequence += 1
+            corpus_index = index % len(prompt_rows)
+            request_id = f"{request_id_prefix}-{index:06d}"
+            offered_ns = time.monotonic_ns()
+            admitted_ns = time.monotonic_ns()
+            try:
+                rows, _ = client.run_batch(
+                    (prompt_rows[corpus_index],),
+                    max_new_tokens=budgets[corpus_index],
+                    seed=seed + index,
+                    temperature=temperature,
+                    routing_key=keys[corpus_index],
+                    request_ids=(request_id,),
+                    timeout_seconds=deadline_seconds,
+                )
+                result = rows[0]
+                outcome = RequestOutcome(
+                    request_id,
+                    "completed",
+                    offered_ns,
+                    admitted_ns,
+                    time.monotonic_ns(),
+                )
+                with lock:
+                    results[index] = result
+                    outcomes[index] = outcome
+            except Exception as error:
+                status = _request_error(error)
+                if status == "error":
+                    failed.set()
+                with lock:
+                    outcomes[index] = RequestOutcome(
+                        request_id,
+                        status,
+                        offered_ns,
+                        admitted_ns,
+                        time.monotonic_ns(),
+                        f"{type(error).__name__}: {error}",
+                    )
+
+    with ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+        futures = tuple(pool.submit(worker) for _ in range(max_in_flight))
+        for future in futures:
+            future.result()
+    return ScheduledRun(
+        tuple(results[index] for index in sorted(results)),
+        tuple(outcomes[index] for index in sorted(outcomes)),
+        time.perf_counter() - started,
+    )
 
 
 def _native_events(meta: dict, output_ids: list[int]) -> tuple[int, ...]:
@@ -299,6 +482,56 @@ class SGLangClient:
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             if response.status != 200:
                 raise RuntimeError("SGLang request cancellation failed")
+
+    def run_bounded(
+        self,
+        prompts: Iterable[str | Sequence[int]],
+        *,
+        max_new_tokens: int | Sequence[int],
+        seed: int,
+        temperature: float = 0.0,
+        routing_keys: Iterable[str] | None = None,
+        request_ids: Sequence[str] | None = None,
+        max_in_flight: int = 1,
+        deadline_seconds: float = 120.0,
+    ) -> ScheduledRun:
+        return _run_bounded(
+            self,
+            prompts,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+            temperature=temperature,
+            routing_keys=routing_keys,
+            request_ids=request_ids,
+            max_in_flight=max_in_flight,
+            deadline_seconds=deadline_seconds,
+        )
+
+    def run_closed_loop(
+        self,
+        prompts: Iterable[str | Sequence[int]],
+        *,
+        max_new_tokens: int | Sequence[int],
+        seed: int,
+        temperature: float = 0.0,
+        routing_keys: Iterable[str] | None = None,
+        max_in_flight: int = 1,
+        duration_seconds: float = 60.0,
+        deadline_seconds: float = 120.0,
+        request_id_prefix: str = "closed-loop",
+    ) -> ScheduledRun:
+        return _run_closed_loop(
+            self,
+            prompts,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+            temperature=temperature,
+            routing_keys=routing_keys,
+            max_in_flight=max_in_flight,
+            duration_seconds=duration_seconds,
+            deadline_seconds=deadline_seconds,
+            request_id_prefix=request_id_prefix,
+        )
 
     def run_scheduled(
         self,

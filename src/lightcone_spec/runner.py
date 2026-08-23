@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -21,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import requests
 import yaml
 from scipy.interpolate import BSpline
 from scipy.linalg import null_space
@@ -410,6 +410,23 @@ def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int
     return len(offsets) if offsets is not None else max(config.server.requests_per_cell, concurrency)
 
 
+def _cell_concurrency(job: Job) -> int:
+    load = job.load or ""
+    if load.startswith("closed_loop_c"):
+        return int(load.removeprefix("closed_loop_c"))
+    if load.startswith("c") and load[1:].isdigit():
+        return int(load[1:])
+    return 1
+
+
+def _uses_request_scope(job: Job) -> bool:
+    if job.method not in {"tts", "l0_naive"}:
+        return False
+    if job.parameters.get("controlled_replay") or job.node == "TTS-Cal":
+        return True
+    return not job.node.startswith("E5") and _cell_concurrency(job) == 1
+
+
 def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -> tuple[int, ...]:
     if length < 1:
         raise ScientificFailure("a context cell has no room for a prompt")
@@ -759,7 +776,13 @@ def _fault_action_passed(
 
 
 def _run_multi_turn(
-    client, prompts, max_new_tokens: int, seed: int, *, request_scoped: bool
+    client,
+    prompts,
+    max_new_tokens: int,
+    seed: int,
+    *,
+    request_scoped: bool,
+    max_in_flight: int,
 ):
     histories = [tuple(prompt) for prompt in prompts]
     turns_by_request: list[list[GenerationResult]] = [[] for _ in prompts]
@@ -777,11 +800,19 @@ def _run_multi_turn(
                 request_prefix=f"multi-turn-{turn}",
             )
         else:
-            turn_results, turn_elapsed = client.run_batch(
+            scheduled = client.run_bounded(
                 histories,
                 max_new_tokens=budget,
                 seed=seed + turn,
-                request_id_prefix=f"multi-turn-{turn}",
+                request_ids=tuple(
+                    f"multi-turn-{turn}-{index:05d}"
+                    for index in range(len(histories))
+                ),
+                max_in_flight=max_in_flight,
+            )
+            turn_results, turn_elapsed = (
+                scheduled.results,
+                scheduled.elapsed_seconds,
             )
         elapsed += turn_elapsed
         for index, result in enumerate(turn_results):
@@ -948,62 +979,51 @@ def _canonical_accuracy(
             )
         return passed / len(results), "canonical_tests_bubblewrap", verdicts
     if task in {"MT-Bench", "Alpaca", "Arena-Hard"}:
-        base_url = os.environ.get("LIGHTCONE_JUDGE_BASE_URL")
-        model = os.environ.get("LIGHTCONE_JUDGE_MODEL")
-        api_key = os.environ.get("LIGHTCONE_JUDGE_API_KEY")
-        if not all((base_url, model, api_key)):
-            return None, "N/A: official judge environment unavailable", []
-        verdicts = []
-        for result, example in zip(results, examples, strict=True):
-            response = requests.post(
-                base_url.rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                f"Apply the official {task} judge rubric. Return only "
-                                '{"score": <number from 0 to 10>}.'
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "prompt": example.get("prompt"),
-                                    "reference": example.get("reference"),
-                                    "candidate": result.output_text,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        },
-                    ],
-                },
-                timeout=120,
-            )
-            response.raise_for_status()
-            text = response.json()["choices"][0]["message"]["content"]
-            match = re.search(r"(?:score\D*)?([0-9]+(?:\.[0-9]+)?)", text)
-            if match is None:
-                raise ScientificFailure(f"{task} judge returned no score")
-            score = float(match.group(1))
-            if not 0 <= score <= 10:
-                raise ScientificFailure(f"{task} judge score is outside 0..10")
-            verdicts.append(
-                {
-                    "request_id": result.request_id,
-                    "score": score,
-                    "judge_model": model,
-                }
-            )
-        return (
-            float(np.mean([row["score"] for row in verdicts])) / 10,
-            f"official_{task.lower()}_judge",
-            verdicts,
-        )
+        variable = {
+            "MT-Bench": "LIGHTCONE_MT_BENCH_EVALUATOR",
+            "Alpaca": "LIGHTCONE_ALPACA_EVALUATOR",
+            "Arena-Hard": "LIGHTCONE_ARENA_HARD_EVALUATOR",
+        }[task]
+        command_template = os.environ.get(variable)
+        if not command_template:
+            return None, f"N/A: {task} official evaluator unavailable", []
+        with tempfile.TemporaryDirectory(prefix="lightcone-evaluator-") as temporary:
+            input_path = Path(temporary) / "input.jsonl"
+            output_path = Path(temporary) / "output.jsonl"
+            with input_path.open("w", encoding="utf-8") as stream:
+                for result, example in zip(results, examples, strict=True):
+                    stream.write(
+                        json.dumps(
+                            {
+                                "request_id": result.request_id,
+                                "prompt": example.get("prompt"),
+                                "reference": example.get("reference"),
+                                "candidate": result.output_text,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            command = [
+                value.format(input=str(input_path), output=str(output_path))
+                for value in shlex.split(command_template)
+            ]
+            subprocess.run(command, check=True, timeout=3600)
+            verdicts = [
+                json.loads(line)
+                for line in output_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        expected = {result.request_id for result in results}
+        if {row.get("request_id") for row in verdicts} != expected:
+            raise ScientificFailure(f"{task} evaluator changed request identities")
+        scores = [row.get("score") for row in verdicts]
+        if any(
+            not isinstance(score, (int, float)) or not 0 <= float(score) <= 1
+            for score in scores
+        ):
+            raise ScientificFailure(f"{task} evaluator must return normalized scores")
+        return float(np.mean(scores)), f"official_{task.lower()}_evaluator", verdicts
     if task not in {"GSM8K", "MATH-500", "AIME-2025"}:
         return None, "N/A: no official local judge", []
     pairs = [
@@ -1240,6 +1260,8 @@ def _execute_cell(
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
+            concurrency = _cell_concurrency(runtime_job)
+            request_scoped = _uses_request_scope(runtime_job)
             controlled_rows: list[dict[str, object]] = list(exactness_rows)
             if runtime_job.parameters.get("controlled_replay"):
                 pair_seed = config.protocol.seed + (job.block or 0)
@@ -1291,15 +1313,28 @@ def _execute_cell(
                     prompts,
                     max_new_tokens,
                     config.protocol.seed + (job.block or 0),
-                    request_scoped=runtime_job.method in {"tts", "l0_naive"},
+                    request_scoped=request_scoped,
+                    max_in_flight=concurrency,
                 )
             elif arrivals is None:
                 seed = config.protocol.seed + (job.block or 0)
-                serial = runtime_job.method in {"tts", "l0_naive"} or (
-                    runtime_job.node == "E1a"
-                    and runtime_job.parameters.get("verification") == "fixed_budget"
-                )
-                if serial:
+                if runtime_job.load and runtime_job.load.startswith("closed_loop_c"):
+                    scheduled = client.run_closed_loop(
+                        prompts,
+                        max_new_tokens=max_new_tokens,
+                        seed=seed,
+                        routing_keys=_routing_keys(config, runtime_job, len(prompts)),
+                        max_in_flight=concurrency,
+                        duration_seconds=E5_HEADLINE_SECONDS,
+                        deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
+                        request_id_prefix=f"{job.job_id}-closed-loop",
+                    )
+                    results, elapsed = scheduled.results, scheduled.elapsed_seconds
+                    if any(
+                        outcome.status == "error" for outcome in scheduled.outcomes
+                    ):
+                        raise RuntimeError("closed-loop request failed")
+                elif request_scoped:
                     results, elapsed = _run_request_scoped(
                         client,
                         prompts,
@@ -1309,12 +1344,19 @@ def _execute_cell(
                         request_prefix=f"{job.job_id}-measure",
                     )
                 else:
-                    results, elapsed = client.run_batch(
+                    scheduled = client.run_bounded(
                         prompts,
                         max_new_tokens=max_new_tokens,
                         seed=seed,
-                        request_id_prefix=f"{job.job_id}-measure",
+                        routing_keys=_routing_keys(config, runtime_job, len(prompts)),
+                        request_ids=tuple(
+                            f"{job.job_id}-measure-{index:05d}"
+                            for index in range(len(prompts))
+                        ),
+                        max_in_flight=concurrency,
+                        deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     )
+                    results, elapsed = scheduled.results, scheduled.elapsed_seconds
             else:
                 scheduled = client.run_scheduled(
                     prompts,
@@ -1326,16 +1368,14 @@ def _execute_cell(
                         f"{job.job_id}-scheduled-{index:05d}"
                         for index in range(len(prompts))
                     ),
-                    max_in_flight=(
-                        1 if runtime_job.method in {"tts", "l0_naive"} else 256
-                    ),
+                    max_in_flight=256,
                     deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     drain_seconds=E5_DRAIN_SECONDS,
                 )
                 results, elapsed = scheduled.results, scheduled.elapsed_seconds
             if profiler in {"nvtx", "nsys", "ncu"}:
                 client.stop_profile()
-            if runtime_job.method in {"tts", "l0_naive"}:
+            if request_scoped:
                 _wait_request_scope_release(client)
             after = _speed_metrics(client.server_info(), topology)
             if runtime_job.parameters.get("controlled_pair_baseline"):
@@ -2045,6 +2085,91 @@ def _e6_load_jobs() -> tuple[Job, ...]:
     return tuple(rows)
 
 
+def _e6_interface_jobs(parents: tuple[Job, ...]) -> tuple[Job, ...]:
+    rows = []
+    for parent in parents:
+        for mode in ("lora", "full"):
+            rows.append(
+                replace(
+                    parent,
+                    job_id=f"{parent.job_id}-{mode}",
+                    node="E6-interface",
+                    ordinal=len(rows),
+                    parameters={
+                        **parent.parameters,
+                        "interface_fit": True,
+                        "interface_parent": parent.job_id,
+                        "parameterization": mode,
+                        "rank": 8 if mode == "lora" else None,
+                        "scope": "all",
+                        "minimum_updates": 1,
+                    },
+                )
+            )
+    return tuple(rows)
+
+
+def _complete_e6_interface_rows(
+    config: ExperimentConfig,
+    state: StateStore,
+    parents: tuple[Job, ...],
+) -> set[str]:
+    components: dict[str, dict[str, tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for raw_config, metrics in _metric_rows(state, "E6-interface"):
+        parameters = raw_config.get("parameters", {})
+        parent = parameters.get("interface_parent")
+        mode = parameters.get("parameterization")
+        if isinstance(parent, str) and mode in {"lora", "full"}:
+            components.setdefault(parent, {})[str(mode)] = (raw_config, metrics)
+    feasible_models = set()
+    for parent in parents:
+        modes = components.get(parent.job_id, {})
+        if set(modes) != {"lora", "full"}:
+            raise ScientificFailure(f"{parent.job_id} lacks LoRA/Full interface results")
+        feasible = all(row[1].get("feasible") is not False for row in modes.values())
+        if feasible:
+            feasible_models.add(parent.model)
+        attempt_number = state.next_attempt(parent.job_id)
+        output_dir = (
+            config.run_dir
+            / "jobs"
+            / parent.job_id
+            / f"attempt-{attempt_number:02d}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        attempt = state.start(parent, config.gpu_ids, output_dir)
+        _write_json(output_dir / "config.json", parent.to_dict())
+        _write_json(
+            output_dir / "metrics.json",
+            {
+                "scientific_outcome": "completed" if feasible else "blocked",
+                "feasible": feasible,
+                "slo_pass": feasible,
+                "components": {
+                    mode: {
+                        "feasible": metrics.get("feasible") is not False,
+                        "error": metrics.get("error"),
+                        "source_attempt": metrics.get("source_attempt"),
+                        "source_attempt_dir": metrics.get("source_attempt_dir"),
+                    }
+                    for mode, (_, metrics) in modes.items()
+                },
+                "request_outcomes": {
+                    "offered": sum(
+                        int(row[1].get("request_outcomes", {}).get("offered", 0))
+                        for row in modes.values()
+                    ),
+                    "completed": sum(
+                        int(row[1].get("request_outcomes", {}).get("completed", 0))
+                        for row in modes.values()
+                    ),
+                },
+            },
+        )
+        state.complete(parent.job_id, attempt)
+    return feasible_models
+
+
 def _select_e6_common_loads(state: StateStore) -> dict[str, str]:
     counts: Counter[tuple[str, str]] = Counter()
     for config, metrics in _metric_rows(state, "E6-common-load"):
@@ -2357,13 +2482,20 @@ def _run_node_jobs(
             job for job in pending if job.parameters.get("interface_fit")
         )
         if interfaces:
-            _run_pending_jobs(config, state, node, stop_event, interfaces)
-            fit_models = {
-                item["model"]
-                for item, metrics in _metric_rows(state, node)
-                if item.get("parameters", {}).get("interface_fit")
-                and metrics.get("slo_pass") is True
-            }
+            state.add_internal_jobs(_e6_interface_jobs(interfaces))
+            _run_pending_jobs(
+                config,
+                state,
+                "E6-interface",
+                stop_event,
+                state.pending_jobs("E6-interface"),
+            )
+            if stop_event.is_set():
+                return
+            _require_internal_jobs(state, "E6-interface")
+            fit_models = _complete_e6_interface_rows(
+                config, state, interfaces
+            )
             probes = tuple(
                 job for job in _e6_load_jobs() if job.model in fit_models
             )
