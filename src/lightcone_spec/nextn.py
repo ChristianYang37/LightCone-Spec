@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import math
+import types
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+
+@contextmanager
+def grad_enabled_forwards(model: torch.nn.Module):
+    """Temporarily bypass model-local no-grad decorators during shadow replay."""
+    restored = []
+    for module in model.modules():
+        forward = module.forward
+        raw = getattr(forward, "__wrapped__", None)
+        if raw is None:
+            continue
+        restored.append((module, forward))
+        module.forward = types.MethodType(raw, module)
+    try:
+        yield
+    finally:
+        for module, forward in reversed(restored):
+            module.forward = forward
 
 
 @dataclass

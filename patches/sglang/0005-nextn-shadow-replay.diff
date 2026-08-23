@@ -10,11 +10,12 @@ diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b
 +from collections.abc import Callable, Sequence
  
  import torch
-@@ -26,4 +27,11 @@
+@@ -26,4 +27,12 @@
      build_native_parameter_plan,
  )
 +
 +from lightcone_spec.nextn import (
++    grad_enabled_forwards,
 +    MergedPublicationBank,
 +    PublicationSlot,
 +    RequestLedger,
@@ -375,7 +376,7 @@ diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b
                      raw = torch.autograd.grad(
                          loss,
                          self.trainable,
-@@ -336,6 +552,60 @@
+@@ -336,6 +552,61 @@
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -418,13 +419,14 @@ diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b
 +            linear_methods.append((method, method.apply))
 +            method.apply = types.MethodType(_shadow_linear_apply, method)
 +        try:
-+            return torch.func.functional_call(
-+                self.model,
-+                self.shadow_parameters(),
-+                args,
-+                kwargs,
-+                strict=False,
-+            )
++            with grad_enabled_forwards(self.model):
++                return torch.func.functional_call(
++                    self.model,
++                    self.shadow_parameters(),
++                    args,
++                    kwargs,
++                    strict=False,
++                )
 +        finally:
 +            for method, forward in reversed(linear_methods):
 +                method.apply = forward

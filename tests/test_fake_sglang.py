@@ -17,6 +17,7 @@ from lightcone_spec.nextn import (
     MergedPublicationBank,
     PublicationSlot,
     RequestLedger,
+    grad_enabled_forwards,
     torch_native_moe,
     torch_native_selected_moe,
 )
@@ -239,6 +240,27 @@ def test_nextn_shadow_has_finite_lora_and_full_gradients():
     )
     assert fp8_output.shape == (1, 2)
     assert torch.isfinite(fp8_output).all()
+
+
+def test_nextn_shadow_bypasses_model_no_grad_decorator():
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+
+        @torch.no_grad()
+        def forward(self, value):
+            return value @ self.weight
+
+    draft = Draft()
+    value = torch.ones(1, 2)
+    assert not draft(value).requires_grad
+    with grad_enabled_forwards(draft):
+        loss = draft(value).square().mean()
+    loss.backward()
+    assert draft.weight.grad is not None
+    assert torch.count_nonzero(draft.weight.grad)
+    assert not draft(value).requires_grad
 
 
 def test_nextn_merge_publication_and_ragged_rid_join():
