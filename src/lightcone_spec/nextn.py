@@ -35,6 +35,17 @@ def gradient_leaves(parameters: Sequence[torch.Tensor]) -> tuple[torch.Tensor, .
     return tuple(value.detach().requires_grad_(True) for value in parameters)
 
 
+def torch_native_shared_expert_add(
+    hidden: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+) -> None:
+    """Differentiable equivalent of Qwen's fused shared-expert add."""
+    gate = F.linear(hidden, gate_weight.unsqueeze(0))
+    routed.add_(torch.sigmoid(gate) * shared)
+
+
 @dataclass
 class RequestRow:
     rid: str

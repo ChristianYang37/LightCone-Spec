@@ -21,6 +21,7 @@ from lightcone_spec.nextn import (
     gradient_leaves,
     torch_native_moe,
     torch_native_selected_moe,
+    torch_native_shared_expert_add,
 )
 from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import (
@@ -271,6 +272,18 @@ def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
     (gradient,) = torch.autograd.grad(loss, (weight,))
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient)
+
+
+def test_nextn_shadow_shared_expert_add_keeps_gradient():
+    hidden = torch.ones(2, 3)
+    gate = torch.ones(3)
+    shared_weight = torch.ones(3, 3, requires_grad=True)
+    shared = hidden @ shared_weight
+    routed = torch.zeros_like(shared)
+    torch_native_shared_expert_add(hidden, gate, shared, routed)
+    routed.square().mean().backward()
+    assert shared_weight.grad is not None
+    assert torch.count_nonzero(shared_weight.grad)
 
 
 def test_nextn_merge_publication_and_ragged_rid_join():
