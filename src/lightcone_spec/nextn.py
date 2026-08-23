@@ -32,7 +32,8 @@ def grad_enabled_forwards(model: torch.nn.Module):
 
 def gradient_leaves(parameters: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
     """Expose resident optimizer values as differentiable replay inputs."""
-    return tuple(value.detach().requires_grad_(True) for value in parameters)
+    with torch.inference_mode(False), torch.enable_grad():
+        return tuple(value.detach().requires_grad_(True) for value in parameters)
 
 
 def torch_native_shared_expert_add(

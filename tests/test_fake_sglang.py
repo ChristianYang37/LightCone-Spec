@@ -268,9 +268,12 @@ def test_nextn_shadow_bypasses_model_no_grad_decorator():
 
 def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
     master = (torch.ones(2, 2),)
-    (weight,) = gradient_leaves(master)
-    loss = (torch.ones(1, 2) @ weight).square().mean()
+    with torch.inference_mode():
+        (weight,) = gradient_leaves(master)
+        with torch.inference_mode(False), torch.enable_grad():
+            loss = (torch.ones(1, 2) @ weight).square().mean()
     (gradient,) = torch.autograd.grad(loss, (weight,))
+    assert not weight.is_inference()
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient)
 
