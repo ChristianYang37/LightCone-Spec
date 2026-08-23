@@ -476,7 +476,7 @@ index 7fc522e2..e64b827d 100644
                          (batch_size,),
                          self.speculative_num_draft_tokens,
 diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-index f1da6d2d..404e3cca 100644
+index f1da6d2d..3d32c421 100644
 --- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
 @@ -4,7 +4,8 @@ from __future__ import annotations
@@ -643,7 +643,17 @@ index f1da6d2d..404e3cca 100644
  def _canonical_named_parameters(model) -> tuple[tuple[str, str, torch.Tensor], ...]:
      rows = []
      seen = set()
-@@ -97,16 +219,39 @@ class NativeBackendOnlineAdapter:
+@@ -90,6 +212,9 @@ class NativeBackendOnlineAdapter:
+         self.model = model
+         self.device = torch.device(worker.device)
+         rows = _canonical_named_parameters(model)
++        if algorithm == "NEXTN":
++            for _, _, parameter in rows:
++                parameter.requires_grad_(False)
+         self.plan: ParameterSelection = build_native_parameter_plan(
+             ((raw_name, parameter) for _, raw_name, parameter in rows),
+             config,
+@@ -97,16 +222,39 @@ class NativeBackendOnlineAdapter:
          self.live_launch_count = 0
          self.last_source_tensor_shapes: tuple[tuple[int, ...], ...] = ()
          self.last_feedback_source_version: int | None = None
@@ -687,7 +697,7 @@ index f1da6d2d..404e3cca 100644
          else:
              if config.rank is None:
                  raise AssertionError("validated native LoRA config has no rank")
-@@ -116,37 +261,79 @@ class NativeBackendOnlineAdapter:
+@@ -116,37 +264,79 @@ class NativeBackendOnlineAdapter:
                  if leaf != "weight":
                      raise ValueError("native LoRA selector named a non-weight tensor")
                  module = model.get_submodule(parent_name) if parent_name else model
@@ -781,7 +791,7 @@ index f1da6d2d..404e3cca 100644
          context_capacity = int(
              server_args.context_length
              or getattr(model.config, "max_position_embeddings", config.canvas_tokens)
-@@ -192,7 +379,9 @@ class NativeBackendOnlineAdapter:
+@@ -192,7 +382,9 @@ class NativeBackendOnlineAdapter:
          )
          candidate_bytes = estimate_functional_optimizer_scratch_bytes(
              self.optimizer,
@@ -792,7 +802,7 @@ index f1da6d2d..404e3cca 100644
          )
          scratch = parameter_bytes + activation_bytes + candidate_bytes
          self.runtime.bind_memory(
-@@ -228,12 +417,42 @@ class NativeBackendOnlineAdapter:
+@@ -228,12 +420,42 @@ class NativeBackendOnlineAdapter:
      def begin_round(
          self, request_ids: Sequence[str], prefix_lens: torch.Tensor
      ) -> int:
@@ -837,7 +847,7 @@ index f1da6d2d..404e3cca 100644
          request_ids: Sequence[str],
          prefix_lens: torch.Tensor,
          source_tensors: Sequence[torch.Tensor],
-@@ -241,10 +460,8 @@ class NativeBackendOnlineAdapter:
+@@ -241,10 +463,8 @@ class NativeBackendOnlineAdapter:
      ) -> None:
          if not self.runtime.update_due():
              return
@@ -850,7 +860,7 @@ index f1da6d2d..404e3cca 100644
              return
          self.live_launch_count += 1
          self.last_source_tensor_shapes = tuple(
-@@ -256,9 +473,25 @@ class NativeBackendOnlineAdapter:
+@@ -256,9 +476,25 @@ class NativeBackendOnlineAdapter:
          try:
              with self.runtime.side_update(tuple(source_tensors)):
                  with self.runtime.timing("training"):
@@ -877,7 +887,7 @@ index f1da6d2d..404e3cca 100644
                          allow_unused=True,
                      )
                      connected = tuple(
-@@ -336,6 +569,110 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +572,110 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -988,7 +998,7 @@ index f1da6d2d..404e3cca 100644
      def after_commit(
          self,
          request_ids: Sequence[str],
-@@ -345,6 +682,14 @@ class NativeBackendOnlineAdapter:
+@@ -345,6 +685,14 @@ class NativeBackendOnlineAdapter:
          committed_tokens: torch.Tensor,
      ) -> None:
          request_ids = tuple(request_ids)
@@ -1003,7 +1013,7 @@ index f1da6d2d..404e3cca 100644
          self.runtime.record_device_commit(request_ids, committed_tokens)
          self.runtime.record_round_outcome(
              request_ids,
-@@ -354,10 +699,12 @@ class NativeBackendOnlineAdapter:
+@@ -354,10 +702,12 @@ class NativeBackendOnlineAdapter:
          )
  
      def finish_request(self, request_id: str) -> None:
@@ -1016,7 +1026,7 @@ index f1da6d2d..404e3cca 100644
          if self.runtime.abort_request(request_id):
              self._restore_request_source()
  
-@@ -388,6 +735,7 @@ class NativeBackendOnlineAdapter:
+@@ -388,6 +738,7 @@ class NativeBackendOnlineAdapter:
                  "native_last_source_tensor_shapes": self.last_source_tensor_shapes,
                  "native_last_feedback_source_version": self.last_feedback_source_version,
                  "native_parameter_names": self.names,
