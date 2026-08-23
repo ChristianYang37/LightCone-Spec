@@ -290,6 +290,21 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     assert ledger.order == ("replacement",)
 
 
+def test_adapter_tensor_payload_round_trips_without_process_sharing():
+    import base64
+    import importlib.util
+    import pickle
+
+    path = Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py"
+    spec = importlib.util.spec_from_file_location("gpu_acceptance", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original = {"layer.lora_A.weight": torch.arange(8).reshape(2, 4)}
+    restored = pickle.loads(base64.b64decode(module._portable_tensor_payload(original)))
+    assert torch.equal(restored["layer.lora_A.weight"], original["layer.lora_A.weight"])
+
+
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     trace = tmp_path / "trace.csv"
     trace.write_text(

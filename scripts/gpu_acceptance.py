@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
+import pickle
 import signal
 import statistics
 import subprocess
@@ -88,6 +90,12 @@ def _adapter_tensors(model_path: Path, adapter_index: int):
             tensors[f"{prefix}.{name}.lora_A.weight"] = a
             tensors[f"{prefix}.{name}.lora_B.weight"] = b
     return tensors
+
+
+def _portable_tensor_payload(tensors: object) -> str:
+    """Serialize CPU tensors as bytes instead of multiprocessing file descriptors."""
+    payload = pickle.dumps(tensors, protocol=pickle.HIGHEST_PROTOCOL)
+    return base64.b64encode(payload).decode("ascii")
 
 
 def _adapter_observation(row: dict[str, object]) -> dict[str, object]:
@@ -576,8 +584,6 @@ def adapter_batching(args: argparse.Namespace) -> None:
     try:
         _wait_health(base_url, process, config.server.startup_timeout_seconds)
         sampler.start()
-        from sglang.srt.utils import MultiprocessingSerializer
-
         names = tuple(f"excluded-adapter-{index}" for index in range(8))
         adapter_config = {
             "peft_type": "LORA",
@@ -588,9 +594,8 @@ def adapter_batching(args: argparse.Namespace) -> None:
             "bias": "none",
         }
         for index, name in enumerate(names):
-            serialized = MultiprocessingSerializer.serialize(
-                _adapter_tensors(config.model_path("Qwen/Qwen3-8B"), index),
-                output_str=True,
+            serialized = _portable_tensor_payload(
+                _adapter_tensors(config.model_path("Qwen/Qwen3-8B"), index)
             )
             loaded = _post_json(
                 base_url + "/load_lora_adapter_from_tensors",
