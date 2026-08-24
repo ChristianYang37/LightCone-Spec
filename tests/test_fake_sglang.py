@@ -557,6 +557,13 @@ def test_adapter_tensor_payload_round_trips_and_preserves_request_ownership(monk
     )
     rows, _ = module._adapter_generate("http://unused", "p", ("a", "b"), "mixed", 1, 1)
     assert [row["output_ids"] for row in rows] == [[1], [2]]
+    dspark = module._job(0, "lightcone", "DSPARK", block=0)
+    assert module._needs_publication_witness(
+        dspark, {"updates_launched": 1, "updates_published": 0}
+    )
+    assert not module._needs_publication_witness(
+        dspark, {"updates_launched": 1, "updates_published": 1}
+    )
 
 
 def test_gpu_smoke_rejects_cross_kernel_greedy_mismatch(monkeypatch, tmp_path: Path):

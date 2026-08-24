@@ -187,6 +187,12 @@ def _validate_token_accounting(results, committed: int, budget: int) -> None:
     _validate_committed_tokens(results, committed)
 
 
+def _needs_publication_witness(job: Job, metrics: dict[str, object]) -> bool:
+    return job.backend == "DSPARK" and int(metrics["updates_launched"]) > int(
+        metrics["updates_published"]
+    )
+
+
 def _job(
     ordinal: int,
     method: str,
@@ -455,20 +461,34 @@ def _measure(
                 seed=job.block or 0,
                 request_id_prefix=f"acceptance-{job.method}",
             )
-        after = _speed_metrics(client.server_info(), topology)
+        scored_after = _speed_metrics(client.server_info(), topology)
+        publication_witness = None
+        if _needs_publication_witness(job, scored_after):
+            witness, _ = client.run_batch(
+                prompts[:1],
+                max_new_tokens=16,
+                seed=job.block or 0,
+                request_id_prefix="publication-witness",
+            )
+            publication_witness = witness[0].to_dict()
+            after = _speed_metrics(client.server_info(), topology)
+        else:
+            after = scored_after
     intervals = [value for result in results for value in result.inter_token_ms]
-    committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
     _write(
         output / "raw.json",
         {
             "results": [result.to_dict() for result in results],
+            "publication_witness": publication_witness,
             "exactness_trajectory": exactness_trajectory,
             "exactness_evidence": exactness_evidence,
             "before": before,
+            "scored_after": scored_after,
             "after": after,
             "elapsed_seconds": elapsed,
         },
     )
+    committed = int(scored_after["committed_tokens"]) - int(before["committed_tokens"])
     _validate_token_accounting(results, committed, max_new_tokens)
     counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
     row: dict[str, object] = {
