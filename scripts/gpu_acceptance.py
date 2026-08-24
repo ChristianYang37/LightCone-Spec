@@ -46,6 +46,14 @@ LEGACY_MISSING_METRICS = (
 )
 
 
+def _acceptance_gpus(config: ExperimentConfig, job: Job) -> tuple[int, ...]:
+    return config.gpu_ids[:2] if job.gpu_count == 2 else (config.gpu_ids[0],)
+
+
+def _acceptance_port(config: ExperimentConfig, job: Job) -> int:
+    return config.server.base_port + (len(config.gpu_ids) if job.gpu_count == 2 else 0)
+
+
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -265,8 +273,8 @@ def _native_exactness(
             "exactness_bootstrap": True,
         },
     )
-    gpus = config.gpu_ids if exact_job.gpu_count == 2 else (config.gpu_ids[0],)
-    port = config.server.base_port + (2 if exact_job.gpu_count == 2 else 0)
+    gpus = _acceptance_gpus(config, exact_job)
+    port = _acceptance_port(config, exact_job)
     output.mkdir(parents=True, exist_ok=True)
     process_type = (
         ReplicaServerProcess
@@ -334,8 +342,8 @@ def _measure(
             job,
             parameters={**job.parameters, "deterministic_exactness": True},
         )
-    gpus = config.gpu_ids if job.gpu_count == 2 else (config.gpu_ids[0],)
-    port = config.server.base_port + (2 if job.gpu_count == 2 else 0)
+    gpus = _acceptance_gpus(config, job)
+    port = _acceptance_port(config, job)
     output.mkdir(parents=True, exist_ok=True)
     process_type = (
         ReplicaServerProcess
@@ -935,8 +943,8 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
     process = ServerProcess(
         config,
         job,
-        gpus=config.gpu_ids,
-        port=config.server.base_port + 2,
+        gpus=_acceptance_gpus(config, job),
+        port=_acceptance_port(config, job),
         output_dir=args.output,
         selection=None,
     )

@@ -44,6 +44,9 @@ def _plan(config: ExperimentConfig) -> None:
     print("node\trows\tgpus\tdescription")
     for row in paper_plan(final_blocks=config.protocol.final_blocks):
         print(f"{row.name}\t{row.rows}\t{row.gpu_count}\t{row.description}")
+    pairs = tuple(zip(config.gpu_ids[::2], config.gpu_ids[1::2], strict=True))
+    print(f"\ngpu_pairs\t{len(pairs)}\t{pairs}")
+    print(f"max_parallel_blocks\t{len(pairs)}\tone clean block per TP2 pair")
     jobs = tuple(
         job
         for node in PAPER_NODES
@@ -55,6 +58,11 @@ def _plan(config: ExperimentConfig) -> None:
         if not _time_driven(job)
     )
     print("\ninternal_substage\tjobs\trequest_basis")
+    if len(pairs) > 1:
+        print(
+            f"GPU-pair-interference\t{2 * len(pairs)}\t"
+            f"{len(pairs)} isolated + {len(pairs)} concurrent TP2 blocks"
+        )
     print("E1-common-load\tdynamic\t7 loads * (2 baselines + 2 * safe geometries)")
     print("E3-width-calibration\t36\t4 methods * 3 widths * 3 regimes")
     print("E1a-confidence-calibration\t4\t4 confidence weights")

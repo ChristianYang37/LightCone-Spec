@@ -41,13 +41,13 @@ excluded tuning substage independently freezes deployment width for Static,
 TTS, L0, and LightCone.
 
 Methods in a paired block run sequentially on the same device. Independent
-single-GPU blocks may run on GPUs 0 and 1 concurrently. TP2, DP2, E5, and E6
-cells use both devices exclusively. DP2 uses two independent TP1 servers with
+blocks may use different configured devices or TP2 pairs concurrently. TP2,
+DP2, E5, and E6 cells use one pair exclusively. DP2 uses two independent TP1 servers with
 sticky cohort routing. Every independent block gets a clean server;
 cells with the same model/backend, parallel layout, optimizer-state layout,
 width, and profiler mode reuse it after an idle configure/reset. Incompatible
 layouts restart normally. Preflight disables parallel final blocks when measured
-two-GPU interference exceeds 1%.
+pair interference exceeds 1%.
 
 E1 first runs all 68 rows at `c1`, then probes the E3a load grid for the anchors
 and two-optimizer Pareto union. Its highest common safe load caps E2 and is

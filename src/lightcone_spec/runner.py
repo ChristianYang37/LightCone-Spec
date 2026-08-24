@@ -1836,13 +1836,99 @@ def _retryable_process_error(error: Exception) -> bool:
     )
 
 
+def _gpu_pairs(config: ExperimentConfig) -> tuple[tuple[int, int], ...]:
+    return tuple(zip(config.gpu_ids[::2], config.gpu_ids[1::2], strict=True))
+
+
+def _assigned_pair(config: ExperimentConfig, job: Job) -> tuple[int, int]:
+    pairs = _gpu_pairs(config)
+    if job.node == "preflight":
+        return pairs[0]
+    index = job.block if job.block is not None else job.ordinal
+    return pairs[index % len(pairs)]
+
+
 def _assigned_gpu(config: ExperimentConfig, job: Job) -> int:
     gpu_index = job.parameters.get("gpu_index")
     if isinstance(gpu_index, int) and 0 <= gpu_index < len(config.gpu_ids):
         return config.gpu_ids[gpu_index]
     if job.block is not None:
-        return config.gpu_ids[job.block % 2]
-    return config.gpu_ids[job.ordinal % 2]
+        return config.gpu_ids[job.block % len(config.gpu_ids)]
+    return config.gpu_ids[job.ordinal % len(config.gpu_ids)]
+
+
+def _resource_port(config: ExperimentConfig, gpus: tuple[int, ...]) -> int:
+    if len(gpus) == 1:
+        return config.server.base_port + config.gpu_ids.index(gpus[0])
+    return (
+        config.server.base_port
+        + len(config.gpu_ids)
+        + 2 * _gpu_pairs(config).index((gpus[0], gpus[1]))
+    )
+
+
+def _job_gpus(config: ExperimentConfig, job: Job) -> tuple[int, ...]:
+    if job.gpu_count == 2:
+        return _assigned_pair(config, job)
+    return (_assigned_gpu(config, job),)
+
+
+def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:
+    rows = []
+    for pair_index in range(len(_gpu_pairs(config))):
+        for mode in ("isolated", "concurrent"):
+            ordinal = 2 * pair_index + (mode == "concurrent")
+            rows.append(
+                Job(
+                    job_id=f"GPU-pair-interference__{ordinal:06d}__{mode}-pair-{pair_index}",
+                    node="GPU-pair-interference",
+                    ordinal=ordinal,
+                    method="static",
+                    model="Qwen/Qwen3-8B",
+                    backend="DFLASH",
+                    task="controlled_baseline",
+                    context=4096,
+                    load="c8",
+                    width=8,
+                    block=pair_index,
+                    gpu_count=2,
+                    parameters={
+                        "mode": mode,
+                        "topology": "tp2_dp1",
+                        "workload": "pair_interference",
+                    },
+                )
+            )
+    return tuple(rows)
+
+
+def _select_pair_parallelism(state: StateStore, node: str) -> dict[str, Any]:
+    timings: dict[int, dict[str, dict[str, float]]] = {}
+    for item, metrics in _metric_rows(state, node):
+        mode = item["parameters"].get("mode")
+        block = item.get("block")
+        if mode in {"isolated", "concurrent"} and isinstance(block, int):
+            timings.setdefault(block, {})[mode] = {
+                "goodput": float(metrics["goodput"]),
+                "itl": float(metrics["itl_p99_ms"]),
+            }
+    pairs = [
+        rows for rows in timings.values() if {"isolated", "concurrent"} <= rows.keys()
+    ]
+    intervals = {}
+    if len(pairs) >= 3:
+        for metric in ("goodput", "itl"):
+            candidate = [rows["concurrent"][metric] for rows in pairs]
+            baseline = [rows["isolated"][metric] for rows in pairs]
+            intervals[metric] = paired_relative_bca_interval(candidate, baseline)
+    return {
+        "enabled": len(pairs) == len(timings) >= 3
+        and all(
+            abs(point) <= 0.01 and low <= 0 <= high
+            for point, low, high in intervals.values()
+        ),
+        "paired_relative_bca": intervals,
+    }
 
 
 def _e5_execution_phases(
@@ -2200,7 +2286,7 @@ def _complete_e6_interface_rows(
             / f"attempt-{attempt_number:02d}"
         )
         output_dir.mkdir(parents=True, exist_ok=True)
-        attempt = state.start(parent, config.gpu_ids, output_dir)
+        attempt = state.start(parent, _job_gpus(config, parent), output_dir)
         _write_json(output_dir / "config.json", parent.to_dict())
         _write_json(
             output_dir / "metrics.json",
@@ -2414,12 +2500,37 @@ def _run_pending_jobs(
                     if not retry:
                         raise
 
-    run_sessions(
-        exclusive,
-        gpus=config.gpu_ids,
-        port=config.server.base_port + 2,
-        label="gpu-both",
+    headline = node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
+    calibration = state.selection("headline_parallel", {"enabled": False})
+    exclusive_queues = {
+        pair: tuple(job for job in exclusive if _assigned_pair(config, job) == pair)
+        for pair in _gpu_pairs(config)
+    }
+    exclusive_queues = {
+        pair: jobs for pair, jobs in exclusive_queues.items() if jobs
+    }
+    exclusive_workers = (
+        len(exclusive_queues)
+        if not headline or calibration.get("enabled")
+        else min(1, len(exclusive_queues))
     )
+    if exclusive_workers:
+        with ThreadPoolExecutor(
+            max_workers=exclusive_workers,
+            thread_name_prefix="lightcone-pair",
+        ) as pool:
+            futures = [
+                pool.submit(
+                    run_sessions,
+                    jobs,
+                    gpus=pair,
+                    port=_resource_port(config, pair),
+                    label=f"gpu-pair-{pair[0]}-{pair[1]}",
+                )
+                for pair, jobs in exclusive_queues.items()
+            ]
+            for future in futures:
+                future.result()
     if node == "preflight":
         isolated = [job for job in singles if job.parameters.get("mode") == "isolated"]
         for job in isolated:
@@ -2427,13 +2538,13 @@ def _run_pending_jobs(
             run_sessions(
                 (job,),
                 gpus=(gpu,),
-                port=config.server.base_port + config.gpu_ids.index(gpu),
+                port=_resource_port(config, (gpu,)),
                 label=f"isolated-gpu-{gpu}",
             )
         concurrent = [job for job in singles if job.parameters.get("mode") == "concurrent"]
         for block in sorted({job.block for job in concurrent}):
             rows = [job for job in concurrent if job.block == block]
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(rows)) as pool:
                 futures = []
                 for job in rows:
                     gpu = _assigned_gpu(config, job)
@@ -2442,7 +2553,7 @@ def _run_pending_jobs(
                             run_sessions,
                             (job,),
                             gpus=(gpu,),
-                            port=config.server.base_port + config.gpu_ids.index(gpu),
+                            port=_resource_port(config, (gpu,)),
                             label=f"concurrent-gpu-{gpu}",
                         )
                     )
@@ -2455,16 +2566,18 @@ def _run_pending_jobs(
     }
 
     def worker(gpu: int, jobs: Iterable[Job]) -> None:
-        port = config.server.base_port + config.gpu_ids.index(gpu)
+        port = _resource_port(config, (gpu,))
         run_sessions(jobs, gpus=(gpu,), port=port, label=f"gpu-{gpu}")
 
-    headline = node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
-    calibration = state.selection("headline_parallel", {"enabled": False})
-    workers = 2 if not headline or calibration.get("enabled") else 1
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lightcone-gpu") as pool:
-        futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
-        for future in futures:
-            future.result()
+    queues = {gpu: jobs for gpu, jobs in queues.items() if jobs}
+    workers = len(queues) if not headline or calibration.get("enabled") else min(1, len(queues))
+    if workers:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="lightcone-gpu"
+        ) as pool:
+            futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
+            for future in futures:
+                future.result()
 
 
 def _run_node_jobs(
@@ -2474,6 +2587,42 @@ def _run_node_jobs(
     stop_event: threading.Event,
 ) -> None:
     pending = state.pending_jobs(node)
+    if (
+        node == "preflight"
+        and len(_gpu_pairs(config)) > 1
+        and state.selection("pair_interference_complete", None) is None
+    ):
+        calibration = _pair_interference_jobs(config)
+        state.add_internal_jobs(calibration)
+        for job in state.pending_jobs("GPU-pair-interference"):
+            if job.parameters.get("mode") == "isolated":
+                _run_pending_jobs(
+                    config,
+                    state,
+                    "GPU-pair-interference",
+                    stop_event,
+                    (job,),
+                )
+        concurrent = tuple(
+            job
+            for job in state.pending_jobs("GPU-pair-interference")
+            if job.parameters.get("mode") == "concurrent"
+        )
+        _run_pending_jobs(
+            config,
+            state,
+            "GPU-pair-interference",
+            stop_event,
+            concurrent,
+        )
+        if stop_event.is_set():
+            return
+        _require_internal_jobs(state, "GPU-pair-interference")
+        state.set_selection(
+            "headline_parallel",
+            _select_pair_parallelism(state, "GPU-pair-interference"),
+        )
+        state.set_selection("pair_interference_complete", True)
     if node == "E0-tune":
         for job in pending:
             if not job.parameters.get("probe") or config.has_exact_draft(
@@ -2488,7 +2637,7 @@ def _run_node_jobs(
                 / f"attempt-{attempt_number:02d}"
             )
             output_dir.mkdir(parents=True, exist_ok=True)
-            attempt = state.start(job, config.gpu_ids, output_dir)
+            attempt = state.start(job, _job_gpus(config, job), output_dir)
             _write_json(output_dir / "config.json", job.to_dict())
             _write_json(
                 output_dir / "metrics.json",
@@ -3461,17 +3610,18 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                     calibrations[metric] = paired_relative_bca_interval(
                         candidate, baseline
                     )
-        state.set_selection(
-            "headline_parallel",
-            {
-                "enabled": len(pairs) == 4
-                and all(
-                    abs(point) <= 0.01 and low <= 0 <= high
-                    for point, low, high in calibrations.values()
-                ),
-                "paired_relative_bca": calibrations,
-            },
-        )
+        if len(_gpu_pairs(config)) == 1:
+            state.set_selection(
+                "headline_parallel",
+                {
+                    "enabled": len(pairs) == 4
+                    and all(
+                        abs(point) <= 0.01 and low <= 0 <= high
+                        for point, low, high in calibrations.values()
+                    ),
+                    "paired_relative_bca": calibrations,
+                },
+            )
     if node == "E3a":
         rows = _metric_rows(state, node)
         anchors = [

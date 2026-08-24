@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lightcone_spec.config import ExperimentConfig
+from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.data import load_prompt_records, load_tts_calibration
 from lightcone_spec.protocol import (
     PAPER_NODES,
@@ -16,11 +16,16 @@ from lightcone_spec.protocol import (
     paper_plan,
 )
 from lightcone_spec.runner import (
+    _assigned_gpu,
+    _assigned_pair,
     _capacity_infeasible,
     _e5_execution_phases,
     _e5_reference,
     _e6_interface_jobs,
     _e6_role_supported,
+    _gpu_pairs,
+    _pair_interference_jobs,
+    _resource_port,
     _runtime_job,
     _screening_job,
     _selection_for_job,
@@ -81,6 +86,56 @@ def test_two_gpu_exclusivity_and_real_interface_probes():
     probes = materialize("E0-tune", valid_e0=[])[:108]
     assert {job.method for job in probes} == {"static"}
     assert all(job.parameters["adaptive_probe"] for job in probes)
+
+
+def test_eight_gpu_pair_pool_preserves_block_affinity(tmp_path):
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path / "sglang",
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={},
+        gpu_ids=tuple(range(8)),
+        server=ServerConfig(python=tmp_path / "python", base_port=30000),
+        protocol=ProtocolConfig(),
+    )
+    assert _gpu_pairs(config) == ((0, 1), (2, 3), (4, 5), (6, 7))
+    blocks = [
+        next(job for job in materialize("E6-final", final_blocks=12) if job.block == block)
+        for block in range(4, 8)
+    ]
+    assert [_assigned_pair(config, job) for job in blocks] == [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+    ]
+    same_block = [job for job in materialize("E6-final", final_blocks=12) if job.block == 6]
+    assert {_assigned_pair(config, job) for job in same_block} == {(4, 5)}
+    assert _resource_port(config, (0,)) == 30000
+    assert _resource_port(config, (0, 1)) == 30008
+    assert _resource_port(config, (2, 3)) == 30010
+
+    singles = [job for job in materialize("E3b-final", final_blocks=12) if job.block == 7]
+    assert {_assigned_gpu(config, job) for job in singles} == {7}
+
+
+def test_even_gpu_config_and_pair_interference_rows(tmp_path):
+    source = Path("examples/paper.yaml").read_text()
+    eight = tmp_path / "eight.yaml"
+    eight.write_text(source.replace("gpu_ids: [0, 1]", "gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]"))
+    config = ExperimentConfig.load(eight)
+    rows = _pair_interference_jobs(config)
+    assert len(rows) == 8
+    assert {job.parameters["mode"] for job in rows} == {"isolated", "concurrent"}
+    assert {_assigned_pair(config, job) for job in rows} == set(_gpu_pairs(config))
+
+    odd = tmp_path / "odd.yaml"
+    odd.write_text(source.replace("gpu_ids: [0, 1]", "gpu_ids: [0, 1, 2]"))
+    with pytest.raises(ValueError, match="even number"):
+        ExperimentConfig.load(odd)
 
 
 def test_e6_lightcone_uses_the_fitted_lora_layout():

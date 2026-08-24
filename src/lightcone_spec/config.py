@@ -1,4 +1,4 @@
-"""Small YAML configuration for local two-GPU paper experiments."""
+"""Small YAML configuration for local paper experiments."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ class ExperimentConfig:
     models: dict[str, Path]
     drafts: dict[str, Path]
     datasets: dict[str, Path]
-    gpu_ids: tuple[int, int]
+    gpu_ids: tuple[int, ...]
     server: ServerConfig
     protocol: ProtocolConfig
     profiler_tools: dict[str, Path] = field(default_factory=dict)
@@ -87,11 +87,14 @@ class ExperimentConfig:
         raw_gpus = root.get("gpu_ids", [0, 1])
         if (
             not isinstance(raw_gpus, list)
-            or len(raw_gpus) != 2
+            or len(raw_gpus) < 2
+            or len(raw_gpus) % 2
             or any(not isinstance(item, int) or item < 0 for item in raw_gpus)
-            or raw_gpus[0] == raw_gpus[1]
+            or len(set(raw_gpus)) != len(raw_gpus)
         ):
-            raise ValueError("gpu_ids must name two distinct non-negative devices")
+            raise ValueError(
+                "gpu_ids must name an even number of distinct non-negative devices"
+            )
         host = server_data.get("host", "127.0.0.1")
         if not isinstance(host, str) or not host:
             raise ValueError("server.host must be text")
@@ -131,8 +134,8 @@ class ExperimentConfig:
             or server.adaptation_reserve_mb < 0
         ):
             raise ValueError("server request counts and token budget are invalid")
-        if not 1024 <= server.base_port <= 65531:
-            raise ValueError("server.base_port must leave four valid local ports")
+        if not 1024 <= server.base_port <= 65536 - 2 * len(raw_gpus):
+            raise ValueError("server.base_port does not leave enough local ports")
         if server.startup_timeout_seconds < 1 or server.request_timeout_seconds < 1:
             raise ValueError("server timeouts must be positive")
         protocol = ProtocolConfig(
@@ -182,7 +185,7 @@ class ExperimentConfig:
             models=models,
             drafts=drafts,
             datasets=datasets,
-            gpu_ids=(raw_gpus[0], raw_gpus[1]),
+            gpu_ids=tuple(raw_gpus),
             server=server,
             protocol=protocol,
             profiler_tools=profilers,

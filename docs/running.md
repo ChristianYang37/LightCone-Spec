@@ -1,9 +1,10 @@
 # Running the experiment
 
 1. Copy `examples/paper.yaml` outside the checkout and fill in absolute local
-   paths. The file contains only runtime paths, two GPU IDs, ports, memory
+   paths. The file contains only runtime paths, an even list of GPU IDs, ports, memory
    settings, the CUDA toolkit path, the `paper-v1` preset, one process retry,
-   profiler paths, and optional stage bounds.
+   profiler paths, and optional stage bounds. Consecutive IDs form TP2 pairs,
+   so eight GPUs run as four independent pairs.
    Convert raw datasets with `scripts/prepare_datasets.py --splits splits.csv`
    when the configured files are not already normalized. The split CSV is the
    sole source of tuning/pilot/final/holdout membership.

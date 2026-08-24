@@ -112,3 +112,15 @@ def test_plain_config_resume_and_global_final_n(tmp_path: Path):
     assert _node_final_blocks(config, state, "E5-final") == 17
     assert _node_final_blocks(config, state, "E6-final") == 17
     assert _node_final_blocks(config, state, "E0-final") == 17
+
+
+def test_sqlite_records_actual_pair_not_the_whole_pool(tmp_path: Path):
+    state = StateStore(tmp_path)
+    job = materialize("E6-final", final_blocks=12)[0]
+    state.add_jobs("E6-final", (job,))
+    state.start(job, (4, 5), tmp_path / "attempt")
+    with state.connect() as connection:
+        row = connection.execute(
+            "SELECT assigned_gpus FROM jobs WHERE job_id=?", (job.job_id,)
+        ).fetchone()
+    assert row["assigned_gpus"] == "4,5"
