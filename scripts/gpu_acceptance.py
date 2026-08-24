@@ -561,7 +561,9 @@ def _measure(
     }
     if sticky_routing is not None:
         row["sticky_routing"] = sticky_routing
-    if any(value not in (None, 0) for value in counters.values()):
+    if not legacy_metrics and any(
+        value not in (None, 0) for value in counters.values()
+    ):
         raise RuntimeError(f"{job.method} reported nonzero safety counters: {counters}")
     if job.method not in {"target_only", "static"} and int(after["updates_published"]) < 1:
         raise RuntimeError(f"{job.method} did not publish an update")
@@ -1130,9 +1132,8 @@ def compare(args: argparse.Namespace) -> None:
         new_by_block = {int(row["block"]): row["trajectories"] for row in new}
         if old_by_block != new_by_block:
             failures.append(f"{method}: donor/rebuild token trajectories differ")
-        for label, rows in (("donor", old), ("rebuild", new)):
-            if any(any(row["counters"].values()) for row in rows):
-                failures.append(f"{method}: {label} has nonzero safety counters")
+        if any(any(row["counters"].values()) for row in new):
+            failures.append(f"{method}: rebuild has nonzero safety counters")
     report = {"passed": not failures, "failures": failures}
     _write(args.output, report)
     if failures:

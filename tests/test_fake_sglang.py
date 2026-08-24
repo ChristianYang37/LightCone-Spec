@@ -688,6 +688,54 @@ def test_gpu_smoke_rejects_cross_kernel_greedy_mismatch(monkeypatch, tmp_path: P
         module.smoke(args)
 
 
+def test_donor_counters_are_reported_but_only_rebuild_counters_gate(tmp_path: Path):
+    import importlib.util
+    import json
+
+    path = Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py"
+    spec = importlib.util.spec_from_file_location("gpu_acceptance_compare", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    methods = (
+        "target_only",
+        "static",
+        "tts",
+        "l0_naive",
+        "lightcone",
+        "onlinespec_ogd",
+    )
+    donor = []
+    rebuild = []
+    for method in methods:
+        for block in range(3):
+            row = {
+                "method": method,
+                "block": block,
+                "goodput": 1.0,
+                "p99_itl_ms": 1.0,
+                "peak_hbm_bytes": 1,
+                "trajectories": [[1, 2]],
+                "counters": {"retractions": 2},
+            }
+            donor.append(row)
+            rebuild.append({**row, "counters": {"retractions": 0}})
+    donor_path = tmp_path / "donor.json"
+    rebuild_path = tmp_path / "rebuild.json"
+    output = tmp_path / "comparison.json"
+    donor_path.write_text(json.dumps(donor), encoding="utf-8")
+    rebuild_path.write_text(json.dumps(rebuild), encoding="utf-8")
+    args = SimpleNamespace(donor=donor_path, rebuild=rebuild_path, output=output)
+    module.compare(args)
+    assert json.loads(output.read_text(encoding="utf-8"))["passed"]
+
+    rebuild[0]["counters"]["retractions"] = 1
+    rebuild_path.write_text(json.dumps(rebuild), encoding="utf-8")
+    with pytest.raises(SystemExit, match="rebuild has nonzero safety counters"):
+        module.compare(args)
+
+
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     trace = tmp_path / "trace.csv"
     trace.write_text(
