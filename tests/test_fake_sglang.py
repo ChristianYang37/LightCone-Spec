@@ -323,6 +323,52 @@ def test_sglang_terminal_hook_preserves_abort_identity():
     assert worker.events == [("aborted", "cancelled"), ("finished", "eos", True)]
 
 
+def test_update_is_counted_only_after_publication():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "online_adaptation_runtime.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    runtime = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "OnlineCohortRuntime"
+    )
+    function = next(
+        node
+        for node in runtime.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_drain_diagnostics"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"), namespace)
+
+    trace = SimpleNamespace(diagnosed=False, buffer_index=0, status="optimized")
+    fake = SimpleNamespace(
+        pending=None,
+        pending_timings=[],
+        trace_prefix_lens=torch.tensor([[1]]),
+        trace_metrics=torch.tensor([[0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1]]),
+        trace_optimizer_steps=torch.tensor([1]),
+        trace_online_experts=torch.tensor([[[0.0]]]),
+        update_traces=[trace],
+        counters={"updates_published": 0},
+        _record_invalid_candidate=lambda *args, **kwargs: None,
+    )
+    namespace["_drain_diagnostics"](fake)
+    assert not trace.diagnosed
+    assert fake.counters["updates_published"] == 0
+
+    trace.status = "decision_enqueued"
+    namespace["_drain_diagnostics"](fake)
+    assert trace.diagnosed
+    assert trace.status == "published"
+    assert fake.counters["updates_published"] == 1
+
+
 def test_nextn_shadow_bypasses_model_no_grad_decorator():
     class Draft(torch.nn.Module):
         def __init__(self):

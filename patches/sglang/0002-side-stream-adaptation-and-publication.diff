@@ -1584,7 +1584,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2556 @@
+@@ -0,0 +1,2555 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations
@@ -3887,11 +3887,10 @@ index 00000000..7b2cb5db
 +                    reconstruction_ok=reconstruction_ok,
 +                    supervision_ok=supervision_ok,
 +                )
-+            else:
++            elif trace.status == "decision_enqueued":
++                trace.status = "published"
 +                trace.diagnosed = True
-+                if trace.status == "decision_enqueued":
-+                    trace.status = "published"
-+                    self.counters["updates_published"] += 1
++                self.counters["updates_published"] += 1
 +        return prefix_rows, metric_rows, optimizer_steps, expert_rows
 +
 +    def _record_invalid_candidate(
