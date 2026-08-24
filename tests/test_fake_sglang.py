@@ -559,6 +559,41 @@ def test_adapter_tensor_payload_round_trips_and_preserves_request_ownership(monk
     assert [row["output_ids"] for row in rows] == [[1], [2]]
 
 
+def test_gpu_smoke_rejects_cross_kernel_greedy_mismatch(monkeypatch, tmp_path: Path):
+    import importlib.util
+
+    path = Path(__file__).parents[1] / "scripts" / "gpu_acceptance.py"
+    spec = importlib.util.spec_from_file_location("gpu_acceptance_exactness", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Config:
+        def validate_local_paths(self):
+            return None
+
+    monkeypatch.setattr(module.ExperimentConfig, "load", lambda path: Config())
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    def measure(config, job, output, *, max_new_tokens, exactness_tokens):
+        del config, output, max_new_tokens, exactness_tokens
+        return {
+            "method": job.method,
+            "backend": job.backend,
+            "exactness_trajectory": [1, 2] if job.method == "target_only" else [1, 3],
+        }
+
+    monkeypatch.setattr(module, "_measure", measure)
+    args = SimpleNamespace(
+        config=tmp_path / "paper.yaml",
+        output=tmp_path / "smoke",
+        max_new_tokens=2,
+        cases=("target", "static"),
+    )
+    with pytest.raises(RuntimeError, match="greedy trajectory differs"):
+        module.smoke(args)
+
+
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
     trace = tmp_path / "trace.csv"
     trace.write_text(

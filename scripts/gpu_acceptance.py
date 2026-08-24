@@ -309,10 +309,11 @@ def _measure(
     exactness_tokens: int = 0,
 ) -> dict[str, object]:
     dflash_exactness = bool(exactness_tokens and job.backend == "DFLASH")
+    target_exactness = bool(exactness_tokens and job.method == "target_only")
     separate_exactness = bool(
         dflash_exactness and job.method not in {"target_only", "static"}
     )
-    if dflash_exactness and not separate_exactness:
+    if target_exactness or (dflash_exactness and not separate_exactness):
         job = replace(
             job,
             parameters={**job.parameters, "deterministic_exactness": True},
@@ -358,7 +359,7 @@ def _measure(
                 request_id_prefix="warmup",
             )
             client.reset()
-        if dflash_exactness and not separate_exactness:
+        if target_exactness or (dflash_exactness and not separate_exactness):
             exactness_before = _speed_metrics(
                 client.server_info(), str(job.parameters.get("topology", "tp1_dp1"))
             )
@@ -797,16 +798,20 @@ def smoke(args: argparse.Namespace) -> None:
     diagnostic = []
     target = next((row for row in rows if row["method"] == "target_only"), None)
     if target is not None:
+        target_trajectory = target["exactness_trajectory"]
         for row in rows:
+            equal = row["exactness_trajectory"] == target_trajectory
             diagnostic.append(
                 {
                     "method": row["method"],
                     "backend": row["backend"],
-                    "cross_kernel_trajectory_equal": (
-                        row["exactness_trajectory"] == target["exactness_trajectory"]
-                    ),
+                    "cross_kernel_trajectory_equal": equal,
                 }
             )
+            if not equal:
+                raise RuntimeError(
+                    f"{row['method']} greedy trajectory differs from Target-only"
+                )
     _write(args.output / "smoke.json", {"rows": rows, "diagnostic": diagnostic})
 
 
