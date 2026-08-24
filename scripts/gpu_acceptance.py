@@ -534,7 +534,7 @@ def benchmark(args: argparse.Namespace) -> None:
         ("lightcone", "DFLASH"),
         ("onlinespec_ogd", "DFLASH"),
     )
-    for block in range(3):
+    for block in args.blocks:
         block_rows = []
         for ordinal, (method, backend) in enumerate(methods, start=block * len(methods)):
             job = _job(ordinal, method, backend, block=block)
@@ -1092,6 +1092,8 @@ def main() -> None:
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--max-new-tokens", type=int, default=default_tokens)
+        if name == "benchmark":
+            command.add_argument("--blocks", type=int, nargs="+", default=(0, 1, 2))
         if name == "smoke":
             command.add_argument(
                 "--cases",
