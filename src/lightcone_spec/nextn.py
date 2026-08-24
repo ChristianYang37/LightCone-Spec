@@ -344,6 +344,25 @@ class MergedPublicationBank:
         if addresses != self.addresses:
             raise RuntimeError("published NEXTN tensor address changed")
 
+    def matches(self, parameters: Sequence[torch.Tensor]) -> bool:
+        with torch.no_grad():
+            for slot in self.slots:
+                if len(slot.parameter_indices) == 1:
+                    merged = parameters[slot.parameter_indices[0]]
+                else:
+                    a, b = (parameters[index] for index in slot.parameter_indices)
+                    merged = slot.base_master + slot.lora_scale * (b @ a)
+                if slot.quantize is None:
+                    if not torch.equal(slot.live_weight, merged.to(slot.live_weight.dtype)):
+                        return False
+                else:
+                    weight, scale = slot.quantize(merged)
+                    if not torch.equal(slot.live_weight, weight) or not torch.equal(
+                        slot.live_scale, scale
+                    ):
+                        return False
+        return True
+
 
 def ragged_kl_loss(
     draft_logits: torch.Tensor,

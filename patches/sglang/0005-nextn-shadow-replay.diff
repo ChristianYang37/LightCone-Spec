@@ -939,7 +939,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,400 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,405 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1087,7 +1087,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            replay["positions"],
 +            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
 +        )
-+        if not hasattr(self, "_nextn_prepare_diagnostic"):
++        if not self._nextn_prepare_diagnostic:
 +            with torch.no_grad():
 +                native_q, native_k, native_v, native_gate = (
 +                    layer.forward_prepare_cuda_fused(replay["positions"], hidden.detach())
@@ -1220,6 +1220,8 @@ index f1da6d2d3b..c42f10f6b5 100644
 +        inference_logits: torch.Tensor,
 +    ) -> torch.Tensor:
 +        count = inference_logits.shape[0]
++        publication_matches = self.inference.matches(parameters)
++        self._nextn_prepare_diagnostic = {}
 +        logits = torch.stack(
 +            [
 +                self._nextn_reference_logits(
@@ -1248,9 +1250,12 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            "reconstruction_relative_rms": float(relative_rms.item()),
 +            "reconstruction_top1_match": float(top1_match.item()),
 +            "reconstruction_mean_kl": float(mean_kl.item()),
++            "publication_matches": publication_matches,
 +        }
 +        self.last_shadow_grad.update(self._nextn_prepare_diagnostic)
-+        if not bool(valid.item()):
++        if not publication_matches:
++            self.runtime.disable("nextn_publication_mismatch", exactness=True)
++        elif not bool(valid.item()):
 +            self.runtime.disable("nextn_replay_reconstruction_mismatch", exactness=True)
 +        return logits
 +

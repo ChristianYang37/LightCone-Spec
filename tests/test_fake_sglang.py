@@ -401,6 +401,7 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     bank.publish()
     assert live.data_ptr() == address
     assert torch.equal(live.float(), (0.5 * (b @ a)).to(torch.bfloat16).float())
+    assert bank.matches((a, b))
 
     fp8_live = torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
     fp8_scale = torch.ones(1, 1)
@@ -423,6 +424,7 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     fp8_bank.publish()
     assert fp8_scale.item() == pytest.approx(4 / 448)
     assert torch.allclose(fp8_live.float() * fp8_scale, candidate, atol=0.03)
+    assert fp8_bank.matches((candidate,))
 
     ledger = RequestLedger()
     assert ledger.begin(("a", "b"), (10, 20), (0, 2, 5))
