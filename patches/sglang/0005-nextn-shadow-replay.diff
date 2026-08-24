@@ -472,7 +472,7 @@ index f1da6d2d3b..c42f10f6b5 100644
  from sglang.srt.speculative.online_adaptation_config import (
      OnlineAdaptationConfig,
      load_online_adaptation,
-@@ -26,18 +37,45 @@ from sglang.srt.speculative.online_parameter_plan import (
+@@ -26,18 +37,46 @@ from sglang.srt.speculative.online_parameter_plan import (
      build_native_parameter_plan,
  )
  
@@ -486,6 +486,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +    gradient_leaves,
 +    needs_tp_gradient_sum,
 +    ragged_history_locations,
++    ste_block_fp8_activation,
 +    torch_native_ragged_attention,
 +    torch_native_selected_moe,
 +    torch_native_shared_expert_add,
@@ -521,7 +522,7 @@ index f1da6d2d3b..c42f10f6b5 100644
          if weight.ndim != 2 or rank > min(weight.shape):
              raise ValueError("native LoRA rank exceeds its backend matrix")
          generator = torch.Generator(device=weight.device)
-@@ -60,10 +96,148 @@ class _LowRankDelta(torch.nn.Module):
+@@ -60,10 +96,155 @@ class _LowRankDelta(torch.nn.Module):
          )
          torch.nn.init.kaiming_uniform_(self.a, a=math.sqrt(5), generator=generator)
  
@@ -665,6 +666,13 @@ index f1da6d2d3b..c42f10f6b5 100644
 +    scale_name = "weight_scale_inv" if leaf == "weight" else f"{leaf}_scale_inv"
 +    scale = getattr(module, scale_name)
 +    return weight.float() * _expanded_scale(weight, scale)
++
++
++def _reference_input(module, hidden: torch.Tensor, leaf: str = "weight"):
++    weight = getattr(module, leaf)
++    if weight.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
++        return ste_block_fp8_activation(hidden)
++    return hidden
 +
 +
  def _canonical_named_parameters(model) -> tuple[tuple[str, str, torch.Tensor], ...]:
@@ -941,7 +949,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,400 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,402 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1057,7 +1065,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            else hidden
 +        )
 +        qkv = F.linear(
-+            attention_hidden,
++            _reference_input(layer.qkv_proj, attention_hidden),
 +            weight("model.layers.0.qkv_proj.weight", layer.qkv_proj).to(hidden.dtype),
 +        )
 +        q_gate, current_key, current_value = qkv.split(
@@ -1105,7 +1113,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            attended * torch.sigmoid(output_gate), layer.q_size
 +        )
 +        attention_output = F.linear(
-+            attended,
++            _reference_input(layer.o_proj, attended),
 +            weight("model.layers.0.o_proj.weight", layer.o_proj).to(hidden.dtype),
 +        )
 +        if tp_group.world_size > 1:
@@ -1151,7 +1159,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +        )
 +        shared = mlp.shared_expert
 +        gate_up = F.linear(
-+            mlp_hidden,
++            _reference_input(shared.gate_up_proj, mlp_hidden),
 +            weight(
 +                "model.layers.0.mlp.shared_expert.gate_up_proj.weight",
 +                shared.gate_up_proj,
@@ -1159,7 +1167,9 @@ index f1da6d2d3b..c42f10f6b5 100644
 +        )
 +        gate, up = gate_up.chunk(2, dim=-1)
 +        shared_output = F.linear(
-+            F.silu(gate.float()).to(hidden.dtype) * up,
++            _reference_input(
++                shared.down_proj, F.silu(gate.float()).to(hidden.dtype) * up
++            ),
 +            weight(
 +                "model.layers.0.mlp.shared_expert.down_proj.weight",
 +                shared.down_proj,
@@ -1187,7 +1197,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            else hidden
 +        )
 +        local_logits = F.linear(
-+            logit_hidden,
++            _reference_input(model.lm_head, logit_hidden),
 +            _reference_weight(model.lm_head, "weight", None).to(hidden.dtype),
 +        )
 +        if tp_group.world_size > 1:

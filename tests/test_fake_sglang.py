@@ -25,6 +25,7 @@ from lightcone_spec.nextn import (
     needs_tp_gradient_sum,
     ragged_history_locations,
     ragged_kl_loss,
+    ste_block_fp8_activation,
     torch_native_moe,
     torch_native_ragged_attention,
     torch_native_selected_moe,
@@ -320,6 +321,14 @@ def test_nextn_replay_uses_inference_values_and_replay_gradient():
 def test_nextn_attention_flattens_query_width_not_hidden_size():
     attended = torch.zeros(2, 16, 1, 256)
     assert flatten_attention_output(attended, 4096).shape == (2, 4096)
+
+
+def test_nextn_fp8_activation_uses_quantized_values_and_identity_gradient():
+    hidden = torch.linspace(-3, 3, 256).reshape(2, 128).requires_grad_()
+    quantized = ste_block_fp8_activation(hidden)
+    assert not torch.equal(quantized, hidden)
+    quantized.sum().backward()
+    assert torch.equal(hidden.grad, torch.ones_like(hidden))
 
 
 def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():

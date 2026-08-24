@@ -63,6 +63,21 @@ def flatten_attention_output(
     return attended.reshape(attended.shape[0], q_size)
 
 
+def ste_block_fp8_activation(
+    hidden: torch.Tensor, group_size: int = 128
+) -> torch.Tensor:
+    """Match dynamic block-FP8 activation values with an identity backward."""
+    rows = hidden.reshape(-1, hidden.shape[-1])
+    padding = (-rows.shape[-1]) % group_size
+    padded = F.pad(rows.float(), (0, padding))
+    groups = padded.reshape(padded.shape[0], -1, group_size)
+    scale = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 448.0
+    quantized = (groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    dequantized = (quantized.float() * scale).reshape(padded.shape)
+    dequantized = dequantized[:, : rows.shape[-1]].reshape(hidden.shape).to(hidden.dtype)
+    return hidden + (dequantized - hidden).detach()
+
+
 def torch_native_shared_expert_add(
     hidden: torch.Tensor,
     gate_weight: torch.Tensor,
@@ -218,11 +233,15 @@ def torch_native_selected_moe(
     w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Differentiable current-block MoE using only routed experts."""
+    if w13_weight.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+        hidden = ste_block_fp8_activation(hidden)
     selected_w13 = _selected_weight(w13_weight, top_ids, w13_scale)
     gate, up = torch.chunk(
         torch.einsum("th,teih->tei", hidden.float(), selected_w13), 2, dim=-1
     )
     activated = F.silu(gate) * up
+    if w2_weight.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
+        activated = ste_block_fp8_activation(activated)
     selected_w2 = _selected_weight(w2_weight, top_ids, w2_scale)
     expert = torch.einsum("tei,tehi->teh", activated, selected_w2)
     return torch.einsum("teh,te->th", expert, top_weights.float()).to(hidden.dtype)
