@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1103 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -253,6 +253,9 @@ index 00000000..20e93274
 +def _logit_reconstruction_gate(
 +    inference_logits: torch.Tensor,
 +    differentiable_logits: torch.Tensor,
++    *,
++    relative_units: float = 2.5,
++    kl_units: float = 32.0,
 +) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 +    if inference_logits.shape != differentiable_logits.shape:
 +        raise ValueError("DFlash reconstruction logit shapes differ")
@@ -289,17 +292,16 @@ index 00000000..20e93274
 +        .sum(-1)
 +        .mean()
 +    )
-+    # The current canvas traverses five bf16 transformer layers. A 2.5*u
-+    # relative envelope plus the independent 32*u^2 distribution bound covers
-+    # accumulated FlashInfer/SDPA reduction drift without allowing the KL
-+    # average to hide diffuse logit corruption. The actual sampled q still
-+    # comes from inference logits; the surrogate is used only for its Jacobian.
++    # The actual sampled q comes from inference logits; the differentiable
++    # reconstruction is used only for its Jacobian. Callers choose the numeric
++    # envelope for their fused inference path while these DFlash defaults stay
++    # unchanged.
 +    valid = (
 +        torch.isfinite(error).all()
 +        & torch.isfinite(relative_rms)
 +        & torch.isfinite(mean_kl)
-+        & (relative_rms <= 2.5 * numerical_unit)
-+        & (mean_kl <= 32.0 * numerical_unit**2)
++        & (relative_rms <= relative_units * numerical_unit)
++        & (mean_kl <= kl_units * numerical_unit**2)
 +    )
 +    return valid, maximum, relative_rms, top1_match, mean_kl
 +

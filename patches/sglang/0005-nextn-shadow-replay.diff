@@ -939,7 +939,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,391 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,397 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1230,8 +1230,14 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            ],
 +            dim=1,
 +        )
++        # NEXTN crosses fused QK/RoPE, paged attention, fused MoE and TP logits
++        # before the torch-native replay reaches the same distribution. Decode
++        # still uses inference_logits; this envelope gates only its Jacobian.
 +        valid, maximum, relative_rms, top1_match, mean_kl = _logit_reconstruction_gate(
-+            inference_logits, logits
++            inference_logits,
++            logits,
++            relative_units=8.0,
++            kl_units=64.0,
 +        )
 +        self.last_shadow_grad = {
 +            "reconstruction_ok": bool(valid.item()),
