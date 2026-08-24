@@ -1464,3 +1464,80 @@ index e43c46d27b..22c37d8805 100644
          parameterization = "full"
          if config.weight_update_mode == "lora":
              eligible = (
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index e0f99901..f1d77c6f 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -37,6 +37,19 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+ 
++
++def _notify_spec_request_terminal(draft_worker, req) -> None:
++    if not isinstance(draft_worker, BaseSpecWorker):
++        return
++    if isinstance(req.finished_reason, FINISH_ABORT):
++        draft_worker.note_request_aborted(rid=req.rid)
++    else:
++        draft_worker.note_request_finished(
++            rid=req.rid,
++            natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
++        )
++
++
+ if TYPE_CHECKING:
+     from sglang.srt.configs.model_config import ModelConfig
+     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+@@ -251,13 +264,9 @@ class SchedulerBatchResultProcessor:
+                     if self.metrics_reporter.speed_study_enabled:
+                         self.metrics_reporter.speed_study_committed_tokens += len(
+                             committed_tokens
+-                        )
++                    )
+                     if req.finished():
+-                        if isinstance(self.draft_worker, BaseSpecWorker):
+-                            self.draft_worker.note_request_finished(
+-                                rid=req.rid,
+-                                natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+-                            )
++                        _notify_spec_request_terminal(self.draft_worker, req)
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
+                         release_kv_cache(req, self.tree_cache)
+@@ -975,13 +984,7 @@ class SchedulerBatchResultProcessor:
+             self.decode_offload_manager.offload_kv_cache(req)
+ 
+         if req.finished():
+-            # isinstance narrowing: create_worker may also return plain
+-            # TpModelWorker-based drafts, which carry no spec-worker hooks.
+-            if isinstance(self.draft_worker, BaseSpecWorker):
+-                self.draft_worker.note_request_finished(
+-                    rid=req.rid,
+-                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+-                )
++            _notify_spec_request_terminal(self.draft_worker, req)
+ 
+             # delete feature to save memory
+             if req.multimodal_inputs is not None and req.session is None:
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index accb6bc3..49ac2d23 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1931,13 +1931,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+ 
+     def create_abort_task(self, obj: GenerateReqInput):
+         # Abort the request if the client is disconnected.
++        rids = (obj.rid,) if isinstance(obj.rid, str) else tuple(obj.rid)
++
+         async def abort_request():
+             await asyncio.sleep(2)
+-            if obj.is_single:
+-                self.abort_request(obj.rid)
+-            else:
+-                for rid in obj.rid:
+-                    self.abort_request(rid)
++            for rid in rids:
++                self.abort_request(rid)
+ 
+         background_tasks = BackgroundTasks()
+         background_tasks.add_task(abort_request)

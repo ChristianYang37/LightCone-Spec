@@ -7,6 +7,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -272,6 +273,54 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
     cache = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
     output = namespace["_rope"](value, torch.tensor([0]), cos_sin_cache=cache)
     assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
+
+
+def test_sglang_terminal_hook_preserves_abort_identity():
+    patch = Path("patches/sglang/0005-nextn-shadow-replay.diff")
+    lines = patch.read_text().splitlines()
+    start = lines.index("+def _notify_spec_request_terminal(draft_worker, req) -> None:")
+    added = []
+    for line in lines[start:]:
+        if line.startswith("+"):
+            added.append(line[1:])
+        else:
+            break
+    function = ast.parse("\n".join(added)).body[0]
+
+    class BaseSpecWorker:
+        pass
+
+    class FinishAbort:
+        pass
+
+    class FinishMatchedToken:
+        pass
+
+    namespace = {
+        "BaseSpecWorker": BaseSpecWorker,
+        "FINISH_ABORT": FinishAbort,
+        "FINISH_MATCHED_TOKEN": FinishMatchedToken,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"), namespace)
+
+    class Worker(BaseSpecWorker):
+        def __init__(self):
+            self.events = []
+
+        def note_request_aborted(self, *, rid):
+            self.events.append(("aborted", rid))
+
+        def note_request_finished(self, *, rid, natural_stop):
+            self.events.append(("finished", rid, natural_stop))
+
+    worker = Worker()
+    namespace["_notify_spec_request_terminal"](
+        worker, SimpleNamespace(rid="cancelled", finished_reason=FinishAbort())
+    )
+    namespace["_notify_spec_request_terminal"](
+        worker, SimpleNamespace(rid="eos", finished_reason=FinishMatchedToken())
+    )
+    assert worker.events == [("aborted", "cancelled"), ("finished", "eos", True)]
 
 
 def test_nextn_shadow_bypasses_model_no_grad_decorator():
