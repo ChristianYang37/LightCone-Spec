@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import json
 import math
 import os
@@ -57,6 +58,14 @@ def _acceptance_port(config: ExperimentConfig, job: Job) -> int:
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _nvml_peak_hbm(path: Path) -> int:
+    with path.open(encoding="utf-8") as stream:
+        values = [float(row["memory_used_mb"]) for row in csv.DictReader(stream)]
+    if not values:
+        raise RuntimeError(f"NVML sampler produced no rows: {path}")
+    return int(max(values) * 1024 * 1024)
 
 
 def _post_json(url: str, value: object, timeout: float) -> object:
@@ -263,10 +272,11 @@ def _native_exactness(
     job: Job,
     output: Path,
     tokens: int,
-) -> tuple[list[int], dict[str, int]]:
+    *,
+    legacy_metrics: bool = False,
+) -> tuple[list[int], dict[str, object]]:
     exact_job = replace(
         job,
-        method="static",
         parameters={
             **job.parameters,
             "deterministic_exactness": True,
@@ -300,26 +310,45 @@ def _native_exactness(
         client.run_batch((prompt,), max_new_tokens=16, seed=0, request_id_prefix="warmup")
         client.reset()
         topology = str(exact_job.parameters.get("topology", "tp1_dp1"))
-        before = _speed_metrics(client.server_info(), topology)
+        unmeasured = LEGACY_MISSING_METRICS if legacy_metrics else ()
+        before = _speed_metrics(client.server_info(), topology, unmeasured=unmeasured)
         results, _ = client.run_batch(
             (prompt,),
             max_new_tokens=tokens,
             seed=job.block or 0,
             request_id_prefix="exactness",
         )
-        after = _speed_metrics(client.server_info(), topology)
+        after = _speed_metrics(client.server_info(), topology, unmeasured=unmeasured)
     committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
     _validate_token_accounting(results, committed, tokens)
-    checked = int(after.get("greedy_token_checks", 0)) - int(before.get("greedy_token_checks", 0))
-    mismatched = int(after.get("greedy_token_mismatches", 0)) - int(
-        before.get("greedy_token_mismatches", 0)
-    )
-    evidence = {
-        "committed_tokens": committed,
-        "greedy_token_checks": checked,
-        "greedy_token_mismatches": mismatched,
-        **_validate_greedy_verify_counts(committed, checked, mismatched),
-    }
+    evidence: dict[str, object] = {"committed_tokens": committed}
+    if job.backend == "DFLASH":
+        before_checked = before.get("greedy_token_checks")
+        after_checked = after.get("greedy_token_checks")
+        before_mismatched = before.get("greedy_token_mismatches")
+        after_mismatched = after.get("greedy_token_mismatches")
+        if all(
+            isinstance(value, (int, float))
+            for value in (
+                before_checked,
+                after_checked,
+                before_mismatched,
+                after_mismatched,
+            )
+        ):
+            checked = int(after_checked) - int(before_checked)
+            mismatched = int(after_mismatched) - int(before_mismatched)
+            evidence.update(
+                {
+                    "greedy_token_checks": checked,
+                    "greedy_token_mismatches": mismatched,
+                    **_validate_greedy_verify_counts(committed, checked, mismatched),
+                }
+            )
+        else:
+            evidence.update(
+                {"greedy_token_checks": "N/A", "greedy_token_mismatches": "N/A"}
+            )
     return list(results[0].output_ids), evidence
 
 
@@ -543,7 +572,8 @@ def _measure(
         "backend": job.backend,
         "goodput": committed_goodput(committed, elapsed),
         "p99_itl_ms": float(np.quantile(intervals, 0.99)),
-        "peak_hbm_bytes": int(after["peak_hbm_bytes"]),
+        "peak_hbm_bytes": _nvml_peak_hbm(output / "gpu.csv"),
+        "runtime_peak_hbm_bytes": int(after["peak_hbm_bytes"]),
         "committed_tokens": committed,
         "committed_tokens_source": committed_source,
         "runtime_committed_tokens": runtime_committed,
@@ -596,17 +626,31 @@ def benchmark(args: argparse.Namespace) -> None:
             method_output = output / f"block-{block}" / method
             completed = method_output / "acceptance.json"
             if completed.exists():
-                block_rows.append(json.loads(completed.read_text(encoding="utf-8")))
+                row = json.loads(completed.read_text(encoding="utf-8"))
             else:
-                block_rows.append(
-                    _measure(
-                        config,
-                        job,
-                        method_output,
-                        max_new_tokens=args.max_new_tokens,
-                        legacy_metrics=args.donor,
-                    )
+                row = _measure(
+                    config,
+                    job,
+                    method_output,
+                    max_new_tokens=args.max_new_tokens,
+                    legacy_metrics=args.donor,
                 )
+            row["runtime_peak_hbm_bytes"] = int(
+                row.get("runtime_peak_hbm_bytes", row["peak_hbm_bytes"])
+            )
+            row["peak_hbm_bytes"] = _nvml_peak_hbm(method_output / "gpu.csv")
+            if row.get("exactness_trajectory") is None:
+                trajectory, evidence = _native_exactness(
+                    config,
+                    job,
+                    method_output / "exactness-witness",
+                    args.exactness_tokens,
+                    legacy_metrics=args.donor,
+                )
+                row["exactness_trajectory"] = trajectory
+                row["exactness_evidence"] = evidence
+            _write(completed, row)
+            block_rows.append(row)
         rows.extend(block_rows)
     _write(output / "benchmark.json", rows)
 
@@ -1128,8 +1172,12 @@ def compare(args: argparse.Namespace) -> None:
             failures.append(f"{method}: p99 ITL regressed by more than 5%")
         if new_hbm > old_hbm + 512 * 1024 * 1024:
             failures.append(f"{method}: peak HBM increased by more than 512 MiB")
-        old_by_block = {int(row["block"]): row["trajectories"] for row in old}
-        new_by_block = {int(row["block"]): row["trajectories"] for row in new}
+        old_by_block = {
+            int(row["block"]): row["exactness_trajectory"] for row in old
+        }
+        new_by_block = {
+            int(row["block"]): row["exactness_trajectory"] for row in new
+        }
         if old_by_block != new_by_block:
             failures.append(f"{method}: donor/rebuild token trajectories differ")
         if any(any(row["counters"].values()) for row in new):
@@ -1155,6 +1203,7 @@ def main() -> None:
         if name == "benchmark":
             command.add_argument("--blocks", type=int, nargs="+", default=(0, 1, 2))
             command.add_argument("--donor", action="store_true")
+            command.add_argument("--exactness-tokens", type=int, default=128)
         if name == "smoke":
             command.add_argument(
                 "--cases",

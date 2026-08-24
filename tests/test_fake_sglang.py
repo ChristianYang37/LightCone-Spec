@@ -717,6 +717,7 @@ def test_donor_counters_are_reported_but_only_rebuild_counters_gate(tmp_path: Pa
                 "p99_itl_ms": 1.0,
                 "peak_hbm_bytes": 1,
                 "trajectories": [[1, 2]],
+                "exactness_trajectory": [1, 2],
                 "counters": {"retractions": 2},
             }
             donor.append(row)
@@ -734,6 +735,12 @@ def test_donor_counters_are_reported_but_only_rebuild_counters_gate(tmp_path: Pa
     rebuild_path.write_text(json.dumps(rebuild), encoding="utf-8")
     with pytest.raises(SystemExit, match="rebuild has nonzero safety counters"):
         module.compare(args)
+
+    gpu_csv = tmp_path / "gpu.csv"
+    gpu_csv.write_text(
+        "timestamp,index,memory_used_mb\n0,0,10\n1,0,12\n", encoding="utf-8"
+    )
+    assert module._nvml_peak_hbm(gpu_csv) == 12 * 1024 * 1024
 
 
 def test_scheduled_requests_and_trace_loading(fake_server, tmp_path: Path):
