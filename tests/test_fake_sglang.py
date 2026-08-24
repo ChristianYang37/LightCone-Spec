@@ -308,11 +308,12 @@ def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
 def test_nextn_replay_uses_inference_values_and_replay_gradient():
     inference = torch.tensor([[3.0, 1.0]])
     weight = torch.tensor(2.0, requires_grad=True)
-    replay = weight * torch.tensor([[1.0, 4.0]])
+    replay_scale = torch.tensor([[1e8, 4.0]])
+    replay = weight * replay_scale
     anchored = anchor_replay_logits(inference, replay)
     assert torch.equal(anchored, inference)
     anchored.sum().backward()
-    assert weight.grad == 5.0
+    assert weight.grad == replay_scale.sum()
 
 
 def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():

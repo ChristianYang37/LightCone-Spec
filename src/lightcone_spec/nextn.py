@@ -53,7 +53,7 @@ def anchor_replay_logits(
     inference_logits: torch.Tensor, replay_logits: torch.Tensor
 ) -> torch.Tensor:
     """Use inference values with the differentiable replay Jacobian."""
-    return inference_logits.detach() + replay_logits - replay_logits.detach()
+    return inference_logits.detach() + (replay_logits - replay_logits.detach())
 
 
 def torch_native_shared_expert_add(
