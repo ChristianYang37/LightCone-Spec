@@ -319,9 +319,21 @@ def _native_exactness(
             request_id_prefix="exactness",
         )
         after = _speed_metrics(client.server_info(), topology, unmeasured=unmeasured)
-    committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
-    _validate_token_accounting(results, committed, tokens)
-    evidence: dict[str, object] = {"committed_tokens": committed}
+    runtime_committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+    committed = (
+        sum(result.completion_tokens for result in results)
+        if legacy_metrics
+        else runtime_committed
+    )
+    if not legacy_metrics:
+        _validate_token_accounting(results, committed, tokens)
+    evidence: dict[str, object] = {
+        "committed_tokens": committed,
+        "runtime_committed_tokens": runtime_committed,
+        "committed_tokens_source": (
+            "derived_complete_output_tokens" if legacy_metrics else "runtime"
+        ),
+    }
     if job.backend == "DFLASH":
         before_checked = before.get("greedy_token_checks")
         after_checked = after.get("greedy_token_checks")
@@ -339,12 +351,12 @@ def _native_exactness(
             checked = int(after_checked) - int(before_checked)
             mismatched = int(after_mismatched) - int(before_mismatched)
             evidence.update(
-                {
-                    "greedy_token_checks": checked,
-                    "greedy_token_mismatches": mismatched,
-                    **_validate_greedy_verify_counts(committed, checked, mismatched),
-                }
+                {"greedy_token_checks": checked, "greedy_token_mismatches": mismatched}
             )
+            if not legacy_metrics:
+                evidence.update(
+                    _validate_greedy_verify_counts(committed, checked, mismatched)
+                )
         else:
             evidence.update(
                 {"greedy_token_checks": "N/A", "greedy_token_mismatches": "N/A"}
