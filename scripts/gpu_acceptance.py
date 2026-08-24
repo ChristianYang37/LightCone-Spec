@@ -511,6 +511,10 @@ def _measure(
         },
     )
     committed = int(scored_after["committed_tokens"]) - int(before["committed_tokens"])
+    committed_source = "runtime"
+    if legacy_metrics and job.method == "target_only" and committed == 0:
+        committed = sum(result.completion_tokens for result in results)
+        committed_source = "derived_target_only_output_tokens"
     _validate_token_accounting(results, committed, max_new_tokens)
     counters = {
         name: (
@@ -529,6 +533,7 @@ def _measure(
         "p99_itl_ms": float(np.quantile(intervals, 0.99)),
         "peak_hbm_bytes": int(after["peak_hbm_bytes"]),
         "committed_tokens": committed,
+        "committed_tokens_source": committed_source,
         "trajectories": [list(result.output_ids) for result in results],
         "exactness_trajectory": exactness_trajectory,
         "exactness_evidence": exactness_evidence,
