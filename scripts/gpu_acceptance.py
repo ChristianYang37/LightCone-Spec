@@ -510,11 +510,15 @@ def _measure(
             "elapsed_seconds": elapsed,
         },
     )
-    committed = int(scored_after["committed_tokens"]) - int(before["committed_tokens"])
-    committed_source = "runtime"
-    if legacy_metrics and job.method == "target_only" and committed == 0:
+    runtime_committed = int(scored_after["committed_tokens"]) - int(
+        before["committed_tokens"]
+    )
+    if legacy_metrics:
         committed = sum(result.completion_tokens for result in results)
-        committed_source = "derived_target_only_output_tokens"
+        committed_source = "derived_complete_output_tokens"
+    else:
+        committed = runtime_committed
+        committed_source = "runtime"
     _validate_token_accounting(results, committed, max_new_tokens)
     counters = {
         name: (
@@ -534,6 +538,7 @@ def _measure(
         "peak_hbm_bytes": int(after["peak_hbm_bytes"]),
         "committed_tokens": committed,
         "committed_tokens_source": committed_source,
+        "runtime_committed_tokens": runtime_committed,
         "trajectories": [list(result.output_ids) for result in results],
         "exactness_trajectory": exactness_trajectory,
         "exactness_evidence": exactness_evidence,
