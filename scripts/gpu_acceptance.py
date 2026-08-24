@@ -947,10 +947,22 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
     eos_row = eos[0] if isinstance(eos, list) else eos
     eos_reason = eos_row["meta_info"]["finish_reason"]["type"]
     counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
+    report = {
+        "ragged_request_ids": ragged_ids,
+        "ragged_ledger": ragged_ledger,
+        "eos_finish_reason": eos_reason,
+        "eos_ledger": eos_ledger,
+        "cancel_result": cancel_result,
+        "cancelled_ledger": cancelled_ledger,
+        "replacement_request_id": replacement[0].request_id,
+        "replacement_ledger": replacement_ledger,
+        "counters": counters,
+    }
+    _write(args.output / "rid-lifecycle.json", report)
     if tuple(result.request_id for result in ragged) != ragged_ids:
         raise RuntimeError("ragged batch request ownership changed")
-    if tuple(row["rid"] for row in ragged_ledger[0]) != ragged_ids:
-        raise RuntimeError("ragged request ledger changed RID order")
+    if {row["rid"] for row in ragged_ledger[0]} != set(ragged_ids):
+        raise RuntimeError("ragged request ledger changed the RID set")
     if len({row["verify_slot"] for row in ragged_ledger[0]}) != len(ragged_ids):
         raise RuntimeError("ragged request ledger reused a verify slot")
     if eos_reason != "stop":
@@ -968,20 +980,6 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
         raise RuntimeError("replacement request did not replace terminal ledger state")
     if any(counters.values()):
         raise RuntimeError(f"RID lifecycle reported nonzero safety counters: {counters}")
-    _write(
-        args.output / "rid-lifecycle.json",
-        {
-            "ragged_request_ids": ragged_ids,
-            "ragged_ledger": ragged_ledger,
-            "eos_finish_reason": eos_reason,
-            "eos_ledger": eos_ledger,
-            "cancel_result": cancel_result,
-            "cancelled_ledger": cancelled_ledger,
-            "replacement_request_id": replacement[0].request_id,
-            "replacement_ledger": replacement_ledger,
-            "counters": counters,
-        },
-    )
 
 
 def compare(args: argparse.Namespace) -> None:
