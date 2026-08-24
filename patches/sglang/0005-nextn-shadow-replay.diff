@@ -57,7 +57,7 @@ index be5902f1b8..6f54e43c70 100644
  
          return parent_list, top_scores_index, draft_tokens, draft_probs
  
-+    def replay_current_block(self, adapter, parameters, inference_logits) -> torch.Tensor:
++    def replay_current_block(self, adapter, parameters, inference_logits, microbatch) -> torch.Tensor:
 +        if not self._online_replay_batches:
 +            raise RuntimeError("NEXTN current-block replay is empty")
 +        with torch.inference_mode(False), torch.enable_grad():
@@ -65,7 +65,7 @@ index be5902f1b8..6f54e43c70 100644
 +                parameters,
 +                tuple(batch for batch, _ in self._online_replay_batches),
 +                inference_logits,
-+            )
++            )[:microbatch]
 +
      def draft_extend(self):
          pass
@@ -128,8 +128,8 @@ index be5902f1b8..6f54e43c70 100644
 +
 +                            def replay_loss(parameters):
 +                                replay = self.draft_worker.replay_current_block(
-+                                    online_adapter, parameters, baseline
-+                                )[:microbatch]
++                                    online_adapter, parameters, baseline, microbatch
++                                )
 +                                return ragged_kl_loss(
 +                                    replay,
 +                                    teacher[:expected],
@@ -272,7 +272,7 @@ index 7fc522e219..e64b827d1a 100644
 +            replay.mm_input_embeds = forward_batch.mm_input_embeds.detach().clone()
 +        return replay
 +
-+    def replay_current_block(self, adapter, parameters) -> torch.Tensor:
++    def replay_current_block(self, adapter, parameters, microbatch) -> torch.Tensor:
 +        logits = []
 +        with torch.inference_mode(False), torch.enable_grad():
 +            for forward_batch in self._online_replay_batches:
@@ -291,7 +291,7 @@ index 7fc522e219..e64b827d1a 100644
 +                logits.append(output.next_token_logits)
 +            if not logits:
 +                raise RuntimeError("NEXTN current-block replay is empty")
-+            return torch.stack(logits, dim=1)
++            return torch.stack(logits, dim=1)[:microbatch]
 +
      def draft(self, batch: ScheduleBatch):
          if batch.forward_mode.is_idle():
@@ -416,8 +416,8 @@ index 7fc522e219..e64b827d1a 100644
 +
 +                        def replay_loss(parameters):
 +                            replay = self.draft_worker.replay_current_block(
-+                                online_adapter, parameters
-+                            )[:microbatch]
++                                online_adapter, parameters, microbatch
++                            )
 +                            return ragged_kl_loss(
 +                                replay,
 +                                teacher[:expected_rows],

@@ -331,6 +331,7 @@ def test_nextn_ragged_loss_flattens_without_severing_replay_graph():
             replay = (torch.arange(6, dtype=torch.float32).reshape(2, 3) @ weight).view(
                 1, 2, 4
             )
+            replay = replay[:1]
         loss = ragged_kl_loss(replay, torch.zeros(2, 4), ledger)
     (gradient,) = torch.autograd.grad(loss, (weight,), allow_unused=True)
     assert gradient is not None
