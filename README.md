@@ -32,7 +32,7 @@ cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 ```
 
 On the first invocation, `run_paper.sh` checks and applies the five SGLang
-diffs in lexical order, writes `paper-v1-nextn-shadow-v3` to
+diffs in lexical order, writes `paper-v1-nextn-shadow-v4` to
 `.lightcone-spec-patched` in the SGLang checkout,
 and starts the paper runner. Later invocations use the marker and resume the
 same `run_name` from `state.sqlite`; a small import smoke confirms the required

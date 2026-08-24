@@ -949,7 +949,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,424 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,438 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1005,9 +1005,6 @@ index f1da6d2d3b..c42f10f6b5 100644
 +
 +        handles["native_hidden"] = self.model.model.register_forward_hook(
 +            capture("native_hidden")
-+        )
-+        handles["native_local_logits"] = self.model.lm_head.register_forward_hook(
-+            capture("native_local_logits")
 +        )
 +        return replay
 +
@@ -1218,9 +1215,6 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            _reference_input(model.lm_head, logit_hidden),
 +            _reference_weight(model.lm_head, "weight", None).to(hidden.dtype),
 +        )
-+        local_logits = anchor_replay_logits(
-+            replay["native_local_logits"], local_logits
-+        )
 +        if tp_group.world_size > 1:
 +            local_logits = _TensorParallelAllGather.apply(
 +                local_logits, tp_group.device_group
@@ -1235,7 +1229,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +    ) -> torch.Tensor:
 +        count = inference_logits.shape[0]
 +        publication_matches = self.inference.matches(parameters)
-+        logits = torch.stack(
++        surrogate_logits = torch.stack(
 +            [
 +                self._nextn_reference_logits(
 +                    parameters,
@@ -1245,9 +1239,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            ],
 +            dim=1,
 +        )
-+        # NEXTN crosses fused QK/RoPE, paged attention, fused MoE and TP logits
-+        # before the torch-native replay reaches the same distribution. Decode
-+        # still uses inference_logits; this envelope gates only its Jacobian.
++        logits = anchor_replay_logits(inference_logits, surrogate_logits)
 +        valid, maximum, relative_rms, top1_match, mean_kl = _logit_reconstruction_gate(
 +            inference_logits,
 +            logits,
@@ -1257,7 +1249,29 @@ index f1da6d2d3b..c42f10f6b5 100644
 +                float(torch.finfo(batches[0]["hidden_states"].dtype).eps), 1e-3
 +            ),
 +        )
++        (
++            surrogate_valid,
++            surrogate_maximum,
++            surrogate_relative_rms,
++            surrogate_top1_match,
++            surrogate_mean_kl,
++        ) = _logit_reconstruction_gate(
++            inference_logits,
++            surrogate_logits,
++            relative_units=8.0,
++            kl_units=64.0,
++            numerical_unit=max(
++                float(torch.finfo(batches[0]["hidden_states"].dtype).eps), 1e-3
++            ),
++        )
 +        surrogate = (
++            bool(surrogate_valid.item()),
++            float(surrogate_maximum.item()),
++            float(surrogate_relative_rms.item()),
++            float(surrogate_top1_match.item()),
++            float(surrogate_mean_kl.item()),
++        )
++        reconstruction = (
 +            bool(valid.item()),
 +            float(maximum.item()),
 +            float(relative_rms.item()),
@@ -1265,7 +1279,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            float(mean_kl.item()),
 +        )
 +        if self.runtime.active_version == 0:
-+            self._nextn_zero_delta = surrogate
++            self._nextn_zero_delta = reconstruction
 +        zero_delta = self._nextn_zero_delta
 +        self.last_shadow_grad = {
 +            "reconstruction_ok": zero_delta[0],
@@ -1286,7 +1300,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            self.runtime.disable("nextn_publication_mismatch", exactness=True)
 +        elif self.runtime.active_version == 0 and not bool(valid.item()):
 +            self.runtime.disable("nextn_replay_reconstruction_mismatch", exactness=True)
-+        return anchor_replay_logits(inference_logits, logits)
++        return logits
 +
 +    def shadow_forward(self, parameters, *args, **kwargs):
 +        self.last_shadow_grad = {
