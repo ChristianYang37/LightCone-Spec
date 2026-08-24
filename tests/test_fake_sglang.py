@@ -1007,6 +1007,24 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     )
     assert "--enable-deterministic-inference" not in performance_command
 
+    acceptance = Job(
+        "acceptance-static",
+        "gpu-acceptance",
+        0,
+        "static",
+        "Qwen/Qwen3-8B",
+        "DFLASH",
+        "controlled_baseline",
+        load="c8",
+        parameters={"regime": "short_input_long_generation"},
+    )
+    acceptance_command = server_command(
+        config, acceptance, port=30001, output_dir=output, adaptation=None
+    )
+    assert acceptance_command[
+        acceptance_command.index("--max-running-requests") + 1
+    ] == "8"
+
 
 def test_preflight_adaptive_exactness_uses_static_deterministic_bootstrap():
     job = materialize("preflight")[1]

@@ -157,7 +157,7 @@ def server_command(
         memory_fraction = min(memory_fraction, 0.80)
     if job.parameters.get("exactness_bootstrap"):
         max_running = 1
-    elif job.node.startswith("E6"):
+    elif job.node.startswith("E6") or job.node.endswith("acceptance"):
         max_running = _concurrency(job)
     else:
         max_running = 256
@@ -321,7 +321,11 @@ def server_session_key(
         job.backend,
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
-        _concurrency(job) if job.node.startswith("E6") else 256,
+        (
+            _concurrency(job)
+            if job.node.startswith("E6") or job.node.endswith("acceptance")
+            else 256
+        ),
         _speculative_canvas(job),
         bool(job.parameters.get("graph_replay", True)),
         bool(job.parameters.get("chunked_prefill")),
