@@ -48,6 +48,7 @@ from lightcone_spec.server import (
     StickyReplicaClient,
     adaptation_payload,
     server_command,
+    server_session_key,
 )
 
 
@@ -774,8 +775,9 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
         adaptive = adaptive.__class__(
             **{**adaptive.to_dict(), "method": "lightcone_candidate"}
         )
-        process.restart_for(adaptive, None)
+        process.configure(adaptive, None)
         assert process.adaptation is not None
+        assert process.session_key == server_session_key(adaptive)
     assert (output / "server.stopped").is_file()
 
     config.drafts["Qwen/Qwen3-8B|DSPARK"] = model

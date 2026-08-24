@@ -432,8 +432,12 @@ class ServerProcess:
     def configure(
         self, job: Job, selection: dict[str, Any] | None
     ) -> SGLangClient:
-        if server_session_key(job, selection) != self.session_key:
-            raise RuntimeError("server session layout changed")
+        if (
+            self.process is None
+            or self.process.poll() is not None
+            or server_session_key(job, selection) != self.session_key
+        ):
+            return self.restart_for(job, selection)
         adaptation = adaptation_payload(job, selection)
         if adaptation is not None:
             (self.output_dir / "adaptation.json").write_text(
