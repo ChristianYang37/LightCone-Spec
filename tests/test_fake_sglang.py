@@ -318,6 +318,16 @@ def test_nextn_replay_uses_inference_values_and_replay_gradient():
     assert weight.grad == replay_scale.sum()
 
 
+def test_nextn_operator_boundaries_keep_native_values_and_shadow_jacobian():
+    weight = torch.tensor(2.0, requires_grad=True)
+    hidden = anchor_replay_logits(torch.tensor([5.0]), weight * 3.0)
+    logits = anchor_replay_logits(torch.tensor([11.0]), hidden * weight)
+    assert torch.equal(hidden, torch.tensor([5.0]))
+    assert torch.equal(logits, torch.tensor([11.0]))
+    logits.sum().backward()
+    assert weight.grad == 11.0
+
+
 def test_nextn_attention_flattens_query_width_not_hidden_size():
     attended = torch.zeros(2, 16, 1, 256)
     assert flatten_attention_output(attended, 4096).shape == (2, 4096)
