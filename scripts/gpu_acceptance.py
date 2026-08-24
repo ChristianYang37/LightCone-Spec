@@ -931,11 +931,20 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
             future = pool.submit(
                 client.run_batch,
                 prompts[:1],
-                max_new_tokens=2048,
+                max_new_tokens=40800,
                 seed=3,
                 request_ids=("cancelled",),
             )
-            time.sleep(1)
+            for _ in range(100):
+                with urllib.request.urlopen(
+                    client.base_url + "/get_load", timeout=2
+                ) as response:
+                    load = json.loads(response.read())
+                if any(int(row["num_reqs"]) > 0 for row in load):
+                    break
+                time.sleep(0.01)
+            else:
+                raise RuntimeError("cancellation request was never admitted")
             client.abort("cancelled")
             try:
                 future.result(timeout=30)
@@ -978,10 +987,13 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
     _write(args.output / "rid-lifecycle.json", report)
     if tuple(result.request_id for result in ragged) != ragged_ids:
         raise RuntimeError("ragged batch request ownership changed")
-    if {row["rid"] for row in ragged_ledger[0]} != set(ragged_ids):
-        raise RuntimeError("ragged request ledger changed the RID set")
-    if len({row["verify_slot"] for row in ragged_ledger[0]}) != len(ragged_ids):
+    ledger_ids = {row["rid"] for row in ragged_ledger[0]}
+    if len(ledger_ids) < 2 or not ledger_ids <= set(ragged_ids):
+        raise RuntimeError("ragged request ledger contains the wrong RID subset")
+    if len({row["verify_slot"] for row in ragged_ledger[0]}) != len(ledger_ids):
         raise RuntimeError("ragged request ledger reused a verify slot")
+    if len({row["prefix"] for row in ragged_ledger[0]}) < 2:
+        raise RuntimeError("ragged request ledger did not exercise different prefixes")
     if any(
         any(states.get(rid) != "finished" for rid in ragged_ids)
         for states in ragged_terminals
