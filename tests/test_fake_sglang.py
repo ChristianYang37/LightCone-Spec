@@ -19,6 +19,7 @@ from lightcone_spec.nextn import (
     PublicationSlot,
     RequestLedger,
     anchor_replay_logits,
+    flatten_attention_output,
     grad_enabled_forwards,
     gradient_leaves,
     needs_tp_gradient_sum,
@@ -314,6 +315,11 @@ def test_nextn_replay_uses_inference_values_and_replay_gradient():
     assert torch.equal(anchored, inference)
     anchored.sum().backward()
     assert weight.grad == replay_scale.sum()
+
+
+def test_nextn_attention_flattens_query_width_not_hidden_size():
+    attended = torch.zeros(2, 16, 1, 256)
+    assert flatten_attention_output(attended, 4096).shape == (2, 4096)
 
 
 def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():

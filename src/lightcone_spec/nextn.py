@@ -56,6 +56,13 @@ def anchor_replay_logits(
     return inference_logits.detach() + (replay_logits - replay_logits.detach())
 
 
+def flatten_attention_output(
+    attended: torch.Tensor, q_size: int
+) -> torch.Tensor:
+    """Flatten query heads independently of the model hidden size."""
+    return attended.reshape(attended.shape[0], q_size)
+
+
 def torch_native_shared_expert_add(
     hidden: torch.Tensor,
     gate_weight: torch.Tensor,

@@ -472,7 +472,7 @@ index f1da6d2d3b..c42f10f6b5 100644
  from sglang.srt.speculative.online_adaptation_config import (
      OnlineAdaptationConfig,
      load_online_adaptation,
-@@ -26,18 +37,44 @@ from sglang.srt.speculative.online_parameter_plan import (
+@@ -26,18 +37,45 @@ from sglang.srt.speculative.online_parameter_plan import (
      build_native_parameter_plan,
  )
  
@@ -481,6 +481,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +    PublicationSlot,
 +    RequestLedger,
 +    anchor_replay_logits,
++    flatten_attention_output,
 +    grad_enabled_forwards,
 +    gradient_leaves,
 +    needs_tp_gradient_sum,
@@ -940,7 +941,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,398 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,400 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1100,7 +1101,9 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            replay["history_valid"],
 +            scale=layer.scaling,
 +        )
-+        attended = (attended * torch.sigmoid(output_gate)).reshape(hidden.shape)
++        attended = flatten_attention_output(
++            attended * torch.sigmoid(output_gate), layer.q_size
++        )
 +        attention_output = F.linear(
 +            attended,
 +            weight("model.layers.0.o_proj.weight", layer.o_proj).to(hidden.dtype),
