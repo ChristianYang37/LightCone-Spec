@@ -939,7 +939,7 @@ index f1da6d2d3b..c42f10f6b5 100644
                      connected = tuple(
                          gradient for gradient in raw if gradient is not None
                      )
-@@ -336,6 +648,397 @@ class NativeBackendOnlineAdapter:
+@@ -336,6 +648,400 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -1238,6 +1238,9 @@ index f1da6d2d3b..c42f10f6b5 100644
 +            logits,
 +            relative_units=8.0,
 +            kl_units=64.0,
++            numerical_unit=max(
++                float(torch.finfo(batches[0]["hidden_states"].dtype).eps), 1e-3
++            ),
 +        )
 +        self.last_shadow_grad = {
 +            "reconstruction_ok": bool(valid.item()),
