@@ -139,7 +139,12 @@ def _validate_greedy_verify_counts(
     }
 
 
-def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, Any]:
+def _speed_metrics(
+    server_info: dict[str, object],
+    topology: str,
+    *,
+    unmeasured: tuple[str, ...] = (),
+) -> dict[str, Any]:
     states = server_info.get("internal_states")
     rank_states = states if isinstance(states, list) and states else [server_info.get("internal_state", server_info)]
     rank_metrics: list[dict[str, Any]] = []
@@ -154,6 +159,8 @@ def _speed_metrics(server_info: dict[str, object], topology: str) -> dict[str, A
             online = adaptation.get("online_adaptation")
             if isinstance(online, dict):
                 metrics = {**metrics, **online}
+        for name in unmeasured:
+            metrics.setdefault(name, None)
         rank_metrics.append(metrics)
     required = {
         "committed_tokens",

@@ -36,6 +36,15 @@ from lightcone_spec.server import (
     StickyReplicaClient,
 )
 
+LEGACY_MISSING_METRICS = (
+    "peak_hbm_reserved_bytes",
+    "stale_publications",
+    "exactness_violations",
+    "version_mismatches",
+    "fallbacks",
+    "nonfinite_updates",
+)
+
 
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,6 +322,7 @@ def _measure(
     *,
     max_new_tokens: int,
     exactness_tokens: int = 0,
+    legacy_metrics: bool = False,
 ) -> dict[str, object]:
     dflash_exactness = bool(exactness_tokens and job.backend == "DFLASH")
     target_exactness = bool(exactness_tokens and job.method == "target_only")
@@ -397,7 +407,11 @@ def _measure(
                 }
             client.reset()
         topology = str(job.parameters.get("topology", "tp1_dp1"))
-        before = _speed_metrics(client.server_info(), topology)
+        before = _speed_metrics(
+            client.server_info(),
+            topology,
+            unmeasured=LEGACY_MISSING_METRICS if legacy_metrics else (),
+        )
         if isinstance(client, StickyReplicaClient):
             routing_keys = tuple(f"cohort-{index % 4:04d}" for index in range(len(prompts)))
             routing_rows = [
@@ -461,7 +475,11 @@ def _measure(
                 seed=job.block or 0,
                 request_id_prefix=f"acceptance-{job.method}",
             )
-        scored_after = _speed_metrics(client.server_info(), topology)
+        scored_after = _speed_metrics(
+            client.server_info(),
+            topology,
+            unmeasured=LEGACY_MISSING_METRICS if legacy_metrics else (),
+        )
         publication_witness = None
         if _needs_publication_witness(job, scored_after):
             witness, _ = client.run_batch(
@@ -471,7 +489,11 @@ def _measure(
                 request_id_prefix="publication-witness",
             )
             publication_witness = witness[0].to_dict()
-            after = _speed_metrics(client.server_info(), topology)
+            after = _speed_metrics(
+                client.server_info(),
+                topology,
+                unmeasured=LEGACY_MISSING_METRICS if legacy_metrics else (),
+            )
         else:
             after = scored_after
     intervals = [value for result in results for value in result.inter_token_ms]
@@ -490,7 +512,15 @@ def _measure(
     )
     committed = int(scored_after["committed_tokens"]) - int(before["committed_tokens"])
     _validate_token_accounting(results, committed, max_new_tokens)
-    counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
+    counters = {
+        name: (
+            int(after[name]) - int(before[name])
+            if isinstance(after[name], (int, float))
+            and isinstance(before[name], (int, float))
+            else None
+        )
+        for name in SAFETY_COUNTERS
+    }
     row: dict[str, object] = {
         "block": job.block,
         "method": job.method,
@@ -505,10 +535,15 @@ def _measure(
         "counters": counters,
         "rank_local": after["rank_local"],
         "rank_aggregates": after["rank_aggregates"],
+        "unmeasured_metrics": (
+            sorted(name for name in LEGACY_MISSING_METRICS if after.get(name) is None)
+            if legacy_metrics
+            else []
+        ),
     }
     if sticky_routing is not None:
         row["sticky_routing"] = sticky_routing
-    if any(counters.values()):
+    if any(value not in (None, 0) for value in counters.values()):
         raise RuntimeError(f"{job.method} reported nonzero safety counters: {counters}")
     if job.method not in {"target_only", "static"} and int(after["updates_published"]) < 1:
         raise RuntimeError(f"{job.method} did not publish an update")
@@ -544,6 +579,7 @@ def benchmark(args: argparse.Namespace) -> None:
                     job,
                     output / f"block-{block}" / method,
                     max_new_tokens=args.max_new_tokens,
+                    legacy_metrics=args.donor,
                 )
             )
         rows.extend(block_rows)
@@ -1094,6 +1130,7 @@ def main() -> None:
         command.add_argument("--max-new-tokens", type=int, default=default_tokens)
         if name == "benchmark":
             command.add_argument("--blocks", type=int, nargs="+", default=(0, 1, 2))
+            command.add_argument("--donor", action="store_true")
         if name == "smoke":
             command.add_argument(
                 "--cases",

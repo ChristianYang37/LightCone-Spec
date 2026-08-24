@@ -40,6 +40,7 @@ from lightcone_spec.runner import (
     _fault_action_passed,
     _request_scope_released,
     _run_request_scoped,
+    _speed_metrics,
     _validate_committed_tokens,
     _validate_greedy_verify_counts,
 )
@@ -92,6 +93,32 @@ def test_native_timestamps_accept_scheduler_field_names():
         },
         output_ids,
     ) == (100, 101)
+
+
+def test_donor_metrics_preserve_unmeasured_fields():
+    info = {
+        "speed_study_metrics": {
+            "committed_tokens": 1,
+            "peak_hbm_bytes": 2,
+            "kv_token_capacity": 3,
+            "oom_events": 0,
+            "retractions": 0,
+        }
+    }
+    metrics = _speed_metrics(
+        info,
+        "tp1_dp1",
+        unmeasured=(
+            "peak_hbm_reserved_bytes",
+            "stale_publications",
+            "exactness_violations",
+            "version_mismatches",
+            "fallbacks",
+            "nonfinite_updates",
+        ),
+    )
+    assert metrics["stale_publications"] is None
+    assert metrics["peak_hbm_reserved_bytes"] is None
 
 
 class Handler(BaseHTTPRequestHandler):
