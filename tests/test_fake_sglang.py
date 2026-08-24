@@ -321,6 +321,23 @@ def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():
     assert torch.count_nonzero(gradient)
 
 
+def test_nextn_ragged_loss_flattens_without_severing_replay_graph():
+    ledger = RequestLedger()
+    assert ledger.begin(("request",), (0,), (0, 2))
+    assert ledger.bind_verify(("request",), (0,), (2,))
+    with torch.inference_mode():
+        with torch.inference_mode(False), torch.enable_grad():
+            weight = torch.arange(12, dtype=torch.float32).reshape(3, 4).requires_grad_()
+            replay = (torch.arange(6, dtype=torch.float32).reshape(2, 3) @ weight).view(
+                1, 2, 4
+            )
+        loss = ragged_kl_loss(replay, torch.zeros(2, 4), ledger)
+    (gradient,) = torch.autograd.grad(loss, (weight,), allow_unused=True)
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient)
+
+
 def test_nextn_shadow_shared_expert_add_keeps_gradient():
     hidden = torch.ones(2, 3)
     gate = torch.ones(3)

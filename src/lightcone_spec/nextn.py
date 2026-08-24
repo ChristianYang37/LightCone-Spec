@@ -351,6 +351,8 @@ def ragged_kl_loss(
     ledger: RequestLedger,
 ) -> torch.Tensor:
     with torch.inference_mode(False), torch.enable_grad():
+        if draft_logits.ndim == 3:
+            draft_logits = draft_logits.flatten(0, 1)
         pairs = []
         for rid in ledger.order:
             row = ledger.rows[rid]

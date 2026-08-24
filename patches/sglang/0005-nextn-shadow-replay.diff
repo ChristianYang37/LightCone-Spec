@@ -131,7 +131,7 @@ index be5902f1b8..6f54e43c70 100644
 +                                    online_adapter, parameters, baseline
 +                                )[:microbatch]
 +                                return ragged_kl_loss(
-+                                    replay.flatten(0, 1),
++                                    replay,
 +                                    teacher[:expected],
 +                                    online_adapter.request_ledger,
 +                                )
@@ -419,7 +419,7 @@ index 7fc522e219..e64b827d1a 100644
 +                                online_adapter, parameters
 +                            )[:microbatch]
 +                            return ragged_kl_loss(
-+                                replay.flatten(0, 1),
++                                replay,
 +                                teacher[:expected_rows],
 +                                online_adapter.request_ledger,
                              )
