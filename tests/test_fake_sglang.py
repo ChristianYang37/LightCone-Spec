@@ -471,11 +471,17 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     assert ledger.join_accept_lens(("b", "a"), (1, 2)) == (2, 1)
     ledger.terminal("a", "eos")
     ledger.terminal("b", "cancelled")
+    ledger.terminal("b", "aborted")
+    ledger.terminal("b", "finished")
     assert ledger.rows["a"].terminal == "eos"
-    assert ledger.rows["b"].terminal == "cancelled"
-    assert [row["terminal"] for row in ledger.snapshot()] == ["eos", "cancelled"]
+    assert ledger.rows["b"].terminal == "aborted"
+    assert ledger.terminal_states["b"] == "aborted"
+    assert [row["terminal"] for row in ledger.snapshot()] == ["eos", "aborted"]
     assert ledger.begin(("replacement",), (21,), (0, 2))
     assert ledger.order == ("replacement",)
+    ledger.reset()
+    assert ledger.snapshot() == []
+    assert ledger.terminal_states == {}
 
 
 def test_adapter_tensor_payload_round_trips_and_preserves_request_ownership(monkeypatch):

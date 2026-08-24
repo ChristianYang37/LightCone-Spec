@@ -1416,12 +1416,21 @@ index f1da6d2d3b..c42f10f6b5 100644
          if self.runtime.abort_request(request_id):
              self._restore_request_source()
  
-@@ -388,6 +1095,8 @@ class NativeBackendOnlineAdapter:
+@@ -369,6 +1133,7 @@ class NativeBackendOnlineAdapter:
+     def reset(self) -> None:
+         self.runtime.reset()
++        self.request_ledger.reset()
+         self.optimizer.reset(self.initial)
+         self.inference.stage(self.initial)
+         self.inference.publish()
+
+@@ -388,6 +1095,9 @@ class NativeBackendOnlineAdapter:
                  "native_last_source_tensor_shapes": self.last_source_tensor_shapes,
                  "native_last_feedback_source_version": self.last_feedback_source_version,
                  "native_parameter_names": self.names,
 +                "native_shadow_grad": self.last_shadow_grad,
 +                "native_request_ledger": self.request_ledger.snapshot(),
++                "native_request_terminals": self.request_ledger.terminal_states,
                  "topology": {
                      "tensor_parallel_size": self.config.topology.tensor_parallel_size,
                      "data_parallel_size": self.config.topology.data_parallel_size,

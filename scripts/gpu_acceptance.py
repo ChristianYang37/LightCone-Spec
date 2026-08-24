@@ -843,16 +843,18 @@ def nextn(args: argparse.Namespace) -> None:
 def rid_lifecycle(args: argparse.Namespace) -> None:
     config = ExperimentConfig.load(args.config)
     config.validate_local_paths()
+    base_job = _job(
+        0,
+        "lightcone",
+        "NEXTN",
+        block=0,
+        model="Qwen/Qwen3.6-35B-A3B",
+        tp2=True,
+    )
     job = replace(
-        _job(
-            0,
-            "lightcone",
-            "NEXTN",
-            block=0,
-            model="Qwen/Qwen3.6-35B-A3B",
-            tp2=True,
-        ),
+        base_job,
         load="c4",
+        parameters={**base_job.parameters, "microbatch": 4},
     )
     process = ServerProcess(
         config,
@@ -866,6 +868,10 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
     def ledgers(info: dict[str, object]) -> list[list[dict[str, object]]]:
         metrics = _speed_metrics(info, "tp2_dp1")
         return [rank["native_request_ledger"] for rank in metrics["rank_local"]]
+
+    def terminals(info: dict[str, object]) -> list[dict[str, str]]:
+        metrics = _speed_metrics(info, "tp2_dp1")
+        return [rank["native_request_terminals"] for rank in metrics["rank_local"]]
 
     with process as client:
         raw = load_prompts(
@@ -886,7 +892,9 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
             seed=1,
             request_ids=ragged_ids,
         )
-        ragged_ledger = ledgers(client.server_info())
+        ragged_info = client.server_info()
+        ragged_ledger = ledgers(ragged_info)
+        ragged_terminals = terminals(ragged_info)
 
         probe, _ = client.run_batch(
             prompts[:1],
@@ -915,7 +923,9 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
             },
             config.server.request_timeout_seconds,
         )
-        eos_ledger = ledgers(client.server_info())
+        eos_info = client.server_info()
+        eos_ledger = ledgers(eos_info)
+        eos_terminals = terminals(eos_info)
 
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
@@ -932,7 +942,9 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
                 cancel_result = "returned"
             except Exception as error:
                 cancel_result = type(error).__name__
-        cancelled_ledger = ledgers(client.server_info())
+        cancelled_info = client.server_info()
+        cancelled_ledger = ledgers(cancelled_info)
+        cancelled_terminals = terminals(cancelled_info)
 
         replacement, _ = client.run_batch(
             prompts[:1],
@@ -942,6 +954,7 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
         )
         after_info = client.server_info()
         replacement_ledger = ledgers(after_info)
+        replacement_terminals = terminals(after_info)
         after = _speed_metrics(after_info, "tp2_dp1")
 
     eos_row = eos[0] if isinstance(eos, list) else eos
@@ -950,12 +963,16 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
     report = {
         "ragged_request_ids": ragged_ids,
         "ragged_ledger": ragged_ledger,
+        "ragged_terminals": ragged_terminals,
         "eos_finish_reason": eos_reason,
         "eos_ledger": eos_ledger,
+        "eos_terminals": eos_terminals,
         "cancel_result": cancel_result,
         "cancelled_ledger": cancelled_ledger,
+        "cancelled_terminals": cancelled_terminals,
         "replacement_request_id": replacement[0].request_id,
         "replacement_ledger": replacement_ledger,
+        "replacement_terminals": replacement_terminals,
         "counters": counters,
     }
     _write(args.output / "rid-lifecycle.json", report)
@@ -965,18 +982,20 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
         raise RuntimeError("ragged request ledger changed the RID set")
     if len({row["verify_slot"] for row in ragged_ledger[0]}) != len(ragged_ids):
         raise RuntimeError("ragged request ledger reused a verify slot")
+    if any(
+        any(states.get(rid) != "finished" for rid in ragged_ids)
+        for states in ragged_terminals
+    ):
+        raise RuntimeError("ragged requests did not reach terminal states")
     if eos_reason != "stop":
         raise RuntimeError("EOS acceptance did not stop on the registered token")
-    if any(rows[-1]["rid"] != "eos" for rows in eos_ledger):
+    if any(states.get("eos") != "finished" for states in eos_terminals):
         raise RuntimeError("EOS request did not reach terminal ledger state")
     if any(rows != ragged_ledger[0] for rows in ragged_ledger[1:]):
         raise RuntimeError("TP2 ranks disagree on the ragged request ledger")
-    if any(rows[-1]["terminal"] != "aborted" for rows in cancelled_ledger):
+    if any(states.get("cancelled") != "aborted" for states in cancelled_terminals):
         raise RuntimeError("cancelled request did not reach the aborted terminal state")
-    if any(
-        rows[-1]["rid"] != "replacement" or rows[-1]["terminal"] != "finished"
-        for rows in replacement_ledger
-    ):
+    if any(states.get("replacement") != "finished" for states in replacement_terminals):
         raise RuntimeError("replacement request did not replace terminal ledger state")
     if any(counters.values()):
         raise RuntimeError(f"RID lifecycle reported nonzero safety counters: {counters}")

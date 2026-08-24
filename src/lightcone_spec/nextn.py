@@ -108,6 +108,7 @@ class RequestLedger:
     def __init__(self) -> None:
         self.rows: dict[str, RequestRow] = {}
         self.order: tuple[str, ...] = ()
+        self.terminal_states: dict[str, str] = {}
 
     def begin(
         self,
@@ -180,9 +181,16 @@ class RequestLedger:
         return tuple(by_rid[rid] for rid in self.order)
 
     def terminal(self, rid: str, state: str) -> None:
+        if state == "aborted" or self.terminal_states.get(rid) != "aborted":
+            self.terminal_states[rid] = state
         row = self.rows.get(rid)
-        if row is not None:
+        if row is not None and (state == "aborted" or row.terminal != "aborted"):
             row.terminal = state
+
+    def reset(self) -> None:
+        self.rows.clear()
+        self.order = ()
+        self.terminal_states.clear()
 
     def snapshot(self) -> list[dict[str, int | str | None]]:
         return [
