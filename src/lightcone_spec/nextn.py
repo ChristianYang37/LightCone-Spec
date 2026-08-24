@@ -184,6 +184,22 @@ class RequestLedger:
         if row is not None:
             row.terminal = state
 
+    def snapshot(self) -> list[dict[str, int | str | None]]:
+        return [
+            {
+                "rid": row.rid,
+                "proposal_slot": row.proposal_slot,
+                "verify_slot": row.verify_slot,
+                "prefix": row.prefix,
+                "draft_start": row.draft_start,
+                "draft_end": row.draft_end,
+                "teacher_start": row.teacher_start,
+                "teacher_end": row.teacher_end,
+                "terminal": row.terminal,
+            }
+            for row in self.rows.values()
+        ]
+
 
 def torch_native_moe(
     hidden: torch.Tensor,

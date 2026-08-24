@@ -473,6 +473,7 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     ledger.terminal("b", "cancelled")
     assert ledger.rows["a"].terminal == "eos"
     assert ledger.rows["b"].terminal == "cancelled"
+    assert [row["terminal"] for row in ledger.snapshot()] == ["eos", "cancelled"]
     assert ledger.begin(("replacement",), (21,), (0, 2))
     assert ledger.order == ("replacement",)
 

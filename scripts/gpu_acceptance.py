@@ -14,6 +14,7 @@ import statistics
 import subprocess
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -839,6 +840,150 @@ def nextn(args: argparse.Namespace) -> None:
     _write(args.output / "nextn.json", {"model": args.model, "mode": args.mode, "row": row})
 
 
+def rid_lifecycle(args: argparse.Namespace) -> None:
+    config = ExperimentConfig.load(args.config)
+    config.validate_local_paths()
+    job = replace(
+        _job(
+            0,
+            "lightcone",
+            "NEXTN",
+            block=0,
+            model="Qwen/Qwen3.6-35B-A3B",
+            tp2=True,
+        ),
+        load="c4",
+    )
+    process = ServerProcess(
+        config,
+        job,
+        gpus=config.gpu_ids,
+        port=config.server.base_port + 2,
+        output_dir=args.output,
+        selection=None,
+    )
+
+    def ledgers(info: dict[str, object]) -> list[list[dict[str, object]]]:
+        metrics = _speed_metrics(info, "tp2_dp1")
+        return [rank["native_request_ledger"] for rank in metrics["rank_local"]]
+
+    with process as client:
+        raw = load_prompts(
+            config.dataset_path("controlled_baseline"),
+            limit=4,
+            split="tuning",
+        )
+        tokens = tuple(client.tokenize(prompt) for prompt in raw)
+        prompts = tuple(row[-length:] for row, length in zip(tokens, (32, 64, 96, 128)))
+        client.run_batch(prompts[:1], max_new_tokens=16, seed=0)
+        client.reset()
+        before = _speed_metrics(client.server_info(), "tp2_dp1")
+
+        ragged_ids = ("ragged-a", "ragged-b", "ragged-c", "ragged-d")
+        ragged, _ = client.run_batch(
+            prompts,
+            max_new_tokens=16,
+            seed=1,
+            request_ids=ragged_ids,
+        )
+        ragged_ledger = ledgers(client.server_info())
+
+        probe, _ = client.run_batch(
+            prompts[:1],
+            max_new_tokens=1,
+            seed=2,
+            request_ids=("eos-probe",),
+        )
+        eos = _post_json(
+            client.base_url + "/generate",
+            {
+                "input_ids": [list(prompts[0])],
+                "rid": ["eos"],
+                "sampling_params": [
+                    {
+                        "temperature": 0.0,
+                        "top_k": 1,
+                        "top_p": 1.0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": False,
+                        "stop_token_ids": [probe[0].output_ids[0]],
+                        "sampling_seed": 2,
+                    }
+                ],
+                "stream": False,
+                "return_native_token_timestamps": True,
+            },
+            config.server.request_timeout_seconds,
+        )
+        eos_ledger = ledgers(client.server_info())
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                client.run_batch,
+                prompts[:1],
+                max_new_tokens=2048,
+                seed=3,
+                request_ids=("cancelled",),
+            )
+            time.sleep(1)
+            client.abort("cancelled")
+            try:
+                future.result(timeout=30)
+                cancel_result = "returned"
+            except Exception as error:
+                cancel_result = type(error).__name__
+        cancelled_ledger = ledgers(client.server_info())
+
+        replacement, _ = client.run_batch(
+            prompts[:1],
+            max_new_tokens=16,
+            seed=4,
+            request_ids=("replacement",),
+        )
+        after_info = client.server_info()
+        replacement_ledger = ledgers(after_info)
+        after = _speed_metrics(after_info, "tp2_dp1")
+
+    eos_row = eos[0] if isinstance(eos, list) else eos
+    eos_reason = eos_row["meta_info"]["finish_reason"]["type"]
+    counters = {name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS}
+    if tuple(result.request_id for result in ragged) != ragged_ids:
+        raise RuntimeError("ragged batch request ownership changed")
+    if tuple(row["rid"] for row in ragged_ledger[0]) != ragged_ids:
+        raise RuntimeError("ragged request ledger changed RID order")
+    if len({row["verify_slot"] for row in ragged_ledger[0]}) != len(ragged_ids):
+        raise RuntimeError("ragged request ledger reused a verify slot")
+    if eos_reason != "stop":
+        raise RuntimeError("EOS acceptance did not stop on the registered token")
+    if any(rows[-1]["rid"] != "eos" for rows in eos_ledger):
+        raise RuntimeError("EOS request did not reach terminal ledger state")
+    if any(rows != ragged_ledger[0] for rows in ragged_ledger[1:]):
+        raise RuntimeError("TP2 ranks disagree on the ragged request ledger")
+    if any(rows[-1]["terminal"] != "aborted" for rows in cancelled_ledger):
+        raise RuntimeError("cancelled request did not reach the aborted terminal state")
+    if any(
+        rows[-1]["rid"] != "replacement" or rows[-1]["terminal"] != "finished"
+        for rows in replacement_ledger
+    ):
+        raise RuntimeError("replacement request did not replace terminal ledger state")
+    if any(counters.values()):
+        raise RuntimeError(f"RID lifecycle reported nonzero safety counters: {counters}")
+    _write(
+        args.output / "rid-lifecycle.json",
+        {
+            "ragged_request_ids": ragged_ids,
+            "ragged_ledger": ragged_ledger,
+            "eos_finish_reason": eos_reason,
+            "eos_ledger": eos_ledger,
+            "cancel_result": cancel_result,
+            "cancelled_ledger": cancelled_ledger,
+            "replacement_request_id": replacement[0].request_id,
+            "replacement_ledger": replacement_ledger,
+            "counters": counters,
+        },
+    )
+
+
 def compare(args: argparse.Namespace) -> None:
     donor = json.loads(args.donor.read_text(encoding="utf-8"))
     rebuild = json.loads(args.rebuild.read_text(encoding="utf-8"))
@@ -924,6 +1069,10 @@ def main() -> None:
     command.add_argument("--mode", choices=("static", "lora", "full"), required=True)
     command.add_argument("--max-new-tokens", type=int, default=128)
     command.set_defaults(handler=nextn)
+    command = commands.add_parser("rid-lifecycle")
+    command.add_argument("--config", type=Path, required=True)
+    command.add_argument("--output", type=Path, required=True)
+    command.set_defaults(handler=rid_lifecycle)
     args = parser.parse_args()
     if hasattr(args, "max_new_tokens") and not 1 <= args.max_new_tokens <= 40800:
         parser.error("--max-new-tokens must be in 1..40800")
