@@ -578,15 +578,20 @@ def benchmark(args: argparse.Namespace) -> None:
         block_rows = []
         for ordinal, (method, backend) in enumerate(methods, start=block * len(methods)):
             job = _job(ordinal, method, backend, block=block)
-            block_rows.append(
-                _measure(
-                    config,
-                    job,
-                    output / f"block-{block}" / method,
-                    max_new_tokens=args.max_new_tokens,
-                    legacy_metrics=args.donor,
+            method_output = output / f"block-{block}" / method
+            completed = method_output / "acceptance.json"
+            if completed.exists():
+                block_rows.append(json.loads(completed.read_text(encoding="utf-8")))
+            else:
+                block_rows.append(
+                    _measure(
+                        config,
+                        job,
+                        method_output,
+                        max_new_tokens=args.max_new_tokens,
+                        legacy_metrics=args.donor,
+                    )
                 )
-            )
         rows.extend(block_rows)
     _write(output / "benchmark.json", rows)
 
