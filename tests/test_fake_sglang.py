@@ -18,6 +18,7 @@ from lightcone_spec.nextn import (
     MergedPublicationBank,
     PublicationSlot,
     RequestLedger,
+    anchor_replay_logits,
     grad_enabled_forwards,
     gradient_leaves,
     needs_tp_gradient_sum,
@@ -302,6 +303,16 @@ def test_nextn_shadow_uses_resident_optimizer_values_as_gradient_leaves():
     assert not weight.is_inference()
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient)
+
+
+def test_nextn_replay_uses_inference_values_and_replay_gradient():
+    inference = torch.tensor([[3.0, 1.0]])
+    weight = torch.tensor(2.0, requires_grad=True)
+    replay = weight * torch.tensor([[1.0, 4.0]])
+    anchored = anchor_replay_logits(inference, replay)
+    assert torch.equal(anchored, inference)
+    anchored.sum().backward()
+    assert weight.grad == 5.0
 
 
 def test_nextn_ragged_loss_keeps_gradient_inside_scheduler_inference_mode():

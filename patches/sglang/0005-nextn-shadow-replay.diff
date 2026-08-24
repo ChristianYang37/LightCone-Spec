@@ -472,7 +472,7 @@ index f1da6d2d3b..c42f10f6b5 100644
  from sglang.srt.speculative.online_adaptation_config import (
      OnlineAdaptationConfig,
      load_online_adaptation,
-@@ -26,18 +37,43 @@ from sglang.srt.speculative.online_parameter_plan import (
+@@ -26,18 +37,44 @@ from sglang.srt.speculative.online_parameter_plan import (
      build_native_parameter_plan,
  )
  
@@ -480,6 +480,7 @@ index f1da6d2d3b..c42f10f6b5 100644
 +    MergedPublicationBank,
 +    PublicationSlot,
 +    RequestLedger,
++    anchor_replay_logits,
 +    grad_enabled_forwards,
 +    gradient_leaves,
 +    needs_tp_gradient_sum,
@@ -1255,9 +1256,9 @@ index f1da6d2d3b..c42f10f6b5 100644
 +        self.last_shadow_grad.update(self._nextn_prepare_diagnostic)
 +        if not publication_matches:
 +            self.runtime.disable("nextn_publication_mismatch", exactness=True)
-+        elif not bool(valid.item()):
++        elif self.runtime.active_version == 0 and not bool(valid.item()):
 +            self.runtime.disable("nextn_replay_reconstruction_mismatch", exactness=True)
-+        return logits
++        return anchor_replay_logits(inference_logits, logits)
 +
 +    def shadow_forward(self, parameters, *args, **kwargs):
 +        self.last_shadow_grad = {

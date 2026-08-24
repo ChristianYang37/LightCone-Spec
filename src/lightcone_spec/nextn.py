@@ -49,6 +49,13 @@ def gradient_leaves(parameters: Sequence[torch.Tensor]) -> tuple[torch.Tensor, .
         return tuple(value.detach().requires_grad_(True) for value in parameters)
 
 
+def anchor_replay_logits(
+    inference_logits: torch.Tensor, replay_logits: torch.Tensor
+) -> torch.Tensor:
+    """Use inference values with the differentiable replay Jacobian."""
+    return inference_logits.detach() + replay_logits - replay_logits.detach()
+
+
 def torch_native_shared_expert_add(
     hidden: torch.Tensor,
     gate_weight: torch.Tensor,
