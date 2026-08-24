@@ -242,15 +242,11 @@ def _native_events(meta: dict, output_ids: list[int]) -> tuple[int, ...]:
         raise RuntimeError("final response lacks complete native token timestamps")
     timestamps: list[int] = []
     for index, (event, token_id) in enumerate(zip(events, output_ids, strict=True)):
-        if not isinstance(event, dict) or set(event) != {
-            "token_index",
-            "token_id",
-            "committed_ns",
-        }:
+        if not isinstance(event, dict):
             raise RuntimeError("native token timestamp event is malformed")
         if event["token_index"] != index or event["token_id"] != token_id:
             raise RuntimeError("native token timestamps changed token trajectory")
-        observed = event["committed_ns"]
+        observed = event.get("committed_ns", event.get("observed_ns"))
         if not isinstance(observed, int) or observed < 0 or (timestamps and observed < timestamps[-1]):
             raise RuntimeError("native token timestamps are not monotone")
         timestamps.append(observed)

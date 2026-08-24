@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lightcone_spec.client import GenerationResult, SGLangClient
+from lightcone_spec.client import GenerationResult, SGLangClient, _native_events
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.data import load_arrival_offsets, load_arrival_trace
 from lightcone_spec.nextn import (
@@ -79,6 +79,19 @@ def _nextn_acceptance_job(model: str) -> Job:
             "topology": "tp2_dp1",
         },
     )
+
+
+def test_native_timestamps_accept_scheduler_field_names():
+    output_ids = [11, 12]
+    assert _native_events(
+        {
+            "native_token_timestamp_events": [
+                {"token_index": 0, "token_id": 11, "observed_ns": 100},
+                {"token_index": 1, "token_id": 12, "observed_ns": 101},
+            ]
+        },
+        output_ids,
+    ) == (100, 101)
 
 
 class Handler(BaseHTTPRequestHandler):
