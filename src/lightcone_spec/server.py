@@ -499,7 +499,13 @@ class ServerProcess:
         deadline = time.monotonic() + self.config.server.startup_timeout_seconds
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
-                raise RuntimeError(f"SGLang exited during startup with {self.process.returncode}")
+                if self.log is not None:
+                    self.log.flush()
+                log_path = self.output_dir / "server.log"
+                tail = log_path.read_bytes()[-4096:].decode(errors="replace")
+                raise RuntimeError(
+                    f"SGLang exited during startup with {self.process.returncode}: {tail}"
+                )
             if client.health():
                 return client
             time.sleep(1)

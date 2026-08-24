@@ -336,26 +336,26 @@ index 00000000..20e93274
 +    head.  Reusing the immutable fp32 cache is both cheaper and bit-identical
 +    to the JIT RoPE kernel after the final activation cast.
 +    """
-+    dimension = value.shape[-1]
-+    if dimension % 2:
-+        raise ValueError("RoPE head dimension must be even")
++    head_dimension, rotary_dimension = value.shape[-1], cos_sin_cache.shape[-1]
++    if rotary_dimension % 2 or rotary_dimension > head_dimension: raise ValueError("RoPE head dimension must be even")
 +    if value.ndim != positions.ndim + 2 or value.shape[:-2] != positions.shape:
 +        raise ValueError("RoPE positions do not match the token dimensions")
-+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] < dimension:
++    if not rotary_dimension:
 +        raise ValueError("RoPE cache does not cover the requested head dimension")
-+    cached = cos_sin_cache.index_select(0, positions.reshape(-1))[:, :dimension]
-+    cached = cached.reshape(*positions.shape, dimension)
++    cached = cos_sin_cache.index_select(0, positions.reshape(-1))
++    cached = cached.reshape(*positions.shape, rotary_dimension)
 +    cosine, sine = cached.to(torch.float32).chunk(2, dim=-1)
 +    cosine = cosine.unsqueeze(-2)
 +    sine = sine.unsqueeze(-2)
-+    left, right = value.to(torch.float32).chunk(2, dim=-1)
-+    return torch.cat(
++    left, right = value[..., :rotary_dimension].to(torch.float32).chunk(2, dim=-1)
++    rotated = torch.cat(
 +        (
 +            left * cosine - right * sine,
 +            right * cosine + left * sine,
 +        ),
 +        dim=-1,
 +    ).to(value.dtype)
++    return torch.cat((rotated, value[..., rotary_dimension:]), dim=-1)
 +
 +
 +class DFlashDrafterAdapter:

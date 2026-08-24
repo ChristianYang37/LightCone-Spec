@@ -54,7 +54,7 @@ export CUDA_PATH="$cuda_home"
 export PATH="$cuda_home/bin:$PATH"
 export LD_LIBRARY_PATH="$cuda_home/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 marker="$sglang_root/.lightcone-spec-patched"
-patch_version="paper-v1-nextn-shadow-v1"
+patch_version="paper-v1-nextn-shadow-v2"
 
 if [[ ! -e "$marker" ]]; then
   patches=()
@@ -98,10 +98,12 @@ PYTHONPATH="$project_root/src:$sglang_root/python" "$python_bin" - <<'PY'
 from lightcone_spec.nextn import MergedPublicationBank, RequestLedger
 from sglang.srt.managers.native_token_timestamps import record_committed_output_tokens
 from sglang.srt.speculative.dspark_online_adaptation import dspark_composite_loss
+from sglang.srt.speculative.native_backend_online_adaptation import NativeBackendOnlineAdapter
 from sglang.srt.speculative.online_adaptation_config import OnlineAdaptationConfig
 
 assert callable(record_committed_output_tokens)
 assert callable(dspark_composite_loss)
+assert NativeBackendOnlineAdapter is not None
 assert OnlineAdaptationConfig is not None
 assert MergedPublicationBank is not None
 assert RequestLedger is not None

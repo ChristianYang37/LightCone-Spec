@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -5,7 +6,11 @@ import pytest
 
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import materialize
-from lightcone_spec.runner import _node_final_blocks, _save_or_validate_run_config
+from lightcone_spec.runner import (
+    _complete_infeasible_startup,
+    _node_final_blocks,
+    _save_or_validate_run_config,
+)
 from lightcone_spec.state import StateStore
 
 
@@ -28,6 +33,7 @@ def test_interrupt_retry_skip_and_resume(tmp_path: Path):
     assert state.next_attempt(first.job_id) == 3
     attempt = state.start(first, (0, 1), tmp_path / "a3")
     state.complete(first.job_id, attempt)
+    assert state.jobs("preflight") == jobs
 
     second = jobs[1]
     attempt = state.start(second, (0,), tmp_path / "b1")
@@ -44,6 +50,24 @@ def test_node_can_expand_without_changing_existing_rows(tmp_path: Path):
     state.add_jobs("E0-tune", probes)
     state.add_jobs("E0-tune", expanded)
     assert state.status_counts("E0-tune") == {"pending": 108 + 239}
+
+
+def test_screening_startup_oom_is_a_completed_infeasible_row(tmp_path: Path):
+    state = StateStore(tmp_path)
+    job = replace(
+        materialize("E3a")[0],
+        job_id="screening-startup-oom",
+        node="E6-interface",
+    )
+    state.add_internal_jobs((job,))
+    _complete_infeasible_startup(
+        state, job, tmp_path, (0, 1), RuntimeError("CUDA out of memory")
+    )
+    assert state.status_counts("E6-interface") == {"completed": 1}
+    directory = state.completed_attempt_dirs("E6-interface")[0]
+    metrics = json.loads((directory / "metrics.json").read_text())
+    assert metrics["scientific_outcome"] == "infeasible"
+    assert metrics["feasible"] is False
 
 
 def test_internal_jobs_resume_without_adding_a_paper_stage(tmp_path: Path):

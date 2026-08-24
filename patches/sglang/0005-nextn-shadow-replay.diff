@@ -1,14 +1,8 @@
 diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
-index be5902f1..7d81d009 100644
+index be5902f1b8..6f54e43c70 100644
 --- a/python/sglang/srt/speculative/eagle_worker_v2.py
 +++ b/python/sglang/srt/speculative/eagle_worker_v2.py
-@@ -1,4 +1,5 @@
- import contextlib
-+import copy
- import logging
- import time
- from dataclasses import replace
-@@ -7,6 +8,7 @@ from typing import List, Optional
+@@ -7,6 +7,7 @@ from typing import List, Optional
  import torch
  import torch.nn.functional as F
  
@@ -16,7 +10,7 @@ index be5902f1..7d81d009 100644
  from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
  from sglang.srt.distributed.parallel_state_wrapper import ParallelState
  from sglang.srt.environ import envs
-@@ -148,6 +150,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -148,6 +149,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
          self._online_adapter = None
          self._online_hidden_rows: tuple[torch.Tensor, ...] = ()
          self._online_logit_rows: tuple[torch.Tensor, ...] = ()
@@ -24,7 +18,7 @@ index be5902f1..7d81d009 100644
  
          self._rebuild_topk1_chain_buffers()
  
-@@ -575,6 +578,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -575,6 +577,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
          )
          online_hidden_rows: list[torch.Tensor] = []
          online_logit_rows: list[torch.Tensor] = []
@@ -32,7 +26,7 @@ index be5902f1..7d81d009 100644
          if self.server_args.speculative_use_rejection_sampling:
              draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
  
-@@ -644,9 +648,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -644,9 +647,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                  if (c := self.draft_runner.canary_manager) is not None
                  else contextlib.nullcontext()
              )
@@ -41,7 +35,7 @@ index be5902f1..7d81d009 100644
 +            )
 +            if nextn_replay:
 +                online_replay_batches.append(
-+                    (self._capture_replay_batch(forward_batch), i)
++                    (self._online_adapter.capture_nextn_replay(forward_batch), i)
 +                )
              with (
 -                torch.inference_mode(not online_update),
@@ -51,7 +45,7 @@ index be5902f1..7d81d009 100644
              ):
                  with (
                      forward_context(
-@@ -712,6 +723,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -712,6 +722,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
  
          self._online_hidden_rows = tuple(online_hidden_rows)
          self._online_logit_rows = tuple(online_logit_rows)
@@ -59,47 +53,24 @@ index be5902f1..7d81d009 100644
  
          draft_probs = (
              torch.stack(draft_probs_list, dim=1)
-@@ -739,6 +751,39 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+@@ -739,6 +750,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
  
          return parent_list, top_scores_index, draft_tokens, draft_probs
  
-+    def _capture_replay_batch(self, forward_batch: ForwardBatch) -> ForwardBatch:
-+        replay = copy.copy(forward_batch)
-+        replay.input_ids = forward_batch.input_ids.detach().clone()
-+        replay.positions = forward_batch.positions.detach().clone()
-+        replay.next_token_logits_buffer = None
-+        replay.spec_info = copy.copy(forward_batch.spec_info)
-+        replay.spec_info.hidden_states = (
-+            forward_batch.spec_info.hidden_states.detach().clone()
-+        )
-+        if forward_batch.mm_input_embeds is not None:
-+            replay.mm_input_embeds = forward_batch.mm_input_embeds.detach().clone()
-+        return replay
-+
-+    def replay_current_block(self, adapter, parameters) -> torch.Tensor:
-+        logits = []
++    def replay_current_block(self, adapter, parameters, inference_logits) -> torch.Tensor:
++        if not self._online_replay_batches:
++            raise RuntimeError("NEXTN current-block replay is empty")
 +        with torch.inference_mode(False), torch.enable_grad():
-+            for forward_batch, step in self._online_replay_batches:
-+                with forward_context(
-+                    ForwardContext(
-+                        attn_backend=self.draft_attn_backend.attn_backends[step]
-+                    )
-+                ):
-+                    output = adapter.shadow_forward(
-+                        parameters,
-+                        forward_batch.input_ids,
-+                        forward_batch.positions,
-+                        forward_batch,
-+                    )
-+                logits.append(output.next_token_logits)
-+            if not logits:
-+                raise RuntimeError("NEXTN current-block replay is empty")
-+            return torch.stack(logits, dim=1)
++            return adapter.replay_nextn(
++                parameters,
++                tuple(batch for batch, _ in self._online_replay_batches),
++                inference_logits,
++            )
 +
      def draft_extend(self):
          pass
  
-@@ -1296,52 +1341,110 @@ class EAGLEWorkerV2(BaseSpecWorker):
+@@ -1296,52 +1317,110 @@ class EAGLEWorkerV2(BaseSpecWorker):
                          len(round_request_ids),
                          online_adapter.config.adaptation_microbatch_size,
                      )
@@ -157,7 +128,7 @@ index be5902f1..7d81d009 100644
 +
 +                            def replay_loss(parameters):
 +                                replay = self.draft_worker.replay_current_block(
-+                                    online_adapter, parameters
++                                    online_adapter, parameters, baseline
 +                                )[:microbatch]
 +                                return ragged_kl_loss(
 +                                    replay.flatten(0, 1),
@@ -184,20 +155,14 @@ index be5902f1..7d81d009 100644
 +                            hidden = torch.cat(
 +                                tuple(row[:microbatch] for row in hidden_rows[:steps]),
 +                                dim=0,
-+                            )
-+                            draft_logits = torch.cat(
-+                                tuple(row[:microbatch] for row in logit_rows[:steps]),
-+                                dim=0,
                              )
 -                            loss = F.kl_div(
 -                                F.log_softmax(draft_logits.float(), dim=-1),
 -                                F.softmax(teacher_logits.float(), dim=-1),
 -                                reduction="batchmean",
-+                        target_logits = (
-+                            batch_output.logits_output.next_token_logits.reshape(
-+                                len(round_request_ids),
-+                                self.speculative_num_draft_tokens,
-+                                -1,
++                            draft_logits = torch.cat(
++                                tuple(row[:microbatch] for row in logit_rows[:steps]),
++                                dim=0,
                              )
 -                        online_adapter.launch(
 -                            loss=loss,
@@ -207,12 +172,18 @@ index be5902f1..7d81d009 100644
 -                            feedback_source_version=(
 -                                online_adapter.source_adapter_version
 -                            ),
-                         )
++                        target_logits = (
++                            batch_output.logits_output.next_token_logits.reshape(
++                                len(round_request_ids),
++                                self.speculative_num_draft_tokens,
++                                -1,
++                            )
++                        )
 +                        teacher_logits = (
 +                            target_logits[:microbatch, :steps]
 +                            .transpose(0, 1)
 +                            .reshape(-1, target_logits.shape[-1])
-+                        )
+                         )
 +                        row_count = min(
 +                            hidden.shape[0],
 +                            draft_logits.shape[0],
@@ -250,7 +221,7 @@ index be5902f1..7d81d009 100644
                  committed = batch_output.accept_lens.to(torch.int64)
                  online_adapter.after_commit(
 diff --git a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
-index 7fc522e2..e64b827d 100644
+index 7fc522e219..e64b827d1a 100644
 --- a/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 +++ b/python/sglang/srt/speculative/frozen_kv_mtp_worker_v2.py
 @@ -21,12 +21,12 @@ start of the next draft.
@@ -476,10 +447,10 @@ index 7fc522e2..e64b827d 100644
                          (batch_size,),
                          self.speculative_num_draft_tokens,
 diff --git a/python/sglang/srt/speculative/native_backend_online_adaptation.py b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-index f1da6d2d..3d32c421 100644
+index f1da6d2d3b..c42f10f6b5 100644
 --- a/python/sglang/srt/speculative/native_backend_online_adaptation.py
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-@@ -4,7 +4,8 @@ from __future__ import annotations
+@@ -4,9 +4,20 @@ from __future__ import annotations
  
  import logging
  import math
@@ -488,8 +459,20 @@ index f1da6d2d..3d32c421 100644
 +from collections.abc import Callable, Sequence
  
  import torch
++import torch.distributed as dist
++import torch.nn.functional as F
++from sglang.srt.distributed.parallel_state import get_tp_group
++from sglang.srt.speculative.dflash_online_adaptation import (
++    _TensorParallelAllGather,
++    _TensorParallelSum,
++    _logit_reconstruction_gate,
++    _rms,
++    _rope,
++)
  from sglang.srt.speculative.online_adaptation_config import (
-@@ -26,6 +27,16 @@ from sglang.srt.speculative.online_parameter_plan import (
+     OnlineAdaptationConfig,
+     load_online_adaptation,
+@@ -26,18 +37,43 @@ from sglang.srt.speculative.online_parameter_plan import (
      build_native_parameter_plan,
  )
  
@@ -499,6 +482,9 @@ index f1da6d2d..3d32c421 100644
 +    RequestLedger,
 +    grad_enabled_forwards,
 +    gradient_leaves,
++    needs_tp_gradient_sum,
++    ragged_history_locations,
++    torch_native_ragged_attention,
 +    torch_native_selected_moe,
 +    torch_native_shared_expert_add,
 +)
@@ -506,7 +492,20 @@ index f1da6d2d..3d32c421 100644
  logger = logging.getLogger(__name__)
  
  
-@@ -33,11 +44,10 @@ def _bytes(tensors: Sequence[torch.Tensor]) -> int:
++class _TensorParallelCopy(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, value: torch.Tensor, group) -> torch.Tensor:
++        ctx.group = group
++        return value
++
++    @staticmethod
++    def backward(ctx, gradient: torch.Tensor):
++        output = gradient.contiguous()
++        dist.all_reduce(output, group=ctx.group)
++        return output, None
++
++
+ def _bytes(tensors: Sequence[torch.Tensor]) -> int:
      return sum(value.numel() * value.element_size() for value in tensors)
  
  
@@ -520,7 +519,7 @@ index f1da6d2d..3d32c421 100644
          if weight.ndim != 2 or rank > min(weight.shape):
              raise ValueError("native LoRA rank exceeds its backend matrix")
          generator = torch.Generator(device=weight.device)
-@@ -60,10 +70,122 @@ class _LowRankDelta(torch.nn.Module):
+@@ -60,10 +96,148 @@ class _LowRankDelta(torch.nn.Module):
          )
          torch.nn.init.kaiming_uniform_(self.a, a=math.sqrt(5), generator=generator)
  
@@ -543,6 +542,7 @@ index f1da6d2d..3d32c421 100644
 +    module: torch.nn.Module,
 +    weight: torch.Tensor,
 +    parameter_indices: tuple[int, ...],
++    lora_scale: float,
 +) -> PublicationSlot:
 +    parent_name, _, leaf = raw_name.rpartition(".")
 +    scale_attribute = (
@@ -581,6 +581,7 @@ index f1da6d2d..3d32c421 100644
 +        live_weight=weight,
 +        base_master=base,
 +        parameter_indices=parameter_indices,
++        lora_scale=lora_scale,
 +        live_scale=scale,
 +        scale_name=f"{parent_name}.{scale_attribute}",
 +        quantize=quantize,
@@ -594,12 +595,15 @@ index f1da6d2d..3d32c421 100644
 +    weight: torch.Tensor,
 +    base: torch.Tensor,
 +    parameter_indices: tuple[int, ...],
++    lora_scale: float = 1.0,
 +) -> PublicationSlot:
 +    if weight.dtype in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
 +        return _block_fp8_slot(
-+            name, raw_name, module, weight, parameter_indices
++            name, raw_name, module, weight, parameter_indices, lora_scale
 +        )
-+    return PublicationSlot(name, weight, base.float(), parameter_indices)
++    return PublicationSlot(
++        name, weight, base.float(), parameter_indices, lora_scale=lora_scale
++    )
 +
 +
 +def _moe_scale(module: torch.nn.Module, stem: str) -> torch.Tensor | None:
@@ -640,10 +644,31 @@ index f1da6d2d..3d32c421 100644
 +    )
 +
 +
++def _expanded_scale(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
++    rows = math.ceil(weight.shape[-2] / scale.shape[-2])
++    columns = math.ceil(weight.shape[-1] / scale.shape[-1])
++    return (
++        scale.float()
++        .repeat_interleave(rows, dim=-2)
++        .repeat_interleave(columns, dim=-1)[..., : weight.shape[-2], : weight.shape[-1]]
++    )
++
++
++def _reference_weight(module, leaf: str, replacement: torch.Tensor | None):
++    if replacement is not None:
++        return replacement
++    weight = getattr(module, leaf)
++    if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e4m3fnuz}:
++        return weight.detach()
++    scale_name = "weight_scale_inv" if leaf == "weight" else f"{leaf}_scale_inv"
++    scale = getattr(module, scale_name)
++    return weight.float() * _expanded_scale(weight, scale)
++
++
  def _canonical_named_parameters(model) -> tuple[tuple[str, str, torch.Tensor], ...]:
      rows = []
      seen = set()
-@@ -90,6 +212,9 @@ class NativeBackendOnlineAdapter:
+@@ -90,6 +264,9 @@ class NativeBackendOnlineAdapter:
          self.model = model
          self.device = torch.device(worker.device)
          rows = _canonical_named_parameters(model)
@@ -653,7 +678,7 @@ index f1da6d2d..3d32c421 100644
          self.plan: ParameterSelection = build_native_parameter_plan(
              ((raw_name, parameter) for _, raw_name, parameter in rows),
              config,
-@@ -97,16 +222,39 @@ class NativeBackendOnlineAdapter:
+@@ -97,16 +274,39 @@ class NativeBackendOnlineAdapter:
          self.live_launch_count = 0
          self.last_source_tensor_shapes: tuple[tuple[int, ...], ...] = ()
          self.last_feedback_source_version: int | None = None
@@ -697,7 +722,7 @@ index f1da6d2d..3d32c421 100644
          else:
              if config.rank is None:
                  raise AssertionError("validated native LoRA config has no rank")
-@@ -116,37 +264,79 @@ class NativeBackendOnlineAdapter:
+@@ -116,37 +316,90 @@ class NativeBackendOnlineAdapter:
                  if leaf != "weight":
                      raise ValueError("native LoRA selector named a non-weight tensor")
                  module = model.get_submodule(parent_name) if parent_name else model
@@ -739,6 +764,7 @@ index f1da6d2d..3d32c421 100644
 +                        parameter,
 +                        parameter.detach().float().clone(),
 +                        parameter_indices,
++                        float(config.lora_alpha) / float(config.rank),
 +                    )
 +                )
 +                functional_parameters[raw_name] = parameter_indices
@@ -773,16 +799,27 @@ index f1da6d2d..3d32c421 100644
              raise RuntimeError("native backend trainable layout is empty")
          self.names = tuple(trainable_names)
          self.trainable = tuple(trainable)
+-        self.initial = tuple(value.detach().clone() for value in self.trainable)
 +        self.functional_parameters = functional_parameters
 +        self.functional_modules = functional_modules
 +        self.publication_slots = tuple(publication_slots)
-         self.initial = tuple(value.detach().clone() for value in self.trainable)
++        full_bases = {
++            slot.parameter_indices[0]: slot.base_master
++            for slot in publication_slots
++            if len(slot.parameter_indices) == 1
++        }
++        self.initial = tuple(
++            full_bases[index] if index in full_bases else value.detach().clone()
++            for index, value in enumerate(self.trainable)
++        )
          self.optimizer = build_parameter_optimizer(
              self.trainable,
              config,
              projection_origin=self.initial,
          )
 -        self.inference = FixedInferenceBank(self.trainable)
++        if algorithm == "NEXTN":
++            self.trainable = self.optimizer.master
 +        self.inference = (
 +            MergedPublicationBank(publication_slots)
 +            if publication_slots
@@ -791,7 +828,7 @@ index f1da6d2d..3d32c421 100644
          context_capacity = int(
              server_args.context_length
              or getattr(model.config, "max_position_embeddings", config.canvas_tokens)
-@@ -192,7 +382,9 @@ class NativeBackendOnlineAdapter:
+@@ -192,7 +445,9 @@ class NativeBackendOnlineAdapter:
          )
          candidate_bytes = estimate_functional_optimizer_scratch_bytes(
              self.optimizer,
@@ -802,7 +839,7 @@ index f1da6d2d..3d32c421 100644
          )
          scratch = parameter_bytes + activation_bytes + candidate_bytes
          self.runtime.bind_memory(
-@@ -228,12 +420,42 @@ class NativeBackendOnlineAdapter:
+@@ -228,12 +483,42 @@ class NativeBackendOnlineAdapter:
      def begin_round(
          self, request_ids: Sequence[str], prefix_lens: torch.Tensor
      ) -> int:
@@ -847,7 +884,7 @@ index f1da6d2d..3d32c421 100644
          request_ids: Sequence[str],
          prefix_lens: torch.Tensor,
          source_tensors: Sequence[torch.Tensor],
-@@ -241,10 +463,8 @@ class NativeBackendOnlineAdapter:
+@@ -241,10 +526,8 @@ class NativeBackendOnlineAdapter:
      ) -> None:
          if not self.runtime.update_due():
              return
@@ -860,13 +897,15 @@ index f1da6d2d..3d32c421 100644
              return
          self.live_launch_count += 1
          self.last_source_tensor_shapes = tuple(
-@@ -256,9 +476,25 @@ class NativeBackendOnlineAdapter:
+@@ -256,11 +539,40 @@ class NativeBackendOnlineAdapter:
          try:
              with self.runtime.side_update(tuple(source_tensors)):
                  with self.runtime.timing("training"):
 +                    if replay is not None:
 +                        gradient_sources = gradient_leaves(self.optimizer.master)
 +                        loss = replay(gradient_sources)
++                        if self.runtime.disabled_reason is not None:
++                            return
 +                    else:
 +                        gradient_sources = self.trainable
 +                    if loss is None or loss.numel() != 1 or not loss.requires_grad:
@@ -886,8 +925,21 @@ index f1da6d2d..3d32c421 100644
 +                        gradient_sources,
                          allow_unused=True,
                      )
++                    tp_group = get_tp_group()
++                    if self.config.algorithm == "NEXTN" and tp_group.world_size > 1:
++                        reduced = list(raw)
++                        for index, (name, gradient) in enumerate(
++                            zip(self.names, raw, strict=True)
++                        ):
++                            if gradient is not None and needs_tp_gradient_sum(name):
++                                gradient = gradient.contiguous()
++                                dist.all_reduce(gradient, group=tp_group.device_group)
++                                reduced[index] = gradient
++                        raw = tuple(reduced)
                      connected = tuple(
-@@ -336,6 +572,110 @@ class NativeBackendOnlineAdapter:
+                         gradient for gradient in raw if gradient is not None
+                     )
+@@ -336,6 +648,391 @@ class NativeBackendOnlineAdapter:
              self.runtime.counters["fallbacks"] += 1
              self.runtime.disable(f"native_update_failed:{type(error).__name__}")
  
@@ -905,12 +957,293 @@ index f1da6d2d..3d32c421 100644
 +                replacement = values[indices[0]]
 +            else:
 +                a, b = (values[index] for index in indices)
-+                replacement = slot.base_master + b @ a
++                replacement = slot.base_master + slot.lora_scale * (b @ a)
 +            if slot.quantize is None:
 +                replacements[raw_name] = replacement.to(slot.live_weight.dtype)
 +            else:
 +                replacements[raw_name] = replacement
 +        return replacements
++
++    def capture_nextn_replay(self, forward_batch) -> dict[str, torch.Tensor]:
++        if self.model.__class__.__name__ != "Qwen3_5ForCausalLMMTP":
++            raise RuntimeError("NEXTN replay supports Qwen3.5-compatible MTP only")
++        spec_info = forward_batch.spec_info
++        locations, valid = ragged_history_locations(
++            spec_info.kv_indptr, spec_info.kv_indices
++        )
++        layer_id = int(self.model.model.layers[0].attn.layer_id)
++        history_key, history_value = self._nextn_history(
++            layer_id, {"history_locations": locations}
++        )
++        return {
++            "input_ids": forward_batch.input_ids.detach().clone(),
++            "positions": forward_batch.positions.detach().clone(),
++            "hidden_states": forward_batch.spec_info.hidden_states.detach().clone(),
++            "history_key": history_key.clone(),
++            "history_value": history_value.clone(),
++            "history_valid": valid.detach().clone(),
++        }
++
++    def _nextn_history(
++        self, layer_id: int, replay: dict[str, torch.Tensor]
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if "history_key" in replay:
++            return replay["history_key"], replay["history_value"]
++        pool = self.worker._draft_worker.draft_runner.token_to_kv_pool
++        key_buffer, value_buffer = pool.get_kv_buffer(layer_id)
++        locations = replay["history_locations"]
++
++        def gather(buffer):
++            if buffer.ndim == 3:
++                return buffer[locations].detach()
++            pages = torch.div(
++                locations,
++                int(self.worker.page_size),
++                rounding_mode="floor",
++            )
++            offsets = torch.remainder(locations, int(self.worker.page_size))
++            return buffer[pages, :, offsets, :].detach()
++
++        return gather(key_buffer), gather(value_buffer)
++
++    def _nextn_reference_logits(
++        self,
++        parameters: Sequence[torch.Tensor],
++        replay: dict[str, torch.Tensor],
++    ) -> torch.Tensor:
++        replacements = self.shadow_parameters(parameters)
++
++        def weight(raw_name, module, leaf="weight"):
++            return _reference_weight(module, leaf, replacements.get(raw_name))
++
++        def value(raw_name, live):
++            return replacements.get(raw_name, live.detach())
++
++        model = self.model
++        root = model.model
++        layer = root.layers[0]
++        with torch.no_grad():
++            embedding = root.embed_tokens(replay["input_ids"])
++        embedding = _rms(
++            embedding,
++            value("pre_fc_norm_embedding.weight", model.pre_fc_norm_embedding.weight) + 1.0,
++            float(model.pre_fc_norm_embedding.variance_epsilon),
++        )
++        previous = _rms(
++            replay["hidden_states"],
++            value("pre_fc_norm_hidden.weight", model.pre_fc_norm_hidden.weight) + 1.0,
++            float(model.pre_fc_norm_hidden.variance_epsilon),
++        )
++        hidden = F.linear(
++            torch.cat((embedding, previous), dim=-1),
++            weight("fc.weight", model.fc).to(previous.dtype),
++        )
++        residual = hidden
++        hidden = _rms(
++            hidden,
++            value(
++                "model.layers.0.input_layernorm.weight",
++                layer.input_layernorm.weight,
++            ) + 1.0,
++            float(layer.input_layernorm.variance_epsilon),
++        )
++
++        tp_group = get_tp_group()
++        attention_hidden = (
++            _TensorParallelCopy.apply(hidden, tp_group.device_group)
++            if tp_group.world_size > 1
++            else hidden
++        )
++        qkv = F.linear(
++            attention_hidden,
++            weight("model.layers.0.qkv_proj.weight", layer.qkv_proj).to(hidden.dtype),
++        )
++        q_gate, current_key, current_value = qkv.split(
++            [layer.q_size * 2, layer.kv_size, layer.kv_size], dim=-1
++        )
++        q_gate = q_gate.view(q_gate.shape[0], layer.num_heads, -1)
++        query, output_gate = q_gate.chunk(2, dim=-1)
++        current_key = current_key.view(current_key.shape[0], layer.num_kv_heads, -1)
++        current_value = current_value.view(
++            current_value.shape[0], layer.num_kv_heads, -1
++        )
++        query = _rms(
++            query,
++            value("model.layers.0.q_norm.weight", layer.q_norm.weight) + 1.0,
++            float(layer.q_norm.variance_epsilon),
++        )
++        current_key = _rms(
++            current_key,
++            value("model.layers.0.k_norm.weight", layer.k_norm.weight) + 1.0,
++            float(layer.k_norm.variance_epsilon),
++        )
++        query = _rope(
++            query,
++            replay["positions"],
++            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
++        )
++        current_key = _rope(
++            current_key,
++            replay["positions"],
++            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
++        )
++        if not hasattr(self, "_nextn_prepare_diagnostic"):
++            with torch.no_grad():
++                native_q, native_k, native_v, native_gate = (
++                    layer.forward_prepare_cuda_fused(replay["positions"], hidden.detach())
++                )
++            def relative(left, right):
++                delta = (left.float() - right.float()).square().mean().sqrt()
++                scale = right.float().square().mean().sqrt().clamp_min(1e-12)
++                return float((delta / scale).item())
++            self._nextn_prepare_diagnostic = {
++                "prepare_query_relative_rms": relative(query, native_q.view_as(query)),
++                "prepare_key_relative_rms": relative(current_key, native_k.view_as(current_key)),
++                "prepare_value_relative_rms": relative(current_value, native_v.view_as(current_value)),
++                "prepare_gate_relative_rms": relative(output_gate, native_gate.view_as(output_gate)),
++            }
++        history_key, history_value = self._nextn_history(
++            int(layer.attn.layer_id), replay
++        )
++        attended = torch_native_ragged_attention(
++            query,
++            current_key,
++            current_value,
++            history_key,
++            history_value,
++            replay["history_valid"],
++            scale=layer.scaling,
++        )
++        attended = (attended * torch.sigmoid(output_gate)).reshape(hidden.shape)
++        attention_output = F.linear(
++            attended,
++            weight("model.layers.0.o_proj.weight", layer.o_proj).to(hidden.dtype),
++        )
++        if tp_group.world_size > 1:
++            attention_output = _TensorParallelSum.apply(
++                attention_output, tp_group.device_group
++            )
++        residual = residual + attention_output
++        hidden = _rms(
++            residual,
++            value(
++                "model.layers.0.post_attention_layernorm.weight",
++                layer.post_attention_layernorm.weight,
++            ) + 1.0,
++            float(layer.post_attention_layernorm.variance_epsilon),
++        )
++
++        mlp = layer.mlp
++        mlp_hidden = (
++            _TensorParallelCopy.apply(hidden, tp_group.device_group)
++            if tp_group.world_size > 1
++            else hidden
++        )
++        router_logits = F.linear(
++            mlp_hidden,
++            weight("model.layers.0.mlp.gate.weight", mlp.gate).to(hidden.dtype),
++        )
++        probabilities = F.softmax(router_logits.float(), dim=-1)
++        topk = mlp.topk.topk_config
++        top_weights, top_ids = torch.topk(probabilities, topk.top_k, dim=-1)
++        if topk.renormalize:
++            top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
++        experts = mlp.experts
++        w13_name = "model.layers.0.mlp.experts.w13_weight"
++        w2_name = "model.layers.0.mlp.experts.w2_weight"
++        routed = torch_native_selected_moe(
++            mlp_hidden,
++            top_weights,
++            top_ids,
++            weight(w13_name, experts, "w13_weight"),
++            weight(w2_name, experts, "w2_weight"),
++            w13_scale=None if w13_name in replacements else _moe_scale(experts, "w13"),
++            w2_scale=None if w2_name in replacements else _moe_scale(experts, "w2"),
++        )
++        shared = mlp.shared_expert
++        gate_up = F.linear(
++            mlp_hidden,
++            weight(
++                "model.layers.0.mlp.shared_expert.gate_up_proj.weight",
++                shared.gate_up_proj,
++            ).to(hidden.dtype),
++        )
++        gate, up = gate_up.chunk(2, dim=-1)
++        shared_output = F.linear(
++            F.silu(gate.float()).to(hidden.dtype) * up,
++            weight(
++                "model.layers.0.mlp.shared_expert.down_proj.weight",
++                shared.down_proj,
++            ).to(hidden.dtype),
++        )
++        shared_gate = F.linear(
++            mlp_hidden,
++            value(
++                "model.layers.0.mlp.shared_expert_gate.weight",
++                mlp.shared_expert_gate.weight,
++            ).to(hidden.dtype),
++        )
++        shared_output = torch.sigmoid(shared_gate) * shared_output
++        moe_output = routed + shared_output
++        if tp_group.world_size > 1:
++            moe_output = _TensorParallelSum.apply(moe_output, tp_group.device_group)
++        if "mlp_relative_rms" not in self._nextn_prepare_diagnostic:
++            with torch.no_grad():
++                native_moe = mlp(hidden.detach())
++            self._nextn_prepare_diagnostic["mlp_relative_rms"] = relative(
++                moe_output, native_moe
++            )
++        hidden = _rms(
++            residual + moe_output,
++            value("model.norm.weight", root.norm.weight) + 1.0,
++            float(root.norm.variance_epsilon),
++        )
++        logit_hidden = (
++            _TensorParallelCopy.apply(hidden, tp_group.device_group)
++            if tp_group.world_size > 1
++            else hidden
++        )
++        local_logits = F.linear(
++            logit_hidden,
++            _reference_weight(model.lm_head, "weight", None).to(hidden.dtype),
++        )
++        if tp_group.world_size > 1:
++            local_logits = _TensorParallelAllGather.apply(
++                local_logits, tp_group.device_group
++            )
++        return local_logits[..., : model.config.vocab_size]
++
++    def replay_nextn(
++        self,
++        parameters: Sequence[torch.Tensor],
++        batches: Sequence[dict[str, torch.Tensor]],
++        inference_logits: torch.Tensor,
++    ) -> torch.Tensor:
++        count = inference_logits.shape[0]
++        logits = torch.stack(
++            [
++                self._nextn_reference_logits(
++                    parameters,
++                    {name: value[:count].clone() for name, value in batch.items()},
++                )
++                for batch in batches
++            ],
++            dim=1,
++        )
++        valid, maximum, relative_rms, top1_match, mean_kl = _logit_reconstruction_gate(
++            inference_logits, logits
++        )
++        self.last_shadow_grad = {
++            "reconstruction_ok": bool(valid.item()),
++            "reconstruction_max_abs": float(maximum.item()),
++            "reconstruction_relative_rms": float(relative_rms.item()),
++            "reconstruction_top1_match": float(top1_match.item()),
++            "reconstruction_mean_kl": float(mean_kl.item()),
++        }
++        self.last_shadow_grad.update(self._nextn_prepare_diagnostic)
++        if not bool(valid.item()):
++            self.runtime.disable("nextn_replay_reconstruction_mismatch", exactness=True)
++        return logits
 +
 +    def shadow_forward(self, parameters, *args, **kwargs):
 +        self.last_shadow_grad = {
@@ -998,7 +1331,7 @@ index f1da6d2d..3d32c421 100644
      def after_commit(
          self,
          request_ids: Sequence[str],
-@@ -345,6 +685,14 @@ class NativeBackendOnlineAdapter:
+@@ -345,6 +1042,14 @@ class NativeBackendOnlineAdapter:
          committed_tokens: torch.Tensor,
      ) -> None:
          request_ids = tuple(request_ids)
@@ -1013,7 +1346,7 @@ index f1da6d2d..3d32c421 100644
          self.runtime.record_device_commit(request_ids, committed_tokens)
          self.runtime.record_round_outcome(
              request_ids,
-@@ -354,10 +702,12 @@ class NativeBackendOnlineAdapter:
+@@ -354,10 +1059,12 @@ class NativeBackendOnlineAdapter:
          )
  
      def finish_request(self, request_id: str) -> None:
@@ -1026,7 +1359,7 @@ index f1da6d2d..3d32c421 100644
          if self.runtime.abort_request(request_id):
              self._restore_request_source()
  
-@@ -388,6 +738,7 @@ class NativeBackendOnlineAdapter:
+@@ -388,6 +1095,7 @@ class NativeBackendOnlineAdapter:
                  "native_last_source_tensor_shapes": self.last_source_tensor_shapes,
                  "native_last_feedback_source_version": self.last_feedback_source_version,
                  "native_parameter_names": self.names,
@@ -1035,7 +1368,7 @@ index f1da6d2d..3d32c421 100644
                      "tensor_parallel_size": self.config.topology.tensor_parallel_size,
                      "data_parallel_size": self.config.topology.data_parallel_size,
 diff --git a/python/sglang/srt/speculative/online_parameter_plan.py b/python/sglang/srt/speculative/online_parameter_plan.py
-index e43c46d2..22c37d88 100644
+index e43c46d27b..22c37d8805 100644
 --- a/python/sglang/srt/speculative/online_parameter_plan.py
 +++ b/python/sglang/srt/speculative/online_parameter_plan.py
 @@ -22,11 +22,6 @@ _BORROWED = frozenset({"embed_tokens", "lm_head", "target_model"})

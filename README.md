@@ -9,8 +9,8 @@ the run state is SQLite, and the SGLang changes are five plain unified diffs.
 Repository state and source/model/data byte identity are not inspected in the
 execution path.
 
-> Current empirical status: **UNMEASURED**. The implementation and CPU tests do
-> not establish any GPU speed, capacity, or quality result.
+> Formal E0--E6 status: **UNMEASURED**. GPU acceptance is incomplete; CPU tests
+> do not establish speed, capacity, or quality results.
 
 ## One-command paper run
 
@@ -32,7 +32,7 @@ cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 ```
 
 On the first invocation, `run_paper.sh` checks and applies the five SGLang
-diffs in lexical order, writes `paper-v1-nextn-shadow-v1` to
+diffs in lexical order, writes `paper-v1-nextn-shadow-v2` to
 `.lightcone-spec-patched` in the SGLang checkout,
 and starts the paper runner. Later invocations use the marker and resume the
 same `run_name` from `state.sqlite`; a small import smoke confirms the required

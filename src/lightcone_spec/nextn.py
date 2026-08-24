@@ -11,6 +11,19 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+_TP_PARTIAL_REPLICATED = frozenset(
+    {
+        "layers.0.q_norm.weight",
+        "layers.0.k_norm.weight",
+        "layers.0.mlp.gate.weight",
+        "layers.0.mlp.shared_expert_gate.weight",
+    }
+)
+
+
+def needs_tp_gradient_sum(name: str) -> bool:
+    return name in _TP_PARTIAL_REPLICATED
+
 
 @contextmanager
 def grad_enabled_forwards(model: torch.nn.Module):
@@ -201,12 +214,63 @@ def torch_native_selected_moe(
     return torch.einsum("teh,te->th", expert, top_weights.float()).to(hidden.dtype)
 
 
+def torch_native_ragged_attention(
+    query: torch.Tensor,
+    current_key: torch.Tensor,
+    current_value: torch.Tensor,
+    history_key: torch.Tensor,
+    history_value: torch.Tensor,
+    history_valid: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """Differentiable one-token attention over detached ragged KV history."""
+    key = torch.cat((history_key, current_key[:, None]), dim=1)
+    value = torch.cat((history_value, current_value[:, None]), dim=1)
+    repeat = query.shape[1] // current_key.shape[1]
+    key = key.repeat_interleave(repeat, dim=2).transpose(1, 2)
+    value = value.repeat_interleave(repeat, dim=2).transpose(1, 2)
+    visible = torch.cat(
+        (
+            history_valid,
+            torch.ones(
+                (query.shape[0], 1), device=query.device, dtype=torch.bool
+            ),
+        ),
+        dim=1,
+    )
+    return F.scaled_dot_product_attention(
+        query[:, :, None, :],
+        key,
+        value,
+        attn_mask=visible[:, None, None, :],
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    )[:, :, 0, :]
+
+
+def ragged_history_locations(
+    indptr: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return each draft row's KV prefix, excluding its current write slot."""
+    starts = indptr[:-1].to(torch.int64)
+    lengths = (indptr[1:].to(torch.int64) - starts - 1).clamp_min(0)
+    width = max(1, int(lengths.max().item()))
+    offsets = torch.arange(width, device=indices.device, dtype=torch.int64)[None, :]
+    valid = offsets < lengths[:, None]
+    flat = starts[:, None] + offsets
+    locations = indices[flat.clamp(max=indices.numel() - 1)]
+    return locations.masked_fill(~valid, 0), valid
+
+
 @dataclass(frozen=True)
 class PublicationSlot:
     name: str
     live_weight: torch.Tensor
     base_master: torch.Tensor
     parameter_indices: tuple[int, ...]
+    lora_scale: float = 1.0
     live_scale: torch.Tensor | None = None
     scale_name: str | None = None
     quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None = None
@@ -248,7 +312,7 @@ class MergedPublicationBank:
                     merged = parameters[slot.parameter_indices[0]]
                 else:
                     a, b = (parameters[index] for index in slot.parameter_indices)
-                    merged = slot.base_master + b @ a
+                    merged = slot.base_master + slot.lora_scale * (b @ a)
                 if slot.quantize is None:
                     weight_staging.copy_(merged.to(weight_staging.dtype))
                 else:

@@ -1,3 +1,4 @@
+import ast
 import json
 import math
 import subprocess
@@ -19,8 +20,11 @@ from lightcone_spec.nextn import (
     RequestLedger,
     grad_enabled_forwards,
     gradient_leaves,
+    needs_tp_gradient_sum,
+    ragged_history_locations,
     ragged_kl_loss,
     torch_native_moe,
+    torch_native_ragged_attention,
     torch_native_selected_moe,
     torch_native_shared_expert_add,
 )
@@ -245,6 +249,28 @@ def test_nextn_shadow_has_finite_lora_and_full_gradients():
     assert torch.isfinite(fp8_output).all()
 
 
+def test_replay_rope_preserves_non_rotary_head_suffix():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "dflash_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_rope"
+    )
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"), namespace)
+
+    value = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]])
+    cache = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
+    output = namespace["_rope"](value, torch.tensor([0]), cos_sin_cache=cache)
+    assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
+
+
 def test_nextn_shadow_bypasses_model_no_grad_decorator():
     class Draft(torch.nn.Module):
         def __init__(self):
@@ -307,10 +333,48 @@ def test_nextn_shadow_shared_expert_add_keeps_gradient():
     assert torch.count_nonzero(shared_weight.grad)
 
 
+def test_nextn_ragged_attention_keeps_current_block_gradient():
+    query = torch.randn(2, 4, 3, requires_grad=True)
+    key = torch.randn(2, 2, 3, requires_grad=True)
+    value = torch.randn(2, 2, 3, requires_grad=True)
+    history_key = torch.randn(2, 3, 2, 3)
+    history_value = torch.randn(2, 3, 2, 3)
+    valid = torch.tensor([[True, True, True], [True, False, False]])
+    output = torch_native_ragged_attention(
+        query,
+        key,
+        value,
+        history_key,
+        history_value,
+        valid,
+        scale=3**-0.5,
+    )
+    output.square().mean().backward()
+    for tensor in (query, key, value):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.count_nonzero(tensor.grad)
+
+
+def test_nextn_ragged_history_excludes_current_write_slot():
+    indptr = torch.tensor([0, 4, 6], dtype=torch.int32)
+    indices = torch.tensor([10, 11, 12, 13, 20, 21], dtype=torch.int64)
+    locations, valid = ragged_history_locations(indptr, indices)
+    assert locations.tolist() == [[10, 11, 12], [20, 0, 0]]
+    assert valid.tolist() == [[True, True, True], [True, False, False]]
+
+
+def test_nextn_tp_reduces_only_partial_replicated_parameters():
+    assert needs_tp_gradient_sum("layers.0.q_norm.weight")
+    assert needs_tp_gradient_sum("layers.0.mlp.gate.weight")
+    assert not needs_tp_gradient_sum("fc.weight")
+    assert not needs_tp_gradient_sum("layers.0.qkv_proj.weight")
+
+
 def test_nextn_merge_publication_and_ragged_rid_join():
     live = torch.zeros(3, 4, dtype=torch.bfloat16)
     base = torch.zeros(3, 4)
-    slot = PublicationSlot("bf16", live, base, (0, 1))
+    slot = PublicationSlot("bf16", live, base, (0, 1), lora_scale=0.5)
     bank = MergedPublicationBank((slot,))
     a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     b = torch.ones(3, 2)
@@ -318,7 +382,7 @@ def test_nextn_merge_publication_and_ragged_rid_join():
     bank.stage((a, b))
     bank.publish()
     assert live.data_ptr() == address
-    assert torch.equal(live.float(), (b @ a).to(torch.bfloat16).float())
+    assert torch.equal(live.float(), (0.5 * (b @ a)).to(torch.bfloat16).float())
 
     fp8_live = torch.zeros(2, 2, dtype=torch.float8_e4m3fn)
     fp8_scale = torch.ones(1, 1)

@@ -136,6 +136,13 @@ class StateStore:
             ).fetchall()
         return tuple(Job(**json.loads(row["config_json"])) for row in rows)
 
+    def jobs(self, node: str) -> tuple[Job, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT config_json FROM jobs WHERE node=? ORDER BY ordinal", (node,)
+            ).fetchall()
+        return tuple(Job(**json.loads(row["config_json"])) for row in rows)
+
     def start(self, job: Job, gpus: tuple[int, ...], output_dir: Path) -> int:
         with self.connect() as connection:
             row = connection.execute(

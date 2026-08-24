@@ -84,7 +84,15 @@ CANDIDATE_METHODS = {
 
 
 def _screening_job(job: Job) -> bool:
-    return job.node in {"E3a", "E1-common-load", "E6-common-load"}
+    return job.node in {"E3a", "E1-common-load", "E6-interface", "E6-common-load"}
+
+
+def _capacity_infeasible(error: Exception) -> bool:
+    return isinstance(error, MemoryError) or re.search(
+        r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve",
+        str(error),
+        flags=re.IGNORECASE,
+    ) is not None
 
 
 def _exactness_bootstrap(job: Job) -> Job:
@@ -1718,9 +1726,7 @@ def _execute_cell(
             )
             return
         except Exception as error:
-            if _screening_job(job) and re.search(
-                r"out of memory|\b(?:cuda )?oom\b", str(error), flags=re.IGNORECASE
-            ):
+            if _screening_job(job) and _capacity_infeasible(error):
                 _write_json(
                     output_dir / "metrics.json",
                     {
@@ -1792,7 +1798,10 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         return state.selection("tts_recipe", {})
     if job.method == "lightcone":
         name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
-        return state.selection(name, {})
+        selected = dict(state.selection(name, {}))
+        if job.node.startswith("E6"):
+            selected.update(parameterization="lora", rank=8, scope="all")
+        return selected
     if job.node.startswith("E1a") and job.method == "lightcone_candidate":
         selected = dict(state.selection("lightcone_recipe", {}))
         weight = state.selection("dspark_confidence_weight", None)
@@ -1847,6 +1856,38 @@ def _require_internal_jobs(state: StateStore, node: str) -> None:
     counts = state.status_counts(node)
     if counts.get("failed") or counts.get("pending") or counts.get("running"):
         raise ScientificFailure(f"internal substage {node} did not complete")
+
+
+def _complete_infeasible_startup(
+    state: StateStore,
+    job: Job,
+    run_dir: Path,
+    gpus: tuple[int, ...],
+    error: Exception,
+) -> None:
+    attempt_number = state.next_attempt(job.job_id)
+    output_dir = run_dir / "jobs" / job.job_id / f"attempt-{attempt_number:02d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt = state.start(job, gpus, output_dir)
+    _write_json(output_dir / "config.json", job.to_dict())
+    _write_json(
+        output_dir / "metrics.json",
+        {
+            "scientific_outcome": "infeasible",
+            "feasible": False,
+            "error": f"{type(error).__name__}: {error}",
+            "request_outcomes": {
+                "offered": 0,
+                "admitted": 0,
+                "completed": 0,
+                "error": 0,
+                "timed_out": 0,
+                "cancelled": 0,
+                "unfinished": 0,
+            },
+        },
+    )
+    state.complete(job.job_id, attempt)
 
 
 def _confidence_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
@@ -2109,11 +2150,19 @@ def _e6_interface_jobs(parents: tuple[Job, ...]) -> tuple[Job, ...]:
     return tuple(rows)
 
 
+def _e6_role_supported(role: str, modes: set[str]) -> bool:
+    if role == "lightcone":
+        return "lora" in modes
+    if role in {"tts", "l0_naive"}:
+        return "full" in modes
+    return True
+
+
 def _complete_e6_interface_rows(
     config: ExperimentConfig,
     state: StateStore,
     parents: tuple[Job, ...],
-) -> set[str]:
+) -> dict[str, set[str]]:
     components: dict[str, dict[str, tuple[dict[str, Any], dict[str, Any]]]] = {}
     for raw_config, metrics in _metric_rows(state, "E6-interface"):
         parameters = raw_config.get("parameters", {})
@@ -2121,14 +2170,21 @@ def _complete_e6_interface_rows(
         mode = parameters.get("parameterization")
         if isinstance(parent, str) and mode in {"lora", "full"}:
             components.setdefault(parent, {})[str(mode)] = (raw_config, metrics)
-    feasible_models = set()
+    capabilities: dict[str, set[str]] = {}
+    pending = {job.job_id for job in state.pending_jobs("E6-pilot")}
     for parent in parents:
         modes = components.get(parent.job_id, {})
         if set(modes) != {"lora", "full"}:
             raise ScientificFailure(f"{parent.job_id} lacks LoRA/Full interface results")
-        feasible = all(row[1].get("feasible") is not False for row in modes.values())
-        if feasible:
-            feasible_models.add(parent.model)
+        supported = {
+            mode
+            for mode, (_, metrics) in modes.items()
+            if metrics.get("feasible") is not False
+        }
+        capabilities[parent.model] = supported
+        feasible = supported == {"lora", "full"}
+        if parent.job_id not in pending:
+            continue
         attempt_number = state.next_attempt(parent.job_id)
         output_dir = (
             config.run_dir
@@ -2167,10 +2223,12 @@ def _complete_e6_interface_rows(
             },
         )
         state.complete(parent.job_id, attempt)
-    return feasible_models
+    return capabilities
 
 
-def _select_e6_common_loads(state: StateStore) -> dict[str, str]:
+def _select_e6_common_loads(
+    state: StateStore, capabilities: dict[str, set[str]]
+) -> dict[str, str]:
     counts: Counter[tuple[str, str]] = Counter()
     for config, metrics in _metric_rows(state, "E6-common-load"):
         if (
@@ -2181,10 +2239,14 @@ def _select_e6_common_loads(state: StateStore) -> dict[str, str]:
             counts[(str(config["model"]), str(config["load"]))] += 1
     selected = {}
     for model in {key[0] for key in counts}:
+        required = sum(
+            _e6_role_supported(role, capabilities.get(model, set()))
+            for role in ("target_only", "static", "tts", "l0_naive", "lightcone")
+        )
         loads = [
             load
             for (candidate, load), count in counts.items()
-            if candidate == model and count == 5
+            if candidate == model and count == required
         ]
         if loads:
             selected[model] = max(
@@ -2324,6 +2386,12 @@ def _run_pending_jobs(
                                 return
                     break
                 except Exception as error:
+                    if _screening_job(first_job) and _capacity_infeasible(error):
+                        for job, _, _ in rows:
+                            _complete_infeasible_startup(
+                                state, job, config.run_dir, gpus, error
+                            )
+                        break
                     retry = (
                         _retryable_process_error(error)
                         and startup_attempt < config.protocol.max_process_retries
@@ -2477,9 +2545,9 @@ def _run_node_jobs(
         if stop_event.is_set():
             return
         pending = state.pending_jobs(node)
-    if node == "E6-pilot":
+    if node == "E6-pilot" and state.selection("e6_common_loads", None) is None:
         interfaces = tuple(
-            job for job in pending if job.parameters.get("interface_fit")
+            job for job in state.jobs(node) if job.parameters.get("interface_fit")
         )
         if interfaces:
             state.add_internal_jobs(_e6_interface_jobs(interfaces))
@@ -2493,11 +2561,14 @@ def _run_node_jobs(
             if stop_event.is_set():
                 return
             _require_internal_jobs(state, "E6-interface")
-            fit_models = _complete_e6_interface_rows(
+            capabilities = _complete_e6_interface_rows(
                 config, state, interfaces
             )
             probes = tuple(
-                job for job in _e6_load_jobs() if job.model in fit_models
+                job
+                for job in _e6_load_jobs()
+                if job.model in capabilities
+                and _e6_role_supported(job.method, capabilities[job.model])
             )
             state.add_internal_jobs(probes)
             _run_pending_jobs(
@@ -2508,13 +2579,26 @@ def _run_node_jobs(
                 state.pending_jobs("E6-common-load"),
             )
             _require_internal_jobs(state, "E6-common-load")
-            state.set_selection("e6_common_loads", _select_e6_common_loads(state))
+            state.set_selection(
+                "e6_capabilities",
+                {model: sorted(modes) for model, modes in capabilities.items()},
+            )
+            state.set_selection(
+                "e6_common_loads", _select_e6_common_loads(state, capabilities)
+            )
+    if node in {"E6-pilot", "E6-final"}:
         if stop_event.is_set():
             return
         pending = state.pending_jobs(node)
         loads = state.selection("e6_common_loads", {})
+        capabilities = {
+            model: set(modes)
+            for model, modes in state.selection("e6_capabilities", {}).items()
+        }
         for job in pending:
-            if job.model not in loads:
+            if not _e6_role_supported(job.method, capabilities.get(job.model, set())):
+                state.skip_job(job.job_id, "required NEXTN update mode is infeasible")
+            elif job.model not in loads:
                 state.skip_job(job.job_id, "model has no feasible TP2 NEXTN common load")
         pending = state.pending_jobs(node)
     _run_pending_jobs(config, state, node, stop_event, pending)

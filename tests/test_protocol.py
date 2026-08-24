@@ -16,10 +16,14 @@ from lightcone_spec.protocol import (
     paper_plan,
 )
 from lightcone_spec.runner import (
+    _capacity_infeasible,
     _e5_execution_phases,
     _e5_reference,
     _e6_interface_jobs,
+    _e6_role_supported,
     _runtime_job,
+    _screening_job,
+    _selection_for_job,
 )
 from lightcone_spec.server import adaptation_payload, server_session_key
 
@@ -64,9 +68,36 @@ def test_two_gpu_exclusivity_and_real_interface_probes():
     assert {
         job.parameters["parameterization"] for job in interface_components
     } == {"lora", "full"}
+    assert _e6_role_supported("target_only", set())
+    assert _e6_role_supported("static", set())
+    assert _e6_role_supported("lightcone", {"lora"})
+    assert not _e6_role_supported("tts", {"lora"})
+    assert _e6_role_supported("l0_naive", {"full"})
+    assert all(_screening_job(job) for job in interface_components)
+    assert _capacity_infeasible(
+        RuntimeError("adaptation peak 9 exceeds pre-KV reserve 8")
+    )
+    assert not _capacity_infeasible(RuntimeError("NCCL communicator failed"))
     probes = materialize("E0-tune", valid_e0=[])[:108]
     assert {job.method for job in probes} == {"static"}
     assert all(job.parameters["adaptive_probe"] for job in probes)
+
+
+def test_e6_lightcone_uses_the_fitted_lora_layout():
+    class Selections:
+        def selection(self, _name, _default):
+            return {"parameterization": "full", "rank": None, "scope": "last5"}
+
+    job = next(
+        row
+        for row in materialize("E6-final", final_blocks=12)
+        if row.method == "lightcone"
+    )
+    selected = _selection_for_job(Selections(), job)
+    assert selected is not None
+    assert selected["parameterization"] == "lora"
+    assert selected["rank"] == 8
+    assert selected["scope"] == "all"
 
 
 def test_registered_axes_reach_runtime_parameters():
