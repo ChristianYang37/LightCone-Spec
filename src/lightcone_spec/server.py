@@ -147,12 +147,7 @@ def server_command(
     memory_fraction = config.server.mem_fraction_static
     if job.backend == "DSPARK" or job.parameters.get("exactness_bootstrap"):
         memory_fraction = min(memory_fraction, 0.80)
-    if job.parameters.get("exactness_bootstrap"):
-        max_running = 1
-    elif job.node.startswith("E6") or job.node.endswith("acceptance"):
-        max_running = _concurrency(job)
-    else:
-        max_running = 256
+    max_running = _server_capacity(job, adaptation)
     argv = [
         str(config.server.python),
         "-m",
@@ -313,11 +308,7 @@ def server_session_key(
         job.backend,
         job.parameters.get("topology", "tp1_dp1"),
         *_topology(job),
-        (
-            _concurrency(job)
-            if job.node.startswith("E6") or job.node.endswith("acceptance")
-            else 256
-        ),
+        _server_capacity(job, adaptation),
         _speculative_canvas(job),
         bool(job.parameters.get("graph_replay", True)),
         bool(job.parameters.get("chunked_prefill")),
@@ -341,6 +332,16 @@ def _concurrency(job: Job) -> int:
     if job.load and job.load.startswith("closed_loop_c"):
         return int(job.load.removeprefix("closed_loop_c"))
     return 1
+
+
+def _server_capacity(job: Job, adaptation: dict[str, Any] | None) -> int:
+    if adaptation is not None and adaptation.get("reset_scope") == "request":
+        return 1
+    if job.parameters.get("exactness_bootstrap"):
+        return 1
+    if job.node.startswith("E6") or job.node.endswith("acceptance"):
+        return _concurrency(job)
+    return 256
 
 
 class GpuSampler:

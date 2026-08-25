@@ -322,7 +322,7 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
 def test_qwen_speculative_workspace_covers_registered_width():
     patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
     assert "cuda_graph_config.decode.max_bs" in patch
-    assert "workspace_mb = 768 if graph_max_bs >= 256 else 528" in patch
+    assert "workspace_mb = 768 if graph_max_bs >= 256 else 512" in patch
     assert "speculative_num_draft_tokens or 0" not in patch
 
 
@@ -1100,6 +1100,29 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
     assert acceptance_command[
         acceptance_command.index("--max-running-requests") + 1
     ] == "8"
+
+    tts = Job(
+        "tts-c8",
+        "E3b-final",
+        0,
+        "tts",
+        "Qwen/Qwen3-8B",
+        "DFLASH",
+        "controlled_baseline",
+        load="c8",
+        parameters={"regime": "short_input_long_generation"},
+    )
+    tts_command = server_command(
+        config,
+        tts,
+        port=30001,
+        output_dir=output,
+        adaptation=adaptation_payload(tts),
+    )
+    assert tts_command[tts_command.index("--max-running-requests") + 1] == "1"
+    graph_index = tts_command.index("--cuda-graph-bs-decode")
+    assert tts_command[graph_index + 1] == "1"
+    assert tts_command[graph_index + 2].startswith("--")
 
 
 def test_preflight_adaptive_exactness_uses_static_deterministic_bootstrap():
