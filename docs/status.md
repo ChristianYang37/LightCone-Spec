@@ -13,7 +13,9 @@ Empirical status: **REVISED GATE 8 COMPLETE; GATE 9 IN PROGRESS**.
 - The efficiency-first Gate 8 completed all ten jobs and the stage reducer.
   Candidate equality and all six runtime safety events passed. The paired
   E3a smoke then exposed a 512 MiB FlashInfer workspace limit for registered
-  speculative width 16; the v10 patch raises only that path to 768 MiB.
+  speculative width 16. The first conditional fix depended on a server field
+  that is not initialized when the attention backend is constructed; v11
+  instead gives Qwen FlashInfer a direct 768 MiB workspace.
 - The revised Gate 9 no longer requires dataset splits, answer scorers,
   answer-execution sandboxes, or LLM judges. It now checks CalibrationMix composition, nine
   renderable workload pools, the E5 trace, full materialization, and measured

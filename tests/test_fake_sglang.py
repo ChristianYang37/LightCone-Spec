@@ -320,10 +320,8 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
 
 def test_qwen_speculative_workspace_covers_registered_width():
     patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
-    assert "speculative_num_draft_tokens or 0) >= 16" in patch
-    assert "workspace_mb = (" in patch
-    assert "768" in patch
-    assert "else 512" in patch
+    assert "SGLANG_FLASHINFER_WORKSPACE_SIZE.set(768 * 1024 * 1024)" in patch
+    assert "speculative_num_draft_tokens or 0" not in patch
 
 
 def test_sglang_terminal_hook_preserves_abort_identity():
