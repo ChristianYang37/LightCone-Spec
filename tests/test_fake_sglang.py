@@ -318,6 +318,14 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
     assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
 
 
+def test_qwen_speculative_workspace_covers_registered_width():
+    patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
+    assert "speculative_num_draft_tokens or 0) >= 16" in patch
+    assert "workspace_mb = (" in patch
+    assert "768" in patch
+    assert "else 512" in patch
+
+
 def test_sglang_terminal_hook_preserves_abort_identity():
     patch = Path("patches/sglang/0005-nextn-shadow-replay.diff")
     lines = patch.read_text().splitlines()

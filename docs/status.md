@@ -1,6 +1,6 @@
 # Current status
 
-Empirical status: **GATE 7 COMPLETE; REVISED GATES 8--9 NOT YET RUN**.
+Empirical status: **REVISED GATE 8 COMPLETE; GATE 9 IN PROGRESS**.
 
 - The four-command CLI, 21-node DAG, SQLite resume, strict scientific metrics,
   ordinary SGLang diffs, and even-GPU TP2 pair pool are implemented. Gate 6 is
@@ -10,12 +10,15 @@ Empirical status: **GATE 7 COMPLETE; REVISED GATES 8--9 NOT YET RUN**.
   Rebuild deltas were goodput `-0.32%..+0.50%`, p99 ITL `-0.07%..+1.02%`, and
   peak NVML HBM `0..144 MiB`; deterministic trajectories matched and rebuild
   safety counters were zero.
-- The earlier Gate 8 passed, but the efficiency-first protocol requires a fresh
-  run with the revised implementation smoke and compressed evidence.
+- The efficiency-first Gate 8 completed all ten jobs and the stage reducer.
+  Candidate equality and all six runtime safety events passed. The paired
+  E3a smoke then exposed a 512 MiB FlashInfer workspace limit for registered
+  speculative width 16; the v10 patch raises only that path to 768 MiB.
 - The revised Gate 9 no longer requires dataset splits, answer scorers,
   answer-execution sandboxes, or LLM judges. It now checks CalibrationMix composition, nine
   renderable workload pools, the E5 trace, full materialization, and measured
-  result capacity. These checks are pending.
+  result capacity. Data and trace validation passed; paired E3a, capacity, and
+  post-patch performance checks remain pending.
 - Future eight-GPU execution uses four independent TP2 pairs. It still requires
   eight-GPU visibility/static-load checks, four-pair interference calibration,
   and one eight-GPU preflight before the full protocol starts.
