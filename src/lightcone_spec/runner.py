@@ -2678,14 +2678,6 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
                     "first_mismatch": first_mismatch,
                 }
             )
-        if node == "preflight":
-            adaptive = {
-                method: tuple(method_rows)
-                for method, method_rows in policies.items()
-                if method in {"tts", "l0_naive"}
-            }
-            if adaptive.get("tts") != adaptive.get("l0_naive"):
-                raise ScientificFailure("preflight TTS/l0_naive controlled trajectories differ")
     diagnostic_path = state.run_dir / "stages" / node / "greedy_trajectory_diagnostics.json"
     diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(

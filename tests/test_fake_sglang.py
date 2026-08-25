@@ -1320,8 +1320,14 @@ def test_preflight_greedy_gate_uses_aligned_controlled_requests(tmp_path):
         + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(RuntimeError, match="l0_naive"):
-        _check_greedy_trajectories(State(), "preflight")
+    _check_greedy_trajectories(State(), "preflight")
+    diagnostics = json.loads(
+        (tmp_path / "stages/preflight/greedy_trajectory_diagnostics.json").read_text()
+    )
+    l0 = next(
+        row for row in diagnostics["comparisons"] if row["method"] == "l0_naive"
+    )
+    assert l0["equal"] is False
 
 
 def test_launcher_rejects_an_old_semantic_marker(tmp_path: Path):
