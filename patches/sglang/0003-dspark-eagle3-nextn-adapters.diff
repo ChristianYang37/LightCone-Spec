@@ -8,7 +8,7 @@ index 02bc8e6..02bc8e6 100644
          ):
 -            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 +            graph_max_bs = model_runner.server_args.cuda_graph_config.decode.max_bs
-+            workspace_mb = 768 if graph_max_bs >= 256 else 512
++            workspace_mb = 768 if graph_max_bs >= 256 else 528
 +            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(workspace_mb * 1024 * 1024)
  
          # When deterministic inference is enabled, tensor cores should be used for decode

@@ -15,8 +15,9 @@ Empirical status: **REVISED GATE 8 COMPLETE; GATE 9 IN PROGRESS**.
   E3a smoke then exposed a 512 MiB FlashInfer workspace limit for registered
   speculative width 16. The first conditional fix depended on a server field
   that is not initialized when the attention backend is constructed. A direct
-  768 MiB allocation then regressed the c8 TTS Gate 7 median. v12 keeps 512 MiB
-  for small CUDA graphs and uses 768 MiB only when decode graph capacity is 256.
+  768 MiB allocation then regressed the c8 TTS Gate 7 median. A full-drafter
+  TTS startup needed 4 MiB beyond the old 512 MiB arena, so v13 uses 528 MiB
+  for small CUDA graphs and 768 MiB only when decode graph capacity is 256.
 - The revised Gate 9 no longer requires dataset splits, answer scorers,
   answer-execution sandboxes, or LLM judges. It now checks CalibrationMix composition, nine
   renderable workload pools, the E5 trace, full materialization, and measured
