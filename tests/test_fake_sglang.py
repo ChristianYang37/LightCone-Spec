@@ -320,7 +320,8 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
 
 def test_qwen_speculative_workspace_covers_registered_width():
     patch = Path("patches/sglang/0003-dspark-eagle3-nextn-adapters.diff").read_text()
-    assert "SGLANG_FLASHINFER_WORKSPACE_SIZE.set(768 * 1024 * 1024)" in patch
+    assert "cuda_graph_config.decode.max_bs" in patch
+    assert "workspace_mb = 768 if graph_max_bs >= 256 else 512" in patch
     assert "speculative_num_draft_tokens or 0" not in patch
 
 
