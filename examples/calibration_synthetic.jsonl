@@ -1,0 +1,4 @@
+{"problem_id":"controlled-0","prompt":"Explain why a ready speculative candidate may still fail to improve throughput when its update occupies the critical path."}
+{"problem_id":"controlled-1","prompt":"Continue the sequence 1, 1, 2, 3, 5, 8 and explain the rule in several sentences."}
+{"problem_id":"controlled-2","prompt":"Write a short dialogue in which a user asks two follow-up questions about GPU memory."}
+{"problem_id":"controlled-3","prompt":"Solve 3x + 7 = 31 and show each algebraic step."}

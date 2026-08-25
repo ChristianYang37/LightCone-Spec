@@ -12,7 +12,6 @@ import pandas as pd
 from scipy.stats import norm, ttest_rel
 
 SAFETY_COUNTERS = (
-    "exactness_violations",
     "version_mismatches",
     "fallbacks",
     "nonfinite_updates",

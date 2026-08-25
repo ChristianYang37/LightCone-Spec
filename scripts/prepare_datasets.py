@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""Convert explicitly selected benchmark rows to LightCone JSONL."""
+"""Normalize prompt pools and build the fixed 76-row CalibrationMix."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import random
 from pathlib import Path
 
-from lightcone_spec.data import ID_FIELDS, PROMPT_FIELDS, _rows, load_prompt_pool
-
-
-def _assignments(path: Path) -> dict[tuple[str, str], str]:
-    result: dict[tuple[str, str], str] = {}
-    with path.open(newline="", encoding="utf-8") as stream:
-        for row in csv.DictReader(stream):
-            key = (row["task"], row["problem_id"])
-            if key in result:
-                raise ValueError(f"duplicate split assignment {key}")
-            result[key] = row["split"]
-    return result
+from lightcone_spec.data import (
+    CALIBRATION_SOURCES,
+    ID_FIELDS,
+    PROMPT_FIELDS,
+    _rows,
+    load_calibration_mix,
+    load_prompt_pool,
+)
 
 
 def _source(value: str) -> tuple[str, Path]:
@@ -43,82 +40,102 @@ def _first(row: dict, fields: tuple[str, ...]):
     )
 
 
+def _turns(row: dict) -> list[str] | None:
+    turns = row.get("turns")
+    if isinstance(turns, list) and all(isinstance(turn, str) for turn in turns):
+        return turns
+    messages = row.get("messages")
+    if isinstance(messages, list):
+        values = [
+            message.get("content")
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "user"
+        ]
+        if values and all(isinstance(value, str) for value in values):
+            return values
+    return None
+
+
+def _normalize(task: str, source: Path) -> list[dict[str, object]]:
+    normalized = []
+    for index, row in enumerate(_rows(source)):
+        turns = _turns(row)
+        prompt = _first(row, PROMPT_FIELDS)
+        if prompt is None and turns:
+            prompt = "\n".join(turns)
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        template = row.get("template")
+        if isinstance(template, str):
+            prompt = template.format(**row)
+        problem_id = _first(row, ID_FIELDS)
+        normalized.append(
+            {
+                "problem_id": str(problem_id or f"{task}-{index:08d}"),
+                "prompt": prompt,
+                "turns": turns,
+            }
+        )
+    if not normalized:
+        raise ValueError(f"{task} supplied no usable prompts")
+    return normalized
+
+
+def _write(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _build_calibration(path: Path, output: Path) -> None:
+    selected: list[dict[str, object]] = []
+    with path.open(newline="", encoding="utf-8") as stream:
+        manifest = list(csv.DictReader(stream))
+    counts = {row.get("source"): int(row.get("count", 0)) for row in manifest}
+    if counts != CALIBRATION_SOURCES:
+        raise ValueError(
+            "calibration manifest must request 24 APPS, 24 OpenR1-Math, "
+            "24 UltraChat, and 4 controlled_synthetic prompts"
+        )
+    by_source = {str(row["source"]): row for row in manifest}
+    for source_name in CALIBRATION_SOURCES:
+        row = by_source[source_name]
+        source_path = Path(str(row["path"]))
+        if not source_path.is_absolute():
+            raise ValueError("calibration source paths must be absolute")
+        candidates = _normalize(source_name, source_path)
+        random.Random(0).shuffle(candidates)
+        count = int(row["count"])
+        if len(candidates) < count:
+            raise ValueError(f"{source_name} supplied {len(candidates)} prompts; {count} required")
+        selected.extend(
+            {
+                **candidate,
+                "problem_id": f"{source_name}:{candidate['problem_id']}",
+                "source": source_name,
+            }
+            for candidate in candidates[:count]
+        )
+    _write(output, selected)
+    load_calibration_mix(output)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", action="append", type=_source, required=True)
-    parser.add_argument("--splits", type=Path, required=True)
+    parser.add_argument("--task", action="append", type=_source, default=[])
+    parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     args = parser.parse_args()
-    split_by_id = _assignments(args.splits)
     args.output_root.mkdir(parents=True, exist_ok=True)
     for task, source in args.task:
         output = args.output_root / f"{task}.jsonl"
-        found: set[str] = set()
-        with output.open("w", encoding="utf-8") as stream:
-            for row in _rows(source):
-                problem_id = _first(row, ID_FIELDS)
-                prompt = _first(row, PROMPT_FIELDS)
-                turns = row.get("turns")
-                if prompt is None and isinstance(turns, list) and turns:
-                    prompt = "\n".join(str(turn) for turn in turns)
-                if problem_id is None or prompt is None:
-                    continue
-                problem_id = str(problem_id)
-                split = split_by_id.get((task, problem_id))
-                if split is None:
-                    continue
-                found.add(problem_id)
-                reference = _first(
-                    row,
-                    (
-                        "reference",
-                        "answer",
-                        "solution",
-                        "canonical_solution",
-                        "output",
-                        "code",
-                    ),
-                )
-                test_metadata = _first(
-                    row,
-                    (
-                        "test_metadata",
-                        "tests",
-                        "test",
-                        "test_code",
-                        "test_list",
-                    ),
-                )
-                if reference is None and test_metadata is None:
-                    if task not in {"controlled_baseline", "TTS-Cal"}:
-                        raise ValueError(f"{task}:{problem_id} lacks reference or tests")
-                    test_metadata = {
-                        "scorer": "N/A",
-                        "reason": "protocol control task is not accuracy-scored",
-                    }
-                normalized = {
-                    "problem_id": problem_id,
-                    "split": split,
-                    "prompt": prompt,
-                    "template": row.get("template"),
-                    "turns": turns,
-                    "reference": reference,
-                    "test_metadata": test_metadata,
-                }
-                stream.write(json.dumps(normalized, ensure_ascii=False) + "\n")
-        expected = {
-            problem_id
-            for candidate, problem_id in split_by_id
-            if candidate == task
-        }
-        missing = expected - found
-        if missing:
-            raise ValueError(f"{task} is missing selected IDs: {sorted(missing)[:10]}")
-        rows = load_prompt_pool(output)
-        if task == "TTS-Cal":
-            counts = {name: sum(row["split"] == name for row in rows) for name in ("tuning", "holdout")}
-            if counts != {"tuning": 76, "holdout": 4}:
-                raise ValueError("TTS-Cal needs exactly 76 tuning and 4 holdout IDs")
+        _write(output, _normalize(task, source))
+        load_prompt_pool(output)
+    if args.calibration_manifest is not None:
+        _build_calibration(
+            args.calibration_manifest,
+            args.output_root / "CalibrationMix.jsonl",
+        )
 
 
 if __name__ == "__main__":

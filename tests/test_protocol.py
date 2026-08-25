@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
-from lightcone_spec.data import load_prompt_records, load_tts_calibration
+from lightcone_spec.data import load_calibration_mix, load_prompt_records
 from lightcone_spec.protocol import (
     PAPER_NODES,
     default_row_counts,
@@ -48,6 +48,13 @@ def test_registered_node_order_and_counts():
         "E0-tune": 25920, "E0-pilot": 6912, "E0-final": 20736,
     }
     assert len(paper_plan()) == 21
+    assert {job.task for job in materialize("TTS-Cal")} == {"CalibrationMix"}
+    assert {job.task for job in materialize("E1")} == {"CalibrationMix"}
+    assert {job.task for job in materialize("E2-r0")} == {"CalibrationMix"}
+    assert {job.task for job in materialize("E1a")} == {"CalibrationMix"}
+    e0_tasks = {job.task for job in materialize("E0-tune", valid_e0=[])[:108]}
+    assert "AlpacaEval" in e0_tasks
+    assert "Alpaca" not in e0_tasks
 
 
 def test_readable_ids_and_dynamic_e0_grid():
@@ -245,66 +252,47 @@ def test_e5_reference_uses_faster_slo_baseline(monkeypatch):
     assert _e5_reference(object(), anchor) == (12.0, 16)
 
 
-def test_exact_draft_mapping_and_explicit_tts_split(tmp_path):
+def test_exact_draft_mapping_and_calibration_mix(tmp_path):
     example = ExperimentConfig.load("examples/paper.yaml")
     assert example.server.cuda_home == Path("/usr/local/cuda-12.9")
     assert len(example.drafts) == 12
     assert all("|" in key for key in example.drafts)
-    rows = []
-    for index in range(76):
-        rows.append(
-            {
-                "problem_id": f"t-{index}",
-                "split": "tuning",
-                "prompt": "p",
-                "reference": "r",
-            }
-        )
-    for index in range(4):
-        rows.append(
-            {
-                "problem_id": f"h-{index}",
-                "split": "holdout",
-                "prompt": "p",
-                "reference": "r",
-            }
-        )
+    rows = [
+        {"problem_id": f"{source}-{index}", "prompt": "p", "source": source}
+        for source, count in {
+            "APPS": 24,
+            "OpenR1-Math": 24,
+            "UltraChat": 24,
+            "controlled_synthetic": 4,
+        }.items()
+        for index in range(count)
+    ]
     path = tmp_path / "tts.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in rows))
-    tuning, holdout = load_tts_calibration(path)
-    assert len(tuning) == 76
-    assert holdout == ("h-0", "h-1", "h-2", "h-3")
+    assert len(load_calibration_mix(path)) == 76
 
 
-def test_dataset_split_and_template_are_explicit(tmp_path):
+def test_prompt_pool_needs_only_identity_and_renderable_prompt(tmp_path):
     path = tmp_path / "rows.jsonl"
     path.write_text(
         json.dumps(
             {
                 "problem_id": "p1",
-                "split": "pilot",
                 "question": "2+2",
                 "template": "Question: {question}",
-                "reference": "4",
             }
         )
         + "\n"
     )
-    rows = load_prompt_records(path, limit=1, split="pilot")
+    rows = load_prompt_records(path, limit=1)
     assert rows[0]["prompt"] == "Question: 2+2"
     missing = tmp_path / "missing.jsonl"
-    missing.write_text(json.dumps({"problem_id": "p2", "prompt": "x"}) + "\n")
-    with pytest.raises(ValueError, match="explicit split"):
-        load_prompt_records(missing, limit=1, split="pilot")
-    missing_metadata = tmp_path / "missing-metadata.jsonl"
-    missing_metadata.write_text(
-        json.dumps({"problem_id": "p3", "split": "pilot", "prompt": "x"}) + "\n"
-    )
-    with pytest.raises(ValueError, match="reference or test metadata"):
-        load_prompt_records(missing_metadata, limit=1, split="pilot")
+    missing.write_text(json.dumps({"prompt": "x"}) + "\n")
+    with pytest.raises(ValueError, match="requires problem_id"):
+        load_prompt_records(missing, limit=1)
 
     repeated = load_prompt_records(
-        path, limit=3, split="pilot", selection_seed=0, allow_repeat=True
+        path, limit=3, selection_seed=0, allow_repeat=True
     )
     assert [row["problem_id"] for row in repeated] == ["p1", "p1", "p1"]
     assert [row["repeat_index"] for row in repeated] == [0, 1, 2]
@@ -314,21 +302,34 @@ def test_dataset_split_and_template_are_explicit(tmp_path):
         json.dumps(
             {
                 "unique_id": "math-1",
-                "split": "final",
                 "question_content": "Solve it",
-                "answer": "42",
             }
         )
         + "\n"
     )
-    assert load_prompt_records(native, limit=1, split="final")[0]["problem_id"] == "math-1"
+    assert load_prompt_records(native, limit=1)[0]["problem_id"] == "math-1"
+
+    chat = tmp_path / "chat.jsonl"
+    chat.write_text(
+        json.dumps({"problem_id": "chat-1", "turns": ["hello", "continue"]})
+        + "\n"
+    )
+    assert load_prompt_records(chat, limit=1)[0]["prompt"] == "hello\ncontinue"
+
+    duplicate = tmp_path / "duplicate.jsonl"
+    duplicate.write_text(
+        json.dumps({"problem_id": "p", "prompt": "a"})
+        + "\n"
+        + json.dumps({"problem_id": "p", "prompt": "b"})
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="repeats problem_id"):
+        load_prompt_records(duplicate, limit=1)
 
 
-def test_control_dataset_conversion_does_not_invent_an_accuracy_target(tmp_path):
+def test_dataset_conversion_keeps_only_workload_inputs(tmp_path):
     source = tmp_path / "source.jsonl"
     source.write_text(json.dumps({"problem_id": "p1", "prompt": "hello"}) + "\n")
-    splits = tmp_path / "splits.csv"
-    splits.write_text("task,problem_id,split\ncontrolled_baseline,p1,tuning\n")
     output = tmp_path / "prepared"
     subprocess.run(
         [
@@ -336,16 +337,13 @@ def test_control_dataset_conversion_does_not_invent_an_accuracy_target(tmp_path)
             "scripts/prepare_datasets.py",
             "--task",
             f"controlled_baseline={source}",
-            "--splits",
-            str(splits),
             "--output-root",
             str(output),
         ],
         check=True,
     )
     row = json.loads((output / "controlled_baseline.jsonl").read_text())
-    assert row["reference"] is None
-    assert row["test_metadata"]["scorer"] == "N/A"
+    assert row == {"problem_id": "p1", "prompt": "hello", "turns": None}
 
 
 def test_e3_uses_three_explicit_strata_without_filler():

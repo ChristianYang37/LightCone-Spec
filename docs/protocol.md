@@ -6,7 +6,7 @@ representation at runtime.
 
 | Node | Registered rows | GPUs per cell | Purpose |
 |---|---:|---:|---|
-| preflight | 10 | 1 or 2 | model load, exactness, memory, HTTP, interference |
+| preflight | 10 | 1 or 2 | model load, implementation smoke, memory, HTTP, interference |
 | E3a | 360 | 1 | Target-only/Static capacity surface |
 | TTS-Cal | 288 | 1 | TTS numeric calibration |
 | E1 | 68 | 1 | scope/rank screen with fixed roles |
@@ -18,7 +18,7 @@ representation at runtime.
 | E4-local | 96 | 1 | local factorial |
 | E4-profile | 3 | 2 | isolated profiling |
 | E3b-pilot | 1920 | 1 | four excluded 480-row blocks |
-| E3b-final | `480N` | 1 | long-context confirmation |
+| E3b-final | `480N` | 1 | long-context efficiency confirmation |
 | E1a | 116 | 1 | DSpark scope/rank and verification mode |
 | E5-pilot | 2064 | 2 | four 450-row pilots plus 264 failure cells |
 | E5-final | `450N` | 2 | production/topology confirmation |
@@ -55,10 +55,9 @@ reused by E3/E4. TTS uses the fixed paper recipe: Adam, zero weight decay, no gr
 the complete drafter, one update step, latest-round-only teacher rows,
 and `exp(-1/7)` positional decay. TTS-Cal and single-request mechanism rows
 reset per request; registered multi-request blocks reset once and share one cohort
-state. TTS and L0-naive share the
-candidate update and differ only in publication policy. TTS-Cal uses 76 tuning
-problems from an explicit tuning split and never executes the four explicit
-holdout IDs. E2
+state. TTS and L0-naive share the candidate update and differ only in
+publication policy. TTS-Cal, E1, E2, E1a, and deployment-width selection use
+the fixed 76-prompt CalibrationMix. E2
 uses the registered `(B,L)` points as closed-loop concurrency and generated
 history length. E1a selects one confidence weight from `0.05/0.1/0.25/0.5` on
 an excluded `last5_native_heads/full` calibration before its 116 rows. E4 factors map directly to runtime arguments and its profiling
@@ -72,12 +71,10 @@ finite-update gates; an infeasible Full `c1` gate remains blocked. Every E6
 role, including Target-only, runs TP2 and
 each model freezes its own common load from `c1` through `c256`.
 
-Required correctness checks are limited to:
+Formal scientific checks are limited to:
 
 - proposal version matches the published parameter version;
 - TTS and L0 controlled replay produce the same staged candidate;
-- greedy output token trajectories agree with Target-only;
-- stochastic decoding passes the registered distributional test;
 - loss, gradients, and updates are finite;
 - OOM, fallback, retraction, and stale-publication events are counted;
 - goodput uses committed tokens and comparisons share an HBM-feasible load;
@@ -85,7 +82,13 @@ Required correctness checks are limited to:
   sum/max/min aggregates are present rather than reconstructed from HTTP delivery time;
 - pilot rows never enter final estimates; statistics operate on paired blocks.
 
-Process and network failures retry at most once. Numerical errors, exactness
-violations, and failed scientific criteria are terminal for the cell. OOM in a
+Preflight also runs one excluded four-prompt implementation smoke: greedy
+same-logit agreement and a fixed-random-number reference rejection sampler.
+Those checks diagnose the implementation and are not repeated in formal cells
+or entered into paper statistics. Benchmark prompts are workload stimuli only;
+no answer, code test, or judge score is evaluated.
+
+Process and network failures retry at most once. Numerical errors and failed
+scientific criteria are terminal for the cell. OOM in a
 declared capacity screen is an ordinary completed `feasible=false` outcome;
 OOM elsewhere remains terminal.

@@ -303,7 +303,6 @@ def _native_exactness(
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
             limit=1,
-            split="tuning",
             offset=(job.block or 0) * 16,
         )
         prompt = tuple(client.tokenize(raw[0])[-128:])
@@ -410,7 +409,6 @@ def _measure(
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
             limit=8 if isinstance(client, StickyReplicaClient) else 16,
-            split="tuning",
             offset=(job.block or 0) * 16,
         )
         prompts = tuple(tuple(client.tokenize(prompt)[-128:]) for prompt in raw)
@@ -753,7 +751,7 @@ def adapter_batching(args: argparse.Namespace) -> None:
                 raise RuntimeError(f"failed to load {name}: {loaded}")
 
         prompt = load_prompts(
-            config.dataset_path("controlled_baseline"), limit=1, split="tuning"
+            config.dataset_path("controlled_baseline"), limit=1
         )[0]
         base_rows, _ = _adapter_generate(
             base_url,
@@ -1019,7 +1017,6 @@ def rid_lifecycle(args: argparse.Namespace) -> None:
         raw = load_prompts(
             config.dataset_path("controlled_baseline"),
             limit=4,
-            split="tuning",
         )
         tokens = tuple(client.tokenize(prompt) for prompt in raw)
         prompts = tuple(row[-length:] for row, length in zip(tokens, (32, 64, 96, 128)))

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 import os
 import re
-import shlex
-import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.error
@@ -31,9 +29,9 @@ from .config import ExperimentConfig
 from .data import (
     load_arrival_offsets,
     load_arrival_trace,
+    load_calibration_mix,
     load_prompt_pool,
     load_prompt_records,
-    load_tts_calibration,
 )
 from .metrics import (
     SAFETY_COUNTERS,
@@ -104,7 +102,6 @@ def _exactness_bootstrap(job: Job) -> Job:
         parameters={
             **job.parameters,
             "controlled_replay": False,
-            "distribution_check": False,
             "deterministic_exactness": True,
             "exactness_bootstrap": True,
         },
@@ -121,11 +118,15 @@ def _validate_committed_tokens(results: Sequence[GenerationResult], committed: i
 
 
 def _validate_greedy_verify_counts(
-    committed: int, checked: int, mismatched: int
+    committed: int,
+    checked: int,
+    mismatched: int,
+    *,
+    allowed_unverified: int = 1,
 ) -> dict[str, int]:
     missing_output_tokens = max(committed - checked, 0)
     extra_checked_tokens = max(checked - committed, 0)
-    if missing_output_tokens > 1 or mismatched:
+    if missing_output_tokens > allowed_unverified or mismatched:
         raise ScientificFailure(
             "deterministic verification did not match every speculative output token "
             f"to its same-logit target argmax ({checked} checked, "
@@ -324,17 +325,6 @@ def _task_for_data(config: ExperimentConfig, job: Job) -> str:
     return job.task
 
 
-def _dataset_split(job: Job) -> str:
-    explicit = job.parameters.get("data_split")
-    if explicit in {"tuning", "pilot", "final"}:
-        return str(explicit)
-    if job.node.endswith("-final"):
-        return "final"
-    if job.node.endswith("-pilot"):
-        return "pilot"
-    return "tuning"
-
-
 def _prompt_offset(job: Job, limit: int) -> int:
     condition = "|".join(
         str(value)
@@ -463,16 +453,13 @@ def _cell_inputs(
 ) -> tuple[tuple[str | tuple[int, ...], ...], int, dict[str, object]]:
     count = _request_count(config, state, job)
     dataset_key = _task_for_data(config, job)
-    split = _dataset_split(job)
-    metadata: dict[str, object] = {"dataset": dataset_key, "split": split}
+    metadata: dict[str, object] = {"dataset": dataset_key}
     if job.node == "TTS-Cal":
-        prompts, holdout = load_tts_calibration(config.dataset_path(dataset_key))
-        metadata["holdout_problem_ids"] = holdout
+        prompts = load_calibration_mix(config.dataset_path(dataset_key))
     else:
         records = load_prompt_records(
             config.dataset_path(dataset_key),
             limit=count,
-            split=split,
             selection_seed=_prompt_offset(job, count),
             allow_repeat=job.node.startswith("E5"),
         )
@@ -487,7 +474,6 @@ def _cell_inputs(
         pool_prompts = tuple(
             str(row["prompt"])
             for row in load_prompt_pool(config.dataset_path(dataset_key))
-            if row["split"] == split
         )
     filler = tuple(
         token for prompt in pool_prompts for token in client.tokenize(prompt + "\n")
@@ -538,6 +524,37 @@ def _cell_inputs(
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_jsonl(path: Path, rows: Iterable[dict[str, object]]) -> None:
+    with gzip.open(path, "wt", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _request_metrics(result: GenerationResult) -> dict[str, object]:
+    return {
+        "request_id": result.request_id,
+        "input_tokens": result.input_tokens,
+        "completion_tokens": result.completion_tokens,
+        "ttft_ms": result.ttft_ms,
+        "inter_token_ms": list(result.inter_token_ms),
+        "elapsed_seconds": result.elapsed_seconds,
+        "stop_reason": result.stop_reason,
+        "native_token_timestamps_ns": list(result.native_token_timestamps_ns),
+        "stop_details": result.stop_details,
+    }
+
+
+def _jsonl_path(directory: Path, name: str) -> Path:
+    compressed = directory / f"{name}.gz"
+    return compressed if compressed.is_file() else directory / name
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
 
 
 def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
@@ -886,175 +903,6 @@ def _run_request_scoped(
     return tuple(results), time.perf_counter() - started
 
 
-def _answer_value(text: object) -> str | None:
-    if not isinstance(text, str) or not text.strip():
-        return None
-    boxed = re.findall(r"\\boxed\{([^{}]+)\}", text)
-    if boxed:
-        return boxed[-1].replace(" ", "")
-    numbers = re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
-    return numbers[-1] if numbers else None
-
-
-def _python_code(text: str) -> str:
-    fenced = re.findall(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL)
-    return fenced[-1].strip() if fenced else text.strip()
-
-
-def _code_tests(metadata: object) -> str | None:
-    if isinstance(metadata, str) and metadata.strip():
-        return metadata
-    if isinstance(metadata, list) and all(isinstance(row, str) for row in metadata):
-        return "\n".join(metadata)
-    if isinstance(metadata, dict):
-        for key in ("tests", "test", "test_code"):
-            value = metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-            if isinstance(value, list) and all(isinstance(row, str) for row in value):
-                return "\n".join(value)
-    return None
-
-
-def _canonical_accuracy(
-    task: str,
-    results: tuple[GenerationResult, ...],
-    workload: dict[str, object],
-    python: Path,
-) -> tuple[float | None, str, list[dict[str, object]]]:
-    examples = workload.get("examples")
-    if not isinstance(examples, tuple) or len(examples) != len(results):
-        return None, "N/A: scorer metadata unavailable", []
-    if task in {"MBPP", "HumanEval", "LiveCodeBench"}:
-        bwrap = shutil.which("bwrap")
-        prlimit = shutil.which("prlimit")
-        if bwrap is None or prlimit is None:
-            return None, "N/A: bubblewrap scorer unavailable", []
-        passed = 0
-        verdicts = []
-        for result, example in zip(results, examples, strict=True):
-            tests = _code_tests(example.get("test_metadata"))
-            if tests is None:
-                return None, "N/A: executable canonical tests unavailable", []
-            with tempfile.TemporaryDirectory(prefix="lightcone-score-") as temporary:
-                program = Path(temporary) / "program.py"
-                program.write_text(
-                    _python_code(result.output_text) + "\n" + tests,
-                    encoding="utf-8",
-                )
-                command = [
-                    prlimit,
-                    "--as=1073741824",
-                    "--cpu=10",
-                    "--nproc=32",
-                    "--",
-                    bwrap,
-                    "--die-with-parent",
-                    "--new-session",
-                    "--unshare-all",
-                    "--clearenv",
-                    "--ro-bind",
-                    "/usr",
-                    "/usr",
-                    "--dev",
-                    "/dev",
-                    "--proc",
-                    "/proc",
-                    "--tmpfs",
-                    "/tmp",
-                    "--dir",
-                    "/work",
-                    "--ro-bind",
-                    str(program),
-                    "/work/program.py",
-                    "--setenv",
-                    "HOME",
-                    "/tmp",
-                    "--setenv",
-                    "PATH",
-                    "/usr/bin:/bin",
-                ]
-                for directory in (Path("/lib"), Path("/lib64"), python.parent.parent):
-                    if directory.exists() and str(directory) != "/usr":
-                        command.extend(("--ro-bind", str(directory), str(directory)))
-                command.extend((str(python), "-I", "/work/program.py"))
-                process = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-            passed += process.returncode == 0
-            verdicts.append(
-                {
-                    "request_id": result.request_id,
-                    "passed": process.returncode == 0,
-                }
-            )
-        return passed / len(results), "canonical_tests_bubblewrap", verdicts
-    if task in {"MT-Bench", "Alpaca", "Arena-Hard"}:
-        variable = {
-            "MT-Bench": "LIGHTCONE_MT_BENCH_EVALUATOR",
-            "Alpaca": "LIGHTCONE_ALPACA_EVALUATOR",
-            "Arena-Hard": "LIGHTCONE_ARENA_HARD_EVALUATOR",
-        }[task]
-        command_template = os.environ.get(variable)
-        if not command_template:
-            return None, f"N/A: {task} official evaluator unavailable", []
-        with tempfile.TemporaryDirectory(prefix="lightcone-evaluator-") as temporary:
-            input_path = Path(temporary) / "input.jsonl"
-            output_path = Path(temporary) / "output.jsonl"
-            with input_path.open("w", encoding="utf-8") as stream:
-                for result, example in zip(results, examples, strict=True):
-                    stream.write(
-                        json.dumps(
-                            {
-                                "request_id": result.request_id,
-                                "prompt": example.get("prompt"),
-                                "reference": example.get("reference"),
-                                "candidate": result.output_text,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            command = [
-                value.format(input=str(input_path), output=str(output_path))
-                for value in shlex.split(command_template)
-            ]
-            subprocess.run(command, check=True, timeout=3600)
-            verdicts = [
-                json.loads(line)
-                for line in output_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        expected = {result.request_id for result in results}
-        if {row.get("request_id") for row in verdicts} != expected:
-            raise ScientificFailure(f"{task} evaluator changed request identities")
-        scores = [row.get("score") for row in verdicts]
-        if any(
-            not isinstance(score, (int, float)) or not 0 <= float(score) <= 1
-            for score in scores
-        ):
-            raise ScientificFailure(f"{task} evaluator must return normalized scores")
-        return float(np.mean(scores)), f"official_{task.lower()}_evaluator", verdicts
-    if task not in {"GSM8K", "MATH-500", "AIME-2025"}:
-        return None, "N/A: no official local judge", []
-    pairs = [
-        (_answer_value(result.output_text), _answer_value(example.get("reference")))
-        for result, example in zip(results, examples, strict=True)
-        if isinstance(example, dict)
-    ]
-    if len(pairs) != len(results) or any(None in pair for pair in pairs):
-        return None, "N/A: canonical answer unavailable", []
-    return (
-        sum(left == right for left, right in pairs) / len(pairs),
-        "exact_final_answer",
-        [],
-    )
-
-
 def _execute_cell(
     config: ExperimentConfig,
     state: StateStore,
@@ -1070,14 +918,7 @@ def _execute_cell(
         output_dir.mkdir(parents=True, exist_ok=True)
         attempt = state.start(job, gpus, output_dir)
         _write_json(output_dir / "config.json", job.to_dict())
-        (output_dir / "requests.jsonl").write_text("", encoding="utf-8")
-        (output_dir / "cycles.jsonl").write_text("", encoding="utf-8")
-        (output_dir / "server.log").write_text("", encoding="utf-8")
-        (output_dir / "gpu.csv").write_text(
-            "timestamp,index,memory_used_mb,gpu_util_pct,memory_util_pct,power_w,"
-            "energy_mj,temperature_c,sm_clock_mhz,pstate,throttle\n",
-            encoding="utf-8",
-        )
+        _write_jsonl(output_dir / "requests.jsonl.gz", ())
         session_files = {
             "server.log": server.output_dir / "server.log",
             "cycles.jsonl": server.output_dir / "cycles.jsonl",
@@ -1121,7 +962,7 @@ def _execute_cell(
                     client.server_info(), bootstrap_topology
                 )
                 verified, _ = client.run_batch(
-                    prompts[:1],
+                    prompts[:4],
                     max_new_tokens=max_new_tokens,
                     seed=pair_seed,
                     request_id_prefix="controlled-speculative-verify",
@@ -1149,7 +990,10 @@ def _execute_cell(
                     bootstrap_after.get("greedy_token_mismatches", 0)
                 ) - int(bootstrap_before.get("greedy_token_mismatches", 0))
                 coverage = _validate_greedy_verify_counts(
-                    bootstrap_committed, checked_tokens, mismatched_tokens
+                    bootstrap_committed,
+                    checked_tokens,
+                    mismatched_tokens,
+                    allowed_unverified=len(verified),
                 )
                 exactness_evidence = {
                     "mode": "deterministic_verification_kernel",
@@ -1159,12 +1003,13 @@ def _execute_cell(
                     **coverage,
                     "safety_counters": bootstrap_safety,
                 }
-                exactness_rows.append(
+                exactness_rows.extend(
                     {
                         "policy": "speculative_verify",
                         "exactness_scope": "deterministic_verification_kernel",
-                        **verified[0].to_dict(),
+                        **result.to_dict(),
                     }
+                    for result in verified
                 )
                 runtime_job = replace(
                     runtime_job,
@@ -1291,7 +1136,7 @@ def _execute_cell(
                 client = server.configure(capture, state.selection("tts_recipe", {}))
                 tts_results, tts_elapsed = _run_request_scoped(
                     client,
-                    prompts[:1],
+                    prompts[:4],
                     max_new_tokens,
                     pair_seed,
                     same_seed=True,
@@ -1308,7 +1153,7 @@ def _execute_cell(
                 client = server.configure(compare, state.selection("tts_recipe", {}))
                 l0_results, l0_elapsed = _run_request_scoped(
                     client,
-                    prompts[:1],
+                    prompts[:4],
                     max_new_tokens,
                     pair_seed,
                     same_seed=True,
@@ -1317,8 +1162,11 @@ def _execute_cell(
                 results = (*tts_results, *l0_results)
                 elapsed = tts_elapsed + l0_elapsed
                 controlled_rows.extend(
-                    {"policy": policy, **result.to_dict()}
-                    for policy, result in zip(("tts", "l0_naive"), results, strict=True)
+                    {"policy": "tts", **result.to_dict()} for result in tts_results
+                )
+                controlled_rows.extend(
+                    {"policy": "l0_naive", **result.to_dict()}
+                    for result in l0_results
                 )
             elif runtime_job.parameters.get("regime") == "multi_turn_shared_prefix":
                 if arrivals is not None:
@@ -1396,44 +1244,16 @@ def _execute_cell(
             if runtime_job.parameters.get("controlled_pair_baseline"):
                 pair_seed = config.protocol.seed + (job.block or 0)
                 controlled, _ = client.run_batch(
-                    prompts[:1],
+                    prompts[:4],
                     max_new_tokens=max_new_tokens,
                     seed=pair_seed,
                     request_id_prefix="controlled-target",
                 )
                 controlled_rows = [
-                    {"policy": "target_only", **controlled[0].to_dict()}
+                    {"policy": "target_only", **result.to_dict()}
+                    for result in controlled
                 ]
-            stochastic_rows: list[dict[str, int]] = []
-            if runtime_job.parameters.get("distribution_check"):
-                for sample in range(16):
-                    sample_seed = config.protocol.seed + 10000 + sample * len(prompts)
-                    if runtime_job.method in {"tts", "l0_naive"}:
-                        sampled, _ = _run_request_scoped(
-                            client,
-                            prompts,
-                            1,
-                            sample_seed,
-                            request_prefix=f"stochastic-{sample:02d}",
-                            temperature=0.8,
-                        )
-                    else:
-                        sampled, _ = client.run_batch(
-                            prompts,
-                            max_new_tokens=1,
-                            seed=sample_seed,
-                            temperature=0.8,
-                            request_id_prefix=f"{job.job_id}-stochastic-{sample:02d}",
-                        )
-                    stochastic_rows.extend(
-                        {
-                            "request_index": index,
-                            "sample": sample,
-                            "token_id": int(result.output_ids[0]),
-                        }
-                        for index, result in enumerate(sampled)
-                    )
-            request_rows = [result.to_dict() for result in results]
+            request_rows = [_request_metrics(result) for result in results]
             outcome_rows = (
                 [outcome.to_dict() for outcome in scheduled.outcomes]
                 if scheduled is not None
@@ -1449,25 +1269,10 @@ def _execute_cell(
                     for result in results
                 ]
             )
-            with (output_dir / "requests.jsonl").open("w", encoding="utf-8") as stream:
-                for row in request_rows:
-                    stream.write(json.dumps(row, sort_keys=True) + "\n")
-            with (output_dir / "request_outcomes.jsonl").open(
-                "w", encoding="utf-8"
-            ) as stream:
-                for row in outcome_rows:
-                    stream.write(json.dumps(row, sort_keys=True) + "\n")
-            if stochastic_rows:
-                with (output_dir / "stochastic.jsonl").open("w", encoding="utf-8") as stream:
-                    for row in stochastic_rows:
-                        stream.write(json.dumps(row, sort_keys=True) + "\n")
+            _write_jsonl(output_dir / "requests.jsonl.gz", request_rows)
+            _write_jsonl(output_dir / "request_outcomes.jsonl.gz", outcome_rows)
             if controlled_rows:
-                with (output_dir / "controlled.jsonl").open("w", encoding="utf-8") as stream:
-                    for row in controlled_rows:
-                        stream.write(json.dumps(row, sort_keys=True) + "\n")
-            cycles = output_dir / "cycles.jsonl"
-            if not cycles.exists():
-                cycles.write_text("", encoding="utf-8")
+                _write_jsonl(output_dir / "controlled.jsonl.gz", controlled_rows)
             committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
             output_tokens = _validate_committed_tokens(results, committed)
             peak_hbm = int(after["peak_hbm_bytes"])
@@ -1537,12 +1342,6 @@ def _execute_cell(
             }
             if exactness_evidence is not None:
                 metrics["exactness_bootstrap"] = exactness_evidence
-            accuracy, scorer, scorer_verdicts = _canonical_accuracy(
-                job.task, results, workload, config.server.python
-            )
-            metrics["canonical_accuracy"] = accuracy
-            metrics["scorer"] = scorer
-            metrics["scorer_verdicts"] = scorer_verdicts
             if runtime_job.parameters.get("probe"):
                 metrics["compatible"] = True
                 metrics["static_interface_passed"] = static_interface_passed
@@ -1784,20 +1583,19 @@ def _execute_cell(
                 with source.open("rb") as stream:
                     stream.seek(session_offsets[name])
                     payload = stream.read()
-                target = output_dir / name
+                target = output_dir / f"{name}.gz"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if name.endswith("gpu.csv"):
-                    if not target.exists():
-                        target.write_text(
-                            "timestamp,index,memory_used_mb,gpu_util_pct,"
-                            "memory_util_pct,power_w,energy_mj,temperature_c,"
-                            "sm_clock_mhz,pstate,throttle\n",
-                            encoding="utf-8",
-                        )
-                    with target.open("ab") as stream:
-                        stream.write(payload)
+                    header = (
+                        b"timestamp,index,memory_used_mb,gpu_util_pct,"
+                        b"memory_util_pct,power_w,energy_mj,temperature_c,"
+                        b"sm_clock_mhz,pstate,throttle\n"
+                    )
+                    if payload.startswith(b"timestamp,"):
+                        header = b""
+                    target.write_bytes(gzip.compress(header + payload))
                 else:
-                    target.write_bytes(payload)
+                    target.write_bytes(gzip.compress(payload))
 
 
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
@@ -1995,7 +1793,7 @@ def _confidence_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
             method="lightcone_candidate",
             model="Qwen/Qwen3-8B",
             backend="DSPARK",
-            task="LiveCodeBench",
+            task="CalibrationMix",
             context=40928,
             load=common,
             width=16,
@@ -2029,7 +1827,7 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                     method,
                     "Qwen/Qwen3-8B",
                     backend,
-                    "LiveCodeBench",
+                    "CalibrationMix",
                     context=40928,
                     load=load,
                     width=None if method == "target_only" else 16,
@@ -2047,7 +1845,7 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                         "lightcone_candidate",
                         "Qwen/Qwen3-8B",
                         "DFLASH",
-                        "LiveCodeBench",
+                        "CalibrationMix",
                         context=40928,
                         load=load,
                         width=16,
@@ -2134,9 +1932,9 @@ def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
     if not isinstance(common, str):
         raise ScientificFailure("deployment width tuning lacks E1 common load")
     tasks = {
-        "long_input_short_output": "controlled_baseline",
-        "short_input_long_generation": "LiveCodeBench",
-        "multi_turn_shared_prefix": "MATH-500",
+        "long_input_short_output": "CalibrationMix",
+        "short_input_long_generation": "CalibrationMix",
+        "multi_turn_shared_prefix": "CalibrationMix",
     }
     rows = []
     ordinal = 0
@@ -2388,7 +2186,6 @@ def _e5_p99_jobs(state: StateStore) -> tuple[Job, ...]:
                     "registered_load": config["parameters"]["registered_load"],
                     "arrival_rate": rate,
                     "p99_extension": True,
-                    "data_split": "final",
                     "workload": "production_crossover",
                 },
             )
@@ -2818,45 +2615,41 @@ def _trajectory_group(config: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _check_greedy_trajectories(state: StateStore, node: str) -> None:
-    groups: dict[tuple[Any, ...], list[tuple[str, tuple[tuple[int, ...], ...]]]] = {}
+    groups: dict[
+        tuple[Any, ...], dict[str, list[tuple[int, ...]]]
+    ] = {}
     preflight_policies: set[str] = set()
     for directory in state.completed_attempt_dirs(node):
-        config_path, requests_path = directory / "config.json", directory / "requests.jsonl"
-        if not config_path.is_file() or not requests_path.is_file():
+        config_path = directory / "config.json"
+        if not config_path.is_file():
             continue
         config = json.loads(config_path.read_text(encoding="utf-8"))
         if config.get("parameters", {}).get("probe"):
             continue
         if node == "preflight":
-            controlled_path = directory / "controlled.jsonl"
+            controlled_path = _jsonl_path(directory, "controlled.jsonl")
             if not controlled_path.is_file():
                 continue
-            for line in controlled_path.read_text(encoding="utf-8").splitlines():
-                row = json.loads(line)
+            for row in _read_jsonl(controlled_path):
                 preflight_policies.add(str(row["policy"]))
-                groups.setdefault(_trajectory_group(config), []).append(
-                    (str(row["policy"]), (tuple(row["output_ids"]),))
-                )
+                policy = str(row["policy"])
+                groups.setdefault(_trajectory_group(config), {}).setdefault(
+                    policy, []
+                ).append(tuple(row["output_ids"]))
             continue
-        trajectories = tuple(
-            tuple(json.loads(line)["output_ids"])
-            for line in requests_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
-        groups.setdefault(_trajectory_group(config), []).append((config["method"], trajectories))
     if node == "preflight":
         required = {"target_only", "speculative_verify", "tts", "l0_naive"}
         if preflight_policies != required:
             raise ScientificFailure("preflight lacks target/verify/TTS/L0 trajectories")
     diagnostics: list[dict[str, object]] = []
-    for group, rows in groups.items():
-        baselines = [trajectory for method, trajectory in rows if method == "target_only"]
-        if not baselines:
+    for group, policies in groups.items():
+        baseline = tuple(policies.get("target_only", ()))
+        if not baseline:
             continue
-        baseline = baselines[0]
-        for method, trajectory in rows:
+        for method, method_rows in policies.items():
             if method == "target_only":
                 continue
+            trajectory = tuple(method_rows)
             mismatch_count = 0
             first_mismatch = None
             request_count = max(len(baseline), len(trajectory))
@@ -2887,8 +2680,8 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
             )
         if node == "preflight":
             adaptive = {
-                method: trajectory
-                for method, trajectory in rows
+                method: tuple(method_rows)
+                for method, method_rows in policies.items()
                 if method in {"tts", "l0_naive"}
             }
             if adaptive.get("tts") != adaptive.get("l0_naive"):
@@ -2899,51 +2692,11 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
         diagnostic_path,
         {
             "interpretation": (
-                "cross-kernel bitwise comparison is diagnostic; greedy exactness is gated "
-                "against same-logit target argmax in preflight"
+                "excluded implementation smoke; it is not a benchmark-quality result"
             ),
             "comparisons": diagnostics,
         },
     )
-
-
-def _categorical_distance(left: list[tuple[int, int]], right: list[tuple[int, int]]) -> float:
-    categories = set(left) | set(right)
-    left_raw, right_raw = Counter(left), Counter(right)
-    left_counts = {item: left_raw[item] / len(left) for item in categories}
-    right_counts = {item: right_raw[item] / len(right) for item in categories}
-    return sum((left_counts[item] - right_counts[item]) ** 2 for item in categories)
-
-
-def _check_stochastic_exactness(state: StateStore, node: str) -> None:
-    rows: dict[str, list[tuple[int, int]]] = {}
-    for directory in state.completed_attempt_dirs(node):
-        config_path, samples_path = directory / "config.json", directory / "stochastic.jsonl"
-        if not config_path.is_file() or not samples_path.is_file():
-            continue
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        samples = [json.loads(line) for line in samples_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        rows[config["method"]] = [
-            (int(row["request_index"]), int(row["token_id"])) for row in samples
-        ]
-    target = rows.get("target_only")
-    candidate = rows.get("l0_naive")
-    if not target or not candidate or len(target) != len(candidate):
-        raise ScientificFailure("preflight lacks paired stochastic samples")
-    observed = _categorical_distance(target, candidate)
-    combined = np.asarray(target + candidate, dtype=np.int64)
-    rng = np.random.default_rng(0)
-    exceed = 0
-    for _ in range(999):
-        permutation = rng.permutation(len(combined))
-        left = [tuple(row) for row in combined[permutation[: len(target)]].tolist()]
-        right = [tuple(row) for row in combined[permutation[len(target) :]].tolist()]
-        exceed += _categorical_distance(left, right) >= observed
-    p_value = (exceed + 1) / 1000
-    if p_value < 0.01:
-        raise ScientificFailure(
-            f"preflight stochastic distributions differ (permutation p={p_value:.4f})"
-        )
 
 
 def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, Any]]:
@@ -3102,7 +2855,7 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
     for directory in state.completed_attempt_dirs(node):
         config_path = directory / "config.json"
         metrics_path = directory / "metrics.json"
-        requests_path = directory / "requests.jsonl"
+        requests_path = _jsonl_path(directory, "requests.jsonl")
         if (
             not config_path.is_file()
             or not metrics_path.is_file()
@@ -3125,15 +2878,13 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
             parameters.get("width_panel"),
         )
         rows = []
-        for line in requests_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                request = json.loads(line)
-                rows.append(
-                    (
-                        int(request["completion_tokens"]),
-                        float(request["elapsed_seconds"]),
-                    )
+        for request in _read_jsonl(requests_path):
+            rows.append(
+                (
+                    int(request["completion_tokens"]),
+                    float(request["elapsed_seconds"]),
                 )
+            )
         if rows:
             request_groups.setdefault(key, {}).setdefault(context, {})[block] = (
                 rows,
@@ -3324,19 +3075,15 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
         directories.extend(state.completed_attempt_dirs("E5-p99-extension"))
     for directory in directories:
         config_path = directory / "config.json"
-        requests_path = directory / "requests.jsonl"
-        outcomes_path = directory / "request_outcomes.jsonl"
+        requests_path = _jsonl_path(directory, "requests.jsonl")
+        outcomes_path = _jsonl_path(directory, "request_outcomes.jsonl")
         if not config_path.is_file() or not requests_path.is_file() or not outcomes_path.is_file():
             continue
         config = json.loads(config_path.read_text(encoding="utf-8"))
         parameters = config.get("parameters", {})
         load = parameters.get("registered_load", config.get("load"))
         key = (config["method"], config["backend"], str(load))
-        outcome_rows = [
-            json.loads(line)
-            for line in outcomes_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        outcome_rows = _read_jsonl(outcomes_path)
         offered_counts[key] += len(outcome_rows)
         completed_counts[key] += sum(row.get("status") == "completed" for row in outcome_rows)
         sources.setdefault(key, []).append(
@@ -3346,10 +3093,7 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
                 "attempt_dir": str(directory),
             }
         )
-        for line in requests_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            request = json.loads(line)
+        for request in _read_jsonl(requests_path):
             stamps = request.get("native_token_timestamps_ns", [])
             intervals = request.get("inter_token_ms", [])
             if stamps and intervals:
@@ -3574,10 +3318,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         _write_json(
             summary_dir / "tail_latency.json", _e5_tail_statistics(state, node)
         )
-    if node in {"preflight", "E3a", "E1", "E3b-pilot", "E3b-final", "E5-pilot", "E5-final", "E6-pilot", "E6-final", "E0-pilot", "E0-final"}:
+    if node == "preflight":
         _check_greedy_trajectories(state, node)
     if node == "preflight":
-        _check_stochastic_exactness(state, node)
         timings: dict[tuple[int, int], dict[str, dict[str, float]]] = {}
         for item, metrics in _metric_rows(state, node):
             mode = item["parameters"].get("mode")

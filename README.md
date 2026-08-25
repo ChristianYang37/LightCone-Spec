@@ -9,21 +9,22 @@ the run state is SQLite, and the SGLang changes are five plain unified diffs.
 Repository state and source/model/data byte identity are not inspected in the
 execution path.
 
-> Formal E0--E6 status: **UNMEASURED**. GPU acceptance is incomplete; CPU tests
-> do not establish speed, capacity, or quality results.
+> Formal E0--E6 status: **UNMEASURED**. CPU tests and GPU acceptance do not
+> establish paper speed, capacity, or transfer results.
 
 ## One-command paper run
 
-The intended machine is one host with two RTX PRO 6000 Blackwell 96 GB GPUs.
+The intended machine is one host with an even number of GPUs; adjacent IDs form
+TP2 pairs. The current acceptance host has two RTX PRO 6000 Blackwell 96 GB GPUs.
 Models, datasets, the Python environment, profilers, and a local SGLang checkout
 must already exist at the absolute paths in the configuration.
 
-Raw benchmark downloads are converted once with
-`scripts/prepare_datasets.py` and an explicit `task,problem_id,split` CSV.
-Code benchmarks require `bwrap` and `prlimit`. Chat benchmarks run the
-task-specific official evaluator command named by `LIGHTCONE_MT_BENCH_EVALUATOR`,
-`LIGHTCONE_ALPACA_EVALUATOR`, or `LIGHTCONE_ARENA_HARD_EVALUATOR`. Evaluator
-credentials remain process environment variables and are never stored.
+Raw benchmark downloads are converted once with `scripts/prepare_datasets.py`.
+Formal pools need only a unique `problem_id` and a renderable `prompt` or
+`turns`. They are workload stimuli: the runner does not execute answers, score
+task accuracy, or call an LLM judge. Recipe selection uses a fixed 76-prompt
+`CalibrationMix`: 24 APPS train, 24 OpenR1-Math train, 24 UltraChat train, and
+four controlled synthetic prompts.
 
 ```bash
 cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
@@ -70,10 +71,11 @@ The registered row counts are 10, 360, 288, 68, 3364, 844, 214, 57, 48, 96,
 number of executable E0 model/backend/task combinations.
 
 The runner preserves the paper gates that matter scientifically: proposal
-version consistency, controlled candidate replay, greedy token equality,
-stochastic distributional exactness, finite optimization state, HBM/KV
-feasibility, safety counters, committed-token goodput, pilot/final separation,
-paired block statistics, and both Target-only and Static deployment baselines.
+version consistency, controlled TTS/L0 candidate replay, finite optimization
+state, HBM/KV feasibility, safety events, committed-token goodput, pilot/final
+block separation, paired statistics, and both Target-only and Static baselines.
+Exact rejection-sampling semantics receive one excluded implementation smoke;
+they are not remeasured in every formal cell.
 
 See [docs/protocol.md](docs/protocol.md) for the grid and dependency behavior.
 
@@ -92,12 +94,12 @@ results/run-name/
 ├── state.sqlite
 ├── jobs/<readable-job-id>/attempt-01/
 │   ├── config.json
-│   ├── requests.jsonl
-│   ├── request_outcomes.jsonl
-│   ├── cycles.jsonl
+│   ├── requests.jsonl.gz
+│   ├── request_outcomes.jsonl.gz
+│   ├── cycles.jsonl.gz
 │   ├── metrics.json
-│   ├── server.log
-│   └── gpu.csv
+│   ├── server.log.gz
+│   └── gpu.csv.gz
 └── stages/<node>/
     ├── summary.csv
     ├── summary.parquet
@@ -128,11 +130,11 @@ is a separate manual acceptance step and requires explicit operator approval.
 
 ## Evidence boundary
 
-The experiment package records named models and datasets, the YAML snapshot,
-software versions, seed, raw request/cycle rows, server/GPU logs, completed
-attempts, block structure, and statistical outputs. It does not establish the
-cryptographic identity of local files. Exact local file identity therefore
-remains an operator responsibility rather than a property of this runner.
+The experiment package records named models and workload pools, the YAML
+snapshot, software versions, seed, compressed numeric request/cycle rows,
+server/GPU logs, completed attempts, block structure, and statistical outputs.
+Formal rows omit generated text and token trajectories. The runner does not
+establish the cryptographic identity of local files.
 
 See [docs/running.md](docs/running.md), [docs/evidence.md](docs/evidence.md),
 and [docs/status.md](docs/status.md).

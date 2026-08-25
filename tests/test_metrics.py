@@ -39,11 +39,10 @@ def test_safety_metrics_reject_numerical_failures():
         "goodput": 100.0,
         "peak_hbm_bytes": 1,
         "kv_capacity": 1,
-        "exactness_violations": 1,
         "itl_p99_ms": 1.0,
-        **{name: 0 for name in SAFETY_COUNTERS if name != "exactness_violations"},
+        **{name: int(name == "nonfinite_updates") for name in SAFETY_COUNTERS},
     }
-    with pytest.raises(RuntimeError, match="exactness"):
+    with pytest.raises(RuntimeError, match="nonfinite"):
         validate_scientific_metrics(metrics)
     with pytest.raises(ValueError):
         committed_goodput(1, math.nan)

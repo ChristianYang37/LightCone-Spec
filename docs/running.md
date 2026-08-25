@@ -5,9 +5,11 @@
    settings, the CUDA toolkit path, the `paper-v1` preset, one process retry,
    profiler paths, and optional stage bounds. Consecutive IDs form TP2 pairs,
    so eight GPUs run as four independent pairs.
-   Convert raw datasets with `scripts/prepare_datasets.py --splits splits.csv`
-   when the configured files are not already normalized. The split CSV is the
-   sole source of tuning/pilot/final/holdout membership.
+   Convert raw prompt pools with `scripts/prepare_datasets.py --task
+   NAME=/absolute/source --output-root /absolute/pools`. Build CalibrationMix
+   with `--calibration-manifest /absolute/calibration.csv`; the CSV columns are
+   `source,path,count` and the counts must be 24/24/24/4 for APPS,
+   OpenR1-Math, UltraChat, and controlled synthetic prompts.
 2. From the project checkout, run:
 
    ```bash
@@ -24,8 +26,8 @@ of mixing configurations in one SQLite run.
 
 SIGINT and SIGTERM stop new work at the next cell boundary. A process/network
 failure is retried once, including server startup. OOM, non-finite adaptation,
-trajectory mismatch, missing native timing or counters, and scientific-gate
-failures are not retried. Expected capacity-screen OOM is recorded as an
+missing native timing or counters, and scientific-gate failures are not
+retried. Expected capacity-screen OOM is recorded as an
 infeasible completed probe so higher-load screening does not abort the DAG.
 
 Useful read-only commands:
@@ -35,6 +37,10 @@ lightcone-spec plan --config /root/lightcone-tts-runtime/paper.yaml
 lightcone-spec status --run-dir /root/lightcone-results/paper-v1-main
 lightcone-spec summarize --run-dir /root/lightcone-results/paper-v1-main
 ```
+
+Formal attempts write compressed numeric request, cycle, GPU, and log files.
+Generated text and per-token trajectories are retained only by the excluded
+implementation smoke. Put the result root on the data disk.
 
 The initial SGLang patch application uses ordinary `git apply --check`
 followed by `git apply`. Repository state is not inspected.

@@ -2,7 +2,7 @@ run_name: paper-v1-main
 gpu_ids: [0, 1]
 paths:
   sglang_root: /root/sglang
-  results_root: /root/lightcone-results
+  results_root: /root/autodl-tmp/lightcone-results
   models:
     Qwen/Qwen3-4B: /root/models/Qwen3-4B
     Qwen/Qwen3-8B: /root/models/Qwen3-8B
@@ -25,7 +25,7 @@ paths:
     Gemma4-12B|EAGLE3: /root/models/Gemma4-12B-EAGLE3
   datasets:
     controlled_baseline: /root/datasets/controlled-baseline.jsonl
-    TTS-Cal: /root/datasets/tts-cal.jsonl
+    CalibrationMix: /root/datasets/CalibrationMix.jsonl
     LiveCodeBench: /root/datasets/livecodebench.jsonl
     MATH-500: /root/datasets/math500.jsonl
     GSM8K: /root/datasets/gsm8k.jsonl
@@ -33,7 +33,7 @@ paths:
     MBPP: /root/datasets/mbpp.jsonl
     HumanEval: /root/datasets/humaneval.jsonl
     MT-Bench: /root/datasets/mtbench.jsonl
-    Alpaca: /root/datasets/alpaca.jsonl
+    AlpacaEval: /root/datasets/alpacaeval.jsonl
     Arena-Hard: /root/datasets/arena-hard.jsonl
     BurstGPT: /root/datasets/BurstGPT.csv
 server:

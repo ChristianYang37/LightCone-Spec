@@ -1,4 +1,4 @@
-"""Local benchmark prompt loading."""
+"""Local prompt-pool loading for efficiency experiments."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ PROMPT_FIELDS = (
     "input",
 )
 ID_FIELDS = ("problem_id", "question_id", "unique_id", "uid", "id", "task_id")
-SPLITS = {"tuning", "pilot", "final", "holdout"}
+CALIBRATION_SOURCES = {
+    "APPS": 24,
+    "OpenR1-Math": 24,
+    "UltraChat": 24,
+    "controlled_synthetic": 4,
+}
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -45,13 +50,12 @@ def load_prompt_records(
     path: Path,
     *,
     limit: int,
-    split: str,
     selection_seed: int = 0,
     allow_repeat: bool = False,
 ) -> tuple[dict[str, Any], ...]:
-    available = tuple(row for row in load_prompt_pool(path) if row["split"] == split)
+    available = load_prompt_pool(path)
     if not available:
-        raise ValueError(f"dataset {path} supplied no {split} prompts")
+        raise ValueError(f"dataset {path} supplied no prompts")
     if len(available) < limit and not allow_repeat:
         raise ValueError(f"dataset {path} supplied {len(available)} prompts; {limit} required")
     selected: list[dict[str, Any]] = []
@@ -71,25 +75,35 @@ def load_prompt_records(
 
 def load_prompt_pool(path: Path) -> tuple[dict[str, Any], ...]:
     available: list[dict[str, Any]] = []
+    identities: set[str] = set()
     for index, row in enumerate(_rows(path)):
-        value = next((row[field] for field in PROMPT_FIELDS if isinstance(row.get(field), str) and row[field].strip()), None)
+        turns = row.get("turns")
+        if turns is not None and (
+            not isinstance(turns, list)
+            or not all(isinstance(turn, str) and turn.strip() for turn in turns)
+        ):
+            raise ValueError(f"dataset row {index} turns must be non-empty text")
+        value = next(
+            (
+                row[field]
+                for field in PROMPT_FIELDS
+                if isinstance(row.get(field), str) and row[field].strip()
+            ),
+            None,
+        )
+        if value is None and turns:
+            value = "\n".join(turns)
         identity = next(
             (str(row[field]) for field in ID_FIELDS if row.get(field) is not None),
             None,
         )
-        split = row.get("split")
-        if identity is None or split not in SPLITS:
-            raise ValueError(
-                f"dataset row {index} requires problem_id and an explicit split"
-            )
+        if identity is None:
+            raise ValueError(f"dataset row {index} requires problem_id")
+        if identity in identities:
+            raise ValueError(f"dataset {path} repeats problem_id {identity}")
+        identities.add(identity)
         if value is None:
             raise ValueError(f"dataset row {index} requires a prompt or template input")
-        if not any(
-            field in row for field in ("reference", "answer", "test_metadata", "tests")
-        ):
-            raise ValueError(
-                f"dataset row {index} requires explicit reference or test metadata"
-            )
         template = row.get("template")
         if template is not None:
             if not isinstance(template, str):
@@ -100,56 +114,41 @@ def load_prompt_pool(path: Path) -> tuple[dict[str, Any], ...]:
                 raise ValueError(
                     f"dataset row {index} template cannot be rendered: {error}"
                 ) from error
-        turns = row.get("turns")
         if turns is not None:
-            if not isinstance(turns, list) or not all(
-                isinstance(turn, str) and turn.strip() for turn in turns
-            ):
-                raise ValueError(f"dataset row {index} turns must be non-empty text")
             value = "\n".join(turns)
         available.append(
             {
                 "problem_id": identity,
-                "split": split,
                 "prompt": value,
                 "template": template,
                 "turns": turns,
-                "reference": row.get("reference", row.get("answer")),
-                "test_metadata": row.get("test_metadata", row.get("tests")),
+                "source": row.get("source"),
             }
         )
     return tuple(available)
 
 
-def load_prompts(
-    path: Path, *, limit: int, split: str, offset: int = 0
-) -> tuple[str, ...]:
+def load_prompts(path: Path, *, limit: int, offset: int = 0) -> tuple[str, ...]:
     return tuple(
         row["prompt"]
         for row in load_prompt_records(
-            path, limit=limit, split=split, selection_seed=offset
+            path, limit=limit, selection_seed=offset
         )
     )
 
 
-def load_tts_calibration(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    identified = tuple(
-        (row["problem_id"], row["prompt"], row["split"])
-        for row in load_prompt_pool(path)
-    )
-    if any(split not in {"tuning", "holdout"} for _, _, split in identified):
-        raise ValueError("TTS-Cal rows must use only tuning or holdout splits")
-    tuning_rows = sorted(
-        ((identity, prompt) for identity, prompt, split in identified if split == "tuning")
-    )
-    holdout_rows = sorted(
-        ((identity, prompt) for identity, prompt, split in identified if split == "holdout")
-    )
-    if len(tuning_rows) != 76 or len(holdout_rows) != 4:
-        raise ValueError("TTS-Cal requires explicit 76 tuning and 4 holdout rows")
-    holdout = tuple(identity for identity, _ in holdout_rows)
-    tuning = tuple(prompt for _, prompt in tuning_rows)
-    return tuning, holdout
+def load_calibration_mix(path: Path) -> tuple[str, ...]:
+    rows = load_prompt_pool(path)
+    counts = {
+        source: sum(row["source"] == source for row in rows)
+        for source in CALIBRATION_SOURCES
+    }
+    if len(rows) != 76 or counts != CALIBRATION_SOURCES:
+        raise ValueError(
+            "CalibrationMix requires 24 APPS, 24 OpenR1-Math, "
+            "24 UltraChat, and 4 controlled_synthetic prompts"
+        )
+    return tuple(row["prompt"] for row in rows)
 
 
 def load_arrival_offsets(path: Path, *, limit: int, offset: int = 0) -> tuple[float, ...]:

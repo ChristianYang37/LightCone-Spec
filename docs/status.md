@@ -1,6 +1,6 @@
 # Current status
 
-Empirical status: **GPU GATES 1--8 COMPLETE; GATE 9 BLOCKED**.
+Empirical status: **GATE 7 COMPLETE; REVISED GATES 8--9 NOT YET RUN**.
 
 - The four-command CLI, 21-node DAG, SQLite resume, strict scientific metrics,
   ordinary SGLang diffs, and even-GPU TP2 pair pool are implemented. Gate 6 is
@@ -10,18 +10,17 @@ Empirical status: **GPU GATES 1--8 COMPLETE; GATE 9 BLOCKED**.
   Rebuild deltas were goodput `-0.32%..+0.50%`, p99 ITL `-0.07%..+1.02%`, and
   peak NVML HBM `0..144 MiB`; deterministic trajectories matched and rebuild
   safety counters were zero.
-- Gate 8 passed on a fresh run: stage `completed`, 10/10 jobs `completed`, no
-  failed or skipped jobs.
-- Gate 9 is blocked. Nine formal datasets lack historical explicit split IDs;
-  `bwrap` is installed but the host kernel rejects its namespace smoke; official
-  MT-Bench, AlpacaEval, and Arena-Hard evaluators and judge credentials are
-  absent; and 24.7 GB free space is below the measured result projection.
-  TTS-Cal itself is valid at 76 tuning plus four unexecuted holdout IDs.
+- The earlier Gate 8 passed, but the efficiency-first protocol requires a fresh
+  run with the revised implementation smoke and compressed evidence.
+- The revised Gate 9 no longer requires dataset splits, answer scorers,
+  answer-execution sandboxes, or LLM judges. It now checks CalibrationMix composition, nine
+  renderable workload pools, the E5 trace, full materialization, and measured
+  result capacity. These checks are pending.
 - Future eight-GPU execution uses four independent TP2 pairs. It still requires
   eight-GPU visibility/static-load checks, four-pair interference calibration,
   and one eight-GPU preflight before the full protocol starts.
 
-The Gate 7--9 run used two RTX PRO 6000 Blackwell 96 GB GPUs. Evidence is under
+The previous acceptance run used two RTX PRO 6000 Blackwell 96 GB GPUs. Evidence is under
 `lightcone-gpu-results/acceptance-v26` outside the repository. The AutoDL
 instance was confirmed `shutdown`; it was not released. No full E0--E6 run was
-started and the paper source was not modified.
+started. Paper speed and transfer claims remain unmeasured.

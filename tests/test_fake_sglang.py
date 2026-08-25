@@ -34,15 +34,17 @@ from lightcone_spec.nextn import (
 )
 from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import (
-    _canonical_accuracy,
     _check_greedy_trajectories,
     _exactness_bootstrap,
     _fault_action_passed,
+    _read_jsonl,
+    _request_metrics,
     _request_scope_released,
     _run_request_scoped,
     _speed_metrics,
     _validate_committed_tokens,
     _validate_greedy_verify_counts,
+    _write_jsonl,
 )
 from lightcone_spec.server import (
     ServerProcess,
@@ -1148,8 +1150,7 @@ def test_preflight_interference_only_captures_registered_request_batch(tmp_path:
     assert command[graph_index + 1 : graph_index + 6] == ["1", "2", "4", "8", "16"]
 
 
-def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr("lightcone_spec.runner.shutil.which", lambda name: None)
+def test_formal_request_evidence_omits_text_and_token_trajectory(tmp_path: Path):
     result = GenerationResult(
         request_id="r",
         input_tokens=1,
@@ -1159,55 +1160,15 @@ def test_code_scorer_never_executes_without_bubblewrap(monkeypatch, tmp_path: Pa
         elapsed_seconds=1.0,
         stop_reason="length",
         output_ids=(1,),
-        output_text="open('/root/should-not-exist', 'w')",
+        output_text="not stored",
         native_token_timestamps_ns=(1,),
     )
-    score, scorer, verdicts = _canonical_accuracy(
-        "HumanEval",
-        (result,),
-        {"examples": ({"test_metadata": "assert True"},)},
-        tmp_path / "python",
-    )
-    assert score is None
-    assert "bubblewrap" in scorer
-    assert verdicts == []
-
-
-def test_chat_score_comes_only_from_task_evaluator(monkeypatch, tmp_path: Path):
-    evaluator = tmp_path / "evaluate.py"
-    evaluator.write_text(
-        "import json, pathlib, sys\n"
-        "rows=[json.loads(x) for x in pathlib.Path(sys.argv[1]).read_text().splitlines()]\n"
-        "pathlib.Path(sys.argv[2]).write_text(''.join(json.dumps({"
-        "'request_id': r['request_id'], 'score': 0.75, 'evaluator': 'fastchat', "
-        "'version': 'test', 'judge_model': 'judge'})+'\\n' for r in rows))\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv(
-        "LIGHTCONE_MT_BENCH_EVALUATOR",
-        f"{sys.executable} {evaluator} {{input}} {{output}}",
-    )
-    result = GenerationResult(
-        request_id="chat-1",
-        input_tokens=1,
-        completion_tokens=1,
-        ttft_ms=1,
-        inter_token_ms=(),
-        elapsed_seconds=1,
-        stop_reason="length",
-        output_ids=(1,),
-        output_text="answer",
-        native_token_timestamps_ns=(1,),
-    )
-    score, scorer, verdicts = _canonical_accuracy(
-        "MT-Bench",
-        (result,),
-        {"examples": ({"prompt": "question", "reference": None},)},
-        tmp_path / "python",
-    )
-    assert score == 0.75
-    assert scorer == "official_mt-bench_evaluator"
-    assert verdicts[0]["evaluator"] == "fastchat"
+    row = _request_metrics(result)
+    assert "output_ids" not in row
+    assert "output_text" not in row
+    path = tmp_path / "requests.jsonl.gz"
+    _write_jsonl(path, (row,))
+    assert _read_jsonl(path) == [row]
 
 
 def test_dspark_loss_retains_graph_inside_inference_scheduler():

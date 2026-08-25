@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import shutil
 from pathlib import Path
@@ -19,6 +20,11 @@ def _absolute(value: str) -> Path:
     if not path.is_absolute():
         raise argparse.ArgumentTypeError("path must be absolute")
     return path
+
+
+def _gzip_lines(path: Path) -> int:
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        return sum(1 for _ in stream)
 
 
 def _config_parser(subparsers) -> argparse.ArgumentParser:
@@ -79,12 +85,14 @@ def _plan(config: ExperimentConfig) -> None:
         request_files = tuple(
             path
             for path in files
-            if path.name in {"requests.jsonl", "request_outcomes.jsonl", "cycles.jsonl"}
+            if path.name
+            in {
+                "requests.jsonl.gz",
+                "request_outcomes.jsonl.gz",
+                "cycles.jsonl.gz",
+            }
         )
-        request_rows = sum(
-            len(path.read_text(encoding="utf-8").splitlines())
-            for path in request_files
-        )
+        request_rows = sum(_gzip_lines(path) for path in request_files)
         variable_bytes = sum(path.stat().st_size for path in request_files)
         fixed_bytes = sum(path.stat().st_size for path in files) - variable_bytes
         if attempts and request_rows:
