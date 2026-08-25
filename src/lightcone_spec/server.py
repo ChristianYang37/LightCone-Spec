@@ -42,15 +42,7 @@ def _speculative_canvas(job: Job) -> int:
 
 
 def _request_scoped_adaptation(job: Job) -> bool:
-    return (
-        job.method in {"tts", "l0_naive"}
-        and not job.node.startswith("E5")
-        and (
-            job.node == "TTS-Cal"
-            or bool(job.parameters.get("controlled_replay"))
-            or _concurrency(job) == 1
-        )
-    )
+    return job.method in {"tts", "l0_naive"}
 
 
 def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dict[str, Any] | None:

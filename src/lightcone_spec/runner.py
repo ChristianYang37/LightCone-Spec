@@ -425,11 +425,7 @@ def _cell_concurrency(job: Job) -> int:
 
 
 def _uses_request_scope(job: Job) -> bool:
-    if job.method not in {"tts", "l0_naive"}:
-        return False
-    if job.parameters.get("controlled_replay") or job.node == "TTS-Cal":
-        return True
-    return not job.node.startswith("E5") and _cell_concurrency(job) == 1
+    return job.method in {"tts", "l0_naive"}
 
 
 def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -> tuple[int, ...]:
@@ -1187,7 +1183,7 @@ def _execute_cell(
                         max_new_tokens=max_new_tokens,
                         seed=seed,
                         routing_keys=_routing_keys(config, runtime_job, len(prompts)),
-                        max_in_flight=concurrency,
+                        max_in_flight=1 if request_scoped else concurrency,
                         duration_seconds=E5_HEADLINE_SECONDS,
                         deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                         request_id_prefix=f"{job.job_id}-closed-loop",
@@ -1231,7 +1227,7 @@ def _execute_cell(
                         f"{job.job_id}-scheduled-{index:05d}"
                         for index in range(len(prompts))
                     ),
-                    max_in_flight=256,
+                    max_in_flight=1 if request_scoped else 256,
                     deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     drain_seconds=E5_DRAIN_SECONDS,
                 )

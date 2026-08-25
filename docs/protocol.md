@@ -51,12 +51,14 @@ pair interference exceeds 1%.
 
 E1 first runs all 68 rows at `c1`, then probes the E3a load grid for the anchors
 and two-optimizer Pareto union. Its highest common safe load caps E2 and is
-reused by E3/E4. TTS uses the fixed paper recipe: Adam, zero weight decay, no gradient clipping,
+reused by E3/E4. TTS uses the paper recipe: Adam, zero weight decay, no gradient clipping,
 the complete drafter, one update step, latest-round-only teacher rows,
-and `exp(-1/7)` positional decay. TTS-Cal and single-request mechanism rows
-reset per request; registered multi-request blocks reset once and share one cohort
-state. TTS and L0-naive share the candidate update and differ only in
-publication policy. TTS-Cal, E1, E2, E1a, and deployment-width selection use
+and `exp(-1/7)` positional decay. TTS resets between requests as specified by
+the source paper, so a server has one adaptive TTS request owner. Registered
+load is still offered to TTS and excess requests remain visible as queueing or
+non-admission. L0-naive uses the same request lifetime and candidate update but
+publishes first-ready, isolating publication policy.
+TTS-Cal, E1, E2, E1a, and deployment-width selection use
 the fixed 76-prompt CalibrationMix. E2
 uses the registered `(B,L)` points as closed-loop concurrency and generated
 history length. E1a selects one confidence weight from `0.05/0.1/0.25/0.5` on

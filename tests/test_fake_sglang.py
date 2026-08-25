@@ -42,6 +42,7 @@ from lightcone_spec.runner import (
     _request_scope_released,
     _run_request_scoped,
     _speed_metrics,
+    _uses_request_scope,
     _validate_committed_tokens,
     _validate_greedy_verify_counts,
     _write_jsonl,
@@ -942,7 +943,7 @@ def test_cosine_horizon_and_e1a_fixed_settings():
     assert e1a["canvas_tokens"] == 8
 
 
-def test_adaptive_reset_scope_tracks_multi_request_concurrency():
+def test_tts_always_resets_between_requests():
     tts_cal = materialize("TTS-Cal")[0]
     assert adaptation_payload(tts_cal)["reset_scope"] == "request"
 
@@ -952,10 +953,21 @@ def test_adaptive_reset_scope_tracks_multi_request_concurrency():
         if job.method == "tts" and job.load == "common_load"
     )
     concurrent = e3.__class__(**{**e3.to_dict(), "load": "c8"})
-    assert adaptation_payload(concurrent)["reset_scope"] == "cohort"
+    assert adaptation_payload(concurrent)["reset_scope"] == "request"
+    assert _uses_request_scope(concurrent)
 
     single = concurrent.__class__(**{**concurrent.to_dict(), "load": "c1"})
     assert adaptation_payload(single)["reset_scope"] == "request"
+
+    l0 = concurrent.__class__(**{**concurrent.to_dict(), "method": "l0_naive"})
+    assert adaptation_payload(l0)["reset_scope"] == "request"
+    assert _uses_request_scope(l0)
+
+    lightcone = concurrent.__class__(
+        **{**concurrent.to_dict(), "method": "lightcone"}
+    )
+    assert adaptation_payload(lightcone)["reset_scope"] == "cohort"
+    assert not _uses_request_scope(lightcone)
 
 
 def test_sticky_replica_routing_is_repeatable():
