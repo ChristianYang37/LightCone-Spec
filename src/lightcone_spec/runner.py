@@ -1752,6 +1752,8 @@ def _assigned_gpu(config: ExperimentConfig, job: Job) -> int:
         return config.gpu_ids[gpu_index]
     if job.block is not None:
         return config.gpu_ids[job.block % len(config.gpu_ids)]
+    if job.parameters.get("parent_job_id"):
+        return config.gpu_ids[(job.ordinal // 1000) % len(config.gpu_ids)]
     return config.gpu_ids[job.ordinal % len(config.gpu_ids)]
 
 

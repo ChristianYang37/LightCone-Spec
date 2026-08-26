@@ -13,7 +13,7 @@ from lightcone_spec.protocol import (
     paper_plan,
     segment_count,
 )
-from lightcone_spec.runner import _assigned_gpu, _assigned_pair, _gpu_pairs
+from lightcone_spec.runner import _assigned_gpu, _assigned_pair, _gpu_pairs, _segment_jobs
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 EXPECTED = {
@@ -136,3 +136,22 @@ def test_server_reuse_and_eight_gpu_block_affinity(tmp_path: Path):
     assert {_assigned_gpu(config, job) for job in singles} == {3}
     first, second = materialize("TTS-Cal")[:2]
     assert server_session_key(first) == server_session_key(second)
+
+
+def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path / "sglang",
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python", base_port=30000),
+        protocol=ProtocolConfig(),
+    )
+    parents = materialize("E3a")[:2]
+    children = [_segment_jobs(parent) for parent in parents]
+    assert all(len({_assigned_gpu(config, child) for child in rows}) == 1 for rows in children)
+    assert {_assigned_gpu(config, rows[0]) for rows in children} == {0, 1}
