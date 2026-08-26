@@ -42,11 +42,10 @@ class ServerConfig:
 
 @dataclass(frozen=True)
 class ProtocolConfig:
-    preset: str = "paper-v1"
+    preset: str = "paper-v2"
     start_stage: str | None = None
     end_stage: str | None = None
     max_process_retries: int = 1
-    final_blocks: int | None = None
     seed: int = 0
 
 
@@ -92,9 +91,7 @@ class ExperimentConfig:
             or any(not isinstance(item, int) or item < 0 for item in raw_gpus)
             or len(set(raw_gpus)) != len(raw_gpus)
         ):
-            raise ValueError(
-                "gpu_ids must name an even number of distinct non-negative devices"
-            )
+            raise ValueError("gpu_ids must name an even number of distinct non-negative devices")
         host = server_data.get("host", "127.0.0.1")
         if not isinstance(host, str) or not host:
             raise ValueError("server.host must be text")
@@ -139,23 +136,16 @@ class ExperimentConfig:
         if server.startup_timeout_seconds < 1 or server.request_timeout_seconds < 1:
             raise ValueError("server timeouts must be positive")
         protocol = ProtocolConfig(
-            preset=str(protocol_data.get("preset", "paper-v1")),
+            preset=str(protocol_data.get("preset", "paper-v2")),
             start_stage=protocol_data.get("start_stage"),
             end_stage=protocol_data.get("end_stage"),
             max_process_retries=int(protocol_data.get("max_process_retries", 1)),
-            final_blocks=(
-                int(protocol_data["final_blocks"])
-                if protocol_data.get("final_blocks") is not None
-                else None
-            ),
             seed=int(protocol_data.get("seed", 0)),
         )
-        if protocol.preset != "paper-v1":
-            raise ValueError("only protocol preset paper-v1 is supported")
+        if protocol.preset != "paper-v2":
+            raise ValueError("only protocol preset paper-v2 is supported")
         if protocol.max_process_retries not in {0, 1}:
             raise ValueError("max_process_retries must be zero or one")
-        if protocol.final_blocks is not None and not 12 <= protocol.final_blocks <= 20:
-            raise ValueError("final_blocks must be between 12 and 20")
         from .protocol import PAPER_NODES
 
         for name, value in (
@@ -211,9 +201,7 @@ class ExperimentConfig:
                 for name, value in vars(self.server).items()
             },
             "protocol": dict(vars(self.protocol)),
-            "profiler_tools": {
-                name: str(path) for name, path in self.profiler_tools.items()
-            },
+            "profiler_tools": {name: str(path) for name, path in self.profiler_tools.items()},
         }
 
     def validate_local_paths(self) -> None:

@@ -2,12 +2,12 @@ import json
 import math
 
 import pytest
+import torch
 
 from lightcone_spec.metrics import (
     SAFETY_COUNTERS,
     benjamini_hochberg,
     block_bootstrap_interval,
-    choose_final_blocks,
     committed_goodput,
     hierarchical_request_interval,
     holm_decisions,
@@ -17,10 +17,11 @@ from lightcone_spec.metrics import (
     summarize_attempts,
     validate_scientific_metrics,
 )
-from lightcone_spec.runner import _natural_spline_fit
+from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
+from lightcone_spec.state import StateStore
 
 
-def test_goodput_bootstrap_holm_and_power():
+def test_goodput_bootstrap_and_holm():
     assert committed_goodput(200, 4.0) == 50.0
     estimate, low, high = paired_bca_interval([2, 3, 4, 5], [1, 1, 2, 3], resamples=500, seed=0)
     assert low <= estimate <= high
@@ -29,7 +30,24 @@ def test_goodput_bootstrap_holm_and_power():
     )
     assert relative[1] <= relative[0] <= relative[2]
     assert holm_decisions([0.001, 0.02, 0.8]) == (True, True, False)
-    assert choose_final_blocks([0.04, 0.04, 0.04, 0.04]) == 12
+
+
+def test_tts_source_policy_kl_has_zero_one_step_gradient():
+    source_logits = torch.tensor([0.3, -0.2, 0.7], dtype=torch.float64)
+    teacher = torch.tensor([0.1, 0.6, 0.3], dtype=torch.float64)
+    gradients = []
+    for coefficient in (0.0, 0.1, 1.0, 10.0):
+        logits = source_logits.clone().requires_grad_(True)
+        source = torch.softmax(source_logits, dim=-1)
+        target = torch.softmax(teacher, dim=-1)
+        log_q = torch.log_softmax(logits, dim=-1)
+        distillation = torch.sum(target * (torch.log(target) - log_q))
+        proximal = torch.sum(source * (torch.log(source) - log_q))
+        (distillation + coefficient * proximal).backward()
+        gradients.append(logits.grad.clone())
+    assert all(
+        torch.allclose(gradients[0], gradient, atol=1e-14, rtol=0) for gradient in gradients[1:]
+    )
 
 
 def test_safety_metrics_reject_numerical_failures():
@@ -53,16 +71,13 @@ def test_fdr_and_time_block_bootstrap():
     point, low, high = block_bootstrap_interval([10, 11, 12, 13], resamples=500)
     assert low <= point <= high
     point, low, high = hierarchical_request_interval(
-        {
-            block: [(10 + block, 1.0), (20 + block, 2.0)]
-            for block in range(4)
-        },
+        {block: [(10 + block, 1.0), (20 + block, 2.0)] for block in range(4)},
         resamples=500,
     )
     assert low <= point <= high
 
 
-def test_final_block_statistics_are_paired_and_corrected():
+def test_final_block_statistics_are_paired():
     rows = []
     for block in range(4, 16):
         for method, goodput in (("static", 100.0), ("lightcone", 104.0 + block / 100)):
@@ -82,31 +97,41 @@ def test_final_block_statistics_are_paired_and_corrected():
                 )
             )
     result = paired_block_statistics(rows)
-    assert len(result) == 1
-    assert result[0]["candidate"] == "lightcone"
-    assert result[0]["blocks"] == list(range(4, 16))
-    assert result[0]["ci95_relative_low"] > 0
-    assert result[0]["reducer"] == "paired_log_goodput_bca"
-    assert result[0]["holm_reject"] is True
+    focal = next(row for row in result if row["baseline"] == "static")
+    assert focal["candidate"] == "lightcone"
+    assert focal["blocks"] == list(range(4, 16))
+    assert focal["ci95_relative_low"] > 0
+    assert focal["reducer"] == "paired_log_goodput_bca"
+    assert focal["holm_reject"] is None
 
 
-def test_holm_only_marks_two_confirmatory_comparisons():
-    rows = []
-    for block in range(4, 16):
-        for method, goodput, slope in (
-            ("static", 100.0, 0.01),
-            ("tts", 101.0, 0.02),
-            ("l0_naive", 102.0, 0.03),
-            ("lightcone", 105.0, 0.05),
-        ):
-            rows.append(({
-                "method": method, "model": "m", "backend": "DFLASH",
-                "task": "t", "context": 4096, "load": "c1", "block": block,
-                "parameters": {},
-            }, {"goodput": goodput + block * slope, "request_count": 10}))
-    result = paired_block_statistics(rows)
-    corrected = {(row["candidate"], row["baseline"]) for row in result if row["holm_reject"] is not None}
-    assert corrected == {("lightcone", "static"), ("lightcone", "tts")}
+def test_holm_combines_only_the_three_preregistered_hypotheses(tmp_path):
+    state = StateStore(tmp_path)
+    path = tmp_path / "stages" / "E3b-final"
+    path.mkdir(parents=True)
+    rows = [
+        {
+            "candidate": "lightcone",
+            "baseline": baseline,
+            "workload": "primary_long_history",
+            "context": 32768,
+            "p_value": p_value,
+        }
+        for baseline, p_value in (("tts", 0.001), ("operational_baseline", 0.02))
+    ]
+    (path / "statistics.json").write_text(json.dumps(rows))
+    combined = _confirmatory_holm(
+        state,
+        {
+            "hypothesis": "H3",
+            "candidate": "lightcone",
+            "baseline": "operational_baseline",
+            "metric": "maximum_slo_feasible_rate",
+            "p_value": 0.8,
+        },
+    )
+    assert [row["hypothesis"] for row in combined] == ["H1", "H2", "H3"]
+    assert [row["holm_reject"] for row in combined] == [True, True, False]
 
 
 def test_pairing_uses_block_stimulus_but_ignores_runtime_backend_and_width():
@@ -138,9 +163,7 @@ def test_pairing_uses_block_stimulus_but_ignores_runtime_backend_and_width():
                 )
             )
     result = paired_block_statistics(rows)
-    assert [(row["candidate"], row["baseline"]) for row in result] == [
-        ("lightcone", "target_only")
-    ]
+    assert [(row["candidate"], row["baseline"]) for row in result] == [("lightcone", "target_only")]
 
 
 def test_natural_spline_uses_fixed_interior_knots_and_natural_boundaries():
@@ -163,9 +186,7 @@ def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
         directory = tmp_path / f"attempt-{index:02d}"
         directory.mkdir()
         (directory / "config.json").write_text(json.dumps({"method": "static"}))
-        (directory / "metrics.json").write_text(
-            json.dumps({"parameter_layout": layout})
-        )
+        (directory / "metrics.json").write_text(json.dumps({"parameter_layout": layout}))
         attempts.append(directory)
     output = tmp_path / "summary"
     summarize_attempts(attempts, output)

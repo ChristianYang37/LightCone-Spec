@@ -99,12 +99,8 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "optimizer": optimizer,
         "stride": stride,
         "canvas_tokens": _speculative_canvas(job),
-        "loss_position_decay": float(
-            chosen.get("loss_position_decay", math.exp(-1.0 / 7.0))
-        ),
-        "teacher_row_policy": chosen.get(
-            "teacher_row_policy", "latest_update_round_only"
-        ),
+        "loss_position_decay": float(chosen.get("loss_position_decay", math.exp(-1.0 / 7.0))),
+        "teacher_row_policy": chosen.get("teacher_row_policy", "latest_update_round_only"),
         "extra_logical_delay": int(chosen.get("logical_delay", 0)),
         "adaptation_microbatch_size": int(chosen.get("microbatch", 1)),
         "update_coalescing": coalescing,
@@ -122,9 +118,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     if job.node == "E1a" and chosen.get("verification") == "fixed_budget":
         payload["fixed_total_token_budget"] = 8
     if job.node == "E1a":
-        payload["confidence_loss_weight"] = float(
-            chosen.get("confidence_loss_weight", 0.1)
-        )
+        payload["confidence_loss_weight"] = float(chosen.get("confidence_loss_weight", 0.1))
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
             "projection_radius": chosen.get("projection_radius"),
@@ -231,11 +225,12 @@ def server_command(
         if job.backend == "NEXTN" and adaptation["weight_update_mode"] == "lora":
             reserve_mb = min(reserve_mb, 8192)
         adaptation_path = output_dir / "adaptation.json"
-        adaptation_path.write_text(json.dumps(adaptation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        adaptation_path.write_text(
+            json.dumps(adaptation, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         telemetry_path = (
             Path("/dev/full")
-            if job.parameters.get("failure")
-            in {"telemetry_backpressure", "disk_quota"}
+            if job.parameters.get("failure") in {"telemetry_backpressure", "disk_quota"}
             else output_dir / "cycles.jsonl"
         )
         argv.extend(
@@ -274,9 +269,7 @@ def server_command(
     return argv
 
 
-def server_session_key(
-    job: Job, selection: dict[str, Any] | None = None
-) -> tuple[object, ...]:
+def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tuple[object, ...]:
     adaptation = adaptation_payload(job, selection)
     if adaptation is None:
         adaptation_layout: tuple[object, ...] = (
@@ -286,9 +279,7 @@ def server_session_key(
         optimizer = adaptation["optimizer"]
         online = adaptation.get("online_spec") or {}
         optimizer_state = (
-            "two_moment"
-            if optimizer["name"] in {"adam", "adamw", "chronobelief"}
-            else "one_moment"
+            "two_moment" if optimizer["name"] in {"adam", "adamw", "chronobelief"} else "one_moment"
         )
         adaptation_layout = (
             "online" if str(adaptation["method"]).startswith("onlinespec_") else "adaptive",
@@ -313,8 +304,7 @@ def server_session_key(
         job.parameters.get("profiler"),
         (
             "full-device"
-            if job.parameters.get("failure")
-            in {"telemetry_backpressure", "disk_quota"}
+            if job.parameters.get("failure") in {"telemetry_backpressure", "disk_quota"}
             else "normal-device"
         ),
         *adaptation_layout,
@@ -334,6 +324,9 @@ def _server_capacity(job: Job, adaptation: dict[str, Any] | None) -> int:
         return 1
     if job.parameters.get("exactness_bootstrap"):
         return 1
+    bundled = job.parameters.get("server_capacity")
+    if isinstance(bundled, int) and bundled > 0:
+        return bundled
     return _concurrency(job)
 
 
@@ -419,9 +412,7 @@ class ServerProcess:
         self.log = None
         self.sampler = GpuSampler(gpus, output_dir / "gpu.csv")
 
-    def configure(
-        self, job: Job, selection: dict[str, Any] | None
-    ) -> SGLangClient:
+    def configure(self, job: Job, selection: dict[str, Any] | None) -> SGLangClient:
         if (
             self.process is None
             or self.process.poll() is not None
@@ -513,9 +504,7 @@ class ServerProcess:
         self.sampler = GpuSampler(self.gpus, self.output_dir / "gpu.csv")
         return self.start()
 
-    def restart_for(
-        self, job: Job, selection: dict[str, Any] | None
-    ) -> SGLangClient:
+    def restart_for(self, job: Job, selection: dict[str, Any] | None) -> SGLangClient:
         self.stop()
         self.job = job
         self.adaptation = adaptation_payload(job, selection)
@@ -577,9 +566,7 @@ class StickyReplicaClient:
     def replica_index(self, routing_key: str | None) -> int:
         if routing_key is None:
             return 0
-        return sum(
-            (offset + 1) * ord(value) for offset, value in enumerate(routing_key)
-        ) % 2
+        return sum((offset + 1) * ord(value) for offset, value in enumerate(routing_key)) % 2
 
     def _replica(self, routing_key: str | None) -> SGLangClient:
         return self.replicas[self.replica_index(routing_key)]
@@ -607,16 +594,16 @@ class StickyReplicaClient:
         for replica in self.replicas:
             info = replica.server_info()
             nested = info.get("internal_states")
-            states.extend(nested if isinstance(nested, list) else [info.get("internal_state", info)])
+            states.extend(
+                nested if isinstance(nested, list) else [info.get("internal_state", info)]
+            )
         return {"internal_states": states}
 
     def tokenize(self, text: str) -> tuple[int, ...]:
         return self.replicas[0].tokenize(text)
 
     def run_batch(self, prompts, *, routing_key=None, **kwargs):
-        return self._replica(routing_key).run_batch(
-            prompts, routing_key=routing_key, **kwargs
-        )
+        return self._replica(routing_key).run_batch(prompts, routing_key=routing_key, **kwargs)
 
     def abort(self, request_id: str) -> None:
         for replica in self.replicas:
@@ -676,9 +663,7 @@ class StickyReplicaClient:
         with ThreadPoolExecutor(max_workers=2) as pool:
             runs = tuple(
                 future.result()
-                for future in (
-                    pool.submit(run_group, index) for index in range(2) if groups[index]
-                )
+                for future in (pool.submit(run_group, index) for index in range(2) if groups[index])
             )
         results = sorted(
             (result for run in runs for result in run.results),
@@ -705,8 +690,17 @@ class ReplicaServerProcess:
         second_dir = output_dir / "replica-1"
         second_dir.mkdir(parents=True, exist_ok=True)
         self.replicas = (
-            ServerProcess(config, job, gpus=(gpus[0],), port=port, output_dir=output_dir, selection=selection),
-            ServerProcess(config, job, gpus=(gpus[1],), port=port + 1, output_dir=second_dir, selection=selection),
+            ServerProcess(
+                config, job, gpus=(gpus[0],), port=port, output_dir=output_dir, selection=selection
+            ),
+            ServerProcess(
+                config,
+                job,
+                gpus=(gpus[1],),
+                port=port + 1,
+                output_dir=second_dir,
+                selection=selection,
+            ),
         )
         self.output_dir = output_dir
 

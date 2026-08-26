@@ -50,7 +50,7 @@ server:
   max_new_tokens: 256
   warmup_requests: 1
 protocol:
-  preset: paper-v1
+  preset: paper-v2
   max_process_retries: 1
   seed: 0
 profiler_tools:

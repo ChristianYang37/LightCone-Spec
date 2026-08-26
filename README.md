@@ -64,11 +64,15 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The registered row counts are 10, 268, 288, 68, 424, 109, 31, 25, 48, 96,
-3, 1360, `340N`, 116, 2064, `450N`, 282, `70N`, `108+239P`, `32V`, and
-`8VN`, where the four excluded E3b pilot blocks select one global `N` in
-12--20, `V` is the number of executable E0 model/backend/task combinations,
-and `P` is the number of distinct valid model/backend pairs.
+The `paper-v2` preset registers 2,317 static jobs and at most 2,385 runner jobs
+after bounded finalist and load-selection work. A job is one
+`method × block × compatible server layout`; its `segments` cover the
+registered contexts, loads, traces, or workload pools without reloading the
+same model. The per-node job counts are 10, 140, 72 (at most 108 after TTS
+finalist confirmation), 68 (at most 100 after Pareto confirmation), 424, 109,
+31, 25, 48, 168, 3, 20, 132, 141, 53, 160, 22, 60, 287, 86, and 258.
+Primary E3b/E5 conclusions use 12 clean-server blocks; E4/E6/E0 secondary
+evidence uses six. There is no global power-selected repeat count.
 
 The runner preserves the paper gates that matter scientifically: proposal
 version consistency, controlled TTS/L0 candidate replay, finite optimization

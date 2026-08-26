@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import itertools
 import json
 import math
 import os
@@ -37,8 +38,9 @@ from .metrics import (
     SAFETY_COUNTERS,
     benjamini_hochberg,
     block_bootstrap_interval,
-    choose_final_blocks,
     committed_goodput,
+    holm_decisions,
+    paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
     summarize_attempts,
@@ -57,7 +59,7 @@ from .protocol import (
     GEOMETRY_GENERATION_TOKENS,
     MAX_E2_GEOMETRIES,
     PAPER_NODES,
-    TTS_GENERATION_TOKENS,
+    PRIMARY_BLOCKS,
     Job,
     e2_candidates,
     materialize,
@@ -98,11 +100,15 @@ def _capacity_infeasible(
         with server_log.open("rb") as stream:
             stream.seek(offset)
             message += stream.read().decode("utf-8", errors="replace")
-    return isinstance(error, MemoryError) or re.search(
-        r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve",
-        message,
-        flags=re.IGNORECASE,
-    ) is not None
+    return (
+        isinstance(error, MemoryError)
+        or re.search(
+            r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve",
+            message,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _exactness_bootstrap(job: Job) -> Job:
@@ -159,7 +165,11 @@ def _speed_metrics(
     unmeasured: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     states = server_info.get("internal_states")
-    rank_states = states if isinstance(states, list) and states else [server_info.get("internal_state", server_info)]
+    rank_states = (
+        states
+        if isinstance(states, list) and states
+        else [server_info.get("internal_state", server_info)]
+    )
     rank_metrics: list[dict[str, Any]] = []
     for state in rank_states:
         if not isinstance(state, dict):
@@ -385,7 +395,10 @@ def _e5_poisson_offsets(
     if not job.node.startswith("E5") or not isinstance(registered, str):
         return None
     if job.parameters.get("p99_extension"):
-        rate = float(job.parameters["arrival_rate"])
+        extension = state.selection("e5_p99_extensions", {}).get(f"{job.backend}|{job.method}")
+        if not isinstance(extension, dict):
+            raise ScientificFailure("E5 p99 extension rate is not frozen")
+        rate = float(extension["arrival_rate"])
         rng = np.random.default_rng(config.protocol.seed + (job.block or 0) * 1000)
         gaps = rng.exponential(1.0 / rate, size=E5_P99_EXTENSION_REQUESTS - 1)
         return tuple(np.concatenate(([0.0], np.cumsum(gaps))).tolist())
@@ -424,7 +437,9 @@ def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int
     elif load.startswith("closed_loop_c"):
         concurrency = int(load.removeprefix("closed_loop_c"))
     offsets = _e5_poisson_offsets(config, state, job)
-    return len(offsets) if offsets is not None else max(config.server.requests_per_cell, concurrency)
+    return (
+        len(offsets) if offsets is not None else max(config.server.requests_per_cell, concurrency)
+    )
 
 
 def _cell_concurrency(job: Job) -> int:
@@ -482,12 +497,9 @@ def _cell_inputs(
         pool_prompts = prompts
     else:
         pool_prompts = tuple(
-            str(row["prompt"])
-            for row in load_prompt_pool(config.dataset_path(dataset_key))
+            str(row["prompt"]) for row in load_prompt_pool(config.dataset_path(dataset_key))
         )
-    filler = tuple(
-        token for prompt in pool_prompts for token in client.tokenize(prompt + "\n")
-    )
+    filler = tuple(token for prompt in pool_prompts for token in client.tokenize(prompt + "\n"))
     regime = str(job.parameters.get("regime", "long_input_short_output"))
     if regime == "short_input_long_generation":
         inputs = tuple(tokens[-min(len(tokens), 128) :] for tokens in tokenized)
@@ -499,9 +511,7 @@ def _cell_inputs(
         prompt_length = max(1, job.context - max_new_tokens)
         if regime == "multi_turn_shared_prefix":
             shared_length = prompt_length // 2
-            shared = (filler * ((shared_length + len(filler) - 1) // len(filler)))[
-                :shared_length
-            ]
+            shared = (filler * ((shared_length + len(filler) - 1) // len(filler)))[:shared_length]
             inputs = tuple(
                 shared + _fit_prompt(tokens, filler, prompt_length - shared_length)
                 for tokens in tokenized
@@ -607,7 +617,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
     by_method: dict[str, list[tuple[float, int]]] = {}
-    for config, metrics in _metric_rows(state, job.node):
+    rows = _metric_rows(state, job.node)
+    rows.extend(_metric_rows(state, f"{job.node}-segments"))
+    for config, metrics in rows:
         load = config.get("load")
         if (
             config.get("block") != job.block
@@ -623,9 +635,7 @@ def _e5_reference(state: StateStore, job: Job) -> tuple[float, int]:
             (float(metrics["request_rate"]), concurrency)
         )
     if set(by_method) != {"target_only", "static"}:
-        raise ScientificFailure(
-            f"{job.node} lacks SLO-feasible Target-only/Static load anchors"
-        )
+        raise ScientificFailure(f"{job.node} lacks SLO-feasible Target-only/Static load anchors")
     per_method = [max(rows) for rows in by_method.values()]
     return max(per_method, key=lambda row: row[0])
 
@@ -677,17 +687,40 @@ def _runtime_job(state: StateStore, job: Job) -> Job:
             if job.parameters["width_panel"] == "deployment_optimal":
                 widths = state.selection("deployment_widths", None)
                 if not isinstance(widths, dict) or job.method not in widths:
-                    raise ScientificFailure(
-                        f"deployment width is not frozen for {job.method}"
-                    )
+                    raise ScientificFailure(f"deployment width is not frozen for {job.method}")
                 width = int(widths[job.method])
             else:
                 width = int(capacity.get("width", 16))
         job = replace(job, width=width)
+    if job.parameters.get("p99_extension"):
+        extension = state.selection("e5_p99_extensions", {}).get(f"{job.backend}|{job.method}")
+        if not isinstance(extension, dict):
+            raise ScientificFailure("E5 p99 extension configuration is not frozen")
+        return replace(
+            job,
+            load=str(extension["load"]),
+            parameters={
+                **job.parameters,
+                "arrival_rate": float(extension["arrival_rate"]),
+                "registered_load": "p99_boundary",
+            },
+        )
     if job.load not in {"common_load", "common_slo_load"}:
-        if job.node.startswith("E5") and isinstance(job.load, str) and (
-            job.load.startswith("lambda_")
-            or job.load in {"immediate_burst", "burstgpt_shape", "moderate_soak", "saturation_soak", "overload_soak", "saturation"}
+        if (
+            job.node.startswith("E5")
+            and isinstance(job.load, str)
+            and (
+                job.load.startswith("lambda_")
+                or job.load
+                in {
+                    "immediate_burst",
+                    "burstgpt_shape",
+                    "moderate_soak",
+                    "saturation_soak",
+                    "overload_soak",
+                    "saturation",
+                }
+            )
         ):
             _, concurrency = _e5_reference(state, job)
             return replace(
@@ -707,10 +740,7 @@ def _runtime_job(state: StateStore, job: Job) -> Job:
         )
     capacity = state.selection("e3a", None)
     common = state.selection("e1_common_load", None)
-    if (
-        not isinstance(capacity, dict)
-        or not isinstance(common, str)
-    ):
+    if not isinstance(capacity, dict) or not isinstance(common, str):
         raise ScientificFailure("common-load cell lacks E1/E3a selections")
     width = job.width
     if job.method != "target_only" and width is None:
@@ -774,21 +804,20 @@ def _slo_metrics(
     outcome_rows = tuple(outcomes)
     passed = 0
     for result in rows:
-        ttft_limit = 2000 if result.input_tokens < 4096 else 5000 if result.input_tokens < 16384 else 10000
+        ttft_limit = (
+            2000 if result.input_tokens < 4096 else 5000 if result.input_tokens < 16384 else 10000
+        )
         itl_p99 = float(np.quantile(result.inter_token_ms or (0.0,), 0.99))
         passed += result.ttft_ms <= ttft_limit and itl_p99 <= 100
     offered = len(outcome_rows)
     completed = sum(row["status"] == "completed" for row in outcome_rows)
     errors = sum(
-        row["status"] in {"error", "timed_out", "cancelled", "unfinished"}
-        for row in outcome_rows
+        row["status"] in {"error", "timed_out", "cancelled", "unfinished"} for row in outcome_rows
     )
     pass_rate = passed / offered if offered else 0.0
     completion_rate = completed / offered if offered else 0.0
     error_rate = errors / offered if offered else 1.0
-    return pass_rate, (
-        pass_rate >= 0.99 and error_rate <= 0.001 and completion_rate >= 0.999
-    )
+    return pass_rate, (pass_rate >= 0.99 and error_rate <= 0.001 and completion_rate >= 0.999)
 
 
 def _exercise_request_fault(client, failure: str, prompt, max_new_tokens: int) -> bool:
@@ -885,8 +914,7 @@ def _run_multi_turn(
                 max_new_tokens=budget,
                 seed=seed + turn,
                 request_ids=tuple(
-                    f"multi-turn-{turn}-{index:05d}"
-                    for index in range(len(histories))
+                    f"multi-turn-{turn}-{index:05d}" for index in range(len(histories))
                 ),
                 max_in_flight=max_in_flight,
             )
@@ -904,9 +932,7 @@ def _run_multi_turn(
         remaining -= budget
     results = []
     for index, rows in enumerate(turns_by_request):
-        timestamps = tuple(
-            value for row in rows for value in row.native_token_timestamps_ns
-        )
+        timestamps = tuple(value for row in rows for value in row.native_token_timestamps_ns)
         results.append(
             GenerationResult(
                 request_id=f"multi-turn-{index:05d}",
@@ -914,8 +940,7 @@ def _run_multi_turn(
                 completion_tokens=sum(row.completion_tokens for row in rows),
                 ttft_ms=rows[0].ttft_ms,
                 inter_token_ms=tuple(
-                    (right - left) / 1_000_000
-                    for left, right in zip(timestamps, timestamps[1:])
+                    (right - left) / 1_000_000 for left, right in zip(timestamps, timestamps[1:])
                 ),
                 elapsed_seconds=sum(row.elapsed_seconds for row in rows),
                 stop_reason=rows[-1].stop_reason,
@@ -983,9 +1008,7 @@ def _execute_cell(
                 source = session_files[key]
                 session_offsets[key] = source.stat().st_size if source.exists() else 0
         if server.process is not None:
-            (output_dir / "server.pid").write_text(
-                f"{server.process.pid}\n", encoding="utf-8"
-            )
+            (output_dir / "server.pid").write_text(f"{server.process.pid}\n", encoding="utf-8")
         offered = 0
         try:
             runtime_job = _runtime_job(state, job)
@@ -995,36 +1018,27 @@ def _execute_cell(
             _write_json(output_dir / "config.json", raw_config)
             bootstrap_job = _exactness_bootstrap(runtime_job)
             client = server.configure(bootstrap_job, selection)
-            prompts, max_new_tokens, workload = _cell_inputs(
-                config, state, client, job
-            )
+            prompts, max_new_tokens, workload = _cell_inputs(config, state, client, job)
             offered = len(prompts)
             exactness_rows: list[dict[str, object]] = []
             exactness_evidence: dict[str, object] | None = None
             if bootstrap_job is not runtime_job:
                 pair_seed = config.protocol.seed + (job.block or 0)
-                bootstrap_topology = str(
-                    bootstrap_job.parameters.get("topology", "tp1_dp1")
-                )
-                bootstrap_before = _speed_metrics(
-                    client.server_info(), bootstrap_topology
-                )
+                bootstrap_topology = str(bootstrap_job.parameters.get("topology", "tp1_dp1"))
+                bootstrap_before = _speed_metrics(client.server_info(), bootstrap_topology)
                 verified, _ = client.run_batch(
                     prompts[:4],
                     max_new_tokens=max_new_tokens,
                     seed=pair_seed,
                     request_id_prefix="controlled-speculative-verify",
                 )
-                bootstrap_after = _speed_metrics(
-                    client.server_info(), bootstrap_topology
-                )
+                bootstrap_after = _speed_metrics(client.server_info(), bootstrap_topology)
                 bootstrap_committed = int(bootstrap_after["committed_tokens"]) - int(
                     bootstrap_before["committed_tokens"]
                 )
                 _validate_committed_tokens(verified, bootstrap_committed)
                 bootstrap_safety = {
-                    counter: int(bootstrap_after[counter])
-                    - int(bootstrap_before[counter])
+                    counter: int(bootstrap_after[counter]) - int(bootstrap_before[counter])
                     for counter in SAFETY_COUNTERS
                 }
                 if any(bootstrap_safety.values()):
@@ -1034,9 +1048,9 @@ def _execute_cell(
                 checked_tokens = int(bootstrap_after.get("greedy_token_checks", 0)) - int(
                     bootstrap_before.get("greedy_token_checks", 0)
                 )
-                mismatched_tokens = int(
-                    bootstrap_after.get("greedy_token_mismatches", 0)
-                ) - int(bootstrap_before.get("greedy_token_mismatches", 0))
+                mismatched_tokens = int(bootstrap_after.get("greedy_token_mismatches", 0)) - int(
+                    bootstrap_before.get("greedy_token_mismatches", 0)
+                )
                 coverage = _validate_greedy_verify_counts(
                     bootstrap_committed,
                     checked_tokens,
@@ -1089,9 +1103,7 @@ def _execute_cell(
             static_interface_passed = False
             if runtime_job.parameters.get("probe"):
                 probe_budget = (
-                    max_new_tokens[0]
-                    if isinstance(max_new_tokens, tuple)
-                    else max_new_tokens
+                    max_new_tokens[0] if isinstance(max_new_tokens, tuple) else max_new_tokens
                 )
                 static_rows, _ = client.run_batch(
                     prompts[:1],
@@ -1117,14 +1129,10 @@ def _execute_cell(
                 "controlled_replay"
             ):
                 warmup_budget = (
-                    max_new_tokens[0]
-                    if isinstance(max_new_tokens, tuple)
-                    else max_new_tokens
+                    max_new_tokens[0] if isinstance(max_new_tokens, tuple) else max_new_tokens
                 )
                 warmup_deadline = (
-                    time.monotonic() + E5_WARMUP_SECONDS
-                    if job.node.startswith("E5")
-                    else None
+                    time.monotonic() + E5_WARMUP_SECONDS if job.node.startswith("E5") else None
                 )
                 warmup_index = 0
                 while True:
@@ -1154,9 +1162,7 @@ def _execute_cell(
                     client,
                     failure,
                     prompts[0],
-                    max(max_new_tokens)
-                    if isinstance(max_new_tokens, tuple)
-                    else max_new_tokens,
+                    max(max_new_tokens) if isinstance(max_new_tokens, tuple) else max_new_tokens,
                 )
             topology = str(runtime_job.parameters.get("topology", "tp1_dp1"))
             profiler = runtime_job.parameters.get("profiler")
@@ -1213,8 +1219,7 @@ def _execute_cell(
                     {"policy": "tts", **result.to_dict()} for result in tts_results
                 )
                 controlled_rows.extend(
-                    {"policy": "l0_naive", **result.to_dict()}
-                    for result in l0_results
+                    {"policy": "l0_naive", **result.to_dict()} for result in l0_results
                 )
             elif runtime_job.parameters.get("regime") == "multi_turn_shared_prefix":
                 if arrivals is not None:
@@ -1241,9 +1246,7 @@ def _execute_cell(
                         request_id_prefix=f"{job.job_id}-closed-loop",
                     )
                     results, elapsed = scheduled.results, scheduled.elapsed_seconds
-                    if any(
-                        outcome.status == "error" for outcome in scheduled.outcomes
-                    ):
+                    if any(outcome.status == "error" for outcome in scheduled.outcomes):
                         raise RuntimeError("closed-loop request failed")
                 elif request_scoped:
                     results, elapsed = _run_request_scoped(
@@ -1261,8 +1264,7 @@ def _execute_cell(
                         seed=seed,
                         routing_keys=_routing_keys(config, runtime_job, len(prompts)),
                         request_ids=tuple(
-                            f"{job.job_id}-measure-{index:05d}"
-                            for index in range(len(prompts))
+                            f"{job.job_id}-measure-{index:05d}" for index in range(len(prompts))
                         ),
                         max_in_flight=concurrency,
                         deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
@@ -1276,8 +1278,7 @@ def _execute_cell(
                     seed=config.protocol.seed + (job.block or 0),
                     routing_keys=_routing_keys(config, runtime_job, len(prompts)),
                     request_ids=tuple(
-                        f"{job.job_id}-scheduled-{index:05d}"
-                        for index in range(len(prompts))
+                        f"{job.job_id}-scheduled-{index:05d}" for index in range(len(prompts))
                     ),
                     max_in_flight=1 if request_scoped else 256,
                     deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
@@ -1298,8 +1299,7 @@ def _execute_cell(
                     request_id_prefix="controlled-target",
                 )
                 controlled_rows = [
-                    {"policy": "target_only", **result.to_dict()}
-                    for result in controlled
+                    {"policy": "target_only", **result.to_dict()} for result in controlled
                 ]
             request_rows = [_request_metrics(result) for result in results]
             outcome_rows = (
@@ -1325,23 +1325,15 @@ def _execute_cell(
             output_tokens = _validate_committed_tokens(results, committed)
             peak_hbm = int(after["peak_hbm_bytes"])
             reserved_hbm = int(after["peak_hbm_reserved_bytes"])
-            nvml_hbm = _peak_hbm_from_csv(
-                server.output_dir / "gpu.csv", session_offsets["gpu.csv"]
-            )
-            energy_mj = _energy_from_csv(
-                server.output_dir / "gpu.csv", session_offsets["gpu.csv"]
-            )
+            nvml_hbm = _peak_hbm_from_csv(server.output_dir / "gpu.csv", session_offsets["gpu.csv"])
+            energy_mj = _energy_from_csv(server.output_dir / "gpu.csv", session_offsets["gpu.csv"])
             kv_capacity = after.get("kv_token_capacity")
-            native_intervals = [
-                value for result in results for value in result.inter_token_ms
-            ]
-            native_itl = (
-                float(np.quantile(native_intervals, 0.99))
-                if native_intervals
-                else 0.0
-            )
+            native_intervals = [value for result in results for value in result.inter_token_ms]
+            native_itl = float(np.quantile(native_intervals, 0.99)) if native_intervals else 0.0
             if peak_hbm <= 0 or not isinstance(kv_capacity, (int, float)) or kv_capacity <= 0:
-                raise ScientificFailure("patched runtime did not report positive HBM and KV capacity")
+                raise ScientificFailure(
+                    "patched runtime did not report positive HBM and KV capacity"
+                )
             if (
                 not isinstance(native_itl, (int, float))
                 or isinstance(native_itl, bool)
@@ -1505,8 +1497,7 @@ def _execute_cell(
                 )
             if (
                 job.parameters.get("workload") != "failure_injection"
-                and runtime_job.method
-                in {"tts", "l0_naive", "lightcone", "lightcone_candidate"}
+                and runtime_job.method in {"tts", "l0_naive", "lightcone", "lightcone_candidate"}
                 and metrics.get("updates_published", 0)
                 < int(job.parameters.get("minimum_updates", 1))
             ):
@@ -1521,8 +1512,7 @@ def _execute_cell(
             if job.parameters.get("workload") != "failure_injection":
                 validate_scientific_metrics(metrics)
             elif not (
-                metrics.get("recovery_health_passed")
-                and metrics.get("expected_action_passed")
+                metrics.get("recovery_health_passed") and metrics.get("expected_action_passed")
             ):
                 raise ScientificFailure("fault diagnostic did not complete its expected action")
             _write_json(output_dir / "metrics.json", metrics)
@@ -1612,8 +1602,7 @@ def _execute_cell(
                 return
             retry = (
                 _retryable_process_error(error)
-                and state.failed_attempts(job.job_id)
-                < config.protocol.max_process_retries
+                and state.failed_attempts(job.job_id) < config.protocol.max_process_retries
             )
             _write_json(
                 output_dir / "metrics.json",
@@ -1665,7 +1654,13 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
             selected.update(parameterization="lora", rank=8, scope="all")
         return selected
     if job.node.startswith("E1a") and job.method == "lightcone_candidate":
-        selected = dict(state.selection("lightcone_recipe", {}))
+        finalists = state.selection("e1a_finalists", [])
+        slot = job.parameters.get("finalist_slot")
+        selected = (
+            dict(finalists[int(slot)])
+            if isinstance(slot, int) and slot < len(finalists)
+            else dict(state.selection("lightcone_recipe", {}))
+        )
         weight = state.selection("dspark_confidence_weight", None)
         if isinstance(weight, (int, float)):
             selected["confidence_loss_weight"] = float(weight)
@@ -1767,9 +1762,7 @@ def _select_pair_parallelism(state: StateStore, node: str) -> dict[str, Any]:
                 "goodput": float(metrics["goodput"]),
                 "itl": float(metrics["itl_p99_ms"]),
             }
-    pairs = [
-        rows for rows in timings.values() if {"isolated", "concurrent"} <= rows.keys()
-    ]
+    pairs = [rows for rows in timings.values() if {"isolated", "concurrent"} <= rows.keys()]
     intervals = {}
     if len(pairs) >= 3:
         for metric in ("goodput", "itl"):
@@ -1778,10 +1771,7 @@ def _select_pair_parallelism(state: StateStore, node: str) -> dict[str, Any]:
             intervals[metric] = paired_relative_bca_interval(candidate, baseline)
     return {
         "enabled": len(pairs) == len(timings) >= 3
-        and all(
-            abs(point) <= 0.01 and low <= 0 <= high
-            for point, low, high in intervals.values()
-        ),
+        and all(abs(point) <= 0.01 and low <= 0 <= high for point, low, high in intervals.values()),
         "paired_relative_bca": intervals,
     }
 
@@ -1838,88 +1828,55 @@ def _complete_infeasible_startup(
     state.complete(job.job_id, attempt)
 
 
-def _confidence_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
-    common = state.selection("e1_common_load", None)
-    if not isinstance(common, str):
-        raise ScientificFailure("E1a confidence calibration lacks E1 common load")
-    return tuple(
-        Job(
-            job_id=f"e1a-confidence-weight-{str(weight).replace('.', 'p')}",
-            node="E1a-confidence-calibration",
-            ordinal=index,
-            method="lightcone_candidate",
-            model="Qwen/Qwen3-8B",
-            backend="DSPARK",
-            task="CalibrationMix",
-            context=40928,
-            load=common,
-            width=16,
-            parameters={
-                "scope": "last5_native_heads",
-                "parameterization": "full",
-                "rank": None,
-                "verification": "native_scheduler",
-                "confidence_loss_weight": weight,
-                "regime": "short_input_long_generation",
-                "generation_tokens": TTS_GENERATION_TOKENS,
-                "workload": "excluded_confidence_calibration",
-            },
-        )
-        for index, weight in enumerate(CONFIDENCE_WEIGHTS)
-    )
-
-
 def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
     geometries = _rank_e1_geometries(state)
     if not geometries:
         raise ScientificFailure("E1 reference screen has no two-anchor Pareto geometry")
+    segments = [{"load": f"c{value}"} for value in (1, 2, 4, 8, 16, 32, 64)]
     rows: list[Job] = []
-    ordinal = 0
-    for concurrency in (1, 2, 4, 8, 16, 32, 64):
-        load = f"c{concurrency}"
-        for method, backend in (("target_only", "NONE"), ("static", "DFLASH")):
+    for method, backend in (("target_only", "NONE"), ("static", "DFLASH")):
+        rows.append(
+            Job(
+                f"e1-load-{method}",
+                "E1-common-load",
+                len(rows),
+                method,
+                "Qwen/Qwen3-8B",
+                backend,
+                "CalibrationMix",
+                context=40928,
+                load="c1",
+                width=None if method == "target_only" else 16,
+                parameters={
+                    "regime": "long_input_short_output",
+                    "segments": segments,
+                    "workload": "excluded_common_load_probe",
+                },
+            )
+        )
+    for geometry_index, geometry in enumerate(geometries):
+        for optimizer in ("adamw", "sgdm"):
             rows.append(
                 Job(
-                    f"e1-load-{load}-{method}",
+                    f"e1-load-g{geometry_index:02d}-{optimizer}",
                     "E1-common-load",
-                    ordinal,
-                    method,
+                    len(rows),
+                    "lightcone_candidate",
                     "Qwen/Qwen3-8B",
-                    backend,
+                    "DFLASH",
                     "CalibrationMix",
                     context=40928,
-                    load=load,
-                    width=None if method == "target_only" else 16,
+                    load="c1",
+                    width=16,
                     parameters={
+                        **geometry,
+                        "optimizer": optimizer,
                         "regime": "long_input_short_output",
+                        "segments": segments,
                         "workload": "excluded_common_load_probe",
                     },
                 )
             )
-            ordinal += 1
-        for geometry_index, geometry in enumerate(geometries):
-            for optimizer in ("adamw", "sgdm"):
-                rows.append(
-                    Job(
-                        f"e1-load-{load}-g{geometry_index:02d}-{optimizer}",
-                        "E1-common-load",
-                        ordinal,
-                        "lightcone_candidate",
-                        "Qwen/Qwen3-8B",
-                        "DFLASH",
-                        "CalibrationMix",
-                        context=40928,
-                        load=load,
-                        width=16,
-                        parameters={
-                            **geometry,
-                            "optimizer": optimizer,
-                            "regime": "long_input_short_output",
-                            "workload": "excluded_common_load_probe",
-                        },
-                    )
-                )
-                ordinal += 1
     return tuple(rows)
 
 
@@ -1931,11 +1888,7 @@ def _select_e1_common_load(state: StateStore, expected_per_load: int) -> str:
         and metrics.get("feasible") is not False
         and all(metrics.get(counter, 0) == 0 for counter in SAFETY_COUNTERS)
     )
-    feasible = [
-        load
-        for load, count in counts.items()
-        if count == expected_per_load
-    ]
+    feasible = [load for load, count in counts.items() if count == expected_per_load]
     if not feasible:
         raise ScientificFailure("E1 found no common safe adaptation load")
     return max(feasible, key=lambda value: int(value.removeprefix("c")))
@@ -1955,7 +1908,9 @@ def _safe_screen_row(metrics: dict[str, Any]) -> bool:
 
 def _select_confidence_weight(state: StateStore) -> float:
     candidates = []
-    for config, metrics in _metric_rows(state, "E1a-confidence-calibration"):
+    for config, metrics in _metric_rows(state, "E1a"):
+        if config.get("parameters", {}).get("workload") != "confidence_calibration":
+            continue
         brier = metrics.get("confidence_brier")
         ece = metrics.get("confidence_ece")
         required = (
@@ -2000,34 +1955,38 @@ def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
         "multi_turn_shared_prefix": "CalibrationMix",
     }
     rows = []
-    ordinal = 0
     for method in ("static", "tts", "l0_naive", "lightcone"):
         for width in (4, 8, 16):
-            for regime, task in tasks.items():
-                rows.append(
-                    Job(
-                        f"e3-width-{method}-{width}-{regime}",
-                        "E3-width-calibration",
-                        ordinal,
-                        method,
-                        "Qwen/Qwen3-8B",
-                        "DFLASH",
-                        task,
-                        context=40928,
-                        load=common,
-                        width=width,
-                        parameters={
-                            "regime": regime,
-                            **(
-                                {"generation_tokens": GEOMETRY_GENERATION_TOKENS}
-                                if regime == "short_input_long_generation"
-                                else {}
-                            ),
-                            "workload": "excluded_deployment_width_tuning",
-                        },
-                    )
+            segments = [
+                {
+                    "task": task,
+                    "regime": regime,
+                    **(
+                        {"generation_tokens": GEOMETRY_GENERATION_TOKENS}
+                        if regime == "short_input_long_generation"
+                        else {}
+                    ),
+                }
+                for regime, task in tasks.items()
+            ]
+            rows.append(
+                Job(
+                    f"e3-width-{method}-{width}",
+                    "E3-width-calibration",
+                    len(rows),
+                    method,
+                    "Qwen/Qwen3-8B",
+                    "DFLASH",
+                    "CalibrationMix",
+                    context=40928,
+                    load=common,
+                    width=width,
+                    parameters={
+                        "segments": segments,
+                        "workload": "excluded_deployment_width_tuning",
+                    },
                 )
-                ordinal += 1
+            )
     return tuple(rows)
 
 
@@ -2035,9 +1994,7 @@ def _select_deployment_widths(state: StateStore) -> dict[str, int]:
     groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for config, metrics in _metric_rows(state, "E3-width-calibration"):
         if metrics.get("slo_pass") is True:
-            groups.setdefault((config["method"], int(config["width"])), []).append(
-                metrics
-            )
+            groups.setdefault((config["method"], int(config["width"])), []).append(metrics)
     selected = {}
     for method in ("static", "tts", "l0_naive", "lightcone"):
         candidates = []
@@ -2061,27 +2018,28 @@ def _e6_load_jobs() -> tuple[Job, ...]:
     models = ("Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.5-122B-A10B-FP8")
     roles = ("target_only", "static", "tts", "l0_naive", "lightcone")
     rows = []
-    ordinal = 0
+    segments = [{"load": f"c{value}"} for value in (1, 2, 4, 8, 16, 32, 64, 128, 256)]
     for model in models:
-        for concurrency in (1, 2, 4, 8, 16, 32, 64, 128, 256):
-            for role in roles:
-                rows.append(
-                    Job(
-                        f"e6-load-{model.rsplit('/', 1)[-1]}-c{concurrency}-{role}",
-                        "E6-common-load",
-                        ordinal,
-                        role,
-                        model,
-                        "NONE" if role == "target_only" else "NEXTN",
-                        "LiveCodeBench",
-                        context=40928,
-                        load=f"c{concurrency}",
-                        width=None if role == "target_only" else 16,
-                        gpu_count=2,
-                        parameters={"workload": "excluded_e6_common_load_probe"},
-                    )
+        for role in roles:
+            rows.append(
+                Job(
+                    f"e6-load-{model.rsplit('/', 1)[-1]}-{role}",
+                    "E6-common-load",
+                    len(rows),
+                    role,
+                    model,
+                    "NONE" if role == "target_only" else "NEXTN",
+                    "LiveCodeBench",
+                    context=40928,
+                    load="c1",
+                    width=None if role == "target_only" else 16,
+                    gpu_count=2,
+                    parameters={
+                        "segments": segments,
+                        "workload": "excluded_e6_common_load_probe",
+                    },
                 )
-                ordinal += 1
+            )
     return tuple(rows)
 
 
@@ -2136,21 +2094,14 @@ def _complete_e6_interface_rows(
         if set(modes) != {"lora", "full"}:
             raise ScientificFailure(f"{parent.job_id} lacks LoRA/Full interface results")
         supported = {
-            mode
-            for mode, (_, metrics) in modes.items()
-            if metrics.get("feasible") is not False
+            mode for mode, (_, metrics) in modes.items() if metrics.get("feasible") is not False
         }
         capabilities[parent.model] = supported
         feasible = supported == {"lora", "full"}
         if parent.job_id not in pending:
             continue
         attempt_number = state.next_attempt(parent.job_id)
-        output_dir = (
-            config.run_dir
-            / "jobs"
-            / parent.job_id
-            / f"attempt-{attempt_number:02d}"
-        )
+        output_dir = config.run_dir / "jobs" / parent.job_id / f"attempt-{attempt_number:02d}"
         output_dir.mkdir(parents=True, exist_ok=True)
         attempt = state.start(parent, _job_gpus(config, parent), output_dir)
         _write_json(output_dir / "config.json", parent.to_dict())
@@ -2185,9 +2136,7 @@ def _complete_e6_interface_rows(
     return capabilities
 
 
-def _select_e6_common_loads(
-    state: StateStore, capabilities: dict[str, set[str]]
-) -> dict[str, str]:
+def _select_e6_common_loads(state: StateStore, capabilities: dict[str, set[str]]) -> dict[str, str]:
     counts: Counter[tuple[str, str]] = Counter()
     for config, metrics in _metric_rows(state, "E6-common-load"):
         if (
@@ -2208,14 +2157,12 @@ def _select_e6_common_loads(
             if candidate == model and count == required
         ]
         if loads:
-            selected[model] = max(
-                loads, key=lambda value: int(value.removeprefix("c"))
-            )
+            selected[model] = max(loads, key=lambda value: int(value.removeprefix("c")))
     return selected
 
 
-def _e5_p99_jobs(state: StateStore) -> tuple[Job, ...]:
-    winners: dict[tuple[int, str, str], tuple[float, dict[str, Any], dict[str, Any]]] = {}
+def _select_e5_p99_extensions(state: StateStore) -> dict[str, dict[str, float | str]]:
+    winners: dict[tuple[int, str, str], tuple[float, str]] = {}
     for config, metrics in _metric_rows(state, "E5-final"):
         parameters = config.get("parameters", {})
         registered = parameters.get("registered_load")
@@ -2230,35 +2177,123 @@ def _e5_p99_jobs(state: StateStore) -> tuple[Job, ...]:
         key = (int(config["block"]), str(config["backend"]), str(config["method"]))
         rate = float(metrics["offered_rate"])
         if key not in winners or rate > winners[key][0]:
-            winners[key] = (rate, config, metrics)
-    rows = []
-    for ordinal, ((block, backend, method), (rate, config, _)) in enumerate(
-        sorted(winners.items())
-    ):
-        rows.append(
-            Job(
-                f"e5-p99-b{block:02d}-{backend.lower()}-{method}",
-                "E5-p99-extension",
-                ordinal,
-                method,
-                str(config["model"]),
-                backend,
-                str(config["task"]),
-                context=int(config["context"]),
-                load=str(config["load"]),
-                width=config.get("width"),
-                block=block,
-                gpu_count=2,
+            winners[key] = (rate, str(config["load"]))
+    selected: dict[str, dict[str, float | str]] = {}
+    for backend in ("DFLASH", "DSPARK"):
+        for method in ("static", "lightcone"):
+            rows = sorted(
+                (rate, load)
+                for (block, candidate_backend, candidate_method), (rate, load) in winners.items()
+                if candidate_backend == backend and candidate_method == method
+            )
+            if len(rows) != len(PRIMARY_BLOCKS):
+                raise ScientificFailure(
+                    f"E5 p99 extension lacks {len(PRIMARY_BLOCKS)} boundary blocks for "
+                    f"{backend}/{method}"
+                )
+            rate, load = rows[len(rows) // 2]
+            selected[f"{backend}|{method}"] = {"arrival_rate": rate, "load": load}
+    return selected
+
+
+_JOB_FIELDS = {
+    "method",
+    "model",
+    "backend",
+    "task",
+    "context",
+    "load",
+    "width",
+    "block",
+    "gpu_count",
+}
+
+
+def _segment_jobs(parent: Job) -> tuple[Job, ...]:
+    raw_segments = parent.parameters.get("segments")
+    if not isinstance(raw_segments, list):
+        return ()
+    base_parameters = {key: value for key, value in parent.parameters.items() if key != "segments"}
+    capacities = []
+    for row in raw_segments:
+        load = row.get("load", parent.load)
+        if isinstance(load, str) and load.startswith("c") and load[1:].isdigit():
+            capacities.append(int(load[1:]))
+        elif isinstance(load, str) and load.startswith("closed_loop_c"):
+            capacities.append(int(load.removeprefix("closed_loop_c")))
+    if capacities:
+        base_parameters["server_capacity"] = max(capacities)
+    children = []
+    for index, raw in enumerate(raw_segments):
+        segment = dict(raw)
+        fields = {key: segment.pop(key) for key in tuple(segment) if key in _JOB_FIELDS}
+        children.append(
+            replace(
+                parent,
+                job_id=f"{parent.job_id}__segment-{index:03d}",
+                ordinal=parent.ordinal * 1000 + index,
                 parameters={
-                    **config["parameters"],
-                    "registered_load": config["parameters"]["registered_load"],
-                    "arrival_rate": rate,
-                    "p99_extension": True,
-                    "workload": "production_crossover",
+                    **base_parameters,
+                    **segment,
+                    "parent_job_id": parent.job_id,
+                    "segment_index": index,
                 },
+                **fields,
             )
         )
-    return tuple(rows)
+    return tuple(children)
+
+
+def _complete_segment_parent(
+    config: ExperimentConfig,
+    state: StateStore,
+    parent: Job,
+    children: tuple[Job, ...],
+) -> None:
+    if parent.job_id not in {job.job_id for job in state.pending_jobs(parent.node)}:
+        return
+    rows = []
+    for child in children:
+        directory = state.completed_attempt_dir(child.job_id)
+        if directory is None:
+            raise ScientificFailure(f"bundle {parent.job_id} has an incomplete segment")
+        metrics = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
+        child_config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        rows.append(
+            {
+                "segment_index": child.parameters["segment_index"],
+                "config": child_config,
+                "metrics": metrics,
+                "attempt_dir": str(directory),
+            }
+        )
+    attempt_number = state.next_attempt(parent.job_id)
+    output_dir = config.run_dir / "jobs" / parent.job_id / f"attempt-{attempt_number:02d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt = state.start(parent, _job_gpus(config, parent), output_dir)
+    outcomes = Counter()
+    for row in rows:
+        outcomes.update(row["metrics"].get("request_outcomes", {}))
+    committed = sum(int(row["metrics"].get("committed_tokens", 0)) for row in rows)
+    duration = sum(float(row["metrics"].get("duration_seconds", 0.0)) for row in rows)
+    metrics = {
+        "scientific_outcome": "completed",
+        "segments": rows,
+        "segment_count": len(rows),
+        "committed_tokens": committed,
+        "duration_seconds": duration,
+        "goodput": committed_goodput(committed, duration) if duration > 0 else 0.0,
+        "peak_hbm_bytes": max(int(row["metrics"].get("peak_hbm_bytes", 0)) for row in rows),
+        "request_count": sum(int(row["metrics"].get("request_count", 0)) for row in rows),
+        "request_outcomes": dict(outcomes),
+        "feasible": all(row["metrics"].get("feasible") is not False for row in rows),
+        "slo_pass": all(row["metrics"].get("slo_pass") is not False for row in rows),
+    }
+    for counter in SAFETY_COUNTERS:
+        metrics[counter] = sum(int(row["metrics"].get(counter, 0)) for row in rows)
+    _write_json(output_dir / "config.json", parent.to_dict())
+    _write_json(output_dir / "metrics.json", metrics)
+    state.complete(parent.job_id, attempt)
 
 
 def _run_pending_jobs(
@@ -2268,16 +2303,44 @@ def _run_pending_jobs(
     stop_event: threading.Event,
     pending: tuple[Job, ...],
 ) -> None:
+    bundled = tuple(job for job in pending if isinstance(job.parameters.get("segments"), list))
+    if bundled:
+        storage_node = f"{node}-segments"
+        children_by_parent = {job.job_id: _segment_jobs(job) for job in bundled}
+        children = tuple(child for rows in children_by_parent.values() for child in rows)
+        state.add_internal_jobs(children, storage_node=storage_node)
+        wanted = {job.job_id for job in children}
+        child_pending = tuple(
+            job for job in state.pending_jobs(storage_node) if job.job_id in wanted
+        )
+        if node.startswith("E5"):
+            anchors = tuple(
+                job
+                for job in child_pending
+                if job.method in {"target_only", "static"}
+                and isinstance(job.load, str)
+                and job.load.startswith("closed_loop_c")
+            )
+            if anchors:
+                _run_pending_jobs(config, state, node, stop_event, anchors)
+            child_pending = tuple(
+                job for job in state.pending_jobs(storage_node) if job.job_id in wanted
+            )
+        if child_pending and not stop_event.is_set():
+            _run_pending_jobs(config, state, node, stop_event, child_pending)
+        if stop_event.is_set():
+            return
+        for parent in bundled:
+            _complete_segment_parent(config, state, parent, children_by_parent[parent.job_id])
+        pending = tuple(job for job in pending if job not in bundled)
+        if not pending:
+            return
     exclusive = tuple(job for job in pending if job.gpu_count == 2)
     singles = tuple(job for job in pending if job.gpu_count == 1)
     node_failed = threading.Event()
 
-    def run_sessions(
-        jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str
-    ) -> None:
-        grouped: dict[
-            tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]
-        ] = {}
+    def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str) -> None:
+        grouped: dict[tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]] = {}
         for job in jobs:
             runtime_job = _runtime_job(state, job)
             selection = _selection_for_job(state, job)
@@ -2286,7 +2349,9 @@ def _run_pending_jobs(
             key = (job.block, probe, *server_session_key(process_job, selection))
             grouped.setdefault(key, []).append((job, runtime_job, selection))
         keys = []
-        blocks = sorted({key[0] for key in grouped}, key=lambda value: (-1 if value is None else value))
+        blocks = sorted(
+            {key[0] for key in grouped}, key=lambda value: -1 if value is None else value
+        )
         for block in blocks:
             block_keys = [key for key in grouped if key[0] == block]
             rng = np.random.default_rng(
@@ -2314,8 +2379,7 @@ def _run_pending_jobs(
             while True:
                 process_type = (
                     ReplicaServerProcess
-                    if first_runtime.parameters.get("topology")
-                    == "two_replica_tp1_dp2"
+                    if first_runtime.parameters.get("topology") == "two_replica_tp1_dp2"
                     else ServerProcess
                 )
                 process = process_type(
@@ -2346,9 +2410,7 @@ def _run_pending_jobs(
                 except Exception as error:
                     if _screening_job(first_job) and _capacity_infeasible(error):
                         for job, _, _ in rows:
-                            _complete_infeasible_startup(
-                                state, job, config.run_dir, gpus, error
-                            )
+                            _complete_infeasible_startup(state, job, config.run_dir, gpus, error)
                         break
                     retry = (
                         _retryable_process_error(error)
@@ -2371,9 +2433,7 @@ def _run_pending_jobs(
         pair: tuple(job for job in exclusive if _assigned_pair(config, job) == pair)
         for pair in _gpu_pairs(config)
     }
-    exclusive_queues = {
-        pair: jobs for pair, jobs in exclusive_queues.items() if jobs
-    }
+    exclusive_queues = {pair: jobs for pair, jobs in exclusive_queues.items() if jobs}
     exclusive_workers = (
         len(exclusive_queues)
         if not headline or calibration.get("enabled")
@@ -2437,9 +2497,7 @@ def _run_pending_jobs(
     queues = {gpu: jobs for gpu, jobs in queues.items() if jobs}
     workers = len(queues) if not headline or calibration.get("enabled") else min(1, len(queues))
     if workers:
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="lightcone-gpu"
-        ) as pool:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lightcone-gpu") as pool:
             futures = [pool.submit(worker, gpu, jobs) for gpu, jobs in queues.items()]
             for future in futures:
                 future.result()
@@ -2490,17 +2548,10 @@ def _run_node_jobs(
         state.set_selection("pair_interference_complete", True)
     if node == "E0-tune":
         for job in pending:
-            if not job.parameters.get("probe") or config.has_exact_draft(
-                job.model, job.backend
-            ):
+            if not job.parameters.get("probe") or config.has_exact_draft(job.model, job.backend):
                 continue
             attempt_number = state.next_attempt(job.job_id)
-            output_dir = (
-                config.run_dir
-                / "jobs"
-                / job.job_id
-                / f"attempt-{attempt_number:02d}"
-            )
+            output_dir = config.run_dir / "jobs" / job.job_id / f"attempt-{attempt_number:02d}"
             output_dir.mkdir(parents=True, exist_ok=True)
             attempt = state.start(job, _job_gpus(config, job), output_dir)
             _write_json(output_dir / "config.json", job.to_dict())
@@ -2523,9 +2574,7 @@ def _run_node_jobs(
             )
             state.complete(job.job_id, attempt)
         pending = state.pending_jobs(node)
-    if node == "E3b-pilot" and state.selection(
-        "deployment_widths_tuned", None
-    ) is None:
+    if node == "E3b-pilot" and state.selection("deployment_widths_tuned", None) is None:
         width_jobs = _deployment_width_jobs(state)
         state.add_internal_jobs(width_jobs)
         _run_pending_jobs(
@@ -2543,22 +2592,42 @@ def _run_node_jobs(
         state.set_selection("deployment_widths_tuned", True)
         pending = state.pending_jobs(node)
     if node == "E1a" and state.selection("dspark_confidence_weight", None) is None:
-        calibration = _confidence_calibration_jobs(state)
-        state.add_internal_jobs(calibration)
+        calibration = tuple(
+            job for job in pending if job.parameters.get("workload") == "confidence_calibration"
+        )
         _run_pending_jobs(
             config,
             state,
-            "E1a-confidence-calibration",
+            node,
             stop_event,
-            state.pending_jobs("E1a-confidence-calibration"),
+            calibration,
         )
         if stop_event.is_set():
             return
-        _require_internal_jobs(state, "E1a-confidence-calibration")
-        state.set_selection(
-            "dspark_confidence_weight", _select_confidence_weight(state)
-        )
+        state.set_selection("dspark_confidence_weight", _select_confidence_weight(state))
         pending = state.pending_jobs(node)
+    if node == "E1a" and state.selection("e1a_finalists", None) is None:
+        confirmation = tuple(
+            job for job in pending if isinstance(job.parameters.get("finalist_slot"), int)
+        )
+        screen = tuple(
+            job
+            for job in pending
+            if job not in confirmation
+            and job.parameters.get("workload") != "confidence_calibration"
+        )
+        _run_pending_jobs(config, state, node, stop_event, screen)
+        if stop_event.is_set():
+            return
+        finalists = _rank_candidates(state, node, 4)
+        if len(finalists) != 4:
+            raise ScientificFailure("E1a did not produce four confirmation finalists")
+        state.set_selection("e1a_finalists", finalists)
+        pending = tuple(
+            job
+            for job in state.pending_jobs(node)
+            if isinstance(job.parameters.get("finalist_slot"), int)
+        )
     if node.startswith("E5"):
         anchors, _ = _e5_execution_phases(pending)
         if anchors:
@@ -2567,9 +2636,7 @@ def _run_node_jobs(
             return
         pending = state.pending_jobs(node)
     if node == "E6-pilot" and state.selection("e6_common_loads", None) is None:
-        interfaces = tuple(
-            job for job in state.jobs(node) if job.parameters.get("interface_fit")
-        )
+        interfaces = tuple(job for job in state.jobs(node) if job.parameters.get("interface_fit"))
         if interfaces:
             state.add_internal_jobs(_e6_interface_jobs(interfaces))
             _run_pending_jobs(
@@ -2582,9 +2649,7 @@ def _run_node_jobs(
             if stop_event.is_set():
                 return
             _require_internal_jobs(state, "E6-interface")
-            capabilities = _complete_e6_interface_rows(
-                config, state, interfaces
-            )
+            capabilities = _complete_e6_interface_rows(config, state, interfaces)
             probes = tuple(
                 job
                 for job in _e6_load_jobs()
@@ -2604,17 +2669,14 @@ def _run_node_jobs(
                 "e6_capabilities",
                 {model: sorted(modes) for model, modes in capabilities.items()},
             )
-            state.set_selection(
-                "e6_common_loads", _select_e6_common_loads(state, capabilities)
-            )
+            state.set_selection("e6_common_loads", _select_e6_common_loads(state, capabilities))
     if node in {"E6-pilot", "E6-final"}:
         if stop_event.is_set():
             return
         pending = state.pending_jobs(node)
         loads = state.selection("e6_common_loads", {})
         capabilities = {
-            model: set(modes)
-            for model, modes in state.selection("e6_capabilities", {}).items()
+            model: set(modes) for model, modes in state.selection("e6_capabilities", {}).items()
         }
         for job in pending:
             if not _e6_role_supported(job.method, capabilities.get(job.model, set())):
@@ -2622,20 +2684,36 @@ def _run_node_jobs(
             elif job.model not in loads:
                 state.skip_job(job.job_id, "model has no feasible TP2 NEXTN common load")
         pending = state.pending_jobs(node)
+    p99_slots = ()
+    if node == "E5-final":
+        p99_slots = tuple(job for job in pending if job.parameters.get("p99_extension"))
+        pending = tuple(job for job in pending if job not in p99_slots)
     _run_pending_jobs(config, state, node, stop_event, pending)
-    if node == "E5-final" and state.selection("e5_p99_extension_complete", None) is None:
-        extensions = _e5_p99_jobs(state)
-        state.add_internal_jobs(extensions)
+    if node == "TTS-Cal" and state.selection("tts_confirmation_complete", None) is None:
+        confirmations = _tts_confirmation_jobs(state)
+        state.add_internal_jobs(confirmations)
         _run_pending_jobs(
             config,
             state,
-            "E5-p99-extension",
+            "TTS-Cal-confirmation",
             stop_event,
-            state.pending_jobs("E5-p99-extension"),
+            state.pending_jobs("TTS-Cal-confirmation"),
         )
-        if not stop_event.is_set():
-            _require_internal_jobs(state, "E5-p99-extension")
-            state.set_selection("e5_p99_extension_complete", True)
+        if stop_event.is_set():
+            return
+        _require_internal_jobs(state, "TTS-Cal-confirmation")
+        state.set_selection("tts_recipe", _select_tts_recipe(state))
+        state.set_selection("tts_confirmation_complete", True)
+    if node == "E5-final" and state.selection("e5_p99_extensions", None) is None:
+        state.set_selection("e5_p99_extensions", _select_e5_p99_extensions(state))
+    if node == "E5-final":
+        _run_pending_jobs(
+            config,
+            state,
+            node,
+            stop_event,
+            tuple(job for job in state.pending_jobs(node) if job.parameters.get("p99_extension")),
+        )
     if node == "E1" and state.selection("e1_common_load", None) is None:
         probes = _e1_load_jobs(state)
         state.add_internal_jobs(probes)
@@ -2649,10 +2727,7 @@ def _run_node_jobs(
         if stop_event.is_set():
             return
         _require_internal_jobs(state, "E1-common-load")
-        per_load = len(probes) // 7
-        state.set_selection(
-            "e1_common_load", _select_e1_common_load(state, per_load)
-        )
+        state.set_selection("e1_common_load", _select_e1_common_load(state, len(probes)))
         state.set_selection("e1_geometries", _rank_e1_geometries(state))
 
 
@@ -2662,11 +2737,19 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
         config_path, metrics_path = directory / "config.json", directory / "metrics.json"
         if config_path.is_file() and metrics_path.is_file():
             metrics = json.loads(metrics_path.read_text())
-            metrics["source_attempt"] = int(
-                directory.name.removeprefix("attempt-")
-            )
+            metrics["source_attempt"] = int(directory.name.removeprefix("attempt-"))
             metrics["source_attempt_dir"] = str(directory)
-            rows.append((json.loads(config_path.read_text()), metrics))
+            config = json.loads(config_path.read_text())
+            segments = metrics.get("segments")
+            if isinstance(segments, list):
+                for segment in segments:
+                    segment_config = dict(segment["config"])
+                    segment_metrics = dict(segment["metrics"])
+                    segment_metrics["source_attempt"] = metrics["source_attempt"]
+                    segment_metrics["source_attempt_dir"] = segment["attempt_dir"]
+                    rows.append((segment_config, segment_metrics))
+            else:
+                rows.append((config, metrics))
     return rows
 
 
@@ -2678,14 +2761,15 @@ def _trajectory_group(config: dict[str, Any]) -> tuple[Any, ...]:
         config.get("context"),
         config.get("load"),
         config.get("block"),
-        *(parameters.get(name) for name in ("regime", "width_panel", "topology", "cohorts", "popularity")),
+        *(
+            parameters.get(name)
+            for name in ("regime", "width_panel", "topology", "cohorts", "popularity")
+        ),
     )
 
 
 def _check_greedy_trajectories(state: StateStore, node: str) -> None:
-    groups: dict[
-        tuple[Any, ...], dict[str, list[tuple[int, ...]]]
-    ] = {}
+    groups: dict[tuple[Any, ...], dict[str, list[tuple[int, ...]]]] = {}
     preflight_policies: set[str] = set()
     for directory in state.completed_attempt_dirs(node):
         config_path = directory / "config.json"
@@ -2701,9 +2785,9 @@ def _check_greedy_trajectories(state: StateStore, node: str) -> None:
             for row in _read_jsonl(controlled_path):
                 preflight_policies.add(str(row["policy"]))
                 policy = str(row["policy"])
-                groups.setdefault(_trajectory_group(config), {}).setdefault(
-                    policy, []
-                ).append(tuple(row["output_ids"]))
+                groups.setdefault(_trajectory_group(config), {}).setdefault(policy, []).append(
+                    tuple(row["output_ids"])
+                )
             continue
     if node == "preflight":
         required = {"target_only", "speculative_verify", "tts", "l0_naive"}
@@ -2772,6 +2856,8 @@ def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, 
         for config, metrics in _metric_rows(state, node)
         if config["method"] in {"lightcone_candidate", "lightcone"}
         and metrics.get("feasible") is not False
+        and config.get("parameters", {}).get("workload")
+        not in {"confidence_calibration", "dspark_finalist_confirmation"}
     ]
     candidates.sort(key=lambda item: item[:-1])
     return [row[-1] for row in candidates[:keep]]
@@ -2779,10 +2865,16 @@ def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, 
 
 def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
     groups: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
-    for config, metrics in _metric_rows(state, "TTS-Cal"):
+    rows = _metric_rows(state, "TTS-Cal")
+    rows.extend(_metric_rows(state, "TTS-Cal-confirmation"))
+    for config, metrics in rows:
         if metrics.get("feasible") is False:
             continue
-        parameters = config["parameters"]
+        parameters = {
+            key: value
+            for key, value in config["parameters"].items()
+            if key not in {"workload", "confirmation_block"}
+        }
         key = json.dumps(parameters, sort_keys=True)
         groups.setdefault(key, (parameters, []))[1].append(metrics)
     candidates = [
@@ -2793,11 +2885,45 @@ def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
             parameters,
         )
         for parameters, rows in groups.values()
-        if len(rows) == 4
+        if len(rows) >= 4
     ]
     if not candidates:
         raise ScientificFailure("TTS-Cal produced no complete four-window recipe")
     return min(candidates, key=lambda row: row[:-1])[-1]
+
+
+def _tts_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
+    candidates = []
+    for config, metrics in _metric_rows(state, "TTS-Cal"):
+        if metrics.get("feasible") is False:
+            continue
+        candidates.append(
+            (
+                -float(metrics["goodput"]),
+                int(metrics["peak_hbm_bytes"]),
+                float(metrics["itl_p99_ms"]),
+                config,
+            )
+        )
+    rows = []
+    for finalist, (_, _, _, config) in enumerate(sorted(candidates)[:9]):
+        source = Job(**config)
+        for block in range(4):
+            rows.append(
+                replace(
+                    source,
+                    job_id=f"tts-confirm-{finalist:02d}-block-{block:02d}",
+                    node="TTS-Cal-confirmation",
+                    ordinal=len(rows),
+                    block=block,
+                    parameters={
+                        **source.parameters,
+                        "workload": "tts_calibration_confirmation",
+                        "confirmation_block": block,
+                    },
+                )
+            )
+    return tuple(rows)
 
 
 def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
@@ -2863,9 +2989,7 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
         if metrics.get("feasible") is False:
             continue
         goodput = float(metrics["goodput"])
-        objective = min(
-            goodput / baselines["static"], goodput / baselines["tts"]
-        )
+        objective = min(goodput / baselines["static"], goodput / baselines["tts"])
         candidates.append(
             (
                 -objective,
@@ -2895,22 +3019,14 @@ def _natural_spline_fit(
 
     def basis(points: np.ndarray, derivative: int = 0) -> np.ndarray:
         return np.column_stack(
-            [
-                BSpline(knots, row, 3)(points, nu=derivative)
-                for row in coefficients
-            ]
+            [BSpline(knots, row, 3)(points, nu=derivative) for row in coefficients]
         )
 
-    constraints = np.vstack(
-        (basis(np.asarray([left]), 2), basis(np.asarray([right]), 2))
-    )
+    constraints = np.vstack((basis(np.asarray([left]), 2), basis(np.asarray([right]), 2)))
     natural = null_space(constraints)
     design = basis(x) @ natural
     beta = np.linalg.lstsq(design, y, rcond=None)[0]
-    return tuple(
-        basis(evaluation, derivative) @ natural @ beta
-        for derivative in (0, 1, 2)
-    )
+    return tuple(basis(evaluation, derivative) @ natural @ beta for derivative in (0, 1, 2))
 
 
 def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
@@ -2928,10 +3044,7 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         )
         checkpoints = metrics.get("trajectory_checkpoints")
         points = (
-            [
-                (int(row["generation_tokens"]), float(row["goodput"]))
-                for row in checkpoints
-            ]
+            [(int(row["generation_tokens"]), float(row["goodput"])) for row in checkpoints]
             if parameters.get("regime") == "short_input_long_generation"
             and isinstance(checkpoints, list)
             else [(context, float(metrics["goodput"]))]
@@ -2948,11 +3061,7 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         config_path = directory / "config.json"
         metrics_path = directory / "metrics.json"
         requests_path = _jsonl_path(directory, "requests.jsonl")
-        if (
-            not config_path.is_file()
-            or not metrics_path.is_file()
-            or not requests_path.is_file()
-        ):
+        if not config_path.is_file() or not metrics_path.is_file() or not requests_path.is_file():
             continue
         config = json.loads(config_path.read_text(encoding="utf-8"))
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -2995,9 +3104,7 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
                         )
                     )
             if rows:
-                block_duration = (
-                    (max(ends) - min(starts)) / 1e9 if starts else float(duration)
-                )
+                block_duration = (max(ends) - min(starts)) / 1e9 if starts else float(duration)
                 request_groups.setdefault(key, {}).setdefault(length, {})[block] = (
                     rows,
                     block_duration,
@@ -3029,9 +3136,11 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
             log_contexts, np.log(goodput), log_contexts
         )
         by_context = request_groups.get(key, {})
-        common_blocks = set.intersection(
-            *(set(by_context.get(int(context), {})) for context in contexts)
-        ) if len(contexts) else set()
+        common_blocks = (
+            set.intersection(*(set(by_context.get(int(context), {})) for context in contexts))
+            if len(contexts)
+            else set()
+        )
         bootstrap_elasticity = []
         bootstrap_curvature = []
         bootstrap_fitted = []
@@ -3131,9 +3240,7 @@ def _context_crossover_statistics(
             contexts = list(candidate["contexts"])
             if contexts != reference["contexts"]:
                 continue
-            differences = np.log(candidate["fitted_goodput"]) - np.log(
-                reference["fitted_goodput"]
-            )
+            differences = np.log(candidate["fitted_goodput"]) - np.log(reference["fitted_goodput"])
             point = _first_crossover(contexts, differences)
             candidate_draws = candidate["_bootstrap_log_fitted"]
             reference_draws = reference["_bootstrap_log_fitted"]
@@ -3142,11 +3249,7 @@ def _context_crossover_statistics(
                 roots = [
                     root
                     for left, right in zip(candidate_draws, reference_draws, strict=True)
-                    if (
-                        root := _first_crossover(
-                            contexts, np.asarray(left) - np.asarray(right)
-                        )
-                    )
+                    if (root := _first_crossover(contexts, np.asarray(left) - np.asarray(right)))
                     is not None
                 ]
             interval = np.quantile(roots, (0.025, 0.975)) if len(roots) >= 100 else None
@@ -3250,6 +3353,98 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
     return result
 
 
+def _exact_sign_flip(log_ratios: np.ndarray) -> float:
+    observed = float(np.mean(log_ratios))
+    signs = np.asarray(list(itertools.product((-1.0, 1.0), repeat=len(log_ratios))))
+    return float((np.sum(np.mean(signs * log_ratios, axis=1) >= observed) + 1) / (len(signs) + 1))
+
+
+def _e5_max_rate_statistic(state: StateStore) -> dict[str, object] | None:
+    rates: dict[tuple[int, str, str], float] = {}
+    for config, metrics in _metric_rows(state, "E5-final"):
+        parameters = config.get("parameters", {})
+        registered = parameters.get("registered_load")
+        block = config.get("block")
+        method = config.get("method")
+        backend = config.get("backend")
+        rate = metrics.get("offered_rate")
+        if (
+            not isinstance(block, int)
+            or method not in {"target_only", "static", "lightcone"}
+            or backend not in {"DFLASH", "DSPARK"}
+            or not isinstance(registered, str)
+            or not registered.startswith("lambda_")
+            or metrics.get("slo_pass") is not True
+            or not isinstance(rate, (int, float))
+        ):
+            continue
+        key = (block, backend, str(method))
+        rates[key] = max(rates.get(key, 0.0), float(rate))
+    candidate = []
+    baseline = []
+    for block in PRIMARY_BLOCKS:
+        lightcone = []
+        operational = []
+        for backend in ("DFLASH", "DSPARK"):
+            required = [
+                rates.get((block, backend, method))
+                for method in ("target_only", "static", "lightcone")
+            ]
+            if any(value is None for value in required):
+                break
+            target, static, adaptive = (float(value) for value in required)
+            lightcone.append(adaptive)
+            operational.append(max(target, static))
+        if len(lightcone) == 2:
+            candidate.append(math.sqrt(lightcone[0] * lightcone[1]))
+            baseline.append(math.sqrt(operational[0] * operational[1]))
+    if len(candidate) != len(PRIMARY_BLOCKS) or any(
+        value <= 0 for value in (*candidate, *baseline)
+    ):
+        return None
+    log_ratios = np.log(candidate) - np.log(baseline)
+    estimate, low, high = paired_bca_interval(log_ratios, np.zeros_like(log_ratios))
+    return {
+        "hypothesis": "H3",
+        "candidate": "lightcone",
+        "baseline": "operational_baseline",
+        "metric": "maximum_slo_feasible_rate",
+        "blocks": list(PRIMARY_BLOCKS),
+        "backend_aggregation": "per-block geometric mean over DFLASH and DSPARK",
+        "mean_log_ratio": estimate,
+        "relative_effect": math.exp(estimate) - 1.0,
+        "ci95_relative_low": math.exp(low) - 1.0,
+        "ci95_relative_high": math.exp(high) - 1.0,
+        "p_value": _exact_sign_flip(log_ratios),
+        "reducer": "paired_log_max_slo_rate_bca",
+    }
+
+
+def _confirmatory_holm(
+    state: StateStore, e5_rate: dict[str, object] | None
+) -> list[dict[str, object]]:
+    path = state.run_dir / "stages" / "E3b-final" / "statistics.json"
+    if not path.is_file() or e5_rate is None:
+        return []
+    e3 = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    for hypothesis, baseline in (("H1", "tts"), ("H2", "operational_baseline")):
+        matches = [
+            row
+            for row in e3
+            if row.get("candidate") == "lightcone"
+            and row.get("baseline") == baseline
+            and row.get("workload") == "primary_long_history"
+            and row.get("context") == 32768
+        ]
+        if len(matches) != 1:
+            return []
+        rows.append({**matches[0], "hypothesis": hypothesis})
+    rows.append(e5_rate)
+    decisions = holm_decisions([float(row["p_value"]) for row in rows])
+    return [{**row, "holm_reject": decision} for row, decision in zip(rows, decisions, strict=True)]
+
+
 def _select_valid_e0(state: StateStore) -> list[tuple[str, str, str]]:
     dspark_ready = state.selection("dspark_recipe", None) is not None
     return [
@@ -3271,9 +3466,7 @@ def _select_e0_recipes(state: StateStore) -> dict[str, dict[str, Any]]:
             continue
         key = "|".join((config["model"], config["backend"], method))
         parameters = {
-            name: value
-            for name, value in config["parameters"].items()
-            if name != "tuning_index"
+            name: value for name, value in config["parameters"].items() if name != "tuning_index"
         }
         score = (
             -float(metrics["goodput"]),
@@ -3310,47 +3503,7 @@ def _select_e4_screen(state: StateStore) -> dict[str, tuple[object, object]]:
     }
 
 
-def _pilot_final_blocks(state: StateStore, node: str) -> int | None:
-    by_block: dict[int, dict[str, list[float]]] = {}
-    metric_rows = _metric_rows(state, node)
-    row_counts = Counter(
-        config.get("block")
-        for config, _ in metric_rows
-        if isinstance(config.get("block"), int)
-    )
-    expected = {
-        "E3b-pilot": 340,
-        "E5-pilot": 450,
-        "E6-pilot": 70,
-        "E0-pilot": 8 * len(state.selection("valid_e0", [])),
-    }[node]
-    if any(row_counts.get(block, 0) != expected for block in range(4)):
-        return None
-    for config, metrics in metric_rows:
-        block = config.get("block")
-        method = config.get("method")
-        if isinstance(block, int) and method in {"static", "tts", "lightcone"}:
-            by_block.setdefault(block, {}).setdefault(method, []).append(float(metrics["goodput"]))
-    required = []
-    for baseline in ("static", "tts"):
-        differences = [
-            math.log(float(np.mean(rows["lightcone"])))
-            - math.log(float(np.mean(rows[baseline])))
-            for block, rows in sorted(by_block.items())
-            if block in {0, 1, 2, 3} and {"lightcone", baseline} <= rows.keys()
-        ]
-        if len(differences) != 4:
-            return None
-        selected = choose_final_blocks(differences)
-        if selected is None:
-            return None
-        required.append(selected)
-    return max(required)
-
-
-def _mechanism_summary(
-    state: StateStore, node: str
-) -> list[dict[str, object]]:
+def _mechanism_summary(state: StateStore, node: str) -> list[dict[str, object]]:
     fields = (
         "position_conditional_survival",
         "total_variation",
@@ -3391,9 +3544,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     summary_dir = config.run_dir / "stages" / node
     summarize_attempts(state.completed_attempt_dirs(node), summary_dir)
     if node != "preflight":
-        _write_json(
-            summary_dir / "mechanism.json", _mechanism_summary(state, node)
-        )
+        _write_json(summary_dir / "mechanism.json", _mechanism_summary(state, node))
     if node.endswith("-final"):
         statistics = paired_block_statistics(_metric_rows(state, node))
         _write_json(
@@ -3407,9 +3558,11 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                 if (row["candidate"], row["baseline"])
                 not in {("lightcone", "static"), ("lightcone", "tts")}
             ]
-            decisions = benjamini_hochberg(
-                [float(row["p_value"]) for row in secondary]
-            ) if secondary else ()
+            decisions = (
+                benjamini_hochberg([float(row["p_value"]) for row in secondary])
+                if secondary
+                else ()
+            )
             _write_json(
                 summary_dir / "breadth_fdr.json",
                 [
@@ -3431,9 +3584,11 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             ],
         )
     if node in {"E5-pilot", "E5-final"}:
-        _write_json(
-            summary_dir / "tail_latency.json", _e5_tail_statistics(state, node)
-        )
+        _write_json(summary_dir / "tail_latency.json", _e5_tail_statistics(state, node))
+    if node == "E5-final":
+        rate = _e5_max_rate_statistic(state)
+        _write_json(summary_dir / "maximum_slo_rate.json", rate)
+        _write_json(summary_dir / "confirmatory_holm.json", _confirmatory_holm(state, rate))
     if node == "preflight":
         _check_greedy_trajectories(state, node)
     if node == "preflight":
@@ -3451,11 +3606,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                     "goodput": float(metrics["goodput"]),
                     "itl": float(metrics["itl_p99_ms"]),
                 }
-        pairs = [
-            rows
-            for rows in timings.values()
-            if {"isolated", "concurrent"} <= rows.keys()
-        ]
+        pairs = [rows for rows in timings.values() if {"isolated", "concurrent"} <= rows.keys()]
         calibrations = {}
         if len(pairs) >= 3:
             for metric in ("goodput", "itl"):
@@ -3466,9 +3617,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
                 elif any(value <= 0 for value in baseline):
                     calibrations[metric] = (2.0, 2.0, 2.0)
                 else:
-                    calibrations[metric] = paired_relative_bca_interval(
-                        candidate, baseline
-                    )
+                    calibrations[metric] = paired_relative_bca_interval(candidate, baseline)
         if len(_gpu_pairs(config)) == 1:
             state.set_selection(
                 "headline_parallel",
@@ -3483,17 +3632,14 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             )
     if node == "E3a":
         rows = _metric_rows(state, node)
-        anchors = [
-            (item, metrics)
-            for item, metrics in rows
-            if item.get("context") == 40928
-        ]
+        anchors = [(item, metrics) for item, metrics in rows if item.get("context") == 40928]
         feasible_loads: list[str] = []
         for load in {str(item["load"]) for item, _ in anchors}:
             target_regimes = {
                 item["parameters"].get("regime")
                 for item, metrics in anchors
-                if item["method"] == "target_only" and item["load"] == load
+                if item["method"] == "target_only"
+                and item["load"] == load
                 and _safe_screen_row(metrics)
             }
             static_regimes = {
@@ -3507,9 +3653,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             if len(target_regimes) == len(static_regimes) == 3:
                 feasible_loads.append(load)
         if not feasible_loads:
-            raise ScientificFailure(
-                "E3a found no common 40,928-token Target-only/Static load"
-            )
+            raise ScientificFailure("E3a found no common 40,928-token Target-only/Static load")
         common_load = max(feasible_loads, key=lambda value: int(value.removeprefix("c")))
         width_scores = {
             width: float(
@@ -3538,9 +3682,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             == 3
         }
         selected_width = max(width_scores, key=width_scores.get, default=16)
-        state.set_selection(
-            "e3a", {"width": selected_width, "load": common_load}
-        )
+        state.set_selection("e3a", {"width": selected_width, "load": common_load})
         state.set_selection(
             "deployment_widths",
             {"static": selected_width},
@@ -3558,14 +3700,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     elif node.startswith("E2-r"):
         round_index = int(node[-1])
         candidate_count = sum(
-            item["method"] == "lightcone_candidate"
-            for item, _ in _metric_rows(state, node)
+            item["method"] == "lightcone_candidate" for item, _ in _metric_rows(state, node)
         )
-        keep = (
-            max(math.ceil(candidate_count / 4), 21)
-            if round_index < 3
-            else 1
-        )
+        keep = max(math.ceil(candidate_count / 4), 21) if round_index < 3 else 1
         winners = _rank_e2_candidates(state, node, keep)
         state.set_selection(
             f"{node}_counts",
@@ -3578,13 +3715,10 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         if len(winners) != keep:
             state.set_selection(f"{node}_no_feasible_candidate", True)
         else:
-            state.set_selection("lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}", winners[0] if round_index == 3 else winners)
-    elif node == "E3b-pilot" and config.protocol.final_blocks is None:
-        selected = _pilot_final_blocks(state, node)
-        if selected is None:
-            state.set_selection(f"{node}_underpowered", True)
-        else:
-            state.set_selection("global_final_blocks", selected)
+            state.set_selection(
+                "lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}",
+                winners[0] if round_index == 3 else winners,
+            )
     elif node == "E1a":
         winners = _rank_candidates(state, node, 1)
         if winners:
@@ -3651,9 +3785,11 @@ def _save_environment(config: ExperimentConfig) -> None:
         check=False,
         env=environment,
     )
-    versions = json.loads(runtime.stdout) if runtime.returncode == 0 else {
-        "runtime_error": runtime.stderr.strip()
-    }
+    versions = (
+        json.loads(runtime.stdout)
+        if runtime.returncode == 0
+        else {"runtime_error": runtime.stderr.strip()}
+    )
     gpu = subprocess.run(
         [
             "nvidia-smi",
@@ -3683,14 +3819,6 @@ def _save_environment(config: ExperimentConfig) -> None:
     )
 
 
-def _node_final_blocks(config: ExperimentConfig, state: StateStore, node: str) -> int:
-    if config.protocol.final_blocks is not None:
-        return config.protocol.final_blocks
-    if node in {"E3b-final", "E5-final", "E6-final", "E0-final"}:
-        return int(state.selection("global_final_blocks", 12))
-    return 12
-
-
 def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -> str | None:
     if node != "preflight" and state.stage_status("preflight") != "completed":
         return "preflight did not complete"
@@ -3713,12 +3841,6 @@ def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -
     for selection in requirements.get(node, ()):
         if state.selection(selection, None) is None:
             return f"required selection {selection} is unavailable"
-    if (
-        node in {"E3b-final", "E5-final", "E6-final", "E0-final"}
-        and config.protocol.final_blocks is None
-        and state.selection("global_final_blocks", None) is None
-    ):
-        return "E3b-pilot did not select global N in 12-20"
     return None
 
 
@@ -3749,7 +3871,6 @@ class PaperRunner:
             for node in nodes:
                 if self.stop_event.is_set():
                     break
-                final_blocks = _node_final_blocks(self.config, self.state, node)
                 valid_e0 = self.state.selection("valid_e0", None)
                 e2_rows = None
                 if node == "E2-r0":
@@ -3757,16 +3878,16 @@ class PaperRunner:
                 elif node.startswith("E2-r"):
                     e2_rows = self.state.selection(f"e2_round_{int(node[-1]) - 1}", None)
                 if node == "E0-tune" and valid_e0 is None:
-                    probe_jobs = materialize(node, valid_e0=[])
+                    probe_jobs = tuple(
+                        job for job in materialize(node) if job.parameters.get("probe")
+                    )
                     self.state.add_jobs(node, probe_jobs)
                     dependency_reason = _dependency_reason(self.config, self.state, node)
                     if dependency_reason:
                         self.state.skip_pending(node, dependency_reason)
                         continue
                     try:
-                        _run_node_jobs(
-                            self.config, self.state, node, self.stop_event
-                        )
+                        _run_node_jobs(self.config, self.state, node, self.stop_event)
                     except ScientificFailure as error:
                         self.state.skip_pending(node, str(error))
                         self.state.mark_stage_failed(node)
@@ -3783,7 +3904,6 @@ class PaperRunner:
                     self.state.set_selection("valid_e0", valid_e0)
                 jobs = materialize(
                     node,
-                    final_blocks=final_blocks,
                     valid_e0=valid_e0,
                     e2_rows=e2_rows,
                     e0_recipes=self.state.selection("e0_recipes", None),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from collections.abc import Iterable
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, ttest_rel
+from scipy.stats import norm
 
 SAFETY_COUNTERS = (
     "version_mismatches",
@@ -40,7 +41,11 @@ def validate_scientific_metrics(metrics: dict[str, object]) -> None:
     missing = [name for name in required if name not in metrics]
     if missing:
         raise ValueError(f"metrics are missing {missing}")
-    numeric = [value for value in metrics.values() if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    numeric = [
+        value
+        for value in metrics.values()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
     if any(not math.isfinite(float(value)) for value in numeric):
         raise ValueError("metrics contain a non-finite number")
     for counter in SAFETY_COUNTERS:
@@ -136,23 +141,6 @@ def holm_decisions(p_values: Iterable[float], alpha: float = 0.05) -> tuple[bool
     return tuple(decisions)
 
 
-def choose_final_blocks(
-    paired_log_differences: Iterable[float],
-    *,
-    effect: float = math.log(1.03),
-    power: float = 0.80,
-    alpha: float = 0.025,
-) -> int | None:
-    values = np.asarray(tuple(paired_log_differences), dtype=np.float64)
-    if values.size < 4 or np.any(~np.isfinite(values)):
-        raise ValueError("power selection requires four finite pilot blocks")
-    sigma = float(np.std(values, ddof=1))
-    if sigma == 0:
-        return 12
-    required = math.ceil(((norm.ppf(1 - alpha / 2) + norm.ppf(power)) * sigma / effect) ** 2)
-    return max(12, required) if required <= 20 else None
-
-
 def block_bootstrap_interval(
     values: Iterable[float], *, resamples: int = 5000, seed: int = 0
 ) -> tuple[float, float, float]:
@@ -194,15 +182,9 @@ def hierarchical_request_interval(
         points.append(float(np.sum(rows[:, 0]) / np.max(rows[:, 1])))
         indexes = rng.integers(0, len(rows), size=(resamples, len(rows)))
         draws = rows[indexes]
-        within[:, block_index] = np.sum(draws[:, :, 0], axis=1) / np.max(
-            draws[:, :, 1], axis=1
-        )
-    block_indexes = rng.integers(
-        0, len(samples), size=(resamples, len(samples))
-    )
-    draws = np.mean(
-        within[np.arange(resamples)[:, None], block_indexes], axis=1
-    )
+        within[:, block_index] = np.sum(draws[:, :, 0], axis=1) / np.max(draws[:, :, 1], axis=1)
+    block_indexes = rng.integers(0, len(samples), size=(resamples, len(samples)))
+    draws = np.mean(within[np.arange(resamples)[:, None], block_indexes], axis=1)
     low, high = np.quantile(draws, (0.025, 0.975))
     return float(np.mean(points)), float(low), float(high)
 
@@ -233,9 +215,11 @@ def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.Da
         if parquet[name].dtype != object:
             continue
         parquet[name] = parquet[name].map(
-            lambda value: value
-            if value is None or isinstance(value, str)
-            else json.dumps(value, sort_keys=True)
+            lambda value: (
+                value
+                if value is None or isinstance(value, str)
+                else json.dumps(value, sort_keys=True)
+            )
         )
     parquet.to_parquet(output_root / "summary.parquet", index=False)
     return frame
@@ -255,9 +239,7 @@ def paired_block_statistics(
         "registered_load",
         "effective_load",
     )
-    groups: dict[
-        str, dict[str, dict[int, tuple[float, int, dict[str, object]]]]
-    ] = {}
+    groups: dict[str, dict[str, dict[int, tuple[float, int, dict[str, object]]]]] = {}
     descriptions: dict[str, dict[str, object]] = {}
     for config, metrics in rows:
         block = config.get("block")
@@ -266,10 +248,7 @@ def paired_block_statistics(
             continue
         parameters = config.get("parameters")
         parameters = parameters if isinstance(parameters, dict) else {}
-        condition = {
-            name: config.get(name)
-            for name in ("model", "task", "context", "load")
-        }
+        condition = {name: config.get(name) for name in ("model", "task", "context", "load")}
         condition["comparison_backend"] = parameters.get(
             "comparison_backend", config.get("backend")
         )
@@ -293,6 +272,7 @@ def paired_block_statistics(
         ("lightcone", "target_only"),
         ("lightcone", "static"),
         ("lightcone", "tts"),
+        ("lightcone", "operational_baseline"),
         ("l0_naive", "tts"),
         ("lightcone", "l0_naive"),
         ("onlinespec_ogd", "static"),
@@ -300,14 +280,20 @@ def paired_block_statistics(
         ("onlinespec_ens", "static"),
     )
     results: list[dict[str, object]] = []
-    confirmatory: list[tuple[int, float]] = []
     for key, methods in groups.items():
+        if {"target_only", "static"} <= methods.keys():
+            shared = methods["target_only"].keys() & methods["static"].keys()
+            methods["operational_baseline"] = {
+                block: max(
+                    (methods["target_only"][block], methods["static"][block]),
+                    key=lambda row: row[0],
+                )
+                for block in shared
+            }
         for candidate_name, baseline_name in comparisons:
             if candidate_name not in methods or baseline_name not in methods:
                 continue
-            blocks = sorted(
-                methods[candidate_name].keys() & methods[baseline_name].keys()
-            )
+            blocks = sorted(methods[candidate_name].keys() & methods[baseline_name].keys())
             if len(blocks) < 3:
                 continue
             candidate = [methods[candidate_name][block][0] for block in blocks]
@@ -317,20 +303,16 @@ def paired_block_statistics(
                 != methods[baseline_name][block][2]["stimulus_id"]
                 for block in blocks
             ):
-                raise ValueError(
-                    f"paired methods received different stimuli for {key}"
-                )
+                raise ValueError(f"paired methods received different stimuli for {key}")
             if any(value <= 0 for value in (*candidate, *baseline)):
                 continue
             log_ratios = np.log(candidate) - np.log(baseline)
-            estimate, low, high = paired_bca_interval(
-                log_ratios, np.zeros_like(log_ratios)
-            )
+            estimate, low, high = paired_bca_interval(log_ratios, np.zeros_like(log_ratios))
+            observed = float(np.mean(log_ratios))
+            signs = np.asarray(list(itertools.product((-1.0, 1.0), repeat=len(log_ratios))))
             p_value = float(
-                ttest_rel(log_ratios, np.zeros_like(log_ratios), alternative="greater").pvalue
+                (np.sum(np.mean(signs * log_ratios, axis=1) >= observed) + 1) / (len(signs) + 1)
             )
-            if not math.isfinite(p_value):
-                p_value = 1.0
             results.append(
                 {
                     **descriptions[key],
@@ -339,26 +321,16 @@ def paired_block_statistics(
                     "blocks": blocks,
                     "pairing_key": key,
                     "paired_unit_keys": [
-                        json.dumps(
-                            {**descriptions[key], "block": block}, sort_keys=True
-                        )
+                        json.dumps({**descriptions[key], "block": block}, sort_keys=True)
                         for block in blocks
                     ],
                     "request_counts": {
-                        candidate_name: sum(
-                            methods[candidate_name][block][1] for block in blocks
-                        ),
-                        baseline_name: sum(
-                            methods[baseline_name][block][1] for block in blocks
-                        ),
+                        candidate_name: sum(methods[candidate_name][block][1] for block in blocks),
+                        baseline_name: sum(methods[baseline_name][block][1] for block in blocks),
                     },
                     "source_attempts": {
-                        candidate_name: [
-                            methods[candidate_name][block][2] for block in blocks
-                        ],
-                        baseline_name: [
-                            methods[baseline_name][block][2] for block in blocks
-                        ],
+                        candidate_name: [methods[candidate_name][block][2] for block in blocks],
+                        baseline_name: [methods[baseline_name][block][2] for block in blocks],
                     },
                     "reducer": "paired_log_goodput_bca",
                     "mean_log_ratio": estimate,
@@ -368,14 +340,6 @@ def paired_block_statistics(
                     "p_value": p_value,
                 }
             )
-            if (candidate_name, baseline_name) in {
-                ("lightcone", "static"),
-                ("lightcone", "tts"),
-            }:
-                confirmatory.append((len(results) - 1, p_value))
-    decisions = holm_decisions([row[1] for row in confirmatory]) if confirmatory else ()
     for row in results:
         row["holm_reject"] = None
-    for (index, _), decision in zip(confirmatory, decisions, strict=True):
-        results[index]["holm_reject"] = decision
     return results

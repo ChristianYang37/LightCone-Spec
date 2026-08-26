@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .config import ExperimentConfig
 from .metrics import summarize_attempts
-from .protocol import PAPER_NODES, Job, materialize, paper_plan
+from .protocol import PAPER_NODES, Job, materialize, paper_plan, segment_count
 from .runner import PaperRunner
 from .state import StateStore
 
@@ -41,23 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--config", required=True, type=_absolute)
     status = subparsers.add_parser("status", help="show SQLite run progress")
     status.add_argument("--run-dir", required=True, type=_absolute)
-    summarize = subparsers.add_parser("summarize", help="regenerate stage CSV and Parquet summaries")
+    summarize = subparsers.add_parser(
+        "summarize", help="regenerate stage CSV and Parquet summaries"
+    )
     summarize.add_argument("--run-dir", required=True, type=_absolute)
     return parser
 
 
 def _plan(config: ExperimentConfig) -> None:
     print("node\trows\tgpus\tdescription")
-    for row in paper_plan(final_blocks=config.protocol.final_blocks):
+    for row in paper_plan():
         print(f"{row.name}\t{row.rows}\t{row.gpu_count}\t{row.description}")
     pairs = tuple(zip(config.gpu_ids[::2], config.gpu_ids[1::2], strict=True))
     print(f"\ngpu_pairs\t{len(pairs)}\t{pairs}")
     print(f"max_parallel_blocks\t{len(pairs)}\tone clean block per TP2 pair")
-    jobs = tuple(
-        job
-        for node in PAPER_NODES
-        for job in materialize(node, final_blocks=config.protocol.final_blocks or 12)
-    )
+    jobs = tuple(job for node in PAPER_NODES for job in materialize(node))
+    segments = sum(segment_count(job) for job in jobs)
     finite_requests = sum(
         _request_floor(job, config.server.requests_per_cell)
         for job in jobs
@@ -69,15 +68,16 @@ def _plan(config: ExperimentConfig) -> None:
             f"GPU-pair-interference\t{2 * len(pairs)}\t"
             f"{len(pairs)} isolated + {len(pairs)} concurrent TP2 blocks"
         )
-    print("E1-common-load\tdynamic\t7 loads * (2 baselines + 2 * safe geometries)")
-    print("E3-width-calibration\t36\t4 methods * 3 widths * 3 regimes")
-    print("E1a-confidence-calibration\t4\t4 confidence weights")
-    print("E6-common-load\t90\t2 models * 9 loads * 5 roles")
-    print("E5-p99-extension\tdynamic\t11,000 offered requests per selected boundary")
+    print("E1-common-load\t<=10\t7 bundled loads * (2 baselines + 2 * <=4 finalists)")
+    print("E3-width-calibration\t12\t4 methods * 3 widths, each with 3 segments")
+    print("E6-common-load\t10\t2 models * 5 roles, each with 9 load segments")
+    print("registered E5 p99 extension\t4\t11,000 offered requests per selected boundary")
     print(
         f"registered finite-request floor\t{finite_requests}\t"
         f"requests_per_cell={config.server.requests_per_cell}; E5 time-driven rows excluded"
     )
+    print(f"registered jobs\t{len(jobs)}\tsegments={segments}")
+    print(f"maximum runner jobs\t{len(jobs) + 68}\tincluding dynamic confirmations")
     acceptance = config.results_root / "acceptance"
     if acceptance.is_dir():
         files = tuple(path for path in acceptance.rglob("*") if path.is_file())
@@ -101,10 +101,7 @@ def _plan(config: ExperimentConfig) -> None:
                 + finite_requests * variable_bytes // request_rows
             )
             free = shutil.disk_usage(config.results_root).free
-            print(
-                f"result capacity lower bound\t{projected}\t"
-                f"free={free}; source={acceptance}"
-            )
+            print(f"result capacity lower bound\t{projected}\tfree={free}; source={acceptance}")
     else:
         print(
             "result capacity lower bound\tUNMEASURED\t"

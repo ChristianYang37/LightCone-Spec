@@ -2,7 +2,7 @@
 
 1. Copy `examples/paper.yaml` outside the checkout and fill in absolute local
    paths. The file contains only runtime paths, an even list of GPU IDs, ports, memory
-   settings, the CUDA toolkit path, the `paper-v1` preset, one process retry,
+   settings, the CUDA toolkit path, the `paper-v2` preset, one process retry,
    profiler paths, and optional stage bounds. Consecutive IDs form TP2 pairs,
    so eight GPUs run as four independent pairs.
    Convert raw prompt pools with `scripts/prepare_datasets.py --task
@@ -34,8 +34,8 @@ Useful read-only commands:
 
 ```bash
 lightcone-spec plan --config /root/lightcone-tts-runtime/paper.yaml
-lightcone-spec status --run-dir /root/lightcone-results/paper-v1-main
-lightcone-spec summarize --run-dir /root/lightcone-results/paper-v1-main
+lightcone-spec status --run-dir /root/lightcone-results/paper-v2-efficiency-main
+lightcone-spec summarize --run-dir /root/lightcone-results/paper-v2-efficiency-main
 ```
 
 Formal attempts write compressed numeric request, cycle, GPU, and log files.

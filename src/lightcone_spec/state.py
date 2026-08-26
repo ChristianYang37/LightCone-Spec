@@ -72,7 +72,9 @@ class StateStore:
 
     def recover_interrupted(self) -> int:
         with self.connect() as connection:
-            rows = connection.execute("SELECT job_id, attempt_count FROM jobs WHERE status='running'").fetchall()
+            rows = connection.execute(
+                "SELECT job_id, attempt_count FROM jobs WHERE status='running'"
+            ).fetchall()
             for row in rows:
                 connection.execute(
                     "UPDATE attempts SET status='interrupted', completed_at=CURRENT_TIMESTAMP, error='runner interrupted' WHERE job_id=? AND attempt=? AND status='running'",
@@ -90,15 +92,11 @@ class StateStore:
             ).fetchall()
             existing = len(existing_rows)
             if existing > len(jobs):
-                raise RuntimeError(
-                    f"node {node} cannot shrink from {existing} to {len(jobs)} rows"
-                )
+                raise RuntimeError(f"node {node} cannot shrink from {existing} to {len(jobs)} rows")
             for index, row in enumerate(existing_rows):
                 expected = json.dumps(jobs[index].to_dict(), sort_keys=True)
                 if row["config_json"] != expected:
-                    raise RuntimeError(
-                        f"node {node} row {index} changed after materialization"
-                    )
+                    raise RuntimeError(f"node {node} row {index} changed after materialization")
             for job in jobs:
                 connection.execute(
                     "INSERT OR IGNORE INTO jobs(job_id,node,ordinal,config_json,status) VALUES(?,?,?,?, 'pending')",
@@ -112,7 +110,7 @@ class StateStore:
                 (node, len(jobs)),
             )
 
-    def add_internal_jobs(self, jobs: tuple[Job, ...]) -> None:
+    def add_internal_jobs(self, jobs: tuple[Job, ...], *, storage_node: str | None = None) -> None:
         """Persist resumable calibration work without adding a paper DAG node."""
         with self.connect() as connection:
             for job in jobs:
@@ -125,8 +123,17 @@ class StateStore:
                 connection.execute(
                     "INSERT OR IGNORE INTO jobs(job_id,node,ordinal,config_json,status) "
                     "VALUES(?,?,?,?, 'pending')",
-                    (job.job_id, job.node, job.ordinal, payload),
+                    (job.job_id, storage_node or job.node, job.ordinal, payload),
                 )
+
+    def completed_attempt_dir(self, job_id: str) -> Path | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT output_dir FROM attempts WHERE job_id=? AND status='completed' "
+                "ORDER BY attempt DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        return None if row is None else Path(row["output_dir"])
 
     def pending_jobs(self, node: str) -> tuple[Job, ...]:
         with self.connect() as connection:
@@ -228,9 +235,7 @@ class StateStore:
         counts = self.status_counts(node)
         status = (
             "completed"
-            if not counts.get("pending")
-            and not counts.get("running")
-            and not counts.get("failed")
+            if not counts.get("pending") and not counts.get("running") and not counts.get("failed")
             else "failed"
         )
         with self.connect() as connection:
@@ -243,8 +248,7 @@ class StateStore:
     def mark_stage_failed(self, node: str) -> None:
         with self.connect() as connection:
             connection.execute(
-                "UPDATE stage_state SET status='failed', updated_at=CURRENT_TIMESTAMP "
-                "WHERE node=?",
+                "UPDATE stage_state SET status='failed', updated_at=CURRENT_TIMESTAMP WHERE node=?",
                 (node,),
             )
 
@@ -286,7 +290,9 @@ class StateStore:
 
     def selection(self, name: str, default: Any = None) -> Any:
         with self.connect() as connection:
-            row = connection.execute("SELECT value_json FROM selections WHERE name=?", (name,)).fetchone()
+            row = connection.execute(
+                "SELECT value_json FROM selections WHERE name=?", (name,)
+            ).fetchone()
         return default if row is None else json.loads(row["value_json"])
 
     def completed_attempt_dirs(self, node: str) -> tuple[Path, ...]:

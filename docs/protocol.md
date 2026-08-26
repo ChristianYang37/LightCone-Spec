@@ -1,105 +1,70 @@
 # Paper protocol
 
-`paper-v1` is a fixed scientific protocol expressed directly in
-`lightcone_spec.protocol`. It has 21 nodes and does not build a second workflow
-representation at runtime.
+`paper-v2` keeps the original 21-node scientific order while separating
+screening, primary confirmation, and secondary transfer. A registered job is
+one clean-server `method × block × compatible layout`. Its `segments` run
+multiple contexts, loads, traces, or workload pools on that resident server;
+every segment keeps separate requests, timing, and metrics.
 
-| Node | Registered rows | GPUs per cell | Purpose |
-|---|---:|---:|---|
-| preflight | 10 | 1 or 2 | model load, implementation smoke, memory, HTTP, interference |
-| E3a | 268 | 1 | capacity surface plus checkpointed long trajectories |
-| TTS-Cal | 288 | 1 | TTS numeric calibration |
-| E1 | 68 | 1 | scope/rank screen with fixed roles |
-| E2-r0 | 424 | 1 | 2K-history successive halving |
-| E2-r1 | 109 | 1 | 4K-history successive halving |
-| E2-r2 | 31 | 1 | 8K-history successive halving |
-| E2-r3 | 25 | 1 | 16K-history final selection |
-| E4-screen | 48 | 1 | mechanism screen |
-| E4-local | 96 | 1 | local factorial |
-| E4-profile | 3 | 2 | isolated profiling |
-| E3b-pilot | 1360 | 1 | four excluded 340-row blocks |
-| E3b-final | `340N` | 1 | context and generated-history confirmation |
-| E1a | 116 | 1 | DSpark scope/rank and verification mode |
-| E5-pilot | 2064 | 2 | four 450-row pilots plus 264 failure cells |
-| E5-final | `450N` | 2 | production/topology confirmation |
-| E6-pilot | 282 | 2 | two fit probes plus four 70-row pilots |
-| E6-final | `70N` | 2 | two-model transfer plus 16K history trajectories |
-| E0-tune | `108+239P` | 2 | compatibility and pair-level OnlineSPEC tuning |
-| E0-pilot | `32V` | 2 | four excluded common-load breadth blocks |
-| E0-final | `8VN` | 2 | common-load breadth confirmation |
+| Node | Max jobs | Role |
+|---|---:|---|
+| preflight | 10 | runtime and excluded implementation smoke |
+| E3a | 140 | three-regime width, context, and capacity screen |
+| TTS-Cal | 108 | 72 recipes plus up to 36 finalist confirmations |
+| E1 | 100 | 68 geometry rows plus Pareto confirmation |
+| E2-r0/r1/r2/r3 | 424/109/31/25 | full successive halving and four fixed roles |
+| E4-screen/local/profile | 48/168/3 | systems factors, six-block ablation, profiling |
+| E3b-pilot/final | 20/132 | excluded pilots, 12-block primary and six-block secondary curves |
+| E1a | 141 | DSpark geometry, five confidence weights, confirmation |
+| E5-pilot/final | 53/160 | serving calibration, faults, 12/6-block confirmation |
+| E6-pilot/final | 22/60 | interface/fit and six-block two-model transfer |
+| E0-tune/pilot/final | 287/86/258 | compatibility, representative OnlineSPEC, bundled breadth |
 
-`N` is selected once from the four excluded E3b pilot blocks and must be in
-12--20; E5, E6, and E0 reuse that same final-block prefix. `V` is read from completed E0 compatibility
-probes, and `P` is the number of distinct valid model/backend pairs. OnlineSPEC
-is tuned once per pair on CalibrationMix and frozen across workloads. A missing selection skips only dependent nodes. Independent diagnostics
-continue, and no absent row is converted into a result.
+The static materialization is 2,317 jobs; bounded TTS confirmation, E1 load,
+width, and E6 load work bring the maximum to 2,385 runner jobs. There is no
+global `N` or `final_blocks` setting.
 
-Short-input/long-generation is reserved for within-request learning dynamics.
-E3a and E3b run one 40.8K trajectory per condition and read speed at
-1K/2K/4K/8K/16K/24K/32K/40.8K checkpoints from its native timestamps.
-Capacity, memory, systems, production, and compatibility cells use long input
-with short output or their registered traffic trace. TTS-Cal uses 4K output,
-with four disjoint 19-prompt blocks covering CalibrationMix; E1/E1a use 8K,
-and E2 uses 2K/4K/8K/16K across its four rounds.
+## Comparisons and repetition
 
-Each E0 compatibility row runs the registered Static interface, then restarts
-the same model/backend as adaptive LightCone and requires a finite published
-update. E3 refits a natural cubic spline with fixed 4K/16K/32K interior knots
-inside each block--request resample. Matched width uses the E3a winner; an
-excluded tuning substage independently freezes deployment width for Static,
-TTS, L0, and LightCone.
+- E3b primary: LiveCodeBench 32K generated history, five mechanism roles,
+  12 paired clean-server blocks.
+- E3b secondary: MATH-500 16K generated history and four-context
+  long-input/multi-turn suites, four core roles, six blocks.
+- E5 primary: Target-only, Static, TTS, and LightCone; two backends; all
+  registered concurrency, arrival-rate, and trace segments; 12 blocks.
+- E5 topology and E4/E6/E0 transfer: six blocks.
+- L0-naive is the publication-policy ablation. OnlineSPEC is tuned and reported
+  only for Qwen3-8B + DFlash.
 
-Methods in a paired block run sequentially on the same device. Independent
-blocks may use different configured devices or TP2 pairs concurrently. TP2,
-DP2, E5, and E6 cells use one pair exclusively. DP2 uses two independent TP1 servers with
-sticky cohort routing. Every independent block gets a clean server;
-cells with the same model/backend, parallel layout, optimizer-state layout,
-width, and profiler mode reuse it after an idle configure/reset. Incompatible
-layouts restart normally. Preflight disables parallel final blocks when measured
-pair interference exceeds 1%.
+Screening and tuning are exploratory. Only frozen confirmation blocks support
+effect claims. Paired methods share stimuli and run on the same GPU resource in
+random order. A segment failure excludes its parent job attempt from reducers;
+resume keeps completed segment evidence and completes the parent only when all
+segments are terminal.
 
-E1 first runs all 68 rows at `c1`, then probes the E3a load grid for the anchors
-and two-optimizer Pareto union. Its highest common safe load caps E2 and is
-reused by E3/E4. TTS uses the paper recipe: Adam, zero weight decay, no gradient clipping,
-the complete drafter, one update step, latest-round-only teacher rows,
-and `exp(-1/7)` positional decay. TTS resets between requests as specified by
-the source paper, so a server has one adaptive TTS request owner. Registered
-load is still offered to TTS and excess requests remain visible as queueing or
-non-admission. L0-naive uses the same request lifetime and candidate update but
-publishes first-ready, isolating publication policy.
-TTS-Cal, E1, E2, E1a, and deployment-width selection use
-the fixed 76-prompt CalibrationMix. E2
-uses the registered `(B,L)` points as closed-loop concurrency and generated
-history length. E1a selects one confidence weight from `0.05/0.1/0.25/0.5` on
-an excluded `last5_native_heads/full` calibration before its 116 rows. E4 factors map directly to runtime arguments and its profiling
-rows invoke NVTX, Nsight Systems, and Nsight Compute. E5 maps the registered
-arrival traces, sticky cohorts, popularity, topology, and eleven failures to
-runtime behavior; BurstGPT replays both arrival times and input/output lengths.
-E5 uses 10 s warm-up, 60 s headline, 300 s soak, 120 s request deadlines and
-180 s drain; a separate 11,000-request boundary extension resolves p99 only
-after 10,000 completions. Each E6 interface row runs separate LoRA and Full
-finite-update gates; an infeasible Full `c1` gate remains blocked. Every E6
-role, including Target-only, runs TP2 and
-each model freezes its own common load from `c1` through `c256`.
+## TTS and DSpark
 
-Formal scientific checks are limited to:
+TTS uses Adam, one update, latest-round teacher rows, request reset, zero weight
+decay, no clipping, positional decay `exp(-1/7)`, and strides
+`1,5,10,15,20,30,40,50`. Its paper does not publish a learning rate, so the
+nine learning rates are explicitly LightCone-Spec calibration. The source-policy
+KL is algebraically omitted for the one-step update because its gradient is
+zero at the current source policy.
 
-- proposal version matches the published parameter version;
-- TTS and L0 controlled replay produce the same staged candidate;
-- loss, gradients, and updates are finite;
-- OOM, fallback, retraction, and stale-publication events are counted;
-- goodput uses committed tokens and comparisons share an HBM-feasible load;
-- scheduler committed-token timestamps, rank-local metrics, and TP/DP
-  sum/max/min aggregates are present rather than reconstructed from HTTP delivery time;
-- pilot rows never enter final estimates; statistics operate on paired blocks.
+DSpark keeps its native checkpoint and confidence scheduler. Confidence weights
+`0.05,0.1,0.25,0.5,1.0` are calibration candidates; verification budget,
+Brier score, ECE, and verification waste are always reported.
 
-Preflight also runs one excluded four-prompt implementation smoke: greedy
-same-logit agreement and a fixed-random-number reference rejection sampler.
-Those checks diagnose the implementation and are not repeated in formal cells
-or entered into paper statistics. Benchmark prompts are workload stimuli only;
-no answer, code test, or judge score is evaluated.
+## Statistics
 
-Process and network failures retry at most once. Numerical errors and failed
-scientific criteria are terminal for the cell. OOM in a
-declared capacity screen is an ordinary completed `feasible=false` outcome;
-OOM elsewhere remains terminal.
+Three primary hypotheses share Holm correction: E3b LightCone–TTS goodput,
+E3b LightCone–the faster frozen Target-only/Static baseline, and E5
+LightCone–operational-baseline maximum feasible rate. E3b/E5 use paired log
+ratios, BCa 95% intervals, and exact sign-flip tests over 12 blocks. E4/E6/E0
+use block→request hierarchical bootstrap over six blocks. E5 p99 requires
+10,000 completed requests and a time-block bootstrap. E0 workload-family
+results are exploratory and use BH-FDR.
+
+Formal evidence is compressed numeric request/cycle data, GPU telemetry,
+configuration, metrics, SQLite state, and source attempt directories. Generated
+text and token trajectories appear only in the excluded implementation smoke.
