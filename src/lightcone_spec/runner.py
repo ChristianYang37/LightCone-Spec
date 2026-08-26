@@ -55,6 +55,7 @@ from .protocol import (
     E5_SOAK_SECONDS,
     E5_WARMUP_SECONDS,
     PAPER_NODES,
+    TTS_GENERATION_TOKENS,
     Job,
     e2_candidates,
     materialize,
@@ -85,10 +86,19 @@ def _screening_job(job: Job) -> bool:
     return job.node in {"E3a", "E1-common-load", "E6-interface", "E6-common-load"}
 
 
-def _capacity_infeasible(error: Exception) -> bool:
+def _capacity_infeasible(
+    error: Exception,
+    server_log: Path | None = None,
+    offset: int = 0,
+) -> bool:
+    message = str(error)
+    if server_log is not None and server_log.exists():
+        with server_log.open("rb") as stream:
+            stream.seek(offset)
+            message += stream.read().decode("utf-8", errors="replace")
     return isinstance(error, MemoryError) or re.search(
         r"out of memory|\b(?:cuda )?oom\b|adaptation peak .* exceeds pre-KV reserve",
-        str(error),
+        message,
         flags=re.IGNORECASE,
     ) is not None
 
@@ -477,7 +487,9 @@ def _cell_inputs(
     regime = str(job.parameters.get("regime", "long_input_short_output"))
     if regime == "short_input_long_generation":
         inputs = tuple(tokens[-min(len(tokens), 128) :] for tokens in tokenized)
-        max_new_tokens = max(1, job.context - max(len(tokens) for tokens in inputs))
+        available = job.context - max(len(tokens) for tokens in inputs)
+        requested = int(job.parameters.get("generation_tokens", available))
+        max_new_tokens = max(1, min(requested, available))
     else:
         max_new_tokens = min(256, config.server.max_new_tokens)
         prompt_length = max(1, job.context - max_new_tokens)
@@ -1528,7 +1540,11 @@ def _execute_cell(
             )
             return
         except Exception as error:
-            if _screening_job(job) and _capacity_infeasible(error):
+            if _screening_job(job) and _capacity_infeasible(
+                error,
+                session_files["server.log"],
+                session_offsets["server.log"],
+            ):
                 _write_json(
                     output_dir / "metrics.json",
                     {
@@ -1799,6 +1815,8 @@ def _confidence_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
                 "rank": None,
                 "verification": "native_scheduler",
                 "confidence_loss_weight": weight,
+                "regime": "short_input_long_generation",
+                "generation_tokens": TTS_GENERATION_TOKENS,
                 "workload": "excluded_confidence_calibration",
             },
         )
@@ -1827,7 +1845,11 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                     context=40928,
                     load=load,
                     width=None if method == "target_only" else 16,
-                    parameters={"workload": "excluded_common_load_probe"},
+                    parameters={
+                        "regime": "short_input_long_generation",
+                        "generation_tokens": TTS_GENERATION_TOKENS,
+                        "workload": "excluded_common_load_probe",
+                    },
                 )
             )
             ordinal += 1
@@ -1848,6 +1870,8 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                         parameters={
                             **geometry,
                             "optimizer": optimizer,
+                            "regime": "short_input_long_generation",
+                            "generation_tokens": TTS_GENERATION_TOKENS,
                             "workload": "excluded_common_load_probe",
                         },
                     )

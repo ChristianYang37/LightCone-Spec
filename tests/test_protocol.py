@@ -19,10 +19,12 @@ from lightcone_spec.runner import (
     _assigned_gpu,
     _assigned_pair,
     _capacity_infeasible,
+    _cell_inputs,
     _e5_execution_phases,
     _e5_reference,
     _e6_interface_jobs,
     _e6_role_supported,
+    _fit_prompt,
     _gpu_pairs,
     _pair_interference_jobs,
     _resource_port,
@@ -93,6 +95,22 @@ def test_two_gpu_exclusivity_and_real_interface_probes():
     probes = materialize("E0-tune", valid_e0=[])[:108]
     assert {job.method for job in probes} == {"static"}
     assert all(job.parameters["adaptive_probe"] for job in probes)
+
+
+def test_capacity_screen_reads_only_the_current_server_log(tmp_path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text("old CUDA out of memory\n")
+    offset = server_log.stat().st_size
+    server_log.write_text(server_log.read_text() + "scheduler exited\n")
+    assert not _capacity_infeasible(RuntimeError("short response"), server_log, offset)
+    with server_log.open("a") as stream:
+        stream.write("torch.OutOfMemoryError: CUDA out of memory\n")
+    assert _capacity_infeasible(RuntimeError("short response"), server_log, offset)
+
+
+def test_dataset_context_does_not_repeat_its_prompt_pool():
+    with pytest.raises(RuntimeError, match="dataset-native context"):
+        _fit_prompt((9, 10), (1, 2, 3), 8)
 
 
 def test_eight_gpu_pair_pool_preserves_block_affinity(tmp_path):
@@ -171,6 +189,12 @@ def test_registered_axes_reach_runtime_parameters():
     assert payload["optimizer"]["grad_clip"] == 0
     assert payload["teacher_row_policy"] == "latest_update_round_only"
     assert payload["loss_position_decay"] == math.exp(-1 / 7)
+    for node in ("TTS-Cal", "E1", "E1a"):
+        jobs = materialize(node)
+        assert {job.parameters["regime"] for job in jobs} == {
+            "short_input_long_generation"
+        }
+        assert {job.parameters["generation_tokens"] for job in jobs} == {32768}
 
     rounds = [materialize(f"E2-r{index}")[0] for index in range(4)]
     assert [(job.load, job.context) for job in rounds] == [
@@ -209,7 +233,10 @@ def test_session_key_reuses_scalar_recipe_but_not_layout():
     assert server_session_key(lora) != server_session_key(full)
     context = materialize("E3a")[-1]
     assert server_session_key(context) == server_session_key(
-        context.__class__(**{**context.to_dict(), "context": 4096, "load": "c1"})
+        context.__class__(**{**context.to_dict(), "context": 4096})
+    )
+    assert server_session_key(context) != server_session_key(
+        context.__class__(**{**context.to_dict(), "load": "c1"})
     )
     high_priority = first.__class__(
         **{
@@ -270,6 +297,41 @@ def test_exact_draft_mapping_and_calibration_mix(tmp_path):
     path = tmp_path / "tts.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in rows))
     assert len(load_calibration_mix(path)) == 76
+
+    config = ExperimentConfig(
+        source=tmp_path / "paper.yaml",
+        run_name="run",
+        sglang_root=tmp_path / "sglang",
+        results_root=tmp_path,
+        models={},
+        drafts={},
+        datasets={"CalibrationMix": path},
+        gpu_ids=(0, 1),
+        server=ServerConfig(python=tmp_path / "python"),
+        protocol=ProtocolConfig(),
+    )
+
+    class Tokenizer:
+        @staticmethod
+        def tokenize(prompt):
+            return tuple(range(1, len(prompt.split()) + 2))
+
+    job = materialize("TTS-Cal")[0]
+    prompts, max_new_tokens, metadata = _cell_inputs(config, object(), Tokenizer(), job)
+    assert len(prompts) == 76
+    assert max_new_tokens == 32768
+    assert max(map(len, prompts)) <= 128
+    assert metadata["regime"] == "short_input_long_generation"
+
+
+def test_preflight_covers_short_and_long_context_without_changing_count():
+    jobs = materialize("preflight")
+    assert len(jobs) == 10
+    interference = jobs[2:]
+    assert {job.context for job in interference if job.block == 0} == {4096}
+    assert {job.context for job in interference if job.block == 1} == {40928}
+    assert {job.task for job in interference if job.block == 1} == {"MATH-500"}
+    assert all(job.load == "c1" for job in interference)
 
 
 def test_prompt_pool_needs_only_identity_and_renderable_prompt(tmp_path):

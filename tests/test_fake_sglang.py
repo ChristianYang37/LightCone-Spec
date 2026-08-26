@@ -1046,7 +1046,7 @@ def test_greedy_verify_allows_block_overshoot_but_not_mismatch():
         _validate_greedy_verify_counts(256, 259, 1)
 
 
-def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
+def test_target_server_keeps_overlap_and_uses_registered_capacity(tmp_path: Path):
     python = tmp_path / "python"
     python.write_text("")
     model = tmp_path / "model"
@@ -1066,13 +1066,12 @@ def test_target_server_keeps_overlap_and_fixed_capacity(tmp_path: Path):
         config, materialize("preflight")[0], port=30000, output_dir=output,
         adaptation=None,
     )
-    assert command[command.index("--max-running-requests") + 1] == "256"
+    assert command[command.index("--max-running-requests") + 1] == "1"
     assert "--disable-overlap-schedule" not in command
     assert "--disable-cuda-graph" not in command
     graph_index = command.index("--cuda-graph-bs-decode")
-    assert command[graph_index + 1 : graph_index + 10] == [
-        "1", "2", "4", "8", "16", "32", "64", "128", "256",
-    ]
+    assert command[graph_index + 1] == "1"
+    assert command[graph_index + 2].startswith("--")
     assert "--skip-server-warmup" in command
     assert "--enable-deterministic-inference" in command
 
@@ -1166,7 +1165,7 @@ def test_exactness_bootstrap_only_captures_single_request_graph(tmp_path: Path):
     assert command[graph + 2] == "--chunked-prefill-size"
 
 
-def test_preflight_interference_only_captures_registered_request_batch(tmp_path: Path):
+def test_preflight_interference_only_captures_registered_concurrency(tmp_path: Path):
     python = tmp_path / "python"
     python.write_text("")
     model = tmp_path / "model"
@@ -1187,9 +1186,26 @@ def test_preflight_interference_only_captures_registered_request_batch(tmp_path:
     )
     job = materialize("preflight")[2]
     command = server_command(config, job, port=30000, output_dir=tmp_path, adaptation=None)
-    assert command[command.index("--max-running-requests") + 1] == "256"
+    assert command[command.index("--max-running-requests") + 1] == "1"
     graph_index = command.index("--cuda-graph-bs-decode")
-    assert command[graph_index + 1 : graph_index + 6] == ["1", "2", "4", "8", "16"]
+    assert command[graph_index + 1] == "1"
+    assert command[graph_index + 2].startswith("--")
+
+    c64 = next(job for job in materialize("E3a") if job.load == "c64")
+    command = server_command(
+        config, c64, port=30000, output_dir=tmp_path, adaptation=None
+    )
+    assert command[command.index("--max-running-requests") + 1] == "64"
+    graph_index = command.index("--cuda-graph-bs-decode")
+    assert command[graph_index + 1 : graph_index + 8] == [
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+    ]
 
 
 def test_formal_request_evidence_omits_text_and_token_trajectory(tmp_path: Path):

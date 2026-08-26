@@ -53,6 +53,7 @@ SCHEDULES = ("constant", "inverse_sqrt_published_update", "cosine_to_zero")
 LEARNING_RATES = (1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
 TTS_LEARNING_RATES = (1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
 TTS_STRIDES = (1, 5, 10, 15, 20, 30, 40, 50)
+TTS_GENERATION_TOKENS = 32768
 PILOT_BLOCKS = (0, 1, 2, 3)
 E5_CONCURRENCY = (1, 2, 4, 8, 16, 32, 64, 128, 256)
 E5_LOADS = (0.25, 0.50, 0.75, 0.90, 1.00, 1.10, 1.25)
@@ -212,7 +213,24 @@ def _preflight() -> Iterator[dict[str, Any]]:
     yield dict(method="target_only", model="Qwen/Qwen3-8B", backend="NONE", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", preflight_kind="runtime_load", controlled_pair_baseline=True, deterministic_exactness=True)
     yield dict(method="l0_naive", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", gpu_count=2, topology="tp2_dp1", controlled_replay=True, preflight_kind="implementation_smoke", deterministic_verify=True)
     for block, mode, gpu in itertools.product(range(2), ("isolated", "concurrent"), range(2)):
-        yield dict(method="static", model="Qwen/Qwen3-8B", backend="DFLASH", task="controlled_baseline", context=4096, block=block, mode=mode, gpu_index=gpu, workload="interference")
+        long_context = block == 1
+        yield dict(
+            method="static",
+            model="Qwen/Qwen3-8B",
+            backend="DFLASH",
+            task="MATH-500" if long_context else "controlled_baseline",
+            context=40928 if long_context else 4096,
+            block=block,
+            mode=mode,
+            gpu_index=gpu,
+            load="c1",
+            regime=(
+                "multi_turn_shared_prefix"
+                if long_context
+                else "long_input_short_output"
+            ),
+            workload="interference",
+        )
 
 
 def _e3a() -> Iterator[dict[str, Any]]:
@@ -233,14 +251,14 @@ def _e3a() -> Iterator[dict[str, Any]]:
 
 def _tts_cal() -> Iterator[dict[str, Any]]:
     for lr, stride, block in itertools.product(TTS_LEARNING_RATES, TTS_STRIDES, PILOT_BLOCKS):
-        yield dict(method="tts", model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix", context=40928, width=16, block=block, learning_rate=lr, stride=stride, optimizer="adam", parameterization="full", scope="all", workload="tts_calibration")
+        yield dict(method="tts", model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix", context=40928, width=16, block=block, learning_rate=lr, stride=stride, optimizer="adam", parameterization="full", scope="all", regime="short_input_long_generation", generation_tokens=TTS_GENERATION_TOKENS, workload="tts_calibration")
 
 
 def _e1() -> Iterator[dict[str, Any]]:
     for role in ("target_only", "static", "tts", "l0_naive"):
-        yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", task="CalibrationMix", context=40928, width=16, fixed_role=True)
+        yield dict(method=role, model="Qwen/Qwen3-8B", backend="NONE" if role == "target_only" else "DFLASH", task="CalibrationMix", context=40928, width=16, fixed_role=True, regime="short_input_long_generation", generation_tokens=TTS_GENERATION_TOKENS)
     for geometry, optimizer in itertools.product(_parameter_geometries(), ("adamw", "sgdm")):
-        yield dict(method="lightcone_candidate", model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix", context=40928, width=16, optimizer=optimizer, **geometry)
+        yield dict(method="lightcone_candidate", model="Qwen/Qwen3-8B", backend="DFLASH", task="CalibrationMix", context=40928, width=16, optimizer=optimizer, regime="short_input_long_generation", generation_tokens=TTS_GENERATION_TOKENS, **geometry)
 
 
 def e2_candidates(geometries: Iterable[dict[str, Any]] | None = None) -> tuple[dict[str, Any], ...]:
@@ -366,7 +384,7 @@ def _e1a() -> Iterator[dict[str, Any]]:
     configs.extend(({"scope": "none", "parameterization": "none", "rank": None, "baseline": "target_only"}, {"scope": "none", "parameterization": "none", "rank": None, "baseline": "static"}))
     for configuration, verification in itertools.product(configs, ("fixed_budget", "native_scheduler")):
         baseline = configuration.get("baseline")
-        yield dict(method=baseline or "lightcone_candidate", model="Qwen/Qwen3-8B", backend="NONE" if baseline == "target_only" else "DSPARK", task="CalibrationMix", context=40928, width=16, verification=verification, **configuration)
+        yield dict(method=baseline or "lightcone_candidate", model="Qwen/Qwen3-8B", backend="NONE" if baseline == "target_only" else "DSPARK", task="CalibrationMix", context=40928, width=16, verification=verification, regime="short_input_long_generation", generation_tokens=TTS_GENERATION_TOKENS, **configuration)
 
 
 def _e5_blocks(blocks: Iterable[int]) -> Iterator[dict[str, Any]]:
