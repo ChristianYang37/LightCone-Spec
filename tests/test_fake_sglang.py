@@ -37,6 +37,7 @@ from lightcone_spec.runner import (
     _check_greedy_trajectories,
     _exactness_bootstrap,
     _fault_action_passed,
+    _fit_prompt,
     _read_jsonl,
     _request_metrics,
     _request_scope_released,
@@ -132,6 +133,7 @@ class Handler(BaseHTTPRequestHandler):
     sampling_params = []
     active = 0
     peak_active = 0
+    aborted = []
     active_lock = threading.Lock()
 
     def log_message(self, format, *args):
@@ -177,6 +179,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == "/abort_request":
+            Handler.aborted.append(request["rid"])
             self.send_response(200)
             self.end_headers()
             return
@@ -233,6 +236,7 @@ def fake_server():
         Handler.sampling_params = []
         Handler.active = 0
         Handler.peak_active = 0
+        Handler.aborted = []
         server.shutdown()
         thread.join()
 
@@ -803,6 +807,26 @@ def test_bounded_and_closed_loop_enforce_real_concurrency(fake_server):
     assert len(closed.results) >= 4
     assert Handler.peak_active == 2
     assert closed.elapsed_seconds >= 0.07
+
+
+def test_bounded_timeout_aborts_the_exact_request(fake_server):
+    Handler.delay = 0.03
+    client = SGLangClient(f"http://127.0.0.1:{fake_server}", 2)
+    run = client.run_bounded(
+        ("a",),
+        max_new_tokens=2,
+        seed=0,
+        request_ids=("timeout-request",),
+        deadline_seconds=0.005,
+    )
+    assert not run.results
+    assert run.outcomes[0].status == "timed_out"
+    assert Handler.aborted == ["timeout-request"]
+
+
+def test_long_context_prompt_repeats_the_registered_workload_pool():
+    prompt = _fit_prompt((7, 8), (1, 2, 3), 10)
+    assert prompt == (1, 2, 3, 1, 2, 3, 1, 2, 7, 8)
 
 
 def test_request_scope_waits_for_every_rank():

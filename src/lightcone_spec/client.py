@@ -132,6 +132,7 @@ def _run_bounded(
                         ids[index], "completed", offered_ns, admitted_ns, finished_ns
                     )
                 except Exception as error:
+                    client.abort(ids[index])
                     outcomes[index] = RequestOutcome(
                         ids[index],
                         _request_error(error),

@@ -461,11 +461,10 @@ def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -
     if len(tokens) >= length:
         return tokens[-length:]
     needed = length - len(tokens)
-    if len(filler) < needed:
-        raise ScientificFailure(
-            f"dataset-native context has {len(filler)} tokens; {needed} required"
-        )
-    return filler[:needed] + tokens
+    if not filler:
+        raise ScientificFailure("a long-context cell has an empty workload prompt pool")
+    repeated = filler * math.ceil(needed / len(filler))
+    return repeated[:needed] + tokens
 
 
 def _cell_inputs(
@@ -509,6 +508,10 @@ def _cell_inputs(
     else:
         max_new_tokens = min(256, config.server.max_new_tokens)
         prompt_length = max(1, job.context - max_new_tokens)
+        if not filler:
+            raise ScientificFailure("a long-context cell has an empty workload prompt pool")
+        metadata["context_construction"] = "repeated_workload_prefix"
+        metadata["prefix_repetitions"] = math.ceil(prompt_length / len(filler))
         if regime == "multi_turn_shared_prefix":
             shared_length = prompt_length // 2
             shared = (filler * ((shared_length + len(filler) - 1) // len(filler)))[:shared_length]
@@ -1322,6 +1325,51 @@ def _execute_cell(
             if controlled_rows:
                 _write_jsonl(output_dir / "controlled.jsonl.gz", controlled_rows)
             committed = int(after["committed_tokens"]) - int(before["committed_tokens"])
+            incomplete = [row for row in outcome_rows if row["status"] != "completed"]
+            if incomplete:
+                if not _screening_job(job):
+                    raise RuntimeError(
+                        f"{len(incomplete)} requests did not complete in a measured cell"
+                    )
+                counters = {
+                    name: int(after[name]) - int(before[name]) for name in SAFETY_COUNTERS
+                }
+                _write_json(
+                    output_dir / "metrics.json",
+                    {
+                        "scientific_outcome": "infeasible",
+                        "feasible": False,
+                        "slo_pass": False,
+                        "error": f"{len(incomplete)} requests did not complete at registered load",
+                        "duration_seconds": elapsed,
+                        "committed_tokens": committed,
+                        "output_tokens": sum(result.completion_tokens for result in results),
+                        "request_count": len(results),
+                        "request_outcomes": {
+                            "offered": len(outcome_rows),
+                            "admitted": sum(
+                                row["admitted_ns"] is not None for row in outcome_rows
+                            ),
+                            "completed": sum(
+                                row["status"] == "completed" for row in outcome_rows
+                            ),
+                            "error": sum(row["status"] == "error" for row in outcome_rows),
+                            "timed_out": sum(
+                                row["status"] == "timed_out" for row in outcome_rows
+                            ),
+                            "cancelled": sum(
+                                row["status"] == "cancelled" for row in outcome_rows
+                            ),
+                            "unfinished": sum(
+                                row["status"] == "unfinished" for row in outcome_rows
+                            ),
+                        },
+                        **counters,
+                    },
+                )
+                client.reset()
+                state.complete(job.job_id, attempt)
+                return
             output_tokens = _validate_committed_tokens(results, committed)
             peak_hbm = int(after["peak_hbm_bytes"])
             reserved_hbm = int(after["peak_hbm_reserved_bytes"])
