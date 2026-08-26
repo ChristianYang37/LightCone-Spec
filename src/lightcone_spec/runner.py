@@ -54,6 +54,8 @@ from .protocol import (
     E5_REQUEST_DEADLINE_SECONDS,
     E5_SOAK_SECONDS,
     E5_WARMUP_SECONDS,
+    GEOMETRY_GENERATION_TOKENS,
+    MAX_E2_GEOMETRIES,
     PAPER_NODES,
     TTS_GENERATION_TOKENS,
     Job,
@@ -410,7 +412,7 @@ def _e5_poisson_offsets(
 
 def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int:
     if job.node == "TTS-Cal":
-        return 76
+        return 19
     if job.parameters.get("p99_extension"):
         return E5_P99_EXTENSION_REQUESTS
     if job.parameters.get("failure") == "queue_saturation":
@@ -461,7 +463,9 @@ def _cell_inputs(
     dataset_key = _task_for_data(config, job)
     metadata: dict[str, object] = {"dataset": dataset_key}
     if job.node == "TTS-Cal":
-        prompts = load_calibration_mix(config.dataset_path(dataset_key))
+        calibration = load_calibration_mix(config.dataset_path(dataset_key))
+        start = int(job.block or 0) * 19
+        prompts = calibration[start : start + 19]
     else:
         records = load_prompt_records(
             config.dataset_path(dataset_key),
@@ -552,6 +556,42 @@ def _request_metrics(result: GenerationResult) -> dict[str, object]:
         "native_token_timestamps_ns": list(result.native_token_timestamps_ns),
         "stop_details": result.stop_details,
     }
+
+
+def _trajectory_checkpoint_metrics(
+    results: Iterable[GenerationResult], checkpoints: Iterable[int]
+) -> list[dict[str, float | int]]:
+    rows = tuple(results)
+    output = []
+    for checkpoint in checkpoints:
+        timestamps = [
+            result.native_token_timestamps_ns[:checkpoint]
+            for result in rows
+            if len(result.native_token_timestamps_ns) >= checkpoint
+        ]
+        if len(timestamps) != len(rows) or not timestamps:
+            continue
+        start = min(row[0] for row in timestamps)
+        end = max(row[-1] for row in timestamps)
+        duration = (end - start) / 1e9
+        if duration <= 0:
+            continue
+        intervals = [
+            (right - left) / 1e6
+            for row in timestamps
+            for left, right in zip(row, row[1:], strict=False)
+        ]
+        output.append(
+            {
+                "generation_tokens": checkpoint,
+                "committed_tokens": checkpoint * len(rows),
+                "decode_seconds": duration,
+                "goodput": checkpoint * len(rows) / duration,
+                "itl_p99_ms": float(np.quantile(intervals, 0.99)),
+                "request_count": len(rows),
+            }
+        )
+    return output
 
 
 def _jsonl_path(directory: Path, name: str) -> Path:
@@ -1348,6 +1388,11 @@ def _execute_cell(
                 "executed_flops": "N/A",
                 "hbm_bytes_per_committed_token": "N/A",
             }
+            checkpoints = runtime_job.parameters.get("generation_checkpoints")
+            if isinstance(checkpoints, (list, tuple)):
+                metrics["trajectory_checkpoints"] = _trajectory_checkpoint_metrics(
+                    results, (int(value) for value in checkpoints)
+                )
             if exactness_evidence is not None:
                 metrics["exactness_bootstrap"] = exactness_evidence
             if runtime_job.parameters.get("probe"):
@@ -1846,8 +1891,7 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                     load=load,
                     width=None if method == "target_only" else 16,
                     parameters={
-                        "regime": "short_input_long_generation",
-                        "generation_tokens": TTS_GENERATION_TOKENS,
+                        "regime": "long_input_short_output",
                         "workload": "excluded_common_load_probe",
                     },
                 )
@@ -1870,8 +1914,7 @@ def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
                         parameters={
                             **geometry,
                             "optimizer": optimizer,
-                            "regime": "short_input_long_generation",
-                            "generation_tokens": TTS_GENERATION_TOKENS,
+                            "regime": "long_input_short_output",
                             "workload": "excluded_common_load_probe",
                         },
                     )
@@ -1975,6 +2018,11 @@ def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
                         width=width,
                         parameters={
                             "regime": regime,
+                            **(
+                                {"generation_tokens": GEOMETRY_GENERATION_TOKENS}
+                                if regime == "short_input_long_generation"
+                                else {}
+                            ),
                             "workload": "excluded_deployment_width_tuning",
                         },
                     )
@@ -2729,6 +2777,29 @@ def _rank_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, 
     return [row[-1] for row in candidates[:keep]]
 
 
+def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
+    groups: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+    for config, metrics in _metric_rows(state, "TTS-Cal"):
+        if metrics.get("feasible") is False:
+            continue
+        parameters = config["parameters"]
+        key = json.dumps(parameters, sort_keys=True)
+        groups.setdefault(key, (parameters, []))[1].append(metrics)
+    candidates = [
+        (
+            -float(np.mean([row["goodput"] for row in rows])),
+            int(np.max([row["peak_hbm_bytes"] for row in rows])),
+            float(np.max([row["itl_p99_ms"] for row in rows])),
+            parameters,
+        )
+        for parameters, rows in groups.values()
+        if len(rows) == 4
+    ]
+    if not candidates:
+        raise ScientificFailure("TTS-Cal produced no complete four-window recipe")
+    return min(candidates, key=lambda row: row[:-1])[-1]
+
+
 def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
     grouped: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     for config, metrics in _metric_rows(state, "E1"):
@@ -2773,7 +2844,7 @@ def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
         )
     ]
     pareto.sort(key=lambda row: (-row[1], row[2], row[3]))
-    return [parameters for parameters, _, _, _ in pareto[:32]]
+    return [parameters for parameters, _, _, _ in pareto[:MAX_E2_GEOMETRIES]]
 
 
 def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, Any]]:
@@ -2855,9 +2926,18 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
             config.get("load"),
             parameters.get("width_panel"),
         )
-        grouped.setdefault(key, {}).setdefault(context, []).append(
-            float(metrics["goodput"])
+        checkpoints = metrics.get("trajectory_checkpoints")
+        points = (
+            [
+                (int(row["generation_tokens"]), float(row["goodput"]))
+                for row in checkpoints
+            ]
+            if parameters.get("regime") == "short_input_long_generation"
+            and isinstance(checkpoints, list)
+            else [(context, float(metrics["goodput"]))]
         )
+        for length, goodput in points:
+            grouped.setdefault(key, {}).setdefault(length, []).append(goodput)
     request_groups: dict[
         tuple[object, ...],
         dict[int, dict[int, tuple[list[tuple[int, float]], float]]],
@@ -2889,20 +2969,41 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
             config.get("load"),
             parameters.get("width_panel"),
         )
-        rows = []
-        for request in _read_jsonl(requests_path):
-            rows.append(
-                (
-                    int(request["completion_tokens"]),
-                    float(request["elapsed_seconds"]),
+        requests = _read_jsonl(requests_path)
+        checkpoint_rows = metrics.get("trajectory_checkpoints")
+        lengths = (
+            [int(row["generation_tokens"]) for row in checkpoint_rows]
+            if parameters.get("regime") == "short_input_long_generation"
+            and isinstance(checkpoint_rows, list)
+            else [context]
+        )
+        for length in lengths:
+            rows = []
+            starts = []
+            ends = []
+            for request in requests:
+                timestamps = request.get("native_token_timestamps_ns", [])
+                if length != context and len(timestamps) >= length:
+                    starts.append(int(timestamps[0]))
+                    ends.append(int(timestamps[length - 1]))
+                    rows.append((length, (ends[-1] - starts[-1]) / 1e9))
+                elif length == context:
+                    rows.append(
+                        (
+                            int(request["completion_tokens"]),
+                            float(request["elapsed_seconds"]),
+                        )
+                    )
+            if rows:
+                block_duration = (
+                    (max(ends) - min(starts)) / 1e9 if starts else float(duration)
                 )
-            )
-        if rows:
-            request_groups.setdefault(key, {}).setdefault(context, {})[block] = (
-                rows,
-                float(duration),
-            )
-            request_counts[key] += len(rows)
+                request_groups.setdefault(key, {}).setdefault(length, {})[block] = (
+                    rows,
+                    block_duration,
+                )
+                request_counts[key] += len(rows)
+        if requests:
             sources.setdefault(key, []).append(
                 {
                     "job_id": config.get("job_id"),
@@ -2973,6 +3074,11 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
                 "regime": key[1],
                 "load": key[2],
                 "width_panel": key[3],
+                "length_axis": (
+                    "generated_tokens"
+                    if key[1] == "short_input_long_generation"
+                    else "total_context_tokens"
+                ),
                 "contexts": contexts.astype(int).tolist(),
                 "goodput": goodput.tolist(),
                 "spline_knots": fixed.astype(int).tolist(),
@@ -3163,9 +3269,7 @@ def _select_e0_recipes(state: StateStore) -> dict[str, dict[str, Any]]:
             continue
         if metrics.get("feasible") is False or metrics.get("slo_pass") is not True:
             continue
-        key = "|".join(
-            (config["model"], config["backend"], config["task"], method)
-        )
+        key = "|".join((config["model"], config["backend"], method))
         parameters = {
             name: value
             for name, value in config["parameters"].items()
@@ -3215,10 +3319,10 @@ def _pilot_final_blocks(state: StateStore, node: str) -> int | None:
         if isinstance(config.get("block"), int)
     )
     expected = {
-        "E3b-pilot": 480,
+        "E3b-pilot": 340,
         "E5-pilot": 450,
-        "E6-pilot": 60,
-        "E0-pilot": 16 * len(state.selection("valid_e0", [])),
+        "E6-pilot": 70,
+        "E0-pilot": 8 * len(state.selection("valid_e0", [])),
     }[node]
     if any(row_counts.get(block, 0) != expected for block in range(4)):
         return None
@@ -3442,13 +3546,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             {"static": selected_width},
         )
     elif node == "TTS-Cal":
-        winners = _rank_candidates(state, node, 1)
-        if not winners:
-            rows = _metric_rows(state, node)
-            if not rows:
-                raise ScientificFailure("TTS-Cal produced no feasible recipe")
-            winners = [max(rows, key=lambda pair: pair[1]["goodput"])[0]["parameters"]]
-        state.set_selection("tts_recipe", winners[0])
+        state.set_selection("tts_recipe", _select_tts_recipe(state))
     elif node == "E1":
         winners = _rank_e1_geometries(state)
         if not winners:
@@ -3494,8 +3592,9 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     elif node == "E0-tune":
         valid = _select_valid_e0(state)
         recipes = _select_e0_recipes(state)
+        pairs = {(model, backend) for model, backend, _ in valid}
         state.set_selection("valid_e0", valid)
-        if len(recipes) == 3 * len(valid):
+        if len(recipes) == 3 * len(pairs):
             state.set_selection("e0_recipes", recipes)
         else:
             state.set_selection("E0_incomplete_onlinespec_tuning", True)

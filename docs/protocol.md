@@ -7,31 +7,40 @@ representation at runtime.
 | Node | Registered rows | GPUs per cell | Purpose |
 |---|---:|---:|---|
 | preflight | 10 | 1 or 2 | model load, implementation smoke, memory, HTTP, interference |
-| E3a | 360 | 1 | Target-only/Static capacity surface |
+| E3a | 268 | 1 | capacity surface plus checkpointed long trajectories |
 | TTS-Cal | 288 | 1 | TTS numeric calibration |
 | E1 | 68 | 1 | scope/rank screen with fixed roles |
-| E2-r0 | 3364 | 1 | successive halving round 0 |
-| E2-r1 | 844 | 1 | successive halving round 1 |
-| E2-r2 | 214 | 1 | successive halving round 2 |
-| E2-r3 | 57 | 1 | final recipe selection |
+| E2-r0 | 424 | 1 | 2K-history successive halving |
+| E2-r1 | 109 | 1 | 4K-history successive halving |
+| E2-r2 | 31 | 1 | 8K-history successive halving |
+| E2-r3 | 25 | 1 | 16K-history final selection |
 | E4-screen | 48 | 1 | mechanism screen |
 | E4-local | 96 | 1 | local factorial |
 | E4-profile | 3 | 2 | isolated profiling |
-| E3b-pilot | 1920 | 1 | four excluded 480-row blocks |
-| E3b-final | `480N` | 1 | long-context efficiency confirmation |
+| E3b-pilot | 1360 | 1 | four excluded 340-row blocks |
+| E3b-final | `340N` | 1 | context and generated-history confirmation |
 | E1a | 116 | 1 | DSpark scope/rank and verification mode |
 | E5-pilot | 2064 | 2 | four 450-row pilots plus 264 failure cells |
 | E5-final | `450N` | 2 | production/topology confirmation |
-| E6-pilot | 242 | 2 | two interface/fit probes plus four 60-row pilots |
-| E6-final | `60N` | 2 | two-model transfer confirmation |
-| E0-tune | `108+239V` | 2 | Static/adaptive compatibility and independent OnlineSPEC tuning |
-| E0-pilot | `64V` | 2 | four excluded breadth blocks |
-| E0-final | `16VN` | 2 | breadth confirmation |
+| E6-pilot | 282 | 2 | two fit probes plus four 70-row pilots |
+| E6-final | `70N` | 2 | two-model transfer plus 16K history trajectories |
+| E0-tune | `108+239P` | 2 | compatibility and pair-level OnlineSPEC tuning |
+| E0-pilot | `32V` | 2 | four excluded common-load breadth blocks |
+| E0-final | `8VN` | 2 | common-load breadth confirmation |
 
 `N` is selected once from the four excluded E3b pilot blocks and must be in
 12--20; E5, E6, and E0 reuse that same final-block prefix. `V` is read from completed E0 compatibility
-probes. A missing selection skips only dependent nodes. Independent diagnostics
+probes, and `P` is the number of distinct valid model/backend pairs. OnlineSPEC
+is tuned once per pair on CalibrationMix and frozen across workloads. A missing selection skips only dependent nodes. Independent diagnostics
 continue, and no absent row is converted into a result.
+
+Short-input/long-generation is reserved for within-request learning dynamics.
+E3a and E3b run one 40.8K trajectory per condition and read speed at
+1K/2K/4K/8K/16K/24K/32K/40.8K checkpoints from its native timestamps.
+Capacity, memory, systems, production, and compatibility cells use long input
+with short output or their registered traffic trace. TTS-Cal uses 4K output,
+with four disjoint 19-prompt blocks covering CalibrationMix; E1/E1a use 8K,
+and E2 uses 2K/4K/8K/16K across its four rounds.
 
 Each E0 compatibility row runs the registered Static interface, then restarts
 the same model/backend as adaptive LightCone and requires a finite published

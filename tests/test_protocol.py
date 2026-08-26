@@ -30,6 +30,7 @@ from lightcone_spec.runner import (
     _resource_port,
     _runtime_job,
     _screening_job,
+    _select_tts_recipe,
     _selection_for_job,
 )
 from lightcone_spec.server import adaptation_payload, server_session_key
@@ -42,12 +43,12 @@ def test_registered_node_order_and_counts():
         "E5-pilot", "E5-final", "E6-pilot", "E6-final", "E0-tune", "E0-pilot", "E0-final",
     )
     assert default_row_counts() == {
-        "preflight": 10, "E3a": 360, "TTS-Cal": 288, "E1": 68,
-        "E2-r0": 3364, "E2-r1": 844, "E2-r2": 214, "E2-r3": 57,
+        "preflight": 10, "E3a": 268, "TTS-Cal": 288, "E1": 68,
+        "E2-r0": 424, "E2-r1": 109, "E2-r2": 31, "E2-r3": 25,
         "E4-screen": 48, "E4-local": 96, "E4-profile": 3,
-        "E3b-pilot": 1920, "E3b-final": 5760, "E1a": 116,
-        "E5-pilot": 2064, "E5-final": 5400, "E6-pilot": 242, "E6-final": 720,
-        "E0-tune": 25920, "E0-pilot": 6912, "E0-final": 20736,
+        "E3b-pilot": 1360, "E3b-final": 4080, "E1a": 116,
+        "E5-pilot": 2064, "E5-final": 5400, "E6-pilot": 282, "E6-final": 840,
+        "E0-tune": 2976, "E0-pilot": 3456, "E0-final": 10368,
     }
     assert len(paper_plan()) == 21
     assert {job.task for job in materialize("TTS-Cal")} == {"CalibrationMix"}
@@ -69,6 +70,21 @@ def test_readable_ids_and_dynamic_e0_grid():
         "onlinespec_ogd", "onlinespec_opt", "onlinespec_ens"
     }} == {"onlinespec_ogd": 64, "onlinespec_opt": 64, "onlinespec_ens": 108}
     assert len({repr(sorted(job.parameters.items())) for job in candidates}) == 236
+    assert {job.task for job in jobs[108:]} == {"CalibrationMix"}
+
+
+def test_e0_tunes_once_per_model_backend_and_confirms_common_load():
+    valid = [("m", "DFLASH", "task-a"), ("m", "DFLASH", "task-b")]
+    assert len(materialize("E0-tune", valid_e0=valid)) == 108 + 239
+    pilot = materialize("E0-pilot", valid_e0=valid)
+    assert len(pilot) == 2 * 4 * 8
+    assert {job.load for job in pilot} == {"common_slo_load"}
+    recipes = {"m|DFLASH|onlinespec_ogd": {"stride": 40}}
+    final = materialize(
+        "E0-final", valid_e0=valid[:1], final_blocks=12, e0_recipes=recipes
+    )
+    ogd = next(job for job in final if job.method == "onlinespec_ogd")
+    assert ogd.parameters["stride"] == 40
 
 
 def test_two_gpu_exclusivity_and_real_interface_probes():
@@ -194,7 +210,9 @@ def test_registered_axes_reach_runtime_parameters():
         assert {job.parameters["regime"] for job in jobs} == {
             "short_input_long_generation"
         }
-        assert {job.parameters["generation_tokens"] for job in jobs} == {32768}
+    assert {job.parameters["generation_tokens"] for job in materialize("TTS-Cal")} == {4096}
+    assert {job.parameters["generation_tokens"] for job in materialize("E1")} == {8192}
+    assert {job.parameters["generation_tokens"] for job in materialize("E1a")} == {8192}
 
     rounds = [materialize(f"E2-r{index}")[0] for index in range(4)]
     assert [(job.load, job.context) for job in rounds] == [
@@ -203,6 +221,9 @@ def test_registered_axes_reach_runtime_parameters():
     assert {job.parameters["regime"] for job in rounds} == {
         "short_input_long_generation"
     }
+    assert [job.parameters["generation_tokens"] for job in rounds] == [
+        2048, 4096, 8192, 16384
+    ]
     state = type(
         "State",
         (),
@@ -223,6 +244,48 @@ def test_registered_axes_reach_runtime_parameters():
     candidates = e2_candidates(geometries)
     assert len(candidates) == 210
     assert len(materialize("E2-r0", e2_rows=candidates)) == 214
+
+
+def test_long_generation_uses_one_checkpointed_trajectory_per_condition():
+    e3a = materialize("E3a")
+    trajectories = [
+        job for job in e3a
+        if job.parameters.get("regime") == "short_input_long_generation"
+    ]
+    assert len(trajectories) == 28
+    assert {job.context for job in trajectories} == {40928}
+    assert {job.parameters["generation_tokens"] for job in trajectories} == {40800}
+    assert trajectories[0].parameters["generation_checkpoints"] == (
+        1024, 2048, 4096, 8192, 16384, 24576, 32768, 40800
+    )
+
+    e3b = materialize("E3b-pilot")
+    assert sum(
+        job.parameters.get("regime") == "short_input_long_generation"
+        for job in e3b
+    ) == 80
+    assert sum(
+        job.parameters.get("regime") == "long_input_short_output"
+        for job in e3b
+    ) == 640
+
+
+def test_tts_recipe_uses_all_four_disjoint_windows(monkeypatch):
+    rows = []
+    for recipe, values in (("stable", (3, 3, 3, 3)), ("lucky", (10, 0, 0, 0))):
+        for value in values:
+            rows.append(
+                (
+                    {"parameters": {"recipe": recipe}},
+                    {
+                        "goodput": value,
+                        "peak_hbm_bytes": 1,
+                        "itl_p99_ms": 1.0,
+                    },
+                )
+            )
+    monkeypatch.setattr("lightcone_spec.runner._metric_rows", lambda *_: rows)
+    assert _select_tts_recipe(object())["recipe"] == "stable"
 
 
 def test_session_key_reuses_scalar_recipe_but_not_layout():
@@ -318,8 +381,8 @@ def test_exact_draft_mapping_and_calibration_mix(tmp_path):
 
     job = materialize("TTS-Cal")[0]
     prompts, max_new_tokens, metadata = _cell_inputs(config, object(), Tokenizer(), job)
-    assert len(prompts) == 76
-    assert max_new_tokens == 32768
+    assert len(prompts) == 19
+    assert max_new_tokens == 4096
     assert max(map(len, prompts)) <= 128
     assert metadata["regime"] == "short_input_long_generation"
 

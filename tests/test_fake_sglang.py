@@ -42,6 +42,7 @@ from lightcone_spec.runner import (
     _request_scope_released,
     _run_request_scoped,
     _speed_metrics,
+    _trajectory_checkpoint_metrics,
     _uses_request_scope,
     _validate_committed_tokens,
     _validate_greedy_verify_counts,
@@ -1227,6 +1228,25 @@ def test_formal_request_evidence_omits_text_and_token_trajectory(tmp_path: Path)
     path = tmp_path / "requests.jsonl.gz"
     _write_jsonl(path, (row,))
     assert _read_jsonl(path) == [row]
+
+
+def test_one_long_trajectory_yields_multiple_speed_checkpoints():
+    result = GenerationResult(
+        request_id="r",
+        input_tokens=1,
+        completion_tokens=4,
+        ttft_ms=1.0,
+        inter_token_ms=(1.0, 1.0, 1.0),
+        elapsed_seconds=0.004,
+        stop_reason="length",
+        output_ids=(1, 2, 3, 4),
+        output_text="",
+        native_token_timestamps_ns=(1_000_000, 2_000_000, 3_000_000, 4_000_000),
+    )
+    rows = _trajectory_checkpoint_metrics((result,), (2, 4))
+    assert [row["generation_tokens"] for row in rows] == [2, 4]
+    assert rows[0]["goodput"] == pytest.approx(2000.0)
+    assert rows[1]["itl_p99_ms"] == pytest.approx(1.0)
 
 
 def test_dspark_loss_retains_graph_inside_inference_scheduler():

@@ -64,11 +64,11 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The registered row counts are 10, 360, 288, 68, 3364, 844, 214, 57, 48, 96,
-3, 1920, `480N`, 116, 2064, `450N`, 242, `60N`, `108+239V`, `64V`, and
-`16VN`, where the four excluded E3b pilot blocks select one global `N` in
-12--20 and `V` is the
-number of executable E0 model/backend/task combinations.
+The registered row counts are 10, 268, 288, 68, 424, 109, 31, 25, 48, 96,
+3, 1360, `340N`, 116, 2064, `450N`, 282, `70N`, `108+239P`, `32V`, and
+`8VN`, where the four excluded E3b pilot blocks select one global `N` in
+12--20, `V` is the number of executable E0 model/backend/task combinations,
+and `P` is the number of distinct valid model/backend pairs.
 
 The runner preserves the paper gates that matter scientifically: proposal
 version consistency, controlled TTS/L0 candidate replay, finite optimization
