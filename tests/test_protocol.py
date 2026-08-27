@@ -14,6 +14,8 @@ from lightcone_spec.protocol import (
     segment_count,
 )
 from lightcone_spec.runner import (
+    ScientificFailure,
+    _all_jobs_completed,
     _assigned_gpu,
     _assigned_pair,
     _gpu_pairs,
@@ -21,6 +23,7 @@ from lightcone_spec.runner import (
     _scientific_rejection,
     _screening_job,
     _segment_jobs,
+    _validate_measured_metrics,
 )
 from lightcone_spec.server import adaptation_payload, server_session_key
 
@@ -180,3 +183,22 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
 
     runtime_config = {**tts_screen[0].to_dict(), "adaptation": {"method": "tts"}}
     assert _job_from_metric_config(runtime_config) == tts_screen[0]
+
+    assert _all_jobs_completed({"completed": 72})
+    assert not _all_jobs_completed({"completed": 42, "pending": 29, "failed": 1})
+    unsafe = {
+        "committed_tokens": 1,
+        "duration_seconds": 1.0,
+        "goodput": 1.0,
+        "peak_hbm_bytes": 1,
+        "kv_capacity": 1,
+        "itl_p99_ms": 1.0,
+        "version_mismatches": 0,
+        "fallbacks": 1,
+        "nonfinite_updates": 0,
+        "oom_events": 0,
+        "retractions": 0,
+        "stale_publications": 0,
+    }
+    with pytest.raises(ScientificFailure, match="fallbacks=1"):
+        _validate_measured_metrics(unsafe)

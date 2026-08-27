@@ -122,6 +122,19 @@ def _scientific_rejection(
     return rejected
 
 
+def _validate_measured_metrics(metrics: dict[str, Any]) -> None:
+    try:
+        validate_scientific_metrics(metrics)
+    except RuntimeError as error:
+        raise ScientificFailure(str(error)) from error
+
+
+def _all_jobs_completed(counts: dict[str, int]) -> bool:
+    return counts.get("completed", 0) > 0 and not any(
+        counts.get(status, 0) for status in ("pending", "running", "failed")
+    )
+
+
 def _capacity_infeasible(
     error: Exception,
     server_log: Path | None = None,
@@ -1591,7 +1604,7 @@ def _execute_cell(
                 metrics["controlled_candidate_compared"] = True
                 metrics["controlled_candidate_equal"] = True
             if job.parameters.get("workload") != "failure_injection":
-                validate_scientific_metrics(metrics)
+                _validate_measured_metrics(metrics)
             elif not (
                 metrics.get("recovery_health_passed") and metrics.get("expected_action_passed")
             ):
@@ -2762,6 +2775,8 @@ def _run_node_jobs(
         pending = tuple(job for job in pending if job not in p99_slots)
     _run_pending_jobs(config, state, node, stop_event, pending)
     if node == "TTS-Cal" and state.selection("tts_confirmation_complete", None) is None:
+        if not _all_jobs_completed(state.status_counts(node)):
+            return
         confirmations = _tts_confirmation_jobs(state)
         state.add_internal_jobs(confirmations)
         _run_pending_jobs(
