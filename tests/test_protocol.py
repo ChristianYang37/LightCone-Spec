@@ -17,6 +17,7 @@ from lightcone_spec.runner import (
     _assigned_gpu,
     _assigned_pair,
     _gpu_pairs,
+    _job_from_metric_config,
     _scientific_rejection,
     _screening_job,
     _segment_jobs,
@@ -176,3 +177,6 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     assert rejected["scientific_outcome"] == "rejected"
     assert rejected["feasible"] is False
     assert rejected["request_outcomes"] == measured["request_outcomes"]
+
+    runtime_config = {**tts_screen[0].to_dict(), "adaptation": {"method": "tts"}}
+    assert _job_from_metric_config(runtime_config) == tts_screen[0]

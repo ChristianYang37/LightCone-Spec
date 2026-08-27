@@ -2964,6 +2964,10 @@ def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
     return min(candidates, key=lambda row: row[:-1])[-1]
 
 
+def _job_from_metric_config(config: dict[str, Any]) -> Job:
+    return Job(**{name: config[name] for name in Job.__dataclass_fields__})
+
+
 def _tts_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
     candidates = []
     for config, metrics in _metric_rows(state, "TTS-Cal"):
@@ -2979,7 +2983,7 @@ def _tts_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
         )
     rows = []
     for finalist, (_, _, _, config) in enumerate(sorted(candidates)[:9]):
-        source = Job(**config)
+        source = _job_from_metric_config(config)
         for block in range(4):
             rows.append(
                 replace(
