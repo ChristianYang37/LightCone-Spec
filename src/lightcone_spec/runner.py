@@ -1808,6 +1808,36 @@ def _job_gpus(config: ExperimentConfig, job: Job) -> tuple[int, ...]:
     return (_assigned_gpu(config, job),)
 
 
+def _single_gpu_queues(
+    config: ExperimentConfig, jobs: tuple[Job, ...]
+) -> dict[int, tuple[Job, ...]]:
+    if jobs and all(
+        job.parameters.get("workload") == "tts_calibration_screen" for job in jobs
+    ):
+        queues: dict[int, list[Job]] = {gpu: [] for gpu in config.gpu_ids}
+        work = {gpu: 0.0 for gpu in config.gpu_ids}
+        ordered = sorted(
+            jobs,
+            key=lambda job: (
+                -float(job.parameters["generation_tokens"])
+                / float(job.parameters["stride"]),
+                job.ordinal,
+            ),
+        )
+        for job in ordered:
+            gpu = min(config.gpu_ids, key=lambda value: (work[value], value))
+            queues[gpu].append(job)
+            work[gpu] += float(job.parameters["generation_tokens"]) / float(
+                job.parameters["stride"]
+            )
+        return {gpu: tuple(rows) for gpu, rows in queues.items() if rows}
+    return {
+        gpu: tuple(job for job in jobs if _assigned_gpu(config, job) == gpu)
+        for gpu in config.gpu_ids
+        if any(_assigned_gpu(config, job) == gpu for job in jobs)
+    }
+
+
 def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:
     rows = []
     for pair_index in range(len(_gpu_pairs(config))):
@@ -2570,16 +2600,12 @@ def _run_pending_jobs(
                 for future in futures:
                     future.result()
         return
-    queues = {
-        gpu: tuple(job for job in singles if _assigned_gpu(config, job) == gpu)
-        for gpu in config.gpu_ids
-    }
+    queues = _single_gpu_queues(config, singles)
 
     def worker(gpu: int, jobs: Iterable[Job]) -> None:
         port = _resource_port(config, (gpu,))
         run_sessions(jobs, gpus=(gpu,), port=port, label=f"gpu-{gpu}")
 
-    queues = {gpu: jobs for gpu, jobs in queues.items() if jobs}
     workers = len(queues) if not headline or calibration.get("enabled") else min(1, len(queues))
     if workers:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lightcone-gpu") as pool:

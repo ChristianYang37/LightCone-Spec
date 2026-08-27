@@ -23,6 +23,7 @@ from lightcone_spec.runner import (
     _scientific_rejection,
     _screening_job,
     _segment_jobs,
+    _single_gpu_queues,
     _validate_measured_metrics,
 )
 from lightcone_spec.server import adaptation_payload, server_session_key
@@ -169,6 +170,15 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
 
     tts_screen = materialize("TTS-Cal")
     assert {_assigned_gpu(config, job) for job in tts_screen} == {0, 1}
+    queues = _single_gpu_queues(config, tts_screen)
+    estimated = {
+        gpu: sum(
+            job.parameters["generation_tokens"] / job.parameters["stride"] for job in jobs
+        )
+        for gpu, jobs in queues.items()
+    }
+    assert set(queues) == {0, 1}
+    assert max(estimated.values()) / min(estimated.values()) < 1.01
     assert _screening_job(tts_screen[0])
 
     measured = {
