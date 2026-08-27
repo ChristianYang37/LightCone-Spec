@@ -3082,6 +3082,8 @@ def _natural_spline_fit(
 def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
     grouped: dict[tuple[object, ...], dict[int, list[float]]] = {}
     for config, metrics in _metric_rows(state, node):
+        if metrics.get("feasible") is False:
+            continue
         context = config.get("context")
         if not isinstance(context, int):
             continue
@@ -3094,10 +3096,19 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         )
         checkpoints = metrics.get("trajectory_checkpoints")
         points = (
-            [(int(row["generation_tokens"]), float(row["goodput"])) for row in checkpoints]
+            [
+                (int(row["generation_tokens"]), float(row["goodput"]))
+                for row in checkpoints
+                if isinstance(row.get("goodput"), (int, float)) and row["goodput"] > 0
+            ]
             if parameters.get("regime") == "short_input_long_generation"
             and isinstance(checkpoints, list)
-            else [(context, float(metrics["goodput"]))]
+            else (
+                [(context, float(metrics["goodput"]))]
+                if isinstance(metrics.get("goodput"), (int, float))
+                and metrics["goodput"] > 0
+                else []
+            )
         )
         for length, goodput in points:
             grouped.setdefault(key, {}).setdefault(length, []).append(goodput)

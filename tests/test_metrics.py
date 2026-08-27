@@ -4,6 +4,7 @@ import math
 import pytest
 import torch
 
+import lightcone_spec.runner as runner
 from lightcone_spec.metrics import (
     SAFETY_COUNTERS,
     benjamini_hochberg,
@@ -177,6 +178,22 @@ def test_natural_spline_uses_fixed_interior_knots_and_natural_boundaries():
     assert len(elasticity) == len(contexts)
     assert abs(curvature[0]) < 1e-8
     assert abs(curvature[-1]) < 1e-8
+
+
+def test_context_spline_ignores_infeasible_rows_without_goodput(monkeypatch):
+    config = {
+        "method": "static",
+        "context": 40928,
+        "load": "c64",
+        "parameters": {"regime": "long_input_short_output"},
+    }
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: [(config, {"feasible": False})])
+
+    class EmptyState:
+        def completed_attempt_dirs(self, node):
+            return ()
+
+    assert runner._context_splines(EmptyState(), "E3a") == []
 
 
 def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
