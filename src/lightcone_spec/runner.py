@@ -3192,6 +3192,8 @@ def _context_splines(state: StateStore, node: str) -> list[dict[str, object]]:
         fixed = np.asarray([4096, 16384, 32768], dtype=np.float64)
         if not all(int(value) in values for value in fixed):
             continue
+        if not contexts[0] < fixed[0] or not fixed[-1] < contexts[-1]:
+            continue
         log_contexts = np.log(contexts)
         fitted, elasticity, curvature = _natural_spline_fit(
             log_contexts, np.log(goodput), log_contexts

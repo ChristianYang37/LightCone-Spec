@@ -196,6 +196,28 @@ def test_context_spline_ignores_infeasible_rows_without_goodput(monkeypatch):
     assert runner._context_splines(EmptyState(), "E3a") == []
 
 
+def test_context_spline_skips_unbracketed_fixed_knots(monkeypatch):
+    rows = [
+        (
+            {
+                "method": "static",
+                "context": context,
+                "load": "c1",
+                "parameters": {"regime": "long_input_short_output"},
+            },
+            {"goodput": 10.0},
+        )
+        for context in (4096, 16384, 32768, 40928)
+    ]
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+
+    class EmptyState:
+        def completed_attempt_dirs(self, node):
+            return ()
+
+    assert runner._context_splines(EmptyState(), "E3a") == []
+
+
 def test_attempt_summary_serializes_mixed_nested_parquet_columns(tmp_path):
     pytest.importorskip("pyarrow")
     attempts = []
