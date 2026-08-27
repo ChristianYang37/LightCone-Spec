@@ -41,6 +41,7 @@ from lightcone_spec.runner import (
     _read_jsonl,
     _request_metrics,
     _request_scope_released,
+    _run_multi_turn,
     _run_request_scoped,
     _speed_metrics,
     _trajectory_checkpoint_metrics,
@@ -1271,6 +1272,38 @@ def test_one_long_trajectory_yields_multiple_speed_checkpoints():
     assert [row["generation_tokens"] for row in rows] == [2, 4]
     assert rows[0]["goodput"] == pytest.approx(2000.0)
     assert rows[1]["itl_p99_ms"] == pytest.approx(1.0)
+
+
+def test_multi_turn_itl_excludes_cross_turn_prefill_gap():
+    class Client:
+        turn = 0
+
+        def run_bounded(self, prompts, *, max_new_tokens, seed, request_ids, max_in_flight):
+            start = self.turn * 10_000_000_000
+            self.turn += 1
+            result = GenerationResult(
+                request_id=request_ids[0],
+                input_tokens=len(prompts[0]),
+                completion_tokens=2,
+                ttft_ms=5.0,
+                inter_token_ms=(1.0,),
+                elapsed_seconds=0.01,
+                stop_reason="length",
+                output_ids=(1, 2),
+                output_text="",
+                native_token_timestamps_ns=(start + 1_000_000, start + 2_000_000),
+            )
+            return SimpleNamespace(results=(result,), elapsed_seconds=0.01)
+
+    results, _ = _run_multi_turn(
+        Client(),
+        ((7,),),
+        8,
+        0,
+        request_scoped=False,
+        max_in_flight=1,
+    )
+    assert results[0].inter_token_ms == (1.0, 1.0, 1.0, 1.0)
 
 
 def test_dspark_loss_retains_graph_inside_inference_scheduler():

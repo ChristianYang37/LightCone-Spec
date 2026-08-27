@@ -987,9 +987,7 @@ def _run_multi_turn(
                 input_tokens=rows[0].input_tokens,
                 completion_tokens=sum(row.completion_tokens for row in rows),
                 ttft_ms=rows[0].ttft_ms,
-                inter_token_ms=tuple(
-                    (right - left) / 1_000_000 for left, right in zip(timestamps, timestamps[1:])
-                ),
+                inter_token_ms=tuple(value for row in rows for value in row.inter_token_ms),
                 elapsed_seconds=sum(row.elapsed_seconds for row in rows),
                 stop_reason=rows[-1].stop_reason,
                 output_ids=tuple(value for row in rows for value in row.output_ids),
