@@ -87,7 +87,13 @@ CANDIDATE_METHODS = {
 
 
 def _screening_job(job: Job) -> bool:
-    return job.node in {"E3a", "E1-common-load", "E6-interface", "E6-common-load"}
+    return job.node in {
+        "E3a",
+        "TTS-Cal",
+        "E1-common-load",
+        "E6-interface",
+        "E6-common-load",
+    }
 
 
 def _capacity_infeasible(

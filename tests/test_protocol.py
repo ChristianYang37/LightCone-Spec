@@ -13,7 +13,13 @@ from lightcone_spec.protocol import (
     paper_plan,
     segment_count,
 )
-from lightcone_spec.runner import _assigned_gpu, _assigned_pair, _gpu_pairs, _segment_jobs
+from lightcone_spec.runner import (
+    _assigned_gpu,
+    _assigned_pair,
+    _gpu_pairs,
+    _screening_job,
+    _segment_jobs,
+)
 from lightcone_spec.server import adaptation_payload, server_session_key
 
 EXPECTED = {
@@ -158,3 +164,4 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
 
     tts_screen = materialize("TTS-Cal")
     assert {_assigned_gpu(config, job) for job in tts_screen} == {0, 1}
+    assert _screening_job(tts_screen[0])
