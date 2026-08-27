@@ -96,6 +96,32 @@ def _screening_job(job: Job) -> bool:
     }
 
 
+def _scientific_rejection(
+    metrics: dict[str, Any] | None, offered: int, error: Exception
+) -> dict[str, Any]:
+    rejected = dict(metrics or {})
+    rejected.update(
+        {
+            "scientific_outcome": "rejected",
+            "feasible": False,
+            "error": str(error),
+        }
+    )
+    rejected.setdefault(
+        "request_outcomes",
+        {
+            "offered": offered,
+            "admitted": 0,
+            "completed": 0,
+            "error": 0,
+            "timed_out": 0,
+            "cancelled": 0,
+            "unfinished": offered,
+        },
+    )
+    return rejected
+
+
 def _capacity_infeasible(
     error: Exception,
     server_log: Path | None = None,
@@ -1019,6 +1045,7 @@ def _execute_cell(
         if server.process is not None:
             (output_dir / "server.pid").write_text(f"{server.process.pid}\n", encoding="utf-8")
         offered = 0
+        metrics: dict[str, Any] | None = None
         try:
             runtime_job = _runtime_job(state, job)
             raw_config = runtime_job.to_dict()
@@ -1596,20 +1623,7 @@ def _execute_cell(
             ):
                 _write_json(
                     output_dir / "metrics.json",
-                    {
-                        "scientific_outcome": "rejected",
-                        "feasible": False,
-                        "error": str(error),
-                        "request_outcomes": {
-                            "offered": offered,
-                            "admitted": 0,
-                            "completed": 0,
-                            "error": 0,
-                            "timed_out": 0,
-                            "cancelled": 0,
-                            "unfinished": offered,
-                        },
-                    },
+                    _scientific_rejection(metrics, offered, error),
                 )
                 state.complete(job.job_id, attempt)
                 return

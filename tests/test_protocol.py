@@ -17,6 +17,7 @@ from lightcone_spec.runner import (
     _assigned_gpu,
     _assigned_pair,
     _gpu_pairs,
+    _scientific_rejection,
     _screening_job,
     _segment_jobs,
 )
@@ -165,3 +166,13 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     tts_screen = materialize("TTS-Cal")
     assert {_assigned_gpu(config, job) for job in tts_screen} == {0, 1}
     assert _screening_job(tts_screen[0])
+
+    measured = {
+        "goodput": 12.0,
+        "fallbacks": 1,
+        "request_outcomes": {"offered": 19, "completed": 19, "unfinished": 0},
+    }
+    rejected = _scientific_rejection(measured, 19, RuntimeError("unsafe recipe"))
+    assert rejected["scientific_outcome"] == "rejected"
+    assert rejected["feasible"] is False
+    assert rejected["request_outcomes"] == measured["request_outcomes"]
