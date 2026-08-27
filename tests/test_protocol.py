@@ -155,3 +155,6 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     children = [_segment_jobs(parent) for parent in parents]
     assert all(len({_assigned_gpu(config, child) for child in rows}) == 1 for rows in children)
     assert {_assigned_gpu(config, rows[0]) for rows in children} == {0, 1}
+
+    tts_screen = materialize("TTS-Cal")
+    assert {_assigned_gpu(config, job) for job in tts_screen} == {0, 1}

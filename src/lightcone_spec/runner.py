@@ -1750,6 +1750,8 @@ def _assigned_gpu(config: ExperimentConfig, job: Job) -> int:
     gpu_index = job.parameters.get("gpu_index")
     if isinstance(gpu_index, int) and 0 <= gpu_index < len(config.gpu_ids):
         return config.gpu_ids[gpu_index]
+    if job.parameters.get("workload") == "tts_calibration_screen":
+        return config.gpu_ids[job.ordinal % len(config.gpu_ids)]
     if job.block is not None:
         return config.gpu_ids[job.block % len(config.gpu_ids)]
     if job.parameters.get("parent_job_id"):
