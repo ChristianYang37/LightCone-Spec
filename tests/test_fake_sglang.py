@@ -328,9 +328,14 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
 
 def test_request_lora_slots_are_isolated_and_generation_safe():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    text = patch.read_text()
+    assert "for optimizer in self.slot_optimizers\n+                        for tensor in optimizer.master" in text
+    assert "for optimizer in self.slot_optimizers\n+                            for tensor in optimizer.first" in text
+    assert "for optimizer in self.slot_optimizers\n+                            for tensor in optimizer.second" in text
+    assert "for optimizer in self.slot_optimizers\n+                        for tensor in optimizer.metadata_tensors" in text
     added = []
     active = False
-    for line in patch.read_text().splitlines():
+    for line in text.splitlines():
         if line.startswith("diff --git "):
             active = "dflash_online_adaptation.py" in line
         elif active and line.startswith("+") and not line.startswith("+++"):

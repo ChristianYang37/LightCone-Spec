@@ -665,26 +665,54 @@ index 00000000..20e93274
 +                "active_or_base_bytes": bytes_of(
 +                    tuple(self.base.values()) + self.initial_trainable
 +                ),
-+                "master_fp32_bytes": bytes_of(self.optimizer.master),
++                "master_fp32_bytes": bytes_of(
++                    self.optimizer.master
++                    + tuple(
++                        tensor
++                        for optimizer in self.slot_optimizers
++                        for tensor in optimizer.master
++                    )
++                ),
 +                # Hedge experts are differentiated sequentially. Only one
 +                # expert-gradient layout is live at the scratch peak.
 +                "gradient_bytes": trainable_bytes,
 +                "first_moment_bytes": (
 +                    0
 +                    if isinstance(self.optimizer, OnlineSpecOptimizer)
-+                    else bytes_of(self.optimizer.first)
++                    else bytes_of(
++                        self.optimizer.first
++                        + tuple(
++                            tensor
++                            for optimizer in self.slot_optimizers
++                            for tensor in optimizer.first
++                        )
++                    )
 +                ),
 +                "second_moment_bytes": (
 +                    0
 +                    if isinstance(self.optimizer, OnlineSpecOptimizer)
-+                    else bytes_of(self.optimizer.second)
++                    else bytes_of(
++                        self.optimizer.second
++                        + tuple(
++                            tensor
++                            for optimizer in self.slot_optimizers
++                            for tensor in optimizer.second
++                        )
++                    )
 +                ),
 +                "online_state_bytes": (
 +                    bytes_of(self.optimizer.first + self.optimizer.second)
 +                    if isinstance(self.optimizer, OnlineSpecOptimizer)
 +                    else 0
 +                ),
-+                "optimizer_metadata_bytes": bytes_of(self.optimizer.metadata_tensors),
++                "optimizer_metadata_bytes": bytes_of(
++                    self.optimizer.metadata_tensors
++                    + tuple(
++                        tensor
++                        for optimizer in self.slot_optimizers
++                        for tensor in optimizer.metadata_tensors
++                    )
++                ),
 +                "staging_bytes": bytes_of(self.inference.staging),
 +                "training_activation_bytes": activation_scratch,
 +                "kv_gather_scratch_bytes": kv_gather_scratch,

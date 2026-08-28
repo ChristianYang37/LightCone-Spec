@@ -11,7 +11,7 @@ Empirical status: **PAPER-V2 RUN PAUSED AT E1 FOR TTS BATCHING UPDATE**.
 - `paper-v2` keeps the 21-node order and now has 2,185 static jobs by running compatible conditions as measured segments on one
   resident server. Primary E3b/E5 effects use 12 blocks; secondary E4/E6/E0
   evidence uses six.
-- The next SGLang semantic marker is `paper-v1-nextn-shadow-v14`; cohort telemetry
+- The next SGLang semantic marker is `paper-v1-nextn-shadow-v15`; cohort telemetry
   is sized for a complete measured cell rather than one request.
 - Qwen3.5-122B Full at TP2 `c1` may remain a visible HBM-blocked E6 result. It
   is not silently replaced by LoRA or another tensor-parallel degree.
