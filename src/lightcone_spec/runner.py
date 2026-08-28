@@ -51,10 +51,7 @@ from .protocol import (
     E1_REFERENCE_LOAD,
     E5_DRAIN_SECONDS,
     E5_HEADLINE_SECONDS,
-    E5_P99_EXTENSION_REQUESTS,
-    E5_P99_MIN_COMPLETED,
     E5_REQUEST_DEADLINE_SECONDS,
-    E5_SOAK_SECONDS,
     E5_WARMUP_SECONDS,
     GEOMETRY_GENERATION_TOKENS,
     MAX_E2_GEOMETRIES,
@@ -93,6 +90,7 @@ def _screening_job(job: Job) -> bool:
         "E1-common-load",
         "E6-interface",
         "E6-common-load",
+        "TTS-batched-calibration",
     }
 
 
@@ -423,68 +421,16 @@ def _stimulus_id(job: Job) -> str:
     return "__".join(str(value) for value in values)
 
 
-def _poisson_offsets(rate: float, duration: float, seed: int) -> tuple[float, ...]:
-    rng = np.random.default_rng(seed)
-    offsets = [0.0]
-    while True:
-        value = offsets[-1] + float(rng.exponential(1.0 / rate))
-        if value > duration:
-            return tuple(offsets)
-        offsets.append(value)
-
-
-def _e5_poisson_offsets(
-    config: ExperimentConfig, state: StateStore, job: Job
-) -> tuple[float, ...] | None:
-    registered = job.parameters.get("registered_load", job.load)
-    if not job.node.startswith("E5") or not isinstance(registered, str):
-        return None
-    if job.parameters.get("p99_extension"):
-        extension = state.selection("e5_p99_extensions", {}).get(f"{job.backend}|{job.method}")
-        if not isinstance(extension, dict):
-            raise ScientificFailure("E5 p99 extension rate is not frozen")
-        rate = float(extension["arrival_rate"])
-        rng = np.random.default_rng(config.protocol.seed + (job.block or 0) * 1000)
-        gaps = rng.exponential(1.0 / rate, size=E5_P99_EXTENSION_REQUESTS - 1)
-        return tuple(np.concatenate(([0.0], np.cumsum(gaps))).tolist())
-    if registered.startswith("lambda_"):
-        factor = float(registered.removeprefix("lambda_"))
-        duration = E5_HEADLINE_SECONDS
-    else:
-        factors = {
-            "moderate_soak": 0.75,
-            "saturation_soak": 1.0,
-            "overload_soak": 1.25,
-        }
-        factor = factors.get(registered)
-        duration = E5_SOAK_SECONDS
-    if factor is None:
-        return None
-    reference_rate, _ = _e5_reference(state, job)
-    return _poisson_offsets(
-        reference_rate * factor,
-        duration,
-        config.protocol.seed + (job.block or 0) * 1000,
-    )
-
-
 def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int:
     if job.node == "TTS-Cal":
         return 19
-    if job.parameters.get("p99_extension"):
-        return E5_P99_EXTENSION_REQUESTS
-    if job.parameters.get("failure") == "queue_saturation":
-        return 512
     concurrency = 1
     load = job.load or ""
     if load.startswith("c") and load[1:].isdigit():
         concurrency = int(load[1:])
     elif load.startswith("closed_loop_c"):
         concurrency = int(load.removeprefix("closed_loop_c"))
-    offsets = _e5_poisson_offsets(config, state, job)
-    return (
-        len(offsets) if offsets is not None else max(config.server.requests_per_cell, concurrency)
-    )
+    return max(config.server.requests_per_cell, concurrency)
 
 
 def _cell_concurrency(job: Job) -> int:
@@ -740,34 +686,12 @@ def _runtime_job(state: StateStore, job: Job) -> Job:
             else:
                 width = int(capacity.get("width", 16))
         job = replace(job, width=width)
-    if job.parameters.get("p99_extension"):
-        extension = state.selection("e5_p99_extensions", {}).get(f"{job.backend}|{job.method}")
-        if not isinstance(extension, dict):
-            raise ScientificFailure("E5 p99 extension configuration is not frozen")
-        return replace(
-            job,
-            load=str(extension["load"]),
-            parameters={
-                **job.parameters,
-                "arrival_rate": float(extension["arrival_rate"]),
-                "registered_load": "p99_boundary",
-            },
-        )
     if job.load not in {"common_load", "common_slo_load"}:
         if (
             job.node.startswith("E5")
             and isinstance(job.load, str)
             and (
-                job.load.startswith("lambda_")
-                or job.load
-                in {
-                    "immediate_burst",
-                    "burstgpt_shape",
-                    "moderate_soak",
-                    "saturation_soak",
-                    "overload_soak",
-                    "saturation",
-                }
+                job.load == "burstgpt_shape"
             )
         ):
             _, concurrency = _e5_reference(state, job)
@@ -809,15 +733,8 @@ def _arrival_offsets(
     count: int,
 ) -> tuple[float, ...] | None:
     registered = runtime_job.parameters.get("registered_load")
-    workload = original_job.parameters.get("workload")
-    if original_job.parameters.get("failure") == "queue_saturation":
-        return (0.0,) * count
-    if workload == "topology_cohort_capacity":
-        return (0.0,) * count
-    if workload != "production_crossover" or not isinstance(registered, str):
+    if not original_job.node.startswith("E5") or not isinstance(registered, str):
         return None
-    if registered == "immediate_burst":
-        return (0.0,) * count
     if registered == "burstgpt_shape":
         trace = config.datasets.get("BurstGPT")
         if trace is None:
@@ -827,10 +744,7 @@ def _arrival_offsets(
             limit=count,
             offset=_prompt_offset(original_job, count),
         )
-    offsets = _e5_poisson_offsets(config, state, original_job)
-    if offsets is None or len(offsets) != count:
-        raise ScientificFailure("open-loop arrival trace is incomplete")
-    return offsets
+    return None
 
 
 def _routing_keys(config: ExperimentConfig, job: Job, count: int) -> tuple[str, ...] | None:
@@ -1223,6 +1137,7 @@ def _execute_cell(
             scheduled: ScheduledRun | None = None
             concurrency = _cell_concurrency(runtime_job)
             request_scoped = _uses_request_scope(runtime_job)
+            temperature = float(runtime_job.parameters.get("temperature", 0.0))
             controlled_rows: list[dict[str, object]] = list(exactness_rows)
             if runtime_job.parameters.get("controlled_replay"):
                 pair_seed = config.protocol.seed + (job.block or 0)
@@ -1286,6 +1201,7 @@ def _execute_cell(
                         prompts,
                         max_new_tokens=max_new_tokens,
                         seed=seed,
+                        temperature=temperature,
                         routing_keys=_routing_keys(config, runtime_job, len(prompts)),
                         max_in_flight=1 if request_scoped else concurrency,
                         duration_seconds=E5_HEADLINE_SECONDS,
@@ -1303,12 +1219,14 @@ def _execute_cell(
                         seed,
                         same_seed=bool(runtime_job.parameters.get("controlled_replay")),
                         request_prefix=f"{job.job_id}-measure",
+                        temperature=temperature,
                     )
                 else:
                     scheduled = client.run_bounded(
                         prompts,
                         max_new_tokens=max_new_tokens,
                         seed=seed,
+                        temperature=temperature,
                         routing_keys=_routing_keys(config, runtime_job, len(prompts)),
                         request_ids=tuple(
                             f"{job.job_id}-measure-{index:05d}" for index in range(len(prompts))
@@ -1323,6 +1241,7 @@ def _execute_cell(
                     arrivals,
                     max_new_tokens=max_new_tokens,
                     seed=config.protocol.seed + (job.block or 0),
+                    temperature=temperature,
                     routing_keys=_routing_keys(config, runtime_job, len(prompts)),
                     request_ids=tuple(
                         f"{job.job_id}-scheduled-{index:05d}" for index in range(len(prompts))
@@ -1437,6 +1356,8 @@ def _execute_cell(
                 "committed_tokens": committed,
                 "duration_seconds": elapsed,
                 "goodput": committed_goodput(committed, elapsed),
+                "per_user_generation_speed": committed_goodput(committed, elapsed)
+                / max(1, _cell_concurrency(runtime_job)),
                 "peak_hbm_bytes": peak_hbm,
                 "allocated_peak_hbm_bytes": peak_hbm,
                 "reserved_peak_hbm_bytes": reserved_hbm,
@@ -1514,6 +1435,8 @@ def _execute_cell(
                 "queue_occupancy",
                 "confidence_brier",
                 "confidence_ece",
+                "confidence_probabilities",
+                "confidence_outcomes",
                 "resident_bytes",
                 "peak_bytes",
                 "optimizer_bytes",
@@ -1538,6 +1461,8 @@ def _execute_cell(
                         in {
                             "confidence_brier",
                             "confidence_ece",
+                            "confidence_probabilities",
+                            "confidence_outcomes",
                             "graph_replay_hit_rate",
                             "main_side_overlap_ratio",
                             "memory_ledger",
@@ -1726,6 +1651,8 @@ def _execute_cell(
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
     if job.method in {"tts", "l0_naive"}:
         return state.selection("tts_recipe", {})
+    if job.method == "tts_lora_batched":
+        return state.selection("tts_batched_geometry", {})
     if job.method == "lightcone":
         name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
         selected = dict(state.selection(name, {}))
@@ -1743,6 +1670,9 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         weight = state.selection("dspark_confidence_weight", None)
         if isinstance(weight, (int, float)):
             selected["confidence_loss_weight"] = float(weight)
+        temperature = state.selection("dspark_confidence_temperature", None)
+        if isinstance(temperature, (int, float)):
+            selected["confidence_temperature"] = float(temperature)
         return selected
     return None
 
@@ -2020,7 +1950,7 @@ def _safe_screen_row(metrics: dict[str, Any]) -> bool:
 
 
 def _select_confidence_weight(state: StateStore) -> float:
-    candidates = []
+    grouped: dict[float, list[tuple[float, float, float, int]]] = {}
     for config, metrics in _metric_rows(state, "E1a"):
         if config.get("parameters", {}).get("workload") != "confidence_calibration":
             continue
@@ -2044,18 +1974,104 @@ def _select_confidence_weight(state: StateStore) -> float:
             )
         ):
             continue
-        candidates.append(
+        weight = float(config["parameters"]["confidence_loss_weight"])
+        grouped.setdefault(weight, []).append(
             (
                 float(brier),
                 float(ece),
                 -float(metrics["goodput"]),
                 int(metrics["peak_hbm_bytes"]),
-                float(config["parameters"]["confidence_loss_weight"]),
             )
         )
-    if len(candidates) != len(CONFIDENCE_WEIGHTS):
+    if set(grouped) != set(CONFIDENCE_WEIGHTS) or any(
+        len(rows) != 10 for rows in grouped.values()
+    ):
         raise ScientificFailure("DSpark confidence calibration is incomplete")
+    candidates = [
+        (
+            float(np.mean([row[0] for row in rows])),
+            float(np.mean([row[1] for row in rows])),
+            float(np.mean([row[2] for row in rows])),
+            max(row[3] for row in rows),
+            weight,
+        )
+        for weight, rows in grouped.items()
+    ]
     return min(candidates)[-1]
+
+
+def _select_confidence_temperature(state: StateStore, weight: float) -> float:
+    probabilities: list[float] = []
+    outcomes: list[float] = []
+    for config, metrics in _metric_rows(state, "E1a"):
+        parameters = config.get("parameters", {})
+        if (
+            parameters.get("workload") != "confidence_calibration"
+            or float(parameters.get("confidence_loss_weight", -1)) != weight
+        ):
+            continue
+        probabilities.extend(metrics.get("confidence_probabilities", []))
+        outcomes.extend(metrics.get("confidence_outcomes", []))
+    if not probabilities or len(probabilities) != len(outcomes):
+        raise ScientificFailure("DSpark confidence outcomes are incomplete")
+    probability = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1 - 1e-6)
+    target = np.asarray(outcomes, dtype=np.float64)
+    logits = np.log(probability / (1.0 - probability))
+    candidates = np.linspace(0.25, 4.0, 151)
+    losses = []
+    for temperature in candidates:
+        calibrated = 1.0 / (1.0 + np.exp(-logits / temperature))
+        losses.append(float(np.mean((calibrated - target) ** 2)))
+    return float(candidates[int(np.argmin(losses))])
+
+
+def _tts_batched_calibration_jobs(state: StateStore) -> tuple[Job, ...]:
+    geometries = [
+        dict(row)
+        for row in state.selection("e1_geometries", [])
+        if row.get("parameterization") == "lora"
+    ][:4]
+    return tuple(
+        Job(
+            job_id=f"tts-batched-geometry-{index:02d}",
+            node="TTS-batched-calibration",
+            ordinal=index,
+            method="tts_lora_batched",
+            model="Qwen/Qwen3-8B",
+            backend="DFLASH",
+            task="CalibrationMix",
+            context=40928,
+            load="c8",
+            width=16,
+            parameters={
+                **geometry,
+                "generation_tokens": 512,
+                "regime": "short_input_long_generation",
+                "workload": "excluded_tts_batched_geometry",
+            },
+        )
+        for index, geometry in enumerate(geometries)
+    )
+
+
+def _select_tts_batched_geometry(state: StateStore) -> dict[str, Any]:
+    candidates = []
+    for config, metrics in _metric_rows(state, "TTS-batched-calibration"):
+        if metrics.get("feasible") is False:
+            continue
+        if any(int(metrics.get(counter, 0)) for counter in SAFETY_COUNTERS):
+            continue
+        candidates.append(
+            (
+                int(metrics.get("adapter_crosstalk", 0)),
+                -float(metrics.get("goodput", 0.0)),
+                int(metrics.get("peak_hbm_bytes", 0)),
+                config["parameters"],
+            )
+        )
+    if not candidates:
+        raise ScientificFailure("per-request LoRA calibration found no feasible geometry")
+    return dict(min(candidates, key=lambda row: row[:-1])[-1])
 
 
 def _deployment_width_jobs(state: StateStore) -> tuple[Job, ...]:
@@ -2271,41 +2287,6 @@ def _select_e6_common_loads(state: StateStore, capabilities: dict[str, set[str]]
         ]
         if loads:
             selected[model] = max(loads, key=lambda value: int(value.removeprefix("c")))
-    return selected
-
-
-def _select_e5_p99_extensions(state: StateStore) -> dict[str, dict[str, float | str]]:
-    winners: dict[tuple[int, str, str], tuple[float, str]] = {}
-    for config, metrics in _metric_rows(state, "E5-final"):
-        parameters = config.get("parameters", {})
-        registered = parameters.get("registered_load")
-        if (
-            not isinstance(config.get("block"), int)
-            or not isinstance(registered, str)
-            or not registered.startswith("lambda_")
-            or metrics.get("slo_pass") is not True
-            or not isinstance(metrics.get("offered_rate"), (int, float))
-        ):
-            continue
-        key = (int(config["block"]), str(config["backend"]), str(config["method"]))
-        rate = float(metrics["offered_rate"])
-        if key not in winners or rate > winners[key][0]:
-            winners[key] = (rate, str(config["load"]))
-    selected: dict[str, dict[str, float | str]] = {}
-    for backend in ("DFLASH", "DSPARK"):
-        for method in ("static", "lightcone"):
-            rows = sorted(
-                (rate, load)
-                for (block, candidate_backend, candidate_method), (rate, load) in winners.items()
-                if candidate_backend == backend and candidate_method == method
-            )
-            if len(rows) != len(PRIMARY_BLOCKS):
-                raise ScientificFailure(
-                    f"E5 p99 extension lacks {len(PRIMARY_BLOCKS)} boundary blocks for "
-                    f"{backend}/{method}"
-                )
-            rate, load = rows[len(rows) // 2]
-            selected[f"{backend}|{method}"] = {"arrival_rate": rate, "load": load}
     return selected
 
 
@@ -2713,7 +2694,12 @@ def _run_node_jobs(
         )
         if stop_event.is_set():
             return
-        state.set_selection("dspark_confidence_weight", _select_confidence_weight(state))
+        weight = _select_confidence_weight(state)
+        state.set_selection("dspark_confidence_weight", weight)
+        state.set_selection(
+            "dspark_confidence_temperature",
+            _select_confidence_temperature(state, weight),
+        )
         pending = state.pending_jobs(node)
     if node == "E1a" and state.selection("e1a_finalists", None) is None:
         confirmation = tuple(
@@ -2737,6 +2723,23 @@ def _run_node_jobs(
             for job in state.pending_jobs(node)
             if isinstance(job.parameters.get("finalist_slot"), int)
         )
+    if node == "E5-pilot" and state.selection("tts_batched_geometry", None) is None:
+        calibration = _tts_batched_calibration_jobs(state)
+        if not calibration:
+            raise ScientificFailure("E1 produced no LoRA geometry for TTS batching")
+        state.add_internal_jobs(calibration)
+        _run_pending_jobs(
+            config,
+            state,
+            "TTS-batched-calibration",
+            stop_event,
+            state.pending_jobs("TTS-batched-calibration"),
+        )
+        if stop_event.is_set():
+            return
+        _require_internal_jobs(state, "TTS-batched-calibration")
+        state.set_selection("tts_batched_geometry", _select_tts_batched_geometry(state))
+        pending = state.pending_jobs(node)
     if node.startswith("E5"):
         anchors, _ = _e5_execution_phases(pending)
         if anchors:
@@ -2793,10 +2796,6 @@ def _run_node_jobs(
             elif job.model not in loads:
                 state.skip_job(job.job_id, "model has no feasible TP2 NEXTN common load")
         pending = state.pending_jobs(node)
-    p99_slots = ()
-    if node == "E5-final":
-        p99_slots = tuple(job for job in pending if job.parameters.get("p99_extension"))
-        pending = tuple(job for job in pending if job not in p99_slots)
     _run_pending_jobs(config, state, node, stop_event, pending)
     if node == "TTS-Cal" and state.selection("tts_confirmation_complete", None) is None:
         if not _all_jobs_completed(state.status_counts(node)):
@@ -2815,16 +2814,6 @@ def _run_node_jobs(
         _require_internal_jobs(state, "TTS-Cal-confirmation")
         state.set_selection("tts_recipe", _select_tts_recipe(state))
         state.set_selection("tts_confirmation_complete", True)
-    if node == "E5-final" and state.selection("e5_p99_extensions", None) is None:
-        state.set_selection("e5_p99_extensions", _select_e5_p99_extensions(state))
-    if node == "E5-final":
-        _run_pending_jobs(
-            config,
-            state,
-            node,
-            stop_event,
-            tuple(job for job in state.pending_jobs(node) if job.parameters.get("p99_extension")),
-        )
     if node == "E1" and state.selection("e1_common_load", None) is None:
         probes = _e1_load_jobs(state)
         state.add_internal_jobs(probes)
@@ -3420,8 +3409,6 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
     completed_counts: Counter[tuple[str, str, str]] = Counter()
     sources: dict[tuple[str, str, str], list[dict[str, object]]] = {}
     directories = list(state.completed_attempt_dirs(node))
-    if node == "E5-final":
-        directories.extend(state.completed_attempt_dirs("E5-p99-extension"))
     for directory in directories:
         config_path = directory / "config.json"
         requests_path = _jsonl_path(directory, "requests.jsonl")
@@ -3453,7 +3440,7 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
         offered = offered_counts[(method, backend, load)]
         completed = completed_counts[(method, backend, load)]
         values = [float(np.quantile(rows, 0.99)) for rows in blocks.values() if rows]
-        resolved = completed >= E5_P99_MIN_COMPLETED and len(values) >= 3
+        resolved = len(values) >= 3
         estimate = block_bootstrap_interval(values) if resolved else (None, None, None)
         result.append(
             {
@@ -3462,8 +3449,6 @@ def _e5_tail_statistics(state: StateStore, node: str) -> list[dict[str, object]]
                 "load": load,
                 "offered_requests": offered,
                 "completed_requests": completed,
-                "required_completed_requests": E5_P99_MIN_COMPLETED,
-                "extension_offered_requests": E5_P99_EXTENSION_REQUESTS,
                 "time_block_count": len(values),
                 "resolved": resolved,
                 "request_count": completed,
@@ -3487,72 +3472,66 @@ def _exact_sign_flip(log_ratios: np.ndarray) -> float:
     return float((np.sum(np.mean(signs * log_ratios, axis=1) >= observed) + 1) / (len(signs) + 1))
 
 
-def _e5_max_rate_statistic(state: StateStore) -> dict[str, object] | None:
-    rates: dict[tuple[int, str, str], float] = {}
+def _frontier_area(points: list[tuple[float, float]]) -> float | None:
+    rows = sorted((speed, throughput) for speed, throughput in points if speed > 0 and throughput > 0)
+    if len(rows) < 2:
+        return None
+    x = np.log([row[0] for row in rows])
+    y = np.log([row[1] for row in rows])
+    return float(np.trapezoid(y, x))
+
+
+def _e5_frontier_statistic(state: StateStore) -> dict[str, object] | None:
+    baseline_method = state.selection("e5_operational_baseline", None)
+    if baseline_method not in {"target_only", "static"}:
+        return None
+    points: dict[tuple[int, str], list[tuple[float, float]]] = {}
     for config, metrics in _metric_rows(state, "E5-final"):
-        parameters = config.get("parameters", {})
-        registered = parameters.get("registered_load")
+        if config.get("backend") not in {"NONE", "DFLASH"}:
+            continue
         block = config.get("block")
         method = config.get("method")
-        backend = config.get("backend")
-        rate = metrics.get("offered_rate")
-        if (
-            not isinstance(block, int)
-            or method not in {"target_only", "static", "lightcone"}
-            or backend not in {"DFLASH", "DSPARK"}
-            or not isinstance(registered, str)
-            or not registered.startswith("lambda_")
-            or metrics.get("slo_pass") is not True
-            or not isinstance(rate, (int, float))
-        ):
+        if not isinstance(block, int) or method not in {baseline_method, "lightcone"}:
             continue
-        key = (block, backend, str(method))
-        rates[key] = max(rates.get(key, 0.0), float(rate))
+        load = str(config.get("load", ""))
+        if not load.startswith("closed_loop_c"):
+            continue
+        concurrency = int(load.removeprefix("closed_loop_c"))
+        throughput = float(metrics.get("goodput", 0.0))
+        speed = float(metrics.get("per_user_generation_speed", throughput / concurrency))
+        points.setdefault((block, str(method)), []).append((speed, throughput))
     candidate = []
     baseline = []
     for block in PRIMARY_BLOCKS:
-        lightcone = []
-        operational = []
-        for backend in ("DFLASH", "DSPARK"):
-            required = [
-                rates.get((block, backend, method))
-                for method in ("target_only", "static", "lightcone")
-            ]
-            if any(value is None for value in required):
-                break
-            target, static, adaptive = (float(value) for value in required)
-            lightcone.append(adaptive)
-            operational.append(max(target, static))
-        if len(lightcone) == 2:
-            candidate.append(math.sqrt(lightcone[0] * lightcone[1]))
-            baseline.append(math.sqrt(operational[0] * operational[1]))
-    if len(candidate) != len(PRIMARY_BLOCKS) or any(
-        value <= 0 for value in (*candidate, *baseline)
-    ):
-        return None
-    log_ratios = np.log(candidate) - np.log(baseline)
+        left = _frontier_area(points.get((block, "lightcone"), []))
+        right = _frontier_area(points.get((block, baseline_method), []))
+        if left is None or right is None:
+            return None
+        candidate.append(left)
+        baseline.append(right)
+    log_ratios = np.asarray(candidate) - np.asarray(baseline)
     estimate, low, high = paired_bca_interval(log_ratios, np.zeros_like(log_ratios))
     return {
         "hypothesis": "H3",
         "candidate": "lightcone",
         "baseline": "operational_baseline",
-        "metric": "maximum_slo_feasible_rate",
+        "metric": "throughput_interactivity_frontier_log_auc",
         "blocks": list(PRIMARY_BLOCKS),
-        "backend_aggregation": "per-block geometric mean over DFLASH and DSPARK",
+        "operational_baseline_method": baseline_method,
         "mean_log_ratio": estimate,
         "relative_effect": math.exp(estimate) - 1.0,
         "ci95_relative_low": math.exp(low) - 1.0,
         "ci95_relative_high": math.exp(high) - 1.0,
         "p_value": _exact_sign_flip(log_ratios),
-        "reducer": "paired_log_max_slo_rate_bca",
+        "reducer": "paired_log_log_frontier_auc_bca",
     }
 
 
 def _confirmatory_holm(
-    state: StateStore, e5_rate: dict[str, object] | None
+    state: StateStore, e5_frontier: dict[str, object] | None
 ) -> list[dict[str, object]]:
     path = state.run_dir / "stages" / "E3b-final" / "statistics.json"
-    if not path.is_file() or e5_rate is None:
+    if not path.is_file() or e5_frontier is None:
         return []
     e3 = json.loads(path.read_text(encoding="utf-8"))
     rows = []
@@ -3568,7 +3547,7 @@ def _confirmatory_holm(
         if len(matches) != 1:
             return []
         rows.append({**matches[0], "hypothesis": hypothesis})
-    rows.append(e5_rate)
+    rows.append(e5_frontier)
     decisions = holm_decisions([float(row["p_value"]) for row in rows])
     return [{**row, "holm_reject": decision} for row, decision in zip(rows, decisions, strict=True)]
 
@@ -3714,9 +3693,12 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
     if node in {"E5-pilot", "E5-final"}:
         _write_json(summary_dir / "tail_latency.json", _e5_tail_statistics(state, node))
     if node == "E5-final":
-        rate = _e5_max_rate_statistic(state)
-        _write_json(summary_dir / "maximum_slo_rate.json", rate)
-        _write_json(summary_dir / "confirmatory_holm.json", _confirmatory_holm(state, rate))
+        frontier = _e5_frontier_statistic(state)
+        _write_json(summary_dir / "serving_frontier.json", frontier)
+        _write_json(
+            summary_dir / "confirmatory_holm.json",
+            _confirmatory_holm(state, frontier),
+        )
     if node == "preflight":
         _check_greedy_trajectories(state, node)
     if node == "preflight":
@@ -3851,6 +3833,17 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         winners = _rank_candidates(state, node, 1)
         if winners:
             state.set_selection("dspark_recipe", winners[0])
+    elif node == "E5-pilot":
+        scores: dict[str, float] = {}
+        for config, metrics in _metric_rows(state, node):
+            method = str(config["method"])
+            if method not in {"target_only", "static"}:
+                continue
+            if str(config.get("load", "")).startswith("closed_loop_c"):
+                scores.setdefault(method, 0.0)
+                scores[method] += float(metrics.get("goodput", 0.0))
+        if scores:
+            state.set_selection("e5_operational_baseline", max(scores, key=scores.get))
     elif node == "E0-tune":
         valid = _select_valid_e0(state)
         recipes = _select_e0_recipes(state)
@@ -3886,8 +3879,21 @@ def _save_or_validate_run_config(config: ExperimentConfig) -> None:
     saved = config.run_dir / "paper.yaml"
     normalized = config.normalized()
     if saved.exists():
-        if yaml.safe_load(saved.read_text(encoding="utf-8")) != normalized:
+        previous = yaml.safe_load(saved.read_text(encoding="utf-8"))
+        old_paths = dict(previous["paths"])
+        new_paths = dict(normalized["paths"])
+        old_datasets = dict(old_paths.pop("datasets"))
+        new_datasets = dict(new_paths.pop("datasets"))
+        old_paths.pop("sglang_root")
+        new_paths.pop("sglang_root")
+        same_existing_datasets = all(
+            new_datasets.get(name) == value for name, value in old_datasets.items()
+        )
+        previous = {**previous, "paths": old_paths}
+        current = {**normalized, "paths": new_paths}
+        if previous != current or not same_existing_datasets:
             raise RuntimeError("run directory belongs to a different experiment config")
+        saved.write_text(yaml.safe_dump(normalized, sort_keys=True), encoding="utf-8")
         return
     saved.write_text(yaml.safe_dump(normalized, sort_keys=True), encoding="utf-8")
 

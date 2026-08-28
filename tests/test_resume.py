@@ -68,6 +68,21 @@ def test_plain_config_resume_rejects_different_values(tmp_path: Path):
     assert "final_blocks" not in saved["protocol"]
 
 
+def test_plain_config_resume_allows_new_sglang_path_and_dataset_key(tmp_path: Path):
+    config = _config(tmp_path)
+    config.run_dir.mkdir()
+    _save_or_validate_run_config(config)
+    changed = replace(
+        config,
+        sglang_root=tmp_path / "sglang-v14",
+        datasets={"AIME-2024": tmp_path / "aime-2024.jsonl"},
+    )
+    _save_or_validate_run_config(changed)
+    saved = yaml.safe_load((config.run_dir / "paper.yaml").read_text())
+    assert saved["paths"]["sglang_root"].endswith("sglang-v14")
+    assert set(saved["paths"]["datasets"]) == {"AIME-2024"}
+
+
 def test_sqlite_records_actual_gpu_pair(tmp_path: Path):
     state = StateStore(tmp_path)
     job = materialize("E6-final")[0]

@@ -188,6 +188,44 @@ index 00000000..20e93274
 +    valid_mask: torch.Tensor
 +
 +
++@dataclass(frozen=True)
++class RequestLoRASlot:
++    index: int
++    generation: int
++    request_id: str
++
++
++class RequestLoRASlotBank:
++    """Fixed request slots with generation-safe reuse."""
++
++    def __init__(self, capacity: int) -> None:
++        self.free = list(reversed(range(capacity)))
++        self.generations = [0] * capacity
++        self.by_request: dict[str, RequestLoRASlot] = {}
++
++    def acquire(self, request_id: str) -> RequestLoRASlot:
++        current = self.by_request.get(request_id)
++        if current is not None:
++            return current
++        if not self.free:
++            raise RuntimeError("per-request LoRA slot capacity is exhausted")
++        index = self.free.pop()
++        slot = RequestLoRASlot(index, self.generations[index], request_id)
++        self.by_request[request_id] = slot
++        return slot
++
++    def get(self, request_id: str) -> RequestLoRASlot:
++        return self.by_request[request_id]
++
++    def release(self, request_id: str) -> RequestLoRASlot | None:
++        slot = self.by_request.pop(request_id, None)
++        if slot is None:
++            return None
++        self.generations[slot.index] += 1
++        self.free.append(slot.index)
++        return slot
++
++
 +class _TensorParallelAllGather(torch.autograd.Function):
 +    @staticmethod
 +    def forward(ctx, local: torch.Tensor, group) -> torch.Tensor:
@@ -534,11 +572,35 @@ index 00000000..20e93274
 +        self._captured_positions: torch.Tensor | None = None
 +        self._captured_prefix_lens: torch.Tensor | None = None
 +        self._captured_request_ids: tuple[str, ...] = ()
++        self.request_slots = (
++            RequestLoRASlotBank(max_batch)
++            if config.reset_scope == "request_batched"
++            else None
++        )
++        self.slot_optimizers = (
++            tuple(
++                build_parameter_optimizer(
++                    tuple(value.detach().clone() for value in self.initial_trainable),
++                    config,
++                    projection_origin=self.initial_trainable,
++                )
++                for _ in range(max_batch)
++            )
++            if self.request_slots is not None
++            else ()
++        )
++        self.slot_rounds = [0] * max_batch
++        self.slot_ready: list[torch.cuda.Event | None] = [None] * max_batch
 +        self._captured_history: _CapturedHistory | None = None
 +        resident = (
 +            tuple(self.base.values())
 +            + self.initial_trainable
 +            + self.optimizer.state_tensors
++            + tuple(
++                tensor
++                for optimizer in self.slot_optimizers
++                for tensor in optimizer.state_tensors
++            )
 +            + self.inference.staging
 +            + self.runtime.telemetry_tensors
 +        )
@@ -635,6 +697,10 @@ index 00000000..20e93274
 +
 +    def begin_round(self, batch) -> tuple[int, ...]:
 +        request_ids = tuple(request.rid for request in batch.reqs)
++        if self.request_slots is not None:
++            for request_id in request_ids:
++                slot = self.request_slots.acquire(request_id)
++                self.slot_rounds[slot.index] += 1
 +        version = self.runtime.begin_round(request_ids, batch.seq_lens)
 +        return (version,) * len(request_ids)
 +
@@ -645,7 +711,7 @@ index 00000000..20e93274
 +        input_embeds: torch.Tensor,
 +        positions: torch.Tensor,
 +    ) -> None:
-+        if not self.runtime.update_due():
++        if self.request_slots is None and not self.runtime.update_due():
 +            self._captured_input = None
 +            self._captured_positions = None
 +            self._captured_prefix_lens = None
@@ -688,6 +754,40 @@ index 00000000..20e93274
 +                trainable[b_index] @ trainable[a_index]
 +            )
 +        return values
++
++    def inference_hidden(self, fused_hidden: torch.Tensor) -> torch.Tensor:
++        if self.request_slots is None:
++            return fused_hidden
++        if (
++            self._captured_input is None
++            or self._captured_positions is None
++            or self._captured_history is None
++        ):
++            return fused_hidden
++        block = int(self.worker.block_size)
++        rows = []
++        for index, request_id in enumerate(self._captured_request_ids):
++            slot = self.request_slots.get(request_id)
++            ready = self.slot_ready[slot.index]
++            if ready is not None:
++                torch.cuda.current_stream(self.device).wait_event(ready)
++            start, end = index * block, (index + 1) * block
++            values = self._effective_parameters(
++                self.slot_optimizers[slot.index].master
++            )
++            rows.append(
++                self._surrogate_hidden(
++                    values,
++                    self._captured_input[start:end],
++                    self._captured_positions[start:end],
++                    (request_id,),
++                    _CapturedHistory(
++                        self._captured_history.locations[index : index + 1],
++                        self._captured_history.valid_mask[index : index + 1],
++                    ),
++                )
++            )
++        return torch.cat(rows, dim=0).reshape_as(fused_hidden)
 +
 +    def _parameter(
 +        self,
@@ -994,6 +1094,73 @@ index 00000000..20e93274
 +            local_logits, self.tp_group.device_group
 +        )[..., :vocab_size]
 +
++    def _launch_request_batched(
++        self,
++        *,
++        draft_hidden: torch.Tensor,
++        target_logits: torch.Tensor,
++        valid_mask: torch.Tensor,
++        lm_head_weight: torch.Tensor,
++    ) -> None:
++        if (
++            self.request_slots is None
++            or self._captured_input is None
++            or self._captured_positions is None
++            or self._captured_history is None
++        ):
++            return
++        block = int(self.worker.block_size)
++        batch = len(self._captured_request_ids)
++        target = target_logits.view(batch, block, -1)
++        hidden = draft_hidden.view(batch, block, -1)
++        for index, request_id in enumerate(self._captured_request_ids):
++            slot = self.request_slots.get(request_id)
++            if self.slot_rounds[slot.index] % self.config.stride:
++                continue
++            optimizer = self.slot_optimizers[slot.index]
++            start, end = index * block, (index + 1) * block
++            history = _CapturedHistory(
++                self._captured_history.locations[index : index + 1],
++                self._captured_history.valid_mask[index : index + 1],
++            )
++            teacher = target[index : index + 1, : block - 1].detach()
++            mask = valid_mask[index : index + 1].detach()
++            inference_logits = self._full_vocab_logits(
++                hidden[index : index + 1, 1:, :].to(lm_head_weight.dtype)
++                @ lm_head_weight.T,
++                teacher.shape[-1],
++            ).detach()
++
++            def objective(leaves):
++                values = self._effective_parameters(leaves)
++                surrogate = self._surrogate_hidden(
++                    values,
++                    self._captured_input[start:end],
++                    self._captured_positions[start:end],
++                    (request_id,),
++                    history,
++                )
++                logits = self._full_vocab_logits(
++                    surrogate[:, 1:, :].to(lm_head_weight.dtype)
++                    @ lm_head_weight.T,
++                    teacher.shape[-1],
++                )
++                return self._distillation_loss(
++                    anchor_forward_value(logits, inference_logits), teacher, mask
++                )
++
++            with torch.cuda.stream(self.runtime.side_stream):
++                loss, gradients = loss_and_grad(optimizer.master, objective)
++                finite = torch.isfinite(loss) & torch.stack(
++                    [torch.isfinite(gradient).all() for gradient in gradients]
++                ).all()
++                optimizer.commit(optimizer.propose(gradients), valid=finite)
++                ready = torch.cuda.Event(blocking=False)
++                ready.record(self.runtime.side_stream)
++                self.slot_ready[slot.index] = ready
++            self.runtime.counters["updates_launched"] += 1
++            self.runtime.counters["updates_published"] += 1
++
 +    def maybe_launch(
 +        self,
 +        *,
@@ -1003,6 +1170,14 @@ index 00000000..20e93274
 +        lm_head_weight: torch.Tensor,
 +        has_supervision: bool = True,
 +    ) -> None:
++        if self.request_slots is not None:
++            self._launch_request_batched(
++                draft_hidden=draft_hidden,
++                target_logits=target_logits,
++                valid_mask=valid_mask,
++                lm_head_weight=lm_head_weight,
++            )
++            return
 +        if not self.runtime.update_due():
 +            return
 +        if not has_supervision:
@@ -1228,26 +1403,39 @@ index 00000000..20e93274
 +    def after_commit(
 +        self,
 +        batch,
-+        new_seq_lens: torch.Tensor,
 +        *,
 +        accepted_drafts: torch.Tensor,
 +        verified_drafts: torch.Tensor,
 +        committed_tokens: torch.Tensor,
 +    ) -> None:
 +        request_ids = tuple(request.rid for request in batch.reqs)
++        self.runtime.record_device_commit(request_ids, committed_tokens)
 +        self.runtime.record_round_outcome(
 +            request_ids,
 +            verified_drafts=verified_drafts,
 +            accepted_drafts=accepted_drafts,
 +            committed_tokens=committed_tokens,
 +        )
-+        self.runtime.record_device_commit(request_ids, new_seq_lens)
 +
 +    def finish_request(self, request_id: str) -> bool:
++        if self.request_slots is not None:
++            slot = self.request_slots.release(request_id)
++            if slot is not None:
++                ready = self.slot_ready[slot.index]
++                if ready is not None:
++                    ready.synchronize()
++                self.slot_optimizers[slot.index].reset(self.initial_trainable)
++                self.slot_rounds[slot.index] = 0
++                self.slot_ready[slot.index] = None
++            self.runtime.finish_request(request_id)
++            return
 +        if self.runtime.finish_request(request_id):
 +            self._restore_request_source()
 +
 +    def abort_request(self, request_id: str) -> None:
++        if self.request_slots is not None:
++            self.finish_request(request_id)
++            return
 +        if self.runtime.abort_request(request_id):
 +            self._restore_request_source()
 +
@@ -1258,6 +1446,9 @@ index 00000000..20e93274
 +        self.inference.publish()
 +
 +    def reset(self) -> None:
++        if self.request_slots is not None:
++            for request_id in tuple(self.request_slots.by_request):
++                self.finish_request(request_id)
 +        self.runtime.reset()
 +        self.optimizer.reset(self.initial_trainable)
 +        effective = self._effective_parameters(self.optimizer.master)
@@ -1508,6 +1699,9 @@ index 0bfd3b24..2dcf226a 100644
 +        online_draft_hidden = draft_logits_output.hidden_states
 +        if online_adapter is not None and online_draft_hidden is None:
 +            raise RuntimeError("DFLASH online adaptation requires draft hidden states")
++        if online_adapter is not None:
++            online_draft_hidden = online_adapter.inference_hidden(online_draft_hidden)
++            draft_logits_output.hidden_states = online_draft_hidden
  
          if self._draft_sampler is not None and draft_out.can_run_graph:
              draft_next = self._draft_sampler.out[
@@ -2908,6 +3102,8 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_count = torch.zeros(10, device=device)
 +        self.confidence_bin_prediction = torch.zeros(10, device=device)
 +        self.confidence_bin_survival = torch.zeros(10, device=device)
++        self.confidence_probabilities: list[float] = []
++        self.confidence_outcomes: list[float] = []
 +
 +    @property
 +    def telemetry_tensors(self) -> tuple[torch.Tensor, ...]:
@@ -2941,6 +3137,9 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_count.scatter_add_(0, indexes, ones)
 +        self.confidence_bin_prediction.scatter_add_(0, indexes, prediction[valid_mask])
 +        self.confidence_bin_survival.scatter_add_(0, indexes, survival[valid_mask])
++        if self.config.save_confidence_outcomes:
++            self.confidence_probabilities.extend(prediction[valid_mask].cpu().tolist())
++            self.confidence_outcomes.extend(survival[valid_mask].cpu().tolist())
 +
 +    def _confidence_ece(self) -> float | None:
 +        total = float(self.confidence_count.item())
@@ -3704,6 +3903,8 @@ index 00000000..7b2cb5db
 +        self.confidence_bin_count.zero_()
 +        self.confidence_bin_prediction.zero_()
 +        self.confidence_bin_survival.zero_()
++        self.confidence_probabilities.clear()
++        self.confidence_outcomes.clear()
 +
 +    def reload_config(self, config: OnlineAdaptationConfig) -> None:
 +        if config.stream_priority != self.config.stream_priority:
@@ -3979,6 +4180,8 @@ index 00000000..7b2cb5db
 +                else None
 +            ),
 +            "confidence_ece": self._confidence_ece(),
++            "confidence_probabilities": list(self.confidence_probabilities),
++            "confidence_outcomes": list(self.confidence_outcomes),
 +            "cohort_epoch": self.epoch,
 +            "slot_generation": self.slot_generation,
 +            "active_version": self.active_version,

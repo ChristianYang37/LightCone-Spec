@@ -51,6 +51,39 @@ def test_tts_source_policy_kl_has_zero_one_step_gradient():
     )
 
 
+def test_dspark_confidence_selection_aggregates_threshold_segments(monkeypatch):
+    rows = []
+    for weight in (0.05, 0.1, 0.25, 0.5, 1.0):
+        for threshold in range(10):
+            rows.append(
+                (
+                    {
+                        "parameters": {
+                            "workload": "confidence_calibration",
+                            "confidence_loss_weight": weight,
+                            "confidence_threshold": threshold / 10,
+                        }
+                    },
+                    {
+                        "slo_pass": True,
+                        "feasible": True,
+                        **{counter: 0 for counter in SAFETY_COUNTERS},
+                        "confidence_brier": abs(weight - 0.25) + 0.1,
+                        "confidence_ece": abs(weight - 0.25) + 0.05,
+                        "goodput": 100.0,
+                        "peak_hbm_bytes": 10,
+                        "confidence_probabilities": [0.2, 0.8],
+                        "confidence_outcomes": [0.0, 1.0],
+                    },
+                )
+            )
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    weight = runner._select_confidence_weight(object())
+    temperature = runner._select_confidence_temperature(object(), weight)
+    assert weight == 0.25
+    assert 0.25 <= temperature <= 4.0
+
+
 def test_tts_recipe_groups_confirmation_stimuli(monkeypatch):
     rows = []
     for block in range(4):

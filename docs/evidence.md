@@ -17,8 +17,8 @@ Stage summaries are reproducible projections from completed attempt folders:
 
 Committed-token goodput, native per-token ITL, peak HBM, KV capacity, safety
 counters, and distributed rank-local plus sum/max/min metrics are mandatory.
-Missing fields fail the cell. E5 runs a separate 11,000-offer boundary extension
-and reports p99 only when at least 10,000 requests complete.
+Missing fields fail the cell. E5 reports its concurrency curves and the shared
+BurstGPT trace from the same registered request outcomes.
 
 The evidence boundary is the ordinary academic one: report model and workload
 pool names, local paths, environment versions, hardware, seeds, numeric rows,

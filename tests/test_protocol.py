@@ -37,14 +37,14 @@ EXPECTED = {
     "E2-r1": 109,
     "E2-r2": 31,
     "E2-r3": 25,
-    "E4-screen": 48,
+    "E4-screen": 52,
     "E4-local": 168,
     "E4-profile": 3,
     "E3b-pilot": 20,
     "E3b-final": 132,
     "E1a": 141,
-    "E5-pilot": 53,
-    "E5-final": 160,
+    "E5-pilot": 11,
+    "E5-final": 66,
     "E6-pilot": 22,
     "E6-final": 60,
     "E0-tune": 287,
@@ -56,7 +56,7 @@ EXPECTED = {
 def test_paper_v2_node_order_counts_and_plan():
     assert len(PAPER_NODES) == 21
     assert default_row_counts() == EXPECTED
-    assert sum(EXPECTED.values()) == 2317
+    assert sum(EXPECTED.values()) == 2185
     assert len(paper_plan()) == 21
     assert [row.rows for row in paper_plan() if row.name == "TTS-Cal"] == ["<=108"]
 
@@ -114,6 +114,35 @@ def test_tts_and_dspark_registered_fidelity():
         if job.parameters.get("workload") == "confidence_calibration"
     ]
     assert tuple(confidence) == CONFIDENCE_WEIGHTS
+    assert {
+        job.parameters["update_steps"]
+        for job in materialize("E4-screen")
+        if job.parameters.get("workload") == "tts_update_steps"
+    } == {1, 2, 4, 8}
+
+
+def test_e5_source_aligned_methods_and_curves():
+    pilot = materialize("E5-pilot")
+    final = materialize("E5-final")
+    assert len(pilot) == 11
+    assert len(final) == 66
+    assert sum(job.parameters["workload"] == "topology_compatibility" for job in pilot) == 4
+    assert {job.method for job in final if job.block in range(12)} >= {
+        "target_only",
+        "static",
+        "tts",
+        "lightcone",
+    }
+    batched = [job for job in final if job.method == "tts_lora_batched"]
+    assert len(batched) == 6
+    assert {
+        segment["load"] for segment in batched[0].parameters["segments"]
+    } >= {"closed_loop_c1", "closed_loop_c256", "burstgpt_shape"}
+    full_tts = next(job for job in final if job.method == "tts")
+    assert {segment["load"] for segment in full_tts.parameters["segments"]} == {
+        "closed_loop_c1",
+        "burstgpt_shape",
+    }
 
 
 def test_e0_method_scope_is_deliberately_sparse():

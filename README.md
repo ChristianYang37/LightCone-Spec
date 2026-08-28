@@ -64,13 +64,13 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The `paper-v2` preset registers 2,317 static jobs and at most 2,385 runner jobs
+The `paper-v2` preset registers 2,185 static jobs and at most 2,253 runner jobs
 after bounded finalist and load-selection work. A job is one
 `method × block × compatible server layout`; its `segments` cover the
 registered contexts, loads, traces, or workload pools without reloading the
 same model. The per-node job counts are 10, 140, 72 (at most 108 after TTS
 finalist confirmation), 68 (at most 100 after Pareto confirmation), 424, 109,
-31, 25, 48, 168, 3, 20, 132, 141, 53, 160, 22, 60, 287, 86, and 258.
+31, 25, 52, 168, 3, 20, 132, 141, 11, 66, 22, 60, 287, 86, and 258.
 Primary E3b/E5 conclusions use 12 clean-server blocks; E4/E6/E0 secondary
 evidence uses six. There is no global power-selected repeat count.
 

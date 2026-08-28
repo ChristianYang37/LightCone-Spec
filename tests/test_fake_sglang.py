@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -323,6 +324,36 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
     cache = torch.tensor([[0.0, 1.0, 1.0, 0.0]])
     output = namespace["_rope"](value, torch.tensor([0]), cos_sin_cache=cache)
     assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
+
+
+def test_request_lora_slots_are_isolated_and_generation_safe():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "dflash_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name in {"RequestLoRASlot", "RequestLoRASlotBank"}
+    ]
+    namespace = {"dataclass": dataclass}
+    exec(compile(ast.Module(body=classes, type_ignores=[]), str(patch), "exec"), namespace)
+    bank = namespace["RequestLoRASlotBank"](2)
+    first = bank.acquire("first")
+    second = bank.acquire("second")
+    assert first.index != second.index
+    assert bank.acquire("first") == first
+    bank.release("first")
+    replacement = bank.acquire("replacement")
+    assert replacement.index == first.index
+    assert replacement.generation == first.generation + 1
+    assert bank.get("second") == second
 
 
 def test_qwen_speculative_workspace_covers_registered_width():

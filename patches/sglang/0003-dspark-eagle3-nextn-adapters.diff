@@ -429,66 +429,6 @@ index ebda751..019fff3 100644
      def forward(
          self,
          input_ids: torch.Tensor,
-diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
-index fd38dfa..18418d7 100644
---- a/python/sglang/srt/speculative/dflash_online_adaptation.py
-+++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -1099,3 +1099,55 @@ class DFlashDrafterAdapter:
-             self._restore_request_source()
- 
-     def _restore_request_source(self) -> None:
-+        self.optimizer.reset(self.initial_trainable)
-+        effective = self._effective_parameters(self.optimizer.master)
-+        self.inference.stage(tuple(effective[name] for name in self.names))
-+        self.inference.publish()
-+
-+    def reset(self) -> None:
-+        self.runtime.reset()
-+        self.optimizer.reset(self.initial_trainable)
-+        effective = self._effective_parameters(self.optimizer.master)
-+        self.inference.stage(tuple(effective[name] for name in self.names))
-+        self.inference.publish()
-+        self._captured_input = None
-+        self._captured_positions = None
-+        self._captured_prefix_lens = None
-+        self._captured_request_ids = ()
-+        self._captured_history = None
-+
-+    def reload_config(self, server_args) -> None:
-+        config = load_online_adaptation(server_args)
-+        if config is None or adaptation_layout(config) != adaptation_layout(self.config):
-+            raise ValueError("DFlash adaptation layout changed; restart the server")
-+        self.config = config
-+        self.runtime.reload_config(config)
-+        reconfigure_parameter_optimizer(self.optimizer, config)
-+
-+    def note_load(
-+        self,
-+        *,
-+        running_requests: int,
-+        waiting_requests: int,
-+        graph_replay: bool,
-+    ) -> None:
-+        self.runtime.note_load(
-+            running_requests=running_requests,
-+            waiting_requests=waiting_requests,
-+            graph_replay=graph_replay,
-+        )
-+
-+    def diagnostics(self) -> dict:
-+        online_spec_state = (
-+            self.optimizer.diagnostics()
-+            if isinstance(self.optimizer, OnlineSpecOptimizer)
-+            else None
-+        )
-+        return self.runtime.diagnostics(extra={"online_spec_state": online_spec_state})
-+
-+
-+def maybe_build_dflash_drafter_adapter(server_args, worker):
-+    config = load_online_adaptation(server_args)
-+    if config is None or config.algorithm != "DFLASH":
-+        return None
-+    return DFlashDrafterAdapter(server_args, worker)
 diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
 index acdbd74..7319db1 100644
 --- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
@@ -927,6 +867,18 @@ index ae778ee..eb8fe29 100644
 +                    confidence_tap=proposal.confidence_tap,
 +                )
 +                update_confidence = confidence
++        if (
++            online_adapter is not None
++            and confidence is not None
++            and online_adapter.config.confidence_threshold is not None
++        ):
++            probability = torch.sigmoid(
++                torch.logit(confidence.clamp(1e-6, 1 - 1e-6))
++                / online_adapter.config.confidence_temperature
++            )
++            confidence = (
++                probability >= online_adapter.config.confidence_threshold
++            ).to(confidence.dtype)
  
          verify_token_budget = self._verify_planner.resolve_verify_token_budget(
              draft_input=draft_input,

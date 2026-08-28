@@ -74,6 +74,7 @@ def _normalize(task: str, source: Path) -> list[dict[str, object]]:
                 "problem_id": str(problem_id or f"{task}-{index:08d}"),
                 "prompt": prompt,
                 "turns": turns,
+                "source": task,
             }
         )
     if not normalized:

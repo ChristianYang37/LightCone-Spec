@@ -527,32 +527,6 @@ index c8934b27e2..accb6bc357 100644
              self.rid_to_state[rid] = state
              if self.enable_trace:
                  time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
-diff --git a/python/sglang/srt/speculative/dflash_online_adaptation.py b/python/sglang/srt/speculative/dflash_online_adaptation.py
-index 18418d7ee0..d64614e695 100644
---- a/python/sglang/srt/speculative/dflash_online_adaptation.py
-+++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -1075,20 +1075,19 @@ class DFlashDrafterAdapter:
-     def after_commit(
-         self,
-         batch,
--        new_seq_lens: torch.Tensor,
-         *,
-         accepted_drafts: torch.Tensor,
-         verified_drafts: torch.Tensor,
-         committed_tokens: torch.Tensor,
-     ) -> None:
-         request_ids = tuple(request.rid for request in batch.reqs)
-+        self.runtime.record_device_commit(request_ids, committed_tokens)
-         self.runtime.record_round_outcome(
-             request_ids,
-             verified_drafts=verified_drafts,
-             accepted_drafts=accepted_drafts,
-             committed_tokens=committed_tokens,
-         )
--        self.runtime.record_device_commit(request_ids, new_seq_lens)
- 
-     def finish_request(self, request_id: str) -> bool:
-         if self.runtime.finish_request(request_id):
 diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
 index 2dcf226ad8..80c60d7998 100644
 --- a/python/sglang/srt/speculative/dflash_worker_v2.py

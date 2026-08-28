@@ -71,7 +71,7 @@ def _plan(config: ExperimentConfig) -> None:
     print("E1-common-load\t<=10\t7 bundled loads * (2 baselines + 2 * <=4 finalists)")
     print("E3-width-calibration\t12\t4 methods * 3 widths, each with 3 segments")
     print("E6-common-load\t10\t2 models * 5 roles, each with 9 load segments")
-    print("registered E5 p99 extension\t4\t11,000 offered requests per selected boundary")
+    print("TTS-batched-calibration\t<=4\tE1 LoRA finalists at excluded c8")
     print(
         f"registered finite-request floor\t{finite_requests}\t"
         f"requests_per_cell={config.server.requests_per_cell}; E5 time-driven rows excluded"
@@ -113,9 +113,7 @@ def _time_driven(job: Job) -> bool:
     load = job.load or ""
     registered = str(job.parameters.get("registered_load", load))
     return job.node.startswith("E5") and (
-        load.startswith("closed_loop_c")
-        or registered.startswith("lambda_")
-        or registered.endswith("_soak")
+        load.startswith("closed_loop_c") or registered.startswith("closed_loop_c")
     )
 
 

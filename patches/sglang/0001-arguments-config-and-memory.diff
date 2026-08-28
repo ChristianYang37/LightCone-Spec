@@ -248,6 +248,9 @@ index 00000000..8ec8b2c7
 +    update_coalescing: int = 1
 +    stream_priority: str = "default"
 +    confidence_loss_weight: float = 0.1
++    confidence_threshold: float | None = None
++    confidence_temperature: float = 1.0
++    save_confidence_outcomes: bool = False
 +    lora_matrix_policy: str = "linear_weights"
 +    native_head_policy: str = "include_for_hybrid_scope"
 +    failure_injection: str | None = None
@@ -315,17 +318,29 @@ index 00000000..8ec8b2c7
 +        confidence_weight = _finite(
 +            value.get("confidence_loss_weight", 0.1), "confidence_loss_weight"
 +        )
++        confidence_threshold = value.get("confidence_threshold")
++        if confidence_threshold is not None:
++            confidence_threshold = _finite(confidence_threshold, "confidence_threshold")
++        confidence_temperature = _finite(
++            value.get("confidence_temperature", 1.0), "confidence_temperature"
++        )
 +        if stride < 1 or canvas < 1 or microbatch < 1 or coalescing < 1:
 +            raise ValueError(
 +                "stride, canvas_tokens, and adaptation_microbatch_size must be positive"
 +            )
 +        if confidence_weight < 0:
 +            raise ValueError("confidence_loss_weight cannot be negative")
++        if confidence_threshold is not None and not 0 <= confidence_threshold <= 1:
++            raise ValueError("confidence_threshold must be between zero and one")
++        if confidence_temperature <= 0:
++            raise ValueError("confidence_temperature must be positive")
 +        if stream_priority not in {"default", "high"}:
 +            raise ValueError("stream_priority must be default or high")
 +        reset_scope = str(value.get("reset_scope", "cohort"))
-+        if reset_scope not in {"cohort", "request"}:
-+            raise ValueError("reset_scope must be cohort or request")
++        if reset_scope not in {"cohort", "request", "request_batched"}:
++            raise ValueError("reset_scope must be cohort, request, or request_batched")
++        if reset_scope == "request_batched" and mode != "lora":
++            raise ValueError("request_batched reset requires LoRA")
 +        fixed_budget = value.get("fixed_total_token_budget")
 +        if fixed_budget is not None and (
 +            not isinstance(fixed_budget, int) or fixed_budget < 1
@@ -367,6 +382,9 @@ index 00000000..8ec8b2c7
 +            update_coalescing=coalescing,
 +            stream_priority=stream_priority,
 +            confidence_loss_weight=confidence_weight,
++            confidence_threshold=confidence_threshold,
++            confidence_temperature=confidence_temperature,
++            save_confidence_outcomes=bool(value.get("save_confidence_outcomes", False)),
 +            failure_injection=value.get("failure_injection"),
 +        )
 +

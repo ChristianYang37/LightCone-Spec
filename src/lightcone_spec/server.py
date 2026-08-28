@@ -19,6 +19,7 @@ from .protocol import Job
 
 ADAPTIVE_METHODS = {
     "tts",
+    "tts_lora_batched",
     "l0_naive",
     "lightcone",
     "lightcone_candidate",
@@ -65,8 +66,16 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
             parameterization="full",
             scope="all",
         )
+    if job.method == "tts_lora_batched":
+        chosen.update(
+            optimizer="adam",
+            weight_decay=0.0,
+            grad_clip=0.0,
+            parameterization="lora",
+        )
     method = {
         "tts": "tts",
+        "tts_lora_batched": "tts",
         "l0_naive": "l0",
         "lightcone": "l0",
         "lightcone_candidate": "l0",
@@ -112,9 +121,15 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "adaptation_microbatch_size": int(chosen.get("microbatch", 1)),
         "update_coalescing": coalescing,
         "stream_priority": chosen.get("stream_priority", "default"),
-        "max_in_flight": 1,
+        "max_in_flight": _concurrency(job),
         "kv_history_policy": "frozen",
-        "reset_scope": "request" if _request_scoped_adaptation(job) else "cohort",
+        "reset_scope": (
+            "request_batched"
+            if job.method == "tts_lora_batched"
+            else "request"
+            if _request_scoped_adaptation(job)
+            else "cohort"
+        ),
         "telemetry_round_items": _telemetry_round_items(job),
         "adaptation_group_id": f"{job.node}-{job.ordinal}",
         "telemetry_detail": "profile" if job.node == "E4-profile" else "headline",
@@ -124,9 +139,18 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "failure_injection": chosen.get("failure"),
     }
     if job.node == "E1a" and chosen.get("verification") == "fixed_budget":
-        payload["fixed_total_token_budget"] = 8
+        payload["fixed_total_token_budget"] = int(
+            chosen.get("proposal_budget", 8)
+        ) * _concurrency(job)
     if job.node == "E1a":
         payload["confidence_loss_weight"] = float(chosen.get("confidence_loss_weight", 0.1))
+        payload["save_confidence_outcomes"] = bool(
+            chosen.get("save_confidence_outcomes", False)
+        )
+        if chosen.get("confidence_threshold") is not None:
+            payload["confidence_threshold"] = float(chosen["confidence_threshold"])
+        if chosen.get("confidence_temperature") is not None:
+            payload["confidence_temperature"] = float(chosen["confidence_temperature"])
     if method.startswith("onlinespec_"):
         payload["online_spec"] = {
             "projection_radius": chosen.get("projection_radius"),

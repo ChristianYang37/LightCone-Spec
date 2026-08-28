@@ -39,6 +39,8 @@ CONCURRENCY = (1, 2, 4, 8, 16, 32, 64)
 WIDTHS = (4, 8, 16)
 ROLES = ("target_only", "static", "tts", "l0_naive", "lightcone")
 CORE_ROLES = ("target_only", "static", "tts", "lightcone")
+E5_PRIMARY_METHODS = ("target_only", "static", "lightcone", "tts")
+E5_SECONDARY_METHODS = ("static", "lightcone", "tts_lora_batched")
 SCOPES = ("last1", "last3", "last5", "all")
 RANKS = (1, 2, 4, 8, 16, 32, 64)
 OPTIMIZERS = ("adam", "adamw", "sgdm", "nag", "muon", "lion", "chronobelief")
@@ -60,37 +62,10 @@ E1_REFERENCE_LOAD = "c1"
 E4_LOADS = ("low", "moderate", "saturation")
 E4_TRAFFIC = ("pure_decode", "mixed_prefill_decode")
 E5_CONCURRENCY = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-E5_LOADS = (0.25, 0.50, 0.75, 0.90, 1.00, 1.10, 1.25)
-E5_TRACES = (
-    "immediate_burst",
-    "burstgpt_shape",
-    "moderate_soak",
-    "saturation_soak",
-    "overload_soak",
-)
-E5_TOPOLOGIES = ("tp1_dp1", "tp2_dp1", "two_replica_tp1_dp2")
-E5_COHORTS = (1, 16, 64)
-E5_POPULARITY = ("uniform", "zipf")
-E5_FAILURES = (
-    "queue_saturation",
-    "cancellation",
-    "duplicate_retry",
-    "nonfinite_candidate",
-    "oom_candidate",
-    "telemetry_backpressure",
-    "disk_quota",
-    "slow_rank",
-    "communicator_failure",
-    "replica_drain",
-    "replica_restart",
-)
 E5_WARMUP_SECONDS = 10
 E5_HEADLINE_SECONDS = 60
-E5_SOAK_SECONDS = 300
 E5_REQUEST_DEADLINE_SECONDS = 120
 E5_DRAIN_SECONDS = 180
-E5_P99_MIN_COMPLETED = 10_000
-E5_P99_EXTENSION_REQUESTS = 11_000
 E6_MODELS = ("Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.5-122B-A10B-FP8")
 E0_MODELS = ("Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Gemma4-12B")
 E0_BACKENDS = ("EAGLE3", "DFLASH", "DSPARK")
@@ -104,6 +79,16 @@ E0_TASKS = (
     "MT-Bench",
     "AlpacaEval",
     "Arena-Hard",
+)
+TTS_SOURCE_TASKS = (
+    "AIME-2024",
+    "AIME-2025",
+    "MATH-500",
+    "OlympiadBench-Math",
+    "OlympiadBench-Physics",
+    "GPQA-Diamond",
+    "TheoremQA",
+    "LiveCodeBench",
 )
 
 
@@ -188,14 +173,14 @@ def paper_plan(
             NodePlan(f"E2-r{i}", str(rows + 4), 1, "successive halving plus four fixed roles")
             for i, rows in enumerate(e2)
         ),
-        NodePlan("E4-screen", "48", 1, "systems mechanism screen"),
+        NodePlan("E4-screen", "52", 1, "systems screen and TTS update-step ablation"),
         NodePlan("E4-local", "168", 1, "local factorial and six-block cumulative ablation"),
         NodePlan("E4-profile", "3", 2, "isolated profilers"),
         NodePlan("E3b-pilot", "20", 1, "excluded bundled trajectory pilots"),
         NodePlan("E3b-final", "132", 1, "12-block primary and six-block secondary confirmation"),
         NodePlan("E1a", "141", 1, "DSpark screen, confidence calibration, and confirmation"),
-        NodePlan("E5-pilot", "53", 2, "serving calibration and one-shot fault diagnostics"),
-        NodePlan("E5-final", "160", 2, "12-block serving and six-block topology confirmation"),
+        NodePlan("E5-pilot", "11", 2, "serving curve pilot and TP/DP compatibility"),
+        NodePlan("E5-final", "66", 2, "12-block primary and six-block secondary serving curves"),
         NodePlan("E6-pilot", "22", 2, "interface, fit, and bundled pilots"),
         NodePlan("E6-final", "60", 2, "six-block native-MTP transfer"),
         NodePlan("E0-tune", "287", 2, "compatibility and representative OnlineSPEC tuning"),
@@ -447,6 +432,18 @@ def _e4_screen() -> Iterator[dict[str, Any]]:
                 workload="systems_screen",
                 **factors,
             )
+    for steps in (1, 2, 4, 8):
+        yield dict(
+            method="tts",
+            model="Qwen/Qwen3-8B",
+            backend="DFLASH",
+            task="LiveCodeBench",
+            context=32768,
+            width=16,
+            load="c1",
+            update_steps=steps,
+            workload="tts_update_steps",
+        )
 
 
 def _e4_local(neighborhoods: dict[str, tuple[object, object]] | None) -> Iterator[dict[str, Any]]:
@@ -558,13 +555,30 @@ def _e3b_final() -> Iterator[dict[str, Any]]:
             workload="primary_long_history",
         )
     secondary = _segments(
-        {
-            "task": "MATH-500",
-            "context": 16384,
-            "regime": "short_input_long_generation",
-            "generation_tokens": 16384,
-            "generation_checkpoints": tuple(x for x in GENERATION_CHECKPOINTS if x <= 16384),
-        }
+        *(
+            {
+                "task": task,
+                "context": 16384,
+                "regime": "short_input_long_generation",
+                "generation_tokens": 16384,
+                "generation_checkpoints": tuple(
+                    x for x in GENERATION_CHECKPOINTS if x <= 16384
+                ),
+                "source_panel": "tts_long_history",
+            }
+            for task in ("AIME-2025", "MATH-500", "OlympiadBench-Math", "LiveCodeBench")
+        ),
+        *(
+            {
+                "task": task,
+                "context": 4096,
+                "regime": "short_input_long_generation",
+                "generation_tokens": 4096,
+                "generation_checkpoints": (1024, 2048, 4096),
+                "source_panel": "tts_breadth",
+            }
+            for task in TTS_SOURCE_TASKS
+        ),
     )
     for block, role in itertools.product(SECONDARY_BLOCKS, CORE_ROLES):
         yield dict(
@@ -652,6 +666,16 @@ def _e1a() -> Iterator[dict[str, Any]]:
             confidence_loss_weight=weight,
             verification="native_scheduler",
             workload="confidence_calibration",
+            segments=_segments(
+                *(
+                    {
+                        "confidence_threshold": round(threshold / 10, 1),
+                        "domains": ("math", "code", "chat"),
+                        "save_confidence_outcomes": True,
+                    }
+                    for threshold in range(10)
+                )
+            ),
         )
     for slot, block in itertools.product(range(4), range(5)):
         yield dict(
@@ -665,6 +689,20 @@ def _e1a() -> Iterator[dict[str, Any]]:
             block=block,
             verification="native_scheduler",
             workload="dspark_finalist_confirmation",
+            segments=_segments(
+                *(
+                    {
+                        "proposal_budget": budget,
+                        "verification": "fixed_budget",
+                        "load": "c128",
+                        "batch_size": 128,
+                        "latency_context": context,
+                    }
+                    for budget, context in itertools.product(
+                        (2, 4, 6, 8), (512, 1024, 2048, 4096)
+                    )
+                )
+            ),
         )
 
 
@@ -674,13 +712,38 @@ def _e5_serving_segments() -> list[dict[str, Any]]:
             {"load": f"closed_loop_c{value}", "registered_load": f"closed_loop_c{value}"}
             for value in E5_CONCURRENCY
         ),
-        *({"load": f"lambda_{value}", "registered_load": f"lambda_{value}"} for value in E5_LOADS),
-        *({"load": trace, "registered_load": trace} for trace in E5_TRACES),
+        {
+            "load": "burstgpt_shape",
+            "registered_load": "burstgpt_shape",
+            "arrival_trace": "BurstGPT",
+        },
     )
 
 
+def _e5_method_segments(method: str) -> list[dict[str, Any]]:
+    if method == "tts":
+        return _segments(
+            {"load": "closed_loop_c1", "registered_load": "closed_loop_c1"},
+            {
+                "load": "burstgpt_shape",
+                "registered_load": "burstgpt_shape",
+                "arrival_trace": "BurstGPT",
+            },
+        )
+    return _e5_serving_segments()
+
+
 def _e5_pilot() -> Iterator[dict[str, Any]]:
-    for backend, role in itertools.product(("DFLASH", "DSPARK"), CORE_ROLES):
+    methods = (
+        ("NONE", "target_only"),
+        ("DFLASH", "static"),
+        ("DFLASH", "lightcone"),
+        ("DFLASH", "tts"),
+        ("DSPARK", "static"),
+        ("DSPARK", "lightcone"),
+        ("DFLASH", "tts_lora_batched"),
+    )
+    for backend, role in methods:
         yield dict(
             method=role,
             model="Qwen/Qwen3-8B",
@@ -690,66 +753,29 @@ def _e5_pilot() -> Iterator[dict[str, Any]]:
             load="closed_loop_c1",
             block=0,
             gpu_count=2,
-            segments=_e5_serving_segments(),
+            comparison_backend="DFLASH" if backend == "NONE" else backend,
+            segments=_e5_method_segments(role),
             workload="serving_pilot",
         )
-    for backend, role in itertools.product(("DFLASH", "DSPARK"), CORE_ROLES):
-        for replicate in range(2):
-            yield dict(
-                method=role,
-                model="Qwen/Qwen3-8B",
-                backend=backend,
-                task="LiveCodeBench",
-                context=40928,
-                load="saturation",
-                block=replicate,
-                gpu_count=2,
-                segments=_segments(
-                    *(
-                        {
-                            "topology": topology,
-                            "cohorts": cohort,
-                            "popularity": popularity,
-                            "load": "saturation",
-                        }
-                        for topology, cohort, popularity in itertools.product(
-                            E5_TOPOLOGIES, E5_COHORTS, E5_POPULARITY
-                        )
-                    )
-                ),
-                workload="topology_pilot",
-            )
-    for backend, failure in itertools.product(("DFLASH", "DSPARK"), E5_FAILURES):
+    for backend, topology in itertools.product(
+        ("DFLASH", "DSPARK"), ("tp2_dp1", "two_replica_tp1_dp2")
+    ):
         yield dict(
             method="lightcone",
             model="Qwen/Qwen3-8B",
             backend=backend,
             task="controlled_baseline",
             context=40928,
-            load="c256" if failure == "queue_saturation" else "c1",
+            load="c1",
             gpu_count=2,
-            failure=failure,
-            topology="tp2_dp1",
-            cohorts=1,
-            workload="failure_injection",
-        )
-    for index in range(7):
-        yield dict(
-            method="lightcone",
-            model="Qwen/Qwen3-8B",
-            backend="DFLASH" if index < 4 else "DSPARK",
-            task="LiveCodeBench",
-            context=40928,
-            load="saturation",
-            block=index,
-            gpu_count=2,
-            calibration_slot=index,
-            workload="serving_calibration",
+            topology=topology,
+            workload="topology_compatibility",
         )
 
 
 def _e5_final() -> Iterator[dict[str, Any]]:
-    for backend, block, role in itertools.product(("DFLASH", "DSPARK"), PRIMARY_BLOCKS, CORE_ROLES):
+    for block, role in itertools.product(PRIMARY_BLOCKS, E5_PRIMARY_METHODS):
+        backend = "NONE" if role == "target_only" else "DFLASH"
         yield dict(
             method=role,
             model="Qwen/Qwen3-8B",
@@ -759,62 +785,24 @@ def _e5_final() -> Iterator[dict[str, Any]]:
             load="closed_loop_c1",
             block=block,
             gpu_count=2,
-            segments=_e5_serving_segments(),
-            workload="production_crossover",
+            comparison_backend="DFLASH",
+            segments=_e5_method_segments(role),
+            workload="primary_serving_frontier",
         )
-    topology_segments = _segments(
-        *(
-            {
-                "topology": topology,
-                "cohorts": cohort,
-                "popularity": popularity,
-                "load": "saturation",
-            }
-            for topology, cohort, popularity in itertools.product(
-                E5_TOPOLOGIES, E5_COHORTS, E5_POPULARITY
-            )
-        )
-    )
-    for backend, block, role in itertools.product(
-        ("DFLASH", "DSPARK"), SECONDARY_BLOCKS, CORE_ROLES
-    ):
+    for block, role in itertools.product(SECONDARY_BLOCKS, E5_SECONDARY_METHODS):
+        backend = "DSPARK" if role != "tts_lora_batched" else "DFLASH"
         yield dict(
             method=role,
             model="Qwen/Qwen3-8B",
             backend=backend,
             task="LiveCodeBench",
             context=40928,
-            load="saturation",
+            load="closed_loop_c1",
             block=block,
             gpu_count=2,
-            segments=topology_segments,
-            workload="topology_confirmation",
-        )
-    for backend, method in itertools.product(("DFLASH", "DSPARK"), ("static", "lightcone")):
-        yield dict(
-            method=method,
-            model="Qwen/Qwen3-8B",
-            backend=backend,
-            task="LiveCodeBench",
-            context=40928,
-            load="saturation",
-            gpu_count=2,
-            p99_extension=True,
-            workload="p99_extension",
-        )
-    for block in SECONDARY_BLOCKS:
-        for method in ("static", "lightcone"):
-            yield dict(
-                method=method,
-                model="Qwen/Qwen3-8B",
-                backend="DFLASH",
-                task="LiveCodeBench",
-                context=40928,
-                load="saturation",
-                block=block,
-                gpu_count=2,
-                matched_throughput=True,
-                workload="matched_throughput",
+            comparison_backend=backend,
+            segments=_e5_method_segments(role),
+            workload="secondary_serving_frontier",
             )
 
 
@@ -993,15 +981,45 @@ def _e0_tune() -> Iterator[dict[str, Any]]:
 
 
 def _e0_blocks(
-    blocks: Iterable[int], valid_pairs: set[tuple[str, str]] | None = None
+    blocks: Iterable[int],
+    valid_pairs: set[tuple[str, str]] | None = None,
+    *,
+    source_panel: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    segments = _segments(
-        *(
-            {"task": task, "context": 40928, "workload": "cross_workload_efficiency"}
-            for task in E0_TASKS
-        )
-    )
     for model, backend, method in _e0_methods(valid_pairs):
+        segments = _segments(
+            *(
+                {
+                    "task": task,
+                    "context": 40928,
+                    "workload": "cross_workload_efficiency",
+                }
+                for task in E0_TASKS
+            )
+        )
+        if source_panel:
+            segments.extend(
+                {
+                    "task": task,
+                    "context": 4096,
+                    "workload": "tts_source_panel",
+                    "temperature": 1.0,
+                }
+                for task in TTS_SOURCE_TASKS
+            )
+            if backend == "DSPARK":
+                segments.extend(
+                    {
+                        "task": task,
+                        "context": 4096,
+                        "workload": "dspark_source_panel",
+                        "temperature": 1.0,
+                        "drafting": "chain",
+                        "verification": "fixed_budget",
+                        "proposal_budget": 8,
+                    }
+                    for task in E0_TASKS
+                )
         for block in blocks:
             yield dict(
                 method=method,
@@ -1062,7 +1080,7 @@ def materialize(
         rows = _e0_tune()
     elif node == "E0-pilot":
         pairs = None if valid_e0 is None else {(model, backend) for model, backend, _ in valid_e0}
-        rows = _e0_blocks((0, 1), pairs)
+        rows = _e0_blocks((0, 1), pairs, source_panel=True)
     else:
         pairs = None if valid_e0 is None else {(model, backend) for model, backend, _ in valid_e0}
         rows = _e0_blocks(SECONDARY_BLOCKS, pairs)
