@@ -1759,11 +1759,33 @@ def _single_gpu_queues(
                 job.parameters["stride"]
             )
         return {gpu: tuple(rows) for gpu, rows in queues.items() if rows}
-    return {
-        gpu: tuple(job for job in jobs if _assigned_gpu(config, job) == gpu)
-        for gpu in config.gpu_ids
-        if any(_assigned_gpu(config, job) == gpu for job in jobs)
-    }
+    groups: dict[tuple[str, object], list[Job]] = {}
+    for job in jobs:
+        parent = job.parameters.get("parent_job_id")
+        if parent is not None:
+            key = ("parent", parent)
+        elif job.block is not None:
+            key = ("block", job.block)
+        else:
+            key = ("job", job.job_id)
+        groups.setdefault(key, []).append(job)
+
+    queues = {gpu: [] for gpu in config.gpu_ids}
+    work = {gpu: 0.0 for gpu in config.gpu_ids}
+    ordered = sorted(
+        groups.values(),
+        key=lambda rows: (
+            -sum(float(row.parameters.get("generation_tokens", 256)) for row in rows),
+            min(row.ordinal for row in rows),
+        ),
+    )
+    for rows in ordered:
+        gpu = min(config.gpu_ids, key=lambda value: (work[value], value))
+        queues[gpu].extend(rows)
+        work[gpu] += sum(
+            float(row.parameters.get("generation_tokens", 256)) for row in rows
+        )
+    return {gpu: tuple(rows) for gpu, rows in queues.items() if rows}
 
 
 def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:

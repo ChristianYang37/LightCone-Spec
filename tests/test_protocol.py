@@ -210,6 +210,28 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     assert max(estimated.values()) / min(estimated.values()) < 1.01
     assert _screening_job(tts_screen[0])
 
+    remaining_e1 = tuple(
+        job for job in materialize("E1") if job.ordinal in {51, 61}
+    )
+    e1_queues = _single_gpu_queues(config, remaining_e1)
+    assert {gpu: len(rows) for gpu, rows in e1_queues.items()} == {0: 1, 1: 1}
+
+    paired = tuple(
+        job
+        for job in materialize("E3b-final")
+        if job.block in {0, 1} and job.parameters["workload"] == "primary_long_history"
+    )
+    paired_queues = _single_gpu_queues(config, paired)
+    block_gpus = {
+        block: {
+            gpu
+            for gpu, rows in paired_queues.items()
+            if any(job.block == block for job in rows)
+        }
+        for block in (0, 1)
+    }
+    assert block_gpus == {0: {0}, 1: {1}}
+
     measured = {
         "goodput": 12.0,
         "fallbacks": 1,
