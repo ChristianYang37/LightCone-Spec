@@ -2984,7 +2984,7 @@ def _select_tts_recipe(state: StateStore) -> dict[str, Any]:
         parameters = {
             key: value
             for key, value in config["parameters"].items()
-            if key not in {"workload", "confirmation_block"}
+            if key not in {"workload", "confirmation_block", "stimulus_id"}
         }
         key = json.dumps(parameters, sort_keys=True)
         groups.setdefault(key, (parameters, []))[1].append(metrics)
@@ -3950,6 +3950,15 @@ def _save_environment(config: ExperimentConfig) -> None:
 def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -> str | None:
     if node != "preflight" and state.stage_status("preflight") != "completed":
         return "preflight did not complete"
+    stage_requirements = {
+        "E3b-final": "E3b-pilot",
+        "E5-final": "E5-pilot",
+        "E6-final": "E6-pilot",
+        "E0-final": "E0-pilot",
+    }
+    required_stage = stage_requirements.get(node)
+    if required_stage and state.stage_status(required_stage) != "completed":
+        return f"{required_stage} did not complete"
     requirements = {
         "E1": ("tts_recipe", "e3a"),
         "E2-r0": ("e1_geometries",),

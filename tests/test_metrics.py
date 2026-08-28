@@ -51,6 +51,48 @@ def test_tts_source_policy_kl_has_zero_one_step_gradient():
     )
 
 
+def test_tts_recipe_groups_confirmation_stimuli(monkeypatch):
+    rows = []
+    for block in range(4):
+        rows.append(
+            (
+                {
+                    "parameters": {
+                        "learning_rate": 1e-4,
+                        "stride": 50,
+                        "workload": "tts_calibration_confirmation",
+                        "confirmation_block": block,
+                        "stimulus_id": f"confirmation-block-{block}",
+                    }
+                },
+                {
+                    "goodput": 100.0 + block,
+                    "peak_hbm_bytes": 10,
+                    "itl_p99_ms": 5.0,
+                },
+            )
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "_metric_rows",
+        lambda state, node: rows if node == "TTS-Cal-confirmation" else [],
+    )
+    recipe = runner._select_tts_recipe(None)
+    assert recipe == {"learning_rate": 1e-4, "stride": 50}
+
+
+def test_final_stage_requires_completed_pilot():
+    class State:
+        def stage_status(self, node):
+            return {"preflight": "completed", "E5-pilot": "skipped"}.get(node)
+
+        def selection(self, name, default=None):
+            return default
+
+    assert runner._dependency_reason(None, State(), "E5-final") == "E5-pilot did not complete"
+
+
 def test_safety_metrics_reject_numerical_failures():
     metrics = {
         "committed_tokens": 100,
