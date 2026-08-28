@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,251 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
@@ -243,6 +243,7 @@ index 00000000..8ec8b2c7
 +    controlled_candidate_role: str | None
 +    reset_scope: str
 +    fixed_total_token_budget: int | None
++    telemetry_round_items: int
 +    adaptation_microbatch_size: int = 1
 +    update_coalescing: int = 1
 +    stream_priority: str = "default"
@@ -330,6 +331,9 @@ index 00000000..8ec8b2c7
 +            not isinstance(fixed_budget, int) or fixed_budget < 1
 +        ):
 +            raise ValueError("fixed_total_token_budget must be a positive integer")
++        telemetry_round_items = int(value.get("telemetry_round_items", 3_000_000))
++        if telemetry_round_items < 1:
++            raise ValueError("telemetry_round_items must be positive")
 +        controlled_role = value.get("controlled_candidate_role")
 +        if controlled_role not in {None, "capture", "compare"}:
 +            raise ValueError("controlled_candidate_role must be capture or compare")
@@ -358,6 +362,7 @@ index 00000000..8ec8b2c7
 +            controlled_candidate_role=controlled_role,
 +            reset_scope=reset_scope,
 +            fixed_total_token_budget=fixed_budget,
++            telemetry_round_items=telemetry_round_items,
 +            adaptation_microbatch_size=microbatch,
 +            update_coalescing=coalescing,
 +            stream_priority=stream_priority,

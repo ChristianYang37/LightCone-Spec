@@ -2399,7 +2399,7 @@ new file mode 100644
 index 0000000..748bbdf
 --- /dev/null
 +++ b/python/sglang/srt/speculative/native_backend_online_adaptation.py
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,415 @@
 +"""Online updates shared by DSpark, EAGLE3, and NEXTN workers."""
 +
 +from __future__ import annotations
@@ -2555,6 +2555,7 @@ index 0000000..748bbdf
 +        )
 +        max_batch = max(1, int(server_args.max_running_requests))
 +        training_batch = min(max_batch, config.adaptation_microbatch_size)
++        trace_rounds = math.ceil(config.telemetry_round_items / max_batch)
 +        self.runtime = OnlineCohortRuntime(
 +            config,
 +            device=self.device,
@@ -2562,7 +2563,7 @@ index 0000000..748bbdf
 +            * 1024
 +            * 1024,
 +            telemetry_path=server_args.speculative_adaptation_telemetry_path,
-+            max_trace_updates=context_capacity // config.stride + 2,
++            max_trace_updates=math.ceil(trace_rounds / config.stride) + 2,
 +            max_trace_batch=max_batch,
 +        )
 +        self.runtime.bind_parameter_layout(

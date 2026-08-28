@@ -972,6 +972,7 @@ def test_cosine_horizon_and_e1a_fixed_settings():
 def test_tts_always_resets_between_requests():
     tts_cal = materialize("TTS-Cal")[0]
     assert adaptation_payload(tts_cal)["reset_scope"] == "request"
+    assert adaptation_payload(tts_cal)["telemetry_round_items"] == tts_cal.context
 
     e3 = next(
         job
@@ -993,6 +994,7 @@ def test_tts_always_resets_between_requests():
         **{**concurrent.to_dict(), "method": "lightcone"}
     )
     assert adaptation_payload(lightcone)["reset_scope"] == "cohort"
+    assert adaptation_payload(lightcone)["telemetry_round_items"] == 3_000_000
     assert not _uses_request_scope(lightcone)
 
 

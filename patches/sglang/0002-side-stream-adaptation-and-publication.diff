@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1106 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -441,6 +441,7 @@ index 00000000..20e93274
 +        )
 +        max_batch = max(1, int(server_args.max_running_requests))
 +        training_batch = min(max_batch, config.adaptation_microbatch_size)
++        trace_rounds = math.ceil(config.telemetry_round_items / max_batch)
 +        self.runtime = OnlineCohortRuntime(
 +            config,
 +            device=self.device,
@@ -448,7 +449,7 @@ index 00000000..20e93274
 +            * 1024
 +            * 1024,
 +            telemetry_path=server_args.speculative_adaptation_telemetry_path,
-+            max_trace_updates=context_capacity // config.stride + 2,
++            max_trace_updates=math.ceil(trace_rounds / config.stride) + 2,
 +            max_trace_batch=max_batch,
 +        )
 +        self.factor_names: tuple[str, ...] = ()

@@ -29,6 +29,7 @@ ADAPTIVE_METHODS = {
 }
 
 E2_MINIMUM_UPDATES = (2, 4, 8, 16)
+COHORT_TELEMETRY_ROUND_ITEMS = 3_000_000
 
 
 def _topology(job: Job) -> tuple[int, int]:
@@ -43,6 +44,12 @@ def _speculative_canvas(job: Job) -> int:
 
 def _request_scoped_adaptation(job: Job) -> bool:
     return job.method in {"tts", "l0_naive"}
+
+
+def _telemetry_round_items(job: Job) -> int:
+    if _request_scoped_adaptation(job):
+        return int(job.context or 40960)
+    return COHORT_TELEMETRY_ROUND_ITEMS
 
 
 def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -108,6 +115,7 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "max_in_flight": 1,
         "kv_history_policy": "frozen",
         "reset_scope": "request" if _request_scoped_adaptation(job) else "cohort",
+        "telemetry_round_items": _telemetry_round_items(job),
         "adaptation_group_id": f"{job.node}-{job.ordinal}",
         "telemetry_detail": "profile" if job.node == "E4-profile" else "headline",
         "verification_mode": chosen.get("verification", "native_scheduler"),
@@ -288,6 +296,7 @@ def server_session_key(job: Job, selection: dict[str, Any] | None = None) -> tup
             adaptation["rank"],
             optimizer_state,
             len(online.get("additional_learning_rates", ())),
+            adaptation["telemetry_round_items"],
         )
     return (
         job.model,
