@@ -2819,6 +2819,8 @@ def _run_node_jobs(
                 state.skip_job(job.job_id, "model has no feasible TP2 NEXTN common load")
         pending = state.pending_jobs(node)
     _run_pending_jobs(config, state, node, stop_event, pending)
+    if stop_event.is_set():
+        return
     if node == "TTS-Cal" and state.selection("tts_confirmation_complete", None) is None:
         if not _all_jobs_completed(state.status_counts(node)):
             return
