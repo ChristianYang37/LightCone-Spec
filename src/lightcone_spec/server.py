@@ -95,7 +95,10 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
         "beta2": float(chosen.get("beta2", 0.999)),
         "epsilon": float(chosen.get("epsilon", 1e-8)),
         "grad_clip": float(chosen.get("grad_clip", 1.0)),
-        "momentum": chosen.get("momentum"),
+        "momentum": chosen.get(
+            "momentum",
+            0.9 if chosen.get("optimizer") in {"sgdm", "nag"} else None,
+        ),
         "schedule": chosen.get("schedule", "constant"),
     }
     if optimizer["schedule"] == "cosine_to_zero":

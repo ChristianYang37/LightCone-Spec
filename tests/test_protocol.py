@@ -106,6 +106,12 @@ def test_tts_and_dspark_registered_fidelity():
     assert payload["optimizer"]["name"] == "adam"
     assert payload["optimizer"]["weight_decay"] == 0
     assert payload["optimizer"]["grad_clip"] == 0
+    sgdm = next(
+        job
+        for job in materialize("E1")
+        if job.parameters.get("optimizer") == "sgdm"
+    )
+    assert adaptation_payload(sgdm)["optimizer"]["momentum"] == 0.9
     assert payload["teacher_row_policy"] == "latest_update_round_only"
     assert payload["loss_position_decay"] == pytest.approx(math.exp(-1 / 7))
     confidence = [
