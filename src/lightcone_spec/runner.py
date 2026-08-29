@@ -40,9 +40,11 @@ from .metrics import (
     block_bootstrap_interval,
     committed_goodput,
     holm_decisions,
+    normalize_attempt_semantics,
     paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
+    per_user_generation_speed,
     summarize_attempts,
     validate_scientific_metrics,
 )
@@ -444,6 +446,14 @@ def _cell_concurrency(job: Job) -> int:
 
 def _uses_request_scope(job: Job) -> bool:
     return job.method in {"tts", "l0_naive"}
+
+
+def _dispatcher_concurrency(job: Job) -> int:
+    if _uses_request_scope(job):
+        return 1
+    if job.parameters.get("registered_load") == "burstgpt_shape":
+        return 256
+    return _cell_concurrency(job)
 
 
 def _fit_prompt(tokens: tuple[int, ...], filler: tuple[int, ...], length: int) -> tuple[int, ...]:
@@ -973,6 +983,18 @@ def _execute_cell(
         metrics: dict[str, Any] | None = None
         try:
             runtime_job = _runtime_job(state, job)
+            declared_concurrency = _cell_concurrency(runtime_job)
+            dispatcher_concurrency = _dispatcher_concurrency(runtime_job)
+            runtime_job = replace(
+                runtime_job,
+                parameters={
+                    **runtime_job.parameters,
+                    "declared_concurrency": declared_concurrency,
+                    "dispatcher_concurrency": dispatcher_concurrency,
+                    "effective_load": f"c{dispatcher_concurrency}",
+                    "metric_semantics": "per_request_native_v2",
+                },
+            )
             raw_config = runtime_job.to_dict()
             raw_config["parameters"]["stimulus_id"] = _stimulus_id(runtime_job)
             raw_config["adaptation"] = adaptation_payload(runtime_job, selection)
@@ -1135,7 +1157,6 @@ def _execute_cell(
             before = _speed_metrics(client.server_info(), topology)
             arrivals = _arrival_offsets(config, state, job, runtime_job, len(prompts))
             scheduled: ScheduledRun | None = None
-            concurrency = _cell_concurrency(runtime_job)
             request_scoped = _uses_request_scope(runtime_job)
             temperature = float(runtime_job.parameters.get("temperature", 0.0))
             controlled_rows: list[dict[str, object]] = list(exactness_rows)
@@ -1192,7 +1213,7 @@ def _execute_cell(
                     max_new_tokens,
                     config.protocol.seed + (job.block or 0),
                     request_scoped=request_scoped,
-                    max_in_flight=concurrency,
+                    max_in_flight=dispatcher_concurrency,
                 )
             elif arrivals is None:
                 seed = config.protocol.seed + (job.block or 0)
@@ -1203,7 +1224,7 @@ def _execute_cell(
                         seed=seed,
                         temperature=temperature,
                         routing_keys=_routing_keys(config, runtime_job, len(prompts)),
-                        max_in_flight=1 if request_scoped else concurrency,
+                        max_in_flight=dispatcher_concurrency,
                         duration_seconds=E5_HEADLINE_SECONDS,
                         deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                         request_id_prefix=f"{job.job_id}-closed-loop",
@@ -1231,7 +1252,7 @@ def _execute_cell(
                         request_ids=tuple(
                             f"{job.job_id}-measure-{index:05d}" for index in range(len(prompts))
                         ),
-                        max_in_flight=concurrency,
+                        max_in_flight=dispatcher_concurrency,
                         deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     )
                     results, elapsed = scheduled.results, scheduled.elapsed_seconds
@@ -1246,7 +1267,7 @@ def _execute_cell(
                     request_ids=tuple(
                         f"{job.job_id}-scheduled-{index:05d}" for index in range(len(prompts))
                     ),
-                    max_in_flight=1 if request_scoped else 256,
+                    max_in_flight=dispatcher_concurrency,
                     deadline_seconds=E5_REQUEST_DEADLINE_SECONDS,
                     drain_seconds=E5_DRAIN_SECONDS,
                 )
@@ -1268,6 +1289,7 @@ def _execute_cell(
                     {"policy": "target_only", **result.to_dict()} for result in controlled
                 ]
             request_rows = [_request_metrics(result) for result in results]
+            measured_user_speed = per_user_generation_speed(request_rows)
             outcome_rows = (
                 [outcome.to_dict() for outcome in scheduled.outcomes]
                 if scheduled is not None
@@ -1356,8 +1378,13 @@ def _execute_cell(
                 "committed_tokens": committed,
                 "duration_seconds": elapsed,
                 "goodput": committed_goodput(committed, elapsed),
-                "per_user_generation_speed": committed_goodput(committed, elapsed)
-                / max(1, _cell_concurrency(runtime_job)),
+                "per_user_generation_speed": (
+                    measured_user_speed if measured_user_speed is not None else "N/A"
+                ),
+                "declared_concurrency": declared_concurrency,
+                "dispatcher_concurrency": dispatcher_concurrency,
+                "effective_load": f"c{dispatcher_concurrency}",
+                "metric_semantics": "per_request_native_v2",
                 "peak_hbm_bytes": peak_hbm,
                 "allocated_peak_hbm_bytes": peak_hbm,
                 "reserved_peak_hbm_bytes": reserved_hbm,
@@ -2869,10 +2896,16 @@ def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dic
                 for segment in segments:
                     segment_config = dict(segment["config"])
                     segment_metrics = dict(segment["metrics"])
+                    segment_config, segment_metrics = normalize_attempt_semantics(
+                        segment_config,
+                        segment_metrics,
+                        Path(segment["attempt_dir"]),
+                    )
                     segment_metrics["source_attempt"] = metrics["source_attempt"]
                     segment_metrics["source_attempt_dir"] = segment["attempt_dir"]
                     rows.append((segment_config, segment_metrics))
             else:
+                config, metrics = normalize_attempt_semantics(config, metrics, directory)
                 rows.append((config, metrics))
     return rows
 
@@ -3104,11 +3137,15 @@ def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
 def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[str, Any]]:
     rows = _metric_rows(state, node)
     baselines = {
-        config["method"]: float(metrics["goodput"])
+        config["method"]: metrics
         for config, metrics in rows
         if config["method"] in {"static", "tts"}
     }
     if set(baselines) != {"static", "tts"}:
+        return []
+    static_goodput = float(baselines["static"]["goodput"])
+    tts_user_speed = baselines["tts"].get("per_user_generation_speed")
+    if not isinstance(tts_user_speed, (int, float)) or tts_user_speed <= 0:
         return []
     candidates = []
     for config, metrics in rows:
@@ -3117,7 +3154,13 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
         if metrics.get("feasible") is False:
             continue
         goodput = float(metrics["goodput"])
-        objective = min(goodput / baselines["static"], goodput / baselines["tts"])
+        user_speed = metrics.get("per_user_generation_speed")
+        if not isinstance(user_speed, (int, float)) or user_speed <= 0:
+            continue
+        objective = min(
+            goodput / static_goodput,
+            float(user_speed) / float(tts_user_speed),
+        )
         candidates.append(
             (
                 -objective,
@@ -3133,6 +3176,56 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
         )
     candidates.sort(key=lambda row: row[:-1])
     return [row[-1] for row in candidates[:keep]]
+
+
+_E2_RUNTIME_PARAMETER_KEYS = {
+    "declared_concurrency",
+    "dispatcher_concurrency",
+    "effective_load",
+    "metric_semantics",
+    "registered_load",
+    "stimulus_id",
+}
+
+
+def _e2_recipe_key(recipe: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            key: value
+            for key, value in recipe.items()
+            if key not in _E2_RUNTIME_PARAMETER_KEYS
+        },
+        sort_keys=True,
+    )
+
+
+def _preserve_or_audit_e2_selection(
+    state: StateStore,
+    node: str,
+    selection_name: str,
+    winners: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    existing = state.selection(selection_name, None)
+    if not isinstance(existing, list):
+        return winners
+    same_set = {_e2_recipe_key(row) for row in existing} == {
+        _e2_recipe_key(row) for row in winners
+    }
+    path = state.run_dir / "stages" / node / "concurrency_metric_audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        path,
+        {
+            "metric_semantics": "per_request_native_v2",
+            "previous_finalists": len(existing),
+            "corrected_finalists": len(winners),
+            "same_scientific_set": same_set,
+            "action": "preserved_existing_order" if same_set else "selection_changed",
+        },
+    )
+    if same_set:
+        return existing
+    return winners
 
 
 def _natural_spline_fit(
@@ -3520,9 +3613,11 @@ def _e5_frontier_statistic(state: StateStore) -> dict[str, object] | None:
         load = str(config.get("load", ""))
         if not load.startswith("closed_loop_c"):
             continue
-        concurrency = int(load.removeprefix("closed_loop_c"))
         throughput = float(metrics.get("goodput", 0.0))
-        speed = float(metrics.get("per_user_generation_speed", throughput / concurrency))
+        speed_value = metrics.get("per_user_generation_speed")
+        if not isinstance(speed_value, (int, float)) or speed_value <= 0:
+            raise ScientificFailure("E5 frontier lacks native per-request generation speed")
+        speed = float(speed_value)
         points.setdefault((block, str(method)), []).append((speed, throughput))
     candidate = []
     baseline = []
@@ -3838,6 +3933,15 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
         )
         keep = max(math.ceil(candidate_count / 4), 21) if round_index < 3 else 1
         winners = _rank_e2_candidates(state, node, keep)
+        selection_name = (
+            "lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}"
+        )
+        winners = _preserve_or_audit_e2_selection(
+            state,
+            node,
+            selection_name,
+            winners,
+        )
         state.set_selection(
             f"{node}_counts",
             {
@@ -3850,7 +3954,7 @@ def _reduce_node(config: ExperimentConfig, state: StateStore, node: str) -> None
             state.set_selection(f"{node}_no_feasible_candidate", True)
         else:
             state.set_selection(
-                "lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}",
+                selection_name,
                 winners[0] if round_index == 3 else winners,
             )
     elif node == "E1a":

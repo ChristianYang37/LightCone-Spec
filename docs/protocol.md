@@ -27,7 +27,8 @@ global `N` or `final_blocks` setting.
 ## Comparisons and repetition
 
 - E3b primary: LiveCodeBench 32K generated history, five mechanism roles,
-  12 paired clean-server blocks.
+  12 paired clean-server blocks. All methods run at matched `c1`; E5 carries
+  the registered serving-concurrency comparison.
 - E3b secondary: MATH-500 16K generated history and four-context
   long-input/multi-turn suites, four core roles, six blocks.
 - E5 primary: Target-only, DFlash Static, Full TTS, and DFlash LightCone;
@@ -68,6 +69,12 @@ ratios, BCa 95% intervals, and exact sign-flip tests over 12 blocks. E4/E6/E0
 use block→request hierarchical bootstrap over six blocks. E5 p99 uses a
 time-block bootstrap. E0 workload-family
 results are exploratory and use BH-FDR.
+
+Aggregate committed-token throughput and per-user generation speed are distinct
+metrics. Per-user speed is the arithmetic mean of each completed request's
+native decode rate, computed from committed-token timestamps. Full TTS therefore
+records declared and dispatcher concurrency separately and is never divided by
+a nominal load that its request-reset implementation does not execute.
 
 Formal evidence is compressed numeric request/cycle data, GPU telemetry,
 configuration, metrics, SQLite state, and source attempt directories. Generated

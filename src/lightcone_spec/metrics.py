@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import itertools
 import json
 import math
@@ -26,6 +27,74 @@ def committed_goodput(committed_tokens: int, duration_seconds: float) -> float:
     if committed_tokens < 0 or not math.isfinite(duration_seconds) or duration_seconds <= 0:
         raise ValueError("goodput requires non-negative tokens and positive finite time")
     return committed_tokens / duration_seconds
+
+
+def per_user_generation_speed(requests: Iterable[dict[str, object]]) -> float | None:
+    """Return the mean native decode speed across completed requests."""
+    speeds = []
+    for request in requests:
+        timestamps = request.get("native_token_timestamps_ns")
+        if not isinstance(timestamps, list) or len(timestamps) < 2:
+            continue
+        elapsed_ns = int(timestamps[-1]) - int(timestamps[0])
+        if elapsed_ns > 0:
+            speeds.append((len(timestamps) - 1) * 1_000_000_000 / elapsed_ns)
+    return float(np.mean(speeds)) if speeds else None
+
+
+def _load_concurrency(load: object) -> int:
+    value = str(load or "")
+    if value.startswith("closed_loop_c"):
+        suffix = value.removeprefix("closed_loop_c")
+        return int(suffix) if suffix.isdigit() else 1
+    if value.startswith("c") and value[1:].isdigit():
+        return int(value[1:])
+    return 1
+
+
+def _attempt_requests(directory: Path) -> list[dict[str, object]]:
+    compressed = directory / "requests.jsonl.gz"
+    plain = directory / "requests.jsonl"
+    if compressed.is_file():
+        with gzip.open(compressed, "rt", encoding="utf-8") as stream:
+            return [json.loads(line) for line in stream if line.strip()]
+    if plain.is_file():
+        return [
+            json.loads(line)
+            for line in plain.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    return []
+
+
+def normalize_attempt_semantics(
+    config: dict[str, object], metrics: dict[str, object], directory: Path
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Derive concurrency and per-user metrics without rewriting raw attempts."""
+    normalized_config = dict(config)
+    parameters = dict(normalized_config.get("parameters") or {})
+    declared = _load_concurrency(normalized_config.get("load"))
+    request_scoped = normalized_config.get("method") in {"tts", "l0_naive"}
+    burst_trace = parameters.get("registered_load") == "burstgpt_shape"
+    dispatcher = 1 if request_scoped else (256 if burst_trace else declared)
+    parameters.update(
+        declared_concurrency=declared,
+        dispatcher_concurrency=dispatcher,
+        effective_load=f"c{dispatcher}",
+        metric_semantics="per_request_native_v2",
+    )
+    normalized_config["parameters"] = parameters
+
+    normalized_metrics = dict(metrics)
+    speed = per_user_generation_speed(_attempt_requests(directory))
+    normalized_metrics.update(
+        declared_concurrency=declared,
+        dispatcher_concurrency=dispatcher,
+        effective_load=f"c{dispatcher}",
+        metric_semantics="per_request_native_v2",
+        per_user_generation_speed=speed if speed is not None else "N/A",
+    )
+    return normalized_config, normalized_metrics
 
 
 def validate_scientific_metrics(metrics: dict[str, object]) -> None:
@@ -198,13 +267,14 @@ def summarize_attempts(attempt_dirs: Iterable[Path], output_root: Path) -> pd.Da
             continue
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        config, metrics = normalize_attempt_semantics(config, metrics, directory)
         rows.append(
             {
                 **config,
                 **metrics,
                 "attempt": directory.name,
                 "attempt_dir": str(directory),
-                "reducer": "attempt_summary_v1",
+                "reducer": "attempt_summary_v2",
             }
         )
     frame = pd.DataFrame(rows)

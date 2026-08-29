@@ -36,6 +36,7 @@ from lightcone_spec.nextn import (
 from lightcone_spec.protocol import Job, materialize
 from lightcone_spec.runner import (
     _check_greedy_trajectories,
+    _dispatcher_concurrency,
     _exactness_bootstrap,
     _fault_action_passed,
     _fit_prompt,
@@ -1013,11 +1014,12 @@ def test_tts_always_resets_between_requests():
     e3 = next(
         job
         for job in materialize("E3b-pilot")
-        if job.method == "tts" and job.load == "common_load"
+        if job.method == "tts" and job.load == "c1"
     )
     concurrent = e3.__class__(**{**e3.to_dict(), "load": "c8"})
     assert adaptation_payload(concurrent)["reset_scope"] == "request"
     assert _uses_request_scope(concurrent)
+    assert _dispatcher_concurrency(concurrent) == 1
 
     single = concurrent.__class__(**{**concurrent.to_dict(), "load": "c1"})
     assert adaptation_payload(single)["reset_scope"] == "request"
@@ -1032,6 +1034,7 @@ def test_tts_always_resets_between_requests():
     assert adaptation_payload(lightcone)["reset_scope"] == "cohort"
     assert adaptation_payload(lightcone)["telemetry_round_items"] == 3_000_000
     assert not _uses_request_scope(lightcone)
+    assert _dispatcher_concurrency(lightcone) == 8
 
 
 def test_sticky_replica_routing_is_repeatable():

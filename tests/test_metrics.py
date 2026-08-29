@@ -1,3 +1,4 @@
+import gzip
 import json
 import math
 
@@ -12,9 +13,11 @@ from lightcone_spec.metrics import (
     committed_goodput,
     hierarchical_request_interval,
     holm_decisions,
+    normalize_attempt_semantics,
     paired_bca_interval,
     paired_block_statistics,
     paired_relative_bca_interval,
+    per_user_generation_speed,
     summarize_attempts,
     validate_scientific_metrics,
 )
@@ -31,6 +34,34 @@ def test_goodput_bootstrap_and_holm():
     )
     assert relative[1] <= relative[0] <= relative[2]
     assert holm_decisions([0.001, 0.02, 0.8]) == (True, True, False)
+
+
+def test_native_per_user_speed_and_historical_tts_concurrency(tmp_path):
+    requests = [
+        {"native_token_timestamps_ns": [1_000_000_000, 1_010_000_000, 1_020_000_000]},
+        {"native_token_timestamps_ns": [2_000_000_000, 2_020_000_000]},
+    ]
+    assert per_user_generation_speed(requests) == pytest.approx(75.0)
+    with gzip.open(tmp_path / "requests.jsonl.gz", "wt", encoding="utf-8") as stream:
+        for row in requests:
+            stream.write(json.dumps(row) + "\n")
+    config, metrics = normalize_attempt_semantics(
+        {"method": "tts", "load": "c2", "parameters": {}},
+        {"goodput": 200.0, "per_user_generation_speed": 100.0},
+        tmp_path,
+    )
+    assert config["parameters"]["declared_concurrency"] == 2
+    assert config["parameters"]["dispatcher_concurrency"] == 1
+    assert metrics["effective_load"] == "c1"
+    assert metrics["per_user_generation_speed"] == pytest.approx(75.0)
+    raw_metrics = {"goodput": 200.0, "per_user_generation_speed": 100.0}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"method": "tts", "load": "c2", "parameters": {}})
+    )
+    (tmp_path / "metrics.json").write_text(json.dumps(raw_metrics))
+    summary = summarize_attempts([tmp_path], tmp_path / "summary")
+    assert summary.iloc[0]["per_user_generation_speed"] == pytest.approx(75.0)
+    assert json.loads((tmp_path / "metrics.json").read_text()) == raw_metrics
 
 
 def test_tts_source_policy_kl_has_zero_one_step_gradient():
@@ -115,6 +146,74 @@ def test_tts_recipe_groups_confirmation_stimuli(monkeypatch):
     assert recipe == {"learning_rate": 1e-4, "stride": 50}
 
 
+def test_e2_ranking_uses_static_goodput_and_tts_native_user_speed(monkeypatch):
+    rows = [
+        ({"method": "static", "parameters": {}}, {"goodput": 100.0}),
+        (
+            {"method": "tts", "parameters": {}},
+            {"goodput": 10.0, "per_user_generation_speed": 100.0},
+        ),
+        (
+            {"method": "lightcone_candidate", "parameters": {"name": "aggregate"}},
+            {
+                "goodput": 120.0,
+                "per_user_generation_speed": 80.0,
+                "peak_hbm_bytes": 1,
+                "itl_p99_ms": 1.0,
+                "exposed_update_ms": 1.0,
+            },
+        ),
+        (
+            {"method": "lightcone_candidate", "parameters": {"name": "balanced"}},
+            {
+                "goodput": 90.0,
+                "per_user_generation_speed": 110.0,
+                "peak_hbm_bytes": 1,
+                "itl_p99_ms": 1.0,
+                "exposed_update_ms": 1.0,
+            },
+        ),
+    ]
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    assert runner._rank_e2_candidates(object(), "E2-r0", 1) == [{"name": "balanced"}]
+
+
+def test_e2_audit_preserves_existing_order_when_scientific_set_matches(tmp_path):
+    state = StateStore(tmp_path)
+    state.set_selection("e2_round_0", [{"rank": 1}, {"rank": 8}])
+    corrected = [{"rank": 8, "metric_semantics": "per_request_native_v2"}, {"rank": 1}]
+    assert runner._preserve_or_audit_e2_selection(
+        state, "E2-r0", "e2_round_0", corrected
+    ) == [{"rank": 1}, {"rank": 8}]
+    audit = json.loads((tmp_path / "stages/E2-r0/concurrency_metric_audit.json").read_text())
+    assert audit["same_scientific_set"] is True
+    assert audit["action"] == "preserved_existing_order"
+
+
+def test_e5_frontier_rejects_nominal_concurrency_speed_fallback(monkeypatch):
+    class State:
+        def selection(self, name, default=None):
+            return "static" if name == "e5_operational_baseline" else default
+
+    monkeypatch.setattr(
+        runner,
+        "_metric_rows",
+        lambda state, node: [
+            (
+                {
+                    "method": "static",
+                    "backend": "DFLASH",
+                    "block": 0,
+                    "load": "closed_loop_c2",
+                },
+                {"goodput": 200.0},
+            )
+        ],
+    )
+    with pytest.raises(runner.ScientificFailure, match="native per-request"):
+        runner._e5_frontier_statistic(State())
+
+
 def test_final_stage_requires_completed_pilot():
     class State:
         def stage_status(self, node):
@@ -179,6 +278,31 @@ def test_final_block_statistics_are_paired():
     assert focal["ci95_relative_low"] > 0
     assert focal["reducer"] == "paired_log_goodput_bca"
     assert focal["holm_reject"] is None
+
+
+def test_pairing_separates_effective_concurrency():
+    rows = []
+    for block in range(4):
+        for method, effective_load in (("static", "c2"), ("lightcone", "c1")):
+            rows.append(
+                (
+                    {
+                        "method": method,
+                        "model": "m",
+                        "backend": "DFLASH",
+                        "task": "t",
+                        "context": 40928,
+                        "load": "c2",
+                        "block": block,
+                        "parameters": {
+                            "regime": "long",
+                            "effective_load": effective_load,
+                        },
+                    },
+                    {"goodput": 100.0, "request_count": 1},
+                )
+            )
+    assert paired_block_statistics(rows) == []
 
 
 def test_holm_combines_only_the_three_preregistered_hypotheses(tmp_path):

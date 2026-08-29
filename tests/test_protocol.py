@@ -88,6 +88,8 @@ def test_bundled_jobs_preserve_registered_conditions():
 
 def test_primary_and_secondary_block_semantics():
     e3b = materialize("E3b-final")
+    assert {job.load for job in materialize("E3b-pilot")} == {"c1"}
+    assert {job.load for job in e3b} == {"c1"}
     primary = [job for job in e3b if job.parameters["workload"] == "primary_long_history"]
     secondary = [job for job in e3b if job.parameters["workload"].startswith("secondary_")]
     assert len(primary) == 60
