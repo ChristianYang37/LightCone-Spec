@@ -369,9 +369,16 @@ def _e2(round_index: int, candidates: Iterable[dict[str, Any]] | None) -> Iterat
     )
     for candidate in rows:
         recipe = {
-            key: value
-            for key, value in candidate.items()
-            if key not in {"round", "fixed_role", "design_index", "probe", "tuning_index"}
+            key: candidate[key]
+            for key in (
+                "parameterization",
+                "rank",
+                "scope",
+                "optimizer",
+                "learning_rate",
+                "schedule",
+            )
+            if key in candidate
         }
         yield dict(
             method="lightcone_candidate",

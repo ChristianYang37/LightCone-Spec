@@ -127,6 +127,27 @@ def test_tts_and_dspark_registered_fidelity():
     } == {1, 2, 4, 8}
 
 
+def test_e2_uses_selected_recipe_without_inheriting_e1_runtime_fields():
+    selected = {
+        "parameterization": "lora",
+        "rank": 8,
+        "scope": "last1",
+        "optimizer": "adamw",
+        "learning_rate": 1e-4,
+        "schedule": "constant",
+        "generation_tokens": 8192,
+        "regime": "short_input_long_generation",
+        "registered_load": "reference_load",
+        "stimulus_id": "E1-selection-stimulus",
+    }
+    row = materialize("E2-r0", e2_rows=(selected,))[0]
+    assert row.parameters["generation_tokens"] == 2048
+    assert row.parameters["regime"] == "short_input_long_generation"
+    assert row.load == "c2"
+    assert "registered_load" not in row.parameters
+    assert "stimulus_id" not in row.parameters
+
+
 def test_e5_source_aligned_methods_and_curves():
     pilot = materialize("E5-pilot")
     final = materialize("E5-final")
