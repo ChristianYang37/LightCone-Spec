@@ -48,6 +48,20 @@ SCHEDULES = ("constant", "inverse_sqrt_published_update", "cosine_to_zero")
 LEARNING_RATES = (1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
 TTS_LEARNING_RATES = (1e-7, 3e-7, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3)
 TTS_STRIDES = (1, 5, 10, 15, 20, 30, 40, 50)
+FORMAL_ADAPTATION_STRIDE = 10
+FORMAL_ADAPTIVE_METHODS = {
+    "tts",
+    "tts_lora_batched",
+    "l0_naive",
+    "lightcone",
+    "lightcone_candidate",
+}
+EXPLORATORY_STRIDE_WORKLOADS = {
+    "tts_calibration_screen",
+    "tts_calibration_confirmation",
+    "systems_screen",
+    "systems_local_factorial",
+}
 CONFIDENCE_WEIGHTS = (0.05, 0.1, 0.25, 0.5, 1.0)
 GENERATION_CHECKPOINTS = (1024, 2048, 4096, 8192, 16384, 24576, 32768)
 TTS_GENERATION_TOKENS = 4096
@@ -118,6 +132,20 @@ class NodePlan:
     rows: str
     gpu_count: int
     description: str
+
+
+def uses_formal_adaptation_stride(job: Job) -> bool:
+    """Return whether a job belongs to the frozen S=10 scientific protocol.
+
+    TTS-Cal and the E4 systems factorial deliberately retain their registered
+    stride sweeps as exploratory evidence.  Every other adaptive paper job is
+    evaluated at the common formal stride.
+    """
+
+    return (
+        job.method in FORMAL_ADAPTIVE_METHODS
+        and job.parameters.get("workload") not in EXPLORATORY_STRIDE_WORKLOADS
+    )
 
 
 def _slug(value: object) -> str:

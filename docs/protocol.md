@@ -21,7 +21,9 @@ every segment keeps separate requests, timing, and metrics.
 | E0-tune/pilot/final | 287/86/258 | compatibility, representative OnlineSPEC, bundled breadth |
 
 The static materialization is 2,185 jobs; bounded confirmation, E1 load,
-width, batching calibration, and E6 load work bring the maximum to 2,253 runner jobs. There is no
+width, batching calibration, E6 load, eight TTS-S10 confirmation jobs, and 19
+replacement jobs bring the maximum to 2,280 unique runner jobs. The registered
+E4-profile retry is a new attempt of an existing job. There is no
 global `N` or `final_blocks` setting.
 
 ## Comparisons and repetition
@@ -48,12 +50,18 @@ segments are terminal.
 
 ## TTS and DSpark
 
+Every formal adaptive TTS, L0-naive, LightCone, LightCone-candidate,
+DSpark-LightCone, and TTS-LoRA-Batched row uses stride `S=10`. TTS-Cal retains
+the source-paper stride sweep `1,5,10,15,20,30,40,50`, and E4 retains its
+stride ablation, but both are exploratory and do not select the formal stride.
 TTS uses Adam, one update, latest-round teacher rows, request reset, zero weight
-decay, no clipping, positional decay `exp(-1/7)`, and strides
-`1,5,10,15,20,30,40,50`. Its paper does not publish a learning rate, so the
-nine learning rates are explicitly LightCone-Spec calibration. The source-policy
-KL is algebraically omitted for the one-step update because its gradient is
-zero at the current source policy.
+decay, no clipping, and positional decay `exp(-1/7)`. Because its paper does
+not publish a learning rate, four paired `S=10` blocks compare `3e-5` with
+`1e-4` before freezing the formal recipe. Multi-turn request-scoped adaptation
+keeps one owner across four turns and restores source weights only at the full
+conversation boundary; zero-publication segments are rejected. The
+source-policy KL is algebraically omitted for the one-step update because its
+gradient is zero at the current source policy.
 
 DSpark keeps its native checkpoint and confidence scheduler. Confidence weights
 `0.05,0.1,0.25,0.5,1.0` are calibration candidates; verification budget,

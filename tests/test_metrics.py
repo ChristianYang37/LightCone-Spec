@@ -1,6 +1,7 @@
 import gzip
 import json
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from lightcone_spec.metrics import (
     summarize_attempts,
     validate_scientific_metrics,
 )
+from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import _confirmatory_holm, _natural_spline_fit
 from lightcone_spec.state import StateStore
 
@@ -144,6 +146,112 @@ def test_tts_recipe_groups_confirmation_stimuli(monkeypatch):
     )
     recipe = runner._select_tts_recipe(None)
     assert recipe == {"learning_rate": 1e-4, "stride": 50}
+
+
+def test_tts_s10_confirmation_uses_registered_tie_break(tmp_path, monkeypatch):
+    rows = []
+    for learning_rate, goodput, accepted in (
+        (3e-5, 100.0, 300.0),
+        (1e-4, 100.5, 200.0),
+    ):
+        for block in range(4):
+            rows.append(
+                (
+                    {
+                        "block": block,
+                        "parameters": {"learning_rate": learning_rate, "stride": 10},
+                    },
+                    {
+                        "goodput": goodput,
+                        "accepted_drafts": accepted,
+                        "target_calls": 100,
+                        "itl_p99_ms": 10.0,
+                        "updates_published": 1,
+                        **{counter: 0 for counter in SAFETY_COUNTERS},
+                    },
+                )
+            )
+    monkeypatch.setattr(runner, "_metric_rows", lambda state, node: rows)
+    state = StateStore(tmp_path)
+    recipe = runner._select_tts_s10_recipe(state)
+    assert recipe["stride"] == 10
+    assert recipe["learning_rate"] == 3e-5
+    audit = json.loads(
+        (tmp_path / "stages/TTS-S10-confirmation/selection_audit.json").read_text()
+    )
+    assert audit["selected_learning_rate"] == 3e-5
+
+
+def test_s10_reconciliation_has_exact_registered_replacement_budget(tmp_path):
+    state = StateStore(tmp_path)
+    for node in ("E1", "E2-r0", "E2-r1", "E2-r2", "E2-r3", "E4-screen"):
+        state.add_jobs(node, materialize(node))
+    dynamic_source = replace(
+        materialize("E2-r1")[0],
+        job_id="E2-r1__dynamic-nag-rank1-last1-constant",
+        parameters={
+            **materialize("E2-r1")[0].parameters,
+            "parameterization": "lora",
+            "rank": 1,
+            "scope": "last1",
+            "optimizer": "nag",
+            "learning_rate": 3e-5,
+            "schedule": "constant",
+        },
+    )
+    state.add_internal_jobs((dynamic_source,), storage_node="E2-r1")
+    repairs = runner._s10_reconciliation_jobs(state)
+    assert len(repairs) == 19
+    assert (
+        sum(job.parameters["reconciliation_kind"] == "formal_stride" for job in repairs)
+        == 14
+    )
+    assert (
+        sum(
+            job.parameters["reconciliation_kind"] == "masked_logit_reconstruction"
+            for job in repairs
+        )
+        == 5
+    )
+    assert len({job.parameters["replaces_job_id"] for job in repairs}) == 19
+
+
+def test_formal_replacement_excludes_old_attempt_without_overwriting_it(tmp_path):
+    state = StateStore(tmp_path)
+    source = next(job for job in materialize("E1") if job.method == "tts")
+    state.add_jobs("E1", (source,))
+    old_dir = tmp_path / "attempt-01"
+    old_dir.mkdir()
+    old_attempt = state.start(source, (0,), old_dir)
+    (old_dir / "config.json").write_text(json.dumps(source.to_dict()))
+    (old_dir / "metrics.json").write_text(json.dumps({"goodput": 1.0}))
+    state.complete(source.job_id, old_attempt)
+
+    replacement = replace(
+        source,
+        job_id=f"s10-repair__{source.job_id}",
+        node="S10-reconciliation",
+        parameters={
+            **source.parameters,
+            "source_node": "E1",
+            "replaces_job_id": source.job_id,
+            "reconciliation_kind": "formal_stride",
+        },
+    )
+    state.add_internal_jobs((replacement,))
+    new_dir = tmp_path / "attempt-02"
+    new_dir.mkdir()
+    new_attempt = state.start(replacement, (0,), new_dir)
+    (new_dir / "config.json").write_text(json.dumps(replacement.to_dict()))
+    (new_dir / "metrics.json").write_text(json.dumps({"goodput": 2.0}))
+    state.complete(replacement.job_id, new_attempt)
+    state.set_selection("formal_evidence_exclusions", [source.job_id])
+
+    rows = runner._metric_rows(state, "E1")
+    assert len(rows) == 1
+    assert rows[0][0]["node"] == "E1"
+    assert rows[0][1]["goodput"] == 2.0
+    assert json.loads((old_dir / "metrics.json").read_text()) == {"goodput": 1.0}
 
 
 def test_e2_ranking_uses_static_goodput_and_tts_native_user_speed(monkeypatch):

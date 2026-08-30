@@ -33,7 +33,7 @@ cp examples/paper.yaml /root/lightcone-tts-runtime/paper.yaml
 ```
 
 On the first invocation, `run_paper.sh` checks and applies the five SGLang
-diffs in lexical order, writes `paper-v1-nextn-shadow-v15` to
+diffs in lexical order, writes `paper-v1-nextn-shadow-v16` to
 `.lightcone-spec-patched` in the SGLang checkout,
 and starts the paper runner. Later invocations use the marker and resume the
 same `run_name` from `state.sqlite`; a small import smoke confirms the required
@@ -64,8 +64,10 @@ preflight -> E3a -> TTS-Cal -> E1 -> E2-r0 -> E2-r1 -> E2-r2 -> E2-r3
 -> E0-tune -> E0-pilot -> E0-final
 ```
 
-The `paper-v2` preset registers 2,185 static jobs and at most 2,253 runner jobs
-after bounded finalist and load-selection work. A job is one
+The `paper-v2` preset registers 2,185 static jobs and at most 2,280 unique
+runner jobs after bounded finalist, load-selection, and formal-S=10
+reconciliation work. The one E4-profile retry is a new attempt of its existing
+job, not a new materialized job. A job is one
 `method × block × compatible server layout`; its `segments` cover the
 registered contexts, loads, traces, or workload pools without reloading the
 same model. The per-node job counts are 10, 140, 72 (at most 108 after TTS
@@ -80,6 +82,13 @@ state, HBM/KV feasibility, safety events, committed-token goodput, pilot/final
 block separation, paired statistics, and both Target-only and Static baselines.
 Exact rejection-sampling semantics receive one excluded implementation smoke;
 they are not remeasured in every formal cell.
+
+Formal adaptive evidence fixes the publication stride at `S=10` for TTS,
+L0-naive, LightCone, LightCone-candidate, DSpark-LightCone, and
+TTS-LoRA-Batched. The original TTS-Cal and E4 stride grids remain visible as
+exploratory ablations. A bounded four-block `S=10` comparison freezes the TTS
+learning rate, and multi-turn request-scoped runs reset only after the complete
+conversation.
 
 See [docs/protocol.md](docs/protocol.md) for the grid and dependency behavior.
 

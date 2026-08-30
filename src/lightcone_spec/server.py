@@ -15,7 +15,7 @@ from typing import Any
 
 from .client import ScheduledRun, SGLangClient
 from .config import ExperimentConfig
-from .protocol import Job
+from .protocol import FORMAL_ADAPTATION_STRIDE, Job, uses_formal_adaptation_stride
 
 ADAPTIVE_METHODS = {
     "tts",
@@ -85,7 +85,11 @@ def adaptation_payload(job: Job, selection: dict[str, Any] | None = None) -> dic
     parameterization = chosen.get("parameterization", "lora")
     if parameterization == "none":
         return None
-    stride = int(chosen.get("stride", 10))
+    if uses_formal_adaptation_stride(job):
+        chosen["stride"] = FORMAL_ADAPTATION_STRIDE
+    stride = int(chosen.get("stride", FORMAL_ADAPTATION_STRIDE))
+    if uses_formal_adaptation_stride(job) and stride != FORMAL_ADAPTATION_STRIDE:
+        raise ValueError("formal adaptive jobs must resolve to stride S=10")
     coalescing = int(chosen.get("coalescing", 1))
     optimizer = {
         "name": chosen.get("optimizer", "adam"),

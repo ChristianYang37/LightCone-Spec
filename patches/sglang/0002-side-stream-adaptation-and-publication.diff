@@ -292,6 +292,7 @@ index 00000000..20e93274
 +    inference_logits: torch.Tensor,
 +    differentiable_logits: torch.Tensor,
 +    *,
++    valid_mask: torch.Tensor | None = None,
 +    relative_units: float = 2.5,
 +    kl_units: float = 32.0,
 +    numerical_unit: float | None = None,
@@ -300,6 +301,16 @@ index 00000000..20e93274
 +        raise ValueError("DFlash reconstruction logit shapes differ")
 +    inference = inference_logits.detach().to(torch.float32)
 +    reconstructed = differentiable_logits.detach().to(torch.float32)
++    if valid_mask is not None:
++        if valid_mask.shape != inference.shape[:-1]:
++            raise ValueError("DFlash reconstruction mask shape differs")
++        selected = valid_mask.detach().to(device=inference.device, dtype=torch.bool)
++        inference = inference[selected]
++        reconstructed = reconstructed[selected]
++        if inference.numel() == 0:
++            zero = torch.zeros((), device=inference_logits.device, dtype=torch.float32)
++            infinity = torch.full_like(zero, torch.inf)
++            return zero.to(torch.bool), zero, infinity, zero, infinity
 +    error = (reconstructed - inference).abs()
 +    maximum = error.max()
 +    # FlashInfer and differentiable SDPA evaluate the same attention equation
@@ -1287,7 +1298,11 @@ index 00000000..20e93274
 +                        reconstruction_relative_rms,
 +                        reconstruction_top1_match,
 +                        reconstruction_mean_kl,
-+                    ) = _logit_reconstruction_gate(inference_logits, active_logits)
++                    ) = _logit_reconstruction_gate(
++                        inference_logits,
++                        active_logits,
++                        valid_mask=owned_mask[:microbatch],
++                    )
 +                    loss = self._distillation_loss(
 +                        inference_logits,
 +                        target,
@@ -3698,7 +3713,7 @@ index 00000000..7b2cb5db
 +                raise RuntimeError(
 +                    "request-scoped adaptation requires serialized requests"
 +                )
-+            request_id = request_ids[0]
++            request_id = self._request_scope_owner(request_ids[0])
 +            if self.active_request_id is None:
 +                self.active_request_id = request_id
 +            elif self.active_request_id != request_id:
@@ -3868,13 +3883,32 @@ index 00000000..7b2cb5db
 +            self.update_traces[candidate.trace_index].status = "request_aborted"
 +            self.counters["updates_discarded"] += 1
 +            self.pending = None
-+        return self._reset_request_scope(request_id)
++        return self._reset_request_scope(request_id, force=True)
 +
-+    def _reset_request_scope(self, request_id: str) -> bool:
++    @staticmethod
++    def _request_scope_owner(request_id: str) -> str:
++        marker = "::turn-"
++        return request_id.split(marker, 1)[0] if marker in request_id else request_id
++
++    @staticmethod
++    def _request_scope_session_complete(request_id: str) -> bool:
++        marker = "::turn-"
++        suffix = "::of-"
++        if marker not in request_id or suffix not in request_id:
++            return True
++        try:
++            turn_text, count_text = request_id.split(marker, 1)[1].split(suffix, 1)
++            return int(turn_text) + 1 == int(count_text)
++        except ValueError:
++            return True
++
++    def _reset_request_scope(self, request_id: str, *, force: bool = False) -> bool:
 +        if self.config.reset_scope != "request":
 +            return False
-+        if self.active_request_id != request_id:
++        if self.active_request_id != self._request_scope_owner(request_id):
 +            raise RuntimeError("terminal request differs from adaptation owner")
++        if not force and not self._request_scope_session_complete(request_id):
++            return False
 +        self.side_stream.synchronize()
 +        self.diagnostics()
 +        self.epoch += 1

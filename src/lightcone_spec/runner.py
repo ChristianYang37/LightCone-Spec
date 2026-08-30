@@ -55,6 +55,7 @@ from .protocol import (
     E5_HEADLINE_SECONDS,
     E5_REQUEST_DEADLINE_SECONDS,
     E5_WARMUP_SECONDS,
+    FORMAL_ADAPTATION_STRIDE,
     GEOMETRY_GENERATION_TOKENS,
     MAX_E2_GEOMETRIES,
     PAPER_NODES,
@@ -62,6 +63,7 @@ from .protocol import (
     Job,
     e2_candidates,
     materialize,
+    uses_formal_adaptation_stride,
 )
 from .server import (
     ReplicaServerProcess,
@@ -424,7 +426,7 @@ def _stimulus_id(job: Job) -> str:
 
 
 def _request_count(config: ExperimentConfig, state: StateStore, job: Job) -> int:
-    if job.node == "TTS-Cal":
+    if job.node == "TTS-Cal" or job.parameters.get("workload") == "tts_stride10_confirmation":
         return 19
     concurrency = 1
     load = job.load or ""
@@ -477,7 +479,11 @@ def _cell_inputs(
     count = _request_count(config, state, job)
     dataset_key = _task_for_data(config, job)
     metadata: dict[str, object] = {"dataset": dataset_key}
-    if job.node == "TTS-Cal":
+    tts_calibration_window = (
+        job.node == "TTS-Cal"
+        or job.parameters.get("workload") == "tts_stride10_confirmation"
+    )
+    if tts_calibration_window:
         calibration = load_calibration_mix(config.dataset_path(dataset_key))
         start = int(job.block or 0) * 19
         prompts = calibration[start : start + 19]
@@ -493,7 +499,7 @@ def _cell_inputs(
     if job.context is None:
         return prompts, config.server.max_new_tokens, metadata
     tokenized = tuple(client.tokenize(prompt) for prompt in prompts)
-    if job.node == "TTS-Cal":
+    if tts_calibration_window:
         pool_prompts = prompts
     else:
         pool_prompts = tuple(
@@ -865,6 +871,56 @@ def _run_multi_turn(
     request_scoped: bool,
     max_in_flight: int,
 ):
+    if request_scoped:
+        started = time.perf_counter()
+        results = []
+        for index, prompt in enumerate(prompts):
+            history = tuple(prompt)
+            rows: list[GenerationResult] = []
+            remaining = max_new_tokens
+            try:
+                for turn in range(4):
+                    turns_left = 4 - turn
+                    budget = max(1, remaining // turns_left)
+                    turn_rows, _ = client.run_batch(
+                        (history,),
+                        max_new_tokens=budget,
+                        seed=seed + turn,
+                        request_ids=(
+                            f"multi-turn-{index:05d}::turn-{turn}::of-4",
+                        ),
+                    )
+                    result = turn_rows[0]
+                    rows.append(result)
+                    history = (*history, *result.output_ids)
+                    remaining -= budget
+            except Exception:
+                # A final-turn terminal hook normally restores request-scoped
+                # source weights. An interrupted conversation needs an
+                # explicit reset so it cannot leak state into the next cell.
+                client.reset()
+                raise
+            timestamps = tuple(
+                value for row in rows for value in row.native_token_timestamps_ns
+            )
+            results.append(
+                GenerationResult(
+                    request_id=f"multi-turn-{index:05d}",
+                    input_tokens=rows[0].input_tokens,
+                    completion_tokens=sum(row.completion_tokens for row in rows),
+                    ttft_ms=rows[0].ttft_ms,
+                    inter_token_ms=tuple(
+                        value for row in rows for value in row.inter_token_ms
+                    ),
+                    elapsed_seconds=sum(row.elapsed_seconds for row in rows),
+                    stop_reason=rows[-1].stop_reason,
+                    output_ids=tuple(value for row in rows for value in row.output_ids),
+                    output_text="".join(row.output_text for row in rows),
+                    native_token_timestamps_ns=timestamps,
+                )
+            )
+        return tuple(results), time.perf_counter() - started
+
     histories = [tuple(prompt) for prompt in prompts]
     turns_by_request: list[list[GenerationResult]] = [[] for _ in prompts]
     elapsed = 0.0
@@ -872,28 +928,19 @@ def _run_multi_turn(
     for turn in range(4):
         turns_left = 4 - turn
         budget = max(1, remaining // turns_left)
-        if request_scoped:
-            turn_results, turn_elapsed = _run_request_scoped(
-                client,
-                histories,
-                budget,
-                seed + turn,
-                request_prefix=f"multi-turn-{turn}",
-            )
-        else:
-            scheduled = client.run_bounded(
-                histories,
-                max_new_tokens=budget,
-                seed=seed + turn,
-                request_ids=tuple(
-                    f"multi-turn-{turn}-{index:05d}" for index in range(len(histories))
-                ),
-                max_in_flight=max_in_flight,
-            )
-            turn_results, turn_elapsed = (
-                scheduled.results,
-                scheduled.elapsed_seconds,
-            )
+        scheduled = client.run_bounded(
+            histories,
+            max_new_tokens=budget,
+            seed=seed + turn,
+            request_ids=tuple(
+                f"multi-turn-{turn}-{index:05d}" for index in range(len(histories))
+            ),
+            max_in_flight=max_in_flight,
+        )
+        turn_results, turn_elapsed = (
+            scheduled.results,
+            scheduled.elapsed_seconds,
+        )
         elapsed += turn_elapsed
         for index, result in enumerate(turn_results):
             turns_by_request[index].append(result)
@@ -1503,6 +1550,23 @@ def _execute_cell(
                         if isinstance(value, (int, float))
                         else value
                     )
+            adaptation = raw_config.get("adaptation")
+            metrics["resolved_stride"] = (
+                adaptation.get("stride") if isinstance(adaptation, dict) else None
+            )
+            if (
+                uses_formal_adaptation_stride(runtime_job)
+                and metrics["resolved_stride"] != FORMAL_ADAPTATION_STRIDE
+            ):
+                raise ScientificFailure("formal adaptive cell did not resolve to stride S=10")
+            if (
+                uses_formal_adaptation_stride(runtime_job)
+                and runtime_job.parameters.get("regime") == "multi_turn_shared_prefix"
+                and int(metrics.get("target_calls", 0)) < FORMAL_ADAPTATION_STRIDE
+            ):
+                raise ScientificFailure(
+                    "formal multi-turn segment produced fewer than ten speculation rounds"
+                )
             survival = _position_survival(metrics.get("rounds"))
             metrics["position_conditional_survival"] = survival
             metrics["effective_target_token_batch"] = (
@@ -1541,7 +1605,14 @@ def _execute_cell(
                 )
             if (
                 job.parameters.get("workload") != "failure_injection"
-                and runtime_job.method in {"tts", "l0_naive", "lightcone", "lightcone_candidate"}
+                and runtime_job.method
+                in {
+                    "tts",
+                    "tts_lora_batched",
+                    "l0_naive",
+                    "lightcone",
+                    "lightcone_candidate",
+                }
                 and metrics.get("updates_published", 0)
                 < int(job.parameters.get("minimum_updates", 1))
             ):
@@ -1677,15 +1748,15 @@ def _execute_cell(
 
 def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
     if job.method in {"tts", "l0_naive"}:
-        return state.selection("tts_recipe", {})
+        return _formalize_recipe(dict(state.selection("tts_recipe", {})))
     if job.method == "tts_lora_batched":
-        return state.selection("tts_batched_geometry", {})
+        return _formalize_recipe(dict(state.selection("tts_batched_geometry", {})))
     if job.method == "lightcone":
         name = "dspark_recipe" if job.backend == "DSPARK" else "lightcone_recipe"
         selected = dict(state.selection(name, {}))
         if job.node.startswith("E6"):
             selected.update(parameterization="lora", rank=8, scope="all")
-        return selected
+        return _formalize_recipe(selected)
     if job.node.startswith("E1a") and job.method == "lightcone_candidate":
         finalists = state.selection("e1a_finalists", [])
         slot = job.parameters.get("finalist_slot")
@@ -1700,7 +1771,7 @@ def _selection_for_job(state: StateStore, job: Job) -> dict[str, Any] | None:
         temperature = state.selection("dspark_confidence_temperature", None)
         if isinstance(temperature, (int, float)):
             selected["confidence_temperature"] = float(temperature)
-        return selected
+        return _formalize_recipe(selected)
     return None
 
 
@@ -2884,13 +2955,38 @@ def _run_node_jobs(
 
 def _metric_rows(state: StateStore, node: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for directory in state.completed_attempt_dirs(node):
+    excluded = set(state.selection("formal_evidence_exclusions", []))
+    candidates = list(state.completed_attempt_rows(node))
+    if node in PAPER_NODES:
+        for job_id, directory in state.completed_attempt_rows():
+            config_path = directory / "config.json"
+            if not config_path.is_file():
+                continue
+            config = json.loads(config_path.read_text())
+            if config.get("parameters", {}).get("source_node") == node:
+                candidates.append((job_id, directory))
+    for job_id, directory in candidates:
+        if job_id in excluded:
+            continue
         config_path, metrics_path = directory / "config.json", directory / "metrics.json"
         if config_path.is_file() and metrics_path.is_file():
             metrics = json.loads(metrics_path.read_text())
             metrics["source_attempt"] = int(directory.name.removeprefix("attempt-"))
             metrics["source_attempt_dir"] = str(directory)
             config = json.loads(config_path.read_text())
+            if config.get("parameters", {}).get("source_node") == node:
+                config = dict(config)
+                config["node"] = node
+                config["parameters"] = {
+                    key: value
+                    for key, value in config["parameters"].items()
+                    if key
+                    not in {
+                        "source_node",
+                        "replaces_job_id",
+                        "reconciliation_kind",
+                    }
+                }
             segments = metrics.get("segments")
             if isinstance(segments, list):
                 for segment in segments:
@@ -3087,6 +3183,197 @@ def _tts_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
     return tuple(rows)
 
 
+def _tts_s10_confirmation_jobs(state: StateStore) -> tuple[Job, ...]:
+    sources = {
+        float(job.parameters["learning_rate"]): job
+        for job in state.jobs("TTS-Cal")
+        if job.method == "tts"
+        and int(job.parameters.get("stride", -1)) == FORMAL_ADAPTATION_STRIDE
+        and float(job.parameters.get("learning_rate", -1.0)) in {3e-5, 1e-4}
+    }
+    if set(sources) != {3e-5, 1e-4}:
+        raise ScientificFailure("TTS-Cal has no S=10 source rows for both confirmation LRs")
+    rows: list[Job] = []
+    for learning_rate in (3e-5, 1e-4):
+        source = sources[learning_rate]
+        for block in range(4):
+            rows.append(
+                replace(
+                    source,
+                    job_id=f"tts-s10-lr-{learning_rate:.0e}-block-{block:02d}",
+                    node="TTS-S10-confirmation",
+                    ordinal=len(rows),
+                    block=block,
+                    parameters={
+                        **source.parameters,
+                        "learning_rate": learning_rate,
+                        "stride": FORMAL_ADAPTATION_STRIDE,
+                        "workload": "tts_stride10_confirmation",
+                        "confirmation_block": block,
+                    },
+                )
+            )
+    return tuple(rows)
+
+
+def _select_tts_s10_recipe(state: StateStore) -> dict[str, Any]:
+    grouped: dict[float, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for config, metrics in _metric_rows(state, "TTS-S10-confirmation"):
+        learning_rate = float(config["parameters"]["learning_rate"])
+        grouped.setdefault(learning_rate, []).append((config, metrics))
+    candidates: list[dict[str, Any]] = []
+    for learning_rate in (3e-5, 1e-4):
+        rows = grouped.get(learning_rate, [])
+        blocks = {int(config.get("block", -1)) for config, _ in rows}
+        valid = (
+            blocks == set(range(4))
+            and len(rows) == 4
+            and all(metrics.get("feasible") is not False for _, metrics in rows)
+            and all(int(metrics.get("updates_published", 0)) >= 1 for _, metrics in rows)
+            and all(
+                all(int(metrics.get(counter, 0)) == 0 for counter in SAFETY_COUNTERS)
+                for _, metrics in rows
+            )
+        )
+        if not valid:
+            continue
+        goodputs = np.asarray([float(metrics["goodput"]) for _, metrics in rows])
+        if np.any(~np.isfinite(goodputs)) or np.any(goodputs <= 0):
+            continue
+        accepted_per_call = [
+            float(metrics.get("accepted_drafts", 0.0))
+            / max(float(metrics.get("target_calls", 0.0)), 1.0)
+            for _, metrics in rows
+        ]
+        candidates.append(
+            {
+                "learning_rate": learning_rate,
+                "geometric_mean_goodput": float(np.exp(np.mean(np.log(goodputs)))),
+                "accepted_drafts_per_target_call": float(np.mean(accepted_per_call)),
+                "p99_itl_ms": float(max(metrics["itl_p99_ms"] for _, metrics in rows)),
+            }
+        )
+    if not candidates:
+        raise ScientificFailure("S=10 TTS confirmation produced no valid four-block recipe")
+    candidates.sort(key=lambda row: row["geometric_mean_goodput"], reverse=True)
+    selected = candidates[0]
+    if len(candidates) == 2:
+        best, other = candidates
+        relative_gap = (
+            best["geometric_mean_goodput"] / other["geometric_mean_goodput"] - 1.0
+        )
+        if relative_gap <= 0.01:
+            selected = min(
+                candidates,
+                key=lambda row: (
+                    -row["accepted_drafts_per_target_call"],
+                    row["p99_itl_ms"],
+                    row["learning_rate"],
+                ),
+            )
+    audit = {
+        "formal_stride": FORMAL_ADAPTATION_STRIDE,
+        "blocks": 4,
+        "decision_rule": (
+            "paired geometric-mean goodput; within one percent, higher accepted "
+            "drafts per target call then lower p99 ITL"
+        ),
+        "candidates": candidates,
+        "selected_learning_rate": selected["learning_rate"],
+    }
+    path = state.run_dir / "stages" / "TTS-S10-confirmation" / "selection_audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, audit)
+    return {
+        "learning_rate": selected["learning_rate"],
+        "stride": FORMAL_ADAPTATION_STRIDE,
+        "optimizer": "adam",
+        "parameterization": "full",
+        "scope": "all",
+    }
+
+
+def _is_reconstruction_repair_source(job: Job) -> bool:
+    parameters = job.parameters
+    if job.node == "E1":
+        return (
+            job.method == "lightcone_candidate"
+            and parameters.get("optimizer") in {"adamw", "sgdm"}
+            and parameters.get("parameterization") == "lora"
+            and parameters.get("rank") == 16
+            and parameters.get("scope") in {"last5", "all"}
+        )
+    return (
+        job.node == "E2-r1"
+        and job.method == "lightcone_candidate"
+        and parameters.get("optimizer") == "nag"
+        and float(parameters.get("learning_rate", -1.0)) == 3e-5
+        and parameters.get("parameterization") == "lora"
+        and parameters.get("rank") == 1
+        and parameters.get("scope") == "last1"
+        and parameters.get("schedule") == "constant"
+    )
+
+
+def _s10_reconciliation_jobs(state: StateStore) -> tuple[Job, ...]:
+    sources: list[tuple[Job, str]] = []
+    sources.extend(
+        (job, "formal_stride")
+        for job in state.jobs("E1")
+        if job.method in {"tts", "l0_naive"}
+    )
+    for node in ("E2-r0", "E2-r1", "E2-r2", "E2-r3"):
+        sources.extend(
+            (job, "formal_stride")
+            for job in state.jobs(node)
+            if job.method in {"tts", "l0_naive"}
+        )
+    sources.extend(
+        (job, "formal_stride")
+        for job in state.jobs("E4-screen")
+        if job.method == "tts" and job.parameters.get("workload") == "tts_update_steps"
+    )
+    for node in ("E1", "E2-r1"):
+        sources.extend(
+            (job, "masked_logit_reconstruction")
+            for job in state.jobs(node)
+            if _is_reconstruction_repair_source(job)
+        )
+    unique: dict[str, tuple[Job, str]] = {job.job_id: (job, kind) for job, kind in sources}
+    if len(unique) != 19:
+        raise ScientificFailure(
+            f"formal S=10 reconciliation expected 19 completed source jobs, found {len(unique)}"
+        )
+    rows: list[Job] = []
+    for source, kind in sorted(unique.values(), key=lambda row: row[0].job_id):
+        rows.append(
+            replace(
+                source,
+                job_id=f"s10-repair__{source.job_id}",
+                node="S10-reconciliation",
+                ordinal=len(rows),
+                parameters={
+                    **source.parameters,
+                    "source_node": source.node,
+                    "replaces_job_id": source.job_id,
+                    "reconciliation_kind": kind,
+                },
+            )
+        )
+    return tuple(rows)
+
+
+def _formalize_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
+    return {**recipe, "stride": FORMAL_ADAPTATION_STRIDE}
+
+
+def _enforce_formal_recipe_selections(state: StateStore) -> None:
+    for name in ("tts_recipe", "lightcone_recipe", "dspark_recipe", "tts_batched_geometry"):
+        value = state.selection(name, None)
+        if isinstance(value, dict):
+            state.set_selection(name, _formalize_recipe(value))
+
+
 def _rank_e1_geometries(state: StateStore) -> list[dict[str, Any]]:
     grouped: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     for config, metrics in _metric_rows(state, "E1"):
@@ -3147,7 +3434,7 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
     tts_user_speed = baselines["tts"].get("per_user_generation_speed")
     if not isinstance(tts_user_speed, (int, float)) or tts_user_speed <= 0:
         return []
-    candidates = []
+    candidates: dict[str, tuple[Any, ...]] = {}
     for config, metrics in rows:
         if config["method"] != "lightcone_candidate":
             continue
@@ -3161,21 +3448,29 @@ def _rank_e2_candidates(state: StateStore, node: str, keep: int) -> list[dict[st
             goodput / static_goodput,
             float(user_speed) / float(tts_user_speed),
         )
-        candidates.append(
-            (
+        recipe = {
+            name: value
+            for name, value in config["parameters"].items()
+            if name
+            not in {
+                "round",
+                "minimum_updates",
+                "fixed_role",
+                "stride",
+            }
+        }
+        row = (
                 -objective,
                 int(metrics["peak_hbm_bytes"]),
                 float(metrics["itl_p99_ms"]),
                 float(metrics.get("exposed_update_ms", math.inf)),
-                {
-                    name: value
-                    for name, value in config["parameters"].items()
-                    if name not in {"round", "minimum_updates", "fixed_role"}
-                },
+                recipe,
             )
-        )
-    candidates.sort(key=lambda row: row[:-1])
-    return [row[-1] for row in candidates[:keep]]
+        key = _e2_recipe_key(recipe)
+        if key not in candidates or row[:-1] < candidates[key][:-1]:
+            candidates[key] = row
+    ordered = sorted(candidates.values(), key=lambda row: row[:-1])
+    return [row[-1] for row in ordered[:keep]]
 
 
 _E2_RUNTIME_PARAMETER_KEYS = {
@@ -3185,6 +3480,7 @@ _E2_RUNTIME_PARAMETER_KEYS = {
     "metric_semantics",
     "registered_load",
     "stimulus_id",
+    "stride",
 }
 
 
@@ -4115,6 +4411,209 @@ def _dependency_reason(config: ExperimentConfig, state: StateStore, node: str) -
     return None
 
 
+def _e2_missing_dependency_jobs(
+    state: StateStore,
+    node: str,
+    recipes: list[dict[str, Any]],
+) -> tuple[Job, ...]:
+    existing = {
+        _e2_recipe_key(config["parameters"])
+        for config, _ in _metric_rows(state, node)
+        if config["method"] == "lightcone_candidate"
+    }
+    planned = materialize(node, e2_rows=recipes)
+    rows: list[Job] = []
+    for job in planned:
+        if job.method != "lightcone_candidate":
+            continue
+        if _e2_recipe_key(job.parameters) in existing:
+            continue
+        rows.append(
+            replace(
+                job,
+                job_id=f"s10-e2-dependency__{job.job_id}",
+                node="S10-e2-dependency-repair",
+                ordinal=job.ordinal,
+                parameters={
+                    **job.parameters,
+                    "source_node": node,
+                    "reconciliation_kind": "e2_dependency_closure",
+                },
+            )
+        )
+    return tuple(rows)
+
+
+def _audit_e2_after_s10(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    geometries = _rank_e1_geometries(state)
+    if not geometries:
+        raise ScientificFailure("S=10 E1 reconciliation produced no Pareto geometry")
+    state.set_selection("e1_geometries", geometries)
+    audit_rows: list[dict[str, Any]] = []
+    previous = geometries
+    for round_index in range(4):
+        node = f"E2-r{round_index}"
+        if round_index > 0:
+            missing = _e2_missing_dependency_jobs(state, node, previous)
+            if missing:
+                state.add_internal_jobs(missing, storage_node="S10-e2-dependency-repair")
+                _run_pending_jobs(
+                    config,
+                    state,
+                    "S10-e2-dependency-repair",
+                    stop_event,
+                    state.pending_jobs("S10-e2-dependency-repair"),
+                )
+                if stop_event.is_set():
+                    return
+                _require_internal_jobs(state, "S10-e2-dependency-repair")
+        candidate_count = len(
+            {
+                _e2_recipe_key(config_row["parameters"])
+                for config_row, _ in _metric_rows(state, node)
+                if config_row["method"] == "lightcone_candidate"
+            }
+        )
+        keep = max(math.ceil(candidate_count / 4), 21) if round_index < 3 else 1
+        winners = _rank_e2_candidates(state, node, keep)
+        if len(winners) != keep:
+            raise ScientificFailure(
+                f"{node} S=10 audit retained {len(winners)} candidates, expected {keep}"
+            )
+        selection_name = "lightcone_recipe" if round_index == 3 else f"e2_round_{round_index}"
+        existing = state.selection(selection_name, None)
+        existing_rows = [existing] if isinstance(existing, dict) else existing or []
+        same_set = {_e2_recipe_key(row) for row in existing_rows} == {
+            _e2_recipe_key(row) for row in winners
+        }
+        selected_rows = existing_rows if same_set else winners
+        selected_rows = [_formalize_recipe(dict(row)) for row in selected_rows]
+        state.set_selection(
+            selection_name,
+            selected_rows[0] if round_index == 3 else selected_rows,
+        )
+        state.set_selection(
+            f"{node}_counts",
+            {
+                "entered": candidate_count,
+                "rejected": candidate_count - len(winners),
+                "retained": len(winners),
+            },
+        )
+        audit_rows.append(
+            {
+                "node": node,
+                "previous_finalists": len(existing_rows),
+                "corrected_finalists": len(winners),
+                "same_scientific_set": same_set,
+                "dependency_jobs_added": len(missing) if round_index > 0 else 0,
+            }
+        )
+        previous = selected_rows
+    path = state.run_dir / "stages" / "S10-reconciliation" / "e2_finalist_audit.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        path,
+        {
+            "formal_stride": FORMAL_ADAPTATION_STRIDE,
+            "rounds": audit_rows,
+        },
+    )
+
+
+def _run_formal_s10_reconciliation(
+    config: ExperimentConfig,
+    state: StateStore,
+    stop_event: threading.Event,
+) -> None:
+    _enforce_formal_recipe_selections(state)
+    if state.selection("formal_s10_reconciliation_complete", False):
+        return
+    prerequisites = (
+        "TTS-Cal",
+        "E1",
+        "E2-r0",
+        "E2-r1",
+        "E2-r2",
+        "E2-r3",
+        "E4-screen",
+    )
+    if any(state.stage_status(node) != "completed" for node in prerequisites):
+        return
+    if state.stage_status("E4-profile") not in {"completed", "failed"}:
+        return
+
+    confirmations = _tts_s10_confirmation_jobs(state)
+    state.add_internal_jobs(confirmations)
+    _run_pending_jobs(
+        config,
+        state,
+        "TTS-S10-confirmation",
+        stop_event,
+        state.pending_jobs("TTS-S10-confirmation"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "TTS-S10-confirmation")
+    state.set_selection("tts_recipe", _select_tts_s10_recipe(state))
+
+    repairs = _s10_reconciliation_jobs(state)
+    excluded = set(state.selection("formal_evidence_exclusions", []))
+    excluded.update(str(job.parameters["replaces_job_id"]) for job in repairs)
+    state.set_selection("formal_evidence_exclusions", sorted(excluded))
+    state.add_internal_jobs(repairs)
+    _run_pending_jobs(
+        config,
+        state,
+        "S10-reconciliation",
+        stop_event,
+        state.pending_jobs("S10-reconciliation"),
+    )
+    if stop_event.is_set():
+        return
+    _require_internal_jobs(state, "S10-reconciliation")
+    _audit_e2_after_s10(config, state, stop_event)
+    if stop_event.is_set():
+        return
+
+    e4_profile_retries = state.retry_failed("E4-profile")
+    width_retries = state.retry_failed("E3-width-calibration")
+    reopened = state.reopen_skipped(
+        (
+            "E3b-pilot",
+            "E3b-final",
+            "E1a",
+            "E5-pilot",
+            "E5-final",
+            "E6-pilot",
+            "E6-final",
+            "E0-tune",
+            "E0-pilot",
+            "E0-final",
+        )
+    )
+    _enforce_formal_recipe_selections(state)
+    audit_path = state.run_dir / "stages" / "S10-reconciliation" / "reconciliation.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        audit_path,
+        {
+            "formal_stride": FORMAL_ADAPTATION_STRIDE,
+            "tts_confirmation_jobs": len(confirmations),
+            "replacement_jobs": len(repairs),
+            "excluded_source_jobs": len(excluded),
+            "e4_profile_retries": e4_profile_retries,
+            "width_calibration_retries": width_retries,
+            "future_jobs_reopened": reopened,
+        },
+    )
+    state.set_selection("formal_s10_reconciliation_complete", True)
+
+
 class PaperRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
@@ -4140,6 +4639,13 @@ class PaperRunner:
             if self.config.protocol.end_stage:
                 nodes = nodes[: nodes.index(self.config.protocol.end_stage) + 1]
             for node in nodes:
+                if self.stop_event.is_set():
+                    break
+                _run_formal_s10_reconciliation(
+                    self.config,
+                    self.state,
+                    self.stop_event,
+                )
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)

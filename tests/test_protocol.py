@@ -6,12 +6,14 @@ import pytest
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import (
     CONFIDENCE_WEIGHTS,
+    FORMAL_ADAPTATION_STRIDE,
     PAPER_NODES,
     TTS_STRIDES,
     default_row_counts,
     materialize,
     paper_plan,
     segment_count,
+    uses_formal_adaptation_stride,
 )
 from lightcone_spec.runner import (
     ScientificFailure,
@@ -127,6 +129,37 @@ def test_tts_and_dspark_registered_fidelity():
         for job in materialize("E4-screen")
         if job.parameters.get("workload") == "tts_update_steps"
     } == {1, 2, 4, 8}
+
+
+def test_formal_adaptive_jobs_resolve_s10_without_erasing_exploratory_sweeps():
+    tts_screen = next(job for job in materialize("TTS-Cal") if job.parameters["stride"] == 50)
+    assert not uses_formal_adaptation_stride(tts_screen)
+    assert adaptation_payload(tts_screen)["stride"] == 50
+
+    e4_screen = next(
+        job
+        for job in materialize("E4-screen")
+        if job.method == "lightcone" and job.parameters["stride"] == 50
+    )
+    assert not uses_formal_adaptation_stride(e4_screen)
+    assert adaptation_payload(e4_screen)["stride"] == 50
+
+    formal = [
+        next(job for job in materialize("E1") if job.method == "tts"),
+        next(job for job in materialize("E1") if job.method == "l0_naive"),
+        next(job for job in materialize("E2-r0") if job.method == "lightcone_candidate"),
+        next(job for job in materialize("E3b-final") if job.method == "lightcone"),
+        next(job for job in materialize("E5-final") if job.method == "tts_lora_batched"),
+    ]
+    for job in formal:
+        assert uses_formal_adaptation_stride(job)
+        assert adaptation_payload(job, {"stride": 50})["stride"] == FORMAL_ADAPTATION_STRIDE
+
+    onlinespec = next(
+        job for job in materialize("E0-tune") if job.method.startswith("onlinespec")
+    )
+    assert not uses_formal_adaptation_stride(onlinespec)
+    assert adaptation_payload(onlinespec)["stride"] in {20, 40, 80, 160}
 
 
 def test_e2_uses_selected_recipe_without_inheriting_e1_runtime_fields():

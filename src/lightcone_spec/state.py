@@ -231,6 +231,43 @@ class StateStore:
             )
             return changed
 
+    def retry_failed(self, node: str) -> int:
+        """Requeue failed jobs while retaining every failed attempt record."""
+
+        with self.connect() as connection:
+            changed = connection.execute(
+                "UPDATE jobs SET status='pending', assigned_gpus=NULL, started_at=NULL, "
+                "completed_at=NULL, error='explicit protocol repair retry' "
+                "WHERE node=? AND status='failed'",
+                (node,),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    "UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                    "WHERE node=?",
+                    (node,),
+                )
+            return changed
+
+    def reopen_skipped(self, nodes: tuple[str, ...]) -> int:
+        """Resume future DAG nodes skipped by an earlier dependency failure."""
+
+        if not nodes:
+            return 0
+        placeholders = ",".join("?" for _ in nodes)
+        with self.connect() as connection:
+            changed = connection.execute(
+                f"UPDATE jobs SET status='pending', completed_at=NULL, error=NULL "
+                f"WHERE node IN ({placeholders}) AND status='skipped'",
+                nodes,
+            ).rowcount
+            connection.execute(
+                f"UPDATE stage_state SET status='pending', updated_at=CURRENT_TIMESTAMP "
+                f"WHERE node IN ({placeholders})",
+                nodes,
+            )
+            return changed
+
     def finish_stage(self, node: str) -> str:
         counts = self.status_counts(node)
         status = (
@@ -296,9 +333,18 @@ class StateStore:
         return default if row is None else json.loads(row["value_json"])
 
     def completed_attempt_dirs(self, node: str) -> tuple[Path, ...]:
+        return tuple(path for _, path in self.completed_attempt_rows(node))
+
+    def completed_attempt_rows(self, node: str | None = None) -> tuple[tuple[str, Path], ...]:
+        query = (
+            "SELECT a.job_id,a.output_dir FROM attempts a "
+            "JOIN jobs j ON j.job_id=a.job_id WHERE a.status='completed'"
+        )
+        parameters: tuple[object, ...] = ()
+        if node is not None:
+            query += " AND j.node=?"
+            parameters = (node,)
+        query += " ORDER BY j.rowid,a.attempt"
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT a.output_dir FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE j.node=? AND a.status='completed' ORDER BY j.ordinal",
-                (node,),
-            ).fetchall()
-        return tuple(Path(row["output_dir"]) for row in rows)
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple((str(row["job_id"]), Path(row["output_dir"])) for row in rows)

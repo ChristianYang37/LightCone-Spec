@@ -72,12 +72,14 @@ def _plan(config: ExperimentConfig) -> None:
     print("E3-width-calibration\t12\t4 methods * 3 widths, each with 3 segments")
     print("E6-common-load\t10\t2 models * 5 roles, each with 9 load segments")
     print("TTS-batched-calibration\t<=4\tE1 LoRA finalists at excluded c8")
+    print("TTS-S10-confirmation\t8\t2 learning rates * 4 paired blocks")
+    print("S10-reconciliation\t19\t14 formal-stride + 5 masked-logit replacements")
     print(
         f"registered finite-request floor\t{finite_requests}\t"
         f"requests_per_cell={config.server.requests_per_cell}; E5 time-driven rows excluded"
     )
     print(f"registered jobs\t{len(jobs)}\tsegments={segments}")
-    print(f"maximum runner jobs\t{len(jobs) + 68}\tincluding dynamic confirmations")
+    print(f"maximum runner jobs\t{len(jobs) + 95}\tincluding dynamic confirmations")
     acceptance = config.results_root / "acceptance"
     if acceptance.is_dir():
         files = tuple(path for path in acceptance.rglob("*") if path.is_file())

@@ -327,6 +327,61 @@ def test_replay_rope_preserves_non_rotary_head_suffix():
     assert torch.equal(output, torch.tensor([[[-3.0, 2.0, 1.0, 4.0, 5.0, 6.0]]]))
 
 
+def _patched_logit_reconstruction_gate():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "dflash_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_logit_reconstruction_gate"
+    )
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"), namespace)
+    return namespace["_logit_reconstruction_gate"]
+
+
+def test_logit_reconstruction_ignores_only_masked_canvas_positions():
+    gate = _patched_logit_reconstruction_gate()
+    inference = torch.tensor([[[8.0, 0.0], [8.0, 0.0]]], dtype=torch.bfloat16)
+    padded_mismatch = torch.tensor(
+        [[[8.0, 0.0], [0.0, 8.0]]], dtype=torch.bfloat16
+    )
+    valid_mask = torch.tensor([[True, False]])
+    accepted = gate(inference, padded_mismatch, valid_mask=valid_mask)
+    assert bool(accepted[0])
+    assert accepted[3].item() == 1.0
+
+    valid_mismatch = torch.tensor(
+        [[[0.0, 8.0], [8.0, 0.0]]], dtype=torch.bfloat16
+    )
+    rejected = gate(inference, valid_mismatch, valid_mask=valid_mask)
+    assert not bool(rejected[0])
+    assert rejected[3].item() == 0.0
+
+
+def test_logit_reconstruction_empty_mask_cannot_publish():
+    gate = _patched_logit_reconstruction_gate()
+    logits = torch.zeros((1, 2, 4), dtype=torch.bfloat16)
+    valid, maximum, relative_rms, top1, mean_kl = gate(
+        logits,
+        logits,
+        valid_mask=torch.zeros((1, 2), dtype=torch.bool),
+    )
+    assert not bool(valid)
+    assert maximum.item() == 0.0
+    assert math.isinf(relative_rms.item())
+    assert top1.item() == 0.0
+    assert math.isinf(mean_kl.item())
+
+
 def test_request_lora_slots_are_isolated_and_generation_safe():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
     text = patch.read_text()
@@ -1345,6 +1400,87 @@ def test_multi_turn_itl_excludes_cross_turn_prefill_gap():
         max_in_flight=1,
     )
     assert results[0].inter_token_ms == (1.0, 1.0, 1.0, 1.0)
+
+
+def test_request_scoped_multi_turn_uses_one_runtime_session_per_conversation():
+    class Client:
+        def __init__(self):
+            self.calls = []
+            self.resets = 0
+
+        def run_batch(self, prompts, *, max_new_tokens, seed, request_ids):
+            self.calls.append((prompts[0], request_ids[0]))
+            result = GenerationResult(
+                request_id=request_ids[0],
+                input_tokens=len(prompts[0]),
+                completion_tokens=1,
+                ttft_ms=1.0,
+                inter_token_ms=(),
+                elapsed_seconds=0.001,
+                stop_reason="length",
+                output_ids=(seed + 1,),
+                output_text="",
+                native_token_timestamps_ns=(seed + 1,),
+            )
+            return (result,), 0.001
+
+        def reset(self):
+            self.resets += 1
+
+    client = Client()
+    results, _ = _run_multi_turn(
+        client,
+        ((7,), (8,)),
+        8,
+        0,
+        request_scoped=True,
+        max_in_flight=1,
+    )
+    assert len(results) == 2
+    assert client.resets == 0
+    assert [request_id for _, request_id in client.calls[:4]] == [
+        "multi-turn-00000::turn-0::of-4",
+        "multi-turn-00000::turn-1::of-4",
+        "multi-turn-00000::turn-2::of-4",
+        "multi-turn-00000::turn-3::of-4",
+    ]
+    assert len(client.calls[0][0]) < len(client.calls[1][0]) < len(client.calls[2][0])
+
+
+def test_request_scope_session_markers_reset_only_on_final_turn():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    added = []
+    active = False
+    for line in patch.read_text().splitlines():
+        if line.startswith("diff --git "):
+            active = "online_adaptation_runtime.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    runtime = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "OnlineCohortRuntime"
+    )
+    functions = {
+        node.name: node
+        for node in runtime.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_request_scope_owner", "_request_scope_session_complete"}
+    }
+    namespace = {}
+    for function in functions.values():
+        function.decorator_list = []
+        exec(
+            compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"),
+            namespace,
+        )
+    first = "multi-turn-00000::turn-0::of-4"
+    final = "multi-turn-00000::turn-3::of-4"
+    assert namespace["_request_scope_owner"](first) == "multi-turn-00000"
+    assert not namespace["_request_scope_session_complete"](first)
+    assert namespace["_request_scope_session_complete"](final)
+    assert namespace["_request_scope_session_complete"]("ordinary-request")
 
 
 def test_dspark_loss_retains_graph_inside_inference_scheduler():

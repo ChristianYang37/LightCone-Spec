@@ -93,3 +93,26 @@ def test_sqlite_records_actual_gpu_pair(tmp_path: Path):
             "SELECT assigned_gpus FROM jobs WHERE job_id=?", (job.job_id,)
         ).fetchone()
     assert row["assigned_gpus"] == "4,5"
+
+
+def test_protocol_repair_requeues_without_deleting_attempt_history(tmp_path: Path):
+    state = StateStore(tmp_path)
+    failed = materialize("E4-profile")[0]
+    skipped = materialize("E3b-pilot")[0]
+    state.add_jobs("E4-profile", (failed,))
+    state.add_jobs("E3b-pilot", (skipped,))
+    attempt = state.start(failed, (0, 1), tmp_path / "failed-attempt")
+    state.fail(failed.job_id, attempt, "diagnostic", retry=False)
+    state.skip_job(skipped.job_id, "upstream failure")
+
+    assert state.retry_failed("E4-profile") == 1
+    assert state.reopen_skipped(("E3b-pilot",)) == 1
+    assert state.status_counts("E4-profile") == {"pending": 1}
+    assert state.status_counts("E3b-pilot") == {"pending": 1}
+    with state.connect() as connection:
+        attempts = connection.execute(
+            "SELECT status,error FROM attempts WHERE job_id=?", (failed.job_id,)
+        ).fetchall()
+    assert [(row["status"], row["error"]) for row in attempts] == [
+        ("failed", "diagnostic")
+    ]
