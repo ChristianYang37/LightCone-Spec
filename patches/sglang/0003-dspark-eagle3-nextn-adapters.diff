@@ -824,7 +824,7 @@ index ae778ee..eb8fe29 100644
  
          target_model = self.target_worker.model_runner.model
  
-@@ -530,19 +584,39 @@ class DSparkWorkerV2(BaseSpecWorker):
+@@ -530,19 +584,51 @@ class DSparkWorkerV2(BaseSpecWorker):
                  device=device,
                  target_model=target_model,
                  sampling_info=sampling_info,

@@ -382,6 +382,61 @@ def test_logit_reconstruction_empty_mask_cannot_publish():
     assert math.isinf(mean_kl.item())
 
 
+def test_logit_reconstruction_replays_published_model_dtype_source():
+    patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
+    text = patch.read_text()
+    assert "+                    active_values = self._active_inference_parameters()" in text
+    assert (
+        "+                        member_loss, gradients = "
+        "member_feedback(self.optimizer.master)"
+    ) in text
+    added = []
+    active = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            active = "dflash_online_adaptation.py" in line
+        elif active and line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    tree = ast.parse("\n".join(added))
+    adapter = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DFlashDrafterAdapter"
+    )
+    function = next(
+        node
+        for node in adapter.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_active_inference_parameters"
+    )
+    namespace = {"torch": torch}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(patch), "exec"),
+        namespace,
+    )
+    source = namespace["_active_inference_parameters"]
+
+    published = torch.tensor([1.0], dtype=torch.bfloat16)
+    full = SimpleNamespace(
+        config=SimpleNamespace(weight_update_mode="full"),
+        base={},
+        names=("weight",),
+        inference=SimpleNamespace(active=(published,)),
+    )
+    assert source(full)["weight"] is published
+
+    frozen = torch.tensor([2.0], dtype=torch.float32)
+    lora = SimpleNamespace(
+        config=SimpleNamespace(weight_update_mode="lora"),
+        base={"weight": torch.tensor([1.0001]), "frozen": frozen},
+        names=("weight",),
+        inference=SimpleNamespace(active=(published,)),
+    )
+    values = source(lora)
+    assert values["weight"] is published
+    assert values["frozen"] is frozen
+
+
 def test_request_lora_slots_are_isolated_and_generation_safe():
     patch = Path("patches/sglang/0002-side-stream-adaptation-and-publication.diff")
     text = patch.read_text()

@@ -1423,7 +1423,7 @@ index f1da6d2d3b..c42f10f6b5 100644
          self.optimizer.reset(self.initial)
          self.inference.stage(self.initial)
          self.inference.publish()
-
+ 
 @@ -388,6 +1095,9 @@ class NativeBackendOnlineAdapter:
                  "native_last_source_tensor_shapes": self.last_source_tensor_shapes,
                  "native_last_feedback_source_version": self.last_feedback_source_version,

@@ -145,7 +145,7 @@ new file mode 100644
 index 00000000..20e93274
 --- /dev/null
 +++ b/python/sglang/srt/speculative/dflash_online_adaptation.py
-@@ -0,0 +1,1106 @@
+@@ -0,0 +1,1407 @@
 +"""DFlash backend-native Full/LoRA updates on a bounded current canvas."""
 +
 +from __future__ import annotations
@@ -794,6 +794,21 @@ index 00000000..20e93274
 +            )
 +        return values
 +
++    def _active_inference_parameters(self) -> dict[str, torch.Tensor]:
++        """Return the exact model-dtype weights that produced inference q.
++
++        The optimizer keeps an fp32 master, while publication copies a
++        model-dtype value into the fixed inference bank.  After many updates
++        those representations can differ enough to trip the reconstruction
++        gate even when the differentiable operator exactly reconstructs the
++        live model.  The gate must isolate operator drift, so replay its
++        source point from the published bank; optimization still evaluates
++        the fp32 master and anchors its forward value to inference q.
++        """
++        values = {} if self.config.weight_update_mode == "full" else dict(self.base)
++        values.update(dict(zip(self.names, self.inference.active, strict=True)))
++        return values
++
 +    def inference_hidden(self, fused_hidden: torch.Tensor) -> torch.Tensor:
 +        if self.request_slots is None:
 +            return fused_hidden
@@ -1277,7 +1292,7 @@ index 00000000..20e93274
 +                    inference_logits = self._full_vocab_logits(
 +                        local_inference_logits, target.shape[-1]
 +                    )
-+                    active_values = self._effective_parameters(self.optimizer.master)
++                    active_values = self._active_inference_parameters()
 +                    active_surrogate = self._surrogate_hidden(
 +                        active_values,
 +                        self._captured_input,
@@ -1735,7 +1750,7 @@ index 0bfd3b24..2dcf226a 100644
  
          seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
          if self.use_compact_draft_cache:
-@@ -1634,6 +1749,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+@@ -1634,6 +1749,12 @@ class DFlashWorkerV2(BaseSpecWorker):
          with torch.inference_mode():
              draft_out = self.draft_model_runner.forward(forward_batch)
          draft_logits_output = draft_out.logits_output
@@ -1822,7 +1837,7 @@ new file mode 100644
 index 00000000..7b2cb5db
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_runtime.py
-@@ -0,0 +1,2555 @@
+@@ -0,0 +1,2583 @@
 +"""Cohort-shared CUDA runtime for TTS and L0 publication."""
 +
 +from __future__ import annotations

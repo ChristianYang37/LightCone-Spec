@@ -151,7 +151,7 @@ new file mode 100644
 index 00000000..8ec8b2c7
 --- /dev/null
 +++ b/python/sglang/srt/speculative/online_adaptation_config.py
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,269 @@
 +"""Small JSON configuration for online speculative adaptation."""
 +
 +from __future__ import annotations
