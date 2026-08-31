@@ -511,6 +511,8 @@ def test_unified_dspark_model_accepts_markovless_dflash_checkpoint():
     assert "+        return None" in patch
     assert "-        if not dspark_config.require_markov():" in patch
     assert "-                \"DSpark draft requires markov_rank > 0, \"" in patch
+    assert 'if hasattr(self.draft_model, "attach_shared_modules"):' in patch
+    assert "self.draft_model.attach_shared_modules(" in patch
 
 
 def test_sglang_terminal_hook_preserves_abort_identity():
