@@ -127,6 +127,8 @@ def _records_scientific_rejection(job: Job) -> bool:
 
 def _screening_job(job: Job) -> bool:
     node = str(job.parameters.get("source_node", job.node))
+    if node.endswith("-segments"):
+        node = node[: -len("-segments")]
     return node in {
         "E3a",
         "TTS-Cal",
