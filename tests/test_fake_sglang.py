@@ -1047,6 +1047,7 @@ def test_scheduled_dispatcher_does_not_queue_behind_worker_pool(fake_server):
 
 def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     launched = {}
+    launch_count = 0
 
     class Process:
         pid = 12345
@@ -1056,6 +1057,8 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
         def wait(self, timeout=None): self.returncode = 0
 
     def launch(*args, **kwargs):
+        nonlocal launch_count
+        launch_count += 1
         launched.update(kwargs)
         return Process()
 
@@ -1063,6 +1066,7 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("lightcone_spec.server.GpuSampler.start", lambda self: None)
     monkeypatch.setattr("lightcone_spec.server.GpuSampler.stop", lambda self: None)
     monkeypatch.setattr("lightcone_spec.server.SGLangClient.health", lambda self: True)
+    monkeypatch.setattr("lightcone_spec.server.SGLangClient.reset", lambda self: None)
     monkeypatch.setattr("lightcone_spec.server.os.killpg", lambda *a: None)
     python = tmp_path / "python"
     python.write_text("")
@@ -1113,6 +1117,26 @@ def test_server_process_lifecycle(monkeypatch, tmp_path: Path):
     with dspark:
         assert launched["env"]["SGLANG_RAGGED_VERIFY_MODE"] == "compact"
         assert "native_heads" in dspark.adaptation["parameter_scope"]
+        calibration = next(
+            job
+            for job in materialize("E1a")
+            if job.parameters.get("workload") == "confidence_calibration"
+        )
+        low = replace(
+            calibration,
+            parameters={**calibration.parameters, "confidence_threshold": 0.0},
+        )
+        high = replace(
+            calibration,
+            parameters={**calibration.parameters, "confidence_threshold": 0.9},
+        )
+        assert server_session_key(low) == server_session_key(high) == dspark.session_key
+        launches_before_reconfigure = launch_count
+        dspark.configure(low, None)
+        dspark.configure(high, None)
+        assert launch_count == launches_before_reconfigure
+        reloaded = json.loads((output / "adaptation.json").read_text())
+        assert reloaded["confidence_threshold"] == 0.9
 
 
 def test_onlinespec_payload_contains_independent_learner_settings():

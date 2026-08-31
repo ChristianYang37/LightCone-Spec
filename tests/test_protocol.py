@@ -1,4 +1,5 @@
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from lightcone_spec.runner import (
     _screening_incomplete_classification,
     _screening_job,
     _segment_jobs,
+    _session_pool_eligible,
+    _SessionCellPool,
     _single_gpu_queues,
     _validate_measured_metrics,
 )
@@ -339,6 +342,81 @@ def test_bundled_segments_stay_together_and_parents_balance(tmp_path: Path):
     }
     with pytest.raises(ScientificFailure, match="fallbacks=1"):
         _validate_measured_metrics(unsafe)
+
+
+def test_session_cell_pool_splits_only_independent_segments():
+    parents = tuple(
+        job
+        for job in materialize("E1a")
+        if job.parameters.get("workload") == "confidence_calibration"
+    )
+    children = tuple(child for parent in parents for child in _segment_jobs(parent))
+    assert len(parents) == len(CONFIDENCE_WEIGHTS)
+    assert len(children) == 50
+    assert all(_session_pool_eligible(job) for job in children)
+
+    pool = _SessionCellPool((job, ("e1a",), 8192.0) for job in children)
+    assignments = {0: [], 1: []}
+    while len(pool):
+        for gpu in assignments:
+            job = pool.claim(("e1a",))
+            if job is not None:
+                assignments[gpu].append(job.job_id)
+    assert {gpu: len(rows) for gpu, rows in assignments.items()} == {0: 25, 1: 25}
+
+    remaining = _segment_jobs(parents[-1])[2:]
+    pool = _SessionCellPool((job, ("e1a",), 8192.0) for job in remaining)
+    resumed = {0: [], 1: []}
+    while len(pool):
+        for gpu in resumed:
+            job = pool.claim(("e1a",))
+            if job is not None:
+                resumed[gpu].append(job.job_id)
+    assert {gpu: len(rows) for gpu, rows in resumed.items()} == {0: 4, 1: 4}
+
+    atomic = _SessionCellPool((job, ("e1a",), 8192.0) for job in children)
+
+    def drain() -> list[str]:
+        claimed = []
+        while True:
+            job = atomic.claim(("e1a",))
+            if job is None:
+                return claimed
+            claimed.append(job.job_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(drain) for _ in range(2)]
+        claimed = sum((future.result() for future in futures), [])
+    assert len(claimed) == len(set(claimed)) == 50
+
+    blocked = replace(children[0], block=0)
+    tp2 = replace(
+        children[0],
+        gpu_count=2,
+        parameters={**children[0].parameters, "topology": "tp2_dp1"},
+    )
+    assert not _session_pool_eligible(blocked)
+    assert not _session_pool_eligible(tp2)
+
+    width = replace(
+        children[0],
+        node="E3-width-calibration",
+        parameters={
+            **children[0].parameters,
+            "workload": "excluded_deployment_width_tuning",
+        },
+    )
+    runtime_repair = replace(
+        children[0],
+        node="bugfix-reconciliation-v1",
+        parameters={
+            **children[0].parameters,
+            "workload": "runtime_repair",
+            "reconciliation_kind": "screening_runtime_error_classification",
+        },
+    )
+    assert _session_pool_eligible(width)
+    assert _session_pool_eligible(runtime_repair)
 
 
 def test_screening_capacity_detects_zero_kv_after_adaptation_headroom():

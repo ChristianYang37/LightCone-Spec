@@ -2003,6 +2003,149 @@ def _single_gpu_queues(
     return {gpu: tuple(rows) for gpu, rows in queues.items() if rows}
 
 
+def _session_pool_eligible(job: Job) -> bool:
+    """Return whether a bundled cell is independent and safe to steal."""
+
+    if (
+        job.gpu_count != 1
+        or job.block is not None
+        or job.parameters.get("parent_job_id") is None
+        or job.parameters.get("topology", "tp1_dp1") != "tp1_dp1"
+    ):
+        return False
+    if any(
+        job.parameters.get(name)
+        for name in (
+            "profiler",
+            "failure",
+            "adaptive_probe",
+            "controlled_replay",
+            "controlled_pair_baseline",
+        )
+    ):
+        return False
+    return (
+        job.parameters.get("workload")
+        in {"confidence_calibration", "excluded_deployment_width_tuning"}
+        or job.parameters.get("reconciliation_kind")
+        == "screening_runtime_error_classification"
+    )
+
+
+class _SessionCellPool:
+    """Thread-safe work pool with deterministic session-local preference."""
+
+    def __init__(
+        self,
+        entries: Iterable[tuple[Job, tuple[object, ...], float]],
+    ):
+        self._pending = list(entries)
+        self._lock = threading.Lock()
+
+    def claim(self, preferred_key: tuple[object, ...] | None = None) -> Job | None:
+        with self._lock:
+            if not self._pending:
+                return None
+            candidates = [
+                index
+                for index, (_, key, _) in enumerate(self._pending)
+                if preferred_key is not None and key == preferred_key
+            ]
+            if not candidates:
+                candidates = list(range(len(self._pending)))
+            index = min(
+                candidates,
+                key=lambda value: (
+                    -self._pending[value][2],
+                    self._pending[value][0].ordinal,
+                    self._pending[value][0].job_id,
+                ),
+            )
+            job, _, _ = self._pending.pop(index)
+            return job
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+
+def _session_pool_work(job: Job) -> float:
+    return float(job.parameters.get("generation_tokens", 256))
+
+
+def _run_session_cell_pool(
+    config: ExperimentConfig,
+    state: StateStore,
+    node: str,
+    stop_event: threading.Event,
+    node_failed: threading.Event,
+    jobs: tuple[Job, ...],
+) -> None:
+    entries = []
+    for job in jobs:
+        runtime_job = _runtime_job(config, state, job)
+        selection = _selection_for_job(state, job)
+        process_job = _exactness_bootstrap(runtime_job)
+        entries.append(
+            (
+                job,
+                server_session_key(process_job, selection),
+                _session_pool_work(job),
+            )
+        )
+    pool = _SessionCellPool(entries)
+
+    def worker(gpu: int) -> None:
+        first = pool.claim()
+        if first is None:
+            return
+        first_runtime = _runtime_job(config, state, first)
+        first_selection = _selection_for_job(state, first)
+        first_process_job = _exactness_bootstrap(first_runtime)
+        session_dir = config.run_dir / "sessions" / node / f"cell-pool-gpu-{gpu}"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "cycles.jsonl").touch()
+        process = ServerProcess(
+            config,
+            first_process_job,
+            gpus=(gpu,),
+            port=_resource_port(config, (gpu,)),
+            output_dir=session_dir,
+            selection=first_selection,
+        )
+        job = first
+        try:
+            while not stop_event.is_set() and not node_failed.is_set():
+                selection = _selection_for_job(state, job)
+                _execute_cell(
+                    config,
+                    state,
+                    job,
+                    gpus=(gpu,),
+                    selection=selection,
+                    server=process,
+                )
+                if state.status_counts(node).get("failed"):
+                    node_failed.set()
+                    return
+                if stop_event.is_set() or node_failed.is_set():
+                    return
+                job = pool.claim(process.session_key)
+                if job is None:
+                    return
+        finally:
+            process.stop()
+
+    worker_count = min(len(config.gpu_ids), len(jobs))
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="lightcone-cell-pool",
+    ) as executor:
+        futures = [executor.submit(worker, gpu) for gpu in config.gpu_ids[:worker_count]]
+        for future in futures:
+            future.result()
+
+
 def _pair_interference_jobs(config: ExperimentConfig) -> tuple[Job, ...]:
     rows = []
     for pair_index in range(len(_gpu_pairs(config))):
@@ -2742,6 +2885,8 @@ def _run_pending_jobs(
     exclusive = tuple(job for job in pending if job.gpu_count == 2)
     singles = tuple(job for job in pending if job.gpu_count == 1)
     node_failed = threading.Event()
+    pooled_singles = tuple(job for job in singles if _session_pool_eligible(job))
+    singles = tuple(job for job in singles if job not in pooled_singles)
 
     def run_sessions(jobs: Iterable[Job], *, gpus: tuple[int, ...], port: int, label: str) -> None:
         grouped: dict[tuple[object, ...], list[tuple[Job, Job, dict[str, Any] | None]]] = {}
@@ -2902,6 +3047,17 @@ def _run_pending_jobs(
                 for future in futures:
                     future.result()
         return
+    if pooled_singles:
+        _run_session_cell_pool(
+            config,
+            state,
+            node,
+            stop_event,
+            node_failed,
+            pooled_singles,
+        )
+        if stop_event.is_set() or node_failed.is_set():
+            return
     queues = _single_gpu_queues(config, singles)
 
     def worker(gpu: int, jobs: Iterable[Job]) -> None:
