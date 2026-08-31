@@ -1,3 +1,5 @@
+import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,6 +9,8 @@ import yaml
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
+    _complete_blocked_profiler,
+    _ncu_permission_block_reason,
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
@@ -142,3 +146,36 @@ def test_pending_stage_resume_uses_current_materialization(tmp_path: Path):
     state.add_jobs("E2-r2", (original,))
     changed = replace(original, parameters={**original.parameters, "lr": 9e-4})
     assert _resume_materialization(state, "E2-r2", (changed,)) == (changed,)
+
+
+def test_ncu_permission_probe_reports_provider_block(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        return subprocess.CompletedProcess(command, 1, "", "==ERROR== ERR_NVGPUCTRPERM")
+
+    monkeypatch.setattr("lightcone_spec.runner.subprocess.run", fake_run)
+    reason = _ncu_permission_block_reason(tmp_path / "ncu", tmp_path / "python", 1)
+    assert reason == "Nsight Compute counters blocked by provider (ERR_NVGPUCTRPERM)"
+    assert captured["kwargs"]["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert captured["kwargs"]["timeout"] == 120
+
+
+def test_blocked_profiler_is_auditable_completed_outcome(tmp_path: Path):
+    state = StateStore(tmp_path)
+    job = materialize("E4-profile")[2]
+    state.add_jobs("E4-profile", (job,))
+    _complete_blocked_profiler(
+        state,
+        job,
+        tmp_path,
+        (0, 1),
+        "Nsight Compute counters blocked by provider (ERR_NVGPUCTRPERM)",
+    )
+    assert state.status_counts("E4-profile") == {"completed": 1}
+    metrics_path = state.completed_attempt_dir(job.job_id) / "metrics.json"
+    metrics = json.loads(metrics_path.read_text())
+    assert metrics["scientific_outcome"] == "blocked"
+    assert metrics["feasible"] is False
+    assert metrics["profiler"] == "ncu"

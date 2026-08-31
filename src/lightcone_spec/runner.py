@@ -2019,6 +2019,78 @@ def _complete_infeasible_startup(
     state.complete(job.job_id, attempt)
 
 
+def _ncu_permission_block_reason(
+    executable: Path, python: Path, gpu: int
+) -> str | None:
+    """Probe Nsight Compute counter access before launching a formal server."""
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    result = subprocess.run(
+        [
+            str(executable),
+            "--target-processes",
+            "all",
+            "--profile-from-start",
+            "on",
+            "--metrics",
+            "gpu__time_duration.sum",
+            str(python),
+            "-c",
+            (
+                "import torch; "
+                "x=torch.ones(1,device='cuda'); "
+                "(x+1).sum().item(); torch.cuda.synchronize()"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env=environment,
+    )
+    output = f"{result.stdout}\n{result.stderr}"
+    if "ERR_NVGPUCTRPERM" in output:
+        return "Nsight Compute counters blocked by provider (ERR_NVGPUCTRPERM)"
+    if result.returncode != 0:
+        tail = " ".join(output.splitlines()[-3:]).strip()
+        raise RuntimeError(f"Nsight Compute capability probe failed: {tail}")
+    return None
+
+
+def _complete_blocked_profiler(
+    state: StateStore,
+    job: Job,
+    run_dir: Path,
+    gpus: tuple[int, ...],
+    reason: str,
+) -> None:
+    attempt_number = state.next_attempt(job.job_id)
+    output_dir = run_dir / "jobs" / job.job_id / f"attempt-{attempt_number:02d}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempt = state.start(job, gpus, output_dir)
+    _write_json(output_dir / "config.json", job.to_dict())
+    _write_json(
+        output_dir / "metrics.json",
+        {
+            "scientific_outcome": "blocked",
+            "feasible": False,
+            "profiler": job.parameters.get("profiler"),
+            "blocked_reason": reason,
+            "error": reason,
+            "request_outcomes": {
+                "offered": 0,
+                "admitted": 0,
+                "completed": 0,
+                "error": 0,
+                "timed_out": 0,
+                "cancelled": 0,
+                "unfinished": 0,
+            },
+        },
+    )
+    state.complete(job.job_id, attempt)
+
+
 def _e1_load_jobs(state: StateStore) -> tuple[Job, ...]:
     geometries = _rank_e1_geometries(state)
     if not geometries:
@@ -2606,6 +2678,19 @@ def _run_pending_jobs(
                 return
             rows = grouped[key]
             first_job, first_runtime, first_selection = rows[0]
+            if (
+                first_job.node == "E4-profile"
+                and first_job.parameters.get("profiler") == "ncu"
+            ):
+                reason = _ncu_permission_block_reason(
+                    config.profiler_tools["ncu"], config.server.python, gpus[0]
+                )
+                if reason is not None:
+                    for job, _, _ in rows:
+                        _complete_blocked_profiler(
+                            state, job, config.run_dir, gpus, reason
+                        )
+                    continue
             first_process_job = _exactness_bootstrap(first_runtime)
             block = "none" if first_job.block is None else f"{first_job.block:02d}"
             session_dir = (
