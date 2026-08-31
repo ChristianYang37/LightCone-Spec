@@ -87,6 +87,23 @@ CANDIDATE_METHODS = {
 }
 
 
+def _resume_materialization(
+    state: StateStore, node: str, planned: tuple[Job, ...]
+) -> tuple[Job, ...]:
+    """Keep a completed stage's immutable rows when selections later change.
+
+    Selection audits can add narrowly scoped dependency-repair jobs without
+    authorizing a completed paper stage to be rematerialized.  Reducers still
+    need to run on resume, so return the stored rows instead of skipping the
+    stage entirely.  Pending or reopened stages continue to use the current
+    protocol materialization.
+    """
+    existing = state.jobs(node)
+    if existing and state.stage_status(node) == "completed":
+        return existing
+    return planned
+
+
 def _records_scientific_rejection(job: Job) -> bool:
     """Return whether a measured rejection is a terminal scientific outcome.
 
@@ -4690,12 +4707,18 @@ class PaperRunner:
                         continue
                     valid_e0 = _select_valid_e0(self.state)
                     self.state.set_selection("valid_e0", valid_e0)
-                jobs = materialize(
+                jobs = _resume_materialization(
+                    self.state,
                     node,
-                    valid_e0=valid_e0,
-                    e2_rows=e2_rows,
-                    e0_recipes=self.state.selection("e0_recipes", None),
-                    e4_neighborhoods=self.state.selection("e4_neighborhoods", None),
+                    materialize(
+                        node,
+                        valid_e0=valid_e0,
+                        e2_rows=e2_rows,
+                        e0_recipes=self.state.selection("e0_recipes", None),
+                        e4_neighborhoods=self.state.selection(
+                            "e4_neighborhoods", None
+                        ),
+                    ),
                 )
                 self.state.add_jobs(node, jobs)
                 dependency_reason = _dependency_reason(self.config, self.state, node)

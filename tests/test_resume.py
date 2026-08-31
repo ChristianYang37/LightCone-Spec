@@ -6,7 +6,11 @@ import yaml
 
 from lightcone_spec.config import ExperimentConfig, ProtocolConfig, ServerConfig
 from lightcone_spec.protocol import materialize
-from lightcone_spec.runner import _save_or_validate_run_config, _segment_jobs
+from lightcone_spec.runner import (
+    _resume_materialization,
+    _save_or_validate_run_config,
+    _segment_jobs,
+)
 from lightcone_spec.state import StateStore
 
 
@@ -116,3 +120,25 @@ def test_protocol_repair_requeues_without_deleting_attempt_history(tmp_path: Pat
     assert [(row["status"], row["error"]) for row in attempts] == [
         ("failed", "diagnostic")
     ]
+
+
+def test_completed_stage_resume_preserves_immutable_materialization(tmp_path: Path):
+    state = StateStore(tmp_path)
+    original = materialize("E2-r2")[0]
+    state.add_jobs("E2-r2", (original,))
+    attempt = state.start(original, (0,), tmp_path / "attempt")
+    state.complete(original.job_id, attempt)
+    assert state.finish_stage("E2-r2") == "completed"
+
+    changed = replace(original, parameters={**original.parameters, "lr": 9e-4})
+    resumed = _resume_materialization(state, "E2-r2", (changed,))
+    assert resumed == (original,)
+    state.add_jobs("E2-r2", resumed)
+
+
+def test_pending_stage_resume_uses_current_materialization(tmp_path: Path):
+    state = StateStore(tmp_path)
+    original = materialize("E2-r2")[0]
+    state.add_jobs("E2-r2", (original,))
+    changed = replace(original, parameters={**original.parameters, "lr": 9e-4})
+    assert _resume_materialization(state, "E2-r2", (changed,)) == (changed,)
