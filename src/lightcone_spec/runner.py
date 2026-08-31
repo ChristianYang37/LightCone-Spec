@@ -87,6 +87,21 @@ CANDIDATE_METHODS = {
 }
 
 
+def _records_scientific_rejection(job: Job) -> bool:
+    """Return whether a measured rejection is a terminal scientific outcome.
+
+    Reconciliation jobs replace already-completed evidence.  A scientifically
+    rejected replacement must remain auditable, but it must not abort the
+    sibling replacement queue or leave the other GPU idle.
+    """
+    return (
+        job.node == "S10-reconciliation"
+        or job.method in CANDIDATE_METHODS
+        or bool(job.parameters.get("interface_fit"))
+        or _screening_job(job)
+    )
+
+
 def _screening_job(job: Job) -> bool:
     return job.node in {
         "E3a",
@@ -1650,11 +1665,7 @@ def _execute_cell(
                 )
                 state.complete(job.job_id, attempt)
                 return
-            if (
-                job.method in CANDIDATE_METHODS
-                or job.parameters.get("interface_fit")
-                or _screening_job(job)
-            ):
+            if _records_scientific_rejection(job):
                 _write_json(
                     output_dir / "metrics.json",
                     _scientific_rejection(metrics, offered, error),

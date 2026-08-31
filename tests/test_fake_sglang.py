@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +41,7 @@ from lightcone_spec.runner import (
     _fault_action_passed,
     _fit_prompt,
     _read_jsonl,
+    _records_scientific_rejection,
     _request_metrics,
     _request_scope_released,
     _run_multi_turn,
@@ -88,6 +89,26 @@ def _nextn_acceptance_job(model: str) -> Job:
             "topology": "tp2_dp1",
         },
     )
+
+
+def test_s10_scientific_rejection_is_terminal_without_stopping_siblings():
+    replacement = Job(
+        job_id="s10-repair__E2-r3__000023__tts",
+        node="S10-reconciliation",
+        ordinal=13,
+        method="tts",
+        model="Qwen/Qwen3-8B",
+        backend="DFLASH",
+        task="CalibrationMix",
+        context=40928,
+        load="c1",
+        width=16,
+        parameters={"reconciliation_kind": "formal_stride"},
+    )
+    original = replace(replacement, job_id="E2-r3__000023__tts", node="E2-r3")
+
+    assert _records_scientific_rejection(replacement)
+    assert not _records_scientific_rejection(original)
 
 
 def test_native_timestamps_accept_scheduler_field_names():
