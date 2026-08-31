@@ -4695,6 +4695,7 @@ def _run_formal_s10_reconciliation(
 
     e4_profile_retries = state.retry_failed("E4-profile")
     width_retries = state.retry_failed("E3-width-calibration")
+    width_segment_retries = state.retry_failed("E3-width-calibration-segments")
     reopened = state.reopen_skipped(
         (
             "E3b-pilot",
@@ -4721,10 +4722,54 @@ def _run_formal_s10_reconciliation(
             "excluded_source_jobs": len(excluded),
             "e4_profile_retries": e4_profile_retries,
             "width_calibration_retries": width_retries,
+            "width_calibration_segment_retries": width_segment_retries,
             "future_jobs_reopened": reopened,
         },
     )
     state.set_selection("formal_s10_reconciliation_complete", True)
+
+
+def _repair_completed_s10_downstream_resume(state: StateStore) -> None:
+    """Apply the bundled-segment resume fix to an already reconciled run."""
+
+    if not state.selection("formal_s10_reconciliation_complete", False):
+        return
+    if state.selection("formal_s10_downstream_resume_version", 0) >= 2:
+        return
+    e4_profile_retries = state.retry_failed("E4-profile")
+    width_retries = state.retry_failed("E3-width-calibration")
+    width_segment_retries = state.retry_failed("E3-width-calibration-segments")
+    reopened = state.reopen_skipped(
+        (
+            "E3b-pilot",
+            "E3b-final",
+            "E1a",
+            "E5-pilot",
+            "E5-final",
+            "E6-pilot",
+            "E6-final",
+            "E0-tune",
+            "E0-pilot",
+            "E0-final",
+        )
+    )
+    audit_path = (
+        state.run_dir
+        / "stages"
+        / "S10-reconciliation"
+        / "downstream-resume-v2.json"
+    )
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        audit_path,
+        {
+            "e4_profile_retries": e4_profile_retries,
+            "width_calibration_retries": width_retries,
+            "width_calibration_segment_retries": width_segment_retries,
+            "future_jobs_reopened": reopened,
+        },
+    )
+    state.set_selection("formal_s10_downstream_resume_version", 2)
 
 
 class PaperRunner:
@@ -4759,6 +4804,7 @@ class PaperRunner:
                     self.state,
                     self.stop_event,
                 )
+                _repair_completed_s10_downstream_resume(self.state)
                 if self.stop_event.is_set():
                     break
                 valid_e0 = self.state.selection("valid_e0", None)

@@ -11,6 +11,7 @@ from lightcone_spec.protocol import materialize
 from lightcone_spec.runner import (
     _complete_blocked_profiler,
     _ncu_permission_block_reason,
+    _repair_completed_s10_downstream_resume,
     _resume_materialization,
     _save_or_validate_run_config,
     _segment_jobs,
@@ -179,3 +180,43 @@ def test_blocked_profiler_is_auditable_completed_outcome(tmp_path: Path):
     assert metrics["scientific_outcome"] == "blocked"
     assert metrics["feasible"] is False
     assert metrics["profiler"] == "ncu"
+
+
+def test_completed_s10_repair_requeues_bundled_segments_and_downstream(
+    tmp_path: Path,
+):
+    state = StateStore(tmp_path)
+    width = materialize("E3b-pilot")[0]
+    failed_segment = replace(
+        width,
+        job_id="e3-width-test__segment-000",
+        node="E3-width-calibration-segments",
+    )
+    skipped_pilot = materialize("E3b-pilot")[1]
+    state.add_internal_jobs((failed_segment,))
+    state.add_jobs("E3b-pilot", (skipped_pilot,))
+    attempt = state.start(failed_segment, (0,), tmp_path / "failed-segment")
+    state.fail(failed_segment.job_id, attempt, "scientific rejection", retry=False)
+    state.skip_job(skipped_pilot.job_id, "width calibration incomplete")
+    state.mark_stage_failed("E3b-pilot")
+    state.set_selection("formal_s10_reconciliation_complete", True)
+
+    _repair_completed_s10_downstream_resume(state)
+
+    assert state.status_counts("E3-width-calibration-segments") == {"pending": 1}
+    assert state.status_counts("E3b-pilot") == {"pending": 1}
+    assert state.stage_status("E3b-pilot") == "pending"
+    assert state.selection("formal_s10_downstream_resume_version") == 2
+    audit = json.loads(
+        (
+            tmp_path
+            / "stages"
+            / "S10-reconciliation"
+            / "downstream-resume-v2.json"
+        ).read_text()
+    )
+    assert audit["width_calibration_segment_retries"] == 1
+    assert audit["future_jobs_reopened"] == 1
+
+    _repair_completed_s10_downstream_resume(state)
+    assert state.status_counts("E3-width-calibration-segments") == {"pending": 1}
